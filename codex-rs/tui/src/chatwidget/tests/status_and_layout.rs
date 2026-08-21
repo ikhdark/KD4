@@ -3,6 +3,7 @@ use crate::bottom_pane::goal_status_indicator_line;
 use crate::chatwidget::rate_limits::NUDGE_MODEL_SLUG;
 use crate::chatwidget::rate_limits::get_limits_duration;
 use codex_app_server_protocol::SpendControlLimitSnapshot;
+use codex_protocol::openai_models::SPEED_TIER_FAST;
 use pretty_assertions::assert_eq;
 use ratatui::backend::TestBackend;
 use serial_test::serial;
@@ -794,7 +795,7 @@ async fn rate_limit_snapshot_keeps_prior_credits_when_missing_from_headers() {
         .and_then(|credits| credits.balance.as_deref());
     assert_eq!(initial_balance, Some("17.5"));
 
-    chat.on_rate_limit_snapshot(Some(RateLimitSnapshot {
+    chat.on_rolling_rate_limit_snapshot(RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
         primary: Some(RateLimitWindow {
@@ -808,7 +809,7 @@ async fn rate_limit_snapshot_keeps_prior_credits_when_missing_from_headers() {
         spend_control_reached: None,
         plan_type: None,
         rate_limit_reached_type: None,
-    }));
+    });
 
     let display = chat
         .rate_limit_snapshots_by_limit_id
@@ -1258,7 +1259,7 @@ async fn header_rate_limit_snapshot_preserves_member_limit_type_for_error_prompt
     // the backend-classified reached type. They arrive before the Error event.
     let mut header_limits = snapshot(/*percent*/ 100.0);
     header_limits.rate_limit_reached_type = None;
-    chat.on_rate_limit_snapshot(Some(header_limits));
+    chat.on_rolling_rate_limit_snapshot(header_limits);
 
     chat.on_rate_limit_error(
         RateLimitErrorKind::UsageLimit,
@@ -1602,7 +1603,14 @@ async fn request_user_input_interrupt_pauses_active_goal_turn() {
 
         chat.handle_key_event(key_event);
 
-        assert_matches!(rx.try_recv(), Ok(AppEvent::CodexOp(Op::Interrupt { .. })));
+        assert_matches!(
+            rx.try_recv(),
+            Ok(AppEvent::CodexOp(Op::UserInputAnswer {
+                id,
+                response,
+            })) if id == "turn-1" && response.interrupted
+        );
+        assert_matches!(rx.try_recv(), Ok(AppEvent::InsertHistoryCell(_)));
         assert_goal_paused_event(&mut rx, thread_id);
     }
 }
@@ -1776,7 +1784,7 @@ async fn fast_status_indicator_supports_legacy_fast_metadata() {
     set_chatgpt_auth(&mut chat);
     let mut preset = get_available_model(&chat, "gpt-5.4");
     preset.service_tiers.clear();
-    preset.additional_speed_tiers = vec![ServiceTier::Fast.request_value().to_string()];
+    preset.additional_speed_tiers = vec![SPEED_TIER_FAST.to_string()];
     chat.model_catalog = std::sync::Arc::new(ModelCatalog::new(vec![preset]));
     chat.set_service_tier(Some(ServiceTier::Fast.request_value().to_string()));
 

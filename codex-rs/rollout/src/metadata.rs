@@ -46,6 +46,7 @@ pub(crate) fn builder_from_session_meta(
         session_meta.meta.source.clone(),
     );
     builder.history_mode = session_meta.meta.history_mode;
+    builder.parent_thread_id = session_meta.meta.parent_thread_id;
     builder.model_provider = session_meta.meta.model_provider.clone();
     builder.agent_nickname = session_meta.meta.agent_nickname.clone();
     builder.agent_role = session_meta.meta.agent_role.clone();
@@ -114,6 +115,7 @@ pub async fn extract_metadata_from_rollout(
             rollout_path.display()
         )
     })?;
+    let parent_thread_id = builder.parent_thread_id;
     let mut metadata = builder.build(default_provider);
     apply_rollout_items(&mut metadata, &items, default_provider);
     if let Some(updated_at) = file_modified_time_utc(rollout_path).await {
@@ -122,6 +124,7 @@ pub async fn extract_metadata_from_rollout(
     }
     Ok(ExtractionOutcome {
         metadata,
+        parent_thread_id,
         memory_mode: items.iter().rev().find_map(|item| match item {
             RolloutItem::SessionMeta(meta_line) => meta_line.meta.memory_mode.clone(),
             RolloutItem::ResponseItem(_)
@@ -275,6 +278,7 @@ pub(crate) async fn backfill_sessions_with_lease(
                             &[("stage", "backfill_sessions")],
                         );
                     }
+                    let parent_thread_id = outcome.parent_thread_id;
                     let mut metadata = outcome.metadata;
                     metadata.cwd = normalize_cwd_for_state_db(&metadata.cwd);
                     let memory_mode = outcome.memory_mode.unwrap_or_else(|| "enabled".to_string());
@@ -290,6 +294,16 @@ pub(crate) async fn backfill_sessions_with_lease(
                     }
                     if let Err(err) = runtime.upsert_thread(&metadata).await {
                         warn!("failed to upsert rollout {}: {err}", rollout.path.display());
+                        false
+                    } else if let Some(parent_thread_id) = parent_thread_id
+                        && let Err(err) = runtime
+                            .insert_thread_spawn_edge_if_absent(parent_thread_id, metadata.id)
+                            .await
+                    {
+                        warn!(
+                            "failed to restore parent edge for {}: {err}",
+                            rollout.path.display()
+                        );
                         false
                     } else {
                         if let Err(err) = runtime

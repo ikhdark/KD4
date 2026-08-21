@@ -7,6 +7,7 @@ use codex_tools::ToolName;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
 use crate::agent::task_capabilities::is_independent_review_source;
+use crate::exec::DEFAULT_EXEC_COMMAND_TIMEOUT_MS;
 use crate::exec::ExecCapturePolicy;
 use crate::exec::ExecParams;
 use crate::exec_env::create_env;
@@ -58,6 +59,19 @@ use super::shell_command_payload_command;
 enum ShellCommandBackend {
     Classic,
     ZshFork,
+}
+
+pub(super) fn effective_stall_timeout_ms(
+    timeout_ms: Option<u64>,
+    requested_stall_timeout_ms: Option<u64>,
+) -> Option<u64> {
+    let hard_timeout_ms = timeout_ms.unwrap_or(DEFAULT_EXEC_COMMAND_TIMEOUT_MS);
+    let stall_timeout_ms = match requested_stall_timeout_ms {
+        Some(0) | None => return None,
+        Some(stall_timeout_ms) => stall_timeout_ms,
+    };
+
+    (stall_timeout_ms < hard_timeout_ms).then_some(stall_timeout_ms)
 }
 
 #[derive(Default)]
@@ -385,11 +399,12 @@ impl ShellCommandHandler {
             exec_params.windows_sandbox_private_desktop,
         );
         let runtime_context = format!(
-            "backend={:?};shell={shell_type:?};login={use_login_shell};capture={:?};network_environment={:?};network={:?}",
+            "backend={:?};shell={shell_type:?};login={use_login_shell};capture={:?};network_environment={:?};network={:?};stall_timeout_ms={:?}",
             self.backend,
             exec_params.capture_policy,
             exec_params.network_environment_id,
             exec_params.network,
+            effective_stall_timeout_ms(params.timeout_ms, params.stall_timeout_ms),
         );
         let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
         let repository_epoch = session
@@ -520,6 +535,10 @@ impl ShellCommandHandler {
         let mut run_args = RunExecLikeArgs {
             tool_name,
             exec_params,
+            stall_timeout_ms: effective_stall_timeout_ms(
+                params.timeout_ms,
+                params.stall_timeout_ms,
+            ),
             cancellation_token,
             hook_command,
             safety_command,

@@ -120,9 +120,11 @@ use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::AcceptedAttemptProvenance;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::CompactedItem;
+use codex_protocol::protocol::ContextFragmentDigest;
 use codex_protocol::protocol::ConversationAudioParams;
 use codex_protocol::protocol::CreditsSnapshot;
 use codex_protocol::protocol::GranularApprovalConfig;
@@ -150,6 +152,7 @@ use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
+use codex_protocol::protocol::TurnContextProvenance;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::protocol::W3cTraceContext;
@@ -217,6 +220,54 @@ impl StepContext {
         );
         self
     }
+}
+
+fn accepted_context(mut item: TurnContextItem) -> TurnContextItem {
+    item.context_provenance = Some(TurnContextProvenance {
+        accepted_attempt: AcceptedAttemptProvenance {
+            sampling_request_id: "test-request".to_string(),
+            physical_attempt_id: "test-attempt".to_string(),
+        },
+        fragment_digests: vec![ContextFragmentDigest {
+            key: "test-fragment".to_string(),
+            digest: "test-digest".to_string(),
+        }],
+    });
+    item
+}
+
+async fn commit_test_context_baseline(session: &Session, suffix: &str) {
+    let request_id = format!("test-request-{suffix}");
+    let attempt_id = format!("test-attempt-{suffix}");
+    assert!(
+        session
+            .bind_context_baseline_candidate(&request_id, &attempt_id)
+            .await,
+        "test should have a staged context baseline candidate"
+    );
+    assert!(
+        session
+            .commit_context_baseline_candidate(&request_id, &attempt_id)
+            .await
+            .expect("test context baseline should commit"),
+        "bound test context baseline should commit"
+    );
+}
+
+fn assert_context_matches_with_accepted_provenance(
+    actual: Option<TurnContextItem>,
+    expected: TurnContextItem,
+) {
+    let mut actual = actual.expect("accepted reference context item");
+    assert!(
+        actual.context_provenance.is_some(),
+        "accepted reference context should retain sampling provenance"
+    );
+    actual.context_provenance = None;
+    assert_eq!(
+        serde_json::to_value(actual).expect("serialize actual context item"),
+        serde_json::to_value(expected).expect("serialize expected context item")
+    );
 }
 
 mod guardian_tests;
@@ -696,20 +747,24 @@ async fn interrupting_regular_turn_after_startup_prewarm_fallback_emits_turn_abo
         .expect("channel open");
     assert!(matches!(marker_evt.msg, EventMsg::RawResponseItem(_)));
 
-    let second = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+    let (turn_id, reason, completed_at, duration_ms, timing) =
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let event = rx.recv().await.expect("channel open");
+                if let EventMsg::TurnAborted(TurnAbortedEvent {
+                    turn_id,
+                    reason,
+                    completed_at,
+                    duration_ms,
+                    timing,
+                }) = event.msg
+                {
+                    break (turn_id, reason, completed_at, duration_ms, timing);
+                }
+            }
+        })
         .await
-        .expect("expected turn aborted event")
-        .expect("channel open");
-    let EventMsg::TurnAborted(TurnAbortedEvent {
-        turn_id,
-        reason,
-        completed_at,
-        duration_ms,
-        timing,
-    }) = second.msg
-    else {
-        panic!("expected turn aborted event");
-    };
+        .expect("expected turn aborted event");
     assert_eq!(turn_id, Some(tc.sub_id.clone()));
     assert_eq!(reason, TurnAbortReason::Interrupted);
     assert!(completed_at.is_some());
@@ -2410,6 +2465,7 @@ async fn resumed_history_injects_initial_context_on_first_context_update_only() 
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
         .await;
+    commit_test_context_baseline(&session, "resumed-first-update").await;
     let initial_context = build_initial_context(&session, &turn_context).await;
     expected.extend(initial_context);
     let history_after_seed = session.clone_history().await;
@@ -3208,6 +3264,10 @@ async fn fork_startup_context_then_first_turn_diff_snapshot_impl() -> anyhow::Re
         .expect("source rollout should flush before fork");
 
     let mut fork_config = initial.config.clone();
+    fork_config.model_providers.insert(
+        fork_config.model_provider_id.clone(),
+        fork_config.model_provider.clone(),
+    );
     fork_config.permissions.approval_policy =
         codex_config::Constrained::allow_any(AskForApproval::UnlessTrusted);
     let forked = initial
@@ -3246,7 +3306,23 @@ async fn fork_startup_context_then_first_turn_diff_snapshot_impl() -> anyhow::Re
             },
         })
         .await?;
-    wait_for_event(&forked.thread, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    loop {
+        let event = forked.thread.next_event().await?;
+        match event.msg {
+            EventMsg::Error(error) => {
+                panic!("forked turn failed before sampling: {}", error.message)
+            }
+            EventMsg::TurnComplete(turn) => {
+                assert!(
+                    turn.error.is_none(),
+                    "forked turn completed with an error before sampling: {:?}",
+                    turn.error
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
 
     let request = first_forked_request.single_request();
     let snapshot = context_snapshot::format_labeled_requests_snapshot(
@@ -3275,7 +3351,7 @@ async fn fork_startup_context_then_first_turn_diff_snapshot_impl() -> anyhow::Re
 async fn record_initial_history_forked_hydrates_previous_turn_settings() {
     let (session, turn_context) = make_session_and_context().await;
     let previous_model = "forked-rollout-model";
-    let previous_context_item = TurnContextItem {
+    let previous_context_item = accepted_context(TurnContextItem {
         turn_id: Some(turn_context.sub_id.clone()),
         #[allow(deprecated)]
         cwd: turn_context.cwd.clone(),
@@ -3298,7 +3374,7 @@ async fn record_initial_history_forked_hydrates_previous_turn_settings() {
         effort: turn_context.reasoning_effort.clone(),
         context_provenance: None,
         summary: codex_protocol::config_types::ReasoningSummary::Auto,
-    };
+    });
     let turn_id = previous_context_item
         .turn_id
         .clone()
@@ -3489,7 +3565,7 @@ async fn thread_rollback_recomputes_previous_turn_settings_and_reference_context
     )
     .await;
 
-    let first_context_item = tc.to_turn_context_item();
+    let first_context_item = accepted_context(tc.to_turn_context_item());
     let first_turn_id = first_context_item
         .turn_id
         .clone()
@@ -5535,6 +5611,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
     let environment_manager = Arc::new(EnvironmentManager::default_for_tests());
     let result = Session::new(
         session_configuration,
+        crate::client::request_effort_for_model(&model_info, config.model_reasoning_effort.clone()),
         Arc::clone(&config),
         /*user_instructions*/ None,
         "11111111-1111-4111-8111-111111111111".to_string(),
@@ -5941,6 +6018,7 @@ async fn make_session_with_config_and_rx(
 
     let session = Session::new(
         session_configuration,
+        crate::client::request_effort_for_model(&model_info, config.model_reasoning_effort.clone()),
         Arc::clone(&config),
         /*user_instructions*/ None,
         "11111111-1111-4111-8111-111111111111".to_string(),
@@ -6049,6 +6127,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
 
     let session = Session::new(
         session_configuration,
+        crate::client::request_effort_for_model(&model_info, config.model_reasoning_effort.clone()),
         Arc::clone(&config),
         /*user_instructions*/ None,
         "11111111-1111-4111-8111-111111111111".to_string(),
@@ -8617,6 +8696,8 @@ async fn make_multi_agent_v2_usage_hint_test_session(
         |config| {
             if enable_multi_agent_v2 {
                 let _ = config.features.enable(Feature::MultiAgentV2);
+            } else {
+                let _ = config.features.disable(Feature::MultiAgentV2);
             }
             config.multi_agent_v2.root_agent_usage_hint_text = Some("Root guidance.".to_string());
             config.multi_agent_v2.subagent_usage_hint_text = Some("Subagent guidance.".to_string());
@@ -9244,15 +9325,25 @@ fn emit_thread_start_skill_metrics_records_description_truncated_chars_without_o
         scope: SkillScope::Repo,
         plugin_id: None,
     };
-    let minimum_skill_line_cost = |skill: &SkillMetadata| {
-        let path = skill.path_to_skills_md.to_string_lossy().replace('\\', "/");
-        format!("- {}: (file: {})\n", skill.name, path)
-            .chars()
-            .count()
-    };
-    let minimum_budget = minimum_skill_line_cost(&alpha) + minimum_skill_line_cost(&beta);
     let mut outcome = SkillLoadOutcome::default();
     outcome.skills = vec![alpha, beta];
+    let full_render = build_available_skills(
+        &outcome,
+        SkillMetadataBudget::Characters(usize::MAX),
+        SkillRenderSideEffects::None,
+    )
+    .expect("full skills should render");
+    let description_chars = outcome
+        .skills
+        .iter()
+        .map(|skill| skill.description.chars().count())
+        .sum::<usize>();
+    let minimum_budget = full_render
+        .skill_lines
+        .iter()
+        .map(|line| line.chars().count())
+        .sum::<usize>()
+        .saturating_sub(description_chars);
 
     let rendered = build_available_skills(
         &outcome,
@@ -9264,14 +9355,14 @@ fn emit_thread_start_skill_metrics_records_description_truncated_chars_without_o
     .expect("skills should render");
 
     assert_eq!(rendered.report.omitted_count, 0);
-    assert_eq!(rendered.report.truncated_description_chars, 8);
+    assert_eq!(rendered.report.truncated_description_chars, 4);
     let snapshot = session_telemetry
         .snapshot_metrics()
         .expect("runtime metrics snapshot");
     assert_eq!(histogram_sum(&snapshot, THREAD_SKILLS_TRUNCATED_METRIC), 0);
     assert_eq!(
         histogram_sum(&snapshot, THREAD_SKILLS_DESCRIPTION_TRUNCATED_CHARS_METRIC),
-        8
+        4
     );
 }
 
@@ -9456,15 +9547,14 @@ async fn record_context_updates_and_set_reference_context_item_injects_full_cont
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
         .await;
+    commit_test_context_baseline(&session, "missing-baseline").await;
     let history = session.clone_history().await;
     let initial_context = build_initial_context(&session, &turn_context).await;
     assert_eq!(history.raw_items().to_vec(), initial_context);
 
-    let current_context = session.reference_context_item().await;
-    assert_eq!(
-        serde_json::to_value(current_context).expect("serialize current context item"),
-        serde_json::to_value(Some(turn_context.to_turn_context_item()))
-            .expect("serialize expected context item")
+    assert_context_matches_with_accepted_provenance(
+        session.reference_context_item().await,
+        turn_context.to_turn_context_item(),
     );
 }
 
@@ -9540,16 +9630,15 @@ async fn record_context_updates_and_set_reference_context_item_persists_baseline
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
         .await;
+    commit_test_context_baseline(&session, "unchanged-settings").await;
 
     assert_eq!(
         session.clone_history().await.raw_items().to_vec(),
         Vec::new()
     );
-    assert_eq!(
-        serde_json::to_value(session.reference_context_item().await)
-            .expect("serialize current context item"),
-        serde_json::to_value(Some(turn_context.to_turn_context_item()))
-            .expect("serialize expected context item")
+    assert_context_matches_with_accepted_provenance(
+        session.reference_context_item().await,
+        turn_context.to_turn_context_item(),
     );
     session.ensure_rollout_materialized().await;
     session.flush_rollout().await.expect("rollout should flush");
@@ -9564,11 +9653,9 @@ async fn record_context_updates_and_set_reference_context_item_persists_baseline
         RolloutItem::TurnContext(ctx) => Some(ctx.clone()),
         _ => None,
     });
-    assert_eq!(
-        serde_json::to_value(persisted_turn_context)
-            .expect("serialize persisted turn context item"),
-        serde_json::to_value(Some(turn_context.to_turn_context_item()))
-            .expect("serialize expected turn context item")
+    assert_context_matches_with_accepted_provenance(
+        persisted_turn_context,
+        turn_context.to_turn_context_item(),
     );
 }
 
@@ -9589,6 +9676,7 @@ async fn record_context_updates_and_set_reference_context_item_persists_split_fi
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
         .await;
+    commit_test_context_baseline(&session, "split-policy").await;
     session.ensure_rollout_materialized().await;
     session.flush_rollout().await.expect("rollout should flush");
 
@@ -9676,6 +9764,7 @@ async fn record_context_updates_and_set_reference_context_item_persists_full_rei
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
         .await;
+    commit_test_context_baseline(&session, "full-reinjection").await;
     session.ensure_rollout_materialized().await;
     session.flush_rollout().await.expect("rollout should flush");
 
@@ -9690,11 +9779,9 @@ async fn record_context_updates_and_set_reference_context_item_persists_full_rei
         _ => None,
     });
 
-    assert_eq!(
-        serde_json::to_value(persisted_turn_context)
-            .expect("serialize persisted turn context item"),
-        serde_json::to_value(Some(turn_context.to_turn_context_item()))
-            .expect("serialize expected turn context item")
+    assert_context_matches_with_accepted_provenance(
+        persisted_turn_context,
+        turn_context.to_turn_context_item(),
     );
 }
 
@@ -10207,8 +10294,15 @@ async fn abort_regular_task_emits_marker_before_turn_aborted() {
         EventMsg::TurnAborted(e) => assert_eq!(TurnAbortReason::Interrupted, e.reason),
         other => panic!("unexpected event: {other:?}"),
     }
-    // No extra events should be emitted after an abort.
-    assert!(rx.try_recv().is_err());
+    while let Ok(event) = rx.try_recv() {
+        assert!(
+            !matches!(
+                event.msg,
+                EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_)
+            ),
+            "abort should emit exactly one terminal event"
+        );
+    }
 }
 
 #[tokio::test]
@@ -10248,8 +10342,15 @@ async fn abort_gracefully_emits_marker_before_turn_aborted() {
         EventMsg::TurnAborted(e) => assert_eq!(TurnAbortReason::Interrupted, e.reason),
         other => panic!("unexpected event: {other:?}"),
     }
-    // No extra events should be emitted after an abort.
-    assert!(rx.try_recv().is_err());
+    while let Ok(event) = rx.try_recv() {
+        assert!(
+            !matches!(
+                event.msg,
+                EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_)
+            ),
+            "abort should emit exactly one terminal event"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -11407,7 +11508,7 @@ async fn abort_review_task_emits_exited_then_aborted_and_records_history() {
             let ResponseItem::Message { role, content, .. } = item else {
                 return false;
             };
-            if role != "user" {
+            if !matches!(role.as_str(), "user" | "developer") {
                 return false;
             }
             content.iter().any(|content_item| {

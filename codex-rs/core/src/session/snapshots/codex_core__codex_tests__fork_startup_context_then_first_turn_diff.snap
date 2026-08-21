@@ -5,12 +5,11 @@ expression: snapshot
 Scenario: First request after fork when startup preserves the parent baseline, the fork changes approval policy, and the first forked turn enters plan mode.
 
 ## First Forked Turn Request
-00:message/developer[2]:
-    [01] <PERMISSIONS_INSTRUCTIONS>
-    [02] <skills_usage_instructions>\n## How to use skills\n- Use a skill when the user names it or the t...
-01:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-02:message/user:fork seed
-03:message/developer[2]:
-    [01] <PERMISSIONS_INSTRUCTIONS>
-    [02] <collaboration_mode>Fork turn collaboration instructions.</collaboration_mode>
-04:message/user:after fork
+00:message/developer:<collaboration_mode>Fork turn collaboration instructions.</collaboration_mode>
+01:message/user:<task_model_guidance>Before acting, form and maintain a working task model from the current requ...
+02:message/developer:<PERMISSIONS_INSTRUCTIONS>
+03:message/developer:<skills_usage_instructions>\n## How to use skills\n- Use the smallest skill set named by the use...
+04:message/developer:<NO_TEXT>
+05:message/user:fork seed
+06:message/user:<ENVIRONMENT_CONTEXT>
+07:message/user:after fork

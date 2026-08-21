@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
+use tokio::sync::watch;
 
 use crate::ARCHITECTURE_CONTRACT_V1_SCHEMA_VERSION;
 use crate::AdmissionOverlapSummary;
@@ -102,6 +103,7 @@ const COLD_REVIEW_REASON_PREFIX: &str = "cold review required: ";
 // flushed. Give short-lived lease and provenance writes enough time to wait out
 // that contention instead of failing an otherwise read-only source inspection.
 const DATABASE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const EXTERNAL_WAKE_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 const DATABASE_FILENAME: &str = "agent_tasks.sqlite";
 
 fn sqlite_contention_code(error: &sqlx::Error) -> Option<&str> {
@@ -195,6 +197,7 @@ pub struct LocalAgentTaskStore {
     pool: SqlitePool,
     coordination_root: Arc<PathBuf>,
     missing_evidence_rejections: Arc<Mutex<HashMap<AttemptId, MissingEvidenceRejection>>>,
+    wake_revision: Arc<watch::Sender<u64>>,
 }
 
 impl std::fmt::Debug for LocalAgentTaskStore {
@@ -228,6 +231,7 @@ impl LocalAgentTaskStore {
             pool,
             coordination_root: Arc::new(coordination_root),
             missing_evidence_rejections: Arc::new(Mutex::new(HashMap::new())),
+            wake_revision: Arc::new(watch::channel(0).0),
         };
         store
             .drain_snapshot_gc_queue_best_effort("store initialization")
@@ -243,6 +247,42 @@ impl LocalAgentTaskStore {
 
     pub async fn close(&self) {
         self.pool.close().await;
+    }
+
+    fn notify_wake_waiters(&self) {
+        self.wake_revision
+            .send_modify(|revision| *revision = revision.saturating_add(1));
+    }
+
+    async fn wait_for_wake_events_impl(
+        &self,
+        root_session_id: String,
+        after_event_id: Option<WakeEventId>,
+    ) -> StoreResult<WakeRead> {
+        let mut wake_rx = self.wake_revision.subscribe();
+        loop {
+            let current = self
+                .read_wake_events_impl(root_session_id.clone(), after_event_id)
+                .await?;
+            if !current.updated_agents.is_empty() {
+                return Ok(current);
+            }
+            tokio::select! {
+                changed = wake_rx.changed() => {
+                    changed.map_err(|_| {
+                        StoreError::InvalidAssignment(
+                            "agent-task wake stream closed while waiting".to_string(),
+                        )
+                    })?;
+                }
+                _ = tokio::time::sleep(EXTERNAL_WAKE_RECHECK_INTERVAL) => {
+                    // Independent Codex processes own independent watch
+                    // senders while sharing this durable SQLite stream.
+                    // Recheck it at a bounded cadence so an external commit
+                    // cannot remain hidden indefinitely.
+                }
+            }
+        }
     }
 
     fn cached_missing_evidence_rejection(
@@ -3366,7 +3406,13 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         repo_root: &'a Path,
         draft: AssignmentDraft,
     ) -> TaskStoreFuture<'a, (Assignment, Attempt)> {
-        Box::pin(async move { self.create_assignment_impl(repo_root, draft).await })
+        Box::pin(async move {
+            let result = self.create_assignment_impl(repo_root, draft).await;
+            if result.is_ok() {
+                self.notify_wake_waiters();
+            }
+            result
+        })
     }
 
     fn create_admitted_assignment<'a>(
@@ -3376,13 +3422,18 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         isolated_integrator_available: bool,
     ) -> TaskStoreFuture<'a, AdmittedAssignment> {
         Box::pin(async move {
-            self.create_assignment_with_admission_impl(
-                repo_root,
-                draft,
-                true,
-                isolated_integrator_available,
-            )
-            .await
+            let result = self
+                .create_assignment_with_admission_impl(
+                    repo_root,
+                    draft,
+                    true,
+                    isolated_integrator_available,
+                )
+                .await;
+            if result.is_ok() {
+                self.notify_wake_waiters();
+            }
+            result
         })
     }
 
@@ -3393,8 +3444,13 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         canonical_payload: String,
     ) -> TaskStoreFuture<'_, Assignment> {
         Box::pin(async move {
-            self.attach_task_capsule_impl(assignment_id, attempt_id, canonical_payload)
-                .await
+            let result = self
+                .attach_task_capsule_impl(assignment_id, attempt_id, canonical_payload)
+                .await;
+            if result.is_ok() {
+                self.notify_wake_waiters();
+            }
+            result
         })
     }
 
@@ -3413,7 +3469,13 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         &self,
         binding: AgentTaskBindingDraft,
     ) -> TaskStoreFuture<'_, AgentTaskBinding> {
-        Box::pin(async move { self.bind_agent_task_impl(binding).await })
+        Box::pin(async move {
+            let result = self.bind_agent_task_impl(binding).await;
+            if result.is_ok() {
+                self.notify_wake_waiters();
+            }
+            result
+        })
     }
 
     fn remove_agent_task_binding(
@@ -3422,8 +3484,13 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         assignment_id: AssignmentId,
     ) -> TaskStoreFuture<'_, bool> {
         Box::pin(async move {
-            self.remove_agent_task_binding_impl(actor, assignment_id)
-                .await
+            let result = self
+                .remove_agent_task_binding_impl(actor, assignment_id)
+                .await;
+            if result.is_ok() {
+                self.notify_wake_waiters();
+            }
+            result
         })
     }
 
@@ -3460,13 +3527,24 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         call_id: Option<String>,
     ) -> TaskStoreFuture<'_, RuntimeObservation> {
         Box::pin(async move {
-            self.append_observation_impl(attempt_id, kind, summary, call_id)
-                .await
+            let result = self
+                .append_observation_impl(attempt_id, kind, summary, call_id)
+                .await;
+            if result.is_ok() {
+                self.notify_wake_waiters();
+            }
+            result
         })
     }
 
     fn record_validation_call(&self, call: ValidationCall) -> TaskStoreFuture<'_, ()> {
-        Box::pin(async move { self.record_validation_call_impl(call).await })
+        Box::pin(async move {
+            let result = self.record_validation_call_impl(call).await;
+            if result.is_ok() {
+                self.notify_wake_waiters();
+            }
+            result
+        })
     }
 
     fn get_validation_call(&self, call_id: String) -> TaskStoreFuture<'_, Option<ValidationCall>> {
@@ -3501,8 +3579,13 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         receipt: ReceiptDraft,
     ) -> TaskStoreFuture<'_, AgentReceipt> {
         Box::pin(async move {
-            self.submit_agent_receipt_impl(attempt_id, receipt, None)
-                .await
+            let result = self
+                .submit_agent_receipt_impl(attempt_id, receipt, None)
+                .await;
+            if result.is_ok() {
+                self.notify_wake_waiters();
+            }
+            result
         })
     }
 
@@ -3513,8 +3596,13 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         review_reason: String,
     ) -> TaskStoreFuture<'_, AgentReceipt> {
         Box::pin(async move {
-            self.submit_agent_receipt_impl(attempt_id, receipt, Some(review_reason))
-                .await
+            let result = self
+                .submit_agent_receipt_impl(attempt_id, receipt, Some(review_reason))
+                .await;
+            if result.is_ok() {
+                self.notify_wake_waiters();
+            }
+            result
         })
     }
 
@@ -3525,8 +3613,13 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         amendment: AttemptAmendment,
     ) -> TaskStoreFuture<'_, Attempt> {
         Box::pin(async move {
-            self.amend_agent_task_impl(actor, assignment_id, amendment)
-                .await
+            let result = self
+                .amend_agent_task_impl(actor, assignment_id, amendment)
+                .await;
+            if result.is_ok() {
+                self.notify_wake_waiters();
+            }
+            result
         })
     }
 
@@ -3537,8 +3630,13 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         reason: String,
     ) -> TaskStoreFuture<'_, AgentReceipt> {
         Box::pin(async move {
-            self.abandon_agent_task_impl(actor, assignment_id, reason)
-                .await
+            let result = self
+                .abandon_agent_task_impl(actor, assignment_id, reason)
+                .await;
+            if result.is_ok() {
+                self.notify_wake_waiters();
+            }
+            result
         })
     }
 
@@ -3551,8 +3649,13 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         reason: String,
     ) -> TaskStoreFuture<'_, AgentGate> {
         Box::pin(async move {
-            self.set_agent_gate_impl(actor, assignment_id, kind, status, reason)
-                .await
+            let result = self
+                .set_agent_gate_impl(actor, assignment_id, kind, status, reason)
+                .await;
+            if result.is_ok() {
+                self.notify_wake_waiters();
+            }
+            result
         })
     }
 
@@ -3564,8 +3667,13 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         reason: String,
     ) -> TaskStoreFuture<'_, AgentGate> {
         Box::pin(async move {
-            self.waive_agent_gate_impl(actor, assignment_id, kind, reason)
-                .await
+            let result = self
+                .waive_agent_gate_impl(actor, assignment_id, kind, reason)
+                .await;
+            if result.is_ok() {
+                self.notify_wake_waiters();
+            }
+            result
         })
     }
 
@@ -3576,6 +3684,17 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
     ) -> TaskStoreFuture<'_, WakeRead> {
         Box::pin(async move {
             self.read_wake_events_impl(root_session_id, after_event_id)
+                .await
+        })
+    }
+
+    fn wait_for_wake_events(
+        &self,
+        root_session_id: String,
+        after_event_id: Option<WakeEventId>,
+    ) -> TaskStoreFuture<'_, WakeRead> {
+        Box::pin(async move {
+            self.wait_for_wake_events_impl(root_session_id, after_event_id)
                 .await
         })
     }
@@ -3626,8 +3745,13 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         no_progress_before: chrono::DateTime<Utc>,
     ) -> TaskStoreFuture<'_, NonproductiveRecovery> {
         Box::pin(async move {
-            self.recover_nonproductive_assignment_impl(assignment_id, no_progress_before)
-                .await
+            let result = self
+                .recover_nonproductive_assignment_impl(assignment_id, no_progress_before)
+                .await;
+            if matches!(&result, Ok(NonproductiveRecovery::Recovered { .. })) {
+                self.notify_wake_waiters();
+            }
+            result
         })
     }
 
@@ -3661,7 +3785,12 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         registration: WorkspaceActorRegistration,
     ) -> TaskStoreFuture<'a, ()> {
         Box::pin(async move {
-            crate::workspace::register_actor(&self.pool, repo_root, registration).await
+            let result =
+                crate::workspace::register_actor(&self.pool, repo_root, registration).await;
+            if result.is_ok() {
+                self.notify_wake_waiters();
+            }
+            result
         })
     }
 
@@ -3693,8 +3822,13 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         confidence: AttributionConfidence,
     ) -> TaskStoreFuture<'a, MutationEventId> {
         Box::pin(async move {
-            self.begin_mutation_impl(attempt_id, repo_root, path, confidence)
-                .await
+            let result = self
+                .begin_mutation_impl(attempt_id, repo_root, path, confidence)
+                .await;
+            if result.is_ok() {
+                self.notify_wake_waiters();
+            }
+            result
         })
     }
 
@@ -3705,8 +3839,13 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         path: String,
     ) -> TaskStoreFuture<'a, MutationEvidence> {
         Box::pin(async move {
-            self.finalize_mutation_impl(attempt_id, repo_root, path)
-                .await
+            let result = self
+                .finalize_mutation_impl(attempt_id, repo_root, path)
+                .await;
+            if result.is_ok() {
+                self.notify_wake_waiters();
+            }
+            result
         })
     }
 
@@ -3714,7 +3853,13 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         &self,
         attempt_id: AttemptId,
     ) -> TaskStoreFuture<'_, Vec<MutationEvidence>> {
-        Box::pin(async move { self.finalize_pending_mutations_impl(attempt_id).await })
+        Box::pin(async move {
+            let result = self.finalize_pending_mutations_impl(attempt_id).await;
+            if result.is_ok() {
+                self.notify_wake_waiters();
+            }
+            result
+        })
     }
 
     fn list_mutation_evidence(
@@ -3977,7 +4122,8 @@ async fn prepare_validation_call(
     )
     .await?;
     let covered_input_manifest_hash = revision.manifest_hash.clone();
-    let dependency_manifest_hash = execution_revision.manifest_hash.clone();
+    let dependency_manifest_hash =
+        validation_dependency_manifest_hash(&call.command_summary, &execution_revision.files)?;
     let normalized_invocation = validation_normalized_invocation(&call)?;
     let coverage_identity =
         validation_coverage_identity(&covered_scopes, &covered_contracts, repository_wide)?;
@@ -4726,6 +4872,30 @@ fn validation_candidate_identity(
         ))?
         .as_bytes(),
     ))
+}
+
+fn validation_dependency_manifest_hash(
+    command_summary: &str,
+    execution_manifest: &[crate::WorkspaceManifestEntry],
+) -> StoreResult<String> {
+    let command = command_summary.to_ascii_lowercase();
+    let is_cargo = command.split_whitespace().any(|argument| {
+        argument == "cargo" || argument.ends_with("/cargo") || argument.ends_with("\\cargo.exe")
+    });
+    let manifest = if is_cargo {
+        execution_manifest
+            .iter()
+            .filter(|entry| !is_cargo_inert_documentation_path(&entry.path))
+            .collect::<Vec<_>>()
+    } else {
+        execution_manifest.iter().collect::<Vec<_>>()
+    };
+    Ok(hash_bytes(encode(&manifest)?.as_bytes()))
+}
+
+fn is_cargo_inert_documentation_path(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    path.ends_with(".md") || path.ends_with(".markdown") || path.ends_with(".rst")
 }
 
 fn validation_output_digest(call: &ValidationCall) -> StoreResult<String> {

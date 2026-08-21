@@ -66,7 +66,7 @@ fn spawn_agent_tool_v2_exposes_typed_assignments_and_lists_visible_models() {
         .as_ref()
         .expect("spawn_agent should use object params");
     assert!(description.contains("Spawns an agent to work on the specified task."));
-    assert!(description.contains("The spawned agent will have the same tools as you"));
+    assert!(description.contains("The spawned agent receives a durable task binding"));
     assert!(description.contains(SPAWN_AGENT_V2_FULL_HISTORY_OVERRIDE_GUIDANCE));
     assert!(!description.contains("max_concurrent_threads_per_session"));
     assert!(description.contains(&spawn_agent_default_guidance()));

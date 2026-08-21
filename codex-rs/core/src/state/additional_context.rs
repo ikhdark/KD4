@@ -107,7 +107,7 @@ mod tests {
             },
         )]));
 
-        let mut values = (0..12)
+        let mut values = (0..48)
             .map(|index| {
                 (
                     format!("source-{index:02}"),

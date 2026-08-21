@@ -1,11 +1,13 @@
 //! Client-side delegate task and closure lifecycle.
 //!
 //! Cancellation revokes the task's completion path before removing its active-call state. The
-//! delegate future may finish later, but it can no longer send a response or affect cell closure.
+//! delegate gets a bounded cleanup grace, then its future is dropped so a non-cooperative callback
+//! cannot leave an unbounded detached task behind.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::panic::AssertUnwindSafe;
 
 use codex_code_mode_protocol::CodeModeNestedToolCall;
 use codex_code_mode_protocol::host::ClientToHost;
@@ -16,6 +18,7 @@ use codex_code_mode_protocol::host::EncodedFrame;
 use codex_code_mode_protocol::host::SessionId;
 use codex_code_mode_protocol::host::WireCellId;
 use codex_code_mode_protocol::host::WireResult;
+use futures::FutureExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -27,6 +30,7 @@ use super::session_registry::FailedSession;
 use super::types::DriverEvent;
 
 const MAX_RECENT_DELEGATE_REQUEST_IDS: usize = 4096;
+const DELEGATE_CANCELLATION_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Clone, Eq, Hash, PartialEq)]
 struct CellKey {
@@ -131,22 +135,6 @@ impl DelegateRuntime {
         };
         let delegate = target.delegate;
         let task_cancellation = cancellation.clone();
-        let delegate_task = tokio::spawn(async move {
-            match task_request {
-                DelegateTask::InvokeTool(invocation) => delegate
-                    .invoke_tool(invocation, task_cancellation)
-                    .await
-                    .map(|result| DelegateResponse::ToolResult { result }),
-                DelegateTask::Notify {
-                    call_id,
-                    cell_id,
-                    text,
-                } => delegate
-                    .notify(call_id, cell_id, text, task_cancellation)
-                    .await
-                    .map(|()| DelegateResponse::NotificationDelivered),
-            }
-        });
         let completion_stop = CancellationToken::new();
         self.calls.insert(
             id,
@@ -160,13 +148,51 @@ impl DelegateRuntime {
             },
         );
         let event_tx = self.event_tx.clone();
+        // Keep execution, panic conversion, and completion delivery in one
+        // owner task so a finished child does not wait on a second join/wakeup.
         tokio::spawn(async move {
+            let delegate_future = async move {
+                match task_request {
+                    DelegateTask::InvokeTool(invocation) => delegate
+                        .invoke_tool(invocation, task_cancellation)
+                        .await
+                        .map(|result| DelegateResponse::ToolResult { result }),
+                    DelegateTask::Notify {
+                        call_id,
+                        cell_id,
+                        text,
+                    } => delegate
+                        .notify(call_id, cell_id, text, task_cancellation)
+                        .await
+                        .map(|()| DelegateResponse::NotificationDelivered),
+                }
+            };
+            let delegate_future = AssertUnwindSafe(delegate_future).catch_unwind();
+            tokio::pin!(delegate_future);
             let result = tokio::select! {
                 biased;
-                _ = completion_stop.cancelled() => return,
-                result = delegate_task => match result {
+                _ = completion_stop.cancelled() => {
+                    // Cancellation revokes delivery immediately. Give the
+                    // forwarded cancellation token a bounded cleanup window,
+                    // then drop the future rather than orphaning this task.
+                    if tokio::time::timeout(
+                        DELEGATE_CANCELLATION_GRACE,
+                        &mut delegate_future,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        tracing::warn!(
+                            request_id = ?id,
+                            grace_ms = DELEGATE_CANCELLATION_GRACE.as_millis(),
+                            "code-mode delegate cleanup exceeded cancellation grace"
+                        );
+                    }
+                    return;
+                },
+                result = &mut delegate_future => match result {
                     Ok(result) => result,
-                    Err(err) => Err(format!("code-mode delegate task failed: {err}")),
+                    Err(_) => Err("code-mode delegate task failed: task panicked".to_string()),
                 },
             };
             tokio::select! {

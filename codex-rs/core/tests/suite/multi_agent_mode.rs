@@ -37,6 +37,9 @@ fn add_ultra_reasoning(model_info: &mut ModelInfo) {
 }
 
 fn configure_multi_agent_v2(config: &mut Config) {
+    // These tests exercise explicit effort and multi-agent mode mapping. Keep the
+    // independent phase governor from replacing those requested effort values.
+    config.reasoning_phase_efforts = None;
     config
         .features
         .enable(Feature::MultiAgentV2)
@@ -333,7 +336,7 @@ async fn leaving_ultra_after_cold_resume_emits_explicit_mode() -> Result<()> {
             count_containing(&texts, NO_SPAWN_TEXT),
             count_containing(&texts, PROACTIVE_TEXT),
         ),
-        (2, 1, 1)
+        (1, 1, 0)
     );
 
     Ok(())
@@ -352,6 +355,7 @@ async fn ultra_on_multi_agent_v1_uses_max_without_mode_instructions() -> Result<
     let test = test_codex()
         .with_model_info_override("gpt-5.4", add_ultra_reasoning)
         .with_config(|config| {
+            config.reasoning_phase_efforts = None;
             config.model_reasoning_effort = Some(ReasoningEffort::Ultra);
         })
         .build(&server)

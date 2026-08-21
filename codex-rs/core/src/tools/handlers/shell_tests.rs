@@ -44,6 +44,7 @@ use serde_json::json;
 use tokio::sync::Mutex;
 
 use super::parse_shell_command_hook_invocation;
+use super::shell_command::effective_stall_timeout_ms;
 use super::shell_failure_sampling_signal;
 use super::shell_sampling_signal;
 
@@ -64,6 +65,18 @@ fn structured_cargo_leaf() -> ValidationRouteLeaf {
         timeout_ms: 30_000,
         semantic_timeout: false,
     }
+}
+
+#[test]
+fn orchestration_correctness_stall_timeout_is_opt_in() {
+    assert_eq!(effective_stall_timeout_ms(None, None), None);
+    assert_eq!(effective_stall_timeout_ms(Some(60_001), None), None);
+    assert_eq!(
+        effective_stall_timeout_ms(Some(300_000), Some(25_000)),
+        Some(25_000)
+    );
+    assert_eq!(effective_stall_timeout_ms(Some(300_000), Some(0)), None);
+    assert_eq!(effective_stall_timeout_ms(Some(30_000), Some(30_000)), None);
 }
 
 #[test]
@@ -1246,6 +1259,7 @@ async fn shell_command_handler_to_exec_params_uses_selected_environment() {
         workdir,
         login,
         timeout_ms,
+        stall_timeout_ms: None,
         sandbox_permissions: Some(sandbox_permissions),
         additional_permissions: None,
         prefix_rule: None,
@@ -1334,6 +1348,7 @@ async fn shell_command_handler_defaults_to_non_login_when_disallowed() {
         workdir: None,
         login: None,
         timeout_ms: None,
+        stall_timeout_ms: None,
         sandbox_permissions: None,
         additional_permissions: None,
         prefix_rule: None,
@@ -1386,6 +1401,7 @@ async fn shell_command_handler_preserves_structured_argv_shape() {
         workdir: None,
         login: None,
         timeout_ms: None,
+        stall_timeout_ms: None,
         sandbox_permissions: None,
         additional_permissions: None,
         prefix_rule: None,

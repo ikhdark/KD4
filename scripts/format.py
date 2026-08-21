@@ -49,7 +49,9 @@ def just_formatter_group(*, check: bool) -> FormatterGroup:
 
 
 def rust_formatter_group(*, check: bool) -> FormatterGroup:
-    args = ["cargo", f"+{RUSTFMT_TOOLCHAIN}", "fmt"]
+    # Invoke Rustup explicitly so formatting does not depend on `cargo` being
+    # the Rustup proxy (for example, Scoop may place its own cargo shim first).
+    args = ["rustup", "run", RUSTFMT_TOOLCHAIN, "cargo", "fmt"]
     if check:
         args.append("--check")
     command = Command(

@@ -5,6 +5,7 @@ use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
 use crate::tasks::SessionTaskResult;
 use crate::tools::exposure::AgentSurfaceStage;
+use crate::tools::exposure::EnvironmentSurfaceMode;
 use crate::tools::exposure::GoalSurfaceState;
 use crate::tools::exposure::ToolExposureIdentity;
 use crate::tools::registry::ToolRegistry;
@@ -421,6 +422,7 @@ fn ordinary_continuation_precedence_is_stable() {
 fn finalized_router_reuse_requires_identical_coarse_exposure_identity() {
     let disabled = ToolExposureIdentity {
         goal_surface_state: GoalSurfaceState::Disabled,
+        environment_mode: EnvironmentSurfaceMode::None,
         ..ToolExposureIdentity::default()
     };
     let router = ToolRouter::from_parts_with_warnings_and_identity(
@@ -440,9 +442,27 @@ fn finalized_router_reuse_requires_identical_coarse_exposure_identity() {
 
     let active = ToolExposureIdentity {
         goal_surface_state: GoalSurfaceState::Active,
-        ..disabled
+        ..disabled.clone()
     };
     assert!(!finalized_router_matches_exposure(&router, &active));
+
+    let ready_environment = ToolExposureIdentity {
+        environment_mode: EnvironmentSurfaceMode::One,
+        ..disabled.clone()
+    };
+    assert!(!finalized_router_matches_exposure(
+        &router,
+        &ready_environment
+    ));
+
+    let starting_environment = ToolExposureIdentity {
+        environment_starting: true,
+        ..disabled
+    };
+    assert!(!finalized_router_matches_exposure(
+        &router,
+        &starting_environment
+    ));
 }
 
 #[test]
@@ -725,6 +745,12 @@ fn non_openai_model_provider(server: &wiremock::MockServer) -> ModelProviderInfo
     provider
 }
 
+fn complete_compaction_summary(state: &str) -> String {
+    format!(
+        "## Goal\nresume the pending turn\n\n## Current state\n{state}\n\n## Completed work\nseed turn completed\n\n## Unresolved work\npending input remains\n\n## Evidence\nmock compaction response\n\n## Next action\nsample the pending input"
+    )
+}
+
 fn write_one_shot_stop_hook(home: &Path) -> Result<()> {
     let script_path = home.join("phase_68_stop_hook.py");
     let counter_path = home.join("phase_68_stop_hook.count");
@@ -928,12 +954,15 @@ async fn initial_response_item_triggers_compaction_before_the_stream_request_imp
                 responses::ev_assistant_message("seed-response-item-message", "seed complete"),
                 responses::ev_completed_with_tokens(
                     "seed-response-item-response",
-                    /*total_tokens*/ 90,
+                    /*total_tokens*/ 21_000,
                 ),
             ]),
             responses::sse(vec![
                 responses::ev_response_created("response-item-compact-response"),
-                responses::ev_assistant_message("response-item-compact-message", "compact summary"),
+                responses::ev_assistant_message(
+                    "response-item-compact-message",
+                    &complete_compaction_summary("initial response context compacted"),
+                ),
                 responses::ev_completed_with_tokens(
                     "response-item-compact-response",
                     /*total_tokens*/ 20,
@@ -956,8 +985,10 @@ async fn initial_response_item_triggers_compaction_before_the_stream_request_imp
     let provider = non_openai_model_provider(&server);
     let mut builder = test_codex().with_config(move |config| {
         config.model_provider = provider;
-        config.model_context_window = Some(10_000);
-        config.model_auto_compact_token_limit = Some(100);
+        config.model_context_window = Some(100_000);
+        config.model_auto_compact_token_limit = Some(22_000);
+        config.model_auto_compact_token_limit_scope =
+            codex_protocol::config_types::AutoCompactTokenLimitScope::Total;
         config.model_provider.request_max_retries = Some(0);
         config.model_provider.stream_max_retries = Some(0);
         let _ = config.features.disable(Feature::RemoteCompactionV2);
@@ -966,6 +997,10 @@ async fn initial_response_item_triggers_compaction_before_the_stream_request_imp
 
     test.submit_turn("seed committed history near the compaction limit")
         .await?;
+    while tokio::time::timeout(Duration::from_millis(10), test.codex.next_event())
+        .await
+        .is_ok()
+    {}
     test.codex
         .submit(Op::UserInput {
             items: Vec::new(),
@@ -983,12 +1018,34 @@ async fn initial_response_item_triggers_compaction_before_the_stream_request_imp
         .await?;
 
     tokio::time::timeout(Duration::from_secs(15), async {
+        while request_log.requests().len() < 3 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the final sampling request should follow pre-turn compaction");
+    let submitted_turn_id = request_log.requests()[2].body_json()["client_metadata"]["turn_id"]
+        .as_str()
+        .expect("final request turn id")
+        .to_string();
+    tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            if matches!(
-                test.codex.next_event().await.expect("turn event").msg,
-                EventMsg::TurnComplete(_)
-            ) {
-                break;
+            match test.codex.next_event().await.expect("turn event").msg {
+                EventMsg::Error(error) => {
+                    panic!(
+                        "response-item turn failed during pre-turn compaction: {}",
+                        error.message
+                    )
+                }
+                EventMsg::TurnComplete(turn) if submitted_turn_id == turn.turn_id => {
+                    assert!(
+                        turn.error.is_none(),
+                        "response-item turn completed with an error: {:?}",
+                        turn.error
+                    );
+                    break;
+                }
+                _ => {}
             }
         }
     })
@@ -1021,11 +1078,14 @@ async fn oversized_pending_input_compacts_once_when_committed_history_is_also_ov
             responses::sse(vec![
                 responses::ev_response_created("seed-response"),
                 responses::ev_assistant_message("seed-message", "seed complete"),
-                responses::ev_completed_with_tokens("seed-response", /*total_tokens*/ 121),
+                responses::ev_completed_with_tokens("seed-response", /*total_tokens*/ 23_000),
             ]),
             responses::sse(vec![
                 responses::ev_response_created("compact-response"),
-                responses::ev_assistant_message("compact-message", "compact summary"),
+                responses::ev_assistant_message(
+                    "compact-message",
+                    &complete_compaction_summary("oversized pending input compacted"),
+                ),
                 responses::ev_completed_with_tokens("compact-response", /*total_tokens*/ 20),
             ]),
             responses::sse(vec![
@@ -1046,8 +1106,10 @@ async fn oversized_pending_input_compacts_once_when_committed_history_is_also_ov
         .with_extensions(Arc::new(extension_builder.build()))
         .with_config(move |config| {
             config.model_provider = provider;
-            config.model_context_window = Some(10_000);
-            config.model_auto_compact_token_limit = Some(100);
+            config.model_context_window = Some(100_000);
+            config.model_auto_compact_token_limit = Some(22_000);
+            config.model_auto_compact_token_limit_scope =
+                codex_protocol::config_types::AutoCompactTokenLimitScope::Total;
             config.model_provider.request_max_retries = Some(0);
             config.model_provider.stream_max_retries = Some(0);
             let _ = config.features.disable(Feature::RemoteCompactionV2);
@@ -1055,9 +1117,53 @@ async fn oversized_pending_input_compacts_once_when_committed_history_is_also_ov
     let test = builder.build(&server).await?;
 
     test.submit_turn("seed committed history").await?;
+    while tokio::time::timeout(Duration::from_millis(10), test.codex.next_event())
+        .await
+        .is_ok()
+    {}
     pending_plan_builds.store(0, Ordering::SeqCst);
-    test.submit_turn(&"oversized pending payload ".repeat(128))
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "oversized pending payload ".repeat(128),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
         .await?;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while request_log.requests().len() < 3 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the final sampling request should follow pending-input compaction");
+    let submitted_turn_id = request_log.requests()[2].body_json()["client_metadata"]["turn_id"]
+        .as_str()
+        .expect("final request turn id")
+        .to_string();
+    loop {
+        match test.codex.next_event().await.expect("turn event").msg {
+            EventMsg::Error(error) => {
+                panic!(
+                    "oversized pending-input turn failed during compaction: {}",
+                    error.message
+                )
+            }
+            EventMsg::TurnComplete(turn) if submitted_turn_id == turn.turn_id => {
+                assert!(
+                    turn.error.is_none(),
+                    "oversized pending-input turn completed with an error: {:?}",
+                    turn.error
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
 
     assert_eq!(
         request_log.requests().len(),
@@ -1066,8 +1172,8 @@ async fn oversized_pending_input_compacts_once_when_committed_history_is_also_ov
     );
     assert_eq!(
         pending_plan_builds.load(Ordering::SeqCst),
-        1,
-        "committed history should compact before the pending plan is built"
+        2,
+        "compaction should invalidate the initial pure projection and rebuild the pending plan against compacted history"
     );
     Ok(())
 }
@@ -1531,6 +1637,30 @@ fn pending_token_estimate_includes_model_visible_tool_schemas() {
     assert_eq!(
         with_schema.body_growth_tokens, baseline.body_growth_tokens,
         "stable tool schemas must not count as body-after-prefix growth"
+    );
+}
+
+#[test]
+fn pending_token_estimate_excludes_stable_startup_injections_from_body_growth() {
+    let empty_registry = crate::tools::registry::ToolRegistry::from_tools(std::iter::empty::<
+        Arc<dyn crate::tools::registry::CoreToolRuntime>,
+    >());
+    let empty_router = ToolRouter::from_parts(empty_registry, Vec::new());
+    let baseline =
+        estimate_pending_tokens(&[], &[], &[], &empty_router, /*initial_context*/ false);
+    let guidance = ContextualUserFragment::into(TaskModelGuidance);
+    let with_guidance = estimate_pending_tokens(
+        &[],
+        &[guidance],
+        &[],
+        &empty_router,
+        /*initial_context*/ false,
+    );
+
+    assert!(with_guidance.total_tokens > baseline.total_tokens);
+    assert_eq!(
+        with_guidance.body_growth_tokens,
+        baseline.body_growth_tokens
     );
 }
 

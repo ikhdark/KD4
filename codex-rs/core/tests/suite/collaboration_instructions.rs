@@ -19,8 +19,6 @@ use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 
-const COLLABORATION_MODE_RESET_TEXT: &str = "No collaboration-mode-specific instructions are currently active. Any previously provided collaboration-mode instructions no longer apply.";
-
 fn collab_mode_with_mode_and_instructions(
     mode: ModeKind,
     instructions: Option<&str>,
@@ -116,18 +114,11 @@ async fn assert_clearing_collaboration_instructions_emits_reset(
 
     let dev_texts = developer_texts(&req2.single_request().input());
     let active_xml = collab_xml(active_instructions);
-    let reset_xml = collab_xml(COLLABORATION_MODE_RESET_TEXT);
-    let active_index = dev_texts
-        .iter()
-        .position(|text| text.contains(&active_xml))
-        .expect("expected original collaboration instructions");
-    let reset_index = dev_texts
-        .iter()
-        .position(|text| text.contains(&reset_xml))
-        .expect("expected collaboration instructions reset");
-    assert!(
-        reset_index > active_index,
-        "reset must supersede the original block"
+    assert_eq!(count_messages_containing(&dev_texts, &active_xml), 0);
+    assert_eq!(
+        count_messages_containing(&dev_texts, COLLABORATION_MODE_OPEN_TAG),
+        0,
+        "clearing collaboration instructions should remove the stable slot"
     );
 
     Ok(())
@@ -499,14 +490,14 @@ async fn collaboration_mode_update_emits_new_instruction_message() -> Result<()>
     let dev_texts = developer_texts(&input);
     let first_text = collab_xml(first_text);
     let second_text = collab_xml(second_text);
-    assert_eq!(count_messages_containing(&dev_texts, &first_text), 1);
+    assert_eq!(count_messages_containing(&dev_texts, &first_text), 0);
     assert_eq!(count_messages_containing(&dev_texts, &second_text), 1);
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn clearing_collaboration_mode_instructions_emits_reset() -> Result<()> {
+async fn clearing_collaboration_mode_instructions_removes_stable_slot() -> Result<()> {
     assert_clearing_collaboration_instructions_emits_reset(None).await?;
     assert_clearing_collaboration_instructions_emits_reset(Some("")).await?;
     Ok(())
@@ -661,7 +652,7 @@ async fn collaboration_mode_update_emits_new_instruction_message_when_mode_chang
     let dev_texts = developer_texts(&input);
     let default_text = collab_xml(default_text);
     let plan_text = collab_xml(plan_text);
-    assert_eq!(count_messages_containing(&dev_texts, &default_text), 1);
+    assert_eq!(count_messages_containing(&dev_texts, &default_text), 0);
     assert_eq!(count_messages_containing(&dev_texts, &plan_text), 1);
 
     Ok(())

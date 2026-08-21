@@ -7,22 +7,20 @@ Scenario: Pre-turn auto-compaction with a context override emits the context dif
 ## Local Compaction Request
 00:message/developer[2]:
     [01] <PERMISSIONS_INSTRUCTIONS>
-    [02] <skills_usage_instructions>\n## How to use skills\n- Use a skill...
-01:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-02:message/user:USER_ONE
-03:message/assistant:FIRST_REPLY
-04:message/user:USER_TWO
-05:message/assistant:SECOND_REPLY
-06:message/user:<SUMMARIZATION_PROMPT>
+    [02] <skills_usage_instructions>\n## How to use skills\n- Use the sma...
+01:message/user:USER_ONE
+02:message/assistant:FIRST_REPLY
+03:message/user:USER_TWO
+04:message/assistant:SECOND_REPLY
+05:message/user:<SUMMARIZATION_PROMPT>
 
 ## Local Post-Compaction History Layout
-00:message/user:USER_ONE
-01:message/user:USER_TWO
-02:message/user:<COMPACTION_SUMMARY>\nPRE_TURN_SUMMARY
-03:message/developer[2]:
-    [01] <PERMISSIONS_INSTRUCTIONS>
-    [02] <skills_usage_instructions>\n## How to use skills\n- Use a skill...
+00:message/user:<task_model_guidance>Before acting, form and maintain a working ...
+01:message/developer:<PERMISSIONS_INSTRUCTIONS>
+02:message/developer:<skills_usage_instructions>\n## How to use skills\n- Use the sma...
+03:message/developer:<NO_TEXT>
 04:message/user:<ENVIRONMENT_CONTEXT:cwd=PRETURN_CONTEXT_DIFF_CWD>
-05:message/user[2]:
+05:message/user:<COMPACTION_SUMMARY>\nPRE_TURN_SUMMARY
+06:message/user[2]:
     [01] <input_image:detail,image_url>
     [02] USER_THREE

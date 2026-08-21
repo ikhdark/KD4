@@ -421,25 +421,16 @@ where
     let req = second_mock.single_request();
     let (output, success) = call_output_content_and_success(&req, &call_id);
     assert_eq!(success, None);
-    assert_eq!(
-        output,
-        format!("request_user_input is unavailable in {mode_name} mode")
-    );
+    assert_eq!(output, "unsupported call: request_user_input");
 
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn request_user_input_rejected_in_execute_mode_alias() -> anyhow::Result<()> {
-    assert_request_user_input_rejected("Execute", false, |model| CollaborationMode {
-        mode: ModeKind::Execute,
-        settings: Settings {
-            model,
-            reasoning_effort: None,
-            developer_instructions: None,
-        },
-    })
-    .await
+#[test]
+fn execute_mode_alias_normalizes_to_default_mode() -> anyhow::Result<()> {
+    let mode: ModeKind = serde_json::from_str("\"execute\"")?;
+    assert_eq!(mode, ModeKind::Default);
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -460,15 +451,9 @@ async fn request_user_input_round_trip_in_default_mode_by_default() -> anyhow::R
     request_user_input_round_trip_for_mode(ModeKind::Default, /*auto_resolution_ms*/ None).await
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn request_user_input_rejected_in_pair_mode_alias() -> anyhow::Result<()> {
-    assert_request_user_input_rejected("Pair Programming", false, |model| CollaborationMode {
-        mode: ModeKind::PairProgramming,
-        settings: Settings {
-            model,
-            reasoning_effort: None,
-            developer_instructions: None,
-        },
-    })
-    .await
+#[test]
+fn pair_programming_mode_alias_normalizes_to_default_mode() -> anyhow::Result<()> {
+    let mode: ModeKind = serde_json::from_str("\"pair_programming\"")?;
+    assert_eq!(mode, ModeKind::Default);
+    Ok(())
 }

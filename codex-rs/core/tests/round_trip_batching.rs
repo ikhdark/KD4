@@ -1,7 +1,6 @@
 #![allow(clippy::expect_used)]
 
-use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::TurnCompleteEvent;
+use codex_features::Feature;
 use codex_protocol::protocol::TurnTiming;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -12,11 +11,16 @@ use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
-use core_test_support::wait_for_event_match;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 
-const EMPTY_TEST_TOOL_ARGS: &str = "{}";
+const EDIT_ARGS: &str = r#"{"sleep_before_ms":1}"#;
+const VALIDATE_TEST_ARGS: &str = r#"{"sleep_before_ms":2}"#;
+const VALIDATE_FORMAT_ARGS: &str = r#"{"sleep_before_ms":3}"#;
+const GIT_DIFF_ARGS: &str = r#"{"sleep_before_ms":4}"#;
+const FAILING_CHECK_ARGS: &str = r#"{"sleep_after_ms":1}"#;
+const DIAGNOSE_ARGS: &str = r#"{"sleep_after_ms":2}"#;
+const TARGETED_VALIDATION_ARGS: &str = r#"{"sleep_after_ms":3}"#;
 
 fn function_call_output_ids(input: &[Value]) -> Vec<&str> {
     input
@@ -24,14 +28,6 @@ fn function_call_output_ids(input: &[Value]) -> Vec<&str> {
         .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
         .filter_map(|item| item.get("call_id").and_then(Value::as_str))
         .collect()
-}
-
-async fn turn_complete(test: &core_test_support::test_codex::TestCodex) -> TurnCompleteEvent {
-    wait_for_event_match(&test.codex, |event| match event {
-        EventMsg::TurnComplete(event) => Some(event.clone()),
-        _ => None,
-    })
-    .await
 }
 
 fn assert_timing_reconciles(timing: &TurnTiming) {
@@ -90,22 +86,22 @@ async fn post_edit_batches_validation_and_git_into_three_model_requests() -> any
         vec![
             sse(vec![
                 ev_response_created("edit"),
-                ev_function_call("edit", "test_sync_tool", EMPTY_TEST_TOOL_ARGS),
+                ev_function_call("edit", "test_sync_tool", EDIT_ARGS),
                 ev_completed("edit"),
             ]),
             sse(vec![
                 ev_response_created("validate-test"),
-                ev_function_call("validate-test", "test_sync_tool", EMPTY_TEST_TOOL_ARGS),
+                ev_function_call("validate-test", "test_sync_tool", VALIDATE_TEST_ARGS),
                 ev_completed("validate-test"),
             ]),
             sse(vec![
                 ev_response_created("validate-format"),
-                ev_function_call("validate-format", "test_sync_tool", EMPTY_TEST_TOOL_ARGS),
+                ev_function_call("validate-format", "test_sync_tool", VALIDATE_FORMAT_ARGS),
                 ev_completed("validate-format"),
             ]),
             sse(vec![
                 ev_response_created("git-diff"),
-                ev_function_call("git-diff", "test_sync_tool", EMPTY_TEST_TOOL_ARGS),
+                ev_function_call("git-diff", "test_sync_tool", GIT_DIFF_ARGS),
                 ev_completed("git-diff"),
             ]),
             sse(vec![
@@ -117,13 +113,17 @@ async fn post_edit_batches_validation_and_git_into_three_model_requests() -> any
     .await;
     let baseline_test = test_codex()
         .with_model("test-gpt-5.1-codex")
+        .with_config(|config| {
+            let _ = config.features.disable(Feature::TaskCompletionReviewer);
+        })
         .build(&baseline_server)
         .await?;
 
-    baseline_test
-        .submit_turn("make the edit, then validate it and inspect the Git diff")
+    let baseline_completion = baseline_test
+        .submit_turn_and_capture_completion(
+            "make the edit, then validate it and inspect the Git diff",
+        )
         .await?;
-    let baseline_completion = turn_complete(&baseline_test).await;
 
     let server = start_mock_server().await;
     let responses = mount_sse_sequence(
@@ -131,14 +131,14 @@ async fn post_edit_batches_validation_and_git_into_three_model_requests() -> any
         vec![
             sse(vec![
                 ev_response_created("edit"),
-                ev_function_call("edit", "test_sync_tool", EMPTY_TEST_TOOL_ARGS),
+                ev_function_call("edit", "test_sync_tool", EDIT_ARGS),
                 ev_completed("edit"),
             ]),
             sse(vec![
                 ev_response_created("post-edit"),
-                ev_function_call("validate-test", "test_sync_tool", EMPTY_TEST_TOOL_ARGS),
-                ev_function_call("validate-format", "test_sync_tool", EMPTY_TEST_TOOL_ARGS),
-                ev_function_call("git-diff", "test_sync_tool", EMPTY_TEST_TOOL_ARGS),
+                ev_function_call("validate-test", "test_sync_tool", VALIDATE_TEST_ARGS),
+                ev_function_call("validate-format", "test_sync_tool", VALIDATE_FORMAT_ARGS),
+                ev_function_call("git-diff", "test_sync_tool", GIT_DIFF_ARGS),
                 ev_completed("post-edit"),
             ]),
             sse(vec![
@@ -150,12 +150,17 @@ async fn post_edit_batches_validation_and_git_into_three_model_requests() -> any
     .await;
     let test = test_codex()
         .with_model("test-gpt-5.1-codex")
+        .with_config(|config| {
+            let _ = config.features.disable(Feature::TaskCompletionReviewer);
+        })
         .build(&server)
         .await?;
 
-    test.submit_turn("make the edit, then validate it and inspect the Git diff")
+    let completion = test
+        .submit_turn_and_capture_completion(
+            "make the edit, then validate it and inspect the Git diff",
+        )
         .await?;
-    let completion = turn_complete(&test).await;
 
     let baseline_requests = baseline_responses.requests();
     let requests = responses.requests();
@@ -211,12 +216,12 @@ async fn diagnosis_and_dynamic_validation_keep_model_boundaries() -> anyhow::Res
         vec![
             sse(vec![
                 ev_response_created("1"),
-                ev_function_call("failing-check", "test_sync_tool", EMPTY_TEST_TOOL_ARGS),
+                ev_function_call("failing-check", "test_sync_tool", FAILING_CHECK_ARGS),
                 ev_completed("failed"),
             ]),
             sse(vec![
                 ev_response_created("2"),
-                ev_function_call("diagnose", "test_sync_tool", EMPTY_TEST_TOOL_ARGS),
+                ev_function_call("diagnose", "test_sync_tool", DIAGNOSE_ARGS),
                 ev_completed("diagnosed"),
             ]),
             sse(vec![
@@ -224,7 +229,7 @@ async fn diagnosis_and_dynamic_validation_keep_model_boundaries() -> anyhow::Res
                 ev_function_call(
                     "targeted-validation",
                     "test_sync_tool",
-                    EMPTY_TEST_TOOL_ARGS,
+                    TARGETED_VALIDATION_ARGS,
                 ),
                 ev_completed("validated"),
             ]),
@@ -237,12 +242,15 @@ async fn diagnosis_and_dynamic_validation_keep_model_boundaries() -> anyhow::Res
     .await;
     let test = test_codex()
         .with_model("test-gpt-5.1-codex")
+        .with_config(|config| {
+            let _ = config.features.disable(Feature::TaskCompletionReviewer);
+        })
         .build(&server)
         .await?;
 
-    test.submit_turn("diagnose the failure, then select validation")
+    let completion = test
+        .submit_turn_and_capture_completion("diagnose the failure, then select validation")
         .await?;
-    let completion = turn_complete(&test).await;
 
     let requests = responses.requests();
     let timing = completion.timing.expect("turn timing");
@@ -273,7 +281,10 @@ async fn diagnosis_and_dynamic_validation_keep_model_boundaries() -> anyhow::Res
 
 #[test]
 fn orchestrator_prompt_preserves_only_substantive_model_boundaries() {
-    let prompt = include_str!("../templates/agents/orchestrator.md");
+    let prompt = include_str!("../templates/agents/orchestrator.md")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
 
     for required_guidance in [
         "request them together",

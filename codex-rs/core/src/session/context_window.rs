@@ -62,20 +62,14 @@ async fn context_window_token_status_for_pressure(
         match turn_context.config.model_auto_compact_token_limit_scope {
             AutoCompactTokenLimitScope::Total => (
                 projected_auto_compact_scope_tokens.unwrap_or(pressure_context_tokens),
-                turn_context
-                    .config
-                    .model_auto_compact_token_limit
-                    .or_else(|| turn_context.model_info.auto_compact_token_limit()),
+                turn_context.model_info.auto_compact_token_limit(),
                 None,
             ),
             AutoCompactTokenLimitScope::BodyAfterPrefix => {
                 let window = sess.auto_compact_window_snapshot().await;
                 let baseline = window.prefill_input_tokens.unwrap_or(active_context_tokens);
 
-                let scope_limit = turn_context
-                    .config
-                    .model_auto_compact_token_limit
-                    .or_else(|| turn_context.model_info.auto_compact_token_limit());
+                let scope_limit = turn_context.model_info.auto_compact_token_limit();
                 let full_context_window_limit = turn_context.model_context_window();
 
                 (

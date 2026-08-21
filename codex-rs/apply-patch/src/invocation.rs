@@ -103,9 +103,12 @@ fn extract_apply_patch_from_shell(
     script: &str,
 ) -> std::result::Result<(String, Option<String>), ExtractHeredocError> {
     match shell {
-        ApplyPatchShell::Unix => extract_apply_patch_from_bash(script),
-        ApplyPatchShell::PowerShell | ApplyPatchShell::Cmd => {
-            Err(ExtractHeredocError::UnsupportedShell)
+        // Models occasionally emit the canonical POSIX heredoc even when the selected host
+        // shell is PowerShell or cmd.exe. The Bash parser below recognizes only the complete,
+        // single-statement apply_patch forms, so accepting that exact shape is safe and avoids
+        // sending syntax that the host shell cannot execute.
+        ApplyPatchShell::Unix | ApplyPatchShell::PowerShell | ApplyPatchShell::Cmd => {
+            extract_apply_patch_from_bash(script)
         }
     }
 }
@@ -633,13 +636,6 @@ mod tests {
         );
     }
 
-    fn assert_shell_not_intercepted(args: Vec<String>, cwd: &PathUri) {
-        assert_matches!(
-            maybe_parse_apply_patch(&args, cwd),
-            MaybeApplyPatch::NotApplyPatch
-        );
-    }
-
     #[tokio::test]
     async fn test_implicit_patch_single_arg_is_error() {
         let patch = "*** Begin Patch\n*** Add File: foo\n+hi\n*** End Patch".to_string();
@@ -774,34 +770,37 @@ PATCH"#,
     }
 
     #[tokio::test]
-    async fn test_powershell_heredoc() {
+    async fn test_powershell_accepts_canonical_posix_heredoc() {
         let script = heredoc_script("");
-        assert_shell_not_intercepted(
+        assert_match_args_with_cwd(
             args_powershell(&script),
             &PathUri::parse("file:///C:/windows").expect("valid Windows test cwd"),
+            /*expected_workdir*/ None,
         );
     }
     #[tokio::test]
-    async fn test_powershell_heredoc_no_profile() {
+    async fn test_powershell_no_profile_accepts_canonical_posix_heredoc() {
         let script = heredoc_script("");
-        assert_shell_not_intercepted(
+        assert_match_args_with_cwd(
             args_powershell_no_profile(&script),
             &PathUri::parse("file:///C:/windows").expect("valid Windows test cwd"),
+            /*expected_workdir*/ None,
         );
     }
     #[tokio::test]
-    async fn test_pwsh_heredoc() {
+    async fn test_pwsh_accepts_canonical_posix_heredoc() {
         let script = heredoc_script("");
-        assert_shell_not_intercepted(
+        assert_match_args_with_cwd(
             args_pwsh(&script),
             &PathUri::parse("file:///C:/windows").expect("valid Windows test cwd"),
+            /*expected_workdir*/ None,
         );
     }
 
     #[tokio::test]
     async fn test_apply_patch_interception_uses_cwd_convention_for_windows_pwsh_path() {
         let script = heredoc_script("");
-        assert_shell_not_intercepted(
+        assert_match_args_with_cwd(
             strs_to_strings(&[
                 r"C:\Program Files\PowerShell\7\pwsh.exe",
                 "-NoProfile",
@@ -809,15 +808,17 @@ PATCH"#,
                 &script,
             ]),
             &PathUri::parse("file:///C:/windows").expect("valid Windows test cwd"),
+            /*expected_workdir*/ None,
         );
     }
 
     #[tokio::test]
     async fn test_cmd_heredoc_with_cd() {
         let script = heredoc_script("cd foo && ");
-        assert_shell_not_intercepted(
+        assert_match_args_with_cwd(
             args_cmd(&script),
             &PathUri::parse("file:///C:/windows").expect("valid Windows test cwd"),
+            Some("foo"),
         );
     }
 

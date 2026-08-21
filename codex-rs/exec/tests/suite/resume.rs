@@ -74,9 +74,9 @@ fn extract_conversation_id(path: &std::path::Path) -> String {
         .to_string()
 }
 
-fn last_user_image_count(path: &std::path::Path) -> usize {
+fn max_user_image_count(path: &std::path::Path) -> usize {
     let content = std::fs::read_to_string(path).unwrap_or_default();
-    let mut last_count = 0;
+    let mut max_count = 0;
     for line in content.lines() {
         if line.trim().is_empty() {
             continue;
@@ -99,12 +99,13 @@ fn last_user_image_count(path: &std::path::Path) -> usize {
         let Some(content_items) = payload.get("content").and_then(|v| v.as_array()) else {
             continue;
         };
-        last_count = content_items
+        let count = content_items
             .iter()
             .filter(|entry| entry.get("type").and_then(|t| t.as_str()) == Some("input_image"))
             .count();
+        max_count = max_count.max(count);
     }
-    last_count
+    max_count
 }
 
 fn exec_repo_root() -> anyhow::Result<std::path::PathBuf> {
@@ -759,7 +760,7 @@ async fn exec_resume_accepts_images_after_subcommand() -> anyhow::Result<()> {
     let sessions_dir = test.home_path().join("sessions");
     let resumed_path = find_session_file_containing_marker(&sessions_dir, &marker2)
         .expect("no session file found after resume with images");
-    let image_count = last_user_image_count(&resumed_path);
+    let image_count = max_user_image_count(&resumed_path);
     assert_eq!(
         image_count, 2,
         "resume prompt should include both attached images"

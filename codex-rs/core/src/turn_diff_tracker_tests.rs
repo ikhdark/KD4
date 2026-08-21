@@ -245,7 +245,7 @@ async fn unproven_validator_scope_does_not_clear_unrelated_changes() {
     assert!(tracker.has_unvalidated_mutation());
     assert_eq!(
         tracker.validation_freshness_status(),
-        ValidationFreshnessStatus::ScopedValidationIncomplete
+        ValidationFreshnessStatus::StaleAfterLastMutation
     );
 }
 

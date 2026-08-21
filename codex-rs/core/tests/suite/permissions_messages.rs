@@ -6,6 +6,7 @@ use codex_core::context::ApprovalPromptContext;
 use codex_core::context::ContextualUserFragment;
 use codex_core::context::PermissionsInstructions;
 use codex_core::load_exec_policy;
+use codex_features::Feature;
 use codex_models_manager::model_info::model_info_from_slug;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ApprovalMessages;
@@ -152,7 +153,7 @@ async fn model_change_appends_new_catalog_approval_message() -> Result<()> {
     submit_text_turn(&test, "second").await?;
 
     let permissions = permissions_texts(&req2.single_request());
-    assert_eq!(permissions.len(), 2);
+    assert_eq!(permissions.len(), 1);
     assert!(
         permissions
             .last()
@@ -258,9 +259,8 @@ async fn permissions_message_added_on_override_change() -> Result<()> {
     let permissions_2 = permissions_texts(&req2.single_request());
 
     assert_eq!(permissions_1.len(), 1);
-    assert_eq!(permissions_2.len(), 2);
-    let unique = permissions_2.into_iter().collect::<HashSet<String>>();
-    assert_eq!(unique.len(), 2);
+    assert_eq!(permissions_2.len(), 1);
+    assert_ne!(permissions_1, permissions_2);
 
     Ok(())
 }
@@ -483,9 +483,9 @@ async fn resume_replays_permissions_messages() -> Result<()> {
     wait_for_event(&resumed.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let permissions = permissions_texts(&req3.single_request());
-    assert_eq!(permissions.len(), 3);
+    assert_eq!(permissions.len(), 1);
     let unique = permissions.into_iter().collect::<HashSet<String>>();
-    assert_eq!(unique.len(), 2);
+    assert_eq!(unique.len(), 1);
 
     Ok(())
 }
@@ -567,7 +567,7 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
     wait_for_event(&initial.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let permissions_base = permissions_texts(&req2.single_request());
-    assert_eq!(permissions_base.len(), 2);
+    assert_eq!(permissions_base.len(), 1);
 
     builder = builder.with_config(|config| {
         config.permissions.approval_policy = Constrained::allow_any(AskForApproval::UnlessTrusted);
@@ -583,18 +583,17 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
             additional_context: Default::default(),
-            thread_settings: Default::default(),
+            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                approval_policy: Some(AskForApproval::UnlessTrusted),
+                ..Default::default()
+            },
         })
         .await?;
     wait_for_event(&resumed.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let permissions_resume = permissions_texts(&req3.single_request());
-    assert_eq!(permissions_resume.len(), permissions_base.len() + 1);
-    assert_eq!(
-        &permissions_resume[..permissions_base.len()],
-        permissions_base.as_slice()
-    );
-    assert!(!permissions_base.contains(permissions_resume.last().expect("new permissions")));
+    assert_eq!(permissions_resume.len(), 1);
+    assert_ne!(permissions_resume, permissions_base);
 
     let mut fork_config = initial.config.clone();
     fork_config.permissions.approval_policy = Constrained::allow_any(AskForApproval::UnlessTrusted);
@@ -618,21 +617,18 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
             additional_context: Default::default(),
-            thread_settings: Default::default(),
+            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                approval_policy: Some(AskForApproval::UnlessTrusted),
+                ..Default::default()
+            },
         })
         .await?;
     wait_for_event(&forked.thread, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let permissions_fork = permissions_texts(&req4.single_request());
-    assert_eq!(permissions_fork.len(), permissions_base.len() + 1);
-    assert_eq!(
-        &permissions_fork[..permissions_base.len()],
-        permissions_base.as_slice()
-    );
-    let new_permissions = &permissions_fork[permissions_base.len()..];
-    assert_eq!(new_permissions.len(), 1);
+    assert_eq!(permissions_fork.len(), 1);
     assert_eq!(permissions_fork, permissions_resume);
-    assert!(!permissions_base.contains(&new_permissions[0]));
+    assert_ne!(permissions_fork, permissions_base);
 
     Ok(())
 }
@@ -694,8 +690,12 @@ async fn permissions_message_includes_writable_roots() -> Result<()> {
         ApprovalPromptContext::new(test.config.approvals_reviewer, /*messages*/ None),
         &exec_policy,
         test.config.cwd.as_path(),
-        /*exec_permission_approvals_enabled*/ false,
-        /*request_permissions_tool_enabled*/ false,
+        test.config
+            .features
+            .enabled(Feature::ExecPermissionApprovals),
+        test.config
+            .features
+            .enabled(Feature::RequestPermissionsTool),
     )
     .render();
     let expected_normalized = normalize_line_endings(&expected);

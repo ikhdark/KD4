@@ -522,6 +522,7 @@ impl Session {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new(
         mut session_configuration: SessionConfiguration,
+        session_reasoning_effort: Option<ReasoningEffortConfig>,
         config: Arc<Config>,
         user_instructions: Option<codex_extension_api::UserInstructions>,
         installation_id: String,
@@ -963,6 +964,9 @@ impl Session {
                 config.features.enabled(Feature::DeferredExecutor),
             ));
             turn_environments.update_selections(session_configuration.environment_selections());
+            // `snapshot()` honors the DeferredExecutor policy configured above: normal
+            // sessions still wait for their selected executor, while deferred sessions
+            // retain a `starting` entry and finish initializing without blocking on it.
             let resolved_environments = turn_environments.snapshot().await;
             let git_workspace = GitWorkspaceCache::new();
             let initial_git_workspace = git_workspace.snapshot(&resolved_environments).await;
@@ -1313,7 +1317,7 @@ impl Session {
                     permission_profile: session_configuration.permission_profile(),
                     active_permission_profile: session_configuration.active_permission_profile(),
                     cwd: session_configuration.cwd().clone(),
-                    reasoning_effort: session_configuration.collaboration_mode.reasoning_effort(),
+                    reasoning_effort: session_reasoning_effort,
                     initial_messages,
                     network_proxy: session_network_proxy.filter(|_| {
                         Self::managed_network_proxy_active_for_permission_profile(
@@ -1327,7 +1331,10 @@ impl Session {
             })
             .chain(post_session_configured_events.into_iter());
             for event in events {
-                sess.send_event_raw(event).await;
+                // Startup metadata must be visible immediately without turning an otherwise
+                // empty thread into a persisted rollout. Resumed/forked rollouts already exist,
+                // so this helper continues to persist their startup events in place.
+                sess.send_event_raw_without_materializing_rollout(event).await;
             }
 
             let mcp_startup_cancellation_token = {

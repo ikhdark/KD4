@@ -44,6 +44,7 @@ use core_test_support::test_path_buf;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -324,8 +325,18 @@ fn instruction_fragments_in_items(items: &[Value]) -> Vec<String> {
         .collect()
 }
 
+fn user_texts_without_task_model_guidance(request: &responses::ResponsesRequest) -> Vec<String> {
+    request
+        .message_input_texts("user")
+        .into_iter()
+        .filter(|text| !text.starts_with("<task_model_guidance>"))
+        .collect()
+}
+
 fn expected_instruction_fragment(contents: &str) -> String {
-    format!("# AGENTS.md instructions\n\n<INSTRUCTIONS>\n{contents}\n</INSTRUCTIONS>")
+    format!(
+        "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n\n{contents}\n</INSTRUCTIONS>"
+    )
 }
 
 fn assert_single_instruction_fragment(request: &responses::ResponsesRequest, expected: &str) {
@@ -1094,12 +1105,12 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
 
     // summary texts from model
     let first_summary_text = "The task is to create an app. I started to create a react app.";
-    let second_summary_text = "The task is to create an app. I started to create a react app. then I realized that I need to create a node app.";
-    let third_summary_text = "The task is to create an app. I started to create a react app. then I realized that I need to create a node app. then I realized that I need to create a python app.";
+    let second_summary_update = "Then I realized that I need to create a node app.";
+    let third_summary_update = "Then I realized that I need to create a python app.";
     // summary texts with prefix
     let prefixed_first_summary = summary_with_prefix(first_summary_text);
-    let prefixed_second_summary = summary_with_prefix(second_summary_text);
-    let prefixed_third_summary = summary_with_prefix(third_summary_text);
+    let prefixed_second_summary = format!("{prefixed_first_summary}\n\n{second_summary_update}");
+    let prefixed_third_summary = format!("{prefixed_second_summary}\n\n{third_summary_update}");
     // token used count after long work
     let token_count_used = 270_000;
     // token used count after compaction
@@ -1131,7 +1142,7 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
 
     // second compaction response
     let model_compact_response_2_sse = sse(vec![
-        ev_assistant_message("m4", second_summary_text),
+        ev_assistant_message("m4", second_summary_update),
         ev_completed_with_tokens("r4", token_count_used_after_compaction),
     ]);
 
@@ -1144,7 +1155,7 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
 
     // third compaction response
     let model_compact_response_3_sse = sse(vec![
-        ev_assistant_message("m7", third_summary_text),
+        ev_assistant_message("m7", third_summary_update),
         ev_completed_with_tokens("r7", token_count_used_after_compaction),
     ]);
 
@@ -1229,23 +1240,30 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
                     return None;
                 }
 
-                let text = value
-                    .get("content")
-                    .and_then(|content| content.as_array())
-                    .and_then(|content| content.first())
-                    .and_then(|item| item.get("text"))
-                    .and_then(|text| text.as_str());
-
-                // Ignore cached prefix messages (project docs + permissions) since they are not
+                // Ignore cached developer-prefix messages since they are not
                 // relevant to compaction behavior and can change as bundled prompts evolve.
                 let role = value.get("role").and_then(|role| role.as_str());
-                if role == Some("developer")
-                    && text.is_some_and(|text| text.contains("`sandbox_mode`"))
-                {
+                if role == Some("developer") {
                     return None;
                 }
                 if role == Some("user") {
-                    return strip_agents_parts_from_user_message(value);
+                    let normalized = strip_agents_parts_from_user_message(value)?;
+                    let is_task_model_guidance = normalized
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .and_then(|content| content.first())
+                        .and_then(|item| item.get("text"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| text.starts_with("<task_model_guidance>"));
+                    let is_consumed_original_user = normalized
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .and_then(|content| content.first())
+                        .and_then(|item| item.get("text"))
+                        .and_then(Value::as_str)
+                        == Some("create an app");
+                    return (!is_task_model_guidance && !is_consumed_original_user)
+                        .then_some(normalized);
                 }
                 Some(value.clone())
             })
@@ -1254,6 +1272,13 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
 
     let initial_input = normalize_inputs(input);
     let environment_message = initial_input[0]["content"][0]["text"].as_str().unwrap();
+    let contains_user_text = |request: &core_test_support::responses::ResponsesRequest,
+                              expected: &str| {
+        request
+            .message_input_texts("user")
+            .iter()
+            .any(|text| text == expected)
+    };
 
     // test 1: after compaction, we should have one environment message, one user message, and one user message with summary prefix
     let compaction_indices = [2, 4, 6];
@@ -1266,15 +1291,28 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
         let body = requests_payloads.clone()[i].body_json();
         let input = body.get("input").and_then(|v| v.as_array()).unwrap();
         let input = normalize_inputs(input);
-        assert_eq!(input.len(), 3);
+        assert_eq!(input.len(), 2, "normalized request {i}: {input:#?}");
         let environment_message = input[0]["content"][0]["text"].as_str().unwrap();
-        let user_message_received = input[1]["content"][0]["text"].as_str().unwrap();
-        let summary_message = input[2]["content"][0]["text"].as_str().unwrap();
+        let summary_message = input[1]["content"][0]["text"].as_str().unwrap();
         assert_eq!(environment_message, environment_message);
-        assert_eq!(user_message_received, user_message);
         assert_eq!(
             summary_message, expected_summary,
             "compaction request at index {i} should include the prefixed summary"
+        );
+    }
+    for request_index in [1, 3, 5] {
+        assert!(
+            contains_user_text(&requests_payloads[request_index], SUMMARIZATION_PROMPT),
+            "compaction request {request_index} should include the base summarization prompt"
+        );
+    }
+    for request_index in [3, 5] {
+        assert!(
+            contains_user_text(
+                &requests_payloads[request_index],
+                INCREMENTAL_SUMMARIZATION_PROMPT
+            ),
+            "repeat compaction request {request_index} should request an incremental update"
         );
     }
 
@@ -1566,7 +1604,28 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
         let body = request.body_json();
         let input = body.get("input").and_then(|v| v.as_array()).unwrap();
         let expected_input = expected_requests_inputs[i].as_array().unwrap();
-        assert_eq!(normalize_inputs(input), normalize_inputs(expected_input));
+        let without_environment = |values: &[serde_json::Value]| {
+            normalize_inputs(values)
+                .into_iter()
+                .filter(|value| {
+                    let text = value
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .and_then(|content| content.first())
+                        .and_then(|item| item.get("text"))
+                        .and_then(Value::as_str);
+                    text.is_none_or(|text| {
+                        !text.starts_with("<environment_context>")
+                            && text != SUMMARIZATION_PROMPT
+                            && text != INCREMENTAL_SUMMARIZATION_PROMPT
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            without_environment(input),
+            without_environment(expected_input)
+        );
     }
 
     // test 3: the number of requests should be 7
@@ -1758,12 +1817,12 @@ async fn auto_compact_runs_after_token_limit_hit() {
         })
         .collect();
     assert!(
-        user_texts.iter().any(|text| text == FIRST_AUTO_MSG),
-        "auto compact follow-up request should include the first user message"
+        !user_texts.iter().any(|text| text == FIRST_AUTO_MSG),
+        "auto compact follow-up request should evict the consumed first user message"
     );
     assert!(
-        user_texts.iter().any(|text| text == SECOND_AUTO_MSG),
-        "auto compact follow-up request should include the second user message"
+        !user_texts.iter().any(|text| text == SECOND_AUTO_MSG),
+        "auto compact follow-up request should evict the consumed second user message"
     );
     assert!(
         user_texts.iter().any(|text| text == POST_AUTO_USER_MSG),
@@ -2019,6 +2078,7 @@ async fn auto_compact_runs_after_resume_when_token_usage_is_over_limit() {
     )
     .await;
     initial.submit_turn("OVER_LIMIT_TURN").await.unwrap();
+    initial.codex.flush_rollout().await.unwrap();
 
     assert!(
         compact_mock.requests().is_empty(),
@@ -2059,10 +2119,22 @@ async fn auto_compact_runs_after_resume_when_token_usage_is_over_limit() {
         .await
         .unwrap();
 
-    wait_for_event(&resumed.codex, |event| {
-        matches!(event, EventMsg::ContextCompacted(_))
+    let mut observed_events = Vec::new();
+    let compacted = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = resumed.codex.next_event().await.expect("event stream");
+            observed_events.push(format!("{:?}", event.msg));
+            if matches!(event.msg, EventMsg::ContextCompacted(_)) {
+                break;
+            }
+        }
     })
     .await;
+    assert!(
+        compacted.is_ok(),
+        "timeout waiting for resumed compaction; compact requests: {}; observed events: {observed_events:#?}",
+        compact_mock.requests().len()
+    );
     wait_for_event(&resumed.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
     })
@@ -3514,7 +3586,7 @@ async fn manual_compact_context_window_error_does_not_batch_delete_history() {
         .with_config(move |config| {
             config.model_provider = model_provider;
             set_test_compact_prompt(config);
-            config.model_context_window = Some(10_000);
+            config.model_context_window = Some(100_000);
             config.model_auto_compact_token_limit = Some(200_000);
         })
         .build(&server)
@@ -3701,10 +3773,8 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
     let final_user_message = "post compact follow-up";
     let first_summary = "FIRST_MANUAL_SUMMARY";
     let second_summary = "SECOND_MANUAL_UPDATE";
-    let expected_second_summary = format!(
-        "{}\n\nIncremental update:\n{second_summary}",
-        summary_with_prefix(first_summary)
-    );
+    let expected_second_summary =
+        format!("{}\n\n{second_summary}", summary_with_prefix(first_summary));
 
     let server = start_mock_server().await;
 
@@ -3882,8 +3952,8 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
         "regular requests after compaction should not be marked as compact requests"
     );
     assert!(
-        contains_user_text(&requests[2], first_user_message),
-        "second turn request should include the compacted user history"
+        !contains_user_text(&requests[2], first_user_message),
+        "second turn request should evict user history consumed by the compact summary"
     );
 
     assert!(
@@ -3913,35 +3983,16 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
         "second compaction should request only an incremental summary update"
     );
 
-    let first_request_user_texts = requests[0].message_input_texts("user");
-    let first_turn_user_index = first_request_user_texts
-        .len()
-        .checked_sub(1)
-        .expect("first turn request missing user messages");
-    assert_eq!(
-        first_request_user_texts[first_turn_user_index], first_user_message,
-        "first turn request should end with the submitted user message"
+    let final_request_user_texts = user_texts_without_task_model_guidance(
+        requests.last().expect("final turn request missing"),
     );
-    let initial_seeded_user_prefix = &first_request_user_texts[..first_turn_user_index];
-
-    let final_request_user_texts = requests
-        .last()
-        .expect("final turn request missing")
-        .message_input_texts("user");
     assert!(
-        !initial_seeded_user_prefix.is_empty(),
-        "first turn should include seeded user prefix before the submitted user message"
+        final_request_user_texts.contains(&expected_second_summary),
+        "final request user texts: {final_request_user_texts:#?}"
     );
-    let history_after_seeded_prefix = final_request_user_texts
-        .strip_prefix(initial_seeded_user_prefix)
-        .expect("final request should retain the seeded user prefix from the first request");
-    let expected_history = vec![
-        first_user_message.to_string(),
-        second_user_message.to_string(),
-        expected_second_summary,
-        final_user_message.to_string(),
-    ];
-    assert_eq!(history_after_seeded_prefix, expected_history.as_slice());
+    assert!(final_request_user_texts.contains(&final_user_message.to_string()));
+    assert!(!final_request_user_texts.contains(&first_user_message.to_string()));
+    assert!(!final_request_user_texts.contains(&second_user_message.to_string()));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3991,6 +4042,7 @@ async fn auto_compact_allows_multiple_attempts_when_interleaved_with_other_turn_
     let codex = builder.build(&server).await.unwrap().codex;
 
     let mut auto_compact_lifecycle_events = Vec::new();
+    let mut observed_last_token_usage = Vec::new();
     for user in [MULTI_AUTO_MSG, follow_up_user, final_user] {
         codex
             .submit(Op::UserInput {
@@ -4008,6 +4060,11 @@ async fn auto_compact_allows_multiple_attempts_when_interleaved_with_other_turn_
 
         loop {
             let event = codex.next_event().await.unwrap();
+            if let EventMsg::TokenCount(token_count) = &event.msg
+                && let Some(info) = token_count.info.as_ref()
+            {
+                observed_last_token_usage.push(info.last_token_usage.total_tokens);
+            }
             if event.id.starts_with("auto-compact-")
                 && matches!(
                     event.msg,
@@ -4030,15 +4087,24 @@ async fn auto_compact_allows_multiple_attempts_when_interleaved_with_other_turn_
         "auto compact should not emit task lifecycle events"
     );
 
-    let request_bodies: Vec<String> = request_log
-        .requests()
+    let requests = request_log.requests();
+    let request_shapes = requests
+        .iter()
+        .map(|request| {
+            (
+                request.message_input_texts("user"),
+                body_contains_text(&request.body_json().to_string(), SUMMARIZATION_PROMPT),
+            )
+        })
+        .collect::<Vec<_>>();
+    let request_bodies: Vec<String> = requests
         .into_iter()
         .map(|request| request.body_json().to_string())
         .collect();
     assert_eq!(
         request_bodies.len(),
         6,
-        "expected six requests including two auto compactions"
+        "expected six requests including two auto compactions; shapes: {request_shapes:#?}; token usage: {observed_last_token_usage:?}"
     );
     assert!(
         request_bodies[0].contains(MULTI_AUTO_MSG),
@@ -4371,15 +4437,15 @@ async fn auto_compact_body_after_prefix_counts_growth_after_compaction() {
     let requests = request_log.requests();
     assert_eq!(
         requests.len(),
-        5,
-        "later post-compaction growth should trigger the second compaction immediately"
+        4,
+        "the first server sample after compaction establishes the new prefix baseline"
     );
     assert!(
-        requests[3..].iter().any(|request| body_contains_text(
+        !requests[3..].iter().any(|request| body_contains_text(
             &request.body_json().to_string(),
             SUMMARIZATION_PROMPT
         )),
-        "post-compaction growth should trigger a second body-after-prefix compaction"
+        "the baseline-establishing sample should not itself trigger another compaction"
     );
 
     test.submit_turn("AFTER_GROWTH_TRIGGER")
@@ -4391,6 +4457,13 @@ async fn auto_compact_body_after_prefix_counts_growth_after_compaction() {
         requests.len(),
         6,
         "fourth turn should compact because later post-compaction growth counted against the body budget"
+    );
+    assert!(
+        requests[4..].iter().any(|request| body_contains_text(
+            &request.body_json().to_string(),
+            SUMMARIZATION_PROMPT
+        )),
+        "later growth beyond the established prefix should trigger the second compaction"
     );
 }
 
@@ -5117,7 +5190,7 @@ async fn manual_compaction_keeps_the_creation_time_global_instructions() -> Resu
     assert_eq!(requests.len(), 3);
     let expected_fragment = expected_instruction_fragment(OLD_GLOBAL_INSTRUCTIONS);
     assert_single_instruction_fragment(&requests[0], &expected_fragment);
-    assert_single_instruction_fragment(&requests[1], &expected_fragment);
+    assert!(instruction_fragments(&requests[1]).is_empty());
     assert_single_instruction_fragment(&requests[2], &expected_fragment);
     assert_eq!(
         test.codex.instruction_sources().await,
@@ -5190,12 +5263,13 @@ async fn mid_turn_compaction_keeps_the_creation_time_global_instructions() -> Re
     assert_ne!(source, new_source);
     test.submit_turn("trigger mid-turn compaction").await?;
 
-    // Assert the initial, compact, and resumed requests all keep the old snapshot and source.
+    // The compact request omits startup envelopes so the summary does not absorb them. The
+    // replacement history then reinjects the creation-time snapshot before sampling resumes.
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 3);
     let expected_fragment = expected_instruction_fragment(OLD_GLOBAL_INSTRUCTIONS);
     assert_single_instruction_fragment(&requests[0], &expected_fragment);
-    assert_single_instruction_fragment(&requests[1], &expected_fragment);
+    assert!(instruction_fragments(&requests[1]).is_empty());
     assert_single_instruction_fragment(&requests[2], &expected_fragment);
     assert_eq!(
         test.codex.instruction_sources().await,
@@ -5279,8 +5353,8 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
     let replacement_history = replacement_history_from_rollout(&rollout_path)?;
     assert_eq!(
         instruction_fragments_in_items(&replacement_history),
-        Vec::<String>::new(),
-        "remote-v2 replacement history currently omits the global-instruction fragment"
+        vec![old_fragment.clone()],
+        "remote-v2 replacement history should preserve the creation-time global instructions"
     );
     assert_eq!(
         test.codex.instruction_sources().await,
@@ -5314,28 +5388,16 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
         .submit_turn("after remote v2 compaction cold resume")
         .await?;
 
-    // Cold resume replays the persisted old context, then appends the newly loaded instructions as
-    // an explicit replacement.
+    // Cold resume canonicalizes the persisted old context to the newly loaded same-path
+    // instructions and emits one explicit replacement.
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 4);
-    let replacement_fragment = expected_instruction_fragment(&format!(
-        "These AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\n{NEW_GLOBAL_INSTRUCTIONS}"
-    ));
+    let replacement_fragment = format!(
+        "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n\n{NEW_GLOBAL_INSTRUCTIONS}\n</INSTRUCTIONS>"
+    );
     assert_eq!(
         instruction_fragments(&requests[3]),
-        vec![old_fragment.clone(), replacement_fragment]
-    );
-    let resumed_input = requests[3].input();
-    assert_eq!(
-        resumed_input.get(..replacement_history.len()),
-        Some(replacement_history.as_slice()),
-        "remote-v2 cold resume should replay persisted replacement history verbatim"
-    );
-    let post_compact_input = requests[2].input();
-    assert_eq!(
-        resumed_input.get(..post_compact_input.len()),
-        Some(post_compact_input.as_slice()),
-        "remote-v2 cold resume should replay the complete post-compaction structured prefix"
+        vec![replacement_fragment]
     );
     assert_eq!(
         resumed.codex.instruction_sources().await,

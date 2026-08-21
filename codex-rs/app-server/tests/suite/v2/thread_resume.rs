@@ -652,6 +652,11 @@ async fn settings_only_model_update_survives_cold_resume_and_explicit_override_w
         )
         .await??;
         let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+        let rollout_path = thread.path.clone().expect("thread path should be present");
+        assert!(
+            !rollout_path.exists(),
+            "fresh thread should remain unmaterialized before the model update"
+        );
 
         let update_id = mcp
             .send_thread_settings_update_request(ThreadSettingsUpdateParams {
@@ -671,6 +676,10 @@ async fn settings_only_model_update_survives_cold_resume_and_explicit_override_w
             mcp.read_stream_until_notification_message("thread/settings/updated"),
         )
         .await??;
+        assert!(
+            rollout_path.exists(),
+            "model-only settings update should materialize resumable state"
+        );
 
         thread.id
     };

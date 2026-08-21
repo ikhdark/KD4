@@ -395,6 +395,11 @@ async fn workspace_evidence_identity_recaptures_without_waiting_for_watcher_deli
         .workspace_evidence_identity(repo.as_path())
         .await
         .expect("first identity");
+    assert_eq!(
+        cache.workspace_evidence_capture_count(),
+        1,
+        "the first identity requires one Git capture"
+    );
     let second = cache
         .workspace_evidence_identity(repo.as_path())
         .await

@@ -282,7 +282,7 @@ impl CellState {
             CellPhase::Completed {
                 pending_initial_yield_items: Some(content_items),
                 event,
-            } if matches!(mode, ObserveMode::YieldAfter(_)) => {
+            } if matches!(mode, ObserveMode::YieldAfter(_) | ObserveMode::StateChange) => {
                 match response_tx.send(Ok(CellEvent::Yielded { content_items })) {
                     Ok(()) => {
                         *phase = CellPhase::Completed {

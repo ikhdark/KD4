@@ -20,11 +20,11 @@ localReconciliationResidual: bigint,
 /**
  * Provider-reported full input tokens, when usage was returned.
  */
-providerInputTokens?: number | null,
+providerInputTokens: number | null,
 /**
  * `provider_input_tokens - logical_total`, when provider usage exists.
  */
-providerReconciliationResidual?: number | null,
+providerReconciliationResidual: number | null,
 /**
  * Overlapping diagnostic: logical tokens in categories whose exact hash
  * matched the preceding request. This is not added to `logical_total`.

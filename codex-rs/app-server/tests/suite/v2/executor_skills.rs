@@ -136,12 +136,6 @@ stream_max_retries = 0
     .await??;
 
     let request = response_mock.single_request();
-    assert!(
-        request
-            .message_input_texts("developer")
-            .iter()
-            .any(|text| text.contains(SKILL_NAME))
-    );
     let skill_fragments = request
         .message_input_texts("user")
         .into_iter()

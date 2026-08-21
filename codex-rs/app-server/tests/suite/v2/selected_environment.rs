@@ -156,7 +156,7 @@ async fn thread_start_reports_selected_environment_instruction_source() -> Resul
         .find(|text| text.starts_with("# AGENTS.md instructions"))
         .context("selected environment instructions should be model visible")?;
     let expected_instructions = format!(
-        "# AGENTS.md instructions for {}\n\n<INSTRUCTIONS>\n{AGENTS_INSTRUCTIONS}\n</INSTRUCTIONS>",
+        "# AGENTS.md instructions for {}\n\n<INSTRUCTIONS>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n\n{AGENTS_INSTRUCTIONS}\n</INSTRUCTIONS>",
         environment_cwd.inferred_native_path_string()
     );
     assert_eq!(instructions, &expected_instructions);

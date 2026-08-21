@@ -1817,6 +1817,9 @@ async fn explicit_batch_ack_reuses_bound_route_and_survives_only_disjoint_edits(
     );
 
     ledger
+        .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::InProgress)]))
+        .await;
+    ledger
         .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Implemented)]))
         .await;
     let after_relevant = ledger
@@ -4325,6 +4328,7 @@ async fn terminal_claim_persistence_failure_establishes_no_durable_success() {
 #[tokio::test]
 async fn late_terminalization_persistence_failure_does_not_change_committed_claim() {
     let (_temp, _repo, ledger) = ledger_fixture().await;
+    install_persistence_supersede_control(&ledger, 0);
     let identity = "committed:turn";
     assert!(matches!(
         ledger
@@ -4622,7 +4626,7 @@ async fn trusted_token_change_between_persistence_retries_starts_new_proof() {
         .await
         .expect("completion task")
         .expect("completion gate");
-    assert_eq!(gate.status, TaskCompletionStatus::Passed);
+    assert_eq!(gate.status, TaskCompletionStatus::Partial);
     let diagnostics = ledger.freshness_diagnostics();
     assert_eq!(diagnostics.scan_invocations, 2);
     assert_eq!(diagnostics.files_strongly_hashed, 2);
@@ -4735,6 +4739,7 @@ async fn completion_persistence_failure_is_partial_then_recovers_when_storage_re
 #[tokio::test]
 async fn atomic_review_commit_publishes_runtime_state_only_after_durable_write() {
     let (_temp, _repo, ledger) = ledger_fixture().await;
+    install_persistence_supersede_control(&ledger, 0);
     let committed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let revision = ledger.document_revision().await.expect("document revision");
     set_persistence_test_failure(&ledger, true);
@@ -6237,6 +6242,15 @@ async fn manifest_gap_replacement_review_links_to_superseded_receipt_across_relo
         AtomicReviewTransition::Persisted(recorded) => recorded,
         other => panic!("replacement initial review did not persist: {other:?}"),
     };
+
+    {
+        let guard = ledger.document.lock().await;
+        assert_eq!(
+            validate_v5_completion_review(guard.as_ref().expect("task evidence")),
+            Ok(()),
+            "replacement lineage must be reload-valid"
+        );
+    }
 
     let thread_id = ledger.thread_id.clone().expect("thread ID");
     drop(ledger);

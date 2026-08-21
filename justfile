@@ -150,7 +150,7 @@ clippy-workspace *args:
 
 [windows]
 clippy-workspace *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\cargo-lane.ps1" -Lane auto cargo clippy --tests @forwarded_args
+    $forwarded_args = @($args | Select-Object -Skip 1); & "{{ justfile_directory() }}\scripts\cargo-workspace-analyzer.ps1" -Analyzer clippy @forwarded_args; exit $LASTEXITCODE
 
 [unix]
 cargo-shear *args:
@@ -166,7 +166,7 @@ rust-dead-code-matrix *args:
 
 [windows]
 rust-dead-code-matrix *args:
-    @$forwarded_args = @($args | Select-Object -Skip 1); if ($forwarded_args.Count -gt 0 -and $forwarded_args[0] -eq "--") { $forwarded_args = @($forwarded_args | Select-Object -Skip 1) }; $cargo_args = @("check"); if (-not (($forwarded_args -contains "-p") -or ($forwarded_args -contains "--package") -or ($forwarded_args -contains "--manifest-path"))) { $cargo_args += "--workspace" }; $cargo_args += "--all-targets"; $cargo_args += $forwarded_args; $env:RUSTFLAGS = "-Ddead_code"; just cargo-lane rust-dead-code-matrix cargo @cargo_args
+    @$forwarded_args = @($args | Select-Object -Skip 1); if ($forwarded_args.Count -gt 0 -and $forwarded_args[0] -eq "--") { $forwarded_args = @($forwarded_args | Select-Object -Skip 1) }; & "{{ justfile_directory() }}\scripts\cargo-workspace-analyzer.ps1" -Analyzer dead-code @forwarded_args; exit $LASTEXITCODE
 
 [unix]
 install:

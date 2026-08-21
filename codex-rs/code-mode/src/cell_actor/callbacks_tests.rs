@@ -19,6 +19,8 @@ use crate::session_runtime::ToolName;
 
 struct PanickingCallbackHost;
 
+struct NonCooperativeCallbackHost;
+
 impl CellHost for PanickingCallbackHost {
     async fn invoke_tool(
         &self,
@@ -35,6 +37,37 @@ impl CellHost for PanickingCallbackHost {
         _cancellation_token: CancellationToken,
     ) -> Result<(), String> {
         panic!("notification callback panic probe");
+    }
+
+    async fn commit_completion(
+        &self,
+        _stored_value_writes: HashMap<String, JsonValue>,
+        _event: CellEvent,
+        _pending_initial_yield_items: Option<Vec<crate::session_runtime::OutputItem>>,
+        _cell_state: Arc<CellState>,
+    ) -> CompletionCommit {
+        panic!("unexpected completion commit");
+    }
+
+    async fn closed(&self, _event: Option<CellEvent>) {}
+}
+
+impl CellHost for NonCooperativeCallbackHost {
+    async fn invoke_tool(
+        &self,
+        _invocation: CellToolCall,
+        _cancellation_token: CancellationToken,
+    ) -> Result<JsonValue, String> {
+        std::future::pending().await
+    }
+
+    async fn notify(
+        &self,
+        _call_id: String,
+        _text: String,
+        _cancellation_token: CancellationToken,
+    ) -> Result<(), String> {
+        std::future::pending().await
     }
 
     async fn commit_completion(
@@ -129,4 +162,53 @@ async fn callback_wrapper_join_error_reports_failure() {
 
     let failure_reason = failure_rx.recv().await.expect("wrapper failure");
     assert!(failure_reason.contains("code mode tool task failed"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_aborts_non_cooperative_callback_after_bounded_grace() {
+    let mut notification_tasks = JoinSet::new();
+    let mut tool_tasks = JoinSet::new();
+    let cancellation_token = CancellationToken::new();
+    let (runtime_tx, _runtime_rx) = std_mpsc::channel();
+    let (failure_tx, mut failure_rx) = mpsc::unbounded_channel();
+    let task_failure_handler: TaskFailureHandler = Arc::new(move |reason| {
+        let _ = failure_tx.send(reason);
+    });
+
+    spawn_tool(
+        &mut tool_tasks,
+        Arc::new(NonCooperativeCallbackHost),
+        CellToolCall {
+            id: "tool-stuck".to_string(),
+            name: ToolName {
+                name: "stuck".to_string(),
+                namespace: None,
+            },
+            kind: ToolKind::Function,
+            input: None,
+        },
+        runtime_tx,
+        cancellation_token.child_token(),
+        Some(task_failure_handler.clone()),
+    );
+
+    let cleanup = tokio::spawn(async move {
+        finish_callbacks(
+            &cancellation_token,
+            &mut notification_tasks,
+            &mut tool_tasks,
+            CallbackCompletion::Cancel,
+            Some(&task_failure_handler),
+        )
+        .await;
+    });
+    tokio::task::yield_now().await;
+    tokio::time::advance(CALLBACK_CANCELLATION_GRACE).await;
+    tokio::task::yield_now().await;
+    cleanup
+        .await
+        .expect("bounded callback cleanup should finish");
+
+    let failure = failure_rx.recv().await.expect("timeout diagnostic");
+    assert!(failure.contains("callback cleanup exceeded"));
 }

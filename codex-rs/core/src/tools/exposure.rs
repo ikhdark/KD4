@@ -17,6 +17,24 @@ pub(crate) enum GoalSurfaceState {
     Active,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum EnvironmentSurfaceMode {
+    None,
+    One,
+    Multiple,
+}
+
+impl EnvironmentSurfaceMode {
+    pub(crate) fn from_count(count: usize) -> Self {
+        match count {
+            0 => Self::None,
+            1 => Self::One,
+            _ => Self::Multiple,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub(crate) struct DirectMcpToolEntrypoint {
     pub(crate) server_name: String,
@@ -35,6 +53,8 @@ pub(crate) struct ToolExposureIdentity {
     pub(crate) mcp_resources_available: bool,
     pub(crate) tool_search_available: bool,
     pub(crate) request_user_input_eligible: bool,
+    pub(crate) environment_mode: EnvironmentSurfaceMode,
+    pub(crate) environment_starting: bool,
 }
 
 impl Default for ToolExposureIdentity {
@@ -48,6 +68,8 @@ impl Default for ToolExposureIdentity {
             mcp_resources_available: true,
             tool_search_available: false,
             request_user_input_eligible: true,
+            environment_mode: EnvironmentSurfaceMode::One,
+            environment_starting: false,
         }
     }
 }
@@ -66,6 +88,8 @@ mod tests {
             mcp_resources_available: false,
             tool_search_available: false,
             request_user_input_eligible: false,
+            environment_mode: EnvironmentSurfaceMode::None,
+            environment_starting: false,
         };
         assert_eq!(base, base.clone());
 
@@ -91,6 +115,14 @@ mod tests {
 
         let mut changed = base.clone();
         changed.agent_surface_stage = AgentSurfaceStage::Lifecycle;
+        assert_ne!(base, changed);
+
+        let mut changed = base.clone();
+        changed.environment_mode = EnvironmentSurfaceMode::One;
+        assert_ne!(base, changed);
+
+        let mut changed = base.clone();
+        changed.environment_starting = true;
         assert_ne!(base, changed);
 
         let mut changed = base.clone();

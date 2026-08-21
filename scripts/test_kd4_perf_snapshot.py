@@ -127,7 +127,9 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
         self.assertEqual(metadata["dirtyPaths"], 0)
 
     def test_model_attempt_analysis_filters_groups_and_reconciles(self) -> None:
-        def attempt(request_id: str, attempt_id: str, wait: int, **overrides: object) -> dict[str, object]:
+        def attempt(
+            request_id: str, attempt_id: str, wait: int, **overrides: object
+        ) -> dict[str, object]:
             record: dict[str, object] = {
                 "event.name": "codex.model_attempt",
                 "turn_id": "turn-1",
@@ -166,7 +168,13 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
 
         records = [
             attempt("clean-1", "a", 100),
-            attempt("clean-2", "b", 200, cached_input_token_count=5, uncached_input_token_count=5),
+            attempt(
+                "clean-2",
+                "b",
+                200,
+                cached_input_token_count=5,
+                uncached_input_token_count=5,
+            ),
             attempt("retry", "c", 300, outcome="failed"),
             attempt("retry", "d", 400, retry_index=1),
             attempt("failed", "e", 500, outcome="failed"),
@@ -178,7 +186,9 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
         self.assertEqual(analysis["totalPhysicalAttempts"], 7)
         self.assertEqual(analysis["includedPhysicalAttempts"], 4)
         self.assertEqual(analysis["includedLogicalRequests"], 3)
-        self.assertEqual(analysis["outcomeCounts"], {"success": 4, "failed": 2, "cancelled": 1})
+        self.assertEqual(
+            analysis["outcomeCounts"], {"success": 4, "failed": 2, "cancelled": 1}
+        )
         self.assertEqual(analysis["exclusionCounts"]["no_terminal_success"], 2)
         self.assertEqual(
             analysis["exclusionCounts"]["missing_first_actionable_output_us"], 1
@@ -192,7 +202,9 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
         self.assertEqual(sum(item["count"] for item in bins), 3)
         self.assertEqual(analysis["componentReconciliation"]["coveredCount"], 3)
         self.assertEqual(analysis["componentReconciliation"]["withinToleranceCount"], 3)
-        self.assertEqual(analysis["componentReconciliation"]["suppliedResidualMismatchCount"], 0)
+        self.assertEqual(
+            analysis["componentReconciliation"]["suppliedResidualMismatchCount"], 0
+        )
         self.assertEqual(len(analysis["rows"]), 3)
         retry_row = next(
             row for row in analysis["rows"] if row["sampling_request_id"] == "retry"
@@ -220,7 +232,9 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
                 "not-json\n"
                 + json.dumps({"event.name": "something.else"})
                 + "\n"
-                + json.dumps({"fields": {"event.name": "codex.model_attempt", "attempt_id": "a"}})
+                + json.dumps(
+                    {"fields": {"event.name": "codex.model_attempt", "attempt_id": "a"}}
+                )
                 + "\n",
                 encoding="utf-8",
             )
@@ -228,7 +242,12 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(exclusions, {"malformed_json": 1, "not_model_attempt": 1})
         args = kd4_perf_snapshot.build_parser().parse_args(
-            ["--model-attempt-jsonl", "attempts.jsonl", "--model-attempt-report", "report.txt"]
+            [
+                "--model-attempt-jsonl",
+                "attempts.jsonl",
+                "--model-attempt-report",
+                "report.txt",
+            ]
         )
         self.assertEqual(args.model_attempt_jsonl, [Path("attempts.jsonl")])
         self.assertEqual(args.model_attempt_report, Path("report.txt"))
@@ -307,13 +326,17 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
             1000.0,
         )
 
-    def test_stable_context_exposure_counts_retries_independent_of_provider_cache(self) -> None:
+    def test_stable_context_exposure_counts_retries_independent_of_provider_cache(
+        self,
+    ) -> None:
         records = []
         for index in range(10):
             records.append(
                 {
                     "event.name": "codex.model_attempt",
-                    "sampling_request_id": "request" if index < 2 else f"request-{index}",
+                    "sampling_request_id": "request"
+                    if index < 2
+                    else f"request-{index}",
                     "attempt_id": f"attempt-{index}",
                     "retry_index": index if index < 2 else 0,
                     "outcome": "success",
@@ -349,7 +372,9 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
         self.assertEqual(stable["localReusedBytes"], 36_000.0)
         self.assertEqual(stable["componentCacheHits"], 9.0)
 
-    def test_stable_context_summary_tolerates_missing_provider_cache_fields(self) -> None:
+    def test_stable_context_summary_tolerates_missing_provider_cache_fields(
+        self,
+    ) -> None:
         stable = kd4_model_attempt_analysis.analyze(
             [
                 {

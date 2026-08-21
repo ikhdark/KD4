@@ -1,4 +1,5 @@
 use super::*;
+use crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS;
 use crate::unified_exec::async_watcher::omitted_output_marker;
 use crate::unified_exec::async_watcher::resolve_aggregated_output;
 use crate::unified_exec::clamp_yield_time;
@@ -220,6 +221,131 @@ async fn initial_output_yields_after_meaningful_output_quiet_period() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn background_wait_yields_after_meaningful_output_quiet_period() {
+    let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(1024)));
+    let output_notify = Arc::new(Notify::new());
+    let output_closed = Arc::new(AtomicBool::new(false));
+    let output_closed_notify = Arc::new(Notify::new());
+    let cancellation_token = CancellationToken::new();
+    let started_at = Instant::now();
+
+    output_buffer.lock().await.push_chunk(b"ready\n".to_vec());
+
+    let collected = UnifiedExecProcessManager::collect_output_until_progress_or_deadline(
+        &output_buffer,
+        &output_notify,
+        &output_closed,
+        &output_closed_notify,
+        &cancellation_token,
+        None,
+        started_at + Duration::from_secs(10),
+    )
+    .await;
+
+    assert_eq!(collected, b"ready\n");
+    assert_eq!(Instant::now() - started_at, Duration::from_millis(250));
+}
+
+#[tokio::test(start_paused = true)]
+async fn orchestration_correctness_output_notification_wakes_owner_wait() {
+    let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(1024)));
+    let output_notify = Arc::new(Notify::new());
+    let output_closed = Arc::new(AtomicBool::new(false));
+    let output_closed_notify = Arc::new(Notify::new());
+    let cancellation_token = CancellationToken::new();
+    let started_at = Instant::now();
+
+    let waiter = tokio::spawn({
+        let output_buffer = Arc::clone(&output_buffer);
+        let output_notify = Arc::clone(&output_notify);
+        let output_closed = Arc::clone(&output_closed);
+        let output_closed_notify = Arc::clone(&output_closed_notify);
+        let cancellation_token = cancellation_token.clone();
+        async move {
+            UnifiedExecProcessManager::collect_output_until_progress_or_deadline(
+                &output_buffer,
+                &output_notify,
+                &output_closed,
+                &output_closed_notify,
+                &cancellation_token,
+                None,
+                started_at + Duration::from_secs(10),
+            )
+            .await
+        }
+    });
+    tokio::task::yield_now().await;
+
+    output_buffer.lock().await.push_chunk(b"ready\n".to_vec());
+    output_notify.notify_waiters();
+
+    assert_eq!(waiter.await.unwrap(), b"ready\n");
+    assert_eq!(Instant::now() - started_at, Duration::from_millis(250));
+}
+
+#[tokio::test(start_paused = true)]
+async fn background_wait_ignores_whitespace_until_meaningful_progress() {
+    let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(1024)));
+    let output_notify = Arc::new(Notify::new());
+    let output_closed = Arc::new(AtomicBool::new(false));
+    let output_closed_notify = Arc::new(Notify::new());
+    let cancellation_token = CancellationToken::new();
+    let started_at = Instant::now();
+
+    output_buffer.lock().await.push_chunk(b" \r\n".to_vec());
+    let progress_buffer = Arc::clone(&output_buffer);
+    let progress_notify = Arc::clone(&output_notify);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        progress_buffer.lock().await.push_chunk(b"ready\n".to_vec());
+        progress_notify.notify_waiters();
+    });
+
+    let collected = UnifiedExecProcessManager::collect_output_until_progress_or_deadline(
+        &output_buffer,
+        &output_notify,
+        &output_closed,
+        &output_closed_notify,
+        &cancellation_token,
+        None,
+        started_at + Duration::from_secs(10),
+    )
+    .await;
+
+    assert_eq!(collected, b" \r\nready\n");
+    assert_eq!(Instant::now() - started_at, Duration::from_millis(1_250));
+}
+
+#[tokio::test(start_paused = true)]
+async fn silent_background_wait_uses_one_owner_deadline() {
+    let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(1024)));
+    let output_notify = Arc::new(Notify::new());
+    let output_closed = Arc::new(AtomicBool::new(false));
+    let output_closed_notify = Arc::new(Notify::new());
+    let cancellation_token = CancellationToken::new();
+    let started_at = Instant::now();
+
+    let collected = UnifiedExecProcessManager::collect_output_until_progress_or_deadline(
+        &output_buffer,
+        &output_notify,
+        &output_closed,
+        &output_closed_notify,
+        &cancellation_token,
+        None,
+        started_at + Duration::from_secs(10),
+    )
+    .await;
+
+    assert!(collected.is_empty());
+    assert_eq!(Instant::now() - started_at, Duration::from_secs(10));
+}
+
+#[test]
+fn background_owner_deadline_is_bounded_to_one_minute() {
+    assert_eq!(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS, 60_000);
+}
+
+#[tokio::test(start_paused = true)]
 async fn initial_output_quiet_yield_is_clamped_to_hard_deadline() {
     let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(1024)));
     let output_notify = Arc::new(Notify::new());
@@ -332,7 +458,7 @@ async fn initial_output_post_exit_quiet_deadline_resets_after_tail_output() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn initial_output_without_meaningful_bytes_waits_for_hard_deadline() {
+async fn initial_output_whitespace_returns_a_live_handle_promptly() {
     let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(1024)));
     let output_notify = Arc::new(Notify::new());
     let output_closed = Arc::new(AtomicBool::new(false));
@@ -354,7 +480,7 @@ async fn initial_output_without_meaningful_bytes_waits_for_hard_deadline() {
     .await;
 
     assert_eq!(collected, b" \r\n\t");
-    assert_eq!(Instant::now() - started_at, Duration::from_secs(2));
+    assert_eq!(Instant::now() - started_at, Duration::from_millis(250));
 }
 
 #[tokio::test]

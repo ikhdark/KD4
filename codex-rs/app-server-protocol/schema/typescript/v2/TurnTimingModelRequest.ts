@@ -41,7 +41,7 @@ modelStreamWaitNs: bigint,
  * Dispatch-to-first-actionable-output latency. This excludes reasoning
  * deltas and partial tool arguments; missing actionable output stays null.
  */
-decisionLatencyNs?: number | null,
+decisionLatencyNs: number | null,
 /**
  * Tool calls emitted by this generation. Recorded on its primary attempt.
  */
@@ -60,4 +60,4 @@ tokenUsage?: TurnTimingProviderTokenUsage,
  * Aggregate-only full logical prompt accounting. No prompt text,
  * repository paths, tool arguments, or hashes are persisted here.
  */
-requestTokenCategories?: TurnTimingRequestTokenCategories, dispatchMs?: number | null, firstModelOutputMs?: number | null, firstActionableOutputMs?: number | null, completedMs?: number | null, };
+requestTokenCategories: TurnTimingRequestTokenCategories | null, dispatchMs: number | null, firstModelOutputMs: number | null, firstActionableOutputMs: number | null, completedMs: number | null, };

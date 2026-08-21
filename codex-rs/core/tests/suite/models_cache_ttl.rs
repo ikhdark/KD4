@@ -34,6 +34,7 @@ use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde::Deserialize;
 use serde::Serialize;
+use tempfile::TempDir;
 use wiremock::MockServer;
 
 const ETAG: &str = "\"models-etag-ttl\"";
@@ -156,32 +157,47 @@ async fn renews_cache_ttl_on_matching_models_etag() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn uses_cache_when_version_matches() -> Result<()> {
     let server = MockServer::start().await;
-    let cached_model = test_remote_model(VERSIONED_MODEL, /*priority*/ 1);
     let models_mock = responses::mount_models_once(
         &server,
         ModelsResponse {
-            models: vec![test_remote_model("remote", /*priority*/ 2)],
+            models: vec![test_remote_model(VERSIONED_MODEL, /*priority*/ 1)],
         },
     )
     .await;
+    let home = Arc::new(TempDir::new()?);
 
-    let mut builder = test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
-    builder = builder
-        .with_pre_build_hook(move |home| {
-            let cache = ModelsCache {
-                fetched_at: Utc::now(),
-                etag: None,
-                client_version: Some(client_version_to_whole()),
-                models: vec![cached_model],
-            };
-            let cache_path = home.join(CACHE_FILE);
-            write_cache_sync(&cache_path, &cache).expect("write cache");
-        })
+    // Seed the cache through the real manager so it includes the provider/auth identity.
+    let mut seed_builder = test_codex()
+        .with_home(Arc::clone(&home))
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(|config| {
             config.model_provider.request_max_retries = Some(0);
         });
+    let seed_test = seed_builder.build(&server).await?;
+    let seed_models = seed_test
+        .thread_manager
+        .get_models_manager()
+        .list_models(
+            RefreshStrategy::OnlineIfUncached,
+            codex_core::test_support::default_http_client_factory(),
+        )
+        .await;
+    assert!(
+        seed_models
+            .iter()
+            .any(|preset| preset.model == VERSIONED_MODEL),
+        "expected seeded model"
+    );
+    assert_eq!(models_mock.requests().len(), 1, "expected one seed request");
+    drop(seed_test);
 
-    let test = builder.build(&server).await?;
+    let mut cached_builder = test_codex()
+        .with_home(home)
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(|config| {
+            config.model_provider.request_max_retries = Some(0);
+        });
+    let test = cached_builder.build(&server).await?;
     let models_manager = test.thread_manager.get_models_manager();
     let models = models_manager
         .list_models(
@@ -196,8 +212,8 @@ async fn uses_cache_when_version_matches() -> Result<()> {
     );
     assert_eq!(
         models_mock.requests().len(),
-        0,
-        "/models should not be called when cache version matches"
+        1,
+        "/models should not be called again when cache identity and version match"
     );
 
     Ok(())
@@ -222,6 +238,7 @@ async fn refreshes_when_cache_version_missing() -> Result<()> {
                 fetched_at: Utc::now(),
                 etag: None,
                 client_version: None,
+                provider_cache_identity: None,
                 models: vec![cached_model],
             };
             let cache_path = home.join(CACHE_FILE);
@@ -273,6 +290,7 @@ async fn refreshes_when_cache_version_differs() -> Result<()> {
                 fetched_at: Utc::now(),
                 etag: None,
                 client_version: Some(format!("{client_version}-diff")),
+                provider_cache_identity: None,
                 models: vec![cached_model],
             };
             let cache_path = home.join(CACHE_FILE);
@@ -338,6 +356,8 @@ struct ModelsCache {
     etag: Option<String>,
     #[serde(default)]
     client_version: Option<String>,
+    #[serde(default)]
+    provider_cache_identity: Option<String>,
     models: Vec<ModelInfo>,
 }
 

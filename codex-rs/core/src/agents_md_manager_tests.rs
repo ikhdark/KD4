@@ -176,6 +176,7 @@ async fn config_for(root: &TempDir) -> Config {
     let codex_home = tempfile::tempdir().expect("codex home");
     let mut config = ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(root.path().to_path_buf()))
         .build()
         .await
         .expect("test config");
@@ -437,14 +438,10 @@ async fn names_and_limits_are_cache_dependencies() {
 
     config.project_doc_max_bytes = 8;
     manager.refresh(&config, &environments).await;
-    let truncated = manager.get_loaded().await.expect("truncated load");
-    assert!(!Arc::ptr_eq(&fallback, &truncated));
-    let truncated_text = truncated.text();
-    assert!(truncated_text.starts_with("fallback"));
-    assert!(truncated_text.contains(&root.path().join("WORKFLOW.md").display().to_string()));
-    assert!(truncated_text.contains("original byte count: 21"));
-    assert!(truncated_text.contains("retained byte count: 8"));
-    assert!(truncated_text.contains("omitted byte count: 13"));
+    assert!(
+        manager.get_loaded().await.is_none(),
+        "the bounded truncation notice cannot fit in eight bytes"
+    );
 }
 
 #[tokio::test]
@@ -461,6 +458,7 @@ async fn effective_marker_configuration_invalidates_cached_discovery() {
     let codex_home = tempfile::tempdir().expect("marker codex home");
     let mut marker_config = ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(nested.clone()))
         .cli_overrides(vec![(
             "project_root_markers".to_string(),
             TomlValue::Array(vec![TomlValue::String(".codex-root".to_string())]),

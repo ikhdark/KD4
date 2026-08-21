@@ -158,10 +158,7 @@ impl InProcessCodeModeSession {
         let runtime_cell_id = runtime_cell_id(&cell_id);
         match self
             .runtime
-            .begin_observe(
-                &runtime_cell_id,
-                runtime::ObserveMode::YieldAfter(Duration::from_millis(yield_time_ms)),
-            )
+            .begin_observe(&runtime_cell_id, observe_mode_for_yield_time(yield_time_ms))
             .await
         {
             Ok(pending_event) => Box::pin(async move {
@@ -218,6 +215,14 @@ impl InProcessCodeModeSession {
             .shutdown()
             .await
             .map_err(|error| error.to_string())
+    }
+}
+
+fn observe_mode_for_yield_time(yield_time_ms: u64) -> runtime::ObserveMode {
+    if yield_time_ms == codex_code_mode_protocol::OWNER_HELD_STATE_CHANGE_YIELD_TIME_MS {
+        runtime::ObserveMode::StateChange
+    } else {
+        runtime::ObserveMode::YieldAfter(Duration::from_millis(yield_time_ms))
     }
 }
 

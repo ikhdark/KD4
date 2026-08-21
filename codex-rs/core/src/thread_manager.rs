@@ -1170,7 +1170,11 @@ impl ThreadManager {
                 &new_thread,
                 &persisted_settings,
                 reconstruction.explicit_overrides,
-                reconstruction.explicit_overrides.any(),
+                // Resume overrides remain runtime-only until the first turn starts. That turn
+                // records the authoritative context without making a read-only resume look like
+                // thread activity or advancing the rollout modification time.
+                /*persist_snapshot*/
+                false,
             )
             .await
         {

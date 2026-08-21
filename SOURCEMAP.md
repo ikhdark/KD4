@@ -49,7 +49,7 @@ an SDK, schema, package, installed binary, or Codex Desktop.
 Update it in the same change whenever the repository materially changes.
 
 <!-- BEGIN TRACKED PATH SNAPSHOT -->
-Tracked repository path snapshot: `count=5414 sha256=af9ca156a1cc67fc8cdeffe64633200ad3cf522ac12874efd1d32388f31e40e3`.
+Tracked repository path snapshot: `count=5417 sha256=177388125fb5b14ddc005d1efedb02a00bced8b2706afdaa9c8059b5783f061b`.
 <!-- END TRACKED PATH SNAPSHOT -->
 
 Every repository file or directory add, delete, move, or rename also requires
@@ -166,7 +166,6 @@ below.
 | `.markdownlint-cli2.yaml`, `.prettierignore`, `.prettierrc.toml` | Markdown and Prettier formatting policy |
 | `.npmrc` | npm and pnpm behavior used by the JavaScript workspace |
 | `AGENTS.md`, `SOURCEMAP.md` | Repository-wide editing policy and this cross-cutting ownership contract, including the complete `codex-rs` edit and upstream-sync classification |
-| `WORKTREE_REVIEW.txt` | Historical, frozen whole-worktree review evidence; not a current-checkout verdict |
 | `CHANGELOG.md`, `LICENSE`, `NOTICE` | Release history and legal notices |
 | `flake.nix`, `flake.lock` | Nix development/build environment and its locked inputs |
 | `justfile`, `kd4_features.toml`, `source_owners.toml` | Preferred command router, KD4 feature inventory, and machine-readable source ownership routing |

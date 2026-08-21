@@ -21,7 +21,7 @@ tokio::task_local! {
     static ACTIVE_TOOL_DISPATCH_TIMING: Arc<ToolDispatchTiming>;
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ToolDispatchTimingSnapshot {
     pub item_to_first_poll_ms: Option<u64>,
     pub parallel_gate_wait_ms: Option<u64>,
@@ -34,6 +34,12 @@ pub(crate) struct ToolDispatchTimingSnapshot {
     pub post_tool_hook_ms: Option<u64>,
     pub output_projection_ms: Option<u64>,
     pub history_persistence_ms: Option<u64>,
+    pub first_poll_to_output_collected_ms: Option<u64>,
+    pub exec_request_to_spawn_ms: Option<u64>,
+    pub exec_spawn_to_exit_ms: Option<u64>,
+    pub exec_exit_to_delivery_ms: Option<u64>,
+    pub exec_spawn_to_delivery_ms: Option<u64>,
+    pub exec_process_alive_at_delivery: bool,
     pub post_handler_ms: Option<u64>,
     pub total_duration_ms: Option<u64>,
     pub parallel_gate_admitted: bool,
@@ -54,6 +60,9 @@ pub(crate) struct ToolDispatchTiming {
     post_tool_hook: OnceLock<Duration>,
     output_projection: OnceLock<Duration>,
     history_persistence: OnceLock<Duration>,
+    output_collected_at: OnceLock<Instant>,
+    exec_process_spawned_at: OnceLock<Instant>,
+    exec_process_exited_at: OnceLock<Instant>,
     eager: bool,
 }
 
@@ -72,6 +81,9 @@ impl ToolDispatchTiming {
             post_tool_hook: OnceLock::new(),
             output_projection: OnceLock::new(),
             history_persistence: OnceLock::new(),
+            output_collected_at: OnceLock::new(),
+            exec_process_spawned_at: OnceLock::new(),
+            exec_process_exited_at: OnceLock::new(),
             eager,
         }
     }
@@ -124,11 +136,26 @@ impl ToolDispatchTiming {
         Self::record_phase(&self.history_persistence, duration);
     }
 
+    pub(crate) fn mark_output_collected(&self) {
+        let _ = self.output_collected_at.set(Instant::now());
+    }
+
+    pub(crate) fn mark_exec_process_spawned(&self) {
+        let _ = self.exec_process_spawned_at.set(Instant::now());
+    }
+
+    pub(crate) fn mark_exec_process_exited(&self) {
+        let _ = self.exec_process_exited_at.set(Instant::now());
+    }
+
     pub(crate) fn snapshot(&self, completed_at: Instant) -> ToolDispatchTimingSnapshot {
         let first_poll_at = self.first_poll_at.get().copied();
         let parallel_gate_admitted_at = self.parallel_gate_admitted_at.get().copied();
         let handler_entry_at = self.handler_entry_at.get().copied();
         let handler_exit_at = self.handler_exit_at.get().copied();
+        let exec_process_spawned_at = self.exec_process_spawned_at.get().copied();
+        let exec_process_exited_at = self.exec_process_exited_at.get().copied();
+        let output_collected_at = self.output_collected_at.get().copied();
         ToolDispatchTimingSnapshot {
             item_to_first_poll_ms: first_poll_at
                 .and_then(|at| duration_ms(at.saturating_duration_since(self.item_accepted_at))),
@@ -172,6 +199,27 @@ impl ToolDispatchTiming {
                 .get()
                 .copied()
                 .and_then(duration_ms),
+            first_poll_to_output_collected_ms: first_poll_at.zip(output_collected_at).and_then(
+                |(first_poll_at, output_collected_at)| {
+                    duration_ms(output_collected_at.saturating_duration_since(first_poll_at))
+                },
+            ),
+            exec_request_to_spawn_ms: exec_process_spawned_at.and_then(|spawned_at| {
+                duration_ms(spawned_at.saturating_duration_since(self.item_accepted_at))
+            }),
+            exec_spawn_to_exit_ms: exec_process_spawned_at
+                .zip(exec_process_exited_at)
+                .and_then(|(spawned_at, exited_at)| {
+                    duration_ms(exited_at.saturating_duration_since(spawned_at))
+                }),
+            exec_exit_to_delivery_ms: exec_process_exited_at.and_then(|exited_at| {
+                duration_ms(completed_at.saturating_duration_since(exited_at))
+            }),
+            exec_spawn_to_delivery_ms: exec_process_spawned_at.and_then(|spawned_at| {
+                duration_ms(completed_at.saturating_duration_since(spawned_at))
+            }),
+            exec_process_alive_at_delivery: exec_process_spawned_at.is_some()
+                && exec_process_exited_at.is_none(),
             post_handler_ms: handler_exit_at
                 .and_then(|at| duration_ms(completed_at.saturating_duration_since(at))),
             total_duration_ms: first_poll_at
@@ -208,6 +256,18 @@ pub(crate) fn mark_tool_handler_entry() {
 
 pub(crate) fn mark_tool_handler_exit() {
     let _ = ACTIVE_TOOL_DISPATCH_TIMING.try_with(|timing| timing.mark_handler_exit());
+}
+
+pub(crate) fn mark_exec_process_spawned() {
+    let _ = ACTIVE_TOOL_DISPATCH_TIMING.try_with(|timing| timing.mark_exec_process_spawned());
+}
+
+pub(crate) fn mark_exec_process_exited() {
+    let _ = ACTIVE_TOOL_DISPATCH_TIMING.try_with(|timing| timing.mark_exec_process_exited());
+}
+
+pub(crate) fn active_tool_dispatch_timing() -> Option<Arc<ToolDispatchTiming>> {
+    ACTIVE_TOOL_DISPATCH_TIMING.try_with(Arc::clone).ok()
 }
 
 macro_rules! record_phase {

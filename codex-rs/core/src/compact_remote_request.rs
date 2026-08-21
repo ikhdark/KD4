@@ -2,14 +2,15 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use super::trim_function_call_history_to_fit_context_window;
-use crate::Prompt;
 use crate::client::CompactConversationRequestSettings;
 use crate::compact::CompactionAnalyticsDetails;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
+use crate::session::turn::build_projected_prompt;
 use crate::session::turn::built_tools;
+use crate::session::turn::prepare_sampling_prompt_for_client;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ResponseItem;
@@ -60,7 +61,6 @@ pub(super) async fn run_remote_compact_attempt(
     let trace_input_history = compaction_trace
         .is_enabled()
         .then(|| history.raw_items().to_vec());
-    let prompt_input = history.for_prompt(&turn_context.model_info.input_modalities);
     let tool_router = built_tools(
         sess.as_ref(),
         step_context.as_ref(),
@@ -68,22 +68,23 @@ pub(super) async fn run_remote_compact_attempt(
         &CancellationToken::new(),
     )
     .await?;
-    let prompt = Prompt {
-        input: prompt_input.into(),
-        stable_context_fallback_input: Arc::from([]),
-        tool_history_fallback_input: Arc::from([]),
-        stable_context_tool_history_fallback_input: Arc::from([]),
-        tool_history_substitutions: Arc::from([]),
-        stable_context_fallback_tool_history_substitutions: Arc::from([]),
-        stable_context_manifest: Default::default(),
-        prompt_provenance: Default::default(),
-        digests: Default::default(),
-        tools: tool_router.model_visible_specs(),
-        parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
+    let client_session = sess.services.model_client.new_session();
+    let prepared = prepare_sampling_prompt_for_client(
+        history,
+        turn_context,
+        &client_session,
+        sess.services.git_workspace.as_ref(),
+    )
+    .await;
+    let mut prompt = build_projected_prompt(
+        sess.as_ref(),
+        &prepared,
+        &tool_router,
+        step_context.as_ref(),
         base_instructions,
-        output_schema: None,
-        output_schema_strict: true,
-    };
+    );
+    prompt.output_schema = None;
+    prompt.output_schema_strict = true;
     let window_id = sess.current_window_id().await;
     let responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
         sess.installation_id.clone(),
@@ -99,7 +100,7 @@ pub(super) async fn run_remote_compact_attempt(
             &turn_context.model_info,
             turn_state,
             CompactConversationRequestSettings {
-                effort: turn_context.reasoning_effort.clone(),
+                effort: turn_context.configured_reasoning_effort.clone(),
                 summary: turn_context.reasoning_summary,
                 service_tier: if sess.services.auth_manager.auth_mode() == Some(AuthMode::ApiKey) {
                     None

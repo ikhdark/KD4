@@ -39,9 +39,7 @@ class RolloutSnapshotTest(unittest.TestCase):
             stdout = io.StringIO()
 
             with contextlib.redirect_stdout(stdout):
-                exit_code = rollout_snapshot.main(
-                    [str(path), "--output", str(output)]
-                )
+                exit_code = rollout_snapshot.main([str(path), "--output", str(output)])
 
             metadata = json.loads(stdout.getvalue())
             self.assertEqual(exit_code, 0)

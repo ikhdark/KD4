@@ -207,6 +207,16 @@ pub trait AgentTaskStore: Send + Sync {
         after_event_id: Option<WakeEventId>,
     ) -> TaskStoreFuture<'_, WakeRead>;
 
+    /// Waits until the durable wake stream advances beyond `after_event_id`.
+    /// Implementations must register any local waiter before checking the
+    /// current stream so a commit racing waiter setup cannot be missed, and
+    /// must also observe commits made by independent store instances.
+    fn wait_for_wake_events(
+        &self,
+        root_session_id: String,
+        after_event_id: Option<WakeEventId>,
+    ) -> TaskStoreFuture<'_, WakeRead>;
+
     fn automatic_wake_cursor(
         &self,
         root_session_id: String,

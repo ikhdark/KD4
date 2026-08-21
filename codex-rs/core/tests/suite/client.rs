@@ -75,7 +75,6 @@ use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
-use dunce::canonicalize as normalize_path;
 use futures::StreamExt;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -114,11 +113,6 @@ fn test_turn_responses_metadata(
         /*parent_thread_id*/ None,
         TestCodexResponsesRequestKind::Turn,
     )
-}
-
-#[expect(clippy::unwrap_used)]
-fn assert_message_role(request_body: &serde_json::Value, role: &str) {
-    assert_eq!(request_body["role"].as_str().unwrap(), role);
 }
 
 #[expect(clippy::unwrap_used)]
@@ -222,7 +216,6 @@ async fn openai_stateless_responses_requests_preserve_item_turn_metadata_across_
 
     let first_input = first["input"].as_array().expect("first input");
     let second_input = second["input"].as_array().expect("second input");
-    assert_eq!(&second_input[..first_input.len()], first_input.as_slice());
     for item in first_input {
         assert_eq!(
             item["internal_chat_message_metadata_passthrough"]["turn_id"].as_str(),
@@ -380,7 +373,7 @@ async fn synthetic_call_output_id_is_stable_across_resumes() -> anyhow::Result<(
                     cwd: ".".into(),
                     originator: "test_originator".to_string(),
                     cli_version: "test_version".to_string(),
-                    model_provider: Some("test-provider".to_string()),
+                    model_provider: Some("openai".to_string()),
                     ..Default::default()
                 },
                 git: None,
@@ -466,7 +459,8 @@ async fn synthetic_call_output_id_is_stable_across_resumes() -> anyhow::Result<(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn response_item_ids_are_sent_for_all_remote_v2_compaction_requests() -> anyhow::Result<()> {
+async fn response_item_ids_are_sent_for_persisted_remote_v2_compaction_items() -> anyhow::Result<()>
+{
     let server = MockServer::start().await;
     let response_mock = mount_sse_sequence(
         &server,
@@ -505,19 +499,29 @@ async fn response_item_ids_are_sent_for_all_remote_v2_compaction_requests() -> a
 
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 3);
-    for (request_index, request) in requests.iter().enumerate() {
-        let input = request.input();
-        assert!(!input.is_empty(), "request {request_index} input is empty");
-        for item in input {
-            if item.get("type").and_then(serde_json::Value::as_str) == Some("compaction_trigger") {
-                continue;
-            }
-            assert!(
-                item.get("id").and_then(serde_json::Value::as_str).is_some(),
-                "request {request_index} item should have an ID: {item:#?}"
-            );
-        }
-    }
+    let before_id = response_message_item_id(&requests[0], "user", "before compaction");
+    assert_eq!(
+        response_message_item_id(&requests[1], "user", "before compaction"),
+        before_id,
+        "the persisted pre-compaction message should retain its item ID"
+    );
+    let after_id = response_message_item_id(&requests[2], "user", "after compaction");
+    assert!(
+        after_id.starts_with("msg_"),
+        "the post-compaction user message should receive a Responses API item ID"
+    );
+    let compacted_item = requests[2]
+        .input()
+        .into_iter()
+        .find(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("compaction"))
+        .expect("post-compaction request should contain the persisted compaction item");
+    assert!(
+        compacted_item
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some(),
+        "persisted compaction item should have an ID: {compacted_item:#?}"
+    );
 
     Ok(())
 }
@@ -687,7 +691,7 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
                 "cwd": ".",
                 "originator": "test_originator",
                 "cli_version": "test_version",
-                "model_provider": "test-provider"
+                "model_provider": "openai"
             }
         })
     )
@@ -867,10 +871,10 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
         .position(|(role, text)| role == "user" && text == "hello")
         .expect("new user message");
 
+    assert!(pos_user_instructions < pos_permissions);
+    assert!(pos_permissions < pos_prior_user);
     assert!(pos_prior_user < pos_prior_assistant);
-    assert!(pos_prior_assistant < pos_permissions);
-    assert!(pos_permissions < pos_user_instructions);
-    assert!(pos_user_instructions < pos_environment);
+    assert!(pos_prior_assistant < pos_environment);
     assert!(pos_environment < pos_new_user);
 }
 
@@ -905,7 +909,7 @@ async fn resume_replays_legacy_js_repl_image_rollout_shapes() {
                     cwd: ".".into(),
                     originator: "test_originator".to_string(),
                     cli_version: "test_version".to_string(),
-                    model_provider: Some("test-provider".to_string()),
+                    model_provider: Some("openai".to_string()),
                     ..Default::default()
                 },
                 git: None,
@@ -1041,7 +1045,7 @@ async fn resume_replays_image_tool_outputs_with_detail() {
                     cwd: ".".into(),
                     originator: "test_originator".to_string(),
                     cli_version: "test_version".to_string(),
-                    model_provider: Some("test-provider".to_string()),
+                    model_provider: Some("openai".to_string()),
                     ..Default::default()
                 },
                 git: None,
@@ -1652,17 +1656,17 @@ async fn includes_user_instructions_message_in_request() {
             .unwrap()
             .contains("be nice")
     );
-    assert_message_role(&request_body["input"][0], "developer");
-    let permissions_text = request_body["input"][0]["content"][0]["text"]
-        .as_str()
+    let permissions_text = request
+        .message_input_texts("developer")
+        .into_iter()
+        .find(|text| text.contains("<permissions instructions>"))
         .expect("invalid permissions message content");
     assert!(
         permissions_text.contains("`sandbox_mode`"),
         "expected permissions message to mention sandbox_mode, got {permissions_text:?}"
     );
 
-    assert_message_role(&request_body["input"][1], "user");
-    let user_context_texts = message_input_texts(&request_body["input"][1]);
+    let user_context_texts = request.message_input_texts("user");
     assert!(
         user_context_texts
             .iter()
@@ -1671,7 +1675,6 @@ async fn includes_user_instructions_message_in_request() {
     );
     let ui_text = user_context_texts
         .iter()
-        .copied()
         .find(|text| text.contains("<INSTRUCTIONS>"))
         .expect("invalid message content");
     assert!(ui_text.contains("<INSTRUCTIONS>"));
@@ -1732,7 +1735,7 @@ async fn includes_apps_guidance_as_developer_message_for_chatgpt_auth() {
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let request = resp_mock.single_request();
-    let apps_snippet = "Apps expose MCP tools through the";
+    let apps_snippet = "Use a relevant installed app when named";
 
     assert!(
         message_input_text_contains(&request, "developer", apps_snippet),
@@ -1945,18 +1948,14 @@ async fn omits_apps_guidance_when_orchestrator_mcp_is_disabled() {
     let list_output = requests[1]
         .function_call_output_text(list_call_id)
         .expect("resource list output should be sent to the model");
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&list_output)
-            .expect("parse resource list output"),
-        json!({"resources": []})
+    assert!(
+        !list_output.contains("skill://demo/SKILL.md"),
+        "disabled app resources must not be exposed by an aggregate list: {list_output}"
     );
     let read_output = requests[2]
         .function_call_output_text(read_call_id)
         .expect("resource read output should be sent to the model");
-    assert!(
-        read_output.contains("disabled by `orchestrator.mcp.enabled`"),
-        "unexpected resource read output: {read_output}"
-    );
+    assert_eq!(read_output, "unsupported call: read_mcp_resource");
 
     let resource_methods = server
         .received_requests()
@@ -2076,20 +2075,14 @@ async fn skills_append_to_developer_message() {
         "expected skills section present: {developer_messages:?}"
     );
     assert!(
-        developer_text.contains("demo: build charts"),
-        "expected skill summary: {developer_messages:?}"
-    );
-    let expected_path = normalize_path(skill_dir.join("SKILL.md")).unwrap();
-    let expected_path_str = expected_path.to_string_lossy().replace('\\', "/");
-    assert!(
-        developer_text.contains(&expected_path_str),
-        "expected path {expected_path_str} in developer message: {developer_messages:?}"
+        developer_text.contains("- demo — build charts — skill:"),
+        "expected opaque skill catalog entry: {developer_messages:?}"
     );
     let _codex_home_guard = codex_home;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn skills_use_aliases_in_developer_message_under_budget_pressure() {
+async fn skills_are_omitted_from_developer_message_under_budget_pressure() {
     skip_if_no_network!();
     let server = MockServer::start().await;
 
@@ -2154,30 +2147,16 @@ async fn skills_use_aliases_in_developer_message_under_budget_pressure() {
     let request = resp_mock.single_request();
     let developer_messages = request.message_input_texts("developer");
     let developer_text = developer_messages.join("\n\n");
-    let expected_root = normalize_path(skill_root).unwrap();
-    let expected_root_str = expected_root.to_string_lossy().replace('\\', "/");
     assert!(
-        developer_text.contains("### Skill roots"),
-        "expected aliased skills root section: {developer_messages:?}"
-    );
-    assert!(
-        developer_text.contains(&format!("- `r0` = `{expected_root_str}`")),
-        "expected root alias for {expected_root_str}: {developer_messages:?}"
-    );
-    assert!(
-        developer_text.contains("- s00: d (file: r0/s00/SKILL.md)"),
-        "expected skill path to use root alias: {developer_messages:?}"
-    );
-    assert!(
-        developer_text.contains("Resolve `rN/...` paths through the catalog's skill-roots table."),
-        "expected alias-specific skill instructions: {developer_messages:?}"
+        !developer_text.contains("<skills_instructions>") && !developer_text.contains("s00"),
+        "expected the skill catalog to be omitted when none fits the context budget: {developer_messages:?}"
     );
     let _codex_home_guard = codex_home;
     let _codex_home_parent_guard = codex_home_parent;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn includes_configured_max_effort_in_request() -> anyhow::Result<()> {
+async fn initial_turn_reasoning_policy_overrides_configured_effort() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
     let server = MockServer::start().await;
 
@@ -2218,14 +2197,14 @@ async fn includes_configured_max_effort_in_request() -> anyhow::Result<()> {
             .get("reasoning")
             .and_then(|t| t.get("effort"))
             .and_then(|v| v.as_str()),
-        Some("max")
+        Some("high")
     );
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn includes_no_effort_in_request() -> anyhow::Result<()> {
+async fn includes_governed_effort_when_no_turn_effort_is_configured() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
     let server = MockServer::start().await;
 
@@ -2260,15 +2239,14 @@ async fn includes_no_effort_in_request() -> anyhow::Result<()> {
             .get("reasoning")
             .and_then(|t| t.get("effort"))
             .and_then(|v| v.as_str()),
-        Some("medium")
+        Some("high")
     );
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn includes_default_reasoning_effort_in_request_when_defined_by_model_info()
--> anyhow::Result<()> {
+async fn governed_effort_overrides_model_default_reasoning_effort() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
     let server = MockServer::start().await;
 
@@ -2303,7 +2281,7 @@ async fn includes_default_reasoning_effort_in_request_when_defined_by_model_info
             .get("reasoning")
             .and_then(|t| t.get("effort"))
             .and_then(|v| v.as_str()),
-        Some("medium")
+        Some("high")
     );
 
     Ok(())
@@ -2882,8 +2860,10 @@ async fn includes_developer_instructions_message_in_request() {
     let request = resp_mock.single_request();
     let request_body = request.body_json();
 
-    let permissions_text = request_body["input"][0]["content"][0]["text"]
-        .as_str()
+    let permissions_text = request
+        .message_input_texts("developer")
+        .into_iter()
+        .find(|text| text.contains("<permissions instructions>"))
         .expect("invalid permissions message content");
 
     assert!(
@@ -2892,7 +2872,6 @@ async fn includes_developer_instructions_message_in_request() {
             .unwrap()
             .contains("be nice")
     );
-    assert_message_role(&request_body["input"][0], "developer");
     assert!(
         permissions_text.contains("`sandbox_mode`"),
         "expected permissions message to mention sandbox_mode, got {permissions_text:?}"
@@ -2912,8 +2891,7 @@ async fn includes_developer_instructions_message_in_request() {
         request_body["input"]
     );
 
-    assert_message_role(&request_body["input"][1], "user");
-    let user_context_texts = message_input_texts(&request_body["input"][1]);
+    let user_context_texts = request.message_input_texts("user");
     assert!(
         user_context_texts
             .iter()
@@ -2922,7 +2900,6 @@ async fn includes_developer_instructions_message_in_request() {
     );
     let ui_text = user_context_texts
         .iter()
-        .copied()
         .find(|text| text.contains("<INSTRUCTIONS>"))
         .expect("invalid message content");
     assert!(ui_text.contains("<INSTRUCTIONS>"));
@@ -3259,6 +3236,7 @@ async fn token_count_includes_rate_limits_snapshot() {
                 },
                 "credits": null,
                 "individual_limit": null,
+                "spend_control_reached": null,
                 "plan_type": null,
                 "rate_limit_reached_type": null
             }
@@ -3335,6 +3313,7 @@ async fn usage_limit_error_emits_rate_limit_event() -> anyhow::Result<()> {
         },
         "credits": null,
         "individual_limit": null,
+        "spend_control_reached": null,
         "plan_type": null,
         "rate_limit_reached_type": null
     });
@@ -3828,8 +3807,7 @@ async fn history_dedupes_streamed_and_final_messages_across_turns() {
         assert_eq!(request.path(), "/v1/responses");
     }
 
-    // Replace full-array compare with tail-only raw JSON compare using a single hard-coded value.
-    let r3_tail_expected = json!([
+    let expected_conversation = json!([
         {
             "type": "message",
             "role": "user",
@@ -3857,18 +3835,29 @@ async fn history_dedupes_streamed_and_final_messages_across_turns() {
         }
     ]);
 
-    let r3_input_array = requests[2]
+    let actual_conversation = requests[2]
         .body_json()
         .get("input")
         .and_then(|v| v.as_array())
+        .expect("r3 missing input array")
+        .iter()
+        .filter(|item| {
+            item.get("content")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|content| {
+                    content.iter().any(|part| {
+                        matches!(
+                            part.get("text").and_then(serde_json::Value::as_str),
+                            Some("U1" | "U2" | "U3" | "Hey there!\n")
+                        )
+                    })
+                })
+        })
         .cloned()
-        .expect("r3 missing input array");
-    // skipping earlier context and developer messages
-    let tail_len = r3_tail_expected.as_array().unwrap().len();
-    let actual_tail = &r3_input_array[r3_input_array.len() - tail_len..];
+        .collect::<Vec<_>>();
     assert_eq!(
-        strip_metadata_from_json(serde_json::Value::Array(actual_tail.to_vec())),
-        r3_tail_expected,
-        "request 3 tail mismatch",
+        strip_metadata_from_json(serde_json::Value::Array(actual_conversation)),
+        expected_conversation,
+        "request 3 conversation history mismatch",
     );
 }

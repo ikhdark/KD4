@@ -104,6 +104,12 @@ async fn shell_command_approval_triggers_elicitation() -> anyhow::Result<()> {
     let codex_request_id = mcp_process
         .send_codex_tool_call(CodexToolCallParam {
             prompt: "run `git init`".to_string(),
+            cwd: Some(
+                workdir_for_shell_function_call
+                    .path()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
             ..Default::default()
         })
         .await?;
@@ -369,6 +375,7 @@ async fn codex_tool_passes_base_instructions() -> anyhow::Result<()> {
 
     // Run `codex mcp` with a specific config.toml.
     let codex_home = TempDir::new()?;
+    let cwd = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
     let mut mcp_process = McpProcess::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp_process.initialize()).await??;
@@ -377,6 +384,7 @@ async fn codex_tool_passes_base_instructions() -> anyhow::Result<()> {
     let codex_request_id = mcp_process
         .send_codex_tool_call(CodexToolCallParam {
             prompt: "How are you?".to_string(),
+            cwd: Some(cwd.path().to_string_lossy().into_owned()),
             base_instructions: Some("You are a helpful assistant.".to_string()),
             developer_instructions: Some("Foreshadow upcoming tool calls.".to_string()),
             ..Default::default()

@@ -11,7 +11,7 @@ Most recent user/assistant turns from this exact thread. Use them for continuity
 
 ### Latest turn
 User:
-latest-long-start head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head d…604 tokens truncated… tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail  latest-long-end
+latest-long-start head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detail head detai…614 tokens truncated…tail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail tail detail  latest-long-end
 
 Assistant:
 assistant turn 8
@@ -25,14 +25,7 @@ assistant turn 7
 
 ### Previous turn 2
 User:
-short-turn-6-start detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail  short-turn-6-end
-
-Assistant:
-assistant turn 6
-
-### Previous turn 3
-User:
-short-turn-5-start detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail  short-turn-5-end
+short-turn-6-start detail detail detail detail detail detail detail detail detail …167 tokens truncated… detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail  short-turn-5-end
 
 Assistant:
 assistant turn 5
@@ -46,7 +39,16 @@ assistant turn 4
 
 ### Previous turn 5
 User:
-short-turn-3-start detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail  short-turn-3-end
+short-turn-3-start detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail deta…23 tokens truncated…ail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail  short-turn-3-end
 
 Assistant:
 assistant turn 3
+
+### Previous turn 6
+User:
+short-t…157 tokens truncated…-end
+
+Assistant:
+assistant turn 2
+
+…173 tokens truncated…1

@@ -3525,7 +3525,10 @@ async fn coordinate_completion_review_inner(
             )
         ) {
             state.phase = TurnReviewPhase::Terminal;
-            return Ok(CompletionReviewCoordinatorOutcome::default());
+            return Ok(CompletionReviewCoordinatorOutcome {
+                advisory: sess.services.task_evidence.finalization_advisory().await,
+                ..Default::default()
+            });
         }
         if dossier.cycle_phase == Some(CompletionReviewCyclePhase::ProvisionalClean) {
             state.phase = TurnReviewPhase::Terminal;

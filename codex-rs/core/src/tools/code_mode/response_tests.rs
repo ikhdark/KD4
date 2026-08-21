@@ -23,7 +23,7 @@ fn runtime_response_paths_preserve_status_success_and_output_limits() {
                 cell_id: cell_id(),
                 content_items: content_items(),
             },
-            Some(true),
+            Some(false),
             "Script running with cell ID cell-1",
         ),
         (
@@ -31,7 +31,7 @@ fn runtime_response_paths_preserve_status_success_and_output_limits() {
                 cell_id: cell_id(),
                 content_items: content_items(),
             },
-            Some(true),
+            Some(false),
             "Script terminated",
         ),
         (

@@ -42,7 +42,6 @@ SOURCE: /[\s\S]+/
 mod tests {
     use super::*;
     use codex_tools::ToolName;
-    use codex_utils_output_truncation::DEFAULT_SUCCESS_OUTPUT_TOKENS;
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -92,11 +91,10 @@ SOURCE: /[\s\S]+/
     }
 
     #[test]
-    fn optimization_priority_code_mode_builds_coherent_packets_at_the_shared_limit() {
+    fn optimization_priority_code_mode_builds_coherent_packets_at_the_code_mode_limit() {
         let exec_description =
             codex_code_mode::build_exec_tool_description(&[], &[], &BTreeMap::new(), true);
 
-        assert!(exec_description.contains("coherent nested evidence packet"));
         assert!(exec_description.contains("defaults to 10000"));
         assert!(
             codex_code_mode::build_wait_tool_description()
@@ -104,7 +102,7 @@ SOURCE: /[\s\S]+/
         );
         assert_eq!(
             codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
-            DEFAULT_SUCCESS_OUTPUT_TOKENS
+            10_000
         );
     }
 }

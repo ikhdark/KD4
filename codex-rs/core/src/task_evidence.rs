@@ -6391,6 +6391,7 @@ impl TaskEvidenceLedger {
             let requirement =
                 CompletionReviewRequirement::from_obligation_mode(&ledger.obligation.mode);
             let has_actionable_result = !findings.is_empty()
+                || !manifest_gaps.is_empty()
                 || dispositions.iter().any(|disposition| {
                     matches!(
                         disposition.disposition.as_str(),
@@ -6501,6 +6502,10 @@ impl TaskEvidenceLedger {
                     .active_review_cycle
                     .as_ref()
                     .and_then(|cycle| cycle.parent_terminal_review_id.clone());
+                let correction_consumed = ledger
+                    .active_review_cycle
+                    .as_ref()
+                    .is_some_and(|cycle| cycle.correction_consumed);
                 ledger.manifest_revision = new_revision;
                 ledger.manifest_snapshots.push(RequirementManifestSnapshot {
                     completion_epoch: ledger.completion_epoch,
@@ -6514,7 +6519,7 @@ impl TaskEvidenceLedger {
                     parent_terminal_review_id,
                     superseded_review_id: Some(review_id.clone()),
                     phase: CompletionReviewCyclePhase::InitialReviewPending,
-                    correction_consumed: false,
+                    correction_consumed,
                     manifest_gap_reconstructed: true,
                     accepted_review_id: None,
                     accepted_dossier_snapshot_id: None,
@@ -12706,7 +12711,8 @@ fn validate_v5_review_receipts(
                 return Err("clean review outcome has findings or is not marked clean".to_string());
             }
             Some(CompletionReviewAttemptedOutcome::ActionableFindings)
-                if receipt.findings.is_empty() || receipt.infrastructure_outcome != "ok" =>
+                if (receipt.findings.is_empty() && receipt.manifest_gaps.is_empty())
+                    || receipt.infrastructure_outcome != "ok" =>
             {
                 return Err(
                     "actionable review outcome lacks findings or has infrastructure failure"
@@ -14258,6 +14264,14 @@ fn rebuild_declared_requirements_and_risks(document: &mut TaskEvidenceDocument) 
     document
         .generated_artifact_requirements
         .extend(requirements);
+    let required_artifact_paths = document
+        .generated_artifact_requirements
+        .iter()
+        .filter_map(|requirement| requirement.path.as_deref())
+        .collect::<BTreeSet<_>>();
+    document
+        .latest_generated_artifact_hashes
+        .retain(|path, _| required_artifact_paths.contains(path.as_str()));
     document.risks.extend(risks);
 }
 
@@ -14495,6 +14509,13 @@ fn derive_completion_gate(
             .risks
             .iter()
             .filter(|risk| !risk.resolved && risk.blocking)
+            .map(|risk| risk.description.clone()),
+    );
+    partial.extend(
+        document
+            .risks
+            .iter()
+            .filter(|risk| !risk.resolved && !risk.blocking)
             .map(|risk| risk.description.clone()),
     );
     blocked.sort();
@@ -15454,7 +15475,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_blocking_runtime_risk_is_a_warning_not_a_completion_failure() {
+    async fn non_blocking_runtime_risk_is_a_warning_and_keeps_completion_partial() {
         let (_temp, ledger) = ledger_fixture().await;
         ledger
             .record_plan_update(&plan(StepStatus::Completed))
@@ -15476,8 +15497,11 @@ mod tests {
         }
 
         let gate = ledger.completion_gate().await.expect("gate");
-        assert_eq!(gate.status, TaskCompletionStatus::Passed);
-        assert!(gate.reasons.is_empty());
+        assert_eq!(gate.status, TaskCompletionStatus::Partial);
+        assert_eq!(
+            gate.reasons,
+            vec!["read-only command could not be classified".to_string()]
+        );
 
         let state = ledger
             .compaction_task_state()

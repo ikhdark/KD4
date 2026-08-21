@@ -5,19 +5,21 @@ expression: "format_labeled_requests_snapshot(\"Remote manual /compact while rea
 Scenario: Remote manual /compact while realtime remains active: the next regular turn restates realtime-start instructions after compaction clears the baseline.
 
 ## Remote Compaction Request
-00:message/developer[3]:
-    [01] <PERMISSIONS_INSTRUCTIONS>
-    [02] <realtime_conversation>\nRealtime conversation started.\n\nYou a...
-    [03] <skills_usage_instructions>\n## How to use skills\n- Use a skill...
-01:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-02:message/user:USER_ONE
-03:message/assistant:REMOTE_FIRST_REPLY
+00:message/user:<task_model_guidance>Before acting, form and maintain a working ...
+01:message/developer:<PERMISSIONS_INSTRUCTIONS>
+02:message/developer:<skills_usage_instructions>\n## How to use skills\n- Use the sma...
+03:message/developer:<NO_TEXT>
+04:message/developer:<realtime_conversation>\nRealtime conversation started.\n\nYou a...
+05:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
+06:message/user:USER_ONE
+07:message/assistant:REMOTE_FIRST_REPLY
 
 ## Remote Post-Compaction History Layout
-00:compaction:encrypted=true
-01:message/developer[3]:
-    [01] <PERMISSIONS_INSTRUCTIONS>
-    [02] <realtime_conversation>\nRealtime conversation started.\n\nYou a...
-    [03] <skills_usage_instructions>\n## How to use skills\n- Use a skill...
-02:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-03:message/user:USER_TWO
+00:message/user:<task_model_guidance>Before acting, form and maintain a working ...
+01:message/developer:<PERMISSIONS_INSTRUCTIONS>
+02:message/developer:<skills_usage_instructions>\n## How to use skills\n- Use the sma...
+03:message/developer:<NO_TEXT>
+04:compaction:encrypted=true
+05:message/developer:<realtime_conversation>\nRealtime conversation started.\n\nYou a...
+06:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
+07:message/user:USER_TWO

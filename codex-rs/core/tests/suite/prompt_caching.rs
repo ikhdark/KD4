@@ -133,6 +133,25 @@ fn assert_tool_names(body: &serde_json::Value, expected_names: &[&str]) {
     );
 }
 
+fn message_texts<'a>(body: &'a serde_json::Value, role: &str) -> Vec<&'a str> {
+    body["input"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("role").and_then(serde_json::Value::as_str) == Some(role))
+        .filter_map(|item| item.get("content").and_then(serde_json::Value::as_array))
+        .flatten()
+        .filter_map(|item| item.get("text").and_then(serde_json::Value::as_str))
+        .collect()
+}
+
+fn environment_contexts(body: &serde_json::Value) -> Vec<&str> {
+    message_texts(body, "user")
+        .into_iter()
+        .filter(|text| text.starts_with(ENVIRONMENT_CONTEXT_OPEN_TAG))
+        .collect()
+}
+
 fn normalize_newlines(text: &str) -> String {
     text.replace("\r\n", "\n")
 }
@@ -226,6 +245,7 @@ async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
         "request_permissions",
         "apply_patch",
         "view_image",
+        "tool_search",
         "web_search",
     ];
     let body0 = req1.single_request().body_json();
@@ -390,31 +410,22 @@ async fn prefixes_context_and_instructions_once_and_consistently_across_requests
 
     let body1 = req1.single_request().body_json();
     let input1 = body1["input"].as_array().expect("input array");
-    assert_eq!(
-        input1.len(),
-        3,
-        "expected permissions + cached contextual user prefix + user msg"
-    );
-
-    let ui_text = input1[1]["content"][0]["text"]
-        .as_str()
-        .expect("ui message text");
+    let user_texts = message_texts(&body1, "user");
+    let ui_text = user_texts
+        .iter()
+        .find(|text| text.starts_with("# AGENTS.md instructions"))
+        .expect("AGENTS.md context text");
     assert!(
         ui_text.contains("be consistent and helpful"),
         "expected user instructions in UI message: {ui_text}"
     );
 
     let cwd_str = config.cwd.to_string_lossy();
-    let env_text = input1[1]["content"][1]["text"]
-        .as_str()
-        .expect("environment context text");
+    let env_contexts = environment_contexts(&body1);
+    assert_eq!(env_contexts.len(), 1);
+    let env_text = env_contexts[0];
     assert_default_env_context(env_text, &cwd_str);
-    assert_eq!(
-        input1[1]["content"][1]["type"].as_str(),
-        Some("input_text"),
-        "expected environment context bundled after UI message in cached contextual message"
-    );
-    assert_eq_without_metadata(input1[2].clone(), text_user_input("hello 1".to_string()));
+    assert!(user_texts.contains(&"hello 1"));
 
     let body2 = req2.single_request().body_json();
     let input2 = body2["input"].as_array().expect("input array");
@@ -521,26 +532,19 @@ async fn overrides_turn_context_but_keeps_cached_prefix_and_key_constant() -> an
         "prompt_cache_key should not change across overrides"
     );
 
-    // The entire prefix from the first request should be identical and reused
-    // as the prefix of the second request, ensuring cache hit potential.
-    let expected_user_message_2 = serde_json::json!({
-        "type": "message",
-        "role": "user",
-        "content": [ { "type": "input_text", "text": "hello 2" } ]
-    });
-    let expected_permissions_msg = body1["input"][0].clone();
-    let body1_input = body1["input"].as_array().expect("input array");
-    // After overriding the thread settings, emit one updated permissions message.
-    let expected_permissions_msg_2 = body2["input"][body1_input.len()].clone();
-    assert_ne!(
-        expected_permissions_msg_2, expected_permissions_msg,
-        "expected updated permissions message after override"
-    );
-    let expected_env_msg_2 = body2["input"][body1_input.len() + 1].clone();
-    assert_eq!(expected_env_msg_2["role"].as_str(), Some("user"));
-    let env_text = expected_env_msg_2["content"][0]["text"]
-        .as_str()
-        .expect("environment context text");
+    let first_permissions = message_texts(&body1, "developer")
+        .into_iter()
+        .find(|text| text.starts_with("<permissions instructions>"))
+        .expect("initial permissions context");
+    let second_permissions = message_texts(&body2, "developer")
+        .into_iter()
+        .find(|text| text.starts_with("<permissions instructions>"))
+        .expect("updated permissions context");
+    assert_ne!(first_permissions, second_permissions);
+
+    let env_contexts = environment_contexts(&body2);
+    assert_eq!(env_contexts.len(), 1);
+    let env_text = env_contexts[0];
     assert_env_context_fragment(env_text);
     assert!(
         env_text.contains("<permission_profile type=\"managed\">")
@@ -551,14 +555,9 @@ async fn overrides_turn_context_but_keeps_cached_prefix_and_key_constant() -> an
             )),
         "expected workspace-write filesystem profile in environment context: {env_text}"
     );
-    let mut expected_body2 = body1_input.to_vec();
-    expected_body2.push(expected_permissions_msg_2);
-    expected_body2.push(expected_env_msg_2);
-    expected_body2.push(expected_user_message_2);
-    assert_eq_without_metadata(
-        body2["input"].clone(),
-        serde_json::Value::Array(expected_body2),
-    );
+    let second_user_texts = message_texts(&body2, "user");
+    assert!(second_user_texts.contains(&"hello 1"));
+    assert!(second_user_texts.contains(&"hello 2"));
 
     Ok(())
 }
@@ -810,45 +809,29 @@ async fn per_turn_overrides_keep_cached_prefix_and_key_constant() -> anyhow::Res
         "prompt_cache_key should not change across per-turn overrides"
     );
 
-    // The entire prefix from the first request should be identical and reused
-    // as the prefix of the second request.
-    let expected_user_message_2 = serde_json::json!({
-        "type": "message",
-        "role": "user",
-        "content": [ { "type": "input_text", "text": "hello 2" } ]
-    });
-    let expected_permissions_msg = body1["input"][0].clone();
-    let body1_input = body1["input"].as_array().expect("input array");
-    let expected_settings_update_msg = body2["input"][body1_input.len()].clone();
-    assert_ne!(
-        expected_settings_update_msg, expected_permissions_msg,
-        "expected updated permissions message after per-turn override"
-    );
-    assert_eq!(
-        expected_settings_update_msg["role"].as_str(),
-        Some("developer")
-    );
+    let first_permissions = message_texts(&body1, "developer")
+        .into_iter()
+        .find(|text| text.starts_with("<permissions instructions>"))
+        .expect("initial permissions context");
+    let second_permissions = message_texts(&body2, "developer")
+        .into_iter()
+        .find(|text| text.starts_with("<permissions instructions>"))
+        .expect("updated permissions context");
+    assert_ne!(first_permissions, second_permissions);
     assert!(
         request2.has_message_with_input_texts("developer", |texts| {
             texts.iter().any(|text| text.contains("<model_switch>"))
         }),
-        "expected model switch section after model override: {expected_settings_update_msg:?}"
+        "expected model switch section after model override"
     );
-    let expected_env_msg_2 = body2["input"][body1_input.len() + 1].clone();
-    assert_eq!(expected_env_msg_2["role"].as_str(), Some("user"));
-    let env_text = expected_env_msg_2["content"][0]["text"]
-        .as_str()
-        .expect("environment context text");
+    let env_contexts = environment_contexts(&body2);
+    assert_eq!(env_contexts.len(), 1);
+    let env_text = env_contexts[0];
     let expected_cwd = new_cwd.path().display().to_string();
     assert_default_env_context(env_text, &expected_cwd);
-    let mut expected_body2 = body1_input.to_vec();
-    expected_body2.push(expected_settings_update_msg);
-    expected_body2.push(expected_env_msg_2);
-    expected_body2.push(expected_user_message_2);
-    assert_eq_without_metadata(
-        body2["input"].clone(),
-        serde_json::Value::Array(expected_body2),
-    );
+    let second_user_texts = message_texts(&body2, "user");
+    assert!(second_user_texts.contains(&"hello 1"));
+    assert!(second_user_texts.contains(&"hello 2"));
 
     Ok(())
 }
@@ -953,40 +936,24 @@ async fn send_user_turn_with_no_changes_does_not_send_environment_context() -> a
     let body1 = request1.body_json();
     let body2 = request2.body_json();
 
-    let expected_permissions_msg = body1["input"][0].clone();
-    let expected_ui_msg = body1["input"][1].clone();
-
     let default_cwd_lossy = default_cwd.to_string_lossy();
-    let expected_env_text_1 = expected_ui_msg["content"][1]["text"]
-        .as_str()
-        .expect("cached environment context text")
-        .to_string();
-    assert_default_env_context(&expected_env_text_1, &default_cwd_lossy);
+    let env_1 = environment_contexts(&body1);
+    let env_2 = environment_contexts(&body2);
+    assert_eq!(env_1.len(), 1);
+    assert_eq!(env_2.len(), 1);
+    assert_default_env_context(env_1[0], &default_cwd_lossy);
+    assert_eq!(env_1, env_2);
 
-    let expected_contextual_user_msg_1 = text_user_input_parts(vec![
-        expected_ui_msg["content"][0]["text"]
-            .as_str()
-            .expect("cached user instructions text")
-            .to_string(),
-        expected_env_text_1,
-    ]);
-    let expected_user_message_1 = text_user_input("hello 1".to_string());
-
-    let expected_input_1 = serde_json::Value::Array(vec![
-        expected_permissions_msg.clone(),
-        expected_contextual_user_msg_1.clone(),
-        expected_user_message_1.clone(),
-    ]);
-    assert_eq_without_metadata(body1["input"].clone(), expected_input_1);
-
-    let expected_user_message_2 = text_user_input("hello 2".to_string());
-    let expected_input_2 = serde_json::Value::Array(vec![
-        expected_permissions_msg,
-        expected_contextual_user_msg_1,
-        expected_user_message_1,
-        expected_user_message_2,
-    ]);
-    assert_eq_without_metadata(body2["input"].clone(), expected_input_2);
+    let input1 = body1["input"].as_array().expect("first input array");
+    let input2 = body2["input"].as_array().expect("second input array");
+    assert_eq_without_metadata(
+        serde_json::Value::Array(input2[..input1.len()].to_vec()),
+        serde_json::Value::Array(input1.clone()),
+    );
+    assert_eq_without_metadata(
+        input2[input1.len()].clone(),
+        text_user_input("hello 2".to_string()),
+    );
 
     Ok(())
 }
@@ -1095,50 +1062,18 @@ async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Resu
     let body1 = request1.body_json();
     let body2 = request2.body_json();
 
-    let expected_permissions_msg = body1["input"][0].clone();
-    let expected_ui_msg = body1["input"][1].clone();
-
-    let expected_env_text_1 = expected_ui_msg["content"][1]["text"]
-        .as_str()
-        .expect("cached environment context text")
-        .to_string();
-    assert_default_env_context(&expected_env_text_1, &default_cwd.to_string_lossy());
-    let expected_contextual_user_msg_1 = text_user_input_parts(vec![
-        expected_ui_msg["content"][0]["text"]
-            .as_str()
-            .expect("cached user instructions text")
-            .to_string(),
-        expected_env_text_1,
-    ]);
-    let expected_user_message_1 = text_user_input("hello 1".to_string());
-    let expected_input_1 = serde_json::Value::Array(vec![
-        expected_permissions_msg.clone(),
-        expected_contextual_user_msg_1.clone(),
-        expected_user_message_1.clone(),
-    ]);
-    assert_eq_without_metadata(body1["input"].clone(), expected_input_1);
-
-    let body1_input = body1["input"].as_array().expect("input array");
-    let expected_settings_update_msg = body2["input"][body1_input.len()].clone();
-    assert_ne!(
-        expected_settings_update_msg, expected_permissions_msg,
-        "expected updated permissions message after policy change"
-    );
-    assert_eq!(
-        expected_settings_update_msg["role"].as_str(),
-        Some("developer")
-    );
+    let initial_env = environment_contexts(&body1);
+    assert_eq!(initial_env.len(), 1);
+    assert_default_env_context(initial_env[0], &default_cwd.to_string_lossy());
     assert!(
         request2.has_message_with_input_texts("developer", |texts| {
             texts.iter().any(|text| text.contains("<model_switch>"))
         }),
-        "expected model switch section after model override: {expected_settings_update_msg:?}"
+        "expected model switch section after model override"
     );
-    let expected_env_update_msg = body2["input"][body1_input.len() + 1].clone();
-    assert_eq!(expected_env_update_msg["role"].as_str(), Some("user"));
-    let expected_env_update_text = expected_env_update_msg["content"][0]["text"]
-        .as_str()
-        .expect("environment context text");
+    let updated_env = environment_contexts(&body2);
+    assert_eq!(updated_env.len(), 1);
+    let expected_env_update_text = updated_env[0];
     assert_env_context_fragment(expected_env_update_text);
     assert!(
         expected_env_update_text.contains(
@@ -1146,16 +1081,9 @@ async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Resu
         ),
         "expected disabled filesystem profile in environment context: {expected_env_update_text}"
     );
-    let expected_user_message_2 = text_user_input("hello 2".to_string());
-    let expected_input_2 = serde_json::Value::Array(vec![
-        expected_permissions_msg,
-        expected_contextual_user_msg_1,
-        expected_user_message_1,
-        expected_settings_update_msg,
-        expected_env_update_msg,
-        expected_user_message_2,
-    ]);
-    assert_eq_without_metadata(body2["input"].clone(), expected_input_2);
+    let second_user_texts = message_texts(&body2, "user");
+    assert!(second_user_texts.contains(&"hello 1"));
+    assert!(second_user_texts.contains(&"hello 2"));
 
     Ok(())
 }

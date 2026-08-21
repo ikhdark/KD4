@@ -719,6 +719,10 @@ impl Codex {
                 developer_instructions: None,
             },
         };
+        let session_reasoning_effort = crate::client::request_effort_for_model(
+            &model_info,
+            collaboration_mode.reasoning_effort(),
+        );
         let fast_mode_enabled = config.features.enabled(Feature::FastMode);
         let initial_service_tier_warning = unsupported_service_tier_warning(
             config.service_tier.as_deref(),
@@ -767,6 +771,7 @@ impl Codex {
 
         let session = Box::pin(Session::new(
             session_configuration,
+            session_reasoning_effort,
             config.clone(),
             user_instructions,
             installation_id,
@@ -801,7 +806,7 @@ impl Codex {
         })?;
         if let Some(message) = initial_service_tier_warning {
             session
-                .send_event_raw(Event {
+                .send_event_raw_without_materializing_rollout(Event {
                     id: INITIAL_SUBMIT_ID.to_owned(),
                     msg: EventMsg::Warning(WarningEvent { message }),
                 })
@@ -1395,6 +1400,20 @@ impl Session {
         state.history.estimate_token_count(turn_context)
     }
 
+    pub(crate) async fn get_estimated_token_count_after_pending_user_boundary(
+        &self,
+        turn_context: &TurnContext,
+    ) -> Option<i64> {
+        let state = self.state.lock().await;
+        let personality = turn_context.personality.or(turn_context.config.personality);
+        let base_instructions = BaseInstructions {
+            text: turn_context.model_info.get_model_instructions(personality),
+        };
+        state
+            .history
+            .estimate_token_count_after_pending_user_boundary(&base_instructions)
+    }
+
     pub(crate) async fn get_base_instructions(&self) -> BaseInstructions {
         let state = self.state.lock().await;
         BaseInstructions {
@@ -1447,12 +1466,6 @@ impl Session {
                 // turn/start overrides can be merged before we write model-visible context.
                 self.set_previous_turn_settings(/*previous_turn_settings*/ None)
                     .await;
-                // Persist the authoritative initial settings even when the thread never
-                // starts a turn. Older rollouts without this record continue to fall back
-                // to SessionMeta and store metadata during reconstruction.
-                if let Err(err) = self.persist_thread_settings_snapshot().await {
-                    warn!("failed to persist initial thread settings: {err}");
-                }
             }
             InitialHistory::Resumed(resumed_history) => {
                 let turn_context = self.new_default_turn().await;
@@ -1518,10 +1531,12 @@ impl Session {
                     self.persist_rollout_items(&rollout_items).await;
                 }
 
-                // End every copied fork prefix with the child's fully resolved settings.
-                // This makes the child snapshot authoritative over embedded source metadata
-                // and preserves explicit fork overrides even when no turn is started.
-                if let Err(err) = self.persist_thread_settings_snapshot().await {
+                // Root forks finish restoring reconstructed runtime-only settings in
+                // `ThreadManager` after session construction. Let that owner append the
+                // single authoritative child snapshot instead of recording a provisional
+                // one here as well. Non-root forks have no later reconstruction phase, so
+                // they still persist their resolved settings at this boundary.
+                if is_subagent && let Err(err) = self.persist_thread_settings_snapshot().await {
                     warn!("failed to persist initial fork thread settings: {err}");
                 }
 
@@ -3301,12 +3316,15 @@ impl Session {
 
     pub(crate) async fn record_step_world_state_if_changed(
         &self,
-        _previous_world_state: &Arc<WorldState>,
+        previous_world_state: &Arc<WorldState>,
         step_context: &step_context::StepContext,
     ) -> Arc<WorldState> {
         let turn_context = step_context.turn.as_ref();
         // Render model-visible state from the same step used to build and run tools.
         let world_state = Arc::new(self.build_world_state_for_step(step_context).await);
+        if world_state.snapshot() == previous_world_state.snapshot() {
+            return world_state;
+        }
         // Diff against the realized state without advancing it until the next
         // exact physical attempt accepts this update.
         let (fragments, world_state_item, world_state_snapshot) = {

@@ -208,7 +208,7 @@ async fn resume_restores_dynamic_tools_from_rollout_with_sqlite_enabled() -> Res
             "tools": [{
                 "type": "function",
                 "name": tool_name,
-                "description": tool_description,
+                "description": "Look up a value after resume.\n\nexec tool declaration:\n```ts\ndeclare const tools: { resume_tools__resume_lookup(args: { query: string; }): Promise<unknown>; };\n```",
                 "strict": false,
                 "parameters": input_schema,
             }],
@@ -328,7 +328,7 @@ async fn resume_restores_legacy_dynamic_tools_from_rollout_with_sqlite_enabled()
             "tools": [{
                 "type": "function",
                 "name": tool_name,
-                "description": tool_description,
+                "description": "Look up a value after resume.\n\nexec tool declaration:\n```ts\ndeclare const tools: { resume_tools__resume_lookup(args: { query: string; }): Promise<unknown>; };\n```",
                 "strict": false,
                 "parameters": input_schema,
             }],

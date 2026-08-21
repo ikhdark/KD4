@@ -370,6 +370,14 @@ url = "{mcp_server_url}/mcp"
     .await??;
     let _: EnvironmentAddResponse = to_response(add_environment_response)?;
 
+    let (filesystem_request_tx, filesystem_request_rx) = oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let exec_server_handle = tokio::spawn(serve_environment_until_shutdown(
+        exec_listener,
+        filesystem_request_tx,
+        shutdown_rx,
+    ));
+
     let capability_root = TempDir::new()?;
     let thread_start_id = mcp
         .send_thread_start_request(ThreadStartParams {
@@ -417,13 +425,6 @@ url = "{mcp_server_url}/mcp"
         panic!("expected MCP elicitation request, got: {server_request:?}");
     };
 
-    let (filesystem_request_tx, filesystem_request_rx) = oneshot::channel();
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let exec_server_handle = tokio::spawn(serve_environment_until_shutdown(
-        exec_listener,
-        filesystem_request_tx,
-        shutdown_rx,
-    ));
     let mut filesystem_request_rx = filesystem_request_rx;
     timeout(DEFAULT_READ_TIMEOUT, async {
         loop {

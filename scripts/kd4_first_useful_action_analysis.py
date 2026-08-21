@@ -103,7 +103,9 @@ class _Turn:
 def _rollout_files(inputs: Sequence[Path]) -> list[Path]:
     files: dict[str, Path] = {}
     for input_path in inputs:
-        candidates = input_path.rglob("*.jsonl") if input_path.is_dir() else (input_path,)
+        candidates = (
+            input_path.rglob("*.jsonl") if input_path.is_dir() else (input_path,)
+        )
         for candidate in candidates:
             if candidate.is_file():
                 resolved = candidate.resolve()
@@ -166,8 +168,12 @@ def analyze(inputs: Sequence[Path]) -> dict[str, Any]:
 
                 completed_turns += 1
                 timing = payload.get("timing")
-                milestones = timing.get("milestones") if isinstance(timing, dict) else None
-                schema_version = timing.get("schemaVersion") if isinstance(timing, dict) else None
+                milestones = (
+                    timing.get("milestones") if isinstance(timing, dict) else None
+                )
+                schema_version = (
+                    timing.get("schemaVersion") if isinstance(timing, dict) else None
+                )
                 if (
                     isinstance(schema_version, int)
                     and schema_version >= CANONICAL_TIMING_SCHEMA_VERSION
@@ -187,7 +193,9 @@ def analyze(inputs: Sequence[Path]) -> dict[str, Any]:
                         - active.started_ms
                     }
                     if active.user_input_ms is not None:
-                        row["startToUserInputEventMs"] = active.user_input_ms - active.started_ms
+                        row["startToUserInputEventMs"] = (
+                            active.user_input_ms - active.started_ms
+                        )
                         row["userInputEventToUsefulToolEmittedMs"] = (
                             active.useful_tool_emitted_ms - active.user_input_ms
                         )
@@ -205,19 +213,33 @@ def analyze(inputs: Sequence[Path]) -> dict[str, Any]:
         "userInputToUsefulAcceptedMs": _summary(
             value
             for row in canonical_rows
-            if (value := _delta(row.get("firstUsefulToolAcceptedMs"), row.get("userInputRecordedMs")))
+            if (
+                value := _delta(
+                    row.get("firstUsefulToolAcceptedMs"), row.get("userInputRecordedMs")
+                )
+            )
             is not None
         ),
         "usefulParallelGateWaitMs": _summary(
             value
             for row in canonical_rows
-            if (value := _delta(row.get("firstUsefulToolGateAdmittedMs"), row.get("firstUsefulToolAcceptedMs")))
+            if (
+                value := _delta(
+                    row.get("firstUsefulToolGateAdmittedMs"),
+                    row.get("firstUsefulToolAcceptedMs"),
+                )
+            )
             is not None
         ),
         "usefulAuthorizationAndDispatchMs": _summary(
             value
             for row in canonical_rows
-            if (value := _delta(row.get("firstUsefulActionMs"), row.get("firstUsefulToolGateAdmittedMs")))
+            if (
+                value := _delta(
+                    row.get("firstUsefulActionMs"),
+                    row.get("firstUsefulToolGateAdmittedMs"),
+                )
+            )
             is not None
         ),
         "startToFirstUsefulActionMs": _summary(
@@ -226,7 +248,12 @@ def analyze(inputs: Sequence[Path]) -> dict[str, Any]:
         "usefulExecutionToSuccessMs": _summary(
             value
             for row in canonical_rows
-            if (value := _delta(row.get("firstSuccessfulUsefulActionMs"), row.get("firstUsefulActionMs")))
+            if (
+                value := _delta(
+                    row.get("firstSuccessfulUsefulActionMs"),
+                    row.get("firstUsefulActionMs"),
+                )
+            )
             is not None
         ),
     }

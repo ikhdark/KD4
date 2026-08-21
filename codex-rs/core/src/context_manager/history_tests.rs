@@ -880,6 +880,26 @@ fn total_token_usage_recomputes_projected_history_when_local_tail_contains_bound
 }
 
 #[test]
+fn pending_user_boundary_estimate_excludes_current_group_reasoning() {
+    let history = create_history_with_items(vec![
+        user_input_text_msg("current instruction"),
+        reasoning_with_encrypted_content(/*len*/ 2_000),
+    ]);
+    let base_instructions = BaseInstructions {
+        text: "base instructions".to_string(),
+    };
+
+    let active = history
+        .estimate_token_count_with_base_instructions(&base_instructions)
+        .unwrap();
+    let after_pending_boundary = history
+        .estimate_token_count_after_pending_user_boundary(&base_instructions)
+        .unwrap();
+
+    assert!(after_pending_boundary < active);
+}
+
+#[test]
 fn total_token_usage_recomputes_initial_projected_history_before_any_model_response() {
     let boundary = user_input_text_msg("initial instruction");
     let history = create_history_with_items(vec![boundary]);
@@ -1793,7 +1813,7 @@ fn format_exec_output_truncates_large_error() {
 
     let truncated = truncate_exec_output(&large_error);
 
-    assert_truncated_message_matches(&truncated, line, /*expected_removed*/ 36250);
+    assert_truncated_message_matches(&truncated, line, /*expected_removed*/ 36_338);
     assert_ne!(truncated, large_error);
 }
 
@@ -1802,7 +1822,7 @@ fn format_exec_output_marks_byte_truncation_without_omitted_lines() {
     let long_line = "a".repeat(EXEC_FORMAT_MAX_BYTES + 10000);
     let truncated = truncate_exec_output(&long_line);
     assert_ne!(truncated, long_line);
-    assert_truncated_message_matches(&truncated, "a", /*expected_removed*/ 2500);
+    assert_truncated_message_matches(&truncated, "a", /*expected_removed*/ 2_508);
     assert!(
         !truncated.contains("omitted"),
         "line omission marker should not appear when no lines were dropped: {truncated}"
@@ -1824,7 +1844,7 @@ fn format_exec_output_reports_omitted_lines_and_keeps_head_and_tail() {
         .collect();
 
     let truncated = truncate_exec_output(&content);
-    assert_truncated_message_matches(&truncated, "line-0-", /*expected_removed*/ 34_723);
+    assert_truncated_message_matches(&truncated, "line-0-", /*expected_removed*/ 34_923);
     assert!(
         truncated.contains("line-0-"),
         "expected head line to remain: {truncated}"
@@ -1847,7 +1867,7 @@ fn format_exec_output_prefers_line_marker_when_both_limits_exceeded() {
 
     let truncated = truncate_exec_output(&content);
 
-    assert_truncated_message_matches(&truncated, "line-0-", /*expected_removed*/ 17_423);
+    assert_truncated_message_matches(&truncated, "line-0-", /*expected_removed*/ 17_495);
 }
 
 #[cfg(not(debug_assertions))]
@@ -2205,9 +2225,9 @@ fn sampling_preparation_projects_stable_context_but_generic_preparation_fails_op
     let current_repository =
         "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\ncurrent\n</INSTRUCTIONS>";
     let history = create_history_with_items(vec![
-        user_msg(old_repository),
-        user_msg("dynamic request"),
-        user_msg(current_repository),
+        user_input_text_msg(old_repository),
+        user_input_text_msg("dynamic request"),
+        user_input_text_msg(current_repository),
     ]);
 
     let generic = history
@@ -2220,8 +2240,16 @@ fn sampling_preparation_projects_stable_context_but_generic_preparation_fails_op
     assert!(generic.stable_context_manifest().fail_open());
     assert_eq!(sampled.items().len(), 2);
     assert!(sampled.stable_context_manifest().projection_enabled());
-    assert!(!sampled.items().contains(&user_msg(old_repository)));
-    assert!(sampled.items().contains(&user_msg(current_repository)));
+    assert!(
+        !sampled
+            .items()
+            .contains(&user_input_text_msg(old_repository))
+    );
+    assert!(
+        sampled
+            .items()
+            .contains(&user_input_text_msg(current_repository))
+    );
 }
 
 #[test]
@@ -2232,21 +2260,29 @@ fn sampling_projection_reconstructs_current_variant_after_history_replacement() 
         "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\ncurrent\n</INSTRUCTIONS>";
     let mut history = ContextManager::new();
     history.replace(vec![
-        user_msg(old_repository),
-        user_msg("compaction checkpoint summary"),
-        user_msg(current_repository),
+        user_input_text_msg(old_repository),
+        user_input_text_msg("compaction checkpoint summary"),
+        user_input_text_msg(current_repository),
     ]);
 
     let sampled = history
         .prepare_for_sampling_prompt(&default_input_modalities(), StableContextTarget::Sampling);
 
     assert_eq!(sampled.items().len(), 2);
-    assert!(!sampled.items().contains(&user_msg(old_repository)));
-    assert!(sampled.items().contains(&user_msg(current_repository)));
+    assert!(
+        !sampled
+            .items()
+            .contains(&user_input_text_msg(old_repository))
+    );
     assert!(
         sampled
             .items()
-            .contains(&user_msg("compaction checkpoint summary"))
+            .contains(&user_input_text_msg(current_repository))
+    );
+    assert!(
+        sampled
+            .items()
+            .contains(&user_input_text_msg("compaction checkpoint summary"))
     );
 }
 

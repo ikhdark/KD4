@@ -378,7 +378,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_renewal_requires_exact_identity_and_fresh_ttl() {
+    async fn cache_renewal_requires_exact_identity_and_refreshes_stale_ttl() {
         let temp = tempfile::tempdir().expect("tempdir");
         let manager = ModelsCacheManager::new(
             temp.path().join("models_cache.json"),
@@ -409,12 +409,11 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(
-            manager
-                .renew_cache_ttl("client-one", "etag-one")
-                .await
-                .is_err()
-        );
+        manager
+            .renew_cache_ttl("client-one", "etag-one")
+            .await
+            .expect("a matching 304 response should refresh a stale cache entry");
+        assert!(manager.load_fresh("client-one").await.is_some());
     }
 
     #[tokio::test]

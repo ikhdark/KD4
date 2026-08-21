@@ -1110,7 +1110,13 @@ impl ExecCommandToolOutput {
             projected_text = if codex_utils_string::approx_token_count(&candidate) <= notice_limit {
                 candidate
             } else {
-                truncate_text_to_token_ceiling(&marker, notice_limit)
+                [marker.as_str(), "output truncated", "truncated", "…"]
+                    .into_iter()
+                    .find(|candidate| {
+                        codex_utils_string::approx_token_count(candidate) <= notice_limit
+                    })
+                    .unwrap_or_default()
+                    .to_string()
             };
         }
         let artifact_has_more_bytes = self
@@ -1173,9 +1179,38 @@ impl ExecCommandToolOutput {
         }
 
         sections.push("Output:".to_string());
-        sections.push(self.output_with_reduction_notice(self.projected_model_output()));
+        let projected = self.projected_model_output();
+        let reduction_notice = projected.reduced.then(|| {
+            self.raw_output_artifact
+                .as_ref()
+                .and_then(RawOutputArtifact::reduction_notice)
+        });
+        sections.push(projected.text);
 
-        truncate_text_to_token_ceiling(&sections.join("\n"), max_tokens)
+        let response = sections.join("\n");
+        let Some(Some(notice)) = reduction_notice else {
+            return truncate_text_to_token_ceiling(&response, max_tokens);
+        };
+        let notice = truncate_text_to_token_ceiling(&notice, max_tokens);
+        let notice_tokens = codex_utils_string::approx_token_count(&notice);
+        if notice_tokens >= max_tokens {
+            return notice;
+        }
+        let mut response_budget = max_tokens.saturating_sub(notice_tokens + 1);
+        loop {
+            let response = truncate_text_to_token_ceiling(&response, response_budget);
+            let candidate = if response.is_empty() {
+                notice.clone()
+            } else {
+                format!("{response}\n{notice}")
+            };
+            if codex_utils_string::approx_token_count(&candidate) <= max_tokens
+                || response_budget == 0
+            {
+                return candidate;
+            }
+            response_budget = response_budget.saturating_sub(1);
+        }
     }
 }
 

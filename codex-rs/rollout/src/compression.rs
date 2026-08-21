@@ -1,5 +1,6 @@
 use std::ffi::OsStr;
 use std::fs::File;
+use std::fs::FileTimes;
 use std::fs::Permissions;
 use std::io;
 use std::io::Write;
@@ -170,13 +171,16 @@ fn materialize_rollout_for_append_locked(path: &Path) -> io::Result<PathBuf> {
         std::fs::create_dir_all(parent)?;
     }
     let result: io::Result<()> = (|| {
-        let permissions = std::fs::metadata(compressed_path.as_path())?.permissions();
+        let compressed_metadata = std::fs::metadata(compressed_path.as_path())?;
+        let modified = compressed_metadata.modified()?;
+        let permissions = compressed_metadata.permissions();
         {
             let input = File::open(compressed_path.as_path())?;
             let mut decoder = zstd::stream::read::Decoder::new(input)?;
             let mut output = create_file_with_permissions(temp_path.as_path(), &permissions)?;
             io::copy(&mut decoder, &mut output)?;
             output.flush()?;
+            output.set_times(FileTimes::new().set_modified(modified))?;
             output.sync_all()?;
         }
         match std::fs::hard_link(temp_path.as_path(), plain_path.as_path()) {

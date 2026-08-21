@@ -22,6 +22,7 @@ async fn approval_key_includes_environment_id() {
         hook_command: "echo hello".to_string(),
         cwd: cwd.clone(),
         timeout_ms: None,
+        stall_timeout_ms: None,
         cancellation_token: CancellationToken::new(),
         env: HashMap::new(),
         explicit_env_overrides: HashMap::new(),
@@ -74,6 +75,7 @@ async fn approval_key_uses_inspectable_command_instead_of_encoded_payload() {
         hook_command: "Get-ChildItem".to_string(),
         cwd,
         timeout_ms: None,
+        stall_timeout_ms: None,
         cancellation_token: CancellationToken::new(),
         env: HashMap::new(),
         explicit_env_overrides: HashMap::new(),
@@ -103,4 +105,28 @@ async fn approval_key_uses_inspectable_command_instead_of_encoded_payload() {
         keys[0].command,
         canonicalize_command_for_approval(&request.command)
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn command_progress_resets_stall_deadline() {
+    let progress = crate::exec::CommandProgress::new();
+    let observer = progress.subscribe();
+    let stall = tokio::spawn(super::wait_for_command_stall(
+        observer,
+        std::time::Duration::from_secs(10),
+    ));
+
+    tokio::time::advance(std::time::Duration::from_secs(9)).await;
+    progress.record_output();
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_secs(9)).await;
+    tokio::task::yield_now().await;
+    assert!(!stall.is_finished());
+
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert!(stall.is_finished());
+    stall
+        .await
+        .expect("stall detector exits at the reset deadline");
 }

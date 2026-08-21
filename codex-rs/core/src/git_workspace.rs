@@ -501,6 +501,12 @@ struct GitWorkspaceCacheState {
     project_namespaces: HashMap<PathBuf, ProjectNamespaceCacheEntry>,
 }
 
+#[derive(Clone)]
+struct CachedWorkspaceEvidenceIdentity {
+    capture_sequence: u64,
+    identity: WorkspaceEvidenceIdentity,
+}
+
 pub(crate) struct GitWorkspaceCache {
     state: Mutex<GitWorkspaceCacheState>,
     watcher_epoch: u64,
@@ -510,6 +516,8 @@ pub(crate) struct GitWorkspaceCache {
     watcher_subscriber: Option<FileWatcherSubscriber>,
     source_watch_registrations: StdMutex<HashMap<PathBuf, WatchRegistration>>,
     source_change_journal: StdMutex<SourceChangeJournal>,
+    latest_workspace_evidence: StdMutex<HashMap<PathBuf, CachedWorkspaceEvidenceIdentity>>,
+    workspace_evidence_capture_sequence: AtomicU64,
     #[cfg(test)]
     workspace_evidence_capture_count: AtomicU64,
 }
@@ -582,12 +590,16 @@ impl GitWorkspaceCache {
             watcher_subscriber,
             source_watch_registrations: StdMutex::new(HashMap::new()),
             source_change_journal: StdMutex::new(SourceChangeJournal::default()),
+            latest_workspace_evidence: StdMutex::new(HashMap::new()),
+            workspace_evidence_capture_sequence: AtomicU64::new(0),
             #[cfg(test)]
             workspace_evidence_capture_count: AtomicU64::new(0),
         });
-        if let Some(mut receiver) = receiver {
+        if let Some(mut receiver) = receiver
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
             let weak_cache = Arc::downgrade(&cache);
-            tokio::spawn(async move {
+            runtime.spawn(async move {
                 while let Some(event) = receiver.recv().await {
                     let Some(cache) = weak_cache.upgrade() else {
                         return;
@@ -625,7 +637,47 @@ impl GitWorkspaceCache {
         #[cfg(test)]
         self.workspace_evidence_capture_count
             .fetch_add(1, Ordering::AcqRel);
-        capture_workspace_evidence_identity(cwd).await
+        let capture_sequence = self
+            .workspace_evidence_capture_sequence
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        let identity = capture_workspace_evidence_identity(cwd).await?;
+        if let Some(repo_root) = identity.repository_root.as_deref() {
+            let repo_root = canonical_workspace_evidence_root(Path::new(repo_root));
+            let mut latest = self
+                .latest_workspace_evidence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if latest
+                .get(&repo_root)
+                .is_none_or(|cached| cached.capture_sequence <= capture_sequence)
+            {
+                latest.insert(
+                    repo_root,
+                    CachedWorkspaceEvidenceIdentity {
+                        capture_sequence,
+                        identity: identity.clone(),
+                    },
+                );
+            }
+        }
+        Some(identity)
+    }
+
+    /// Returns the most recent authoritative identity already captured for a
+    /// repository. Sampling refreshes this cache before the model can issue
+    /// tools, so proven read-only children can reuse it without launching a
+    /// second set of Git subprocesses at dispatch time.
+    pub(crate) fn latest_workspace_evidence_identity(
+        &self,
+        repo_root: &Path,
+    ) -> Option<WorkspaceEvidenceIdentity> {
+        let repo_root = canonical_workspace_evidence_root(repo_root);
+        self.latest_workspace_evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&repo_root)
+            .map(|cached| cached.identity.clone())
     }
 
     #[cfg(test)]
@@ -883,10 +935,8 @@ impl GitWorkspaceCache {
         if !self.watcher_reliable.load(Ordering::Acquire) {
             return None;
         }
-        let repo_root = repo_root
-            .canonicalize()
-            .unwrap_or_else(|_| repo_root.to_path_buf());
-        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let repo_root = dunce::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+        let path = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         if !path_is_same_or_descendant(&path, &repo_root) {
             return None;
         }
@@ -1003,15 +1053,17 @@ impl GitWorkspaceCache {
         repo_root: &Path,
         changed_paths: &[String],
     ) {
+        let repo_root = dunce::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
         let paths = changed_paths
             .iter()
             .map(|path| {
                 let path = Path::new(path);
-                if path.is_absolute() {
+                let absolute = if path.is_absolute() {
                     path.to_path_buf()
                 } else {
                     repo_root.join(path)
-                }
+                };
+                dunce::canonicalize(&absolute).unwrap_or(absolute)
             })
             .filter(|path| !is_generated_codex_eval_path(path))
             .collect::<Vec<_>>();
@@ -1034,6 +1086,10 @@ fn is_generated_codex_eval_path(path: &Path) -> bool {
         || normalized.starts_with(".codex/evals/")
         || normalized.ends_with("/.codex/evals")
         || normalized.contains("/.codex/evals/")
+}
+
+fn canonical_workspace_evidence_root(repo_root: &Path) -> PathBuf {
+    dunce::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf())
 }
 
 fn path_is_same_or_descendant(path: &Path, ancestor: &Path) -> bool {

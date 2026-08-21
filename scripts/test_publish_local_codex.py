@@ -107,7 +107,9 @@ class PublishLocalCodexSourceLayoutTest(unittest.TestCase):
         self.assertIn(
             'Write-ProofLine "codexPostPublishVerify" "sha256 ok"', publish_script
         )
-        self.assertIn("running-target process detection was indeterminate", publish_script)
+        self.assertIn(
+            "running-target process detection was indeterminate", publish_script
+        )
         self.assertIn(
             "$script:RunningTargetProcessProbeWarnings.Count -gt 0", publish_script
         )

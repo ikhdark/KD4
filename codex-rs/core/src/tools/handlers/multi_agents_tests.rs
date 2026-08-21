@@ -28,7 +28,6 @@ use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_model_provider::create_model_provider;
 use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_4_MODEL_ID;
-use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_6_LUNA_MODEL_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_6_SOL_MODEL_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID;
 use codex_model_provider_info::ModelProviderInfo;
@@ -435,7 +434,7 @@ async fn spawn_agent_uses_bedrock_qualified_default_model_and_reasoning() {
         .config_snapshot()
         .await;
 
-    assert_eq!(snapshot.model, AMAZON_BEDROCK_GPT_5_6_LUNA_MODEL_ID);
+    assert_eq!(snapshot.model, AMAZON_BEDROCK_GPT_5_6_SOL_MODEL_ID);
     assert_eq!(
         snapshot.reasoning_effort,
         Some(DEFAULT_SPAWN_AGENT_REASONING_EFFORT)
@@ -743,6 +742,7 @@ async fn multi_agent_v2_spawn_fork_turns_all_rejects_agent_type_override() {
         .features
         .enable(Feature::MultiAgentV2)
         .expect("test config should allow feature update");
+    config.multi_agent_v2.allow_full_history_forks = true;
     let turn = TurnContext {
         config: Arc::new(config),
         multi_agent_version: codex_protocol::protocol::MultiAgentVersion::V2,
@@ -1181,6 +1181,7 @@ async fn multi_agent_v2_typed_spawn_admits_overlapping_write_claims() {
                         "text": "complete the bounded edit"
                     }],
                     "write_scope": [{"path": claim_path, "recursive": true}],
+                    "required_evidence": ["focused validation passes"],
                     "stop_condition": "stop after the edit"
                 }
             })),
@@ -1212,6 +1213,7 @@ async fn multi_agent_v2_typed_spawn_admits_overlapping_write_claims() {
                         "text": "complete the bounded edit"
                     }],
                     "write_scope": [{"path": overlapping_path, "recursive": true}],
+                    "required_evidence": ["focused validation passes"],
                     "stop_condition": "stop after the edit"
                 }
             })),
@@ -2124,13 +2126,13 @@ async fn multi_agent_v2_spawn_returns_path_and_send_message_accepts_relative_pat
         *id == child_thread_id
             && matches!(
                 op,
-                Op::InterAgentCommunication { communication }
-                    if communication.author == AgentPath::root()
-                        && communication.recipient.as_str() == "/root/test_process"
-                        && communication.other_recipients.is_empty()
-                        && communication.content.is_empty()
-                        && communication.encrypted_content.as_deref() == Some("encrypted-spawn-message")
-                        && communication.trigger_turn
+                Op::UserInput { items, .. }
+                    if items.iter().any(|item| matches!(
+                        item,
+                        UserInput::Text { text, .. }
+                            if text.starts_with("<task_capsule_v1>")
+                                && text.ends_with("</task_capsule_v1>")
+                    ))
             )
     }));
 
@@ -2237,7 +2239,7 @@ async fn multi_agent_v2_spawn_rejects_invalid_fork_turns_string() {
     assert_eq!(
         err,
         FunctionCallError::RespondToModel(
-            "fork_turns must be `none`, `all`, or a positive integer string".to_string()
+            "fork_turns must be `none` or an integer from 1 through 5".to_string()
         )
     );
 }
@@ -2277,7 +2279,7 @@ async fn multi_agent_v2_spawn_rejects_zero_fork_turns() {
     assert_eq!(
         err,
         FunctionCallError::RespondToModel(
-            "fork_turns must be `none`, `all`, or a positive integer string".to_string()
+            "fork_turns must be `none` or an integer from 1 through 5".to_string()
         )
     );
 }
@@ -2531,7 +2533,7 @@ async fn multi_agent_v2_list_agents_returns_completed_status_without_encrypted_s
         .find(|agent| agent.agent_name == "/root/worker")
         .expect("worker agent should be listed");
     assert_eq!(worker.agent_status, json!({"completed": "done"}));
-    assert_eq!(worker.last_task_message, None);
+    assert_eq!(worker.last_task_message.as_deref(), Some("TaskCapsuleV1"));
     assert_eq!(success, Some(true));
 }
 
@@ -4317,6 +4319,7 @@ async fn multi_agent_v2_wait_agent_accepts_timeout_only_argument() {
         .enable(Feature::MultiAgentV2)
         .expect("test config should allow feature update");
     set_turn_config(&mut turn, config);
+    let explicit_timeout_ms = turn.config.multi_agent_v2.min_wait_timeout_ms;
     let session = Arc::new(session);
     let turn = Arc::new(turn);
 
@@ -4355,7 +4358,7 @@ async fn multi_agent_v2_wait_agent_accepts_timeout_only_argument() {
                     session,
                     turn,
                     "wait_agent",
-                    function_payload(json!({"timeout_ms": 10_000})),
+                    function_payload(json!({"timeout_ms": explicit_timeout_ms})),
                 ))
                 .await
         }
@@ -4380,14 +4383,10 @@ async fn multi_agent_v2_wait_agent_accepts_timeout_only_argument() {
     let (content, success) = expect_text_output(output);
     let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
         serde_json::from_str(&content).expect("wait_agent result should be json");
-    assert_eq!(
-        result,
-        crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
-            message: "Wait completed.".to_string(),
-            timed_out: false,
-            ..Default::default()
-        }
-    );
+    assert_eq!(result.message, "Wait completed.");
+    assert!(!result.timed_out);
+    assert!(result.cursor.is_some());
+    assert!(!result.typed_deltas.is_empty());
     assert_eq!(success, None);
 }
 
@@ -4639,7 +4638,10 @@ async fn multi_agent_v2_wait_agent_accepts_explicit_timeout_at_configured_max() 
 
 #[tokio::test]
 async fn wait_agent_returns_not_found_for_missing_agents() {
-    let (mut session, turn) = make_session_and_context().await;
+    let (mut session, mut turn) = make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    let _ = config.features.disable(Feature::MultiAgentV2);
+    set_turn_config(&mut turn, config);
     let manager = thread_manager();
     session.services.agent_control = manager.agent_control();
     let id_a = ThreadId::new();
@@ -4649,8 +4651,7 @@ async fn wait_agent_returns_not_found_for_missing_agents() {
         Arc::new(turn),
         "wait_agent",
         function_payload(json!({
-            "targets": [id_a.to_string(), id_b.to_string()],
-            "timeout_ms": 10_000
+            "targets": [id_a.to_string(), id_b.to_string()]
         })),
     );
     let output = WaitAgentHandler::default()
@@ -4673,9 +4674,12 @@ async fn wait_agent_returns_not_found_for_missing_agents() {
     assert_eq!(success, None);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn wait_agent_times_out_when_status_is_not_final() {
-    let (mut session, turn) = make_session_and_context().await;
+    let (mut session, mut turn) = make_session_and_context().await;
+    let mut v1_config = (*turn.config).clone();
+    let _ = v1_config.features.disable(Feature::MultiAgentV2);
+    set_turn_config(&mut turn, v1_config);
     let manager = thread_manager();
     session.services.agent_control = manager.agent_control();
     let config = turn.config.as_ref().clone();
@@ -4791,7 +4795,10 @@ async fn wait_agent_returns_final_status_without_timeout() {
 
 #[tokio::test]
 async fn wait_agent_all_waits_for_every_unique_target_and_includes_initial_finals() {
-    let (mut session, turn) = make_session_and_context().await;
+    let (mut session, mut turn) = make_session_and_context().await;
+    let mut v1_config = (*turn.config).clone();
+    let _ = v1_config.features.disable(Feature::MultiAgentV2);
+    set_turn_config(&mut turn, v1_config);
     let manager = thread_manager();
     session.services.agent_control = manager.agent_control();
     let config = turn.config.as_ref().clone();
@@ -4830,7 +4837,6 @@ async fn wait_agent_all_waits_for_every_unique_target_and_includes_initial_final
                 second.thread_id.to_string(),
                 missing.to_string()
             ],
-            "timeout_ms": 10_000,
             "return_when": "all"
         })),
     );
@@ -4924,7 +4930,7 @@ async fn multi_agent_v2_wait_agent_returns_summary_for_mailbox_activity() {
                     session,
                     turn,
                     "wait_agent",
-                    function_payload(json!({"timeout_ms": 10_000})),
+                    function_payload(json!({})),
                 ))
                 .await
         }
@@ -4949,14 +4955,10 @@ async fn multi_agent_v2_wait_agent_returns_summary_for_mailbox_activity() {
     let (content, success) = expect_text_output(wait_output);
     let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
         serde_json::from_str(&content).expect("wait_agent result should be json");
-    assert_eq!(
-        result,
-        crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
-            message: "Wait completed.".to_string(),
-            timed_out: false,
-            ..Default::default()
-        }
-    );
+    assert_eq!(result.message, "Wait completed.");
+    assert!(!result.timed_out);
+    assert!(result.cursor.is_some());
+    assert_eq!(result.typed_deltas.len(), 1);
     assert_eq!(success, None);
 }
 
@@ -5022,7 +5024,7 @@ async fn multi_agent_v2_wait_agent_returns_for_already_queued_mail() {
             session,
             turn,
             "wait_agent",
-            function_payload(json!({"timeout_ms": 10_000})),
+            function_payload(json!({})),
         )),
     )
     .await
@@ -5098,7 +5100,7 @@ async fn multi_agent_v2_wait_agent_wakes_on_any_mailbox_notification() {
                     session,
                     turn,
                     "wait_agent",
-                    function_payload(json!({"timeout_ms": 10_000})),
+                    function_payload(json!({})),
                 ))
                 .await
         }
@@ -5123,14 +5125,10 @@ async fn multi_agent_v2_wait_agent_wakes_on_any_mailbox_notification() {
     let (content, success) = expect_text_output(output);
     let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
         serde_json::from_str(&content).expect("wait_agent result should be json");
-    assert_eq!(
-        result,
-        crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
-            message: "Wait completed.".to_string(),
-            timed_out: false,
-            ..Default::default()
-        }
-    );
+    assert_eq!(result.message, "Wait completed.");
+    assert!(!result.timed_out);
+    assert!(result.cursor.is_some());
+    assert_eq!(result.typed_deltas.len(), 2);
     assert_eq!(success, None);
 }
 
@@ -5187,7 +5185,7 @@ async fn multi_agent_v2_wait_agent_does_not_return_completed_content() {
                     session,
                     turn,
                     "wait_agent",
-                    function_payload(json!({"timeout_ms": 10_000})),
+                    function_payload(json!({})),
                 ))
                 .await
         }
@@ -5212,14 +5210,10 @@ async fn multi_agent_v2_wait_agent_does_not_return_completed_content() {
     let (content, success) = expect_text_output(output);
     let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
         serde_json::from_str(&content).expect("wait_agent result should be json");
-    assert_eq!(
-        result,
-        crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
-            message: "Wait completed.".to_string(),
-            timed_out: false,
-            ..Default::default()
-        }
-    );
+    assert_eq!(result.message, "Wait completed.");
+    assert!(!result.timed_out);
+    assert!(result.cursor.is_some());
+    assert_eq!(result.typed_deltas.len(), 1);
     assert!(!content.contains("sensitive child output"));
     assert_eq!(success, None);
 }
@@ -5228,19 +5222,19 @@ async fn multi_agent_v2_wait_agent_does_not_return_completed_content() {
 async fn multi_agent_v2_interrupt_agent_accepts_task_name_target() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
-    let root = manager
-        .start_thread((*turn.config).clone())
-        .await
-        .expect("root thread should start");
-    session.services.agent_control = manager.agent_control();
-    session.thread_id = root.thread_id;
     let mut config = (*turn.config).clone();
     config
         .features
         .enable(Feature::MultiAgentV2)
         .expect("test config should allow feature update");
     set_turn_config(&mut turn, config);
-
+    let root = manager
+        .start_thread((*turn.config).clone())
+        .await
+        .expect("root thread should start");
+    root.thread.codex.session.new_default_turn().await;
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
     let session = Arc::new(session);
     let turn = Arc::new(turn);
     SpawnAgentHandlerV2::default()
@@ -5804,6 +5798,7 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
     let (_session, turn) = make_session_and_context().await;
     let mut config = turn.config.as_ref().clone();
     config.agent_max_depth = 3;
+    let _ = config.features.disable(Feature::MultiAgentV2);
     config
         .features
         .enable(Feature::Sqlite)

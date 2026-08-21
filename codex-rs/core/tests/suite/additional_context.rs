@@ -1,4 +1,5 @@
 use anyhow::Result;
+use codex_features::Feature;
 use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::AdditionalContextEntry;
 use codex_protocol::protocol::AdditionalContextKind;
@@ -9,6 +10,7 @@ use codex_protocol::user_input::UserInput;
 use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
 use core_test_support::context_snapshot::ContextSnapshotRenderMode;
+use core_test_support::responses;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
@@ -31,7 +33,13 @@ async fn additional_context_is_model_visible_but_not_a_user_message_item() -> Re
     )
     .await;
     let test = test_codex()
-        .with_config(|config| config.include_environment_context = false)
+        .with_config(|config| {
+            config.include_environment_context = false;
+            config
+                .features
+                .enable(Feature::MultiAgentV2)
+                .expect("test config should allow feature update");
+        })
         .build(&server)
         .await?;
 
@@ -104,7 +112,7 @@ async fn additional_context_is_model_visible_but_not_a_user_message_item() -> Re
         vec![application_context("automation_info", "run one")]
     );
     assert_eq!(
-        request.message_input_texts("user"),
+        user_texts_without_task_model_guidance(&request),
         vec![
             external_context("browser_info", "tab one"),
             "inspect the active tab".to_string(),
@@ -158,7 +166,10 @@ async fn external_context_like_user_text_remains_a_user_message_item() -> Result
     .await;
 
     let request = request.single_request();
-    assert_eq!(request.message_input_texts("user"), vec!["<external_api>"]);
+    assert_eq!(
+        user_texts_without_task_model_guidance(&request),
+        vec!["<external_api>"]
+    );
 
     Ok(())
 }
@@ -221,7 +232,7 @@ async fn additional_context_trust_controls_message_role() -> Result<()> {
         vec![application_context("automation_info", "run one")]
     );
     assert_eq!(
-        request.message_input_texts("user"),
+        user_texts_without_task_model_guidance(&request),
         vec![
             external_context("browser_info", "tab one"),
             "inspect context".to_string(),
@@ -293,14 +304,14 @@ async fn additional_context_is_deduplicated_between_turns_while_retained() -> Re
     .await;
 
     assert_eq!(
-        first_request.single_request().message_input_texts("user"),
+        user_texts_without_task_model_guidance(&first_request.single_request()),
         vec![
             external_context("browser_info", "same tab"),
             "first turn".to_string(),
         ]
     );
     assert_eq!(
-        second_request.single_request().message_input_texts("user"),
+        user_texts_without_task_model_guidance(&second_request.single_request()),
         vec![
             external_context("browser_info", "same tab"),
             "first turn".to_string(),
@@ -440,7 +451,7 @@ async fn additional_context_removes_one_value_while_adding_another() -> Result<(
     .await;
 
     assert_eq!(
-        first_request.single_request().message_input_texts("user"),
+        user_texts_without_task_model_guidance(&first_request.single_request()),
         vec![
             external_context("automation_info", "run one"),
             external_context("browser_info", "tab one"),
@@ -448,7 +459,7 @@ async fn additional_context_removes_one_value_while_adding_another() -> Result<(
         ]
     );
     assert_eq!(
-        second_request.single_request().message_input_texts("user"),
+        user_texts_without_task_model_guidance(&second_request.single_request()),
         vec![
             external_context("automation_info", "run one"),
             external_context("browser_info", "tab one"),
@@ -458,7 +469,7 @@ async fn additional_context_removes_one_value_while_adding_another() -> Result<(
         ]
     );
     assert_eq!(
-        third_request.single_request().message_input_texts("user"),
+        user_texts_without_task_model_guidance(&third_request.single_request()),
         vec![
             external_context("automation_info", "run one"),
             external_context("browser_info", "tab one"),
@@ -550,7 +561,7 @@ async fn additional_context_values_are_truncated_before_model_input() -> Result<
         automation_text.len()
     );
 
-    let user_texts = request.message_input_texts("user");
+    let user_texts = user_texts_without_task_model_guidance(&request);
     let [external_text, user_text] = user_texts.as_slice() else {
         panic!("expected external context plus user input, got {user_texts:?}");
     };
@@ -594,4 +605,12 @@ fn application_context(source: &str, value: &str) -> String {
 
 fn application_context_prefix(source: &str) -> String {
     format!("<application_context source=\"{source}\" kind=\"application\">")
+}
+
+fn user_texts_without_task_model_guidance(request: &responses::ResponsesRequest) -> Vec<String> {
+    request
+        .message_input_texts("user")
+        .into_iter()
+        .filter(|text| !text.starts_with("<task_model_guidance>"))
+        .collect()
 }

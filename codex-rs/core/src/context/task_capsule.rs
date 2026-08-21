@@ -13,6 +13,22 @@ impl TaskCapsuleFragment {
     pub(crate) fn new(canonical_payload: String) -> Self {
         Self { canonical_payload }
     }
+
+    /// Returns the delegated objective carried by a rendered task capsule.
+    ///
+    /// Task capsules are submitted as structured user input. Consumers that
+    /// interpret user intent must inspect the objective rather than the JSON
+    /// envelope, whose quotes would otherwise make it look like quoted text.
+    pub(crate) fn objective_from_rendered(rendered: &str) -> Option<String> {
+        let payload = rendered
+            .strip_prefix(TASK_CAPSULE_OPEN_TAG)?
+            .strip_suffix(TASK_CAPSULE_CLOSE_TAG)?;
+        serde_json::from_str::<serde_json::Value>(payload)
+            .ok()?
+            .get("objective")?
+            .as_str()
+            .map(str::to_owned)
+    }
 }
 
 impl ContextualUserFragment for TaskCapsuleFragment {
@@ -44,6 +60,23 @@ mod tests {
         assert_eq!(
             TaskCapsuleFragment::new(payload.clone()).render(),
             format!("{TASK_CAPSULE_OPEN_TAG}{payload}{TASK_CAPSULE_CLOSE_TAG}")
+        );
+    }
+
+    #[test]
+    fn extracts_objective_from_rendered_capsule() {
+        let rendered = TaskCapsuleFragment::new(
+            r#"{"schema_version":1,"objective":"spawn the second worker"}"#.to_string(),
+        )
+        .render();
+
+        assert_eq!(
+            TaskCapsuleFragment::objective_from_rendered(&rendered).as_deref(),
+            Some("spawn the second worker")
+        );
+        assert_eq!(
+            TaskCapsuleFragment::objective_from_rendered("spawn the second worker"),
+            None
         );
     }
 }

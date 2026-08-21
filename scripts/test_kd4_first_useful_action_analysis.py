@@ -19,11 +19,31 @@ class FirstUsefulActionAnalysisTest(unittest.TestCase):
             path.write_text(
                 "\n".join(
                     [
-                        record("2026-08-17T00:00:00Z", "event_msg", {"type": "task_started"}),
-                        record("2026-08-17T00:00:04Z", "event_msg", {"type": "user_message"}),
-                        record("2026-08-17T00:00:05Z", "response_item", {"type": "function_call", "name": "update_plan"}),
-                        record("2026-08-17T00:00:07Z", "response_item", {"type": "function_call", "name": "exec_command"}),
-                        record("2026-08-17T00:00:09Z", "event_msg", {"type": "task_complete"}),
+                        record(
+                            "2026-08-17T00:00:00Z",
+                            "event_msg",
+                            {"type": "task_started"},
+                        ),
+                        record(
+                            "2026-08-17T00:00:04Z",
+                            "event_msg",
+                            {"type": "user_message"},
+                        ),
+                        record(
+                            "2026-08-17T00:00:05Z",
+                            "response_item",
+                            {"type": "function_call", "name": "update_plan"},
+                        ),
+                        record(
+                            "2026-08-17T00:00:07Z",
+                            "response_item",
+                            {"type": "function_call", "name": "exec_command"},
+                        ),
+                        record(
+                            "2026-08-17T00:00:09Z",
+                            "event_msg",
+                            {"type": "task_complete"},
+                        ),
                     ]
                 ),
                 encoding="utf-8",
@@ -47,7 +67,11 @@ class FirstUsefulActionAnalysisTest(unittest.TestCase):
             path.write_text(
                 "\n".join(
                     [
-                        record("2026-08-17T00:00:00Z", "event_msg", {"type": "task_started"}),
+                        record(
+                            "2026-08-17T00:00:00Z",
+                            "event_msg",
+                            {"type": "task_started"},
+                        ),
                         record(
                             "2026-08-17T00:00:01Z",
                             "event_msg",
@@ -74,10 +98,16 @@ class FirstUsefulActionAnalysisTest(unittest.TestCase):
 
         self.assertEqual(result["canonicalTurnCount"], 1)
         self.assertEqual(result["legacyReconstructedTurnCount"], 0)
-        self.assertEqual(result["canonical"]["userInputToUsefulAcceptedMs"]["p50"], 150.0)
+        self.assertEqual(
+            result["canonical"]["userInputToUsefulAcceptedMs"]["p50"], 150.0
+        )
         self.assertEqual(result["canonical"]["usefulParallelGateWaitMs"]["p50"], 30.0)
-        self.assertEqual(result["canonical"]["usefulAuthorizationAndDispatchMs"]["p50"], 40.0)
-        self.assertEqual(result["canonical"]["usefulExecutionToSuccessMs"]["p50"], 180.0)
+        self.assertEqual(
+            result["canonical"]["usefulAuthorizationAndDispatchMs"]["p50"], 40.0
+        )
+        self.assertEqual(
+            result["canonical"]["usefulExecutionToSuccessMs"]["p50"], 180.0
+        )
 
     def test_schema_19_field_is_not_treated_as_canonical(self) -> None:
         self.assertFalse(analysis.is_useful_tool("functions.wait_agent"))

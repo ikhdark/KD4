@@ -179,8 +179,17 @@ async fn responses_lite_prepares_images() -> Result<()> {
     let user_content = request
         .input()
         .into_iter()
-        .rev()
-        .find(|item| item.get("role").and_then(Value::as_str) == Some("user"))
+        .find(|item| {
+            item.get("role").and_then(Value::as_str) == Some("user")
+                && item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|content| {
+                        content.iter().any(|part| {
+                            part.get("type").and_then(Value::as_str) == Some("input_image")
+                        })
+                    })
+        })
         .and_then(|item| item.get("content").and_then(Value::as_array).cloned())
         .context("request should contain user content")?;
     assert_eq!(

@@ -39,6 +39,13 @@ async fn websocket_model_switch_to_responses_lite_omits_top_level_tools() -> Res
         .with_model("gpt-5.2");
     let test = builder.build_with_websocket_server(&server).await?;
 
+    let warmup = server
+        .wait_for_request(/*connection_index*/ 0, /*request_index*/ 0)
+        .await
+        .body_json();
+    assert_eq!(warmup["type"].as_str(), Some("response.create"));
+    assert_eq!(warmup["generate"].as_bool(), Some(false));
+
     test.submit_turn("non-lite turn").await?;
     test.codex
         .submit(Op::UserInput {
@@ -86,11 +93,14 @@ async fn websocket_model_switch_to_responses_lite_omits_top_level_tools() -> Res
     let additional_tools = lite_turn
         .get("input")
         .and_then(Value::as_array)
-        .and_then(|input| input.first())
-        .filter(|item| item.get("type").and_then(Value::as_str) == Some("additional_tools"))
+        .and_then(|input| {
+            input
+                .iter()
+                .find(|item| item.get("type").and_then(Value::as_str) == Some("additional_tools"))
+        })
         .and_then(|item| item.get("tools"))
         .and_then(Value::as_array)
-        .expect("lite turn should start with an additional_tools item");
+        .expect("lite turn should include an additional_tools item");
     assert!(!additional_tools.is_empty());
 
     server.shutdown().await;

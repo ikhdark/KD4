@@ -730,7 +730,7 @@ async fn intercepted_apply_patch_verification_uses_local_sandbox() -> Result<()>
     let out = harness.function_call_stdout(call_id).await;
     assert!(
         serde_json::from_str::<serde_json::Value>(&out).is_err(),
-        "expected heredoc apply_patch output to be plain text"
+        "expected heredoc apply_patch output to be plain text, got: {out}"
     );
     assert!(
         out.contains("apply_patch verification failed"),
@@ -1483,7 +1483,7 @@ async fn apply_patch_shell_accepts_lenient_heredoc_wrapped_patch() -> Result<()>
     let out = harness.function_call_stdout(call_id).await;
     assert!(
         serde_json::from_str::<serde_json::Value>(&out).is_err(),
-        "expected heredoc apply_patch output to be plain text"
+        "expected heredoc apply_patch output to be plain text, got: {out}"
     );
     assert!(
         out.contains("Success. Updated the following files:"),

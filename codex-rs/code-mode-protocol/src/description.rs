@@ -9,30 +9,30 @@ use crate::PUBLIC_TOOL_NAME;
 const MAX_JS_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
 const DEFERRED_NESTED_TOOLS_GUIDANCE: &str = r#"Some deferred nested tools may be omitted from this description. They are still available on the global `tools` object and listed in `ALL_TOOLS`.
 To find one, filter `ALL_TOOLS` by `name` and `description`."#;
-const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript to orchestrate tool calls in a fresh async V8 isolate.
-- Input is JavaScript source, not JSON, quotes, or a Markdown fence. Node, filesystem, network, and console APIs are unavailable.
-- Nested tools are normalized methods on `tools` (for example `await tools.exec_command(...)`); methods accept the documented string or object and return the documented object or string.
+const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript in a fresh V8 isolate. Input is JS, not JSON or Markdown. Node, filesystem, network, and console APIs are unavailable.
+- Nested tools are normalized `tools` methods (for example `await tools.exec_command(...)`) with documented I/O.
 - Only tools listed in `ALL_TOOLS` are callable inside `exec`; direct-only tools stay outside.
 - For a named symbol/config key, query its exact token and direct consumers before broader inventory; search repo/project names only if unresolved, never in the same batch.
 - Batch independent calls with `Promise.allSettled` or per-call catches so one failure preserves other results; keep dependent calls sequential.
+- Plan evidence before crossing the boundary, then synthesize once. Treat eight sampling passes per completed turn as a soft ceiling; exceed it only for decision-changing dependent evidence. Stop when evidence is sufficient or unchanged.
 - After deterministic failure, including a session poll, do not repeat the unchanged call; change route or relevant state.
-- Keep evidence bounded: read relevant config/session tables or line ranges, never whole files; after truncation use a retained-artifact selector. Use `yield_control()` only when the model must choose the next action.
-- Optional first line: `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 10000}`. `yield_time_ms` sets internal observation/progress cadence; empty observations do not cause a model-visible yield or new model generation. `max_output_tokens` defaults to 10000 and bounds output.
+- Keep evidence bounded: read relevant config/session tables or line ranges, never whole files; after truncation use a retained-artifact selector. Keep long commands in the same awaited evaluation; call `yield_control()` only for a new model decision.
+- Optional first line: `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 10000}`. `yield_time_ms` is compatibility-only; owner waits wake on output or terminal state, never unchanged cells. `max_output_tokens` defaults to 10000.
 - When evaluation ends, unawaited work is discarded.
 
 Global helpers:
 - `exit()` ends successfully.
 - `text(value: string | number | boolean | undefined | null)` appends text, JSON-stringifying non-strings when possible.
-- `image(imageUrlOrItem: string | { image_url: string; detail?: "auto" | "low" | "high" | "original" | null } | { type: "image"; data: string; mimeType: string; _meta?: Record<string, unknown> }, detail?: "auto" | "low" | "high" | "original" | null)` appends a base64 `data:` image or one MCP image block; explicit detail overrides metadata.
+- `image(imageUrlOrItem: string | { image_url: string; detail?: "auto" | "low" | "high" | "original" | null } | { type: "image"; data: string; mimeType: string; _meta?: Record<string, unknown> }, detail?: "auto" | "low" | "high" | "original" | null)` appends a base64 image or MCP image; explicit detail wins.
 - `audio(audioUrlOrItem: string | { audio_url: string } | { type: "audio"; data: string; mimeType: string })` appends a base64 `data:` audio URL or one MCP audio block.
-- `generatedImage(result: { image_url: string; output_hint?: string })` appends generated-image output; HTTP(S) URLs are unsupported.
-- `store(key: string, value: any)` and `load(key: string)` persist serializable values within the exec session.
-- `notify(value: string | number | boolean | undefined | null)` emits an immediate extra tool output.
-- `setTimeout(callback: () => void, delayMs?: number)` schedules work; pending timers do not keep exec alive, so await them. `clearTimeout(timeoutId?: number)` cancels one.
-- `ALL_TOOLS` lists `{ name, description }`; `yield_control()` emits accumulated output while execution continues."#;
+- `generatedImage(result: { image_url: string; output_hint?: string })` appends generated output; HTTP(S) is unsupported.
+- `store(key: string, value: any)` and `load(key: string)` persist serializable session values.
+- `notify(value: string | number | boolean | undefined | null)` emits an extra tool output.
+- `setTimeout(callback: () => void, delayMs?: number)` schedules work; await timers to keep exec alive. `clearTimeout(timeoutId?: number)` cancels one.
+- `ALL_TOOLS` lists `{ name, description }`; `yield_control()` emits output while execution continues."#;
 const WAIT_DESCRIPTION_TEMPLATE: &str = r#"- Use `wait` only after `exec` returns `Script running with cell ID ...`.
 - `cell_id` identifies the running `exec` cell to resume.
-- `yield_time_ms` controls the internal observation/progress cadence for an unchanged cell. Empty observations remain host-internal and do not cause a model-visible yield or a new model generation. Defaults to 10000 ms.
+- `yield_time_ms` is retained for compatibility. Owner-held observations wake directly on output or terminal state; unchanged cells remain host-internal and do not cause a model-visible yield or a new model generation.
 - `max_tokens` limits how much new output this wait call returns. Model projections default to a coherent packet of up to 10000 tokens; a lower requested value is honored and every result remains bounded by the model hard limit.
 - `terminate: true` stops the running cell; false or omitted waits for output.
 - `wait` returns only meaningful new output or state changes since the last model-visible result, or the final completion or termination result for that cell.
@@ -932,6 +932,8 @@ bar"
         assert!(description.contains("never in the same batch"));
         assert!(description.contains("Batch independent calls"));
         assert!(description.contains("Promise.allSettled"));
+        assert!(description.contains("eight sampling passes per completed turn"));
+        assert!(description.contains("same awaited evaluation"));
         assert!(description.contains("read relevant config/session tables or line ranges"));
         assert!(description.contains("never whole files"));
         assert!(description.contains("after truncation use a retained-artifact selector"));
@@ -1255,11 +1257,11 @@ bar"
         let exec = build_exec_tool_description(&[], &[], &BTreeMap::new(), false);
         let wait = build_wait_tool_description();
 
-        for description in [&exec, wait] {
-            assert!(description.contains("`yield_time_ms`"));
-            assert!(description.contains("internal observation/progress cadence"));
-            assert!(description.contains("do not cause a model-visible yield"));
-            assert!(description.contains("new model generation"));
-        }
+        assert!(exec.contains("`yield_time_ms` is compatibility-only"));
+        assert!(exec.contains("wake on output or terminal state"));
+        assert!(exec.contains("never unchanged cells"));
+        assert!(wait.contains("`yield_time_ms` is retained for compatibility"));
+        assert!(wait.contains("wake directly on output or terminal state"));
+        assert!(wait.contains("unchanged cells remain host-internal"));
     }
 }

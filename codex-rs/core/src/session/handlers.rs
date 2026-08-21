@@ -93,14 +93,36 @@ pub async fn update_thread_settings(
     sub_id: String,
     thread_settings: ThreadSettingsOverrides,
 ) {
+    // A standalone model update must create resumable state: app-server clients
+    // can acknowledge it and immediately cold-resume the thread. Other runtime
+    // updates intentionally remain live-only until the first user turn.
+    let materialize_rollout = thread_settings.model.is_some();
     let updates = thread_settings_update(sess, thread_settings).await;
     match sess.update_settings(updates).await {
         Ok(()) => {
-            sess.send_event_raw_without_materializing_rollout(Event {
+            let event = Event {
                 id: sub_id,
                 msg: sess.thread_settings_applied_event().await,
-            })
-            .await;
+            };
+            if materialize_rollout {
+                let rollout_items = [RolloutItem::EventMsg(event.msg.clone())];
+                if let Err(err) = sess.persist_rollout_items_durable(&rollout_items).await {
+                    sess.send_event_raw_without_materializing_rollout(Event {
+                        id: event.id,
+                        msg: EventMsg::Error(ErrorEvent {
+                            message: format!("failed to persist thread settings override: {err}"),
+                            codex_error_info: Some(CodexErrorInfo::InternalServerError),
+                        }),
+                    })
+                    .await;
+                    return;
+                }
+                sess.send_event_raw_with_persistence(event, /*persist*/ false)
+                    .await;
+            } else {
+                sess.send_event_raw_without_materializing_rollout(event)
+                    .await;
+            }
         }
         Err(err) => {
             sess.send_event_raw(Event {

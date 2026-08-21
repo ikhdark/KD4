@@ -1,104 +1,128 @@
-## Project context
+# KD4 repository instructions
+
+## Repository identity and runtime boundary
 
 - This is the user's local fork of [`openai/codex`](https://github.com/openai/codex).
-  Treat work as fork-local unless upstream or distribution work is requested.
-- The published fork Desktop uses `CODEX_HOME=C:\Users\kuh\Desktop\LOCAL-KD`;
-  never substitute the profile `.codex` directory.
+  Operate only on fork-local source and artifacts. Upstream synchronization or
+  distribution requires a request that explicitly names it.
+- Treat the active repository root as the checkout location; do not hard-code a
+  workstation-specific checkout path.
+- `C:\Users\kuh\Desktop\LOCAL-KD` is the fork home and
+  `C:\Users\kuh\.codex` is the official upstream home. The published fork
+  Desktop must use `CODEX_HOME=C:\Users\kuh\Desktop\LOCAL-KD`.
+- This repository contains the Rust CLI and app-server, not the native Windows
+  shell. Source changes become Desktop-visible only after rebuilding and
+  replacing or updating the local binary, then restarting Desktop. Perform
+  those activation steps only when the request includes them.
+
+## Routing and task scope
+
+- Read every applicable `AGENTS.md` from the repository root through each path
+  touched. Read every user-provided or user-named file in full.
 - [`SOURCEMAP.md`](SOURCEMAP.md) owns repository inventory, runtime entrypoints,
-  package and Rust-domain routing, the complete `codex-rs` edit and upstream-sync
+  package and Rust-domain routing, `codex-rs` edit and upstream-sync
   classification, generated contracts, validation routes, and cross-cutting
-  change routes. Consult it before changing or upstream-syncing Rust workspace
-  paths.
-- After adding, deleting, moving, or renaming any repository file or directory,
-  run `just source-map-check`. The command automatically rewrites the managed
-  tracked-path snapshot in `SOURCEMAP.md`; this is required even when the
-  ownership narrative and material inventories remain accurate.
-- Read the nearest scoped `AGENTS.md`. `.codex/AGENTS.md` covers workspace
-  routing; `.codex/config.toml` and `.codex/skills` own local config and skills.
+  change routes.
+- Before editing, identify the source-map owner, direct callers and consumers,
+  duplicate or generated representations, compatibility boundary, and named
+  validation route. Record a source path or a scoped search with no match for
+  each category.
+- `.codex/AGENTS.md` covers workspace routing; `scripts/AGENTS.md` covers
+  maintenance scripts; `.codex/config.toml` and `.codex/skills` own local
+  configuration, fork-local skills, and validation workflows.
+- Modify the requested behavior and the contract relationships identified
+  above. Do not add unrelated cleanup, refactoring, dependency changes,
+  publication, or activation.
+- After adding, deleting, moving, or renaming a repository file or directory,
+  run `just source-map-check`. Run it even when ownership prose is unchanged;
+  the command also rewrites the tracked-path snapshot.
+- Ask only when repository or tool output proves incompatible user-visible
+  outcomes, a required compatibility break, an unrequested destructive or
+  external action, or conflicting validation criteria. State the conflict and
+  consequences. Otherwise preserve existing behavior.
+- A bug finding must identify the violated contract or invariant, responsible
+  producer, reachable consumer or user-visible effect, and exact source
+  locations. For a requested finding count, stop when that many distinct
+  findings meet all four requirements. For an exhaustive check, resolve every
+  candidate in the mapped owner paths.
 
-## Desktop app boundary
+## Shared workspace and authorization
 
-- This repository has the Rust CLI and app-server, not the native Windows shell.
-  Source changes require rebuilding/replacing the local binary and restarting
-  Desktop before they are user-visible.
+- Preserve concurrent work and every unrelated hunk. Compare overlapping
+  versions once. Keep the version that satisfies every affected contract and
+  direct test; merge non-conflicting required behavior. Ask under the conflict
+  rule above only when the versions require incompatible user-visible behavior.
+- Publish, deploy, or modify upstream state only when the request explicitly
+  includes that action.
 
-## Delegated and durable workflows
+## Delegated workflows
 
-Load [`.codex/harness/workflow.md`](.codex/harness/workflow.md) only for
-delegation, durable artifacts, or the architect lane. Give child agents only
-their selected role and compact shared rules; fall back to default agents on
-agent issues.
+- Load [`.codex/harness/workflow.md`](.codex/harness/workflow.md) only when the
+  request names delegation, a durable artifact, or the architect lane. Give
+  each child only the role and rules assigned by that workflow. If a child fails
+  to start, returns a tool error, or omits its assigned output, continue in the
+  primary agent.
 
-## Operating defaults
+## Implementation and validation
 
-- Do not publish unless explicitly asked; stay within scope and do not broaden a
-  directed fix.
-- For bug checks, report only real defects, continue until none remain, and do
-  not change functional code merely because another design seems better.
-- Preserve concurrent work. Compare overlapping versions once and keep or merge
-  the best compatible behavior.
-- Ask when intent materially changes the solution; otherwise avoid
-  over-engineering.
-- Read any user-provided or user-named file in full.
+- For a code edit, add or update the direct test in the same change. The test
+  must fail without the implementation change and pass with it.
+- For a Rust edit, run the repository-named package or test filter that executes
+  the changed contract. Validation passes only when at least one direct test is
+  selected and the command exits successfully. Run workspace analyzers only
+  when repository instructions or the user require them. If no direct route is
+  named, report the missing route before editing.
+- For a script edit, follow `scripts/AGENTS.md`. Run its named test; if none is
+  named, run the sibling unit test. If none exists, run the interpreter syntax
+  check and configured formatter or linter.
+- Produce schemas, snapshots, locks, vendored content, and other generated
+  artifacts through their owner commands; do not hand-edit generated files.
+- A formatter, linter, build, or applied patch is not runtime proof. Runtime
+  proof requires the direct contract test or a user-approved end-to-end gate
+  that executes the changed path.
 - Do not run broad tests.
 
+## Sessions and rollout audits
 
-## Validation failure handling
-
-- Run each scoped validation once initially. Retry transient infrastructure at
-  most twice in the warmed Cargo lane; do not create a cold lane just to retry.
-- Stop on unrelated/pre-existing compilation failures. Do not repair them
-  without expanded scope; report passed local checks, the blocker, and checks
-  that could not run.
-- Do not rerun while concurrent edits continue. After the same blocker twice, finish.
-- Preserve narrower passing results despite broad failures.
-
-# Sessions
-
-- Use `C:\Users\kuh\Desktop\LOCAL-KD\sessions` for fork rollouts, never
-  `C:\Users\kuh\.codex\sessions`.
+- Use `C:\Users\kuh\Desktop\LOCAL-KD\sessions` for fork rollouts and
+  `C:\Users\kuh\.codex\sessions` for official upstream rollouts.
 - For a live rollout, use `python scripts/rollout_snapshot.py <path> [--output
   <snapshot>]`. It opens the exact `.jsonl` path with shared access, reads the
   fixed length observed at open, and reports its SHA-256 identity.
 - For a session or turn latency audit, run
   `python scripts/kd4_turn_latency_audit.py <session-uuid-or-path>
   --sessions-root C:\Users\kuh\Desktop\LOCAL-KD\sessions --repo-root <repo>` as
-  the single lookup and analysis pass. The analyzer resolves an exact UUID and
-  performs the required fixed-length snapshot internally; do not precede or
-  follow it with file searches or ad hoc JSONL parsers.
-- Treat `audit decision: finalize` / `auditDecision.readyToFinalize=true` as the
-  audit stop condition. Answer from that report unless contradictory evidence
-  is already present; continue inspection only for the report's blocker codes.
+  the only lookup and analysis pass. It resolves the exact UUID and performs the
+  fixed-length snapshot internally; do not add file searches or ad hoc JSONL
+  parsers before or after it.
+- `audit decision: finalize` or `auditDecision.readyToFinalize=true` ends the
+  audit. Answer from that report; continue only for blocker codes it lists.
 
-## Validation
+## Benchmarking
 
-- Keep validation task-scoped; do not run full-suite/workspace tests unless asked.
-
-
-# Benchmarking
-
-- Do not label unit-test duration, test-binary startup time, analytical action-count projections, or source-level estimates as runtime benchmarks.
-- "C:\Users\kuh\Desktop\LOCAL-KD\backups" contains previous fork binaries that can be used for A/B comparisons of the previous version to the current version.
-- Optimize quality first, then latency and tokens. Define correctness, safety,
-  fidelity, compatibility, and user-visible requirements; compare performance
-  only among candidates passing the same quality contract.
-- For an explicit optimization or a change to a known hot path, identify the
-  repository's real workload, quality checks, latency metric and threshold, and
-  token metric or budget before editing.
-  Prefer an existing dedicated subprocess or end-to-end benchmark. If none
-  exists, define a reproducible workload and compare equivalent current and
-  candidate release builds; do not substitute a unit test or build duration.
-- Prove quality before measuring. Treat latency/token misses as validation
-  failures: inspect bounded owner work, fix it, re-prove quality, then rerun the
-  same workload. Compare against the baseline/best correct candidate and reject
-  regressions or threshold misses.
-- Do not make a failing implementation pass by weakening an established
-  workload, sample count, percentile, or threshold unless the user explicitly
-  changes the performance contract. A benchmark rerun after a relevant code
-  change is a new proof, not an unchanged-command retry under the validation
-  failure rules above.
-- Finish a performance-sensitive task only when the quality gate, latency
-  contract, and token contract all pass, or report `partial` or `blocked` with
-  the measured failure and remaining owner-level bottleneck. Report the actual
-  workload, build identity, sample count, statistic, latency threshold, and
-  token budget; do not generalize beyond the exercised path.
+- Before editing an explicit optimization or documented hot path, record the
+  exact workload command, quality-gate command, latency statistic and threshold,
+  and token metric and budget. If the request and repository provide no value
+  for any field, ask for it and do not edit.
+- Use the repository-named subprocess or end-to-end benchmark. If none is
+  named, request the workload command, inputs, build profile, environment,
+  sample count, and statistic. Hold them constant for baseline and candidate
+  release builds.
+- Unit-test duration, test-binary startup, build duration, analytical action
+  counts, and source estimates are not runtime benchmarks.
+- For an A/B comparison with a previous fork version, use binaries in
+  `C:\Users\kuh\Desktop\LOCAL-KD\backups` as the baseline.
+- Run the quality gate before each comparison. Do not benchmark a failing
+  candidate. Reject a candidate that exceeds a recorded threshold or regresses
+  against the passing baseline.
+- Do not weaken an established workload, sample count, percentile, latency
+  threshold, or token budget unless the user explicitly changes the contract.
+- After changing the workload implementation, inputs, build, or measured path,
+  rerun the quality gate and then the unchanged workload. This is a new proof,
+  not an unchanged-command retry.
+- Finish only when the quality gate passes and measured latency and token use
+  stay within their recorded limits. If code changed and a limit still fails,
+  report `partial`. Report `blocked` only when a required input, permission, or
+  external failure prevents another authorized change. Report the workload,
+  build identity, sample count, statistic and measured value, latency threshold,
+  token measurement, and token budget. Limit claims to that workload.

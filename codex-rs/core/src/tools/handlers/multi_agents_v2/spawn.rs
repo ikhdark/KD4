@@ -210,11 +210,19 @@ async fn handle_spawn_agent(
     };
     apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref(), runtime_role_locks)?;
 
+    // Every V2 spawn becomes a durable typed assignment. Legacy message-shaped
+    // calls have no explicit agent_type, but their durable role is Worker, so
+    // carry that canonical role through admission instead of constructing a
+    // role-less ThreadSpawn source that typed admission must reject.
+    // The spawn source stores the durable assignment role, not the optional
+    // configuration-profile name. Custom agent profiles can select model and
+    // instruction locks, but durable admission accepts canonical typed roles.
+    let durable_role_name = agent_role_metric_label(typed_role);
     let spawn_source = thread_spawn_source(
         session.thread_id,
         &turn.session_source,
         child_depth,
-        role_name,
+        Some(durable_role_name),
         Some(args.task_name.clone()),
     )?;
     let new_agent_path = spawn_source.get_agent_path().ok_or_else(|| {

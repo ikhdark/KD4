@@ -408,7 +408,7 @@ fn resolve_mcp_oauth_credentials_store_mode(
 #[cfg(test)]
 pub(crate) async fn test_config() -> Config {
     let codex_home = tempfile::tempdir().expect("create temp dir");
-    Config::load_from_base_config_with_overrides(
+    let mut config = Config::load_from_base_config_with_overrides(
         ConfigToml {
             model: Some("gpt-5.5".to_string()),
             ..Default::default()
@@ -417,7 +417,12 @@ pub(crate) async fn test_config() -> Config {
         AbsolutePathBuf::from_absolute_path(codex_home.path()).expect("temp dir should resolve"),
     )
     .await
-    .expect("load default test config")
+    .expect("load default test config");
+    // Most core unit tests exercise the legacy collaboration baseline. Keep
+    // that baseline explicit now that multi-agent V2 is enabled by default;
+    // V2-specific tests opt in at their setup boundary.
+    let _ = config.features.disable(Feature::MultiAgentV2);
+    config
 }
 
 /// Application configuration loaded from disk and merged with overrides.

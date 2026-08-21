@@ -205,6 +205,34 @@ async fn read_output_limits_retained_bytes_for_shell_capture() {
 }
 
 #[tokio::test]
+async fn read_output_notifies_the_command_progress_watchdog() {
+    let progress = CommandProgress::new();
+    let observer = progress.subscribe();
+    let (tx_event, _rx_event) = async_channel::unbounded();
+
+    read_output(
+        ChunkedReader::new([b"progress".to_vec()]),
+        Some(StdoutStream {
+            sub_id: "sub".to_string(),
+            call_id: "call".to_string(),
+            tx_event,
+            progress: Some(progress.clone()),
+        }),
+        /*is_stderr*/ false,
+        /*max_bytes*/ None,
+        Arc::new(OutputDeltaLimiter::default()),
+    )
+    .await
+    .expect("read output");
+
+    assert!(
+        observer
+            .has_changed()
+            .expect("progress channel remains open")
+    );
+}
+
+#[tokio::test]
 async fn read_output_preserves_utf8_codepoints_split_across_reads() {
     let expected = "A€𐍈Z";
     let reader = ChunkedReader::new([
@@ -222,6 +250,7 @@ async fn read_output_preserves_utf8_codepoints_split_across_reads() {
             sub_id: "sub".to_string(),
             call_id: "call".to_string(),
             tx_event,
+            progress: None,
         }),
         /*is_stderr*/ false,
         /*max_bytes*/ None,
@@ -261,6 +290,7 @@ async fn read_output_makes_progress_when_pending_exceeds_read_chunk_size() {
             sub_id: "sub".to_string(),
             call_id: "call".to_string(),
             tx_event,
+            progress: None,
         }),
         /*is_stderr*/ false,
         /*max_bytes*/ None,
@@ -290,6 +320,7 @@ async fn read_output_flushes_terminal_incomplete_utf8_once() {
             sub_id: "sub".to_string(),
             call_id: "call".to_string(),
             tx_event,
+            progress: None,
         }),
         /*is_stderr*/ false,
         /*max_bytes*/ None,

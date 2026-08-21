@@ -284,7 +284,7 @@ VALUES (?, ?, TRUE, ?, 0)
         .expect("compatible index creation should be idempotent");
 
     assert_eq!(migration_ledger(&pool).await, original_ledger);
-    assert_eq!(latest_known_version, 42);
+    assert_eq!(latest_known_version, 43);
     assert_eq!(
         STATE_MIGRATOR
             .migrations
@@ -300,6 +300,14 @@ VALUES (?, ?, TRUE, ?, 0)
             .find(|migration| migration.version == 42)
             .map(|migration| migration.description.as_ref()),
         Some("thread and agent job indexes")
+    );
+    assert_eq!(
+        STATE_MIGRATOR
+            .migrations
+            .iter()
+            .find(|migration| migration.version == 43)
+            .map(|migration| migration.description.as_ref()),
+        Some("threads visible sort tiebreaker indexes")
     );
     let index_exists = sqlx::query_scalar::<_, i64>(
         "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_threads_cwd_norm'",

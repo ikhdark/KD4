@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
 use crate::apply_skill_injection_observability;
@@ -24,6 +25,7 @@ use crate::context::PermissionsInstructions;
 use crate::context::PromptContextCategory;
 use crate::context::RecommendedPluginsInstructions;
 use crate::context::TaskModelGuidance;
+use crate::context::is_startup_contextual_user_fragment;
 use crate::context_manager::ContextManager;
 use crate::context_manager::PreparedPromptInput;
 use crate::feedback_tags;
@@ -94,6 +96,7 @@ use crate::tool_history::ModelGenerationId;
 use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::exposure::AgentSurfaceStage;
+use crate::tools::exposure::EnvironmentSurfaceMode;
 use crate::tools::exposure::GoalSurfaceState;
 use crate::tools::exposure::ToolExposureIdentity;
 use crate::tools::parallel::ToolCallRuntime;
@@ -258,6 +261,7 @@ pub(crate) async fn run_turn(
     let mut completion_review_state =
         crate::tasks::completion_review::CompletionReviewState::default();
     let mut mutating_finalizer_ran = false;
+    let mut mutating_finalizer_candidate_diff = None;
     let mut preparation_timing_guard = Some(
         turn_context
             .turn_timing_state
@@ -586,10 +590,6 @@ pub(crate) async fn run_turn(
                         server_end_turn_false && !tool_result_continuation && !has_pending_input,
                     )
                 });
-                if terminal_completion_required {
-                    next_generation_request = next_generation_request
-                        .map(GenerationRequestDisposition::require_terminal_completion);
-                }
                 if next_generation_request
                     .as_ref()
                     .is_some_and(|request| request.sampling.is_residual_deterministic())
@@ -597,6 +597,10 @@ pub(crate) async fn run_turn(
                     turn_context
                         .turn_timing_state
                         .record_residual_deterministic_generation();
+                }
+                if terminal_completion_required {
+                    next_generation_request = next_generation_request
+                        .map(GenerationRequestDisposition::require_terminal_completion);
                 }
                 if next_generation_request
                     .as_ref()
@@ -781,6 +785,15 @@ pub(crate) async fn run_turn(
                             .await;
                         } else if after_agent_outcome.workspace_changed {
                             reasoning_governor.host_mutation();
+                            turn_diff_tracker.lock().await.record_unknown_mutation();
+                            mutating_finalizer_candidate_diff =
+                                crate::git_workspace::capture_candidate_diff(
+                                    turn_context.config.cwd.as_path(),
+                                )
+                                .await
+                                .map(|capture| {
+                                    String::from_utf8_lossy(&capture.raw_diff).into_owned()
+                                });
                         }
                         if after_agent_outcome.aborted {
                             record_completion_review_partial_reason(
@@ -797,7 +810,9 @@ pub(crate) async fn run_turn(
                     let completion_review_turn_evidence = {
                         let tracker = turn_diff_tracker.lock().await;
                         CompletionReviewTurnEvidence {
-                            exact_diff: tracker.get_unified_diff(),
+                            exact_diff: mutating_finalizer_candidate_diff
+                                .clone()
+                                .or_else(|| tracker.get_unified_diff()),
                             mutation_revision: tracker.current_mutation_revision(),
                             validation_freshness: tracker.validation_freshness_status(),
                             last_successful_validation_revision: tracker
@@ -815,7 +830,7 @@ pub(crate) async fn run_turn(
                         ),
                     )
                     .await?;
-                    let review_report =
+                    let mut review_report =
                         report_completion_review_outcome(&sess, &turn_context, review_outcome)
                             .await;
                     if review_report.repair_injected {
@@ -931,6 +946,16 @@ pub(crate) async fn run_turn(
                                 }
                             }
                             if stop_outcome.should_stop {
+                                if let Some(message) =
+                                    sess.services.task_evidence.finalization_advisory().await
+                                    && review_report.advisory.as_deref() != Some(message.as_str())
+                                {
+                                    sess.send_event(
+                                        &turn_context,
+                                        EventMsg::Warning(WarningEvent { message }),
+                                    )
+                                    .await;
+                                }
                                 emit_hook_stop_reason(
                                     &sess,
                                     &turn_context,
@@ -977,14 +1002,21 @@ pub(crate) async fn run_turn(
                                     Some(ContinuationCause::CompletionReviewRepair);
                                 continue 'sampling_loop;
                             }
+                            review_report = refreshed_review_report;
                             trace!(
-                                provisional_clean = refreshed_review_report.provisional_clean,
+                                provisional_clean = review_report.provisional_clean,
                                 "refreshed completion review outcome recorded"
                             );
                         }
                     }
                     if after_agent_outcome.aborted {
                         return Ok(TurnTaskResult::default());
+                    }
+                    if let Some(message) = sess.services.task_evidence.finalization_advisory().await
+                        && review_report.advisory.as_deref() != Some(message.as_str())
+                    {
+                        sess.send_event(&turn_context, EventMsg::Warning(WarningEvent { message }))
+                            .await;
                     }
                     break;
                 }
@@ -1116,10 +1148,13 @@ async fn report_completion_review_outcome(
     turn_context: &TurnContext,
     outcome: crate::tasks::completion_review::CompletionReviewCoordinatorOutcome,
 ) -> CompletionReviewReport {
-    if let Some(warning) = outcome.advisory {
+    let advisory = outcome.advisory;
+    if let Some(warning) = advisory.as_ref() {
         sess.send_event(
             turn_context,
-            EventMsg::Warning(WarningEvent { message: warning }),
+            EventMsg::Warning(WarningEvent {
+                message: warning.clone(),
+            }),
         )
         .await;
     }
@@ -1129,12 +1164,14 @@ async fn report_completion_review_outcome(
     CompletionReviewReport {
         provisional_clean: outcome.provisional_clean,
         repair_injected: outcome.repair_injected,
+        advisory,
     }
 }
 
 struct CompletionReviewReport {
     provisional_clean: bool,
     repair_injected: bool,
+    advisory: Option<String>,
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -1920,6 +1957,7 @@ fn semantic_effect_id(kind: &str, values: &[String]) -> String {
 struct PendingTokenEstimate {
     total_tokens: i64,
     body_growth_tokens: i64,
+    resolves_active_reasoning: bool,
 }
 
 fn estimate_pending_tokens(
@@ -1944,6 +1982,24 @@ fn estimate_pending_tokens(
     let injection_bytes = serde_json::to_vec(injection_items)
         .map(|value| value.len())
         .unwrap_or_default();
+    let body_injection_bytes = injection_items.iter().fold(0usize, |bytes, item| {
+        let is_stable_startup_item = matches!(
+            item,
+            ResponseItem::Message { role, content, .. }
+                if role == "user"
+                    && !content.is_empty()
+                    && content.iter().all(is_startup_contextual_user_fragment)
+        );
+        if is_stable_startup_item {
+            bytes
+        } else {
+            bytes.saturating_add(
+                serde_json::to_vec(item)
+                    .map(|value| value.len())
+                    .unwrap_or_default(),
+            )
+        }
+    });
     let context_update_bytes = serde_json::to_vec(context_update_items)
         .map(|value| value.len())
         .unwrap_or_default();
@@ -1960,11 +2016,15 @@ fn estimate_pending_tokens(
         context_update_bytes
     };
     let body_growth_bytes = input_bytes
-        .saturating_add(injection_bytes)
+        .saturating_add(body_injection_bytes)
         .saturating_add(context_growth_bytes);
     PendingTokenEstimate {
         total_tokens: i64::try_from(total_bytes.div_ceil(4)).unwrap_or(i64::MAX),
         body_growth_tokens: i64::try_from(body_growth_bytes.div_ceil(4)).unwrap_or(i64::MAX),
+        resolves_active_reasoning: input.iter().any(|item| match item {
+            TurnInput::UserInput { .. } | TurnInput::InterAgentCommunication(_) => true,
+            TurnInput::ResponseItem(item) => crate::context_manager::is_user_turn_boundary(item),
+        }),
     }
 }
 
@@ -1980,10 +2040,13 @@ async fn projected_prompt_pressure(
     pending_token_estimate: PendingTokenEstimate,
 ) -> ProjectedPromptPressure {
     let active_context_tokens = sess.get_total_token_usage().await;
-    let committed_history_tokens = sess
-        .get_estimated_token_count(turn_context)
-        .await
-        .unwrap_or(active_context_tokens);
+    let committed_history_tokens = if pending_token_estimate.resolves_active_reasoning {
+        sess.get_estimated_token_count_after_pending_user_boundary(turn_context)
+            .await
+    } else {
+        sess.get_estimated_token_count(turn_context).await
+    }
+    .unwrap_or(active_context_tokens);
     let total_tokens = projected_prompt_tokens_from_estimates(
         active_context_tokens,
         committed_history_tokens,
@@ -3203,6 +3266,9 @@ async fn derive_tool_exposure_identity(
     let request_user_input_eligible = turn_context.config.experimental_request_user_input_enabled
         && !turn_context.session_source.is_non_root_agent()
         && available_rui_modes.contains(&turn_context.collaboration_mode.mode);
+    let environment_mode =
+        EnvironmentSurfaceMode::from_count(step_context.environments.turn_environments.len());
+    let environment_starting = !step_context.environments.starting.is_empty();
 
     ToolExposureIdentity {
         selected_skill_direct_mcp_entrypoints,
@@ -3212,6 +3278,8 @@ async fn derive_tool_exposure_identity(
         mcp_resources_available,
         tool_search_available,
         request_user_input_eligible,
+        environment_mode,
+        environment_starting,
     }
 }
 
@@ -4096,9 +4164,12 @@ async fn try_run_sampling_request(
     }
     let boundary_session = Arc::clone(&sess);
     let boundary_turn_id = turn_context.sub_id.clone();
+    let bound_context_attempts = Arc::new(Mutex::new(HashSet::new()));
+    let boundary_bound_context_attempts = Arc::clone(&bound_context_attempts);
     let attempt_prepared: AttemptPreparedCallback = Arc::new(move |identity| {
         let sess = Arc::clone(&boundary_session);
         let turn_id = boundary_turn_id.clone();
+        let bound_context_attempts = Arc::clone(&boundary_bound_context_attempts);
         Box::pin(async move {
             let terminal = sess
                 .active_turn
@@ -4136,11 +4207,21 @@ async fn try_run_sampling_request(
                     "failed to persist sampling boundary before provider dispatch: {err}"
                 ))
             })?;
-            sess.bind_context_baseline_candidate(
-                &identity.sampling_request_id,
-                &identity.physical_attempt_id,
-            )
-            .await;
+            if sess
+                .bind_context_baseline_candidate(
+                    &identity.sampling_request_id,
+                    &identity.physical_attempt_id,
+                )
+                .await
+            {
+                bound_context_attempts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert((
+                        identity.sampling_request_id.clone(),
+                        identity.physical_attempt_id.clone(),
+                    ));
+            }
             Ok(sampling_admission)
         })
     });
@@ -4174,6 +4255,7 @@ async fn try_run_sampling_request(
         String,
         Box<dyn ToolArgumentDiffConsumer>,
     )> = None;
+    let mut context_baseline_committed = false;
     let mut should_emit_turn_diff = false;
     let mut should_emit_token_count = false;
     let mut latest_models_etag = None;
@@ -4253,16 +4335,40 @@ async fn try_run_sampling_request(
             .record_responses(&handle_responses, &event);
         record_turn_ttft_metric(&turn_context, &event).await;
 
-        match event {
-            ResponseEvent::Created => {
-                if let Some(identity) = attempt_identity.as_ref()
-                    && let Err(err) = sess
-                        .commit_context_baseline_candidate(
-                            &identity.sampling_request_id,
-                            &identity.physical_attempt_id,
-                        )
-                        .await
-                {
+        if !context_baseline_committed && let Some(identity) = attempt_identity.as_ref() {
+            let context_baseline_was_bound = bound_context_attempts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&(
+                    identity.sampling_request_id.clone(),
+                    identity.physical_attempt_id.clone(),
+                ));
+            match sess
+                .commit_context_baseline_candidate(
+                    &identity.sampling_request_id,
+                    &identity.physical_attempt_id,
+                )
+                .await
+            {
+                Ok(true) => context_baseline_committed = true,
+                Ok(false) if !context_baseline_was_bound => {
+                    // Unchanged world state does not stage a context candidate.
+                    // Accept the provider response while preserving fail-closed
+                    // behavior for an attempt that did bind a candidate and
+                    // subsequently failed to commit it.
+                    context_baseline_committed = true;
+                }
+                Ok(false) => {
+                    sess.mark_context_baseline_unknown().await;
+                    client_session.invalidate_provider_history_inheritance(
+                        "prepared context did not match the provider-accepted attempt",
+                    );
+                    break Err(CodexErr::Fatal(
+                        "provider accepted a sampling attempt without a matching prepared context"
+                            .to_string(),
+                    ));
+                }
+                Err(err) => {
                     sess.mark_context_baseline_unknown().await;
                     client_session.invalidate_provider_history_inheritance(
                         "authoritative context persistence failed after provider acceptance",
@@ -4272,6 +4378,10 @@ async fn try_run_sampling_request(
                     )));
                 }
             }
+        }
+
+        match event {
+            ResponseEvent::Created => {}
             ResponseEvent::OutputItemDone(mut item) => {
                 if turn_context.item_ids_enabled() {
                     assign_missing_streamed_response_item_id(&mut item, active_item.as_ref());

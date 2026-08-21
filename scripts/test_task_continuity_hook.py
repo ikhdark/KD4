@@ -79,14 +79,17 @@ def recovery_context(capsule: dict[str, Any]) -> str | None:
             "last_assistant_result",
             "predecessor_thread_id",
         )
-    ) and not any(task_state.get(name) for name in (
-        "goal",
-        "current_state",
-        "completed_work",
-        "unresolved_work",
-        "evidence",
-        "next_action",
-    )):
+    ) and not any(
+        task_state.get(name)
+        for name in (
+            "goal",
+            "current_state",
+            "completed_work",
+            "unresolved_work",
+            "evidence",
+            "next_action",
+        )
+    ):
         return None
 
     def bounded(value: Any, maximum: int) -> Any:
@@ -141,14 +144,18 @@ def exact_injection(capsule: dict[str, Any]) -> str:
     # Windows PowerShell's ConvertTo-Json escapes the marker delimiters in the
     # outer wire object. Keep the byte-for-byte assertion so fast and slow hook
     # entrypoints must continue to canonicalize identically.
-    return compact_json(
-        {
-            "hookSpecificOutput": {
-                "hookEventName": "SessionStart",
-                "additionalContext": context,
+    return (
+        compact_json(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": context,
+                }
             }
-        }
-    ).replace("<", "\\u003c").replace(">", "\\u003e")
+        )
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+    )
 
 
 def invoke_helper(

@@ -705,9 +705,14 @@ async fn lookup_latest_session_target_with_app_server(
             .data
             .into_iter()
             .find_map(session_target_from_app_server_thread);
-        if target.as_ref().is_some_and(|target| {
-            uses_remote_workspace || target.path.as_deref().is_some_and(std::path::Path::exists)
-        }) {
+        let target_is_resumable = if uses_remote_workspace {
+            target.is_some()
+        } else if let Some(path) = target.as_ref().and_then(|target| target.path.as_deref()) {
+            codex_rollout::existing_rollout_path(path).await.is_some()
+        } else {
+            false
+        };
+        if target_is_resumable {
             return Ok(target);
         }
     }
@@ -2615,7 +2620,7 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let project_cwd = temp_dir.path().join("project");
         std::fs::create_dir_all(&project_cwd)?;
-        let config = ConfigBuilder::default()
+        let mut config = ConfigBuilder::default()
             .codex_home(temp_dir.path().to_path_buf())
             .harness_overrides(ConfigOverrides {
                 cwd: Some(project_cwd.clone()),
@@ -2623,6 +2628,9 @@ mod tests {
             })
             .build()
             .await?;
+        // ConfigBuilder honors a workspace-scoped SQLite override. Keep this
+        // embedded app-server fixture isolated from the checkout's live state DB.
+        config.sqlite_home = temp_dir.path().to_path_buf();
         let mut app_server = AppServerSession::new(
             codex_app_server_client::AppServerClient::InProcess(
                 start_test_embedded_app_server(config.clone()).await?,

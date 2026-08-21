@@ -2054,10 +2054,32 @@ async fn thread_list_backwards_cursor_can_seed_forward_delta_sync() -> Result<()
         Some("mock_provider"),
         /*git_info*/ None,
     )?;
-    set_rollout_mtime(
-        rollout_path(codex_home.path(), "2025-02-01T12-00-00", &id_new).as_path(),
-        "2025-02-04T00:00:00Z",
-    )?;
+    let new_rollout_path = rollout_path(codex_home.path(), "2025-02-01T12-00-00", &id_new);
+    set_rollout_mtime(new_rollout_path.as_path(), "2025-02-04T00:00:00Z")?;
+    // A state-db cursor is intentionally bound to that storage path. Simulate the
+    // supported production writer by reconciling the new rollout before delta sync.
+    let state = codex_state::StateRuntime::init(
+        codex_home.path().to_path_buf(),
+        "mock_provider".to_string(),
+    )
+    .await?;
+    codex_rollout::state_db::reconcile_rollout(
+        Some(state.as_ref()),
+        new_rollout_path.as_path(),
+        "mock_provider",
+        /*builder*/ None,
+        /*items*/ &[],
+        /*archived_only*/ Some(false),
+        /*new_thread_memory_mode*/ None,
+    )
+    .await;
+    assert!(
+        state
+            .get_thread(ThreadId::from_string(&id_new)?)
+            .await?
+            .is_some(),
+        "new rollout should be visible through the state-db cursor"
+    );
 
     let ThreadListResponse {
         data: delta_page, ..

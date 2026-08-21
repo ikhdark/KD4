@@ -5,19 +5,21 @@ expression: "context_snapshot::format_labeled_requests_snapshot(\"rollback trims
 Scenario: rollback trims pre-turn override context updates before the follow-up request
 
 ## rolled-back turn request
-00:message/developer:<PERMISSIONS_INSTRUCTIONS>
-01:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-02:message/user:turn 1 user
-03:message/assistant:turn 1 assistant
-04:message/developer:<collaboration_mode>ROLLED_BACK_DEV_INSTRUCTIONS</collaboration_mode>
-05:message/user:<ENVIRONMENT_CONTEXT:cwd=PRETURN_CONTEXT_DIFF_CWD>
-06:message/user:turn 2 user
+00:message/developer:<collaboration_mode>ROLLED_BACK_DEV_INSTRUCTIONS</collaboration_mode>
+01:message/user:<task_model_guidance>Before acting, form and maintain a working task model from the current requ...
+02:message/developer:<PERMISSIONS_INSTRUCTIONS>
+03:message/developer:<NO_TEXT>
+04:message/user:turn 1 user
+05:message/assistant:turn 1 assistant
+06:message/user:<ENVIRONMENT_CONTEXT:cwd=PRETURN_CONTEXT_DIFF_CWD>
+07:message/user:turn 2 user
 
 ## follow-up request after rollback
-00:message/developer:<PERMISSIONS_INSTRUCTIONS>
-01:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-02:message/user:turn 1 user
-03:message/assistant:turn 1 assistant
-04:message/developer:<collaboration_mode>ROLLED_BACK_DEV_INSTRUCTIONS</collaboration_mode>
-05:message/user:<ENVIRONMENT_CONTEXT:cwd=PRETURN_CONTEXT_DIFF_CWD>
-06:message/user:follow-up user
+00:message/developer:<collaboration_mode>ROLLED_BACK_DEV_INSTRUCTIONS</collaboration_mode>
+01:message/user:<task_model_guidance>Before acting, form and maintain a working task model from the current requ...
+02:message/developer:<PERMISSIONS_INSTRUCTIONS>
+03:message/developer:<NO_TEXT>
+04:message/user:turn 1 user
+05:message/assistant:turn 1 assistant
+06:message/user:<ENVIRONMENT_CONTEXT:cwd=PRETURN_CONTEXT_DIFF_CWD>
+07:message/user:follow-up user

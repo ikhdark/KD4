@@ -472,7 +472,7 @@ async fn completed_tool_call_is_persisted_before_its_future_can_start() {
     .await
     .expect("read-safe tool call should be accepted");
 
-    assert!(output.eager_read_eligible);
+    assert!(!output.eager_read_eligible);
     assert!(!started.load(Ordering::SeqCst));
     let history = session.clone_history().await;
     let [ResponseItem::FunctionCall { call_id, .. }] = history.raw_items() else {

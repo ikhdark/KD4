@@ -302,49 +302,136 @@ async fn wait_for_sleep_item_completed(codex: &CodexThread, call_id: &str, durat
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn steer_interrupts_wait_agent_and_is_sent_in_follow_up_request() {
+    const SPAWN_CALL_ID: &str = "spawn-call";
     const WAIT_CALL_ID: &str = "wait-call";
-    const INITIAL_PROMPT: &str = "wait for an agent";
+    const INITIAL_PROMPT: &str = "spawn an agent, then wait for it";
+    const CHILD_TASK: &str = "remain active until the parent stops waiting";
     const STEER_PROMPT: &str = "stop waiting and continue";
     const MULTI_AGENT_V2_NAMESPACE: &str = "agents";
 
-    let first_chunks = vec![
-        chunk(ev_response_created("resp-1")),
-        chunk(ev_function_call_with_namespace(
-            WAIT_CALL_ID,
-            MULTI_AGENT_V2_NAMESPACE,
-            "wait_agent",
-            r#"{"timeout_ms":10000}"#,
-        )),
-        chunk(ev_completed("resp-1")),
-    ];
-    let (server, _completions) =
-        start_streaming_sse_server(vec![first_chunks, response_completed_chunks("resp-2")]).await;
-    let codex = test_codex()
+    let server = responses::start_mock_server().await;
+    let spawn_args = json!({
+        "message": CHILD_TASK,
+        "task_name": "wait_target",
+    })
+    .to_string();
+    responses::mount_sse_once_match(
+        &server,
+        move |request: &wiremock::Request| {
+            serde_json::from_slice::<Value>(&request.body)
+                .is_ok_and(|body| body.to_string().contains(INITIAL_PROMPT))
+        },
+        responses::sse(vec![
+            ev_response_created("resp-1"),
+            ev_function_call_with_namespace(
+                SPAWN_CALL_ID,
+                MULTI_AGENT_V2_NAMESPACE,
+                "spawn_agent",
+                &spawn_args,
+            ),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    responses::mount_response_once_match(
+        &server,
+        move |request: &wiremock::Request| {
+            serde_json::from_slice::<Value>(&request.body).is_ok_and(|body| {
+                let body = body.to_string();
+                body.contains(CHILD_TASK) && !body.contains(SPAWN_CALL_ID)
+            })
+        },
+        responses::sse_response(responses::sse(vec![
+            ev_response_created("child-resp"),
+            responses::ev_assistant_message("child-message", "child done"),
+            ev_completed("child-resp"),
+        ]))
+        .set_delay(std::time::Duration::from_secs(30)),
+    )
+    .await;
+    let spawn_follow_up_mock = responses::mount_sse_once_match(
+        &server,
+        move |request: &wiremock::Request| {
+            serde_json::from_slice::<Value>(&request.body).is_ok_and(|body| {
+                let body = body.to_string();
+                body.contains(SPAWN_CALL_ID) && !body.contains(WAIT_CALL_ID)
+            })
+        },
+        responses::sse(vec![
+            ev_response_created("resp-2"),
+            ev_function_call_with_namespace(
+                WAIT_CALL_ID,
+                MULTI_AGENT_V2_NAMESPACE,
+                "wait_agent",
+                "{}",
+            ),
+            ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+    let follow_up_mock = responses::mount_sse_once_match(
+        &server,
+        move |request: &wiremock::Request| {
+            serde_json::from_slice::<Value>(&request.body)
+                .is_ok_and(|body| body.to_string().contains(WAIT_CALL_ID))
+        },
+        responses::sse(vec![
+            ev_response_created("resp-3"),
+            responses::ev_assistant_message("resp-3-message", "continued"),
+            ev_completed("resp-3"),
+        ]),
+    )
+    .await;
+    let test = test_codex()
         .with_model("gpt-5.4")
         .with_config(|config| {
+            config
+                .features
+                .enable(Feature::Collab)
+                .expect("test config should allow feature update");
             config
                 .features
                 .enable(Feature::MultiAgentV2)
                 .expect("test config should allow feature update");
         })
-        .build_with_streaming_server(&server)
+        .build(&server)
         .await
-        .expect("build Codex test session")
-        .codex;
+        .expect("build Codex test session");
+    let codex = &test.codex;
 
-    submit_user_input(&codex, INITIAL_PROMPT).await;
-    wait_for_event(&codex, |event| {
-        matches!(event, EventMsg::CollabWaitingBegin(_))
+    submit_user_input(codex, INITIAL_PROMPT).await;
+    let wait_started = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let event = codex.next_event().await.expect("event stream").msg;
+            if matches!(
+                event,
+                EventMsg::ItemStarted(started)
+                    if matches!(
+                        &started.item,
+                        TurnItem::CollabAgentToolCall(item)
+                            if item.id == WAIT_CALL_ID
+                                && item.tool == codex_protocol::items::CollabAgentTool::Wait
+                    )
+            ) {
+                break;
+            }
+        }
     })
     .await;
+    if let Err(error) = wait_started {
+        panic!(
+            "{error}; spawn output: {:?}; wait output: {:?}",
+            spawn_follow_up_mock.function_call_output_text(SPAWN_CALL_ID),
+            follow_up_mock.function_call_output_text(WAIT_CALL_ID)
+        );
+    }
 
-    steer_user_input(&codex, STEER_PROMPT).await;
-    wait_for_turn_complete(&codex).await;
+    steer_user_input(codex, STEER_PROMPT).await;
+    wait_for_turn_complete(codex).await;
 
-    let requests = server.requests().await;
-    assert_eq!(requests.len(), 2);
-    let second: Value = from_slice(&requests[1]).expect("parse second request");
-    let relevant_user_input = message_input_texts(&second, "user")
+    let follow_up = follow_up_mock.single_request();
+    let relevant_user_input = follow_up
+        .message_input_texts("user")
         .into_iter()
         .filter(|text| text == INITIAL_PROMPT || text == STEER_PROMPT)
         .collect::<Vec<_>>();
@@ -352,20 +439,26 @@ async fn steer_interrupts_wait_agent_and_is_sent_in_follow_up_request() {
         relevant_user_input,
         vec![INITIAL_PROMPT.to_string(), STEER_PROMPT.to_string()]
     );
-    let wait_output = function_call_output_text(&second, WAIT_CALL_ID).expect("wait_agent output");
+    let wait_output = follow_up
+        .function_call_output_text(WAIT_CALL_ID)
+        .expect("wait_agent output");
+    let wait_output = serde_json::from_str::<Value>(&wait_output).expect("parse wait_agent output");
     assert_eq!(
-        serde_json::from_str::<Value>(wait_output).expect("parse wait_agent output"),
-        json!({
-            "cursor": null,
-            "message": "Wait interrupted by new input.",
-            "nudged_assignment_ids": [],
-            "timed_out": false,
-            "truncated_count": 0,
-            "typed_deltas": [],
-        })
+        wait_output.get("message").and_then(Value::as_str),
+        Some("Wait interrupted by new input.")
     );
-
-    server.shutdown().await;
+    assert_eq!(
+        wait_output.get("timed_out").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(wait_output["nudged_assignment_ids"], json!([]));
+    assert_eq!(wait_output["truncated_count"], json!(0));
+    assert!(wait_output.get("cursor").is_some_and(Value::is_string));
+    let typed_deltas = wait_output["typed_deltas"]
+        .as_array()
+        .expect("typed deltas array");
+    assert_eq!(typed_deltas.len(), 1);
+    assert_eq!(typed_deltas[0]["reason"], json!("accepted"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -771,7 +864,18 @@ async fn user_input_does_not_preempt_after_reasoning_item() {
     let (server, _completions) =
         start_streaming_sse_server(vec![first_chunks, response_completed_chunks("resp-2")]).await;
 
-    let codex = build_codex(&server).await;
+    let codex = test_codex()
+        .with_model("gpt-5.4")
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::MultiAgentV2)
+                .expect("test config should allow feature update");
+        })
+        .build_with_streaming_server(&server)
+        .await
+        .expect("build Codex test session")
+        .codex;
 
     submit_user_input(&codex, "first prompt").await;
 

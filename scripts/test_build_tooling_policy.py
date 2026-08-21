@@ -845,11 +845,11 @@ class BuildToolingPolicyTest(unittest.TestCase):
 
         self.assertEqual(
             package["scripts"]["format"],
-            "prettier --check *.json *.md docs/*.md **/*.js",
+            "prettier --check *.json *.md **/*.js",
         )
         self.assertEqual(
             package["scripts"]["format:fix"],
-            "prettier --write *.json *.md docs/*.md **/*.js",
+            "prettier --write *.json *.md **/*.js",
         )
         tracked_paths = set(
             subprocess.run(
@@ -1023,17 +1023,20 @@ class BuildToolingPolicyTest(unittest.TestCase):
             'RUSTFLAGS="-Ddead_code" just cargo-lane rust-dead-code-matrix cargo check',
             justfile,
         )
-        self.assertIn(
-            '$env:RUSTFLAGS = "-Ddead_code"; just cargo-lane rust-dead-code-matrix cargo @cargo_args',
-            justfile,
+        self.assertIn("cargo-workspace-analyzer.ps1", justfile)
+        analyzer = (REPO_ROOT / "scripts/cargo-workspace-analyzer.ps1").read_text(
+            encoding="utf-8"
         )
+        self.assertIn('$lane = "rust-dead-code-matrix"', analyzer)
+        self.assertIn('$env:RUSTFLAGS = "-Ddead_code"', analyzer)
+        self.assertIn('"--exclude", $v8SandboxPackages[0]', analyzer)
 
     def test_package_validation_defaults_do_not_expand_to_workspace(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
 
         self.assertIn("Pass a package/filter to 'just clippy'", justfile)
         self.assertIn("clippy-workspace *args:", justfile)
-        self.assertIn("cargo clippy --tests @forwarded_args", justfile)
+        self.assertIn("-Analyzer clippy @forwarded_args", justfile)
         self.assertIn(
             '($forwarded_args -contains "-p") -or ($forwarded_args -contains "--package")',
             justfile,

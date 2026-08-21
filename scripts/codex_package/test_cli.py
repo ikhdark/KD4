@@ -145,9 +145,7 @@ class CliPerformanceFlagsTest(unittest.TestCase):
                     cli, "resolve_rg_bin", return_value=target_dir / "rg.exe"
                 ) as resolve_rg_bin,
                 mock.patch.object(cli, "resolve_zsh_bin", return_value=None),
-                mock.patch.object(
-                    cli, "source_build_stamp_matches", return_value=True
-                ),
+                mock.patch.object(cli, "source_build_stamp_matches", return_value=True),
             ):
                 rc = cli.main()
 

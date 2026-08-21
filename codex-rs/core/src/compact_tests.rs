@@ -494,7 +494,7 @@ fn inline_heading_mentions_do_not_trigger_structured_summary_budgeting() {
 }
 
 #[test]
-fn generated_compaction_requires_a_complete_nonempty_checkpoint() {
+fn generated_compaction_accepts_legacy_handoffs_and_validates_structured_checkpoints() {
     let complete = format!(
         "{GOAL_HEADING}\nfinish recovery\n\n{CURRENT_STATE_HEADING}\nimplementation present\n\n{COMPLETED_WORK_HEADING}\nproducer updated\n\n{UNRESOLVED_WORK_HEADING}\nkeep ambiguity\n\n{EVIDENCE_HEADING}\nfocused evidence\n\n{NEXT_ACTION_HEADING}\nrun focused proof"
     );
@@ -504,7 +504,8 @@ fn generated_compaction_requires_a_complete_nonempty_checkpoint() {
         "{GOAL_HEADING}\nfinish recovery\n\n{CURRENT_STATE_HEADING}\nimplementation present\n\n{COMPLETED_WORK_HEADING}\nproducer updated\n\n{UNRESOLVED_WORK_HEADING}\nkeep ambiguity\n\n{EVIDENCE_HEADING}\nfocused evidence\n\n{NEXT_ACTION_HEADING}\n"
     );
     assert!(validate_generated_compaction_summary(None, &incomplete).is_err());
-    assert!(validate_generated_compaction_summary(Some(&complete), "free-form update").is_err());
+    assert!(validate_generated_compaction_summary(None, "free-form checkpoint").is_ok());
+    assert!(validate_generated_compaction_summary(Some(&complete), "free-form update").is_ok());
     assert!(
         validate_generated_compaction_summary(
             Some(&complete),
@@ -786,20 +787,11 @@ async fn process_compacted_history_replaces_developer_messages() {
             internal_chat_message_metadata_passthrough: None,
         },
     ];
-    let (refreshed, mut expected) = process_compacted_history_with_test_session(
+    let (refreshed, expected) = process_compacted_history_with_test_session(
         compacted_history,
         /*previous_turn_settings*/ None,
     )
     .await;
-    expected.push(ResponseItem::Message {
-        id: None,
-        role: "user".to_string(),
-        content: vec![ContentItem::InputText {
-            text: "summary".to_string(),
-        }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    });
     assert_eq!(refreshed, expected);
 }
 
@@ -814,20 +806,11 @@ async fn process_compacted_history_reinjects_full_initial_context() {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     }];
-    let (refreshed, mut expected) = process_compacted_history_with_test_session(
+    let (refreshed, expected) = process_compacted_history_with_test_session(
         compacted_history,
         /*previous_turn_settings*/ None,
     )
     .await;
-    expected.push(ResponseItem::Message {
-        id: None,
-        role: "user".to_string(),
-        content: vec![ContentItem::InputText {
-            text: "summary".to_string(),
-        }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    });
     assert_eq!(refreshed, expected);
 }
 
@@ -941,26 +924,16 @@ keep me updated
             internal_chat_message_metadata_passthrough: None,
         },
     ];
-    let (refreshed, mut expected) = process_compacted_history_with_test_session(
+    let (refreshed, expected) = process_compacted_history_with_test_session(
         compacted_history,
         /*previous_turn_settings*/ None,
     )
     .await;
-    expected.push(ResponseItem::Message {
-        id: None,
-        role: "user".to_string(),
-        content: vec![ContentItem::InputText {
-            text: "summary".to_string(),
-        }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    });
     assert_eq!(refreshed, expected);
 }
 
 #[tokio::test]
 async fn process_compacted_history_drops_legacy_warnings() {
-    let latest_user = user_message("latest user");
     let compacted_history = vec![
         user_message(
             "Warning: The maximum number of unified exec processes you can keep open is 60 and you currently have 61 processes open. Reuse older processes or close them to prevent automatic pruning of old processes",
@@ -971,16 +944,14 @@ async fn process_compacted_history_drops_legacy_warnings() {
         user_message(
             "Warning: Your account was flagged for potentially high-risk cyber activity and this request was routed to gpt-5.2 as a fallback. To regain access to gpt-5.3-codex, apply for trusted access: https://chatgpt.com/cyber or learn more: https://developers.openai.com/codex/concepts/cyber-safety",
         ),
-        latest_user.clone(),
+        user_message("latest user"),
     ];
     let (refreshed, initial_context) = process_compacted_history_with_test_session(
         compacted_history,
         /*previous_turn_settings*/ None,
     )
     .await;
-    let mut expected = initial_context;
-    expected.push(latest_user);
-    assert_eq!(refreshed, expected);
+    assert_eq!(refreshed, initial_context);
 }
 
 #[tokio::test]
@@ -1020,37 +991,7 @@ async fn process_compacted_history_inserts_context_before_last_real_user_message
         /*previous_turn_settings*/ None,
     )
     .await;
-    let mut expected = vec![
-        ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: "older user".to_string(),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        },
-        ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: format!("{SUMMARY_PREFIX}\nsummary text"),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        },
-    ];
-    expected.extend(initial_context);
-    expected.push(ResponseItem::Message {
-        id: None,
-        role: "user".to_string(),
-        content: vec![ContentItem::InputText {
-            text: "latest user".to_string(),
-        }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    });
-    assert_eq!(refreshed, expected);
+    assert_eq!(refreshed, initial_context);
 }
 
 #[tokio::test]
@@ -1085,17 +1026,7 @@ async fn process_compacted_history_reinjects_model_switch_message() {
     };
     assert!(text.contains("<model_switch>"));
 
-    let mut expected = initial_context;
-    expected.push(ResponseItem::Message {
-        id: None,
-        role: "user".to_string(),
-        content: vec![ContentItem::InputText {
-            text: "summary".to_string(),
-        }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    });
-    assert_eq!(refreshed, expected);
+    assert_eq!(refreshed, initial_context);
 }
 
 #[test]

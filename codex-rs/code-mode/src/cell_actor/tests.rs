@@ -255,6 +255,134 @@ async fn yield_timer_preempts_buffered_runtime_output() {
 }
 
 #[tokio::test]
+async fn state_change_observer_wakes_on_output_without_an_empty_timer_yield() {
+    let mut harness = spawn_cell_actor_harness(ObserveMode::StateChange);
+    harness.event_tx.send(RuntimeEvent::Started).unwrap();
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut harness.initial_event_rx,)
+            .await
+            .is_err(),
+        "state-change observation must not poll an unchanged cell"
+    );
+
+    harness
+        .event_tx
+        .send(RuntimeEvent::ContentItem(
+            FunctionCallOutputContentItem::InputText {
+                text: "meaningful output".to_string(),
+            },
+        ))
+        .unwrap();
+    assert_eq!(
+        harness.initial_event_rx.await.unwrap(),
+        Ok(CellEvent::Yielded {
+            content_items: vec![OutputItem::Text {
+                text: "meaningful output".to_string(),
+            }],
+        })
+    );
+
+    let termination = harness.handle.terminate();
+    drop(harness.event_tx);
+    assert_eq!(
+        termination.await,
+        Ok(CellEvent::Terminated {
+            content_items: Vec::new(),
+        })
+    );
+    harness.task.await.unwrap();
+}
+
+#[tokio::test]
+async fn orchestration_correctness_state_change_delivers_already_buffered_output() {
+    let host = Arc::new(RecordingHost::default());
+    let harness = spawn_cell_actor_harness_with_host(
+        ObserveMode::YieldAfter(Duration::ZERO),
+        Arc::clone(&host),
+    );
+    harness.event_tx.send(RuntimeEvent::Started).unwrap();
+    assert_eq!(
+        harness.initial_event_rx.await.unwrap(),
+        Ok(CellEvent::Yielded {
+            content_items: Vec::new(),
+        })
+    );
+
+    harness
+        .event_tx
+        .send(RuntimeEvent::ContentItem(
+            FunctionCallOutputContentItem::InputText {
+                text: "buffered state change".to_string(),
+            },
+        ))
+        .unwrap();
+    harness
+        .event_tx
+        .send(RuntimeEvent::Notify {
+            call_id: "notification-barrier".to_string(),
+            text: "processed".to_string(),
+        })
+        .unwrap();
+    wait_for_notification(&host).await;
+
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            harness.handle.observe(ObserveMode::StateChange),
+        )
+        .await
+        .expect("state-change observation timed out"),
+        Ok(CellEvent::Yielded {
+            content_items: vec![OutputItem::Text {
+                text: "buffered state change".to_string(),
+            }],
+        })
+    );
+
+    let termination = harness.handle.terminate();
+    drop(harness.event_tx);
+    assert_eq!(
+        termination.await,
+        Ok(CellEvent::Terminated {
+            content_items: Vec::new(),
+        })
+    );
+    harness.task.await.unwrap();
+}
+
+#[tokio::test]
+async fn state_change_observer_preserves_an_explicit_empty_yield() {
+    let mut harness = spawn_cell_actor_harness(ObserveMode::StateChange);
+    harness.event_tx.send(RuntimeEvent::Started).unwrap();
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut harness.initial_event_rx)
+            .await
+            .is_err(),
+        "state-change observation must not synthesize an empty timer yield"
+    );
+
+    harness.event_tx.send(RuntimeEvent::YieldRequested).unwrap();
+    assert_eq!(
+        harness.initial_event_rx.await.unwrap(),
+        Ok(CellEvent::Yielded {
+            content_items: Vec::new(),
+        })
+    );
+
+    let termination = harness.handle.terminate();
+    drop(harness.event_tx);
+    assert_eq!(
+        termination.await,
+        Ok(CellEvent::Terminated {
+            content_items: Vec::new(),
+        })
+    );
+    harness.task.await.unwrap();
+}
+
+#[tokio::test]
 async fn queued_termination_preempts_unobserved_runtime_completion() {
     let harness = spawn_cell_actor_harness(ObserveMode::YieldAfter(Duration::from_secs(60)));
     harness

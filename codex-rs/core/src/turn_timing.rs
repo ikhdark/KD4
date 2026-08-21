@@ -37,15 +37,19 @@ use codex_protocol::protocol::TurnTimingProgressKind;
 use codex_protocol::protocol::TurnTimingProviderTokenUsage;
 use codex_protocol::protocol::TurnTimingRequestTokenCategories;
 use codex_protocol::protocol::TurnTimingTerminalization;
+use codex_protocol::protocol::TurnTimingToolCall;
+use codex_protocol::protocol::TurnTimingToolCallSource;
 use codex_protocol::protocol::TurnTimingUnions;
 
 use crate::ResponseEvent;
 use crate::session::turn_context::TurnContext;
 use crate::stream_events_utils::raw_assistant_output_text_from_item;
+use crate::tools::tool_dispatch_trace::ToolDispatchTimingSnapshot;
 
 const NANOS_PER_MILLISECOND: u128 = 1_000_000;
-const TIMING_SCHEMA_VERSION: u16 = 20;
+const TIMING_SCHEMA_VERSION: u16 = 22;
 const MAX_DETERMINISTIC_CONTINUATION_RECEIPTS: usize = 64;
+const MAX_TOOL_CALL_TIMINGS: usize = 1_024;
 
 /// Control-only calls can advance orchestration without beginning the user's
 /// requested work. Keep them observable in dispatch milestones and counters,
@@ -561,6 +565,8 @@ impl TurnTimingSnapshot {
             counters,
             terminalization: profile.terminalization.clone(),
             model_requests,
+            tool_calls: profile.tool_calls.clone(),
+            tool_call_timing_overflow: profile.tool_call_timing_overflow,
             observational_nonprogress_tokens,
             observational_nonprogress_latency,
             deterministic_continuation_receipts: profile
@@ -589,6 +595,8 @@ pub(crate) struct TurnTimingProfile {
     pub(crate) milestones: TimingMilestones,
     pub(crate) counters: TimingCounters,
     pub(crate) model_requests: Vec<ModelRequestTiming>,
+    pub(crate) tool_calls: Vec<TurnTimingToolCall>,
+    pub(crate) tool_call_timing_overflow: u32,
     pub(crate) deterministic_continuation_receipts: Vec<TurnTimingDeterministicContinuationReceipt>,
     pub(crate) deterministic_continuation_receipt_overflow: u32,
     pub(crate) pre_first_model_output: Option<PreFirstModelOutputTiming>,
@@ -624,6 +632,10 @@ pub(crate) struct ModelRequestTiming {
 }
 
 impl ModelRequestTiming {
+    fn physical_attempt_count(&self) -> usize {
+        self.physical_attempt_ids.len().max(1)
+    }
+
     fn decision_latency_ns(&self) -> Option<u128> {
         Some(
             self.first_actionable_output_ns?
@@ -813,6 +825,9 @@ struct TurnTimingStateInner {
     milestones: TimingMilestones,
     counters: TimingCounters,
     model_requests: Vec<ModelRequestTiming>,
+    tool_calls: Vec<TurnTimingToolCall>,
+    tool_call_timing_overflow: u32,
+    background_tool_process_exits: BTreeMap<String, u64>,
     current_generation_index: Option<u32>,
     current_generation_reason: TurnTimingGenerationReason,
     current_generation_purpose: Option<TurnTimingGenerationPurpose>,
@@ -1050,6 +1065,20 @@ impl TurnTimingState {
         let mut state = self.state();
         state.advance(sample.time.monotonic_ns);
         let cause = pending.take();
+        if matches!(cause, Some(ContinuationCause::ToolResult))
+            && let Some(model_resumed_at_ms) = state
+                .elapsed_since_start(sample.time.monotonic_ns)
+                .map(u128_to_u64_ms)
+        {
+            for tool_call in state.tool_calls.iter_mut().rev() {
+                if tool_call.model_resumed_at_ms.is_some() {
+                    break;
+                }
+                if tool_call.delivered_at_ms.is_some() {
+                    tool_call.model_resumed_at_ms = Some(model_resumed_at_ms);
+                }
+            }
+        }
         if let Some(cause) = cause {
             state.legacy.record_continuation(cause);
         }
@@ -1253,6 +1282,127 @@ impl TurnTimingState {
             && let Some(elapsed_ns) = state.elapsed_since_start(sample.time.monotonic_ns)
         {
             state.milestones.first_successful_useful_action_ns = Some(elapsed_ns);
+        }
+    }
+
+    pub(crate) fn record_tool_dispatch_timing(
+        &self,
+        call_id: &str,
+        tool_name: &str,
+        source: TurnTimingToolCallSource,
+        timing: ToolDispatchTimingSnapshot,
+    ) {
+        let sample = self.clock.sample();
+        let mut state = self.state();
+        state.advance(sample.time.monotonic_ns);
+        if state.completed_snapshot.is_some() {
+            state.invalid_transition();
+            return;
+        }
+        if state.tool_calls.len() >= MAX_TOOL_CALL_TIMINGS {
+            state.tool_call_timing_overflow = state.tool_call_timing_overflow.saturating_add(1);
+            return;
+        }
+
+        let delivered_at_ms = state
+            .elapsed_since_start(sample.time.monotonic_ns)
+            .map(u128_to_u64_ms);
+        let first_poll_at_ms = delivered_at_ms
+            .zip(timing.total_duration_ms)
+            .map(|(delivered, total)| delivered.saturating_sub(total));
+        let accepted_at_ms = first_poll_at_ms
+            .zip(timing.item_to_first_poll_ms)
+            .map(|(first_poll, queued)| first_poll.saturating_sub(queued));
+        let parallel_gate_admitted_at_ms = timing
+            .parallel_gate_admitted
+            .then(|| {
+                first_poll_at_ms
+                    .zip(timing.parallel_gate_wait_ms)
+                    .map(|(first_poll, wait)| first_poll.saturating_add(wait))
+            })
+            .flatten();
+        let handler_entry_at_ms = first_poll_at_ms
+            .zip(timing.first_poll_to_handler_entry_ms)
+            .map(|(first_poll, wait)| first_poll.saturating_add(wait));
+        let handler_exit_at_ms = handler_entry_at_ms
+            .zip(timing.handler_duration_ms)
+            .map(|(entry, duration)| entry.saturating_add(duration));
+        let output_collected_at_ms = first_poll_at_ms
+            .zip(timing.first_poll_to_output_collected_ms)
+            .map(|(first_poll, duration)| first_poll.saturating_add(duration));
+        let process_spawned_at_ms = accepted_at_ms
+            .zip(timing.exec_request_to_spawn_ms)
+            .map(|(request, wait)| request.saturating_add(wait));
+        let process_exited_at_ms = process_spawned_at_ms
+            .zip(timing.exec_spawn_to_exit_ms)
+            .map(|(spawned, runtime)| spawned.saturating_add(runtime));
+        let generation_index = state.current_generation_index;
+
+        let mut tool_call = TurnTimingToolCall {
+            call_id: call_id.to_string(),
+            tool_name: tool_name.to_string(),
+            source,
+            generation_index,
+            accepted_at_ms,
+            first_poll_at_ms,
+            parallel_gate_admitted_at_ms,
+            handler_entry_at_ms,
+            handler_exit_at_ms,
+            output_collected_at_ms,
+            process_spawned_at_ms,
+            process_exited_at_ms,
+            delivered_at_ms,
+            model_resumed_at_ms: None,
+            item_to_first_poll_ms: timing.item_to_first_poll_ms,
+            parallel_gate_wait_ms: timing.parallel_gate_wait_ms,
+            authorization_state_coordination_ms: timing.authorization_state_coordination_ms,
+            handler_duration_ms: timing.handler_duration_ms,
+            workspace_evidence_before_ms: timing.workspace_evidence_before_ms,
+            workspace_evidence_after_ms: timing.workspace_evidence_after_ms,
+            pre_tool_hook_ms: timing.pre_tool_hook_ms,
+            post_tool_hook_ms: timing.post_tool_hook_ms,
+            output_projection_ms: timing.output_projection_ms,
+            history_persistence_ms: timing.history_persistence_ms,
+            post_handler_ms: timing.post_handler_ms,
+            total_duration_ms: timing.total_duration_ms,
+            eager: timing.eager,
+            process_alive_at_delivery: timing.exec_process_alive_at_delivery,
+        };
+        if let Some(spawn_to_exit_ms) = state.background_tool_process_exits.remove(call_id) {
+            record_tool_process_exit(&mut tool_call, spawn_to_exit_ms);
+        }
+        state.tool_calls.push(tool_call);
+    }
+
+    /// Persists a background process exit into the turn record even when the
+    /// outer exec tool already returned a live session to the model.
+    pub(crate) fn record_background_tool_process_exit(
+        &self,
+        call_id: &str,
+        timing: ToolDispatchTimingSnapshot,
+    ) {
+        let Some(spawn_to_exit_ms) = timing.exec_spawn_to_exit_ms else {
+            return;
+        };
+        let sample = self.clock.sample();
+        let mut state = self.state();
+        state.advance(sample.time.monotonic_ns);
+        if state.completed_snapshot.is_some() {
+            state.invalid_transition();
+            return;
+        }
+        if let Some(tool_call) = state
+            .tool_calls
+            .iter_mut()
+            .find(|tool_call| tool_call.call_id == call_id)
+        {
+            record_tool_process_exit(tool_call, spawn_to_exit_ms);
+            return;
+        }
+        if state.background_tool_process_exits.len() < MAX_TOOL_CALL_TIMINGS {
+            state
+                .background_tool_process_exits
+                .insert(call_id.to_string(), spawn_to_exit_ms);
         }
     }
 
@@ -2301,6 +2451,8 @@ impl TurnTimingStateInner {
             milestones: self.milestones.clone(),
             counters: self.counters.clone(),
             model_requests: self.model_requests.clone(),
+            tool_calls: self.tool_calls.clone(),
+            tool_call_timing_overflow: self.tool_call_timing_overflow,
             deterministic_continuation_receipts: self
                 .deterministic_continuation_receipts
                 .values()
@@ -2733,6 +2885,12 @@ fn u128_to_u64_ms(nanos: u128) -> u64 {
     u64::try_from(nanos / NANOS_PER_MILLISECOND).unwrap_or(u64::MAX)
 }
 
+fn record_tool_process_exit(tool_call: &mut TurnTimingToolCall, spawn_to_exit_ms: u64) {
+    tool_call.process_exited_at_ms = tool_call
+        .process_spawned_at_ms
+        .map(|spawned_at_ms| spawned_at_ms.saturating_add(spawn_to_exit_ms));
+}
+
 fn u128_to_i64_ms(nanos: u128) -> i64 {
     i64::try_from(nanos / NANOS_PER_MILLISECOND).unwrap_or(i64::MAX)
 }
@@ -2952,7 +3110,13 @@ fn diagnostic_latency_aggregate(
         .collect::<Vec<_>>();
     TurnTimingDiagnosticLatencyAggregate {
         logical_generations: generation_ids.len().try_into().unwrap_or(u32::MAX),
-        physical_attempts: matching.len().try_into().unwrap_or(u32::MAX),
+        physical_attempts: matching
+            .iter()
+            .fold(0_usize, |total, request| {
+                total.saturating_add(request.physical_attempt_count())
+            })
+            .try_into()
+            .unwrap_or(u32::MAX),
         model_stream_wait_ns: public_ns(
             matching.iter().fold(0_u128, |total, request| {
                 total.saturating_add(request.model_stream_wait_ns)

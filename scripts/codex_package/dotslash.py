@@ -323,9 +323,9 @@ def extracted_member_is_valid(dest: Path, artifact: DotSlashArtifact) -> bool:
         "archive_member": artifact.archive_member,
         "url": artifact.url,
     }
-    return all(stamp.get(key) == value for key, value in expected.items()) and stamp.get(
-        "sha256"
-    ) == sha256_file(dest)
+    return all(
+        stamp.get(key) == value for key, value in expected.items()
+    ) and stamp.get("sha256") == sha256_file(dest)
 
 
 def write_extracted_member_stamp(dest: Path, artifact: DotSlashArtifact) -> None:

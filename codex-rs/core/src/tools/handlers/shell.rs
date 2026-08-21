@@ -151,6 +151,7 @@ fn shell_command_payload_command(payload: &ToolPayload) -> Option<String> {
 pub(super) struct RunExecLikeArgs {
     pub(super) tool_name: ToolName,
     pub(super) exec_params: ExecParams,
+    pub(super) stall_timeout_ms: Option<u64>,
     pub(super) cancellation_token: CancellationToken,
     pub(super) hook_command: String,
     pub(super) safety_command: Vec<String>,
@@ -2111,6 +2112,7 @@ async fn run_exec_like_with_exit_code_inner(
     let RunExecLikeArgs {
         tool_name,
         exec_params,
+        stall_timeout_ms,
         cancellation_token,
         hook_command,
         safety_command,
@@ -2401,6 +2403,7 @@ async fn run_exec_like_with_exit_code_inner(
         hook_command,
         cwd: exec_params.cwd.clone(),
         timeout_ms: exec_params.expiration.timeout_ms(),
+        stall_timeout_ms,
         cancellation_token,
         env: exec_params.env.clone(),
         explicit_env_overrides,

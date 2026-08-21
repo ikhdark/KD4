@@ -1209,11 +1209,15 @@ impl Session {
             let detached = active.as_ref().is_none_or(|active_turn| {
                 !Arc::ptr_eq(&active_turn.turn_state, &finalization.turn_state)
             });
+            // Open admission before notifying waiters that interaction release completed.
+            // A caller may submit the next turn immediately after `TurnComplete`; waking its
+            // `abort_all_tasks` waiter while this fence is still set makes `start_task` discard
+            // that already-accepted turn.
+            self.terminal_interaction_pending
+                .store(false, Ordering::Release);
             if let Some(permit) = finalization.permit.as_ref() {
                 permit.mark_interaction_released();
             }
-            self.terminal_interaction_pending
-                .store(false, Ordering::Release);
             detached
         };
         finalization.deadline.record_elapsed(
@@ -1431,6 +1435,12 @@ impl Session {
             warn!(turn_id = %turn_context.sub_id, "process-local terminal registry rejected a conflicting fingerprint");
         }
 
+        // Release the completed turn before its terminal event becomes observable. A client may
+        // submit its next turn as soon as it receives `TurnComplete`; leaving the old turn
+        // attached until after live delivery makes that input look steerable, then drops it when
+        // terminal detachment clears the old turn.
+        let cleared_active_turn = self.detach_terminal_turn(finalization).await;
+
         let delivery_started = tokio::time::Instant::now();
         let live_delivered = self
             .dispatch_terminal_event_live(
@@ -1446,12 +1456,6 @@ impl Session {
         if permit_delivery_claimed && let Some(permit) = finalization.permit.as_ref() {
             permit.mark_delivery_attempted(live_delivered);
         }
-        let cleared_active_turn = if live_delivered {
-            self.detach_terminal_turn(finalization).await
-        } else {
-            false
-        };
-
         let requires_app_server_ack = turn_context.app_server_client_name.is_some();
         if requires_app_server_ack || !live_delivered {
             self.schedule_terminal_redelivery(authority.clone(), requires_app_server_ack);
@@ -3223,6 +3227,13 @@ impl Session {
             warn!(turn_id = %turn_context.sub_id, "terminal live delivery failed; durable decision remains authoritative");
         }
         let cleared_active_turn = terminal_milestone.cleared_active_turn;
+        if cleared_active_turn {
+            let _ = tokio::time::timeout(
+                TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
+                self.emit_thread_idle_lifecycle_if_idle(),
+            )
+            .await;
+        }
         if cleared_active_turn && abort_reason == Some(TurnAbortReason::Interrupted) {
             self.maybe_start_turn_for_pending_work().await;
         }
@@ -3319,13 +3330,6 @@ impl Session {
         .is_err()
         {
             warn!(turn_id = %turn_context.sub_id, "timed out clearing the post-terminal circuit breaker");
-        }
-        if cleared_active_turn {
-            let _ = tokio::time::timeout(
-                TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                self.emit_thread_idle_lifecycle_if_idle(),
-            )
-            .await;
         }
         // Regular items were flushed before this terminal event was appended; buffering
         // thread writers may not flush it without another explicit barrier.
@@ -3516,6 +3520,14 @@ impl Session {
             milestone.cleared_active_turn
         };
 
+        if cleared_active_turn {
+            let _ = tokio::time::timeout(
+                TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
+                self.emit_thread_idle_lifecycle_if_idle(),
+            )
+            .await;
+        }
+
         // Fail-safe cleanup is also post-milestone. Bound every persistence/lifecycle operation
         // so the stronger cleanup signal remains useful to shutdown and tests.
         let post_cleanup_started = tokio::time::Instant::now();
@@ -3588,13 +3600,6 @@ impl Session {
             circuit_breaker_cleanup,
         )
         .await;
-        if cleared_active_turn {
-            let _ = tokio::time::timeout(
-                TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                self.emit_thread_idle_lifecycle_if_idle(),
-            )
-            .await;
-        }
         match tokio::time::timeout(TERMINAL_MUTATION_FINALIZATION_TIMEOUT, self.flush_rollout())
             .await
         {

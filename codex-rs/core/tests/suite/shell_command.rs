@@ -32,9 +32,20 @@ fn shell_responses_with_timeout(
     login: Option<bool>,
     timeout_ms: i64,
 ) -> Vec<String> {
+    shell_responses_with_deadlines(call_id, command, login, timeout_ms, None)
+}
+
+fn shell_responses_with_deadlines(
+    call_id: &str,
+    command: &str,
+    login: Option<bool>,
+    timeout_ms: i64,
+    stall_timeout_ms: Option<i64>,
+) -> Vec<String> {
     let args = json!({
         "command": command,
         "timeout_ms": timeout_ms,
+        "stall_timeout_ms": stall_timeout_ms,
         "login": login,
     });
 
@@ -83,6 +94,26 @@ async fn mount_shell_responses_with_timeout(
     mount_sse_sequence(
         harness.server(),
         shell_responses_with_timeout(call_id, command, login, timeout.as_millis() as i64),
+    )
+    .await;
+}
+
+async fn mount_shell_responses_with_deadlines(
+    harness: &TestCodexHarness,
+    call_id: &str,
+    command: &str,
+    timeout: Duration,
+    stall_timeout: Duration,
+) {
+    mount_sse_sequence(
+        harness.server(),
+        shell_responses_with_deadlines(
+            call_id,
+            command,
+            /*login*/ None,
+            timeout.as_millis() as i64,
+            Some(stall_timeout.as_millis() as i64),
+        ),
     )
     .await;
 }
@@ -249,6 +280,42 @@ async fn shell_command_times_out_with_timeout_ms() -> anyhow::Result<()> {
         .to_string();
     let expected_pattern = r"(?s)^Exit code: 124\nWall time: [0-9]+(?:\.[0-9]+)? seconds\nOutput:\ncommand timed out after [0-9]+ milliseconds\n?$";
     assert_regex_match(expected_pattern, &normalized_output);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shell_command_cancels_after_output_stalls() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let harness = shell_command_harness_with(|builder| builder.with_model("gpt-5.4")).await?;
+    let call_id = "shell-command-stall-timeout";
+    let command = if cfg!(windows) {
+        "powershell.exe -NoProfile -Command \"Start-Sleep -Seconds 5\""
+    } else {
+        "sleep 5"
+    };
+    mount_shell_responses_with_deadlines(
+        &harness,
+        call_id,
+        command,
+        Duration::from_secs(5),
+        Duration::from_millis(200),
+    )
+    .await;
+    harness
+        .submit("run a command with a short stall deadline")
+        .await?;
+
+    let output = harness.function_call_stdout(call_id).await;
+    let normalized_output = output.replace("\r\n", "\n").replace('\r', "\n");
+    let expected_pattern = r"(?s)^Exit code: 124\nWall time: [0-9]+(?:\.[0-9]+)? seconds\nOutput:\ncommand timed out after [0-9]+ milliseconds\n.*command stalled after 200 milliseconds without stdout or stderr\n?$";
+    assert!(
+        regex_lite::Regex::new(expected_pattern)
+            .expect("stall output regex is valid")
+            .is_match(normalized_output.trim_end_matches('\n')),
+        "stall output did not match the expected timeout contract: {normalized_output:?}",
+    );
 
     Ok(())
 }

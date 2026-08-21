@@ -827,13 +827,14 @@ def _cargo_watch_exec_with_target_dir(command: str, target_dir: Path) -> str:
         r"'(?P<single_space>[^']*)'|(?P<bare_space>[^\s]+)))"
     )
     target_matches = list(target_pattern.finditer(cargo_command))
-    if re.search(r"(?:^|\s)--target-dir(?:=|\s|$)", cargo_command) and not target_matches:
+    if (
+        re.search(r"(?:^|\s)--target-dir(?:=|\s|$)", cargo_command)
+        and not target_matches
+    ):
         raise ValueError("Cargo watch exec command has a malformed --target-dir option")
     for target_match in target_matches:
         candidate = next(
-            value
-            for value in target_match.groupdict().values()
-            if value is not None
+            value for value in target_match.groupdict().values() if value is not None
         )
         _require_reserved_target_dir(candidate, target_dir)
     if target_matches:
@@ -958,9 +959,8 @@ def _cargo_command_with_target_dir(
         for index in range(subcommand_index + 1, len(result)):
             if result[index] == "--":
                 break
-            if (
-                result[index] in {"-s", "--shell"}
-                or result[index].startswith("--shell=")
+            if result[index] in {"-s", "--shell"} or result[index].startswith(
+                "--shell="
             ):
                 raise ValueError(
                     "Cargo watch --shell/-s is not allowed inside a reserved "

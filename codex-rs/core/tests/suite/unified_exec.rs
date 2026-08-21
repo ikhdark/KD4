@@ -1291,175 +1291,113 @@ async fn unified_exec_terminal_interaction_captures_delayed_output() -> Result<(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unified_exec_host_wait_removes_model_mediated_poll_generation() -> Result<()> {
+async fn unified_exec_owner_wait_delivers_terminal_output_before_model_resumes() -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
 
-    let command = if cfg!(windows) {
-        "powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 1; Write-Output POLL_DONE\""
+    let open_args = if cfg!(windows) {
+        json!({
+            "kind": "powershell_script",
+            // Windows enforces a two-second floor for the initial exec wait while the executor
+            // warms up. Keep the process alive beyond that floor so `write_stdin` owns the
+            // terminal wait that observes completion.
+            "script_body": "Start-Sleep -Seconds 3; Write-Output POLL_DONE",
+            "yield_time_ms": 10,
+            // A PTY can emit bootstrap control bytes before the command's actual output, which is
+            // valid progress and therefore ends an owner wait. A pipe keeps this fixture silent
+            // until `POLL_DONE`, isolating the terminal-output delivery contract under test.
+            "tty": false,
+        })
     } else {
-        "sleep 1 && echo POLL_DONE"
+        json!({
+            "kind": "argv",
+            "program": "sh",
+            "args": ["-c", "sleep 1 && echo POLL_DONE"],
+            "yield_time_ms": 10,
+            "tty": false,
+        })
     };
 
-    let baseline_server = start_mock_server().await;
-    let baseline_open_args = json!({
-        "cmd": command,
-        "yield_time_ms": 10,
-        "tty": true,
-    });
-    let baseline_poll_args = json!({
+    let server = start_mock_server().await;
+    let poll_args = json!({
         "chars": "",
         "session_id": 1000,
         "yield_time_ms": 3_000,
     });
-    let baseline_responses = mount_sse_sequence(
-        &baseline_server,
+    let responses = mount_sse_sequence(
+        &server,
         vec![
             sse(vec![
-                ev_response_created("baseline-open"),
+                ev_response_created("open"),
                 ev_function_call(
-                    "baseline-open-call",
-                    "unified_exec",
-                    &serde_json::to_string(&baseline_open_args)?,
+                    "open-call",
+                    "exec_command",
+                    &serde_json::to_string(&open_args)?,
                 ),
-                ev_completed("baseline-open"),
+                ev_completed("open"),
             ]),
             sse(vec![
-                ev_response_created("baseline-poll"),
+                ev_response_created("owner-wait"),
                 ev_function_call(
-                    "baseline-poll-call",
+                    "owner-wait-call",
                     "write_stdin",
-                    &serde_json::to_string(&baseline_poll_args)?,
+                    &serde_json::to_string(&poll_args)?,
                 ),
-                ev_completed("baseline-poll"),
+                ev_completed("owner-wait"),
             ]),
             sse(vec![
-                ev_response_created("baseline-final"),
-                ev_assistant_message("baseline-message", "complete"),
-                ev_completed("baseline-final"),
+                ev_response_created("final"),
+                ev_assistant_message("message", "complete"),
+                ev_completed("final"),
             ]),
         ],
     )
     .await;
-    let mut baseline_builder = test_codex().with_config(|config| {
+    let mut builder = test_codex().with_config(|config| {
         config.use_experimental_unified_exec_tool = true;
         config
             .features
             .enable(Feature::UnifiedExec)
             .expect("test config should allow feature update");
     });
-    let baseline = baseline_builder
-        .build_with_auto_env(&baseline_server)
-        .await?;
+    let codex = builder.build_with_auto_env(&server).await?;
     submit_unified_exec_turn(
-        &baseline,
+        &codex,
         "run the command and wait for it to finish",
         PermissionProfile::Disabled,
     )
     .await?;
-    let mut baseline_output = None;
-    let baseline_completion = loop {
-        match wait_for_event(&baseline.codex, |_| true).await {
-            EventMsg::ExecCommandEnd(event) => baseline_output = Some(event.aggregated_output),
-            EventMsg::TurnComplete(event) => break event,
-            _ => {}
+    let completion = loop {
+        if let EventMsg::TurnComplete(event) = wait_for_event(&codex.codex, |_| true).await {
+            break event;
         }
     };
 
-    let optimized_server = start_mock_server().await;
-    let optimized_open_args = json!({
-        "cmd": command,
-        "yield_time_ms": 3_000,
-        "tty": true,
-    });
-    let optimized_responses = mount_sse_sequence(
-        &optimized_server,
-        vec![
-            sse(vec![
-                ev_response_created("optimized-open"),
-                ev_function_call(
-                    "optimized-open-call",
-                    "unified_exec",
-                    &serde_json::to_string(&optimized_open_args)?,
-                ),
-                ev_completed("optimized-open"),
-            ]),
-            sse(vec![
-                ev_response_created("optimized-final"),
-                ev_assistant_message("optimized-message", "complete"),
-                ev_completed("optimized-final"),
-            ]),
-        ],
-    )
-    .await;
-    let mut optimized_builder = test_codex().with_config(|config| {
-        config.use_experimental_unified_exec_tool = true;
-        config
-            .features
-            .enable(Feature::UnifiedExec)
-            .expect("test config should allow feature update");
-    });
-    let optimized = optimized_builder
-        .build_with_auto_env(&optimized_server)
-        .await?;
-    submit_unified_exec_turn(
-        &optimized,
-        "run the command and wait for it to finish",
-        PermissionProfile::Disabled,
-    )
-    .await?;
-    let mut optimized_output = None;
-    let optimized_completion = loop {
-        match wait_for_event(&optimized.codex, |_| true).await {
-            EventMsg::ExecCommandEnd(event) => optimized_output = Some(event.aggregated_output),
-            EventMsg::TurnComplete(event) => break event,
-            _ => {}
-        }
-    };
-
-    assert_eq!(
-        baseline_completion.last_agent_message.as_deref(),
-        Some("complete")
-    );
-    assert_eq!(
-        baseline_completion.last_agent_message,
-        optimized_completion.last_agent_message
-    );
+    assert_eq!(completion.last_agent_message.as_deref(), Some("complete"));
+    let requests = responses.requests();
+    assert_eq!(requests.len(), 3);
+    let final_request = requests[2].body_json();
+    let owner_wait_output = final_request
+        .get("input")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items.iter().find(|item| {
+                item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                    && item.get("call_id").and_then(Value::as_str) == Some("owner-wait-call")
+            })
+        })
+        .and_then(extract_output_text)
+        .expect("final model request should contain the owner-wait result");
     assert!(
-        baseline_output
-            .as_deref()
-            .is_some_and(|output| output.contains("POLL_DONE"))
+        owner_wait_output.contains("POLL_DONE"),
+        "the terminal command output must be present in the request that resumes the model; actual output: {owner_wait_output:?}",
     );
-    assert!(
-        optimized_output
-            .as_deref()
-            .is_some_and(|output| output.contains("POLL_DONE"))
-    );
-    assert_eq!(baseline_responses.requests().len(), 3);
-    assert_eq!(optimized_responses.requests().len(), 2);
 
-    let baseline_timing = baseline_completion.timing.expect("baseline turn timing");
-    let optimized_timing = optimized_completion.timing.expect("optimized turn timing");
-    assert_eq!(baseline_timing.counters.logical_generation_count, 3);
-    assert_eq!(baseline_timing.counters.generations_by_reason.initial, 1);
-    assert_eq!(
-        baseline_timing
-            .counters
-            .generations_by_reason
-            .tool_continuation,
-        2
-    );
-    assert_eq!(baseline_timing.counters.tool_call_count, 2);
-    assert_eq!(optimized_timing.counters.logical_generation_count, 2);
-    assert_eq!(optimized_timing.counters.generations_by_reason.initial, 1);
-    assert_eq!(
-        optimized_timing
-            .counters
-            .generations_by_reason
-            .tool_continuation,
-        1
-    );
-    assert_eq!(optimized_timing.counters.tool_call_count, 1);
+    let timing = completion.timing.expect("turn timing");
+    assert_eq!(timing.counters.logical_generation_count, 3);
+    assert_eq!(timing.counters.generations_by_reason.initial, 1);
+    assert_eq!(timing.counters.generations_by_reason.tool_continuation, 2);
+    assert_eq!(timing.counters.tool_call_count, 2);
 
     Ok(())
 }

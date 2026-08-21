@@ -237,6 +237,7 @@ pub(crate) async fn execute_user_shell_command(
         sub_id: turn_context.sub_id.clone(),
         call_id: call_id.clone(),
         tx_event: session.get_tx_event(),
+        progress: None,
     });
 
     let standalone_work_guard = turn_context.turn_timing_state.begin_standalone_work();

@@ -43,6 +43,9 @@ use crate::validation_admission::classify_validation;
 pub(crate) type SamplingReasoningPhase = ReasoningPolicyPhase;
 pub(crate) type SamplingRequestPolicySource = ReasoningPolicySource;
 
+const TURN_EFFICIENCY_TOOL_CALL_THRESHOLD: usize = 12;
+const TURN_EFFICIENCY_NEGLIGIBLE_CHILD_RUNTIME_MS_PER_CALL: u64 = 500;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum ContinuationDisposition {
     #[default]
@@ -327,7 +330,14 @@ impl SamplingToolOutcome {
             | SamplingToolOutcomeKind::Blocked
             | SamplingToolOutcomeKind::RecoverableCancellation => ToolOutputOutcome::Failure,
         };
-        Self::from_signal(ordinal, ToolOutputOutcomeContext::new(outcome), plan, None)
+        let mut sampling_outcome =
+            Self::from_signal(ordinal, ToolOutputOutcomeContext::new(outcome), plan, None);
+        // A plain outcome has already been classified by its caller. Preserve
+        // distinctions that cannot be reconstructed from the coarse protocol
+        // outcome alone (blocked and recoverable cancellation both serialize
+        // as generic failures).
+        sampling_outcome.kind = kind;
+        sampling_outcome
     }
 
     fn is_failure_evidence(&self) -> bool {
@@ -503,6 +513,7 @@ struct SamplingRequestSignalState {
     code_mode_nested_tool_count: usize,
     code_mode_source_dependencies: BTreeMap<String, BTreeSet<SourceDependencyV1>>,
     authoritative_wait_observations: Vec<AuthoritativeWaitObservation>,
+    child_runtime_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -646,6 +657,22 @@ impl SamplingRequestSignalCollector {
         }) {
             ledger.blocked_wait_gate = None;
         }
+    }
+
+    pub(crate) fn record_child_runtime(&self, runtime_ms: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.child_runtime_ms = state.child_runtime_ms.saturating_add(runtime_ms);
+    }
+
+    fn turn_efficiency_sample(&self) -> (usize, u64) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (state.registered_count, state.child_runtime_ms)
     }
 
     pub(crate) fn record_suppressed_result(&self, ordinal: u64, response: &ResponseInputItem) {
@@ -1094,6 +1121,12 @@ impl SamplingRequestSignalCollector {
             return None;
         }
 
+        let semantic_evidence_only = outcomes
+            .iter()
+            .all(|outcome| outcome.source_evidence.is_some())
+            && !state.saw_validation
+            && !state.saw_mutation
+            && !state.saw_coordination;
         let ordered = outcomes
             .into_iter()
             .map(|outcome| {
@@ -1117,7 +1150,7 @@ impl SamplingRequestSignalCollector {
             .map(|(_, action, evidence)| format!("{}:{evidence}", action.identity))
             .collect::<Vec<_>>()
             .join("|");
-        let semantic_evidence = all_broad_source.then(|| {
+        let semantic_evidence = (all_broad_source || semantic_evidence_only).then(|| {
             let mut identities = ordered
                 .iter()
                 .map(|(_, _, evidence)| (*evidence).clone())
@@ -1131,7 +1164,7 @@ impl SamplingRequestSignalCollector {
             .cloned()
             .collect::<Vec<_>>()
             .join("|");
-        let kind = if all_broad_source {
+        let kind = if all_broad_source || semantic_evidence_only {
             DeterministicCycleKind::BroadSourcePass
         } else if residual_tool_continuation {
             DeterministicCycleKind::ResidualToolContinuation
@@ -1551,6 +1584,7 @@ fn authoritative_wait_observation(
         "action": action,
         "receipt_identity": (disposition == AuthoritativeWaitDisposition::Terminal)
             .then_some(receipt_identity),
+        "surfaceable_message": surfaceable_message,
     }))
     .ok()?;
     let assignment_ids = result
@@ -1761,6 +1795,9 @@ pub(crate) struct SamplingReasoningGovernor {
     directive_issued: bool,
     proven_loop_active: bool,
     wait_convergence: Option<WaitConvergenceHandle>,
+    efficiency_guard_fingerprint: Option<String>,
+    turn_efficiency_tool_calls: usize,
+    turn_efficiency_child_runtime_ms: u64,
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -1796,6 +1833,9 @@ impl SamplingReasoningGovernor {
             directive_issued: false,
             proven_loop_active: false,
             wait_convergence: None,
+            efficiency_guard_fingerprint: None,
+            turn_efficiency_tool_calls: 0,
+            turn_efficiency_child_runtime_ms: 0,
         }
     }
 
@@ -1913,8 +1953,20 @@ impl SamplingReasoningGovernor {
 
         let cycle = collector.deterministic_cycle()?;
         let settled_revision = self.settled_revision_key(settled);
-        (cycle.kind != DeterministicCycleKind::Empty
-            && self.consecutive_no_progress > 0
+        // Broad source passes and failures start the no-progress sequence on
+        // their first observation because they cannot advance state. They
+        // still require one model interpretation before an identical second
+        // observation can become residual-deterministic. Successful
+        // structured evidence starts at zero, so its exact repetition reaches
+        // the same two-observation fixed point at one.
+        let fixed_point_observed = match cycle.kind {
+            DeterministicCycleKind::BroadSourcePass
+            | DeterministicCycleKind::ToolFailure
+            | DeterministicCycleKind::NestedToolFailure => self.consecutive_no_progress > 1,
+            DeterministicCycleKind::Empty => false,
+            _ => self.consecutive_no_progress > 0,
+        };
+        (fixed_point_observed
             && self.last_cycle.as_deref() == Some(cycle.key.as_str())
             && self.last_state_revision.as_deref() == Some(settled_revision.as_str()))
         .then(|| ResidualDeterministicSamplingProof {
@@ -2003,6 +2055,54 @@ impl SamplingReasoningGovernor {
             self.reset_convergence();
             self.last_state_revision = Some(settled_revision);
             return SamplingConvergenceDecision::default();
+        }
+
+        if self
+            .last_state_revision
+            .as_deref()
+            .is_some_and(|previous| previous != settled_revision)
+        {
+            self.reset_turn_efficiency_guard();
+        }
+        let efficiency_sample_eligible = collector.authoritative_wait_observation().is_none();
+        let (request_tool_calls, request_child_runtime_ms) = if efficiency_sample_eligible {
+            collector.turn_efficiency_sample()
+        } else {
+            (0, 0)
+        };
+        self.turn_efficiency_tool_calls = self
+            .turn_efficiency_tool_calls
+            .saturating_add(request_tool_calls);
+        self.turn_efficiency_child_runtime_ms = self
+            .turn_efficiency_child_runtime_ms
+            .saturating_add(request_child_runtime_ms);
+        let negligible_runtime_limit_ms = u64::try_from(self.turn_efficiency_tool_calls)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(TURN_EFFICIENCY_NEGLIGIBLE_CHILD_RUNTIME_MS_PER_CALL);
+        let exceeds_turn_efficiency_guard = request_tool_calls > 0
+            && self.turn_efficiency_tool_calls >= TURN_EFFICIENCY_TOOL_CALL_THRESHOLD
+            && self.turn_efficiency_child_runtime_ms <= negligible_runtime_limit_ms;
+        let efficiency_advisory_already_issued = self
+            .efficiency_guard_fingerprint
+            .as_deref()
+            .is_some_and(|fingerprint| fingerprint == settled_revision);
+        if exceeds_turn_efficiency_guard && !efficiency_advisory_already_issued {
+            // Call volume and child runtime are useful consolidation signals,
+            // but they are not evidence that the work is redundant. Issue one
+            // advisory per settled state and leave terminal enforcement to the
+            // exact deterministic-cycle checks below.
+            self.efficiency_guard_fingerprint = Some(settled_revision.clone());
+            self.last_state_revision = Some(settled_revision);
+            self.directive_issued = true;
+            return SamplingConvergenceDecision {
+                continuation: ContinuationDisposition::ModelRequired,
+                directive: Some(
+                    "Turn-efficiency guard: this turn accumulated many tool calls with negligible child runtime while state stayed unchanged. Consolidate the returned evidence now; use another tool only when additional evidence or state change is necessary."
+                        .to_string(),
+                ),
+                proven_loop_activated: false,
+                authoritative_wait: None,
+            };
         }
 
         if let Some(observation) = collector.authoritative_wait_observation() {
@@ -2159,7 +2259,16 @@ impl SamplingReasoningGovernor {
                 cycle.kind,
                 DeterministicCycleKind::ToolFailure | DeterministicCycleKind::NestedToolFailure
             );
-        let threshold = if repeated_failure { 2 } else { 3 };
+        // The first successful structured observation initializes the counter
+        // at zero because it may be new evidence. An exact repetition against
+        // the same settled state increments it to one, which is already the
+        // requested two-observation fixed point. Ambiguous or merely empty
+        // cycles retain the more conservative three-observation threshold.
+        let threshold = if repeated_cycle && cycle_is_nonempty {
+            1
+        } else {
+            3
+        };
         if self.consecutive_no_progress < threshold
             && self.consecutive_obligation_no_progress < threshold
         {
@@ -2215,6 +2324,13 @@ impl SamplingReasoningGovernor {
         self.directive_issued = false;
         self.proven_loop_active = false;
         self.wait_convergence = None;
+        self.reset_turn_efficiency_guard();
+    }
+
+    fn reset_turn_efficiency_guard(&mut self) {
+        self.efficiency_guard_fingerprint = None;
+        self.turn_efficiency_tool_calls = 0;
+        self.turn_efficiency_child_runtime_ms = 0;
     }
 
     fn clear_broad_source_pass_gate(&self) {
@@ -4212,6 +4328,32 @@ mod tests {
         collector
     }
 
+    fn high_volume_tool_pass_collector(
+        governor: &SamplingReasoningGovernor,
+        baselines: &SamplingRequestBaselines,
+        evidence: &str,
+    ) -> SamplingRequestSignalCollector {
+        let collector = governor.collector(baselines);
+        for ordinal in 0..TURN_EFFICIENCY_TOOL_CALL_THRESHOLD {
+            let call_id = format!("exec-call-{ordinal}");
+            let arguments = format!(r#"{{"command":"inspect-{ordinal}"}}"#);
+            let registration = collector.register_deterministic_tool_call(
+                &ToolName::plain("exec"),
+                &ToolPayload::Function { arguments },
+                &call_id,
+            );
+            collector.record_response_result_with_mutation(
+                registration.ordinal,
+                ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+                None,
+                &successful_tool_response(&call_id, evidence),
+                false,
+                false,
+            );
+        }
+        collector
+    }
+
     fn residual_tool_collector(
         governor: &SamplingReasoningGovernor,
         baselines: &SamplingRequestBaselines,
@@ -4300,14 +4442,16 @@ mod tests {
         );
 
         let repeated = residual_tool_collector(&governor, &baselines, "revision-1", "same");
+        let repeated_decision = governor.evaluate_convergence(&baselines, &repeated, &settled);
         assert_eq!(
-            governor.evaluate_convergence(&baselines, &repeated, &settled),
-            SamplingConvergenceDecision::default()
+            repeated_decision.continuation,
+            ContinuationDisposition::ModelRequired
         );
+        assert!(repeated_decision.directive.is_some());
+        let repeated_request =
+            governor.continuation_generation_request(&baselines, &repeated, &settled, false, false);
         assert!(matches!(
-            governor
-                .continuation_generation_request(&baselines, &repeated, &settled, false, false,)
-                .sampling,
+            &repeated_request.sampling,
             SamplingGenerationDisposition::ResidualDeterministic(
                 ResidualDeterministicSamplingProof {
                     exact_action: ResidualDeterministicAction::RequireChangedContinuation,
@@ -4315,7 +4459,6 @@ mod tests {
                 }
             )
         ));
-
         let changed_evidence =
             residual_tool_collector(&governor, &baselines, "revision-2", "changed");
         assert!(
@@ -4345,12 +4488,12 @@ mod tests {
         let arguments =
             r#"{"artifact_id":"artifact-1","selectors":[{"kind":"lines","start":1,"end":1}]}"#;
 
-        for generation in 1..=3 {
+        for generation in 1..=2 {
             let (collector, registration) =
                 read_only_pass_collector(&governor, &baselines, arguments, "same-evidence");
             assert!(registration.suppressed_source_pass.is_none());
             let decision = governor.evaluate_convergence(&baselines, &collector, &settled);
-            assert_eq!(decision.directive.is_some(), generation == 3);
+            assert_eq!(decision.directive.is_some(), generation > 1);
             if generation > 1 {
                 assert_eq!(
                     governor
@@ -4436,7 +4579,7 @@ mod tests {
                 cycle_key = Some(current_key.clone());
             }
             let decision = governor.evaluate_convergence(&baselines, &collector, &settled);
-            assert_eq!(decision.directive.is_some(), generation == 2);
+            assert_eq!(decision.directive.is_some(), generation > 0);
         }
     }
 
@@ -4551,7 +4694,7 @@ mod tests {
         let mut governor = SamplingReasoningGovernor::new(None);
         let (baselines, settled) = unchanged_state(&governor);
 
-        for generation in 1..=3 {
+        for generation in 1..=2 {
             let collector = direct_failure_collector(&governor, &baselines, "io.locked");
             assert!(
                 collector
@@ -4787,7 +4930,7 @@ mod tests {
         let mut governor = SamplingReasoningGovernor::new(None);
         let (baselines, settled) = unchanged_state(&governor);
 
-        for generation in 1..=4 {
+        for generation in 1..=3 {
             let collector = structured_tool_pass_collector(
                 &governor,
                 &baselines,
@@ -4796,7 +4939,69 @@ mod tests {
             );
             assert!(collector.deterministic_cycle_key().is_some());
             let decision = governor.evaluate_convergence(&baselines, &collector, &settled);
-            assert_eq!(decision.directive.is_some(), generation == 4);
+            assert_eq!(decision.directive.is_some(), generation >= 2);
+        }
+    }
+
+    #[test]
+    fn turn_efficiency_high_tool_count_requests_consolidation_without_forcing_completion() {
+        let mut governor = SamplingReasoningGovernor::new(None);
+        let (baselines, settled) = unchanged_state(&governor);
+
+        for generation in 1..=2 {
+            let collector = high_volume_tool_pass_collector(&governor, &baselines, "same-result");
+            collector.record_child_runtime(
+                TURN_EFFICIENCY_NEGLIGIBLE_CHILD_RUNTIME_MS_PER_CALL
+                    * u64::try_from(TURN_EFFICIENCY_TOOL_CALL_THRESHOLD).unwrap(),
+            );
+            let decision = governor.evaluate_convergence(&baselines, &collector, &settled);
+            assert_eq!(
+                decision.continuation,
+                ContinuationDisposition::ModelRequired
+            );
+            assert_eq!(decision.directive.is_some(), generation == 1);
+            assert!(!decision.proven_loop_activated);
+        }
+    }
+
+    #[test]
+    fn orchestration_correctness_sequential_tiny_calls_do_not_discard_new_evidence() {
+        let mut governor = SamplingReasoningGovernor::new(None);
+        let (baselines, settled) = unchanged_state(&governor);
+
+        for generation in 1..=TURN_EFFICIENCY_TOOL_CALL_THRESHOLD + 1 {
+            let arguments = format!(r#"{{"command":"inspect-{generation}"}}"#);
+            let evidence = format!("evidence-{generation}");
+            let collector =
+                structured_tool_pass_collector(&governor, &baselines, &arguments, &evidence);
+            collector.record_child_runtime(100);
+            let decision = governor.evaluate_convergence(&baselines, &collector, &settled);
+            assert_eq!(
+                decision.continuation,
+                ContinuationDisposition::ModelRequired
+            );
+            assert_eq!(
+                decision.directive.is_some(),
+                generation == TURN_EFFICIENCY_TOOL_CALL_THRESHOLD
+            );
+            assert!(!decision.proven_loop_activated);
+        }
+    }
+
+    #[test]
+    fn turn_efficiency_substantive_average_child_runtime_does_not_trigger_guard() {
+        let mut governor = SamplingReasoningGovernor::new(None);
+        let (baselines, settled) = unchanged_state(&governor);
+
+        for generation in 1..=TURN_EFFICIENCY_TOOL_CALL_THRESHOLD + 1 {
+            let arguments = format!(r#"{{"command":"inspect-{generation}"}}"#);
+            let evidence = format!("evidence-{generation}");
+            let collector =
+                structured_tool_pass_collector(&governor, &baselines, &arguments, &evidence);
+            collector
+                .record_child_runtime(TURN_EFFICIENCY_NEGLIGIBLE_CHILD_RUNTIME_MS_PER_CALL + 1);
+            let decision = governor.evaluate_convergence(&baselines, &collector, &settled);
+            assert!(decision.directive.is_none());
         }
     }
 
@@ -4805,7 +5010,7 @@ mod tests {
         let mut governor = SamplingReasoningGovernor::new(None);
         let (baselines, settled) = unchanged_state(&governor);
 
-        for generation in 1..=5 {
+        for generation in 1..=3 {
             let collector = structured_tool_pass_collector(
                 &governor,
                 &baselines,
@@ -4813,7 +5018,7 @@ mod tests {
                 "same-result",
             );
             let decision = governor.evaluate_convergence(&baselines, &collector, &settled);
-            if generation < 5 {
+            if generation < 3 {
                 assert_eq!(
                     decision.continuation,
                     ContinuationDisposition::ModelRequired

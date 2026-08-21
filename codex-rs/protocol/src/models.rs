@@ -1847,6 +1847,11 @@ pub struct ShellCommandToolCallParams {
     /// This is the maximum time in milliseconds that the command is allowed to run.
     #[serde(alias = "timeout")]
     pub timeout_ms: Option<u64>,
+    /// Maximum time a running command may produce no stdout or stderr before it is
+    /// treated as stalled. A value of zero disables progress-based stall detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub stall_timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub sandbox_permissions: Option<SandboxPermissions>,

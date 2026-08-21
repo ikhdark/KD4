@@ -920,10 +920,10 @@ async fn responses_websocket_request_prewarm_is_reused_even_with_header_changes(
 async fn responses_websocket_prewarm_uses_v2_when_provider_supports_websockets() {
     skip_if_no_network!();
 
-    let server = start_websocket_server(vec![vec![vec![
-        ev_response_created("resp-1"),
-        ev_completed("resp-1"),
-    ]]])
+    let server = start_websocket_server(vec![vec![
+        vec![ev_response_created("warm-1"), ev_completed("warm-1")],
+        vec![ev_response_created("resp-1"), ev_completed("resp-1")],
+    ]])
     .await;
 
     let harness = websocket_harness_with_options(&server, /*runtime_metrics_enabled*/ false).await;
@@ -960,16 +960,23 @@ async fn responses_websocket_prewarm_uses_v2_when_provider_supports_websockets()
     stream_until_complete(&mut client_session, &harness, &prompt).await;
     assert_eq!(server.handshakes().len(), 1);
     let connection = server.single_connection();
-    assert_eq!(connection.len(), 1);
+    assert_eq!(connection.len(), 2);
     let prewarm = connection
         .first()
         .expect("missing prewarm request")
+        .body_json();
+    let follow_up = connection
+        .get(1)
+        .expect("missing follow-up request")
         .body_json();
     assert_eq!(prewarm["type"].as_str(), Some("response.create"));
     assert_eq!(
         prewarm["input"],
         serde_json::to_value(&prompt.input).unwrap()
     );
+    assert_eq!(follow_up["type"].as_str(), Some("response.create"));
+    assert_eq!(follow_up["previous_response_id"].as_str(), Some("warm-1"));
+    assert_eq!(follow_up["input"], serde_json::json!([]));
 
     server.shutdown().await;
 }
@@ -1068,7 +1075,7 @@ async fn responses_websocket_v2_requests_use_v2_when_provider_supports_websocket
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn responses_websocket_v2_incremental_requests_are_reused_across_turns() {
+async fn responses_websocket_v2_connection_is_reused_but_response_chain_resets_across_turns() {
     skip_if_no_network!();
 
     let mut assistant_output_with_turn_id = ev_assistant_message("msg_1", "assistant output");
@@ -1110,7 +1117,7 @@ async fn responses_websocket_v2_incremental_requests_are_reused_across_turns() {
         stream_until_complete(&mut client_session, &harness, &prompt_one).await;
     }
 
-    // Turn two: the response and reconstructed history have matching metadata.
+    // Turn two: a new logical session reuses the transport but sends the full prompt.
     let mut first_assistant_output = assistant_message_item("1", "assistant output");
     first_assistant_output.set_turn_id_if_missing("turn-1");
 
@@ -1125,7 +1132,7 @@ async fn responses_websocket_v2_incremental_requests_are_reused_across_turns() {
         stream_until_complete(&mut client_session, &harness, &prompt_two).await;
     }
 
-    // Turn three: the reconstructed history has metadata that the response omitted.
+    // Turn three: response-chain state remains scoped to each logical session.
     let mut second_assistant_output = assistant_message_item("2", "second assistant output");
     second_assistant_output.set_turn_id_if_missing("turn-2");
 
@@ -1149,19 +1156,19 @@ async fn responses_websocket_v2_incremental_requests_are_reused_across_turns() {
     // validate second turn
     let second = connection.get(1).expect("missing request").body_json();
     assert_eq!(second["type"].as_str(), Some("response.create"));
-    assert_eq!(second["previous_response_id"].as_str(), Some("resp-1"));
+    assert_eq!(second["previous_response_id"].as_str(), None);
     assert_eq!(
         second["input"],
-        serde_json::to_value(&prompt_two.input[2..]).unwrap()
+        serialized_prompt_input_without_item_ids(&prompt_two)
     );
 
     // validate third turn
     let third = connection.get(2).expect("missing request").body_json();
     assert_eq!(third["type"].as_str(), Some("response.create"));
-    assert_eq!(third["previous_response_id"].as_str(), Some("resp-2"));
+    assert_eq!(third["previous_response_id"].as_str(), None);
     assert_eq!(
         third["input"],
-        serde_json::to_value(&prompt_three.input[4..]).unwrap()
+        serialized_prompt_input_without_item_ids(&prompt_three)
     );
 
     server.shutdown().await;
@@ -1548,7 +1555,8 @@ async fn responses_websocket_usage_limit_error_emits_rate_limit_event() {
                 "credits": null,
                 "individual_limit": null,
                 "plan_type": null,
-                "rate_limit_reached_type": null
+                "rate_limit_reached_type": null,
+                "spend_control_reached": null
             }
         })
     );
@@ -2244,6 +2252,19 @@ fn prompt_with_input(input: Vec<ResponseItem>) -> Prompt {
     let mut prompt = Prompt::default();
     prompt.input = input.into();
     prompt
+}
+
+fn serialized_prompt_input_without_item_ids(prompt: &Prompt) -> serde_json::Value {
+    let mut input = serde_json::to_value(&prompt.input).expect("prompt input should serialize");
+    for item in input
+        .as_array_mut()
+        .expect("prompt input should be an array")
+    {
+        item.as_object_mut()
+            .expect("prompt item should be an object")
+            .remove("id");
+    }
+    input
 }
 
 fn prompt_with_input_and_instructions(input: Vec<ResponseItem>, instructions: &str) -> Prompt {

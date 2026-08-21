@@ -459,10 +459,16 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
         first_response_request.body_json()["parallel_tool_calls"],
         "compact requests should match /v1/responses parallel_tool_calls"
     );
+    let expected_compact_effort = harness
+        .test()
+        .session_configured
+        .reasoning_effort
+        .as_ref()
+        .map(ToString::to_string);
     assert_eq!(
-        compact_body["reasoning"],
-        first_response_request.body_json()["reasoning"],
-        "compact requests should match /v1/responses reasoning"
+        compact_body["reasoning"]["effort"].as_str(),
+        expected_compact_effort.as_deref(),
+        "remote compact should use the turn baseline reasoning effort, independently of governed sampling effort"
     );
     assert_eq!(
         compact_body["text"],
@@ -799,6 +805,7 @@ async fn assert_remote_manual_compact_request_parity(
         "input",
         "client_metadata",
         "include",
+        "reasoning",
         "store",
         "stream",
         "tool_choice",
@@ -813,6 +820,21 @@ async fn assert_remote_manual_compact_request_parity(
         .as_object_mut()
         .expect("compact request body should be an object")
         .remove("input");
+    compact_body_without_input
+        .as_object_mut()
+        .expect("compact request body should be an object")
+        .remove("reasoning");
+    let expected_compact_effort = harness
+        .test()
+        .session_configured
+        .reasoning_effort
+        .as_ref()
+        .map(ToString::to_string);
+    assert_eq!(
+        compact_body["reasoning"]["effort"].as_str(),
+        expected_compact_effort.as_deref(),
+        "remote compact should use the turn baseline reasoning effort, independently of governed sampling effort"
+    );
     let canonical_compact_body_without_input = canonical_json(&compact_body_without_input);
     let canonical_expected_compact_body_without_input =
         canonical_json(&expected_compact_body_without_input);
@@ -1015,8 +1037,8 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
         "expected follow-up request to include the compaction payload"
     );
     assert!(
-        follow_up_body.contains("hello remote compact"),
-        "expected v2 follow-up request to preserve retained original user messages"
+        !follow_up_body.contains("hello remote compact"),
+        "expected v2 follow-up request to evict original user history consumed by compaction"
     );
 
     Ok(())
@@ -3556,8 +3578,8 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_strips_incoming_model
 
     let follow_up_body = post_compact_turn_request.body_json().to_string();
     assert!(
-        follow_up_body.contains("BEFORE_SWITCH_USER"),
-        "post-compaction follow-up should preserve older user messages when they fit"
+        !follow_up_body.contains("BEFORE_SWITCH_USER"),
+        "post-compaction follow-up should evict older user messages consumed by compaction"
     );
     assert!(
         follow_up_body.contains("AFTER_SWITCH_USER"),

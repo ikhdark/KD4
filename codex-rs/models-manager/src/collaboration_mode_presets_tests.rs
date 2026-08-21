@@ -28,12 +28,13 @@ fn default_mode_instructions_keep_only_the_compact_execution_contract() {
         .join(" ");
     assert!(!default_instructions.contains("{{KNOWN_MODE_NAMES}}"));
     assert!(!default_instructions.contains("Known mode names"));
-    assert!(!default_instructions.contains("request_user_input"));
+    assert!(default_instructions.contains("`request_user_input` is available"));
+    assert!(default_instructions.contains("exactly four mutually exclusive suggested answers"));
     assert!(!default_instructions.contains("For example"));
     assert!(default_instructions.contains("requests are read-only"));
     assert!(default_instructions.contains("scoped implementation"));
     assert!(default_instructions.contains("Resolve discoverable facts"));
-    assert!(normalized_instructions.contains("one concise question"));
+    assert!(normalized_instructions.contains("one concise direct question"));
     assert!(default_instructions.contains("external-action"));
     assert!(default_instructions.contains("nearest sufficient proof"));
     assert!(default_instructions.len() < 1_000);

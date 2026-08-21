@@ -231,7 +231,6 @@ async fn current_time_reminders_can_follow_only_user_or_tool_outputs() -> Result
                 ev_assistant_message("msg-2", "continue"),
                 continue_response,
             ]),
-            sse(vec![ev_response_created("resp-3"), ev_completed("resp-3")]),
         ],
     )
     .await;
@@ -252,14 +251,13 @@ async fn current_time_reminders_can_follow_only_user_or_tool_outputs() -> Result
         .await?;
 
     let requests = responses.requests();
-    assert_eq!(requests.len(), 3);
+    // An unchanged end_turn=false continuation is host-completed without
+    // spending another model request. The requests that remain correspond to
+    // the user input and the tool output, and each receives one new reminder.
+    assert_eq!(requests.len(), 2);
     assert_eq!(current_time_reminders(&requests[0]), vec![FIRST_REMINDER]);
     assert_eq!(
         current_time_reminders(&requests[1]),
-        vec![FIRST_REMINDER, SECOND_REMINDER]
-    );
-    assert_eq!(
-        current_time_reminders(&requests[2]),
         vec![FIRST_REMINDER, SECOND_REMINDER]
     );
     Ok(())

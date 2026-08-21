@@ -5,32 +5,32 @@ expression: "format_labeled_requests_snapshot(\"Remote mid-turn continuation com
 Scenario: Remote mid-turn continuation compaction after realtime was closed before the turn: the initial second-turn request emits realtime-end instructions, but the continuation request does not restate them after compaction because the current turn already established the inactive baseline.
 
 ## Second Turn Initial Request
-00:message/developer[3]:
-    [01] <PERMISSIONS_INSTRUCTIONS>
-    [02] <realtime_conversation>\nRealtime conversation started.\n\nYou a...
-    [03] <skills_usage_instructions>\n## How to use skills\n- Use a skill...
-01:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-02:message/user:SETUP_USER
-03:message/assistant:REMOTE_SETUP_REPLY
-04:message/developer:<realtime_conversation>\nRealtime conversation ended.\n\nSubsequ...
-05:message/user:USER_TWO
+00:message/user:<task_model_guidance>Before acting, form and maintain a working ...
+01:message/developer:<PERMISSIONS_INSTRUCTIONS>
+02:message/developer:<skills_usage_instructions>\n## How to use skills\n- Use the sma...
+03:message/developer:<NO_TEXT>
+04:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
+05:message/user:SETUP_USER
+06:message/assistant:REMOTE_SETUP_REPLY
+07:message/developer:<realtime_conversation>\nRealtime conversation ended.\n\nSubsequ...
+08:message/user:USER_TWO
 
 ## Remote Compaction Request
-00:message/developer[3]:
-    [01] <PERMISSIONS_INSTRUCTIONS>
-    [02] <realtime_conversation>\nRealtime conversation started.\n\nYou a...
-    [03] <skills_usage_instructions>\n## How to use skills\n- Use a skill...
-01:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-02:message/user:SETUP_USER
-03:message/assistant:REMOTE_SETUP_REPLY
-04:message/developer:<realtime_conversation>\nRealtime conversation ended.\n\nSubsequ...
-05:message/user:USER_TWO
-06:function_call/test_tool
-07:function_call_output:unsupported call: test_tool
+00:message/user:<task_model_guidance>Before acting, form and maintain a working ...
+01:message/developer:<PERMISSIONS_INSTRUCTIONS>
+02:message/developer:<skills_usage_instructions>\n## How to use skills\n- Use the sma...
+03:message/developer:<NO_TEXT>
+04:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
+05:message/user:SETUP_USER
+06:message/assistant:REMOTE_SETUP_REPLY
+07:message/developer:<realtime_conversation>\nRealtime conversation ended.\n\nSubsequ...
+08:message/user:USER_TWO
+09:function_call/test_tool
+10:function_call_output:unsupported call: test_tool
 
 ## Remote Post-Compaction History Layout
-00:message/developer[2]:
-    [01] <PERMISSIONS_INSTRUCTIONS>
-    [02] <skills_usage_instructions>\n## How to use skills\n- Use a skill...
-01:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-02:compaction:encrypted=true
+00:message/developer:<PERMISSIONS_INSTRUCTIONS>
+01:message/developer:<skills_usage_instructions>\n## How to use skills\n- Use the sma...
+02:message/developer:<NO_TEXT>
+03:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
+04:compaction:encrypted=true

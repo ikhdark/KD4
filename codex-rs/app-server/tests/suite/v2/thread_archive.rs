@@ -347,6 +347,18 @@ async fn thread_archive_succeeds_when_descendant_archive_fails() -> Result<()> {
         .path()
         .join(ARCHIVED_SESSIONS_SUBDIR)
         .join(child_rollout_path.file_name().expect("rollout file name"));
+    #[cfg(windows)]
+    let _child_rollout_lock = {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        std::fs::OpenOptions::new()
+            .read(true)
+            // Let the app-server read the rollout while denying the delete sharing
+            // required by MoveFileExW, so the descendant archive itself fails.
+            .share_mode(0x0000_0001 | 0x0000_0002)
+            .open(&child_rollout_path)?
+    };
+    #[cfg(not(windows))]
     std::fs::create_dir_all(&archived_child_path)?;
 
     let mut mcp = TestAppServer::builder()
@@ -397,6 +409,12 @@ async fn thread_archive_succeeds_when_descendant_archive_fails() -> Result<()> {
         child_rollout_path.exists(),
         "child should stay active after descendant archive failure"
     );
+    #[cfg(windows)]
+    assert!(
+        !archived_child_path.exists(),
+        "locked child should not be moved into archived sessions"
+    );
+    #[cfg(not(windows))]
     assert!(
         archived_child_path.is_dir(),
         "test conflict should remain in archived sessions"

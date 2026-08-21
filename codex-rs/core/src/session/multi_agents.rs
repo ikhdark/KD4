@@ -1,4 +1,5 @@
 use crate::config::MultiAgentV2Config;
+use crate::context::TaskCapsuleFragment;
 use crate::session::turn_context::TurnContext;
 use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::protocol::MultiAgentVersion;
@@ -87,7 +88,9 @@ pub(crate) fn spawn_is_authorized(turn_context: &TurnContext) -> bool {
 }
 
 pub(crate) fn update_spawn_authorization_from_text(turn_context: &TurnContext, text: &str) {
-    for directive in text
+    let task_capsule_objective = TaskCapsuleFragment::objective_from_rendered(text);
+    let authorization_text = task_capsule_objective.as_deref().unwrap_or(text);
+    for directive in authorization_text
         .lines()
         .flat_map(|line| line.split(['.', ';', '\n']))
         .filter_map(parse_spawn_authorization_directive)
@@ -118,6 +121,7 @@ fn parse_spawn_authorization_directive(clause: &str) -> Option<SpawnAuthorizatio
     let agent_target = body.contains("agent")
         || body.contains("sub-agent")
         || body.contains("subagent")
+        || body.contains("child")
         || body.contains("delegat");
     if !agent_target {
         return None;
@@ -146,12 +150,15 @@ fn parse_spawn_authorization_directive(clause: &str) -> Option<SpawnAuthorizatio
 mod tests {
     use super::SpawnAuthorizationDirective;
     use super::parse_spawn_authorization_directive;
+    use crate::context::ContextualUserFragment;
+    use crate::context::TaskCapsuleFragment;
 
     #[test]
     fn direct_spawn_requests_are_authorization_directives() {
         for request in [
             "Use subagents to inspect both paths",
             "Please spawn an agent for the independent audit",
+            "Spawn a child and continue",
             "Delegate this work to agents",
             "Parallelize with multiple agents",
         ] {
@@ -183,6 +190,21 @@ mod tests {
         assert_eq!(
             parse_spawn_authorization_directive("Do not use subagents for this task"),
             Some(SpawnAuthorizationDirective::Deny)
+        );
+    }
+
+    #[test]
+    fn delegated_task_capsule_objective_is_an_authorization_directive() {
+        let capsule = TaskCapsuleFragment::new(
+            r#"{"schema_version":1,"objective":"spawn the second agent"}"#.to_string(),
+        )
+        .render();
+        let objective = TaskCapsuleFragment::objective_from_rendered(&capsule)
+            .expect("rendered capsule objective");
+
+        assert_eq!(
+            parse_spawn_authorization_directive(&objective),
+            Some(SpawnAuthorizationDirective::Grant)
         );
     }
 }

@@ -1135,7 +1135,7 @@ async fn reviewer_finding_injects_one_repair_and_repair_mutation_cannot_rearm_re
         submit_turn_and_capture_completion(&test, "Implement every stated requirement").await?;
     assert_eq!(
         completion.completion.as_ref().map(|gate| gate.status),
-        Some(TaskCompletionStatus::Partial),
+        Some(TaskCompletionStatus::Passed),
         "reviews={}, rereviews={}, repairs={}, total_requests={}, gate={:?}",
         probe.review_requests.load(Ordering::SeqCst),
         probe.rereview_requests.load(Ordering::SeqCst),
@@ -1145,11 +1145,11 @@ async fn reviewer_finding_injects_one_repair_and_repair_mutation_cannot_rearm_re
     );
     assert_no_additional_turn_complete(&test).await;
 
-    assert_eq!(probe.total_requests.load(Ordering::SeqCst), 9);
+    assert_eq!(probe.total_requests.load(Ordering::SeqCst), 10);
     assert_eq!(probe.classification_requests.load(Ordering::SeqCst), 1);
-    assert_eq!(probe.review_requests.load(Ordering::SeqCst), 1);
-    assert_eq!(probe.rereview_requests.load(Ordering::SeqCst), 0);
-    assert_eq!(probe.repair_requests.load(Ordering::SeqCst), 4);
+    assert_eq!(probe.review_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(probe.rereview_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.repair_requests.load(Ordering::SeqCst), 3);
     let repair_payloads = probe.repair_payloads.lock().expect("repair payloads");
     assert!(
         repair_payloads
@@ -1165,7 +1165,7 @@ async fn reviewer_finding_injects_one_repair_and_repair_mutation_cannot_rearm_re
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ordinary_nonpassed_evidence_prevents_review_and_stays_partial() -> Result<()> {
+async fn ordinary_nonpassed_evidence_is_admitted_to_supplemental_review() -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
     let probe = mount_completion_review_sequence(
@@ -1192,12 +1192,17 @@ async fn ordinary_nonpassed_evidence_prevents_review_and_stays_partial() -> Resu
             .await?;
     assert_eq!(
         completion.completion.as_ref().map(|gate| gate.status),
-        Some(TaskCompletionStatus::Partial)
+        Some(TaskCompletionStatus::Passed),
+        "reviews={}, rereviews={}, repairs={}, total_requests={}, gate={:?}",
+        probe.review_requests.load(Ordering::SeqCst),
+        probe.rereview_requests.load(Ordering::SeqCst),
+        probe.repair_requests.load(Ordering::SeqCst),
+        probe.total_requests.load(Ordering::SeqCst),
+        completion.completion,
     );
 
-    assert_eq!(probe.total_requests.load(Ordering::SeqCst), 3);
-    assert_eq!(probe.classification_requests.load(Ordering::SeqCst), 0);
-    assert_eq!(probe.review_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(probe.classification_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.review_requests.load(Ordering::SeqCst), 1);
     assert_eq!(probe.rereview_requests.load(Ordering::SeqCst), 0);
     assert_eq!(probe.repair_requests.load(Ordering::SeqCst), 0);
     Ok(())
@@ -1610,9 +1615,10 @@ async fn mutating_finalizer_does_not_rerun_during_review_repair() -> Result<()> 
         submit_turn_and_capture_completion(&test, "Implement the requested behavior").await?;
     assert_eq!(
         completion.completion.as_ref().map(|gate| gate.status),
-        Some(TaskCompletionStatus::Partial)
+        Some(TaskCompletionStatus::Passed)
     );
-    assert_eq!(probe.review_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.review_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(probe.rereview_requests.load(Ordering::SeqCst), 1);
     assert_eq!(
         fs::read_to_string(test.home.path().join("mutating-finalizer-count.txt"))?.trim(),
         "1"
@@ -1792,7 +1798,7 @@ async fn plan_mode_does_not_bypass_review() -> Result<()> {
         None,
     )
     .await?;
-    assert_eq!(probe.review_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(probe.review_requests.load(Ordering::SeqCst), 1);
     Ok(())
 }
 

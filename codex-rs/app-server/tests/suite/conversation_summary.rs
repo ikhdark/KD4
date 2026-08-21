@@ -61,13 +61,13 @@ fn expected_summary(conversation_id: ThreadId, path: PathBuf) -> ConversationSum
     }
 }
 
-fn normalized_canonical_path(path: impl AsRef<Path>) -> Result<PathBuf> {
-    Ok(AbsolutePathBuf::from_absolute_path(path.as_ref().canonicalize()?)?.into_path_buf())
+fn normalized_absolute_path(path: impl AsRef<Path>) -> Result<PathBuf> {
+    Ok(AbsolutePathBuf::from_absolute_path(path.as_ref())?.into_path_buf())
 }
 
 fn normalized_summary_path(mut summary: ConversationSummary) -> Result<ConversationSummary> {
     if !summary.path.as_os_str().is_empty() {
-        summary.path = normalized_canonical_path(summary.path)?;
+        summary.path = normalized_absolute_path(summary.path)?;
     }
     Ok(summary)
 }
@@ -86,7 +86,7 @@ async fn get_conversation_summary_by_thread_id_reads_rollout() -> Result<()> {
     let thread_id = ThreadId::from_string(&conversation_id)?;
     let expected = expected_summary(
         thread_id,
-        normalized_canonical_path(rollout_path(
+        normalized_absolute_path(rollout_path(
             codex_home.path(),
             FILENAME_TS,
             &conversation_id,
@@ -220,7 +220,7 @@ async fn get_conversation_summary_by_relative_rollout_path_resolves_from_codex_h
     let thread_id = ThreadId::from_string(&conversation_id)?;
     let rollout_path = rollout_path(codex_home.path(), FILENAME_TS, &conversation_id);
     let relative_path = rollout_path.strip_prefix(codex_home.path())?.to_path_buf();
-    let expected = expected_summary(thread_id, normalized_canonical_path(rollout_path)?);
+    let expected = expected_summary(thread_id, normalized_absolute_path(rollout_path)?);
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())

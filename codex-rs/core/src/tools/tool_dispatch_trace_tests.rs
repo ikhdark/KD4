@@ -42,6 +42,8 @@ async fn dispatch_timing_separates_item_poll_gate_authorization_and_handler_boun
     timing.mark_handler_entry();
     tokio::time::advance(std::time::Duration::from_millis(10)).await;
     timing.mark_handler_exit();
+    tokio::time::advance(std::time::Duration::from_millis(5)).await;
+    timing.mark_output_collected();
     timing.record_workspace_evidence_before(std::time::Duration::from_millis(3));
     timing.record_workspace_evidence_after(std::time::Duration::from_millis(4));
 
@@ -52,10 +54,38 @@ async fn dispatch_timing_separates_item_poll_gate_authorization_and_handler_boun
     assert_eq!(snapshot.authorization_state_coordination_ms, Some(17));
     assert_eq!(snapshot.first_poll_to_handler_entry_ms, Some(70));
     assert_eq!(snapshot.handler_duration_ms, Some(10));
+    assert_eq!(snapshot.first_poll_to_output_collected_ms, Some(85));
     assert_eq!(snapshot.workspace_evidence_before_ms, Some(3));
     assert_eq!(snapshot.workspace_evidence_after_ms, Some(4));
-    assert_eq!(snapshot.post_handler_ms, Some(0));
-    assert_eq!(snapshot.total_duration_ms, Some(80));
+    assert_eq!(snapshot.post_handler_ms, Some(5));
+    assert_eq!(snapshot.total_duration_ms, Some(85));
+}
+
+#[tokio::test(start_paused = true)]
+async fn dispatch_timing_measures_exec_spawn_from_request_acceptance() {
+    let accepted_at = tokio::time::Instant::now();
+    let timing = ToolDispatchTiming::new(accepted_at, /*eager*/ false);
+
+    tokio::time::advance(std::time::Duration::from_millis(20)).await;
+    timing.mark_first_poll();
+    tokio::time::advance(std::time::Duration::from_millis(30)).await;
+    timing.mark_exec_process_spawned();
+
+    let live_snapshot = timing.snapshot(tokio::time::Instant::now());
+    assert_eq!(live_snapshot.item_to_first_poll_ms, Some(20));
+    assert_eq!(live_snapshot.exec_request_to_spawn_ms, Some(50));
+    assert!(live_snapshot.exec_process_alive_at_delivery);
+
+    tokio::time::advance(std::time::Duration::from_millis(100)).await;
+    timing.mark_exec_process_exited();
+    tokio::time::advance(std::time::Duration::from_millis(7)).await;
+
+    let exited_snapshot = timing.snapshot(tokio::time::Instant::now());
+    assert_eq!(exited_snapshot.exec_request_to_spawn_ms, Some(50));
+    assert_eq!(exited_snapshot.exec_spawn_to_exit_ms, Some(100));
+    assert_eq!(exited_snapshot.exec_exit_to_delivery_ms, Some(7));
+    assert_eq!(exited_snapshot.exec_spawn_to_delivery_ms, Some(107));
+    assert!(!exited_snapshot.exec_process_alive_at_delivery);
 }
 
 struct TestHandler {

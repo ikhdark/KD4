@@ -13,7 +13,7 @@ pub(crate) fn create_wait_tool() -> ToolSpec {
         (
             "yield_time_ms".to_string(),
             JsonSchema::number(Some(
-                "Internal observation/progress cadence for an unchanged cell. Empty observations do not cause a model-visible yield or a new model generation, and this does not set a completion deadline. Defaults to 10000 ms."
+                "Compatibility field; owner-held waits wake directly on output or terminal state. Unchanged observations do not cause a model-visible yield or a new model generation, and this does not set a completion deadline."
                     .to_string(),
             )),
         ),
@@ -95,7 +95,7 @@ mod tests {
                         (
                             "yield_time_ms".to_string(),
                             JsonSchema::number(Some(
-                                "Internal observation/progress cadence for an unchanged cell. Empty observations do not cause a model-visible yield or a new model generation, and this does not set a completion deadline. Defaults to 10000 ms."
+                                "Compatibility field; owner-held waits wake directly on output or terminal state. Unchanged observations do not cause a model-visible yield or a new model generation, and this does not set a completion deadline."
                                     .to_string(),
                             )),
                         ),
@@ -123,7 +123,7 @@ mod tests {
             vec!["cell_id", "max_tokens", "terminate", "yield_time_ms"]
         );
         assert!(
-            code_properties["yield-time_ms"]
+            code_properties["yield_time_ms"]
                 .description
                 .as_deref()
                 .is_some_and(

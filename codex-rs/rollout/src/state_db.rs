@@ -545,6 +545,7 @@ pub async fn reconcile_rollout(
                 return;
             }
         };
+    let parent_thread_id = outcome.parent_thread_id;
     let mut metadata = outcome.metadata;
     let memory_mode = outcome.memory_mode.unwrap_or_else(|| "enabled".to_string());
     metadata.cwd = normalize_cwd_for_state_db(&metadata.cwd);
@@ -564,6 +565,17 @@ pub async fn reconcile_rollout(
     if let Err(err) = ctx.upsert_thread(&metadata).await {
         warn!(
             "state db reconcile_rollout upsert failed {}: {err}",
+            rollout_path.display()
+        );
+        return;
+    }
+    if let Some(parent_thread_id) = parent_thread_id
+        && let Err(err) = ctx
+            .insert_thread_spawn_edge_if_absent(parent_thread_id, metadata.id)
+            .await
+    {
+        warn!(
+            "state db reconcile_rollout parent edge update failed {}: {err}",
             rollout_path.display()
         );
         return;

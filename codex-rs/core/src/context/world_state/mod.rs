@@ -285,7 +285,6 @@ impl WorldState {
             .insert(id, Box::new(ExtensionWorldStateSection(section)));
     }
 
-    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> WorldStateSnapshot {
         WorldStateSnapshot {
             sections: self

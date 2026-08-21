@@ -78,7 +78,6 @@ async fn features_enable_under_development_feature_or_alias_prints_canonical_war
 {
     for (configured_key, canonical_key) in [
         ("runtime_metrics", "runtime_metrics"),
-        ("request_permissions", "exec_permission_approvals"),
         ("telepathy", "chronicle"),
     ] {
         let codex_home = TempDir::new()?;
@@ -97,6 +96,23 @@ async fn features_enable_under_development_feature_or_alias_prints_canonical_war
             assert!(!config.contains(&format!("{configured_key} =")));
         }
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn features_enable_stable_alias_writes_canonical_key_without_warning() -> Result<()> {
+    let codex_home = TempDir::new()?;
+
+    let mut cmd = codex_command(codex_home.path())?;
+    cmd.args(["features", "enable", "request_permissions"])
+        .assert()
+        .success()
+        .stderr(predicates::str::is_empty());
+
+    let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
+    assert!(config.contains("exec_permission_approvals = true"));
+    assert!(!config.contains("request_permissions ="));
 
     Ok(())
 }

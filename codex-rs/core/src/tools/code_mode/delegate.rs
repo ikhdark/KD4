@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use codex_code_mode::CellId;
 use codex_code_mode::CodeModeNestedToolCall;
@@ -13,6 +14,7 @@ use serde_json::Value as JsonValue;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
+use tracing::info;
 
 use super::ExecContext;
 use super::PUBLIC_TOOL_NAME;
@@ -165,46 +167,138 @@ impl CodeModeDispatchBroker {
                         cancellation_token,
                         response_tx,
                     } => {
-                        let response = if wait_until_cell_ready_for_dispatch(
-                            &cells,
-                            &cell_id,
-                            &cancellation_token,
-                        )
-                        .await
-                        {
-                            host.notify(call_id, cell_id, text).await
-                        } else {
-                            close_cell(&cells, &cell_id);
-                            Err("code mode notification cancelled".to_string())
-                        };
-                        let _ = response_tx.send(response);
+                        let host = Arc::clone(&host);
+                        let cells = Arc::clone(&cells);
+                        tokio::spawn(async move {
+                            let ready = wait_until_cell_ready_for_dispatch(
+                                &cells,
+                                &cell_id,
+                                &cancellation_token,
+                            )
+                            .await;
+                            let response = if ready {
+                                tokio::select! {
+                                    response = host.notify(call_id, cell_id.clone(), text) => response,
+                                    _ = cancellation_token.cancelled() => {
+                                        Err("code mode notification cancelled".to_string())
+                                    }
+                                }
+                            } else {
+                                close_cell(&cells, &cell_id);
+                                Err("code mode notification cancelled".to_string())
+                            };
+                            let _ = response_tx.send(response);
+                        });
                     }
                     DispatchMessage::InvokeTool {
                         invocation,
                         cancellation_token,
+                        enqueued_at,
                         response_tx,
                     } => {
-                        let cell_id = invocation.cell_id.clone();
-                        if !wait_until_cell_ready_for_dispatch(
-                            &cells,
-                            &cell_id,
-                            &cancellation_token,
-                        )
-                        .await
-                        {
-                            close_cell(&cells, &cell_id);
-                            continue;
-                        }
                         let host = Arc::clone(&host);
+                        let cells = Arc::clone(&cells);
                         tokio::spawn(async move {
+                            let dequeued_at = Instant::now();
+                            let cell_id = invocation.cell_id.clone();
+                            let runtime_tool_call_id = invocation.runtime_tool_call_id.clone();
+                            let tool_name = invocation.tool_name.clone();
+                            info!(
+                                event.name = "codex.code_mode_nested_tool.dispatch",
+                                turn_id = %host.exec.turn.sub_id,
+                                runtime_cell_id = %cell_id,
+                                runtime_tool_call_id = %runtime_tool_call_id,
+                                tool_name = %tool_name,
+                                dispatch_queue_ms = duration_ms(
+                                    dequeued_at.saturating_duration_since(enqueued_at),
+                                ),
+                                "code mode nested tool dispatched"
+                            );
+                            let ready = wait_until_cell_ready_for_dispatch(
+                                &cells,
+                                &cell_id,
+                                &cancellation_token,
+                            )
+                            .await;
+                            if !ready {
+                                close_cell(&cells, &cell_id);
+                                let _ = response_tx
+                                    .send(Err("code mode nested tool call cancelled".to_string()));
+                                return;
+                            }
+                            let child_started_at = Instant::now();
+                            info!(
+                                event.name = "codex.code_mode_nested_tool.child_start",
+                                turn_id = %host.exec.turn.sub_id,
+                                runtime_cell_id = %cell_id,
+                                runtime_tool_call_id = %runtime_tool_call_id,
+                                tool_name = %tool_name,
+                                dispatch_gate_ms = duration_ms(
+                                    child_started_at.saturating_duration_since(dequeued_at),
+                                ),
+                                "code mode nested tool child started"
+                            );
+                            let invocation =
+                                host.invoke_tool(invocation, cancellation_token.clone());
+                            tokio::pin!(invocation);
                             let response = tokio::select! {
-                                response = host.invoke_tool(
-                                    invocation,
-                                    cancellation_token.clone(),
-                                ) => response,
-                                _ = cancellation_token.cancelled() => return,
+                                biased;
+                                response = &mut invocation => response,
+                                _ = cancellation_token.cancelled() => {
+                                    // Keep polling the same owner future so
+                                    // ToolCallRuntime can finish bounded
+                                    // process/runtime cleanup before this
+                                    // dispatch task releases its handles.
+                                    let _ = invocation.await;
+                                    Err("code mode nested tool call cancelled".to_string())
+                                }
                             };
-                            let _ = response_tx.send(response);
+                            let child_completed_at = Instant::now();
+                            let status = if response.is_ok() {
+                                "completed"
+                            } else {
+                                "failed"
+                            };
+                            info!(
+                                event.name = "codex.code_mode_nested_tool.child_end",
+                                turn_id = %host.exec.turn.sub_id,
+                                runtime_cell_id = %cell_id,
+                                runtime_tool_call_id = %runtime_tool_call_id,
+                                tool_name = %tool_name,
+                                status,
+                                child_runtime_ms = duration_ms(
+                                    child_completed_at.saturating_duration_since(child_started_at),
+                                ),
+                                "code mode nested tool child ended"
+                            );
+                            let delivery_started_at = Instant::now();
+                            let response_delivered = response_tx.send(response).is_ok();
+                            let delivered_at = Instant::now();
+                            info!(
+                                event.name = "codex.code_mode_nested_tool",
+                                turn_id = %host.exec.turn.sub_id,
+                                runtime_cell_id = %cell_id,
+                                runtime_tool_call_id = %runtime_tool_call_id,
+                                tool_name = %tool_name,
+                                status,
+                                dispatch_queue_ms = duration_ms(
+                                    dequeued_at.saturating_duration_since(enqueued_at),
+                                ),
+                                dispatch_gate_ms = duration_ms(
+                                    child_started_at.saturating_duration_since(dequeued_at),
+                                ),
+                                child_runtime_ms = duration_ms(
+                                    child_completed_at.saturating_duration_since(child_started_at),
+                                ),
+                                wrapper_delivery_ms = duration_ms(
+                                    delivered_at.saturating_duration_since(delivery_started_at),
+                                ),
+                                total_ms = duration_ms(
+                                    delivered_at.saturating_duration_since(enqueued_at),
+                                ),
+                                response_delivered,
+                                "code mode nested tool completed"
+                            );
                         });
                     }
                 }
@@ -257,6 +351,10 @@ fn cleanup_terminal_cells(cells: &Mutex<HashMap<CellId, CellDispatchState>>) {
         .retain(|_, cell| !cell.terminal);
 }
 
+fn duration_ms(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 async fn wait_until_cell_ready_for_dispatch(
     cells: &Mutex<HashMap<CellId, CellDispatchState>>,
     cell_id: &CellId,
@@ -296,6 +394,7 @@ impl CodeModeSessionDelegate for CodeModeDispatchBroker {
                 .send(DispatchMessage::InvokeTool {
                     invocation,
                     cancellation_token: cancellation_token.clone(),
+                    enqueued_at: Instant::now(),
                     response_tx,
                 })
                 .await
@@ -351,6 +450,7 @@ enum DispatchMessage {
     InvokeTool {
         invocation: CodeModeNestedToolCall,
         cancellation_token: CancellationToken,
+        enqueued_at: Instant,
         response_tx: oneshot::Sender<Result<JsonValue, String>>,
     },
     Notify {
@@ -541,5 +641,22 @@ mod tests {
         assert_eq!(broker.continuation_snapshot(&cell_id).len(), 1);
         cleanup_terminal_cells(&broker.cells);
         assert!(broker.continuation_snapshot(&cell_id).is_empty());
+    }
+
+    #[test]
+    fn worker_cleanup_preserves_live_dispatch_cells() {
+        let broker = CodeModeDispatchBroker::new();
+        let first = CellId::new("cell-live".to_string());
+        let second = CellId::new("cell-pending".to_string());
+        broker.mark_cell_ready_for_dispatch(&first);
+        broker.mark_cell_ready_for_dispatch(&second);
+        broker.record_continuation(&second, continuation(0));
+        assert!(broker.has_waitable_cells());
+
+        cleanup_terminal_cells(&broker.cells);
+
+        assert!(broker.has_waitable_cells());
+        assert!(broker.continuation_snapshot(&first).is_empty());
+        assert_eq!(broker.continuation_snapshot(&second).len(), 1);
     }
 }

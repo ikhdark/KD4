@@ -51,6 +51,7 @@ pub(crate) enum StableContextKind {
     Realtime,
     RootCoordinator,
     MultiAgent,
+    TaskModelGuidance,
     ToolSchemas,
     RequestUserInput,
     Wait,
@@ -78,6 +79,7 @@ impl StableContextKind {
             Self::Realtime => "realtime",
             Self::RootCoordinator => "root_coordinator",
             Self::MultiAgent => "multi_agent",
+            Self::TaskModelGuidance => "task_model_guidance",
             Self::ToolSchemas => "tool_schemas",
             Self::RequestUserInput => "request_user_input",
             Self::Wait => "wait",
@@ -302,6 +304,7 @@ enum StableContextSlot {
     Plugins,
     RecommendedPlugins,
     Environment,
+    TaskModelGuidance,
     Permissions,
     Memory,
     ModelSwitch,
@@ -324,6 +327,7 @@ impl StableContextSlot {
             Self::Plugins => StableContextKind::Plugins,
             Self::RecommendedPlugins => StableContextKind::RecommendedPlugins,
             Self::Environment => StableContextKind::Environment,
+            Self::TaskModelGuidance => StableContextKind::TaskModelGuidance,
             Self::Permissions => StableContextKind::EnvironmentPermissions,
             Self::Memory => StableContextKind::Memory,
             Self::ModelSwitch => StableContextKind::ModelSwitch,
@@ -346,6 +350,7 @@ impl StableContextSlot {
             Self::Plugins => "plugins",
             Self::RecommendedPlugins => "recommended_plugins",
             Self::Environment => "environment",
+            Self::TaskModelGuidance => "task_model_guidance",
             Self::Permissions => "environment_permissions",
             Self::Memory => "memory",
             Self::ModelSwitch => "model_switch",
@@ -365,25 +370,27 @@ impl StableContextSlot {
             Self::Collaboration => 1,
             Self::RootCoordinator => 2,
             Self::MultiAgent => 3,
-            Self::Permissions => 4,
-            Self::Memory => 5,
-            Self::SkillUsage => 6,
-            Self::SkillCatalog => 7,
-            Self::Apps => 8,
-            Self::Plugins => 9,
-            Self::Personality => 10,
-            Self::SelectedSkill => 11,
-            Self::AppContext => 12,
-            Self::ModelSwitch => 13,
-            Self::Realtime => 14,
-            Self::Environment => 15,
-            Self::RecommendedPlugins => 16,
+            Self::TaskModelGuidance => 4,
+            Self::Permissions => 5,
+            Self::Memory => 6,
+            Self::SkillUsage => 7,
+            Self::SkillCatalog => 8,
+            Self::Apps => 9,
+            Self::Plugins => 10,
+            Self::Personality => 11,
+            Self::SelectedSkill => 12,
+            Self::AppContext => 13,
+            Self::ModelSwitch => 14,
+            Self::Realtime => 15,
+            Self::Environment => 16,
+            Self::RecommendedPlugins => 17,
         }
     }
 
-    /// Turn-scoped manifests and runtime observations are deliberately kept
-    /// behind the reusable instruction prefix. They are still placed before
-    /// the current user input, so their steering semantics remain current.
+    /// Turn-scoped manifests and runtime observations remain attached to the
+    /// turn that introduced them. This preserves an unchanged request prefix
+    /// across turns while a replacement still appears immediately before its
+    /// corresponding user input.
     fn is_volatile(self) -> bool {
         matches!(
             self,
@@ -504,7 +511,8 @@ fn project_items(
         .get(&StableContextSlot::RecommendedPlugins)
         .and_then(|index| occurrences.get(*index))
         .is_some_and(|occurrence| {
-            occurrence_matches_latest_user_turn(occurrence, latest_real_user)
+            latest_real_user.is_none()
+                || occurrence_matches_latest_user_turn(occurrence, latest_real_user)
         });
 
     let mut keep = HashSet::<(usize, usize)>::new();
@@ -608,23 +616,27 @@ fn project_items(
 
     let mut projected = Vec::with_capacity(items.len() + reusable.len() + volatile.len());
     projected.extend(reusable.into_iter().map(|(_, _, item)| item));
-    let volatile_insertion_index = latest_real_user.map(|(item_index, _)| *item_index);
-    let mut volatile = Some(
-        volatile
-            .into_iter()
-            .map(|(_, _, item)| item)
-            .collect::<Vec<_>>(),
-    );
-    for (item_index, item) in ordinary {
-        if volatile_insertion_index == Some(item_index)
-            && let Some(items) = volatile.take()
-        {
+    let mut volatile_by_item = HashMap::<usize, Vec<ResponseItem>>::new();
+    for (_, occurrence_index, item) in volatile {
+        let occurrence = &occurrences[occurrence_index];
+        let item_index = volatile_user_insertion_index(occurrence, items, latest_real_user)
+            .unwrap_or(occurrence.item_index);
+        volatile_by_item.entry(item_index).or_default().push(item);
+    }
+    let mut ordinary = ordinary.into_iter().peekable();
+    for item_index in 0..items.len() {
+        if let Some(items) = volatile_by_item.remove(&item_index) {
             projected.extend(items);
         }
-        projected.push(item);
-    }
-    if let Some(items) = volatile {
-        projected.extend(items);
+        while ordinary
+            .peek()
+            .is_some_and(|(ordinary_index, _)| *ordinary_index == item_index)
+        {
+            let Some((_, item)) = ordinary.next() else {
+                break;
+            };
+            projected.push(item);
+        }
     }
 
     let mut components = Vec::new();
@@ -724,6 +736,32 @@ fn occurrence_matches_latest_user_turn(
     }
 }
 
+fn volatile_user_insertion_index(
+    occurrence: &Occurrence,
+    items: &[ResponseItem],
+    latest_real_user: Option<&(usize, Option<String>)>,
+) -> Option<usize> {
+    if let Some(turn_id) = occurrence.turn_id.as_deref()
+        && let Some((item_index, _)) = items.iter().enumerate().find(|(_, item)| {
+            let ResponseItem::Message { role, content, .. } = item else {
+                return false;
+            };
+            role == "user"
+                && item.turn_id() == Some(turn_id)
+                && content.iter().any(|content_item| {
+                    let ContentItem::InputText { text } = content_item else {
+                        return false;
+                    };
+                    classify_stable_text(role, text).is_none()
+                })
+        })
+    {
+        return Some(item_index);
+    }
+
+    latest_real_user.map(|(item_index, _)| *item_index)
+}
+
 fn analyze_unprojected(
     occurrences: &[Occurrence],
     retained_fallback: bool,
@@ -755,6 +793,9 @@ fn classify_stable_text(role: &str, text: &str) -> Option<StableContextSlot> {
     }
     if role == "user" && marked(text, "<environment_context>", "</environment_context>") {
         return Some(StableContextSlot::Environment);
+    }
+    if role == "user" && marked(text, "<task_model_guidance>", "</task_model_guidance>") {
+        return Some(StableContextSlot::TaskModelGuidance);
     }
     if role == "user" && marked(text, "<recommended_plugins>", "</recommended_plugins>") {
         return Some(StableContextSlot::RecommendedPlugins);
@@ -839,6 +880,7 @@ fn contains_known_open_marker(text: &str) -> bool {
         SKILLS_INSTRUCTIONS_OPEN_TAG,
         SKILL_OPEN_TAG,
         "<environment_context>",
+        "<task_model_guidance>",
         "<recommended_plugins>",
         APPS_INSTRUCTIONS_OPEN_TAG,
         "<app-context>",

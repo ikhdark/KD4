@@ -28,17 +28,36 @@ def _meta(cwd: str) -> str:
 
 def _timing(*, valid: bool = True, complete: bool = True) -> dict:
     return {
-        "schemaVersion": 19,
+        "schemaVersion": 22,
         "profileValid": valid,
         "classificationComplete": complete,
+        "startedAtUnixMs": 1_786_924_800_000,
+        "completedAtUnixMs": 1_786_924_801_000,
         "inclusiveDurationNs": 1000,
-        "exclusive": {"modelOnlyNs": 600, "toolOnlyNs": 200, "modelPlusToolNs": 0},
-        "unions": {"modelRequestWaitUnionNs": 10, "modelStreamWaitUnionNs": 590},
+        "machineDurationNs": 900,
+        "exclusive": {
+            "modelOnlyNs": 600,
+            "toolOnlyNs": 200,
+            "modelPlusToolNs": 0,
+            "orchestrationNs": 100,
+            "interactiveOnlyWaitNs": 100,
+        },
+        "unions": {
+            "modelRequestWaitUnionNs": 10,
+            "modelStreamWaitUnionNs": 590,
+            "interactiveWaitUnionNs": 150,
+        },
         "counters": {
             "logicalGenerationCount": 2,
             "toolCallCount": 1,
             "samePurposeContinuationCount": 1,
             "suppressedDeterministicContinuationCount": 1,
+            "exactRepeatedWaitCount": 1,
+            "waitOnlyGenerationCount": 1,
+            "internallyDrainedWaitCount": 2,
+            "noProgressDirectiveCount": 1,
+            "provenLoopActivationCount": 1,
+            "userInputWaitCount": 1,
         },
         "modelRequests": [
             {
@@ -51,6 +70,22 @@ def _timing(*, valid: bool = True, complete: bool = True) -> dict:
                 "toolActiveUnionNs": 100,
                 "unchangedRelevantState": True,
                 "nextStructuredActionChanged": False,
+                "outputTokens": 15,
+                "reasoningOutputTokens": 5,
+                "tokenUsage": {
+                    "inputTokens": 100,
+                    "cachedInputTokens": 80,
+                    "visibleOutputTokens": 10,
+                    "reasoningTokens": 5,
+                    "totalTokens": 115,
+                },
+                "requestTokenCategories": {
+                    "logicalTotal": 95,
+                    "localInputEstimate": 100,
+                    "repeatedUnchangedContext": 70,
+                },
+                "dispatchMs": 10,
+                "completedMs": 20,
             },
             {
                 "generationIndex": 1,
@@ -60,8 +95,58 @@ def _timing(*, valid: bool = True, complete: bool = True) -> dict:
                 "decisionLatencyNs": None,
                 "unchangedRelevantState": False,
                 "nextStructuredActionChanged": True,
+                "outputTokens": 10,
+                "reasoningOutputTokens": 2,
+                "tokenUsage": {
+                    "inputTokens": 110,
+                    "cachedInputTokens": 100,
+                    "visibleOutputTokens": 8,
+                    "reasoningTokens": 2,
+                    "totalTokens": 120,
+                },
+                "requestTokenCategories": {
+                    "logicalTotal": 105,
+                    "localInputEstimate": 110,
+                    "repeatedUnchangedContext": 80,
+                },
+                "dispatchMs": 30,
+                "completedMs": 40,
             },
         ],
+        "toolCalls": [
+            {
+                "callId": "relay-1",
+                "toolName": "shell_command",
+                "source": "direct",
+                "generationIndex": 0,
+                "acceptedAtMs": 1,
+                "firstPollAtMs": 2,
+                "parallelGateAdmittedAtMs": 3,
+                "handlerEntryAtMs": 4,
+                "handlerExitAtMs": 7,
+                "processSpawnedAtMs": 5,
+                "processExitedAtMs": 6,
+                "outputCollectedAtMs": 8,
+                "deliveredAtMs": 9,
+                "modelResumedAtMs": 10,
+                "itemToFirstPollMs": 1,
+                "parallelGateWaitMs": 1,
+                "handlerDurationMs": 3,
+                "postHandlerMs": 2,
+                "totalDurationMs": 7,
+                "eager": True,
+                "processAliveAtDelivery": False,
+            }
+        ],
+        "toolCallTimingOverflow": 2,
+        "observationalNonprogressTokens": {
+            "logicalGenerations": 1,
+            "inputTokens": 100,
+            "cachedInputTokens": 80,
+            "visibleOutputTokens": 10,
+            "reasoningTokens": 5,
+            "totalTokens": 115,
+        },
         "observationalNonprogressLatency": {
             "logicalGenerations": 1,
             "physicalAttempts": 1,
@@ -75,6 +160,92 @@ def _timing(*, valid: bool = True, complete: bool = True) -> dict:
 
 
 class Kd4TurnLatencyAuditTest(unittest.TestCase):
+    def test_empty_token_report_keeps_the_per_turn_schema_complete(self) -> None:
+        tokens = kd4_turn_latency_audit._token_report([])
+
+        self.assertTrue(tokens["complete"])
+        self.assertEqual(tokens["inputTokens"], 0)
+        self.assertEqual(tokens["cachedInputTokens"], 0)
+        self.assertEqual(tokens["outputTokens"], 0)
+        self.assertEqual(tokens["billableTokens"], 0)
+
+    def test_token_report_marks_internal_provider_retries_as_partial(self) -> None:
+        request = dict(_timing()["modelRequests"][0])
+        request["physicalAttemptIds"] = ["attempt-1", "attempt-2", "attempt-2"]
+
+        tokens = kd4_turn_latency_audit._token_report([request])
+
+        self.assertEqual(tokens["physicalAttempts"], 2)
+        self.assertEqual(tokens["providerUsageAttempts"], 1)
+        self.assertEqual(tokens["coverage"], 0.5)
+        self.assertFalse(tokens["complete"])
+        self.assertIsNone(tokens["billableTokens"])
+        self.assertEqual(tokens["observedBillableTokens"], 115)
+        self.assertEqual(tokens["observedBlendedTokens"], 35)
+
+    def test_token_intervals_group_retry_attempts_without_duplicating_tool_batches(
+        self,
+    ) -> None:
+        timing = _timing()
+        retry = dict(timing["modelRequests"][0])
+        retry["attemptKind"] = "retry"
+        retry["dispatchMs"] = 15
+        retry["completedMs"] = 19
+        retry["tokenUsage"] = {
+            "inputTokens": 40,
+            "cachedInputTokens": 30,
+            "visibleOutputTokens": 2,
+            "reasoningTokens": 1,
+            "totalTokens": 43,
+        }
+        requests = [timing["modelRequests"][0], retry, timing["modelRequests"][1]]
+
+        intervals = kd4_turn_latency_audit._token_intervals(
+            requests, timing["toolCalls"]
+        )
+
+        self.assertEqual(len(intervals), 2)
+        self.assertEqual(intervals[0]["requestIndexes"], [0, 1])
+        self.assertEqual(intervals[0]["attemptKinds"], ["primary", "retry"])
+        self.assertEqual(intervals[0]["physicalAttempts"], 2)
+        self.assertEqual(intervals[0]["emittedToolCallIds"], ["relay-1"])
+        self.assertEqual(intervals[0]["tokens"]["inputTokens"], 140)
+        self.assertEqual(intervals[1]["precedingToolCallIds"], ["relay-1"])
+
+    def test_tool_relay_slow_call_includes_pre_poll_queue_time(self) -> None:
+        call = {
+            "callId": "queued",
+            "toolName": "shell_command",
+            "acceptedAtMs": 0,
+            "firstPollAtMs": 6_000,
+            "outputCollectedAtMs": 10_000,
+            "deliveredAtMs": 10_001,
+            "itemToFirstPollMs": 6_000,
+            "totalDurationMs": 4_001,
+        }
+
+        relay = kd4_turn_latency_audit._tool_relay_report([call])
+
+        self.assertEqual(relay["slowCallCount"], 1)
+        self.assertEqual(relay["topSlowCalls"][0]["totalDurationMs"], 4_001)
+        self.assertEqual(relay["topSlowCalls"][0]["endToEndDurationMs"], 10_001)
+
+    def test_tool_relay_reports_process_exit_after_live_handle_delivery(self) -> None:
+        call = {
+            "callId": "background-relay",
+            "acceptedAtMs": 1,
+            "processSpawnedAtMs": 5,
+            "outputCollectedAtMs": 8,
+            "deliveredAtMs": 9,
+            "processExitedAtMs": 20,
+            "processAliveAtDelivery": True,
+        }
+
+        relay = kd4_turn_latency_audit._tool_relay_report([call])
+
+        self.assertEqual(relay["processAliveAtDeliveryCalls"], 1)
+        self.assertEqual(relay["phaseTotalsMs"]["deliveryToProcessExitMs"], 11)
+
     def test_uuid_cli_resolves_snapshot_and_emits_bounded_execution_loop(self) -> None:
         session_id = "01a018c7-a357-7c11-a7ca-9248dd075f22"
         with tempfile.TemporaryDirectory() as temp:
@@ -159,6 +330,180 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         )
         self.assertEqual(report["executionLoop"]["postToolHandoffNs"], 1_000_000_000)
         self.assertEqual(report["executionLoop"]["taskElapsedNs"], 10_000_000_000)
+        self.assertEqual(report["toolRelay"]["calls"], 1)
+        self.assertEqual(report["toolRelay"]["eagerCalls"], 1)
+        self.assertEqual(report["toolRelay"]["timingOverflowCalls"], 2)
+        self.assertEqual(
+            report["toolRelay"]["phaseTotalsMs"]["requestToProcessSpawnMs"], 4
+        )
+        self.assertEqual(report["toolRelay"]["phaseTotalsMs"]["processRuntimeMs"], 1)
+        self.assertEqual(
+            report["toolRelay"]["phaseTotalsMs"]["processExitToDeliveryMs"], 3
+        )
+        self.assertEqual(report["toolRelay"]["phaseTotalsMs"]["endToEndDurationMs"], 8)
+        self.assertEqual(report["toolRelay"]["topSlowCalls"], [])
+        self.assertEqual(report["perTurn"][0]["agentActiveDurationNs"], 900)
+        self.assertEqual(report["perTurn"][0]["humanWaitNs"], 100)
+        self.assertEqual(report["perTurn"][0]["humanOnlyWaitNs"], 100)
+        self.assertEqual(report["perTurn"][0]["humanWaitUnionNs"], 150)
+        self.assertEqual(
+            report["perTurn"][0]["humanWaitCounts"]["userInputWaitCount"], 1
+        )
+        self.assertEqual(report["perTurn"][0]["tokens"]["inputTokens"], 210)
+        self.assertEqual(report["perTurn"][0]["tokens"]["cachedInputTokens"], 180)
+        self.assertEqual(report["perTurn"][0]["tokens"]["outputTokens"], 25)
+        self.assertEqual(report["perTurn"][0]["tokens"]["reasoningTokens"], 7)
+        self.assertEqual(report["perTurn"][0]["tokens"]["billableTokens"], 235)
+        self.assertEqual(report["perTurn"][0]["tokens"]["blendedTokens"], 55)
+        self.assertEqual(
+            report["perTurn"][0]["tokens"]["promptCategories"][
+                "repeatedUnchangedContext"
+            ],
+            150,
+        )
+        self.assertEqual(
+            report["perTurn"][0]["observationalNonprogressTokens"]["totalTokens"],
+            115,
+        )
+        self.assertEqual(report["populations"]["all"]["modelShare"], 2 / 3)
+        self.assertEqual(
+            report["coverage"]["terminalLifecycleStateCounts"], {"completed": 1}
+        )
+        self.assertEqual(report["perTurn"][0]["samplingPasses"], 2)
+        self.assertEqual(report["perTurn"][0]["samplingPassTarget"], 8)
+        self.assertEqual(report["perTurn"][0]["startedAt"], "2026-08-17T00:00:00+00:00")
+        self.assertEqual(report["perTurn"][0]["boundarySource"], "timing")
+        intervals = report["perTurn"][0]["tokenIntervals"]
+        self.assertEqual(len(intervals), 2)
+        self.assertEqual(intervals[0]["emittedToolCallIds"], ["relay-1"])
+        self.assertEqual(intervals[1]["precedingToolCallIds"], ["relay-1"])
+        self.assertEqual(intervals[1]["tokens"]["inputTokens"], 110)
+        summary = kd4_turn_latency_audit.bounded_summary(report)
+        self.assertEqual(len(summary["perTurn"][0]["tokenIntervals"]), 2)
+        self.assertIn(
+            "boundary=2026-08-17", kd4_turn_latency_audit.render_report(report)
+        )
+        self.assertEqual(report["behaviorSignals"]["turnsOverSamplingPassTarget"], 0)
+
+    def test_waiting_input_tail_is_classified_without_blocking_completed_audit(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            session = Path(temp) / "rollout.jsonl"
+            root.mkdir()
+            timing = _timing()
+            second_relay = dict(timing["toolCalls"][0])
+            second_relay["callId"] = "relay-2"
+            timing["toolCalls"].append(second_relay)
+            session.write_text(
+                "\n".join(
+                    [
+                        _meta(str(root)),
+                        _event({"type": "task_started", "turn_id": "complete"}),
+                        _event(
+                            {
+                                "type": "task_complete",
+                                "turn_id": "complete",
+                                "timing": timing,
+                            }
+                        ),
+                        _event({"type": "task_started", "turn_id": "active"}),
+                        _response(
+                            {
+                                "type": "custom_tool_call",
+                                "call_id": "wait-for-user",
+                                "name": "exec",
+                                "input": "await tools.request_user_input({questions: []})",
+                            },
+                            "2026-08-17T00:00:01Z",
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            report = kd4_turn_latency_audit.analyze_session_path(session, root)
+
+        self.assertEqual(report["coverage"]["startedTurnsWithoutTerminal"], 1)
+        self.assertEqual(report["behaviorSignals"]["activeTurnsExcluded"], 1)
+        self.assertEqual(report["coverage"]["openTurnStateCounts"], {"user_waiting": 1})
+        self.assertEqual(report["coverage"]["openTurns"][0]["state"], "user_waiting")
+        self.assertEqual(report["toolRelay"]["batchGroups"], 1)
+        self.assertEqual(report["toolRelay"]["batchedCalls"], 2)
+        self.assertTrue(report["auditDecision"]["readyToFinalize"])
+        self.assertIn("active_tail_excluded", report["auditDecision"]["reasonCodes"])
+        self.assertIn("open_turn_user_waiting", report["auditDecision"]["reasonCodes"])
+
+    def test_terminal_and_open_turn_states_are_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            session = Path(temp) / "rollout.jsonl"
+            root.mkdir()
+            session.write_text(
+                "\n".join(
+                    [
+                        _meta(str(root)),
+                        _event({"type": "task_started", "turn_id": "failed"}),
+                        _event(
+                            {
+                                "type": "task_complete",
+                                "turn_id": "failed",
+                                "error": {"message": "failed"},
+                                "timing": _timing(),
+                            }
+                        ),
+                        _event({"type": "task_started", "turn_id": "canceled"}),
+                        _event(
+                            {
+                                "type": "turn_aborted",
+                                "turn_id": "canceled",
+                                "reason": "interrupted",
+                                "timing": _timing(),
+                            }
+                        ),
+                        _event({"type": "task_started", "turn_id": "abandoned"}),
+                        _event(
+                            {
+                                "type": "turn_aborted",
+                                "turn_id": "abandoned",
+                                "reason": "replaced",
+                                "timing": _timing(),
+                            }
+                        ),
+                        _event({"type": "task_started", "turn_id": "running"}),
+                        _response(
+                            {
+                                "type": "function_call",
+                                "call_id": "running-process",
+                                "name": "shell_command",
+                                "arguments": "{}",
+                            },
+                            "2026-08-17T00:00:01Z",
+                        ),
+                        _event({"type": "task_started", "turn_id": "leaked"}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            report = kd4_turn_latency_audit.analyze_session_path(session, root)
+
+        self.assertEqual(
+            report["coverage"]["terminalLifecycleStateCounts"],
+            {"abandoned": 1, "canceled": 1, "failed": 1},
+        )
+        self.assertEqual(
+            report["coverage"]["openTurnStateCounts"],
+            {"active_without_pending_tool": 1, "running_process": 1},
+        )
+        self.assertEqual(report["behaviorSignals"]["canceledTurns"], 1)
+        self.assertEqual(report["behaviorSignals"]["failedTurns"], 1)
+        self.assertEqual(report["behaviorSignals"]["abandonedTurns"], 1)
+        self.assertEqual(report["behaviorSignals"]["runningProcessTurns"], 1)
+        self.assertEqual(report["behaviorSignals"]["activeWithoutPendingToolTurns"], 1)
 
     def test_emits_bounded_slow_calls_and_finalize_decision(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -210,6 +555,7 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
                 )
             timing = _timing()
             timing["inclusiveDurationNs"] = 100_000_000_000
+            timing["machineDurationNs"] = 100_000_000_000
             timing["exclusive"] = {
                 "orchestrationNs": 70_000_000_000,
                 "modelOnlyNs": 20_000_000_000,
@@ -422,6 +768,10 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
             population["observationalNonprogressLatency"]["physicalAttempts"],
             2,
         )
+        self.assertFalse(population["tokens"]["complete"])
+        self.assertIsNone(population["tokens"]["billableTokens"])
+        self.assertEqual(population["tokens"]["providerUsageAttempts"], 2)
+        self.assertEqual(population["tokens"]["physicalAttempts"], 3)
 
 
 if __name__ == "__main__":

@@ -543,6 +543,8 @@ export type { TurnTimingProviderTokenUsage } from "./TurnTimingProviderTokenUsag
 export type { TurnTimingRequestTokenCategories } from "./TurnTimingRequestTokenCategories";
 export type { TurnTimingTerminalization } from "./TurnTimingTerminalization";
 export type { TurnTimingTokenCategoryBasis } from "./TurnTimingTokenCategoryBasis";
+export type { TurnTimingToolCall } from "./TurnTimingToolCall";
+export type { TurnTimingToolCallSource } from "./TurnTimingToolCallSource";
 export type { TurnTimingUnions } from "./TurnTimingUnions";
 export type { TurnsPage } from "./TurnsPage";
 export type { UserInput } from "./UserInput";

@@ -147,23 +147,23 @@ fn select_terminal_turn(
             EventMsg::TurnStarted(event) => {
                 latest_started_turn_id = Some(event.turn_id.clone());
             }
-            EventMsg::TurnComplete(event) => {
-                if requested_turn_id.is_none_or(|turn_id| turn_id == event.turn_id) {
-                    selected = Some(TerminalTurnTiming {
-                        turn_id: event.turn_id.clone(),
-                        outcome: if event.error.is_some() {
-                            "failed"
-                        } else {
-                            "completed"
-                        },
-                        completed_at: event.completed_at,
-                        duration_ms: event.duration_ms,
-                        time_to_first_token_ms: event.time_to_first_token_ms,
-                        error_message: event.error.as_ref().map(|error| error.message.clone()),
-                        abort_reason: None,
-                        timing: event.timing.clone(),
-                    });
-                }
+            EventMsg::TurnComplete(event)
+                if requested_turn_id.is_none_or(|turn_id| turn_id == event.turn_id) =>
+            {
+                selected = Some(TerminalTurnTiming {
+                    turn_id: event.turn_id.clone(),
+                    outcome: if event.error.is_some() {
+                        "failed"
+                    } else {
+                        "completed"
+                    },
+                    completed_at: event.completed_at,
+                    duration_ms: event.duration_ms,
+                    time_to_first_token_ms: event.time_to_first_token_ms,
+                    error_message: event.error.as_ref().map(|error| error.message.clone()),
+                    abort_reason: None,
+                    timing: event.timing.clone(),
+                });
             }
             EventMsg::TurnAborted(event) => {
                 let turn_id = event

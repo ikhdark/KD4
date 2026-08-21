@@ -1,9 +1,8 @@
-use codex_utils_string::approx_bytes_for_tokens;
 use codex_utils_string::approx_tokens_from_byte_count;
 
 use crate::ContextualUserFragment;
 
-const MAX_ADDITIONAL_CONTEXT_VALUE_TOKENS: usize = 4_000;
+const MAX_ADDITIONAL_CONTEXT_VALUE_BYTES: usize = 4_000;
 const MAX_ADDITIONAL_CONTEXT_SOURCE_LABEL_BYTES: usize = 1_536;
 const SOURCE_LABEL_TRUNCATION_MARKER: &str = "…source truncated…";
 const APPLICATION_CONTEXT_KIND: &str = "application";
@@ -151,7 +150,7 @@ fn matches_rendered_attr_value(mut value: &str) -> bool {
 }
 
 fn matches_rendered_text_value(mut value: &str) -> bool {
-    if value.len() > approx_bytes_for_tokens(MAX_ADDITIONAL_CONTEXT_VALUE_TOKENS) {
+    if value.len() > MAX_ADDITIONAL_CONTEXT_VALUE_BYTES {
         return false;
     }
 
@@ -223,7 +222,7 @@ fn escape_attr_value_with_byte_budget(value: &str) -> String {
 }
 
 fn escape_text_with_token_budget(value: &str) -> String {
-    let max_bytes = approx_bytes_for_tokens(MAX_ADDITIONAL_CONTEXT_VALUE_TOKENS);
+    let max_bytes = MAX_ADDITIONAL_CONTEXT_VALUE_BYTES;
     let escaped_bytes = value.chars().fold(0usize, |total, ch| {
         total.saturating_add(escaped_text_char_len(ch))
     });

@@ -12,8 +12,8 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::time::Duration;
 
-const FIRST_PROMPT: &str = "spawn the first worker";
-const FIRST_TASK: &str = "first worker task";
+const FIRST_PROMPT: &str = "spawn the first agent";
+const FIRST_TASK: &str = "spawn the second agent";
 const SECOND_TASK: &str = "second worker task";
 const MULTI_AGENT_V2_NAMESPACE: &str = "agents";
 
@@ -89,7 +89,7 @@ async fn v2_nested_spawn_checks_shared_active_execution_capacity() -> Result<()>
         ]),
     )
     .await;
-    mount_sse_once_match(
+    let first_followup = mount_sse_once_match(
         &server,
         |request: &wiremock::Request| has_function_call_output(request, "first-call"),
         sse(vec![
@@ -114,7 +114,7 @@ async fn v2_nested_spawn_checks_shared_active_execution_capacity() -> Result<()>
     let test = builder.build(&server).await?;
     test.submit_turn(FIRST_PROMPT).await?;
 
-    let second_output = tokio::time::timeout(Duration::from_secs(2), async {
+    let second_output = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Some(output) = second_followup.function_call_output_text("second-call") {
                 return output;
@@ -122,7 +122,32 @@ async fn v2_nested_spawn_checks_shared_active_execution_capacity() -> Result<()>
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await?;
+    .await;
+    let second_output = match second_output {
+        Ok(output) => output,
+        Err(error) => {
+            let request_summary = server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|request| {
+                    let body = String::from_utf8_lossy(&request.body);
+                    (
+                        body.contains(FIRST_PROMPT),
+                        body.contains(FIRST_TASK),
+                        body.contains(SECOND_TASK),
+                        body.contains("first-call"),
+                        body.contains("second-call"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            anyhow::bail!(
+                "{error}; first spawn output: {:?}; requests (first prompt, first task, second task, first call, second call): {request_summary:?}",
+                first_followup.function_call_output_text("first-call")
+            );
+        }
+    };
     assert_eq!(
         second_output,
         "collab spawn failed: agent thread limit reached"

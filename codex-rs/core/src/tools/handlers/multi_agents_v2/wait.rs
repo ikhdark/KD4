@@ -26,7 +26,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::time::Duration;
 use tokio::time::Instant;
-use tokio::time::timeout_at;
 use tokio_util::sync::CancellationToken;
 
 const MAX_WAKE_EVENT_DRAIN_PAGES: usize =
@@ -207,10 +206,9 @@ impl Handler {
                 store.as_ref(),
                 root_session_id.as_deref(),
                 cursor,
-                &mut unchanged_store_polls,
             );
             let (mut outcome, mut wake_read) = tokio::select! {
-                result = wait => result,
+                biased;
                 _ = cancellation_token.cancelled() => {
                     turn.turn_timing_state
                         .record_internally_drained_waits(drained_event_pages);
@@ -218,6 +216,7 @@ impl Handler {
                         "wait_agent cancelled".to_string(),
                     ));
                 }
+                result = wait => result,
             }
             .map_err(|error| {
                 turn.turn_timing_state
@@ -278,7 +277,7 @@ impl Handler {
                 }
             }
 
-            if outcome == WaitOutcome::DurableActivity {
+            if !wake_read.updated_agents.is_empty() {
                 prove_durable_forward_progress(cursor, &wake_read).map_err(|message| {
                     turn.turn_timing_state
                         .record_internally_drained_waits(drained_event_pages);
@@ -286,7 +285,7 @@ impl Handler {
                 })?;
             }
 
-            if outcome != WaitOutcome::DurableActivity || wake_read.updated_agents.is_empty() {
+            if wake_read.updated_agents.is_empty() {
                 break (outcome, wake_read, HydratedAssignments::default());
             }
             let (Some(store), Some(root_session_id)) = (store.as_ref(), root_session_id.as_deref())
@@ -1285,7 +1284,6 @@ mod tests {
         let (activity_tx, mut activity_rx) =
             tokio::sync::watch::channel(InputQueueActivity::Mailbox);
         let mut activity_open = true;
-        let mut unchanged_polls = 0;
         let (outcome, _) = wait_for_activity(
             &mut activity_rx,
             &mut activity_open,
@@ -1294,13 +1292,11 @@ mod tests {
             None,
             None,
             None,
-            &mut unchanged_polls,
         )
         .await
         .expect("wait result");
 
         assert_eq!(outcome, WaitOutcome::BoundaryElapsed);
-        assert!(unchanged_polls > 0);
         drop(activity_tx);
     }
 
@@ -1309,7 +1305,6 @@ mod tests {
         let (_activity_tx, mut activity_rx) =
             tokio::sync::watch::channel(InputQueueActivity::Steer);
         let mut activity_open = true;
-        let mut unchanged_polls = 0;
         let (outcome, wake_read) = wait_for_activity(
             &mut activity_rx,
             &mut activity_open,
@@ -1318,14 +1313,12 @@ mod tests {
             None,
             None,
             None,
-            &mut unchanged_polls,
         )
         .await
         .expect("wait result");
 
         assert_eq!(outcome, WaitOutcome::Steered);
         assert!(!wake_read.timed_out);
-        assert_eq!(unchanged_polls, 0);
     }
 }
 
@@ -1740,6 +1733,21 @@ async fn read_wake_events(
     }
 }
 
+async fn wait_wake_events(
+    store: Option<&std::sync::Arc<dyn codex_agent_task_store::AgentTaskStore>>,
+    root_session_id: Option<&str>,
+    cursor: Option<WakeEventId>,
+) -> codex_agent_task_store::StoreResult<WakeRead> {
+    match (store, root_session_id) {
+        (Some(store), Some(root_session_id)) => {
+            store
+                .wait_for_wake_events(root_session_id.to_string(), cursor)
+                .await
+        }
+        _ => std::future::pending().await,
+    }
+}
+
 // The explicit activity, deadline, durable-store, and cursor inputs document
 // every wake source participating in this private wait state machine.
 #[allow(clippy::too_many_arguments)]
@@ -1751,7 +1759,6 @@ async fn wait_for_activity(
     store: Option<&std::sync::Arc<dyn codex_agent_task_store::AgentTaskStore>>,
     root_session_id: Option<&str>,
     cursor: Option<WakeEventId>,
-    unchanged_polls: &mut u32,
 ) -> codex_agent_task_store::StoreResult<(WaitOutcome, WakeRead)> {
     if let Some(activity) = pending_activity {
         let outcome = match activity {
@@ -1771,51 +1778,51 @@ async fn wait_for_activity(
             },
         ));
     }
-    let initial = read_wake_events(store, root_session_id, cursor).await?;
-    if !initial.updated_agents.is_empty() {
-        return Ok((WaitOutcome::DurableActivity, initial));
-    }
-    *unchanged_polls = unchanged_polls.saturating_add(1);
     if boundary_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-        return Ok((WaitOutcome::BoundaryElapsed, initial));
+        let current = read_wake_events(store, root_session_id, cursor).await?;
+        return Ok(if current.updated_agents.is_empty() {
+            (WaitOutcome::BoundaryElapsed, current)
+        } else {
+            (WaitOutcome::DurableActivity, current)
+        });
     }
-    loop {
-        let mut poll_deadline = Instant::now() + Duration::from_millis(250);
-        if let Some(deadline) = boundary_deadline {
-            poll_deadline = std::cmp::min(poll_deadline, deadline);
+    let durable_activity = wait_wake_events(store, root_session_id, cursor);
+    let input_activity = async {
+        if !*activity_open {
+            return std::future::pending::<InputQueueActivity>().await;
         }
-        let activity_changed = async {
-            if *activity_open {
-                activity_rx.changed().await
-            } else {
-                std::future::pending().await
-            }
-        };
-        match timeout_at(poll_deadline, activity_changed).await {
-            Ok(Ok(())) => {
-                let outcome = match *activity_rx.borrow_and_update() {
-                    InputQueueActivity::Mailbox => WaitOutcome::MailboxActivity,
-                    InputQueueActivity::Steer => WaitOutcome::Steered,
-                };
-                let wake_read = read_wake_events(store, root_session_id, cursor).await?;
-                if wake_read.updated_agents.is_empty() {
-                    *unchanged_polls = unchanged_polls.saturating_add(1);
-                }
-                return Ok((outcome, wake_read));
-            }
-            Ok(Err(_)) => {
-                *activity_open = false;
-            }
+        match activity_rx.changed().await {
+            Ok(()) => *activity_rx.borrow_and_update(),
             Err(_) => {
-                let durable = read_wake_events(store, root_session_id, cursor).await?;
-                if !durable.updated_agents.is_empty() {
-                    return Ok((WaitOutcome::DurableActivity, durable));
-                }
-                *unchanged_polls = unchanged_polls.saturating_add(1);
-                if boundary_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                    return Ok((WaitOutcome::BoundaryElapsed, durable));
-                }
+                *activity_open = false;
+                std::future::pending::<InputQueueActivity>().await
             }
+        }
+    };
+    let boundary = async {
+        match boundary_deadline {
+            Some(deadline) => tokio::time::sleep_until(deadline).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::select! {
+        biased;
+        activity = input_activity => {
+            let outcome = match activity {
+                InputQueueActivity::Mailbox => WaitOutcome::MailboxActivity,
+                InputQueueActivity::Steer => WaitOutcome::Steered,
+            };
+            let wake_read = read_wake_events(store, root_session_id, cursor).await?;
+            Ok((outcome, wake_read))
+        }
+        durable = durable_activity => Ok((WaitOutcome::DurableActivity, durable?)),
+        _ = boundary => {
+            let current = read_wake_events(store, root_session_id, cursor).await?;
+            Ok(if current.updated_agents.is_empty() {
+                (WaitOutcome::BoundaryElapsed, current)
+            } else {
+                (WaitOutcome::DurableActivity, current)
+            })
         }
     }
 }

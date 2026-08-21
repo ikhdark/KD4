@@ -1,5 +1,6 @@
 use super::*;
 use crate::bottom_pane::slash_commands::ServiceTierCommand;
+use codex_protocol::openai_models::SPEED_TIER_FAST;
 use pretty_assertions::assert_eq;
 use serial_test::serial;
 
@@ -143,7 +144,7 @@ async fn legacy_fast_metadata_exposes_fast_command() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
     let mut preset = get_available_model(&chat, "gpt-5.4");
     preset.service_tiers.clear();
-    preset.additional_speed_tiers = vec![ServiceTier::Fast.request_value().to_string()];
+    preset.additional_speed_tiers = vec![SPEED_TIER_FAST.to_string()];
     chat.model_catalog = std::sync::Arc::new(ModelCatalog::new(vec![preset]));
 
     assert_eq!(

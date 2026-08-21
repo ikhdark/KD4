@@ -5,9 +5,12 @@ expression: "context_snapshot::format_labeled_requests_snapshot(\"additional con
 Scenario: additional context is inserted before the user turn input.
 
 ## Request
-00:message/developer[2]:
-    [01] <PERMISSIONS_INSTRUCTIONS>
-    [02] <skills_usage_instructions>\n## How to use skills\n- Use a skill when the user names it or the task clearly matches its description. Use the smallest applicable...
-01:message/developer:<application_context source="automation_info" kind="application">\nrun one\n</application_context>
-02:message/user:<external_context source="browser_info" kind="untrusted">\ntab one\n</external_context>
-03:message/user:inspect the active tab
+00:message/developer:You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals.\n\nAt the start of your turn, you are the active agent.\n\nYou...
+01:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agen...
+02:message/user:<task_model_guidance>Before acting, form and maintain a working task model from the current request and higher-priority instructions. Track the desired outcome;...
+03:message/developer:<PERMISSIONS_INSTRUCTIONS>
+04:message/developer:<skills_usage_instructions>\n## How to use skills\n- Use the smallest skill set named by the user or clearly matched by the task; announce it, state ordering wh...
+05:message/developer:<NO_TEXT>
+06:message/user:<external_context source="browser_info" kind="untrusted">\ntab one\n</external_context>
+07:message/developer:<application_context source="automation_info" kind="application">\nrun one\n</application_context>
+08:message/user:inspect the active tab

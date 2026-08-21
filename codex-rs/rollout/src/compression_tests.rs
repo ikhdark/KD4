@@ -483,6 +483,39 @@ async fn resume_materializes_compressed_rollout_path() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn resume_materialization_preserves_rollout_modified_time() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let config = RolloutConfig {
+        codex_home: home.path().to_path_buf(),
+        sqlite_home: home.path().to_path_buf(),
+        cwd: home.path().to_path_buf(),
+        model_provider_id: "test-provider".to_string(),
+        generate_memories: true,
+    };
+    let uuid = Uuid::from_u128(4);
+    let thread_id = ThreadId::from_string(&uuid.to_string())?;
+    let rollout_path = rollout_path(home.path(), "2025-01-03T12-00-00", uuid);
+    write_rollout(&rollout_path, thread_id, "hello before resume")?;
+    compress_now(&rollout_path)?;
+    let compressed_path = compressed_rollout_path(&rollout_path);
+    set_old_mtime(&compressed_path)?;
+    let compressed_modified = fs::metadata(&compressed_path)?.modified()?;
+
+    let recorder = RolloutRecorder::new(
+        &config,
+        RolloutRecorderParams::resume(compressed_path.clone()),
+    )
+    .await?;
+
+    assert_eq!(
+        fs::metadata(&rollout_path)?.modified()?,
+        compressed_modified
+    );
+    recorder.shutdown().await?;
+    Ok(())
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn compression_preserves_rollout_permissions() -> anyhow::Result<()> {

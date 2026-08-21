@@ -550,6 +550,7 @@ async fn make_config(root: &TempDir, limit: usize, instructions: Option<&str>) -
     let codex_home = TempDir::new().unwrap();
     let mut config = ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(root.path().to_path_buf()))
         .build()
         .await
         .expect("defaults for test should always succeed");
@@ -599,6 +600,7 @@ async fn make_config_with_project_root_markers(
     )];
     let mut config = ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(root.path().to_path_buf()))
         .cli_overrides(cli_overrides)
         .build()
         .await
@@ -715,7 +717,6 @@ async fn project_doc_truncation_trims_split_multibyte_code_points() {
         fs::write(&source, &contents).unwrap();
         let source_abs = source.abs();
         let source_uri = PathUri::from_abs_path(&source_abs);
-        let cwd_uri = PathUri::from_abs_path(&tmp.abs());
         let stream_counts = Arc::new(MetadataCallCounts::default());
         let filesystem = FailingFileSystem {
             path: source_abs,
@@ -724,26 +725,21 @@ async fn project_doc_truncation_trims_split_multibyte_code_points() {
         };
         let limit = PREFIX.len() + 1;
 
-        let loaded = read_discovered_agents_md(
+        let project_docs = read_discovered_project_docs(
             &filesystem,
-            "local",
-            &cwd_uri,
             vec![ProjectDocCandidate {
                 path: source_uri.clone(),
                 size: contents.len() as u64,
             }],
             limit,
+            /*prefetch_utf8_boundary_slack*/ false,
         )
         .await
-        .expect("project doc read")
-        .loaded
-        .expect("project doc expected");
-        let notice =
-            project_doc_truncation_notice(&source_uri, contents.len() as u64, PREFIX.len());
+        .expect("project doc read");
 
         assert_eq!(
-            loaded.text(),
-            format!("{PREFIX}\n\n{notice}"),
+            project_docs[0].read.retained_data,
+            PREFIX.as_bytes(),
             "split code point {code_point:?}"
         );
         assert_eq!(
@@ -764,7 +760,6 @@ async fn project_doc_truncation_preserves_invalid_boundary_bytes_lossily() {
     fs::write(&source, CONTENTS).unwrap();
     let source_abs = source.abs();
     let source_uri = PathUri::from_abs_path(&source_abs);
-    let cwd_uri = PathUri::from_abs_path(&tmp.abs());
     let stream_counts = Arc::new(MetadataCallCounts::default());
     let filesystem = FailingFileSystem {
         path: source_abs,
@@ -772,27 +767,19 @@ async fn project_doc_truncation_preserves_invalid_boundary_bytes_lossily() {
         metadata_calls: Arc::clone(&stream_counts),
     };
 
-    let loaded = read_discovered_agents_md(
+    let project_docs = read_discovered_project_docs(
         &filesystem,
-        "local",
-        &cwd_uri,
         vec![ProjectDocCandidate {
             path: source_uri.clone(),
             size: CONTENTS.len() as u64,
         }],
         LIMIT,
+        /*prefetch_utf8_boundary_slack*/ false,
     )
     .await
-    .expect("project doc read")
-    .loaded
-    .expect("project doc expected");
-    let notice = project_doc_truncation_notice(
-        &source_uri,
-        CONTENTS.len() as u64,
-        /*retained_bytes*/ LIMIT,
-    );
+    .expect("project doc read");
 
-    assert_eq!(loaded.text(), format!("\u{FFFD}\n\n{notice}"));
+    assert_eq!(project_docs[0].read.retained_data, b"\xC3");
     assert_eq!(
         stream_counts.stream_bytes.load(Ordering::Relaxed),
         CONTENTS.len()
@@ -811,13 +798,15 @@ async fn doc_larger_than_limit_includes_explicit_truncation_notice() {
     let res = get_user_instructions(&make_config(&tmp, LIMIT, /*instructions*/ None).await)
         .await
         .expect("doc expected");
+    let retained = res.bytes().take_while(|byte| *byte == b'A').count();
     let notice = project_doc_truncation_notice(
         &PathUri::from_abs_path(&source.abs()),
         (LIMIT * 2) as u64,
-        LIMIT,
+        retained,
     );
 
-    assert_eq!(res, format!("{}\n\n{notice}", &huge[..LIMIT]));
+    assert_eq!(res, format!("{}\n\n{notice}", &huge[..retained]));
+    assert!(res.len() <= LIMIT);
 }
 
 #[tokio::test]
@@ -834,28 +823,16 @@ async fn total_byte_limit_preserves_nearest_doc_and_notices_broader_truncation()
     config.cwd = nested.abs();
 
     let loaded = load_agents_md(&config).await.expect("project instructions");
-    let root_notice = project_doc_truncation_notice(
-        &PathUri::from_abs_path(&root_doc.abs()),
-        /*original_bytes*/ 4,
-        /*retained_bytes*/ 1,
-    );
-    let truncated_root = format!("r\n\n{root_notice}");
     let expected = LoadedAgentsMd {
         user_instructions: None,
-        entries: vec![
-            InstructionEntry {
-                contents: truncated_root.clone(),
-                provenance: project_provenance(root_doc.abs(), config.cwd.clone()),
-            },
-            InstructionEntry {
-                contents: "abcdef".to_string(),
-                provenance: project_provenance(config.cwd.join("AGENTS.md"), config.cwd.clone()),
-            },
-        ],
+        entries: vec![InstructionEntry {
+            contents: "abcdef".to_string(),
+            provenance: project_provenance(config.cwd.join("AGENTS.md"), config.cwd.clone()),
+        }],
     };
 
     assert_eq!(loaded, expected);
-    assert_eq!(loaded.text(), format!("{truncated_root}\n\nabcdef"));
+    assert_eq!(loaded.text(), "abcdef");
 }
 
 #[tokio::test]
@@ -934,10 +911,12 @@ async fn oversized_project_doc_stream_stops_after_required_prefix() {
         &PathUri::from_abs_path(&config.cwd),
     )
     .await
-    .expect("streamed read")
-    .expect("project instructions");
+    .expect("streamed read");
 
-    assert!(loaded.text().starts_with("abc\n\n"));
+    assert!(
+        loaded.is_none(),
+        "the truncation notice cannot fit the budget"
+    );
     assert_eq!(metadata_calls.stream_chunks.load(Ordering::Relaxed), 3);
     assert_eq!(metadata_calls.stream_bytes.load(Ordering::Relaxed), 3);
 }
@@ -962,15 +941,12 @@ async fn oversized_whitespace_prefix_stops_at_the_budget_and_keeps_a_notice() {
         &PathUri::from_abs_path(&config.cwd),
     )
     .await
-    .expect("streamed read")
-    .expect("conservative truncation notice");
-    let notice = project_doc_truncation_notice(
-        &PathUri::from_abs_path(&source.abs()),
-        /*original_bytes*/ 36,
-        /*retained_bytes*/ 3,
-    );
+    .expect("streamed read");
 
-    assert_eq!(loaded.text(), format!("   \n\n{notice}"));
+    assert!(
+        loaded.is_none(),
+        "the truncation notice cannot fit the budget"
+    );
     assert_eq!(metadata_calls.stream_chunks.load(Ordering::Relaxed), 3);
     assert_eq!(metadata_calls.stream_bytes.load(Ordering::Relaxed), 3);
 }
@@ -1002,13 +978,7 @@ async fn zero_budget_broader_doc_stops_after_first_non_whitespace_byte() {
     .await
     .expect("streamed read")
     .expect("project instructions");
-    let root_notice = project_doc_truncation_notice(
-        &PathUri::from_abs_path(&root_doc.abs()),
-        /*original_bytes*/ 7,
-        /*retained_bytes*/ 0,
-    );
-
-    assert_eq!(loaded.text(), format!("{root_notice}\n\nabc"));
+    assert_eq!(loaded.text(), "abc");
     assert_eq!(metadata_calls.stream_chunks.load(Ordering::Relaxed), 1);
     assert_eq!(metadata_calls.stream_bytes.load(Ordering::Relaxed), 1);
 }

@@ -2569,6 +2569,19 @@
           },
           "description": "Additive terminalization phase timings. Older records deserialize to zeroes; the terminalization receipt remains authoritative for phases that occur after live dispatch."
         },
+        "toolCallTimingOverflow": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "toolCalls": {
+          "description": "Bounded per-call relay timings captured at delivery. Offsets are from turn start; phase durations are diagnostics and are not additive with the canonical `exclusive` partition.",
+          "items": {
+            "$ref": "#/definitions/TurnTimingToolCall"
+          },
+          "type": "array"
+        },
         "unions": {
           "$ref": "#/definitions/TurnTimingUnions"
         }
@@ -3679,6 +3692,7 @@
           "default": "primary"
         },
         "completedMs": {
+          "default": null,
           "format": "uint64",
           "minimum": 0.0,
           "type": [
@@ -3687,6 +3701,7 @@
           ]
         },
         "decisionLatencyNs": {
+          "default": null,
           "description": "Dispatch-to-first-actionable-output latency. This excludes reasoning deltas and partial tool arguments; missing actionable output stays null.",
           "format": "uint64",
           "minimum": 0.0,
@@ -3696,6 +3711,7 @@
           ]
         },
         "dispatchMs": {
+          "default": null,
           "format": "uint64",
           "minimum": 0.0,
           "type": [
@@ -3712,6 +3728,7 @@
           "default": "unknown"
         },
         "firstActionableOutputMs": {
+          "default": null,
           "format": "uint64",
           "minimum": 0.0,
           "type": [
@@ -3720,6 +3737,7 @@
           ]
         },
         "firstModelOutputMs": {
+          "default": null,
           "format": "uint64",
           "minimum": 0.0,
           "type": [
@@ -3808,6 +3826,7 @@
               "type": "null"
             }
           ],
+          "default": null,
           "description": "Aggregate-only full logical prompt accounting. No prompt text, repository paths, tool arguments, or hashes are persisted here."
         },
         "samplingRequestId": {
@@ -4025,6 +4044,7 @@
           "type": "integer"
         },
         "providerInputTokens": {
+          "default": null,
           "description": "Provider-reported full input tokens, when usage was returned.",
           "format": "uint64",
           "minimum": 0.0,
@@ -4034,6 +4054,7 @@
           ]
         },
         "providerReconciliationResidual": {
+          "default": null,
           "description": "`provider_input_tokens - logical_total`, when provider usage exists.",
           "format": "int64",
           "type": [
@@ -4236,6 +4257,254 @@
       "description": "Semantic basis used by request token-category accounting.\n\nCategories describe the complete logical prompt presented to the model. They do not describe only websocket deltas, newly allocated client memory, uncached provider input, or reconciliation residuals.",
       "enum": [
         "full_logical_prompt"
+      ],
+      "type": "string"
+    },
+    "TurnTimingToolCall": {
+      "description": "Delivery-complete lifecycle for one model-issued or nested tool call.\n\nAll `*_at_ms` values are monotonic offsets from turn start. A missing boundary means the call ended before that boundary was observed. No tool arguments, output, paths, or nested runtime identifiers are persisted.",
+      "properties": {
+        "acceptedAtMs": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "authorizationStateCoordinationMs": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "callId": {
+          "type": "string"
+        },
+        "deliveredAtMs": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "eager": {
+          "default": false,
+          "type": "boolean"
+        },
+        "firstPollAtMs": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "generationIndex": {
+          "default": null,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "handlerDurationMs": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "handlerEntryAtMs": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "handlerExitAtMs": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "historyPersistenceMs": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "itemToFirstPollMs": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "modelResumedAtMs": {
+          "default": null,
+          "description": "The next model generation began after this result was delivered.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "outputCollectedAtMs": {
+          "default": null,
+          "description": "The tool result has been collected into the host relay, before any post-handler evidence, projection, persistence, or delivery work.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "outputProjectionMs": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "parallelGateAdmittedAtMs": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "parallelGateWaitMs": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "postHandlerMs": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "postToolHookMs": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "preToolHookMs": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "processAliveAtDelivery": {
+          "default": false,
+          "type": "boolean"
+        },
+        "processExitedAtMs": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "processSpawnedAtMs": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "source": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TurnTimingToolCallSource"
+            }
+          ],
+          "default": "direct"
+        },
+        "toolName": {
+          "type": "string"
+        },
+        "totalDurationMs": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "workspaceEvidenceAfterMs": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "workspaceEvidenceBeforeMs": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "callId",
+        "toolName"
+      ],
+      "type": "object"
+    },
+    "TurnTimingToolCallSource": {
+      "enum": [
+        "direct",
+        "code_mode"
       ],
       "type": "string"
     },

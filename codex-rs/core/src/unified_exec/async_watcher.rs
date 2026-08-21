@@ -26,6 +26,7 @@ use crate::tools::events::ToolEventStage;
 use crate::tools::known_delta_store;
 use crate::tools::known_delta_store::KnownDeltaExecutionObservation;
 use crate::tools::known_delta_store::PreparedKnownDelta;
+use crate::tools::tool_dispatch_trace::ToolDispatchTiming;
 use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::exec_output::StreamOutput;
@@ -220,6 +221,7 @@ pub(crate) fn spawn_exit_watcher(
     validation_waiter: Option<crate::validation_admission::ValidationLeader>,
     known_delta: Option<PreparedKnownDelta>,
     known_delta_executor_started_at: Option<Instant>,
+    tool_dispatch_timing: Option<Arc<ToolDispatchTiming>>,
 ) {
     let exit_token = process.cancellation_token();
     let output_drained = process.output_drained_token();
@@ -244,6 +246,13 @@ pub(crate) fn spawn_exit_watcher(
     tokio::spawn(async move {
         let _validation_waiter = validation_waiter;
         exit_token.cancelled().await;
+        let exit_observed_at = Instant::now();
+        if let Some(timing) = tool_dispatch_timing.as_ref() {
+            timing.mark_exec_process_exited();
+            turn_ref
+                .turn_timing_state
+                .record_background_tool_process_exit(&call_id, timing.snapshot(exit_observed_at));
+        }
         output_drained.cancelled().await;
 
         let duration = Instant::now().saturating_duration_since(started_at);
@@ -369,6 +378,36 @@ pub(crate) fn spawn_exit_watcher(
                 })
                 .await;
         }
+        let delivered_at = Instant::now();
+        let lifecycle = tool_dispatch_timing
+            .as_ref()
+            .map(|timing| timing.snapshot(delivered_at));
+        tracing::info!(
+            event.name = "codex.exec_command.background_lifecycle",
+            conversation.id = %session_ref.thread_id,
+            turn_id = %turn_ref.sub_id,
+            call_id,
+            process_id,
+            request_to_spawn_ms = lifecycle
+                .as_ref()
+                .and_then(|snapshot| snapshot.exec_request_to_spawn_ms)
+                .unwrap_or(0),
+            spawn_to_exit_ms = lifecycle
+                .as_ref()
+                .and_then(|snapshot| snapshot.exec_spawn_to_exit_ms)
+                .unwrap_or_else(|| u64::try_from(
+                    exit_observed_at.saturating_duration_since(started_at).as_millis()
+                ).unwrap_or(u64::MAX)),
+            exit_to_delivery_ms = lifecycle
+                .as_ref()
+                .and_then(|snapshot| snapshot.exec_exit_to_delivery_ms)
+                .unwrap_or_else(|| u64::try_from(
+                    delivered_at
+                        .saturating_duration_since(exit_observed_at)
+                        .as_millis()
+                ).unwrap_or(u64::MAX)),
+            "background exec lifecycle delivered"
+        );
     });
 }
 

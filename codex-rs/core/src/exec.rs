@@ -66,7 +66,7 @@ pub const DEFAULT_EXEC_COMMAND_TIMEOUT_MS: u64 = 10_000;
 const SIGKILL_CODE: i32 = 9;
 const TIMEOUT_CODE: i32 = 64;
 const EXIT_CODE_SIGNAL_BASE: i32 = 128; // conventional shell: 128 + signal
-const EXEC_TIMEOUT_EXIT_CODE: i32 = 124; // conventional timeout exit code
+pub(crate) const EXEC_TIMEOUT_EXIT_CODE: i32 = 124; // conventional timeout exit code
 const CANCELLATION_TERMINATION_GRACE_PERIOD: Duration = Duration::from_millis(50);
 
 // I/O buffer sizing
@@ -322,10 +322,47 @@ impl ExecCapturePolicy {
 }
 
 #[derive(Clone)]
+pub(crate) struct CommandProgress {
+    tx: tokio::sync::watch::Sender<u64>,
+}
+
+impl CommandProgress {
+    pub(crate) fn new() -> Self {
+        let (tx, _rx) = tokio::sync::watch::channel(0);
+        Self { tx }
+    }
+
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.tx.subscribe()
+    }
+
+    pub(crate) fn record_output(&self) {
+        self.tx.send_modify(|revision| {
+            *revision = revision.saturating_add(1);
+        });
+    }
+}
+
+#[derive(Clone)]
 pub struct StdoutStream {
     pub sub_id: String,
     pub call_id: String,
     pub tx_event: Sender<Event>,
+    /// Notifies an owner-held command watchdog whenever stdout or stderr advances.
+    pub(crate) progress: Option<CommandProgress>,
+}
+
+impl StdoutStream {
+    /// Creates a stream for callers that relay output without owning a command
+    /// progress watchdog.
+    pub fn without_progress(sub_id: String, call_id: String, tx_event: Sender<Event>) -> Self {
+        Self {
+            sub_id,
+            call_id,
+            tx_event,
+            progress: None,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -707,6 +744,9 @@ async fn exec_windows_sandbox(
     let output_sink = stdout_stream.map(|stream| {
         let limiter = Arc::new(OutputDeltaLimiter::default());
         Arc::new(move |capture_stream: CaptureOutputStream, chunk: &[u8]| {
+            if let Some(progress) = stream.progress.as_ref() {
+                progress.record_output();
+            }
             let chunk = match limiter.claim() {
                 OutputDeltaDecision::Emit => chunk.to_vec(),
                 OutputDeltaDecision::EmitCapNotice => EXEC_OUTPUT_DELTA_CAP_NOTICE.to_vec(),
@@ -1253,6 +1293,10 @@ async fn read_output<R: AsyncRead + Unpin + Send + 'static>(
         let n = reader.read(&mut tmp).await?;
         if n == 0 {
             break;
+        }
+
+        if let Some(progress) = stream.as_ref().and_then(|stream| stream.progress.as_ref()) {
+            progress.record_output();
         }
 
         if let Some(stream) = &stream

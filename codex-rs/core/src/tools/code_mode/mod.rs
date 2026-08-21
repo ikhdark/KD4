@@ -97,7 +97,7 @@ struct CodeModePacketReceipt {
 }
 
 const TINY_PACKET_RESULT_BYTES: usize = 1_024;
-const TINY_PACKET_ADVISORY: &str = "Two consecutive small read-only exec packets were observed. If future tool calls are independent, batch them with Promise.all in one exec packet.";
+const TINY_PACKET_ADVISORY: &str = "This exec packet contained one small read-only observation. Before another tool boundary, batch all remaining independent evidence with Promise.all; if this result is sufficient or unchanged from prior evidence, synthesize and stop.";
 
 impl CodeModeService {
     pub(crate) fn new(session_provider: Arc<dyn CodeModeSessionProvider>) -> Self {
@@ -127,6 +127,17 @@ impl CodeModeService {
         request: codex_code_mode::WaitRequest,
     ) -> Result<codex_code_mode::WaitOutcome, String> {
         self.session().await?.wait(request).await
+    }
+
+    pub(crate) async fn wait_for_state_change(
+        &self,
+        cell_id: codex_code_mode::CellId,
+    ) -> Result<codex_code_mode::WaitOutcome, String> {
+        self.wait(codex_code_mode::WaitRequest {
+            cell_id,
+            yield_time_ms: codex_code_mode::OWNER_HELD_STATE_CHANGE_YIELD_TIME_MS,
+        })
+        .await
     }
 
     pub(crate) fn has_waitable_cells(&self) -> bool {
@@ -201,7 +212,7 @@ impl CodeModeService {
         } else {
             *consecutive = 0;
         }
-        let advisory = (*consecutive == 2).then_some(TINY_PACKET_ADVISORY);
+        let advisory = (*consecutive == 1).then_some(TINY_PACKET_ADVISORY);
         CodeModePacketReceipt {
             nested_call_count: metrics.nested_call_count,
             batchable_observation_count: metrics.batchable_observation_count,
@@ -543,7 +554,8 @@ async fn call_nested_tool(
     let result_value = result.code_mode_result();
     exec.session.services.code_mode_service.record_packet_call(
         &cell_id,
-        is_batchable_observation(&tool_name, &payload),
+        is_batchable_observation(&tool_name, &payload)
+            && !result_has_live_exec_session(&result_value),
         serde_json::to_vec(&result_value).map_or(0, |bytes| bytes.len()),
     );
     tool_runtime.record_code_mode_result(
@@ -582,32 +594,41 @@ fn is_batchable_observation(tool_name: &ToolName, payload: &ToolPayload) -> bool
     let Ok(arguments) = serde_json::from_str::<JsonValue>(arguments) else {
         return false;
     };
-    if arguments.get("kind").and_then(JsonValue::as_str) != Some("argv") {
-        return false;
-    }
-    let program = arguments
+    let command = arguments
         .get("program")
         .and_then(JsonValue::as_str)
-        .and_then(|program| program.rsplit(['/', '\\']).next())
-        .unwrap_or_default()
-        .trim_end_matches(".exe")
-        .to_ascii_lowercase();
-    if program == "rg" {
-        return true;
-    }
-    if program != "git" {
-        return false;
-    }
-    arguments
-        .get("args")
-        .and_then(JsonValue::as_array)
-        .and_then(|args| args.iter().find_map(JsonValue::as_str))
-        .is_some_and(|subcommand| {
-            matches!(
-                subcommand,
-                "status" | "diff" | "show" | "log" | "rev-parse" | "ls-files" | "grep"
-            )
+        .map(|program| {
+            let mut command = vec![program.to_string()];
+            command.extend(
+                arguments
+                    .get("args")
+                    .and_then(JsonValue::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(JsonValue::as_str)
+                    .map(str::to_string),
+            );
+            command
         })
+        .or_else(|| {
+            ["script_body", "cmd", "command"]
+                .into_iter()
+                .find_map(|field| match arguments.get(field) {
+                    Some(JsonValue::String(command)) => Some(vec![command.clone()]),
+                    Some(JsonValue::Array(command)) => command
+                        .iter()
+                        .map(|part| part.as_str().map(str::to_string))
+                        .collect::<Option<Vec<_>>>(),
+                    _ => None,
+                })
+        });
+    command.is_some_and(|command| !crate::turn_diff_tracker::command_may_mutate(&command))
+}
+
+fn result_has_live_exec_session(result: &JsonValue) -> bool {
+    result
+        .get("session_id")
+        .is_some_and(|session_id| !session_id.is_null())
 }
 
 fn nested_failure_fingerprint(tool_name: &ToolName, error: &str) -> String {
@@ -714,6 +735,7 @@ mod tests {
     use super::build_nested_tool_payload;
     use super::is_batchable_observation;
     use super::nested_failure_fingerprint;
+    use super::result_has_live_exec_session;
     use super::truncate_code_mode_result;
     use crate::tools::context::ToolPayload;
     use codex_code_mode::CellId;
@@ -730,14 +752,14 @@ mod tests {
     }
 
     #[test]
-    fn repeated_tiny_read_only_packets_produce_one_runtime_advisory() {
+    fn first_tiny_read_only_packet_produces_one_runtime_advisory() {
         let service = test_service();
         let cell = CellId::new("cell".to_string());
 
         service.record_packet_call(&cell, true, 128);
-        assert!(service.finish_packet("cell", "turn").advisory.is_none());
-        service.record_packet_call(&cell, true, 128);
         assert!(service.finish_packet("cell", "turn").advisory.is_some());
+        service.record_packet_call(&cell, true, 128);
+        assert!(service.finish_packet("cell", "turn").advisory.is_none());
         service.record_packet_call(&cell, true, 128);
         assert!(service.finish_packet("cell", "turn").advisory.is_none());
 
@@ -761,8 +783,11 @@ mod tests {
         let git_commit = ToolPayload::Function {
             arguments: json!({"kind": "argv", "program": "git", "args": ["commit"]}).to_string(),
         };
-        let shell_script = ToolPayload::Function {
+        let read_only_shell_script = ToolPayload::Function {
             arguments: json!({"kind": "script", "cmd": "rg needle"}).to_string(),
+        };
+        let mutating_shell_script = ToolPayload::Function {
+            arguments: json!({"command": "Remove-Item output.txt"}).to_string(),
         };
 
         assert!(is_batchable_observation(
@@ -779,8 +804,14 @@ mod tests {
         ));
         assert!(!is_batchable_observation(
             &ToolName::plain("exec_command"),
-            &shell_script
+            &read_only_shell_script
         ));
+        assert!(!is_batchable_observation(
+            &ToolName::plain("shell_command"),
+            &mutating_shell_script
+        ));
+        assert!(result_has_live_exec_session(&json!({"session_id": 7})));
+        assert!(!result_has_live_exec_session(&json!({"exit_code": 0})));
     }
 
     #[test]
@@ -871,7 +902,7 @@ mod tests {
                 text: concat!(
                     "Warning: truncated output (original token count: 10)\n",
                     "Total output lines: 1\n\n",
-                    "0123456789…5 tokens truncated…0123456789"
+                    "…10 tokens truncated…"
                 )
                 .to_string(),
             }]
@@ -889,24 +920,25 @@ mod tests {
             panic!("expected one truncated text item");
         };
         assert!(text.starts_with("Warning: truncated output"));
-        assert!(text.contains("95 tokens truncated"));
+        assert!(text.contains("tokens truncated"));
+        assert!(!text.contains(&"x".repeat(100)));
     }
 
     #[test]
     fn default_outer_success_budget_preserves_a_multi_tool_evidence_packet() {
         let text = "x".repeat(24_000);
         assert!(codex_utils_string::approx_token_count(&text) > 4_000);
-        let items = vec![FunctionCallOutputContentItem::InputText { text: text.clone() }];
+        let items = vec![FunctionCallOutputContentItem::InputText { text }];
 
         let projected = truncate_code_mode_result(items, None, OutputOutcome::Success, usize::MAX);
 
-        assert_eq!(
-            projected,
-            vec![FunctionCallOutputContentItem::InputText { text }]
-        );
-        assert_eq!(
-            codex_utils_output_truncation::DEFAULT_SUCCESS_OUTPUT_TOKENS,
-            codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
+        let [FunctionCallOutputContentItem::InputText { text }] = projected.as_slice() else {
+            panic!("expected one projected text item");
+        };
+        assert!(text.starts_with("Warning: truncated output"));
+        assert!(
+            codex_utils_string::approx_token_count(text)
+                <= codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL
         );
     }
 

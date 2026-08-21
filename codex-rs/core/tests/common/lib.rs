@@ -17,6 +17,7 @@ use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
 pub use codex_core::test_support::TestCodexResponsesRequestKind;
 pub use codex_core::test_support::responses_metadata;
+use codex_features::Feature;
 use codex_utils_absolute_path::AbsolutePathBuf;
 pub use codex_utils_absolute_path::test_support::PathBufExt;
 pub use codex_utils_absolute_path::test_support::PathExt;
@@ -218,6 +219,9 @@ pub async fn load_default_config_for_test_with_cloud_config_bundle(
     // Do not let a developer-level CODEX_SQLITE_HOME override make otherwise
     // hermetic integration tests share one state database.
     config.sqlite_home = codex_home.path().join("sqlite");
+    // Preserve the integration harness's legacy baseline now that V2 is a
+    // stable default. Tests that cover V2 enable it explicitly.
+    let _ = config.features.disable(Feature::MultiAgentV2);
     config
 }
 

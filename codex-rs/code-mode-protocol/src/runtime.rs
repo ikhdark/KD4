@@ -10,6 +10,10 @@ use crate::ToolDefinition;
 
 pub const DEFAULT_EXEC_YIELD_TIME_MS: u64 = 10_000;
 pub const DEFAULT_WAIT_YIELD_TIME_MS: u64 = 10_000;
+/// Reserved internal wait value that asks the runtime to wake only when a cell
+/// produces output or reaches a terminal state. Model-facing schemas cap
+/// ordinary yield intervals far below this value.
+pub const OWNER_HELD_STATE_CHANGE_YIELD_TIME_MS: u64 = u64::MAX;
 /// Default coherent evidence-packet budget when no per-call limit is requested.
 /// The core still caps this at the active model's hard output limit.
 pub const DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL: usize = 10_000;

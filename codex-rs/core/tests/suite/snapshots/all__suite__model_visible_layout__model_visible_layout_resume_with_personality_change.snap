@@ -5,22 +5,23 @@ expression: "format_labeled_requests_snapshot(\"First post-resume turn where res
 Scenario: First post-resume turn where resumed config model differs from rollout and personality changes.
 
 ## Last Request Before Resume
-00:message/developer[2]:
-    [01] <PERMISSIONS_INSTRUCTIONS>
-    [02] <SKILLS_INSTRUCTIONS>
-01:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-02:message/user:seed resume history
+00:message/developer:You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals...
+01:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
+02:message/user:<task_model_guidance>Before acting, form and maintain a working task model from the current requ...
+03:message/developer:<PERMISSIONS_INSTRUCTIONS>
+04:message/developer:<SKILLS_INSTRUCTIONS>
+05:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
+06:message/user:seed resume history
 
 ## First Request After Resume
-00:message/developer[2]:
-    [01] <PERMISSIONS_INSTRUCTIONS>
-    [02] <SKILLS_INSTRUCTIONS>
-01:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-02:message/user:seed resume history
-03:message/assistant:recorded before resume
-04:message/developer[3]:
-    [01] <model_switch>\nThe user was previously using a different model. Continue following the session'...
-    [02] <PERMISSIONS_INSTRUCTIONS>
-    [03] <personality_spec> The user has requested a new communication style. Future messages should adhe...
-05:message/user:<ENVIRONMENT_CONTEXT:cwd=PRETURN_CONTEXT_DIFF_CWD>
-06:message/user:resume and change personality
+00:message/developer:You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals...
+01:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
+02:message/user:<task_model_guidance>Before acting, form and maintain a working task model from the current requ...
+03:message/developer:<PERMISSIONS_INSTRUCTIONS>
+04:message/developer:<SKILLS_INSTRUCTIONS>
+05:message/developer:<personality_spec> The user has requested a new communication style. Future messages should adhe...
+06:message/user:seed resume history
+07:message/assistant:recorded before resume
+08:message/developer:<model_switch>\nThe user was previously using a different model. Continue following the session'...
+09:message/user:<ENVIRONMENT_CONTEXT:cwd=PRETURN_CONTEXT_DIFF_CWD>
+10:message/user:resume and change personality

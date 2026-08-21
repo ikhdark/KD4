@@ -492,10 +492,9 @@ def resolve_manifest(
             if isinstance(active_lane, dict)
             else None
         )
-        if (
-            active_target_dir is not None
-            and os.path.normcase(active_target_dir) == os.path.normcase(target_dir)
-        ):
+        if active_target_dir is not None and os.path.normcase(
+            active_target_dir
+        ) == os.path.normcase(target_dir):
             resolved["advisories"].append(
                 {
                     "kind": "cargo_lane_overlap",

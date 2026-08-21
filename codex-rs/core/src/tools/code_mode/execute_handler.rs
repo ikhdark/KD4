@@ -8,7 +8,6 @@ use crate::tools::registry::ToolExecutionTiming;
 use crate::tools::registry::ToolExecutor;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
-use std::collections::HashSet;
 
 use super::ExecContext;
 use super::PUBLIC_TOOL_NAME;
@@ -16,10 +15,10 @@ use super::handle_runtime_response;
 use super::is_exec_tool_name;
 use super::wait_handler::OwnerHeldCodeModeExit;
 use super::wait_handler::attach_drained_wait_evidence;
-use super::wait_handler::effective_observation_yield_time_ms;
-use super::wait_handler::hold_unchanged_waits;
+use super::wait_handler::hold_until_state_change;
 use super::wait_handler::input_activity_response;
 use super::wait_handler::record_internally_drained_waits;
+use super::wait_handler::terminate_cancelled_cell;
 
 pub struct CodeModeExecuteHandler {
     spec: ToolSpec,
@@ -51,19 +50,14 @@ impl CodeModeExecuteHandler {
         let args =
             codex_code_mode::parse_exec_source(&code).map_err(FunctionCallError::RespondToModel)?;
         let exec = ExecContext { session, turn };
-        let activated = exec.turn.activated_deferred_tools();
         let mut nested_tool_specs = self.direct_nested_tool_specs.clone();
-        nested_tool_specs.extend(
-            self.deferred_nested_tool_specs
-                .iter()
-                .filter_map(|spec| filter_deferred_spec(spec, &activated)),
-        );
+        // Deferred tools stay out of the model-visible `exec` description, but
+        // code running inside the isolate can discover and invoke them through
+        // `ALL_TOOLS`. Build the runtime registry from the complete set so a
+        // same-cell tool search can immediately call the tool it discovers.
+        nested_tool_specs.extend(self.deferred_nested_tool_specs.clone());
         let enabled_tools = codex_tools::collect_code_mode_tool_definitions(&nested_tool_specs);
         let started_at = std::time::Instant::now();
-        let yield_time_ms = effective_observation_yield_time_ms(
-            args.yield_time_ms
-                .unwrap_or(codex_code_mode::DEFAULT_EXEC_YIELD_TIME_MS),
-        );
         let started_cell = exec
             .session
             .services
@@ -112,6 +106,7 @@ impl CodeModeExecuteHandler {
         let initial_response = tokio::select! {
             biased;
             _ = cancellation_token.cancelled() => {
+                terminate_cancelled_cell(&exec, &cell_id).await;
                 return Err(FunctionCallError::RespondToModel("exec cancelled".to_string()));
             }
             response = started_cell.initial_response() => {
@@ -124,15 +119,12 @@ impl CodeModeExecuteHandler {
                 if content_items.is_empty()
         );
         let (response, live_cell, drained_observations) = if initial_is_empty {
-            let held = hold_unchanged_waits(
+            let held = hold_until_state_change(
                 || {
                     exec.session
                         .services
                         .code_mode_service
-                        .wait(codex_code_mode::WaitRequest {
-                            cell_id: cell_id.clone(),
-                            yield_time_ms,
-                        })
+                        .wait_for_state_change(cell_id.clone())
                 },
                 &cancellation_token,
                 activity_rx,
@@ -145,6 +137,9 @@ impl CodeModeExecuteHandler {
                 Err(mut error) => {
                     error.drained_observations = error.drained_observations.saturating_add(1);
                     record_internally_drained_waits(&exec, error.drained_observations);
+                    if cancellation_token.is_cancelled() {
+                        terminate_cancelled_cell(&exec, &cell_id).await;
+                    }
                     return Err(FunctionCallError::RespondToModel(error.message));
                 }
             };
@@ -190,30 +185,6 @@ impl CodeModeExecuteHandler {
     }
 }
 
-fn filter_deferred_spec(spec: &ToolSpec, activated: &HashSet<ToolName>) -> Option<ToolSpec> {
-    match spec {
-        ToolSpec::Namespace(namespace) => {
-            let mut namespace = namespace.clone();
-            let namespace_name = namespace.name.clone();
-            namespace.tools.retain(|tool| match tool {
-                codex_tools::ResponsesApiNamespaceTool::Function(tool) => activated.contains(
-                    &ToolName::namespaced(namespace_name.clone(), tool.name.clone()),
-                ),
-            });
-            (!namespace.tools.is_empty()).then_some(ToolSpec::Namespace(namespace))
-        }
-        ToolSpec::Function(tool) => activated
-            .contains(&ToolName::plain(tool.name.clone()))
-            .then(|| spec.clone()),
-        ToolSpec::Freeform(tool) => activated
-            .contains(&ToolName::plain(tool.name.clone()))
-            .then(|| spec.clone()),
-        ToolSpec::ToolSearch { .. } | ToolSpec::WebSearch { .. } => activated
-            .contains(&ToolName::plain(spec.name()))
-            .then(|| spec.clone()),
-    }
-}
-
 impl ToolExecutor<ToolInvocation> for CodeModeExecuteHandler {
     fn tool_name(&self) -> ToolName {
         ToolName::plain(PUBLIC_TOOL_NAME)
@@ -256,6 +227,12 @@ impl CodeModeExecuteHandler {
 }
 
 impl CoreToolRuntime for CodeModeExecuteHandler {
+    fn waits_for_runtime_cancellation(&self) -> bool {
+        // Cancellation must keep polling the handler through bounded cell
+        // termination so the V8/runtime owner cannot be orphaned.
+        true
+    }
+
     fn tool_execution_timing(&self) -> ToolExecutionTiming {
         // Nested tools own their actual execution timing. Treating the entire
         // JavaScript cell as a handler interval double-counts orchestration and
@@ -265,60 +242,5 @@ impl CoreToolRuntime for CodeModeExecuteHandler {
 
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Custom { .. })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use codex_tools::JsonSchema;
-    use codex_tools::ResponsesApiNamespace;
-    use codex_tools::ResponsesApiNamespaceTool;
-    use codex_tools::ResponsesApiTool;
-    use std::collections::BTreeMap;
-
-    fn function(name: &str) -> ResponsesApiTool {
-        ResponsesApiTool {
-            name: name.to_string(),
-            description: format!("{name} description"),
-            strict: false,
-            defer_loading: None,
-            parameters: JsonSchema::object(BTreeMap::new(), Some(Vec::new()), Some(false.into())),
-            output_schema: None,
-        }
-    }
-
-    #[test]
-    fn deferred_namespace_exposes_only_current_turn_activations() {
-        let spec = ToolSpec::Namespace(ResponsesApiNamespace {
-            name: "example".to_string(),
-            description: "example tools".to_string(),
-            tools: vec![
-                ResponsesApiNamespaceTool::Function(function("first")),
-                ResponsesApiNamespaceTool::Function(function("second")),
-            ],
-        });
-
-        assert_eq!(filter_deferred_spec(&spec, &HashSet::new()), None);
-
-        let activated = HashSet::from([ToolName::namespaced("example", "second")]);
-        let ToolSpec::Namespace(filtered) =
-            filter_deferred_spec(&spec, &activated).expect("selected namespace tool")
-        else {
-            panic!("expected namespace tool");
-        };
-        assert_eq!(filtered.tools.len(), 1);
-        let ResponsesApiNamespaceTool::Function(tool) = &filtered.tools[0];
-        assert_eq!(tool.name, "second");
-    }
-
-    #[test]
-    fn deferred_plain_tool_requires_current_turn_activation() {
-        let spec = ToolSpec::Function(function("inspect"));
-        assert_eq!(filter_deferred_spec(&spec, &HashSet::new()), None);
-        assert_eq!(
-            filter_deferred_spec(&spec, &HashSet::from([ToolName::plain("inspect")])),
-            Some(spec)
-        );
     }
 }

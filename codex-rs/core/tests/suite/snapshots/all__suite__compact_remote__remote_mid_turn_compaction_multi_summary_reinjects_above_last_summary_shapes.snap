@@ -5,21 +5,21 @@ expression: "format_labeled_requests_snapshot(\"After a prior manual /compact pr
 Scenario: After a prior manual /compact produced an older remote compaction item, the next turn hits remote auto-compaction before the next sampling request. The compact request carries forward that earlier compaction item, and the next sampling request shows the latest compaction item with context reinjected before USER_TWO.
 
 ## Remote Compaction Request
-00:message/user:USER_ONE
-01:compaction:encrypted=true
-02:message/developer[2]:
-    [01] <PERMISSIONS_INSTRUCTIONS>
-    [02] <skills_usage_instructions>\n## How to use skills\n- Use a skill...
-03:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-04:message/user:USER_TWO
-05:function_call/test_tool
-06:function_call_output:unsupported call: test_tool
+00:message/user:<task_model_guidance>Before acting, form and maintain a working ...
+01:message/developer:<PERMISSIONS_INSTRUCTIONS>
+02:message/developer:<skills_usage_instructions>\n## How to use skills\n- Use the sma...
+03:message/developer:<NO_TEXT>
+04:compaction:encrypted=true
+05:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
+06:message/user:USER_TWO
+07:function_call/test_tool
+08:function_call_output:unsupported call: test_tool
 
 ## Second Turn Request (After Compaction)
-00:message/user:USER_ONE
-01:compaction:encrypted=true
-02:message/developer[2]:
-    [01] <PERMISSIONS_INSTRUCTIONS>
-    [02] <skills_usage_instructions>\n## How to use skills\n- Use a skill...
-03:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-04:message/user:USER_TWO
+00:message/user:<task_model_guidance>Before acting, form and maintain a working ...
+01:message/developer:<PERMISSIONS_INSTRUCTIONS>
+02:message/developer:<skills_usage_instructions>\n## How to use skills\n- Use the sma...
+03:message/developer:<NO_TEXT>
+04:compaction:encrypted=true
+05:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
+06:message/user:USER_TWO

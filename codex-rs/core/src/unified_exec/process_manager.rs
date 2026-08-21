@@ -38,6 +38,9 @@ use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
 #[cfg(windows)]
 use crate::tools::sandboxing::same_exec_authorization_envelope;
+use crate::tools::tool_dispatch_trace::active_tool_dispatch_timing;
+use crate::tools::tool_dispatch_trace::mark_exec_process_exited;
+use crate::tools::tool_dispatch_trace::mark_exec_process_spawned;
 use crate::turn_timing::TurnLocalPhase;
 use crate::unified_exec::ExecCommandRequest;
 use crate::unified_exec::MAX_UNIFIED_EXEC_PROCESSES;
@@ -670,9 +673,12 @@ impl UnifiedExecProcessManager {
 
             let process_id = if should_use_deterministic_process_ids() {
                 // test or deterministic mode
-                (1_000..=u32::MAX)
+                let Some(process_id) = (1_000..=u32::MAX)
                     .find(|candidate| !store.reserved_process_ids.contains(candidate))
-                    .expect("process id space exhausted")
+                else {
+                    panic!("process id space exhausted");
+                };
+                process_id
             } else {
                 // production mode → random
                 rand::rng().random_range(1_000..100_000)
@@ -951,6 +957,9 @@ impl UnifiedExecProcessManager {
             deadline,
         )
         .await;
+        if cancellation_token.is_cancelled() || process.has_exited() {
+            mark_exec_process_exited();
+        }
         if !process_started_alive {
             process.output_drained_token().cancelled().await;
         }
@@ -1228,20 +1237,34 @@ impl UnifiedExecProcessManager {
         };
         let start = Instant::now();
         let deadline = start + Duration::from_millis(yield_time_ms);
-        let collected = Self::collect_output_until_deadline(
-            &output_buffer,
-            &output_notify,
-            &output_closed,
-            &output_closed_notify,
-            &cancellation_token,
-            pause_state,
-            deadline,
-        )
-        .await;
+        let collected = if request.input.is_empty() {
+            // Empty stdin is an owner wait, not a fixed-cadence poll. Hold one
+            // event-driven observation until meaningful output, exit, or the
+            // owner deadline instead of waking every five seconds.
+            Self::collect_output_until_progress_or_deadline(
+                &output_buffer,
+                &output_notify,
+                &output_closed,
+                &output_closed_notify,
+                &cancellation_token,
+                pause_state,
+                deadline,
+            )
+            .await
+        } else {
+            Self::collect_output_until_deadline(
+                &output_buffer,
+                &output_notify,
+                &output_closed,
+                &output_closed_notify,
+                &cancellation_token,
+                pause_state,
+                deadline,
+            )
+            .await
+        };
         let wall_time = Instant::now().saturating_duration_since(start);
 
-        let text = String::from_utf8_lossy(&collected).to_string();
-        let original_token_count = approx_token_count(&text);
         let chunk_id = generate_chunk_id();
         if network_approval
             .as_ref()
@@ -1300,6 +1323,8 @@ impl UnifiedExecProcessManager {
                 }
             }
         };
+        let text = String::from_utf8_lossy(&collected).to_string();
+        let original_token_count = approx_token_count(&text);
 
         let response = ExecCommandToolOutput {
             event_call_id,
@@ -1488,6 +1513,7 @@ impl UnifiedExecProcessManager {
             validation_waiter,
             known_delta,
             known_delta_executor_started_at,
+            active_tool_dispatch_timing(),
         );
         registration.commit();
         Ok(())
@@ -1628,9 +1654,12 @@ impl UnifiedExecProcessManager {
                     .await
                 }
             };
+            let spawned =
+                spawned.map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
             spawn_lifecycle.after_spawn();
+            mark_exec_process_spawned();
             return UnifiedExecProcess::from_spawned(
-                spawned.map_err(|err| UnifiedExecError::create_process(err.to_string()))?,
+                spawned,
                 request.sandbox,
                 spawn_lifecycle,
                 raw_output_artifact,
@@ -1651,6 +1680,7 @@ impl UnifiedExecProcessManager {
                 .await
                 .map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
             spawn_lifecycle.after_spawn();
+            mark_exec_process_spawned();
             return UnifiedExecProcess::from_exec_server_started(
                 started,
                 raw_output_artifact,
@@ -1696,6 +1726,7 @@ impl UnifiedExecProcessManager {
         let spawned =
             spawn_result.map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
         spawn_lifecycle.after_spawn();
+        mark_exec_process_spawned();
         UnifiedExecProcess::from_spawned(
             spawned,
             request.sandbox,
@@ -1879,6 +1910,30 @@ impl UnifiedExecProcessManager {
             pause_state,
             deadline,
             None,
+            false,
+        )
+        .await
+    }
+
+    async fn collect_output_until_progress_or_deadline(
+        output_buffer: &OutputBuffer,
+        output_notify: &Arc<Notify>,
+        output_closed: &Arc<AtomicBool>,
+        output_closed_notify: &Arc<Notify>,
+        cancellation_token: &CancellationToken,
+        pause_state: Option<watch::Receiver<bool>>,
+        deadline: Instant,
+    ) -> Vec<u8> {
+        Self::collect_output_until_deadline_with_quiet_yield(
+            output_buffer,
+            output_notify,
+            output_closed,
+            output_closed_notify,
+            cancellation_token,
+            pause_state,
+            deadline,
+            Some(INITIAL_OUTPUT_QUIET_PERIOD),
+            false,
         )
         .await
     }
@@ -1901,6 +1956,7 @@ impl UnifiedExecProcessManager {
             pause_state,
             deadline,
             Some(INITIAL_OUTPUT_QUIET_PERIOD),
+            true,
         )
         .await
     }
@@ -1915,6 +1971,7 @@ impl UnifiedExecProcessManager {
         mut pause_state: Option<watch::Receiver<bool>>,
         mut deadline: Instant,
         quiet_period: Option<Duration>,
+        yield_when_silent: bool,
     ) -> Vec<u8> {
         let mut collected: Vec<u8> = Vec::with_capacity(4096);
         let mut lagged_chunks = 0_u64;
@@ -1923,8 +1980,9 @@ impl UnifiedExecProcessManager {
         // A silent initial process should return a live session promptly instead
         // of consuming the full requested yield. Meaningful output resets this
         // adaptive deadline so a burst can still be collected to quiescence.
-        let mut early_yield_deadline =
-            quiet_period.map(|period| (Instant::now() + period).min(deadline));
+        let mut early_yield_deadline = yield_when_silent
+            .then(|| quiet_period.map(|period| (Instant::now() + period).min(deadline)))
+            .flatten();
         loop {
             Self::extend_deadlines_while_paused(
                 &mut pause_state,
@@ -1933,10 +1991,17 @@ impl UnifiedExecProcessManager {
                 &mut early_yield_deadline,
             )
             .await;
+            // Register before inspecting the buffer. `notify_waiters` does not
+            // retain a permit, so registering after an empty drain would leave
+            // a race where output can arrive between the drain and the first
+            // poll of `notified()`, stranding an owner-held wait until its
+            // deadline.
+            let output_notified = output_notify.notified();
+            tokio::pin!(output_notified);
+            output_notified.as_mut().enable();
             let drained_chunks: Vec<Vec<u8>>;
             let drained_omitted_bytes: usize;
             let drained_lagged_chunks: u64;
-            let mut wait_for_output = None;
             {
                 let mut guard = output_buffer.lock().await;
                 drained_omitted_bytes = guard.take_unreported_omitted_bytes();
@@ -1944,12 +2009,6 @@ impl UnifiedExecProcessManager {
                     .then(|| omitted_output_marker(drained_omitted_bytes));
                 drained_chunks = guard.drain_chunks_with_omission_marker(omission_marker);
                 drained_lagged_chunks = guard.take_unreported_lagged_chunks();
-                if drained_chunks.is_empty()
-                    && drained_omitted_bytes == 0
-                    && drained_lagged_chunks == 0
-                {
-                    wait_for_output = Some(output_notify.notified());
-                }
             }
             lagged_chunks = lagged_chunks.saturating_add(drained_lagged_chunks);
 
@@ -1985,10 +2044,8 @@ impl UnifiedExecProcessManager {
                     if close_wait_remaining == Duration::ZERO {
                         break;
                     }
-                    let notified = wait_for_output.unwrap_or_else(|| output_notify.notified());
-                    tokio::pin!(notified);
                     tokio::select! {
-                        _ = &mut notified => {}
+                        _ = &mut output_notified => {}
                         _ = &mut closed => {}
                         _ = tokio::time::sleep(close_wait_remaining) => break,
                         _ = Self::wait_for_pause_change(pause_state.as_ref()) => {}
@@ -1996,12 +2053,10 @@ impl UnifiedExecProcessManager {
                     continue;
                 }
 
-                let notified = wait_for_output.unwrap_or_else(|| output_notify.notified());
-                tokio::pin!(notified);
                 let exit_notified = cancellation_token.cancelled();
                 tokio::pin!(exit_notified);
                 tokio::select! {
-                    _ = &mut notified => {}
+                    _ = &mut output_notified => {}
                     _ = &mut exit_notified => exit_signal_received = true,
                     _ = tokio::time::sleep(remaining) => break,
                     _ = Self::wait_for_pause_change(pause_state.as_ref()) => {}
@@ -2013,9 +2068,11 @@ impl UnifiedExecProcessManager {
                 || drained_omitted_bytes > 0
                 || drained_lagged_chunks > 0;
             let meaningful_output_arrived = quiet_period.is_some()
-                && drained_chunks
-                    .iter()
-                    .any(|chunk| chunk.iter().any(|byte| !byte.is_ascii_whitespace()));
+                && (drained_omitted_bytes > 0
+                    || drained_lagged_chunks > 0
+                    || drained_chunks
+                        .iter()
+                        .any(|chunk| chunk.iter().any(|byte| !byte.is_ascii_whitespace())));
             for chunk in drained_chunks {
                 collected.extend_from_slice(&chunk);
             }

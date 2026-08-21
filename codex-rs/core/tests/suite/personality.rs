@@ -371,7 +371,7 @@ async fn user_turn_personality_some_adds_update_message() -> anyhow::Result<()> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn user_turn_personality_none_resets_previous_update_message() -> anyhow::Result<()> {
+async fn user_turn_personality_none_replaces_previous_update_message() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -446,21 +446,23 @@ async fn user_turn_personality_none_resets_previous_update_message() -> anyhow::
         .last()
         .expect("expected personality reset request")
         .message_input_texts("developer");
-    let friendly_index = developer_texts
+    let friendly_updates = developer_texts
         .iter()
-        .position(|text| {
+        .filter(|text| {
             text.contains("<personality_spec>") && text.contains(LOCAL_FRIENDLY_TEMPLATE)
         })
-        .expect("expected prior friendly personality update");
-    let reset_index = developer_texts
+        .count();
+    let reset_updates = developer_texts
         .iter()
-        .position(|text| {
-            text.contains("<personality_spec>") && text.contains(PERSONALITY_RESET_TEXT)
-        })
-        .expect("expected personality reset update");
-    assert!(
-        reset_index > friendly_index,
-        "reset must supersede the prior personality block"
+        .filter(|text| text.contains("<personality_spec>") && text.contains(PERSONALITY_RESET_TEXT))
+        .count();
+    assert_eq!(
+        friendly_updates, 0,
+        "the stale friendly slot must be removed"
+    );
+    assert_eq!(
+        reset_updates, 1,
+        "the reset must be the canonical personality slot"
     );
 
     Ok(())

@@ -1098,7 +1098,9 @@ def commit_staged_packages(
                 file=sys.stderr,
             )
 
-    destinations = {destination.name: destination for destination, _backup, _source in committed}
+    destinations = {
+        destination.name: destination for destination, _backup, _source in committed
+    }
     return [
         StagePackageResult(
             package=result.package,

@@ -94,6 +94,7 @@ async fn websocket_turn_state_persists_within_turn_and_resets_after() -> Result<
 
     let server = start_websocket_server_with_headers(vec![WebSocketConnectionConfig {
         requests: vec![
+            vec![ev_response_created("warm-1"), ev_completed("warm-1")],
             vec![
                 json!({
                     "type": "response.metadata",
@@ -123,6 +124,13 @@ async fn websocket_turn_state_persists_within_turn_and_resets_after() -> Result<
 
     let mut builder = test_codex();
     let test = builder.build_with_websocket_server(&server).await?;
+    let warmup = server
+        .wait_for_request(/*connection_index*/ 0, /*request_index*/ 0)
+        .await
+        .body_json();
+    assert_eq!(warmup["type"].as_str(), Some("response.create"));
+    assert_eq!(warmup["generate"].as_bool(), Some(false));
+
     // Phase 1: the first response mints state for its same-turn tool follow-up.
     test.submit_turn("run the echo command").await?;
     // Phase 2: the follow-up replays that state on the same physical connection.
@@ -131,13 +139,14 @@ async fn websocket_turn_state_persists_within_turn_and_resets_after() -> Result<
 
     assert_eq!(server.handshakes().len(), 1);
     let requests = server.single_connection();
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[0].body_json()["generate"], json!(false));
     assert_eq!(
         requests
             .iter()
             .map(|request| request.body_json()["client_metadata"][TURN_STATE_HEADER].clone())
             .collect::<Vec<_>>(),
-        vec![json!(null), json!("ts-1"), json!(null)]
+        vec![json!(null), json!(null), json!("ts-1"), json!(null)]
     );
 
     server.shutdown().await;
@@ -150,6 +159,7 @@ async fn websocket_turn_state_is_stable_within_turn() -> Result<()> {
 
     let server = start_websocket_server_with_headers(vec![WebSocketConnectionConfig {
         requests: vec![
+            vec![ev_response_created("warm-1"), ev_completed("warm-1")],
             vec![
                 json!({
                     "type": "response.metadata",
@@ -181,6 +191,12 @@ async fn websocket_turn_state_is_stable_within_turn() -> Result<()> {
     .await;
     let mut builder = test_codex();
     let test = builder.build_with_websocket_server(&server).await?;
+    let warmup = server
+        .wait_for_request(/*connection_index*/ 0, /*request_index*/ 0)
+        .await
+        .body_json();
+    assert_eq!(warmup["type"].as_str(), Some("response.create"));
+    assert_eq!(warmup["generate"].as_bool(), Some(false));
 
     // Phase 1: the initial request starts empty and receives the first metadata value.
     // Phase 2: the first tool follow-up replays it and ignores a later value.
@@ -189,13 +205,14 @@ async fn websocket_turn_state_is_stable_within_turn() -> Result<()> {
 
     assert_eq!(server.handshakes().len(), 1);
     let requests = server.single_connection();
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[0].body_json()["generate"], json!(false));
     assert_eq!(
         requests
             .iter()
             .map(|request| request.body_json()["client_metadata"][TURN_STATE_HEADER].clone())
             .collect::<Vec<_>>(),
-        vec![json!(null), json!("ts-1"), json!("ts-1")]
+        vec![json!(null), json!(null), json!("ts-1"), json!("ts-1")]
     );
 
     server.shutdown().await;

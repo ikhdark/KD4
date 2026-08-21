@@ -47,6 +47,7 @@ use codex_protocol::protocol::RealtimeConversationVersion as RealtimeWsVersion;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_protocol::user_input::UserInput;
@@ -774,6 +775,13 @@ impl TestCodexBuilder {
         for mutator in mutators {
             mutator(&mut config);
         }
+        // Resume reconstructs the persisted provider ID through this registry. Keep the test
+        // fixture's active provider and registry entry identical after mutators so a mocked base
+        // URL (or a custom test provider) survives the same reconstruction path as production.
+        config.model_providers.insert(
+            config.model_provider_id.clone(),
+            config.model_provider.clone(),
+        );
         ensure_test_model_catalog(&mut config)?;
 
         Ok((config, cwd))
@@ -870,6 +878,20 @@ impl TestCodex {
     pub async fn submit_turn(&self, prompt: &str) -> Result<()> {
         self.submit_turn_with_permission_profile(prompt, PermissionProfile::Disabled)
             .await
+    }
+
+    pub async fn submit_turn_and_capture_completion(
+        &self,
+        prompt: &str,
+    ) -> Result<TurnCompleteEvent> {
+        self.submit_turn_with_context_and_capture_completion(
+            prompt,
+            AskForApproval::Never,
+            PermissionProfile::Disabled,
+            /*service_tier*/ None,
+            /*environments*/ None,
+        )
+        .await
     }
 
     pub async fn submit_turn_with_permission_profile(
@@ -986,6 +1008,25 @@ impl TestCodex {
         service_tier: Option<Option<String>>,
         environments: Option<Vec<TurnEnvironmentSelection>>,
     ) -> Result<()> {
+        self.submit_turn_with_context_and_capture_completion(
+            prompt,
+            approval_policy,
+            permission_profile,
+            service_tier,
+            environments,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn submit_turn_with_context_and_capture_completion(
+        &self,
+        prompt: &str,
+        approval_policy: AskForApproval,
+        permission_profile: PermissionProfile,
+        service_tier: Option<Option<String>>,
+        environments: Option<Vec<TurnEnvironmentSelection>>,
+    ) -> Result<TurnCompleteEvent> {
         let (sandbox_policy, permission_profile) =
             turn_permission_fields(permission_profile, self.config.cwd.as_path());
         let session_model = self.session_configured.model.clone();
@@ -1025,7 +1066,7 @@ impl TestCodex {
             _ => None,
         })
         .await;
-        wait_for_event_with_timeout(
+        let completed = wait_for_event_with_timeout(
             &self.codex,
             |event| match event {
                 EventMsg::TurnComplete(event) => event.turn_id == turn_id,
@@ -1034,7 +1075,10 @@ impl TestCodex {
             SUBMIT_TURN_COMPLETE_TIMEOUT,
         )
         .await;
-        Ok(())
+        let EventMsg::TurnComplete(completed) = completed else {
+            unreachable!("completion predicate only accepts TurnComplete events");
+        };
+        Ok(completed)
     }
 }
 

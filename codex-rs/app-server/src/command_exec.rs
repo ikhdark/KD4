@@ -278,11 +278,11 @@ impl CommandExecManager {
                                 }
                             });
                             (
-                                Some(StdoutStream {
-                                    sub_id: String::new(),
-                                    call_id: String::new(),
+                                Some(StdoutStream::without_progress(
+                                    String::new(),
+                                    String::new(),
                                     tx_event,
-                                }),
+                                )),
                                 Some(handle),
                             )
                         }

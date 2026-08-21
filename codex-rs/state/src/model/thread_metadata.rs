@@ -45,7 +45,7 @@ pub enum ThreadRelationFilter {
 pub struct Anchor {
     /// The timestamp component of the anchor.
     pub ts: DateTime<Utc>,
-    /// The thread ID component used to disambiguate equal recency timestamps.
+    /// The thread ID component used to disambiguate equal sort timestamps.
     pub id: Option<ThreadId>,
 }
 
@@ -67,6 +67,8 @@ pub struct ThreadsPage {
 pub struct ExtractionOutcome {
     /// The extracted thread metadata.
     pub metadata: ThreadMetadata,
+    /// The explicit parent thread identifier from rollout metadata, if present.
+    pub parent_thread_id: Option<ThreadId>,
     /// The explicit thread memory mode from rollout metadata, if present.
     pub memory_mode: Option<String>,
     /// The number of rollout lines that failed to parse.
@@ -145,6 +147,8 @@ pub struct ThreadMetadataBuilder {
     pub recency_at: Option<DateTime<Utc>>,
     /// The session source.
     pub source: SessionSource,
+    /// The explicit parent thread identifier, if present.
+    pub parent_thread_id: Option<ThreadId>,
     /// Persisted thread history contract selected when this thread was created.
     pub history_mode: ThreadHistoryMode,
     /// Optional analytics source classification for this thread.
@@ -190,6 +194,7 @@ impl ThreadMetadataBuilder {
             updated_at: None,
             recency_at: None,
             source,
+            parent_thread_id: None,
             history_mode: ThreadHistoryMode::Legacy,
             thread_source: None,
             agent_nickname: None,
@@ -499,11 +504,7 @@ impl TryFrom<ThreadRow> for ThreadMetadata {
     }
 }
 
-pub(crate) fn anchor_from_item(
-    item: &ThreadMetadata,
-    sort_key: SortKey,
-    include_thread_id_tiebreaker: bool,
-) -> Option<Anchor> {
+pub(crate) fn anchor_from_item(item: &ThreadMetadata, sort_key: SortKey) -> Option<Anchor> {
     let ts = match sort_key {
         SortKey::CreatedAt => item.created_at,
         SortKey::UpdatedAt => item.updated_at,
@@ -511,7 +512,7 @@ pub(crate) fn anchor_from_item(
     };
     Some(Anchor {
         ts,
-        id: (include_thread_id_tiebreaker || sort_key == SortKey::RecencyAt).then_some(item.id),
+        id: Some(item.id),
     })
 }
 

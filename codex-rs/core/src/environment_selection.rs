@@ -137,15 +137,16 @@ impl ThreadEnvironments {
                 tracing::warn!("skipping unknown turn environment `{environment_id}`");
                 continue;
             };
-            let (resolution_task, resolution) = Self::resolve_environment(
+            let resolution = Self::resolve_environment(
                 selected_environment.clone(),
                 environment,
                 self.local_shell.clone(),
                 self.shell_snapshot.clone(),
             )
-            .remote_handle();
-            drop(tokio::spawn(resolution_task));
-            let resolution = resolution.boxed().shared();
+            .shared();
+            if resolution.clone().now_or_never().is_none() {
+                drop(tokio::spawn(resolution.clone()));
+            }
             replaced_resolution = true;
             next.push(SelectedTurnEnvironment {
                 selection: selected_environment.clone(),
@@ -215,14 +216,19 @@ impl ThreadEnvironments {
     }
 
     pub(crate) async fn snapshot(&self) -> TurnEnvironmentSnapshot {
+        self.snapshot_with_wait_policy(!self.non_blocking_snapshots)
+            .await
+    }
+
+    async fn snapshot_with_wait_policy(&self, wait_for_ready: bool) -> TurnEnvironmentSnapshot {
         let current = self.environments.load_full();
         let mut turn_environments = Vec::with_capacity(current.environments.len());
         let mut starting = Vec::new();
         for environment in &current.environments {
-            let resolved = if self.non_blocking_snapshots {
-                environment.resolution.clone().now_or_never()
-            } else {
+            let resolved = if wait_for_ready {
                 Some(environment.resolution.clone().await)
+            } else {
+                environment.resolution.clone().now_or_never()
             };
             match resolved {
                 Some(Ok(turn_environment)) => turn_environments.push(turn_environment),
@@ -687,16 +693,23 @@ url = "ws://127.0.0.1:8765"
         turn_environments.update_selections(&[remote.clone(), local.clone()]);
 
         let starting = turn_environments.snapshot().await;
-        assert!(starting.turn_environments.is_empty());
+        assert_eq!(
+            starting
+                .turn_environments
+                .iter()
+                .map(TurnEnvironment::selection)
+                .collect::<Vec<_>>(),
+            vec![local.clone()]
+        );
         assert_eq!(
             starting
                 .starting
                 .iter()
                 .map(|environment| environment.selection.clone())
                 .collect::<Vec<_>>(),
-            vec![remote.clone(), local.clone()]
+            vec![remote.clone()]
         );
-        assert!(starting.to_selections().is_empty());
+        assert_eq!(starting.to_selections(), vec![local.clone()]);
         assert!(starting.single_local_environment().is_none());
 
         let server = tokio::spawn(serve_environment_info(listener));

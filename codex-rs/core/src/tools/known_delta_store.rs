@@ -27,6 +27,7 @@ pub(crate) mod test_observation {
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
     #[derive(Clone, Default)]
     struct Counters {
@@ -44,6 +45,7 @@ pub(crate) mod test_observation {
 
     tokio::task_local! {
         static COUNTERS: Counters;
+        static PROFITABILITY_COSTS: (Duration, Duration, Duration);
     }
 
     pub(crate) async fn observe<F: Future>(future: F) -> (F::Output, Snapshot) {
@@ -59,6 +61,29 @@ pub(crate) mod test_observation {
                 .load(Ordering::Relaxed),
         };
         (output, snapshot)
+    }
+
+    pub(crate) async fn with_profitability_costs<F: Future>(
+        future: F,
+        lookup_cost: Duration,
+        fingerprint_cost: Duration,
+        executor_cost: Duration,
+    ) -> F::Output {
+        PROFITABILITY_COSTS
+            .scope((lookup_cost, fingerprint_cost, executor_cost), future)
+            .await
+    }
+
+    pub(super) fn profitability_costs(
+        lookup_cost: Duration,
+        fingerprint_cost: Duration,
+        executor_cost: Duration,
+    ) -> (Duration, Duration, Duration) {
+        PROFITABILITY_COSTS.try_with(|costs| *costs).unwrap_or((
+            lookup_cost,
+            fingerprint_cost,
+            executor_cost,
+        ))
     }
 
     pub(super) fn record_immutable_git_show_identity() {
@@ -377,9 +402,14 @@ pub(crate) async fn record_success(
         }
         let mut record = candidate.record.clone();
         record.shadow_validations = record.shadow_validations.saturating_add(1);
+        let lookup_cost = candidate.lookup_cost;
+        let fingerprint_cost = identity.fingerprint_cost;
+        #[cfg(test)]
+        let (lookup_cost, fingerprint_cost, executor_cost) =
+            test_observation::profitability_costs(lookup_cost, fingerprint_cost, executor_cost);
         record.metrics = EvidenceMetrics {
-            lookup_micros: micros(candidate.lookup_cost),
-            fingerprint_micros: micros(identity.fingerprint_cost),
+            lookup_micros: micros(lookup_cost),
+            fingerprint_micros: micros(fingerprint_cost),
             projected_tokens_avoided: u64::try_from(output.len().div_ceil(4)).unwrap_or(u64::MAX),
             executor_micros_avoided: micros(executor_cost),
         };

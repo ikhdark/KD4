@@ -29,6 +29,7 @@ async fn extract_metadata_from_rollout_uses_session_meta() {
     let dir = tempdir().expect("tempdir");
     let uuid = Uuid::new_v4();
     let id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let parent_thread_id = ThreadId::new();
     let path = dir
         .path()
         .join(format!("rollout-2026-01-27T12-34-56-{uuid}.jsonl"));
@@ -37,7 +38,7 @@ async fn extract_metadata_from_rollout_uses_session_meta() {
         session_id: id.into(),
         id,
         forked_from_id: None,
-        parent_thread_id: None,
+        parent_thread_id: Some(parent_thread_id),
         timestamp: "2026-01-27T12:34:56Z".to_string(),
         cwd: dir.path().to_path_buf(),
         originator: "cli".to_string(),
@@ -83,6 +84,7 @@ async fn extract_metadata_from_rollout_uses_session_meta() {
     expected.recency_at = expected.updated_at;
 
     assert_eq!(outcome.metadata, expected);
+    assert_eq!(outcome.parent_thread_id, Some(parent_thread_id));
     assert_eq!(outcome.memory_mode, None);
     assert_eq!(outcome.parse_errors, 0);
 }

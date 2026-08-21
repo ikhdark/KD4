@@ -142,7 +142,7 @@ async fn thread_start_normalizes_legacy_dynamic_tools_into_model_request() -> Re
         &json!({
             "type": "function",
             "name": "lookup_ticket",
-            "description": "Look up a ticket",
+            "description": "Look up a ticket\n\nexec tool declaration:\n```ts\ndeclare const tools: { lookup_ticket(args: { ticket_id: string; }): Promise<unknown>; };\n```",
             "strict": false,
             "parameters": visible_schema,
         })
@@ -158,13 +158,13 @@ async fn thread_start_normalizes_legacy_dynamic_tools_into_model_request() -> Re
             "tools": [{
                 "type": "function",
                 "name": "lookup_status",
-                "description": "Look up a ticket status",
+                "description": "Look up a ticket status\n\nexec tool declaration:\n```ts\ndeclare const tools: { legacy_app__lookup_status(args: { ticket_id: string; }): Promise<unknown>; };\n```",
                 "strict": false,
                 "parameters": visible_schema,
             }, {
                 "type": "function",
                 "name": "update_ticket",
-                "description": "Update a ticket",
+                "description": "Update a ticket\n\nexec tool declaration:\n```ts\ndeclare const tools: { legacy_app__update_ticket(args: {}): Promise<unknown>; };\n```",
                 "strict": false,
                 "parameters": {
                     "type": "object",
@@ -558,14 +558,14 @@ async fn dynamic_tool_call_round_trip_sends_text_content_items_to_model() -> Res
                 {
                     "type": "function",
                     "name": tool_name,
-                    "description": "Demo dynamic tool",
+                    "description": "Demo dynamic tool\n\nexec tool declaration:\n```ts\ndeclare const tools: { codex_app__demo_tool(args: { city: string; }): Promise<unknown>; };\n```",
                     "strict": false,
                     "parameters": input_schema,
                 },
                 {
                     "type": "function",
                     "name": "lookup_status",
-                    "description": "Look up ticket status",
+                    "description": "Look up ticket status\n\nexec tool declaration:\n```ts\ndeclare const tools: { codex_app__lookup_status(args: { ticket_id: string; }): Promise<unknown>; };\n```",
                     "strict": false,
                     "parameters": status_schema,
                 },

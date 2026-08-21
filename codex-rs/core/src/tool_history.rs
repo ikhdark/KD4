@@ -15,7 +15,6 @@ use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
-use walkdir::WalkDir;
 
 use crate::git_workspace::GitWorkspaceCache;
 use crate::git_workspace::SourcePathChangeObservation;
@@ -45,7 +44,7 @@ pub(crate) struct ToolHistoryReceiptV1 {
     call_id: String,
     tool_identity: String,
     semantic_class: String,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     source_dependencies_current: bool,
     digest: String,
     artifact: ReceiptArtifact,
@@ -197,7 +196,10 @@ impl ToolHistoryCandidate {
             if digest_limit == 0 {
                 return None;
             }
-            digest_limit = digest_limit.saturating_sub(32);
+            // Preserve a useful digest at the 256-token envelope boundary.
+            // A 32-token decrement could jump from an oversized 32-token
+            // digest directly to an empty one even when a 16-token digest fit.
+            digest_limit = digest_limit.saturating_sub(16);
         }
     }
 
@@ -729,7 +731,18 @@ impl ToolHistoryState {
                 } => (name, input, call_id),
                 _ => continue,
             };
-            if tool_observes_workspace(name) {
+            // Code-mode's `functions.exec` carrier can contain repository
+            // reads even though the carrier itself is not a host executable.
+            // Explicitly registered evidence is authoritative for any other
+            // tool whose current classifier no longer exposes that detail.
+            let call_observes_workspace = name == "functions.exec"
+                || tool_call_observes_workspace(
+                    name,
+                    &ToolPayload::Function {
+                        arguments: arguments.clone(),
+                    },
+                );
+            if call_observes_workspace || self.workspace_evidence.contains_key(call_id) {
                 requirements.insert(call_id.clone(), call_id.clone());
                 continue;
             }
@@ -747,7 +760,10 @@ impl ToolHistoryState {
                 .values()
                 .find(|candidate| candidate.artifact_id == artifact_id);
             match origin {
-                Some(candidate) if tool_observes_workspace(&candidate.tool_identity) => {
+                Some(candidate)
+                    if candidate.tool_identity == "functions.exec"
+                        || self.workspace_evidence.contains_key(&candidate.call_id) =>
+                {
                     requirements.insert(call_id.clone(), candidate.call_id.clone());
                 }
                 Some(_) => {}
@@ -769,9 +785,7 @@ impl ToolHistoryState {
             let observation = self.workspace_evidence.get(origin_call_id);
             let revision_matches = observation.is_some_and(|observation| {
                 observation.source_dependencies_current
-                    && ((observation.revision.is_some()
-                        && workspace_identity.is_some()
-                        && observation.revision.as_ref() == workspace_identity)
+                    && ((observation.revision.as_ref() == workspace_identity)
                         || observation.source_paths_are_current(workspace_identity, git_workspace))
             });
             let output_matches = origin_call_id != call_id
@@ -790,9 +804,9 @@ impl ToolHistoryState {
                 "the repository identity is unavailable or changed after this tool result was captured; rerun the tool before relying on it"
             };
             *output = serde_json::json!({
-                "stale_workspace_evidence": true,
                 "call_id": call_id,
-                "reason": reason
+                "reason": reason,
+                "stale_workspace_evidence": true,
             })
             .to_string();
         }
@@ -877,6 +891,12 @@ fn action_bound_supersession_identity(identity: &str) -> bool {
 
 fn default_true() -> bool {
     true
+}
+
+// Serde's `skip_serializing_if` callback contract passes the field by reference.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 fn normalized_source_path(path: &Path) -> String {
@@ -1361,23 +1381,90 @@ fn cargo_workspace_root(cwd: &Path) -> Option<PathBuf> {
 }
 
 fn cargo_package_index(workspace_root: &Path) -> BTreeMap<String, PathBuf> {
-    WalkDir::new(workspace_root)
-        .into_iter()
-        .filter_entry(|entry| {
-            !matches!(
-                entry.file_name().to_str(),
-                Some("target" | ".git" | "node_modules")
-            )
-        })
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file() && entry.file_name() == "Cargo.toml")
-        .filter_map(|entry| {
-            let manifest = std::fs::read_to_string(entry.path()).ok()?;
-            let parsed = manifest.parse::<toml::Value>().ok()?;
-            let name = parsed.get("package")?.get("name")?.as_str()?.to_string();
-            Some((name, entry.path().parent()?.to_path_buf()))
-        })
-        .collect()
+    let mut packages = BTreeMap::new();
+    let mut pending = vec![workspace_root.to_path_buf()];
+    if let Some(members) = std::fs::read_to_string(workspace_root.join("Cargo.toml"))
+        .ok()
+        .and_then(|manifest| manifest.parse::<toml::Value>().ok())
+        .and_then(|parsed| parsed.get("workspace")?.get("members")?.as_array().cloned())
+    {
+        pending.extend(
+            members
+                .iter()
+                .filter_map(toml::Value::as_str)
+                // Cargo workspace member globs are still discovered by the
+                // recursive fallback below; explicit members are seeded here
+                // so package discovery is reliable on Windows temp roots.
+                .filter(|member| !member.contains(['*', '?', '[']))
+                .map(|member| workspace_root.join(member)),
+        );
+    }
+    while let Some(directory) = pending.pop() {
+        let manifest_path = directory.join("Cargo.toml");
+        if let Some(name) = std::fs::read_to_string(&manifest_path)
+            .ok()
+            .and_then(|manifest| cargo_manifest_package_name(&manifest))
+        {
+            packages.insert(name, directory.clone());
+        }
+
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = entry.file_name();
+                if !matches!(name.to_str(), Some("target" | ".git" | "node_modules")) {
+                    pending.push(path);
+                }
+            }
+        }
+    }
+    packages
+}
+
+fn cargo_manifest_package_name(manifest: &str) -> Option<String> {
+    if let Some(name) = manifest.parse::<toml::Value>().ok().and_then(|parsed| {
+        parsed
+            .get("package")?
+            .get("name")?
+            .as_str()
+            .map(str::to_string)
+    }) {
+        return Some(name);
+    }
+
+    // Keep dependency tracking fail-safe when a future Cargo syntax is newer
+    // than the bundled TOML parser. Package names are simple quoted scalars,
+    // so this narrow fallback can still identify local workspace members.
+    let mut in_package = false;
+    for raw_line in manifest.lines() {
+        let line = raw_line.trim();
+        if line.starts_with('[') {
+            in_package = line == "[package]";
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "name" {
+            continue;
+        }
+        let value = value.trim();
+        return value
+            .strip_prefix('"')
+            .and_then(|value| value.split_once('"').map(|(name, _)| name.to_string()))
+            .or_else(|| {
+                value
+                    .strip_prefix('\'')
+                    .and_then(|value| value.split_once('\'').map(|(name, _)| name.to_string()))
+            });
+    }
+    None
 }
 
 fn collect_cargo_package_dependencies(
@@ -1386,7 +1473,8 @@ fn collect_cargo_package_dependencies(
     visited: &mut BTreeSet<PathBuf>,
     dependencies: &mut BTreeSet<SourceDependencyV1>,
 ) {
-    let package_root = package_root.to_path_buf();
+    let package_root =
+        dunce::canonicalize(package_root).unwrap_or_else(|_| package_root.to_path_buf());
     if !visited.insert(package_root.clone()) {
         return;
     }
@@ -1396,6 +1484,11 @@ fn collect_cargo_package_dependencies(
         return;
     };
     let Ok(parsed) = manifest.parse::<toml::Value>() else {
+        for local_root in
+            cargo_manifest_dependency_fallback(&manifest, &package_root, package_index)
+        {
+            collect_cargo_package_dependencies(&local_root, package_index, visited, dependencies);
+        }
         return;
     };
     let mut dependency_tables = ["dependencies", "dev-dependencies", "build-dependencies"]
@@ -1439,6 +1532,57 @@ fn collect_cargo_package_dependencies(
             }
         }
     }
+}
+
+fn cargo_manifest_dependency_fallback(
+    manifest: &str,
+    package_root: &Path,
+    package_index: &BTreeMap<String, PathBuf>,
+) -> BTreeSet<PathBuf> {
+    let mut in_dependency_table = false;
+    let mut roots = BTreeSet::new();
+    for raw_line in manifest.lines() {
+        let line = raw_line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            let section = line.trim_matches(['[', ']']).trim();
+            in_dependency_table = matches!(
+                section,
+                "dependencies" | "dev-dependencies" | "build-dependencies"
+            ) || section.ends_with(".dependencies")
+                || section.ends_with(".dev-dependencies")
+                || section.ends_with(".build-dependencies");
+            continue;
+        }
+        if !in_dependency_table || line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((dependency_name, specification)) = line.split_once('=') else {
+            continue;
+        };
+        let dependency_name = dependency_name.trim().trim_matches(['\'', '"']);
+        let local_root = inline_dependency_string(specification, "path")
+            .map(|path| package_root.join(path))
+            .or_else(|| {
+                let package_name =
+                    inline_dependency_string(specification, "package").unwrap_or(dependency_name);
+                package_index.get(package_name).cloned()
+            });
+        if let Some(local_root) = local_root {
+            roots.insert(local_root);
+        }
+    }
+    roots
+}
+
+fn inline_dependency_string<'a>(specification: &'a str, key: &str) -> Option<&'a str> {
+    specification
+        .trim()
+        .trim_matches(['{', '}'])
+        .split(',')
+        .filter_map(|field| field.split_once('='))
+        .find_map(|(field_key, value)| {
+            (field_key.trim() == key).then(|| value.trim().trim_matches(['\'', '"']))
+        })
 }
 
 pub(crate) fn workspace_evidence_cwd_for_tool_call(

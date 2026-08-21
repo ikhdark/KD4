@@ -244,7 +244,9 @@ def run_installer(
 
 def seed_package_release(codex_home: Path, *, corrupt_sidecar: bool) -> None:
     target = "x86_64-unknown-linux-musl"
-    release_dir = codex_home / "packages" / "standalone" / "releases" / f"{VERSION}-{target}"
+    release_dir = (
+        codex_home / "packages" / "standalone" / "releases" / f"{VERSION}-{target}"
+    )
     managed_files = {
         "codex-package.json": json.dumps(
             {

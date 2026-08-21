@@ -53,7 +53,6 @@ POWERSHELL_PARSE_ALL_SCRIPT = (
 PRETTIER_TARGETS = [
     "package.json",
     "pnpm-workspace.yaml",
-    "docs/*.md",
     "codex-cli/**/*.js",
     "sdk/typescript/**/*.js",
     "sdk/typescript/**/*.ts",

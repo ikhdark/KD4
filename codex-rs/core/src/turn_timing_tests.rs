@@ -20,6 +20,7 @@ use codex_protocol::protocol::TurnTimingGenerationDisposition;
 use codex_protocol::protocol::TurnTimingGenerationPurpose;
 use codex_protocol::protocol::TurnTimingGenerationReason;
 use codex_protocol::protocol::TurnTimingProgressKind;
+use codex_protocol::protocol::TurnTimingToolCallSource;
 use pretty_assertions::assert_eq;
 
 use super::ClockSample;
@@ -33,6 +34,7 @@ use super::response_event_records_actionable_output;
 use super::response_item_records_model_output;
 use super::response_item_records_visible_output;
 use crate::ResponseEvent;
+use crate::tools::tool_dispatch_trace::ToolDispatchTimingSnapshot;
 
 const NS_PER_MS: u128 = 1_000_000;
 
@@ -89,9 +91,19 @@ fn legacy_turn_timing_deserializes_with_empty_terminalization_phases() {
         .as_object_mut()
         .expect("timing object")
         .remove("terminalization");
+    legacy
+        .as_object_mut()
+        .expect("timing object")
+        .remove("toolCalls");
+    legacy
+        .as_object_mut()
+        .expect("timing object")
+        .remove("toolCallTimingOverflow");
 
     let restored: TurnTiming = serde_json::from_value(legacy).expect("legacy timing");
     assert_eq!(restored.terminalization, Default::default());
+    assert!(restored.tool_calls.is_empty());
+    assert_eq!(restored.tool_call_timing_overflow, 0);
 }
 
 #[test]
@@ -419,6 +431,126 @@ fn first_useful_action_and_first_model_output_are_distinct_milestones() {
 }
 
 #[test]
+fn delivered_tool_relay_timing_persists_every_lifecycle_boundary() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    clock.set_ms(100);
+    state.record_tool_dispatch_timing(
+        "call-1",
+        "shell_command",
+        TurnTimingToolCallSource::CodeMode,
+        ToolDispatchTimingSnapshot {
+            item_to_first_poll_ms: Some(10),
+            parallel_gate_wait_ms: Some(5),
+            authorization_state_coordination_ms: Some(2),
+            first_poll_to_handler_entry_ms: Some(10),
+            handler_duration_ms: Some(30),
+            workspace_evidence_before_ms: Some(1),
+            workspace_evidence_after_ms: Some(2),
+            pre_tool_hook_ms: Some(3),
+            post_tool_hook_ms: Some(4),
+            output_projection_ms: Some(5),
+            history_persistence_ms: Some(6),
+            first_poll_to_output_collected_ms: Some(45),
+            exec_request_to_spawn_ms: Some(22),
+            exec_spawn_to_exit_ms: Some(20),
+            exec_exit_to_delivery_ms: Some(38),
+            exec_spawn_to_delivery_ms: Some(58),
+            exec_process_alive_at_delivery: false,
+            post_handler_ms: Some(30),
+            total_duration_ms: Some(70),
+            parallel_gate_admitted: true,
+            eager: true,
+        },
+    );
+    clock.set_ms(120);
+    let mut pending = Some(ContinuationCause::ToolResult);
+    state.begin_model_generation(&mut pending, &SessionSource::Cli);
+
+    let timing = state.complete_snapshot().protocol_timing();
+    assert_eq!(timing.tool_call_timing_overflow, 0);
+    assert_eq!(timing.tool_calls.len(), 1);
+    let call = &timing.tool_calls[0];
+    assert_eq!(call.call_id, "call-1");
+    assert_eq!(call.source, TurnTimingToolCallSource::CodeMode);
+    assert_eq!(call.accepted_at_ms, Some(20));
+    assert_eq!(call.first_poll_at_ms, Some(30));
+    assert_eq!(call.parallel_gate_admitted_at_ms, Some(35));
+    assert_eq!(call.handler_entry_at_ms, Some(40));
+    assert_eq!(call.handler_exit_at_ms, Some(70));
+    assert_eq!(call.output_collected_at_ms, Some(75));
+    assert_eq!(call.process_spawned_at_ms, Some(42));
+    assert_eq!(call.process_exited_at_ms, Some(62));
+    assert_eq!(call.delivered_at_ms, Some(100));
+    assert_eq!(call.model_resumed_at_ms, Some(120));
+    assert_eq!(call.post_handler_ms, Some(30));
+    assert!(call.eager);
+}
+
+#[test]
+fn background_process_exit_updates_a_tool_already_delivered_alive() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    clock.set_ms(40);
+    state.record_tool_dispatch_timing(
+        "call-background",
+        "exec_command",
+        TurnTimingToolCallSource::Direct,
+        ToolDispatchTimingSnapshot {
+            item_to_first_poll_ms: Some(2),
+            exec_request_to_spawn_ms: Some(5),
+            exec_spawn_to_delivery_ms: Some(20),
+            exec_process_alive_at_delivery: true,
+            total_duration_ms: Some(30),
+            ..ToolDispatchTimingSnapshot::default()
+        },
+    );
+    state.record_background_tool_process_exit(
+        "call-background",
+        ToolDispatchTimingSnapshot {
+            exec_spawn_to_exit_ms: Some(75),
+            ..ToolDispatchTimingSnapshot::default()
+        },
+    );
+
+    let timing = state.complete_snapshot().protocol_timing();
+    let call = &timing.tool_calls[0];
+    assert_eq!(call.process_spawned_at_ms, Some(13));
+    assert_eq!(call.process_exited_at_ms, Some(88));
+    assert!(call.process_alive_at_delivery);
+}
+
+#[test]
+fn background_process_exit_racing_delivery_is_applied_when_tool_is_recorded() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    state.record_background_tool_process_exit(
+        "call-racing",
+        ToolDispatchTimingSnapshot {
+            exec_spawn_to_exit_ms: Some(12),
+            ..ToolDispatchTimingSnapshot::default()
+        },
+    );
+    clock.set_ms(25);
+    state.record_tool_dispatch_timing(
+        "call-racing",
+        "exec_command",
+        TurnTimingToolCallSource::Direct,
+        ToolDispatchTimingSnapshot {
+            item_to_first_poll_ms: Some(0),
+            exec_request_to_spawn_ms: Some(3),
+            total_duration_ms: Some(20),
+            ..ToolDispatchTimingSnapshot::default()
+        },
+    );
+
+    let timing = state.complete_snapshot().protocol_timing();
+    let call = &timing.tool_calls[0];
+    assert_eq!(call.process_spawned_at_ms, Some(8));
+    assert_eq!(call.process_exited_at_ms, Some(20));
+}
+
+#[test]
 fn accepted_or_gate_admitted_tool_without_handler_entry_is_not_useful() {
     let (clock, state) = timing();
     state.mark_turn_started();
@@ -586,7 +718,7 @@ fn decision_latency_records_dispatch_actionable_output_and_completion() {
     });
 
     let timing = state.complete_snapshot().protocol_timing();
-    assert_eq!(timing.schema_version, 20);
+    assert_eq!(timing.schema_version, 22);
     assert_eq!(timing.model_requests.len(), 2);
     assert_eq!(timing.model_requests[0].dispatch_ms, Some(20));
     assert_eq!(timing.model_requests[0].first_model_output_ms, Some(25));
@@ -716,6 +848,8 @@ fn typed_deterministic_generation_records_exact_disposition_and_nonprogress() {
         Some("trusted-state".to_string()),
     );
     let request_wait = state.begin_model_request_wait();
+    state.record_model_attempt_identity("sampling-1", "attempt-1");
+    state.record_model_attempt_identity("sampling-1", "attempt-2");
     clock.set_ms(5);
     state.mark_model_request_dispatched();
     drop(request_wait);
@@ -779,7 +913,7 @@ fn typed_deterministic_generation_records_exact_disposition_and_nonprogress() {
     );
     assert_eq!(
         timing.observational_nonprogress_latency.physical_attempts,
-        1
+        2
     );
     assert_eq!(
         timing
@@ -1181,20 +1315,23 @@ fn deterministic_primary_retry_and_fallback_attempts_reconcile_without_inflating
         Some("terminal-state".to_string()),
     );
 
-    let primary = state.begin_model_request_wait();
+    drop(state.begin_model_request_wait());
+    let primary = state.begin_model_stream_wait();
     clock.set_ms(10);
     drop(primary);
     state.record_tool_call("shell");
     state.record_tool_call("shell");
 
     state.record_model_retry();
-    let retry = state.begin_model_request_wait();
+    drop(state.begin_model_request_wait());
+    let retry = state.begin_model_stream_wait();
     clock.set_ms(15);
     drop(retry);
 
     state.record_model_fallback();
     state.record_model_retry();
-    let fallback = state.begin_model_request_wait();
+    drop(state.begin_model_request_wait());
+    let fallback = state.begin_model_stream_wait();
     clock.set_ms(22);
     drop(fallback);
 
@@ -1358,7 +1495,7 @@ fn exclusive_ledger_partitions_every_nanosecond_and_subtracts_only_interactive_o
     clock.set_ms(140);
 
     let profile = state.complete_snapshot().profile;
-    assert_eq!(profile.schema_version, 20);
+    assert_eq!(profile.schema_version, 22);
     assert!(profile.profile_valid);
     assert!(profile.classification_complete);
     assert_eq!(profile.inclusive_duration_ns, 140 * NS_PER_MS);

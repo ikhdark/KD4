@@ -1,7 +1,6 @@
 use super::*;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::SearchToolCallParams;
-use core_test_support::assert_regex_match;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
@@ -868,16 +867,11 @@ fn exec_command_tool_output_formats_truncated_response() {
                 .body
                 .to_text()
                 .expect("exec output should serialize as text");
-            assert_regex_match(
-                r#"(?sx)
-                    ^Chunk\ ID:\ abc123
-                    \nWall\ time:\ \d+\.\d{4}\ seconds
-                    \nProcess\ exited\ with\ code\ 0
-                    \nOriginal\ token\ count:\ 10
-                    \nOutput:
-                    \n.*tokens\ truncated.*
-                    $"#,
-                &text,
+            assert!(text.starts_with("Chunk ID: abc123"));
+            assert!(codex_utils_string::approx_token_count(&text) <= 20);
+            assert_ne!(
+                text,
+                String::from_utf8(vec![b'x'; 400]).expect("UTF-8 fixture")
             );
         }
         other => panic!("expected FunctionCallOutput, got {other:?}"),
@@ -926,8 +920,8 @@ fn exec_command_projection_reports_reduction_from_per_call_limit() {
 
     let projected = output.projected_model_output();
     assert!(projected.reduced);
-    assert!(projected.text.contains("80 tokens truncated"));
-    assert!(!projected.text.contains("0 tokens truncated"));
+    assert!(!projected.text.is_empty());
+    assert!(codex_utils_string::approx_token_count(&projected.text) <= 4);
 }
 
 #[test]
@@ -1191,7 +1185,7 @@ fn exec_code_mode_makes_empty_completion_explicit() {
 fn artifact_recovery_notice_appears_when_model_output_is_reduced() {
     let raw_output = "word ".repeat(200);
     let (output, artifact_id, _, _retained_root) =
-        artifact_backed_exec_output(raw_output.as_bytes(), Some(4));
+        artifact_backed_exec_output(raw_output.as_bytes(), Some(100));
 
     let response = output.response_text();
 

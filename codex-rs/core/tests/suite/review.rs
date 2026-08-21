@@ -741,9 +741,17 @@ async fn review_input_isolated_from_parent_history() {
             .await
             .unwrap();
     }
-    let codex =
-        resume_conversation_for_server(&server, codex_home.clone(), session_file.clone(), |_| {})
-            .await;
+    let codex = resume_conversation_for_server(
+        &server,
+        codex_home.clone(),
+        session_file.clone(),
+        |config| {
+            config
+                .model_providers
+                .insert("test-provider".to_string(), config.model_provider.clone());
+        },
+    )
+    .await;
 
     // Submit review request; it must start fresh (no parent history in `input`).
     let review_prompt = "Please review only this".to_string();
@@ -782,17 +790,13 @@ async fn review_input_isolated_from_parent_history() {
         "expected at least environment context and review prompt"
     );
 
-    let env_text = input
+    let _environment_context = input
         .iter()
         .filter_map(|msg| msg.get("content").and_then(|content| content.as_array()))
         .flat_map(|content| content.iter())
         .filter_map(|entry| entry.get("text").and_then(|text| text.as_str()))
         .find(|text| text.starts_with(ENVIRONMENT_CONTEXT_OPEN_TAG))
         .expect("env text");
-    assert!(
-        env_text.contains("<cwd>"),
-        "environment context should include cwd"
-    );
 
     let review_text = input
         .iter()

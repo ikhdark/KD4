@@ -66,6 +66,10 @@ async fn test_config_with_cli_overrides(
         "model".to_string(),
         TomlValue::String("gpt-5.5".to_string()),
     ));
+    cli_overrides.push((
+        "features.multi_agent_v2".to_string(),
+        TomlValue::Boolean(false),
+    ));
     let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(home.path().to_path_buf())
         .cli_overrides(cli_overrides)
@@ -690,7 +694,11 @@ async fn prepared_typed_spawn_reserves_capacity_revalidates_and_releases_on_drop
     config.multi_agent_v2.max_concurrent_threads_per_session = 2;
     let harness = AgentControlHarness::new_with_config(home, config).await;
     harness.control.agent_execution_limiter.initialize(1);
-    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    // Production V2 spawns happen from a resolved parent turn. Resolve the
+    // parent's model-selected multi-agent version before constructing the
+    // synthetic child so its durable session metadata records V2.
+    parent_thread.codex.session.new_default_turn().await;
     let source = |task_name: &str| {
         SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id,
@@ -701,7 +709,7 @@ async fn prepared_typed_spawn_reserves_capacity_revalidates_and_releases_on_drop
         })
     };
 
-    let first_source = source("prepared-a");
+    let first_source = source("prepared_a");
     let prepared = harness
         .control
         .prepare_typed_spawn(
@@ -716,7 +724,7 @@ async fn prepared_typed_spawn_reserves_capacity_revalidates_and_releases_on_drop
             .control
             .prepare_typed_spawn(
                 &harness.config,
-                source("prepared-b"),
+                source("prepared_b"),
                 Some(parent_thread_id),
             )
             .await,
@@ -738,7 +746,7 @@ async fn prepared_typed_spawn_reserves_capacity_revalidates_and_releases_on_drop
             .control
             .prepare_typed_spawn(
                 &harness.config,
-                source("prepared-c"),
+                source("prepared_c"),
                 Some(parent_thread_id),
             )
             .await,
@@ -750,7 +758,7 @@ async fn prepared_typed_spawn_reserves_capacity_revalidates_and_releases_on_drop
         .control
         .prepare_typed_spawn(
             &harness.config,
-            source("prepared-c"),
+            source("prepared_c"),
             Some(parent_thread_id),
         )
         .await
@@ -830,7 +838,8 @@ async fn ensure_v2_agent_loaded_replaces_stopped_registered_agent() {
     let _ = config.features.enable(Feature::MultiAgentV2);
     let _ = config.features.enable(Feature::Sqlite);
     let harness = AgentControlHarness::new_with_config(home, config).await;
-    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    parent_thread.codex.session.new_default_turn().await;
     let agent_path = AgentPath::try_from("/root/worker").expect("agent path");
     let spawned_agent = harness
         .control
@@ -863,6 +872,11 @@ async fn ensure_v2_agent_loaded_replaces_stopped_registered_agent() {
         )])
         .await
         .expect("child rollout should persist with v2 metadata");
+    child_thread.ensure_rollout_materialized().await;
+    child_thread
+        .flush_rollout()
+        .await
+        .expect("child rollout should flush before cold reload");
     child_thread
         .shutdown_and_wait()
         .await
@@ -1003,7 +1017,8 @@ async fn concurrent_v2_cold_load_is_singleflight_before_residency_impl() {
     let _ = config.features.enable(Feature::Sqlite);
     config.multi_agent_v2.max_concurrent_threads_per_session = 3;
     let harness = AgentControlHarness::new_with_config(home, config).await;
-    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    parent_thread.codex.session.new_default_turn().await;
 
     let target_path = AgentPath::try_from("/root/target").expect("target path");
     let target = harness
@@ -1037,6 +1052,11 @@ async fn concurrent_v2_cold_load_is_singleflight_before_residency_impl() {
         )])
         .await
         .expect("target rollout should persist");
+    target_thread.ensure_rollout_materialized().await;
+    target_thread
+        .flush_rollout()
+        .await
+        .expect("target rollout should flush before cold reload");
     target_thread
         .shutdown_and_wait()
         .await
@@ -1814,11 +1834,9 @@ fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
                 "full-history forked child history should replace parent usage hints with the child subagent hint while filtering non-final assistant/tool chatter"
             );
             assert_eq!(
-                serde_json::to_value(child_thread.codex.session.reference_context_item().await)
-                    .expect("serialize child reference context item"),
-                serde_json::to_value(Some(parent_reference_context_item))
-                    .expect("serialize expected reference context item"),
-                "full-history forked child should preserve the parent diff baseline"
+                child_thread.codex.session.reference_context_item().await,
+                None,
+                "a bare TurnContext without provenance must not establish a child diff baseline"
             );
 
             let mut no_hint_child_config = harness.config.clone();

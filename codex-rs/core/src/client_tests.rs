@@ -984,7 +984,9 @@ fn tool_history_receipt_inside_provider_prefix_forces_transactional_rebase() {
     assert!(session.websocket_session.last_request.is_none());
     assert!(session.websocket_session.last_request_history.is_none());
     assert!(session.prompt_context_baseline.is_none());
-    assert!(session.websocket_cache_publication.is_none());
+    // Unknown provider history disables response inheritance, but the authenticated
+    // transport remains safe to publish because the cache stores it transport-only.
+    assert!(session.websocket_cache_publication.is_some());
 
     // A failed receipt-bearing rebase cannot resurrect the stale provider id.
     let (retry, _) = session.prepare_websocket_request(
@@ -1240,14 +1242,16 @@ async fn responses_lite_orders_base_and_tools_before_history() {
         )
         .expect("Responses Lite request should build");
 
-    assert!(
-        matches!(request.input.first(), Some(ResponseItem::Message { role, .. }) if role == "developer")
-    );
     assert!(matches!(
-        request.input.get(1),
+        request.input.first(),
         Some(ResponseItem::AdditionalTools { .. })
     ));
-    assert_eq!(request.input.last(), prompt.input.last());
+    assert!(
+        matches!(request.input.get(1), Some(ResponseItem::Message { role, .. }) if role == "developer")
+    );
+    let mut expected_history_item = prompt.input.last().cloned().expect("history item");
+    expected_history_item.clear_internal_chat_message_metadata_passthrough();
+    assert_eq!(request.input.last(), Some(&expected_history_item));
 }
 
 #[tokio::test]

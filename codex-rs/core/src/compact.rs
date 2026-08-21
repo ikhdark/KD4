@@ -548,6 +548,13 @@ fn validate_generated_compaction_summary(
         ));
     }
 
+    // Older/custom compaction models may return a non-empty free-form handoff. Preserve that
+    // backward-compatible path; once a model opts into the structured checkpoint format, enforce
+    // its completeness so a partially emitted section set cannot silently discard task state.
+    if !has_compaction_section(summary_suffix) {
+        return Ok(());
+    }
+
     if previous_summary.is_some() && !has_nonempty_compaction_section(summary_suffix) {
         return Err(CodexErr::Fatal(
             "incremental compaction handoff did not contain a recognized non-empty checkpoint section"

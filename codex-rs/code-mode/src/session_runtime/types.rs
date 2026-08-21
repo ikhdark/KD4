@@ -29,6 +29,9 @@ impl fmt::Display for CellId {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ObserveMode {
     YieldAfter(Duration),
+    /// Wake on model-visible output or terminal completion without periodic
+    /// empty observations.
+    StateChange,
     PendingFrontier,
 }
 

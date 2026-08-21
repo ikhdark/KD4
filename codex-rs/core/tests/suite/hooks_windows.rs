@@ -148,7 +148,14 @@ async fn pre_tool_use_rewrites_code_mode_nested_exec_command_before_execution_im
         serde_json::to_string(&original_command).context("serialize original command")?;
     let code = format!(
         r#"
-const output = await tools.exec_command({{ cmd: {original_command_json} }});
+let output = await tools.exec_command({{ cmd: {original_command_json} }});
+while (output.session_id) {{
+  output = await tools.write_stdin({{
+    session_id: output.session_id,
+    chars: "",
+    yield_time_ms: 30_000,
+  }});
+}}
 text(output.output);
 "#
     );

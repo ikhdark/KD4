@@ -158,7 +158,17 @@ enum RateLimitSnapshotSource {
 }
 
 fn has_usable_workspace_credits(credits: &CreditsSnapshot) -> bool {
-    credits.unlimited || credits.has_credits
+    if !credits.has_credits {
+        return false;
+    }
+    if credits.unlimited {
+        return true;
+    }
+    credits.balance.as_deref().is_none_or(|raw| {
+        raw.trim()
+            .parse::<f64>()
+            .map_or(true, |value| value.is_finite() && value > 0.0)
+    })
 }
 
 impl ChatWidget {

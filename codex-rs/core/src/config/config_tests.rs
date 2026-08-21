@@ -10278,9 +10278,9 @@ async fn multi_agent_v2_config_from_feature_table() -> std::io::Result<()> {
         r#"[features.multi_agent_v2]
 enabled = true
 max_concurrent_threads_per_session = 5
-min_wait_timeout_ms = 2500
+min_wait_timeout_ms = 60000
 max_wait_timeout_ms = 120000
-default_wait_timeout_ms = 30000
+default_wait_timeout_ms = 90000
 usage_hint_text = "Custom delegation guidance."
 root_agent_usage_hint_text = "Root guidance."
 subagent_usage_hint_text = "Subagent guidance."
@@ -10299,9 +10299,9 @@ non_code_mode_only = true
 
     assert!(config.features.enabled(Feature::MultiAgentV2));
     assert_eq!(config.multi_agent_v2.max_concurrent_threads_per_session, 5);
-    assert_eq!(config.multi_agent_v2.min_wait_timeout_ms, 2500);
+    assert_eq!(config.multi_agent_v2.min_wait_timeout_ms, 60000);
     assert_eq!(config.multi_agent_v2.max_wait_timeout_ms, 120000);
-    assert_eq!(config.multi_agent_v2.default_wait_timeout_ms, 30000);
+    assert_eq!(config.multi_agent_v2.default_wait_timeout_ms, 90000);
     assert_eq!(
         (
             config.agent_max_threads,

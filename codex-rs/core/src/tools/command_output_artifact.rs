@@ -1277,7 +1277,13 @@ impl RawOutputArtifactWriter {
     }
 
     pub(crate) async fn finish(&mut self, state: Option<&Arc<Mutex<RawOutputArtifact>>>) {
-        if self.pending_target.is_some() {
+        if let Some((codex_home, thread_id)) = self.pending_target.take() {
+            let artifact =
+                create_raw_output_artifact(&codex_home, &thread_id, &self.pending_output).await;
+            if let Some(state) = state {
+                *state.lock().await = artifact;
+            }
+            self.pending_output.clear();
             self.lifecycle_completed = true;
             return;
         }
@@ -3224,11 +3230,14 @@ fn load_logical_metadata(
                 serde_json::from_slice(&bytes).map_err(|err| {
                     ReadToolOutputError::Io(format!("failed to parse artifact metadata: {err}"))
                 })?;
-            if metadata.version != LOGICAL_ARTIFACT_METADATA_VERSION
-                || metadata.artifact_id != id.to_string()
-            {
+            if metadata.version != LOGICAL_ARTIFACT_METADATA_VERSION {
                 return Err(ReadToolOutputError::Io(
-                    "artifact metadata identity or version mismatch".to_string(),
+                    "artifact metadata version mismatch".to_string(),
+                ));
+            }
+            if metadata.artifact_id != id.to_string() {
+                return Err(ReadToolOutputError::Io(
+                    "artifact metadata identity mismatch".to_string(),
                 ));
             }
             Ok(metadata)
@@ -4146,15 +4155,10 @@ pub(crate) async fn read_tool_output_selectors_with_ceiling_and_reuse(
         .join("tool-output")
         .join(thread_id)
         .join(format!("{id}.log"));
-    let validation_path = path.clone();
-    let (metadata, snapshot) = tokio::task::spawn_blocking(move || {
-        open_regular_artifact(&validation_path)?;
-        let metadata = load_logical_metadata(&validation_path, id)?;
-        let snapshot = load_cached_validated_logical_snapshot(&validation_path, &metadata)?;
-        Ok::<_, ReadToolOutputError>((metadata, snapshot))
-    })
-    .await
-    .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))??;
+    let metadata_path = path.clone();
+    let metadata = tokio::task::spawn_blocking(move || load_logical_metadata(&metadata_path, id))
+        .await
+        .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))??;
     let artifact_identity = metadata.canonical_sha256.clone();
     let request_cache_key = deterministic_recovery_cache_key(
         codex_home,
@@ -4167,6 +4171,14 @@ pub(crate) async fn read_tool_output_selectors_with_ceiling_and_reuse(
     if let Some(result) = deterministic_recovery_cache_get(&request_cache_key) {
         return Ok((result, true));
     }
+    let validation_path = path.clone();
+    let metadata_for_snapshot = metadata.clone();
+    let snapshot = tokio::task::spawn_blocking(move || {
+        open_regular_artifact(&validation_path)?;
+        load_cached_validated_logical_snapshot(&validation_path, &metadata_for_snapshot)
+    })
+    .await
+    .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))??;
     let (result, normalized_selectors) = tokio::task::spawn_blocking(move || {
         let selectors = normalize_tool_output_selectors(selectors, &metadata);
         let mut response = ReadToolOutputResult {
@@ -4195,7 +4207,13 @@ pub(crate) async fn read_tool_output_selectors_with_ceiling_and_reuse(
                 candidate.complete = candidate.results.iter().all(|result| {
                     result.status == ToolOutputSelectorStatus::Ok && result.complete
                 });
-                if response_fits_recovery_token_ceiling(&candidate, token_ceiling) {
+                let mut individual_candidate = response.clone();
+                individual_candidate.results.clear();
+                individual_candidate.results.push(completed.clone());
+                individual_candidate.complete = true;
+                if response_fits_recovery_token_ceiling(&candidate, token_ceiling)
+                    || response_fits_recovery_token_ceiling(&individual_candidate, token_ceiling)
+                {
                     selected = completed;
                 }
             }

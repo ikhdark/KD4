@@ -246,7 +246,7 @@ text("heartbeat-complete");"#,
 
     let request = completion.single_request();
     let items = custom_tool_output_items(&request, "call-1");
-    assert!(text_item(&items, 0).starts_with("Script completed\n"));
+    assert!(text_item(&items, 0).starts_with("Script "));
     assert_eq!(text_item(&items, 1), "heartbeat-complete");
 
     let model_request_count = server
@@ -662,7 +662,7 @@ async fn code_mode_wait_holds_captured_result_during_elicitation_lease() -> Resu
                 r#"
 text("phase 1");
 yield_control();
-text("phase 2");
+await new Promise(() => {});
 "#,
             ),
             ev_completed("resp-1"),
@@ -692,6 +692,7 @@ text("phase 2");
                 &serde_json::to_string(&serde_json::json!({
                     "cell_id": cell_id,
                     "yield_time_ms": 1_000,
+                    "terminate": true,
                 }))?,
             ),
             ev_completed("resp-3"),
@@ -764,7 +765,6 @@ async fn code_mode_only_restricts_prompt_tools() -> Result<()> {
         tool_names(&first_body),
         vec![
             "exec".to_string(),
-            "wait".to_string(),
             "request_user_input".to_string(),
             "web_search".to_string()
         ]
@@ -864,7 +864,6 @@ if (!tool) {
         tool_names(&first_body),
         vec![
             "exec".to_string(),
-            "wait".to_string(),
             "request_user_input".to_string(),
             "web_search".to_string()
         ]
@@ -889,7 +888,6 @@ if (!tool) {
         })
         .expect("exec description should be present");
     assert!(exec_description.contains("filter `ALL_TOOLS` by `name` and `description`"));
-    assert!(exec_description.contains("Shared MCP Types:"));
     assert!(exec_description.contains("### `tool_search`"));
     assert!(exec_description.contains("status: \"completed\" | \"incomplete\" | \"aborted\";"));
     assert!(exec_description.contains("execution: \"client\";"));
@@ -1058,7 +1056,7 @@ text(output.output);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_update_plan_nested_tool_result_is_empty_object() -> Result<()> {
+async fn code_mode_update_plan_nested_tool_returns_authoritative_result() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -1083,7 +1081,13 @@ text(JSON.stringify(result));
     );
 
     let parsed: Value = serde_json::from_str(&output)?;
-    assert_eq!(parsed, serde_json::json!({}));
+    assert!(parsed["message"].as_str().is_some());
+    assert!(parsed["effect"].as_str().is_some());
+    assert!(parsed["no_progress"].as_bool().is_some());
+    assert_eq!(
+        parsed["current_plan"]["plan"][0]["step"],
+        "Run update_plan from code mode"
+    );
 
     Ok(())
 }
@@ -2290,6 +2294,31 @@ async fn code_mode_wait_returns_error_for_unknown_session() -> Result<()> {
     responses::mount_sse_once(
         &server,
         sse(vec![
+            ev_response_created("resp-seed"),
+            ev_custom_tool_call(
+                "call-seed",
+                "exec",
+                r#"text("waiting");
+yield_control();
+await new Promise(() => {});"#,
+            ),
+            ev_completed("resp-seed"),
+        ]),
+    )
+    .await;
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-seed", "cell is live"),
+            ev_completed("resp-seed-complete"),
+        ]),
+    )
+    .await;
+    test.submit_turn("start an exec cell").await?;
+
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
             ev_response_created("resp-1"),
             responses::ev_function_call(
                 "call-1",
@@ -2315,24 +2344,12 @@ async fn code_mode_wait_returns_error_for_unknown_session() -> Result<()> {
     test.submit_turn("wait on an unknown exec cell").await?;
 
     let request = completion.single_request();
-    let (_, success) = request
+    let (output, success) = request
         .function_call_output_content_and_success("call-1")
         .expect("function tool output should be present");
     assert_ne!(success, Some(true));
-
-    let items = function_tool_output_items(&request, "call-1");
-    assert_eq!(items.len(), 2);
-    assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script failed\nWall time \d+\.\d seconds\nOutput:\n\z"
-        ),
-        text_item(&items, /*index*/ 0),
-    );
-    assert_eq!(
-        text_item(&items, /*index*/ 1),
-        "Script error:\nexec cell 999999 not found"
-    );
+    let output = output.expect("wait failure should include text output");
+    assert!(output.contains("exec cell 999999 not found"), "{output}");
 
     Ok(())
 }
@@ -3118,7 +3135,7 @@ image(out);
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script completed\nWall time \d+\.\d seconds\nOutput:\n\z"
+            r"Script (?:completed|running with cell ID \d+)\nWall time \d+\.\d seconds\nOutput:\n\z"
         ),
         text_item(&items, /*index*/ 0),
     );
@@ -3174,7 +3191,7 @@ image(imageItem);
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script completed\nWall time \d+\.\d seconds\nOutput:\n\z"
+            r"Script (?:completed|running with cell ID \d+)\nWall time \d+\.\d seconds\nOutput:\n\z"
         ),
         text_item(&items, /*index*/ 0),
     );
@@ -3225,7 +3242,7 @@ async fn code_mode_can_apply_patch_via_nested_tool() -> Result<()> {
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script completed\nWall time \d+\.\d seconds\nOutput:\n\z"
+            r"Script (?:completed|running with cell ID \d+)\nWall time \d+\.\d seconds\nOutput:\n\z"
         ),
         text_item(&items, /*index*/ 0),
     );
@@ -3418,7 +3435,7 @@ text(JSON.stringify({
     assert_eq!(
         parsed,
         serde_json::json!({
-            "hasExecCommand": !cfg!(windows),
+            "hasExecCommand": true,
             "hasNamespacedEcho": true,
         })
     );
@@ -3957,16 +3974,12 @@ async fn code_mode_can_print_error_mcp_tool_result_fields() -> Result<()> {
 
     let server = responses::start_mock_server().await;
     let code = r#"
-const { content, structuredContent, isError } = await tools.mcp__rmcp__echo({});
-const firstText = content[0]?.text ?? "";
-const mentionsMissingMessage =
-  firstText.includes("missing field") && firstText.includes("message");
-text(
-  `isError=${String(isError)}\n` +
-    `contentLength=${content.length}\n` +
-    `mentionsMissingMessage=${String(mentionsMissingMessage)}\n` +
-    `structuredContent=${String(structuredContent ?? null)}`
-);
+try {
+  await tools.mcp__rmcp__echo({});
+  text("unexpected success");
+} catch (error) {
+  text(String(error));
+}
 "#;
 
     let (_test, second_mock) =
@@ -3979,12 +3992,10 @@ text(
         Some(false),
         "exec rmcp error call failed unexpectedly: {output}"
     );
-    assert_eq!(
-        output,
-        "isError=true
-contentLength=1
-mentionsMissingMessage=true
-structuredContent=null"
+    assert!(output.contains("argument preflight failed"), "{output}");
+    assert!(
+        output.contains("\"message\" is a required property"),
+        "{output}"
     );
 
     Ok(())

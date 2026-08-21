@@ -278,9 +278,7 @@ def staged_package_destination(
     """Build beside the destination and activate only after successful validation."""
     package_dir.parent.mkdir(parents=True, exist_ok=True)
     staging_root = Path(
-        tempfile.mkdtemp(
-            prefix=f".{package_dir.name}.staging-", dir=package_dir.parent
-        )
+        tempfile.mkdtemp(prefix=f".{package_dir.name}.staging-", dir=package_dir.parent)
     )
     staged_dir = staging_root / package_dir.name
     backup_dir: Path | None = None
@@ -353,9 +351,7 @@ def write_archives_atomically(
         for archive_path, staged_path, _ in staged:
             if archive_path.exists():
                 if not force:
-                    raise RuntimeError(
-                        f"Archive output already exists: {archive_path}"
-                    )
+                    raise RuntimeError(f"Archive output already exists: {archive_path}")
                 backup_path = archive_path.with_name(
                     f".{archive_path.name}.backup-{uuid.uuid4().hex}"
                 )
@@ -386,7 +382,9 @@ def write_archives_atomically(
                 try:
                     remove_tree_allow_readonly(staging_root)
                 except OSError as exc:
-                    print(f"warning: archive staging cleanup failed: {staging_root}: {exc}")
+                    print(
+                        f"warning: archive staging cleanup failed: {staging_root}: {exc}"
+                    )
 
 
 def resolve_package_inputs(

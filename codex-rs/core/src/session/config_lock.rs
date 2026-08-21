@@ -287,18 +287,22 @@ mod tests {
             .multi_agent_v2
             .as_ref()
             .expect("multi_agent_v2 config should be materialized");
-        assert!(matches!(
-            multi_agent_v2,
-            FeatureToml::Config(MultiAgentV2ConfigToml {
-                enabled: Some(false),
-                max_concurrent_threads_per_session: Some(_),
-                min_wait_timeout_ms: Some(_),
-                max_wait_timeout_ms: Some(_),
-                default_wait_timeout_ms: Some(_),
-                hide_spawn_agent_metadata: Some(_),
-                ..
-            })
-        ));
+        let FeatureToml::Config(multi_agent_v2) = multi_agent_v2 else {
+            panic!("multi_agent_v2 should retain its resolved structured config");
+        };
+        assert_eq!(
+            multi_agent_v2.enabled,
+            Some(
+                sc.original_config_do_not_use
+                    .features
+                    .enabled(Feature::MultiAgentV2)
+            )
+        );
+        assert!(multi_agent_v2.max_concurrent_threads_per_session.is_some());
+        assert!(multi_agent_v2.min_wait_timeout_ms.is_some());
+        assert!(multi_agent_v2.max_wait_timeout_ms.is_some());
+        assert!(multi_agent_v2.default_wait_timeout_ms.is_some());
+        assert!(multi_agent_v2.hide_spawn_agent_metadata.is_some());
 
         assert_eq!(
             features.current_time_reminder,

@@ -110,7 +110,9 @@ def _derive_event_metrics(raw_events: list[Any], *, path: Path) -> dict[str, Any
         if item_type in _NON_TOOL_ITEM_TYPES:
             continue
         action = {
-            key: value for key, value in item.items() if key not in _VOLATILE_TOOL_FIELDS
+            key: value
+            for key, value in item.items()
+            if key not in _VOLATILE_TOOL_FIELDS
         }
         actions.append(json.dumps(action, sort_keys=True, separators=(",", ":")))
 

@@ -328,30 +328,37 @@ async fn known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_la
     };
 
     let ((first, second, third), launches) =
-        crate::tools::runtimes::unified_exec::test_observation::observe(async {
-            let first = run_exec_command_for_test(
-                &session,
-                &turn,
-                "known-delta-unified-first",
-                payload.clone(),
-            )
-            .await;
-            let second = run_exec_command_for_test(
-                &session,
-                &turn,
-                "known-delta-unified-second",
-                payload.clone(),
-            )
-            .await;
-            let third = run_exec_command_for_test(
-                &session,
-                &turn,
-                "known-delta-unified-third",
-                payload.clone(),
-            )
-            .await;
-            (first, second, third)
-        })
+        crate::tools::runtimes::unified_exec::test_observation::observe(
+            crate::tools::known_delta_store::test_observation::with_profitability_costs(
+                async {
+                    let first = run_exec_command_for_test(
+                        &session,
+                        &turn,
+                        "known-delta-unified-first",
+                        payload.clone(),
+                    )
+                    .await;
+                    let second = run_exec_command_for_test(
+                        &session,
+                        &turn,
+                        "known-delta-unified-second",
+                        payload.clone(),
+                    )
+                    .await;
+                    let third = run_exec_command_for_test(
+                        &session,
+                        &turn,
+                        "known-delta-unified-third",
+                        payload.clone(),
+                    )
+                    .await;
+                    (first, second, third)
+                },
+                std::time::Duration::from_millis(1),
+                std::time::Duration::from_millis(1),
+                std::time::Duration::from_secs(1),
+            ),
+        )
         .await;
     assert_eq!(launches.process_launches, 2);
 
@@ -389,14 +396,20 @@ async fn known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_la
         })
         .to_string(),
     };
-    let (fresh, fresh_launches) =
-        crate::tools::runtimes::unified_exec::test_observation::observe(run_exec_command_for_test(
-            &session,
-            &turn,
-            "known-delta-unified-force-fresh",
-            force_fresh_payload.clone(),
-        ))
-        .await;
+    let (fresh, fresh_launches) = crate::tools::runtimes::unified_exec::test_observation::observe(
+        crate::tools::known_delta_store::test_observation::with_profitability_costs(
+            run_exec_command_for_test(
+                &session,
+                &turn,
+                "known-delta-unified-force-fresh",
+                force_fresh_payload.clone(),
+            ),
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_secs(1),
+        ),
+    )
+    .await;
     assert_eq!(fresh_launches.process_launches, 1);
     let fresh_text = String::from_utf8(
         fresh
@@ -408,12 +421,19 @@ async fn known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_la
     assert!(!fresh_text.contains("known-delta cache hit"));
 
     let (reused_after_fresh, post_fresh_launches) =
-        crate::tools::runtimes::unified_exec::test_observation::observe(run_exec_command_for_test(
-            &session,
-            &turn,
-            "known-delta-unified-after-fresh",
-            payload.clone(),
-        ))
+        crate::tools::runtimes::unified_exec::test_observation::observe(
+            crate::tools::known_delta_store::test_observation::with_profitability_costs(
+                run_exec_command_for_test(
+                    &session,
+                    &turn,
+                    "known-delta-unified-after-fresh",
+                    payload.clone(),
+                ),
+                std::time::Duration::from_millis(1),
+                std::time::Duration::from_millis(1),
+                std::time::Duration::from_secs(1),
+            ),
+        )
         .await;
     assert_eq!(post_fresh_launches.process_launches, 0);
     assert!(canonical_text(reused_after_fresh.as_ref()).contains("known-delta cache hit"));
@@ -716,7 +736,7 @@ async fn mutating_preflight_rejection_does_not_reserve_process_id() {
 }
 
 #[tokio::test]
-async fn intercepted_apply_patch_failure_releases_process_id_and_counts_retry_failure() {
+async fn intercepted_apply_patch_failure_releases_process_id_and_remains_retryable() {
     let patch = "*** Begin Patch\n*** Update File: missing.txt\n@@\n-old\n+new\n*** End Patch";
     let payload = ToolPayload::Function {
         arguments: serde_json::json!({
@@ -773,7 +793,7 @@ async fn intercepted_apply_patch_failure_releases_process_id_and_counts_retry_fa
         })
         .to_string(),
     };
-    let blocked = match handler
+    let third_failure = match handler
         .handle(ToolInvocation {
             session: Arc::clone(&session),
             step_context: StepContext::for_test(Arc::clone(&turn)),
@@ -787,10 +807,12 @@ async fn intercepted_apply_patch_failure_releases_process_id_and_counts_retry_fa
         })
         .await
     {
-        Ok(_) => panic!("third identical failure must be blocked"),
+        Ok(_) => panic!("third identical failure must still fail verification"),
         Err(err) => err,
     };
-    assert!(blocked.to_string().contains("Command blocked"));
+    let third_failure = third_failure.to_string();
+    assert!(third_failure.contains("apply_patch verification failed"));
+    assert!(!third_failure.contains("execution was suppressed"));
 
     let artifact_directory = turn
         .config
@@ -929,24 +951,28 @@ async fn unpolled_background_failure_finalizes_artifact_and_attempt_ledger() {
         .as_u64()
         .and_then(|value| u32::try_from(value).ok())
         .expect("numeric background process id");
-    let attempt_key = session
+    let running = session
         .services
         .command_execution
         .running_process(process_id)
         .await
-        .expect("background process must be tracked while it is running")
-        .key;
-    let artifact_id = code_mode["raw_output_artifact_id"]
-        .as_str()
-        .expect("raw output artifact id");
-    let artifact_path = artifact_directory.join(format!("{artifact_id}.log"));
-
+        .expect("background process must be tracked while it is running");
+    let attempt_key = running.key;
     let mut retained = String::new();
     let mut consecutive_failures = 0;
     for _ in 0..100 {
-        retained = tokio::fs::read_to_string(&artifact_path)
+        if let Some(artifact_id) = session
+            .services
+            .command_execution
+            .running_process(process_id)
             .await
-            .unwrap_or_default();
+            .and_then(|running| running.artifact.model_projection().0)
+        {
+            retained =
+                tokio::fs::read_to_string(artifact_directory.join(format!("{artifact_id}.log")))
+                    .await
+                    .unwrap_or_default();
+        }
         consecutive_failures = session
             .services
             .command_execution

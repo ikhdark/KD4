@@ -630,7 +630,8 @@ async fn request_user_input_stays_direct_in_code_mode_only() {
     let ToolSpec::Freeform(exec) = plan.visible_spec(codex_code_mode::PUBLIC_TOOL_NAME) else {
         panic!("expected code mode exec tool");
     };
-    assert!(!exec.description.contains("request_user_input"));
+    assert!(exec.description.contains("direct-only tools stay outside"));
+    assert!(exec.description.contains("request_user_input"));
 }
 
 #[tokio::test]
@@ -1038,7 +1039,9 @@ async fn mcp_resource_tools_follow_the_aggregate_ready_server_capability() {
             ..ToolExposureIdentity::default()
         };
         let plan = probe_with(
-            |_| {},
+            |turn| {
+                turn.model_info.supports_search_tool = true;
+            },
             ToolPlanInputs {
                 mcp_tools: Some(vec![mcp_tool("direct", "mcp__direct", "lookup")]),
                 exposure_identity: identity,
@@ -1426,7 +1429,14 @@ async fn code_mode_only_exposes_code_executor_and_hides_nested_tools() {
         )],
         ..ToolPlanInputs::default()
     };
-    let plain = probe_with(|_| {}, input).await;
+    let plain = probe_with(
+        |turn| {
+            set_feature(turn, Feature::CodeMode, /*enabled*/ false);
+            set_feature(turn, Feature::CodeModeOnly, /*enabled*/ false);
+        },
+        input,
+    )
+    .await;
     assert_eq!(
         plain.namespace_function_names("codex_app"),
         &["lookup".to_string()]

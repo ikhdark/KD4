@@ -46,7 +46,11 @@ class InvestigationEvalTests(unittest.TestCase):
             "raw_events": [
                 {
                     "type": "item.completed",
-                    "item": {"id": "item_0", "type": "agent_message", "text": "No findings."},
+                    "item": {
+                        "id": "item_0",
+                        "type": "agent_message",
+                        "text": "No findings.",
+                    },
                 }
             ],
         }

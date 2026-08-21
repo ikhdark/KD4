@@ -573,7 +573,7 @@ async fn deferred_executor_updates_context_and_tools_after_startup() -> Result<(
         });
     let test = timeout(Duration::from_secs(5), builder.build(&server))
         .await
-        .context("thread startup should not wait for the remote environment")??;
+        .context("DeferredExecutor session startup must not wait for the remote environment")??;
 
     test.codex
         .submit(Op::UserInput {
@@ -657,7 +657,7 @@ async fn deferred_executor_updates_context_and_tools_after_startup() -> Result<(
             .iter()
             .filter(|text| text.contains("<status>starting</status>"))
             .count(),
-        1
+        0
     );
     assert_eq!(
         final_user_context
@@ -854,7 +854,7 @@ async fn deferred_executor_wait_reports_startup_failure() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn deferred_executor_compaction_preserves_then_updates_environment_once() -> Result<()> {
+async fn deferred_executor_compaction_replaces_stale_environment_context() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let server = start_mock_server().await;
     let response_mock = mount_sse_sequence(
@@ -968,7 +968,7 @@ async fn deferred_executor_compaction_preserves_then_updates_environment_once() 
             .iter()
             .filter(|text| text.contains("<status>starting</status>"))
             .count(),
-        1
+        0
     );
     assert_eq!(
         post_compaction_context
@@ -977,16 +977,6 @@ async fn deferred_executor_compaction_preserves_then_updates_environment_once() 
             .count(),
         1
     );
-    let starting_index = post_compaction_context
-        .iter()
-        .position(|text| text.contains("<status>starting</status>"))
-        .expect("compaction should preserve the prior environment state");
-    let ready_index = post_compaction_context
-        .iter()
-        .position(|text| text.contains("<shell>zsh</shell>"))
-        .expect("the next sampling step should report that the environment is ready");
-    assert!(starting_index < ready_index);
-
     test.codex.ensure_rollout_materialized().await;
     test.codex.flush_rollout().await?;
     let rollout_path = test.codex.rollout_path().context("rollout path")?;
@@ -1006,7 +996,7 @@ async fn deferred_executor_compaction_preserves_then_updates_environment_once() 
             .iter()
             .map(|item| item.full)
             .collect::<Vec<_>>(),
-        vec![true, true, false]
+        vec![true, true]
     );
     assert_eq!(
         world_state_items[0]
@@ -1015,13 +1005,13 @@ async fn deferred_executor_compaction_preserves_then_updates_environment_once() 
         Some(&json!("starting"))
     );
     assert_eq!(
-        world_state_items[2]
+        world_state_items[1]
             .state
             .pointer("/environments/environments/remote/status"),
         Some(&json!("available"))
     );
     assert_eq!(
-        world_state_items[2]
+        world_state_items[1]
             .state
             .pointer("/environments/environments/remote/shell"),
         Some(&json!("zsh"))

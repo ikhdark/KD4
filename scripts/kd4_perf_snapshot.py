@@ -429,7 +429,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     failed = [result.name for result in results if result.status == "failed"]
     skipped = [result.name for result in results if result.status == "skipped"]
     skipped_required = [
-        result.name for result in results if result.status == "skipped" and result.required
+        result.name
+        for result in results
+        if result.status == "skipped" and result.required
     ]
     complete = not skipped_required
     ok = not failed and (complete or args.allow_incomplete)
@@ -461,12 +463,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not args.json:
             print(human_report)
     if args.rollout_jsonl:
-        first_action_analysis = kd4_first_useful_action_analysis.analyze(args.rollout_jsonl)
+        first_action_analysis = kd4_first_useful_action_analysis.analyze(
+            args.rollout_jsonl
+        )
         payload["firstUsefulActionAnalysis"] = first_action_analysis
         human_report = kd4_first_useful_action_analysis.render(first_action_analysis)
         if args.first_useful_action_report is not None:
             args.first_useful_action_report.parent.mkdir(parents=True, exist_ok=True)
-            args.first_useful_action_report.write_text(human_report + "\n", encoding="utf-8")
+            args.first_useful_action_report.write_text(
+                human_report + "\n", encoding="utf-8"
+            )
         if not args.json:
             print(human_report)
     if args.output is not None:

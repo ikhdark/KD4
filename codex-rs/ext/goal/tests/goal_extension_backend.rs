@@ -134,6 +134,9 @@ async fn installed_goal_tools_only_replace_complete_goal() -> anyhow::Result<()>
     let thread_id = test_thread_id()?;
     seed_thread_metadata(runtime.as_ref(), thread_id).await?;
     let harness = GoalExtensionHarness::new(runtime, thread_id).await?;
+    harness
+        .start_turn("turn-1", &token_usage(0, 0, 0, 0, 0))
+        .await;
     let tools = harness.tools();
 
     let create_tool = tool_by_name(&tools, "create_goal");
@@ -192,6 +195,9 @@ async fn goal_tool_surface_tracks_inactive_and_active_state() -> anyhow::Result<
     let thread_id = test_thread_id()?;
     seed_thread_metadata(runtime.as_ref(), thread_id).await?;
     let harness = GoalExtensionHarness::new(runtime, thread_id).await?;
+    harness
+        .start_turn("turn-1", &token_usage(0, 0, 0, 0, 0))
+        .await;
 
     let inactive = harness.tools();
     assert_eq!(tool_names(&inactive), ["create_goal"]);

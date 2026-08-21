@@ -172,7 +172,7 @@ fn write_stdin_tool_matches_expected_spec() {
         (
             "yield_time_ms".to_string(),
             JsonSchema::number(Some(
-                "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms; empty polls wait 5000-300000 ms by default.".to_string(),
+                "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms; empty polls default to one event-driven 60000 ms wait. A wait deadline does not terminate the process.".to_string(),
             )),
         ),
         (
@@ -321,6 +321,13 @@ Examples of valid command strings:
             "timeout_ms".to_string(),
             JsonSchema::number(Some(
                 "Maximum command runtime. Defaults to 10000 ms.".to_string(),
+            )),
+        ),
+        (
+            "stall_timeout_ms".to_string(),
+            JsonSchema::number(Some(
+                "Optional maximum time without stdout or stderr progress before cancellation. Omit or set zero to disable the stall deadline."
+                    .to_string(),
             )),
         ),
         ("validation".to_string(), validation_context_schema()),

@@ -580,14 +580,39 @@ impl ContextManager {
         Self::estimate_items_token_count_with_base_instructions(self.raw_items(), base_instructions)
     }
 
+    pub(crate) fn estimate_token_count_after_pending_user_boundary(
+        &self,
+        base_instructions: &BaseInstructions,
+    ) -> Option<i64> {
+        Self::estimate_items_token_count(
+            self.raw_items(),
+            base_instructions,
+            /*pending_user_boundary*/ true,
+        )
+    }
+
     pub(crate) fn estimate_items_token_count_with_base_instructions(
         items: &[ResponseItem],
         base_instructions: &BaseInstructions,
     ) -> Option<i64> {
+        Self::estimate_items_token_count(
+            items,
+            base_instructions,
+            /*pending_user_boundary*/ false,
+        )
+    }
+
+    fn estimate_items_token_count(
+        items: &[ResponseItem],
+        base_instructions: &BaseInstructions,
+        pending_user_boundary: bool,
+    ) -> Option<i64> {
         let base_tokens =
             i64::try_from(approx_token_count(&base_instructions.text)).unwrap_or(i64::MAX);
 
-        let last_instruction_boundary = items.iter().rposition(is_user_turn_boundary);
+        let last_instruction_boundary = pending_user_boundary
+            .then_some(items.len())
+            .or_else(|| items.iter().rposition(is_user_turn_boundary));
         let items_tokens = items
             .iter()
             .enumerate()

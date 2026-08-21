@@ -2079,6 +2079,13 @@ pub struct TurnTiming {
     /// from turn start and are diagnostic only; they are not additive buckets.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_requests: Vec<TurnTimingModelRequest>,
+    /// Bounded per-call relay timings captured at delivery. Offsets are from
+    /// turn start; phase durations are diagnostics and are not additive with
+    /// the canonical `exclusive` partition.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<TurnTimingToolCall>,
+    #[serde(default)]
+    pub tool_call_timing_overflow: u32,
     /// Provider usage observed on generations where neither relevant
     /// structured state nor the next-correct-action changed. This is a
     /// diagnostic and is never treated as measured avoidable savings.
@@ -2099,6 +2106,106 @@ pub struct TurnTiming {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub pre_first_model_output: Option<TurnTimingPreFirstModelOutput>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case", export_to = "v2/")]
+pub enum TurnTimingToolCallSource {
+    #[default]
+    Direct,
+    CodeMode,
+}
+
+/// Delivery-complete lifecycle for one model-issued or nested tool call.
+///
+/// All `*_at_ms` values are monotonic offsets from turn start. A missing
+/// boundary means the call ended before that boundary was observed. No tool
+/// arguments, output, paths, or nested runtime identifiers are persisted.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnTimingToolCall {
+    pub call_id: String,
+    pub tool_name: String,
+    #[serde(default)]
+    pub source: TurnTimingToolCallSource,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub generation_index: Option<u32>,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub accepted_at_ms: Option<u64>,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub first_poll_at_ms: Option<u64>,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub parallel_gate_admitted_at_ms: Option<u64>,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub handler_entry_at_ms: Option<u64>,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub handler_exit_at_ms: Option<u64>,
+    /// The tool result has been collected into the host relay, before any
+    /// post-handler evidence, projection, persistence, or delivery work.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub output_collected_at_ms: Option<u64>,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub process_spawned_at_ms: Option<u64>,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub process_exited_at_ms: Option<u64>,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub delivered_at_ms: Option<u64>,
+    /// The next model generation began after this result was delivered.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub model_resumed_at_ms: Option<u64>,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub item_to_first_poll_ms: Option<u64>,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub parallel_gate_wait_ms: Option<u64>,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub authorization_state_coordination_ms: Option<u64>,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub handler_duration_ms: Option<u64>,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub workspace_evidence_before_ms: Option<u64>,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub workspace_evidence_after_ms: Option<u64>,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub pre_tool_hook_ms: Option<u64>,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub post_tool_hook_ms: Option<u64>,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub output_projection_ms: Option<u64>,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub history_persistence_ms: Option<u64>,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub post_handler_ms: Option<u64>,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub total_duration_ms: Option<u64>,
+    #[serde(default)]
+    pub eager: bool,
+    #[serde(default)]
+    pub process_alive_at_delivery: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -2241,12 +2348,12 @@ pub struct TurnTimingRequestTokenCategories {
     #[serde(default)]
     pub local_reconciliation_residual: i64,
     /// Provider-reported full input tokens, when usage was returned.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(type = "number | null", optional)]
+    #[serde(default)]
+    #[ts(type = "number | null")]
     pub provider_input_tokens: Option<u64>,
     /// `provider_input_tokens - logical_total`, when provider usage exists.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(type = "number | null", optional)]
+    #[serde(default)]
+    #[ts(type = "number | null")]
     pub provider_reconciliation_residual: Option<i64>,
     /// Overlapping diagnostic: logical tokens in categories whose exact hash
     /// matched the preceding request. This is not added to `logical_total`.
@@ -2297,8 +2404,8 @@ pub struct TurnTimingModelRequest {
     pub model_stream_wait_ns: u64,
     /// Dispatch-to-first-actionable-output latency. This excludes reasoning
     /// deltas and partial tool arguments; missing actionable output stays null.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(type = "number | null", optional)]
+    #[serde(default)]
+    #[ts(type = "number | null")]
     pub decision_latency_ns: Option<u64>,
     /// Tool calls emitted by this generation. Recorded on its primary attempt.
     #[serde(default)]
@@ -2318,20 +2425,19 @@ pub struct TurnTimingModelRequest {
     pub token_usage: Option<TurnTimingProviderTokenUsage>,
     /// Aggregate-only full logical prompt accounting. No prompt text,
     /// repository paths, tool arguments, or hashes are persisted here.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
+    #[serde(default)]
     pub request_token_categories: Option<TurnTimingRequestTokenCategories>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(type = "number | null", optional)]
+    #[serde(default)]
+    #[ts(type = "number | null")]
     pub dispatch_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(type = "number | null", optional)]
+    #[serde(default)]
+    #[ts(type = "number | null")]
     pub first_model_output_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(type = "number | null", optional)]
+    #[serde(default)]
+    #[ts(type = "number | null")]
     pub first_actionable_output_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(type = "number | null", optional)]
+    #[serde(default)]
+    #[ts(type = "number | null")]
     pub completed_ms: Option<u64>,
 }
 

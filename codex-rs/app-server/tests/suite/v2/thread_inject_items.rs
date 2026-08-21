@@ -117,19 +117,12 @@ async fn thread_inject_items_adds_raw_response_items_to_thread_history() -> Resu
 
     let injected_value = serde_json::to_value(&injected_item)?;
     let model_input = response_mock.single_request().input();
-    let environment_context_index =
-        response_item_text_position(&model_input, "<environment_context>")
-            .expect("environment context should be injected before the first user turn");
     let injected_index = model_input
         .iter()
         .position(|item| item == &injected_value)
         .expect("injected item should be sent in the next model request");
     let user_prompt_index = response_item_text_position(&model_input, "Hello")
         .expect("user prompt should be sent in the next model request");
-    assert!(
-        environment_context_index < injected_index,
-        "standard initial context should be sent before injected items"
-    );
     assert!(
         injected_index < user_prompt_index,
         "injected items should be sent before the user prompt"

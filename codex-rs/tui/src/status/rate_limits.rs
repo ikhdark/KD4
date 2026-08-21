@@ -361,13 +361,20 @@ pub(crate) fn format_status_limit_summary(percent_remaining: f64) -> String {
 /// Unlimited credits are shown explicitly; finite credits show their rounded
 /// balance or `Available` when the balance is hidden.
 fn credit_status_row(credits: &CreditsSnapshotDisplay) -> Option<StatusRateLimitRow> {
+    if !credits.has_credits {
+        return None;
+    }
     if credits.unlimited {
         return Some(StatusRateLimitRow {
             label: "Credits".to_string(),
             value: StatusRateLimitValue::Text("Unlimited".to_string()),
         });
     }
-    if !credits.has_credits {
+    if credits.balance.as_deref().is_some_and(|raw| {
+        raw.trim()
+            .parse::<f64>()
+            .is_ok_and(|value| value.is_finite() && value <= 0.0)
+    }) {
         return None;
     }
     let value = credits

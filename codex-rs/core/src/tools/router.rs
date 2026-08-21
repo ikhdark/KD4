@@ -16,6 +16,7 @@ use crate::tools::registry::ToolArgumentDiffConsumer;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::spec_plan::build_tool_router;
 use crate::tools::tool_dispatch_trace::record_authorization_state_coordination;
+use codex_agent_task_store::AssignmentAdmissionOrigin;
 use codex_agent_task_store::AttemptState;
 use codex_mcp::ToolInfo;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
@@ -668,12 +669,20 @@ async fn authorize_bound_typed_tool_call(
         )));
     }
 
-    authorize_typed_tool(class).map_err(|error| {
-        FunctionCallError::RespondToModel(format!(
-            "{}: typed assignment capability denied: {error}",
-            call.tool_name.name
-        ))
-    })?;
+    let is_legacy_nested_spawn = class == TypedToolClass::RootTaskControl
+        && call.tool_name.name == "spawn_agent"
+        && matches!(
+            task.assignment.admission_origin,
+            AssignmentAdmissionOrigin::LegacyMessage { .. }
+        );
+    if !is_legacy_nested_spawn {
+        authorize_typed_tool(class).map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "{}: typed assignment capability denied: {error}",
+                call.tool_name.name
+            ))
+        })?;
+    }
     let heartbeated = coordinator
         .heartbeat_typed_actor_binding(&binding)
         .await

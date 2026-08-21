@@ -2,8 +2,9 @@ use crate::MEMORY_TOOL_DEVELOPER_INSTRUCTIONS_SUMMARY_TOKEN_LIMIT;
 use crate::MEMORY_TOOL_DEVELOPER_INSTRUCTIONS_TOKEN_LIMIT;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_output_truncation::TruncationPolicy;
-use codex_utils_output_truncation::approx_bytes_for_tokens;
+use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::truncate_text;
+use codex_utils_output_truncation::truncate_text_to_token_ceiling;
 use codex_utils_template::Template;
 use std::sync::LazyLock;
 use tokio::fs;
@@ -56,17 +57,16 @@ fn render_memory_tool_developer_instructions(
     let fixed_instructions = MEMORY_TOOL_DEVELOPER_INSTRUCTIONS_TEMPLATE
         .render([("base_path", base_path), ("memory_summary", "")])
         .ok()?;
-    let total_byte_limit = approx_bytes_for_tokens(MEMORY_TOOL_DEVELOPER_INSTRUCTIONS_TOKEN_LIMIT);
-    let mut summary_byte_limit = total_byte_limit.checked_sub(fixed_instructions.len())?;
-    if summary_byte_limit == 0 {
+    let fixed_token_count = approx_token_count(&fixed_instructions);
+    let mut summary_token_limit =
+        MEMORY_TOOL_DEVELOPER_INSTRUCTIONS_TOKEN_LIMIT.checked_sub(fixed_token_count)?;
+    if summary_token_limit == 0 {
         return None;
     }
 
     loop {
-        let memory_summary = truncate_text(
-            memory_summary.as_str(),
-            TruncationPolicy::Bytes(summary_byte_limit),
-        );
+        let memory_summary =
+            truncate_text_to_token_ceiling(memory_summary.as_str(), summary_token_limit);
         if memory_summary.is_empty() {
             return None;
         }
@@ -76,19 +76,21 @@ fn render_memory_tool_developer_instructions(
                 ("memory_summary", memory_summary.as_str()),
             ])
             .ok()?;
-        if rendered.len() <= total_byte_limit {
+        let rendered_token_count = approx_token_count(&rendered);
+        if rendered_token_count <= MEMORY_TOOL_DEVELOPER_INSTRUCTIONS_TOKEN_LIMIT {
             return Some(rendered);
         }
 
-        // Byte truncation includes its omission marker in addition to the
-        // requested budget. Account for that marker and retry until the whole
-        // rendered prompt, not just the summary, fits the hard ceiling.
-        let overflow = rendered.len() - total_byte_limit;
-        let next_limit = summary_byte_limit.saturating_sub(overflow.max(1));
-        if next_limit == 0 || next_limit >= summary_byte_limit {
+        // The estimator is deliberately lexical as well as byte based, so the
+        // rendered template and summary are not perfectly additive. Reduce by
+        // the observed overflow until the complete prompt fits the token cap.
+        let token_overflow =
+            rendered_token_count.saturating_sub(MEMORY_TOOL_DEVELOPER_INSTRUCTIONS_TOKEN_LIMIT);
+        let next_limit = summary_token_limit.saturating_sub(token_overflow.max(1));
+        if next_limit == 0 || next_limit >= summary_token_limit {
             return None;
         }
-        summary_byte_limit = next_limit;
+        summary_token_limit = next_limit;
     }
 }
 

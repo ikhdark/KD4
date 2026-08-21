@@ -36,7 +36,7 @@ use tokio::time::sleep;
 
 const CHILD_MODEL: &str = "test-multi-agent-child";
 const ROOT_MODEL: &str = "test-multi-agent-root";
-const ROOT_PROMPT: &str = "spawn a child";
+const ROOT_PROMPT: &str = "spawn an agent child";
 const MULTI_AGENT_V2_NAMESPACE: &str = "agents";
 const UNSUPPORTED_CODE_MODE_WARNING: &str = "does not advertise Code Mode support";
 
@@ -199,7 +199,6 @@ async fn remote_tool_mode_selector_overrides_feature_flags() -> Result<()> {
         vec![
             // Code-mode entrypoints.
             codex_code_mode::PUBLIC_TOOL_NAME.to_string(),
-            codex_code_mode::WAIT_TOOL_NAME.to_string(),
             "request_user_input".to_string(),
             // Hosted Responses tool.
             "web_search".to_string(),
@@ -328,6 +327,7 @@ async fn remote_multi_agent_selector_overrides_feature_flags() -> Result<()> {
     v2_model.multi_agent_version = Some(MultiAgentVersion::V2);
     let v2_body = response_body_for_remote_model(v2_model, |config| {
         config.agent_max_threads = Some(3);
+        config.multi_agent_v2.multi_agent_mode_hint_text = Some("use agents".to_string());
         config
             .features
             .enable(Feature::Collab)

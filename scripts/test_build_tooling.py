@@ -937,7 +937,14 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         command = groups[0].commands[0]
         self.assertEqual(
             command.args,
-            ("cargo", f"+{tool_versions.RUSTFMT_TOOLCHAIN}", "fmt", "--check"),
+            (
+                "rustup",
+                "run",
+                tool_versions.RUSTFMT_TOOLCHAIN,
+                "cargo",
+                "fmt",
+                "--check",
+            ),
         )
         self.assertEqual(command.cwd, REPO_ROOT / "codex-rs")
         self.assertFalse(hasattr(command, "discard_stderr"))
@@ -953,7 +960,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         self.assertEqual(len(groups), 1)
         command = groups[0].commands[0]
         self.assertEqual(command.args[:4], ("pnpm", "exec", "prettier", "--check"))
-        self.assertIn("docs/*.md", command.args)
+        self.assertNotIn("docs/*.md", command.args)
         self.assertIn("codex-cli/**/*.js", command.args)
         self.assertIn("sdk/typescript/**/*.ts", command.args)
 

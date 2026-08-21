@@ -11,6 +11,7 @@ import type { TurnTimingMilestones } from "./TurnTimingMilestones";
 import type { TurnTimingModelRequest } from "./TurnTimingModelRequest";
 import type { TurnTimingPreFirstModelOutput } from "./TurnTimingPreFirstModelOutput";
 import type { TurnTimingTerminalization } from "./TurnTimingTerminalization";
+import type { TurnTimingToolCall } from "./TurnTimingToolCall";
 import type { TurnTimingUnions } from "./TurnTimingUnions";
 
 /**
@@ -34,6 +35,12 @@ terminalization: TurnTimingTerminalization,
  * from turn start and are diagnostic only; they are not additive buckets.
  */
 modelRequests?: Array<TurnTimingModelRequest>,
+/**
+ * Bounded per-call relay timings captured at delivery. Offsets are from
+ * turn start; phase durations are diagnostics and are not additive with
+ * the canonical `exclusive` partition.
+ */
+toolCalls?: Array<TurnTimingToolCall>, toolCallTimingOverflow: number,
 /**
  * Provider usage observed on generations where neither relevant
  * structured state nor the next-correct-action changed. This is a

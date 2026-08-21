@@ -477,6 +477,14 @@ impl ModelToolProjection {
         if continuations.is_empty() {
             return Vec::new();
         }
+        let mut identity_counts = std::collections::HashMap::new();
+        for continuation in &continuations {
+            if valid_owner_drained_receipt(&continuation.receipt)
+                && let Some(identity) = continuation.receipt.runtime_identity()
+            {
+                *identity_counts.entry(identity).or_insert(0_usize) += 1;
+            }
+        }
         let mut identities = std::collections::HashSet::with_capacity(continuations.len());
         let Some(mut envelope) = self.bounded.envelope().cloned() else {
             return Vec::new();
@@ -492,7 +500,9 @@ impl ModelToolProjection {
                 || !continuation
                     .receipt
                     .runtime_identity()
-                    .is_some_and(|identity| identities.insert(identity))
+                    .is_some_and(|identity| {
+                        identity_counts.get(&identity) == Some(&1) && identities.insert(identity)
+                    })
             {
                 continue;
             }
@@ -1003,6 +1013,19 @@ impl ToolRegistry {
             )
             .await;
         record_lifecycle_phase(&invocation, "handler", phase_started);
+        // When the cancellation owner has already claimed the terminal
+        // lifecycle, the handler was awaited only for runtime/process cleanup.
+        // Do not extend the failed round-trip with hooks, projection, or a
+        // duplicate completion path after that cleanup has finished.
+        if invocation.cancellation_token.is_cancelled()
+            && terminal_outcome_reached.load(Ordering::Acquire)
+        {
+            let err = FunctionCallError::RespondToModel(
+                "tool cancelled after runtime cleanup".to_string(),
+            );
+            dispatch_trace.record_failed(&err);
+            return Err(err);
+        }
         let success = match &result {
             Ok((_, success)) => *success,
             Err(_) => false,
@@ -1651,6 +1674,14 @@ fn canonicalize_json(value: Value) -> Value {
 
 fn generic_projection_is_exempt(tool_name: &ToolName, force_inline_carrier: bool) -> bool {
     tool_name.name == "read_tool_output"
+        // MCP handlers already own provider-safe truncation and typed content
+        // shaping. Re-projecting their results can replace image content with
+        // a text artifact and can supersede distinct parallel call/output
+        // pairs when their arguments and results happen to be identical.
+        || tool_name
+            .namespace
+            .as_deref()
+            .is_some_and(|namespace| namespace.starts_with("mcp__"))
         || (crate::tools::code_mode::is_exec_tool_name(tool_name) && !force_inline_carrier)
 }
 

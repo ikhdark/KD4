@@ -43,6 +43,8 @@ Scenario: After five varied ChatGPT-auth turns, remote manual compaction reuses 
 +      ],
 +      "role": "assistant",
 +      "type": "message"
+-    "effort": "high"
++    "effort": "medium"
 -  "store": false,
 -  "stream": true,
 -  "tool_choice": "auto",

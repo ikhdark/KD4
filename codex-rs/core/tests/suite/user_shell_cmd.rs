@@ -497,18 +497,28 @@ async fn user_shell_command_is_truncated_only_once() -> anyhow::Result<()> {
 
     let mut builder = test_codex().with_model("gpt-5.4").with_config(|config| {
         config.tool_output_token_limit = Some(100);
+        let numbers = (1..=2000)
+            .map(|number| format!("{number}\n"))
+            .collect::<String>();
+        std::fs::write(config.cwd.join("numbers.txt"), numbers).expect("write shell fixture");
+        let initialized = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&config.cwd)
+            .status()
+            .expect("run git init");
+        assert!(initialized.success(), "initialize shell command fixture");
     });
     let fixture = builder.build(&server).await?;
 
     let call_id = "user-shell-double-truncation";
     let args = if cfg!(windows) {
         serde_json::json!({
-            "command": "for ($i=1; $i -le 2000; $i++) { Write-Output $i }",
+            "command": "Get-Content -LiteralPath numbers.txt",
             "timeout_ms": 5_000,
         })
     } else {
         serde_json::json!({
-            "command": "seq 1 2000",
+            "command": "cat numbers.txt",
             "timeout_ms": 5_000,
         })
     };

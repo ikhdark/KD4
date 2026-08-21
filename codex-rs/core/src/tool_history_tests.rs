@@ -250,10 +250,8 @@ fn non_git_unknown_workspace_evidence_invalidates_on_recorded_mutation() {
             .expect("non-git observation"),
     );
 
-    let unavailable = state.project_with_workspace_identity(Arc::clone(&canonical), None);
-    let (_, unavailable_output) =
-        textual_output_identity(&unavailable.items[1]).expect("unavailable output");
-    assert!(unavailable_output.contains("\"stale_workspace_evidence\":true"));
+    let current = state.project_with_workspace_identity(Arc::clone(&canonical), None);
+    assert_eq!(current.items, canonical);
 
     assert!(state.invalidate_source_dependencies(
         Some(&BTreeSet::from([PathBuf::from("/repo/changed.rs")])),
@@ -498,7 +496,11 @@ fn cargo_test_dependencies_follow_selected_local_package_graph() {
         arguments: serde_json::json!({"package": "app", "workdir": temp.path()}).to_string(),
     };
     let dependencies = source_dependencies_for_tool_call("cargo_test", &payload, temp.path());
-    assert!(dependencies.contains(&SourceDependencyV1::new(&temp.path().join("app"), true,)));
+    let package_index = cargo_package_index(temp.path());
+    assert!(
+        dependencies.contains(&SourceDependencyV1::new(&temp.path().join("app"), true,)),
+        "selected package graph: {dependencies:#?}; package index: {package_index:#?}"
+    );
     assert!(dependencies.contains(&SourceDependencyV1::new(&temp.path().join("support"), true,)));
     assert!(!dependencies.contains(&SourceDependencyV1::new(temp.path(), true)));
 }
@@ -586,9 +588,11 @@ fn completed_tool_history_receipt_lifecycle_keeps_canonical_history_unchanged() 
     assert_eq!(projection.substitutions.len(), 1);
     assert_eq!(projection.substitutions[0].item_index, 0);
     assert_eq!(projection.substitutions[0].call_id, call_id);
-    assert!(response_item_has_valid_tool_history_receipt(
-        &projection.items[0]
-    ));
+    assert!(
+        response_item_has_valid_tool_history_receipt(&projection.items[0]),
+        "projected item: {:#?}",
+        projection.items[0]
+    );
     assert_eq!(
         serde_json::to_vec(&canonical).expect("serialize canonical history"),
         canonical_before

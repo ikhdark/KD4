@@ -154,6 +154,11 @@ async fn app_server_emits_structured_tool_call_timing_event() -> Result<()> {
         .and_then(|duration| duration.as_u64())
         .context("handler_duration_ms must be a nonnegative integer")?;
     let phase_durations = [
+        "exec_request_to_spawn_ms",
+        "first_poll_to_output_collected_ms",
+        "exec_spawn_to_delivery_ms",
+        "exec_exit_to_delivery_ms",
+        "exec_spawn_to_exit_ms",
         "workspace_evidence_before_ms",
         "workspace_evidence_after_ms",
         "pre_tool_hook_ms",
@@ -208,8 +213,11 @@ async fn app_server_emits_structured_tool_call_timing_event() -> Result<()> {
                 "tool_name": "exec_command",
                 "call_id": "exec-call-1",
                 "tool_source": "direct",
+                "parent_cell_id": "",
+                "runtime_tool_call_id": "",
                 "execution_started": true,
                 "eager": false,
+                "exec_process_alive_at_delivery": false,
             },
             "target": "codex_core::tools::parallel",
         })

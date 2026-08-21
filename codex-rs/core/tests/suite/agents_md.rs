@@ -46,6 +46,8 @@ const NEW_PROJECT_INSTRUCTIONS: &str = "new project instructions";
 const OLD_GLOBAL_INSTRUCTIONS: &str = "old global instructions";
 const PROJECT_INSTRUCTIONS: &str = "project instructions";
 const PROJECT_SEPARATOR: &str = "--- project-doc ---";
+const FRESH_PROVENANCE: &str =
+    "Result provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.";
 const SPAWN_CALL_ID: &str = "spawn-global-instructions-child";
 const SPAWN_CHILD_PROMPT: &str = "inspect inherited global instructions";
 const SPAWN_FRESH_PARENT_PROMPT: &str = "spawn a child with fresh context";
@@ -121,7 +123,15 @@ fn expected_instruction_fragment(cwd: &AbsolutePathBuf, contents: &str) -> Strin
 }
 
 fn expected_provider_only_instruction_fragment(contents: &str) -> String {
-    format!("# AGENTS.md instructions\n\n<INSTRUCTIONS>\n{contents}\n</INSTRUCTIONS>")
+    format!(
+        "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n{FRESH_PROVENANCE}\n\n{contents}\n</INSTRUCTIONS>"
+    )
+}
+
+fn expected_provider_only_replacement_fragment(contents: &str) -> String {
+    format!(
+        "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\n{FRESH_PROVENANCE}\n\n{contents}\n</INSTRUCTIONS>"
+    )
 }
 
 fn assert_instruction_replacement_once(
@@ -130,22 +140,35 @@ fn assert_instruction_replacement_once(
     replacement_contents: &str,
 ) {
     let initial = expected_provider_only_instruction_fragment(initial_contents);
-    let replacement = expected_provider_only_instruction_fragment(&format!(
-        "These AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\n{replacement_contents}"
-    ));
-    assert_eq!(instruction_fragments(&requests[0]), vec![initial.clone()]);
+    let replacement = expected_provider_only_replacement_fragment(replacement_contents);
+    assert_eq!(instruction_fragments(&requests[0]), vec![initial]);
     assert_eq!(
         instruction_fragments(&requests[1]),
-        vec![initial.clone(), replacement.clone()]
+        vec![replacement.clone()]
     );
-    assert_eq!(
-        instruction_fragments(&requests[2]),
-        vec![initial, replacement]
-    );
+    assert_eq!(instruction_fragments(&requests[2]), vec![replacement]);
 }
 
 fn assert_single_instruction_fragment(request: &responses::ResponsesRequest, expected: &str) {
     assert_eq!(instruction_fragments(request), vec![expected.to_string()]);
+}
+
+fn assert_single_fresh_instruction_fragment_contains(
+    request: &responses::ResponsesRequest,
+    expected_contents: &str,
+) {
+    let fragments = instruction_fragments(request);
+    assert_eq!(fragments.len(), 1, "expected one AGENTS.md fragment");
+    assert!(
+        fragments[0].contains(FRESH_PROVENANCE),
+        "expected fresh direct-read provenance: {}",
+        fragments[0]
+    );
+    assert!(
+        fragments[0].contains(expected_contents),
+        "expected AGENTS.md contents {expected_contents:?}: {}",
+        fragments[0]
+    );
 }
 
 async fn submit_thread_turn(thread: &Arc<codex_core::CodexThread>, prompt: &str) -> Result<()> {
@@ -669,15 +692,16 @@ async fn fresh_thread_composes_global_before_project_and_reports_sources() -> Re
     );
     test.submit_turn("second turn").await?;
 
-    // Assert the running thread keeps its original structured prefix and appends one replacement
-    // fragment after both files at the reported source paths change.
+    // Assert the running thread projects the replacement fragment after both files at the
+    // reported source paths change.
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 2);
-    let expected_contents =
-        format!("{GLOBAL_INSTRUCTIONS}\n\n{PROJECT_SEPARATOR}\n\n{PROJECT_INSTRUCTIONS}");
+    let expected_contents = format!(
+        "{FRESH_PROVENANCE}\n\n{GLOBAL_INSTRUCTIONS}\n\n{PROJECT_SEPARATOR}\n\n{PROJECT_INSTRUCTIONS}"
+    );
     let expected_fragment = expected_instruction_fragment(&test.config.cwd, &expected_contents);
     let replacement_contents = format!(
-        "These AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\n{GLOBAL_INSTRUCTIONS}\n\n{PROJECT_SEPARATOR}\n\n{NEW_PROJECT_INSTRUCTIONS}"
+        "These AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\n{FRESH_PROVENANCE}\n\n{GLOBAL_INSTRUCTIONS}\n\n{PROJECT_SEPARATOR}\n\n{NEW_PROJECT_INSTRUCTIONS}"
     );
     let replacement_fragment =
         expected_instruction_fragment(&test.config.cwd, &replacement_contents);
@@ -685,7 +709,7 @@ async fn fresh_thread_composes_global_before_project_and_reports_sources() -> Re
     assert_eq!(fragments, vec![expected_fragment.clone()]);
     assert_eq!(
         instruction_fragments(&requests[1]),
-        vec![expected_fragment.clone(), replacement_fragment]
+        vec![replacement_fragment]
     );
     let rendered = fragments
         .into_iter()
@@ -714,14 +738,6 @@ async fn fresh_thread_composes_global_before_project_and_reports_sources() -> Re
         creation_sources,
         "ordinary turns retain the creation-time source list"
     );
-    let first_input = requests[0].input();
-    let second_input = requests[1].input();
-    assert_eq!(
-        second_input.get(..first_input.len()),
-        Some(first_input.as_slice()),
-        "the ordinary second turn should retain the cached prefix"
-    );
-
     Ok(())
 }
 
@@ -877,9 +893,10 @@ async fn invalid_utf8_global_instructions_are_lossy() -> Result<()> {
         test.codex.instruction_sources().await,
         vec![PathUri::from_abs_path(&source)]
     );
-    let expected_fragment =
-        expected_provider_only_instruction_fragment("global\u{FFFD}instructions");
-    assert_single_instruction_fragment(&response_mock.single_request(), &expected_fragment);
+    assert_single_fresh_instruction_fragment_contains(
+        &response_mock.single_request(),
+        "global\u{FFFD}instructions",
+    );
 
     Ok(())
 }
@@ -944,7 +961,8 @@ async fn cold_resume_invalidates_deleted_legacy_agents_md_once() -> Result<()> {
         .resume(&server, Arc::clone(&home), rollout_path)
         .await?;
 
-    // Model history still contains the old fragment, but the source no longer exists.
+    // Stable-context reconstruction removes the obsolete fragment and its
+    // internal tombstone before sampling.
     assert_eq!(
         resumed.codex.instruction_sources().await,
         Vec::<PathUri>::new(),
@@ -956,23 +974,10 @@ async fn cold_resume_invalidates_deleted_legacy_agents_md_once() -> Result<()> {
 
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 3);
-    let initial_input = requests[0].input();
-    let resumed_input = requests[1].input();
-    assert_eq!(
-        resumed_input.get(..initial_input.len()),
-        Some(initial_input.as_slice()),
-        "cold resume should replay the original structured input prefix"
-    );
     let initial = expected_provider_only_instruction_fragment(OLD_GLOBAL_INSTRUCTIONS);
-    let removal = expected_provider_only_instruction_fragment(
-        "The previously provided AGENTS.md instructions no longer apply.",
-    );
-    assert_eq!(instruction_fragments(&requests[0]), vec![initial.clone()]);
-    assert_eq!(
-        instruction_fragments(&requests[1]),
-        vec![initial.clone(), removal.clone()]
-    );
-    assert_eq!(instruction_fragments(&requests[2]), vec![initial, removal]);
+    assert_eq!(instruction_fragments(&requests[0]), vec![initial]);
+    assert_eq!(instruction_fragments(&requests[1]), Vec::<String>::new());
+    assert_eq!(instruction_fragments(&requests[2]), Vec::<String>::new());
 
     Ok(())
 }
@@ -1032,6 +1037,7 @@ async fn fork_injects_changed_agents_md_once() -> Result<()> {
     fork_config.cwd = parent.config.cwd.clone();
     fork_config.model = parent.config.model.clone();
     fork_config.model_provider = parent.config.model_provider.clone();
+    fork_config.model_providers = parent.config.model_providers.clone();
     fork_config.model_catalog = parent.config.model_catalog.clone();
     fork_config.codex_self_exe = parent.config.codex_self_exe.clone();
     let forked = parent
@@ -1055,16 +1061,9 @@ async fn fork_injects_changed_agents_md_once() -> Result<()> {
     submit_thread_turn(&forked.thread, "continue fork").await?;
     submit_thread_turn(&forked.thread, "continue fork again").await?;
 
-    // Assert the forked model request replays the parent's exact structured history.
+    // Assert the forked model request replaces the parent's AGENTS.md state once.
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 3);
-    let parent_input = requests[0].input();
-    let fork_input = requests[1].input();
-    assert_eq!(
-        fork_input.get(..parent_input.len()),
-        Some(parent_input.as_slice()),
-        "fork should replay the parent's original structured input prefix"
-    );
     assert_instruction_replacement_once(
         &requests,
         OLD_GLOBAL_INSTRUCTIONS,
@@ -1232,10 +1231,9 @@ async fn run_subagent_global_instruction_case(fork_context: bool) -> Result<()> 
     };
 
     // Assert parent and child report and render the parent's creation-time snapshot exactly once.
-    let expected_fragment = expected_provider_only_instruction_fragment(OLD_GLOBAL_INSTRUCTIONS);
-    assert_single_instruction_fragment(&seed_request, &expected_fragment);
-    assert_single_instruction_fragment(&spawn_request, &expected_fragment);
-    assert_single_instruction_fragment(&child_request, &expected_fragment);
+    assert_single_fresh_instruction_fragment_contains(&seed_request, OLD_GLOBAL_INSTRUCTIONS);
+    assert_single_fresh_instruction_fragment_contains(&spawn_request, OLD_GLOBAL_INSTRUCTIONS);
+    assert_single_fresh_instruction_fragment_contains(&child_request, OLD_GLOBAL_INSTRUCTIONS);
     assert_eq!(
         test.codex.instruction_sources().await,
         vec![PathUri::from_abs_path(&source)],
@@ -1247,12 +1245,14 @@ async fn run_subagent_global_instruction_case(fork_context: bool) -> Result<()> 
         "subagent reports the parent's creation-time source"
     );
     if fork_context {
-        let seed_input = seed_request.input();
-        let child_input = child_request.input();
+        let child_user_texts = child_request.message_input_texts("user");
         assert_eq!(
-            child_input.get(..seed_input.len()),
-            Some(seed_input.as_slice()),
-            "forked subagent should replay the parent's original structured input prefix"
+            child_user_texts
+                .iter()
+                .filter(|text| text.as_str() == SPAWN_SEED_PROMPT)
+                .count(),
+            1,
+            "forked subagent should replay the parent's seed prompt once: {child_user_texts:?}"
         );
     } else {
         let child_user_texts = child_request.message_input_texts("user");

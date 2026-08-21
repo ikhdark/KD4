@@ -344,6 +344,50 @@ fn canonical_projection_places_volatile_context_after_reusable_history_prefix() 
 }
 
 #[test]
+fn unchanged_runtime_context_preserves_the_previous_request_prefix() {
+    let environment = "<environment_context>same environment</environment_context>";
+    let guidance = "<task_model_guidance>same guidance</task_model_guidance>";
+    let first = project_stable_context(
+        vec![
+            text_message_for_turn("user", environment, "turn-1"),
+            text_message_for_turn("user", guidance, "turn-1"),
+            text_message_for_turn("user", "first task", "turn-1"),
+        ]
+        .into(),
+        StableContextTarget::Sampling,
+    );
+    let second = project_stable_context(
+        vec![
+            text_message_for_turn("user", environment, "turn-1"),
+            text_message_for_turn("user", guidance, "turn-1"),
+            text_message_for_turn("user", "first task", "turn-1"),
+            text_message_for_turn("user", guidance, "turn-2"),
+            text_message_for_turn("user", "second task", "turn-2"),
+        ]
+        .into(),
+        StableContextTarget::Sampling,
+    );
+
+    let first_visible = visible_text(&first.items);
+    let second_visible = visible_text(&second.items);
+    assert_eq!(
+        &second_visible[..first_visible.len()],
+        first_visible.as_slice()
+    );
+    assert_eq!(second_visible.last(), Some(&"second task"));
+    assert_eq!(
+        second_visible
+            .iter()
+            .filter(|text| **text == guidance)
+            .count(),
+        1
+    );
+    assert!(second.manifest.components().iter().any(|component| {
+        component.kind == StableContextKind::TaskModelGuidance && component.active
+    }));
+}
+
+#[test]
 fn recommended_plugins_expire_after_the_requesting_turn() {
     let plugins = "<recommended_plugins>requested catalog</recommended_plugins>";
     let projection = project_stable_context(

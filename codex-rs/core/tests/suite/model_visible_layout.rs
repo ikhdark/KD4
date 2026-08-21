@@ -95,6 +95,10 @@ async fn snapshot_model_visible_layout_turn_overrides() -> Result<()> {
     let mut builder = test_codex().with_model("gpt-5.4").with_config(|config| {
         config
             .features
+            .enable(Feature::MultiAgentV2)
+            .expect("test config should allow feature update");
+        config
+            .features
             .enable(Feature::Personality)
             .expect("test config should allow feature update");
         config.personality = Some(Personality::Pragmatic);
@@ -217,7 +221,12 @@ async fn snapshot_model_visible_layout_refreshes_agents_between_turns() -> Resul
     )
     .await;
 
-    let mut builder = test_codex().with_model("gpt-5.4");
+    let mut builder = test_codex().with_model("gpt-5.4").with_config(|config| {
+        config
+            .features
+            .enable(Feature::MultiAgentV2)
+            .expect("test config should allow feature update");
+    });
     let test = builder.build(&server).await?;
     let cwd_one = test.cwd_path().join("agents_one");
     let cwd_two = test.cwd_path().join("agents_two");
@@ -385,6 +394,10 @@ async fn snapshot_model_visible_layout_resume_with_personality_change() -> Resul
     let server = start_mock_server().await;
     let mut initial_builder = test_codex().with_config(|config| {
         config.model = Some("gpt-5.2".to_string());
+        config
+            .features
+            .enable(Feature::MultiAgentV2)
+            .expect("test config should allow feature update");
     });
     let initial = initial_builder.build(&server).await?;
     let codex = Arc::clone(&initial.codex);
@@ -433,6 +446,10 @@ async fn snapshot_model_visible_layout_resume_with_personality_change() -> Resul
         config.model = Some("gpt-5.4".to_string());
         config
             .features
+            .enable(Feature::MultiAgentV2)
+            .expect("test config should allow feature update");
+        config
+            .features
             .enable(Feature::Personality)
             .expect("test config should allow feature update");
         config.personality = Some(Personality::Pragmatic);
@@ -460,11 +477,12 @@ async fn snapshot_model_visible_layout_resume_with_personality_change() -> Resul
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
+                model: Some("gpt-5.4".to_string()),
                 personality: Some(Personality::Friendly),
                 collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
                     mode: codex_protocol::config_types::ModeKind::Default,
                     settings: codex_protocol::config_types::Settings {
-                        model: resumed.session_configured.model.clone(),
+                        model: "gpt-5.4".to_string(),
                         reasoning_effort: resumed.config.model_reasoning_effort.clone(),
                         developer_instructions: None,
                     },
@@ -500,6 +518,10 @@ async fn snapshot_model_visible_layout_resume_override_matches_rollout_model() -
     let server = start_mock_server().await;
     let mut initial_builder = test_codex().with_config(|config| {
         config.model = Some("gpt-5.2".to_string());
+        config
+            .features
+            .enable(Feature::MultiAgentV2)
+            .expect("test config should allow feature update");
     });
     let initial = initial_builder.build(&server).await?;
     let codex = Arc::clone(&initial.codex);
@@ -546,6 +568,10 @@ async fn snapshot_model_visible_layout_resume_override_matches_rollout_model() -
 
     let mut resume_builder = test_codex().with_config(|config| {
         config.model = Some("gpt-5.4".to_string());
+        config
+            .features
+            .enable(Feature::MultiAgentV2)
+            .expect("test config should allow feature update");
     });
     let resumed = resume_builder.resume(&server, home, rollout_path).await?;
     let resume_override_cwd = resumed.cwd_path().join(PRETURN_CONTEXT_DIFF_CWD);

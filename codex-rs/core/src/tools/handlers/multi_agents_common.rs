@@ -233,6 +233,12 @@ pub(crate) fn apply_spawn_agent_runtime_overrides(
 ) -> Result<(), FunctionCallError> {
     if !role_locks.permissions {
         config.permissions = turn.config.permissions.clone();
+        config
+            .permissions
+            .set_permission_profile(turn.permission_profile())
+            .map_err(|err| {
+                FunctionCallError::RespondToModel(format!("permission_profile is invalid: {err}"))
+            })?;
     }
     config
         .permissions

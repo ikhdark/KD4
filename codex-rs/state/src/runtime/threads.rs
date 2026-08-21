@@ -354,7 +354,8 @@ ORDER BY depth ASC, child_thread_id ASC
             .collect()
     }
 
-    async fn insert_thread_spawn_edge_if_absent(
+    /// Persist an open parent-child edge unless the child already has an incoming edge.
+    pub async fn insert_thread_spawn_edge_if_absent(
         &self,
         parent_thread_id: ThreadId,
         child_thread_id: ThreadId,
@@ -552,10 +553,7 @@ ON CONFLICT(child_thread_id) DO NOTHING
         let mut parent_thread_ids = std::collections::HashMap::new();
         for row in rows {
             let item = ThreadRow::try_from_row(&row).and_then(ThreadMetadata::try_from)?;
-            if relation_filter.is_some()
-                && let Some(parent_thread_id) =
-                    row.try_get::<Option<String>, _>("parent_thread_id")?
-            {
+            if let Some(parent_thread_id) = row.try_get::<Option<String>, _>("parent_thread_id")? {
                 parent_thread_ids.insert(item.id, ThreadId::try_from(parent_thread_id)?);
             }
             items.push(item);
@@ -565,9 +563,9 @@ ON CONFLICT(child_thread_id) DO NOTHING
             if let Some(overflow_item) = items.pop() {
                 parent_thread_ids.remove(&overflow_item.id);
             }
-            items.last().and_then(|item| {
-                anchor_from_item(item, filters.sort_key, relation_filter.is_some())
-            })
+            items
+                .last()
+                .and_then(|item| anchor_from_item(item, filters.sort_key))
         } else {
             None
         };
@@ -603,14 +601,14 @@ ON CONFLICT(child_thread_id) DO NOTHING
                 search_term: None,
             },
             /*include_empty_preview*/ false,
-            sort_key == crate::SortKey::RecencyAt,
+            /*include_thread_id_tiebreaker*/ true,
         );
         push_thread_order_and_limit(
             &mut builder,
             sort_key,
             SortDirection::Desc,
             OrderByIndex::Enabled,
-            sort_key == crate::SortKey::RecencyAt,
+            /*include_thread_id_tiebreaker*/ true,
             limit,
         );
 
@@ -1039,6 +1037,10 @@ ON CONFLICT(id) DO UPDATE SET
             self.upsert_thread(&metadata).await
         };
         upsert_result?;
+        if let Some(parent_thread_id) = builder.parent_thread_id {
+            self.insert_thread_spawn_edge_if_absent(parent_thread_id, builder.id)
+                .await?;
+        }
         if let Some(memory_mode) = extract_memory_mode(items)
             && let Err(err) = self
                 .set_thread_memory_mode(builder.id, memory_mode.as_str())
@@ -1315,10 +1317,11 @@ WITH RECURSIVE subtree(child_thread_id, parent_thread_id) AS (
         Some(crate::ThreadRelationFilter::DescendantsOf(_)) => builder.push(
             ", subtree.parent_thread_id AS parent_thread_id\nFROM subtree\nCROSS JOIN threads ON threads.id = subtree.child_thread_id",
         ),
-        None => builder.push(" FROM threads"),
+        None => builder.push(
+            ", listed_edge.parent_thread_id AS parent_thread_id\nFROM threads\nLEFT JOIN thread_spawn_edges AS listed_edge ON listed_edge.child_thread_id = threads.id",
+        ),
     };
-    let include_thread_id_tiebreaker =
-        relation_filter.is_some() || filters.sort_key == SortKey::RecencyAt;
+    let include_thread_id_tiebreaker = true;
     push_thread_filters(
         builder,
         filters,
@@ -1886,7 +1889,7 @@ mod tests {
             Some(Anchor {
                 ts: DateTime::<Utc>::from_timestamp_millis(1_700_000_200_000)
                     .expect("valid timestamp"),
-                id: None,
+                id: Some(newer_id),
             })
         );
 
@@ -1971,7 +1974,7 @@ mod tests {
             Some(Anchor {
                 ts: DateTime::<Utc>::from_timestamp_millis(1_700_000_300_000)
                     .expect("valid timestamp"),
-                id: None,
+                id: Some(second_id),
             })
         );
 

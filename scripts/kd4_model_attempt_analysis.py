@@ -96,7 +96,10 @@ def load_jsonl(paths: Sequence[Path]) -> tuple[list[dict[str, Any]], dict[str, i
                         )
                         if identity in seen_components:
                             exclusions["duplicate_context_component_collapsed"] = (
-                                exclusions.get("duplicate_context_component_collapsed", 0) + 1
+                                exclusions.get(
+                                    "duplicate_context_component_collapsed", 0
+                                )
+                                + 1
                             )
                         else:
                             seen_components.add(identity)
@@ -128,7 +131,11 @@ def load_jsonl(paths: Sequence[Path]) -> tuple[list[dict[str, Any]], dict[str, i
                             seen_attempts[identity] = fields
                     records.append(fields)
     attempts_by_identity = {
-        (record.get("sampling_request_id"), record.get("attempt_id"), record.get("retry_index")): record
+        (
+            record.get("sampling_request_id"),
+            record.get("attempt_id"),
+            record.get("retry_index"),
+        ): record
         for record in records
     }
     for component in components:
@@ -139,7 +146,9 @@ def load_jsonl(paths: Sequence[Path]) -> tuple[list[dict[str, Any]], dict[str, i
         )
         attempt = attempts_by_identity.get(identity)
         if attempt is None:
-            exclusions["orphan_context_component"] = exclusions.get("orphan_context_component", 0) + 1
+            exclusions["orphan_context_component"] = (
+                exclusions.get("orphan_context_component", 0) + 1
+            )
             continue
         attempt.setdefault("_stable_context_components", []).append(component)
     return records, exclusions
@@ -156,7 +165,7 @@ def _stable_context_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]
     wire_bytes = 0.0
     cached_tokens = 0.0
     input_tokens = 0.0
-    requests_over_80k = 0
+    requests_over_120k = 0
     for record in records:
         active_total = 0.0
         attempt_constructed_bytes = 0.0
@@ -218,8 +227,8 @@ def _stable_context_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]
         component_cache_hits += (
             attempt_cache_hits if reported_hits is None else reported_hits
         )
-        if active_total > 80_000:
-            requests_over_80k += 1
+        if active_total > 120_000:
+            requests_over_120k += 1
         if record.get("provider_baseline") == "fail_open_stale_retained":
             fail_open_attempts += 1
         if (
@@ -244,13 +253,15 @@ def _stable_context_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]
         if active_totals
         else None,
         "peakActiveContextTokens": max(active_totals) if active_totals else None,
-        "requestsOver80K": requests_over_80k,
+        "requestsOver120K": requests_over_120k,
         "cumulativeLogicalContextTokens": sum(active_totals),
         "localConstructedBytes": local_constructed_bytes,
         "localReusedBytes": local_reused_bytes,
         "componentCacheHits": component_cache_hits,
         "wireRequestBytes": wire_bytes,
-        "providerCachedShare": round(cached_tokens / input_tokens, 6) if input_tokens else None,
+        "providerCachedShare": round(cached_tokens / input_tokens, 6)
+        if input_tokens
+        else None,
         "failOpenAttempts": fail_open_attempts,
         "successfulRebases": successful_rebases,
     }
@@ -293,13 +304,17 @@ def _distribution(values: Sequence[float]) -> dict[str, float | int | None]:
     }
 
 
-def _quantile_bins(rows: Sequence[dict[str, Any]], predictor: str, count: int = 4) -> list[dict[str, Any]]:
+def _quantile_bins(
+    rows: Sequence[dict[str, Any]], predictor: str, count: int = 4
+) -> list[dict[str, Any]]:
     eligible = [row for row in rows if _number(row.get(predictor)) is not None]
     eligible.sort(key=lambda row: (float(row[predictor]), str(row["attempt_id"])))
     count = min(count, len(eligible))
     bins: list[dict[str, Any]] = []
     for index in range(count):
-        chunk = eligible[index * len(eligible) // count : (index + 1) * len(eligible) // count]
+        chunk = eligible[
+            index * len(eligible) // count : (index + 1) * len(eligible) // count
+        ]
         values = [float(row[predictor]) for row in chunk]
         waits = [float(row["decision_latency_us"]) for row in chunk]
         bins.append(
@@ -314,7 +329,9 @@ def _quantile_bins(rows: Sequence[dict[str, Any]], predictor: str, count: int = 
     return bins
 
 
-def analyze(records: Sequence[dict[str, Any]], exclusions: dict[str, int] | None = None) -> dict[str, Any]:
+def analyze(
+    records: Sequence[dict[str, Any]], exclusions: dict[str, int] | None = None
+) -> dict[str, Any]:
     exclusion_counts = dict(exclusions or {})
     outcome_counts = {"success": 0, "failed": 0, "cancelled": 0}
     logical: dict[str, list[dict[str, Any]]] = {}
@@ -324,7 +341,9 @@ def analyze(records: Sequence[dict[str, Any]], exclusions: dict[str, int] | None
             outcome_counts[outcome] += 1
         request_id = record.get("sampling_request_id")
         if not isinstance(request_id, str) or not request_id:
-            exclusion_counts["missing_sampling_request_id"] = exclusion_counts.get("missing_sampling_request_id", 0) + 1
+            exclusion_counts["missing_sampling_request_id"] = (
+                exclusion_counts.get("missing_sampling_request_id", 0) + 1
+            )
             continue
         logical.setdefault(request_id, []).append(record)
 
@@ -366,7 +385,9 @@ def analyze(records: Sequence[dict[str, Any]], exclusions: dict[str, int] | None
             for index, attempt in enumerate(attempts):
                 dispatch_ready_us = _number(attempt.get("dispatch_ready_us"))
                 terminal = index == len(attempts) - 1
-                endpoint_field = "first_actionable_output_us" if terminal else "completed_us"
+                endpoint_field = (
+                    "first_actionable_output_us" if terminal else "completed_us"
+                )
                 endpoint_us = _number(attempt.get(endpoint_field))
                 if dispatch_ready_us is None:
                     reason = "missing_dispatch_ready"
@@ -413,8 +434,11 @@ def analyze(records: Sequence[dict[str, Any]], exclusions: dict[str, int] | None
             "retry_count": len(attempts) - 1,
             "retry_overhead_us": retry_overhead_us,
             "terminal_decision_latency_us": terminal_decision_latency_us,
-            "decision_latency_us": retry_overhead_us + float(terminal_decision_latency_us),
-            "reconciliation_residual_bytes": record.get("reconciliation_residual_bytes"),
+            "decision_latency_us": retry_overhead_us
+            + float(terminal_decision_latency_us),
+            "reconciliation_residual_bytes": record.get(
+                "reconciliation_residual_bytes"
+            ),
             "logical_request_bytes": record.get("logical_request_bytes"),
         }
         row.update({field: record.get(field) for field in COMPONENT_FIELDS})
@@ -432,7 +456,10 @@ def analyze(records: Sequence[dict[str, Any]], exclusions: dict[str, int] | None
         )
         members_by_group.setdefault(key, []).append(row)
     groups: list[dict[str, Any]] = []
-    for key, members in sorted(members_by_group.items(), key=lambda item: tuple(str(value) for value in item[0])):
+    for key, members in sorted(
+        members_by_group.items(),
+        key=lambda item: tuple(str(value) for value in item[0]),
+    ):
         predictors: dict[str, Any] = {}
         for predictor in PREDICTOR_FIELDS:
             pairs = [
@@ -453,12 +480,24 @@ def analyze(records: Sequence[dict[str, Any]], exclusions: dict[str, int] | None
                 "generationPurpose": key[3],
                 "generationDisposition": key[4],
                 "sampleCount": len(members),
-                "decisionLatencyUs": _distribution([float(row["decision_latency_us"]) for row in members]),
-                "retryOverheadUs": _distribution([float(row["retry_overhead_us"]) for row in members]),
-                "physicalAttemptCount": _distribution([float(row["physical_attempt_count"]) for row in members]),
-                "inputTokens": _distribution([float(row["input_token_count"]) for row in members]),
-                "cachedInputTokens": _distribution([float(row["cached_input_token_count"]) for row in members]),
-                "uncachedInputTokens": _distribution([float(row["uncached_input_token_count"]) for row in members]),
+                "decisionLatencyUs": _distribution(
+                    [float(row["decision_latency_us"]) for row in members]
+                ),
+                "retryOverheadUs": _distribution(
+                    [float(row["retry_overhead_us"]) for row in members]
+                ),
+                "physicalAttemptCount": _distribution(
+                    [float(row["physical_attempt_count"]) for row in members]
+                ),
+                "inputTokens": _distribution(
+                    [float(row["input_token_count"]) for row in members]
+                ),
+                "cachedInputTokens": _distribution(
+                    [float(row["cached_input_token_count"]) for row in members]
+                ),
+                "uncachedInputTokens": _distribution(
+                    [float(row["uncached_input_token_count"]) for row in members]
+                ),
                 "predictors": predictors,
             }
         )
@@ -476,7 +515,9 @@ def analyze(records: Sequence[dict[str, Any]], exclusions: dict[str, int] | None
         )
         residuals.append(computed_residual)
         supplied = _number(row.get("reconciliation_residual_bytes"), nonnegative=False)
-        if supplied is None or not math.isclose(float(supplied), computed_residual, abs_tol=0.5):
+        if supplied is None or not math.isclose(
+            float(supplied), computed_residual, abs_tol=0.5
+        ):
             supplied_residual_mismatches += 1
         row["computed_reconciliation_residual_bytes"] = computed_residual
     return {
@@ -498,7 +539,8 @@ def analyze(records: Sequence[dict[str, Any]], exclusions: dict[str, int] | None
             "coverageFraction": round(len(residuals) / len(rows), 6) if rows else None,
             "toleranceBytes": RECONCILIATION_TOLERANCE_BYTES,
             "withinToleranceCount": sum(
-                abs(residual) <= RECONCILIATION_TOLERANCE_BYTES for residual in residuals
+                abs(residual) <= RECONCILIATION_TOLERANCE_BYTES
+                for residual in residuals
             ),
             "outsideToleranceCount": sum(
                 abs(residual) > RECONCILIATION_TOLERANCE_BYTES for residual in residuals
@@ -559,7 +601,7 @@ def render(analysis: dict[str, Any]) -> str:
         "stable context: "
         f"average_active_tokens={stable['averageActiveContextTokens']} "
         f"peak_active_tokens={stable['peakActiveContextTokens']} "
-        f"requests_over_80k={stable['requestsOver80K']} "
+        f"requests_over_120k={stable['requestsOver120K']} "
         f"local_constructed_bytes={stable['localConstructedBytes']} "
         f"local_reused_bytes={stable['localReusedBytes']} "
         f"component_cache_hits={stable['componentCacheHits']} "

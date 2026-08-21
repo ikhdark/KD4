@@ -240,7 +240,9 @@ class WorkflowPreflightTest(unittest.TestCase):
         ):
             self.resolve(value)
 
-    def test_main_registers_overlaps_with_advisories_and_release_removes_receipts(self) -> None:
+    def test_main_registers_overlaps_with_advisories_and_release_removes_receipts(
+        self,
+    ) -> None:
         first = self.manifest("root:first")
         first_path = self.repo / "first.json"
         first_path.write_text(json.dumps(first), encoding="utf-8")

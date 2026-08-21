@@ -1,6 +1,7 @@
 use super::*;
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn multi_selector_recovery_returns_several_omitted_sections_exactly() {
     let temp = tempfile::tempdir().expect("tempdir");
     let mut canonical = CanonicalToolResult::text("primary\ncaller\ntest\n");
@@ -68,6 +69,7 @@ async fn multi_selector_recovery_returns_several_omitted_sections_exactly() {
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn receipt_reuse_completed_exact_recovery_avoids_reopening_the_artifact() {
     let temp = tempfile::tempdir().expect("tempdir");
     let canonical = CanonicalToolResult::text("one\ntwo\nthree\n");
@@ -107,6 +109,7 @@ struct ProjectionMeasurement {
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn four_chunk_fixture_recovers_every_omitted_chunk_in_one_combined_call() {
     let temp = tempfile::tempdir().expect("tempdir");
     let content = (1..=126)
@@ -202,13 +205,16 @@ async fn four_chunk_fixture_recovers_every_omitted_chunk_in_one_combined_call() 
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn aggregate_recovery_reserves_space_for_later_ranges_and_returns_continuations() {
     let temp = tempfile::tempdir().expect("tempdir");
     let line = "x".repeat(16_000);
-    let canonical = CanonicalToolResult::text(format!("{line}\n{line}\n{line}\n"));
+    let canonical =
+        CanonicalToolResult::text(format!("{line}\nskip one\n{line}\nskip two\n{line}\n"));
     let artifact = create_canonical_output_artifact(temp.path(), "thread", &canonical).await;
     let artifact_id = artifact.artifact_id().expect("canonical artifact ID");
-    let selectors = (1..=3)
+    let selectors = [1, 3, 5]
+        .into_iter()
         .map(|line| ToolOutputSelector::Lines {
             start: line,
             end: line,
@@ -249,6 +255,7 @@ async fn aggregate_recovery_reserves_space_for_later_ranges_and_returns_continua
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn exact_three_kib_section_is_complete_in_one_transaction() {
     let temp = tempfile::tempdir().expect("tempdir");
     let text = (0..48)
@@ -286,6 +293,7 @@ async fn exact_three_kib_section_is_complete_in_one_transaction() {
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn exact_eight_kib_lines_drain_all_subdivisions_when_final_transaction_fits() {
     let temp = tempfile::tempdir().expect("tempdir");
     let text = (0..128)
@@ -324,6 +332,7 @@ async fn exact_eight_kib_lines_drain_all_subdivisions_when_final_transaction_fit
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn exact_ranges_are_deduplicated_coalesced_and_returned_in_source_order() {
     let temp = tempfile::tempdir().expect("tempdir");
     let text = "0123456789".repeat(8);
@@ -364,6 +373,7 @@ async fn exact_ranges_are_deduplicated_coalesced_and_returned_in_source_order() 
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn byte_selectors_return_utf8_directly_and_non_utf8_as_base64() {
     let temp = tempfile::tempdir().expect("tempdir");
     let canonical = CanonicalToolResult::bytes(vec![b'h', b'i', b' ', 0xff, 0x00]);
@@ -399,6 +409,7 @@ async fn byte_selectors_return_utf8_directly_and_non_utf8_as_base64() {
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn artifact_recovery_search_returns_batched_exact_selectors_and_continuation() {
     let temp = tempfile::tempdir().expect("tempdir");
     let canonical = CanonicalToolResult::text(
@@ -468,6 +479,7 @@ async fn artifact_recovery_search_returns_batched_exact_selectors_and_continuati
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn artifact_recovery_search_page_fits_its_ceiling_and_advances() {
     let temp = tempfile::tempdir().expect("tempdir");
     let canonical = CanonicalToolResult::text(
@@ -514,6 +526,7 @@ async fn artifact_recovery_search_page_fits_its_ceiling_and_advances() {
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn artifact_recovery_sparse_search_avoids_a_historical_line_sweep() {
     let temp = tempfile::tempdir().expect("tempdir");
     let canonical = CanonicalToolResult::text(
@@ -582,6 +595,7 @@ async fn artifact_recovery_sparse_search_avoids_a_historical_line_sweep() {
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn oversized_json_pointer_exposes_exact_chunkable_canonical_range() {
     let temp = tempfile::tempdir().expect("tempdir");
     let canonical = CanonicalToolResult::json(serde_json::json!({
@@ -682,6 +696,7 @@ async fn oversized_json_pointer_exposes_exact_chunkable_canonical_range() {
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn stall_nested_recovery_budget_returns_a_bounded_subdivision_plan() {
     let temp = tempfile::tempdir().expect("tempdir");
     let canonical = CanonicalToolResult::text("source line\n".repeat(600));
@@ -708,6 +723,7 @@ async fn stall_nested_recovery_budget_returns_a_bounded_subdivision_plan() {
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn stale_artifact_metadata_version_is_rejected_without_partial_success() {
     let temp = tempfile::tempdir().expect("tempdir");
     let canonical = CanonicalToolResult::text("version identity\n");
@@ -743,6 +759,7 @@ async fn stale_artifact_metadata_version_is_rejected_without_partial_success() {
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn stale_artifact_sha_is_rejected_without_partial_success() {
     let temp = tempfile::tempdir().expect("tempdir");
     let canonical = CanonicalToolResult::text("sha identity\n");
@@ -771,6 +788,7 @@ async fn stale_artifact_sha_is_rejected_without_partial_success() {
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn stale_artifact_size_is_rejected_without_partial_success() {
     let temp = tempfile::tempdir().expect("tempdir");
     let canonical = CanonicalToolResult::text("size identity\n");
@@ -799,6 +817,7 @@ async fn stale_artifact_size_is_rejected_without_partial_success() {
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn active_output_file_lock_blocks_removal_until_release() {
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("active.log");
@@ -827,6 +846,7 @@ async fn active_output_file_lock_blocks_removal_until_release() {
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn replacement_does_not_truncate_before_acquiring_the_lock() {
     let temp = tempfile::tempdir().expect("tempdir");
     let artifact = create_raw_output_artifact(temp.path(), "thread", b"retained output").await;
@@ -851,6 +871,7 @@ async fn replacement_does_not_truncate_before_acquiring_the_lock() {
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn per_thread_retention_skips_active_artifacts() {
     let temp = tempfile::tempdir().expect("tempdir");
     let directory = temp.path().join("tool-output").join("thread");
@@ -898,6 +919,7 @@ async fn per_thread_retention_skips_active_artifacts() {
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn global_retention_bounds_artifacts_across_threads() {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path().join("tool-output");
@@ -942,6 +964,7 @@ async fn global_retention_bounds_artifacts_across_threads() {
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn protected_evidence_artifact_survives_per_thread_retention_without_reducing_generic_limit()
 {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -978,6 +1001,7 @@ async fn protected_evidence_artifact_survives_per_thread_retention_without_reduc
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn evidence_creation_holds_retention_permit_until_marker_is_durable() {
     let temp = tempfile::tempdir().expect("tempdir");
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
@@ -1064,6 +1088,7 @@ async fn evidence_creation_holds_retention_permit_until_marker_is_durable() {
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn active_reader_trim_unprotects_artifact_before_eventual_retention_cleanup() {
     let temp = tempfile::tempdir().expect("tempdir");
     let artifact = create_evidence_output_artifact(temp.path(), "thread", b"durable evidence")
@@ -1097,6 +1122,7 @@ async fn active_reader_trim_unprotects_artifact_before_eventual_retention_cleanu
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn cancelled_evidence_creation_leaves_no_protected_orphan() {
     let temp = tempfile::tempdir().expect("tempdir");
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
@@ -1131,6 +1157,7 @@ async fn cancelled_evidence_creation_leaves_no_protected_orphan() {
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn cancelled_pending_evidence_lease_cleans_up_but_durable_lease_survives() {
     let temp = tempfile::tempdir().expect("tempdir");
     let pending = create_evidence_output_artifact(temp.path(), "thread", b"pending evidence")
@@ -1167,6 +1194,7 @@ async fn cancelled_pending_evidence_lease_cleans_up_but_durable_lease_survives()
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn global_retention_skips_protected_evidence_without_broadening_generic_limit() {
     let temp = tempfile::tempdir().expect("tempdir");
     let artifact =
@@ -1221,6 +1249,7 @@ async fn global_retention_skips_protected_evidence_without_broadening_generic_li
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn retention_sweeps_are_serialized() {
     let temp = tempfile::tempdir().expect("tempdir");
     let directory = temp.path().join("tool-output").join("thread");
@@ -1269,6 +1298,7 @@ async fn create_artifacts_and_measure(count: usize) -> (RetentionDiagnostics, st
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn indexed_retention_scans_only_at_configured_boundaries() {
     let (at_100, wall_100) = create_artifacts_and_measure(100).await;
     let (at_127, wall_127) = create_artifacts_and_measure(127).await;
@@ -1284,6 +1314,7 @@ async fn indexed_retention_scans_only_at_configured_boundaries() {
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn streaming_chunks_update_bytes_but_count_as_one_logical_mutation() {
     let temp = tempfile::tempdir().expect("tempdir");
     let artifact = create_raw_output_artifact(temp.path(), "thread", b"").await;
@@ -1309,6 +1340,7 @@ async fn streaming_chunks_update_bytes_but_count_as_one_logical_mutation() {
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn near_limit_streaming_growth_reconciles_before_the_next_retention_decision() {
     let temp = tempfile::tempdir().expect("tempdir");
     let artifact = create_raw_output_artifact(temp.path(), "thread", b"").await;
@@ -1350,6 +1382,7 @@ async fn near_limit_streaming_growth_reconciles_before_the_next_retention_decisi
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn stale_streaming_writer_cannot_update_a_rebuilt_generation() {
     let temp = tempfile::tempdir().expect("tempdir");
     let artifact = create_raw_output_artifact(temp.path(), "thread", b"").await;
@@ -1394,6 +1427,7 @@ async fn stale_streaming_writer_cannot_update_a_rebuilt_generation() {
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn every_indexed_mutation_publisher_rejects_a_stale_generation() {
     let temp = tempfile::tempdir().expect("tempdir");
     let artifact = create_raw_output_artifact(temp.path(), "thread", b"artifact").await;
@@ -1439,6 +1473,7 @@ async fn every_indexed_mutation_publisher_rejects_a_stale_generation() {
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn reconciliation_releases_registry_mutex_and_rejects_known_internal_mutation() {
     let temp = tempfile::tempdir().expect("tempdir");
     let artifact = create_raw_output_artifact(temp.path(), "thread", b"").await;
@@ -1467,6 +1502,7 @@ async fn reconciliation_releases_registry_mutex_and_rejects_known_internal_mutat
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn token_captured_during_reconciliation_cannot_update_the_installed_candidate() {
     let temp = tempfile::tempdir().expect("tempdir");
     let artifact = create_raw_output_artifact(temp.path(), "thread", b"artifact").await;
@@ -1508,6 +1544,7 @@ async fn token_captured_during_reconciliation_cannot_update_the_installed_candid
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn detectable_external_inconsistency_discards_the_reconciliation_candidate() {
     let temp = tempfile::tempdir().expect("tempdir");
     let artifact = create_raw_output_artifact(temp.path(), "thread", b"artifact").await;
@@ -1533,6 +1570,7 @@ async fn detectable_external_inconsistency_discards_the_reconciliation_candidate
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn generation_is_not_reused_after_root_eviction_and_reinitialization() {
     let temp = tempfile::tempdir().expect("tempdir");
     let roots = (0..=MAX_RETENTION_INDEX_ROOTS)
@@ -1556,6 +1594,7 @@ async fn generation_is_not_reused_after_root_eviction_and_reinitialization() {
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn invalid_protection_marker_fails_reconciliation_open() {
     let temp = tempfile::tempdir().expect("tempdir");
     let artifact = create_raw_output_artifact(temp.path(), "thread", b"artifact").await;
@@ -1574,6 +1613,7 @@ async fn invalid_protection_marker_fails_reconciliation_open() {
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn periodic_scan_only_reconciliation_exits_after_capacity_recovers() {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path().join("tool-output");
@@ -1605,6 +1645,7 @@ async fn periodic_scan_only_reconciliation_exits_after_capacity_recovers() {
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn stale_generation_invalidates_a_rebuilt_scan_only_root() {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path().join("tool-output");
@@ -1639,6 +1680,7 @@ async fn stale_generation_invalidates_a_rebuilt_scan_only_root() {
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn oversized_root_is_sticky_scan_only_until_an_authoritative_in_capacity_scan() {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path().join("tool-output");

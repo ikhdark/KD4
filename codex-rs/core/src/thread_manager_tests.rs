@@ -107,7 +107,7 @@ fn user_msg(text: &str) -> ResponseItem {
     ResponseItem::Message {
         id: None,
         role: "user".to_string(),
-        content: vec![ContentItem::OutputText {
+        content: vec![ContentItem::InputText {
             text: text.to_string(),
         }],
         phase: None,
@@ -346,6 +346,7 @@ async fn ignores_session_prefix_messages_when_truncating() {
     let mut items = session
         .build_initial_context_with_world_state(&turn_context, &world_state)
         .await;
+    let initial_context_len = items.len();
     items.push(user_msg("feature request"));
     items.push(assistant_msg("ack"));
     items.push(user_msg("second question"));
@@ -368,12 +369,11 @@ async fn ignores_session_prefix_messages_when_truncating() {
     );
     let got_items = truncated.get_rollout_items();
 
-    let expected: Vec<RolloutItem> = vec![
-        RolloutItem::ResponseItem(items[0].clone()),
-        RolloutItem::ResponseItem(items[1].clone()),
-        RolloutItem::ResponseItem(items[2].clone()),
-        RolloutItem::ResponseItem(items[3].clone()),
-    ];
+    let expected: Vec<RolloutItem> = items[..initial_context_len + 2]
+        .iter()
+        .cloned()
+        .map(RolloutItem::ResponseItem)
+        .collect();
 
     assert_eq!(
         serde_json::to_value(got_items).unwrap(),
@@ -879,6 +879,13 @@ async fn resume_and_fork_restore_thread_environments_from_rollout_impl() {
         })
         .await
         .expect("start source thread");
+    source
+        .thread
+        .codex
+        .session
+        .persist_thread_settings_snapshot()
+        .await
+        .expect("persist source thread settings before resume and fork");
     source.thread.ensure_rollout_materialized().await;
     source
         .thread

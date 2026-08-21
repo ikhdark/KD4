@@ -65,7 +65,9 @@ async fn memory_tool_developer_instructions_have_a_firm_total_budget() {
 
 #[test]
 fn memory_tool_budget_accounts_for_a_long_memory_root() {
-    let base_path = format!("C:/{}", "nested/".repeat(80));
+    // Keep the fixed template itself below the combined budget while leaving
+    // little enough room that a byte-only summary budget would overflow it.
+    let base_path = format!("C:/{}", "nested/".repeat(50));
     let memory_summary = "memory-token ".repeat(5_000);
     let instructions =
         render_memory_tool_developer_instructions(base_path.as_str(), memory_summary.as_str())

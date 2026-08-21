@@ -9,6 +9,7 @@ pub(crate) mod unix_escalation;
 pub(crate) mod zsh_fork_backend;
 
 use crate::command_canonicalization::canonicalize_command_for_approval;
+use crate::exec::CommandProgress;
 use crate::exec::ExecCapturePolicy;
 use crate::guardian::GuardianNetworkAccessTrigger;
 use crate::sandboxing::ExecOptions;
@@ -42,6 +43,8 @@ use crate::tools::sandboxing::managed_network_for_sandbox_permissions;
 use crate::tools::sandboxing::sandbox_permissions_preserving_denied_reads;
 use crate::tools::sandboxing::with_cached_approval;
 use codex_network_proxy::NetworkProxy;
+use codex_protocol::error::CodexErr;
+use codex_protocol::error::SandboxErr;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::ReviewDecision;
@@ -69,6 +72,7 @@ pub struct ShellRequest {
     pub hook_command: String,
     pub cwd: AbsolutePathBuf,
     pub timeout_ms: Option<u64>,
+    pub stall_timeout_ms: Option<u64>,
     pub cancellation_token: CancellationToken,
     pub env: HashMap<String, String>,
     pub explicit_env_overrides: HashMap<String, String>,
@@ -118,13 +122,51 @@ impl ShellRuntime {
         Self { backend }
     }
 
-    fn stdout_stream(ctx: &ToolCtx) -> Option<crate::exec::StdoutStream> {
+    fn stdout_stream(
+        ctx: &ToolCtx,
+        progress: Option<CommandProgress>,
+    ) -> Option<crate::exec::StdoutStream> {
         Some(crate::exec::StdoutStream {
             sub_id: ctx.turn.sub_id.clone(),
             call_id: ctx.call_id.clone(),
             tx_event: ctx.session.get_tx_event(),
+            progress,
         })
     }
+}
+
+async fn wait_for_command_stall(
+    mut progress: tokio::sync::watch::Receiver<u64>,
+    stall_timeout: std::time::Duration,
+) {
+    loop {
+        let deadline = tokio::time::sleep(stall_timeout);
+        tokio::pin!(deadline);
+        tokio::select! {
+            biased;
+            changed = progress.changed() => {
+                if changed.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }
+            _ = &mut deadline => return,
+        }
+    }
+}
+
+fn mark_command_stalled(output: &mut ExecToolCallOutput, stall_timeout_ms: u64) {
+    let notice =
+        format!("command stalled after {stall_timeout_ms} milliseconds without stdout or stderr");
+    if !output.aggregated_output.text.is_empty() && !output.aggregated_output.text.ends_with('\n') {
+        output.aggregated_output.text.push('\n');
+    }
+    output.aggregated_output.text.push_str(&notice);
+    if !output.stderr.text.is_empty() && !output.stderr.text.ends_with('\n') {
+        output.stderr.text.push('\n');
+    }
+    output.stderr.text.push_str(&notice);
+    output.exit_code = crate::exec::EXEC_TIMEOUT_EXIT_CODE;
+    output.timed_out = true;
 }
 
 impl Sandboxable for ShellRuntime {
@@ -351,7 +393,9 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             command
         };
 
-        if self.backend == ShellRuntimeBackend::ShellCommandZshFork {
+        if self.backend == ShellRuntimeBackend::ShellCommandZshFork
+            && req.stall_timeout_ms.is_none()
+        {
             match zsh_fork_backend::maybe_run_shell_command(req, attempt, ctx, &command).await? {
                 Some(out) => return Ok(out),
                 None => {
@@ -366,6 +410,10 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             build_sandbox_command(&command, &req.cwd, &env, req.additional_permissions.clone())?;
         let mut expiration: crate::exec::ExecExpiration = req.timeout_ms.into();
         expiration = expiration.with_cancellation(req.cancellation_token.clone());
+        let stall_cancellation = req.stall_timeout_ms.map(|_| CancellationToken::new());
+        if let Some(cancellation) = stall_cancellation.as_ref() {
+            expiration = expiration.with_cancellation(cancellation.clone());
+        }
         if let Some(cancellation) = attempt.network_denial_cancellation_token.clone() {
             expiration = expiration.with_cancellation(cancellation);
         }
@@ -427,9 +475,40 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
                 drop(guard);
             }) as Box<dyn FnOnce() + Send>
         });
-        let out = execute_exec_request_with_after_spawn(env, Self::stdout_stream(ctx), after_spawn)
-            .await
-            .map_err(ToolError::Codex)?;
+        let progress = req.stall_timeout_ms.map(|_| CommandProgress::new());
+        let progress_observer = progress.as_ref().map(CommandProgress::subscribe);
+        let execution = execute_exec_request_with_after_spawn(
+            env,
+            Self::stdout_stream(ctx, progress),
+            after_spawn,
+        );
+        tokio::pin!(execution);
+        let (out, stalled) = match (req.stall_timeout_ms, progress_observer, stall_cancellation) {
+            (Some(stall_timeout_ms), Some(progress_observer), Some(stall_cancellation)) => {
+                let stall = wait_for_command_stall(
+                    progress_observer,
+                    std::time::Duration::from_millis(stall_timeout_ms),
+                );
+                tokio::pin!(stall);
+                tokio::select! {
+                    biased;
+                    result = &mut execution => (result, false),
+                    _ = &mut stall => {
+                        stall_cancellation.cancel();
+                        (execution.await, true)
+                    }
+                }
+            }
+            _ => (execution.await, false),
+        };
+        let mut out = match out {
+            Ok(out) => out,
+            Err(CodexErr::Sandbox(SandboxErr::Timeout { output })) if stalled => *output,
+            Err(err) => return Err(ToolError::Codex(err)),
+        };
+        if stalled && let Some(stall_timeout_ms) = req.stall_timeout_ms {
+            mark_command_stalled(&mut out, stall_timeout_ms);
+        }
         if let Some(token) = observation_token {
             let elapsed_ms = u64::try_from(out.duration.as_millis()).unwrap_or(u64::MAX);
             if req.cancellation_token.is_cancelled() || out.timed_out {
@@ -437,6 +516,11 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             } else {
                 token.record_completed(elapsed_ms).await;
             }
+        }
+        if stalled {
+            return Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Timeout {
+                output: Box::new(out),
+            })));
         }
         Ok(out)
     }

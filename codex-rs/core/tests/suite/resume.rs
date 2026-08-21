@@ -113,6 +113,7 @@ async fn resume_includes_initial_messages_from_rollout_events() -> Result<()> {
                     EventMsg::AgentMessage(_),
                     EventMsg::TokenCount(_),
                     EventMsg::TurnComplete(_),
+                    EventMsg::ReasoningPolicySummary(_),
                 ]
             )
         },
@@ -129,6 +130,7 @@ async fn resume_includes_initial_messages_from_rollout_events() -> Result<()> {
             EventMsg::AgentMessage(assistant_message),
             EventMsg::TokenCount(_),
             EventMsg::TurnComplete(completed),
+            EventMsg::ReasoningPolicySummary(_),
         ] => {
             assert_eq!(first_user.message, "Record some messages");
             assert_eq!(first_user.text_elements, text_elements);
@@ -201,6 +203,7 @@ async fn resume_includes_initial_messages_from_reasoning_events() -> Result<()> 
                     EventMsg::AgentMessage(_),
                     EventMsg::TokenCount(_),
                     EventMsg::TurnComplete(_),
+                    EventMsg::ReasoningPolicySummary(_),
                 ]
             )
         },
@@ -220,6 +223,7 @@ async fn resume_includes_initial_messages_from_reasoning_events() -> Result<()> 
             EventMsg::AgentMessage(assistant_message),
             EventMsg::TokenCount(_),
             EventMsg::TurnComplete(completed),
+            EventMsg::ReasoningPolicySummary(_),
         ] => {
             assert_eq!(first_user.message, "Record reasoning messages");
             assert_eq!(reasoning.text, "Summarized step");
@@ -272,7 +276,7 @@ async fn resume_includes_initial_messages_from_reasoning_events() -> Result<()> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn resume_switches_models_preserves_base_instructions() -> Result<()> {
+async fn resume_preserves_persisted_model_and_base_instructions() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -378,26 +382,31 @@ async fn resume_switches_models_preserves_base_instructions() -> Result<()> {
 
     let first_resumed = &requests[0];
     assert_eq!(first_resumed.instructions_text(), initial_instructions);
+    assert_eq!(first_resumed.body_json()["model"].as_str(), Some("gpt-5.2"));
     let first_developer_texts = first_resumed.message_input_texts("developer");
     let first_model_switch_count = first_developer_texts
         .iter()
         .filter(|text| text.contains("<model_switch>"))
         .count();
-    assert!(
-        first_model_switch_count >= 1,
-        "expected model switch message on first post-resume turn"
+    assert_eq!(
+        first_model_switch_count, 0,
+        "cold resume should preserve the persisted model without a synthetic model switch"
     );
 
     let second_resumed = &requests[1];
     assert_eq!(second_resumed.instructions_text(), initial_instructions);
+    assert_eq!(
+        second_resumed.body_json()["model"].as_str(),
+        Some("gpt-5.2")
+    );
     let second_developer_texts = second_resumed.message_input_texts("developer");
     let second_model_switch_count = second_developer_texts
         .iter()
         .filter(|text| text.contains("<model_switch>"))
         .count();
     assert_eq!(
-        second_model_switch_count, 1,
-        "did not expect duplicate model switch message after first post-resume turn"
+        second_model_switch_count, 0,
+        "persisted-model continuation should not add a model switch"
     );
 
     Ok(())

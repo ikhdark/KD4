@@ -37,7 +37,6 @@ use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
-use serde_json::json;
 use std::sync::Arc;
 use tempfile::TempDir;
 use wiremock::MockServer;
@@ -93,6 +92,29 @@ fn json_message_input_texts(request: &Value, role: &str) -> Vec<String> {
                 .and_then(Value::as_str)
                 .map(str::to_string)
         })
+        .collect()
+}
+
+fn is_injected_user_context(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with("<environment_context>")
+        || text.starts_with("<task_model_guidance>")
+        || text.starts_with("<recommended_plugins>")
+        || text.starts_with("# AGENTS.md instructions")
+}
+
+fn json_conversation_user_texts(request: &Value) -> Vec<String> {
+    json_message_input_texts(request, "user")
+        .into_iter()
+        .filter(|text| !is_injected_user_context(text))
+        .collect()
+}
+
+fn response_conversation_user_texts(request: &ResponsesRequest) -> Vec<String> {
+    request
+        .message_input_texts("user")
+        .into_iter()
+        .filter(|text| !is_injected_user_context(text))
         .collect()
 }
 
@@ -165,117 +187,33 @@ async fn compact_resume_and_fork_preserve_model_history_view() {
     let mut requests = gather_request_bodies(&request_log);
     normalize_compact_prompts(&mut requests);
 
-    // input after compact is a prefix of input after resume/fork
-    let input_after_compact = json!(requests[requests.len() - 3]["input"]);
-    let input_after_resume = json!(requests[requests.len() - 2]["input"]);
-    let input_after_fork = json!(requests[requests.len() - 1]["input"]);
-
-    let compact_arr = input_after_compact
-        .as_array()
-        .expect("input after compact should be an array");
-    let resume_arr = input_after_resume
-        .as_array()
-        .expect("input after resume should be an array");
-    let fork_arr = input_after_fork
-        .as_array()
-        .expect("input after fork should be an array");
-
-    assert!(
-        compact_arr.len() <= resume_arr.len(),
-        "after-resume input should have at least as many items as after-compact",
-    );
-    assert_eq!(compact_arr.as_slice(), &resume_arr[..compact_arr.len()]);
-
-    assert!(
-        compact_arr.len() <= fork_arr.len(),
-        "after-fork input should have at least as many items as after-compact",
-    );
     assert_eq!(
-        &compact_arr.as_slice()[..compact_arr.len()],
-        &fork_arr[..compact_arr.len()]
+        json_conversation_user_texts(&requests[0]),
+        vec!["hello world".to_string()]
     );
-
-    let first_request_user_texts = json_message_input_texts(&requests[0], "user");
-    let first_turn_user_index = first_request_user_texts
-        .len()
-        .checked_sub(1)
-        .expect("first turn request missing user messages");
-    assert_eq!(
-        first_request_user_texts[first_turn_user_index],
-        "hello world"
-    );
-    let seeded_user_prefix = &first_request_user_texts[..first_turn_user_index];
     let summary_after_compact = extract_summary_user_text(&requests[2], SUMMARY_TEXT);
     let summary_after_resume = extract_summary_user_text(&requests[3], SUMMARY_TEXT);
     let summary_after_fork = extract_summary_user_text(&requests[4], SUMMARY_TEXT);
-    let mut expected_after_compact_user_texts =
-        vec!["hello world".to_string(), summary_after_compact];
-    expected_after_compact_user_texts.extend_from_slice(seeded_user_prefix);
-    expected_after_compact_user_texts.push("AFTER_COMPACT".to_string());
     assert_eq!(
-        json_message_input_texts(&requests[2], "user"),
-        expected_after_compact_user_texts
+        json_conversation_user_texts(&requests[2]),
+        vec![summary_after_compact, "AFTER_COMPACT".to_string()]
     );
-
-    let mut expected_after_resume_user_texts =
-        vec!["hello world".to_string(), summary_after_resume];
-    expected_after_resume_user_texts.extend_from_slice(seeded_user_prefix);
-    expected_after_resume_user_texts.push("AFTER_COMPACT".to_string());
-    let after_resume_user_texts = json_message_input_texts(&requests[3], "user");
-    let (after_resume_last, after_resume_prefix) = after_resume_user_texts
-        .split_last()
-        .expect("after-resume request missing user messages");
-    assert_eq!(after_resume_last, "AFTER_RESUME");
-    assert!(
-        after_resume_prefix.starts_with(&expected_after_resume_user_texts),
-        "after-resume user texts should preserve compacted history prefix"
+    assert_eq!(
+        json_conversation_user_texts(&requests[3]),
+        vec![
+            summary_after_resume,
+            "AFTER_COMPACT".to_string(),
+            "AFTER_RESUME".to_string(),
+        ]
     );
-    let after_resume_seeded_suffix = &after_resume_prefix[expected_after_resume_user_texts.len()..];
-    if seeded_user_prefix.is_empty() {
-        assert!(
-            after_resume_seeded_suffix.is_empty(),
-            "after-resume request should not append unexpected user prefix items"
-        );
-    } else {
-        let mut chunks = after_resume_seeded_suffix.chunks_exact(seeded_user_prefix.len());
-        assert!(
-            chunks.remainder().is_empty(),
-            "after-resume suffix should be whole seeded-prefix repeats"
-        );
-        for chunk in &mut chunks {
-            assert_eq!(chunk, seeded_user_prefix);
-        }
-    }
-
-    let after_fork_user_texts = json_message_input_texts(&requests[4], "user");
-    let mut expected_after_fork_history_prefix =
-        vec!["hello world".to_string(), summary_after_fork];
-    expected_after_fork_history_prefix.extend_from_slice(seeded_user_prefix);
-    expected_after_fork_history_prefix.push("AFTER_COMPACT".to_string());
-    let (after_fork_last, after_fork_prefix) = after_fork_user_texts
-        .split_last()
-        .expect("after-fork request missing user messages");
-    assert_eq!(after_fork_last, "AFTER_FORK");
-    assert!(
-        after_fork_prefix.starts_with(&expected_after_fork_history_prefix),
-        "after-fork user texts should preserve compacted user history prefix"
+    assert_eq!(
+        json_conversation_user_texts(&requests[4]),
+        vec![
+            summary_after_fork,
+            "AFTER_COMPACT".to_string(),
+            "AFTER_FORK".to_string(),
+        ]
     );
-    let after_fork_seeded_suffix = &after_fork_prefix[expected_after_fork_history_prefix.len()..];
-    if seeded_user_prefix.is_empty() {
-        assert!(
-            after_fork_seeded_suffix.is_empty(),
-            "after-fork request should not append unexpected user prefix items"
-        );
-    } else {
-        let mut chunks = after_fork_seeded_suffix.chunks_exact(seeded_user_prefix.len());
-        assert!(
-            chunks.remainder().is_empty(),
-            "after-fork suffix should be whole seeded-prefix repeats"
-        );
-        for chunk in &mut chunks {
-            assert_eq!(chunk, seeded_user_prefix);
-        }
-    }
     assert_eq!(requests.len(), 5);
 }
 
@@ -336,90 +274,35 @@ async fn compact_resume_after_second_compaction_preserves_history() -> Result<()
         .collect::<Vec<_>>();
     requests.iter_mut().for_each(normalize_line_endings);
     normalize_compact_prompts(&mut requests);
-    let input_after_compact = json!(requests[requests.len() - 2]["input"]);
-    let input_after_resume = json!(requests[requests.len() - 1]["input"]);
-
-    // test input after compact before resume is the same as input after resume
-    let compact_input_array = input_after_compact
-        .as_array()
-        .expect("input after compact should be an array");
-    let resume_input_array = input_after_resume
-        .as_array()
-        .expect("input after resume should be an array");
-    assert!(
-        compact_input_array.len() <= resume_input_array.len(),
-        "after-resume input should have at least as many items as after-compact"
-    );
     assert_eq!(
-        compact_input_array.as_slice(),
-        &resume_input_array[..compact_input_array.len()]
+        json_conversation_user_texts(&requests[0]),
+        vec!["hello world".to_string()]
     );
-    let first_request_user_texts = json_message_input_texts(&requests[0], "user");
-    let first_turn_user_index = first_request_user_texts
-        .len()
-        .checked_sub(1)
-        .expect("first turn request missing user messages");
-    assert_eq!(
-        first_request_user_texts[first_turn_user_index],
-        "hello world"
-    );
-    let seeded_user_prefix = &first_request_user_texts[..first_turn_user_index];
     let summary_after_second_compact =
         extract_summary_user_text(&requests[requests.len() - 2], SUMMARY_TEXT);
-    let mut expected_after_second_compact_user_texts = vec![
-        "hello world".to_string(),
-        "AFTER_COMPACT".to_string(),
+    let expected_after_second_compact_user_texts = vec![
         "AFTER_RESUME".to_string(),
         "AFTER_FORK".to_string(),
-        summary_after_second_compact.clone(),
+        summary_after_second_compact,
+        "AFTER_COMPACT_2".to_string(),
     ];
-    expected_after_second_compact_user_texts.extend_from_slice(seeded_user_prefix);
-    expected_after_second_compact_user_texts.push("AFTER_COMPACT_2".to_string());
-    let mut expected_fork_local_user_texts =
-        vec!["AFTER_FORK".to_string(), summary_after_second_compact];
-    expected_fork_local_user_texts.extend_from_slice(seeded_user_prefix);
-    expected_fork_local_user_texts.push("AFTER_COMPACT_2".to_string());
-    let final_user_texts = json_message_input_texts(&requests[requests.len() - 1], "user");
-    let (final_last, final_prefix) = final_user_texts
-        .split_last()
-        .expect("after-second-resume request missing user messages");
-    assert_eq!(final_last, AFTER_SECOND_RESUME);
-    let matched_prefix_len = if let Some(start) = final_prefix
-        .windows(expected_after_second_compact_user_texts.len())
-        .position(|window| window == expected_after_second_compact_user_texts)
-    {
-        start + expected_after_second_compact_user_texts.len()
-    } else if let Some(start) = final_prefix
-        .windows(expected_fork_local_user_texts.len())
-        .position(|window| window == expected_fork_local_user_texts)
-    {
-        start + expected_fork_local_user_texts.len()
-    } else {
-        panic!("after-second-resume user texts should preserve post-compact user history prefix");
-    };
-    let final_seeded_suffix = &final_prefix[matched_prefix_len..];
-    if seeded_user_prefix.is_empty() {
-        assert!(
-            final_seeded_suffix.is_empty(),
-            "after-second-resume request should not append unexpected user prefix items"
-        );
-    } else {
-        let mut chunks = final_seeded_suffix.chunks_exact(seeded_user_prefix.len());
-        assert!(
-            chunks.remainder().is_empty(),
-            "after-second-resume suffix should be whole seeded-prefix repeats"
-        );
-        for chunk in &mut chunks {
-            assert_eq!(chunk, seeded_user_prefix);
-        }
-    }
+    assert_eq!(
+        json_conversation_user_texts(&requests[requests.len() - 2]),
+        expected_after_second_compact_user_texts
+    );
+    let mut expected_after_second_resume_user_texts = expected_after_second_compact_user_texts;
+    expected_after_second_resume_user_texts.push(AFTER_SECOND_RESUME.to_string());
+    assert_eq!(
+        json_conversation_user_texts(&requests[requests.len() - 1]),
+        expected_after_second_resume_user_texts
+    );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 /// Scenario: rolling back behind a pre-turn compaction should replay
-/// append-only history from the rollout file and keep earlier compacted
-/// history visible.
+/// append-only history from the rollout file and keep the compaction summary
+/// visible without restoring source messages consumed by compaction.
 async fn snapshot_rollback_past_compaction_replays_append_only_history() -> Result<()> {
     if network_disabled() {
         println!("Skipping test because network is disabled in this sandbox");
@@ -467,17 +350,17 @@ async fn snapshot_rollback_past_compaction_replays_append_only_history() -> Resu
     let requests = request_log.requests();
     assert_eq!(requests.len(), 4);
     assert!(requests[1].body_contains_text(SUMMARIZATION_PROMPT));
-    assert!(requests[2].body_contains_text("hello world"));
+    assert!(!requests[2].body_contains_text("hello world"));
     assert!(requests[2].body_contains_text(SUMMARY_TEXT));
     assert!(requests[2].body_contains_text(EDITED_AFTER_COMPACT));
-    let after_rollback_user_texts = requests[3].message_input_texts("user");
+    let after_rollback_user_texts = response_conversation_user_texts(&requests[3]);
     let after_rollback_last = after_rollback_user_texts
         .last()
         .expect("post-rollback request missing user messages");
     assert_eq!(after_rollback_last, AFTER_ROLLBACK);
     assert!(
-        requests[3].body_contains_text("hello world"),
-        "the first turn should remain visible after rollback behind compaction",
+        !requests[3].body_contains_text("hello world"),
+        "rollback must not restore source messages consumed by compaction",
     );
     assert!(
         !requests[3].body_contains_text(EDITED_AFTER_COMPACT),
@@ -605,14 +488,15 @@ async fn snapshot_rollback_followup_turn_trims_context_updates() -> Result<()> {
         .count();
     assert_eq!(after_rollback_developer_count, 1);
 
-    let after_rollback_user_texts = requests[2].message_input_texts("user");
+    let after_rollback_all_user_texts = requests[2].message_input_texts("user");
     assert_eq!(
-        after_rollback_user_texts
+        after_rollback_all_user_texts
             .iter()
             .filter(|text| text.contains(PRETURN_CONTEXT_DIFF_CWD))
             .count(),
         1
     );
+    let after_rollback_user_texts = response_conversation_user_texts(&requests[2]);
     assert_eq!(
         after_rollback_user_texts.last().map(String::as_str),
         Some(FOLLOWUP_USER)

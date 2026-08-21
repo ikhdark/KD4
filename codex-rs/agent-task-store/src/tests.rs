@@ -2452,6 +2452,95 @@ async fn exhausted_review_and_failed_verification_transition_to_needs_main() {
 }
 
 #[tokio::test]
+async fn wake_wait_is_event_driven_and_observes_the_next_commit() {
+    let fixture = Fixture::new().await;
+    let (_, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), worker_draft("wait-root", "src"))
+        .await
+        .expect("assignment");
+    let cursor = fixture
+        .store
+        .read_wake_events("wait-root".to_string(), None)
+        .await
+        .expect("initial wake read")
+        .latest_event_id;
+    let waiter_store = fixture.store.clone();
+    let waiter = tokio::spawn(async move {
+        waiter_store
+            .wait_for_wake_events("wait-root".to_string(), cursor)
+            .await
+    });
+    tokio::task::yield_now().await;
+
+    fixture
+        .store
+        .append_observation(
+            attempt.attempt_id,
+            ObservationKind::Reading,
+            "event-driven progress".to_string(),
+            None,
+        )
+        .await
+        .expect("observation appends");
+
+    let wake = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+        .await
+        .expect("wake wait should not poll until a maintenance boundary")
+        .expect("wake task joins")
+        .expect("wake read succeeds");
+    assert_eq!(wake.updated_agents.len(), 1);
+    assert_eq!(wake.updated_agents[0].reason, ObservationKind::Reading);
+}
+
+#[tokio::test]
+async fn wake_wait_observes_a_commit_from_an_independent_store_instance() {
+    let fixture = Fixture::new().await;
+    let (_, attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            worker_draft("external-wait-root", "src"),
+        )
+        .await
+        .expect("assignment");
+    let independent_store = LocalAgentTaskStore::initialize(&fixture.state)
+        .await
+        .expect("independent store");
+    let cursor = fixture
+        .store
+        .read_wake_events("external-wait-root".to_string(), None)
+        .await
+        .expect("initial wake read")
+        .latest_event_id;
+    let waiter_store = fixture.store.clone();
+    let waiter = tokio::spawn(async move {
+        waiter_store
+            .wait_for_wake_events("external-wait-root".to_string(), cursor)
+            .await
+    });
+    tokio::task::yield_now().await;
+
+    independent_store
+        .append_observation(
+            attempt.attempt_id,
+            ObservationKind::Reading,
+            "cross-instance progress".to_string(),
+            None,
+        )
+        .await
+        .expect("independent observation appends");
+
+    let wake = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+        .await
+        .expect("durable wake recheck should observe the external commit")
+        .expect("wake task joins")
+        .expect("wake read succeeds");
+    assert_eq!(wake.updated_agents.len(), 1);
+    assert_eq!(wake.updated_agents[0].reason, ObservationKind::Reading);
+}
+
+#[tokio::test]
 async fn wake_stream_is_bounded_non_draining_and_rebuilt() {
     let fixture = Fixture::new().await;
     let (_, attempt) = fixture
@@ -2520,11 +2609,21 @@ async fn wake_stream_is_bounded_non_draining_and_rebuilt() {
             assert!(page.timed_out);
             break;
         }
-        assert_eq!(page.lost_to_retention_count, 0);
-        assert_eq!(
-            page.truncated_count, page.remaining_count,
-            "watermarked pages must report only retained unread events"
-        );
+        if cursor.is_none() {
+            assert_eq!(page.lost_to_retention_count, first.lost_to_retention_count);
+            assert_eq!(
+                page.truncated_count,
+                page.lost_to_retention_count
+                    .saturating_add(page.remaining_count),
+                "the initial retained page reports retention loss and unread events"
+            );
+        } else {
+            assert_eq!(page.lost_to_retention_count, 0);
+            assert_eq!(
+                page.truncated_count, page.remaining_count,
+                "watermarked pages must report only retained unread events"
+            );
+        }
         for event in &page.updated_agents {
             assert!(
                 retained_ids.insert(event.event_id),

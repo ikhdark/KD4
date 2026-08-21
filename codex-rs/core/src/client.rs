@@ -2324,6 +2324,11 @@ impl ModelClient {
             self.request_schema_components(prompt, verbosity, model_info.use_responses_lite)?;
         let (instructions, tools) = if model_info.use_responses_lite {
             let mut prefix = Vec::with_capacity(2 + input.len());
+            prefix.push(ResponseItem::AdditionalTools {
+                id: None,
+                role: "developer".to_string(),
+                tools,
+            });
             if !prompt.base_instructions.text.is_empty() {
                 prefix.push(ResponseItem::Message {
                     id: None,
@@ -2335,11 +2340,6 @@ impl ModelClient {
                     internal_chat_message_metadata_passthrough: None,
                 });
             }
-            prefix.push(ResponseItem::AdditionalTools {
-                id: None,
-                role: "developer".to_string(),
-                tools,
-            });
             prefix.extend(input.iter().cloned());
             input = Arc::from(prefix);
             (String::new(), None)
@@ -2735,7 +2735,6 @@ impl ModelClientSession {
         self.invalidate_incremental_history(reason);
         self.prompt_context_baseline = None;
         self.prepared_startup_websocket_attempt = None;
-        self.revoke_cache_publication();
     }
 
     fn remember_request_history(

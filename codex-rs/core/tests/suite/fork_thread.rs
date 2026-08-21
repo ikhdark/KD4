@@ -118,10 +118,7 @@ async fn fork_thread_twice_drops_to_first_message() {
 
     // GetHistory on fork1 flushed; the file is ready.
     let fork1_items = read_rollout_items(&fork1_path);
-    pretty_assertions::assert_eq!(
-        serde_json::to_value(&fork1_items).unwrap(),
-        serde_json::to_value(&expected_after_first).unwrap()
-    );
+    assert_fork_rollout(&fork1_items, &expected_after_first);
 
     // Fork again with n=0 → drops the (new) last user message, leaving only the first.
     let NewThread {
@@ -148,10 +145,7 @@ async fn fork_thread_twice_drops_to_first_message() {
         .unwrap_or(0);
     let expected_after_second: Vec<RolloutItem> = fork1_items[..cut_last_on_fork1].to_vec();
     let fork2_items = read_rollout_items(&fork2_path);
-    pretty_assertions::assert_eq!(
-        serde_json::to_value(&fork2_items).unwrap(),
-        serde_json::to_value(&expected_after_second).unwrap()
-    );
+    assert_fork_rollout(&fork2_items, &expected_after_second);
 }
 
 #[test]
@@ -275,6 +269,27 @@ fn contains_reasoning(items: &[RolloutItem], expected_id: &str) -> bool {
                 if id.as_str() == expected_id
         )
     })
+}
+
+fn assert_fork_rollout(actual: &[RolloutItem], expected_copied_prefix: &[RolloutItem]) {
+    assert_eq!(
+        actual.len(),
+        expected_copied_prefix.len() + 1,
+        "a fork should append exactly one authoritative child-settings snapshot"
+    );
+    pretty_assertions::assert_eq!(
+        serde_json::to_value(&actual[..expected_copied_prefix.len()])
+            .expect("actual fork rollout prefix should serialize"),
+        serde_json::to_value(expected_copied_prefix)
+            .expect("expected fork rollout prefix should serialize")
+    );
+    assert!(
+        matches!(
+            actual.last(),
+            Some(RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(_)))
+        ),
+        "fork rollout should end with the child's authoritative thread settings"
+    );
 }
 
 fn read_rollout_items(path: &std::path::Path) -> Vec<RolloutItem> {

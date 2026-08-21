@@ -252,7 +252,11 @@ def validate_explicit_output_paths(
 ) -> None:
     explicit_paths = [
         ("--entrypoint-bin", "prebuilt entrypoint executable", entrypoint_bin),
-        ("--code-mode-host-bin", "prebuilt code-mode host executable", code_mode_host_bin),
+        (
+            "--code-mode-host-bin",
+            "prebuilt code-mode host executable",
+            code_mode_host_bin,
+        ),
         ("--bwrap-bin", "prebuilt Linux bwrap executable", bwrap_bin),
         (
             "--codex-command-runner-bin",

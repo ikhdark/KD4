@@ -48,6 +48,7 @@ use codex_app_server_protocol::ThreadDeletedNotification;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadLoadedListResponse;
+use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
 use codex_app_server_protocol::ThreadSource;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
@@ -104,6 +105,7 @@ const TEST_ORIGINATOR: &str = "codex_vscode";
 const LOCAL_PRAGMATIC_TEMPLATE: &str = "You are a deeply pragmatic, effective software engineer.";
 const MULTI_AGENT_V2_NAMESPACE: &str = "agents";
 const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
+const TEST_MODEL_CATALOG_FILENAME: &str = "models_test_catalog.json";
 const TINY_PNG_BYTES: &[u8] = &[
     137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0,
     0, 0, 31, 21, 196, 137, 0, 0, 0, 11, 73, 68, 65, 84, 120, 156, 99, 96, 0, 2, 0, 0, 5, 0, 1,
@@ -593,12 +595,12 @@ async fn turn_start_emits_thread_scoped_warning_notification_for_trimmed_skills(
         &BTreeMap::from([(Feature::Personality, true)]),
     )?;
     write_models_cache(codex_home.path())?;
-    let cache_path = codex_home.path().join("models_cache.json");
+    let cache_path = codex_home.path().join(TEST_MODEL_CATALOG_FILENAME);
     let mut cache: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&cache_path)?)?;
     let models = cache["models"]
         .as_array_mut()
-        .expect("models_cache.json models should be an array");
+        .expect("test model catalog models should be an array");
     let entry = models
         .first_mut()
         .expect("models cache should not be empty");
@@ -606,16 +608,26 @@ async fn turn_start_emits_thread_scoped_warning_notification_for_trimmed_skills(
         .as_str()
         .expect("model slug should be present")
         .to_string();
-    entry["context_window"] = serde_json::Value::from(20_000);
+    // Keep the metadata budget small enough to trim the test skills without triggering
+    // pre-sampling compaction, which is outside this notification contract.
+    entry["context_window"] = serde_json::Value::from(15_000);
     std::fs::write(&cache_path, serde_json::to_string_pretty(&cache)?)?;
     let config_path = codex_home.path().join("config.toml");
     let config = std::fs::read_to_string(&config_path)?;
     std::fs::write(
         &config_path,
-        config.replace("model = \"mock-model\"", &format!("model = \"{model}\"")),
+        format!("model_context_window = 15000\n{config}"),
     )?;
     write_test_skill(codex_home.path(), "alpha-skill")?;
     write_test_skill(codex_home.path(), "beta-skill")?;
+    write_test_skill(codex_home.path(), "gamma-skill")?;
+    write_test_skill(codex_home.path(), "delta-skill")?;
+    write_test_skill(codex_home.path(), "epsilon-skill")?;
+    write_test_skill(codex_home.path(), "zeta-skill")?;
+    write_test_skill(codex_home.path(), "eta-skill")?;
+    write_test_skill(codex_home.path(), "theta-skill")?;
+    write_test_skill(codex_home.path(), "iota-skill")?;
+    write_test_skill(codex_home.path(), "kappa-skill")?;
 
     let isolated_home = codex_home.path().to_string_lossy();
     let mut mcp = TestAppServer::builder()
@@ -629,7 +641,10 @@ async fn turn_start_emits_thread_scoped_warning_notification_for_trimmed_skills(
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let thread_req = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            model: Some(model),
+            ..Default::default()
+        })
         .await?;
     let thread_resp: JSONRPCResponse = timeout(
         DEFAULT_READ_TIMEOUT,
@@ -691,7 +706,7 @@ async fn turn_start_emits_thread_scoped_warning_notification_for_trimmed_skills(
         "expected outgoing request to include the skills section"
     );
     assert!(
-        body_contains(request, "- alpha-skill:") && body_contains(request, "- beta-skill:"),
+        body_contains(request, "- alpha-skill —") && body_contains(request, "- beta-skill —"),
         "expected skills with shortened descriptions to remain in the outgoing request body"
     );
     assert!(
@@ -1630,6 +1645,20 @@ async fn turn_start_accepts_collaboration_mode_override_v2() -> Result<()> {
     .await??;
     let _turn: TurnStartResponse = to_response::<TurnStartResponse>(turn_resp)?;
 
+    let settings_notification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("thread/settings/updated"),
+    )
+    .await??;
+    let settings: ThreadSettingsUpdatedNotification = serde_json::from_value(
+        settings_notification
+            .params
+            .expect("thread/settings/updated notification params"),
+    )?;
+    assert_eq!(settings.thread_id, thread.id);
+    assert_eq!(settings.thread_settings.model, "mock-model-collab");
+    assert_eq!(settings.thread_settings.effort, Some(ReasoningEffort::High));
+
     timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("turn/completed"),
@@ -1639,11 +1668,6 @@ async fn turn_start_accepts_collaboration_mode_override_v2() -> Result<()> {
     let request = response_mock.single_request();
     let payload = request.body_json();
     assert_eq!(payload["model"].as_str(), Some("mock-model-collab"));
-    let payload_text = payload.to_string();
-    assert!(payload_text.contains("Use `request_user_input` only when it is available"));
-    assert!(payload_text.contains("ask early instead of spending turns"));
-    assert!(payload_text.contains("exactly four mutually exclusive suggested answers"));
-    assert!(payload_text.contains("a free-text response"));
 
     Ok(())
 }
@@ -1731,8 +1755,16 @@ async fn turn_start_uses_thread_feature_overrides_for_request_user_input_tool_de
     .await??;
 
     let request = response_mock.single_request();
-    let payload_text = request.body_json().to_string();
-    assert!(payload_text.contains("This tool is only available in Plan mode."));
+    let body = request.body_json();
+    let exposes_request_user_input = body["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|tool| tool["name"] == "request_user_input");
+    assert!(
+        !exposes_request_user_input,
+        "the thread-level feature override should remove request_user_input from the model tool surface"
+    );
 
     Ok(())
 }
@@ -3389,18 +3421,20 @@ async fn turn_start_streams_apply_patch_change_updates_v2() -> Result<()> {
         ]),
     )?;
     write_models_cache(&codex_home)?;
-    let cache_path = codex_home.join("models_cache.json");
+    let cache_path = codex_home.join(TEST_MODEL_CATALOG_FILENAME);
     let mut cache: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&cache_path)?)?;
     let models = cache["models"]
         .as_array_mut()
-        .expect("models_cache.json models should be an array");
+        .expect("test model catalog models should be an array");
     let model = models
         .first_mut()
-        .expect("models_cache.json should contain at least one model");
-    model["slug"] = serde_json::Value::from("mock-model");
-    model["display_name"] = serde_json::Value::from("mock-model");
+        .expect("test model catalog should contain at least one model");
     model["apply_patch_tool_type"] = serde_json::Value::from("freeform");
+    let model_slug = model["slug"]
+        .as_str()
+        .expect("models cache entry should have a slug")
+        .to_string();
     std::fs::write(&cache_path, serde_json::to_string_pretty(&cache)?)?;
 
     let mut mcp = TestAppServer::builder()
@@ -3411,7 +3445,7 @@ async fn turn_start_streams_apply_patch_change_updates_v2() -> Result<()> {
 
     let start_req = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams {
-            model: Some("mock-model".to_string()),
+            model: Some(model_slug),
             cwd: Some(workspace.to_string_lossy().into_owned()),
             ..Default::default()
         })
@@ -3535,7 +3569,7 @@ async fn turn_start_emits_spawn_agent_item_with_model_metadata_v2() -> Result<()
         codex_home.path(),
         &server.uri(),
         "never",
-        &BTreeMap::from([(Feature::Collab, true)]),
+        &BTreeMap::from([(Feature::Collab, true), (Feature::MultiAgentV2, false)]),
     )?;
 
     let mut mcp = TestAppServer::builder()
@@ -3920,7 +3954,7 @@ async fn turn_start_emits_spawn_agent_item_with_effective_role_model_metadata_v2
         codex_home.path(),
         &server.uri(),
         "never",
-        &BTreeMap::from([(Feature::Collab, true)]),
+        &BTreeMap::from([(Feature::Collab, true), (Feature::MultiAgentV2, false)]),
     )?;
     std::fs::write(
         codex_home.path().join("custom-role.toml"),

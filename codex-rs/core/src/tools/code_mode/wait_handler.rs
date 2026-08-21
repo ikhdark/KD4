@@ -2,7 +2,9 @@ use serde::Deserialize;
 use sha2::Digest;
 use sha2::Sha256;
 use std::future::Future;
+use std::time::Duration;
 use std::time::Instant;
+use tracing::warn;
 
 use crate::function_tool::FunctionCallError;
 use crate::session::InputQueueActivity;
@@ -27,6 +29,8 @@ use super::WAIT_TOOL_NAME;
 use super::handle_runtime_response;
 use super::wait_spec::create_wait_tool;
 
+const CANCELLED_CELL_TERMINATION_GRACE: Duration = Duration::from_secs(2);
+
 pub struct CodeModeWaitHandler;
 
 #[derive(Debug, Deserialize)]
@@ -42,17 +46,6 @@ struct ExecWaitArgs {
 
 fn default_wait_yield_time_ms() -> u64 {
     DEFAULT_WAIT_YIELD_TIME_MS
-}
-
-pub(super) fn effective_observation_yield_time_ms(yield_time_ms: u64) -> u64 {
-    // A zero-duration owner-held observation would turn a formerly visible
-    // yield loop into a host-side busy loop. Reuse the existing default
-    // observation cadence without treating it as a completion deadline.
-    if yield_time_ms == 0 {
-        DEFAULT_WAIT_YIELD_TIME_MS
-    } else {
-        yield_time_ms
-    }
 }
 
 #[derive(Debug)]
@@ -136,15 +129,17 @@ impl CodeModeWaitHandler {
                         .input_queue
                         .subscribe_activity(turn_state.as_deref())
                         .await;
-                    let yield_time_ms = effective_observation_yield_time_ms(args.yield_time_ms);
-                    let held = hold_unchanged_waits(
+                    // Periodic empty observations are host-owned and no longer
+                    // wake the model. The compatibility cadence argument stays
+                    // accepted, while the runtime now wakes this owner on
+                    // output, explicit `yield_control()`, or terminal completion.
+                    let _requested_yield_time_ms = args.yield_time_ms;
+                    let held = hold_until_state_change(
                         || {
-                            exec.session.services.code_mode_service.wait(
-                                codex_code_mode::WaitRequest {
-                                    cell_id: cell_id.clone(),
-                                    yield_time_ms,
-                                },
-                            )
+                            exec.session
+                                .services
+                                .code_mode_service
+                                .wait_for_state_change(cell_id.clone())
                         },
                         &cancellation_token,
                         activity_rx,
@@ -156,6 +151,9 @@ impl CodeModeWaitHandler {
                         Ok(held) => held,
                         Err(error) => {
                             record_internally_drained_waits(&exec, error.drained_observations);
+                            if cancellation_token.is_cancelled() {
+                                terminate_cancelled_cell(&exec, &cell_id).await;
+                            }
                             return Err(FunctionCallError::RespondToModel(error.message));
                         }
                     };
@@ -218,6 +216,50 @@ impl CodeModeWaitHandler {
     }
 }
 
+pub(super) async fn terminate_cancelled_cell(
+    exec: &ExecContext,
+    cell_id: &codex_code_mode::CellId,
+) {
+    let termination = tokio::time::timeout(
+        CANCELLED_CELL_TERMINATION_GRACE,
+        exec.session
+            .services
+            .code_mode_service
+            .terminate(cell_id.clone()),
+    )
+    .await;
+    match termination {
+        Ok(Ok(codex_code_mode::WaitOutcome::LiveCell(response))) => {
+            exec.session
+                .services
+                .rollout_thread_trace
+                .code_cell_trace_context(exec.turn.sub_id.as_str(), cell_id.as_str())
+                .record_ended(&response);
+        }
+        Ok(Ok(codex_code_mode::WaitOutcome::MissingCell(_))) => {}
+        Ok(Err(error)) => {
+            warn!(
+                turn_id = %exec.turn.sub_id,
+                runtime_cell_id = %cell_id,
+                %error,
+                "failed to terminate cancelled code mode cell"
+            );
+        }
+        Err(_) => {
+            warn!(
+                turn_id = %exec.turn.sub_id,
+                runtime_cell_id = %cell_id,
+                grace_ms = CANCELLED_CELL_TERMINATION_GRACE.as_millis(),
+                "timed out terminating cancelled code mode cell"
+            );
+        }
+    }
+    exec.session
+        .services
+        .code_mode_service
+        .finish_cell_dispatch(cell_id);
+}
+
 fn terminal_wait_owner_signal(
     outcome: &codex_code_mode::WaitOutcome,
     cell_id: &codex_code_mode::CellId,
@@ -247,54 +289,42 @@ fn terminal_wait_owner_signal(
     }))
 }
 
-pub(super) async fn hold_unchanged_waits<F, Fut>(
-    mut wait_once: F,
+pub(super) async fn hold_until_state_change<F, Fut>(
+    wait_once: F,
     cancellation_token: &tokio_util::sync::CancellationToken,
     mut activity_rx: tokio::sync::watch::Receiver<InputQueueActivity>,
     mut pending_activity: Option<InputQueueActivity>,
     cancellation_message: &'static str,
 ) -> Result<OwnerHeldCodeModeWait, OwnerHeldCodeModeWaitError>
 where
-    F: FnMut() -> Fut,
+    F: FnOnce() -> Fut,
     Fut: Future<Output = Result<codex_code_mode::WaitOutcome, String>>,
 {
-    let mut drained_observations = 0_u32;
-    loop {
-        let response = tokio::select! {
-            biased;
-            _ = cancellation_token.cancelled() => {
-                return Err(OwnerHeldCodeModeWaitError {
-                    message: cancellation_message.to_string(),
-                    drained_observations,
-                });
-            }
-            activity = next_input_activity(&mut activity_rx, &mut pending_activity) => {
-                return Ok(OwnerHeldCodeModeWait {
-                    exit: OwnerHeldCodeModeExit::InputActivity(activity),
-                    drained_observations,
-                });
-            }
-            result = wait_once() => {
-                match result {
-                    Ok(response) => response,
-                    Err(message) => {
-                        return Err(OwnerHeldCodeModeWaitError {
-                            message,
-                            drained_observations,
-                        });
-                    }
-                }
-            }
-        };
-        if is_empty_live_yield(&response) {
-            drained_observations = drained_observations.saturating_add(1);
-            tokio::task::yield_now().await;
-            continue;
+    tokio::select! {
+        biased;
+        _ = cancellation_token.cancelled() => {
+            Err(OwnerHeldCodeModeWaitError {
+                message: cancellation_message.to_string(),
+                drained_observations: 0,
+            })
         }
-        return Ok(OwnerHeldCodeModeWait {
-            exit: OwnerHeldCodeModeExit::Runtime(response),
-            drained_observations,
-        });
+        activity = next_input_activity(&mut activity_rx, &mut pending_activity) => {
+            Ok(OwnerHeldCodeModeWait {
+                exit: OwnerHeldCodeModeExit::InputActivity(activity),
+                drained_observations: 0,
+            })
+        }
+        result = wait_once() => {
+            result
+                .map(|response| OwnerHeldCodeModeWait {
+                    exit: OwnerHeldCodeModeExit::Runtime(response),
+                    drained_observations: 0,
+                })
+                .map_err(|message| OwnerHeldCodeModeWaitError {
+                    message,
+                    drained_observations: 0,
+                })
+        }
     }
 }
 
@@ -311,16 +341,6 @@ async fn next_input_activity(
         }
         std::future::pending::<()>().await;
     }
-}
-
-fn is_empty_live_yield(outcome: &codex_code_mode::WaitOutcome) -> bool {
-    matches!(
-        outcome,
-        codex_code_mode::WaitOutcome::LiveCell(codex_code_mode::RuntimeResponse::Yielded {
-            content_items,
-            ..
-        }) if content_items.is_empty()
-    )
 }
 
 fn unchanged_wait_receipt(
@@ -393,6 +413,12 @@ pub(super) fn attach_drained_wait_evidence(
 }
 
 impl CoreToolRuntime for CodeModeWaitHandler {
+    fn waits_for_runtime_cancellation(&self) -> bool {
+        // Cancellation must keep polling the handler through bounded cell
+        // termination so the V8/runtime owner cannot be orphaned.
+        true
+    }
+
     fn pre_tool_use_payload(&self, _invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
         // Code-mode `wait` is runtime control for an existing code cell, not a
         // standalone user action. Tool calls made from code mode still flow
@@ -415,7 +441,6 @@ impl CoreToolRuntime for CodeModeWaitHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
@@ -462,25 +487,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ten_unchanged_observations_are_held_until_one_meaningful_transition() {
+    async fn explicit_empty_state_change_is_returned_without_resampling() {
         let cell_id = codex_code_mode::CellId::new("cell-1".to_string());
-        let meaningful =
-            codex_code_mode::WaitOutcome::LiveCell(codex_code_mode::RuntimeResponse::Yielded {
-                cell_id: cell_id.clone(),
-                content_items: vec![codex_code_mode::FunctionCallOutputContentItem::InputText {
-                    text: "meaningful".to_string(),
-                }],
-            });
-        let mut observations = VecDeque::from(
-            std::iter::repeat_with(|| Ok(empty_yield(&cell_id)))
-                .take(10)
-                .chain(std::iter::once(Ok(meaningful)))
-                .collect::<Vec<_>>(),
-        );
+        let mut observations = 0_u32;
 
         let (_activity_tx, activity_rx) = tokio::sync::watch::channel(InputQueueActivity::Mailbox);
-        let held = hold_unchanged_waits(
-            || std::future::ready(observations.pop_front().expect("scripted observation")),
+        let held = hold_until_state_change(
+            || {
+                observations = observations.saturating_add(1);
+                std::future::ready(Ok(empty_yield(&cell_id)))
+            },
             &tokio_util::sync::CancellationToken::new(),
             activity_rx,
             None,
@@ -493,18 +509,16 @@ mod tests {
             held.exit,
             OwnerHeldCodeModeExit::Runtime(codex_code_mode::WaitOutcome::LiveCell(
                 codex_code_mode::RuntimeResponse::Yielded { content_items, .. }
-            )) if !content_items.is_empty()
+            )) if content_items.is_empty()
         ));
-        assert_eq!(held.drained_observations, 10);
-        assert!(observations.is_empty());
-        let receipt = unchanged_wait_receipt(&cell_id, held.drained_observations);
-        assert_eq!(receipt.suppressed_continuation_count, 10);
+        assert_eq!(held.drained_observations, 0);
+        assert_eq!(observations, 1);
     }
 
     #[tokio::test]
     async fn held_wait_preserves_error_and_cancellation() {
         let (_activity_tx, activity_rx) = tokio::sync::watch::channel(InputQueueActivity::Mailbox);
-        let error = hold_unchanged_waits(
+        let error = hold_until_state_change(
             || std::future::ready(Err("runtime failed".to_string())),
             &tokio_util::sync::CancellationToken::new(),
             activity_rx,
@@ -521,7 +535,7 @@ mod tests {
         let cancellation = tokio_util::sync::CancellationToken::new();
         cancellation.cancel();
         let (_activity_tx, activity_rx) = tokio::sync::watch::channel(InputQueueActivity::Mailbox);
-        let cancelled = hold_unchanged_waits(
+        let cancelled = hold_until_state_change(
             std::future::pending::<Result<codex_code_mode::WaitOutcome, String>>,
             &cancellation,
             activity_rx,
@@ -546,7 +560,7 @@ mod tests {
 
         let held = tokio::spawn(async move {
             let mut started_tx = Some(started_tx);
-            hold_unchanged_waits(
+            hold_until_state_change(
                 move || {
                     let started_tx = started_tx.take();
                     let marker = DropMarker(Arc::clone(&dropped_for_wait));
@@ -582,50 +596,13 @@ mod tests {
         assert!(dropped.load(Ordering::Acquire));
     }
 
-    #[tokio::test]
-    async fn arbitrary_empty_observation_count_does_not_end_held_wait() {
-        let cell_id = codex_code_mode::CellId::new("cell-3".to_string());
-        let cancellation = tokio_util::sync::CancellationToken::new();
-        let cancel = cancellation.clone();
-        let (_activity_tx, activity_rx) = tokio::sync::watch::channel(InputQueueActivity::Mailbox);
-        let mut observations = 0_u32;
-        let held = hold_unchanged_waits(
-            || {
-                observations = observations.saturating_add(1);
-                let should_block = observations > 300;
-                let empty = empty_yield(&cell_id);
-                async move {
-                    if should_block {
-                        std::future::pending().await
-                    } else {
-                        Ok(empty)
-                    }
-                }
-            },
-            &cancellation,
-            activity_rx,
-            None,
-            "wait cancelled",
-        );
-        let cancelled = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            cancel.cancel();
-        });
-        let error = held
-            .await
-            .expect_err("cancellation should end the held wait");
-        cancelled.await.expect("cancellation task");
-        assert_eq!(error.message, "wait cancelled");
-        assert!(error.drained_observations > 256);
-    }
-
     #[tokio::test(start_paused = true)]
     async fn elapsed_five_minutes_does_not_end_held_wait() {
         let cancellation = tokio_util::sync::CancellationToken::new();
         let wait_cancellation = cancellation.clone();
         let (_activity_tx, activity_rx) = tokio::sync::watch::channel(InputQueueActivity::Mailbox);
         let held = tokio::spawn(async move {
-            hold_unchanged_waits(
+            hold_until_state_change(
                 std::future::pending::<Result<codex_code_mode::WaitOutcome, String>>,
                 &wait_cancellation,
                 activity_rx,
@@ -656,14 +633,5 @@ mod tests {
 
         assert_eq!(first.state_revision, same.state_revision);
         assert_ne!(first.state_revision, other.state_revision);
-    }
-
-    #[test]
-    fn zero_yield_uses_existing_default_internal_cadence() {
-        assert_eq!(
-            effective_observation_yield_time_ms(0),
-            DEFAULT_WAIT_YIELD_TIME_MS
-        );
-        assert_eq!(effective_observation_yield_time_ms(25), 25);
     }
 }

@@ -1703,7 +1703,7 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
  {
     let (session, turn_context) = make_session_and_context().await;
     let previous_model = "previous-rollout-model";
-    let previous_context_item = TurnContextItem {
+    let previous_context_item = accepted_context(TurnContextItem {
         turn_id: Some(turn_context.sub_id.clone()),
         #[allow(deprecated)]
         cwd: turn_context.cwd.clone(),
@@ -1726,7 +1726,7 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
         effort: turn_context.reasoning_effort.clone(),
         context_provenance: None,
         summary: codex_protocol::config_types::ReasoningSummary::Auto,
-    };
+    });
     let previous_turn_id = previous_context_item
         .turn_id
         .clone()
@@ -1795,7 +1795,7 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
     assert_eq!(
         serde_json::to_value(session.reference_context_item().await)
             .expect("serialize seeded reference context item"),
-        serde_json::to_value(Some(TurnContextItem {
+        serde_json::to_value(Some(accepted_context(TurnContextItem {
             turn_id: Some(turn_context.sub_id.clone()),
             #[allow(deprecated)]
             cwd: turn_context.cwd.clone(),
@@ -1818,7 +1818,7 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
             effort: turn_context.reasoning_effort.clone(),
             context_provenance: None,
             summary: codex_protocol::config_types::ReasoningSummary::Auto,
-        }))
+        })))
         .expect("serialize expected reference context item")
     );
 }
@@ -1961,7 +1961,7 @@ async fn record_initial_history_resumed_unmatched_abort_preserves_active_turn_fo
     let current_model = "current-rollout-model";
     let current_turn_id = "current-turn".to_string();
     let unmatched_abort_turn_id = "other-turn".to_string();
-    let current_context_item = TurnContextItem {
+    let current_context_item = accepted_context(TurnContextItem {
         turn_id: Some(current_turn_id.clone()),
         #[allow(deprecated)]
         cwd: turn_context.cwd.clone(),
@@ -1984,7 +1984,7 @@ async fn record_initial_history_resumed_unmatched_abort_preserves_active_turn_fo
         effort: turn_context.reasoning_effort.clone(),
         context_provenance: None,
         summary: codex_protocol::config_types::ReasoningSummary::Auto,
-    };
+    });
 
     let rollout_items = vec![
         RolloutItem::EventMsg(EventMsg::TurnStarted(

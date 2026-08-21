@@ -23,6 +23,15 @@ fn direct_output_admission_is_not_config_gated() {
 }
 
 #[test]
+fn mcp_output_keeps_its_native_provider_shape() {
+    let source = ToolCallSource::Direct;
+    let tool_name = ToolName::namespaced("mcp__rmcp", "sync");
+
+    assert!(!projection_admission_required(&source, &tool_name, false));
+    assert!(!projection_admission_required(&source, &tool_name, true));
+}
+
+#[test]
 fn direct_recovery_is_exempt_from_recursive_generic_projection() {
     assert!(generic_projection_is_exempt(
         &ToolName::plain("read_tool_output"),
@@ -33,11 +42,11 @@ fn direct_recovery_is_exempt_from_recursive_generic_projection() {
         true,
     ));
     assert!(generic_projection_is_exempt(
-        &ToolName::new(Some("functions".to_string()), "exec"),
+        &ToolName::plain("exec"),
         false,
     ));
     assert!(!generic_projection_is_exempt(
-        &ToolName::new(Some("functions".to_string()), "exec"),
+        &ToolName::plain("exec"),
         true,
     ));
 }
@@ -105,14 +114,14 @@ fn complete_projection_envelope_respects_applied_limit() {
     };
     let output = "!".repeat(8_000);
 
-    let projected = serialize_projection_with_limit(envelope, &output, 64).expect("projection");
+    let projected = serialize_projection_with_limit(envelope, &output, 512).expect("projection");
     let rendered = projected.rendered();
 
     assert!(matches!(
         &projected,
         BoundedModelProjection::Envelope { .. }
     ));
-    assert!(approx_token_count(rendered) <= 64);
+    assert!(approx_token_count(rendered) <= 512);
     let envelope = projected.envelope().expect("projection envelope");
     assert_eq!(envelope.model_bytes, rendered.len() as u64);
     assert_eq!(
@@ -624,7 +633,20 @@ async fn projection_owner_recovery_drains_exact_json_pointer_in_original_return(
 async fn one_predetermined_range_is_recovered_in_the_original_return() {
     let temp = tempfile::tempdir().expect("temporary Codex home");
     let full_output = "included line\nomitted exact line".to_string();
-    let canonical = CanonicalToolResult::text(full_output.clone());
+    let mut canonical = CanonicalToolResult::text(full_output.clone());
+    let omitted_start = "included line\n".len() as u64;
+    canonical.sections = vec![ToolProjectionSection {
+        id: "omitted-chunk".to_string(),
+        value: None,
+        exact_bytes: canonical.exact_bytes - omitted_start,
+        inclusion: ToolProjectionInclusion::Omitted,
+        canonical_range: Some(CanonicalByteRange::new(
+            omitted_start,
+            canonical.exact_bytes,
+        )),
+        children: Vec::new(),
+        recovery_chunk_bytes: None,
+    }];
     let projection = project_model_output(ModelProjectionInput {
         spillable_text: full_output.clone(),
         outcome: ToolOutputOutcome::Success,
@@ -691,7 +713,7 @@ async fn three_predetermined_artifact_ranges_are_drained_in_original_return() {
         .map(|line| format!("line-{line:03}"))
         .collect::<Vec<_>>()
         .join("\n");
-    let canonical = CanonicalToolResult::text(full_output.clone());
+    let mut canonical = CanonicalToolResult::text(full_output.clone());
     let ranges = vec![
         ToolOutputProjectionRange {
             id: "head".to_string(),
@@ -709,6 +731,30 @@ async fn three_predetermined_artifact_ranges_are_drained_in_original_return() {
             end_line: 300,
         },
     ];
+    let line_ranges = full_output
+        .split_inclusive('\n')
+        .scan(0_u64, |cursor, line| {
+            let start = *cursor;
+            *cursor += line.len() as u64;
+            Some(CanonicalByteRange::new(start, *cursor))
+        })
+        .collect::<Vec<_>>();
+    canonical.sections = ranges
+        .iter()
+        .map(|range| {
+            let start = line_ranges[range.start_line - 1].start;
+            let end = line_ranges[range.end_line - 1].end;
+            ToolProjectionSection {
+                id: range.id.clone(),
+                value: None,
+                exact_bytes: end - start,
+                inclusion: ToolProjectionInclusion::Omitted,
+                canonical_range: Some(CanonicalByteRange::new(start, end)),
+                children: Vec::new(),
+                recovery_chunk_bytes: None,
+            }
+        })
+        .collect();
     let original_output_sha256 = canonical.sha256.clone();
     let original_output_tokens = canonical.approximate_tokens;
     let projection = project_model_output(ModelProjectionInput {
@@ -942,10 +988,19 @@ async fn small_code_mode_owner_result_uses_artifact_free_inline_carrier() {
 #[tokio::test]
 async fn projection_owner_recovery_mixed_selectors_survive_code_mode_continuation_merging() {
     let temp = tempfile::tempdir().expect("temporary Codex home");
-    let inner_canonical = CanonicalToolResult::json(serde_json::json!({
+    let mut inner_canonical = CanonicalToolResult::json(serde_json::json!({
         "line": "exact nested evidence",
         "pointer": {"blocker": "exact pointer evidence"},
     }));
+    inner_canonical.sections = vec![ToolProjectionSection {
+        id: "nested-range".to_string(),
+        value: None,
+        exact_bytes: inner_canonical.exact_bytes,
+        inclusion: ToolProjectionInclusion::Omitted,
+        canonical_range: Some(CanonicalByteRange::new(0, inner_canonical.exact_bytes)),
+        children: Vec::new(),
+        recovery_chunk_bytes: None,
+    }];
     let inner_text = String::from_utf8(inner_canonical.bytes.clone()).expect("canonical JSON text");
     let inner_projection = project_model_output(ModelProjectionInput {
         spillable_text: inner_text.clone(),

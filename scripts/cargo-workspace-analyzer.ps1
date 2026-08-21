@@ -1,0 +1,115 @@
+param(
+    [Parameter(Mandatory = $true)]
+    [ValidateSet("clippy", "dead-code")]
+    [string]$Analyzer,
+
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$ForwardedArgs
+)
+
+$ErrorActionPreference = "Stop"
+
+$cargoLaneScript = Join-Path $PSScriptRoot "cargo-lane.ps1"
+$v8SandboxPackages = @("codex-code-mode", "codex-v8-poc")
+
+function Invoke-CargoLane {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Lane,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$CargoArgs
+    )
+
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $cargoLaneScript `
+        -Lane $Lane cargo @CargoArgs
+    return $LASTEXITCODE
+}
+
+function Remove-WorkspaceFeatureArgs {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Args
+    )
+
+    $filtered = [System.Collections.Generic.List[string]]::new()
+    for ($index = 0; $index -lt $Args.Count; $index++) {
+        $arg = $Args[$index]
+        if ($arg -in @("--workspace", "--all-features")) {
+            continue
+        }
+        if ($arg -eq "--exclude") {
+            $index++
+            continue
+        }
+        if ($arg.StartsWith("--exclude=")) {
+            continue
+        }
+        $filtered.Add($arg)
+    }
+    return $filtered.ToArray()
+}
+
+$forwarded = @($ForwardedArgs)
+$hasAllFeatures = $forwarded -contains "--all-features"
+$hasExplicitPackage =
+    ($forwarded -contains "-p") -or
+    ($forwarded -contains "--package") -or
+    ($forwarded -contains "--manifest-path")
+
+if ($Analyzer -eq "clippy") {
+    $lane = "auto"
+    $cargoArgs = @("clippy", "--tests") + $forwarded
+    $isWorkspace = $forwarded -contains "--workspace"
+} else {
+    $lane = "rust-dead-code-matrix"
+    $env:RUSTFLAGS = "-Ddead_code"
+    $cargoArgs = @("check")
+    if (-not $hasExplicitPackage) {
+        $cargoArgs += "--workspace"
+    }
+    $cargoArgs += "--all-targets"
+    $cargoArgs += $forwarded
+    $isWorkspace = -not $hasExplicitPackage
+}
+
+$needsWindowsV8Fallback =
+    ($env:OS -eq "Windows_NT") -and
+    $hasAllFeatures -and
+    $isWorkspace
+
+if (-not $needsWindowsV8Fallback) {
+    exit (Invoke-CargoLane -Lane $lane -CargoArgs $cargoArgs)
+}
+
+# rusty_v8 does not publish a Windows archive for the ptrcomp+sandbox feature
+# combination. Analyze the complete workspace with only the two forwarding
+# packages excluded, then analyze those packages without that unavailable
+# upstream feature. Their Rust sources contain no sandbox-gated code.
+Write-Warning (
+    "rusty_v8 has no Windows ptrcomp+sandbox archive; " +
+    "checking the full workspace while omitting only that upstream feature."
+)
+
+$workspaceArgs = $cargoArgs + @(
+    "--exclude", $v8SandboxPackages[0],
+    "--exclude", $v8SandboxPackages[1]
+)
+$exitCode = Invoke-CargoLane -Lane $lane -CargoArgs $workspaceArgs
+if ($exitCode -ne 0) {
+    exit $exitCode
+}
+
+$packageForwarded = Remove-WorkspaceFeatureArgs -Args $forwarded
+if ($Analyzer -eq "clippy") {
+    $packageArgs = @("clippy", "--tests")
+} else {
+    $packageArgs = @("check", "--all-targets")
+}
+$packageArgs += @(
+    "--package", $v8SandboxPackages[0],
+    "--package", $v8SandboxPackages[1]
+)
+$packageArgs += $packageForwarded
+
+exit (Invoke-CargoLane -Lane $lane -CargoArgs $packageArgs)
