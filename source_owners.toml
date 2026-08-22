@@ -499,3 +499,49 @@ id = "app-server-schema-focused"
 cwd = "."
 argv = ["python", "scripts/app_server_schema_runtime_check.py", "--mode", "check"]
 role = "generated_contract_check"
+
+[[owners]]
+id = "semantic-quality-gate"
+concern_ids = ["agent-quality-gate", "semantic-contracts", "validation-admission"]
+aliases = ["kda configuration", "agent semantic gate"]
+phrases = ["autonomous change semantic quality gate"]
+roots = ["codex-rs/kda.toml"]
+primary_entries = [{ path = "codex-rs/kda.toml", symbol = "version" }]
+instructions = ["AGENTS.md", "codex-rs/AGENTS.md"]
+consumers = []
+contracts = ["codex-rs/kda.toml"]
+generated_mirrors = []
+tests = []
+
+[owners.facet_exclusions]
+control_and_data_flow = "This owner is declarative admission policy evaluated by the external cargo-kda analyzer rather than a KD4 runtime flow."
+callers_and_consumers = "The configuration is consumed by the external cargo-kda entrypoint, which is not source-owned in this repository."
+registration_and_entrypoints = "Cargo discovers the external cargo-kda subcommand; KD4 has no in-repository runtime registration point."
+generated_artifacts = "The quality-gate configuration is authored source and has no generated mirror."
+
+[[owners.relationships]]
+category = "configuration"
+kind = "gated_by"
+target = "config:codex-rs/kda.toml"
+confidence = "manifest_derived"
+evidence = [{ path = "codex-rs/kda.toml", symbol = "architecture-gate" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:codex-rs/kda.toml"
+confidence = "declared"
+evidence = [{ path = "codex-rs/kda.toml", symbol = "version" }]
+
+[[owners.invariants]]
+id = "source-bound-agent-admission"
+kind = "semantic"
+statement = "Autonomous changes cannot pass on unowned impact, incomplete consequence closure, or validation evidence from a different source, profile, architecture, dependency, command, target, or test selection."
+evidence = [{ path = "codex-rs/kda.toml", symbol = "architecture-gate" }]
+tests = []
+
+[[owners.validation]]
+id = "kda-config-syntax"
+cwd = "."
+argv = ["python", "-c", "import pathlib,tomllib; tomllib.loads(pathlib.Path('codex-rs/kda.toml').read_text())"]
+role = "configuration_check"

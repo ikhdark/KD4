@@ -1,5 +1,5 @@
 {
-  "manifest_sha256": "da089a8e146fb1280e962dba32ddf4959cd68ea283d6d04fb228d44f3fd8c982",
+  "manifest_sha256": "3c5decfcf89873f1f2cf63742a654086ed5fa5e8207d453347f342ad81011e59",
   "omitted": {
     "relationships": 0
   },
@@ -384,6 +384,55 @@
           "cwd": "codex-rs",
           "id": "repository-context-focused",
           "role": "focused_tests"
+        }
+      ]
+    },
+    {
+      "configuration": [
+        "codex-rs/kda.toml"
+      ],
+      "facet_exclusions": {
+        "callers_and_consumers": "The configuration is consumed by the external cargo-kda entrypoint, which is not source-owned in this repository.",
+        "control_and_data_flow": "This owner is declarative admission policy evaluated by the external cargo-kda analyzer rather than a KD4 runtime flow.",
+        "generated_artifacts": "The quality-gate configuration is authored source and has no generated mirror.",
+        "registration_and_entrypoints": "Cargo discovers the external cargo-kda subcommand; KD4 has no in-repository runtime registration point."
+      },
+      "generated_artifacts": [],
+      "id": "semantic-quality-gate",
+      "invariants": [
+        {
+          "evidence": [
+            {
+              "path": "codex-rs/kda.toml",
+              "symbol": "architecture-gate"
+            }
+          ],
+          "id": "source-bound-agent-admission",
+          "kind": "semantic",
+          "statement": "Autonomous changes cannot pass on unowned impact, incomplete consequence closure, or validation evidence from a different source, profile, architecture, dependency, command, target, or test selection.",
+          "tests": []
+        }
+      ],
+      "primary_entries": [
+        {
+          "path": "codex-rs/kda.toml",
+          "symbol": "version"
+        }
+      ],
+      "roots": [
+        "codex-rs/kda.toml"
+      ],
+      "tests": [],
+      "validation": [
+        {
+          "argv": [
+            "python",
+            "-c",
+            "import pathlib,tomllib; tomllib.loads(pathlib.Path('codex-rs/kda.toml').read_text())"
+          ],
+          "cwd": ".",
+          "id": "kda-config-syntax",
+          "role": "configuration_check"
         }
       ]
     },
@@ -799,6 +848,32 @@
       "target": "path:codex-rs/core/src/git_workspace_tests.rs"
     },
     {
+      "category": "configuration",
+      "confidence": "manifest_derived",
+      "evidence": [
+        {
+          "path": "codex-rs/kda.toml",
+          "symbol": "architecture-gate"
+        }
+      ],
+      "kind": "gated_by",
+      "source": "owner:semantic-quality-gate",
+      "target": "config:codex-rs/kda.toml"
+    },
+    {
+      "category": "tests_contracts",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "codex-rs/kda.toml",
+          "symbol": "version"
+        }
+      ],
+      "kind": "validated_by",
+      "source": "owner:semantic-quality-gate",
+      "target": "path:codex-rs/kda.toml"
+    },
+    {
       "category": "callers_consumers",
       "confidence": "declared",
       "evidence": [
@@ -929,7 +1004,7 @@
       "target": "path:codex-rs/core/src/tools/command_output_artifact_tests.rs"
     }
   ],
-  "repository_revision": "manifest:da089a8e146fb1280e962dba32ddf4959cd68ea283d6d04fb228d44f3fd8c982",
+  "repository_revision": "manifest:3c5decfcf89873f1f2cf63742a654086ed5fa5e8207d453347f342ad81011e59",
   "schema_version": 2,
   "status": "complete",
   "unresolved": []

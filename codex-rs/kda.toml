@@ -1,0 +1,395 @@
+version = 1
+
+# Autonomous changes are admitted only when every changed path resolves through
+# the repository's generated ownership index and all declared consequences have
+# current, source-bound proof.
+change-proof-receipts = ".kda/change-proofs.json"
+
+[architecture-gate]
+enabled = true
+base-ref = "HEAD"
+index = "../architecture_index.json"
+proof-receipt = ".kda/architecture-closure.json"
+select-profiles = true
+
+# Protocol and app-server wire changes need exact-package validation, not a
+# command string that could select the wrong target or zero tests.
+[[change-consequence]]
+id = "codex-protocol-wire-change"
+subject-patterns = ["codex_protocol::*"]
+downstream-contracts = ["rollout compatibility", "app-server consumers", "resume and replay"]
+required-proofs = [
+  { id = "codex-protocol-focused", command = "just test-fast -p codex-protocol", argv = ["just", "test-fast", "-p", "codex-protocol"], cwd = ".", minimum-selected-test-count = 1, toolchain = "1.95.0" },
+]
+
+[[change-consequence]]
+id = "app-server-protocol-wire-change"
+subject-patterns = ["codex_app_server_protocol::*"]
+downstream-contracts = ["generated schemas", "desktop client compatibility", "app-server dispatch"]
+required-proofs = [
+  { id = "app-server-protocol-focused", command = "just test-fast -p codex-app-server-protocol", argv = ["just", "test-fast", "-p", "codex-app-server-protocol"], cwd = ".", minimum-selected-test-count = 1, toolchain = "1.95.0" },
+]
+
+# Count caps and per-item truncation do not establish a workspace-wide memory
+# bound. These names mirror the retained command-output implementation.
+[[retained-budget]]
+name = "command-output-artifact-retention"
+per-item-bound-terms = ["max_retained_artifact_bytes_per_thread", "max_output_bytes", "max_artifact_bytes", ".truncate("]
+retention-operations = [".push(", ".push_back(", ".insert(", ".entry("]
+aggregate-byte-terms = ["max_retained_artifact_bytes_total", "total_bytes", "global_bytes", "retained_bytes", "byte_budget"]
+cardinality-terms = ["max_retained_artifacts_total", "max_retained_artifacts_per_thread", "max_entries", ".len() >="]
+
+# Summed child work is not elapsed time when the children overlap.
+[[elapsed-topology]]
+name = "parallel-child-latency"
+parallel-terms = ["join_all", "futuresunordered", "joinset", "parallel", "concurrent"]
+duration-terms = ["elapsed", "duration", "wall_time", "latency"]
+sum-terms = [".sum", "fold(", "saturating_add("]
+interval-terms = ["started_at", "finished_at", "critical_path", "union_duration", "attributed_client_union"]
+
+# Every production CoreToolRuntime must reach both router construction and the
+# terminal-outcome dispatcher. Implementations compile even when they are
+# omitted from the runtime plan, so registration is a deny-level contract.
+[[registration-check]]
+id = "core-tool-runtime-registration"
+candidate-traits = ["codex_core::tools::registry::CoreToolRuntime"]
+registration-calls = [
+  { selector = "codex_core::tools::spec_plan::PlannedTools::add", component-argument = 0 },
+  { selector = "codex_core::tools::spec_plan::PlannedTools::add_with_exposure", component-argument = 0 },
+  { selector = "codex_core::tools::spec_plan::PlannedTools::add_dispatch_only", component-argument = 0 },
+  { selector = "codex_core::tools::spec_plan::PlannedTools::add_arc", component-argument = 0 },
+]
+dispatchers = ["codex_core::tools::registry::ToolRegistry::dispatch_any_with_terminal_outcome"]
+entrypoints = [{ id = "core-tool-runtime", roots = ["codex_core::tools::spec_plan::build_tool_router", "codex_core::tools::router::ToolRouter::dispatch_tool_call_with_terminal_outcome"] }]
+coverage = "every-entrypoint"
+exclude-targets = ["test", "bench", "example", "build-script"]
+ignore = [{ component = "codex_core::tools::registry::ExposureOverride", reason = "internal decorator created inside the registration helper" }]
+severity = "deny"
+
+# Each extension facet is independently discoverable. A type implementing a
+# facet must be installed into the app-server host exactly once.
+[[registration-check]]
+id = "extension-approval-review-registration"
+candidate-traits = ["codex_extension_api::contributors::ApprovalReviewContributor"]
+registration-calls = [{ selector = "codex_extension_api::registry::ExtensionRegistryBuilder::approval_review_contributor", component-argument = 0 }]
+entrypoints = [{ id = "app-server-extensions", roots = ["codex_app_server::extensions::thread_extensions"] }]
+coverage = "exactly-once-per-entrypoint"
+exclude-targets = ["test", "bench", "example", "build-script"]
+severity = "deny"
+
+[[registration-check]]
+id = "extension-thread-lifecycle-registration"
+candidate-traits = ["codex_extension_api::contributors::ThreadLifecycleContributor"]
+registration-calls = [{ selector = "codex_extension_api::registry::ExtensionRegistryBuilder::thread_lifecycle_contributor", component-argument = 0 }]
+entrypoints = [{ id = "app-server-extensions", roots = ["codex_app_server::extensions::thread_extensions"] }]
+coverage = "exactly-once-per-entrypoint"
+exclude-targets = ["test", "bench", "example", "build-script"]
+severity = "deny"
+
+[[registration-check]]
+id = "extension-turn-lifecycle-registration"
+candidate-traits = ["codex_extension_api::contributors::TurnLifecycleContributor"]
+registration-calls = [{ selector = "codex_extension_api::registry::ExtensionRegistryBuilder::turn_lifecycle_contributor", component-argument = 0 }]
+entrypoints = [{ id = "app-server-extensions", roots = ["codex_app_server::extensions::thread_extensions"] }]
+coverage = "exactly-once-per-entrypoint"
+exclude-targets = ["test", "bench", "example", "build-script"]
+severity = "deny"
+
+[[registration-check]]
+id = "extension-config-registration"
+candidate-traits = ["codex_extension_api::contributors::ConfigContributor"]
+registration-calls = [{ selector = "codex_extension_api::registry::ExtensionRegistryBuilder::config_contributor", component-argument = 0 }]
+entrypoints = [{ id = "app-server-extensions", roots = ["codex_app_server::extensions::thread_extensions"] }]
+coverage = "exactly-once-per-entrypoint"
+exclude-targets = ["test", "bench", "example", "build-script"]
+severity = "deny"
+
+[[registration-check]]
+id = "extension-token-usage-registration"
+candidate-traits = ["codex_extension_api::contributors::TokenUsageContributor"]
+registration-calls = [{ selector = "codex_extension_api::registry::ExtensionRegistryBuilder::token_usage_contributor", component-argument = 0 }]
+entrypoints = [{ id = "app-server-extensions", roots = ["codex_app_server::extensions::thread_extensions"] }]
+coverage = "exactly-once-per-entrypoint"
+exclude-targets = ["test", "bench", "example", "build-script"]
+severity = "deny"
+
+[[registration-check]]
+id = "extension-context-registration"
+candidate-traits = ["codex_extension_api::contributors::ContextContributor"]
+registration-calls = [{ selector = "codex_extension_api::registry::ExtensionRegistryBuilder::prompt_contributor", component-argument = 0 }]
+entrypoints = [{ id = "app-server-extensions", roots = ["codex_app_server::extensions::thread_extensions"] }]
+coverage = "exactly-once-per-entrypoint"
+exclude-targets = ["test", "bench", "example", "build-script"]
+severity = "deny"
+
+[[registration-check]]
+id = "extension-mcp-server-registration"
+candidate-traits = ["codex_extension_api::contributors::McpServerContributor"]
+registration-calls = [{ selector = "codex_extension_api::registry::ExtensionRegistryBuilder::mcp_server_contributor", component-argument = 0 }]
+entrypoints = [{ id = "app-server-extensions", roots = ["codex_app_server::extensions::thread_extensions"] }]
+coverage = "exactly-once-per-entrypoint"
+exclude-targets = ["test", "bench", "example", "build-script"]
+severity = "deny"
+
+[[registration-check]]
+id = "extension-turn-input-registration"
+candidate-traits = ["codex_extension_api::contributors::TurnInputContributor"]
+registration-calls = [{ selector = "codex_extension_api::registry::ExtensionRegistryBuilder::turn_input_contributor", component-argument = 0 }]
+entrypoints = [{ id = "app-server-extensions", roots = ["codex_app_server::extensions::thread_extensions"] }]
+coverage = "exactly-once-per-entrypoint"
+exclude-targets = ["test", "bench", "example", "build-script"]
+severity = "deny"
+
+[[registration-check]]
+id = "extension-tool-registration"
+candidate-traits = ["codex_extension_api::contributors::ToolContributor"]
+registration-calls = [{ selector = "codex_extension_api::registry::ExtensionRegistryBuilder::tool_contributor", component-argument = 0 }]
+entrypoints = [{ id = "app-server-extensions", roots = ["codex_app_server::extensions::thread_extensions"] }]
+coverage = "exactly-once-per-entrypoint"
+exclude-targets = ["test", "bench", "example", "build-script"]
+severity = "deny"
+
+[[registration-check]]
+id = "extension-tool-lifecycle-registration"
+candidate-traits = ["codex_extension_api::contributors::ToolLifecycleContributor"]
+registration-calls = [{ selector = "codex_extension_api::registry::ExtensionRegistryBuilder::tool_lifecycle_contributor", component-argument = 0 }]
+entrypoints = [{ id = "app-server-extensions", roots = ["codex_app_server::extensions::thread_extensions"] }]
+coverage = "exactly-once-per-entrypoint"
+exclude-targets = ["test", "bench", "example", "build-script"]
+severity = "deny"
+
+[[registration-check]]
+id = "extension-turn-item-registration"
+candidate-traits = ["codex_extension_api::contributors::TurnItemContributor"]
+registration-calls = [{ selector = "codex_extension_api::registry::ExtensionRegistryBuilder::turn_item_contributor", component-argument = 0 }]
+entrypoints = [{ id = "app-server-extensions", roots = ["codex_app_server::extensions::thread_extensions"] }]
+coverage = "exactly-once-per-entrypoint"
+exclude-targets = ["test", "bench", "example", "build-script"]
+severity = "deny"
+
+# A model transport session is turn-scoped. Only the reviewed one-shot startup
+# handoff and the standalone compaction attempt may retain it in an ADT field.
+[[semantic-type-policy.retention]]
+id = "kd4-model-client-session-turn-scope"
+retained-adt = "codex_core::client::ModelClientSession"
+allowed-owner-adts = [
+  "codex_core::session_startup_prewarm::SessionStartupPrewarmHandle",
+  "codex_core::session_startup_prewarm::SessionStartupTransportHandle",
+  "codex_core::session_startup_prewarm::SessionStartupTransportResolution",
+  "codex_core::session_startup_prewarm::SessionStartupPrewarmResolution",
+  "codex_core::compact_remote_v2_attempt::RemoteCompactV2Attempt",
+]
+severity = "deny"
+remediation = "Keep ModelClientSession local to one turn, or explicitly review and add a one-shot lifecycle owner."
+
+# Raw provider account scope may be used transiently to derive the cache
+# identity, but it must not cross a resolved logging or persistence boundary.
+[[semantic-effect-policy.sensitive-sinks]]
+id = "kd4-provider-account-scope-nonescape"
+source-adts = ["codex_model_provider::auth::ProviderAccountScope"]
+source-fields = [
+  "codex_model_provider::auth::ProviderAccountScope::auth_mode",
+  "codex_model_provider::auth::ProviderAccountScope::account_id",
+  "codex_model_provider::auth::ProviderAccountScope::chatgpt_user_id",
+  "codex_model_provider::auth::ProviderAccountScope::account_plan_type",
+  "codex_model_provider::auth::ProviderAccountScope::workspace_account",
+  "codex_model_provider::auth::ProviderAccountScope::fedramp_header",
+  "codex_model_provider::auth::ProviderAccountScope::credential_scope_digest",
+]
+sink-callables = ["std::fs::write"]
+sink-macro-crates = ["tracing"]
+declassifier-callables = [
+  "codex_model_provider::auth::provider_cache_auth_identity",
+  "codex_model_provider::auth::credential_scope_digest",
+  "codex_model_provider::auth::credential_scope_digest_for_headers",
+]
+severity = "deny"
+message = "raw ProviderAccountScope material reaches a logging or persistence sink"
+remediation = "Keep raw provider scope transient and emit only the reviewed digest or non-sensitive cache identity."
+
+# Trace recording is observational. Calls resolved to the rollout-trace crate
+# may not decide control flow, propagate failure, become runtime failure, or
+# panic in the runtime crates that consume it.
+[[semantic-effect-policy.noninterference]]
+id = "kd4-rollout-trace-runtime-noninterference"
+source-callables = [
+  "codex_rollout_trace::writer::TraceWriter::create",
+  "codex_rollout_trace::writer::TraceWriter::write_json_payload",
+  "codex_rollout_trace::writer::TraceWriter::append",
+  "codex_rollout_trace::writer::TraceWriter::append_with_context",
+]
+within-crates = ["codex_core", "codex_model_provider"]
+severity = "deny"
+message = "a rollout-trace result can affect model, tool, or runtime behavior"
+remediation = "Handle rollout tracing as best-effort observation and keep its failures outside runtime control and result paths."
+
+# A durable plan update is a transaction: cancellation is checked before the
+# commit, and the commit dominates both publication and successful return.
+[[semantic-effect-policy.ordering]]
+id = "kd4-plan-cancellation-before-commit"
+within-callable = "codex_core::tools::handlers::plan::PlanHandler::handle_call"
+prerequisite-callables = ["tokio_util::sync::cancellation_token::CancellationToken::is_cancelled"]
+dependent-callables = ["codex_core::task_evidence::TaskEvidenceLedger::record_planning_update"]
+unknown-behavior = "diagnose"
+severity = "deny"
+message = "the durable plan commit is reachable without a dominating cancellation check"
+remediation = "Check the invocation cancellation token on every path before recording the plan update."
+
+[[semantic-effect-policy.ordering]]
+id = "kd4-plan-commit-before-publish"
+within-callable = "codex_core::tools::handlers::plan::PlanHandler::handle_call"
+prerequisite-callables = ["codex_core::task_evidence::TaskEvidenceLedger::record_planning_update"]
+dependent-callables = ["codex_core::session::session::Session::send_event"]
+unknown-behavior = "diagnose"
+severity = "deny"
+message = "a plan update event can be published before the durable plan commit"
+remediation = "Record the authoritative plan update before publishing EventMsg::PlanUpdate."
+
+[[semantic-effect-policy.ordering]]
+id = "kd4-plan-commit-before-success"
+within-callable = "codex_core::tools::handlers::plan::PlanHandler::handle_call"
+prerequisite-callables = ["codex_core::task_evidence::TaskEvidenceLedger::record_planning_update"]
+dependent-callables = ["codex_core::tools::context::boxed_tool_output"]
+unknown-behavior = "diagnose"
+severity = "deny"
+message = "the plan tool can report success before the durable plan commit"
+remediation = "Make every successful tool-result path pass through record_planning_update first."
+
+# A blocked authoritative wait is nonterminal and must never be translated to
+# the terminal surfaced-result vocabulary.
+[[semantic-type-policy.forbidden-variant-construction]]
+id = "kd4-blocked-wait-remains-nonterminal"
+source-variant = "codex_core::session::reasoning_governor::AuthoritativeWaitResolution::Blocked"
+target-adt = "codex_protocol::protocol::SurfacedToolResult"
+severity = "deny"
+remediation = "Keep Blocked on the nonterminal wait path; construct SurfacedToolResult only from a terminal resolution."
+
+# A tool implementation must be reached through the registry-owned dispatch
+# boundary. Direct handler invocation is valid Rust but bypasses lifecycle,
+# telemetry, projection, and terminal-outcome behavior owned by the registry.
+[[required-mediation]]
+id = "tool-handler-execution-through-registry"
+entrypoints = ["codex_core::tools::router::ToolRouter::dispatch_tool_call_with_terminal_outcome"]
+effect = "codex_core::tools::registry::handle_any_tool"
+mediators = ["codex_core::tools::registry::ToolRegistry::dispatch_any_with_terminal_outcome"]
+severity = "deny"
+
+# Lifecycle contributors are observers. The contributor trait itself says
+# implementations must not inspect, rewrite, or own tool execution.
+[[trait-effect-envelope]]
+id = "tool-lifecycle-contributors-remain-observers"
+trait = "codex_extension_api::contributors::ToolLifecycleContributor"
+role = "observer"
+effect = [
+  { selector = "codex_core::tools::registry::ToolRegistry::dispatch_any_with_terminal_outcome", disposition = "must-not-reach" },
+  { selector = "codex_core::tools::registry::handle_any_tool", disposition = "must-not-reach" },
+]
+severity = "deny"
+
+# The concrete permission profile and the named active-profile identity are
+# resolved as one unit. Supplying same-typed values from different resolution
+# roots compiles but misrepresents the active permission state.
+[[co-provenance]]
+id = "active-permission-profile-resolution"
+severity = "deny"
+[co-provenance.sink]
+kind = "function"
+function = "codex_core::config::resolved_permission_profile::PermissionProfileSnapshot::active"
+arguments = [0, 1]
+
+# ModelClient is session-scoped; ModelClientSession is turn-scoped and carries
+# sticky routing state that must never escape into the longer-lived client.
+[[lifetime-scope]]
+id = "model-client-session-lifetime"
+scopes = [
+  { name = "turn", rank = 1, types = ["codex_core::client::ModelClientSession"] },
+  { name = "session", rank = 2, types = ["codex_core::client::ModelClient"] },
+]
+severity = "deny"
+
+# The registry is a generic runtime hub. Code-mode-specific policy belongs to
+# the code-mode runtime/handler abstraction, even though the registry can
+# legally branch on ToolCallSource today. Keep this warning visible as existing
+# ownership debt while preventing new specializations from going unnoticed.
+[[generic-hub]]
+id = "tool-registry-remains-generic"
+hubs = ["codex_core::tools::registry::ToolRegistry::dispatch_any_with_terminal_outcome"]
+specializations = [
+  { owner = "codex_core::tools::code_mode::CodeModeService", variants = ["codex_core::tools::context::ToolCallSource::CodeMode"] },
+]
+severity = "warn"
+
+# Extension producers may add EventMsg variants that compile but are silently
+# swallowed by the app-server host's wildcard arm.
+[[variant-flow]]
+id = "extension-event-host-disposition"
+kind = "extension-event"
+enum-path = "codex_protocol::protocol::EventMsg"
+subject = "constructed"
+producer-paths = ["ext/*/src/*.rs", "ext/*/src/**/*.rs"]
+stages = [{ name = "app-server-host", path-patterns = ["app-server/src/extensions.rs"], function-patterns = ["*AppServerExtensionEventSink*::emit"], required-disposition = "explicit" }]
+
+# Turn-context fields that reconstruct the active rollout segment must keep
+# their live producer, persisted wire form, and replay consumer connected.
+[[persistence-continuity]]
+id = "turn-context-rollout-reconstruction"
+field-patterns = [
+  "codex_protocol::protocol::TurnContextItem::turn_id",
+  "codex_protocol::protocol::TurnContextItem::model",
+  "codex_protocol::protocol::TurnContextItem::comp_hash",
+  "codex_protocol::protocol::TurnContextItem::realtime_active",
+  "codex_protocol::protocol::TurnContextItem::context_provenance",
+]
+stages = [
+  { name = "live", path-patterns = ["core/src/**"], required-evidence = "producer" },
+  { name = "persist", path-patterns = ["protocol/src/protocol.rs"], required-evidence = "consumer", evidence-kinds = ["external_serialize"] },
+  { name = "replay", path-patterns = ["core/src/session/rollout_reconstruction.rs"], required-evidence = "consumer" },
+]
+
+# Settings restored from rollout history must remain wired from live context
+# construction through serialization into the resume reducer.
+[[persistence-continuity]]
+id = "turn-context-resumed-settings"
+field-patterns = [
+  "codex_protocol::protocol::TurnContextItem::cwd",
+  "codex_protocol::protocol::TurnContextItem::workspace_roots",
+  "codex_protocol::protocol::TurnContextItem::approval_policy",
+  "codex_protocol::protocol::TurnContextItem::approvals_reviewer",
+  "codex_protocol::protocol::TurnContextItem::sandbox_policy",
+  "codex_protocol::protocol::TurnContextItem::permission_profile",
+  "codex_protocol::protocol::TurnContextItem::model",
+  "codex_protocol::protocol::TurnContextItem::personality",
+  "codex_protocol::protocol::TurnContextItem::collaboration_mode",
+  "codex_protocol::protocol::TurnContextItem::effort",
+]
+stages = [
+  { name = "live", path-patterns = ["core/src/session/turn_context.rs"], required-evidence = "producer" },
+  { name = "persist", path-patterns = ["protocol/src/protocol.rs"], required-evidence = "consumer", evidence-kinds = ["external_serialize"] },
+  { name = "resume", path-patterns = ["protocol/src/persisted_thread_settings.rs"], required-evidence = "consumer" },
+]
+
+# Public boundary crates own their wire/API vocabulary. Implementation types
+# may be dependencies, but must not escape through these public signatures.
+[[public-boundary]]
+id = "extension-api-does-not-leak-host"
+crates = "codex_extension_api"
+forbid-public-types-from = ["codex_core", "codex_app_server"]
+severity = "deny"
+
+[[public-boundary]]
+id = "core-protocol-ownership"
+crates = "codex_protocol"
+forbid-public-types-from = ["codex_core", "codex_app_server", "codex_app_server_protocol", "codex_extension_api"]
+severity = "deny"
+
+[[public-boundary]]
+id = "app-server-protocol-ownership"
+crates = "codex_app_server_protocol"
+forbid-public-types-from = ["codex_core", "codex_app_server", "codex_extension_api"]
+severity = "deny"
+
+[[public-boundary]]
+id = "tools-api-does-not-leak-core"
+crates = "codex_tools"
+forbid-public-types-from = ["codex_core", "codex_app_server"]
+severity = "deny"
