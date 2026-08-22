@@ -13848,6 +13848,16 @@
         },
         "type": "object"
       },
+      "NextSampleBlockReason": {
+        "enum": [
+          "waiting_for_tool",
+          "waiting_for_delivery",
+          "waiting_for_gate",
+          "waiting_for_process_cleanup",
+          "ready_to_sample"
+        ],
+        "type": "string"
+      },
       "NonSteerableTurnKind": {
         "enum": [
           "review",
@@ -20976,6 +20986,118 @@
         ],
         "type": "object"
       },
+      "ToolLifecycleBoundary": {
+        "enum": [
+          "request_created",
+          "admitted",
+          "handler_start",
+          "process_spawn",
+          "process_exit",
+          "handler_return",
+          "relay_enqueue",
+          "relay_delivery",
+          "next_model_sample_start"
+        ],
+        "type": "string"
+      },
+      "ToolLifecycleContext": {
+        "description": "Queue and waiter state captured at a lifecycle boundary.",
+        "properties": {
+          "activeToolCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "parallelGateWaiterCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "processOutputWaiterCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "relayQueueDepth": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "samplingGateWaiterCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "ToolLifecycleTimerWait": {
+        "description": "Attribution for a bounded or sticky lifecycle wait.",
+        "properties": {
+          "deadlineAtMs": {
+            "default": null,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "effectiveTimeoutMs": {
+            "default": null,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "requestedTimeoutMs": {
+            "default": null,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "sequence": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "waitKind": {
+            "type": "string"
+          },
+          "wakeReason": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/v2/ToolLifecycleWakeReason"
+              }
+            ],
+            "default": "completed"
+          }
+        },
+        "required": [
+          "waitKind"
+        ],
+        "type": "object"
+      },
+      "ToolLifecycleWakeReason": {
+        "enum": [
+          "completed",
+          "timeout",
+          "cancelled",
+          "retry"
+        ],
+        "type": "string"
+      },
       "ToolsV2": {
         "properties": {
           "web_search": {
@@ -22972,6 +23094,20 @@
             ],
             "default": "unknown"
           },
+          "executorAdmittedToolCallCount": {
+            "default": 0,
+            "description": "Direct model-issued calls that acquired the executor admission gate.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "executorMaxConcurrentToolCalls": {
+            "default": 0,
+            "description": "Peak direct model-issued calls holding executor admission concurrently.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
           "firstActionableOutputMs": {
             "default": null,
             "format": "uint64",
@@ -23018,6 +23154,13 @@
           },
           "isContinuation": {
             "type": "boolean"
+          },
+          "modelEmittedToolCallCount": {
+            "default": 0,
+            "description": "Tool calls parsed from completed model output before relay persistence or executor polling. Recorded on the generation's primary attempt.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
           },
           "modelStreamWaitNs": {
             "default": 0,
@@ -23101,7 +23244,7 @@
           },
           "toolCallCount": {
             "default": 0,
-            "description": "Tool calls emitted by this generation. Recorded on its primary attempt.",
+            "description": "Tool calls whose deferred executor future was polled for this generation. Kept under its historical field name for rollout compatibility.",
             "format": "uint32",
             "minimum": 0.0,
             "type": "integer"
@@ -23506,7 +23649,7 @@
         "type": "string"
       },
       "TurnTimingToolCall": {
-        "description": "Delivery-complete lifecycle for one model-issued or nested tool call.\n\nAll `*_at_ms` values are monotonic offsets from turn start. A missing boundary means the call ended before that boundary was observed. No tool arguments, output, paths, or nested runtime identifiers are persisted.",
+        "description": "Relay and persistence lifecycle for one model-issued or nested tool call.\n\nAll `*_at_ms` values are monotonic offsets from turn start. A missing boundary means the call ended before that boundary was observed. No tool arguments, output, paths, or nested runtime identifiers are persisted.",
         "properties": {
           "acceptedAtMs": {
             "default": null,
@@ -23526,11 +23669,17 @@
               "null"
             ]
           },
+          "backgroundProcessExpected": {
+            "default": false,
+            "description": "A retained running process is expected only when the response returned a background process identifier for a later `write_stdin` call.",
+            "type": "boolean"
+          },
           "callId": {
             "type": "string"
           },
           "deliveredAtMs": {
             "default": null,
+            "description": "Historical relay-completion boundary. This predates persistence timing and therefore does not prove that the output reached conversation history or the rollout recorder.",
             "format": "uint64",
             "minimum": 0.0,
             "type": [
@@ -23541,6 +23690,15 @@
           "eager": {
             "default": false,
             "type": "boolean"
+          },
+          "execCleanupStateObserved": {
+            "default": false,
+            "description": "The exec handler reached its post-cleanup process-store observation.",
+            "type": "boolean"
+          },
+          "executionId": {
+            "default": "",
+            "type": "string"
           },
           "firstPollAtMs": {
             "default": null,
@@ -23605,9 +23763,17 @@
               "null"
             ]
           },
+          "lifecycleEvents": {
+            "default": [],
+            "description": "Exact event-site lifecycle records. Older timestamp fields remain as compatibility projections of these boundaries.",
+            "items": {
+              "$ref": "#/definitions/v2/TurnTimingToolLifecycleEvent"
+            },
+            "type": "array"
+          },
           "modelResumedAtMs": {
             "default": null,
-            "description": "The next model generation began after this result was delivered.",
+            "description": "The next model generation began after this result became model-visible.",
             "format": "uint64",
             "minimum": 0.0,
             "type": [
@@ -23615,9 +23781,34 @@
               "null"
             ]
           },
+          "nextSampleBlockReason": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/v2/NextSampleBlockReason"
+              }
+            ],
+            "default": "ready_to_sample"
+          },
+          "outcome": {
+            "description": "Payload-free terminal classification reported by the tool runtime.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "outputCollectedAtMs": {
             "default": null,
             "description": "The tool result has been collected into the host relay, before any post-handler evidence, projection, persistence, or delivery work.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "outputModelVisibleAtMs": {
+            "default": null,
+            "description": "The direct tool output was committed to model-visible conversation history and the best-effort rollout persistence attempt returned. This does not prove that a rollout recorder existed, that its append succeeded, or that storage was flushed. Nested code-mode calls are represented by the outer direct tool output and leave this absent.",
             "format": "uint64",
             "minimum": 0.0,
             "type": [
@@ -23701,6 +23892,27 @@
               "null"
             ]
           },
+          "reentryCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "retryCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "runningProcessAfterCleanup": {
+            "default": false,
+            "description": "The process manager still retained this call after foreground cleanup.",
+            "type": "boolean"
+          },
+          "samplingGenerationId": {
+            "default": "",
+            "type": "string"
+          },
           "source": {
             "allOf": [
               {
@@ -23708,6 +23920,13 @@
               }
             ],
             "default": "direct"
+          },
+          "timerWaits": {
+            "default": [],
+            "items": {
+              "$ref": "#/definitions/v2/ToolLifecycleTimerWait"
+            },
+            "type": "array"
           },
           "toolName": {
             "type": "string"
@@ -23752,6 +23971,50 @@
           "code_mode"
         ],
         "type": "string"
+      },
+      "TurnTimingToolLifecycleEvent": {
+        "description": "Exact event-site timestamp from the turn's single monotonic clock.",
+        "properties": {
+          "atMs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "boundary": {
+            "$ref": "#/definitions/v2/ToolLifecycleBoundary"
+          },
+          "context": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/v2/ToolLifecycleContext"
+              }
+            ],
+            "default": {
+              "activeToolCount": 0,
+              "parallelGateWaiterCount": 0,
+              "processOutputWaiterCount": 0,
+              "relayQueueDepth": 0,
+              "samplingGateWaiterCount": 0
+            }
+          },
+          "reentryCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "retryCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "atMs",
+          "boundary"
+        ],
+        "type": "object"
       },
       "TurnTimingUnions": {
         "properties": {

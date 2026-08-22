@@ -804,6 +804,44 @@ impl Drop for WorkerDoneNotifier {
     }
 }
 
+pub(crate) struct TasklessTurnStartupGuard {
+    session: Arc<Session>,
+    turn_state: Arc<tokio::sync::Mutex<TurnState>>,
+    armed: bool,
+}
+
+impl TasklessTurnStartupGuard {
+    pub(crate) fn new(
+        session: &Arc<Session>,
+        turn_state: Arc<tokio::sync::Mutex<TurnState>>,
+    ) -> Self {
+        Self {
+            session: Arc::clone(session),
+            turn_state,
+            armed: true,
+        }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TasklessTurnStartupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let session = Arc::clone(&self.session);
+        let turn_state = Arc::clone(&self.turn_state);
+        self.session.terminal_tasks.spawn(async move {
+            session
+                .recover_cancelled_taskless_placeholder(&turn_state)
+                .await;
+        });
+    }
+}
+
 impl Session {
     pub async fn spawn_task<T: SessionTask>(
         self: &Arc<Self>,
@@ -888,6 +926,7 @@ impl Session {
             );
             Arc::clone(&turn.turn_state)
         };
+        let mut startup_guard = TasklessTurnStartupGuard::new(self, Arc::clone(&turn_state));
         let pending_items = self.input_queue.get_pending_input(&self.active_turn).await;
         turn_state.lock().await.token_usage_at_turn_start = token_usage_at_turn_start.clone();
         self.input_queue
@@ -971,20 +1010,66 @@ impl Session {
         turn.task = Some(running_task);
         turn.terminal = Some(terminal);
         drop(active);
+        startup_guard.disarm();
         let _ = start_tx.send(());
     }
 
-    async fn clear_taskless_placeholder(
+    pub(crate) async fn clear_taskless_placeholder(
         &self,
         expected_turn_state: &Arc<tokio::sync::Mutex<TurnState>>,
     ) {
-        let mut active_turn = self.active_turn.lock().await;
-        if active_turn.as_ref().is_some_and(|active_turn| {
-            active_turn.task.is_none()
-                && active_turn.terminal.is_none()
-                && Arc::ptr_eq(&active_turn.turn_state, expected_turn_state)
-        }) {
-            *active_turn = None;
+        let cleared = {
+            let mut active_turn = self.active_turn.lock().await;
+            if active_turn.as_ref().is_some_and(|active_turn| {
+                active_turn.task.is_none()
+                    && active_turn.terminal.is_none()
+                    && Arc::ptr_eq(&active_turn.turn_state, expected_turn_state)
+            }) {
+                *active_turn = None;
+                true
+            } else {
+                false
+            }
+        };
+        if cleared {
+            self.emit_thread_idle_lifecycle_if_idle().await;
+        }
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "taskless placeholder identity and pending input extraction must remain atomic"
+    )]
+    async fn recover_cancelled_taskless_placeholder(
+        &self,
+        expected_turn_state: &Arc<tokio::sync::Mutex<TurnState>>,
+    ) {
+        let recovered_input = {
+            let mut active_turn = self.active_turn.lock().await;
+            if active_turn.as_ref().is_some_and(|active_turn| {
+                active_turn.task.is_none()
+                    && active_turn.terminal.is_none()
+                    && Arc::ptr_eq(&active_turn.turn_state, expected_turn_state)
+            }) {
+                let recovered_input = self
+                    .input_queue
+                    .take_pending_input_for_turn_state(expected_turn_state.as_ref())
+                    .await;
+                *active_turn = None;
+                Some(recovered_input)
+            } else {
+                None
+            }
+        };
+        let Some(recovered_input) = recovered_input else {
+            return;
+        };
+        let recovered_work = !recovered_input.is_empty();
+        self.input_queue
+            .recover_cancelled_startup_input(recovered_input)
+            .await;
+        if !recovered_work {
+            self.emit_thread_idle_lifecycle_if_idle().await;
         }
     }
 
@@ -1035,7 +1120,7 @@ impl Session {
             return;
         }
 
-        {
+        let turn_state = {
             let mut active_turn = self.active_turn.lock().await;
             if active_turn.is_some()
                 || self.terminal_interaction_pending.load(Ordering::Acquire)
@@ -1045,14 +1130,17 @@ impl Session {
             {
                 return;
             }
-            *active_turn = Some(ActiveTurn::default());
-        }
+            let active_turn = active_turn.insert(ActiveTurn::default());
+            Arc::clone(&active_turn.turn_state)
+        };
+        let mut startup_guard = TasklessTurnStartupGuard::new(self, Arc::clone(&turn_state));
 
         let turn_context = self.new_default_turn_with_sub_id(sub_id).await;
         self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
             .await;
         self.start_task(turn_context, Vec::new(), RegularTask::new())
             .await;
+        startup_guard.disarm();
     }
 
     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {

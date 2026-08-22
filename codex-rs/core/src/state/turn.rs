@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU8;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
@@ -15,6 +17,7 @@ use tracing::Span;
 
 use codex_extension_api::ExtensionData;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
+use codex_protocol::protocol::SamplingGenerationId;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
@@ -109,6 +112,12 @@ pub(crate) struct TurnTerminalCoordinator {
     interrupt_persistence_failed: AtomicBool,
     interrupt_resolution_notify: Notify,
     sampling_admission_gate: Arc<Mutex<()>>,
+    wake_generation: AtomicU64,
+    completion_waiters: AtomicU32,
+    #[cfg(test)]
+    cleanup_waiters: AtomicU32,
+    interrupt_resolution_waiters: AtomicU32,
+    sampling_admission_waiters: AtomicU32,
     #[cfg(test)]
     panic_before_worker_cancellation: AtomicBool,
 }
@@ -126,6 +135,37 @@ pub(crate) enum TerminalDeliveryState {
 pub(crate) enum SamplingAdmission {
     Allowed,
     Fenced,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TerminalWakeResult {
+    Applied,
+    Stale,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TerminalWaiterSnapshot {
+    pub(crate) completion: u32,
+    pub(crate) cleanup: u32,
+    pub(crate) interrupt_resolution: u32,
+    pub(crate) sampling_admission: u32,
+}
+
+struct TerminalWaiterGuard<'a>(&'a AtomicU32);
+
+impl<'a> TerminalWaiterGuard<'a> {
+    fn new(counter: &'a AtomicU32) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self(counter)
+    }
+}
+
+impl Drop for TerminalWaiterGuard<'_> {
+    fn drop(&mut self) {
+        let previous = self.0.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "terminal waiter count underflow");
+    }
 }
 
 impl TerminalDeliveryState {
@@ -156,6 +196,12 @@ impl TurnTerminalCoordinator {
             interrupt_persistence_failed: AtomicBool::new(false),
             interrupt_resolution_notify: Notify::new(),
             sampling_admission_gate: Arc::new(Mutex::new(())),
+            wake_generation: AtomicU64::new(1),
+            completion_waiters: AtomicU32::new(0),
+            #[cfg(test)]
+            cleanup_waiters: AtomicU32::new(0),
+            interrupt_resolution_waiters: AtomicU32::new(0),
+            sampling_admission_waiters: AtomicU32::new(0),
             #[cfg(test)]
             panic_before_worker_cancellation: AtomicBool::new(false),
         })
@@ -163,6 +209,28 @@ impl TurnTerminalCoordinator {
 
     pub(crate) fn turn_id(&self) -> &str {
         &self.turn_id
+    }
+
+    pub(crate) fn wake_generation_id(&self) -> SamplingGenerationId {
+        SamplingGenerationId(format!(
+            "terminal-{}-{}",
+            self.turn_id,
+            self.wake_generation.load(Ordering::Acquire)
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn waiter_snapshot(&self) -> TerminalWaiterSnapshot {
+        TerminalWaiterSnapshot {
+            completion: self.completion_waiters.load(Ordering::Acquire),
+            cleanup: self.cleanup_waiters.load(Ordering::Acquire),
+            interrupt_resolution: self.interrupt_resolution_waiters.load(Ordering::Acquire),
+            sampling_admission: self.sampling_admission_waiters.load(Ordering::Acquire),
+        }
+    }
+
+    fn wake_generation_matches(&self, expected: &SamplingGenerationId) -> bool {
+        &self.wake_generation_id() == expected
     }
 
     pub(crate) fn try_claim(self: &Arc<Self>) -> Option<TurnTerminalPermit> {
@@ -201,6 +269,7 @@ impl TurnTerminalCoordinator {
     /// Establish a pre-terminal fence. This deliberately does not claim or
     /// terminalize the turn; it only closes provider sampling admission.
     pub(crate) async fn mark_interrupt_pending(&self) -> bool {
+        let _waiter = TerminalWaiterGuard::new(&self.sampling_admission_waiters);
         let _admission_gate = self.sampling_admission_gate.lock().await;
         if self.claimed.load(Ordering::Acquire) {
             return false;
@@ -209,6 +278,7 @@ impl TurnTerminalCoordinator {
             .store(false, Ordering::Release);
         self.interrupt_terminal_ready
             .store(false, Ordering::Release);
+        self.wake_generation.fetch_add(1, Ordering::AcqRel);
         self.interrupt_pending.store(true, Ordering::Release);
         if self.claimed.load(Ordering::Acquire) {
             self.interrupt_pending.store(false, Ordering::Release);
@@ -220,6 +290,7 @@ impl TurnTerminalCoordinator {
     }
 
     pub(crate) async fn acquire_sampling_admission(&self) -> Option<OwnedMutexGuard<()>> {
+        let _waiter = TerminalWaiterGuard::new(&self.sampling_admission_waiters);
         let guard = Arc::clone(&self.sampling_admission_gate).lock_owned().await;
         if self.interrupt_pending() {
             None
@@ -242,29 +313,50 @@ impl TurnTerminalCoordinator {
 
     /// Open terminal admission after the interrupted tool output has crossed
     /// its durability barrier. Sampling remains fenced until cleanup.
-    pub(crate) fn mark_interrupt_output_durable(&self) {
+    pub(crate) fn mark_interrupt_output_durable(
+        &self,
+        expected_generation: &SamplingGenerationId,
+    ) -> TerminalWakeResult {
+        if !self.wake_generation_matches(expected_generation) {
+            return TerminalWakeResult::Stale;
+        }
         debug_assert!(self.interrupt_pending());
         self.interrupt_terminal_ready.store(true, Ordering::Release);
         self.interrupt_resolution_notify.notify_waiters();
+        TerminalWakeResult::Applied
     }
 
-    pub(crate) fn mark_interrupt_persistence_failed(&self) {
+    pub(crate) fn mark_interrupt_persistence_failed(
+        &self,
+        expected_generation: &SamplingGenerationId,
+    ) -> TerminalWakeResult {
+        if !self.wake_generation_matches(expected_generation) {
+            return TerminalWakeResult::Stale;
+        }
         debug_assert!(self.interrupt_pending());
         self.interrupt_persistence_failed
             .store(true, Ordering::Release);
         self.interrupt_terminal_ready.store(true, Ordering::Release);
         self.interrupt_resolution_notify.notify_waiters();
+        TerminalWakeResult::Applied
     }
 
     pub(crate) fn interrupt_persistence_failed(&self) -> bool {
         self.interrupt_persistence_failed.load(Ordering::Acquire)
     }
 
-    pub(crate) async fn wait_for_interrupt_resolution(&self) {
+    pub(crate) async fn wait_for_interrupt_resolution(
+        &self,
+        expected_generation: &SamplingGenerationId,
+    ) -> TerminalWakeResult {
+        let _waiter = TerminalWaiterGuard::new(&self.interrupt_resolution_waiters);
         loop {
             let notified = self.interrupt_resolution_notify.notified();
+            if !self.wake_generation_matches(expected_generation) {
+                return TerminalWakeResult::Stale;
+            }
             if self.interrupt_terminal_ready.load(Ordering::Acquire) || !self.interrupt_pending() {
-                return;
+                return TerminalWakeResult::Applied;
             }
             notified.await;
         }
@@ -278,6 +370,7 @@ impl TurnTerminalCoordinator {
     }
 
     pub(crate) async fn wait_completed(&self) {
+        let _waiter = TerminalWaiterGuard::new(&self.completion_waiters);
         loop {
             let notified = self.completion_notify.notified();
             if self.interaction_released() {
@@ -289,6 +382,7 @@ impl TurnTerminalCoordinator {
 
     #[cfg(test)]
     pub(crate) async fn wait_cleanup_completed(&self) {
+        let _waiter = TerminalWaiterGuard::new(&self.cleanup_waiters);
         loop {
             let notified = self.cleanup_completion_notify.notified();
             if self.cleanup_completed.load(Ordering::Acquire) {

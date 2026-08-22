@@ -10,10 +10,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::parse_turn_item;
 use crate::session::session::Session;
+use crate::session::turn::reconcile_turn_progress_event;
 use crate::session::turn_context::TurnContext;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::router::ToolCallBuildError;
 use crate::tools::router::ToolRouter;
+use crate::tools::tool_dispatch_trace::ToolDispatchTiming;
 use codex_memories_read::citations::parse_memory_citation;
 use codex_memories_read::citations::thread_ids_from_memory_citation;
 use codex_protocol::error::Result;
@@ -21,6 +23,7 @@ use codex_protocol::memory_citation::MemoryCitation;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::ToolExecutionId;
 use codex_rollout::state_db;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_stream_parser::strip_proposed_plan_blocks;
@@ -221,11 +224,56 @@ async fn record_stage1_output_usage_for_memory_citation(
 pub(crate) type InFlightFuture<'f> =
     Pin<Box<dyn Future<Output = Result<ResponseInputItem>> + Send + 'f>>;
 
+pub(crate) struct InFlightToolCall {
+    pub(crate) call_id: String,
+    pub(crate) execution_id: ToolExecutionId,
+    pub(crate) timing: Arc<ToolDispatchTiming>,
+    future: InFlightFuture<'static>,
+}
+
+pub(crate) struct InFlightToolResult {
+    pub(crate) call_id: String,
+    pub(crate) execution_id: ToolExecutionId,
+    pub(crate) timing: Arc<ToolDispatchTiming>,
+    pub(crate) result: Result<ResponseInputItem>,
+}
+
+impl InFlightToolCall {
+    #[cfg(test)]
+    pub(crate) fn from_test_future(
+        call_id: impl Into<String>,
+        future: InFlightFuture<'static>,
+    ) -> Self {
+        let timing = Arc::new(ToolDispatchTiming::new(tokio::time::Instant::now(), false));
+        let execution_id = timing.execution_id().clone();
+        Self {
+            call_id: call_id.into(),
+            execution_id,
+            timing,
+            future,
+        }
+    }
+
+    pub(crate) async fn into_future(self) -> InFlightToolResult {
+        let result = self.future.await;
+        self.timing.mark_relay_enqueue();
+        if let Some(turn_timing_state) = self.timing.turn_timing_state() {
+            reconcile_turn_progress_event(&turn_timing_state, 1, "relay enqueue");
+        }
+        InFlightToolResult {
+            call_id: self.call_id,
+            execution_id: self.execution_id,
+            timing: self.timing,
+            result,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct OutputItemResult {
     pub last_agent_message: Option<String>,
     pub needs_follow_up: bool,
-    pub tool_future: Option<InFlightFuture<'static>>,
+    pub tool_future: Option<InFlightToolCall>,
     pub eager_read_eligible: bool,
 }
 
@@ -328,6 +376,9 @@ pub(crate) async fn handle_output_item_done(
     match ToolRouter::build_tool_call(item.clone()) {
         // The model emitted a tool call; log it, persist the item immediately, and queue the tool execution.
         Ok(Some(call)) => {
+            ctx.turn_context
+                .turn_timing_state
+                .record_model_emitted_tool_call();
             ctx.sess
                 .input_queue
                 .accept_mailbox_delivery_for_current_turn(
@@ -354,17 +405,26 @@ pub(crate) async fn handle_output_item_done(
             let cancellation_token = ctx.cancellation_token.child_token();
             let tool_runtime = ctx.tool_runtime.clone();
             let eager = output.eager_read_eligible;
+            let call_id = call.call_id.clone();
+            let timing = tool_runtime.create_tool_dispatch_timing(item_accepted_at, eager);
+            let execution_id = timing.execution_id().clone();
+            let future_timing = Arc::clone(&timing);
             // Keep deferred dispatch genuinely lazy. Eager callers poll this
             // future after persistence; deferred callers do not construct the
             // runtime dispatch task until the response tail has completed.
             let tool_future: InFlightFuture<'static> = Box::pin(async move {
                 tool_runtime
-                    .handle_tool_call_with_timing(call, cancellation_token, item_accepted_at, eager)
+                    .handle_tool_call_with_trace(call, cancellation_token, future_timing)
                     .await
             });
 
             output.needs_follow_up = true;
-            output.tool_future = Some(tool_future);
+            output.tool_future = Some(InFlightToolCall {
+                call_id,
+                execution_id,
+                timing,
+                future: tool_future,
+            });
         }
         // No tool call: convert messages/reasoning into turn items and mark them as complete.
         Ok(None) => {

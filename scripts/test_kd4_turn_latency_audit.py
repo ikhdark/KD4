@@ -28,12 +28,13 @@ def _meta(cwd: str) -> str:
 
 def _timing(*, valid: bool = True, complete: bool = True) -> dict:
     return {
-        "schemaVersion": 22,
+        "schemaVersion": 23,
         "profileValid": valid,
         "classificationComplete": complete,
         "startedAtUnixMs": 1_786_924_800_000,
         "completedAtUnixMs": 1_786_924_801_000,
         "inclusiveDurationNs": 1000,
+        "milestones": {"firstUsefulActionMs": 12.5},
         "machineDurationNs": 900,
         "exclusive": {
             "modelOnlyNs": 600,
@@ -128,9 +129,15 @@ def _timing(*, valid: bool = True, complete: bool = True) -> dict:
                 "processExitedAtMs": 6,
                 "outputCollectedAtMs": 8,
                 "deliveredAtMs": 9,
+                "outputModelVisibleAtMs": 9,
                 "modelResumedAtMs": 10,
                 "itemToFirstPollMs": 1,
                 "parallelGateWaitMs": 1,
+                "preToolHookMs": 0,
+                "postToolHookMs": 0,
+                "workspaceEvidenceBeforeMs": 0,
+                "workspaceEvidenceAfterMs": 0,
+                "authorizationStateCoordinationMs": 0,
                 "handlerDurationMs": 3,
                 "postHandlerMs": 2,
                 "totalDurationMs": 7,
@@ -220,6 +227,7 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
             "firstPollAtMs": 6_000,
             "outputCollectedAtMs": 10_000,
             "deliveredAtMs": 10_001,
+            "outputModelVisibleAtMs": 10_501,
             "itemToFirstPollMs": 6_000,
             "totalDurationMs": 4_001,
         }
@@ -228,7 +236,8 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
 
         self.assertEqual(relay["slowCallCount"], 1)
         self.assertEqual(relay["topSlowCalls"][0]["totalDurationMs"], 4_001)
-        self.assertEqual(relay["topSlowCalls"][0]["endToEndDurationMs"], 10_001)
+        self.assertEqual(relay["topSlowCalls"][0]["endToEndDurationMs"], 10_501)
+        self.assertTrue(relay["topSlowCalls"][0]["outputModelVisibilityRecorded"])
 
     def test_tool_relay_reports_process_exit_after_live_handle_delivery(self) -> None:
         call = {
@@ -244,7 +253,93 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         relay = kd4_turn_latency_audit._tool_relay_report([call])
 
         self.assertEqual(relay["processAliveAtDeliveryCalls"], 1)
-        self.assertEqual(relay["phaseTotalsMs"]["deliveryToProcessExitMs"], 11)
+        self.assertEqual(relay["phaseTotalsMs"]["modelVisibleToProcessExitMs"], 11)
+
+    def test_reports_exclusive_gate_convoy_between_parallel_nested_reads(self) -> None:
+        calls = [
+            {
+                "_turnId": "convoy",
+                "callId": "read-a",
+                "toolName": "exec_command",
+                "source": "code_mode",
+                "generationIndex": 4,
+                "acceptedAtMs": 0,
+                "firstPollAtMs": 1,
+                "parallelGateAdmittedAtMs": 1,
+                "handlerEntryAtMs": 2,
+                "processSpawnedAtMs": 3,
+                "processExitedAtMs": 113_900,
+                "outputCollectedAtMs": 113_950,
+                "outputModelVisibleAtMs": 114_000,
+                "parallelGateWaitMs": 0,
+                "totalDurationMs": 114_000,
+            },
+            {
+                "_turnId": "convoy",
+                "callId": "read-b",
+                "toolName": "exec_command",
+                "source": "code_mode",
+                "generationIndex": 4,
+                "acceptedAtMs": 1,
+                "firstPollAtMs": 1,
+                "parallelGateAdmittedAtMs": 114_001,
+                "handlerEntryAtMs": 114_002,
+                "processSpawnedAtMs": 114_003,
+                "processExitedAtMs": 114_045,
+                "outputCollectedAtMs": 114_050,
+                "outputModelVisibleAtMs": 114_051,
+                "parallelGateWaitMs": 114_000,
+                "totalDurationMs": 114_050,
+            },
+        ]
+
+        relay = kd4_turn_latency_audit._tool_relay_report(calls)
+
+        self.assertEqual(relay["batchGroups"], 1)
+        self.assertEqual(relay["batchedCalls"], 2)
+        self.assertEqual(relay["phaseTotalsMs"]["parallelGateWaitMs"], 114_000)
+        self.assertEqual(relay["dominantPhase"], "parallelGateWaitMs")
+        self.assertEqual(relay["dominantPhaseOwner"], "ExclusiveGate")
+        self.assertEqual(relay["exclusiveGateConvoyCount"], 1)
+        self.assertEqual(
+            relay["topExclusiveGateConvoys"][0],
+            {
+                "turnId": "convoy",
+                "generationIndex": 4,
+                "callIds": ["read-a", "read-b"],
+                "waitingCallIds": ["read-b"],
+                "parallelGateWaitMs": 114_000,
+            },
+        )
+
+    def test_reports_post_tool_hook_as_owner_of_post_process_stall(self) -> None:
+        call = {
+            "_turnId": "post-hook",
+            "callId": "exec-a",
+            "toolName": "exec_command",
+            "source": "direct",
+            "generationIndex": 0,
+            "acceptedAtMs": 0,
+            "firstPollAtMs": 1,
+            "parallelGateAdmittedAtMs": 1,
+            "handlerEntryAtMs": 2,
+            "processSpawnedAtMs": 3,
+            "processExitedAtMs": 48,
+            "outputCollectedAtMs": 99_049,
+            "outputModelVisibleAtMs": 99_050,
+            "modelResumedAtMs": 99_051,
+            "parallelGateWaitMs": 0,
+            "postToolHookMs": 99_000,
+            "totalDurationMs": 99_050,
+        }
+
+        relay = kd4_turn_latency_audit._tool_relay_report([call])
+
+        self.assertEqual(relay["phaseTotalsMs"]["processRuntimeMs"], 45)
+        self.assertEqual(relay["phaseTotalsMs"]["postToolHookMs"], 99_000)
+        self.assertEqual(relay["dominantPhase"], "postToolHookMs")
+        self.assertEqual(relay["dominantPhaseOwner"], "PostToolUse")
+        self.assertEqual(relay["dominantPhaseMs"], 99_000)
 
     def test_uuid_cli_resolves_snapshot_and_emits_bounded_execution_loop(self) -> None:
         session_id = "01a018c7-a357-7c11-a7ca-9248dd075f22"
@@ -338,11 +433,12 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         )
         self.assertEqual(report["toolRelay"]["phaseTotalsMs"]["processRuntimeMs"], 1)
         self.assertEqual(
-            report["toolRelay"]["phaseTotalsMs"]["processExitToDeliveryMs"], 3
+            report["toolRelay"]["phaseTotalsMs"]["processExitToModelVisibleMs"], 3
         )
         self.assertEqual(report["toolRelay"]["phaseTotalsMs"]["endToEndDurationMs"], 8)
         self.assertEqual(report["toolRelay"]["topSlowCalls"], [])
         self.assertEqual(report["perTurn"][0]["agentActiveDurationNs"], 900)
+        self.assertEqual(report["perTurn"][0]["firstUsefulActionMs"], 12.5)
         self.assertEqual(report["perTurn"][0]["humanWaitNs"], 100)
         self.assertEqual(report["perTurn"][0]["humanOnlyWaitNs"], 100)
         self.assertEqual(report["perTurn"][0]["humanWaitUnionNs"], 150)
@@ -497,13 +593,104 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         )
         self.assertEqual(
             report["coverage"]["openTurnStateCounts"],
-            {"active_without_pending_tool": 1, "running_process": 1},
+            {"active_without_pending_tool": 1, "unresolved_tool_call": 1},
         )
         self.assertEqual(report["behaviorSignals"]["canceledTurns"], 1)
         self.assertEqual(report["behaviorSignals"]["failedTurns"], 1)
         self.assertEqual(report["behaviorSignals"]["abandonedTurns"], 1)
-        self.assertEqual(report["behaviorSignals"]["runningProcessTurns"], 1)
+        self.assertEqual(report["behaviorSignals"]["unresolvedToolCallTurns"], 1)
         self.assertEqual(report["behaviorSignals"]["activeWithoutPendingToolTurns"], 1)
+
+    def test_terminal_turn_with_unresolved_tool_call_is_inconsistent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            session = Path(temp) / "rollout.jsonl"
+            root.mkdir()
+            session.write_text(
+                "\n".join(
+                    [
+                        _meta(str(root)),
+                        _event(
+                            {"type": "task_started", "turn_id": "inconsistent"},
+                            "2026-08-17T00:00:00Z",
+                        ),
+                        _response(
+                            {
+                                "type": "function_call",
+                                "call_id": "wait-1",
+                                "name": "wait",
+                                "arguments": "{}",
+                            },
+                            "2026-08-17T00:00:01Z",
+                        ),
+                        _event(
+                            {
+                                "type": "task_complete",
+                                "turn_id": "inconsistent",
+                                "timing": _timing(),
+                            },
+                            "2026-08-17T00:00:02Z",
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            report = kd4_turn_latency_audit.analyze_session_path(session, root)
+
+        self.assertEqual(report["executionLoop"]["unpairedToolCalls"], 1)
+        self.assertEqual(report["coverage"]["terminalTurnsWithUnresolvedToolCalls"], 1)
+        violation = report["coverage"]["terminalTurnInvariantViolations"][0]
+        self.assertEqual(violation["turnId"], "inconsistent")
+        self.assertEqual(violation["pendingTools"], ["wait"])
+        self.assertIn(
+            "terminal_with_unresolved_tool_call", report["perTurn"][0]["signals"]
+        )
+        self.assertEqual(
+            report["behaviorSignals"]["terminalTurnsWithUnresolvedToolCalls"], 1
+        )
+        self.assertIn(
+            "terminal_turn_with_unresolved_tool_call",
+            report["auditDecision"]["blockerCodes"],
+        )
+        self.assertFalse(report["auditDecision"]["readyToFinalize"])
+
+    def test_blocked_task_complete_is_not_successful_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            session = Path(temp) / "rollout.jsonl"
+            root.mkdir()
+            session.write_text(
+                "\n".join(
+                    [
+                        _meta(str(root)),
+                        _event({"type": "task_started", "turn_id": "blocked"}),
+                        _event(
+                            {
+                                "type": "task_complete",
+                                "turn_id": "blocked",
+                                "completion": {
+                                    "status": "blocked",
+                                    "reasons": ["unresolved tool call"],
+                                },
+                                "timing": _timing(),
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            report = kd4_turn_latency_audit.analyze_session_path(session, root)
+
+        self.assertEqual(
+            report["coverage"]["terminalLifecycleStateCounts"], {"blocked": 1}
+        )
+        self.assertEqual(report["perTurn"][0]["lifecycle"], "blocked")
+        self.assertEqual(report["behaviorSignals"]["blockedTurns"], 1)
+        self.assertEqual(report["behaviorSignals"]["failedTurns"], 0)
 
     def test_emits_bounded_slow_calls_and_finalize_decision(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -644,8 +831,84 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         self.assertEqual(orchestration["orchestrationGapUpperBoundNs"], 2_250_000_000)
         self.assertEqual(orchestration["orchestrationShareLowerBound"], 2 / 3)
         self.assertEqual(orchestration["orchestrationShareUpperBound"], 3 / 4)
+        self.assertEqual(
+            orchestration["evidenceSource"], "responseOutputWallTimeFallback"
+        )
         rendered = kd4_turn_latency_audit.render_report(report)
         self.assertIn("round-trip=3.0s child-work=1.0s gap=2.0-2.2s", rendered)
+
+    def test_prefers_detailed_tool_call_timing_over_output_wall_time(self) -> None:
+        timing = _timing()
+        timing["toolCalls"] = [
+            {
+                "callId": "call-1",
+                "toolName": "exec_command",
+                "source": "direct",
+                "generationIndex": 0,
+                "acceptedAtMs": 0,
+                "firstPollAtMs": 1,
+                "parallelGateAdmittedAtMs": 2,
+                "handlerEntryAtMs": 3,
+                "processSpawnedAtMs": 50,
+                "processExitedAtMs": 95,
+                "outputCollectedAtMs": 2_999,
+                "outputModelVisibleAtMs": 3_000,
+                "postToolHookMs": 2_900,
+                "totalDurationMs": 3_000,
+            }
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            session = Path(temp) / "rollout.jsonl"
+            root.mkdir()
+            session.write_text(
+                "\n".join(
+                    [
+                        _meta(str(root)),
+                        _event({"type": "task_started", "turn_id": "timed"}),
+                        _response(
+                            {"type": "custom_tool_call", "call_id": "call-1"},
+                            "2026-08-17T00:00:00Z",
+                        ),
+                        _response(
+                            {
+                                "type": "custom_tool_call_output",
+                                "call_id": "call-1",
+                                "output": [
+                                    {
+                                        "type": "input_text",
+                                        "text": '{"wall_time_seconds":1.0}',
+                                    }
+                                ],
+                            },
+                            "2026-08-17T00:00:10Z",
+                        ),
+                        _event(
+                            {
+                                "type": "task_complete",
+                                "turn_id": "timed",
+                                "timing": timing,
+                            },
+                            "2026-08-17T00:00:11Z",
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            report = kd4_turn_latency_audit.analyze_session_path(session, root)
+
+        orchestration = report["commandOrchestration"]
+        self.assertEqual(orchestration["evidenceSource"], "toolCalls")
+        self.assertEqual(orchestration["roundTripNs"], 3_000_000_000)
+        self.assertEqual(orchestration["reportedChildWorkNs"], 45_000_000)
+        self.assertEqual(
+            orchestration["orchestrationGapLowerBoundNs"], 2_955_000_000
+        )
+        self.assertEqual(
+            orchestration["orchestrationGapUpperBoundNs"], 2_955_000_000
+        )
 
     def test_reports_coverage_and_segments_eval_from_repository_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

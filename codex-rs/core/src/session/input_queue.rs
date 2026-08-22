@@ -36,6 +36,7 @@ pub(crate) struct TurnInputQueue {
 /// Session-scoped pending input storage and active-turn mailbox delivery coordination.
 pub(crate) struct InputQueue {
     activity_tx: watch::Sender<InputQueueActivity>,
+    startup_recovery_items: Mutex<VecDeque<TurnInput>>,
     mailbox_pending_mails: Mutex<VecDeque<InterAgentCommunication>>,
     seen_mailbox_communication_ids: Mutex<HashSet<codex_protocol::ResponseItemId>>,
 }
@@ -45,6 +46,7 @@ impl InputQueue {
         let (activity_tx, _) = watch::channel(InputQueueActivity::Mailbox);
         Self {
             activity_tx,
+            startup_recovery_items: Mutex::new(VecDeque::new()),
             mailbox_pending_mails: Mutex::new(VecDeque::new()),
             seen_mailbox_communication_ids: Mutex::new(HashSet::new()),
         }
@@ -109,15 +111,45 @@ impl InputQueue {
     }
 
     pub(crate) async fn has_pending_mailbox_items(&self) -> bool {
-        !self.mailbox_pending_mails.lock().await.is_empty()
+        self.startup_recovery_items
+            .lock()
+            .await
+            .iter()
+            .any(|item| matches!(item, TurnInput::InterAgentCommunication(_)))
+            || !self.mailbox_pending_mails.lock().await.is_empty()
     }
 
     pub(crate) async fn has_trigger_turn_mailbox_items(&self) -> bool {
-        self.mailbox_pending_mails
+        self.startup_recovery_items.lock().await.iter().any(
+            |item| matches!(item, TurnInput::InterAgentCommunication(mail) if mail.trigger_turn),
+        ) || self
+            .mailbox_pending_mails
             .lock()
             .await
             .iter()
             .any(|mail| mail.trigger_turn)
+    }
+
+    /// Restores input owned by a taskless startup placeholder that was
+    /// cancelled before a supervisor could take ownership. Restored items
+    /// precede work accepted after the cancellation.
+    pub(crate) async fn recover_cancelled_startup_input(&self, input: Vec<TurnInput>) {
+        if input.is_empty() {
+            return;
+        }
+        let activity = if input.iter().any(
+            |item| matches!(item, TurnInput::InterAgentCommunication(mail) if mail.trigger_turn),
+        ) {
+            InputQueueActivity::Mailbox
+        } else {
+            InputQueueActivity::Steer
+        };
+        let mut recovered = self.startup_recovery_items.lock().await;
+        let mut restored = VecDeque::from(input);
+        restored.append(&mut recovered);
+        *recovered = restored;
+        drop(recovered);
+        self.activity_tx.send_replace(activity);
     }
 
     pub(crate) async fn drain_mailbox_input_items(&self) -> Vec<TurnInput> {
@@ -225,6 +257,8 @@ impl InputQueue {
         &self,
         active_turn: &Mutex<Option<ActiveTurn>>,
     ) -> Vec<TurnInput> {
+        let recovered_input: Vec<TurnInput> =
+            self.startup_recovery_items.lock().await.drain(..).collect();
         let (pending_input, accepts_mailbox_delivery) = {
             let mut active = active_turn.lock().await;
             match active.as_mut() {
@@ -239,16 +273,15 @@ impl InputQueue {
             }
         };
         if !accepts_mailbox_delivery {
-            return pending_input;
+            let mut input = recovered_input;
+            input.extend(pending_input);
+            return input;
         }
         let mailbox_items = self.drain_mailbox_input_items().await.into_iter();
-        if pending_input.is_empty() {
-            mailbox_items.collect()
-        } else {
-            let mut pending_input = pending_input;
-            pending_input.extend(mailbox_items);
-            pending_input
-        }
+        let mut input = recovered_input;
+        input.extend(pending_input);
+        input.extend(mailbox_items);
+        input
     }
 
     #[expect(
@@ -256,6 +289,9 @@ impl InputQueue {
         reason = "active turn checks and turn state reads must remain atomic"
     )]
     pub(crate) async fn has_pending_input(&self, active_turn: &Mutex<Option<ActiveTurn>>) -> bool {
+        if !self.startup_recovery_items.lock().await.is_empty() {
+            return true;
+        }
         let (has_turn_pending_input, accepts_mailbox_delivery) = {
             let active = active_turn.lock().await;
             match active.as_ref() {

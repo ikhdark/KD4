@@ -15,6 +15,7 @@ use crate::session::tests::make_session_and_context_with_rx;
 use crate::state::ActiveTurn;
 use crate::state::SamplingAdmission;
 use crate::state::TerminalDeliveryState;
+use crate::state::TerminalWakeResult;
 use crate::state::TurnTerminalCoordinator;
 use crate::task_evidence::TerminalDeliveryState as DurableDeliveryState;
 use crate::task_evidence::TerminalRecoveryState;
@@ -354,6 +355,7 @@ async fn interrupt_pending_fences_sampling_without_terminalizing() {
     let coordinator = TurnTerminalCoordinator::new("turn-fenced".to_string());
     assert_eq!(coordinator.sampling_admission(), SamplingAdmission::Allowed);
     assert!(coordinator.mark_interrupt_pending().await);
+    let generation = coordinator.wake_generation_id();
     assert_eq!(coordinator.sampling_admission(), SamplingAdmission::Fenced);
     assert!(!coordinator.durable_terminal_committed());
 
@@ -361,13 +363,48 @@ async fn interrupt_pending_fences_sampling_without_terminalizing() {
     // eventual TurnAborted transition after output persistence.
     assert!(coordinator.try_claim().is_none());
     assert!(coordinator.interrupt_pending());
-    coordinator.mark_interrupt_output_durable();
+    assert_eq!(
+        coordinator.mark_interrupt_output_durable(&generation),
+        TerminalWakeResult::Applied
+    );
     let permit = coordinator
         .try_claim()
         .expect("terminal claim opens after durability");
     permit.complete_cleanup();
-    coordinator.wait_for_interrupt_resolution().await;
+    assert_eq!(
+        coordinator.wait_for_interrupt_resolution(&generation).await,
+        TerminalWakeResult::Applied
+    );
     assert_eq!(coordinator.sampling_admission(), SamplingAdmission::Allowed);
+}
+
+#[tokio::test]
+async fn terminal_wakeups_are_generation_aware_and_waiter_counts_are_cancellation_safe() {
+    let coordinator = TurnTerminalCoordinator::new("turn-generation".to_string());
+    let stale_generation = coordinator.wake_generation_id();
+    assert!(coordinator.mark_interrupt_pending().await);
+    assert_eq!(
+        coordinator
+            .wait_for_interrupt_resolution(&stale_generation)
+            .await,
+        TerminalWakeResult::Stale
+    );
+    assert_eq!(
+        coordinator.mark_interrupt_output_durable(&stale_generation),
+        TerminalWakeResult::Stale
+    );
+    assert!(coordinator.try_claim().is_none());
+
+    let generation = coordinator.wake_generation_id();
+    let waiter = {
+        let coordinator = Arc::clone(&coordinator);
+        tokio::spawn(async move { coordinator.wait_for_interrupt_resolution(&generation).await })
+    };
+    tokio::task::yield_now().await;
+    assert_eq!(coordinator.waiter_snapshot().interrupt_resolution, 1);
+    waiter.abort();
+    let _ = waiter.await;
+    assert_eq!(coordinator.waiter_snapshot().interrupt_resolution, 0);
 }
 
 #[test]

@@ -8,6 +8,7 @@ use crate::maybe_emit_implicit_skill_invocation;
 use crate::shell::Shell;
 use crate::shell::ShellType;
 use crate::tools::command_execution::CommandAttemptKey;
+use crate::tools::command_execution::CompletionApplyResult;
 use crate::tools::command_output_artifact::create_raw_output_artifact;
 use crate::tools::command_output_artifact::replace_raw_output_artifact;
 use crate::tools::context::ExecCommandToolOutput;
@@ -941,8 +942,15 @@ impl ExecCommandHandler {
             .command_execution
             .observe_repository_revision(&turn.sub_id, observed_mutation_revision)
             .await;
-        match exec_result {
+        let tracked_execution = session
+            .services
+            .command_execution
+            .process_execution_identity(process_id)
+            .await;
+        let mut background_process_expected = false;
+        let result = match exec_result {
             Ok(mut response) => {
+                background_process_expected = response.process_id.is_some();
                 let finalized_artifact = response
                     .raw_output_artifact
                     .clone()
@@ -956,12 +964,26 @@ impl ExecCommandHandler {
                             .update_running_artifact(process_id, finalized_artifact)
                             .await;
                     } else if let Some(exit_code) = response.exit_code {
-                        let tracked = session
-                            .services
-                            .command_execution
-                            .finish_running_process(process_id, Some(exit_code))
-                            .await;
-                        if !tracked {
+                        let tracked = if let Some((execution_id, parent_tool_execution_id)) =
+                            tracked_execution.as_ref()
+                        {
+                            session
+                                .services
+                                .command_execution
+                                .finish_running_process_with_execution_id(
+                                    process_id,
+                                    *execution_id,
+                                    parent_tool_execution_id,
+                                    Some(exit_code),
+                                )
+                                .await
+                        } else {
+                            CompletionApplyResult::Missing
+                        };
+                        if !matches!(
+                            tracked,
+                            CompletionApplyResult::Applied | CompletionApplyResult::AlreadyApplied
+                        ) {
                             session
                                 .services
                                 .command_execution
@@ -978,12 +1000,26 @@ impl ExecCommandHandler {
                 let finalized_artifact =
                     replace_raw_output_artifact(&raw_output_artifact, output_text.as_bytes()).await;
                 if !known_delta_hit {
-                    let tracked = session
-                        .services
-                        .command_execution
-                        .finish_running_process(process_id, Some(output.exit_code))
-                        .await;
-                    if !tracked {
+                    let tracked = if let Some((execution_id, parent_tool_execution_id)) =
+                        tracked_execution.as_ref()
+                    {
+                        session
+                            .services
+                            .command_execution
+                            .finish_running_process_with_execution_id(
+                                process_id,
+                                *execution_id,
+                                parent_tool_execution_id,
+                                Some(output.exit_code),
+                            )
+                            .await
+                    } else {
+                        CompletionApplyResult::Missing
+                    };
+                    if !matches!(
+                        tracked,
+                        CompletionApplyResult::Applied | CompletionApplyResult::AlreadyApplied
+                    ) {
                         session
                             .services
                             .command_execution
@@ -1026,15 +1062,29 @@ impl ExecCommandHandler {
                 if retry_failure && !known_delta_hit {
                     let finalized_running_process =
                         if matches!(&err, UnifiedExecError::ProcessFailed { .. }) {
-                            session
-                                .services
-                                .command_execution
-                                .finish_running_process(process_id, Some(-1))
-                                .await
+                            if let Some((execution_id, parent_tool_execution_id)) =
+                                tracked_execution.as_ref()
+                            {
+                                session
+                                    .services
+                                    .command_execution
+                                    .finish_running_process_with_execution_id(
+                                        process_id,
+                                        *execution_id,
+                                        parent_tool_execution_id,
+                                        Some(-1),
+                                    )
+                                    .await
+                            } else {
+                                CompletionApplyResult::Missing
+                            }
                         } else {
-                            false
+                            CompletionApplyResult::Missing
                         };
-                    if !finalized_running_process {
+                    if !matches!(
+                        finalized_running_process,
+                        CompletionApplyResult::Applied | CompletionApplyResult::AlreadyApplied
+                    ) {
                         session
                             .services
                             .command_execution
@@ -1049,7 +1099,18 @@ impl ExecCommandHandler {
                     "exec_command failed for `{command_for_display}`: {err:?}{repair}"
                 )))
             }
-        }
+        };
+        let running_process_after_cleanup = session
+            .services
+            .command_execution
+            .running_process(process_id)
+            .await
+            .is_some();
+        crate::tools::tool_dispatch_trace::record_exec_cleanup_state(
+            background_process_expected,
+            running_process_after_cleanup,
+        );
+        result
     }
 }
 

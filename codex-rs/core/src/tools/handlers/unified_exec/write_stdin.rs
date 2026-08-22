@@ -8,10 +8,13 @@ use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::PostToolUsePayload;
 use crate::tools::registry::PreToolUsePayload;
 use crate::tools::registry::ToolExecutor;
+use crate::tools::tool_dispatch_trace;
 use crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS;
 use crate::unified_exec::WriteStdinRequest;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TerminalInteractionEvent;
+use codex_protocol::protocol::ToolLifecycleTimerWait;
+use codex_protocol::protocol::ToolLifecycleWakeReason;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use serde::Deserialize;
@@ -76,7 +79,12 @@ impl WriteStdinHandler {
         validate_independent_review_stdin(&turn.session_source, &args.chars)
             .map_err(|message| FunctionCallError::RespondToModel(message.to_string()))?;
         let yield_time_ms = owner_wait_yield_time_ms(&args.chars, args.yield_time_ms);
-        let mut response = session
+        if args.chars.is_empty() {
+            let _ = tool_dispatch_trace::increment_retry_count();
+            let _ = tool_dispatch_trace::increment_reentry_count();
+        }
+        let deadline_at_ms = tool_dispatch_trace::lifecycle_deadline_after_ms(yield_time_ms);
+        let response = session
             .services
             .unified_exec_manager
             .write_stdin(WriteStdinRequest {
@@ -86,10 +94,23 @@ impl WriteStdinHandler {
                 max_output_tokens: args.max_output_tokens,
                 truncation_policy: turn.model_info.truncation_policy.into(),
             })
-            .await
-            .map_err(|err| {
-                FunctionCallError::RespondToModel(format!("write_stdin failed: {err}"))
-            })?;
+            .await;
+        let wake_reason = match &response {
+            Ok(response) if response.process_id.is_some() => ToolLifecycleWakeReason::Timeout,
+            Ok(_) => ToolLifecycleWakeReason::Completed,
+            Err(_) => ToolLifecycleWakeReason::Cancelled,
+        };
+        tool_dispatch_trace::record_timer_wait(ToolLifecycleTimerWait {
+            wait_kind: "write_stdin_yield".to_string(),
+            requested_timeout_ms: args.yield_time_ms,
+            effective_timeout_ms: Some(yield_time_ms),
+            deadline_at_ms,
+            wake_reason,
+            sequence: 0,
+        });
+        let mut response = response.map_err(|err| {
+            FunctionCallError::RespondToModel(format!("write_stdin failed: {err}"))
+        })?;
 
         if let Some(running) = session
             .services
@@ -112,7 +133,12 @@ impl WriteStdinHandler {
                 session
                     .services
                     .command_execution
-                    .finish_running_process(args.session_id, response.exit_code)
+                    .finish_running_process_with_execution_id(
+                        args.session_id,
+                        running.execution_id,
+                        &running.parent_tool_execution_id,
+                        response.exit_code,
+                    )
                     .await;
             }
         }

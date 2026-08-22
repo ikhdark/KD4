@@ -2117,7 +2117,111 @@ pub enum TurnTimingToolCallSource {
     CodeMode,
 }
 
-/// Delivery-complete lifecycle for one model-issued or nested tool call.
+/// Opaque identity for one concrete execution of a tool call.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, Hash, JsonSchema, TS)]
+#[serde(transparent)]
+#[ts(type = "string")]
+pub struct ToolExecutionId(pub String);
+
+/// Opaque identity for the sampling generation that emitted a tool call.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, Hash, JsonSchema, TS)]
+#[serde(transparent)]
+#[ts(type = "string")]
+pub struct SamplingGenerationId(pub String);
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum ToolLifecycleBoundary {
+    #[default]
+    RequestCreated,
+    Admitted,
+    HandlerStart,
+    ProcessSpawn,
+    ProcessExit,
+    HandlerReturn,
+    RelayEnqueue,
+    RelayDelivery,
+    NextModelSampleStart,
+}
+
+/// Queue and waiter state captured at a lifecycle boundary.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct ToolLifecycleContext {
+    #[serde(default)]
+    pub relay_queue_depth: u32,
+    #[serde(default)]
+    pub parallel_gate_waiter_count: u32,
+    #[serde(default)]
+    pub sampling_gate_waiter_count: u32,
+    #[serde(default)]
+    pub process_output_waiter_count: u32,
+    #[serde(default)]
+    pub active_tool_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum NextSampleBlockReason {
+    WaitingForTool,
+    WaitingForDelivery,
+    WaitingForGate,
+    WaitingForProcessCleanup,
+    #[default]
+    ReadyToSample,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum ToolLifecycleWakeReason {
+    #[default]
+    Completed,
+    Timeout,
+    Cancelled,
+    Retry,
+}
+
+/// Attribution for a bounded or sticky lifecycle wait.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct ToolLifecycleTimerWait {
+    pub wait_kind: String,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub requested_timeout_ms: Option<u64>,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub effective_timeout_ms: Option<u64>,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub deadline_at_ms: Option<u64>,
+    #[serde(default)]
+    pub wake_reason: ToolLifecycleWakeReason,
+    #[serde(default)]
+    pub sequence: u32,
+}
+
+/// Exact event-site timestamp from the turn's single monotonic clock.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct TurnTimingToolLifecycleEvent {
+    pub boundary: ToolLifecycleBoundary,
+    pub at_ms: u64,
+    #[serde(default)]
+    pub context: ToolLifecycleContext,
+    #[serde(default)]
+    pub retry_count: u32,
+    #[serde(default)]
+    pub reentry_count: u32,
+}
+
+/// Relay and persistence lifecycle for one model-issued or nested tool call.
 ///
 /// All `*_at_ms` values are monotonic offsets from turn start. A missing
 /// boundary means the call ended before that boundary was observed. No tool
@@ -2130,6 +2234,14 @@ pub struct TurnTimingToolCall {
     pub tool_name: String,
     #[serde(default)]
     pub source: TurnTimingToolCallSource,
+    #[serde(default)]
+    pub execution_id: ToolExecutionId,
+    #[serde(default)]
+    pub sampling_generation_id: SamplingGenerationId,
+    /// Payload-free terminal classification reported by the tool runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub outcome: Option<String>,
     #[serde(default)]
     #[ts(type = "number | null")]
     pub generation_index: Option<u32>,
@@ -2159,10 +2271,21 @@ pub struct TurnTimingToolCall {
     #[serde(default)]
     #[ts(type = "number | null")]
     pub process_exited_at_ms: Option<u64>,
+    /// Historical relay-completion boundary. This predates persistence timing
+    /// and therefore does not prove that the output reached conversation
+    /// history or the rollout recorder.
     #[serde(default)]
     #[ts(type = "number | null")]
     pub delivered_at_ms: Option<u64>,
-    /// The next model generation began after this result was delivered.
+    /// The direct tool output was committed to model-visible conversation
+    /// history and the best-effort rollout persistence attempt returned.
+    /// This does not prove that a rollout recorder existed, that its append
+    /// succeeded, or that storage was flushed. Nested code-mode calls are
+    /// represented by the outer direct tool output and leave this absent.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub output_model_visible_at_ms: Option<u64>,
+    /// The next model generation began after this result became model-visible.
     #[serde(default)]
     #[ts(type = "number | null")]
     pub model_resumed_at_ms: Option<u64>,
@@ -2206,6 +2329,28 @@ pub struct TurnTimingToolCall {
     pub eager: bool,
     #[serde(default)]
     pub process_alive_at_delivery: bool,
+    /// The exec handler reached its post-cleanup process-store observation.
+    #[serde(default)]
+    pub exec_cleanup_state_observed: bool,
+    /// A retained running process is expected only when the response returned
+    /// a background process identifier for a later `write_stdin` call.
+    #[serde(default)]
+    pub background_process_expected: bool,
+    /// The process manager still retained this call after foreground cleanup.
+    #[serde(default)]
+    pub running_process_after_cleanup: bool,
+    /// Exact event-site lifecycle records. Older timestamp fields remain as
+    /// compatibility projections of these boundaries.
+    #[serde(default)]
+    pub lifecycle_events: Vec<TurnTimingToolLifecycleEvent>,
+    #[serde(default)]
+    pub timer_waits: Vec<ToolLifecycleTimerWait>,
+    #[serde(default)]
+    pub retry_count: u32,
+    #[serde(default)]
+    pub reentry_count: u32,
+    #[serde(default)]
+    pub next_sample_block_reason: NextSampleBlockReason,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -2407,9 +2552,20 @@ pub struct TurnTimingModelRequest {
     #[serde(default)]
     #[ts(type = "number | null")]
     pub decision_latency_ns: Option<u64>,
-    /// Tool calls emitted by this generation. Recorded on its primary attempt.
+    /// Tool calls whose deferred executor future was polled for this generation.
+    /// Kept under its historical field name for rollout compatibility.
     #[serde(default)]
     pub tool_call_count: u32,
+    /// Tool calls parsed from completed model output before relay persistence
+    /// or executor polling. Recorded on the generation's primary attempt.
+    #[serde(default)]
+    pub model_emitted_tool_call_count: u32,
+    /// Direct model-issued calls that acquired the executor admission gate.
+    #[serde(default)]
+    pub executor_admitted_tool_call_count: u32,
+    /// Peak direct model-issued calls holding executor admission concurrently.
+    #[serde(default)]
+    pub executor_max_concurrent_tool_calls: u32,
     /// Unioned tool-active duration attributed to this generation. Parallel
     /// tool calls are counted once per wall-clock interval.
     #[serde(default)]
@@ -8059,6 +8215,10 @@ mod tests {
             physical_attempt_ids: vec!["attempt-1".to_string(), "attempt-2".to_string()],
             decision_latency_ns: Some(123),
             tool_active_union_ns: 456,
+            tool_call_count: 2,
+            model_emitted_tool_call_count: 3,
+            executor_admitted_tool_call_count: 2,
+            executor_max_concurrent_tool_calls: 2,
             first_actionable_output_ms: Some(7),
             ..Default::default()
         };
@@ -8071,11 +8231,117 @@ mod tests {
         );
         assert_eq!(value["decisionLatencyNs"], 123);
         assert_eq!(value["toolActiveUnionNs"], 456);
+        assert_eq!(value["toolCallCount"], 2);
+        assert_eq!(value["modelEmittedToolCallCount"], 3);
+        assert_eq!(value["executorAdmittedToolCallCount"], 2);
+        assert_eq!(value["executorMaxConcurrentToolCalls"], 2);
         assert_eq!(value["firstActionableOutputMs"], 7);
         assert_eq!(
             serde_json::from_value::<TurnTimingModelRequest>(value)
                 .expect("request deserialization"),
             request
+        );
+
+        let historical: TurnTimingModelRequest = serde_json::from_value(serde_json::json!({
+            "isContinuation": false,
+            "toolCallCount": 1
+        }))
+        .expect("historical model request timing");
+        assert_eq!(historical.tool_call_count, 1);
+        assert_eq!(historical.model_emitted_tool_call_count, 0);
+        assert_eq!(historical.executor_admitted_tool_call_count, 0);
+        assert_eq!(historical.executor_max_concurrent_tool_calls, 0);
+    }
+
+    #[test]
+    fn turn_timing_tool_call_round_trips_outcome_and_exec_cleanup_state() {
+        let historical: TurnTimingToolCall = serde_json::from_value(serde_json::json!({
+            "callId": "legacy-call",
+            "toolName": "exec_command"
+        }))
+        .expect("historical tool timing");
+        assert_eq!(historical.outcome, None);
+        assert_eq!(historical.output_model_visible_at_ms, None);
+        assert!(!historical.exec_cleanup_state_observed);
+        assert!(!historical.background_process_expected);
+        assert!(!historical.running_process_after_cleanup);
+
+        let current = TurnTimingToolCall {
+            call_id: "failed-call".to_string(),
+            tool_name: "exec_command".to_string(),
+            outcome: Some("failure".to_string()),
+            output_model_visible_at_ms: Some(17),
+            exec_cleanup_state_observed: true,
+            running_process_after_cleanup: true,
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&current).expect("tool timing serialization");
+        assert_eq!(value["outcome"], "failure");
+        assert_eq!(value["outputModelVisibleAtMs"], 17);
+        assert_eq!(value["execCleanupStateObserved"], true);
+        assert_eq!(value["backgroundProcessExpected"], false);
+        assert_eq!(value["runningProcessAfterCleanup"], true);
+        assert_eq!(
+            serde_json::from_value::<TurnTimingToolCall>(value)
+                .expect("tool timing deserialization"),
+            current
+        );
+    }
+
+    #[test]
+    fn turn_timing_tool_lifecycle_fields_are_backward_compatible() {
+        let historical: TurnTimingToolCall = serde_json::from_value(serde_json::json!({
+            "callId": "legacy-call",
+            "toolName": "exec_command"
+        }))
+        .expect("historical tool timing remains readable");
+        assert_eq!(historical.execution_id, ToolExecutionId::default());
+        assert_eq!(
+            historical.sampling_generation_id,
+            SamplingGenerationId::default()
+        );
+        assert!(historical.lifecycle_events.is_empty());
+        assert!(historical.timer_waits.is_empty());
+        assert_eq!(
+            historical.next_sample_block_reason,
+            NextSampleBlockReason::ReadyToSample
+        );
+
+        let current = TurnTimingToolCall {
+            call_id: "current-call".to_string(),
+            tool_name: "exec_command".to_string(),
+            execution_id: ToolExecutionId("tool-execution-7".to_string()),
+            sampling_generation_id: SamplingGenerationId("generation-3".to_string()),
+            lifecycle_events: vec![TurnTimingToolLifecycleEvent {
+                boundary: ToolLifecycleBoundary::ProcessExit,
+                at_ms: 23,
+                context: ToolLifecycleContext {
+                    process_output_waiter_count: 1,
+                    ..ToolLifecycleContext::default()
+                },
+                retry_count: 2,
+                reentry_count: 1,
+            }],
+            timer_waits: vec![ToolLifecycleTimerWait {
+                wait_kind: "output_drain".to_string(),
+                effective_timeout_ms: Some(60_000),
+                deadline_at_ms: Some(60_023),
+                wake_reason: ToolLifecycleWakeReason::Timeout,
+                sequence: 1,
+                ..ToolLifecycleTimerWait::default()
+            }],
+            retry_count: 2,
+            reentry_count: 1,
+            next_sample_block_reason: NextSampleBlockReason::WaitingForProcessCleanup,
+            ..TurnTimingToolCall::default()
+        };
+        let value = serde_json::to_value(&current).expect("current timing serialization");
+        assert_eq!(value["executionId"], "tool-execution-7");
+        assert_eq!(value["lifecycleEvents"][0]["boundary"], "process_exit");
+        assert_eq!(
+            serde_json::from_value::<TurnTimingToolCall>(value)
+                .expect("current timing deserialization"),
+            current
         );
     }
 

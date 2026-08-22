@@ -43,9 +43,23 @@ modelStreamWaitNs: bigint,
  */
 decisionLatencyNs: number | null,
 /**
- * Tool calls emitted by this generation. Recorded on its primary attempt.
+ * Tool calls whose deferred executor future was polled for this generation.
+ * Kept under its historical field name for rollout compatibility.
  */
 toolCallCount: number,
+/**
+ * Tool calls parsed from completed model output before relay persistence
+ * or executor polling. Recorded on the generation's primary attempt.
+ */
+modelEmittedToolCallCount: number,
+/**
+ * Direct model-issued calls that acquired the executor admission gate.
+ */
+executorAdmittedToolCallCount: number,
+/**
+ * Peak direct model-issued calls holding executor admission concurrently.
+ */
+executorMaxConcurrentToolCalls: number,
 /**
  * Unioned tool-active duration attributed to this generation. Parallel
  * tool calls are counted once per wall-clock interval.

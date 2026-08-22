@@ -6,10 +6,13 @@ use std::hash::Hasher;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::SystemTime;
 
 use codex_protocol::plan_tool::ValidationRoute;
+use codex_protocol::protocol::ToolExecutionId;
 use codex_protocol::validation::ValidationFreshness;
 use codex_protocol::validation::ValidationProofKey;
 use codex_protocol::validation::ValidationResult;
@@ -27,6 +30,25 @@ use crate::validation_admission::ValidationLaunchPlan;
 const MAX_TRACKED_COMMANDS: usize = 128;
 const MAX_COMPLETED_VALIDATION_PROOFS: usize = 128;
 const COMMAND_EXECUTION_CACHE_SCHEMA_VERSION: u32 = 1;
+static NEXT_COMMAND_EXECUTION_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub(crate) struct CommandExecutionId(u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompletionApplyResult {
+    Applied,
+    AlreadyApplied,
+    Stale,
+    Missing,
+}
+
+impl CompletionApplyResult {
+    #[cfg(test)]
+    pub(crate) fn accepted(self) -> bool {
+        matches!(self, Self::Applied | Self::AlreadyApplied)
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CommandAttemptKey {
     tool_name: String,
@@ -309,11 +331,24 @@ struct AttemptEntry {
 
 #[derive(Debug, Clone)]
 pub(crate) struct RunningCommand {
+    pub(crate) execution_id: CommandExecutionId,
+    pub(crate) parent_tool_execution_id: ToolExecutionId,
     pub(crate) key: CommandAttemptKey,
     pub(crate) artifact: RawOutputArtifact,
     completed_exit_code: Option<i32>,
     validation_launch: Option<ValidationLaunchPlan>,
     started_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct PendingCommandCompletion {
+    process_id: u32,
+    command: RunningCommand,
+}
+
+#[derive(Debug, Clone)]
+struct CommandCompletionReceipt {
+    parent_tool_execution_id: ToolExecutionId,
 }
 
 #[derive(Debug, Clone)]
@@ -350,6 +385,9 @@ struct CommandExecutionState {
     insertion_order: VecDeque<CommandAttemptKey>,
     running: HashMap<u32, RunningCommand>,
     running_order: VecDeque<u32>,
+    pending_by_execution_id: HashMap<CommandExecutionId, PendingCommandCompletion>,
+    completion_receipts: HashMap<CommandExecutionId, CommandCompletionReceipt>,
+    completion_receipt_order: VecDeque<CommandExecutionId>,
     repository_epoch: u64,
     observed_workspace_identity: Option<(u64, crate::git_workspace::WorkspaceEvidenceIdentity)>,
     observed_turn_mutation_revisions: HashMap<String, u64>,
@@ -379,6 +417,10 @@ impl Default for CommandExecutionLedger {
 }
 
 impl CommandExecutionLedger {
+    pub(crate) fn allocate_execution_id(&self) -> CommandExecutionId {
+        CommandExecutionId(NEXT_COMMAND_EXECUTION_ID.fetch_add(1, Ordering::Relaxed))
+    }
+
     pub(crate) async fn load_or_new(codex_home: PathBuf, thread_id: String, cwd: &Path) -> Self {
         let Some(workspace_identity) =
             crate::git_workspace::capture_workspace_evidence_identity(cwd).await
@@ -693,7 +735,10 @@ impl CommandExecutionLedger {
         key: CommandAttemptKey,
         artifact: RawOutputArtifact,
     ) {
-        self.track_running_process_with_validation_contract(
+        let execution_id = self.allocate_execution_id();
+        self.track_running_process_with_execution_id(
+            execution_id,
+            ToolExecutionId::default(),
             process_id,
             key,
             artifact,
@@ -704,6 +749,7 @@ impl CommandExecutionLedger {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) async fn track_running_process_with_validation_contract(
         &self,
         process_id: u32,
@@ -712,7 +758,32 @@ impl CommandExecutionLedger {
         validation_launch: Option<ValidationLaunchPlan>,
         started_at: Instant,
     ) {
+        let execution_id = self.allocate_execution_id();
+        self.track_running_process_with_execution_id(
+            execution_id,
+            ToolExecutionId::default(),
+            process_id,
+            key,
+            artifact,
+            validation_launch,
+            started_at,
+        )
+        .await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn track_running_process_with_execution_id(
+        &self,
+        execution_id: CommandExecutionId,
+        parent_tool_execution_id: ToolExecutionId,
+        process_id: u32,
+        key: CommandAttemptKey,
+        artifact: RawOutputArtifact,
+        validation_launch: Option<ValidationLaunchPlan>,
+        started_at: Instant,
+    ) {
         let mut state = self.state.lock().await;
+        debug_assert_command_execution_invariants(&state);
         if state.running.contains_key(&process_id) {
             tracing::error!(process_id, "refusing to replace live command bookkeeping");
             return;
@@ -721,6 +792,8 @@ impl CommandExecutionLedger {
         state.running.insert(
             process_id,
             RunningCommand {
+                execution_id,
+                parent_tool_execution_id,
                 key,
                 artifact,
                 completed_exit_code: None,
@@ -728,10 +801,39 @@ impl CommandExecutionLedger {
                 started_at,
             },
         );
+        debug_assert_command_execution_invariants(&state);
     }
 
     pub(crate) async fn running_process(&self, process_id: u32) -> Option<RunningCommand> {
         self.state.lock().await.running.get(&process_id).cloned()
+    }
+
+    pub(crate) async fn process_execution_identity(
+        &self,
+        process_id: u32,
+    ) -> Option<(CommandExecutionId, ToolExecutionId)> {
+        let state = self.state.lock().await;
+        state
+            .running
+            .get(&process_id)
+            .map(|running| {
+                (
+                    running.execution_id,
+                    running.parent_tool_execution_id.clone(),
+                )
+            })
+            .or_else(|| {
+                state
+                    .pending_by_execution_id
+                    .iter()
+                    .find(|(_, pending)| pending.process_id == process_id)
+                    .map(|(execution_id, pending)| {
+                        (
+                            *execution_id,
+                            pending.command.parent_tool_execution_id.clone(),
+                        )
+                    })
+            })
     }
 
     pub(crate) async fn finish_turn(&self, turn_id: &str) {
@@ -816,13 +918,26 @@ impl CommandExecutionLedger {
     ) {
         {
             let mut state = self.state.lock().await;
-            let deterministic_completion = state.running.get_mut(&process_id).and_then(|running| {
+            debug_assert_command_execution_invariants(&state);
+            let mut update_artifact = |running: &mut RunningCommand| {
                 running.artifact = artifact.clone();
                 running
                     .completed_exit_code
                     .filter(|exit_code| *exit_code != 0 && running.validation_launch.is_some())
                     .map(|exit_code| (running.key.clone(), exit_code))
-            });
+            };
+            let deterministic_completion = if state.running.contains_key(&process_id) {
+                state
+                    .running
+                    .get_mut(&process_id)
+                    .and_then(&mut update_artifact)
+            } else {
+                state
+                    .pending_by_execution_id
+                    .values_mut()
+                    .find(|pending| pending.process_id == process_id)
+                    .and_then(|pending| update_artifact(&mut pending.command))
+            };
             if let Some((key, exit_code)) = deterministic_completion
                 && let Some(failure) = state
                     .attempts
@@ -832,35 +947,164 @@ impl CommandExecutionLedger {
             {
                 failure.evidence = artifact;
             }
+            debug_assert_command_execution_invariants(&state);
         }
         self.publish_completed_validation_if_ready(process_id).await;
     }
 
+    #[cfg(test)]
     pub(crate) async fn mark_running_process_completed(
         &self,
         process_id: u32,
         exit_code: i32,
-    ) -> bool {
+    ) -> CompletionApplyResult {
+        let identity = {
+            let state = self.state.lock().await;
+            state
+                .running
+                .get(&process_id)
+                .map(|running| {
+                    (
+                        running.execution_id,
+                        running.parent_tool_execution_id.clone(),
+                    )
+                })
+                .or_else(|| {
+                    state
+                        .pending_by_execution_id
+                        .iter()
+                        .find(|(_, pending)| pending.process_id == process_id)
+                        .map(|(execution_id, pending)| {
+                            (
+                                *execution_id,
+                                pending.command.parent_tool_execution_id.clone(),
+                            )
+                        })
+                })
+        };
+        let Some((execution_id, parent_tool_execution_id)) = identity else {
+            return CompletionApplyResult::Missing;
+        };
+        self.mark_process_exited(
+            process_id,
+            execution_id,
+            &parent_tool_execution_id,
+            exit_code,
+        )
+        .await
+    }
+
+    pub(crate) async fn mark_process_exited(
+        &self,
+        process_id: u32,
+        execution_id: CommandExecutionId,
+        parent_tool_execution_id: &ToolExecutionId,
+        exit_code: i32,
+    ) -> CompletionApplyResult {
         {
             let mut state = self.state.lock().await;
-            let Some(running) = state.running.get_mut(&process_id) else {
-                return false;
-            };
-            if running.completed_exit_code.is_some() {
-                return true;
+            debug_assert_command_execution_invariants(&state);
+            if state.running.get(&process_id).is_some_and(|running| {
+                running.execution_id != execution_id
+                    || &running.parent_tool_execution_id != parent_tool_execution_id
+            }) {
+                return CompletionApplyResult::Stale;
             }
+            if let Some(receipt) = state.completion_receipts.get(&execution_id) {
+                return if &receipt.parent_tool_execution_id == parent_tool_execution_id {
+                    CompletionApplyResult::AlreadyApplied
+                } else {
+                    CompletionApplyResult::Stale
+                };
+            }
+            if let Some(pending) = state.pending_by_execution_id.get(&execution_id) {
+                return if &pending.command.parent_tool_execution_id == parent_tool_execution_id {
+                    CompletionApplyResult::AlreadyApplied
+                } else {
+                    CompletionApplyResult::Stale
+                };
+            }
+            let Some(live) = state.running.get(&process_id) else {
+                return if state
+                    .pending_by_execution_id
+                    .values()
+                    .any(|pending| pending.process_id == process_id)
+                {
+                    CompletionApplyResult::Stale
+                } else {
+                    CompletionApplyResult::Missing
+                };
+            };
+            if live.execution_id != execution_id
+                || &live.parent_tool_execution_id != parent_tool_execution_id
+            {
+                return CompletionApplyResult::Stale;
+            }
+            let Some(mut running) = state.running.remove(&process_id) else {
+                return CompletionApplyResult::Missing;
+            };
+            state.running_order.retain(|tracked| *tracked != process_id);
             running.completed_exit_code = Some(exit_code);
-            let running = running.clone();
             record_running_exit_locked(&mut state, &running, exit_code);
+            state.pending_by_execution_id.insert(
+                execution_id,
+                PendingCommandCompletion {
+                    process_id,
+                    command: running,
+                },
+            );
+            debug_assert_command_execution_invariants(&state);
         }
         self.publish_completed_validation_if_ready(process_id).await;
-        true
+        CompletionApplyResult::Applied
+    }
+
+    pub(crate) async fn retire_completed_process(
+        &self,
+        execution_id: CommandExecutionId,
+        parent_tool_execution_id: &ToolExecutionId,
+    ) -> CompletionApplyResult {
+        let mut state = self.state.lock().await;
+        debug_assert_command_execution_invariants(&state);
+        if let Some(receipt) = state.completion_receipts.get(&execution_id) {
+            return if &receipt.parent_tool_execution_id == parent_tool_execution_id {
+                CompletionApplyResult::AlreadyApplied
+            } else {
+                CompletionApplyResult::Stale
+            };
+        }
+        let Some(pending) = state.pending_by_execution_id.get(&execution_id) else {
+            return CompletionApplyResult::Missing;
+        };
+        if &pending.command.parent_tool_execution_id != parent_tool_execution_id {
+            return CompletionApplyResult::Stale;
+        }
+        let Some(pending) = state.pending_by_execution_id.remove(&execution_id) else {
+            return CompletionApplyResult::Missing;
+        };
+        insert_completion_receipt(
+            &mut state,
+            execution_id,
+            pending.command.parent_tool_execution_id,
+        );
+        while state.attempts.len() > MAX_TRACKED_COMMANDS
+            && evict_oldest_inactive_attempt_locked(&mut state)
+        {}
+        debug_assert_command_execution_invariants(&state);
+        CompletionApplyResult::Applied
     }
 
     async fn publish_completed_validation_if_ready(&self, process_id: u32) {
         let candidate = {
             let state = self.state.lock().await;
-            let Some(running) = state.running.get(&process_id) else {
+            let running = state.running.get(&process_id).or_else(|| {
+                state
+                    .pending_by_execution_id
+                    .values()
+                    .find(|pending| pending.process_id == process_id)
+                    .map(|pending| &pending.command)
+            });
+            let Some(running) = running else {
                 return;
             };
             let Some(exit_code) = running.completed_exit_code else {
@@ -1072,16 +1316,71 @@ impl CommandExecutionLedger {
         true
     }
 
+    #[cfg(test)]
     pub(crate) async fn finish_running_process(
         &self,
         process_id: u32,
         exit_code: Option<i32>,
-    ) -> bool {
-        {
-            let mut state = self.state.lock().await;
-            let Some(mut running) = state.running.remove(&process_id) else {
-                return false;
+    ) -> CompletionApplyResult {
+        let identity = {
+            let state = self.state.lock().await;
+            state
+                .running
+                .get(&process_id)
+                .map(|running| {
+                    (
+                        running.execution_id,
+                        running.parent_tool_execution_id.clone(),
+                    )
+                })
+                .or_else(|| {
+                    state
+                        .pending_by_execution_id
+                        .iter()
+                        .find(|(_, pending)| pending.process_id == process_id)
+                        .map(|(execution_id, pending)| {
+                            (
+                                *execution_id,
+                                pending.command.parent_tool_execution_id.clone(),
+                            )
+                        })
+                })
+        };
+        let Some((execution_id, parent_tool_execution_id)) = identity else {
+            return CompletionApplyResult::Missing;
+        };
+        self.finish_running_process_with_execution_id(
+            process_id,
+            execution_id,
+            &parent_tool_execution_id,
+            exit_code,
+        )
+        .await
+    }
+
+    pub(crate) async fn finish_running_process_with_execution_id(
+        &self,
+        process_id: u32,
+        execution_id: CommandExecutionId,
+        parent_tool_execution_id: &ToolExecutionId,
+        exit_code: Option<i32>,
+    ) -> CompletionApplyResult {
+        let mut state = self.state.lock().await;
+        debug_assert_command_execution_invariants(&state);
+        if let Some(receipt) = state.completion_receipts.get(&execution_id) {
+            return if &receipt.parent_tool_execution_id == parent_tool_execution_id {
+                CompletionApplyResult::AlreadyApplied
+            } else {
+                CompletionApplyResult::Stale
             };
+        }
+        if state.running.get(&process_id).is_some_and(|running| {
+            running.execution_id != execution_id
+                || &running.parent_tool_execution_id != parent_tool_execution_id
+        }) {
+            return CompletionApplyResult::Stale;
+        }
+        if let Some(mut running) = state.running.remove(&process_id) {
             state.running_order.retain(|tracked| *tracked != process_id);
             if running.completed_exit_code.is_none()
                 && let Some(exit_code) = exit_code
@@ -1089,12 +1388,29 @@ impl CommandExecutionLedger {
                 running.completed_exit_code = Some(exit_code);
                 record_running_exit_locked(&mut state, &running, exit_code);
             }
+            insert_completion_receipt(&mut state, execution_id, running.parent_tool_execution_id);
+        } else if let Some(pending) = state.pending_by_execution_id.get(&execution_id) {
+            if pending.process_id != process_id
+                || &pending.command.parent_tool_execution_id != parent_tool_execution_id
+            {
+                return CompletionApplyResult::Stale;
+            }
+            let Some(pending) = state.pending_by_execution_id.remove(&execution_id) else {
+                return CompletionApplyResult::Missing;
+            };
+            insert_completion_receipt(
+                &mut state,
+                execution_id,
+                pending.command.parent_tool_execution_id,
+            );
+        } else {
+            return CompletionApplyResult::Missing;
         }
-        let mut state = self.state.lock().await;
         while state.attempts.len() > MAX_TRACKED_COMMANDS
             && evict_oldest_inactive_attempt_locked(&mut state)
         {}
-        true
+        debug_assert_command_execution_invariants(&state);
+        CompletionApplyResult::Applied
     }
 
     #[cfg(test)]
@@ -1108,6 +1424,62 @@ impl CommandExecutionLedger {
             .await
             .map_or(0, |entry| entry.consecutive_failures)
     }
+}
+
+fn insert_completion_receipt(
+    state: &mut CommandExecutionState,
+    execution_id: CommandExecutionId,
+    parent_tool_execution_id: ToolExecutionId,
+) {
+    if state.completion_receipts.contains_key(&execution_id) {
+        return;
+    }
+    state.completion_receipts.insert(
+        execution_id,
+        CommandCompletionReceipt {
+            parent_tool_execution_id,
+        },
+    );
+    state.completion_receipt_order.push_back(execution_id);
+    while state.completion_receipt_order.len() > MAX_TRACKED_COMMANDS {
+        if let Some(oldest) = state.completion_receipt_order.pop_front() {
+            state.completion_receipts.remove(&oldest);
+        }
+    }
+}
+
+fn debug_assert_command_execution_invariants(state: &CommandExecutionState) {
+    debug_assert!(state.running.values().all(|running| {
+        running.completed_exit_code.is_none()
+            && !state
+                .pending_by_execution_id
+                .contains_key(&running.execution_id)
+            && !state
+                .completion_receipts
+                .contains_key(&running.execution_id)
+    }));
+    debug_assert!(
+        state
+            .pending_by_execution_id
+            .iter()
+            .all(|(execution_id, pending)| {
+                pending.command.execution_id == *execution_id
+                    && pending.command.completed_exit_code.is_some()
+                    && !state.completion_receipts.contains_key(execution_id)
+                    && state
+                        .running
+                        .values()
+                        .all(|running| running.execution_id != *execution_id)
+            })
+    );
+    debug_assert!(state.completion_receipt_order.iter().all(|execution_id| {
+        state.completion_receipts.contains_key(execution_id)
+            && !state.pending_by_execution_id.contains_key(execution_id)
+            && state
+                .running
+                .values()
+                .all(|running| running.execution_id != *execution_id)
+    }));
 }
 
 fn record_running_exit_locked(
@@ -1244,6 +1616,7 @@ fn selected_test_count(output: &[u8]) -> Option<u64> {
 mod tests {
     use super::*;
     use std::process::Command;
+    use tokio_util::sync::CancellationToken;
 
     fn key(command: &str) -> CommandAttemptKey {
         CommandAttemptKey::new("exec_command", "local", "C:/repo", &[command.to_string()])
@@ -1688,11 +2061,133 @@ mod tests {
                 RawOutputArtifact::unavailable("background search fixture"),
             )
             .await;
-        assert!(ledger.mark_running_process_completed(42, 1).await);
+        assert!(
+            ledger
+                .mark_running_process_completed(42, 1)
+                .await
+                .accepted()
+        );
         ledger
             .begin_attempt(&equivalent, false)
             .await
             .expect_err("background miss should be reused");
+    }
+
+    #[tokio::test]
+    async fn stale_execution_completion_cannot_clear_reused_process_id() {
+        let ledger = CommandExecutionLedger::default();
+        let first_id = ledger.allocate_execution_id();
+        let first_parent = ToolExecutionId("tool-execution-first".to_string());
+        ledger
+            .track_running_process_with_execution_id(
+                first_id,
+                first_parent.clone(),
+                42,
+                key("first"),
+                RawOutputArtifact::unavailable("first"),
+                None,
+                Instant::now(),
+            )
+            .await;
+        assert_eq!(
+            ledger
+                .mark_process_exited(42, first_id, &first_parent, 0)
+                .await,
+            CompletionApplyResult::Applied
+        );
+        assert_eq!(
+            ledger
+                .retire_completed_process(first_id, &first_parent)
+                .await,
+            CompletionApplyResult::Applied
+        );
+        assert_eq!(
+            ledger
+                .retire_completed_process(first_id, &ToolExecutionId("wrong-parent".to_string()),)
+                .await,
+            CompletionApplyResult::Stale
+        );
+
+        let second_id = ledger.allocate_execution_id();
+        let second_parent = ToolExecutionId("tool-execution-second".to_string());
+        ledger
+            .track_running_process_with_execution_id(
+                second_id,
+                second_parent.clone(),
+                42,
+                key("second"),
+                RawOutputArtifact::unavailable("second"),
+                None,
+                Instant::now(),
+            )
+            .await;
+        assert_eq!(
+            ledger
+                .mark_process_exited(42, first_id, &first_parent, 0)
+                .await,
+            CompletionApplyResult::Stale
+        );
+        assert_eq!(
+            ledger
+                .mark_process_exited(42, second_id, &first_parent, 0)
+                .await,
+            CompletionApplyResult::Stale
+        );
+        assert_eq!(
+            ledger
+                .running_process(42)
+                .await
+                .map(|running| running.execution_id),
+            Some(second_id)
+        );
+        assert_eq!(
+            ledger
+                .mark_process_exited(42, second_id, &second_parent, 0)
+                .await,
+            CompletionApplyResult::Applied
+        );
+        assert_eq!(
+            ledger
+                .mark_process_exited(42, second_id, &second_parent, 0)
+                .await,
+            CompletionApplyResult::AlreadyApplied
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_before_watcher_registration_is_observed_once() {
+        let ledger = CommandExecutionLedger::default();
+        let execution_id = ledger.allocate_execution_id();
+        let parent = ToolExecutionId("tool-execution-sticky".to_string());
+        ledger
+            .track_running_process_with_execution_id(
+                execution_id,
+                parent.clone(),
+                73,
+                key("sticky-exit"),
+                RawOutputArtifact::unavailable("sticky exit"),
+                None,
+                Instant::now(),
+            )
+            .await;
+        let exit = CancellationToken::new();
+        exit.cancel();
+
+        // CancellationToken is sticky: registering after exit must still wake.
+        exit.cancelled().await;
+        assert_eq!(
+            ledger
+                .mark_process_exited(73, execution_id, &parent, 0)
+                .await,
+            CompletionApplyResult::Applied
+        );
+        assert_eq!(
+            ledger
+                .mark_process_exited(73, execution_id, &parent, 0)
+                .await,
+            CompletionApplyResult::AlreadyApplied
+        );
+        assert!(ledger.running_process(73).await.is_none());
     }
 
     #[tokio::test]
@@ -1821,9 +2316,19 @@ mod tests {
             )
             .await;
 
-        assert!(ledger.mark_running_process_completed(42, 7).await);
-        assert!(ledger.mark_running_process_completed(42, 7).await);
-        assert!(ledger.finish_running_process(42, Some(7)).await);
+        assert!(
+            ledger
+                .mark_running_process_completed(42, 7)
+                .await
+                .accepted()
+        );
+        assert!(
+            ledger
+                .mark_running_process_completed(42, 7)
+                .await
+                .accepted()
+        );
+        assert!(ledger.finish_running_process(42, Some(7)).await.accepted());
 
         let snapshot = ledger.snapshot(&key).await.expect("tracked entry");
         assert_eq!(snapshot.consecutive_failures, 1);
@@ -1831,6 +2336,59 @@ mod tests {
             .begin_attempt(&key, false)
             .await
             .expect("one failure must not block the next attempt");
+    }
+
+    #[tokio::test]
+    async fn kd4_latency_watcher_completion_retires_only_completed_metadata() {
+        let ledger = CommandExecutionLedger::default();
+        let completed_key = key("completed-background.exe");
+        let live_key = key("live-background.exe");
+        for (process_id, command_key) in [(41, &completed_key), (42, &live_key)] {
+            ledger
+                .begin_attempt(command_key, false)
+                .await
+                .expect("attempt");
+            ledger
+                .track_running_process(
+                    process_id,
+                    command_key.clone(),
+                    RawOutputArtifact::unavailable("fixture"),
+                )
+                .await;
+        }
+
+        let completed = ledger
+            .running_process(41)
+            .await
+            .expect("completed identity");
+        assert!(
+            ledger
+                .mark_running_process_completed(41, 7)
+                .await
+                .accepted()
+        );
+        assert_eq!(
+            ledger
+                .retire_completed_process(
+                    completed.execution_id,
+                    &completed.parent_tool_execution_id,
+                )
+                .await,
+            CompletionApplyResult::Applied
+        );
+        assert_eq!(
+            ledger
+                .retire_completed_process(
+                    completed.execution_id,
+                    &completed.parent_tool_execution_id,
+                )
+                .await,
+            CompletionApplyResult::AlreadyApplied
+        );
+        assert!(ledger.running_process(41).await.is_none());
+        assert!(ledger.running_process(42).await.is_some());
+        assert_eq!(ledger.consecutive_failures(&completed_key).await, 1);
+        assert_eq!(ledger.consecutive_failures(&live_key).await, 0);
     }
 
     #[tokio::test]
@@ -1852,12 +2410,22 @@ mod tests {
             )
             .await;
 
-        assert!(ledger.mark_running_process_completed(42, 7).await);
-        assert!(ledger.mark_running_process_completed(42, 7).await);
+        assert!(
+            ledger
+                .mark_running_process_completed(42, 7)
+                .await
+                .accepted()
+        );
+        assert!(
+            ledger
+                .mark_running_process_completed(42, 7)
+                .await
+                .accepted()
+        );
         ledger
             .update_running_artifact(42, finalized_artifact.clone())
             .await;
-        assert!(ledger.finish_running_process(42, Some(7)).await);
+        assert!(ledger.finish_running_process(42, Some(7)).await.accepted());
 
         let snapshot = ledger.snapshot(&command_key).await.expect("tracked entry");
         assert_eq!(snapshot.consecutive_failures, 1);
@@ -1890,8 +2458,8 @@ mod tests {
             .update_running_artifact(43, finalized_artifact.clone())
             .await;
 
-        assert!(ledger.finish_running_process(43, Some(9)).await);
-        assert!(!ledger.finish_running_process(43, Some(9)).await);
+        assert!(ledger.finish_running_process(43, Some(9)).await.accepted());
+        assert!(!ledger.finish_running_process(43, Some(9)).await.accepted());
 
         let snapshot = ledger.snapshot(&command_key).await.expect("tracked entry");
         assert_eq!(snapshot.consecutive_failures, 1);
@@ -1922,8 +2490,13 @@ mod tests {
             )
             .await;
 
-        assert!(ledger.mark_running_process_completed(44, 0).await);
-        assert!(ledger.finish_running_process(44, Some(0)).await);
+        assert!(
+            ledger
+                .mark_running_process_completed(44, 0)
+                .await
+                .accepted()
+        );
+        assert!(ledger.finish_running_process(44, Some(0)).await.accepted());
 
         let snapshot = ledger.snapshot(&command_key).await.expect("tracked entry");
         assert_eq!(snapshot.consecutive_failures, 0);
@@ -2022,8 +2595,13 @@ mod tests {
             .track_running_process(42, key.clone(), RawOutputArtifact::unavailable("fixture"))
             .await;
 
-        assert!(ledger.finish_running_process(42, Some(-1)).await);
-        assert!(!ledger.mark_running_process_completed(42, -1).await);
+        assert!(ledger.finish_running_process(42, Some(-1)).await.accepted());
+        assert!(
+            !ledger
+                .mark_running_process_completed(42, -1)
+                .await
+                .accepted()
+        );
         assert_eq!(ledger.consecutive_failures(&key).await, 1);
     }
 
@@ -2059,7 +2637,7 @@ mod tests {
 
         assert!(ledger.running_process(0).await.is_some());
         assert_eq!(ledger.consecutive_failures(&keys[0]).await, 0);
-        assert!(ledger.mark_running_process_completed(0, 0).await);
+        assert!(ledger.mark_running_process_completed(0, 0).await.accepted());
         assert_eq!(ledger.consecutive_failures(&keys[0]).await, 0);
         assert!(ledger.running_process(64).await.is_some());
     }

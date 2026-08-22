@@ -71,6 +71,76 @@ struct ToolCallTimingGuard {
     emit_log: bool,
 }
 
+struct ModelToolGateTimingGuard {
+    turn_timing_state: Option<Arc<TurnTimingState>>,
+}
+
+enum LifecycleCounter {
+    ParallelGateWaiter,
+    ActiveTool,
+}
+
+struct LifecycleCounterGuard {
+    turn_timing_state: Arc<TurnTimingState>,
+    counter: LifecycleCounter,
+}
+
+impl LifecycleCounterGuard {
+    fn increment(turn_timing_state: &Arc<TurnTimingState>, counter: LifecycleCounter) -> Self {
+        match counter {
+            LifecycleCounter::ParallelGateWaiter => {
+                turn_timing_state.adjust_parallel_gate_waiters(1);
+            }
+            LifecycleCounter::ActiveTool => turn_timing_state.adjust_active_tools(1),
+        }
+        Self {
+            turn_timing_state: Arc::clone(turn_timing_state),
+            counter,
+        }
+    }
+}
+
+impl Drop for LifecycleCounterGuard {
+    fn drop(&mut self) {
+        match self.counter {
+            LifecycleCounter::ParallelGateWaiter => {
+                self.turn_timing_state.adjust_parallel_gate_waiters(-1);
+            }
+            LifecycleCounter::ActiveTool => self.turn_timing_state.adjust_active_tools(-1),
+        }
+    }
+}
+
+impl ModelToolGateTimingGuard {
+    fn admitted(turn_timing_state: &Arc<TurnTimingState>, model_issued: bool) -> Self {
+        let turn_timing_state = model_issued.then(|| {
+            turn_timing_state.record_model_tool_gate_admitted();
+            Arc::clone(turn_timing_state)
+        });
+        Self { turn_timing_state }
+    }
+}
+
+impl Drop for ModelToolGateTimingGuard {
+    fn drop(&mut self) {
+        if let Some(turn_timing_state) = self.turn_timing_state.as_ref() {
+            turn_timing_state.record_model_tool_gate_released();
+        }
+    }
+}
+
+fn tool_dispatch_outcome_label(result: &Result<AnyToolResult, FunctionCallError>) -> &'static str {
+    match result {
+        Ok(result) => match result.outcome_for_logging() {
+            codex_tools::ToolOutputOutcome::Success => "success",
+            codex_tools::ToolOutputOutcome::Failure => "failure",
+            codex_tools::ToolOutputOutcome::TimedOut => "timed_out",
+            codex_tools::ToolOutputOutcome::Skipped => "skipped",
+        },
+        Err(_) => "failure",
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ToolCallRuntime {
     session: Arc<Session>,
@@ -447,6 +517,7 @@ impl ToolCallRuntime {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn handle_tool_call_with_timing(
         self,
         call: ToolCall,
@@ -454,7 +525,28 @@ impl ToolCallRuntime {
         item_accepted_at: TokioInstant,
         eager: bool,
     ) -> impl std::future::Future<Output = Result<ResponseInputItem, CodexErr>> {
-        let timing = Arc::new(ToolDispatchTiming::new(item_accepted_at, eager));
+        let timing = self.create_tool_dispatch_timing(item_accepted_at, eager);
+        self.handle_tool_call_with_trace(call, cancellation_token, timing)
+    }
+
+    pub(crate) fn create_tool_dispatch_timing(
+        &self,
+        item_accepted_at: TokioInstant,
+        eager: bool,
+    ) -> Arc<ToolDispatchTiming> {
+        Arc::new(ToolDispatchTiming::new_with_turn_clock(
+            Arc::clone(&self.step_context.turn.turn_timing_state),
+            item_accepted_at,
+            eager,
+        ))
+    }
+
+    pub(crate) fn handle_tool_call_with_trace(
+        self,
+        call: ToolCall,
+        cancellation_token: CancellationToken,
+        timing: Arc<ToolDispatchTiming>,
+    ) -> impl std::future::Future<Output = Result<ResponseInputItem, CodexErr>> {
         self.step_context
             .turn
             .turn_timing_state
@@ -511,6 +603,7 @@ impl ToolCallRuntime {
                     call_id: call.call_id.clone(),
                     output,
                 };
+                timing.record_outcome("failure");
                 timing.mark_output_collected();
                 if let Some(signal_collector) = signal_collector.as_ref() {
                     signal_collector.record_suppressed_failure(
@@ -539,6 +632,7 @@ impl ToolCallRuntime {
                     call_id: call.call_id.clone(),
                     output,
                 };
+                timing.record_outcome("success");
                 timing.mark_output_collected();
                 if let Some(signal_collector) = signal_collector.as_ref() {
                     signal_collector.record_suppressed_source_pass(
@@ -579,6 +673,7 @@ impl ToolCallRuntime {
                         call_id: call.call_id.clone(),
                         output,
                     };
+                    timing.record_outcome("success");
                     timing.mark_output_collected();
                     if let Some(signal_collector) = signal_collector.as_ref() {
                         signal_collector
@@ -649,6 +744,7 @@ impl ToolCallRuntime {
                 timing,
             );
             let result = future.await;
+            evidence_timing.record_outcome(tool_dispatch_outcome_label(&result));
             evidence_timing.mark_output_collected();
             if let Some(collector) = signal_collector.as_ref()
                 && !crate::tools::code_mode::is_exec_tool_name(&owner_tool_name)
@@ -788,7 +884,8 @@ impl ToolCallRuntime {
         source: ToolCallSource,
         cancellation_token: CancellationToken,
     ) -> impl std::future::Future<Output = Result<AnyToolResult, FunctionCallError>> {
-        let timing = Arc::new(ToolDispatchTiming::new(
+        let timing = Arc::new(ToolDispatchTiming::new_with_turn_clock(
+            Arc::clone(&self.step_context.turn.turn_timing_state),
             TokioInstant::now(),
             /*eager*/ false,
         ));
@@ -817,6 +914,7 @@ impl ToolCallRuntime {
                     Arc::clone(&timing),
                 )
                 .await;
+            timing.record_outcome(tool_dispatch_outcome_label(&result));
             if nested_code_mode && let Some(collector) = signal_collector.as_ref() {
                 let timing_snapshot = timing.snapshot(TokioInstant::now());
                 collector.record_child_runtime(
@@ -858,6 +956,7 @@ impl ToolCallRuntime {
         // where code-mode dependency overrides are also available. Nested
         // code-mode calls have no such outer layer and register here.
         let register_workspace_evidence_in_dispatch = !matches!(&source, ToolCallSource::Direct);
+        let model_issued = matches!(&source, ToolCallSource::Direct);
         let abort_turn = Arc::clone(&turn);
         let terminal_outcome_reached = Arc::new(AtomicBool::new(false));
         let dispatch_terminal_outcome_reached = Arc::clone(&terminal_outcome_reached);
@@ -891,6 +990,10 @@ impl ToolCallRuntime {
 
         let mut dispatch_handle: AbortOnDropHandle<Result<AnyToolResult, FunctionCallError>> =
             AbortOnDropHandle::new(tokio::spawn(async move {
+                let gate_waiter_guard = LifecycleCounterGuard::increment(
+                    &turn.turn_timing_state,
+                    LifecycleCounter::ParallelGateWaiter,
+                );
                 let _guard = if workspace_tool_may_use_parallel_gate(
                     supports_parallel,
                     proven_read_only,
@@ -900,11 +1003,23 @@ impl ToolCallRuntime {
                 } else {
                     Either::Right(lock.write().await)
                 };
+                drop(gate_waiter_guard);
                 // Gate admission is distinct from authorization and actual
                 // handler entry; keep each boundary independently observable.
                 timing.mark_parallel_gate_admitted();
                 turn.turn_timing_state
                     .record_tool_gate_admitted(dispatch_tool_name.as_str());
+                crate::session::turn::reconcile_turn_progress_event(
+                    &turn.turn_timing_state,
+                    1,
+                    "tool request admitted",
+                );
+                let _model_tool_gate_timing_guard =
+                    ModelToolGateTimingGuard::admitted(&turn.turn_timing_state, model_issued);
+                let _active_tool_guard = LifecycleCounterGuard::increment(
+                    &turn.turn_timing_state,
+                    LifecycleCounter::ActiveTool,
+                );
 
                 let evidence_revision_before = if observes_workspace {
                     let evidence_capture_started = Instant::now();
@@ -1217,7 +1332,12 @@ impl Drop for ToolCallTimingGuard {
                     "direct" => TurnTimingToolCallSource::Direct,
                     _ => TurnTimingToolCallSource::CodeMode,
                 },
-                snapshot,
+                snapshot.clone(),
+            );
+            crate::session::turn::reconcile_turn_progress_event(
+                turn_timing_state,
+                1,
+                "tool lifecycle completion",
             );
         }
         if !self.emit_log {
@@ -1234,6 +1354,7 @@ impl Drop for ToolCallTimingGuard {
             parent_cell_id = %self.parent_cell_id,
             runtime_tool_call_id = %self.runtime_tool_call_id,
             eager = snapshot.eager,
+            outcome = snapshot.outcome.unwrap_or("unknown"),
             execution_started = snapshot.parallel_gate_admitted,
             item_to_first_poll_ms = snapshot.item_to_first_poll_ms.unwrap_or(0),
             parallel_gate_wait_ms = snapshot.parallel_gate_wait_ms.unwrap_or(0),
@@ -1259,6 +1380,11 @@ impl Drop for ToolCallTimingGuard {
             exec_exit_to_delivery_ms = snapshot.exec_exit_to_delivery_ms.unwrap_or(0),
             exec_spawn_to_delivery_ms = snapshot.exec_spawn_to_delivery_ms.unwrap_or(0),
             exec_process_alive_at_delivery = snapshot.exec_process_alive_at_delivery,
+            exec_cleanup_state_observed = snapshot.exec_cleanup_state_observed,
+            exec_background_process_expected = snapshot.exec_background_process_expected,
+            exec_running_process_after_cleanup = snapshot.exec_running_process_after_cleanup,
+            exec_running_process_stale = snapshot.exec_running_process_after_cleanup
+                && !snapshot.exec_background_process_expected,
             post_handler_ms = snapshot.post_handler_ms.unwrap_or(0),
             total_duration_ms = snapshot.total_duration_ms.unwrap_or(0),
             "tool call completed"
@@ -1625,6 +1751,85 @@ mod tests {
     }
 
     impl CoreToolRuntime for ImmediateHandler {}
+
+    #[tokio::test]
+    async fn parallel_gate_wait_is_separate_from_handler_and_released_before_relay()
+    -> anyhow::Result<()> {
+        let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        let turn_context = Arc::new(turn_context);
+        turn_context.turn_timing_state.mark_turn_started();
+        let tool_name = codex_tools::ToolName::plain("serial_lifecycle_tool");
+        let handler = Arc::new(ImmediateHandler {
+            tool_name: tool_name.clone(),
+        }) as Arc<dyn CoreToolRuntime>;
+        let step_context = StepContext::for_test(Arc::clone(&turn_context));
+        let router = Arc::new(ToolRouter::from_parts(
+            ToolRegistry::from_tools([handler]),
+            Vec::new(),
+        ));
+        let step_context = step_context.with_tool_router_for_test(router);
+        let runtime = ToolCallRuntime::new(
+            session,
+            step_context,
+            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        );
+        let timing = runtime.create_tool_dispatch_timing(TokioInstant::now(), false);
+        let gate = Arc::clone(&runtime.parallel_execution);
+        let held_gate = Arc::clone(&gate)
+            .try_write_owned()
+            .expect("parallel gate initially available");
+        let task = tokio::spawn(runtime.clone().handle_tool_call_with_trace(
+            ToolCall {
+                tool_name,
+                call_id: "gate-lifecycle-call".to_string(),
+                payload: ToolPayload::Function {
+                    arguments: "{}".to_string(),
+                },
+            },
+            CancellationToken::new(),
+            Arc::clone(&timing),
+        ));
+        for _ in 0..100 {
+            if turn_context
+                .turn_timing_state
+                .lifecycle_context()
+                .parallel_gate_waiter_count
+                == 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            turn_context
+                .turn_timing_state
+                .lifecycle_context()
+                .parallel_gate_waiter_count,
+            1
+        );
+        drop(held_gate);
+        task.await.expect("tool task joins")?;
+
+        let snapshot = timing.snapshot(TokioInstant::now());
+        assert!(snapshot.parallel_gate_wait_ms.is_some());
+        assert!(snapshot.handler_duration_ms.is_some());
+        assert_eq!(
+            turn_context
+                .turn_timing_state
+                .lifecycle_context()
+                .parallel_gate_waiter_count,
+            0
+        );
+        assert!(
+            Arc::clone(&gate).try_write_owned().is_ok(),
+            "handler gate must be released before relay enqueue"
+        );
+        assert!(timing.mark_relay_enqueue());
+        assert!(Arc::clone(&gate).try_write_owned().is_ok());
+
+        Ok(())
+    }
 
     #[tokio::test]
     async fn workspace_observers_reuse_sampling_identity_without_git_round_trips() {

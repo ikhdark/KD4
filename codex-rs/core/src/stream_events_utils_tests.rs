@@ -16,6 +16,7 @@ use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use crate::tools::registry::ToolRegistry;
 use crate::turn_diff_tracker::TurnDiffTracker;
+use crate::turn_timing::ContinuationCause;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::TurnItemContributor;
 use codex_protocol::ResponseItemId;
@@ -29,6 +30,7 @@ use codex_protocol::models::LocalShellExecAction;
 use codex_protocol::models::LocalShellStatus;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::SessionSource;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -431,6 +433,13 @@ async fn completed_tool_call_is_persisted_before_its_future_can_start() {
     let (session, turn_context) = make_session_and_context().await;
     let session = Arc::new(session);
     let turn_context = Arc::new(turn_context);
+    turn_context.turn_timing_state.mark_turn_started();
+    let sampling = turn_context.turn_timing_state.begin_sampling();
+    let mut pending = None::<ContinuationCause>;
+    turn_context
+        .turn_timing_state
+        .begin_model_generation(&mut pending, &SessionSource::Cli);
+    drop(sampling);
     let started = Arc::new(AtomicBool::new(false));
     let handler = Arc::new(PersistenceProbeHandler {
         started: Arc::clone(&started),
@@ -474,6 +483,11 @@ async fn completed_tool_call_is_persisted_before_its_future_can_start() {
 
     assert!(!output.eager_read_eligible);
     assert!(!started.load(Ordering::SeqCst));
+    assert_eq!(
+        turn_context.turn_timing_state.model_tool_call_counts(),
+        Some((1, 0)),
+        "model emission must be counted before the deferred executor future is polled"
+    );
     let history = session.clone_history().await;
     let [ResponseItem::FunctionCall { call_id, .. }] = history.raw_items() else {
         panic!("completed tool call must be persisted before dispatch")
@@ -483,9 +497,16 @@ async fn completed_tool_call_is_persisted_before_its_future_can_start() {
     output
         .tool_future
         .expect("accepted tool call should retain its lazy future")
+        .into_future()
         .await
+        .result
         .expect("persistence probe handler should succeed");
     assert!(started.load(Ordering::SeqCst));
+    assert_eq!(
+        turn_context.turn_timing_state.model_tool_call_counts(),
+        Some((1, 1)),
+        "executor polling must be counted separately from model emission"
+    );
 }
 
 #[tokio::test]

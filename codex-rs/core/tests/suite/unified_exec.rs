@@ -243,6 +243,213 @@ async fn create_workspace_directory(
     Ok(abs_path.into_path_buf())
 }
 
+fn controlled_lifecycle_exec_args(script_body: &str) -> Value {
+    if cfg!(windows) {
+        json!({
+            "kind": "powershell_script",
+            "script_body": script_body,
+            "yield_time_ms": 10_000,
+            "tty": false,
+        })
+    } else {
+        json!({
+            "kind": "argv",
+            "program": "sh",
+            "args": ["-c", script_body],
+            "yield_time_ms": 10_000,
+            "tty": false,
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exec_command_controlled_lifecycle_trio_completes_without_stale_processes() -> Result<()> {
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
+    let test = builder.build_with_auto_env(&server).await?;
+
+    let cases = if cfg!(windows) {
+        [
+            ("lifecycle-fast-success", "exit 0", 0, "success"),
+            ("lifecycle-fast-failure", "exit 7", 7, "failure"),
+            (
+                "lifecycle-delayed-success",
+                "Write-Output 'started'; Start-Sleep -Milliseconds 2250; exit 0",
+                0,
+                "timed_out",
+            ),
+        ]
+    } else {
+        [
+            ("lifecycle-fast-success", "exit 0", 0, "success"),
+            ("lifecycle-fast-failure", "exit 7", 7, "failure"),
+            (
+                "lifecycle-delayed-success",
+                "printf 'started\\n'; sleep 2.25; exit 0",
+                0,
+                "timed_out",
+            ),
+        ]
+    };
+
+    let delayed_poll_call_id = "lifecycle-delayed-poll";
+    let delayed_poll_args = json!({
+        "session_id": 1000,
+        "chars": "",
+        "yield_time_ms": 5_000,
+    });
+
+    let mut first_response = vec![ev_response_created("lifecycle-response")];
+    for (call_id, script_body, _, _) in cases {
+        let arguments = controlled_lifecycle_exec_args(script_body);
+        first_response.push(ev_function_call(
+            call_id,
+            "exec_command",
+            &serde_json::to_string(&arguments)?,
+        ));
+    }
+    first_response.push(ev_completed("lifecycle-response"));
+    mount_sse_sequence(
+        &server,
+        vec![
+            sse(first_response),
+            sse(vec![
+                ev_response_created("lifecycle-poll"),
+                ev_function_call(
+                    delayed_poll_call_id,
+                    "write_stdin",
+                    &serde_json::to_string(&delayed_poll_args)?,
+                ),
+                ev_completed("lifecycle-poll"),
+            ]),
+            sse(vec![
+                ev_response_created("lifecycle-final"),
+                ev_assistant_message("lifecycle-message", "done"),
+                ev_completed("lifecycle-final"),
+            ]),
+        ],
+    )
+    .await;
+
+    let collect_raw_outputs = async {
+        let (fast_success, fast_failure, delayed_success, delayed_poll) = tokio::join!(
+            wait_for_raw_unified_exec_output(&test, "lifecycle-fast-success"),
+            wait_for_raw_unified_exec_output(&test, "lifecycle-fast-failure"),
+            wait_for_raw_unified_exec_output(&test, "lifecycle-delayed-success"),
+            wait_for_raw_unified_exec_output(&test, delayed_poll_call_id),
+        );
+        Ok::<_, anyhow::Error>(HashMap::from([
+            ("lifecycle-fast-success".to_string(), fast_success?),
+            ("lifecycle-fast-failure".to_string(), fast_failure?),
+            ("lifecycle-delayed-success".to_string(), delayed_success?),
+            (delayed_poll_call_id.to_string(), delayed_poll?),
+        ]))
+    };
+    let (submit_result, outputs) = tokio::join!(
+        submit_unified_exec_turn(
+            &test,
+            "run the controlled exec lifecycle cases",
+            PermissionProfile::Disabled,
+        ),
+        collect_raw_outputs,
+    );
+    submit_result?;
+    let outputs = outputs?;
+
+    let timing = tokio::time::timeout(
+        Duration::from_secs(15),
+        wait_for_event_match(&test.codex, |event| match event {
+            EventMsg::TurnComplete(event) => event.timing.clone(),
+            _ => None,
+        }),
+    )
+    .await
+    .context("controlled exec lifecycle exceeded 15 seconds")?;
+
+    let lifecycle_by_id = timing
+        .tool_calls
+        .iter()
+        .filter(|call| call.tool_name == "exec_command")
+        .map(|call| (call.call_id.as_str(), call))
+        .collect::<HashMap<_, _>>();
+
+    for (call_id, _, expected_exit_code, expected_outcome) in cases {
+        let output = outputs
+            .get(call_id)
+            .unwrap_or_else(|| panic!("missing output for {call_id}"));
+        let background_expected = call_id == "lifecycle-delayed-success";
+        if background_expected {
+            assert_eq!(output.process_id.as_deref(), Some("1000"));
+            assert_eq!(output.exit_code, None);
+        } else {
+            assert_eq!(
+                output.exit_code,
+                Some(expected_exit_code),
+                "unexpected terminal status for {call_id}: {output:?}"
+            );
+            assert!(output.process_id.is_none(), "{call_id} must finish inline");
+        }
+
+        let lifecycle = lifecycle_by_id
+            .get(call_id)
+            .unwrap_or_else(|| panic!("missing lifecycle for {call_id}"));
+        assert_eq!(lifecycle.outcome.as_deref(), Some(expected_outcome));
+        assert!(lifecycle.first_poll_at_ms.is_some());
+        assert!(lifecycle.parallel_gate_admitted_at_ms.is_some());
+        assert!(lifecycle.handler_entry_at_ms.is_some());
+        assert!(lifecycle.handler_exit_at_ms.is_some());
+        assert!(lifecycle.process_spawned_at_ms.is_some());
+        assert!(lifecycle.process_exited_at_ms.is_some());
+        assert!(lifecycle.output_collected_at_ms.is_some());
+        assert!(lifecycle.delivered_at_ms.is_some());
+        assert!(lifecycle.output_model_visible_at_ms.is_some());
+        assert!(lifecycle.model_resumed_at_ms.is_some());
+        assert!(lifecycle.exec_cleanup_state_observed);
+        assert_eq!(lifecycle.background_process_expected, background_expected);
+        assert_eq!(lifecycle.running_process_after_cleanup, background_expected);
+        assert_eq!(lifecycle.process_alive_at_delivery, background_expected);
+    }
+
+    let delayed_poll = outputs
+        .get(delayed_poll_call_id)
+        .expect("missing delayed lifecycle poll output");
+    assert_eq!(delayed_poll.exit_code, Some(0));
+    assert!(delayed_poll.process_id.is_none());
+
+    let emitting_request = timing
+        .model_requests
+        .iter()
+        .find(|request| request.model_emitted_tool_call_count > 0)
+        .expect("model request owning the controlled tool calls");
+    assert_eq!(emitting_request.model_emitted_tool_call_count, 3);
+    assert_eq!(emitting_request.tool_call_count, 3);
+    assert_eq!(emitting_request.executor_admitted_tool_call_count, 3);
+    assert!(
+        (1..=3).contains(&emitting_request.executor_max_concurrent_tool_calls),
+        "executor peak must describe the admitted controlled calls"
+    );
+
+    let delayed = lifecycle_by_id
+        .get("lifecycle-delayed-success")
+        .copied()
+        .expect("delayed lifecycle");
+    let delayed_process_duration_ms = delayed
+        .process_spawned_at_ms
+        .zip(delayed.process_exited_at_ms)
+        .map(|(spawned, exited)| exited.saturating_sub(spawned));
+    assert!(
+        delayed_process_duration_ms.is_some_and(|duration| duration >= 2_000),
+        "delayed control must remain alive for at least two seconds: {delayed:?}"
+    );
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unified_exec_intercepts_apply_patch_exec_command() -> Result<()> {
     skip_if_no_network!(Ok(()));

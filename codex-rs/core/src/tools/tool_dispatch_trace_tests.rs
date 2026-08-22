@@ -4,6 +4,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::ToolLifecycleBoundary;
+use codex_protocol::protocol::ToolLifecycleTimerWait;
+use codex_protocol::protocol::ToolLifecycleWakeReason;
 use codex_rollout_trace::ExecutionStatus;
 use codex_rollout_trace::ThreadStartedTraceMetadata;
 use codex_rollout_trace::ToolCallRequester;
@@ -27,6 +30,97 @@ use crate::tools::registry::ToolExecutor;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::tool_dispatch_trace::ToolDispatchTiming;
 use crate::turn_diff_tracker::TurnDiffTracker;
+use crate::turn_timing::TurnTimingState;
+
+#[test]
+fn tool_lifecycle_uses_one_clock_and_records_all_boundaries() {
+    let turn_timing = Arc::new(TurnTimingState::default());
+    turn_timing.mark_turn_started();
+    let timing = ToolDispatchTiming::new_with_turn_clock(
+        Arc::clone(&turn_timing),
+        tokio::time::Instant::now(),
+        false,
+    );
+    turn_timing.adjust_parallel_gate_waiters(1);
+    timing.mark_parallel_gate_admitted();
+    turn_timing.adjust_parallel_gate_waiters(-1);
+    turn_timing.adjust_active_tools(1);
+    timing.mark_handler_entry();
+    timing.mark_exec_process_spawned();
+    timing.mark_exec_process_exited();
+    timing.increment_retry_count();
+    timing.mark_handler_entry();
+    timing.mark_handler_exit();
+    turn_timing.adjust_active_tools(-1);
+    assert!(timing.mark_relay_enqueue());
+    let execution_id = timing.execution_id().clone();
+    assert!(timing.mark_relay_delivery(&execution_id));
+    timing.mark_next_model_sample_start();
+
+    let snapshot = timing.snapshot(tokio::time::Instant::now());
+    let boundaries = snapshot
+        .lifecycle_events
+        .iter()
+        .map(|event| event.boundary)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        boundaries,
+        vec![
+            ToolLifecycleBoundary::RequestCreated,
+            ToolLifecycleBoundary::Admitted,
+            ToolLifecycleBoundary::HandlerStart,
+            ToolLifecycleBoundary::ProcessSpawn,
+            ToolLifecycleBoundary::ProcessExit,
+            ToolLifecycleBoundary::HandlerReturn,
+            ToolLifecycleBoundary::RelayEnqueue,
+            ToolLifecycleBoundary::RelayDelivery,
+            ToolLifecycleBoundary::NextModelSampleStart,
+        ]
+    );
+    assert_eq!(snapshot.retry_count, 1);
+    assert_eq!(snapshot.reentry_count, 1);
+    assert_eq!(
+        snapshot
+            .lifecycle_events
+            .iter()
+            .find(|event| event.boundary == ToolLifecycleBoundary::Admitted)
+            .expect("admission event")
+            .context
+            .parallel_gate_waiter_count,
+        1
+    );
+    assert_eq!(turn_timing.lifecycle_context().relay_queue_depth, 0);
+}
+
+#[test]
+fn process_wait_records_timeout_wake_and_reentry() {
+    let turn_timing = Arc::new(TurnTimingState::default());
+    turn_timing.mark_turn_started();
+    let timing =
+        ToolDispatchTiming::new_with_turn_clock(turn_timing, tokio::time::Instant::now(), false);
+    timing.mark_handler_entry();
+    timing.mark_handler_entry();
+    timing.increment_retry_count();
+    timing.record_timer_wait(ToolLifecycleTimerWait {
+        wait_kind: "owner_wait".to_string(),
+        requested_timeout_ms: Some(60_000),
+        effective_timeout_ms: Some(60_000),
+        deadline_at_ms: timing.deadline_after_ms(60_000),
+        wake_reason: ToolLifecycleWakeReason::Timeout,
+        sequence: 0,
+    });
+
+    let snapshot = timing.snapshot(tokio::time::Instant::now());
+    assert_eq!(snapshot.retry_count, 1);
+    assert_eq!(snapshot.reentry_count, 1);
+    assert_eq!(snapshot.timer_waits.len(), 1);
+    assert_eq!(snapshot.timer_waits[0].sequence, 1);
+    assert_eq!(snapshot.timer_waits[0].deadline_at_ms, Some(60_000));
+    assert_eq!(
+        snapshot.timer_waits[0].wake_reason,
+        ToolLifecycleWakeReason::Timeout
+    );
+}
 
 #[tokio::test(start_paused = true)]
 async fn dispatch_timing_separates_item_poll_gate_authorization_and_handler_boundaries() {
@@ -78,6 +172,10 @@ async fn dispatch_timing_measures_exec_spawn_from_request_acceptance() {
 
     tokio::time::advance(std::time::Duration::from_millis(100)).await;
     timing.mark_exec_process_exited();
+    timing.record_outcome("failure");
+    timing.record_exec_cleanup_state(
+        /*background_process_expected*/ false, /*running_process_after_cleanup*/ true,
+    );
     tokio::time::advance(std::time::Duration::from_millis(7)).await;
 
     let exited_snapshot = timing.snapshot(tokio::time::Instant::now());
@@ -86,6 +184,10 @@ async fn dispatch_timing_measures_exec_spawn_from_request_acceptance() {
     assert_eq!(exited_snapshot.exec_exit_to_delivery_ms, Some(7));
     assert_eq!(exited_snapshot.exec_spawn_to_delivery_ms, Some(107));
     assert!(!exited_snapshot.exec_process_alive_at_delivery);
+    assert_eq!(exited_snapshot.outcome, Some("failure"));
+    assert!(exited_snapshot.exec_cleanup_state_observed);
+    assert!(!exited_snapshot.exec_background_process_expected);
+    assert!(exited_snapshot.exec_running_process_after_cleanup);
 }
 
 struct TestHandler {

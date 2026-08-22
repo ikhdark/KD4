@@ -890,12 +890,11 @@ async fn intercepted_apply_patch_success_reports_terminal_completion_and_post_ho
 }
 
 #[tokio::test]
-async fn unpolled_background_failure_finalizes_artifact_and_attempt_ledger() {
+async fn kd4_latency_unpolled_background_failure_retires_live_metadata() {
     let python = which::which("python")
         .or_else(|_| which::which("python3"))
         .expect("Python is required by the KD4 test environment");
-    let script =
-        "import time; time.sleep(2.5); print('BACKGROUND_FINAL_MARKER'); raise SystemExit(7)";
+    let script = "import time; print('X' * 5000, flush=True); time.sleep(2.5); print('BACKGROUND_FINAL_MARKER'); raise SystemExit(7)";
     let program = python.to_string_lossy().into_owned();
     let command = vec![program.clone(), "-c".to_string(), script.to_string()];
     let (session, turn) = make_session_and_context().await;
@@ -958,27 +957,33 @@ async fn unpolled_background_failure_finalizes_artifact_and_attempt_ledger() {
         .await
         .expect("background process must be tracked while it is running");
     let attempt_key = running.key;
+    let artifact_id = running
+        .artifact
+        .model_projection()
+        .0
+        .expect("background process should own a retained artifact");
     let mut retained = String::new();
     let mut consecutive_failures = 0;
+    let mut running_metadata_retired = false;
     for _ in 0..100 {
-        if let Some(artifact_id) = session
+        retained = tokio::fs::read_to_string(artifact_directory.join(format!("{artifact_id}.log")))
+            .await
+            .unwrap_or_default();
+        running_metadata_retired = session
             .services
             .command_execution
             .running_process(process_id)
             .await
-            .and_then(|running| running.artifact.model_projection().0)
-        {
-            retained =
-                tokio::fs::read_to_string(artifact_directory.join(format!("{artifact_id}.log")))
-                    .await
-                    .unwrap_or_default();
-        }
+            .is_none();
         consecutive_failures = session
             .services
             .command_execution
             .consecutive_failures(&attempt_key)
             .await;
-        if retained.contains("BACKGROUND_FINAL_MARKER") && consecutive_failures == 1 {
+        if retained.contains("BACKGROUND_FINAL_MARKER")
+            && consecutive_failures == 1
+            && running_metadata_retired
+        {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -986,6 +991,7 @@ async fn unpolled_background_failure_finalizes_artifact_and_attempt_ledger() {
 
     assert!(retained.contains("BACKGROUND_FINAL_MARKER"));
     assert_eq!(consecutive_failures, 1);
+    assert!(running_metadata_retired);
 }
 
 #[tokio::test]

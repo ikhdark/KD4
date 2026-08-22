@@ -21,6 +21,7 @@ use serde_json::json;
 use std::collections::HashMap;
 
 const SUMMARY_SLOW_MODEL_REQUEST_LIMIT: usize = 5;
+const SUMMARY_SLOW_TOOL_CALL_LIMIT: usize = 5;
 const SUMMARY_ERROR_MESSAGE_LIMIT: usize = 500;
 
 #[derive(Debug, Deserialize)]
@@ -242,6 +243,18 @@ fn compact_timing(timing: &TurnTiming) -> Value {
     let mut slowest_model_requests = timing.model_requests.iter().collect::<Vec<_>>();
     slowest_model_requests.sort_by_key(|request| std::cmp::Reverse(request.model_stream_wait_ns));
     slowest_model_requests.truncate(SUMMARY_SLOW_MODEL_REQUEST_LIMIT);
+    let mut slowest_tool_calls = timing.tool_calls.iter().collect::<Vec<_>>();
+    slowest_tool_calls.sort_by_key(|tool_call| {
+        let first = tool_call.lifecycle_events.first().map(|event| event.at_ms);
+        let last = tool_call.lifecycle_events.last().map(|event| event.at_ms);
+        std::cmp::Reverse(
+            first
+                .zip(last)
+                .map(|(first, last)| last.saturating_sub(first))
+                .unwrap_or_default(),
+        )
+    });
+    slowest_tool_calls.truncate(SUMMARY_SLOW_TOOL_CALL_LIMIT);
 
     json!({
         "schemaVersion": timing.schema_version,
@@ -330,6 +343,17 @@ fn compact_timing(timing: &TurnTiming) -> Value {
             "firstActionableOutputMs": request.first_actionable_output_ms,
             "completedMs": request.completed_ms,
         })).collect::<Vec<_>>(),
+        "slowestToolCalls": slowest_tool_calls.into_iter().map(|tool_call| json!({
+            "callId": tool_call.call_id,
+            "toolName": tool_call.tool_name,
+            "executionId": tool_call.execution_id,
+            "samplingGenerationId": tool_call.sampling_generation_id,
+            "nextSampleBlockReason": tool_call.next_sample_block_reason,
+            "retryCount": tool_call.retry_count,
+            "reentryCount": tool_call.reentry_count,
+            "lifecycle": tool_call.lifecycle_events,
+            "timerWaits": tool_call.timer_waits,
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -380,12 +404,16 @@ mod tests {
     use codex_protocol::config_types::ModeKind;
     use codex_protocol::protocol::TerminalizationDeliveryState;
     use codex_protocol::protocol::TerminalizationRecoveryState;
+    use codex_protocol::protocol::ToolExecutionId;
+    use codex_protocol::protocol::ToolLifecycleBoundary;
     use codex_protocol::protocol::TurnCompleteEvent;
     use codex_protocol::protocol::TurnStartedEvent;
     use codex_protocol::protocol::TurnTerminalizationCompleteEvent;
     use codex_protocol::protocol::TurnTerminalizationReceipt;
     use codex_protocol::protocol::TurnTimingModelRequest;
     use codex_protocol::protocol::TurnTimingTerminalization;
+    use codex_protocol::protocol::TurnTimingToolCall;
+    use codex_protocol::protocol::TurnTimingToolLifecycleEvent;
 
     fn completed(turn_id: &str, timing: TurnTiming) -> RolloutItem {
         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
@@ -524,6 +552,44 @@ mod tests {
         assert_eq!(
             full_timing("thread", terminal).get("timing"),
             Some(&serde_json::to_value(timing).expect("serialize timing"))
+        );
+    }
+
+    #[test]
+    fn compact_timing_reports_slowest_tool_lifecycle() {
+        let tool_calls = (0..10)
+            .map(|index| TurnTimingToolCall {
+                call_id: format!("call-{index}"),
+                tool_name: "exec_command".to_string(),
+                execution_id: ToolExecutionId(format!("execution-{index}")),
+                lifecycle_events: vec![
+                    TurnTimingToolLifecycleEvent {
+                        boundary: ToolLifecycleBoundary::RequestCreated,
+                        at_ms: 1,
+                        ..TurnTimingToolLifecycleEvent::default()
+                    },
+                    TurnTimingToolLifecycleEvent {
+                        boundary: ToolLifecycleBoundary::RelayDelivery,
+                        at_ms: 2 + index,
+                        ..TurnTimingToolLifecycleEvent::default()
+                    },
+                ],
+                ..TurnTimingToolCall::default()
+            })
+            .collect();
+        let summary = compact_timing(&TurnTiming {
+            tool_calls,
+            ..TurnTiming::default()
+        });
+
+        let slowest = summary["slowestToolCalls"]
+            .as_array()
+            .expect("slowest tool calls array");
+        assert_eq!(slowest.len(), SUMMARY_SLOW_TOOL_CALL_LIMIT);
+        assert_eq!(slowest[0]["executionId"], json!("execution-9"));
+        assert_eq!(
+            slowest[0]["lifecycle"][1]["boundary"],
+            json!("relay_delivery")
         );
     }
 }

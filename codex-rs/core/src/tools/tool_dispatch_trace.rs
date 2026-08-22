@@ -6,7 +6,12 @@
 
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -14,15 +19,30 @@ use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
+use crate::turn_timing::TurnTimingState;
+use codex_protocol::protocol::SamplingGenerationId;
+use codex_protocol::protocol::ToolExecutionId;
+use codex_protocol::protocol::ToolLifecycleBoundary;
+use codex_protocol::protocol::ToolLifecycleTimerWait;
+use codex_protocol::protocol::TurnTimingToolLifecycleEvent;
 use codex_tools::ToolOutputOutcome;
 use codex_tools::ToolOutputSkipDisposition;
+
+static NEXT_TOOL_EXECUTION_ID: AtomicU64 = AtomicU64::new(1);
 
 tokio::task_local! {
     static ACTIVE_TOOL_DISPATCH_TIMING: Arc<ToolDispatchTiming>;
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ToolDispatchTimingSnapshot {
+    pub execution_id: ToolExecutionId,
+    pub sampling_generation_id: SamplingGenerationId,
+    pub lifecycle_events: Vec<TurnTimingToolLifecycleEvent>,
+    pub timer_waits: Vec<ToolLifecycleTimerWait>,
+    pub retry_count: u32,
+    pub reentry_count: u32,
+    pub outcome: Option<&'static str>,
     pub item_to_first_poll_ms: Option<u64>,
     pub parallel_gate_wait_ms: Option<u64>,
     pub authorization_state_coordination_ms: Option<u64>,
@@ -40,6 +60,9 @@ pub(crate) struct ToolDispatchTimingSnapshot {
     pub exec_exit_to_delivery_ms: Option<u64>,
     pub exec_spawn_to_delivery_ms: Option<u64>,
     pub exec_process_alive_at_delivery: bool,
+    pub exec_cleanup_state_observed: bool,
+    pub exec_background_process_expected: bool,
+    pub exec_running_process_after_cleanup: bool,
     pub post_handler_ms: Option<u64>,
     pub total_duration_ms: Option<u64>,
     pub parallel_gate_admitted: bool,
@@ -48,6 +71,13 @@ pub(crate) struct ToolDispatchTimingSnapshot {
 
 #[derive(Debug)]
 pub(crate) struct ToolDispatchTiming {
+    turn_timing: Option<Arc<TurnTimingState>>,
+    execution_id: ToolExecutionId,
+    sampling_generation_id: SamplingGenerationId,
+    lifecycle_events: StdMutex<Vec<TurnTimingToolLifecycleEvent>>,
+    timer_waits: StdMutex<Vec<ToolLifecycleTimerWait>>,
+    retry_count: AtomicU32,
+    reentry_count: AtomicU32,
     item_accepted_at: Instant,
     first_poll_at: OnceLock<Instant>,
     parallel_gate_admitted_at: OnceLock<Instant>,
@@ -63,12 +93,50 @@ pub(crate) struct ToolDispatchTiming {
     output_collected_at: OnceLock<Instant>,
     exec_process_spawned_at: OnceLock<Instant>,
     exec_process_exited_at: OnceLock<Instant>,
+    outcome: OnceLock<&'static str>,
+    exec_cleanup_state_recorded: AtomicBool,
+    exec_background_process_expected: AtomicBool,
+    exec_running_process_after_cleanup: AtomicBool,
     eager: bool,
 }
 
 impl ToolDispatchTiming {
+    #[cfg(test)]
     pub(crate) fn new(item_accepted_at: Instant, eager: bool) -> Self {
-        Self {
+        Self::new_inner(None, item_accepted_at, eager)
+    }
+
+    pub(crate) fn new_with_turn_clock(
+        turn_timing: Arc<TurnTimingState>,
+        item_accepted_at: Instant,
+        eager: bool,
+    ) -> Self {
+        Self::new_inner(Some(turn_timing), item_accepted_at, eager)
+    }
+
+    fn new_inner(
+        turn_timing: Option<Arc<TurnTimingState>>,
+        item_accepted_at: Instant,
+        eager: bool,
+    ) -> Self {
+        let execution_id = ToolExecutionId(format!(
+            "tool-execution-{}",
+            NEXT_TOOL_EXECUTION_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let sampling_generation_id = SamplingGenerationId(
+            turn_timing
+                .as_ref()
+                .map(|timing| timing.sampling_generation_id())
+                .unwrap_or_else(|| "generation-pending".to_string()),
+        );
+        let timing = Self {
+            turn_timing,
+            execution_id,
+            sampling_generation_id,
+            lifecycle_events: StdMutex::new(Vec::new()),
+            timer_waits: StdMutex::new(Vec::new()),
+            retry_count: AtomicU32::new(0),
+            reentry_count: AtomicU32::new(0),
             item_accepted_at,
             first_poll_at: OnceLock::new(),
             parallel_gate_admitted_at: OnceLock::new(),
@@ -84,8 +152,66 @@ impl ToolDispatchTiming {
             output_collected_at: OnceLock::new(),
             exec_process_spawned_at: OnceLock::new(),
             exec_process_exited_at: OnceLock::new(),
+            outcome: OnceLock::new(),
+            exec_cleanup_state_recorded: AtomicBool::new(false),
+            exec_background_process_expected: AtomicBool::new(false),
+            exec_running_process_after_cleanup: AtomicBool::new(false),
             eager,
+        };
+        timing.record_boundary(ToolLifecycleBoundary::RequestCreated);
+        timing
+    }
+
+    pub(crate) fn execution_id(&self) -> &ToolExecutionId {
+        &self.execution_id
+    }
+
+    pub(crate) fn turn_timing_state(&self) -> Option<Arc<TurnTimingState>> {
+        self.turn_timing.as_ref().map(Arc::clone)
+    }
+
+    pub(crate) fn record_boundary(&self, boundary: ToolLifecycleBoundary) -> bool {
+        let Some(turn_timing) = self.turn_timing.as_ref() else {
+            return false;
+        };
+        let mut events = self
+            .lifecycle_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if events.iter().any(|event| event.boundary == boundary) {
+            return false;
         }
+        events.push(TurnTimingToolLifecycleEvent {
+            boundary,
+            at_ms: turn_timing.monotonic_offset_ms(),
+            context: turn_timing.lifecycle_context(),
+            retry_count: self.retry_count.load(Ordering::Acquire),
+            reentry_count: self.reentry_count.load(Ordering::Acquire),
+        });
+        true
+    }
+
+    pub(crate) fn increment_retry_count(&self) -> u32 {
+        self.retry_count.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    pub(crate) fn increment_reentry_count(&self) -> u32 {
+        self.reentry_count.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    pub(crate) fn record_timer_wait(&self, mut wait: ToolLifecycleTimerWait) {
+        let mut waits = self
+            .timer_waits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        wait.sequence = u32::try_from(waits.len() + 1).unwrap_or(u32::MAX);
+        waits.push(wait);
+    }
+
+    pub(crate) fn deadline_after_ms(&self, timeout_ms: u64) -> Option<u64> {
+        self.turn_timing
+            .as_ref()
+            .map(|timing| timing.monotonic_offset_ms().saturating_add(timeout_ms))
     }
 
     pub(crate) fn mark_first_poll(&self) {
@@ -94,6 +220,7 @@ impl ToolDispatchTiming {
 
     pub(crate) fn mark_parallel_gate_admitted(&self) {
         let _ = self.parallel_gate_admitted_at.set(Instant::now());
+        self.record_boundary(ToolLifecycleBoundary::Admitted);
     }
 
     pub(crate) fn record_authorization_state_coordination(&self, duration: Duration) {
@@ -101,11 +228,16 @@ impl ToolDispatchTiming {
     }
 
     pub(crate) fn mark_handler_entry(&self) {
-        let _ = self.handler_entry_at.set(Instant::now());
+        if self.handler_entry_at.set(Instant::now()).is_err() {
+            self.reentry_count.fetch_add(1, Ordering::AcqRel);
+            return;
+        }
+        self.record_boundary(ToolLifecycleBoundary::HandlerStart);
     }
 
     pub(crate) fn mark_handler_exit(&self) {
         let _ = self.handler_exit_at.set(Instant::now());
+        self.record_boundary(ToolLifecycleBoundary::HandlerReturn);
     }
 
     fn record_phase(target: &OnceLock<Duration>, duration: Duration) {
@@ -142,10 +274,72 @@ impl ToolDispatchTiming {
 
     pub(crate) fn mark_exec_process_spawned(&self) {
         let _ = self.exec_process_spawned_at.set(Instant::now());
+        self.record_boundary(ToolLifecycleBoundary::ProcessSpawn);
     }
 
     pub(crate) fn mark_exec_process_exited(&self) {
         let _ = self.exec_process_exited_at.set(Instant::now());
+        self.record_boundary(ToolLifecycleBoundary::ProcessExit);
+    }
+
+    pub(crate) fn mark_relay_enqueue(&self) -> bool {
+        if self.has_boundary(ToolLifecycleBoundary::RelayEnqueue) {
+            return false;
+        }
+        if let Some(turn_timing) = self.turn_timing.as_ref() {
+            turn_timing.adjust_relay_queue_depth(1);
+        }
+        if self.record_boundary(ToolLifecycleBoundary::RelayEnqueue) {
+            true
+        } else {
+            if let Some(turn_timing) = self.turn_timing.as_ref() {
+                turn_timing.adjust_relay_queue_depth(-1);
+            }
+            false
+        }
+    }
+
+    pub(crate) fn mark_relay_delivery(&self, execution_id: &ToolExecutionId) -> bool {
+        if execution_id != &self.execution_id
+            || !self.has_boundary(ToolLifecycleBoundary::RelayEnqueue)
+            || self.has_boundary(ToolLifecycleBoundary::RelayDelivery)
+        {
+            return false;
+        }
+        if let Some(turn_timing) = self.turn_timing.as_ref() {
+            turn_timing.adjust_relay_queue_depth(-1);
+        }
+        self.record_boundary(ToolLifecycleBoundary::RelayDelivery)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_next_model_sample_start(&self) {
+        self.record_boundary(ToolLifecycleBoundary::NextModelSampleStart);
+    }
+
+    fn has_boundary(&self, boundary: ToolLifecycleBoundary) -> bool {
+        self.lifecycle_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|event| event.boundary == boundary)
+    }
+
+    pub(crate) fn record_outcome(&self, outcome: &'static str) {
+        let _ = self.outcome.set(outcome);
+    }
+
+    pub(crate) fn record_exec_cleanup_state(
+        &self,
+        background_process_expected: bool,
+        running_process_after_cleanup: bool,
+    ) {
+        self.exec_background_process_expected
+            .store(background_process_expected, Ordering::Release);
+        self.exec_running_process_after_cleanup
+            .store(running_process_after_cleanup, Ordering::Release);
+        self.exec_cleanup_state_recorded
+            .store(true, Ordering::Release);
     }
 
     pub(crate) fn snapshot(&self, completed_at: Instant) -> ToolDispatchTimingSnapshot {
@@ -157,6 +351,21 @@ impl ToolDispatchTiming {
         let exec_process_exited_at = self.exec_process_exited_at.get().copied();
         let output_collected_at = self.output_collected_at.get().copied();
         ToolDispatchTimingSnapshot {
+            execution_id: self.execution_id.clone(),
+            sampling_generation_id: self.sampling_generation_id.clone(),
+            lifecycle_events: self
+                .lifecycle_events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            timer_waits: self
+                .timer_waits
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            retry_count: self.retry_count.load(Ordering::Acquire),
+            reentry_count: self.reentry_count.load(Ordering::Acquire),
+            outcome: self.outcome.get().copied(),
             item_to_first_poll_ms: first_poll_at
                 .and_then(|at| duration_ms(at.saturating_duration_since(self.item_accepted_at))),
             parallel_gate_wait_ms: first_poll_at.and_then(|first_poll_at| {
@@ -220,6 +429,19 @@ impl ToolDispatchTiming {
             }),
             exec_process_alive_at_delivery: exec_process_spawned_at.is_some()
                 && exec_process_exited_at.is_none(),
+            exec_cleanup_state_observed: self.exec_cleanup_state_recorded.load(Ordering::Acquire),
+            exec_background_process_expected: self
+                .exec_cleanup_state_recorded
+                .load(Ordering::Acquire)
+                && self
+                    .exec_background_process_expected
+                    .load(Ordering::Acquire),
+            exec_running_process_after_cleanup: self
+                .exec_cleanup_state_recorded
+                .load(Ordering::Acquire)
+                && self
+                    .exec_running_process_after_cleanup
+                    .load(Ordering::Acquire),
             post_handler_ms: handler_exit_at
                 .and_then(|at| duration_ms(completed_at.saturating_duration_since(at))),
             total_duration_ms: first_poll_at
@@ -264,6 +486,39 @@ pub(crate) fn mark_exec_process_spawned() {
 
 pub(crate) fn mark_exec_process_exited() {
     let _ = ACTIVE_TOOL_DISPATCH_TIMING.try_with(|timing| timing.mark_exec_process_exited());
+}
+
+pub(crate) fn increment_retry_count() -> Option<u32> {
+    ACTIVE_TOOL_DISPATCH_TIMING
+        .try_with(|timing| timing.increment_retry_count())
+        .ok()
+}
+
+pub(crate) fn increment_reentry_count() -> Option<u32> {
+    ACTIVE_TOOL_DISPATCH_TIMING
+        .try_with(|timing| timing.increment_reentry_count())
+        .ok()
+}
+
+pub(crate) fn record_timer_wait(wait: ToolLifecycleTimerWait) {
+    let _ = ACTIVE_TOOL_DISPATCH_TIMING.try_with(|timing| timing.record_timer_wait(wait));
+}
+
+pub(crate) fn lifecycle_deadline_after_ms(timeout_ms: u64) -> Option<u64> {
+    ACTIVE_TOOL_DISPATCH_TIMING
+        .try_with(|timing| timing.deadline_after_ms(timeout_ms))
+        .ok()
+        .flatten()
+}
+
+pub(crate) fn record_exec_cleanup_state(
+    background_process_expected: bool,
+    running_process_after_cleanup: bool,
+) {
+    let _ = ACTIVE_TOOL_DISPATCH_TIMING.try_with(|timing| {
+        timing
+            .record_exec_cleanup_state(background_process_expected, running_process_after_cleanup);
+    });
 }
 
 pub(crate) fn active_tool_dispatch_timing() -> Option<Arc<ToolDispatchTiming>> {

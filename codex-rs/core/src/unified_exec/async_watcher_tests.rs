@@ -1,19 +1,82 @@
 use super::append_output_loss_markers;
 use super::lagged_output_marker;
+use super::observe_process_exit;
 use super::omitted_output_marker;
 use super::record_known_delta_from_transcript;
 use super::resolve_aggregated_output;
 use super::split_valid_utf8_prefix_with_max;
+use super::wait_for_process_output_drain;
 
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
+use crate::tools::command_execution::CommandAttemptKey;
+use crate::tools::command_execution::CommandExecutionLedger;
+use crate::tools::command_execution::CompletionApplyResult;
+use crate::tools::command_output_artifact::RawOutputArtifact;
 use crate::tools::known_delta_store;
 use crate::tools::known_delta_store::KnownDeltaExecutionObservation;
 use crate::tools::known_delta_store::PreparedKnownDelta;
 use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
+use codex_protocol::protocol::ToolExecutionId;
+
+#[tokio::test]
+async fn exit_before_watcher_registration_is_observed_once() {
+    let ledger = CommandExecutionLedger::default();
+    let command_execution_id = ledger.allocate_execution_id();
+    let parent_tool_execution_id = ToolExecutionId("tool-execution-watcher".to_string());
+    ledger
+        .track_running_process_with_execution_id(
+            command_execution_id,
+            parent_tool_execution_id.clone(),
+            73,
+            CommandAttemptKey::new("exec_command", "local", "C:/repo", &["exit".to_string()]),
+            RawOutputArtifact::unavailable("late watcher fixture"),
+            None,
+            tokio::time::Instant::now(),
+        )
+        .await;
+    let exit = CancellationToken::new();
+    let output_drained = CancellationToken::new();
+    exit.cancel();
+    output_drained.cancel();
+
+    assert_eq!(
+        observe_process_exit(
+            &exit,
+            &ledger,
+            73,
+            command_execution_id,
+            &parent_tool_execution_id,
+            0,
+        )
+        .await,
+        CompletionApplyResult::Applied
+    );
+    wait_for_process_output_drain(&output_drained).await;
+    assert_eq!(
+        ledger
+            .retire_completed_process(command_execution_id, &parent_tool_execution_id)
+            .await,
+        CompletionApplyResult::Applied
+    );
+    assert_eq!(
+        observe_process_exit(
+            &exit,
+            &ledger,
+            73,
+            command_execution_id,
+            &parent_tool_execution_id,
+            0,
+        )
+        .await,
+        CompletionApplyResult::AlreadyApplied
+    );
+    assert!(ledger.running_process(73).await.is_none());
+}
 
 fn run_git(cwd: &std::path::Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")

@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
@@ -11,9 +13,13 @@ use codex_analytics::TurnProfile;
 use codex_otel::TURN_TTFM_DURATION_METRIC;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::NextSampleBlockReason;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TokenUsage;
+use codex_protocol::protocol::ToolLifecycleBoundary;
+use codex_protocol::protocol::ToolLifecycleContext;
+use codex_protocol::protocol::ToolLifecycleTimerWait;
 use codex_protocol::protocol::TurnTiming;
 use codex_protocol::protocol::TurnTimingAttemptKind;
 use codex_protocol::protocol::TurnTimingAttemptKindCounts;
@@ -47,9 +53,20 @@ use crate::stream_events_utils::raw_assistant_output_text_from_item;
 use crate::tools::tool_dispatch_trace::ToolDispatchTimingSnapshot;
 
 const NANOS_PER_MILLISECOND: u128 = 1_000_000;
-const TIMING_SCHEMA_VERSION: u16 = 22;
+const TIMING_SCHEMA_VERSION: u16 = 23;
 const MAX_DETERMINISTIC_CONTINUATION_RECEIPTS: usize = 64;
 const MAX_TOOL_CALL_TIMINGS: usize = 1_024;
+
+fn adjust_counter(counter: &AtomicU32, delta: i32) {
+    if delta >= 0 {
+        counter.fetch_add(delta as u32, Ordering::AcqRel);
+    } else {
+        let decrement = delta.unsigned_abs();
+        let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            Some(value.saturating_sub(decrement))
+        });
+    }
+}
 
 /// Control-only calls can advance orchestration without beginning the user's
 /// requested work. Keep them observable in dispatch milestones and counters,
@@ -143,6 +160,11 @@ impl TurnClock for SystemTurnClock {
 pub(crate) struct TurnTimingState {
     clock: Arc<dyn TurnClock>,
     state: StdMutex<TurnTimingStateInner>,
+    relay_queue_depth: AtomicU32,
+    parallel_gate_waiter_count: AtomicU32,
+    sampling_gate_waiter_count: AtomicU32,
+    process_output_waiter_count: AtomicU32,
+    active_tool_count: AtomicU32,
 }
 
 impl Default for TurnTimingState {
@@ -422,6 +444,9 @@ impl TurnTimingSnapshot {
                         .decision_latency_ns()
                         .map(|value| public_ns(value, &mut saturation_count)),
                     tool_call_count: request.tool_call_count,
+                    model_emitted_tool_call_count: request.model_emitted_tool_call_count,
+                    executor_admitted_tool_call_count: request.executor_admitted_tool_call_count,
+                    executor_max_concurrent_tool_calls: request.executor_max_concurrent_tool_calls,
                     tool_active_union_ns: public_ns(
                         request.tool_active_union_ns,
                         &mut saturation_count,
@@ -620,6 +645,10 @@ pub(crate) struct ModelRequestTiming {
     model_stream_wait_ns: u128,
     tool_active_union_ns: u128,
     tool_call_count: u32,
+    model_emitted_tool_call_count: u32,
+    executor_admitted_tool_call_count: u32,
+    executor_max_concurrent_tool_calls: u32,
+    executor_active_tool_call_count: u32,
     output_tokens: u64,
     reasoning_output_tokens: u64,
     token_usage: Option<TurnTimingProviderTokenUsage>,
@@ -994,7 +1023,58 @@ impl TurnTimingState {
         Self {
             clock,
             state: StdMutex::new(TurnTimingStateInner::default()),
+            relay_queue_depth: AtomicU32::new(0),
+            parallel_gate_waiter_count: AtomicU32::new(0),
+            sampling_gate_waiter_count: AtomicU32::new(0),
+            process_output_waiter_count: AtomicU32::new(0),
+            active_tool_count: AtomicU32::new(0),
         }
+    }
+
+    /// Returns a millisecond offset from the turn's sole monotonic clock.
+    pub(crate) fn monotonic_offset_ms(&self) -> u64 {
+        let sample = self.clock.sample();
+        self.state()
+            .elapsed_since_start(sample.time.monotonic_ns)
+            .map(u128_to_u64_ms)
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn sampling_generation_id(&self) -> String {
+        self.state()
+            .current_generation_index
+            .map(|index| format!("generation-{index}"))
+            .unwrap_or_else(|| "generation-pending".to_string())
+    }
+
+    pub(crate) fn lifecycle_context(&self) -> ToolLifecycleContext {
+        ToolLifecycleContext {
+            relay_queue_depth: self.relay_queue_depth.load(Ordering::Acquire),
+            parallel_gate_waiter_count: self.parallel_gate_waiter_count.load(Ordering::Acquire),
+            sampling_gate_waiter_count: self.sampling_gate_waiter_count.load(Ordering::Acquire),
+            process_output_waiter_count: self.process_output_waiter_count.load(Ordering::Acquire),
+            active_tool_count: self.active_tool_count.load(Ordering::Acquire),
+        }
+    }
+
+    pub(crate) fn adjust_relay_queue_depth(&self, delta: i32) {
+        adjust_counter(&self.relay_queue_depth, delta);
+    }
+
+    pub(crate) fn adjust_parallel_gate_waiters(&self, delta: i32) {
+        adjust_counter(&self.parallel_gate_waiter_count, delta);
+    }
+
+    pub(crate) fn adjust_sampling_gate_waiters(&self, delta: i32) {
+        adjust_counter(&self.sampling_gate_waiter_count, delta);
+    }
+
+    pub(crate) fn adjust_process_output_waiters(&self, delta: i32) {
+        adjust_counter(&self.process_output_waiter_count, delta);
+    }
+
+    pub(crate) fn adjust_active_tools(&self, delta: i32) {
+        adjust_counter(&self.active_tool_count, delta);
     }
 
     #[cfg(test)]
@@ -1062,6 +1142,7 @@ impl TurnTimingState {
         relevant_state_fingerprint: Option<String>,
     ) {
         let sample = self.clock.sample();
+        let lifecycle_context = self.lifecycle_context();
         let mut state = self.state();
         state.advance(sample.time.monotonic_ns);
         let cause = pending.take();
@@ -1074,8 +1155,26 @@ impl TurnTimingState {
                 if tool_call.model_resumed_at_ms.is_some() {
                     break;
                 }
-                if tool_call.delivered_at_ms.is_some() {
+                if tool_call.output_model_visible_at_ms.is_some()
+                    || tool_call.delivered_at_ms.is_some()
+                {
                     tool_call.model_resumed_at_ms = Some(model_resumed_at_ms);
+                    if !tool_call
+                        .lifecycle_events
+                        .iter()
+                        .any(|event| event.boundary == ToolLifecycleBoundary::NextModelSampleStart)
+                    {
+                        tool_call.lifecycle_events.push(
+                            codex_protocol::protocol::TurnTimingToolLifecycleEvent {
+                                boundary: ToolLifecycleBoundary::NextModelSampleStart,
+                                at_ms: model_resumed_at_ms,
+                                context: lifecycle_context,
+                                retry_count: tool_call.retry_count,
+                                reentry_count: tool_call.reentry_count,
+                            },
+                        );
+                    }
+                    tool_call.next_sample_block_reason = NextSampleBlockReason::ReadyToSample;
                 }
             }
         }
@@ -1253,6 +1352,80 @@ impl TurnTimingState {
         }
     }
 
+    /// Records a direct tool call emitted by the model. Nested code-mode calls
+    /// remain in the legacy aggregate but do not inflate this source-side
+    /// serialization diagnostic.
+    pub(crate) fn record_model_emitted_tool_call(&self) {
+        let sample = self.clock.sample();
+        let mut state = self.state();
+        state.advance(sample.time.monotonic_ns);
+        if let Some(generation_index) = state.current_generation_index
+            && let Some(request) = state.model_requests.iter_mut().find(|request| {
+                request.generation_index == generation_index
+                    && request.attempt_kind == TurnTimingAttemptKind::Primary
+            })
+        {
+            request.model_emitted_tool_call_count =
+                request.model_emitted_tool_call_count.saturating_add(1);
+        }
+    }
+
+    /// Records executor gate admission and the exact peak number of direct
+    /// model-issued calls held concurrently for the owning generation.
+    pub(crate) fn record_model_tool_gate_admitted(&self) {
+        let sample = self.clock.sample();
+        let mut state = self.state();
+        state.advance(sample.time.monotonic_ns);
+        if let Some(generation_index) = state.current_generation_index
+            && let Some(request) = state.model_requests.iter_mut().find(|request| {
+                request.generation_index == generation_index
+                    && request.attempt_kind == TurnTimingAttemptKind::Primary
+            })
+        {
+            request.executor_admitted_tool_call_count =
+                request.executor_admitted_tool_call_count.saturating_add(1);
+            request.executor_active_tool_call_count =
+                request.executor_active_tool_call_count.saturating_add(1);
+            request.executor_max_concurrent_tool_calls = request
+                .executor_max_concurrent_tool_calls
+                .max(request.executor_active_tool_call_count);
+        }
+    }
+
+    pub(crate) fn record_model_tool_gate_released(&self) {
+        let sample = self.clock.sample();
+        let mut state = self.state();
+        state.advance(sample.time.monotonic_ns);
+        if let Some(generation_index) = state.current_generation_index
+            && let Some(request) = state.model_requests.iter_mut().find(|request| {
+                request.generation_index == generation_index
+                    && request.attempt_kind == TurnTimingAttemptKind::Primary
+            })
+        {
+            request.executor_active_tool_call_count =
+                request.executor_active_tool_call_count.saturating_sub(1);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn model_tool_call_counts(&self) -> Option<(u32, u32)> {
+        let state = self.state();
+        let generation_index = state.current_generation_index?;
+        state
+            .model_requests
+            .iter()
+            .find(|request| {
+                request.generation_index == generation_index
+                    && request.attempt_kind == TurnTimingAttemptKind::Primary
+            })
+            .map(|request| {
+                (
+                    request.model_emitted_tool_call_count,
+                    request.tool_call_count,
+                )
+            })
+    }
+
     pub(crate) fn record_tool_handler_entry(&self, tool_name: &str) {
         let sample = self.clock.sample();
         let mut state = self.state();
@@ -1304,44 +1477,46 @@ impl TurnTimingState {
             return;
         }
 
-        let delivered_at_ms = state
-            .elapsed_since_start(sample.time.monotonic_ns)
-            .map(u128_to_u64_ms);
-        let first_poll_at_ms = delivered_at_ms
-            .zip(timing.total_duration_ms)
-            .map(|(delivered, total)| delivered.saturating_sub(total));
-        let accepted_at_ms = first_poll_at_ms
+        let accepted_at_ms = lifecycle_boundary_at(
+            &timing.lifecycle_events,
+            ToolLifecycleBoundary::RequestCreated,
+        );
+        let parallel_gate_admitted_at_ms =
+            lifecycle_boundary_at(&timing.lifecycle_events, ToolLifecycleBoundary::Admitted);
+        let handler_entry_at_ms = lifecycle_boundary_at(
+            &timing.lifecycle_events,
+            ToolLifecycleBoundary::HandlerStart,
+        );
+        let handler_exit_at_ms = lifecycle_boundary_at(
+            &timing.lifecycle_events,
+            ToolLifecycleBoundary::HandlerReturn,
+        );
+        let process_spawned_at_ms = lifecycle_boundary_at(
+            &timing.lifecycle_events,
+            ToolLifecycleBoundary::ProcessSpawn,
+        );
+        let process_exited_at_ms =
+            lifecycle_boundary_at(&timing.lifecycle_events, ToolLifecycleBoundary::ProcessExit);
+        let delivered_at_ms = lifecycle_boundary_at(
+            &timing.lifecycle_events,
+            ToolLifecycleBoundary::RelayDelivery,
+        );
+        let first_poll_at_ms = accepted_at_ms
             .zip(timing.item_to_first_poll_ms)
-            .map(|(first_poll, queued)| first_poll.saturating_sub(queued));
-        let parallel_gate_admitted_at_ms = timing
-            .parallel_gate_admitted
-            .then(|| {
-                first_poll_at_ms
-                    .zip(timing.parallel_gate_wait_ms)
-                    .map(|(first_poll, wait)| first_poll.saturating_add(wait))
-            })
-            .flatten();
-        let handler_entry_at_ms = first_poll_at_ms
-            .zip(timing.first_poll_to_handler_entry_ms)
-            .map(|(first_poll, wait)| first_poll.saturating_add(wait));
-        let handler_exit_at_ms = handler_entry_at_ms
-            .zip(timing.handler_duration_ms)
-            .map(|(entry, duration)| entry.saturating_add(duration));
-        let output_collected_at_ms = first_poll_at_ms
-            .zip(timing.first_poll_to_output_collected_ms)
-            .map(|(first_poll, duration)| first_poll.saturating_add(duration));
-        let process_spawned_at_ms = accepted_at_ms
-            .zip(timing.exec_request_to_spawn_ms)
-            .map(|(request, wait)| request.saturating_add(wait));
-        let process_exited_at_ms = process_spawned_at_ms
-            .zip(timing.exec_spawn_to_exit_ms)
-            .map(|(spawned, runtime)| spawned.saturating_add(runtime));
+            .map(|(accepted, queued)| accepted.saturating_add(queued));
+        let output_collected_at_ms = lifecycle_boundary_at(
+            &timing.lifecycle_events,
+            ToolLifecycleBoundary::RelayEnqueue,
+        );
         let generation_index = state.current_generation_index;
 
         let mut tool_call = TurnTimingToolCall {
             call_id: call_id.to_string(),
             tool_name: tool_name.to_string(),
             source,
+            execution_id: timing.execution_id,
+            sampling_generation_id: timing.sampling_generation_id,
+            outcome: timing.outcome.map(str::to_string),
             generation_index,
             accepted_at_ms,
             first_poll_at_ms,
@@ -1352,6 +1527,7 @@ impl TurnTimingState {
             process_spawned_at_ms,
             process_exited_at_ms,
             delivered_at_ms,
+            output_model_visible_at_ms: None,
             model_resumed_at_ms: None,
             item_to_first_poll_ms: timing.item_to_first_poll_ms,
             parallel_gate_wait_ms: timing.parallel_gate_wait_ms,
@@ -1367,11 +1543,94 @@ impl TurnTimingState {
             total_duration_ms: timing.total_duration_ms,
             eager: timing.eager,
             process_alive_at_delivery: timing.exec_process_alive_at_delivery,
+            exec_cleanup_state_observed: timing.exec_cleanup_state_observed,
+            background_process_expected: timing.exec_background_process_expected,
+            running_process_after_cleanup: timing.exec_running_process_after_cleanup,
+            lifecycle_events: timing.lifecycle_events,
+            timer_waits: timing.timer_waits,
+            retry_count: timing.retry_count,
+            reentry_count: timing.reentry_count,
+            next_sample_block_reason: NextSampleBlockReason::ReadyToSample,
         };
         if let Some(spawn_to_exit_ms) = state.background_tool_process_exits.remove(call_id) {
             record_tool_process_exit(&mut tool_call, spawn_to_exit_ms);
         }
         state.tool_calls.push(tool_call);
+    }
+
+    pub(crate) fn update_tool_dispatch_lifecycle(
+        &self,
+        call_id: &str,
+        execution_id: &codex_protocol::protocol::ToolExecutionId,
+        timing: ToolDispatchTimingSnapshot,
+    ) -> bool {
+        let sample = self.clock.sample();
+        let mut state = self.state();
+        state.advance(sample.time.monotonic_ns);
+        let Some(tool_call) = state.tool_calls.iter_mut().rev().find(|tool_call| {
+            tool_call.call_id == call_id && &tool_call.execution_id == execution_id
+        }) else {
+            return false;
+        };
+        tool_call.lifecycle_events = timing.lifecycle_events;
+        tool_call.timer_waits = timing.timer_waits;
+        tool_call.retry_count = timing.retry_count;
+        tool_call.reentry_count = timing.reentry_count;
+        tool_call.delivered_at_ms = lifecycle_boundary_at(
+            &tool_call.lifecycle_events,
+            ToolLifecycleBoundary::RelayDelivery,
+        );
+        tool_call.output_collected_at_ms = lifecycle_boundary_at(
+            &tool_call.lifecycle_events,
+            ToolLifecycleBoundary::RelayEnqueue,
+        );
+        true
+    }
+
+    pub(crate) fn record_next_sample_block_reason(&self, reason: NextSampleBlockReason) {
+        let mut state = self.state();
+        for tool_call in state.tool_calls.iter_mut().rev() {
+            if tool_call.model_resumed_at_ms.is_some() {
+                break;
+            }
+            tool_call.next_sample_block_reason = reason;
+        }
+    }
+
+    pub(crate) fn record_pending_tool_timer_wait(&self, mut wait: ToolLifecycleTimerWait) {
+        let mut state = self.state();
+        for tool_call in state.tool_calls.iter_mut().rev() {
+            if tool_call.model_resumed_at_ms.is_some() {
+                break;
+            }
+            wait.sequence = u32::try_from(tool_call.timer_waits.len() + 1).unwrap_or(u32::MAX);
+            tool_call.timer_waits.push(wait.clone());
+            tool_call.reentry_count = tool_call.reentry_count.saturating_add(1);
+        }
+    }
+
+    /// Records the point at which a direct tool result has been inserted into
+    /// model-visible history and its best-effort rollout persistence attempt
+    /// has returned.
+    pub(crate) fn record_tool_output_model_visible(&self, call_id: &str) {
+        let sample = self.clock.sample();
+        let mut state = self.state();
+        state.advance(sample.time.monotonic_ns);
+        if state.completed_snapshot.is_some() {
+            state.invalid_transition();
+            return;
+        }
+        let model_visible_at_ms = state
+            .elapsed_since_start(sample.time.monotonic_ns)
+            .map(u128_to_u64_ms);
+        if let Some(tool_call) = state
+            .tool_calls
+            .iter_mut()
+            .rev()
+            .find(|tool_call| tool_call.call_id == call_id)
+        {
+            tool_call.output_model_visible_at_ms = model_visible_at_ms;
+        }
     }
 
     /// Persists a background process exit into the turn record even when the
@@ -2889,6 +3148,16 @@ fn record_tool_process_exit(tool_call: &mut TurnTimingToolCall, spawn_to_exit_ms
     tool_call.process_exited_at_ms = tool_call
         .process_spawned_at_ms
         .map(|spawned_at_ms| spawned_at_ms.saturating_add(spawn_to_exit_ms));
+}
+
+fn lifecycle_boundary_at(
+    events: &[codex_protocol::protocol::TurnTimingToolLifecycleEvent],
+    boundary: ToolLifecycleBoundary,
+) -> Option<u64> {
+    events
+        .iter()
+        .find(|event| event.boundary == boundary)
+        .map(|event| event.at_ms)
 }
 
 fn u128_to_i64_ms(nanos: u128) -> i64 {

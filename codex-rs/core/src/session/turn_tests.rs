@@ -27,6 +27,7 @@ use codex_protocol::AgentPath;
 use codex_protocol::ResponseItemId;
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::ResponseInputItem;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::AdditionalContextEntry;
 use codex_protocol::protocol::AdditionalContextKind;
@@ -57,6 +58,30 @@ use wiremock::Mock;
 use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
+
+#[test]
+fn tool_relay_reconciliation_advances_without_watchdog() {
+    let timing = TurnTimingState::default();
+    timing.mark_turn_started();
+    let mut orphan_passes = 0;
+
+    timing.adjust_parallel_gate_waiters(1);
+    assert_eq!(
+        reconcile_turn_progress(&timing, 1, &mut orphan_passes),
+        NextSampleBlockReason::WaitingForGate
+    );
+    timing.adjust_parallel_gate_waiters(-1);
+    timing.adjust_relay_queue_depth(1);
+    assert_eq!(
+        reconcile_turn_progress(&timing, 1, &mut orphan_passes),
+        NextSampleBlockReason::WaitingForDelivery
+    );
+    timing.adjust_relay_queue_depth(-1);
+    assert_eq!(
+        reconcile_turn_progress(&timing, 0, &mut orphan_passes),
+        NextSampleBlockReason::ReadyToSample
+    );
+}
 
 fn authoritative_wait_result(
     surfaceable_message: Option<&str>,
@@ -792,15 +817,25 @@ async fn drain_in_flight_returns_first_error_after_draining_remaining_futures() 
     let (session, turn_context) = crate::session::tests::make_session_and_context().await;
     let remaining_future_polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let remaining_future_polled_clone = Arc::clone(&remaining_future_polled);
-    let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
+    let mut in_flight: FuturesOrdered<BoxFuture<'static, InFlightToolResult>> =
         FuturesOrdered::new();
-    in_flight.push_back(Box::pin(async {
-        Err(CodexErr::Fatal("first tool failure".to_string()))
-    }));
-    in_flight.push_back(Box::pin(async move {
-        remaining_future_polled_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-        Err(CodexErr::Fatal("second tool failure".to_string()))
-    }));
+    in_flight.push_back(Box::pin(
+        InFlightToolCall::from_test_future(
+            "first",
+            Box::pin(async { Err(CodexErr::Fatal("first tool failure".to_string())) }),
+        )
+        .into_future(),
+    ));
+    in_flight.push_back(Box::pin(
+        InFlightToolCall::from_test_future(
+            "second",
+            Box::pin(async move {
+                remaining_future_polled_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err(CodexErr::Fatal("second tool failure".to_string()))
+            }),
+        )
+        .into_future(),
+    ));
 
     let error = drain_in_flight(&mut in_flight, Arc::new(session), Arc::new(turn_context))
         .await
@@ -1985,6 +2020,17 @@ fn controlled_tool_future(
     })
 }
 
+fn controlled_tool_call(
+    call_id: &'static str,
+    first_poll: tokio::sync::oneshot::Sender<tokio::time::Instant>,
+    release: tokio::sync::oneshot::Receiver<()>,
+) -> InFlightToolCall {
+    InFlightToolCall::from_test_future(
+        call_id,
+        controlled_tool_future(call_id, first_poll, release),
+    )
+}
+
 #[tokio::test(start_paused = true)]
 async fn eager_tool_poll_overlaps_a_controlled_response_tail_without_changing_results() {
     const RESPONSE_TAIL: Duration = Duration::from_millis(250);
@@ -2025,9 +2071,8 @@ async fn eager_tool_poll_overlaps_a_controlled_response_tail_without_changing_re
     let eager_item_accepted = tokio::time::Instant::now();
     let (eager_first_poll_tx, eager_first_poll_rx) = tokio::sync::oneshot::channel();
     let (eager_release_tx, eager_release_rx) = tokio::sync::oneshot::channel();
-    let mut eager: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
-        FuturesOrdered::new();
-    eager.push_back(start_eager_tool_future(controlled_tool_future(
+    let mut eager: FuturesOrdered<BoxFuture<'static, InFlightToolResult>> = FuturesOrdered::new();
+    eager.push_back(start_eager_tool_future(controlled_tool_call(
         "read-1",
         eager_first_poll_tx,
         eager_release_rx,
@@ -2065,6 +2110,7 @@ async fn eager_tool_poll_overlaps_a_controlled_response_tail_without_changing_re
             .next()
             .await
             .expect("eager result should exist")
+            .result
             .expect("eager tool should succeed");
         next_sampling_started_after_drain.store(true, Ordering::SeqCst);
         result
@@ -2088,14 +2134,14 @@ async fn eager_tool_results_remain_in_call_order_after_reverse_completion() {
     let (first_release_tx, first_release_rx) = tokio::sync::oneshot::channel();
     let (second_started_tx, second_started_rx) = tokio::sync::oneshot::channel();
     let (second_release_tx, second_release_rx) = tokio::sync::oneshot::channel();
-    let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
+    let mut in_flight: FuturesOrdered<BoxFuture<'static, InFlightToolResult>> =
         FuturesOrdered::new();
-    in_flight.push_back(start_eager_tool_future(controlled_tool_future(
+    in_flight.push_back(start_eager_tool_future(controlled_tool_call(
         "first",
         first_started_tx,
         first_release_rx,
     )));
-    in_flight.push_back(start_eager_tool_future(controlled_tool_future(
+    in_flight.push_back(start_eager_tool_future(controlled_tool_call(
         "second",
         second_started_tx,
         second_release_rx,
@@ -2115,11 +2161,13 @@ async fn eager_tool_results_remain_in_call_order_after_reverse_completion() {
         .next()
         .await
         .expect("first result")
+        .result
         .expect("success");
     let second = in_flight
         .next()
         .await
         .expect("second result")
+        .result
         .expect("success");
     assert_eq!(first, synthetic_tool_result("first"));
     assert_eq!(second, synthetic_tool_result("second"));
@@ -2134,9 +2182,11 @@ async fn eager_tool_failure_is_observed_only_after_response_streaming_finishes()
         let _ = release_rx.await;
         Err(CodexErr::Fatal("synthetic eager tool failure".to_string()))
     });
-    let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
+    let mut in_flight: FuturesOrdered<BoxFuture<'static, InFlightToolResult>> =
         FuturesOrdered::new();
-    in_flight.push_back(start_eager_tool_future(future));
+    in_flight.push_back(start_eager_tool_future(InFlightToolCall::from_test_future(
+        "failure", future,
+    )));
 
     started_rx.await.expect("eager tool should start");
     tokio::time::advance(Duration::from_millis(250)).await;
@@ -2150,6 +2200,7 @@ async fn eager_tool_failure_is_observed_only_after_response_streaming_finishes()
         .next()
         .await
         .expect("failed result should retain its ordered slot")
+        .result
         .expect_err("synthetic tool should fail");
     assert!(error.to_string().contains("synthetic eager tool failure"));
 }
@@ -2174,9 +2225,11 @@ async fn dropping_in_flight_collection_aborts_eager_tool_work() {
         std::future::pending::<()>().await;
         unreachable!("aborted eager work must not resume")
     });
-    let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
+    let mut in_flight: FuturesOrdered<BoxFuture<'static, InFlightToolResult>> =
         FuturesOrdered::new();
-    in_flight.push_back(start_eager_tool_future(future));
+    in_flight.push_back(start_eager_tool_future(InFlightToolCall::from_test_future(
+        "drop", future,
+    )));
 
     started_rx.await.expect("eager work should start");
     drop(in_flight);

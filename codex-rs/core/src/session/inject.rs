@@ -6,6 +6,7 @@ use crate::codex_thread::TryStartTurnIfIdleRejectionReason;
 use crate::state::ActiveTurn;
 use crate::state::TurnState;
 use crate::tasks::RegularTask;
+use crate::tasks::TasklessTurnStartupGuard;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::models::ResponseItem;
 use std::sync::Arc;
@@ -73,6 +74,7 @@ impl Session {
             let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
             Arc::clone(&active_turn.turn_state)
         };
+        let mut startup_guard = TasklessTurnStartupGuard::new(self, Arc::clone(&turn_state));
 
         if self.input_queue.has_trigger_turn_mailbox_items().await {
             self.clear_reserved_idle_turn(&turn_state).await;
@@ -126,17 +128,12 @@ impl Session {
             .await;
         self.start_task(turn_context, Vec::new(), RegularTask::new())
             .await;
+        startup_guard.disarm();
         Ok(())
     }
 
     async fn clear_reserved_idle_turn(&self, turn_state: &Arc<tokio::sync::Mutex<TurnState>>) {
-        let mut active_turn_guard = self.active_turn.lock().await;
-        if let Some(active_turn) = active_turn_guard.as_ref()
-            && active_turn.task.is_none()
-            && Arc::ptr_eq(&active_turn.turn_state, turn_state)
-        {
-            *active_turn_guard = None;
-        }
+        self.clear_taskless_placeholder(turn_state).await;
     }
 
     /// Injects items into active work, or records them without starting a turn.

@@ -80,7 +80,10 @@ use crate::session_startup_prewarm::SessionStartupPrewarmResolution;
 use crate::stable_context::StableContextKind;
 use crate::stable_context::StableContextTarget;
 use crate::state::SamplingAdmission;
+use crate::state::TerminalWakeResult;
 use crate::stream_events_utils::HandleOutputCtx;
+use crate::stream_events_utils::InFlightToolCall;
+use crate::stream_events_utils::InFlightToolResult;
 use crate::stream_events_utils::TurnItemContributorPolicy;
 use crate::stream_events_utils::finalize_non_tool_response_item;
 use crate::stream_events_utils::handle_non_tool_response_item;
@@ -111,6 +114,7 @@ use crate::turn_diff_tracker::TurnDiffTracker;
 use crate::turn_timing::ContinuationCause;
 use crate::turn_timing::TurnLocalPhase;
 use crate::turn_timing::TurnTimingGuard;
+use crate::turn_timing::TurnTimingState;
 use crate::turn_timing::record_turn_ttft_metric;
 use crate::util::error_or_panic;
 use codex_analytics::AppInvocation;
@@ -145,7 +149,6 @@ use codex_protocol::items::build_hook_prompt_message;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::MessagePhase;
-use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentMessageContentDeltaEvent;
 use codex_protocol::protocol::AgentReasoningSectionBreakEvent;
@@ -154,6 +157,7 @@ use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::protocol::NextSampleBlockReason;
 use codex_protocol::protocol::PlanDeltaEvent;
 use codex_protocol::protocol::ReasoningContentDeltaEvent;
 use codex_protocol::protocol::ReasoningRawContentDeltaEvent;
@@ -162,6 +166,8 @@ use codex_protocol::protocol::SafetyBufferingEvent;
 use codex_protocol::protocol::SamplingBoundaryItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SurfacedToolResult;
+use codex_protocol::protocol::ToolLifecycleTimerWait;
+use codex_protocol::protocol::ToolLifecycleWakeReason;
 use codex_protocol::protocol::TurnDiffEvent;
 use codex_protocol::protocol::TurnTimingGenerationPurpose;
 use codex_protocol::protocol::WarningEvent;
@@ -3928,13 +3934,43 @@ async fn handle_assistant_item_done_in_plan_mode(
 
 #[instrument(level = "trace", skip_all)]
 async fn drain_in_flight(
-    in_flight: &mut FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>>,
+    in_flight: &mut FuturesOrdered<BoxFuture<'static, InFlightToolResult>>,
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
 ) -> CodexResult<()> {
     let mut first_error = None;
-    while let Some(res) = in_flight.next().await {
-        match res {
+    let mut active_without_pending_passes = 0_u8;
+    loop {
+        let reason = reconcile_turn_progress(
+            &turn_context.turn_timing_state,
+            in_flight.len(),
+            &mut active_without_pending_passes,
+        );
+        turn_context
+            .turn_timing_state
+            .record_next_sample_block_reason(reason);
+        trace!(
+            ?reason,
+            pending_tool_count = in_flight.len(),
+            "tool relay reconciliation"
+        );
+        let Some(completion) = in_flight.next().await else {
+            break;
+        };
+        if completion.execution_id != *completion.timing.execution_id() {
+            let err = CodexErr::Fatal(format!(
+                "stale tool relay completion for {}: expected {}, received {}",
+                completion.call_id,
+                completion.timing.execution_id().0,
+                completion.execution_id.0,
+            ));
+            error!("{err}");
+            if first_error.is_none() {
+                first_error = Some(err);
+            }
+            continue;
+        }
+        match completion.result {
             Ok(response_input) => {
                 let response_item = response_input.into();
                 let interrupt_terminal = sess
@@ -3943,8 +3979,12 @@ async fn drain_in_flight(
                     .await
                     .as_ref()
                     .and_then(|active| active.terminal.clone())
-                    .filter(|terminal| terminal.interrupt_pending());
-                if let Some(terminal) = interrupt_terminal {
+                    .filter(|terminal| terminal.interrupt_pending())
+                    .map(|terminal| {
+                        let generation = terminal.wake_generation_id();
+                        (terminal, generation)
+                    });
+                if let Some((terminal, generation)) = interrupt_terminal {
                     if let Err(err) = sess
                         .record_conversation_items_durable(
                             &turn_context,
@@ -3952,7 +3992,7 @@ async fn drain_in_flight(
                         )
                         .await
                     {
-                        terminal.mark_interrupt_persistence_failed();
+                        let _ = terminal.mark_interrupt_persistence_failed(&generation);
                         return Err(CodexErr::Fatal(format!(
                             "failed to durably append interrupted tool output: {err}"
                         )));
@@ -3970,9 +4010,41 @@ async fn drain_in_flight(
                     &response_item,
                 )
                 .await;
+                completion
+                    .timing
+                    .mark_relay_delivery(&completion.execution_id);
+                turn_context
+                    .turn_timing_state
+                    .update_tool_dispatch_lifecycle(
+                        &completion.call_id,
+                        &completion.execution_id,
+                        completion.timing.snapshot(tokio::time::Instant::now()),
+                    );
+                record_reconciliation(
+                    &turn_context.turn_timing_state,
+                    in_flight.len(),
+                    &mut active_without_pending_passes,
+                    "relay delivery",
+                );
             }
             Err(err) => {
                 error!("in-flight tool future failed during drain: {err}");
+                completion
+                    .timing
+                    .mark_relay_delivery(&completion.execution_id);
+                turn_context
+                    .turn_timing_state
+                    .update_tool_dispatch_lifecycle(
+                        &completion.call_id,
+                        &completion.execution_id,
+                        completion.timing.snapshot(tokio::time::Instant::now()),
+                    );
+                record_reconciliation(
+                    &turn_context.turn_timing_state,
+                    in_flight.len(),
+                    &mut active_without_pending_passes,
+                    "relay error delivery",
+                );
                 if first_error.is_none() {
                     first_error = Some(err);
                 }
@@ -3982,16 +4054,107 @@ async fn drain_in_flight(
     first_error.map_or(Ok(()), Err)
 }
 
-fn start_eager_tool_future(
-    future: BoxFuture<'static, CodexResult<ResponseInputItem>>,
-) -> BoxFuture<'static, CodexResult<ResponseInputItem>> {
+pub(crate) fn reconcile_turn_progress(
+    turn_timing_state: &TurnTimingState,
+    pending_tool_count: usize,
+    active_without_pending_passes: &mut u8,
+) -> NextSampleBlockReason {
+    let context = turn_timing_state.lifecycle_context();
+    if pending_tool_count == 0 && context.active_tool_count > 0 {
+        *active_without_pending_passes = active_without_pending_passes.saturating_add(1);
+        debug_assert!(
+            *active_without_pending_passes <= 1,
+            "active_without_pending_tool survived more than one reconciliation pass"
+        );
+    } else {
+        *active_without_pending_passes = 0;
+    }
+
+    if context.active_tool_count > 0 {
+        NextSampleBlockReason::WaitingForTool
+    } else if context.relay_queue_depth > 0 {
+        NextSampleBlockReason::WaitingForDelivery
+    } else if context.parallel_gate_waiter_count > 0 || context.sampling_gate_waiter_count > 0 {
+        NextSampleBlockReason::WaitingForGate
+    } else if context.process_output_waiter_count > 0 {
+        NextSampleBlockReason::WaitingForProcessCleanup
+    } else if pending_tool_count > 0 {
+        NextSampleBlockReason::WaitingForTool
+    } else {
+        NextSampleBlockReason::ReadyToSample
+    }
+}
+
+pub(crate) fn reconcile_turn_progress_event(
+    turn_timing_state: &TurnTimingState,
+    pending_tool_count: usize,
+    event: &'static str,
+) -> NextSampleBlockReason {
+    let mut active_without_pending_passes = 0;
+    record_reconciliation(
+        turn_timing_state,
+        pending_tool_count,
+        &mut active_without_pending_passes,
+        event,
+    )
+}
+
+fn record_reconciliation(
+    turn_timing_state: &TurnTimingState,
+    pending_tool_count: usize,
+    active_without_pending_passes: &mut u8,
+    event: &'static str,
+) -> NextSampleBlockReason {
+    let reason = reconcile_turn_progress(
+        turn_timing_state,
+        pending_tool_count,
+        active_without_pending_passes,
+    );
+    turn_timing_state.record_next_sample_block_reason(reason);
+    trace!(
+        ?reason,
+        pending_tool_count, event, "turn progress reconciled"
+    );
+    reason
+}
+
+struct SamplingGateWaiterGuard {
+    turn_timing_state: Arc<TurnTimingState>,
+}
+
+impl SamplingGateWaiterGuard {
+    fn new(turn_timing_state: Arc<TurnTimingState>) -> Self {
+        turn_timing_state.adjust_sampling_gate_waiters(1);
+        Self { turn_timing_state }
+    }
+}
+
+impl Drop for SamplingGateWaiterGuard {
+    fn drop(&mut self) {
+        self.turn_timing_state.adjust_sampling_gate_waiters(-1);
+    }
+}
+
+fn start_eager_tool_future(future: InFlightToolCall) -> BoxFuture<'static, InFlightToolResult> {
     // Dropping a raw Tokio JoinHandle detaches its task. Keeping the abort-on-drop
     // wrapper inside the ordered future makes collection teardown abort eager work.
-    let handle = AbortOnDropHandle::new(tokio::spawn(future));
+    let call_id = future.call_id.clone();
+    let execution_id = future.execution_id.clone();
+    let timing = Arc::clone(&future.timing);
+    let handle = AbortOnDropHandle::new(tokio::spawn(future.into_future()));
     Box::pin(async move {
-        handle
-            .await
-            .map_err(|err| CodexErr::Fatal(format!("eager tool task failed: {err}")))?
+        match handle.await {
+            Ok(result) => result,
+            Err(err) => {
+                timing.mark_relay_enqueue();
+                InFlightToolResult {
+                    call_id,
+                    execution_id,
+                    timing,
+                    result: Err(CodexErr::Fatal(format!("eager tool task failed: {err}"))),
+                }
+            }
+        }
     })
 }
 
@@ -4034,6 +4197,16 @@ async fn try_run_sampling_request(
     sampling: SamplingGenerationDisposition,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
+    let mut active_without_pending_passes = 0_u8;
+    let next_sample_reason = reconcile_turn_progress(
+        &turn_context.turn_timing_state,
+        0,
+        &mut active_without_pending_passes,
+    );
+    turn_context
+        .turn_timing_state
+        .record_next_sample_block_reason(next_sample_reason);
+    trace!(?next_sample_reason, "sampling admission reconciliation");
     if sess.reference_context_item().await.is_none() {
         client_session.invalidate_provider_history_inheritance(
             "realized context baseline is unknown before sampling",
@@ -4048,7 +4221,37 @@ async fn try_run_sampling_request(
     if let Some(terminal) = terminal
         && terminal.sampling_admission() == SamplingAdmission::Fenced
     {
-        terminal.wait_for_interrupt_resolution().await;
+        turn_context
+            .turn_timing_state
+            .record_next_sample_block_reason(NextSampleBlockReason::WaitingForGate);
+        let wait_started_at_ms = turn_context.turn_timing_state.monotonic_offset_ms();
+        let expected_generation = terminal.wake_generation_id();
+        let _sampling_waiter =
+            SamplingGateWaiterGuard::new(Arc::clone(&turn_context.turn_timing_state));
+        let wake = terminal
+            .wait_for_interrupt_resolution(&expected_generation)
+            .await;
+        let wait_finished_at_ms = turn_context.turn_timing_state.monotonic_offset_ms();
+        turn_context
+            .turn_timing_state
+            .record_pending_tool_timer_wait(ToolLifecycleTimerWait {
+                wait_kind: "sampling_interrupt_resolution".to_string(),
+                requested_timeout_ms: None,
+                effective_timeout_ms: Some(wait_finished_at_ms.saturating_sub(wait_started_at_ms)),
+                deadline_at_ms: None,
+                wake_reason: if wake == TerminalWakeResult::Applied {
+                    ToolLifecycleWakeReason::Completed
+                } else {
+                    ToolLifecycleWakeReason::Retry
+                },
+                sequence: 0,
+            });
+        record_reconciliation(
+            &turn_context.turn_timing_state,
+            0,
+            &mut active_without_pending_passes,
+            "sampling interrupt resolution",
+        );
         if terminal.interrupt_persistence_failed() {
             return Err(CodexErr::Fatal(
                 "interrupted request_user_input output was not durably persisted".to_string(),
@@ -4164,11 +4367,13 @@ async fn try_run_sampling_request(
     }
     let boundary_session = Arc::clone(&sess);
     let boundary_turn_id = turn_context.sub_id.clone();
+    let boundary_turn_timing = Arc::clone(&turn_context.turn_timing_state);
     let bound_context_attempts = Arc::new(Mutex::new(HashSet::new()));
     let boundary_bound_context_attempts = Arc::clone(&bound_context_attempts);
     let attempt_prepared: AttemptPreparedCallback = Arc::new(move |identity| {
         let sess = Arc::clone(&boundary_session);
         let turn_id = boundary_turn_id.clone();
+        let turn_timing_state = Arc::clone(&boundary_turn_timing);
         let bound_context_attempts = Arc::clone(&boundary_bound_context_attempts);
         Box::pin(async move {
             let terminal = sess
@@ -4178,8 +4383,31 @@ async fn try_run_sampling_request(
                 .as_ref()
                 .and_then(|active| active.terminal.clone());
             let sampling_admission = if let Some(terminal) = terminal.as_ref() {
+                turn_timing_state
+                    .record_next_sample_block_reason(NextSampleBlockReason::WaitingForGate);
+                let wait_started_at_ms = turn_timing_state.monotonic_offset_ms();
+                let sampling_waiter = SamplingGateWaiterGuard::new(Arc::clone(&turn_timing_state));
                 let Some(admission) = terminal.acquire_sampling_admission().await else {
-                    terminal.wait_for_interrupt_resolution().await;
+                    let expected_generation = terminal.wake_generation_id();
+                    let wake = terminal
+                        .wait_for_interrupt_resolution(&expected_generation)
+                        .await;
+                    let wait_finished_at_ms = turn_timing_state.monotonic_offset_ms();
+                    turn_timing_state.record_pending_tool_timer_wait(ToolLifecycleTimerWait {
+                        wait_kind: "sampling_gate_acquisition_and_resolution".to_string(),
+                        requested_timeout_ms: None,
+                        effective_timeout_ms: Some(
+                            wait_finished_at_ms.saturating_sub(wait_started_at_ms),
+                        ),
+                        deadline_at_ms: None,
+                        wake_reason: if wake == TerminalWakeResult::Applied {
+                            ToolLifecycleWakeReason::Completed
+                        } else {
+                            ToolLifecycleWakeReason::Retry
+                        },
+                        sequence: 0,
+                    });
+                    reconcile_turn_progress_event(&turn_timing_state, 0, "sampling gate fenced");
                     return if terminal.interrupt_persistence_failed() {
                         Err(CodexErr::Fatal(
                             "interrupted request_user_input output was not durably persisted"
@@ -4189,6 +4417,19 @@ async fn try_run_sampling_request(
                         Err(CodexErr::TurnAborted)
                     };
                 };
+                drop(sampling_waiter);
+                let wait_finished_at_ms = turn_timing_state.monotonic_offset_ms();
+                turn_timing_state.record_pending_tool_timer_wait(ToolLifecycleTimerWait {
+                    wait_kind: "sampling_gate_acquisition".to_string(),
+                    requested_timeout_ms: None,
+                    effective_timeout_ms: Some(
+                        wait_finished_at_ms.saturating_sub(wait_started_at_ms),
+                    ),
+                    deadline_at_ms: None,
+                    wake_reason: ToolLifecycleWakeReason::Completed,
+                    sequence: 0,
+                });
+                reconcile_turn_progress_event(&turn_timing_state, 0, "sampling gate acquired");
                 Some(admission)
             } else {
                 None
@@ -4243,7 +4484,7 @@ async fn try_run_sampling_request(
     drop(model_request_timing_guard);
     let mut stream = stream_result??;
     let attempt_identity = stream.attempt_identity().cloned();
-    let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
+    let mut in_flight: FuturesOrdered<BoxFuture<'static, InFlightToolResult>> =
         FuturesOrdered::new();
     let mut earlier_tool_calls_eligible = true;
     let mut needs_follow_up = false;
@@ -4450,7 +4691,7 @@ async fn try_run_sampling_request(
                     if output_result.eager_read_eligible {
                         in_flight.push_back(start_eager_tool_future(tool_future));
                     } else {
-                        in_flight.push_back(tool_future);
+                        in_flight.push_back(Box::pin(tool_future.into_future()));
                     }
                 }
                 if let Some(agent_message) = output_result.last_agent_message {
@@ -4807,13 +5048,16 @@ async fn try_run_sampling_request(
     if let Some(terminal) = terminal
         && terminal.interrupt_pending()
     {
+        let generation = terminal.wake_generation_id();
         if let Err(err) = sess.flush_rollout().await {
-            terminal.mark_interrupt_persistence_failed();
+            let _ = terminal.mark_interrupt_persistence_failed(&generation);
             return Err(CodexErr::Fatal(format!(
                 "failed to durably flush interrupted request_user_input output: {err}"
             )));
         }
-        terminal.mark_interrupt_output_durable();
+        if terminal.mark_interrupt_output_durable(&generation) == TerminalWakeResult::Stale {
+            return Err(CodexErr::TurnAborted);
+        }
         return Err(CodexErr::TurnAborted);
     }
 

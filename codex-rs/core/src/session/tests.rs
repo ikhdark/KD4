@@ -2056,6 +2056,35 @@ async fn record_conversation_items_stamps_missing_turn_id_and_preserves_existing
 }
 
 #[tokio::test]
+async fn record_conversation_items_records_tool_output_model_visibility_boundary() {
+    let (session, turn_context) = make_session_and_context().await;
+    turn_context.turn_timing_state.mark_turn_started();
+    turn_context.turn_timing_state.record_tool_dispatch_timing(
+        "call-persisted",
+        "exec_command",
+        codex_protocol::protocol::TurnTimingToolCallSource::Direct,
+        crate::tools::tool_dispatch_trace::ToolDispatchTimingSnapshot::default(),
+    );
+    let item = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "call-persisted".to_string(),
+        output: FunctionCallOutputPayload::from_text("done".to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    session
+        .record_conversation_items(&turn_context, std::slice::from_ref(&item))
+        .await;
+
+    let timing = turn_context
+        .turn_timing_state
+        .complete_snapshot()
+        .protocol_timing();
+    assert_eq!(timing.tool_calls.len(), 1);
+    assert!(timing.tool_calls[0].output_model_visible_at_ms.is_some());
+}
+
+#[tokio::test]
 async fn record_response_item_and_emit_turn_item_emits_hook_prompt_lifecycle() {
     let (session, turn_context, rx) = make_session_and_context_with_rx().await;
     let response_item = build_hook_prompt_message(&[HookPromptFragment::from_single_hook(
@@ -10812,6 +10841,158 @@ async fn task_finish_emits_thread_idle_lifecycle_after_active_turn_clears() {
         .expect("idle receiver open");
     assert_eq!(1, calls.load(std::sync::atomic::Ordering::SeqCst));
     assert!(session.active_turn.lock().await.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kd4_latency_cancelled_task_start_preserves_input_and_clears_placeholder_once() {
+    struct BlockingTurnStart {
+        started_tx: async_channel::Sender<()>,
+        release: CancellationToken,
+        idle_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl codex_extension_api::TurnLifecycleContributor for BlockingTurnStart {
+        fn on_turn_start<'a>(
+            &'a self,
+            _input: codex_extension_api::TurnStartInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+            Box::pin(async move {
+                self.started_tx
+                    .send(())
+                    .await
+                    .expect("turn-start receiver should remain open");
+                self.release.cancelled().await;
+            })
+        }
+    }
+
+    impl codex_extension_api::ThreadLifecycleContributor<crate::config::Config> for BlockingTurnStart {
+        fn on_thread_idle<'a>(
+            &'a self,
+            _input: codex_extension_api::ThreadIdleInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+            Box::pin(async move {
+                self.idle_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        }
+    }
+
+    let (mut session, turn_context) = make_session_and_context().await;
+    let (started_tx, started_rx) = async_channel::bounded(1);
+    let idle_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
+    let contributor = Arc::new(BlockingTurnStart {
+        started_tx,
+        release: CancellationToken::new(),
+        idle_calls: Arc::clone(&idle_calls),
+    });
+    builder.turn_lifecycle_contributor(contributor.clone());
+    builder.thread_lifecycle_contributor(contributor);
+    session.services.extensions = Arc::new(builder.build());
+    let session = Arc::new(session);
+
+    let response_item = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "startup-response".to_string(),
+        output: FunctionCallOutputPayload::from_text("preserve me".to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let mailbox_item = InterAgentCommunication::new(
+        AgentPath::root(),
+        AgentPath::try_from("/root/worker").expect("worker agent path"),
+        Vec::new(),
+        "preserve mailbox work".to_string(),
+        /*trigger_turn*/ true,
+    );
+    let expected_input = vec![
+        TurnInput::ResponseItem(response_item.clone()),
+        TurnInput::InterAgentCommunication(mailbox_item.clone()),
+    ];
+    let turn_state = {
+        let mut active_turn = session.active_turn.lock().await;
+        *active_turn = Some(ActiveTurn::default());
+        Arc::clone(
+            &active_turn
+                .as_ref()
+                .expect("startup placeholder")
+                .turn_state,
+        )
+    };
+    session
+        .input_queue
+        .extend_pending_input_for_turn_state(turn_state.as_ref(), expected_input.clone())
+        .await;
+
+    let start = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move {
+            session
+                .start_task(Arc::new(turn_context), Vec::new(), CompletingTask)
+                .await;
+        }
+    });
+    timeout(StdDuration::from_secs(2), started_rx.recv())
+        .await
+        .expect("turn start should reach the controlled lifecycle callback")
+        .expect("turn-start receiver should remain open");
+    {
+        let active_turn = session.active_turn.lock().await;
+        let active_turn = active_turn
+            .as_ref()
+            .expect("startup placeholder should exist");
+        assert!(active_turn.task.is_none());
+        assert!(active_turn.terminal.is_none());
+    }
+
+    start.abort();
+    assert!(
+        start
+            .await
+            .expect_err("controlled task start should be cancelled")
+            .is_cancelled()
+    );
+    timeout(StdDuration::from_secs(2), async {
+        loop {
+            if session.active_turn.lock().await.is_none()
+                && session.input_queue.has_trigger_turn_mailbox_items().await
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled startup should restore input and clear its placeholder");
+
+    assert!(session.active_turn.lock().await.is_none());
+    assert!(
+        !session
+            .terminal_interaction_pending
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+    assert!(session.input_queue.has_trigger_turn_mailbox_items().await);
+    assert_eq!(
+        expected_input,
+        session
+            .input_queue
+            .get_pending_input(&session.active_turn)
+            .await,
+        "the next startup must consume every accepted item in FIFO order"
+    );
+    assert_eq!(
+        Vec::<TurnInput>::new(),
+        session
+            .input_queue
+            .get_pending_input(&session.active_turn)
+            .await,
+        "recovered startup input must be delivered exactly once"
+    );
+    assert_eq!(
+        0,
+        idle_calls.load(std::sync::atomic::Ordering::SeqCst),
+        "restored trigger-turn mailbox work must suppress thread idle"
+    );
 }
 
 #[tokio::test]

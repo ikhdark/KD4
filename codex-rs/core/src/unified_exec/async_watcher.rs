@@ -16,7 +16,11 @@ use crate::exec::EXEC_OUTPUT_DELTA_CAP_NOTICE;
 use crate::exec::OutputDeltaDecision;
 use crate::exec::OutputDeltaLimiter;
 use crate::session::session::Session;
+use crate::session::turn::reconcile_turn_progress_event;
 use crate::session::turn_context::TurnContext;
+use crate::tools::command_execution::CommandExecutionId;
+use crate::tools::command_execution::CommandExecutionLedger;
+use crate::tools::command_execution::CompletionApplyResult;
 use crate::tools::command_output_artifact::append_raw_output_artifact;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::events::ToolEmitter;
@@ -34,6 +38,9 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecCommandOutputDeltaEvent;
 use codex_protocol::protocol::ExecCommandSource;
 use codex_protocol::protocol::ExecOutputStream;
+use codex_protocol::protocol::ToolExecutionId;
+use codex_protocol::protocol::ToolLifecycleTimerWait;
+use codex_protocol::protocol::ToolLifecycleWakeReason;
 use codex_utils_path_uri::PathUri;
 
 pub(crate) const TRAILING_OUTPUT_GRACE: Duration = Duration::from_millis(100);
@@ -201,6 +208,53 @@ pub(super) fn lagged_output_marker(skipped: u64) -> Vec<u8> {
         .into_bytes()
 }
 
+struct ProcessOutputWaiterGuard(Arc<crate::turn_timing::TurnTimingState>);
+
+impl ProcessOutputWaiterGuard {
+    fn new(turn_timing: &Arc<crate::turn_timing::TurnTimingState>) -> Self {
+        turn_timing.adjust_process_output_waiters(1);
+        Self(Arc::clone(turn_timing))
+    }
+}
+
+async fn wait_for_sticky_lifecycle_signal(signal: &CancellationToken) {
+    let cancelled = signal.cancelled();
+    tokio::pin!(cancelled);
+    if signal.is_cancelled() {
+        return;
+    }
+    cancelled.await;
+}
+
+async fn observe_process_exit(
+    signal: &CancellationToken,
+    ledger: &CommandExecutionLedger,
+    process_id: u32,
+    command_execution_id: CommandExecutionId,
+    parent_tool_execution_id: &ToolExecutionId,
+    exit_code: i32,
+) -> CompletionApplyResult {
+    wait_for_sticky_lifecycle_signal(signal).await;
+    ledger
+        .mark_process_exited(
+            process_id,
+            command_execution_id,
+            parent_tool_execution_id,
+            exit_code,
+        )
+        .await
+}
+
+pub(super) async fn wait_for_process_output_drain(signal: &CancellationToken) {
+    wait_for_sticky_lifecycle_signal(signal).await;
+}
+
+impl Drop for ProcessOutputWaiterGuard {
+    fn drop(&mut self) {
+        self.0.adjust_process_output_waiters(-1);
+    }
+}
+
 /// Spawn a background watcher that waits for the PTY to exit and then emits a
 /// single ExecCommandEnd event with the aggregated transcript.
 #[allow(clippy::too_many_arguments)]
@@ -213,6 +267,8 @@ pub(crate) fn spawn_exit_watcher(
     cwd: PathUri,
     environment_id: String,
     process_id: u32,
+    command_execution_id: CommandExecutionId,
+    parent_tool_execution_id: ToolExecutionId,
     transcript: Arc<Mutex<HeadTailBuffer>>,
     started_at: Instant,
     tracker: Option<SharedTurnDiffTracker>,
@@ -245,18 +301,75 @@ pub(crate) fn spawn_exit_watcher(
 
     tokio::spawn(async move {
         let _validation_waiter = validation_waiter;
-        exit_token.cancelled().await;
+        turn_ref.turn_timing_state.record_next_sample_block_reason(
+            codex_protocol::protocol::NextSampleBlockReason::WaitingForProcessCleanup,
+        );
+        let exit_wait_started_at_ms = turn_ref.turn_timing_state.monotonic_offset_ms();
+        wait_for_sticky_lifecycle_signal(&exit_token).await;
         let exit_observed_at = Instant::now();
+        let duration = exit_observed_at.saturating_duration_since(started_at);
+        let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        let failure_message = process.failure_message();
+        let exit_code = if failure_message.is_some() {
+            -1
+        } else {
+            process.exit_code().unwrap_or(-1)
+        };
         if let Some(timing) = tool_dispatch_timing.as_ref() {
             timing.mark_exec_process_exited();
+            timing.record_timer_wait(ToolLifecycleTimerWait {
+                wait_kind: "process_exit".to_string(),
+                effective_timeout_ms: Some(
+                    turn_ref
+                        .turn_timing_state
+                        .monotonic_offset_ms()
+                        .saturating_sub(exit_wait_started_at_ms),
+                ),
+                wake_reason: ToolLifecycleWakeReason::Completed,
+                ..Default::default()
+            });
             turn_ref
                 .turn_timing_state
                 .record_background_tool_process_exit(&call_id, timing.snapshot(exit_observed_at));
         }
-        output_drained.cancelled().await;
+        let completion = observe_process_exit(
+            &exit_token,
+            &session_ref.services.command_execution,
+            process_id,
+            command_execution_id,
+            &parent_tool_execution_id,
+            exit_code,
+        )
+        .await;
+        let tracked = matches!(
+            completion,
+            CompletionApplyResult::Applied | CompletionApplyResult::AlreadyApplied
+        );
+        debug_assert!(
+            !matches!(completion, CompletionApplyResult::Stale),
+            "stale process completion cannot own live command state"
+        );
+        let output_waiter_guard = ProcessOutputWaiterGuard::new(&turn_ref.turn_timing_state);
+        turn_ref.turn_timing_state.record_next_sample_block_reason(
+            codex_protocol::protocol::NextSampleBlockReason::WaitingForProcessCleanup,
+        );
+        let output_wait_started_at_ms = turn_ref.turn_timing_state.monotonic_offset_ms();
+        wait_for_process_output_drain(&output_drained).await;
+        drop(output_waiter_guard);
+        if let Some(timing) = tool_dispatch_timing.as_ref() {
+            timing.record_timer_wait(ToolLifecycleTimerWait {
+                wait_kind: "output_drain".to_string(),
+                effective_timeout_ms: Some(
+                    turn_ref
+                        .turn_timing_state
+                        .monotonic_offset_ms()
+                        .saturating_sub(output_wait_started_at_ms),
+                ),
+                wake_reason: ToolLifecycleWakeReason::Completed,
+                ..Default::default()
+            });
+        }
 
-        let duration = Instant::now().saturating_duration_since(started_at);
-        let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
         if let Some(observation) = validation_observation {
             if process.termination_was_requested() {
                 observation.record_cancelled(duration_ms).await;
@@ -264,21 +377,6 @@ pub(crate) fn spawn_exit_watcher(
                 observation.record_completed(duration_ms).await;
             }
         }
-        let failure_message = process.failure_message();
-        let exit_code = if failure_message.is_some() {
-            -1
-        } else {
-            process.exit_code().unwrap_or(-1)
-        };
-
-        // Record the process exit before event delivery. The end event below independently marks
-        // possible workspace mutation, so missing command bookkeeping cannot turn a completed
-        // process into a tool failure.
-        let tracked = session_ref
-            .services
-            .command_execution
-            .mark_running_process_completed(process_id, exit_code)
-            .await;
         if !tracked {
             tracing::debug!(
                 process_id,
@@ -357,6 +455,23 @@ pub(crate) fn spawn_exit_watcher(
                 tracker.clone(),
             )
             .await;
+        }
+        let finalization = session_ref
+            .services
+            .command_execution
+            .retire_completed_process(command_execution_id, &parent_tool_execution_id)
+            .await;
+        reconcile_turn_progress_event(&turn_ref.turn_timing_state, 0, "background process cleanup");
+        if tracked
+            && !matches!(
+                finalization,
+                CompletionApplyResult::Applied | CompletionApplyResult::AlreadyApplied
+            )
+        {
+            tracing::debug!(
+                process_id,
+                "completed command bookkeeping was already released after delivery"
+            );
         }
 
         if let Some(tracker) = tracker.as_ref() {

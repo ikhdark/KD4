@@ -13,6 +13,8 @@ use codex_protocol::protocol::DeterministicContinuationHostAction;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TokenUsage;
+use codex_protocol::protocol::ToolLifecycleBoundary;
+use codex_protocol::protocol::ToolLifecycleContext;
 use codex_protocol::protocol::TurnTiming;
 use codex_protocol::protocol::TurnTimingAttemptKind;
 use codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt;
@@ -21,6 +23,7 @@ use codex_protocol::protocol::TurnTimingGenerationPurpose;
 use codex_protocol::protocol::TurnTimingGenerationReason;
 use codex_protocol::protocol::TurnTimingProgressKind;
 use codex_protocol::protocol::TurnTimingToolCallSource;
+use codex_protocol::protocol::TurnTimingToolLifecycleEvent;
 use pretty_assertions::assert_eq;
 
 use super::ClockSample;
@@ -440,6 +443,17 @@ fn delivered_tool_relay_timing_persists_every_lifecycle_boundary() {
         "shell_command",
         TurnTimingToolCallSource::CodeMode,
         ToolDispatchTimingSnapshot {
+            lifecycle_events: vec![
+                lifecycle_event(ToolLifecycleBoundary::RequestCreated, 20),
+                lifecycle_event(ToolLifecycleBoundary::Admitted, 35),
+                lifecycle_event(ToolLifecycleBoundary::HandlerStart, 40),
+                lifecycle_event(ToolLifecycleBoundary::ProcessSpawn, 42),
+                lifecycle_event(ToolLifecycleBoundary::ProcessExit, 62),
+                lifecycle_event(ToolLifecycleBoundary::HandlerReturn, 70),
+                lifecycle_event(ToolLifecycleBoundary::RelayEnqueue, 75),
+                lifecycle_event(ToolLifecycleBoundary::RelayDelivery, 100),
+            ],
+            outcome: Some("failure"),
             item_to_first_poll_ms: Some(10),
             parallel_gate_wait_ms: Some(5),
             authorization_state_coordination_ms: Some(2),
@@ -457,10 +471,14 @@ fn delivered_tool_relay_timing_persists_every_lifecycle_boundary() {
             exec_exit_to_delivery_ms: Some(38),
             exec_spawn_to_delivery_ms: Some(58),
             exec_process_alive_at_delivery: false,
+            exec_cleanup_state_observed: true,
+            exec_background_process_expected: false,
+            exec_running_process_after_cleanup: true,
             post_handler_ms: Some(30),
             total_duration_ms: Some(70),
             parallel_gate_admitted: true,
             eager: true,
+            ..ToolDispatchTimingSnapshot::default()
         },
     );
     clock.set_ms(120);
@@ -473,6 +491,7 @@ fn delivered_tool_relay_timing_persists_every_lifecycle_boundary() {
     let call = &timing.tool_calls[0];
     assert_eq!(call.call_id, "call-1");
     assert_eq!(call.source, TurnTimingToolCallSource::CodeMode);
+    assert_eq!(call.outcome.as_deref(), Some("failure"));
     assert_eq!(call.accepted_at_ms, Some(20));
     assert_eq!(call.first_poll_at_ms, Some(30));
     assert_eq!(call.parallel_gate_admitted_at_ms, Some(35));
@@ -485,6 +504,50 @@ fn delivered_tool_relay_timing_persists_every_lifecycle_boundary() {
     assert_eq!(call.model_resumed_at_ms, Some(120));
     assert_eq!(call.post_handler_ms, Some(30));
     assert!(call.eager);
+    assert!(call.exec_cleanup_state_observed);
+    assert!(!call.background_process_expected);
+    assert!(call.running_process_after_cleanup);
+}
+
+fn lifecycle_event(boundary: ToolLifecycleBoundary, at_ms: u64) -> TurnTimingToolLifecycleEvent {
+    TurnTimingToolLifecycleEvent {
+        boundary,
+        at_ms,
+        context: ToolLifecycleContext::default(),
+        retry_count: 0,
+        reentry_count: 0,
+    }
+}
+
+#[test]
+fn lifecycle_serialization_counters_separate_emission_polling_and_admission_peak() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+    let sampling = state.begin_sampling();
+    let mut pending = None;
+    state.begin_model_generation(&mut pending, &SessionSource::Cli);
+    drop(state.begin_model_request_wait());
+    drop(sampling);
+
+    state.record_model_emitted_tool_call();
+    state.record_model_emitted_tool_call();
+    state.record_tool_call("exec_command");
+    state.record_tool_call("exec_command");
+    state.record_model_tool_gate_admitted();
+    state.record_model_tool_gate_admitted();
+    state.record_model_tool_gate_released();
+    state.record_model_tool_gate_released();
+
+    let timing = state.complete_snapshot().protocol_timing();
+    let request = timing
+        .model_requests
+        .iter()
+        .find(|request| request.model_emitted_tool_call_count > 0)
+        .expect("primary request with model tool emissions");
+    assert_eq!(request.model_emitted_tool_call_count, 2);
+    assert_eq!(request.tool_call_count, 2);
+    assert_eq!(request.executor_admitted_tool_call_count, 2);
+    assert_eq!(request.executor_max_concurrent_tool_calls, 2);
 }
 
 #[test]
@@ -718,7 +781,7 @@ fn decision_latency_records_dispatch_actionable_output_and_completion() {
     });
 
     let timing = state.complete_snapshot().protocol_timing();
-    assert_eq!(timing.schema_version, 22);
+    assert_eq!(timing.schema_version, 23);
     assert_eq!(timing.model_requests.len(), 2);
     assert_eq!(timing.model_requests[0].dispatch_ms, Some(20));
     assert_eq!(timing.model_requests[0].first_model_output_ms, Some(25));
@@ -1495,7 +1558,7 @@ fn exclusive_ledger_partitions_every_nanosecond_and_subtracts_only_interactive_o
     clock.set_ms(140);
 
     let profile = state.complete_snapshot().profile;
-    assert_eq!(profile.schema_version, 22);
+    assert_eq!(profile.schema_version, 23);
     assert!(profile.profile_valid);
     assert!(profile.classification_complete);
     assert_eq!(profile.inclusive_duration_ns, 140 * NS_PER_MS);

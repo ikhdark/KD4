@@ -128,6 +128,8 @@ async fn exec_command_with_tty(
     if process_started_alive {
         let entry = ProcessEntry {
             process: Arc::clone(&process),
+            command_execution_id: Default::default(),
+            parent_tool_execution_id: Default::default(),
             call_id: context.call_id.clone(),
             process_id,
             cwd: cwd.clone().into(),
@@ -675,6 +677,8 @@ async fn terminating_initial_exec_command_rechecks_initial_response_state() -> a
         process_id,
         ProcessEntry {
             process,
+            command_execution_id: Default::default(),
+            parent_tool_execution_id: Default::default(),
             call_id: "call".to_string(),
             process_id,
             cwd: cwd.into(),
@@ -748,6 +752,8 @@ async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Resu
         process_id,
         ProcessEntry {
             process: Arc::clone(&process),
+            command_execution_id: Default::default(),
+            parent_tool_execution_id: Default::default(),
             call_id: "call".to_string(),
             process_id,
             cwd: cwd.into(),

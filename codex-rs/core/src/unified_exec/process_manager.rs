@@ -62,6 +62,7 @@ use crate::unified_exec::async_watcher::omitted_output_marker;
 use crate::unified_exec::async_watcher::record_known_delta_from_transcript;
 use crate::unified_exec::async_watcher::spawn_exit_watcher;
 use crate::unified_exec::async_watcher::start_streaming_output;
+use crate::unified_exec::async_watcher::wait_for_process_output_drain;
 use crate::unified_exec::clamp_yield_time_for_readiness;
 use crate::unified_exec::generate_chunk_id;
 use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
@@ -74,6 +75,9 @@ use codex_protocol::config_types::ShellEnvironmentPolicy;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::SandboxErr;
 use codex_protocol::protocol::ExecCommandSource;
+use codex_protocol::protocol::NextSampleBlockReason;
+use codex_protocol::protocol::ToolLifecycleTimerWait;
+use codex_protocol::protocol::ToolLifecycleWakeReason;
 use codex_sandboxing::SandboxCommand;
 #[cfg(windows)]
 use codex_shell_command::powershell::prove_noprofile_powershell_command_as_direct_argv;
@@ -490,11 +494,10 @@ async fn cleanup_pending_process_registration(
         .command_execution
         .running_process(cleanup.process_id)
         .await;
-    let tracked_attempt = !process_id_conflict
-        && running
-            .as_ref()
-            .is_some_and(|running| running.key == cleanup.attempt_key);
-    if tracked_attempt {
+    if !process_id_conflict
+        && let Some(running) = running.as_ref()
+        && running.key == cleanup.attempt_key
+    {
         let exit_code = cleanup
             .primary_process
             .as_ref()
@@ -504,7 +507,12 @@ async fn cleanup_pending_process_registration(
             .session
             .services
             .command_execution
-            .finish_running_process(cleanup.process_id, Some(exit_code))
+            .finish_running_process_with_execution_id(
+                cleanup.process_id,
+                running.execution_id,
+                &running.parent_tool_execution_id,
+                Some(exit_code),
+            )
             .await;
     }
     Ok(())
@@ -961,7 +969,19 @@ impl UnifiedExecProcessManager {
             mark_exec_process_exited();
         }
         if !process_started_alive {
-            process.output_drained_token().cancelled().await;
+            let output_drain_started_at = Instant::now();
+            wait_for_process_output_drain(&process.output_drained_token()).await;
+            if let Some(timing) = active_tool_dispatch_timing() {
+                timing.record_timer_wait(ToolLifecycleTimerWait {
+                    wait_kind: "initial_process_output_drain".to_string(),
+                    effective_timeout_ms: Some(
+                        u64::try_from(output_drain_started_at.elapsed().as_millis())
+                            .unwrap_or(u64::MAX),
+                    ),
+                    wake_reason: ToolLifecycleWakeReason::Completed,
+                    ..Default::default()
+                });
+            }
         }
         drop(tool_execution_timing_guard);
         let wall_time = Instant::now().saturating_duration_since(start);
@@ -1207,7 +1227,33 @@ impl UnifiedExecProcessManager {
                     Ok(()) => {
                         // Give the remote process a brief window to react so that we are
                         // more likely to capture its output in the poll below.
+                        let reaction_wait_started_at = Instant::now();
+                        let reaction_timing = active_tool_dispatch_timing();
+                        let reaction_deadline_at_ms = reaction_timing
+                            .as_ref()
+                            .and_then(|timing| timing.deadline_after_ms(100));
+                        if let Some(turn_timing) = reaction_timing
+                            .as_ref()
+                            .and_then(|timing| timing.turn_timing_state())
+                        {
+                            turn_timing.record_next_sample_block_reason(
+                                NextSampleBlockReason::WaitingForProcessCleanup,
+                            );
+                        }
                         tokio::time::sleep(Duration::from_millis(100)).await;
+                        if let Some(timing) = reaction_timing {
+                            timing.record_timer_wait(ToolLifecycleTimerWait {
+                                wait_kind: "write_stdin_process_reaction".to_string(),
+                                requested_timeout_ms: Some(100),
+                                effective_timeout_ms: Some(
+                                    u64::try_from(reaction_wait_started_at.elapsed().as_millis())
+                                        .unwrap_or(u64::MAX),
+                                ),
+                                deadline_at_ms: reaction_deadline_at_ms,
+                                wake_reason: ToolLifecycleWakeReason::Timeout,
+                                sequence: 0,
+                            });
+                        }
                     }
                     Err(err) => {
                         let status = self.refresh_process_state(process_id).await;
@@ -1440,8 +1486,20 @@ impl UnifiedExecProcessManager {
         known_delta: Option<crate::tools::known_delta_store::PreparedKnownDelta>,
         known_delta_executor_started_at: Option<Instant>,
     ) -> Result<(), UnifiedExecError> {
+        let command_execution_id = context
+            .session
+            .services
+            .command_execution
+            .allocate_execution_id();
+        let tool_dispatch_timing = active_tool_dispatch_timing();
+        let parent_tool_execution_id = tool_dispatch_timing
+            .as_ref()
+            .map(|timing| timing.execution_id().clone())
+            .unwrap_or_default();
         let entry = ProcessEntry {
             process: Arc::clone(&process),
+            command_execution_id,
+            parent_tool_execution_id: parent_tool_execution_id.clone(),
             call_id: context.call_id.clone(),
             process_id,
             cwd: cwd.clone(),
@@ -1471,7 +1529,12 @@ impl UnifiedExecProcessManager {
                 .session
                 .services
                 .command_execution
-                .finish_running_process(pruned_entry.process_id, Some(exit_code))
+                .finish_running_process_with_execution_id(
+                    pruned_entry.process_id,
+                    pruned_entry.command_execution_id,
+                    &pruned_entry.parent_tool_execution_id,
+                    Some(exit_code),
+                )
                 .await;
             debug_assert!(pruned_entry.process.has_exited());
         }
@@ -1487,7 +1550,9 @@ impl UnifiedExecProcessManager {
             .session
             .services
             .command_execution
-            .track_running_process_with_validation_contract(
+            .track_running_process_with_execution_id(
+                command_execution_id,
+                parent_tool_execution_id.clone(),
                 process_id,
                 attempt_key,
                 raw_output_artifact.clone(),
@@ -1505,6 +1570,8 @@ impl UnifiedExecProcessManager {
             cwd,
             environment_id,
             process_id,
+            command_execution_id,
+            parent_tool_execution_id,
             transcript,
             started_at,
             context.tracker.clone(),
@@ -1513,7 +1580,7 @@ impl UnifiedExecProcessManager {
             validation_waiter,
             known_delta,
             known_delta_executor_started_at,
-            active_tool_dispatch_timing(),
+            tool_dispatch_timing,
         );
         registration.commit();
         Ok(())
@@ -1975,6 +2042,8 @@ impl UnifiedExecProcessManager {
     ) -> Vec<u8> {
         let mut collected: Vec<u8> = Vec::with_capacity(4096);
         let mut lagged_chunks = 0_u64;
+        let tool_dispatch_timing = active_tool_dispatch_timing();
+        let mut wait_attempt = 0_u32;
         let mut exit_signal_received = cancellation_token.is_cancelled();
         let mut post_exit_deadline: Option<Instant> = None;
         // A silent initial process should return a live session promptly instead
@@ -2044,22 +2113,90 @@ impl UnifiedExecProcessManager {
                     if close_wait_remaining == Duration::ZERO {
                         break;
                     }
-                    tokio::select! {
-                        _ = &mut output_notified => {}
-                        _ = &mut closed => {}
-                        _ = tokio::time::sleep(close_wait_remaining) => break,
-                        _ = Self::wait_for_pause_change(pause_state.as_ref()) => {}
+                    if wait_attempt > 0
+                        && let Some(timing) = tool_dispatch_timing.as_ref()
+                    {
+                        timing.increment_reentry_count();
+                        timing.increment_retry_count();
+                    }
+                    wait_attempt = wait_attempt.saturating_add(1);
+                    let requested_timeout_ms =
+                        u64::try_from(close_wait_remaining.as_millis()).unwrap_or(u64::MAX);
+                    let lifecycle_deadline_at_ms = tool_dispatch_timing
+                        .as_ref()
+                        .and_then(|timing| timing.deadline_after_ms(requested_timeout_ms));
+                    if let Some(turn_timing) = tool_dispatch_timing
+                        .as_ref()
+                        .and_then(|timing| timing.turn_timing_state())
+                    {
+                        turn_timing.record_next_sample_block_reason(
+                            NextSampleBlockReason::WaitingForProcessCleanup,
+                        );
+                    }
+                    let wake_reason = tokio::select! {
+                        _ = &mut output_notified => ToolLifecycleWakeReason::Completed,
+                        _ = &mut closed => ToolLifecycleWakeReason::Completed,
+                        _ = tokio::time::sleep(close_wait_remaining) => ToolLifecycleWakeReason::Timeout,
+                        _ = Self::wait_for_pause_change(pause_state.as_ref()) => ToolLifecycleWakeReason::Retry,
+                    };
+                    if let Some(timing) = tool_dispatch_timing.as_ref() {
+                        timing.record_timer_wait(ToolLifecycleTimerWait {
+                            wait_kind: "post_exit_output_drain".to_string(),
+                            requested_timeout_ms: Some(requested_timeout_ms),
+                            effective_timeout_ms: Some(requested_timeout_ms),
+                            deadline_at_ms: lifecycle_deadline_at_ms,
+                            wake_reason,
+                            sequence: 0,
+                        });
+                    }
+                    if wake_reason == ToolLifecycleWakeReason::Timeout {
+                        break;
                     }
                     continue;
                 }
 
                 let exit_notified = cancellation_token.cancelled();
                 tokio::pin!(exit_notified);
-                tokio::select! {
-                    _ = &mut output_notified => {}
-                    _ = &mut exit_notified => exit_signal_received = true,
-                    _ = tokio::time::sleep(remaining) => break,
-                    _ = Self::wait_for_pause_change(pause_state.as_ref()) => {}
+                if wait_attempt > 0
+                    && let Some(timing) = tool_dispatch_timing.as_ref()
+                {
+                    timing.increment_reentry_count();
+                    timing.increment_retry_count();
+                }
+                wait_attempt = wait_attempt.saturating_add(1);
+                let requested_timeout_ms = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
+                let lifecycle_deadline_at_ms = tool_dispatch_timing
+                    .as_ref()
+                    .and_then(|timing| timing.deadline_after_ms(requested_timeout_ms));
+                if let Some(turn_timing) = tool_dispatch_timing
+                    .as_ref()
+                    .and_then(|timing| timing.turn_timing_state())
+                {
+                    turn_timing.record_next_sample_block_reason(
+                        NextSampleBlockReason::WaitingForProcessCleanup,
+                    );
+                }
+                let wake_reason = tokio::select! {
+                    _ = &mut output_notified => ToolLifecycleWakeReason::Completed,
+                    _ = &mut exit_notified => {
+                        exit_signal_received = true;
+                        ToolLifecycleWakeReason::Completed
+                    },
+                    _ = tokio::time::sleep(remaining) => ToolLifecycleWakeReason::Timeout,
+                    _ = Self::wait_for_pause_change(pause_state.as_ref()) => ToolLifecycleWakeReason::Retry,
+                };
+                if let Some(timing) = tool_dispatch_timing.as_ref() {
+                    timing.record_timer_wait(ToolLifecycleTimerWait {
+                        wait_kind: "owner_output_wait".to_string(),
+                        requested_timeout_ms: Some(requested_timeout_ms),
+                        effective_timeout_ms: Some(requested_timeout_ms),
+                        deadline_at_ms: lifecycle_deadline_at_ms,
+                        wake_reason,
+                        sequence: 0,
+                    });
+                }
+                if wake_reason == ToolLifecycleWakeReason::Timeout {
+                    break;
                 }
                 continue;
             }

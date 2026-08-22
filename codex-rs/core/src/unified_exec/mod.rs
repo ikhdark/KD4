@@ -264,6 +264,8 @@ impl Default for UnifiedExecProcessManager {
 
 struct ProcessEntry {
     process: Arc<UnifiedExecProcess>,
+    command_execution_id: crate::tools::command_execution::CommandExecutionId,
+    parent_tool_execution_id: codex_protocol::protocol::ToolExecutionId,
     call_id: String,
     process_id: u32,
     cwd: PathUri,

@@ -3258,6 +3258,22 @@ impl Session {
         item.set_id(Some(ResponseItemId::new(prefix)));
     }
 
+    fn record_persisted_tool_outputs(turn_context: &TurnContext, items: &[ResponseItem]) {
+        for call_id in items.iter().filter_map(|item| match item {
+            ResponseItem::FunctionCallOutput { call_id, .. }
+            | ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id.as_str()),
+            ResponseItem::ToolSearchOutput {
+                call_id: Some(call_id),
+                ..
+            } => Some(call_id.as_str()),
+            _ => None,
+        }) {
+            turn_context
+                .turn_timing_state
+                .record_tool_output_model_visible(call_id);
+        }
+    }
+
     pub(crate) fn response_item_from_user_input(&self, input: Vec<UserInput>) -> ResponseItem {
         ResponseItem::from(ResponseInputItem::from_user_input(
             input,
@@ -3286,6 +3302,7 @@ impl Session {
             .begin_local_phase(TurnLocalPhase::Persistence);
         self.persist_rollout_response_items(items).await;
         drop(persistence_timing_guard);
+        Self::record_persisted_tool_outputs(turn_context, items);
         self.send_raw_response_items(turn_context, items).await;
     }
 
@@ -3310,6 +3327,7 @@ impl Session {
             .map(RolloutItem::ResponseItem)
             .collect::<Vec<_>>();
         self.persist_rollout_items_durable(&rollout_items).await?;
+        Self::record_persisted_tool_outputs(turn_context, items);
         self.send_raw_response_items(turn_context, items).await;
         Ok(())
     }
