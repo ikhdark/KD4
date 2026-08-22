@@ -21,4 +21,4 @@ deny = ["yanked"]
 quiet = false
 # Keep routine audit output reviewable; use `cargo tree -i <crate>` when a
 # warning or vulnerability needs its full reverse dependency graph.
-show_tree = false
+show_tree = true
