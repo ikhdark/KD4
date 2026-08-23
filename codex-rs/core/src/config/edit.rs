@@ -1,3 +1,4 @@
+use crate::path_utils::acquire_atomic_write_lock;
 use crate::path_utils::resolve_symlink_write_paths;
 use crate::path_utils::write_atomically;
 use anyhow::Context;
@@ -5,6 +6,7 @@ use codex_config::CONFIG_TOML_FILE;
 use codex_config::types::McpServerConfig;
 use codex_config::types::SessionPickerViewMode;
 use codex_config::types::ToolSuggestDisabledTool;
+use codex_config::version_for_toml;
 use codex_features::feature_for_key;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ServiceTier;
@@ -684,16 +686,26 @@ fn write_skill_config_selector(table: &mut TomlTable, selector: &SkillConfigSele
 /// Persist edits using a blocking strategy.
 pub fn apply_blocking(codex_home: &Path, edits: &[ConfigEdit]) -> anyhow::Result<()> {
     let config_path = codex_home.join(CONFIG_TOML_FILE);
-    apply_blocking_to_resolved_file(&config_path, edits)
+    apply_blocking_to_resolved_file(&config_path, edits, None).map(|_| ())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfigApplyOutcome {
+    Applied,
+    VersionConflict,
 }
 
 fn apply_blocking_to_resolved_file(
     resolved_config_file: &Path,
     edits: &[ConfigEdit],
-) -> anyhow::Result<()> {
-    if edits.is_empty() {
-        return Ok(());
-    }
+    expected_version: Option<&str>,
+) -> anyhow::Result<ConfigApplyOutcome> {
+    let _lock = acquire_atomic_write_lock(resolved_config_file).with_context(|| {
+        format!(
+            "failed to lock config at {}",
+            resolved_config_file.display()
+        )
+    })?;
 
     let write_paths = resolve_symlink_write_paths(resolved_config_file)?;
     let serialized = match write_paths.read_path {
@@ -704,6 +716,21 @@ fn apply_blocking_to_resolved_file(
         },
         None => String::new(),
     };
+
+    if let Some(expected_version) = expected_version {
+        let value = toml::from_str(if serialized.is_empty() {
+            ""
+        } else {
+            &serialized
+        })?;
+        if version_for_toml(&value) != expected_version {
+            return Ok(ConfigApplyOutcome::VersionConflict);
+        }
+    }
+
+    if edits.is_empty() {
+        return Ok(ConfigApplyOutcome::Applied);
+    }
 
     let doc = if serialized.is_empty() {
         DocumentMut::new()
@@ -719,7 +746,7 @@ fn apply_blocking_to_resolved_file(
     }
 
     if !mutated {
-        return Ok(());
+        return Ok(ConfigApplyOutcome::Applied);
     }
 
     write_atomically(&write_paths.write_path, &document.doc.to_string()).with_context(|| {
@@ -729,7 +756,7 @@ fn apply_blocking_to_resolved_file(
         )
     })?;
 
-    Ok(())
+    Ok(ConfigApplyOutcome::Applied)
 }
 
 /// Persist edits asynchronously by offloading the blocking writer.
@@ -737,9 +764,10 @@ fn apply_blocking_to_resolved_file(
 pub async fn apply(codex_home: &Path, edits: Vec<ConfigEdit>) -> anyhow::Result<()> {
     let codex_home = codex_home.to_path_buf();
     let config_path = codex_home.join(CONFIG_TOML_FILE);
-    task::spawn_blocking(move || apply_blocking_to_resolved_file(&config_path, &edits))
+    task::spawn_blocking(move || apply_blocking_to_resolved_file(&config_path, &edits, None))
         .await
-        .context("config persistence task panicked")?
+        .context("config persistence task panicked")??;
+    Ok(())
 }
 
 /// Fluent builder to batch config edits and apply them atomically.
@@ -747,6 +775,7 @@ pub async fn apply(codex_home: &Path, edits: Vec<ConfigEdit>) -> anyhow::Result<
 pub struct ConfigEditsBuilder {
     config_path: PathBuf,
     edits: Vec<ConfigEdit>,
+    expected_version: Option<String>,
 }
 
 impl ConfigEditsBuilder {
@@ -767,6 +796,7 @@ impl ConfigEditsBuilder {
         Self {
             config_path: config_path.to_path_buf(),
             edits: Vec::new(),
+            expected_version: None,
         }
     }
 
@@ -966,15 +996,36 @@ impl ConfigEditsBuilder {
         self
     }
 
+    pub fn with_expected_version(mut self, expected_version: Option<String>) -> Self {
+        self.expected_version = expected_version;
+        self
+    }
+
     /// Apply edits on a blocking thread.
     pub fn apply_blocking(self) -> anyhow::Result<()> {
-        apply_blocking_to_resolved_file(&self.config_path, &self.edits)
+        self.apply_blocking_with_outcome().map(|_| ())
+    }
+
+    pub fn apply_blocking_with_outcome(self) -> anyhow::Result<ConfigApplyOutcome> {
+        apply_blocking_to_resolved_file(
+            &self.config_path,
+            &self.edits,
+            self.expected_version.as_deref(),
+        )
     }
 
     /// Apply edits asynchronously via a blocking offload.
     pub async fn apply(self) -> anyhow::Result<()> {
+        self.apply_with_outcome().await.map(|_| ())
+    }
+
+    pub async fn apply_with_outcome(self) -> anyhow::Result<ConfigApplyOutcome> {
         task::spawn_blocking(move || {
-            apply_blocking_to_resolved_file(&self.config_path, &self.edits)
+            apply_blocking_to_resolved_file(
+                &self.config_path,
+                &self.edits,
+                self.expected_version.as_deref(),
+            )
         })
         .await
         .context("config persistence task panicked")?

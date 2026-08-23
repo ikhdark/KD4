@@ -1,4 +1,5 @@
 use super::*;
+use crate::connection_rpc_gate::ConnectionRpcGate;
 
 #[derive(Clone)]
 pub(crate) struct CommandExecRequestProcessor {
@@ -32,9 +33,10 @@ impl CommandExecRequestProcessor {
         &self,
         request_id: &ConnectionRequestId,
         params: CommandExecParams,
+        rpc_gate: &ConnectionRpcGate,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         self.require_local_environment()?;
-        self.exec_one_off_command(request_id, params)
+        self.exec_one_off_command(request_id, params, rpc_gate)
             .await
             .map(|()| None)
     }
@@ -90,8 +92,9 @@ impl CommandExecRequestProcessor {
         &self,
         request_id: &ConnectionRequestId,
         params: CommandExecParams,
+        rpc_gate: &ConnectionRpcGate,
     ) -> Result<(), JSONRPCErrorError> {
-        self.exec_one_off_command_inner(request_id.clone(), params)
+        self.exec_one_off_command_inner(request_id.clone(), params, rpc_gate)
             .await
     }
 
@@ -99,6 +102,7 @@ impl CommandExecRequestProcessor {
         &self,
         request_id: ConnectionRequestId,
         params: CommandExecParams,
+        rpc_gate: &ConnectionRpcGate,
     ) -> Result<(), JSONRPCErrorError> {
         tracing::debug!("ExecOneOffCommand params: {params:?}");
 
@@ -329,18 +333,21 @@ impl CommandExecRequestProcessor {
         )
         .map_err(|err| internal_error(format!("exec failed: {err}")))?;
         self.command_exec_manager
-            .start(StartCommandExecParams {
-                outgoing,
-                request_id: request_for_task,
-                process_id,
-                exec_request,
-                started_network_proxy: started_network_proxy_for_task,
-                tty,
-                stream_stdin,
-                stream_stdout_stderr,
-                output_bytes_cap,
-                size,
-            })
+            .start_with_gate(
+                StartCommandExecParams {
+                    outgoing,
+                    request_id: request_for_task,
+                    process_id,
+                    exec_request,
+                    started_network_proxy: started_network_proxy_for_task,
+                    tty,
+                    stream_stdin,
+                    stream_stdout_stderr,
+                    output_bytes_cap,
+                    size,
+                },
+                rpc_gate,
+            )
             .await
     }
 }

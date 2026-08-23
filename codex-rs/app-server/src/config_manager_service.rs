@@ -21,6 +21,7 @@ use codex_config::ConfigRequirementsToml;
 use codex_config::config_toml::ConfigToml;
 use codex_config::merge_toml_values;
 use codex_core::config::deserialize_config_toml_with_base;
+use codex_core::config::edit::ConfigApplyOutcome;
 use codex_core::config::edit::ConfigEdit;
 use codex_core::config::edit::ConfigEditsBuilder;
 use codex_core::config::resolve_configured_features;
@@ -28,7 +29,6 @@ use codex_core::config::validate_feature_requirements_for_config_toml;
 use codex_core::path_utils;
 use codex_core::path_utils::SymlinkWritePaths;
 use codex_core::path_utils::resolve_symlink_write_paths;
-use codex_core::path_utils::write_atomically;
 use codex_features::Features;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde_json::Value as JsonValue;
@@ -36,7 +36,6 @@ use std::borrow::Cow;
 use std::path::Path;
 use std::path::PathBuf;
 use thiserror::Error;
-use tokio::task;
 use toml::Value as TomlValue;
 use toml_edit::Item as TomlItem;
 
@@ -338,12 +337,17 @@ impl ConfigManager {
             )
         })?;
 
-        if !config_edits.is_empty() {
-            ConfigEditsBuilder::for_config_path(provided_path.as_path())
-                .with_edits(config_edits)
-                .apply()
-                .await
-                .map_err(|err| ConfigManagerError::anyhow("failed to persist config.toml", err))?;
+        let apply_outcome = ConfigEditsBuilder::for_config_path(provided_path.as_path())
+            .with_edits(config_edits)
+            .with_expected_version(expected_version)
+            .apply_with_outcome()
+            .await
+            .map_err(|err| ConfigManagerError::anyhow("failed to persist config.toml", err))?;
+        if apply_outcome == ConfigApplyOutcome::VersionConflict {
+            return Err(ConfigManagerError::write(
+                ConfigWriteErrorCode::ConfigVersionConflict,
+                "Configuration was modified since last read. Fetch latest version and retry.",
+            ));
         }
 
         let overridden = first_overridden_edit(&updated_layers, &effective, &parsed_segments);
@@ -382,7 +386,7 @@ async fn create_empty_user_layer(
 ) -> Result<ConfigLayerEntry, ConfigManagerError> {
     let SymlinkWritePaths {
         read_path,
-        write_path,
+        write_path: _,
     } = resolve_symlink_write_paths(config_toml.as_path())
         .map_err(|err| ConfigManagerError::io("failed to resolve user config path", err))?;
     let toml_value = match read_path {
@@ -391,7 +395,6 @@ async fn create_empty_user_layer(
                 ConfigManagerError::toml("failed to parse existing user config.toml", e)
             })?,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                write_empty_user_config(write_path.clone()).await?;
                 TomlValue::Table(toml::map::Map::new())
             }
             Err(err) => {
@@ -401,10 +404,7 @@ async fn create_empty_user_layer(
                 ));
             }
         },
-        None => {
-            write_empty_user_config(write_path).await?;
-            TomlValue::Table(toml::map::Map::new())
-        }
+        None => TomlValue::Table(toml::map::Map::new()),
     };
     Ok(ConfigLayerEntry::new(
         ConfigLayerSource::User {
@@ -413,13 +413,6 @@ async fn create_empty_user_layer(
         },
         toml_value,
     ))
-}
-
-async fn write_empty_user_config(write_path: PathBuf) -> Result<(), ConfigManagerError> {
-    task::spawn_blocking(move || write_atomically(&write_path, ""))
-        .await
-        .map_err(|err| ConfigManagerError::anyhow("config persistence task panicked", err.into()))?
-        .map_err(|err| ConfigManagerError::io("failed to create empty user config.toml", err))
 }
 
 fn parse_value(value: JsonValue) -> Result<Option<TomlValue>, String> {

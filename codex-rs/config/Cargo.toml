@@ -26,7 +26,6 @@ codex-utils-path = { workspace = true }
 codex-utils-path-uri = { workspace = true }
 dunce = { workspace = true }
 futures = { workspace = true, features = ["alloc", "std"] }
-fs2 = "0.4.3"
 gethostname = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }
 multimap = { workspace = true }
@@ -42,7 +41,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs"] }
 toml = { workspace = true, features = ["preserve_order"] }
 toml_edit = { workspace = true }
-tempfile = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
 tracing = { workspace = true }

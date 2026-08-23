@@ -59,3 +59,24 @@ fn rejects_file_path() {
     .expect_err("file path should fail");
     assert!(err.to_string().contains("path must be a directory"));
 }
+
+#[cfg(target_os = "windows")]
+#[test]
+fn rejects_permission_profiles_without_managed_windows_sandbox_permissions() {
+    let tmp = TempDir::new().expect("tempdir");
+    let workspace_roots = workspace_roots_for(tmp.path());
+    let err = grant_read_root_non_elevated(
+        &PermissionProfile::Disabled,
+        workspace_roots.as_slice(),
+        tmp.path(),
+        &HashMap::new(),
+        tmp.path(),
+        tmp.path(),
+    )
+    .expect_err("disabled permissions must not report a successful read grant");
+
+    assert!(
+        err.to_string().contains("managed permission profiles"),
+        "unexpected error: {err:#}"
+    );
+}

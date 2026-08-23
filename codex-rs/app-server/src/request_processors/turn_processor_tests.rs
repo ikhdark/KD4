@@ -63,6 +63,19 @@ fn in_flight_task_coalescing_returns_reuse_coordinates() {
     );
 }
 
+#[test]
+fn in_flight_task_capacity_error_is_retryable() {
+    let error = in_flight_task_capacity_error();
+
+    assert_eq!(
+        error.data,
+        Some(serde_json::json!({
+            "reason": "inFlightTaskCapacityExceeded",
+            "retryable": true,
+        }))
+    );
+}
+
 fn additional_context_entry(value: impl Into<String>) -> AdditionalContextEntry {
     AdditionalContextEntry {
         value: value.into(),

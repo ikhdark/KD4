@@ -81,7 +81,7 @@ pub const CONFIG_OPTION_DOCS: &[ConfigOptionDoc] = &[
     doc(
         "reasoning_phase_efforts",
         "Reasoning and output",
-        "Optional per-sampling-request effort overrides for orient, inspect, implement, diagnose, verify, and finalize phases.",
+        "Optional per-sampling-request effort overrides. Omitted fields default to `high` for orient, implement, and diagnose, and `low` for inspect, verify, and finalize.",
     ),
     doc(
         "reasoning_phase_efforts.deterministic_continuation",
@@ -326,7 +326,7 @@ pub const CONFIG_OPTION_DOCS: &[ConfigOptionDoc] = &[
     doc(
         "project_doc_max_bytes",
         "Project and profile",
-        "Maximum combined source bytes retained from `AGENTS.md` project docs; generated provenance and truncation notices do not consume this budget.",
+        "Maximum combined source bytes retained from `AGENTS.md` project docs. The rendered project-doc payload, including generated provenance and notices, is separately capped at this value plus 4 KiB.",
     ),
     doc(
         "project_doc_fallback_filenames",

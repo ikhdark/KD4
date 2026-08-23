@@ -1,6 +1,9 @@
 use chrono::DateTime;
 use chrono::Utc;
 use codex_protocol::openai_models::ModelInfo;
+use codex_utils_path::AtomicWriteLock;
+use codex_utils_path::acquire_atomic_write_lock;
+use codex_utils_path::write_bytes_atomically;
 use serde::Deserialize;
 use serde::Serialize;
 use std::fmt;
@@ -22,6 +25,22 @@ pub(crate) struct ModelsCacheManager {
     cache_ttl: Duration,
     cache_identity: ModelsCacheIdentity,
     io_permit: Semaphore,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CacheWriteBasis {
+    disk_revision: DiskRevision,
+    client_version: Option<String>,
+    provider_cache_identity: Option<String>,
+    etag: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DiskRevision {
+    Missing,
+    Persisted(u64),
+    Legacy(Vec<u8>),
+    Opaque(Vec<u8>),
 }
 
 impl fmt::Debug for ModelsCacheManager {
@@ -64,6 +83,16 @@ impl ModelsCacheManager {
             .map_err(|_| io::Error::other("models cache I/O gate closed"))
     }
 
+    async fn acquire_file_lock(&self) -> io::Result<AtomicWriteLock> {
+        if let Some(parent) = self.cache_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        let cache_path = self.cache_path.clone();
+        tokio::task::spawn_blocking(move || acquire_atomic_write_lock(&cache_path))
+            .await
+            .map_err(|err| io::Error::other(format!("models cache lock task failed: {err}")))?
+    }
+
     /// Attempt to load a fresh cache entry. Returns `None` if the cache doesn't exist or is stale.
     #[cfg(test)]
     pub(crate) async fn load_fresh(&self, expected_version: &str) -> Option<ModelsCache> {
@@ -83,6 +112,13 @@ impl ModelsCacheManager {
             Ok(permit) => permit,
             Err(err) => {
                 error!("failed to acquire models cache I/O gate: {err}");
+                return None;
+            }
+        };
+        let _file_lock = match self.acquire_file_lock().await {
+            Ok(lock) => lock,
+            Err(err) => {
+                error!("failed to acquire models cache file lock: {err}");
                 return None;
             }
         };
@@ -161,6 +197,7 @@ impl ModelsCacheManager {
 
     /// Persist only if the request that produced these models still belongs
     /// to the current complete cache identity.
+    #[cfg(test)]
     pub(crate) async fn persist_cache_for_identity(
         &self,
         models: &[ModelInfo],
@@ -168,10 +205,64 @@ impl ModelsCacheManager {
         client_version: String,
         expected_identity: &str,
     ) -> bool {
+        let basis = match self.write_basis_for_identity(expected_identity).await {
+            Ok(basis) => basis,
+            Err(err) => {
+                error!("failed to capture models cache write basis: {err}");
+                return false;
+            }
+        };
+        self.persist_cache_for_identity_if_unchanged(
+            models,
+            etag,
+            client_version,
+            expected_identity,
+            &basis,
+        )
+        .await
+    }
+
+    pub(crate) async fn write_basis_for_identity(
+        &self,
+        expected_identity: &str,
+    ) -> io::Result<CacheWriteBasis> {
+        let _permit = match self.acquire_io_permit().await {
+            Ok(permit) => permit,
+            Err(err) => {
+                return Err(io::Error::other(format!(
+                    "failed to acquire models cache I/O gate: {err}"
+                )));
+            }
+        };
+        let _file_lock = self.acquire_file_lock().await?;
+        if !self.identity_is_current(expected_identity) {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "cache identity changed before write basis capture",
+            ));
+        }
+        self.read_write_basis().await
+    }
+
+    pub(crate) async fn persist_cache_for_identity_if_unchanged(
+        &self,
+        models: &[ModelInfo],
+        etag: Option<String>,
+        client_version: String,
+        expected_identity: &str,
+        expected_basis: &CacheWriteBasis,
+    ) -> bool {
         let _permit = match self.acquire_io_permit().await {
             Ok(permit) => permit,
             Err(err) => {
                 error!("failed to acquire models cache I/O gate: {err}");
+                return false;
+            }
+        };
+        let _file_lock = match self.acquire_file_lock().await {
+            Ok(lock) => lock,
+            Err(err) => {
+                error!("failed to acquire models cache file lock: {err}");
                 return false;
             }
         };
@@ -184,13 +275,36 @@ impl ModelsCacheManager {
             );
             return false;
         }
+        let current_basis = match self.read_write_basis().await {
+            Ok(basis) => basis,
+            Err(err) => {
+                error!("failed to re-read models cache before write: {err}");
+                return false;
+            }
+        };
+        if &current_basis != expected_basis {
+            info!(
+                cache_path = %self.cache_path.display(),
+                "models cache: skipped stale cross-process write"
+            );
+            return false;
+        }
         let cache = ModelsCache {
+            revision: Some(next_revision(&current_basis.disk_revision)),
             fetched_at: Utc::now(),
             etag,
             client_version: Some(client_version),
             provider_cache_identity: Some(current_identity),
             models: models.to_vec(),
         };
+        if !self.identity_is_current(expected_identity) {
+            info!(
+                cache_path = %self.cache_path.display(),
+                mismatch_category = "provider_cache_identity",
+                "models cache: skipped write after identity changed under file lock"
+            );
+            return false;
+        }
         if let Err(err) = self.save_internal(&cache).await {
             error!("failed to write models cache: {err}");
             return false;
@@ -211,13 +325,32 @@ impl ModelsCacheManager {
     }
 
     /// Renew only while the caller's identity snapshot remains authoritative.
+    #[cfg(test)]
     pub(crate) async fn renew_cache_ttl_for_identity(
         &self,
         expected_version: &str,
         expected_etag: &str,
         expected_identity: &str,
     ) -> io::Result<()> {
+        let basis = self.write_basis_for_identity(expected_identity).await?;
+        self.renew_cache_ttl_for_identity_if_unchanged(
+            expected_version,
+            expected_etag,
+            expected_identity,
+            &basis,
+        )
+        .await
+    }
+
+    pub(crate) async fn renew_cache_ttl_for_identity_if_unchanged(
+        &self,
+        expected_version: &str,
+        expected_etag: &str,
+        expected_identity: &str,
+        expected_basis: &CacheWriteBasis,
+    ) -> io::Result<()> {
         let _permit = self.acquire_io_permit().await?;
+        let _file_lock = self.acquire_file_lock().await?;
         if !self.identity_is_current(expected_identity) {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
@@ -228,6 +361,13 @@ impl ModelsCacheManager {
             .load()
             .await?
             .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "cache not found"))?;
+        let current_basis = self.read_write_basis().await?;
+        if &current_basis != expected_basis {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "cache revision changed before TTL renewal",
+            ));
+        }
         if cache.client_version.as_deref() != Some(expected_version)
             || cache.provider_cache_identity.as_deref() != Some(expected_identity)
             || cache.etag.as_deref() != Some(expected_etag)
@@ -238,6 +378,7 @@ impl ModelsCacheManager {
             ));
         }
         cache.fetched_at = Utc::now();
+        cache.revision = Some(next_revision(&current_basis.disk_revision));
         if !self.identity_is_current(expected_identity) {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
@@ -259,13 +400,48 @@ impl ModelsCacheManager {
         }
     }
 
+    async fn read_write_basis(&self) -> io::Result<CacheWriteBasis> {
+        let contents = match fs::read(&self.cache_path).await {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                return Ok(CacheWriteBasis {
+                    disk_revision: DiskRevision::Missing,
+                    client_version: None,
+                    provider_cache_identity: None,
+                    etag: None,
+                });
+            }
+            Err(err) => return Err(err),
+        };
+        match serde_json::from_slice::<ModelsCache>(&contents) {
+            Ok(cache) => Ok(CacheWriteBasis {
+                disk_revision: cache
+                    .revision
+                    .map(DiskRevision::Persisted)
+                    .unwrap_or_else(|| DiskRevision::Legacy(contents)),
+                client_version: cache.client_version,
+                provider_cache_identity: cache.provider_cache_identity,
+                etag: cache.etag,
+            }),
+            Err(_) => Ok(CacheWriteBasis {
+                disk_revision: DiskRevision::Opaque(contents),
+                client_version: None,
+                provider_cache_identity: None,
+                etag: None,
+            }),
+        }
+    }
+
     async fn save_internal(&self, cache: &ModelsCache) -> io::Result<()> {
         if let Some(parent) = self.cache_path.parent() {
             fs::create_dir_all(parent).await?;
         }
         let json = serde_json::to_vec_pretty(cache)
             .map_err(|err| io::Error::new(ErrorKind::InvalidData, err.to_string()))?;
-        fs::write(&self.cache_path, json).await
+        let cache_path = self.cache_path.clone();
+        tokio::task::spawn_blocking(move || write_bytes_atomically(&cache_path, &json))
+            .await
+            .map_err(|err| io::Error::other(format!("models cache write task failed: {err}")))?
     }
 
     #[cfg(test)]
@@ -281,11 +457,14 @@ impl ModelsCacheManager {
         F: FnOnce(&mut DateTime<Utc>),
     {
         let _permit = self.acquire_io_permit().await?;
+        let _file_lock = self.acquire_file_lock().await?;
         let mut cache = match self.load().await? {
             Some(cache) => cache,
             None => return Err(io::Error::new(ErrorKind::NotFound, "cache not found")),
         };
+        let current_basis = self.read_write_basis().await?;
         f(&mut cache.fetched_at);
+        cache.revision = Some(next_revision(&current_basis.disk_revision));
         self.save_internal(&cache).await
     }
 
@@ -296,11 +475,14 @@ impl ModelsCacheManager {
         F: FnOnce(&mut ModelsCache),
     {
         let _permit = self.acquire_io_permit().await?;
+        let _file_lock = self.acquire_file_lock().await?;
         let mut cache = match self.load().await? {
             Some(cache) => cache,
             None => return Err(io::Error::new(ErrorKind::NotFound, "cache not found")),
         };
+        let current_basis = self.read_write_basis().await?;
         f(&mut cache);
+        cache.revision = Some(next_revision(&current_basis.disk_revision));
         self.save_internal(&cache).await
     }
 }
@@ -308,6 +490,8 @@ impl ModelsCacheManager {
 /// Serialized snapshot of models and metadata cached on disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ModelsCache {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) revision: Option<u64>,
     pub(crate) fetched_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) etag: Option<String>,
@@ -316,6 +500,13 @@ pub(crate) struct ModelsCache {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) provider_cache_identity: Option<String>,
     pub(crate) models: Vec<ModelInfo>,
+}
+
+fn next_revision(revision: &DiskRevision) -> u64 {
+    match revision {
+        DiskRevision::Persisted(revision) => revision.saturating_add(1),
+        DiskRevision::Missing | DiskRevision::Legacy(_) | DiskRevision::Opaque(_) => 1,
+    }
 }
 
 impl ModelsCache {
@@ -328,7 +519,7 @@ impl ModelsCache {
             return false;
         };
         let age = Utc::now().signed_duration_since(self.fetched_at);
-        age <= ttl_duration
+        age >= chrono::Duration::zero() && age <= ttl_duration
     }
 }
 
@@ -417,6 +608,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn future_timestamp_is_not_fresh() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let manager = ModelsCacheManager::new(
+            temp.path().join("models_cache.json"),
+            Duration::from_secs(300),
+            fixed_identity("provider"),
+        );
+        manager
+            .persist_cache(&[], Some("etag-one".to_string()), "client-one".to_string())
+            .await;
+        manager
+            .manipulate_cache_for_test(|fetched_at| {
+                *fetched_at = Utc::now() + chrono::Duration::hours(1);
+            })
+            .await
+            .expect("move cache timestamp into the future");
+
+        assert!(manager.load_fresh("client-one").await.is_none());
+    }
+
+    #[tokio::test]
     async fn cache_identity_is_resolved_for_each_operation() {
         let temp = tempfile::tempdir().expect("tempdir");
         let identity = Arc::new(StdMutex::new("scope-digest-one".to_string()));
@@ -447,5 +659,110 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn stale_manager_cannot_overwrite_newer_cross_process_revision() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("models_cache.json");
+        let older = ModelsCacheManager::new(
+            path.clone(),
+            Duration::from_secs(300),
+            fixed_identity("provider"),
+        );
+        let newer =
+            ModelsCacheManager::new(path, Duration::from_secs(300), fixed_identity("provider"));
+        let older_basis = older
+            .write_basis_for_identity("provider")
+            .await
+            .expect("capture older fetch basis");
+        let newer_basis = newer
+            .write_basis_for_identity("provider")
+            .await
+            .expect("capture newer fetch basis");
+
+        assert!(
+            newer
+                .persist_cache_for_identity_if_unchanged(
+                    &[],
+                    Some("newer-etag".to_string()),
+                    "client".to_string(),
+                    "provider",
+                    &newer_basis,
+                )
+                .await
+        );
+        assert!(
+            !older
+                .persist_cache_for_identity_if_unchanged(
+                    &[],
+                    Some("older-etag".to_string()),
+                    "client".to_string(),
+                    "provider",
+                    &older_basis,
+                )
+                .await
+        );
+
+        let persisted = newer
+            .load_fresh("client")
+            .await
+            .expect("newer cache remains readable");
+        assert_eq!(persisted.etag.as_deref(), Some("newer-etag"));
+        assert_eq!(persisted.revision, Some(1));
+    }
+
+    #[tokio::test]
+    async fn stale_ttl_renewal_cannot_rewrite_newer_cross_process_revision() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("models_cache.json");
+        let stale = ModelsCacheManager::new(
+            path.clone(),
+            Duration::from_secs(300),
+            fixed_identity("provider"),
+        );
+        let newer =
+            ModelsCacheManager::new(path, Duration::from_secs(300), fixed_identity("provider"));
+        stale
+            .persist_cache(&[], Some("old-etag".to_string()), "client".to_string())
+            .await;
+        let stale_basis = stale
+            .write_basis_for_identity("provider")
+            .await
+            .expect("capture stale TTL basis");
+        let newer_basis = newer
+            .write_basis_for_identity("provider")
+            .await
+            .expect("capture newer write basis");
+
+        assert!(
+            newer
+                .persist_cache_for_identity_if_unchanged(
+                    &[],
+                    Some("new-etag".to_string()),
+                    "client".to_string(),
+                    "provider",
+                    &newer_basis,
+                )
+                .await
+        );
+        assert!(
+            stale
+                .renew_cache_ttl_for_identity_if_unchanged(
+                    "client",
+                    "old-etag",
+                    "provider",
+                    &stale_basis,
+                )
+                .await
+                .is_err()
+        );
+
+        let persisted = newer
+            .load_fresh("client")
+            .await
+            .expect("newer cache remains readable");
+        assert_eq!(persisted.etag.as_deref(), Some("new-etag"));
+        assert_eq!(persisted.revision, Some(2));
     }
 }

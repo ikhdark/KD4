@@ -4509,7 +4509,7 @@ async fn wait_for_thread_rollback_failed(rx: &async_channel::Receiver<Event>) ->
     }
 }
 
-async fn attach_thread_persistence(session: &mut Session) -> PathBuf {
+pub(crate) async fn attach_thread_persistence(session: &mut Session) -> PathBuf {
     let config = session.get_config().await;
     let live_thread = LiveThread::create(
         Arc::clone(&session.services.thread_store),
@@ -8367,6 +8367,132 @@ async fn refresh_mcp_servers_keeps_the_previous_runtime_alive() {
         codex_mcp::configured_mcp_servers(new_runtime.config()),
         refreshed_mcp_servers
     );
+}
+
+#[tokio::test]
+async fn concurrent_mcp_refresh_does_not_hold_projection_lock_and_discards_stale_build() {
+    let (session, turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| {
+            config
+                .mcp_servers
+                .set(HashMap::from([(
+                    "environment-server".to_string(),
+                    McpServerConfig {
+                        auth: Default::default(),
+                        transport: McpServerTransportConfig::Stdio {
+                            command: "missing-test-mcp-server".to_string(),
+                            args: Vec::new(),
+                            env: None,
+                            env_vars: Vec::new(),
+                            cwd: None,
+                        },
+                        environment_id: "executor".to_string(),
+                        enabled: true,
+                        required: false,
+                        supports_parallel_tool_calls: false,
+                        disabled_reason: None,
+                        startup_timeout_sec: None,
+                        tool_timeout_sec: None,
+                        default_tools_approval_mode: None,
+                        enabled_tools: None,
+                        disabled_tools: None,
+                        scopes: None,
+                        oauth: None,
+                        oauth_resource: None,
+                        tools: HashMap::new(),
+                    },
+                )]))
+                .expect("set environment MCP server");
+        },
+    )
+    .await;
+    let selected_root = codex_protocol::capabilities::SelectedCapabilityRoot {
+        id: "environment-server".to_string(),
+        location: codex_protocol::capabilities::CapabilityRootLocation::Environment {
+            environment_id: "executor".to_string(),
+            path: PathUri::from_host_native_path(turn_context.config.cwd.as_path())
+                .expect("selected capability root URI"),
+        },
+    };
+    let environment = Arc::clone(
+        &turn_context
+            .environments
+            .primary()
+            .expect("test environment")
+            .environment,
+    );
+    let resolved_roots = session
+        .services
+        .turn_environments
+        .environment_manager()
+        .resolve_selected_capability_roots(
+            &[selected_root],
+            &HashMap::from([("executor".to_string(), Some(environment))]),
+        )
+        .await;
+
+    let startup_pause = Arc::new(super::mcp::TestMcpStartupPause::new());
+    let stale_session = Arc::clone(&session);
+    let stale_turn_context = Arc::clone(&turn_context);
+    let stale_pause_scope = Arc::clone(&startup_pause);
+    let stale_refresh = tokio::spawn(async move {
+        super::mcp::with_test_mcp_startup_pause(stale_pause_scope, async move {
+            stale_session
+                .mcp_runtime_for_step(
+                    &stale_turn_context,
+                    &stale_turn_context.environments,
+                    &resolved_roots,
+                )
+                .await
+        })
+        .await
+    });
+    let started = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        startup_pause.started.acquire(),
+    )
+    .await
+    .expect("environment projection reaches MCP startup")
+    .expect("startup pause remains open");
+    started.forget();
+    let stale_token = startup_pause
+        .token
+        .lock()
+        .await
+        .clone()
+        .expect("stale startup token is captured");
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        session.refresh_mcp_servers_now(
+            &turn_context,
+            &turn_context.config,
+            /*elicitation_reviewer*/ None,
+        ),
+    )
+    .await
+    .expect("a newer refresh completes while the first startup is paused");
+    let intervening_runtime = session.services.latest_mcp_runtime();
+    assert!(intervening_runtime.available_environment_ids().is_empty());
+
+    startup_pause.release.add_permits(1);
+    let step_runtime = tokio::time::timeout(std::time::Duration::from_secs(1), stale_refresh)
+        .await
+        .expect("environment projection retries after losing publication race")
+        .expect("environment projection task joins");
+
+    assert!(stale_token.is_cancelled());
+    assert_eq!(
+        step_runtime.available_environment_ids(),
+        &["executor".to_string()]
+    );
+    assert!(Arc::ptr_eq(
+        &step_runtime,
+        &session.services.latest_mcp_runtime()
+    ));
+    assert!(!Arc::ptr_eq(&step_runtime, &intervening_runtime));
 }
 
 #[tokio::test]

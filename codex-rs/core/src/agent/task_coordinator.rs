@@ -132,6 +132,8 @@ pub(crate) struct AgentTaskCoordinator {
     bindings: Arc<RwLock<BindingIndex>>,
     metrics: Arc<Mutex<TaskMetricIndex>>,
     validation_waiters: Arc<Mutex<HashMap<String, ValidationWaiterEntry>>>,
+    #[cfg(test)]
+    validation_wait_armed_hook: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
 }
 
 impl AgentTaskCoordinator {
@@ -514,6 +516,26 @@ impl AgentTaskCoordinator {
         }
     }
 
+    #[cfg(test)]
+    fn set_validation_wait_armed_hook(&self, hook: tokio::sync::mpsc::UnboundedSender<String>) {
+        *self
+            .validation_wait_armed_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn report_validation_wait_armed(&self, call_id: &str) {
+        if let Some(hook) = self
+            .validation_wait_armed_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            let _ = hook.send(call_id.to_string());
+        }
+    }
+
     /// Waits for a persisted validation call without model-visible polling.
     ///
     /// The notifier is installed before the first authoritative read so a
@@ -546,6 +568,11 @@ impl AgentTaskCoordinator {
         };
         let waiter = Arc::clone(&registration.notify);
         loop {
+            let notified = waiter.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            #[cfg(test)]
+            self.report_validation_wait_armed(call_id);
             let current = self.get_validation_call(call_id.to_string()).await?;
             if current
                 .as_ref()
@@ -557,7 +584,7 @@ impl AgentTaskCoordinator {
                 return Ok(current);
             };
             tokio::select! {
-                _ = waiter.notified() => {}
+                _ = &mut notified => {}
                 _ = cancellation.cancelled() => return Ok(None),
                 _ = tokio::time::sleep(remaining) => {
                     return self.get_validation_call(call_id.to_string()).await;

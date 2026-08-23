@@ -1,0 +1,173 @@
+KD4 / cargo-kda finding disposition audit
+Audit date: 2026-08-23
+Language: Rust
+Status: BLOCKED ON REPOSITORY SCOPE; NO IMPLEMENTATION FIX APPLIED
+
+Environment and revision context
+--------------------------------
+- Active repository: the local KD4 fork checkout at the repository root.
+- Active configuration reviewed: codex-rs/kda.toml (version = 1).
+- Source-owner query:
+  python scripts/source_owners.py slice --owner semantic-quality-gate --focus
+  "KDA crash-durable apply, SARIF cumulative fixes, orchestration heap stages,
+  performance, KD4 policy pack, governance" --max-relationships 32
+- The source-owner result was untruncated, omitted zero relationships, and
+  reported no material unknowns.
+- Installed-tool check: `cargo kda --version` failed with
+  `error: no such command: kda`.
+- Worktree source inventory found codex-rs/kda.toml and the KD4 workspace
+  analyzer wrapper, but no cargo-kda implementation crate or Rust source.
+
+Established repository boundary
+-------------------------------
+The semantic-quality-gate owner establishes that codex-rs/kda.toml is authored
+configuration consumed by an external cargo-kda entrypoint. It explicitly says
+that the cargo-kda implementation is not source-owned in this repository and
+that KD4 has no in-repository runtime registration point for it. Consequently,
+the producers and consumers responsible for apply transactions, SARIF output,
+the semantic orchestration frame, analyzer execution cost, and built-in policy
+registration are not present in the active checkout.
+
+Historical evidence, kept separate from current facts
+------------------------------------------------------
+The shared historical corpus contains references to a separate analyzer tree at
+C:\Users\kuh\Documents\ChatGPT\kd-analzyer. That is historical evidence only.
+This session did not inspect or mutate that external tree because the active
+repository instructions limit changes to fork-local source and artifacts, and
+the user request did not explicitly place the external checkout in scope.
+
+Finding dispositions
+--------------------
+
+KDA-2026-08-23-001 - Apply mode is not crash-durable
+Reported severity: not supplied by the user.
+Status: reported, not independently reproduced in the owning source.
+Confidence in repository mismatch: high.
+Reported violated invariant: after a successful multi-file apply, each target
+and the transaction as a whole must survive process termination or power loss;
+recovery must not expose a partially committed edit set.
+Reported producer: cargo-kda native apply implementation.
+Reported reachable effect: users may observe truncated or partially updated
+workspace files after abnormal termination.
+Reported triggering condition: termination or power loss while replacements are
+being flushed in place.
+Expected behavior: staged durable writes, atomic replacement, durable directory
+metadata, and transaction recovery provide a defined all-old or all-new result.
+Reported actual behavior: in-place rewrites and flushes with ordinary I/O
+rollback only.
+Root cause: unknown until the cargo-kda apply source and tests are inspected.
+Fix disposition: blocked because the responsible producer is outside this
+repository. No source file, symbol, or line is invented here.
+Required validation in the owning repository: direct crash/fault-injection tests
+covering staged-file sync, rename/replace, directory sync, journal recovery, and
+multi-file interruption points.
+
+KDA-2026-08-23-002 - SARIF fixes represent cumulative edits as alternatives
+Reported severity: not supplied by the user.
+Status: reported, not independently reproduced in the owning source.
+Confidence in repository mismatch: high.
+Reported violated contract: one logical diagnostic fix containing multiple
+replacements must serialize as one SARIF fix whose artifact changes are applied
+together, matching native apply semantics.
+Reported producer: cargo-kda diagnostic/fix model and SARIF serializer.
+Reported reachable effect: SARIF consumers can offer separate alternative fixes
+instead of one complete multi-edit repair.
+Expected behavior: an explicit Fix { replacements: Vec<Replacement> } model is
+shared by native apply and SARIF output.
+Reported actual behavior: each replacement becomes a top-level SARIF fix.
+Root cause and compatibility boundary: unknown until the owning Rust types,
+native apply caller, SARIF serializer, schema fixtures, and consumers are read.
+Fix disposition: blocked because those sources are absent here.
+Required validation in the owning repository: a direct serialization test for a
+single diagnostic with a two-file or two-range cumulative fix, plus a native
+apply parity test.
+
+KDA-2026-08-23-003 - Semantic orchestration requires an oversized stack
+Reported severity: not supplied by the user.
+Status: reported, not independently reproduced in the owning source.
+Confidence in repository mismatch: high.
+Reported violated architecture invariant: orchestration should pass heap-owned,
+typed stage results rather than retain enough combined phase state in one stack
+frame to exceed the Windows default stack.
+Reported producer: cargo-kda binary semantic-driver orchestration.
+Reported reachable effect: a tiny workspace can overflow the normal Windows
+thread stack unless the binary reserves 16 MiB.
+Expected behavior: heap-owned large phase state and split typed stages execute on
+the platform-default stack.
+Reported actual behavior: a 16 MiB stack reservation works around the frame.
+Root cause: unknown until compiler/build evidence and the owning driver function
+are inspected. Stack size must be measured; it is not inferred from this report.
+Fix disposition: blocked because the driver source and direct tests are absent.
+Required validation in the owning repository: a Windows/default-stack direct
+execution test of a tiny workspace and focused tests for each extracted stage.
+
+KDA-2026-08-23-004 - Default execution has multiple static scaling risks
+Reported severity: not supplied by the user.
+Status: hypotheses requiring benchmark evidence.
+Confidence that the requested optimization cannot start under KD4 policy: high.
+Reported candidate cost centers: build-time full-source parsing/hashing, runtime
+checkout rehashing, one rust-analyzer workspace per profile, build scripts and
+proc macros, all features/all targets, cache prefill, repeated identity work,
+and two final consumed-artifact validation passes.
+No latency percentage or per-stage attribution is established. The user
+explicitly reported that benchmarks could not be executed.
+Required but missing optimization contract: exact workload command and inputs,
+build profile and environment, sample count, latency statistic and threshold,
+quality-gate command, token metric, and token budget.
+Fix disposition: no hot-path edit is permitted before those values are supplied
+and a passing baseline is recorded in the owning repository.
+
+KDA-2026-08-23-005 - Generic engine and KD4 policy are not clearly separated
+Reported severity: not supplied by the user.
+Status: reported architecture concern, not independently traced in owner source.
+Confidence in repository mismatch: high.
+Reported violated boundary: project-specific KD4 policies should be versioned
+configuration or a policy pack layered over generic semantic mechanisms.
+Reported producer: cargo-kda built-in policy modules and policy registration.
+Reported reachable effect: other Rust projects can receive KD4-derived names or
+default-deny behavior as though those rules were universal engine semantics.
+Expected behavior: generic analysis owns mechanisms and a versioned KD4 pack
+owns KD4 selectors, rule names, severities, and defaults.
+Reported actual behavior: KD4-derived contracts appear built into the analyzer.
+Root cause and migration compatibility: unknown until analyzer module ownership,
+CLI/config loading, rule IDs, defaults, and fixtures are inspected.
+Fix disposition: blocked because the analyzer source is outside this checkout.
+The current codex-rs/kda.toml is a KD4 configuration consumer; changing it alone
+cannot remove built-in analyzer policy.
+Required validation in the owning repository: generic-engine tests with no KD4
+pack, versioned KD4-pack loading tests, compatibility tests for rule IDs and
+severity defaults, and adversarial tests proving deny policies activate only
+when the pack is selected.
+
+KDA-2026-08-23-006 - Repository governance does not enforce trust claims
+Reported severity: not supplied by the user.
+Status: target repository is ambiguous and therefore blocked.
+Direct observation: the active KD4 checkout has no .github directory.
+Unknown: whether the user's statement about `main`, required status checks, and
+branch protection concerns this KD4 fork or the separate cargo-kda repository.
+The surrounding findings concern cargo-kda implementation, so adding workflows
+to KD4 would risk repairing the wrong repository. Branch protection is also
+external host state and cannot be established by repository files alone.
+Fix disposition: no workflow or branch setting changed.
+Required validation after target clarification: repository-local workflow
+syntax and execution for build, direct tests, formatting, clippy, protocol,
+provenance-install, adversarial-rule, and dependency gates; then separately
+verify host-side required checks and branch/ruleset enforcement.
+
+Validation performed and exact results
+--------------------------------------
+- Parsed and read the complete 499-line codex-rs/kda.toml in bounded sections.
+- Source-owner slice: succeeded; truncated=false, omitted_relationships=0,
+  material_unknowns=[]; it identifies cargo-kda as external.
+- `cargo kda --version`: failed because cargo-kda is not installed.
+- Scoped repository source searches found no owning cargo-kda Rust
+  implementation to patch or direct implementation test to run.
+- No implementation, configuration, CI workflow, external branch protection,
+  benchmark, publication, or activation change was performed.
+
+Remaining question required to continue
+---------------------------------------
+The user must explicitly place the cargo-kda source checkout in scope (or open
+the task from that repository) and identify whether the governance finding is
+for cargo-kda or KD4. For the performance finding, the benchmark contract listed
+under KDA-2026-08-23-004 must also be supplied or located in the owning repo.

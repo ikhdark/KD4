@@ -2537,10 +2537,7 @@ pub(crate) fn resolve_request_policy_for_generation(
     if sampling.is_residual_deterministic() {
         let configured_override =
             config.and_then(|config| config.deterministic_continuation.clone());
-        let configured_effort = configured_override
-            .clone()
-            .or(turn_fallback)
-            .unwrap_or(ReasoningEffort::Low);
+        let configured_effort = configured_override.clone().unwrap_or(ReasoningEffort::Low);
         let effective_effort = lowest_supported_equivalent(configured_effort.clone(), model_info);
         return SamplingRequestPolicy {
             phase,
@@ -2919,7 +2916,7 @@ mod tests {
     }
 
     #[test]
-    fn residual_deterministic_sampling_inherits_turn_fallback_without_an_override() {
+    fn residual_deterministic_sampling_defaults_to_low_without_an_override() {
         let model = model(
             &[ReasoningEffort::Low, ReasoningEffort::High],
             ReasoningEffort::High,
@@ -2939,8 +2936,8 @@ mod tests {
             &residual,
         );
 
-        assert_eq!(policy.configured_effort, Some(ReasoningEffort::High));
-        assert_eq!(policy.effective_effort, Some(ReasoningEffort::High));
+        assert_eq!(policy.configured_effort, Some(ReasoningEffort::Low));
+        assert_eq!(policy.effective_effort, Some(ReasoningEffort::Low));
         assert_eq!(policy.source, SamplingRequestPolicySource::TurnFallback);
     }
 

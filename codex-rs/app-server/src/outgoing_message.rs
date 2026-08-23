@@ -50,6 +50,8 @@ pub(crate) type ClientRequestResult = std::result::Result<Result, JSONRPCErrorEr
 
 const TURN_DELIVERY_RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
 const TURN_DELIVERY_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+const WRITER_ACKNOWLEDGEMENT_TIMEOUT: Duration = Duration::from_secs(30);
+const RESOURCE_DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const NO_ACTIVE_AUTHORIZED_CONNECTIONS_ERROR: &str =
     "client request canceled because no active authorized connections are available";
 const NO_INITIALIZED_CONNECTIONS_ERROR: &str =
@@ -655,7 +657,7 @@ impl OutgoingMessageSender {
         thread_id: ThreadId,
         experimental_api_enabled: bool,
     ) {
-        let requests = {
+        let request_ids = {
             let active_connections = Arc::clone(&self.active_connections).lock_owned().await;
             let is_active = active_connections
                 .get(&connection_id)
@@ -663,10 +665,10 @@ impl OutgoingMessageSender {
             if !is_active {
                 return;
             }
-            let mut request_id_to_callback = self.request_id_to_callback.lock().await;
+            let request_id_to_callback = self.request_id_to_callback.lock().await;
             request_id_to_callback
-                .values_mut()
-                .filter_map(|entry| {
+                .iter()
+                .filter_map(|(request_id, entry)| {
                     if entry.thread_id != Some(thread_id) {
                         return None;
                     }
@@ -675,30 +677,28 @@ impl OutgoingMessageSender {
                     {
                         return None;
                     }
-                    let newly_authorized = entry.connection_ids.insert(connection_id);
-                    Some((entry.request.clone(), newly_authorized))
+                    Some(request_id.clone())
                 })
                 .collect::<Vec<_>>()
         };
-        for (request, newly_authorized) in requests {
-            let request_id = request.id().clone();
-            if let Err(err) = self
-                .sender
-                .send(OutgoingEnvelope::ToConnection {
-                    connection_id,
-                    message: OutgoingMessage::Request(request),
-                    write_complete_tx: None,
-                })
-                .await
-            {
-                warn!("failed to resend request to client: {err:?}");
-                if newly_authorized {
-                    let mut request_id_to_callback = self.request_id_to_callback.lock().await;
-                    if let Some(entry) = request_id_to_callback.get_mut(&request_id) {
-                        entry.connection_ids.remove(&connection_id);
-                    }
+        for request_id in request_ids {
+            let permit = match self.sender.reserve().await {
+                Ok(permit) => permit,
+                Err(err) => {
+                    warn!("failed to reserve capacity to resend request to client: {err:?}");
+                    return;
                 }
-            }
+            };
+            let mut request_id_to_callback = self.request_id_to_callback.lock().await;
+            let Some(entry) = request_id_to_callback.get_mut(&request_id) else {
+                continue;
+            };
+            entry.connection_ids.insert(connection_id);
+            permit.send(OutgoingEnvelope::ToConnection {
+                connection_id,
+                message: OutgoingMessage::Request(entry.request.clone()),
+                write_complete_tx: None,
+            });
         }
     }
 
@@ -967,6 +967,17 @@ impl OutgoingMessageSender {
             .await;
     }
 
+    pub(crate) fn try_send_server_notification(&self, notification: ServerNotification) -> bool {
+        tracing::trace!("app-server event: {notification}");
+        if let Err(err) = self.sender.try_send(OutgoingEnvelope::Broadcast {
+            message: OutgoingMessage::AppServerNotification(notification),
+        }) {
+            warn!("failed to enqueue server notification to client: {err:?}");
+            return false;
+        }
+        true
+    }
+
     pub(crate) async fn send_server_notification_to_connections(
         &self,
         connection_ids: &[ConnectionId],
@@ -1000,6 +1011,46 @@ impl OutgoingMessageSender {
                 .await
             {
                 warn!("failed to send server notification to client: {err:?}");
+            }
+        }
+    }
+
+    /// Enqueues one resource-owned notification without allowing transport
+    /// backpressure to own the resource's lifetime.
+    pub(crate) async fn send_server_notification_to_connection_bounded(
+        &self,
+        connection_id: ConnectionId,
+        notification: ServerNotification,
+        cancellation: &CancellationToken,
+    ) -> bool {
+        tracing::trace!(?connection_id, "app-server bounded event: {notification}");
+        let send = self.sender.send(OutgoingEnvelope::ToConnection {
+            connection_id,
+            message: OutgoingMessage::AppServerNotification(notification),
+            write_complete_tx: None,
+        });
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return false,
+            _ = self.delivery_shutdown.cancelled() => return false,
+            result = tokio::time::timeout(RESOURCE_DELIVERY_TIMEOUT, send) => result,
+        };
+        match result {
+            Ok(Ok(())) => true,
+            Ok(Err(err)) => {
+                warn!(
+                    ?connection_id,
+                    "failed to enqueue resource notification: {err:?}"
+                );
+                false
+            }
+            Err(_) => {
+                warn!(
+                    ?connection_id,
+                    timeout_ms = RESOURCE_DELIVERY_TIMEOUT.as_millis(),
+                    "timed out enqueueing resource notification"
+                );
+                false
             }
         }
     }
@@ -1136,18 +1187,48 @@ impl OutgoingMessageSender {
         tracing::trace!("app-server event: {notification}");
         let outgoing_message = OutgoingMessage::AppServerNotification(notification.clone());
         let (write_complete_tx, write_complete_rx) = oneshot::channel();
-        if let Err(err) = self
-            .sender
-            .send(OutgoingEnvelope::ToConnection {
-                connection_id,
-                message: outgoing_message,
-                write_complete_tx: Some(write_complete_tx),
-            })
-            .await
-        {
-            warn!("failed to send server notification to client: {err:?}");
+        let send = self.sender.send(OutgoingEnvelope::ToConnection {
+            connection_id,
+            message: outgoing_message,
+            write_complete_tx: Some(write_complete_tx),
+        });
+        match tokio::select! {
+            biased;
+            _ = self.delivery_shutdown.cancelled() => return,
+            result = tokio::time::timeout(RESOURCE_DELIVERY_TIMEOUT, send) => result,
+        } {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                warn!("failed to send server notification to client: {err:?}");
+                return;
+            }
+            Err(_) => {
+                warn!(
+                    ?connection_id,
+                    timeout_ms = RESOURCE_DELIVERY_TIMEOUT.as_millis(),
+                    "timed out enqueueing acknowledged server notification"
+                );
+                return;
+            }
         }
-        let _ = write_complete_rx.await;
+        match tokio::select! {
+            biased;
+            _ = self.delivery_shutdown.cancelled() => return,
+            result = tokio::time::timeout(WRITER_ACKNOWLEDGEMENT_TIMEOUT, write_complete_rx) => result,
+        } {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                warn!(
+                    ?connection_id,
+                    "server notification writer acknowledgement dropped: {err}"
+                )
+            }
+            Err(_) => warn!(
+                ?connection_id,
+                timeout_ms = WRITER_ACKNOWLEDGEMENT_TIMEOUT.as_millis(),
+                "timed out waiting for server notification writer acknowledgement"
+            ),
+        }
     }
 
     pub(crate) async fn send_error(
@@ -1207,14 +1288,28 @@ impl OutgoingMessageSender {
             message,
             write_complete_tx: None,
         });
+        let send_fut = async {
+            tokio::select! {
+                biased;
+                _ = self.delivery_shutdown.cancelled() => None,
+                result = tokio::time::timeout(RESOURCE_DELIVERY_TIMEOUT, send_fut) => Some(result),
+            }
+        };
         let send_result = if let Some(request_context) = request_context {
             send_fut.instrument(request_context.span()).await
         } else {
             send_fut.await
         };
 
-        if let Err(err) = send_result {
-            warn!("failed to send {message_kind} to client: {err:?}");
+        match send_result {
+            Some(Ok(Ok(()))) => {}
+            Some(Ok(Err(err))) => warn!("failed to send {message_kind} to client: {err:?}"),
+            Some(Err(_)) => warn!(
+                ?connection_id,
+                timeout_ms = RESOURCE_DELIVERY_TIMEOUT.as_millis(),
+                "timed out enqueueing {message_kind}"
+            ),
+            None => {}
         }
     }
 }
@@ -1396,6 +1491,7 @@ mod tests {
     use codex_app_server_protocol::AccountRateLimitsUpdatedNotification;
     use codex_app_server_protocol::AccountUpdatedNotification;
     use codex_app_server_protocol::ApplyPatchApprovalParams;
+    use codex_app_server_protocol::AttestationGenerateParams;
     use codex_app_server_protocol::AuthMode;
     use codex_app_server_protocol::CommandExecutionApprovalDecision;
     use codex_app_server_protocol::CommandExecutionRequestApprovalParams;
@@ -1420,6 +1516,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::sync::Arc;
+    use tokio::time::advance;
     use tokio::time::timeout;
     use uuid::Uuid;
 
@@ -1884,6 +1981,41 @@ mod tests {
             .await
             .expect("send task should finish after write completion is signaled")
             .expect("send task should not panic");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_server_notification_to_connection_and_wait_times_out_without_ack() {
+        let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(4);
+        let outgoing =
+            OutgoingMessageSender::new(tx, codex_analytics::AnalyticsEventsClient::disabled());
+        let send_task = tokio::spawn(async move {
+            outgoing
+                .send_server_notification_to_connection_and_wait(
+                    ConnectionId(42),
+                    ServerNotification::ModelRerouted(ModelReroutedNotification {
+                        thread_id: "thread-1".to_string(),
+                        turn_id: "turn-1".to_string(),
+                        from_model: "gpt-5.3-codex".to_string(),
+                        to_model: "gpt-5.2".to_string(),
+                        reason: ModelRerouteReason::HighRiskCyberActivity,
+                    }),
+                )
+                .await
+        });
+
+        let OutgoingEnvelope::ToConnection {
+            write_complete_tx: Some(write_complete_tx),
+            ..
+        } = rx.recv().await.expect("server notification envelope")
+        else {
+            panic!("expected targeted notification with writer acknowledgement");
+        };
+
+        advance(WRITER_ACKNOWLEDGEMENT_TIMEOUT).await;
+        send_task
+            .await
+            .expect("send task should stop waiting at the acknowledgement deadline");
+        drop(write_complete_tx);
     }
 
     #[tokio::test]
@@ -2405,6 +2537,71 @@ mod tests {
             .await
             .expect("replayed callback sender should remain available");
         assert_eq!(result, Ok(expected_result));
+        assert_eq!(outgoing.pending_callback_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn replay_does_not_enqueue_request_resolved_on_another_connection() {
+        let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(1);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let thread_id = ThreadId::new();
+        let original_connection = ConnectionId(43);
+        let resumed_connection = ConnectionId(44);
+        for connection_id in [original_connection, resumed_connection] {
+            outgoing
+                .connection_opened(connection_id, Arc::new(AtomicBool::new(true)))
+                .await;
+        }
+        let thread_outgoing = ThreadScopedOutgoingMessageSender::new(
+            Arc::clone(&outgoing),
+            vec![original_connection],
+            thread_id,
+        );
+        let (request_id, wait_for_result) = thread_outgoing
+            .send_request(ServerRequestPayload::AttestationGenerate(
+                AttestationGenerateParams {},
+            ))
+            .await;
+
+        let replay_outgoing = Arc::clone(&outgoing);
+        let replay_task = tokio::spawn(async move {
+            replay_outgoing
+                .replay_requests_to_connection_for_thread(
+                    resumed_connection,
+                    thread_id,
+                    /*experimental_api_enabled*/ false,
+                )
+                .await;
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !replay_task.is_finished(),
+            "the full channel should hold replay at capacity reservation"
+        );
+
+        let expected_result = json!({"token": "resolved"});
+        outgoing
+            .notify_client_response(original_connection, request_id, expected_result.clone())
+            .await;
+        assert_eq!(
+            wait_for_result
+                .await
+                .expect("original connection should resolve the callback"),
+            Ok(expected_result)
+        );
+        let _original_delivery = rx.recv().await.expect("original request delivery");
+        timeout(Duration::from_secs(1), replay_task)
+            .await
+            .expect("replay should finish after capacity becomes available")
+            .expect("replay task should not panic");
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a request resolved while replay waited must not be enqueued"
+        );
         assert_eq!(outgoing.pending_callback_count().await, 0);
     }
 

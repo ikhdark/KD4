@@ -131,6 +131,7 @@ pub fn run_setup_refresh(
         },
         SetupRootOverrides::default(),
         /*offline_proxy_settings_override*/ None,
+        SetupMode::Full,
     )
 }
 
@@ -139,7 +140,12 @@ pub(crate) fn run_setup_refresh_with_overrides_and_proxy_settings(
     overrides: SetupRootOverrides,
     offline_proxy_settings: &OfflineProxySettings,
 ) -> Result<()> {
-    run_setup_refresh_inner(request, overrides, Some(offline_proxy_settings))
+    run_setup_refresh_inner(
+        request,
+        overrides,
+        Some(offline_proxy_settings),
+        SetupMode::Full,
+    )
 }
 
 pub fn run_setup_refresh_with_extra_read_roots(
@@ -177,6 +183,43 @@ pub fn run_setup_refresh_with_extra_read_roots(
             deny_write_paths: None,
         },
         /*offline_proxy_settings_override*/ None,
+        SetupMode::Full,
+    )
+}
+
+pub fn run_strict_read_root_grant(
+    permission_profile: &PermissionProfile,
+    workspace_roots: &[AbsolutePathBuf],
+    command_cwd: &Path,
+    env_map: &HashMap<String, String>,
+    codex_home: &Path,
+    read_root: PathBuf,
+    proxy_enforced: bool,
+) -> Result<()> {
+    let permissions =
+        ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
+            permission_profile,
+            workspace_roots,
+        )?;
+    let mut read_roots = gather_read_roots(command_cwd, &permissions, env_map, codex_home);
+    read_roots.push(read_root);
+    run_setup_refresh_inner(
+        SandboxSetupRequest {
+            permissions: &permissions,
+            command_cwd,
+            env_map,
+            codex_home,
+            proxy_enforced,
+        },
+        SetupRootOverrides {
+            read_roots: Some(read_roots),
+            read_roots_include_platform_defaults: false,
+            write_roots: Some(Vec::new()),
+            deny_read_paths: None,
+            deny_write_paths: None,
+        },
+        /*offline_proxy_settings_override*/ None,
+        SetupMode::ReadAclsOnlyStrict,
     )
 }
 
@@ -184,6 +227,7 @@ fn run_setup_refresh_inner(
     request: SandboxSetupRequest<'_>,
     overrides: SetupRootOverrides,
     offline_proxy_settings_override: Option<&OfflineProxySettings>,
+    mode: SetupMode,
 ) -> Result<()> {
     if !request.permissions.is_enforceable_by_windows_sandbox() {
         anyhow::bail!("unsupported filesystem permissions for Windows sandbox setup");
@@ -207,7 +251,7 @@ fn run_setup_refresh_inner(
         allow_local_binding: offline_proxy_settings.allow_local_binding,
         otel: None,
         real_user: std::env::var("USERNAME").unwrap_or_else(|_| "Administrators".to_string()),
-        mode: SetupMode::Full,
+        mode,
         refresh_only: true,
     };
     let json = serde_json::to_vec(&payload)?;
@@ -540,6 +584,7 @@ struct ElevationPayload {
 enum SetupMode {
     Full,
     ProvisionOnly,
+    ReadAclsOnlyStrict,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -245,14 +245,21 @@ pub type SharedModelsManager = Arc<dyn ModelsManager>;
 /// OpenAI-compatible model manager backed by bundled models, cache, and `/models`.
 #[derive(Debug)]
 pub struct OpenAiModelsManager {
-    remote_models: RwLock<Vec<ModelInfo>>,
-    etag: RwLock<Option<String>>,
-    active_cache_identity: RwLock<String>,
+    state: RwLock<ModelState>,
     cache_manager: ModelsCacheManager,
     endpoint_client: SharedModelsEndpointClient,
     auth_manager: Option<Arc<AuthManager>>,
+    // If both locks are needed, acquire `state` before `etag_refresh`. Never hold
+    // `etag_refresh` across an await point.
     etag_refresh: Mutex<EtagRefreshState>,
     etag_refresh_idle: Notify,
+}
+
+#[derive(Debug)]
+struct ModelState {
+    remote_models: Vec<ModelInfo>,
+    etag: Option<String>,
+    active_cache_identity: String,
 }
 
 #[derive(Debug, Default)]
@@ -268,6 +275,43 @@ struct EtagRefreshNotice {
     generation: u64,
     etag: String,
     http_client_factory: HttpClientFactory,
+}
+
+struct EtagRefreshWorkerExitGuard {
+    manager: Arc<OpenAiModelsManager>,
+    armed: bool,
+}
+
+impl EtagRefreshWorkerExitGuard {
+    fn new(manager: Arc<OpenAiModelsManager>) -> Self {
+        Self {
+            manager,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for EtagRefreshWorkerExitGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        let mut state = self
+            .manager
+            .etag_refresh
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active_etag = None;
+        state.pending = None;
+        state.worker_running = false;
+        drop(state);
+        self.manager.etag_refresh_idle.notify_waiters();
+    }
 }
 
 /// Static model manager backed by an authoritative in-process catalog.
@@ -291,9 +335,11 @@ impl OpenAiModelsManager {
         let active_cache_identity = cache_manager.current_identity();
         let remote_models = load_remote_models_from_file().unwrap_or_default();
         Self {
-            remote_models: RwLock::new(remote_models),
-            etag: RwLock::new(None),
-            active_cache_identity: RwLock::new(active_cache_identity),
+            state: RwLock::new(ModelState {
+                remote_models,
+                etag: None,
+                active_cache_identity,
+            }),
             cache_manager,
             endpoint_client,
             auth_manager,
@@ -327,11 +373,11 @@ impl ModelsManager for OpenAiModelsManager {
     }
 
     fn get_remote_models(&self) -> ModelsManagerFuture<'_, Vec<ModelInfo>> {
-        Box::pin(async move { self.remote_models.read().await.clone() })
+        Box::pin(async move { self.state.read().await.remote_models.clone() })
     }
 
     fn try_get_remote_models(&self) -> Result<Vec<ModelInfo>, TryLockError> {
-        Ok(self.remote_models.try_read()?.clone())
+        Ok(self.state.try_read()?.remote_models.clone())
     }
 
     fn auth_manager(&self) -> Option<&AuthManager> {
@@ -397,7 +443,8 @@ impl OpenAiModelsManager {
             }
         };
         if should_start_worker {
-            tokio::spawn(async move { self.run_etag_refresh_worker().await });
+            let exit_guard = EtagRefreshWorkerExitGuard::new(Arc::clone(&self));
+            tokio::spawn(async move { self.run_etag_refresh_worker(exit_guard).await });
         }
     }
 
@@ -420,7 +467,7 @@ impl OpenAiModelsManager {
         }
     }
 
-    async fn run_etag_refresh_worker(self: Arc<Self>) {
+    async fn run_etag_refresh_worker(self: Arc<Self>, mut exit_guard: EtagRefreshWorkerExitGuard) {
         loop {
             let notice = {
                 let mut state = self
@@ -433,6 +480,7 @@ impl OpenAiModelsManager {
                 } else {
                     state.active_etag = None;
                     state.worker_running = false;
+                    exit_guard.disarm();
                 }
                 notice
             };
@@ -442,19 +490,33 @@ impl OpenAiModelsManager {
             };
 
             let refresh_identity = self.ensure_current_cache_identity().await;
+            let write_basis = match self
+                .cache_manager
+                .write_basis_for_identity(&refresh_identity)
+                .await
+            {
+                Ok(basis) => Some(basis),
+                Err(err) => {
+                    error!("failed to capture models cache revision before refresh: {err}");
+                    None
+                }
+            };
 
             if self.get_etag().await.as_deref() == Some(notice.etag.as_str()) {
-                if let Err(err) = self
-                    .cache_manager
-                    .renew_cache_ttl_for_identity(
-                        &crate::client_version_to_whole(),
-                        &notice.etag,
-                        &refresh_identity,
-                    )
-                    .await
-                {
-                    error!("failed to renew cache TTL: {err}");
-                    self.ensure_current_cache_identity().await;
+                if let Some(write_basis) = write_basis {
+                    if let Err(err) = self
+                        .cache_manager
+                        .renew_cache_ttl_for_identity_if_unchanged(
+                            &crate::client_version_to_whole(),
+                            &notice.etag,
+                            &refresh_identity,
+                            &write_basis,
+                        )
+                        .await
+                    {
+                        error!("failed to renew cache TTL: {err}");
+                        self.ensure_current_cache_identity().await;
+                    }
                 }
             } else {
                 let current_etag = self.get_etag().await;
@@ -468,29 +530,38 @@ impl OpenAiModelsManager {
                             continue;
                         }
                         let merged_models = self.merged_remote_models(models.clone());
-                        let should_apply = {
-                            let (mut remote_models, mut current_etag) =
-                                tokio::join!(self.remote_models.write(), self.etag.write());
-                            let state = self
+                        let (should_apply, identity_is_current) = {
+                            let mut model_state = self.state.write().await;
+                            let refresh_state = self
                                 .etag_refresh
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            if state.generation == notice.generation {
-                                *remote_models = merged_models;
-                                *current_etag = etag.clone();
-                                true
+                            let identity_is_current = model_state.active_cache_identity
+                                == refresh_identity
+                                && self.cache_manager.identity_is_current(&refresh_identity);
+                            if refresh_state.generation == notice.generation && identity_is_current
+                            {
+                                model_state.remote_models = merged_models;
+                                model_state.etag = etag.clone();
+                                (true, true)
                             } else {
-                                false
+                                (false, identity_is_current)
                             }
                         };
+                        if !identity_is_current {
+                            self.ensure_current_cache_identity().await;
+                            continue;
+                        }
                         if should_apply
+                            && let Some(write_basis) = write_basis.as_ref()
                             && !self
                                 .cache_manager
-                                .persist_cache_for_identity(
+                                .persist_cache_for_identity_if_unchanged(
                                     &models,
                                     etag,
                                     crate::client_version_to_whole(),
                                     &refresh_identity,
+                                    write_basis,
                                 )
                                 .await
                         {
@@ -502,13 +573,15 @@ impl OpenAiModelsManager {
                             self.ensure_current_cache_identity().await;
                             continue;
                         }
-                        if let Some(etag) = current_etag
+                        if let (Some(etag), Some(write_basis)) =
+                            (current_etag, write_basis.as_ref())
                             && let Err(err) = self
                                 .cache_manager
-                                .renew_cache_ttl_for_identity(
+                                .renew_cache_ttl_for_identity_if_unchanged(
                                     &crate::client_version_to_whole(),
                                     &etag,
                                     &refresh_identity,
+                                    write_basis,
                                 )
                                 .await
                         {
@@ -573,6 +646,17 @@ impl OpenAiModelsManager {
         let fetch_identity = self.ensure_current_cache_identity().await;
         let client_version = crate::client_version_to_whole();
         let current_etag = self.get_etag().await;
+        let write_basis = match self
+            .cache_manager
+            .write_basis_for_identity(&fetch_identity)
+            .await
+        {
+            Ok(basis) => Some(basis),
+            Err(err) => {
+                error!("failed to capture models cache revision before fetch: {err}");
+                None
+            }
+        };
         match self
             .fetch_models(http_client_factory, current_etag.as_deref())
             .await?
@@ -582,12 +666,28 @@ impl OpenAiModelsManager {
                     self.ensure_current_cache_identity().await;
                     return Ok(());
                 }
-                self.apply_remote_models(models.clone()).await;
-                *self.etag.write().await = etag.clone();
                 if !self
-                    .cache_manager
-                    .persist_cache_for_identity(&models, etag, client_version, &fetch_identity)
+                    .apply_remote_models_and_etag_for_identity(
+                        models.clone(),
+                        etag.clone(),
+                        &fetch_identity,
+                    )
                     .await
+                {
+                    self.ensure_current_cache_identity().await;
+                    return Ok(());
+                }
+                if let Some(write_basis) = write_basis
+                    && !self
+                        .cache_manager
+                        .persist_cache_for_identity_if_unchanged(
+                            &models,
+                            etag,
+                            client_version,
+                            &fetch_identity,
+                            &write_basis,
+                        )
+                        .await
                 {
                     self.ensure_current_cache_identity().await;
                 }
@@ -597,10 +697,15 @@ impl OpenAiModelsManager {
                     self.ensure_current_cache_identity().await;
                     return Ok(());
                 }
-                if let Some(etag) = current_etag
+                if let (Some(etag), Some(write_basis)) = (current_etag, write_basis.as_ref())
                     && let Err(err) = self
                         .cache_manager
-                        .renew_cache_ttl_for_identity(&client_version, &etag, &fetch_identity)
+                        .renew_cache_ttl_for_identity_if_unchanged(
+                            &client_version,
+                            &etag,
+                            &fetch_identity,
+                            write_basis,
+                        )
                         .await
                 {
                     error!("failed to renew cache TTL after conditional refresh: {err}");
@@ -629,21 +734,17 @@ impl OpenAiModelsManager {
     }
 
     async fn get_etag(&self) -> Option<String> {
-        self.etag.read().await.clone()
+        self.state.read().await.etag.clone()
     }
 
     /// Reset identity-scoped in-memory state when the authoritative auth scope changes.
     async fn ensure_current_cache_identity(&self) -> String {
         let current_identity = self.cache_manager.current_identity();
-        let (mut active_identity, mut remote_models, mut etag) = tokio::join!(
-            self.active_cache_identity.write(),
-            self.remote_models.write(),
-            self.etag.write()
-        );
-        if *active_identity != current_identity {
-            *remote_models = load_remote_models_from_file().unwrap_or_default();
-            *etag = None;
-            *active_identity = current_identity.clone();
+        let mut state = self.state.write().await;
+        if state.active_cache_identity != current_identity {
+            state.remote_models = load_remote_models_from_file().unwrap_or_default();
+            state.etag = None;
+            state.active_cache_identity = current_identity.clone();
             info!(
                 mismatch_category = "provider_cache_identity",
                 "models cache: reset identity-scoped in-memory catalog"
@@ -652,9 +753,23 @@ impl OpenAiModelsManager {
         current_identity
     }
 
-    /// Replace the cached remote models and rebuild the derived presets list.
-    async fn apply_remote_models(&self, models: Vec<ModelInfo>) {
-        *self.remote_models.write().await = self.merged_remote_models(models);
+    /// Replace the identity-scoped catalog and validator as one logical snapshot.
+    async fn apply_remote_models_and_etag_for_identity(
+        &self,
+        models: Vec<ModelInfo>,
+        etag: Option<String>,
+        expected_identity: &str,
+    ) -> bool {
+        let merged_models = self.merged_remote_models(models);
+        let mut state = self.state.write().await;
+        if state.active_cache_identity != expected_identity
+            || !self.cache_manager.identity_is_current(expected_identity)
+        {
+            return false;
+        }
+        state.remote_models = merged_models;
+        state.etag = etag;
+        true
     }
 
     fn merged_remote_models(&self, models: Vec<ModelInfo>) -> Vec<ModelInfo> {
@@ -712,8 +827,17 @@ impl OpenAiModelsManager {
             return false;
         }
         let models = cache.models.clone();
-        *self.etag.write().await = cache.etag.clone();
-        self.apply_remote_models(models.clone()).await;
+        if !self
+            .apply_remote_models_and_etag_for_identity(
+                models.clone(),
+                cache.etag.clone(),
+                &load_identity,
+            )
+            .await
+        {
+            self.ensure_current_cache_identity().await;
+            return false;
+        }
         if !self.cache_manager.identity_is_current(&load_identity) {
             self.ensure_current_cache_identity().await;
             return false;
@@ -840,7 +964,12 @@ fn requested_model_is_sol(requested_model: Option<&str>) -> bool {
 fn find_model_by_longest_prefix(model: &str, candidates: &[ModelInfo]) -> Option<ModelInfo> {
     let mut best: Option<ModelInfo> = None;
     for candidate in candidates {
-        if !model.starts_with(&candidate.slug) {
+        let is_exact_match = model == candidate.slug;
+        let is_hyphenated_variant = !candidate.slug.is_empty()
+            && model
+                .strip_prefix(&candidate.slug)
+                .is_some_and(|suffix| suffix.starts_with('-'));
+        if !is_exact_match && !is_hyphenated_variant {
             continue;
         }
         let is_better_match = if let Some(current) = best.as_ref() {

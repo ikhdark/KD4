@@ -56,6 +56,7 @@ use crate::task_evidence::TerminalDecisionClaim;
 use crate::task_evidence::TerminalDeliveryState as DurableDeliveryState;
 use crate::task_evidence::TerminalInteractionUpdate;
 use crate::task_evidence::TerminalRecoveryState;
+use crate::task_evidence::TerminalRolloutRepairV1;
 use crate::task_evidence::TerminalizationReceiptSnapshot;
 use crate::terminal_event_fingerprint;
 use codex_analytics::TurnProfileFact;
@@ -109,8 +110,55 @@ const TERMINAL_MUTATION_FINALIZATION_TIMEOUT: Duration = Duration::from_secs(1);
 // complete proof bundle. Give it a little more room without lengthening every
 // terminal cleanup operation.
 const FINAL_PROOF_CANDIDATE_SEAL_TIMEOUT: Duration = Duration::from_secs(5);
+// This correctness budget begins after the admission/lock fence. Fence wait is recorded as the
+// initial terminal phase, but does not consume the post-admission terminalization budget.
 const TERMINALIZATION_DEADLINE: Duration = Duration::from_secs(5);
+const TERMINAL_REPAIR_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
+const TERMINAL_REPAIR_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
+const TERMINAL_REPAIR_MAX_BACKOFF: Duration = Duration::from_millis(800);
+const TERMINAL_REPAIR_MAX_ATTEMPTS: usize = 5;
 const TASK_COMPACT_METRIC: &str = "codex.task.compact";
+
+#[derive(Debug, Default)]
+struct TerminalRepairRetry {
+    failed_attempts: usize,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum TerminalRepairFailure {
+    Transient,
+    Permanent,
+}
+
+impl TerminalRepairRetry {
+    fn retry_delay_after_failure(&mut self, failure: TerminalRepairFailure) -> Option<Duration> {
+        if failure == TerminalRepairFailure::Permanent {
+            return None;
+        }
+        self.failed_attempts = self.failed_attempts.saturating_add(1);
+        if self.failed_attempts >= TERMINAL_REPAIR_MAX_ATTEMPTS {
+            return None;
+        }
+        let shift = u32::try_from(self.failed_attempts.saturating_sub(1)).unwrap_or(u32::MAX);
+        Some(
+            TERMINAL_REPAIR_INITIAL_BACKOFF
+                .saturating_mul(1_u32.checked_shl(shift).unwrap_or(u32::MAX))
+                .min(TERMINAL_REPAIR_MAX_BACKOFF),
+        )
+    }
+}
+
+fn classify_terminal_repair_io_error(error: &std::io::Error) -> TerminalRepairFailure {
+    match error.kind() {
+        std::io::ErrorKind::PermissionDenied
+        | std::io::ErrorKind::InvalidInput
+        | std::io::ErrorKind::InvalidData
+        | std::io::ErrorKind::Unsupported
+        | std::io::ErrorKind::NotADirectory
+        | std::io::ErrorKind::IsADirectory => TerminalRepairFailure::Permanent,
+        _ => TerminalRepairFailure::Transient,
+    }
+}
 
 fn pending_terminal_recovery_state(delivery_state: DurableDeliveryState) -> TerminalRecoveryState {
     match delivery_state {
@@ -1446,16 +1494,78 @@ impl Session {
                 cleared_active_turn,
             };
         };
+        let final_proof_identity = self
+            .services
+            .task_evidence
+            .current_finalization_memo_identity()
+            .await;
         if terminal_publication_decision(rollout_structure_ready)
             == TerminalPublicationDecision::DeferForRolloutRepair
         {
-            self.schedule_terminal_after_rollout_repair(
-                Arc::clone(&finalization.task.turn_context),
-                event.clone(),
-                durable_outcome.clone(),
-                finalization.mutation_quiescent,
-                rollout_repair_items,
-            );
+            let candidate_authority = AuthoritativeTerminalEventV1 {
+                version: 1,
+                terminal_identity: terminal_identity.clone(),
+                turn_id: turn_context.sub_id.clone(),
+                event: event.clone(),
+                fingerprint: candidate_fingerprint.clone(),
+                semantic_outcome: durable_outcome.clone(),
+                final_proof_identity: final_proof_identity.clone(),
+                rollout_repair: TerminalRolloutRepairV1 {
+                    items: rollout_repair_items,
+                    repair_missing_call_outputs: true,
+                },
+            };
+            let claim = TerminalDecisionClaim {
+                authoritative_event: candidate_authority.clone(),
+                deadline_exhausted_phase: finalization.deadline.exhausted_phase(),
+                mutation_quiescent: finalization.mutation_quiescent,
+                durable_success_established,
+                retained_ownership: Vec::new(),
+                phase_timings_ns: finalization.deadline.phase_timings_ns(),
+            };
+            let claim_result = finalization
+                .deadline
+                .run(
+                    "durable_commit",
+                    TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
+                    self.services
+                        .task_evidence
+                        .commit_terminal_decision_and_claim(claim.clone()),
+                )
+                .await;
+            let authority = match claim_result {
+                Ok(TerminalClaimResult::Claimed(authority))
+                | Ok(TerminalClaimResult::AlreadyClaimed(authority))
+                    if authority.fingerprint == candidate_fingerprint =>
+                {
+                    Some(authority)
+                }
+                Ok(TerminalClaimResult::Conflict {
+                    authoritative: Some(authority),
+                    ..
+                }) => Some(authority),
+                _ => None,
+            };
+            if let Some(authority) = authority {
+                self.schedule_terminal_after_rollout_repair(
+                    Arc::clone(&finalization.task.turn_context),
+                    authority,
+                );
+            } else {
+                warn!(turn_id = %turn_context.sub_id, "could not durably bind terminal candidate before rollout repair deferral");
+                self.schedule_terminal_claim_then_rollout_repair(
+                    Arc::clone(&finalization.task.turn_context),
+                    candidate_authority,
+                    claim,
+                );
+                return TerminalInteractionMilestone {
+                    live_attempted: false,
+                    live_delivered: false,
+                    // Retain the active turn fence while the exact candidate exists only
+                    // in memory. A successful retry performs the normal recovered handoff.
+                    cleared_active_turn: false,
+                };
+            }
             let cleared_active_turn = self.detach_terminal_turn(finalization).await;
             return TerminalInteractionMilestone {
                 live_attempted: false,
@@ -1463,11 +1573,6 @@ impl Session {
                 cleared_active_turn,
             };
         }
-        let final_proof_identity = self
-            .services
-            .task_evidence
-            .current_finalization_memo_identity()
-            .await;
         let candidate_authority = AuthoritativeTerminalEventV1 {
             version: 1,
             terminal_identity: terminal_identity.clone(),
@@ -1476,6 +1581,7 @@ impl Session {
             fingerprint: candidate_fingerprint.clone(),
             semantic_outcome: durable_outcome,
             final_proof_identity,
+            rollout_repair: TerminalRolloutRepairV1::default(),
         };
         let claim = TerminalDecisionClaim {
             authoritative_event: candidate_authority.clone(),
@@ -1743,6 +1849,7 @@ impl Session {
                 event,
                 fingerprint,
                 final_proof_identity: candidate.final_proof_identity.clone(),
+                rollout_repair: TerminalRolloutRepairV1::default(),
             })
         })
     }
@@ -1774,18 +1881,21 @@ impl Session {
     ) {
         let session = Arc::clone(self);
         self.terminal_tasks.spawn(async move {
-            let retry_interval = Duration::from_millis(500);
+            let mut retry = TerminalRepairRetry::default();
             loop {
                 if session.shutting_down.load(Ordering::Acquire) {
                     warn!(turn_id = %turn_context.sub_id, "terminal receipt persistence stopped at shutdown");
                     return;
                 }
-                if session
-                    .services
-                    .task_evidence
-                    .update_terminal_interaction(update.clone())
-                    .await
-                {
+                let persisted = tokio::time::timeout(
+                    TERMINAL_REPAIR_ATTEMPT_TIMEOUT,
+                    session
+                        .services
+                        .task_evidence
+                        .update_terminal_interaction(update.clone()),
+                )
+                .await;
+                if matches!(persisted, Ok(true)) {
                     session
                         .emit_terminalization_receipt(
                             turn_context.as_ref(),
@@ -1797,7 +1907,13 @@ impl Session {
                     }
                     return;
                 }
-                tokio::time::sleep(retry_interval).await;
+                let Some(delay) =
+                    retry.retry_delay_after_failure(TerminalRepairFailure::Transient)
+                else {
+                    warn!(turn_id = %turn_context.sub_id, "terminal receipt persistence retry budget exhausted");
+                    return;
+                };
+                tokio::time::sleep(delay).await;
             }
         });
     }
@@ -1805,23 +1921,32 @@ impl Session {
     fn schedule_completion_invalidation_retry(self: &Arc<Self>, reason: String) {
         let session = Arc::clone(self);
         self.terminal_tasks.spawn(async move {
-            let retry_interval = Duration::from_millis(500);
+            let mut retry = TerminalRepairRetry::default();
             loop {
                 if session.shutting_down.load(Ordering::Acquire) {
                     warn!(%reason, "completion invalidation persistence stopped at shutdown");
                     return;
                 }
-                if matches!(
+                let persisted = tokio::time::timeout(
+                    TERMINAL_REPAIR_ATTEMPT_TIMEOUT,
                     session
                         .services
                         .task_evidence
-                        .invalidate_completion_after_terminal_emission_failure(&reason)
-                        .await,
-                    crate::task_evidence::AtomicReviewTransition::Persisted(())
+                        .invalidate_completion_after_terminal_emission_failure(&reason),
+                )
+                .await;
+                if matches!(
+                    persisted,
+                    Ok(crate::task_evidence::AtomicReviewTransition::Persisted(()))
                 ) {
                     return;
                 }
-                tokio::time::sleep(retry_interval).await;
+                let Some(delay) = retry.retry_delay_after_failure(TerminalRepairFailure::Transient)
+                else {
+                    warn!(%reason, "completion invalidation persistence retry budget exhausted");
+                    return;
+                };
+                tokio::time::sleep(delay).await;
             }
         });
     }
@@ -1829,23 +1954,32 @@ impl Session {
     fn schedule_provisional_review_supersession_retry(self: &Arc<Self>) {
         let session = Arc::clone(self);
         self.terminal_tasks.spawn(async move {
-            let retry_interval = Duration::from_millis(500);
+            let mut retry = TerminalRepairRetry::default();
             loop {
                 if session.shutting_down.load(Ordering::Acquire) {
                     warn!("provisional completion-review supersession stopped at shutdown");
                     return;
                 }
-                if matches!(
+                let persisted = tokio::time::timeout(
+                    TERMINAL_REPAIR_ATTEMPT_TIMEOUT,
                     session
                         .services
                         .task_evidence
-                        .supersede_current_provisional_completion_review()
-                        .await,
-                    crate::task_evidence::AtomicReviewTransition::Persisted(())
+                        .supersede_current_provisional_completion_review(),
+                )
+                .await;
+                if matches!(
+                    persisted,
+                    Ok(crate::task_evidence::AtomicReviewTransition::Persisted(()))
                 ) {
                     return;
                 }
-                tokio::time::sleep(retry_interval).await;
+                let Some(delay) = retry.retry_delay_after_failure(TerminalRepairFailure::Transient)
+                else {
+                    warn!("provisional completion-review supersession retry budget exhausted");
+                    return;
+                };
+                tokio::time::sleep(delay).await;
             }
         });
     }
@@ -1853,52 +1987,71 @@ impl Session {
     fn schedule_terminal_after_rollout_repair(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
-        event: EventMsg,
-        semantic_outcome: String,
-        mutation_quiescent: bool,
-        mut rollout_repair_items: Vec<ResponseItem>,
+        authority: AuthoritativeTerminalEventV1,
     ) {
         let session = Arc::clone(self);
         self.terminal_tasks.spawn(async move {
-            let retry_interval = Duration::from_millis(500);
-            loop {
-                if session.shutting_down.load(Ordering::Acquire) {
-                    warn!(turn_id = %turn_context.sub_id, "missing tool-output repair stopped at shutdown before terminal publication");
-                    return;
-                }
-                if !rollout_repair_items.is_empty() {
-                    match session
-                        .record_conversation_items_durable(
-                            &turn_context,
-                            &rollout_repair_items,
-                        )
-                        .await
-                    {
-                        Ok(()) => rollout_repair_items.clear(),
-                        Err(err) => {
-                            warn!(turn_id = %turn_context.sub_id, "retrying required rollout-item repair before terminal publication: {err}");
-                            tokio::time::sleep(retry_interval).await;
-                            continue;
-                        }
-                    }
-                }
-                match session
-                    .persist_missing_call_outputs_durable(&turn_context)
-                    .await
-                {
-                    Ok(_) => break,
-                    Err(err) => warn!(turn_id = %turn_context.sub_id, "retrying missing tool-output repair before terminal publication: {err}"),
-                }
-                tokio::time::sleep(retry_interval).await;
-            }
+            debug_assert_eq!(turn_context.sub_id, authority.turn_id);
             session
-                .establish_recovered_terminal_event(
-                    &turn_context,
-                    event,
-                    semantic_outcome,
-                    mutation_quiescent,
+                .recover_authoritative_terminal_delivery(
+                    authority, /*require_app_server_ack*/ false,
                 )
                 .await;
+        });
+    }
+
+    fn schedule_terminal_claim_then_rollout_repair(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        candidate: AuthoritativeTerminalEventV1,
+        claim: TerminalDecisionClaim,
+    ) {
+        let session = Arc::clone(self);
+        self.terminal_tasks.spawn(async move {
+            let mut retry = TerminalRepairRetry::default();
+            loop {
+                if session.shutting_down.load(Ordering::Acquire) {
+                    return;
+                }
+                let result = tokio::time::timeout(
+                    TERMINAL_REPAIR_ATTEMPT_TIMEOUT,
+                    session
+                        .services
+                        .task_evidence
+                        .commit_terminal_decision_and_claim(claim.clone()),
+                )
+                .await;
+                let authority = match result {
+                    Ok(TerminalClaimResult::Claimed(authority))
+                    | Ok(TerminalClaimResult::AlreadyClaimed(authority))
+                        if authority.fingerprint == candidate.fingerprint =>
+                    {
+                        Some(authority)
+                    }
+                    Ok(TerminalClaimResult::Conflict {
+                        authoritative: Some(authority),
+                        ..
+                    }) => Some(authority),
+                    _ => None,
+                };
+                if let Some(authority) = authority {
+                    debug_assert_eq!(turn_context.sub_id, authority.turn_id);
+                    session
+                        .recover_authoritative_terminal_delivery(
+                            authority,
+                            /*require_app_server_ack*/ false,
+                        )
+                        .await;
+                    return;
+                }
+                let Some(delay) =
+                    retry.retry_delay_after_failure(TerminalRepairFailure::Transient)
+                else {
+                    warn!(turn_id = %candidate.turn_id, "terminal claim retry budget exhausted; retaining the active turn because no durable candidate exists");
+                    return;
+                };
+                tokio::time::sleep(delay).await;
+            }
         });
     }
 
@@ -1919,12 +2072,12 @@ impl Session {
                 }
                 entry.redelivery_scheduled = true;
             }
-            let retry_interval = Duration::from_millis(500);
+            let mut retry = TerminalRepairRetry::default();
+            let mut retry_budget_exhausted = false;
             let mut live_side_effect_completed = false;
             let mut receipt_persisted = false;
             let mut pending_update = None;
             loop {
-                tokio::time::sleep(retry_interval).await;
                 if session.shutting_down.load(Ordering::Acquire) {
                     break;
                 }
@@ -1993,6 +2146,28 @@ impl Session {
                         pending_update = None;
                     }
                 }
+                let Some(delay) =
+                    retry.retry_delay_after_failure(TerminalRepairFailure::Transient)
+                else {
+                    retry_budget_exhausted = true;
+                    break;
+                };
+                tokio::time::sleep(delay).await;
+            }
+            if let Some(entry) = session
+                .terminal_delivery_registry
+                .lock()
+                .await
+                .by_identity
+                .get_mut(&authority.terminal_identity)
+            {
+                entry.redelivery_scheduled = false;
+            }
+            if retry_budget_exhausted {
+                warn!(
+                    turn_id = %authority.turn_id,
+                    "terminal redelivery retry budget exhausted; durable delivery remains pending for reconnect or restart"
+                );
             }
         });
     }
@@ -2004,17 +2179,22 @@ impl Session {
     ) {
         let session = Arc::clone(self);
         self.terminal_tasks.spawn(async move {
-            let retry_interval = Duration::from_millis(500);
+            let mut retry = TerminalRepairRetry::default();
             loop {
                 if session.shutting_down.load(Ordering::Acquire) {
                     return;
                 }
-                let claim_matches = match session
-                    .services
-                    .task_evidence
-                    .commit_terminal_decision_and_claim(claim.clone())
-                    .await
-                {
+                let claim_result = tokio::time::timeout(
+                    TERMINAL_REPAIR_ATTEMPT_TIMEOUT,
+                    session
+                        .services
+                        .task_evidence
+                        .commit_terminal_decision_and_claim(claim.clone()),
+                )
+                .await;
+                let claim_matches = match claim_result {
+                    Err(_) => false,
+                    Ok(result) => match result {
                     TerminalClaimResult::Claimed(existing)
                     | TerminalClaimResult::AlreadyClaimed(existing) => {
                         existing.fingerprint == authority.fingerprint
@@ -2036,14 +2216,26 @@ impl Session {
                         ..
                     } => return,
                     TerminalClaimResult::Failed => false,
+                    },
                 };
-                let rollout_mirrored = session
-                    .ensure_terminal_authority_mirrored_in_rollout(&authority)
-                    .await;
+                let rollout_mirrored = matches!(
+                    tokio::time::timeout(
+                        TERMINAL_REPAIR_ATTEMPT_TIMEOUT,
+                        session.ensure_terminal_authority_mirrored_in_rollout(&authority),
+                    )
+                    .await,
+                    Ok(true)
+                );
                 if claim_matches && rollout_mirrored {
                     return;
                 }
-                tokio::time::sleep(retry_interval).await;
+                let Some(delay) =
+                    retry.retry_delay_after_failure(TerminalRepairFailure::Transient)
+                else {
+                    warn!(turn_id = %authority.turn_id, "terminal authority persistence retry budget exhausted");
+                    return;
+                };
+                tokio::time::sleep(delay).await;
             }
         });
     }
@@ -2059,11 +2251,10 @@ impl Session {
         let terminal_identity = format!("{}:{}", self.thread_id, turn_context.sub_id);
         let session = Arc::clone(self);
         self.terminal_tasks.spawn(async move {
-            let retry_interval = Duration::from_secs(1);
+            let mut retry = TerminalRepairRetry::default();
             let mut notification_completed = false;
             let mut receipt_persisted = false;
             loop {
-                tokio::time::sleep(retry_interval).await;
                 if session.shutting_down.load(Ordering::Acquire) {
                     return;
                 }
@@ -2109,6 +2300,16 @@ impl Session {
                         return;
                     }
                 }
+                let Some(delay) =
+                    retry.retry_delay_after_failure(TerminalRepairFailure::Transient)
+                else {
+                    warn!(
+                        turn_id = %turn_context.sub_id,
+                        "parent terminal notification retry budget exhausted; durable notification remains pending for restart"
+                    );
+                    return;
+                };
+                tokio::time::sleep(delay).await;
             }
         });
     }
@@ -2154,9 +2355,25 @@ impl Session {
         authority: AuthoritativeTerminalEventV1,
         require_app_server_ack: bool,
     ) {
-        let rollout_mirrored = self
-            .ensure_terminal_authority_mirrored_in_rollout(&authority)
+        let turn_context = self
+            .new_default_turn_with_sub_id(authority.turn_id.clone())
             .await;
+        let rollout_repaired = self
+            .repair_recovered_terminal_rollout(&turn_context, &authority)
+            .await;
+        if !rollout_repaired {
+            warn!(
+                turn_id = %authority.turn_id,
+                "terminal rollout repair budget exhausted; delivering the durable terminal with recovery still pending"
+            );
+        }
+        let rollout_mirrored = rollout_repaired
+            && self
+                .ensure_terminal_authority_mirrored_in_rollout(&authority)
+                .await;
+        if !rollout_mirrored {
+            warn!(turn_id = %authority.turn_id, "terminal rollout remains pending for restart recovery");
+        }
         if !self
             .register_authoritative_terminal_delivery(
                 authority.terminal_identity.clone(),
@@ -2174,9 +2391,6 @@ impl Session {
             id: authority.turn_id.clone(),
             msg: authority.event.clone(),
         });
-        let turn_context = self
-            .new_default_turn_with_sub_id(authority.turn_id.clone())
-            .await;
         let parent_notification_completed = self
             .maybe_notify_parent_of_terminal_turn(turn_context.as_ref(), &authority.event)
             .await;
@@ -2204,7 +2418,11 @@ impl Session {
             post_terminal_cleanup_completed: true,
             active_turn_detached: released,
             terminal_interaction_released: released,
-            recovery_state: TerminalRecoveryState::Recovered,
+            recovery_state: if rollout_mirrored {
+                TerminalRecoveryState::Recovered
+            } else {
+                TerminalRecoveryState::Pending
+            },
             phase_timings_ns: BTreeMap::new(),
             terminalization: None,
         };
@@ -2233,6 +2451,70 @@ impl Session {
                 Arc::clone(&turn_context),
                 authority.event.clone(),
             );
+        }
+    }
+
+    async fn repair_recovered_terminal_rollout(
+        self: &Arc<Self>,
+        turn_context: &Arc<TurnContext>,
+        authority: &AuthoritativeTerminalEventV1,
+    ) -> bool {
+        let mut repair_items = authority.rollout_repair.items.clone();
+        let mut retry = TerminalRepairRetry::default();
+        loop {
+            if self.shutting_down.load(Ordering::Acquire) {
+                return false;
+            }
+            let mut failure = TerminalRepairFailure::Transient;
+            let items_repaired = if repair_items.is_empty() {
+                true
+            } else {
+                match tokio::time::timeout(
+                    TERMINAL_REPAIR_ATTEMPT_TIMEOUT,
+                    self.record_conversation_items_durable(turn_context, &repair_items),
+                )
+                .await
+                {
+                    Ok(Ok(())) => true,
+                    Ok(Err(error)) => {
+                        failure = classify_terminal_repair_io_error(&error);
+                        false
+                    }
+                    Err(_) => false,
+                }
+            };
+            if items_repaired {
+                repair_items.clear();
+            }
+            let missing_outputs_repaired = if !authority.rollout_repair.repair_missing_call_outputs
+            {
+                true
+            } else {
+                match tokio::time::timeout(
+                    TERMINAL_REPAIR_ATTEMPT_TIMEOUT,
+                    self.persist_missing_call_outputs_durable(turn_context),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => true,
+                    Ok(Err(error)) => {
+                        if classify_terminal_repair_io_error(&error)
+                            == TerminalRepairFailure::Permanent
+                        {
+                            failure = TerminalRepairFailure::Permanent;
+                        }
+                        false
+                    }
+                    Err(_) => false,
+                }
+            };
+            if repair_items.is_empty() && missing_outputs_repaired {
+                return true;
+            }
+            let Some(delay) = retry.retry_delay_after_failure(failure) else {
+                return false;
+            };
+            tokio::time::sleep(delay).await;
         }
     }
 
@@ -2456,6 +2738,7 @@ impl Session {
                 .task_evidence
                 .current_finalization_memo_identity()
                 .await,
+            rollout_repair: TerminalRolloutRepairV1::default(),
         };
         let claim = self
             .services
@@ -4276,6 +4559,7 @@ fn last_terminal_authority_from_rollout(
             fingerprint,
             semantic_outcome: semantic_terminal_outcome(event),
             final_proof_identity: None,
+            rollout_repair: TerminalRolloutRepairV1::default(),
         })
     })
 }

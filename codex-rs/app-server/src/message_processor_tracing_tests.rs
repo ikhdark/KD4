@@ -25,6 +25,11 @@ use codex_app_server_protocol::UserInput;
 use codex_arg0::Arg0DispatchPaths;
 use codex_config::CloudConfigBundleLoader;
 use codex_config::LoaderOverrides;
+use codex_config::ThreadConfigContext;
+use codex_config::ThreadConfigLoadError;
+use codex_config::ThreadConfigLoader;
+use codex_config::ThreadConfigLoaderFuture;
+use codex_config::ThreadConfigSource;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_exec_server::EnvironmentManager;
@@ -49,6 +54,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -119,10 +125,16 @@ struct TracingHarness {
 
 impl TracingHarness {
     async fn new() -> Result<Self> {
+        Self::new_with_thread_config_loader(Arc::new(codex_config::NoopThreadConfigLoader)).await
+    }
+
+    async fn new_with_thread_config_loader(
+        thread_config_loader: Arc<dyn ThreadConfigLoader>,
+    ) -> Result<Self> {
         let server = create_mock_responses_server_repeating_assistant("Done").await;
         let codex_home = TempDir::new()?;
         let config = Arc::new(build_test_config(codex_home.path(), &server.uri()).await?);
-        let (processor, outgoing_rx) = build_test_processor(config).await;
+        let (processor, outgoing_rx) = build_test_processor(config, thread_config_loader).await;
         let tracing = init_test_tracing();
         tracing.exporter.reset();
         tracing::callsite::rebuild_interest_cache();
@@ -231,6 +243,7 @@ async fn build_test_config(codex_home: &Path, server_uri: &str) -> Result<Config
 
 async fn build_test_processor(
     config: Arc<Config>,
+    thread_config_loader: Arc<dyn ThreadConfigLoader>,
 ) -> (
     Arc<MessageProcessor>,
     mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
@@ -245,7 +258,7 @@ async fn build_test_processor(
         /*strict_config*/ false,
         CloudConfigBundleLoader::default(),
         Arg0DispatchPaths::default(),
-        Arc::new(codex_config::NoopThreadConfigLoader),
+        thread_config_loader,
     );
     let analytics_events_client =
         analytics_events_client_from_config(Arc::clone(&auth_manager), config.as_ref());
@@ -277,6 +290,46 @@ async fn build_test_processor(
     (processor, outgoing_rx)
 }
 
+struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl Drop for DropSignal {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+struct BlockingThreadConfigLoader {
+    entered: StdMutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    dropped: StdMutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+
+impl ThreadConfigLoader for BlockingThreadConfigLoader {
+    fn load(
+        &self,
+        _context: ThreadConfigContext,
+    ) -> ThreadConfigLoaderFuture<'_, Vec<ThreadConfigSource>> {
+        let entered = self
+            .entered
+            .lock()
+            .expect("entered signal lock should not be poisoned")
+            .take();
+        let dropped = self
+            .dropped
+            .lock()
+            .expect("dropped signal lock should not be poisoned")
+            .take();
+        Box::pin(async move {
+            let _drop_signal = DropSignal(dropped);
+            if let Some(sender) = entered {
+                let _ = sender.send(());
+            }
+            std::future::pending::<Result<Vec<ThreadConfigSource>, ThreadConfigLoadError>>().await
+        })
+    }
+}
+
 fn run_current_thread_test_with_stack<F>(name: &str, future: F) -> Result<()>
 where
     F: Future<Output = Result<()>> + Send + 'static,
@@ -299,6 +352,70 @@ where
         Ok(result) => result,
         Err(_) => Err(anyhow::anyhow!("{name} thread panicked")),
     }
+}
+
+#[test]
+#[serial(app_server_tracing)]
+fn connection_close_cancels_in_progress_thread_start_before_post_close_response() -> Result<()> {
+    run_current_thread_test_with_stack(
+        "connection_close_cancels_in_progress_thread_start_before_post_close_response",
+        async {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+            let loader = Arc::new(BlockingThreadConfigLoader {
+                entered: StdMutex::new(Some(entered_tx)),
+                dropped: StdMutex::new(Some(dropped_tx)),
+            });
+            let mut harness = TracingHarness::new_with_thread_config_loader(loader).await?;
+            let request = request_from_client_request(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(40_001),
+                params: ThreadStartParams {
+                    ephemeral: Some(true),
+                    ..ThreadStartParams::default()
+                },
+            });
+
+            harness
+                .processor
+                .process_request(
+                    TEST_CONNECTION_ID,
+                    request,
+                    &AppServerTransport::Stdio,
+                    Arc::clone(&harness.session),
+                )
+                .await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx)
+                .await
+                .expect("thread config load should start")
+                .expect("thread config load signal should be sent");
+
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                harness
+                    .processor
+                    .connection_closed(TEST_CONNECTION_ID, &harness.session),
+            )
+            .await
+            .expect("connection close should cancel the in-progress thread start");
+            tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+                .await
+                .expect("thread config load should be dropped on connection close")
+                .expect("thread config drop signal should be sent");
+
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    harness.outgoing_rx.recv(),
+                )
+                .await
+                .is_err(),
+                "canceled thread start must not send a response or thread/started notification"
+            );
+
+            harness.shutdown().await;
+            Ok(())
+        },
+    )
 }
 
 #[test]

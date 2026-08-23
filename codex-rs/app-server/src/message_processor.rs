@@ -9,6 +9,7 @@ use crate::config_manager::ConfigManager;
 use crate::connection_rpc_gate::ConnectionRpcGate;
 use crate::current_time::app_server_time_provider;
 use crate::desktop_activation::DesktopActivationBootstrap;
+use crate::error_code::OVERLOADED_ERROR_CODE;
 use crate::error_code::invalid_request;
 use crate::extensions::ThreadExtensionDependencies;
 use crate::extensions::app_server_extension_event_sink;
@@ -43,6 +44,7 @@ use crate::request_processors::ThreadRequestProcessor;
 use crate::request_processors::TurnRequestProcessor;
 use crate::request_processors::WindowsSandboxRequestProcessor;
 use crate::request_serialization::QueuedInitializedRequest;
+use crate::request_serialization::RequestAdmission;
 use crate::request_serialization::RequestSerializationQueueKey;
 use crate::request_serialization::RequestSerializationQueues;
 use crate::skills_watcher::SkillsWatcher;
@@ -80,14 +82,12 @@ use codex_state::log_db::LogDbLayer;
 use tokio::sync::Semaphore;
 use tokio::sync::broadcast;
 use tokio::sync::watch;
-use tokio::time::Duration;
-use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::models_refresh_worker::ModelsRefreshWorker;
 
-const CONNECTION_RPC_DRAIN_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 30);
+const SERIALIZED_REQUEST_QUEUE_FULL_MESSAGE: &str = "Serialized request queue is full";
 
 fn deserialize_client_request(
     request: &JSONRPCRequest,
@@ -758,17 +758,16 @@ impl MessageProcessor {
         connection_id: ConnectionId,
         session_state: &ConnectionSessionState,
     ) {
-        if timeout(
-            CONNECTION_RPC_DRAIN_TIMEOUT,
-            session_state.rpc_gate.shutdown(),
-        )
-        .await
-        .is_err()
-        {
+        session_state.rpc_gate.close().await;
+        self.request_serialization_queues
+            .cancel_for_gate(&session_state.rpc_gate)
+            .await;
+        let aborted_rpc_tasks = session_state.rpc_gate.shutdown().await;
+        if aborted_rpc_tasks > 0 {
             tracing::warn!(
                 ?connection_id,
-                timeout_seconds = CONNECTION_RPC_DRAIN_TIMEOUT.as_secs(),
-                "timed out waiting for connection RPCs to drain"
+                aborted_rpc_tasks,
+                "aborted connection RPCs that did not stop during shutdown grace period"
             );
         }
         self.outgoing.connection_closed(connection_id).await;
@@ -899,24 +898,34 @@ impl MessageProcessor {
         let supports_openai_form_elicitation = session.supports_openai_form_elicitation();
         let error_request_id = connection_request_id.clone();
         let rpc_gate = Arc::clone(&session.rpc_gate);
+        let rpc_cancellation = rpc_gate.cancellation_token();
+        let handler_rpc_gate = Arc::clone(&rpc_gate);
         let processor = Arc::clone(self);
         let span = request_context.span();
-        let request = QueuedInitializedRequest::new(
+        let estimated_request_bytes = serde_json::to_vec(&codex_request)
+            .map(|request| request.len())
+            .unwrap_or(usize::MAX);
+        let request = QueuedInitializedRequest::new_with_estimated_bytes(
             rpc_gate,
+            estimated_request_bytes,
             async move {
                 let processor_for_request = Arc::clone(&processor);
-                let result = processor_for_request
-                    .handle_initialized_client_request(
+                tokio::select! {
+                    biased;
+                    _ = rpc_cancellation.cancelled() => {}
+                    result = processor_for_request.handle_initialized_client_request(
                         connection_request_id,
                         codex_request,
                         request_context,
                         app_server_client_name,
                         client_version,
                         supports_openai_form_elicitation,
-                    )
-                    .await;
-                if let Err(error) = result {
-                    processor.outgoing.send_error(error_request_id, error).await;
+                        handler_rpc_gate,
+                    ) => {
+                        if let Err(error) = result {
+                            processor.outgoing.send_error(error_request_id, error).await;
+                        }
+                    }
                 }
             }
             .instrument(span),
@@ -924,9 +933,18 @@ impl MessageProcessor {
 
         if let Some(scope) = serialization_scope {
             let (key, access) = RequestSerializationQueueKey::from_scope(connection_id, scope);
-            self.request_serialization_queues
-                .enqueue(key, access, request)
-                .await;
+            if matches!(
+                self.request_serialization_queues
+                    .enqueue(key, access, request)
+                    .await,
+                RequestAdmission::Rejected(_)
+            ) {
+                return Err(JSONRPCErrorError {
+                    code: OVERLOADED_ERROR_CODE,
+                    message: SERIALIZED_REQUEST_QUEUE_FULL_MESSAGE.to_string(),
+                    data: None,
+                });
+            }
         } else {
             tokio::spawn(async move {
                 request.run().await;
@@ -943,6 +961,7 @@ impl MessageProcessor {
         app_server_client_name: Option<String>,
         client_version: Option<String>,
         supports_openai_form_elicitation: bool,
+        rpc_gate: Arc<ConnectionRpcGate>,
     ) -> Result<(), JSONRPCErrorError> {
         let connection_id = connection_request_id.connection_id;
         let request_id = ConnectionRequestId {
@@ -1078,7 +1097,7 @@ impl MessageProcessor {
                 .map(|response| Some(response.into())),
             ClientRequest::FsWatch { params, .. } => self
                 .fs_processor
-                .watch(connection_id, params)
+                .watch(connection_id, params, &rpc_gate)
                 .await
                 .map(|response| Some(response.into())),
             ClientRequest::FsUnwatch { params, .. } => self
@@ -1488,7 +1507,7 @@ impl MessageProcessor {
                 .map(|response| Some(response.into())),
             ClientRequest::OneOffCommandExec { params, .. } => {
                 self.command_exec_processor
-                    .one_off_command_exec(&request_id, params)
+                    .one_off_command_exec(&request_id, params, &rpc_gate)
                     .await
             }
             ClientRequest::CommandExecWrite { params, .. } => {
@@ -1508,7 +1527,7 @@ impl MessageProcessor {
             }
             ClientRequest::ProcessSpawn { params, .. } => self
                 .process_exec_processor
-                .process_spawn(request_id.clone(), params)
+                .process_spawn(request_id.clone(), params, &rpc_gate)
                 .await
                 .map(|()| None),
             ClientRequest::ProcessWriteStdin { params, .. } => {

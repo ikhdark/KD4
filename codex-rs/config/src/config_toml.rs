@@ -65,8 +65,9 @@ const RESERVED_MODEL_PROVIDER_IDS: [&str; 4] = [
     LMSTUDIO_OSS_PROVIDER_ID,
 ];
 
-/// Per-logical-request reasoning effort overrides. Deterministic phase tracking
-/// is enabled by default; omitted fields inherit the resolved turn effort.
+/// Per-logical-request reasoning effort overrides. Omitted fields retain the
+/// compatibility defaults: high for orient, implement, and diagnose; low for
+/// inspect, verify, finalize, and deterministic continuation.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReasoningPhaseEfforts {
@@ -317,7 +318,8 @@ pub struct ConfigToml {
     pub model_providers: HashMap<String, ModelProviderInfo>,
 
     /// Maximum combined source bytes to retain from AGENTS.md project docs.
-    /// Generated provenance and truncation notices do not consume this budget.
+    /// The rendered project-doc payload, including generated provenance and
+    /// notices, is separately capped at this value plus 4 KiB.
     #[serde(default = "default_project_doc_max_bytes")]
     pub project_doc_max_bytes: Option<usize>,
 

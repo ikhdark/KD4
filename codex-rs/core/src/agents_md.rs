@@ -53,6 +53,11 @@ pub const LOCAL_AGENTS_MD_FILENAME: &str = "AGENTS.override.md";
 const AGENTS_MD_SEPARATOR: &str = "\n\n--- project-doc ---\n\n";
 const MAX_CONCURRENT_DIRECTORY_SEARCHES: usize = 8;
 const MAX_UTF8_BOUNDARY_LOOKAHEAD_BYTES: usize = 3;
+/// Project source selection and rendered prompt size are separate contracts. The configured
+/// source budget may be fully used, while provenance and truncation reporting receive this
+/// additional, finite allowance.
+const PROJECT_DOC_RENDERED_OVERHEAD_BYTES: usize = 4 * 1024;
+const PROJECT_DOC_AGGREGATE_NOTICE_RESERVE_BYTES: usize = 256;
 const STABLE_CONTEXT_RENDER_CACHE_CAPACITY: usize = 64;
 const PROJECT_DISCOVERY_REUSE_METRIC: &str = "codex.project_discovery_reuse";
 
@@ -116,6 +121,9 @@ impl AgentsMdFreshness {
 struct EnvironmentProjectInstructions {
     loaded: Option<LoadedAgentsMd>,
     retained_source_bytes: usize,
+    rendered_bytes: usize,
+    aggregate_omitted_documents: usize,
+    aggregate_omitted_bytes: u64,
 }
 
 struct LoadedProjectDoc {
@@ -151,6 +159,12 @@ pub(crate) async fn load_project_instructions(
 ) -> ProjectInstructionsLoad {
     let mut loaded = LoadedAgentsMd::from_user_instructions(user_instructions);
     let mut remaining_source_bytes = config.project_doc_max_bytes;
+    let mut remaining_rendered_bytes = project_doc_rendered_max_bytes(config.project_doc_max_bytes);
+    let aggregate_reserve =
+        remaining_rendered_bytes.min(PROJECT_DOC_AGGREGATE_NOTICE_RESERVE_BYTES);
+    remaining_rendered_bytes = remaining_rendered_bytes.saturating_sub(aggregate_reserve);
+    let mut aggregate_omitted_documents = 0usize;
+    let mut aggregate_omitted_bytes = 0u64;
     let mut complete = true;
     if remaining_source_bytes == 0 {
         return ProjectInstructionsLoad {
@@ -170,9 +184,44 @@ pub(crate) async fn load_project_instructions(
         discoveries.push((environment_id, cwd, filesystem, result));
     }
 
+    let contributing_environments = discoveries
+        .iter()
+        .filter(|(_, _, _, result)| matches!(result, Ok(paths) if !paths.is_empty()))
+        .count();
+    let mut first_project_environment = true;
     for (environment_id, cwd, filesystem, result) in discoveries {
         match result {
             Ok(candidates) if !candidates.is_empty() => {
+                let mut generated_overhead = 0usize;
+                if first_project_environment && loaded.user_instructions.is_some() {
+                    generated_overhead += AGENTS_MD_SEPARATOR.len();
+                }
+                if contributing_environments > 1 {
+                    if !first_project_environment {
+                        generated_overhead += 2;
+                    }
+                    generated_overhead += format!(
+                        "for `{}` with root {}\n\n",
+                        environment_id,
+                        cwd.inferred_native_path_string()
+                    )
+                    .len();
+                }
+                if generated_overhead >= remaining_rendered_bytes {
+                    aggregate_omitted_documents =
+                        aggregate_omitted_documents.saturating_add(candidates.len());
+                    aggregate_omitted_bytes = aggregate_omitted_bytes.saturating_add(
+                        candidates
+                            .iter()
+                            .map(|candidate| candidate.size)
+                            .sum::<u64>(),
+                    );
+                    remaining_rendered_bytes = 0;
+                    first_project_environment = false;
+                    continue;
+                }
+                remaining_rendered_bytes -= generated_overhead;
+
                 let project_docs = match read_discovered_project_docs(
                     filesystem.as_ref(),
                     candidates,
@@ -191,12 +240,24 @@ pub(crate) async fn load_project_instructions(
                         continue;
                     }
                 };
-                let environment_load = render_project_docs(&environment_id, &cwd, project_docs);
+                let environment_load = render_project_docs(
+                    &environment_id,
+                    &cwd,
+                    project_docs,
+                    remaining_rendered_bytes,
+                );
                 remaining_source_bytes =
                     remaining_source_bytes.saturating_sub(environment_load.retained_source_bytes);
+                remaining_rendered_bytes =
+                    remaining_rendered_bytes.saturating_sub(environment_load.rendered_bytes);
+                aggregate_omitted_documents = aggregate_omitted_documents
+                    .saturating_add(environment_load.aggregate_omitted_documents);
+                aggregate_omitted_bytes = aggregate_omitted_bytes
+                    .saturating_add(environment_load.aggregate_omitted_bytes);
                 if let Some(docs) = environment_load.loaded {
                     loaded.entries.extend(docs.entries);
                 }
+                first_project_environment = false;
             }
             Ok(_) => {}
             Err(err) => {
@@ -207,6 +268,18 @@ pub(crate) async fn load_project_instructions(
                 );
             }
         }
+    }
+
+    if aggregate_omitted_documents > 0 {
+        let notice = aggregate_project_doc_omission_notice(
+            aggregate_omitted_documents,
+            aggregate_omitted_bytes,
+        );
+        debug_assert!(notice.len().saturating_add(2) <= aggregate_reserve);
+        loaded.entries.push(InstructionEntry {
+            contents: notice,
+            provenance: InstructionProvenance::Internal,
+        });
     }
 
     ProjectInstructionsLoad {
@@ -254,7 +327,29 @@ async fn read_discovered_agents_md(
         fs, paths, max_total, /*prefetch_utf8_boundary_slack*/ false,
     )
     .await?;
-    Ok(render_project_docs(environment_id, cwd, project_docs))
+    let rendered_max = project_doc_rendered_max_bytes(max_total);
+    let aggregate_reserve = rendered_max.min(PROJECT_DOC_AGGREGATE_NOTICE_RESERVE_BYTES);
+    let mut rendered = render_project_docs(
+        environment_id,
+        cwd,
+        project_docs,
+        rendered_max.saturating_sub(aggregate_reserve),
+    );
+    if rendered.aggregate_omitted_documents > 0 {
+        let notice = aggregate_project_doc_omission_notice(
+            rendered.aggregate_omitted_documents,
+            rendered.aggregate_omitted_bytes,
+        );
+        debug_assert!(notice.len().saturating_add(2) <= aggregate_reserve);
+        let mut loaded = rendered.loaded.take().unwrap_or_default();
+        loaded.entries.push(InstructionEntry {
+            contents: notice,
+            provenance: InstructionProvenance::Internal,
+        });
+        rendered.loaded = Some(loaded);
+        rendered.rendered_bytes = rendered.rendered_bytes.saturating_add(aggregate_reserve);
+    }
+    Ok(rendered)
 }
 
 async fn read_discovered_project_docs(
@@ -306,26 +401,43 @@ fn render_project_docs(
     environment_id: &str,
     cwd: &PathUri,
     project_docs: Vec<LoadedProjectDoc>,
+    max_rendered_bytes: usize,
 ) -> EnvironmentProjectInstructions {
+    let mut remaining = max_rendered_bytes;
     let mut loaded = LoadedAgentsMd::default();
+    let mut entries = Vec::new();
     let mut retained_source_bytes = 0usize;
+    let mut aggregate_omitted_documents = 0usize;
+    let mut aggregate_omitted_bytes = 0u64;
 
-    // Source bytes consume the configured budget. Mandatory truncation notices and provenance
-    // labels do not: charging them to the same budget could silently erase the only evidence that
-    // a broader instruction file was omitted.
-    for LoadedProjectDoc { candidate, read } in project_docs {
-        let retained_bytes = read.retained_data.len();
-        let omitted_bytes = read.original_bytes.saturating_sub(retained_bytes as u64);
-        let mut text = String::from_utf8_lossy(&read.retained_data).to_string();
-        if omitted_bytes > 0 {
-            if !text.is_empty() {
-                text.push_str("\n\n");
+    // Reapply the shared budget nearest-first. Each environment was prefetched with at least
+    // this much local capacity, so narrowing a retained prefix never requires more I/O.
+    let mut project_docs = project_docs.into_iter().rev();
+    while let Some(LoadedProjectDoc {
+        candidate,
+        mut read,
+    }) = project_docs.next()
+    {
+        let separator_bytes = usize::from(!entries.is_empty()) * 2;
+        let Some((text, retained_bytes)) = render_project_doc_to_budget(
+            &mut read,
+            &candidate.path,
+            remaining.saturating_sub(separator_bytes),
+        ) else {
+            aggregate_omitted_documents = aggregate_omitted_documents.saturating_add(1);
+            aggregate_omitted_bytes = aggregate_omitted_bytes.saturating_add(read.original_bytes);
+            for LoadedProjectDoc { read, .. } in project_docs {
+                aggregate_omitted_documents = aggregate_omitted_documents.saturating_add(1);
+                aggregate_omitted_bytes =
+                    aggregate_omitted_bytes.saturating_add(read.original_bytes);
             }
-            text.push_str(&project_doc_truncation_notice(
-                &candidate.path,
-                read.original_bytes,
-                retained_bytes,
-            ));
+            // Do not let a shorter broad-file notice displace this nearer document, or let a
+            // later environment consume the capacity that was unavailable to this one.
+            remaining = 0;
+            break;
+        };
+        let omitted_bytes = read.original_bytes.saturating_sub(retained_bytes as u64);
+        if omitted_bytes > 0 {
             tracing::warn!(
                 path = %candidate.path,
                 original_bytes = read.original_bytes,
@@ -335,7 +447,8 @@ fn render_project_docs(
             );
         }
 
-        loaded.entries.push(InstructionEntry {
+        let rendered_bytes = text.len();
+        entries.push(InstructionEntry {
             contents: text,
             provenance: InstructionProvenance::Project {
                 source_path: candidate.path,
@@ -344,12 +457,64 @@ fn render_project_docs(
             },
         });
         retained_source_bytes = retained_source_bytes.saturating_add(retained_bytes);
+        remaining = remaining.saturating_sub(rendered_bytes + separator_bytes);
     }
+    entries.reverse();
+    loaded.entries.extend(entries);
 
     EnvironmentProjectInstructions {
         loaded: (!loaded.is_empty()).then_some(loaded),
         retained_source_bytes,
+        rendered_bytes: max_rendered_bytes.saturating_sub(remaining),
+        aggregate_omitted_documents,
+        aggregate_omitted_bytes,
     }
+}
+
+const fn project_doc_rendered_max_bytes(source_bytes: usize) -> usize {
+    source_bytes.saturating_add(PROJECT_DOC_RENDERED_OVERHEAD_BYTES)
+}
+
+fn aggregate_project_doc_omission_notice(documents: usize, source_bytes: u64) -> String {
+    format!(
+        "Project documentation omission notice: {documents} additional document(s) totaling {source_bytes} source byte(s) were omitted to preserve the rendered prompt limit."
+    )
+}
+
+fn render_project_doc_to_budget(
+    read: &mut ProjectDocRead,
+    path: &PathUri,
+    max_bytes: usize,
+) -> Option<(String, usize)> {
+    truncate_project_doc_to_budget(read, max_bytes);
+    loop {
+        let retained_bytes = read.retained_data.len();
+        let omitted_bytes = read.original_bytes.saturating_sub(retained_bytes as u64);
+        let mut text = String::from_utf8_lossy(&read.retained_data).to_string();
+        if omitted_bytes > 0 {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(&project_doc_truncation_notice(
+                path,
+                read.original_bytes,
+                retained_bytes,
+            ));
+        }
+        if text.len() <= max_bytes {
+            return Some((text, retained_bytes));
+        }
+        if retained_bytes == 0 {
+            return None;
+        }
+        let excess = text.len().saturating_sub(max_bytes).max(1);
+        truncate_project_doc_to_budget(read, retained_bytes.saturating_sub(excess));
+    }
+}
+
+fn truncate_project_doc_to_budget(project_doc: &mut ProjectDocRead, max_bytes: usize) {
+    let retained_bytes = retained_project_doc_bytes(&project_doc.retained_data, max_bytes);
+    project_doc.retained_data.truncate(retained_bytes);
 }
 
 fn retained_project_doc_bytes(retained_data: &[u8], max_bytes: usize) -> usize {

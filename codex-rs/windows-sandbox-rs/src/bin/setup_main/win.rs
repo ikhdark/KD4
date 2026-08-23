@@ -114,6 +114,7 @@ enum SetupMode {
     Full,
     ProvisionOnly,
     ReadAclsOnly,
+    ReadAclsOnlyStrict,
 }
 
 fn log_line(log: &mut dyn Write, msg: &str) -> Result<()> {
@@ -494,7 +495,11 @@ fn real_main() -> Result<()> {
 }
 
 fn run_setup(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Result<()> {
-    let writes_setup_marker = !payload.refresh_only && payload.mode != SetupMode::ReadAclsOnly;
+    let writes_setup_marker = !payload.refresh_only
+        && !matches!(
+            payload.mode,
+            SetupMode::ReadAclsOnly | SetupMode::ReadAclsOnlyStrict
+        );
     // A missing or temporarily invalid marker can cause several callers to launch full setup at
     // once. Keep marker preparation, user provisioning, and marker commit in one cross-process
     // transaction so the protected marker is never removed or recreated concurrently.
@@ -503,7 +508,8 @@ fn run_setup(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Result<(
         prepare_setup_marker(&payload.codex_home, &payload.real_user)?;
     }
     match payload.mode {
-        SetupMode::ReadAclsOnly => run_read_acl_only(payload, log),
+        SetupMode::ReadAclsOnly => run_read_acl_only(payload, log, false),
+        SetupMode::ReadAclsOnlyStrict => run_read_acl_only(payload, log, true),
         SetupMode::ProvisionOnly => run_provision_only(payload, log, sbx_dir),
         SetupMode::Full => run_setup_full(payload, log, sbx_dir),
     }?;
@@ -519,10 +525,17 @@ fn run_setup(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Result<(
     Ok(())
 }
 
-fn run_read_acl_only(payload: &Payload, log: &mut dyn Write) -> Result<()> {
+fn run_read_acl_only(
+    payload: &Payload,
+    log: &mut dyn Write,
+    fail_if_already_running: bool,
+) -> Result<()> {
     let _read_acl_guard = match acquire_read_acl_mutex()? {
         Some(guard) => guard,
         None => {
+            if fail_if_already_running {
+                anyhow::bail!("read ACL helper already running");
+            }
             log_line(log, "read ACL helper already running; skipping")?;
             return Ok(());
         }

@@ -1,13 +1,12 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::fs::OpenOptions;
 use std::io::ErrorKind;
-use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
-use fs2::FileExt;
-use tempfile::NamedTempFile;
+use codex_utils_path::acquire_atomic_write_lock;
+use codex_utils_path::resolve_symlink_write_paths;
+use codex_utils_path::write_atomically;
 use tokio::task;
 use toml::Value as TomlValue;
 use toml_edit::DocumentMut;
@@ -103,15 +102,12 @@ impl ConfigEditsBuilder {
     fn apply_blocking(self) -> std::io::Result<()> {
         fs::create_dir_all(&self.codex_home)?;
         let config_path = self.codex_home.join(CONFIG_TOML_FILE);
-        let lock_path = self.codex_home.join(".config.toml.lock");
-        let lock_file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(lock_path)?;
-        lock_file.lock_exclusive()?;
-        let mut doc = read_or_create_document(&config_path)?;
+        let _lock = acquire_atomic_write_lock(&config_path)?;
+        let write_paths = resolve_symlink_write_paths(&config_path)?;
+        let mut doc = match write_paths.read_path.as_deref() {
+            Some(read_path) => read_or_create_document(read_path)?,
+            None => DocumentMut::new(),
+        };
         if let Some(servers) = self.mcp_servers.as_ref() {
             replace_mcp_servers(&mut doc, servers);
         }
@@ -124,15 +120,7 @@ impl ConfigEditsBuilder {
             }
             replace_mcp_servers(&mut doc, &current);
         }
-        let mut temporary = NamedTempFile::new_in(&self.codex_home)?;
-        temporary.write_all(doc.to_string().as_bytes())?;
-        temporary.flush()?;
-        temporary.as_file().sync_all()?;
-        temporary
-            .persist(&config_path)
-            .map_err(|error| error.error)?;
-        lock_file.unlock()?;
-        Ok(())
+        write_atomically(&write_paths.write_path, &doc.to_string())
     }
 }
 

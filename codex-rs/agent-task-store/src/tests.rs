@@ -10,6 +10,8 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use super::*;
+use crate::local::TestSnapshotCapturePause;
+use crate::local::with_test_snapshot_capture_pause;
 
 #[test]
 fn editing_and_tool_calls_are_meaningful_progress() {
@@ -69,6 +71,39 @@ async fn coordination_pool(fixture: &Fixture) -> sqlx::SqlitePool {
         .connect_with(options)
         .await
         .expect("coordination database opens")
+}
+
+async fn admit_writer_while_snapshot_capture_is_paused(
+    pause: &TestSnapshotCapturePause,
+    blocker_pool: &sqlx::SqlitePool,
+) {
+    let permit = tokio::time::timeout(std::time::Duration::from_secs(1), pause.started.acquire())
+        .await
+        .expect("snapshot capture reaches the test pause")
+        .expect("snapshot pause remains open");
+    permit.forget();
+
+    let mut blocker = blocker_pool
+        .acquire()
+        .await
+        .expect("independent coordination connection opens");
+    let writer_result = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *blocker),
+    )
+    .await;
+    let writer_acquired = matches!(&writer_result, Ok(Ok(_)));
+    if writer_acquired {
+        sqlx::query("ROLLBACK")
+            .execute(&mut *blocker)
+            .await
+            .expect("independent writer lock is released");
+    }
+    pause.release.add_permits(1);
+    assert!(
+        writer_acquired,
+        "snapshot capture must not retain a SQLite writer transaction"
+    );
 }
 
 async fn validation_evidence_revision(pool: &sqlx::SqlitePool, attempt_id: AttemptId) -> i64 {
@@ -2556,13 +2591,27 @@ async fn wake_wait_observes_a_commit_from_an_independent_store_instance() {
         .await
         .expect("initial wake read")
         .latest_event_id;
-    let waiter_store = fixture.store.clone();
-    let waiter = tokio::spawn(async move {
-        waiter_store
-            .wait_for_wake_events("external-wait-root".to_string(), cursor)
-            .await
-    });
-    tokio::task::yield_now().await;
+    let poll_count_before = fixture.store.durable_wake_poll_count();
+    let mut waiters = Vec::new();
+    for _ in 0..8 {
+        let waiter_store = fixture.store.clone();
+        let cursor = cursor.clone();
+        waiters.push(tokio::spawn(async move {
+            waiter_store
+                .wait_for_wake_events("external-wait-root".to_string(), cursor)
+                .await
+        }));
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    let shared_poll_count = fixture
+        .store
+        .durable_wake_poll_count()
+        .saturating_sub(poll_count_before);
+    assert!(shared_poll_count > 0, "the shared durable poller runs");
+    assert!(
+        shared_poll_count < waiters.len() as u64,
+        "concurrent waiters must share one durable database recheck poller"
+    );
 
     independent_store
         .append_observation(
@@ -2574,13 +2623,15 @@ async fn wake_wait_observes_a_commit_from_an_independent_store_instance() {
         .await
         .expect("independent observation appends");
 
-    let wake = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
-        .await
-        .expect("durable wake recheck should observe the external commit")
-        .expect("wake task joins")
-        .expect("wake read succeeds");
-    assert_eq!(wake.updated_agents.len(), 1);
-    assert_eq!(wake.updated_agents[0].reason, ObservationKind::Reading);
+    for waiter in waiters {
+        let wake = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("durable wake recheck should observe the external commit")
+            .expect("wake task joins")
+            .expect("wake read succeeds");
+        assert_eq!(wake.updated_agents.len(), 1);
+        assert_eq!(wake.updated_agents[0].reason, ObservationKind::Reading);
+    }
 }
 
 #[tokio::test]
@@ -2928,27 +2979,49 @@ async fn mutation_evidence_keeps_private_prewrite_snapshot() {
         .create_assignment(fixture.repo.path(), worker_draft("root", "src"))
         .await
         .expect("worker assignment");
-    let event_id = fixture
-        .store
-        .begin_mutation(
-            attempt.attempt_id,
-            fixture.repo.path(),
-            "src/file.rs".to_string(),
-            AttributionConfidence::Definitive,
-        )
+    let attempt_id = attempt.attempt_id;
+    let blocker_pool = coordination_pool(&fixture).await;
+    let begin_pause = Arc::new(TestSnapshotCapturePause::new());
+    let begin_store = fixture.store.clone();
+    let begin_repo = fixture.repo.path().to_path_buf();
+    let begin_pause_scope = Arc::clone(&begin_pause);
+    let begin = tokio::spawn(async move {
+        with_test_snapshot_capture_pause(begin_pause_scope, async move {
+            begin_store
+                .begin_mutation(
+                    attempt_id,
+                    &begin_repo,
+                    "src/file.rs".to_string(),
+                    AttributionConfidence::Definitive,
+                )
+                .await
+        })
         .await
+    });
+    admit_writer_while_snapshot_capture_is_paused(&begin_pause, &blocker_pool).await;
+    let event_id = begin
+        .await
+        .expect("begin mutation task joins")
         .expect("mutation begins");
     tokio::fs::write(fixture.repo.path().join("src/file.rs"), b"after")
         .await
         .expect("mutated file");
-    let evidence = fixture
-        .store
-        .finalize_mutation(
-            attempt.attempt_id,
-            fixture.repo.path(),
-            "src/file.rs".to_string(),
-        )
+    let finalize_pause = Arc::new(TestSnapshotCapturePause::new());
+    let finalize_store = fixture.store.clone();
+    let finalize_repo = fixture.repo.path().to_path_buf();
+    let finalize_pause_scope = Arc::clone(&finalize_pause);
+    let finalize = tokio::spawn(async move {
+        with_test_snapshot_capture_pause(finalize_pause_scope, async move {
+            finalize_store
+                .finalize_mutation(attempt_id, &finalize_repo, "src/file.rs".to_string())
+                .await
+        })
         .await
+    });
+    admit_writer_while_snapshot_capture_is_paused(&finalize_pause, &blocker_pool).await;
+    let evidence = finalize
+        .await
+        .expect("finalize mutation task joins")
         .expect("mutation finalizes");
     assert_eq!(evidence.mutation_event_ids, vec![event_id]);
     assert_ne!(evidence.pre_write_hash, evidence.final_hash);

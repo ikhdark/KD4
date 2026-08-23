@@ -50,15 +50,20 @@ impl WindowsSandboxRequestProcessor {
         let workspace_roots = config.effective_workspace_roots();
         let codex_home = config.codex_home.to_path_buf();
         let read_root = PathBuf::from(params.path);
+        let grant_required = windows_sandbox_read_root_grant_required(&permission_profile)?;
         let canonical_path = tokio::task::spawn_blocking(move || {
-            codex_core::grant_read_root_non_elevated(
-                &permission_profile,
-                &workspace_roots,
-                &command_cwd,
-                &std::env::vars().collect(),
-                &codex_home,
-                &read_root,
-            )
+            if grant_required {
+                codex_core::grant_read_root_non_elevated(
+                    &permission_profile,
+                    &workspace_roots,
+                    &command_cwd,
+                    &std::env::vars().collect(),
+                    &codex_home,
+                    &read_root,
+                )
+            } else {
+                validate_and_canonicalize_read_root(&read_root)
+            }
         })
         .await
         .map_err(|err| internal_error(format!("Windows sandbox read-root task failed: {err}")))?
@@ -157,6 +162,33 @@ impl WindowsSandboxRequestProcessor {
     }
 }
 
+fn windows_sandbox_read_root_grant_required(
+    permission_profile: &codex_protocol::models::PermissionProfile,
+) -> Result<bool, JSONRPCErrorError> {
+    match permission_profile {
+        codex_protocol::models::PermissionProfile::External { .. } => Err(invalid_request(
+            "windowsSandbox/grantReadRoot is unavailable for an externally managed sandbox",
+        )),
+        codex_protocol::models::PermissionProfile::Disabled => Ok(false),
+        codex_protocol::models::PermissionProfile::Managed { .. } => Ok(!permission_profile
+            .file_system_sandbox_policy()
+            .has_full_disk_read_access()),
+    }
+}
+
+fn validate_and_canonicalize_read_root(read_root: &Path) -> anyhow::Result<PathBuf> {
+    if !read_root.is_absolute() {
+        anyhow::bail!("path must be absolute: {}", read_root.display());
+    }
+    if !read_root.exists() {
+        anyhow::bail!("path does not exist: {}", read_root.display());
+    }
+    if !read_root.is_dir() {
+        anyhow::bail!("path must be a directory: {}", read_root.display());
+    }
+    Ok(std::fs::canonicalize(read_root)?)
+}
+
 fn validate_windows_sandbox_setup_profile(
     params: &WindowsSandboxSetupStartParams,
 ) -> Result<(), JSONRPCErrorError> {
@@ -239,6 +271,38 @@ mod tests {
     use codex_config::Constrained;
     use codex_config::ConstrainedWithSource;
     use codex_config::types::WindowsSandboxModeToml;
+    use codex_protocol::models::PermissionProfile;
+    use codex_protocol::permissions::NetworkSandboxPolicy;
+
+    #[test]
+    fn windows_sandbox_grant_read_root_rejects_external_profile() {
+        let err = windows_sandbox_read_root_grant_required(&PermissionProfile::External {
+            network: NetworkSandboxPolicy::Restricted,
+        })
+        .expect_err("external sandbox roots are not managed by Codex");
+
+        assert_eq!(err.code, INVALID_REQUEST_ERROR_CODE);
+        assert!(
+            err.message.contains("externally managed sandbox"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn windows_sandbox_grant_read_root_skips_already_readable_profiles() {
+        assert!(
+            !windows_sandbox_read_root_grant_required(&PermissionProfile::Disabled)
+                .expect("disabled sandbox has unrestricted read access")
+        );
+        let managed_unrestricted = PermissionProfile::from_runtime_permissions(
+            &codex_protocol::permissions::FileSystemSandboxPolicy::unrestricted(),
+            NetworkSandboxPolicy::Restricted,
+        );
+        assert!(
+            !windows_sandbox_read_root_grant_required(&managed_unrestricted)
+                .expect("managed unrestricted profile has full-disk read access")
+        );
+    }
 
     #[test]
     fn resolve_allowed_windows_sandbox_setup_mode_rejects_disallowed_mode() {

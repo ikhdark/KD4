@@ -8,11 +8,14 @@ use super::TERMINAL_MUTATION_FINALIZATION_TIMEOUT;
 use super::TERMINALIZATION_DEADLINE;
 use super::TerminalDeadline;
 use super::TerminalPublicationDecision;
+use super::TerminalRepairFailure;
+use super::TerminalRepairRetry;
 use super::TerminalSchedule;
 use super::TerminalWaitError;
 use super::TurnTerminalOutcome;
 use super::apply_terminal_phase_timings_to_timing;
 use super::atomic_review_transition_persisted;
+use super::classify_terminal_repair_io_error;
 use super::downgrade_for_required_finalization_memo;
 use super::durable_side_effect_step;
 use super::emit_compact_metric;
@@ -48,7 +51,10 @@ use codex_otel::SessionTelemetry;
 use codex_otel::TURN_MEMORY_METRIC;
 use codex_otel::TURN_NETWORK_PROXY_METRIC;
 use codex_protocol::ThreadId;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TaskCompletionGate;
 use codex_protocol::protocol::TaskCompletionStatus;
@@ -122,6 +128,77 @@ fn implemented_below_ignored_above_missing_output_repair_defers_terminal_publica
         terminal_publication_decision(true),
         TerminalPublicationDecision::Publish
     );
+}
+
+#[test]
+fn terminal_repair_retry_is_bounded_with_capped_exponential_backoff() {
+    let mut retry = TerminalRepairRetry::default();
+
+    assert_eq!(
+        retry.retry_delay_after_failure(TerminalRepairFailure::Transient),
+        Some(Duration::from_millis(100))
+    );
+    assert_eq!(
+        retry.retry_delay_after_failure(TerminalRepairFailure::Transient),
+        Some(Duration::from_millis(200))
+    );
+    assert_eq!(
+        retry.retry_delay_after_failure(TerminalRepairFailure::Transient),
+        Some(Duration::from_millis(400))
+    );
+    assert_eq!(
+        retry.retry_delay_after_failure(TerminalRepairFailure::Transient),
+        Some(Duration::from_millis(800))
+    );
+    assert_eq!(
+        retry.retry_delay_after_failure(TerminalRepairFailure::Transient),
+        None
+    );
+    assert_eq!(
+        retry.retry_delay_after_failure(TerminalRepairFailure::Transient),
+        None
+    );
+}
+
+#[test]
+fn terminal_repair_classifies_permanent_io_failures_without_retrying() {
+    let permission_denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        classify_terminal_repair_io_error(&permission_denied),
+        TerminalRepairFailure::Permanent
+    );
+    let mut retry = TerminalRepairRetry::default();
+    assert_eq!(
+        retry.retry_delay_after_failure(TerminalRepairFailure::Permanent),
+        None
+    );
+
+    let interrupted = std::io::Error::from(std::io::ErrorKind::Interrupted);
+    assert_eq!(
+        classify_terminal_repair_io_error(&interrupted),
+        TerminalRepairFailure::Transient
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn bounded_terminal_retry_tasks_drain_after_multiple_failed_turns() {
+    let terminal_tasks = tokio_util::task::TaskTracker::new();
+    for _ in 0..32 {
+        terminal_tasks.spawn(async {
+            let mut retry = TerminalRepairRetry::default();
+            while let Some(delay) =
+                retry.retry_delay_after_failure(TerminalRepairFailure::Transient)
+            {
+                tokio::time::sleep(delay).await;
+            }
+        });
+    }
+    terminal_tasks.close();
+
+    tokio::time::timeout(Duration::from_secs(2), terminal_tasks.wait())
+        .await
+        .expect("bounded repair tasks must drain instead of accumulating");
+    assert_eq!(terminal_tasks.len(), 0);
 }
 
 #[test]
@@ -363,9 +440,32 @@ async fn terminalization_recovery_notification_claim_is_one_shot() {
     );
 }
 
-#[tokio::test]
-async fn authoritative_terminal_claim_is_replayed_on_cli_restart() {
+#[tokio::test(start_paused = true)]
+async fn permanent_rollout_repair_failure_stops_live_retry_and_recovers_after_restart() {
+    let retry_started = tokio::time::Instant::now();
+    let mut transient_failure_retry = TerminalRepairRetry::default();
+    let mut attempts = 1;
+    while let Some(delay) =
+        transient_failure_retry.retry_delay_after_failure(TerminalRepairFailure::Transient)
+    {
+        attempts += 1;
+        tokio::time::sleep(delay).await;
+    }
+    assert_eq!(
+        attempts, 5,
+        "permanent live failure must have a finite budget"
+    );
+    assert_eq!(
+        tokio::time::Instant::now().saturating_duration_since(retry_started),
+        Duration::from_millis(1_500),
+        "live retry timing is bounded and exponential"
+    );
+
     let (mut session, turn_context, events) = make_session_and_context_with_rx().await;
+    crate::session::tests::attach_thread_persistence(
+        Arc::get_mut(&mut session).expect("test session is uniquely owned"),
+    )
+    .await;
     let evidence_home = tempfile::tempdir().expect("create evidence home");
     let task_evidence = TaskEvidenceLedger::load_or_new(
         evidence_home.path().to_path_buf(),
@@ -392,15 +492,29 @@ async fn authoritative_terminal_claim_is_replayed_on_cli_restart() {
         time_to_first_token_ms: None,
         timing: None,
     });
+    let terminal_fingerprint =
+        crate::terminal_event_fingerprint(&terminal_event).expect("terminal event fingerprint");
+    let repair_item = ResponseItem::Message {
+        id: None,
+        role: "developer".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "durable pre-terminal repair".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
     let authority = AuthoritativeTerminalEventV1 {
         version: 1,
         terminal_identity: terminal_identity.clone(),
         turn_id: turn_id.clone(),
-        fingerprint: crate::terminal_event_fingerprint(&terminal_event)
-            .expect("terminal event fingerprint"),
+        fingerprint: terminal_fingerprint.clone(),
         event: terminal_event.clone(),
         semantic_outcome: "passed".to_string(),
         final_proof_identity: None,
+        rollout_repair: super::TerminalRolloutRepairV1 {
+            items: vec![repair_item.clone()],
+            repair_missing_call_outputs: true,
+        },
     };
     assert!(matches!(
         session
@@ -427,6 +541,30 @@ async fn authoritative_terminal_claim_is_replayed_on_cli_restart() {
         1
     );
 
+    let reloaded = TaskEvidenceLedger::load_or_new(
+        evidence_home.path().to_path_buf(),
+        session.thread_id,
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+    )
+    .await;
+    let reloaded_pending = reloaded.pending_authoritative_terminal_events().await;
+    assert_eq!(reloaded_pending.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&reloaded_pending[0].rollout_repair.items)
+            .expect("serialize recovered repair plan"),
+        serde_json::to_value([&repair_item]).expect("serialize expected repair plan"),
+        "restart must recover the exact pre-terminal rollout mutation"
+    );
+    assert!(
+        reloaded_pending[0]
+            .rollout_repair
+            .repair_missing_call_outputs
+    );
+    Arc::get_mut(&mut session)
+        .expect("test session remains uniquely owned before recovery")
+        .services
+        .task_evidence = reloaded;
+
     session.recover_bound_terminal_intent(turn_id.clone()).await;
 
     let recovered = tokio::time::timeout(Duration::from_secs(1), async {
@@ -435,7 +573,10 @@ async fn authoritative_terminal_claim_is_replayed_on_cli_restart() {
                 .recv()
                 .await
                 .expect("terminal recovery event channel remains open");
-            if event.id == turn_id {
+            if event.id == turn_id
+                && crate::terminal_event_fingerprint(&event.msg).as_deref()
+                    == Some(terminal_fingerprint.as_str())
+            {
                 break event.msg;
             }
         }
@@ -444,7 +585,46 @@ async fn authoritative_terminal_claim_is_replayed_on_cli_restart() {
     .expect("authoritative terminal event is replayed");
     assert_eq!(
         serde_json::to_value(recovered).expect("serialize recovered terminal event"),
-        serde_json::to_value(terminal_event).expect("serialize expected terminal event")
+        serde_json::to_value(&terminal_event).expect("serialize expected terminal event")
+    );
+    let history = session
+        .live_thread()
+        .expect("test session has rollout storage")
+        .load_history(/*include_archived*/ true)
+        .await
+        .expect("load recovered rollout");
+    let repair_position = history
+        .items
+        .iter()
+        .position(|item| {
+            matches!(
+                (item, &repair_item),
+                (
+                    RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }),
+                    ResponseItem::Message {
+                        role: expected_role,
+                        content: expected_content,
+                        ..
+                    }
+                ) if role == expected_role && content == expected_content
+            )
+        })
+        .expect("recovered repair item is durable");
+    let terminal_position = history
+        .items
+        .iter()
+        .position(|item| {
+            matches!(
+                item,
+                RolloutItem::EventMsg(event)
+                    if crate::terminal_event_fingerprint(event).as_deref()
+                        == Some(terminal_fingerprint.as_str())
+            )
+        })
+        .expect("recovered terminal event is durable");
+    assert!(
+        repair_position < terminal_position,
+        "recovery must repair rollout structure before terminal publication"
     );
     assert!(
         session

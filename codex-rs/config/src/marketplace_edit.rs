@@ -2,6 +2,9 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
 
+use codex_utils_path::acquire_atomic_write_lock;
+use codex_utils_path::resolve_symlink_write_paths;
+use codex_utils_path::write_atomically;
 use toml_edit::DocumentMut;
 use toml_edit::Item as TomlItem;
 use toml_edit::Table as TomlTable;
@@ -32,10 +35,14 @@ pub fn record_user_marketplace(
     update: &MarketplaceConfigUpdate<'_>,
 ) -> std::io::Result<()> {
     let config_path = codex_home.join(CONFIG_TOML_FILE);
-    let mut doc = read_or_create_document(&config_path)?;
+    let _lock = acquire_atomic_write_lock(&config_path)?;
+    let write_paths = resolve_symlink_write_paths(&config_path)?;
+    let mut doc = match write_paths.read_path.as_deref() {
+        Some(read_path) => read_or_create_document(read_path)?,
+        None => DocumentMut::new(),
+    };
     upsert_marketplace(&mut doc, marketplace_name, update);
-    fs::create_dir_all(codex_home)?;
-    fs::write(config_path, doc.to_string())
+    write_atomically(&write_paths.write_path, &doc.to_string())
 }
 
 pub fn remove_user_marketplace(codex_home: &Path, marketplace_name: &str) -> std::io::Result<bool> {
@@ -48,7 +55,12 @@ pub fn remove_user_marketplace_config(
     marketplace_name: &str,
 ) -> std::io::Result<RemoveMarketplaceConfigOutcome> {
     let config_path = codex_home.join(CONFIG_TOML_FILE);
-    let mut doc = match fs::read_to_string(&config_path) {
+    let _lock = acquire_atomic_write_lock(&config_path)?;
+    let write_paths = resolve_symlink_write_paths(&config_path)?;
+    let Some(read_path) = write_paths.read_path.as_deref() else {
+        return Ok(RemoveMarketplaceConfigOutcome::NotFound);
+    };
+    let mut doc = match fs::read_to_string(read_path) {
         Ok(raw) => raw
             .parse::<DocumentMut>()
             .map_err(|err| std::io::Error::new(ErrorKind::InvalidData, err))?,
@@ -63,8 +75,7 @@ pub fn remove_user_marketplace_config(
         return Ok(outcome);
     }
 
-    fs::create_dir_all(codex_home)?;
-    fs::write(config_path, doc.to_string())?;
+    write_atomically(&write_paths.write_path, &doc.to_string())?;
     Ok(RemoveMarketplaceConfigOutcome::Removed)
 }
 

@@ -24,11 +24,14 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
+use tokio::time::sleep;
 use tokio::time::sleep_until;
 use tracing::warn;
 
 const RAW_EVENT_BUFFER_CAPACITY: usize = 1024;
 const SUBSCRIBER_PATH_BUFFER_CAPACITY: usize = 4096;
+const DEGRADED_RECONCILE_INITIAL_DELAY: Duration = Duration::from_millis(25);
+const DEGRADED_RECONCILE_MAX_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Coalesced file change notification for a subscriber.
@@ -437,6 +440,7 @@ impl Drop for WatchRegistration {
 pub struct FileWatcher {
     inner: Option<Arc<Mutex<FileWatcherInner>>>,
     state: Arc<RwLock<WatchState>>,
+    reconcile_tx: Option<mpsc::UnboundedSender<()>>,
 }
 
 impl FileWatcher {
@@ -465,11 +469,15 @@ impl FileWatcher {
             fail_next_unwatch: false,
         };
         let state = Arc::new(RwLock::new(WatchState::default()));
+        let inner = Arc::new(Mutex::new(inner));
+        let (reconcile_tx, reconcile_rx) = mpsc::unbounded_channel();
         let file_watcher = Self {
-            inner: Some(Arc::new(Mutex::new(inner))),
+            inner: Some(Arc::clone(&inner)),
             state,
+            reconcile_tx: Some(reconcile_tx),
         };
         file_watcher.spawn_event_loop(&handle, raw_rx, raw_overflow, raw_overflow_notify);
+        file_watcher.spawn_reconcile_loop(&handle, reconcile_rx, &inner);
         Ok(file_watcher)
     }
 
@@ -479,6 +487,7 @@ impl FileWatcher {
         Self {
             inner: None,
             state: Arc::new(RwLock::new(WatchState::default())),
+            reconcile_tx: None,
         }
     }
 
@@ -679,8 +688,17 @@ impl FileWatcher {
             );
             Self::mark_watch_degraded(&actual.path, inner_guard);
             Self::mark_subscribers_rescan_for_path(state, &actual.path);
+            if next_counts.is_empty() {
+                self.request_degraded_reconciliation();
+            }
         } else {
             Self::set_watch_degraded(&actual.path, next_mode, inner_guard);
+        }
+    }
+
+    fn request_degraded_reconciliation(&self) {
+        if let Some(reconcile_tx) = &self.reconcile_tx {
+            let _ = reconcile_tx.send(());
         }
     }
 
@@ -800,6 +818,77 @@ impl FileWatcher {
                 subscriber.tx.mark_rescan_required();
             }
         }
+    }
+
+    fn spawn_reconcile_loop(
+        &self,
+        handle: &Handle,
+        mut reconcile_rx: mpsc::UnboundedReceiver<()>,
+        inner: &Arc<Mutex<FileWatcherInner>>,
+    ) {
+        let state = Arc::clone(&self.state);
+        let inner = Arc::downgrade(inner);
+        handle.spawn(async move {
+            while reconcile_rx.recv().await.is_some() {
+                let mut retry_delay = DEGRADED_RECONCILE_INITIAL_DELAY;
+                loop {
+                    let Some(inner) = inner.upgrade() else {
+                        return;
+                    };
+                    if !Self::reconcile_degraded_paths(&state, &inner) {
+                        break;
+                    }
+                    drop(inner);
+
+                    sleep(retry_delay).await;
+                    retry_delay = retry_delay
+                        .saturating_mul(2)
+                        .min(DEGRADED_RECONCILE_MAX_DELAY);
+                    while reconcile_rx.try_recv().is_ok() {}
+                }
+            }
+        });
+    }
+
+    fn reconcile_degraded_paths(
+        state: &RwLock<WatchState>,
+        inner: &Arc<Mutex<FileWatcherInner>>,
+    ) -> bool {
+        let state = state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner_guard = Some(
+            inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let degraded_paths = inner_guard
+            .as_ref()
+            .map(|guard| guard.degraded_paths.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        for path in degraded_paths {
+            let desired_mode = state
+                .path_ref_counts
+                .get(&path)
+                .copied()
+                .and_then(PathWatchCounts::effective_mode);
+            if let Err(err) =
+                Self::reconfigure_watch_inner(Some(inner), &path, desired_mode, &mut inner_guard)
+            {
+                warn!(
+                    "failed to reconcile degraded file watch {}: {err}",
+                    path.display()
+                );
+                Self::mark_watch_degraded(&path, &mut inner_guard);
+            } else {
+                Self::set_watch_degraded(&path, desired_mode, &mut inner_guard);
+            }
+        }
+
+        inner_guard
+            .as_ref()
+            .is_some_and(|guard| !guard.degraded_paths.is_empty())
     }
 
     fn apply_actual_watch_move<'a>(

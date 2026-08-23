@@ -56,6 +56,12 @@ const NANOS_PER_MILLISECOND: u128 = 1_000_000;
 const TIMING_SCHEMA_VERSION: u16 = 24;
 const MAX_DETERMINISTIC_CONTINUATION_RECEIPTS: usize = 64;
 const MAX_TOOL_CALL_TIMINGS: usize = 1_024;
+// These records are diagnostic histories, not the source of truth for the
+// additive counters above. Retain a useful tail while keeping a long-running
+// turn from accumulating identifiers and request metadata without bound.
+const MAX_MODEL_REQUEST_TIMINGS: usize = 1_024;
+const MAX_MODEL_REQUEST_PHYSICAL_ATTEMPT_IDS: usize = 64;
+const MAX_MODEL_REQUEST_PROGRESS_KINDS: usize = 64;
 const RESERVED_TOOL_OUTPUT_RECURSIVE_SPILL_COUNT: u32 = 0;
 
 fn adjust_counter(counter: &AtomicU32, delta: i32) {
@@ -1303,6 +1309,9 @@ impl TurnTimingState {
             .iter()
             .any(|existing| existing == physical_attempt_id)
         {
+            if request.physical_attempt_ids.len() >= MAX_MODEL_REQUEST_PHYSICAL_ATTEMPT_IDS {
+                request.physical_attempt_ids.remove(0);
+            }
             request
                 .physical_attempt_ids
                 .push(physical_attempt_id.to_string());
@@ -1838,7 +1847,10 @@ impl TurnTimingState {
             request.generation_index == generation_index
                 && request.attempt_kind == TurnTimingAttemptKind::Primary
         }) {
-            request.progress_kinds = progress_kinds;
+            request.progress_kinds = progress_kinds
+                .into_iter()
+                .take(MAX_MODEL_REQUEST_PROGRESS_KINDS)
+                .collect();
             request.next_structured_action_changed = next_structured_action_changed;
             request.unchanged_relevant_state = unchanged_relevant_state;
         }
@@ -2142,6 +2154,9 @@ impl TurnTimingState {
             let relevant_state_fingerprint = state.current_relevant_state_fingerprint.clone();
             let failure_fingerprint = state.current_failure_fingerprint.clone();
             let attempt_kind = std::mem::take(&mut state.next_attempt_kind);
+            if state.model_requests.len() >= MAX_MODEL_REQUEST_TIMINGS {
+                state.model_requests.remove(0);
+            }
             state.model_requests.push(ModelRequestTiming {
                 generation_index,
                 generation_reason,

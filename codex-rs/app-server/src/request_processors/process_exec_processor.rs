@@ -38,6 +38,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::command_exec::StdinWriteRequest;
 use crate::command_exec::spawn_stdin_writer;
+use crate::connection_rpc_gate::ConnectionRpcGate;
 use crate::error_code::internal_error;
 use crate::error_code::invalid_params;
 use crate::error_code::invalid_request;
@@ -71,6 +72,7 @@ impl ProcessExecRequestProcessor {
         &self,
         request_id: ConnectionRequestId,
         params: ProcessSpawnParams,
+        rpc_gate: &ConnectionRpcGate,
     ) -> Result<(), JSONRPCErrorError> {
         self.require_local_environment()?;
         let ProcessSpawnParams {
@@ -125,20 +127,23 @@ impl ProcessExecRequestProcessor {
         let size = size.map(terminal_size_from_protocol).transpose()?;
 
         self.process_exec_manager
-            .start(StartProcessParams {
-                outgoing: self.outgoing.clone(),
-                request_id,
-                process_handle,
-                command,
-                cwd,
-                env,
-                expiration,
-                tty,
-                stream_stdin,
-                stream_stdout_stderr,
-                output_bytes_cap,
-                size,
-            })
+            .start(
+                StartProcessParams {
+                    outgoing: self.outgoing.clone(),
+                    request_id,
+                    process_handle,
+                    command,
+                    cwd,
+                    env,
+                    expiration,
+                    tty,
+                    stream_stdin,
+                    stream_stdout_stderr,
+                    output_bytes_cap,
+                    size,
+                },
+                rpc_gate,
+            )
             .await?;
 
         Ok(())
@@ -246,6 +251,13 @@ struct RunProcessParams {
     stream_stdout_stderr: bool,
     expiration: ExecExpiration,
     output_bytes_cap: Option<usize>,
+    connection_cancellation: CancellationToken,
+    terminal_cleanup: Option<ProcessTerminalCleanup>,
+}
+
+struct ProcessTerminalCleanup {
+    sessions: Arc<Mutex<HashMap<ConnectionProcessHandle, ProcessSession>>>,
+    process_key: ConnectionProcessHandle,
 }
 
 struct SpawnProcessOutputParams {
@@ -257,6 +269,7 @@ struct SpawnProcessOutputParams {
     stream: ProcessOutputStream,
     stream_output: bool,
     output_bytes_cap: Option<usize>,
+    connection_cancellation: CancellationToken,
 }
 
 #[derive(Default)]
@@ -266,7 +279,11 @@ struct ProcessOutputCapture {
 }
 
 impl ProcessExecManager {
-    async fn start(&self, params: StartProcessParams) -> Result<(), JSONRPCErrorError> {
+    async fn start(
+        &self,
+        params: StartProcessParams,
+        rpc_gate: &ConnectionRpcGate,
+    ) -> Result<(), JSONRPCErrorError> {
         let StartProcessParams {
             outgoing,
             request_id,
@@ -281,6 +298,7 @@ impl ProcessExecManager {
             output_bytes_cap,
             size,
         } = params;
+        let connection_cancellation = rpc_gate.cancellation_token().child_token();
 
         let (program, args) = command
             .split_first()
@@ -299,19 +317,20 @@ impl ProcessExecManager {
 
         {
             let mut sessions = self.sessions.lock().await;
-            match sessions.entry(process_key.clone()) {
-                Entry::Occupied(_) => {
-                    return Err(invalid_request(format!(
+            rpc_gate
+                .try_commit(|| match sessions.entry(process_key.clone()) {
+                    Entry::Occupied(_) => Err(invalid_request(format!(
                         "duplicate active process handle: {process_handle:?}",
-                    )));
-                }
-                Entry::Vacant(entry) => {
-                    entry.insert(ProcessSession {
-                        control_tx,
-                        write_tx,
-                    });
-                }
-            }
+                    ))),
+                    Entry::Vacant(entry) => {
+                        entry.insert(ProcessSession {
+                            control_tx,
+                            write_tx,
+                        });
+                        Ok(())
+                    }
+                })
+                .ok_or_else(|| invalid_request("connection is closed"))??;
         }
 
         let spawned = if tty {
@@ -338,11 +357,9 @@ impl ProcessExecManager {
             }
         };
 
-        outgoing
-            .send_response(request_id.clone(), ProcessSpawnResponse {})
-            .await;
-
         let sessions = Arc::clone(&self.sessions);
+        let response_outgoing = Arc::clone(&outgoing);
+        let response_request_id = request_id.clone();
         tokio::spawn(async move {
             run_process(RunProcessParams {
                 outgoing,
@@ -355,10 +372,18 @@ impl ProcessExecManager {
                 stream_stdout_stderr,
                 expiration,
                 output_bytes_cap,
+                connection_cancellation,
+                terminal_cleanup: Some(ProcessTerminalCleanup {
+                    sessions,
+                    process_key,
+                }),
             })
             .await;
-            sessions.lock().await.remove(&process_key);
         });
+
+        response_outgoing
+            .send_response(response_request_id, ProcessSpawnResponse {})
+            .await;
 
         Ok(())
     }
@@ -508,6 +533,8 @@ async fn run_process(params: RunProcessParams) {
         stream_stdout_stderr,
         expiration,
         output_bytes_cap,
+        connection_cancellation,
+        terminal_cleanup,
     } = params;
     let mut control_rx = control_rx;
     let mut control_open = true;
@@ -539,6 +566,7 @@ async fn run_process(params: RunProcessParams) {
         stream: ProcessOutputStream::Stdout,
         stream_output: stream_stdout_stderr,
         output_bytes_cap,
+        connection_cancellation: connection_cancellation.clone(),
     });
     let stderr_handle = collect_spawn_process_output(SpawnProcessOutputParams {
         connection_id: request_id.connection_id,
@@ -549,6 +577,7 @@ async fn run_process(params: RunProcessParams) {
         stream: ProcessOutputStream::Stderr,
         stream_output: stream_stdout_stderr,
         output_bytes_cap,
+        connection_cancellation: connection_cancellation.clone(),
     });
 
     let exit_code = loop {
@@ -609,8 +638,12 @@ async fn run_process(params: RunProcessParams) {
     let stderr = stderr_handle.await.unwrap_or_default();
     timeout_handle.abort();
 
+    if let Some(cleanup) = terminal_cleanup {
+        cleanup.sessions.lock().await.remove(&cleanup.process_key);
+    }
+
     outgoing
-        .send_server_notification_to_connection_and_wait(
+        .send_server_notification_to_connection_bounded(
             request_id.connection_id,
             ServerNotification::ProcessExited(ProcessExitedNotification {
                 process_handle,
@@ -620,6 +653,7 @@ async fn run_process(params: RunProcessParams) {
                 stderr: stderr.text,
                 stderr_cap_reached: stderr.cap_reached,
             }),
+            &connection_cancellation,
         )
         .await;
 }
@@ -634,8 +668,9 @@ fn collect_spawn_process_output(
         mut stdio_timeout_rx,
         outgoing,
         stream,
-        stream_output,
+        mut stream_output,
         output_bytes_cap,
+        connection_cancellation,
     } = params;
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::new();
@@ -666,8 +701,8 @@ fn collect_spawn_process_output(
             };
             cap_reached = Some(observed_num_bytes) == output_bytes_cap;
             if stream_output {
-                outgoing
-                    .send_server_notification_to_connection_and_wait(
+                if !outgoing
+                    .send_server_notification_to_connection_bounded(
                         connection_id,
                         ServerNotification::ProcessOutputDelta(ProcessOutputDeltaNotification {
                             process_handle: process_handle.clone(),
@@ -675,8 +710,13 @@ fn collect_spawn_process_output(
                             delta_base64: STANDARD.encode(capped_chunk),
                             cap_reached,
                         }),
+                        &connection_cancellation,
                     )
-                    .await;
+                    .await
+                {
+                    stream_output = false;
+                    buffer.extend_from_slice(capped_chunk);
+                }
             } else {
                 buffer.extend_from_slice(capped_chunk);
             }
@@ -781,6 +821,8 @@ mod tests {
             stream_stdout_stderr: false,
             expiration: ExecExpiration::Cancellation(CancellationToken::new()),
             output_bytes_cap: Some(DEFAULT_OUTPUT_BYTES_CAP),
+            connection_cancellation: CancellationToken::new(),
+            terminal_cleanup: None,
         }));
 
         let (write_response_tx, mut write_response_rx) = oneshot::channel();
@@ -839,10 +881,7 @@ mod tests {
             message,
             OutgoingMessage::AppServerNotification(ServerNotification::ProcessExited(_))
         ));
-        write_complete_tx
-            .expect("process exit should request a writer receipt")
-            .send(())
-            .expect("run process should await the writer receipt");
+        assert!(write_complete_tx.is_none());
         timeout(Duration::from_secs(1), run_handle)
             .await
             .expect("run process did not finish")

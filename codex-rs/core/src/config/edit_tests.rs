@@ -15,6 +15,46 @@ use tempfile::tempdir;
 use toml::Value as TomlValue;
 
 #[test]
+fn expected_version_is_compared_under_the_persistence_lock() {
+    let tmp = tempdir().expect("tmpdir");
+    let config_path = tmp.path().join(CONFIG_TOML_FILE);
+    std::fs::write(&config_path, "model = \"initial\"\n").expect("seed config");
+    let initial: TomlValue = toml::from_str("model = \"initial\"\n").expect("parse seed");
+    let expected_version = version_for_toml(&initial);
+
+    let writers = ["first", "second"].map(|model| {
+        let config_path = config_path.clone();
+        let expected_version = expected_version.clone();
+        std::thread::spawn(move || {
+            ConfigEditsBuilder::for_config_path(&config_path)
+                .with_edits([ConfigEdit::SetPath {
+                    segments: vec!["model".to_string()],
+                    value: value(model),
+                }])
+                .with_expected_version(Some(expected_version))
+                .apply_blocking_with_outcome()
+                .expect("apply config edit")
+        })
+    });
+
+    let outcomes = writers.map(|writer| writer.join().expect("writer thread"));
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == ConfigApplyOutcome::Applied)
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == ConfigApplyOutcome::VersionConflict)
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn blocking_set_model_top_level() {
     let tmp = tempdir().expect("tmpdir");
     let codex_home = tmp.path();

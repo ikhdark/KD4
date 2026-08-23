@@ -227,6 +227,26 @@ pub fn run_setup_refresh_with_extra_read_roots(
     )
 }
 
+#[cfg(target_os = "windows")]
+pub fn run_strict_read_root_grant(
+    permission_profile: &PermissionProfile,
+    workspace_roots: &[AbsolutePathBuf],
+    command_cwd: &Path,
+    env_map: &HashMap<String, String>,
+    codex_home: &Path,
+    read_root: PathBuf,
+) -> anyhow::Result<()> {
+    codex_windows_sandbox::run_strict_read_root_grant(
+        permission_profile,
+        workspace_roots,
+        command_cwd,
+        env_map,
+        codex_home,
+        read_root,
+        /*proxy_enforced*/ false,
+    )
+}
+
 #[cfg(not(target_os = "windows"))]
 pub fn run_legacy_setup_preflight(
     _permission_profile: &PermissionProfile,
@@ -248,6 +268,18 @@ pub fn run_setup_refresh_with_extra_read_roots(
     _extra_read_roots: Vec<PathBuf>,
 ) -> anyhow::Result<()> {
     anyhow::bail!("Windows sandbox read-root refresh is only supported on Windows")
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn run_strict_read_root_grant(
+    _permission_profile: &PermissionProfile,
+    _workspace_roots: &[AbsolutePathBuf],
+    _command_cwd: &Path,
+    _env_map: &HashMap<String, String>,
+    _codex_home: &Path,
+    _read_root: PathBuf,
+) -> anyhow::Result<()> {
+    anyhow::bail!("Windows sandbox read-root grants are only supported on Windows")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

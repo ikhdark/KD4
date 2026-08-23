@@ -1,0 +1,173 @@
+KD4 RUST BUG FIX: KNOWN DELTA AUDIT FOLLOW-UP
+Date: 2026-08-23
+Project: KD4 local fork of openai/codex
+Revision inspected: 2546d114ed4125d29edd9eeab5ba9ccb21633f21
+Environment: Windows / PowerShell / dirty shared worktree with concurrent agent changes
+
+Evidence source and method
+==========================
+
+This session evaluated the user-provided report beginning "Tool-call and local
+execution overhead / Known Delta does not reduce model tool calls or provider
+tokens." Two delegated read-only agents traced the findings through current source
+and history. Historical audit text was not treated as implementation proof without
+that trace. Direct facts, unresolved product contracts, and benchmark hypotheses are
+separated below.
+
+KD4-KD-FOLLOWUP-001 -- High reasoning effort inherited by every phase
+Severity: High
+Status: FIXED IN WORKING TREE; focused Rust test did not complete
+Confidence: High
+Files: codex-rs/core/src/config/mod.rs and config/config_tests.rs
+Producer/consumer: loaded Config phase policy -> SamplingReasoningGovernor
+Trigger: High turn effort with omitted per-phase TOML fields.
+Actual: inspect, verify, finalize, and deterministic continuation inherited High.
+Expected invariant: established fork defaults apply unless explicitly overridden.
+Cause: effective_reasoning_phase_efforts used unwrap_or_default(), leaving every
+phase absent for later turn-level fallback.
+Fix: restored orient=High, inspect=Low, implement=High, diagnose=High,
+verify=Low, finalize=Low, deterministic=Low. Explicit values still win. Loader
+tests now assert the complete overlay and explicit overrides.
+Risk: Low phases may affect quality. Keeping High everywhere requires the fixed
+quality/latency/token benchmark contract that was not supplied.
+
+KD4-KD-FOLLOWUP-002 -- Windows grantReadRoot false success
+Severity: Critical
+Status: FIXED IN WORKING TREE; supported-profile ACL integration unverified
+Confidence: High for the two established causes
+Files: windows-sandbox-rs/src/{setup.rs,lib.rs,bin/setup_main/win.rs};
+core/src/{windows_sandbox.rs,windows_sandbox_read_grants.rs,
+windows_sandbox_read_grants_tests.rs}
+Producer/consumer: strict core grant helper -> app-server response -> TUI success.
+Actual: unsupported profiles could be converted to Ok; supported requests could
+return before a detached ACL child ran, and mutex contention could skip work while
+still reporting success.
+Expected invariant: success means strict profile resolution and synchronous ACL
+application for the canonical requested directory.
+Fix: introduced run_strict_read_root_grant and ReadAclsOnlyStrict. The strict path
+propagates resolution errors, waits for ACL-only execution, and fails on mutex
+contention. The lenient general setup refresh remains compatible. A Windows-only
+test requires PermissionProfile::Disabled to return an error.
+Unknown/product decision: the V2 request has no thread id and no grant state/revoke
+API exists. ACL lifetime, workspace/thread scope, revocation, and restart policy
+remain undefined and were not invented here.
+
+KD4-KD-FOLLOWUP-003 -- Unbounded terminal persistence repair
+Severity: Critical
+Status: FIXED/STRENGTHENED IN COMBINED WORKING TREE; integration unverified
+Confidence: High for bounded policy and degraded representation
+Files: core/src/{tasks/mod.rs,tasks/mod_tests.rs,task_evidence.rs,
+task_evidence_tests.rs}
+Actual: several repair loops polled every 500 ms forever and placed no timeout
+around a database/rollout attempt. A permanent failure could suppress terminal
+delivery indefinitely.
+Expected invariant: terminalization has bounded liveness and an explicit degraded
+outcome when durable repair cannot complete.
+Fix: shared five-attempt retry policy, capped 100/200/400/800 ms exponential
+backoff, one-second attempt timeout, permanent/transient I/O classification, and
+machine-readable terminal_persistence_degraded Partial completion. Durable
+AuthoritativeTerminalEventV1 now retains the exact rollout repair intent where a
+store accepts it. Tests cover the retry sequence/ceiling, classification, bounded
+drain across many failed repair tasks, and degraded completion semantics.
+Remaining limitation: restart-safe exactly-once delivery is impossible when every
+durable backend is permanently unavailable unless a third durable outbox exists.
+
+KD4-KD-FOLLOWUP-004 -- Orchestrator marker extraction failed open
+Severity: High
+Status: FIXED IN WORKING TREE
+Confidence: High
+File: core/src/context/multi_agent_mode_instructions.rs
+Actual: a missing marker injected the full approximately 14.7 KB orchestrator
+template instead of the intended short root subsection.
+Invariant: optional root policy extraction must be exact and fail closed.
+Fix: require exactly one open and one close marker in order. Missing, duplicate,
+or reversed markers emit a diagnostic and omit the fragment. Tests cover valid
+and malformed variants. Existing rendered world-state fragments already use an
+aggregate byte budget; this separate fail-open fragment was the proven defect.
+
+KD4-KD-FOLLOWUP-005 -- Request-schema Lite cache test could mask divergence
+Severity: Medium future-regression risk
+Status: TEST STRENGTHENED; no current runtime defect
+Confidence: High
+File: core/src/client_tests.rs
+Facts: the key already contains codex.request-schema-cache.v1 and current regular
+and Lite schema components are identical. The former test populated one cache with
+regular mode before observing Lite mode.
+Change: fresh regular and fresh Lite clients now prove equality before the separate
+same-client cache-reuse assertion. No mode bit was added because values do not
+currently diverge and cross-mode reuse is intentional.
+
+KD4-KD-FOLLOWUP-006 -- Typed proof reuse omits semantic dependencies
+Severity: High
+Status: OPEN; established defect, no speculative patch
+Confidence: High
+Files: core/src/task_evidence.rs and shell/unified-exec handlers
+Cause/effect: scoped identity snapshots only declared covered_paths. It does not
+derive Cargo manifests/lockfile, build.rs, generated inputs, rust-toolchain files,
+.cargo config, transitive local dependencies, or the resolved tool binary/version.
+A relevant semantic input can change while a successful proof remains reusable.
+Why open: whole-repository hashing would break the required unrelated-change reuse
+contract. A correct fix needs command/package-aware dependency closure, explicit
+generated-input ownership, and actual tool identity. Concurrent work also modified
+task_evidence throughout this session.
+Required regression matrix: independently change owning manifest, lockfile, build
+script, generated input, toolchain/tool version, transitive local dependency,
+workspace root, and environment; each relevant change invalidates while an
+unrelated file does not.
+
+KD4-KD-FOLLOWUP-007 -- Known Delta hit profitability and remint overhead
+Severity: Medium performance/cost risk
+Status: BENCHMARK-BLOCKED; no optimization edit authorized by repository contract
+Confidence: High that the copy/write/render path exists; unknown release impact
+Facts: a hit still incurs the model tool call and returned provider tokens, local
+validation/read/render work, and a per-thread immutable-blob remint. Router counters
+measure reuse; they do not establish latency improvement.
+Missing mandatory optimization inputs: exact cold/warm/hit workload commands and
+fixtures for small/large outputs; quality gate; release profile/environment; sample
+count; acceptance statistic (including p50/p90 if required); latency threshold;
+bytes-written definition; token metric and budget. The same passing baseline and
+candidate workload must be used. A content-addressed reference/hardlink/shared
+artifact remains a hypothesis until that A/B proof exists.
+
+KD4-KD-FOLLOWUP-008 -- Router telemetry described as speedup
+Severity: Informational
+Status: NO DEFECT / NO CODE CHANGE
+Confidence: High
+Disposition: the parent already reused routers. New counters expose reuse/rebuild
+events but are not performance evidence.
+
+Validation and exact results
+============================
+
+Passed:
+- cargo fmt --all -- --check (exit 0; stable rustfmt emitted only warnings that
+  nightly-only imports_granularity could not be applied)
+- just source-map-check (exit 0; source map, ASCII, TOC, and ownership checks)
+- git diff --check before final record creation found no code whitespace error;
+  only line-ending conversion warnings occurred.
+
+Focused command attempted with isolated target:
+  cargo test -p codex-core --lib terminal_repair --no-fail-fast
+
+No direct test is claimed as passed. The shared worktree changed repeatedly during
+the first-time build. Failures encountered and repaired or superseded included
+missing agent-task-store helper definitions; private ResponseItem/ContentItem import
+paths; missing PathExt import; a moved MCP CancellationToken; and omitted terminal
+degraded helper/constant. The final retry was invalidated as an fs2 import and its
+new core dependency arrived at different points in Cargo graph resolution. The
+working tree later contained fs2 and a Cargo.lock update. The user directed that
+test instability should no longer block task completion, so no further Rust test
+run was made.
+
+No broad test, release build, publish doctor, activation, deployment, upstream
+mutation, GitHub mutation, or benchmark was performed.
+
+Follow-up required
+==================
+
+1. Freeze the concurrent tree and run the named focused filters for phase defaults,
+Windows grants, terminal repair, orchestration extraction, and schema cache; then
+run supported-profile ACL/idempotency and app-server error integration on Windows.
+2. Implement command/package-aware proof dependency closure with the stated matrix.
+3. Supply the complete Known Delta workload, quality, latency, and token contract.
+4. Choose read-grant lifetime/scope/revocation semantics before changing protocol.

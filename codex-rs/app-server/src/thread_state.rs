@@ -36,6 +36,8 @@ use tracing::error;
 type PendingInterruptQueue = Vec<ConnectionRequestId>;
 const MAX_TRACKED_TURN_ORIGINS: usize = 256;
 const MAX_TRACKED_IN_FLIGHT_TASKS: usize = 1_024;
+const MAX_ACKNOWLEDGED_TERMINAL_LEDGER_ENTRIES: usize = 1_024;
+pub(crate) const THREAD_LISTENER_COMMAND_CAPACITY: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct InFlightTaskReference {
@@ -47,6 +49,7 @@ pub(crate) struct InFlightTaskReference {
 pub(crate) enum InFlightTaskClaim {
     Claimed,
     Existing(InFlightTaskReference),
+    CapacityExceeded,
 }
 
 #[derive(Default)]
@@ -178,6 +181,13 @@ pub(crate) enum ThreadListenerCommand {
     },
 }
 
+pub(crate) fn thread_listener_command_channel() -> (
+    mpsc::Sender<ThreadListenerCommand>,
+    mpsc::Receiver<ThreadListenerCommand>,
+) {
+    mpsc::channel(THREAD_LISTENER_COMMAND_CAPACITY)
+}
+
 /// Per-conversation accumulation of the latest states e.g. error message while a turn runs.
 #[derive(Default, Clone)]
 pub(crate) struct TurnSummary {
@@ -213,6 +223,7 @@ struct TerminalLedgerEntry {
     origin_connection_id: Option<ConnectionId>,
     accepted_connection_ids: HashSet<ConnectionId>,
     notification_accepted: bool,
+    acknowledged_queued: bool,
 }
 
 #[derive(Default)]
@@ -223,11 +234,12 @@ pub(crate) struct ThreadState {
     pub(crate) last_terminal_turn_id: Option<String>,
     active_turn_id: Option<String>,
     terminal_ledger: HashMap<String, TerminalLedgerEntry>,
+    acknowledged_terminal_order: VecDeque<String>,
     pub(crate) cancel_tx: Option<oneshot::Sender<()>>,
     pub(crate) experimental_raw_events: bool,
     pub(crate) listener_generation: u64,
     last_thread_settings: Option<ThreadSettings>,
-    listener_command_tx: Option<mpsc::UnboundedSender<ThreadListenerCommand>>,
+    listener_command_tx: Option<mpsc::Sender<ThreadListenerCommand>>,
     current_turn_history: ThreadHistoryBuilder,
     turn_origin_tracker: TurnOriginTracker,
     listener_thread: Option<Weak<CodexThread>>,
@@ -248,13 +260,13 @@ impl ThreadState {
         conversation: &Arc<CodexThread>,
         watch_registration: WatchRegistration,
         thread_settings_baseline: ThreadSettings,
-    ) -> (mpsc::UnboundedReceiver<ThreadListenerCommand>, u64) {
+    ) -> (mpsc::Receiver<ThreadListenerCommand>, u64) {
         if let Some(previous) = self.cancel_tx.replace(cancel_tx) {
             let _ = previous.send(());
         }
         self.listener_generation = self.listener_generation.wrapping_add(1);
         self.last_thread_settings = Some(thread_settings_baseline);
-        let (listener_command_tx, listener_command_rx) = mpsc::unbounded_channel();
+        let (listener_command_tx, listener_command_rx) = thread_listener_command_channel();
         self.listener_command_tx = Some(listener_command_tx);
         self.listener_thread = Some(Arc::downgrade(conversation));
         self.watch_registration = watch_registration;
@@ -275,9 +287,7 @@ impl ThreadState {
         self.experimental_raw_events = enabled;
     }
 
-    pub(crate) fn listener_command_tx(
-        &self,
-    ) -> Option<mpsc::UnboundedSender<ThreadListenerCommand>> {
+    pub(crate) fn listener_command_tx(&self) -> Option<mpsc::Sender<ThreadListenerCommand>> {
         self.listener_command_tx.clone()
     }
 
@@ -364,6 +374,7 @@ impl ThreadState {
                 origin_connection_id: None,
                 accepted_connection_ids: HashSet::new(),
                 notification_accepted: false,
+                acknowledged_queued: false,
             },
         );
         TerminalEventDisposition::Apply { fingerprint }
@@ -395,6 +406,7 @@ impl ThreadState {
                     origin_connection_id: None,
                     accepted_connection_ids: HashSet::new(),
                     notification_accepted: false,
+                    acknowledged_queued: false,
                 });
             if retained_active_turn_id.as_deref() == Some(turn_id) {
                 retained_active_turn_id = None;
@@ -410,6 +422,7 @@ impl ThreadState {
             && entry.fingerprint == fingerprint
         {
             entry.state_reduced = true;
+            self.queue_acknowledged_terminal_tombstone(turn_id);
         }
     }
 
@@ -464,9 +477,48 @@ impl ThreadState {
         if let Some(entry) = self.terminal_ledger.get_mut(turn_id)
             && entry.fingerprint == fingerprint
         {
+            entry.notification_accepted = true;
             entry.notification = None;
             entry.origin_connection_id = None;
             entry.accepted_connection_ids.clear();
+            self.queue_acknowledged_terminal_tombstone(turn_id);
+        }
+    }
+
+    fn queue_acknowledged_terminal_tombstone(&mut self, turn_id: &str) {
+        let Some(entry) = self.terminal_ledger.get_mut(turn_id) else {
+            return;
+        };
+        if !entry.state_reduced
+            || !entry.notification_accepted
+            || entry.notification.is_some()
+            || entry.acknowledged_queued
+        {
+            return;
+        }
+        entry.acknowledged_queued = true;
+        self.acknowledged_terminal_order
+            .push_back(turn_id.to_string());
+        self.prune_acknowledged_terminal_ledger();
+    }
+
+    fn prune_acknowledged_terminal_ledger(&mut self) {
+        while self.acknowledged_terminal_order.len() > MAX_ACKNOWLEDGED_TERMINAL_LEDGER_ENTRIES {
+            let Some(expired_turn_id) = self.acknowledged_terminal_order.pop_front() else {
+                break;
+            };
+            let is_acknowledged_tombstone =
+                self.terminal_ledger
+                    .get(&expired_turn_id)
+                    .is_some_and(|entry| {
+                        entry.state_reduced
+                            && entry.notification_accepted
+                            && entry.notification.is_none()
+                            && entry.acknowledged_queued
+                    });
+            if is_acknowledged_tombstone {
+                self.terminal_ledger.remove(&expired_turn_id);
+            }
         }
     }
 
@@ -508,6 +560,7 @@ pub(crate) async fn resolve_server_request_on_thread_listener(
             request_id,
             completion_tx,
         })
+        .await
         .is_err()
     {
         error!(
@@ -650,6 +703,49 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn in_flight_task_capacity_never_evicts_live_fingerprints() {
+        let manager = ThreadStateManager::new();
+        let original_thread = ThreadId::new();
+
+        for index in 0..MAX_TRACKED_IN_FLIGHT_TASKS {
+            assert_eq!(
+                manager
+                    .claim_in_flight_task(
+                        format!("fingerprint-{index}"),
+                        original_thread,
+                        format!("turn-{index}"),
+                    )
+                    .await,
+                InFlightTaskClaim::Claimed
+            );
+        }
+
+        assert_eq!(
+            manager
+                .claim_in_flight_task(
+                    "overflow".to_string(),
+                    ThreadId::new(),
+                    "overflow-turn".to_string(),
+                )
+                .await,
+            InFlightTaskClaim::CapacityExceeded
+        );
+        assert_eq!(
+            manager
+                .claim_in_flight_task(
+                    "fingerprint-0".to_string(),
+                    ThreadId::new(),
+                    "duplicate-turn".to_string(),
+                )
+                .await,
+            InFlightTaskClaim::Existing(InFlightTaskReference {
+                thread_id: original_thread,
+                turn_id: "turn-0".to_string(),
+            })
+        );
+    }
+
     #[test]
     fn identical_terminal_replay_retries_only_pending_notification_targets() {
         let mut state = ThreadState::default();
@@ -722,6 +818,94 @@ mod tests {
             state.classify_terminal_event("turn-1", &event, &[ConnectionId(7)]),
             TerminalEventDisposition::Acknowledge { .. }
         ));
+    }
+
+    #[test]
+    fn terminal_ledger_bounds_acknowledged_tombstones_without_evicting_pending_delivery() {
+        let mut state = ThreadState::default();
+
+        let unreduced_event = terminal_event("unreduced", "done");
+        let unreduced_fingerprint =
+            terminal_event_fingerprint(&unreduced_event).expect("terminal fingerprint");
+        assert!(matches!(
+            state.classify_terminal_event("unreduced", &unreduced_event, &[]),
+            TerminalEventDisposition::Apply { .. }
+        ));
+        state.mark_terminal_acknowledged("unreduced", &unreduced_fingerprint);
+
+        let pending_event = terminal_event("pending", "done");
+        let pending_fingerprint =
+            terminal_event_fingerprint(&pending_event).expect("terminal fingerprint");
+        assert!(matches!(
+            state.classify_terminal_event("pending", &pending_event, &[ConnectionId(7)]),
+            TerminalEventDisposition::Apply { .. }
+        ));
+        state.mark_terminal_state_reduced("pending", &pending_fingerprint);
+        assert!(!state.record_terminal_notification_attempt(
+            "pending",
+            &pending_fingerprint,
+            cached_notification(),
+            Some(ConnectionId(7)),
+            &[ConnectionId(7)],
+            &[],
+        ));
+
+        for index in 0..=MAX_ACKNOWLEDGED_TERMINAL_LEDGER_ENTRIES {
+            let turn_id = format!("acknowledged-{index}");
+            let event = terminal_event(&turn_id, "done");
+            let fingerprint = terminal_event_fingerprint(&event).expect("terminal fingerprint");
+            assert!(matches!(
+                state.classify_terminal_event(&turn_id, &event, &[]),
+                TerminalEventDisposition::Apply { .. }
+            ));
+            state.mark_terminal_state_reduced(&turn_id, &fingerprint);
+            state.mark_terminal_acknowledged(&turn_id, &fingerprint);
+        }
+
+        let newest_turn_id = format!("acknowledged-{}", MAX_ACKNOWLEDGED_TERMINAL_LEDGER_ENTRIES);
+        let newest_fingerprint = state
+            .terminal_ledger
+            .get(&newest_turn_id)
+            .expect("newest acknowledged tombstone")
+            .fingerprint
+            .clone();
+        state.mark_terminal_acknowledged(&newest_turn_id, &newest_fingerprint);
+
+        assert!(!state.terminal_ledger.contains_key("acknowledged-0"));
+        assert!(state.terminal_ledger.contains_key(&newest_turn_id));
+        assert_eq!(
+            state.acknowledged_terminal_order.len(),
+            MAX_ACKNOWLEDGED_TERMINAL_LEDGER_ENTRIES
+        );
+        assert_eq!(
+            state.terminal_ledger.len(),
+            MAX_ACKNOWLEDGED_TERMINAL_LEDGER_ENTRIES + 2
+        );
+
+        let unreduced = state
+            .terminal_ledger
+            .get("unreduced")
+            .expect("unreduced entry must remain");
+        assert!(!unreduced.state_reduced);
+        assert!(!unreduced.acknowledged_queued);
+
+        state.mark_terminal_state_reduced("unreduced", &unreduced_fingerprint);
+        let reduced_tombstone = state
+            .terminal_ledger
+            .get("unreduced")
+            .expect("newest acknowledged tombstone must remain");
+        assert!(reduced_tombstone.state_reduced);
+        assert!(reduced_tombstone.acknowledged_queued);
+        assert!(!state.terminal_ledger.contains_key("acknowledged-1"));
+
+        let pending = state
+            .terminal_ledger
+            .get("pending")
+            .expect("notification-pending entry must remain");
+        assert!(pending.state_reduced);
+        assert!(!pending.notification_accepted);
+        assert!(pending.notification.is_some());
+        assert!(!pending.acknowledged_queued);
     }
 
     #[test]
@@ -856,8 +1040,7 @@ pub(crate) struct ThreadStateManager {
     state: Arc<Mutex<ThreadStateManagerInner>>,
     // Extension event sinks are synchronous, so they need an await-free way to
     // enqueue work on the active per-thread listener.
-    listener_commands:
-        Arc<StdMutex<HashMap<ThreadId, mpsc::UnboundedSender<ThreadListenerCommand>>>>,
+    listener_commands: Arc<StdMutex<HashMap<ThreadId, mpsc::Sender<ThreadListenerCommand>>>>,
 }
 
 fn core_lease_id(lease: &OutOfBandElicitationLeaseKey) -> OutOfBandElicitationLeaseId {
@@ -930,6 +1113,12 @@ impl ThreadStateManager {
             return InFlightTaskClaim::Existing(existing.clone());
         }
 
+        // This map is live correctness state. Evicting an active fingerprint
+        // would admit the same task again while its original execution runs.
+        if state.in_flight_tasks.len() >= MAX_TRACKED_IN_FLIGHT_TASKS {
+            return InFlightTaskClaim::CapacityExceeded;
+        }
+
         state.in_flight_tasks.insert(
             fingerprint.clone(),
             InFlightTaskReference {
@@ -938,20 +1127,6 @@ impl ThreadStateManager {
             },
         );
         state.in_flight_task_order.push_back((fingerprint, turn_id));
-        while state.in_flight_tasks.len() > MAX_TRACKED_IN_FLIGHT_TASKS {
-            let Some((expired_fingerprint, expired_turn_id)) =
-                state.in_flight_task_order.pop_front()
-            else {
-                break;
-            };
-            if state
-                .in_flight_tasks
-                .get(&expired_fingerprint)
-                .is_some_and(|entry| entry.turn_id == expired_turn_id)
-            {
-                state.in_flight_tasks.remove(&expired_fingerprint);
-            }
-        }
         InFlightTaskClaim::Claimed
     }
 
@@ -1046,14 +1221,15 @@ impl ThreadStateManager {
             .map_or(0, HashMap::len)
     }
 
-    pub(crate) async fn first_attestation_capable_connection_for_thread(
+    pub(crate) async fn attestation_capable_connections_for_thread(
         &self,
         thread_id: ThreadId,
-    ) -> Option<ConnectionId> {
+    ) -> Vec<ConnectionId> {
         let state = self.state.lock().await;
-        state
-            .threads
-            .get(&thread_id)?
+        let Some(thread) = state.threads.get(&thread_id) else {
+            return Vec::new();
+        };
+        let mut connection_ids = thread
             .connection_ids
             .iter()
             .filter_map(|connection_id| {
@@ -1063,7 +1239,20 @@ impl ThreadStateManager {
                     .request_attestation
                     .then_some(*connection_id)
             })
-            .min_by_key(|connection_id| connection_id.0)
+            .collect::<Vec<_>>();
+        connection_ids.sort_by_key(|connection_id| connection_id.0);
+        connection_ids
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn first_attestation_capable_connection_for_thread(
+        &self,
+        thread_id: ThreadId,
+    ) -> Option<ConnectionId> {
+        self.attestation_capable_connections_for_thread(thread_id)
+            .await
+            .into_iter()
+            .next()
     }
 
     pub(crate) async fn wait_for_thread_subscriber(&self, thread_id: ThreadId) {
@@ -1132,7 +1321,7 @@ impl ThreadStateManager {
     pub(crate) fn current_listener_command_tx(
         &self,
         thread_id: ThreadId,
-    ) -> Option<mpsc::UnboundedSender<ThreadListenerCommand>> {
+    ) -> Option<mpsc::Sender<ThreadListenerCommand>> {
         self.listener_commands
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1143,7 +1332,7 @@ impl ThreadStateManager {
     pub(crate) fn register_listener_command_tx(
         &self,
         thread_id: ThreadId,
-        tx: mpsc::UnboundedSender<ThreadListenerCommand>,
+        tx: mpsc::Sender<ThreadListenerCommand>,
     ) {
         self.listener_commands
             .lock()

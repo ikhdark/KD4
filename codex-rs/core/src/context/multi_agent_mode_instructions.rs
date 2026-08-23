@@ -9,12 +9,75 @@ const ORCHESTRATOR_TEMPLATE: &str = include_str!("../../templates/agents/orchest
 const ROOT_ORCHESTRATION_OPEN: &str = "<!-- runtime-root-orchestration:start -->";
 const ROOT_ORCHESTRATION_CLOSE: &str = "<!-- runtime-root-orchestration:end -->";
 
+fn extract_root_orchestration_text(template: &str) -> Option<&str> {
+    let (before_open, after_open) = template.split_once(ROOT_ORCHESTRATION_OPEN)?;
+    let (body, after_close) = after_open.split_once(ROOT_ORCHESTRATION_CLOSE)?;
+    if before_open.contains(ROOT_ORCHESTRATION_OPEN)
+        || before_open.contains(ROOT_ORCHESTRATION_CLOSE)
+        || body.contains(ROOT_ORCHESTRATION_OPEN)
+        || body.contains(ROOT_ORCHESTRATION_CLOSE)
+        || after_close.contains(ROOT_ORCHESTRATION_OPEN)
+        || after_close.contains(ROOT_ORCHESTRATION_CLOSE)
+    {
+        return None;
+    }
+    let body = body.trim();
+    (!body.is_empty()).then_some(body)
+}
+
 fn root_orchestration_text() -> &'static str {
-    ORCHESTRATOR_TEMPLATE
-        .split_once(ROOT_ORCHESTRATION_OPEN)
-        .and_then(|(_, remainder)| remainder.split_once(ROOT_ORCHESTRATION_CLOSE))
-        .map(|(body, _)| body.trim())
-        .unwrap_or(ORCHESTRATOR_TEMPLATE.trim())
+    extract_root_orchestration_text(ORCHESTRATOR_TEMPLATE).unwrap_or_else(|| {
+        tracing::error!(
+            "orchestrator template must contain exactly one ordered runtime root section"
+        );
+        ""
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ROOT_ORCHESTRATION_CLOSE;
+    use super::ROOT_ORCHESTRATION_OPEN;
+    use super::extract_root_orchestration_text;
+    use super::root_orchestration_text;
+
+    #[test]
+    fn extracts_exactly_one_ordered_root_orchestration_section() {
+        let template = format!(
+            "preamble\n{ROOT_ORCHESTRATION_OPEN}\n runtime policy \n{ROOT_ORCHESTRATION_CLOSE}\nappendix"
+        );
+
+        assert_eq!(
+            extract_root_orchestration_text(&template),
+            Some("runtime policy")
+        );
+        assert!(!root_orchestration_text().is_empty());
+    }
+
+    #[test]
+    fn malformed_root_orchestration_markers_fail_closed() {
+        let cases = [
+            "no markers".to_string(),
+            format!("{ROOT_ORCHESTRATION_OPEN} body"),
+            format!("body {ROOT_ORCHESTRATION_CLOSE}"),
+            format!("{ROOT_ORCHESTRATION_CLOSE} body {ROOT_ORCHESTRATION_OPEN}"),
+            format!(
+                "{ROOT_ORCHESTRATION_OPEN} first {ROOT_ORCHESTRATION_OPEN} second {ROOT_ORCHESTRATION_CLOSE}"
+            ),
+            format!(
+                "{ROOT_ORCHESTRATION_OPEN} first {ROOT_ORCHESTRATION_CLOSE} second {ROOT_ORCHESTRATION_CLOSE}"
+            ),
+            format!("{ROOT_ORCHESTRATION_OPEN}   {ROOT_ORCHESTRATION_CLOSE}"),
+        ];
+
+        for template in cases {
+            assert_eq!(
+                extract_root_orchestration_text(&template),
+                None,
+                "{template}"
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

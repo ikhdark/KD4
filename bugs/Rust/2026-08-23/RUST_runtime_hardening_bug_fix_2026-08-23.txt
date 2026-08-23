@@ -1,0 +1,128 @@
+KD4 runtime concurrency, persistence, retention, and cleanup fixes
+Fix date: 2026-08-23
+Implementation language: Rust
+Project: local KD4 fork of openai/codex
+Starting revision: 2546d114ed4125d29edd9eeab5ba9ccb21633f21
+Session status: IMPLEMENTED; focused validation was curtailed because many concurrent Cargo/rustc jobs occupied the shared build lane.
+
+Evidence classification
+-----------------------
+Facts below were established from the named source paths and working-tree diffs. Hypotheses are explicitly labeled. No runtime result is claimed unless a command and exit result are recorded. The checkout contained unrelated concurrent changes; this session preserved them and merged only contract-compatible edits.
+
+RUST-RUNTIME-2026-08-23-001 - model catalog state used independently acquired locks
+Severity: high. Status: fixed. Confidence: high.
+Producer and consumer: OpenAiModelsManager publishes the remote catalog, ETag, and active cache identity; model selection and refresh consumers read those values.
+Affected files/symbols: codex-rs/models-manager/src/manager.rs, OpenAiModelsManager, ensure_current_cache_identity, ETag refresh worker; codex-rs/models-manager/src/manager_tests.rs.
+Trigger and actual behavior: concurrent identity changes, fetch completion, and ETag refresh acquired separate RwLocks using joined acquisition. Different paths could observe or publish catalog and validator values from different logical generations, and inconsistent lock combinations increased deadlock risk.
+Expected invariant: catalog, validator, and identity form one coherent state snapshot and have one lock order.
+Established cause: the three fields were independent RwLocks and multiple operations attempted combined acquisition.
+Implemented fix: replace them with one RwLock<ModelState>; make identity-scoped publication validate identity before updating the catalog and ETag together; clean up abnormal ETag worker exit state.
+Direct regressions: concurrent_model_state_access_completes_with_coherent_snapshots; etag_refresh_worker_recovers_after_abnormal_exit.
+Risk: refresh throughput is serialized at the state publication point, intentionally trading a short critical section for coherence.
+
+RUST-RUNTIME-2026-08-23-002 - connection shutdown did not cancel owned RPC work
+Severity: high. Status: fixed. Confidence: high.
+Producer and consumer: ConnectionRpcGate admits app-server RPC futures; per-connection shutdown must stop their execution before connection resources are released.
+Affected files: codex-rs/app-server/src/connection_rpc_gate.rs and request integration in app-server processors.
+Actual behavior: closing admission prevented some later work but did not provide a real cancellation signal to already running futures; queued or unpolled work could outlive the connection.
+Expected invariant: close rejects late admission, cancels running connection-owned RPC futures, prevents queued futures from being polled, and waits until in-flight accounting reaches zero.
+Implemented fix: add a CancellationToken, biased cancellation selection, commit gating, and shutdown waiting.
+Direct regressions: connection_rpc_gate::tests, including shutdown_of_live_gate_cancels_running_and_skips_already_queued_requests.
+
+RUST-RUNTIME-2026-08-23-003 - resource cleanup depended on outbound writer acknowledgement
+Severity: high. Status: fixed. Confidence: high.
+Producer and consumer: command/process output relays and filesystem-watch notifications enqueue outbound messages; process/session/watcher owners perform cleanup after delivery work.
+Affected files: codex-rs/app-server/src/command_exec.rs, request_processors/process_exec_processor.rs, fs_watch.rs, outgoing_message.rs.
+Actual behavior: relays used send_server_notification_to_connection_and_wait, so a client writer that never acknowledged could retain relay tasks and the resources cleaned up behind them.
+Expected invariant: bounded enqueue preserves admitted FIFO order, but process/session/watcher cleanup does not depend on a remote writer acknowledgment. Any remaining explicit acknowledgment waiter has a finite deadline.
+Implemented fix: lifecycle relays now use bounded outbound enqueue without writer acknowledgements; the acknowledgement helper is deadline bounded.
+Direct regressions: output_delivery_relay_finishes_without_writer_ack_and_preserves_fifo; process output and filesystem watcher cleanup tests; send_server_notification_to_connection_and_wait_times_out_without_ack.
+
+RUST-RUNTIME-2026-08-23-004 - request, listener, and mailbox admission could grow without bound
+Severity: high. Status: fixed. Confidence: high.
+Producers and consumers: app-server request serialization queues feed RPC execution; per-thread listener commands feed the serialized listener; core mailbox input feeds agent turns.
+Affected files: codex-rs/app-server/src/request_serialization.rs, message_processor.rs, thread_state.rs, extensions.rs, request_processors/thread_goal_processor.rs, thread_processor.rs, thread_lifecycle.rs; codex-rs/core/src/session/input_queue.rs.
+Actual behavior: serialized request keys, thread-listener commands, and mailbox pending/history structures admitted unbounded work or retained unbounded identifiers.
+Expected invariant: overload is rejected or backpressured at explicit total/per-key capacities; rejected futures are not polled; mailbox retry IDs are not poisoned by rejected admission.
+Implemented fix: request serialization uses total 1024, per-key 64, and shared read concurrency 16 limits with deterministic JSON-RPC overload error -32001; listener commands use a bounded queue and bounded-safe synchronous admission; mailbox pending entries cap at 1024 and seen-ID history at 4096, rejecting before marking an ID seen.
+Direct regressions: per_key_limit_rejects_without_polling_request; total_limit_rejects_across_keys; admission_recovers_after_queue_drains; shared_read_batch_respects_concurrency_limit; listener_command_admission_is_bounded; mailbox_admission_is_bounded_without_poisoning_retries.
+
+RUST-RUNTIME-2026-08-23-005 - config and model-cache persistence lacked cross-process CAS
+Severity: high. Status: fixed. Confidence: high from source inspection; focused runtime tests pending.
+Config producer/consumer: app-server ConfigManager validates expectedVersion and ConfigEditsBuilder persists config.toml; other Codex processes may write the same file.
+Config affected files: codex-rs/utils/path-utils/src/lib.rs and path_utils_tests.rs; core/src/config/edit.rs and edit_tests.rs; app-server/src/config_manager_service.rs and config_manager_service_tests.rs; applicable Cargo manifests and Cargo.lock.
+Config sequence and cause: app-server loaded a version and compared expectedVersion before the core writer re-read and atomically replaced the file. No sibling advisory lock covered compare/read/modify/replace. A missing-file path also eagerly wrote an empty file outside the persistence boundary.
+Config invariant: all participating processes serialize on the same sibling lock; expectedVersion is compared against the bytes read while holding that lock; the winner atomically replaces the file; a stale contender returns ConfigVersionConflict without writing.
+Config fix: the shared path utility exposes a canonical sibling advisory lock and durable atomic replacement; ConfigEditsBuilder accepts an expected version and returns Applied or VersionConflict; core persistence holds the lock across re-read, canonical TOML version comparison, edit, and atomic replace; missing layers no longer create an empty file before this boundary.
+Config direct regressions: expected_version_is_compared_under_the_persistence_lock; concurrent_writes_with_the_same_version_have_one_winner.
+Model-cache producer/consumer: ModelsCacheManager persists models_cache.json used by independent OpenAiModelsManager instances. The pre-fix Semaphore serialized only one manager instance and fs::write was not atomic across processes.
+Model-cache expected invariant: sibling advisory lock, atomic replacement, and stable revision/CAS prevent an older fetch or TTL renewal from overwriting a newer snapshot; identity/client/ETag checks occur under the lock.
+Model-cache affected files: codex-rs/models-manager/Cargo.toml, src/cache.rs, src/manager.rs, and src/manager_tests.rs, plus the shared path utility and generated Cargo.lock.
+Model-cache fix: cache files carry a monotonically increasing persisted revision. Legacy valid JSON and opaque bytes remain byte-stable CAS bases. Each fetch or TTL renewal captures the disk revision, client version, provider identity, and ETag before the remote operation, then revalidates the full basis while holding the sibling cross-process lock before a durable atomic replacement. The manager's identity-scoped in-memory catalog and ETag are also published together through the coherent ModelState lock.
+Model-cache direct regressions: stale_manager_cannot_overwrite_newer_cross_process_revision; stale_ttl_renewal_cannot_rewrite_newer_cross_process_revision; older_openai_manager_fetch_cannot_overwrite_newer_process_cache.
+
+RUST-RUNTIME-2026-08-23-006 - task snapshots were taken inside SQLite transactions
+Severity: medium. Status: fixed. Confidence: high.
+Producer and consumer: codex-agent-task-store mutation evidence snapshots copy task artifacts while SQLite mutation transactions serialize durable state.
+Affected files: codex-rs/agent-task-store/src/local.rs and tests.rs.
+Actual behavior: filesystem snapshot work could execute while a SQLite transaction remained open, increasing lock duration and blocking unrelated durable work.
+Expected invariant: expensive filesystem snapshots occur outside SQLite transactions; the write transaction revalidates the candidate before committing metadata; failed/replaced candidates clean references.
+Implemented fix: select unique candidates, snapshot before opening the final write transaction, revalidate within that transaction, and clean unused snapshot references.
+Integration correction: tests.rs initially omitted explicit imports for the new test-only snapshot pause helpers from local.rs, causing E0425/E0433 compile errors. The missing imports were added without changing runtime behavior.
+Direct regression: mutation_evidence_keeps_private_prewrite_snapshot.
+
+RUST-RUNTIME-2026-08-23-007 - durable wake polling was duplicated per waiter
+Severity: medium. Status: fixed. Confidence: high.
+Producer and consumer: agent-task-store waiters observe commits made by independent store instances/processes.
+Affected files: codex-rs/agent-task-store/src/local.rs and tests.rs.
+Actual behavior: each waiter could create its own polling loop, multiplying PRAGMA/data-version activity and timers.
+Expected invariant: one lazy store-level poller observes durable change and fans out wakeups to all waiters.
+Implemented fix: add a shared DurableWakePoller using PRAGMA data_version, a 250 ms polling interval, and watch-channel fanout.
+Direct regression: wake_wait_observes_a_commit_from_an_independent_store_instance.
+
+RUST-RUNTIME-2026-08-23-008 - MCP startup occurred under the publication lock
+Severity: high. Status: fixed. Confidence: high.
+Producer and consumer: session MCP refresh constructs/authenticates a new runtime, then publishes it for tool consumers.
+Affected files: codex-rs/core/src/session/mcp.rs and session/tests.rs.
+Actual behavior: slow MCP startup/authentication held mcp_projection_lock, blocking consumers of the still-valid previous runtime and creating lock/cancellation coupling.
+Expected invariant: startup occurs outside the short publication critical section; publication revalidates candidate identity; stale/cancelled candidates are shut down and the previous runtime remains usable.
+Implemented fix: build and authenticate outside the lock, then compare Arc identity and publish under the lock; clean stale candidates.
+Direct regression: refresh_mcp_servers_keeps_the_previous_runtime_alive.
+
+RUST-RUNTIME-2026-08-23-009 - terminal IDs, mailbox IDs, and timing histories retained forever
+Severity: medium. Status: fixed. Confidence: high.
+Producers and consumers: app-server ThreadState terminal replay ledger; core mailbox deduplication; turn timing diagnostic histories.
+Affected files: codex-rs/app-server/src/thread_state.rs; codex-rs/core/src/session/input_queue.rs; core/src/turn_timing.rs and turn_timing_tests.rs.
+Actual behavior: acknowledged terminal tombstones, seen mailbox identifiers, request timing entries, physical-attempt IDs, and progress-kind maps could grow for the lifetime of their owner.
+Expected invariant: terminal entries awaiting reduction/delivery are never evicted; completed tombstones and diagnostic histories have explicit oldest-first caps; exact aggregate counters remain exact.
+Implemented fix: retain at most 1024 acknowledged terminal tombstones, 4096 mailbox IDs, 1024 request timing records, 64 physical attempt IDs, and 64 progress kinds; evict oldest retained diagnostics while preserving aggregate counts.
+Direct regressions: terminal_ledger_bounds_acknowledged_tombstones_without_evicting_pending_delivery; seen_mailbox_ids_evict_the_oldest_history_entry; timing_histories_evict_oldest_entries_at_their_caps.
+Risk: detailed timing diagnostics describe the retained tail once the cap is exceeded; aggregate request counters remain exact.
+
+RUST-RUNTIME-2026-08-23-010 - spill, watcher, and Windows job cleanup was incomplete
+Severity: high. Status: fixed. Confidence: high from source diff; platform runtime proof pending.
+Producers and consumers: hook output spilling creates files; file-watcher registrations own OS watches; Windows sandbox launches processes assigned to job objects.
+Affected files: codex-rs/hooks/src/output_spill.rs and tests; codex-rs/file-watcher/src/lib.rs and file_watcher_tests.rs; codex-rs/windows-sandbox-rs/src/lib.rs, setup.rs, bin/setup_main/win.rs; codex-rs/core/src/windows_sandbox.rs and Windows read-grant tests.
+Actual behavior: spill files had no complete age/count/byte retention cleanup; failed unwatch operations could leave watcher state divergent; sandbox job handles/process cleanup was not consistently wired through abnormal exit.
+Expected invariant: spill retention is bounded, watcher teardown failures remain tracked and are reconciled, and Windows job ownership terminates contained processes on cleanup.
+Implemented fix: invoke spill cleanup with age/count/byte policies; retain degraded watcher state and reconcile it; use job termination/RAII cleanup wiring for Windows sandbox setup and process ownership.
+Direct regressions are located in output_spill_tests.rs, file_watcher_tests.rs, windows-sandbox-rs/setup tests, and core Windows sandbox tests.
+
+Validation evidence and limitations
+-----------------------------------
+- `rustfmt --edition 2024 --check` completed successfully for the integrated config CAS, model manager/cache, writer acknowledgement, and listener admission source/test files, with only stable-toolchain warnings that nightly-only imports_granularity could not be set.
+- `git diff --check` exited successfully; output contained only line-ending conversion warnings.
+- `just source-map-check` exited successfully after the dated fix record was added; source-map structure, ASCII policy, table of contents markers, and owner relationships all passed.
+- `just test-fast -p codex-hooks output_spill` exited 0: 5 passed, 122 skipped.
+- `just test-fast -p codex-file-watcher` exited 0: 28 passed, 0 skipped.
+- `just test-fast -p codex-agent-task-store mutation_evidence_keeps_private_prewrite_snapshot` exited 0: 1 passed, 79 skipped.
+- `just test-fast -p codex-agent-task-store wake_wait_observes_a_commit_from_an_independent_store_instance` exited 0: 1 passed, 79 skipped.
+- A focused `just test-fast -p codex-core expected_version_is_compared_under_the_persistence_lock` run was started, selected the intended route, and compiled many dependencies. It was intentionally interrupted before test execution because the shared checkout had many concurrent Cargo/rustc jobs and the user directed the task not to remain blocked on tests. This is not a passing runtime result.
+- A final focused app-server cancellation run was also stopped during dependency compilation after waiting on the shared Cargo package cache, under the user's instruction to finish rather than remain blocked by tests. No passing app-server result is claimed from that attempt.
+- No broad test, publication, deployment, binary replacement, Desktop restart, or upstream mutation was performed.
+- Exact focused commands for later validation are the named direct test filters above, using `just test-fast -p <owning-package> <test-filter>`.
+
+Remaining unknowns/follow-up
+----------------------------
+- Complete the focused direct-test matrix when the shared Cargo lane is available. A formatter or successful compilation is not runtime proof.
+- Confirm Windows cleanup on a Windows test runner because Unix-only execution cannot prove job-object behavior.

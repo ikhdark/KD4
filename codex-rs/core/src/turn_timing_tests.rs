@@ -29,6 +29,9 @@ use pretty_assertions::assert_eq;
 use super::ClockSample;
 use super::ContinuationCause;
 use super::InteractiveWaitKind;
+use super::MAX_MODEL_REQUEST_PHYSICAL_ATTEMPT_IDS;
+use super::MAX_MODEL_REQUEST_PROGRESS_KINDS;
+use super::MAX_MODEL_REQUEST_TIMINGS;
 use super::RESERVED_TOOL_OUTPUT_RECURSIVE_SPILL_COUNT;
 use super::TimeSample;
 use super::TurnClock;
@@ -1838,4 +1841,56 @@ fn planning_counters_are_deterministic_and_additive() {
     assert_eq!(counters.planning_invalidation_count, 1);
     assert_eq!(counters.planning_semantic_effect_count, 1);
     assert_eq!(counters.planning_failure_count, 1);
+}
+
+#[test]
+fn timing_histories_evict_oldest_entries_at_their_caps() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+
+    for request_index in 0..=MAX_MODEL_REQUEST_TIMINGS {
+        let mut pending = None;
+        state.begin_model_generation(&mut pending, &SessionSource::Cli);
+        drop(state.begin_model_request_wait());
+        state.record_model_attempt_identity(
+            &format!("sampling-{request_index}"),
+            &format!("attempt-{request_index}"),
+        );
+    }
+
+    for attempt_index in 0..=MAX_MODEL_REQUEST_PHYSICAL_ATTEMPT_IDS {
+        state.record_model_attempt_identity(
+            &format!("sampling-{MAX_MODEL_REQUEST_TIMINGS}"),
+            &format!("latest-attempt-{attempt_index}"),
+        );
+    }
+    state.record_generation_outcome(
+        vec![TurnTimingProgressKind::WorkspaceMutation; MAX_MODEL_REQUEST_PROGRESS_KINDS + 1],
+        false,
+        false,
+    );
+
+    let profile = state.complete_snapshot().profile;
+    assert_eq!(
+        profile.counters.model_request_count,
+        u32::try_from(MAX_MODEL_REQUEST_TIMINGS + 1).expect("request cap fits u32")
+    );
+    assert_eq!(profile.model_requests.len(), MAX_MODEL_REQUEST_TIMINGS);
+    assert_eq!(
+        profile.model_requests[0].sampling_request_id.as_deref(),
+        Some("sampling-1")
+    );
+    let latest = profile.model_requests.last().expect("latest request");
+    assert_eq!(
+        latest.physical_attempt_ids.len(),
+        MAX_MODEL_REQUEST_PHYSICAL_ATTEMPT_IDS
+    );
+    assert_eq!(
+        latest.physical_attempt_ids.first().map(String::as_str),
+        Some("latest-attempt-1")
+    );
+    assert_eq!(
+        latest.progress_kinds.len(),
+        MAX_MODEL_REQUEST_PROGRESS_KINDS
+    );
 }

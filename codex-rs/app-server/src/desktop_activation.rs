@@ -2,10 +2,14 @@ use chrono::SecondsFormat;
 use chrono::Utc;
 use codex_core::DesktopPublishInstallEvidenceV1;
 use std::io::Read;
+use std::time::Duration;
+use std::time::Instant;
 
 pub(crate) const DESKTOP_ACTIVATION_EVIDENCE_HANDLE_ENV: &str =
     "CODEX_DESKTOP_ACTIVATION_EVIDENCE_HANDLE";
 const MAX_BOOTSTRAP_EVIDENCE_BYTES: u64 = 64 * 1024;
+const BOOTSTRAP_READ_TIMEOUT: Duration = Duration::from_millis(250);
+const BOOTSTRAP_READ_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 #[derive(Debug, Clone)]
 pub(crate) enum DesktopActivationBootstrap {
@@ -31,18 +35,19 @@ pub(crate) fn consume_desktop_activation_bootstrap() -> DesktopActivationBootstr
     if raw_handle == 0 {
         return DesktopActivationBootstrap::Malformed;
     }
+    consume_desktop_activation_bootstrap_from_raw_handle(raw_handle)
+}
+
+fn consume_desktop_activation_bootstrap_from_raw_handle(
+    raw_handle: usize,
+) -> DesktopActivationBootstrap {
     let Ok(mut pipe) = inherited_pipe_file(raw_handle) else {
         return DesktopActivationBootstrap::Malformed;
     };
-    let mut bytes = Vec::new();
-    if pipe
-        .by_ref()
-        .take(MAX_BOOTSTRAP_EVIDENCE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .is_err()
-        || bytes.is_empty()
-        || bytes.len() as u64 > MAX_BOOTSTRAP_EVIDENCE_BYTES
-    {
+    let Ok(bytes) = read_inherited_pipe_until_complete(&mut pipe, raw_handle) else {
+        return DesktopActivationBootstrap::Malformed;
+    };
+    if bytes.is_empty() || bytes.len() as u64 > MAX_BOOTSTRAP_EVIDENCE_BYTES {
         return DesktopActivationBootstrap::Malformed;
     }
     let Ok(evidence) = serde_json::from_slice::<DesktopPublishInstallEvidenceV1>(&bytes) else {
@@ -52,6 +57,174 @@ pub(crate) fn consume_desktop_activation_bootstrap() -> DesktopActivationBootstr
         evidence: Box::new(evidence),
         consumed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
     }
+}
+
+fn evidence_is_complete(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<DesktopPublishInstallEvidenceV1>(bytes).is_ok()
+}
+
+#[cfg(unix)]
+fn read_inherited_pipe_until_complete(
+    pipe: &mut std::fs::File,
+    raw_handle: usize,
+) -> std::io::Result<Vec<u8>> {
+    const F_GETFL: i32 = 3;
+    const F_SETFL: i32 = 4;
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    const O_NONBLOCK: i32 = 0x800;
+    #[cfg(any(
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "ios",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    const O_NONBLOCK: i32 = 0x4;
+    #[cfg(any(target_os = "illumos", target_os = "solaris"))]
+    const O_NONBLOCK: i32 = 0x80;
+    #[cfg(not(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "solaris"
+    )))]
+    const O_NONBLOCK: i32 = 0x4;
+
+    unsafe extern "C" {
+        fn fcntl(fd: i32, command: i32, ...) -> i32;
+    }
+
+    let fd = i32::try_from(raw_handle)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid pipe fd"))?;
+    // SAFETY: `fd` is the inherited descriptor now owned by `pipe`; F_GETFL does not
+    // access memory and returns its current status flags.
+    let flags = unsafe { fcntl(fd, F_GETFL) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` remains owned by `pipe`; F_SETFL changes only its status flags.
+    if unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    read_nonblocking_pipe_until_complete(pipe)
+}
+
+#[cfg(windows)]
+fn read_inherited_pipe_until_complete(
+    pipe: &mut std::fs::File,
+    raw_handle: usize,
+) -> std::io::Result<Vec<u8>> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn PeekNamedPipe(
+            named_pipe: *mut std::ffi::c_void,
+            buffer: *mut std::ffi::c_void,
+            buffer_size: u32,
+            bytes_read: *mut u32,
+            total_bytes_available: *mut u32,
+            bytes_left_this_message: *mut u32,
+        ) -> i32;
+    }
+
+    let deadline = Instant::now() + BOOTSTRAP_READ_TIMEOUT;
+    let mut bytes = Vec::new();
+    loop {
+        if evidence_is_complete(&bytes) || bytes.len() as u64 > MAX_BOOTSTRAP_EVIDENCE_BYTES {
+            return Ok(bytes);
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out reading Desktop activation bootstrap",
+            ));
+        }
+
+        let mut available = 0_u32;
+        // SAFETY: the handle is owned by `pipe`; null buffer arguments ask only for
+        // the current byte count and do not write through the omitted pointers.
+        let peeked = unsafe {
+            PeekNamedPipe(
+                raw_handle as *mut std::ffi::c_void,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        };
+        if peeked == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if available == 0 {
+            sleep_until_next_poll(deadline);
+            continue;
+        }
+
+        let remaining =
+            (MAX_BOOTSTRAP_EVIDENCE_BYTES + 1).saturating_sub(bytes.len() as u64) as usize;
+        let read_len = remaining.min(available as usize);
+        let mut chunk = vec![0_u8; read_len];
+        let count = pipe.read(&mut chunk)?;
+        if count == 0 {
+            return Ok(bytes);
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
+fn read_inherited_pipe_until_complete(
+    _pipe: &mut std::fs::File,
+    _raw_handle: usize,
+) -> std::io::Result<Vec<u8>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Desktop activation bootstrap handles are unsupported",
+    ))
+}
+
+#[cfg(unix)]
+fn read_nonblocking_pipe_until_complete(pipe: &mut std::fs::File) -> std::io::Result<Vec<u8>> {
+    let deadline = Instant::now() + BOOTSTRAP_READ_TIMEOUT;
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 8 * 1024];
+    loop {
+        if evidence_is_complete(&bytes) || bytes.len() as u64 > MAX_BOOTSTRAP_EVIDENCE_BYTES {
+            return Ok(bytes);
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out reading Desktop activation bootstrap",
+            ));
+        }
+
+        let remaining =
+            (MAX_BOOTSTRAP_EVIDENCE_BYTES + 1).saturating_sub(bytes.len() as u64) as usize;
+        match pipe.read(&mut chunk[..remaining.min(chunk.len())]) {
+            Ok(0) => return Ok(bytes),
+            Ok(count) => bytes.extend_from_slice(&chunk[..count]),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                sleep_until_next_poll(deadline);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+#[cfg(any(windows, unix))]
+fn sleep_until_next_poll(deadline: Instant) {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    std::thread::sleep(remaining.min(BOOTSTRAP_READ_POLL_INTERVAL));
 }
 
 #[cfg(windows)]
@@ -85,4 +258,66 @@ fn inherited_pipe_file(_raw_handle: usize) -> std::io::Result<std::fs::File> {
         std::io::ErrorKind::Unsupported,
         "Desktop activation bootstrap handles are unsupported",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BOOTSTRAP_READ_TIMEOUT;
+    use super::DesktopActivationBootstrap;
+    use super::consume_desktop_activation_bootstrap_from_raw_handle;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    #[cfg(any(windows, unix))]
+    #[test]
+    fn desktop_activation_stalled_inherited_handle_is_deadline_bounded() {
+        let (raw_handle, _writer) = stalled_pipe();
+        let started_at = Instant::now();
+
+        let bootstrap = consume_desktop_activation_bootstrap_from_raw_handle(raw_handle);
+
+        assert!(matches!(bootstrap, DesktopActivationBootstrap::Malformed));
+        assert!(
+            started_at.elapsed() < BOOTSTRAP_READ_TIMEOUT + Duration::from_secs(1),
+            "stalled inherited pipe must not hang Desktop startup"
+        );
+    }
+
+    #[cfg(unix)]
+    fn stalled_pipe() -> (usize, std::os::unix::net::UnixStream) {
+        use std::os::fd::IntoRawFd;
+
+        let (reader, writer) =
+            std::os::unix::net::UnixStream::pair().expect("create stalled pipe pair");
+        (reader.into_raw_fd() as usize, writer)
+    }
+
+    #[cfg(windows)]
+    fn stalled_pipe() -> (usize, std::fs::File) {
+        use std::os::windows::io::FromRawHandle;
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn CreatePipe(
+                read_pipe: *mut *mut std::ffi::c_void,
+                write_pipe: *mut *mut std::ffi::c_void,
+                pipe_attributes: *const std::ffi::c_void,
+                size: u32,
+            ) -> i32;
+        }
+
+        let mut read_pipe = std::ptr::null_mut();
+        let mut write_pipe = std::ptr::null_mut();
+        // SAFETY: both output pointers are valid and null security attributes request
+        // a non-inheritable anonymous pipe suitable for this ownership test.
+        assert_ne!(
+            unsafe { CreatePipe(&mut read_pipe, &mut write_pipe, std::ptr::null(), 0) },
+            0,
+            "create stalled anonymous pipe: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: CreatePipe returned a distinct owned write handle, transferred here.
+        let writer = unsafe { std::fs::File::from_raw_handle(write_pipe) };
+        (read_pipe as usize, writer)
+    }
 }

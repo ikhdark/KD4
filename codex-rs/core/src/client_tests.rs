@@ -1258,11 +1258,18 @@ fn request_schema_cache_reuses_equivalent_raw_and_precomputed_tool_schema_identi
 #[test]
 fn request_schema_cache_reuses_across_responses_lite_modes() {
     let client = test_model_client(SessionSource::Cli);
+    let lite_client = test_model_client(SessionSource::Cli);
     let prompt = request_schema_cache_test_prompt();
 
     let regular = client
         .request_schema_components(&prompt, None, /*use_responses_lite*/ false)
         .expect("regular request schema should serialize");
+    let lite_from_fresh_cache = lite_client
+        .request_schema_components(&prompt, None, /*use_responses_lite*/ true)
+        .expect("Responses Lite schema should serialize from a fresh cache");
+    assert_eq!(regular.tools, lite_from_fresh_cache.tools);
+    assert_eq!(regular.text, lite_from_fresh_cache.text);
+
     let lite = client
         .request_schema_components(&prompt, None, /*use_responses_lite*/ true)
         .expect("Responses Lite should reuse request schema components");

@@ -38,7 +38,9 @@ use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
+use crate::connection_rpc_gate::ConnectionRpcGate;
 use crate::error_code::internal_error;
 use crate::error_code::invalid_params;
 use crate::error_code::invalid_request;
@@ -123,6 +125,13 @@ struct RunCommandParams {
     stream_stdout_stderr: bool,
     expiration: ExecExpiration,
     output_bytes_cap: Option<usize>,
+    connection_cancellation: CancellationToken,
+    terminal_cleanup: Option<CommandTerminalCleanup>,
+}
+
+struct CommandTerminalCleanup {
+    sessions: Arc<Mutex<HashMap<ConnectionProcessId, CommandExecSession>>>,
+    process_key: ConnectionProcessId,
 }
 
 struct SpawnProcessOutputParams {
@@ -166,9 +175,10 @@ impl InternalProcessIdExt for InternalProcessId {
 }
 
 impl CommandExecManager {
-    pub(crate) async fn start(
+    pub(crate) async fn start_with_gate(
         &self,
         params: StartCommandExecParams,
+        rpc_gate: &ConnectionRpcGate,
     ) -> Result<(), JSONRPCErrorError> {
         let StartCommandExecParams {
             outgoing,
@@ -182,6 +192,7 @@ impl CommandExecManager {
             output_bytes_cap,
             size,
         } = params;
+        let connection_cancellation = rpc_gate.cancellation_token().child_token();
         if process_id.is_none() && (tty || stream_stdin || stream_stdout_stderr) {
             return Err(invalid_request(
                 "command/exec tty or streaming requires a client-supplied processId",
@@ -214,16 +225,21 @@ impl CommandExecManager {
             }
             if let InternalProcessId::Client(_) = &process_id {
                 let mut sessions = self.sessions.lock().await;
-                if sessions.contains_key(&process_key) {
-                    return Err(invalid_request(format!(
-                        "duplicate active command/exec process id: {}",
-                        process_key.process_id.error_repr(),
-                    )));
-                }
-                sessions.insert(
-                    process_key.clone(),
-                    CommandExecSession::UnsupportedWindowsSandbox,
-                );
+                rpc_gate
+                    .try_commit(|| {
+                        if sessions.contains_key(&process_key) {
+                            return Err(invalid_request(format!(
+                                "duplicate active command/exec process id: {}",
+                                process_key.process_id.error_repr(),
+                            )));
+                        }
+                        sessions.insert(
+                            process_key.clone(),
+                            CommandExecSession::UnsupportedWindowsSandbox,
+                        );
+                        Ok(())
+                    })
+                    .ok_or_else(|| invalid_request("connection is closed"))??;
             }
             let sessions = Arc::clone(&self.sessions);
             tokio::spawn(async move {
@@ -232,6 +248,7 @@ impl CommandExecManager {
                     let (relay, handle) = spawn_output_delivery_relay(
                         Arc::clone(&outgoing),
                         request_id.connection_id,
+                        connection_cancellation.clone(),
                     );
                     (Some(relay), Some(handle))
                 } else {
@@ -296,6 +313,7 @@ impl CommandExecManager {
                 if let Some(handle) = delivery_handle {
                     let _ = handle.await;
                 }
+                sessions.lock().await.remove(&process_key);
                 match output {
                     Ok(output) => {
                         outgoing
@@ -315,7 +333,6 @@ impl CommandExecManager {
                             .await;
                     }
                 }
-                sessions.lock().await.remove(&process_key);
             });
             return Ok(());
         }
@@ -351,19 +368,24 @@ impl CommandExecManager {
             .ok_or_else(|| invalid_request("command must not be empty"))?;
         {
             let mut sessions = self.sessions.lock().await;
-            if sessions.contains_key(&process_key) {
-                return Err(invalid_request(format!(
-                    "duplicate active command/exec process id: {}",
-                    process_key.process_id.error_repr(),
-                )));
-            }
-            sessions.insert(
-                process_key.clone(),
-                CommandExecSession::Active {
-                    control_tx,
-                    write_tx,
-                },
-            );
+            rpc_gate
+                .try_commit(|| {
+                    if sessions.contains_key(&process_key) {
+                        return Err(invalid_request(format!(
+                            "duplicate active command/exec process id: {}",
+                            process_key.process_id.error_repr(),
+                        )));
+                    }
+                    sessions.insert(
+                        process_key.clone(),
+                        CommandExecSession::Active {
+                            control_tx,
+                            write_tx,
+                        },
+                    );
+                    Ok(())
+                })
+                .ok_or_else(|| invalid_request("connection is closed"))??;
         }
         let spawned = if tty {
             codex_utils_pty::spawn_pty_process(
@@ -401,11 +423,21 @@ impl CommandExecManager {
                 stream_stdout_stderr,
                 expiration,
                 output_bytes_cap,
+                connection_cancellation,
+                terminal_cleanup: Some(CommandTerminalCleanup {
+                    sessions,
+                    process_key,
+                }),
             })
             .await;
-            sessions.lock().await.remove(&process_key);
         });
         Ok(())
+    }
+
+    #[cfg(test)]
+    async fn start(&self, params: StartCommandExecParams) -> Result<(), JSONRPCErrorError> {
+        self.start_with_gate(params, &ConnectionRpcGate::new())
+            .await
     }
 
     pub(crate) async fn write(
@@ -568,6 +600,8 @@ async fn run_command(params: RunCommandParams) {
         stream_stdout_stderr,
         expiration,
         output_bytes_cap,
+        connection_cancellation,
+        terminal_cleanup,
     } = params;
     let mut control_rx = control_rx;
     let mut control_open = true;
@@ -591,8 +625,11 @@ async fn run_command(params: RunCommandParams) {
     );
 
     let (delivery_relay, delivery_handle) = if stream_stdout_stderr {
-        let (relay, handle) =
-            spawn_output_delivery_relay(Arc::clone(&outgoing), request_id.connection_id);
+        let (relay, handle) = spawn_output_delivery_relay(
+            Arc::clone(&outgoing),
+            request_id.connection_id,
+            connection_cancellation,
+        );
         (Some(relay), Some(handle))
     } else {
         (None, None)
@@ -672,6 +709,9 @@ async fn run_command(params: RunCommandParams) {
     if let Some(delivery_handle) = delivery_handle {
         let _ = delivery_handle.await;
     }
+    if let Some(cleanup) = terminal_cleanup {
+        cleanup.sessions.lock().await.remove(&cleanup.process_key);
+    }
 
     outgoing
         .send_response(
@@ -688,6 +728,7 @@ async fn run_command(params: RunCommandParams) {
 fn spawn_output_delivery_relay(
     outgoing: Arc<OutgoingMessageSender>,
     connection_id: ConnectionId,
+    cancellation: CancellationToken,
 ) -> (OutputDeliveryRelay, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = mpsc::channel::<QueuedOutputDelivery>(OUTPUT_DELIVERY_QUEUE_ITEMS);
     let relay = OutputDeliveryRelay {
@@ -696,9 +737,16 @@ fn spawn_output_delivery_relay(
     };
     let handle = tokio::spawn(async move {
         while let Some(queued) = rx.recv().await {
-            outgoing
-                .send_server_notification_to_connection_and_wait(connection_id, queued.notification)
-                .await;
+            if !outgoing
+                .send_server_notification_to_connection_bounded(
+                    connection_id,
+                    queued.notification,
+                    &cancellation,
+                )
+                .await
+            {
+                break;
+            }
         }
     });
     (relay, handle)
@@ -901,12 +949,65 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    #[cfg(not(target_os = "windows"))]
     use crate::outgoing_message::OutgoingEnvelope;
-    #[cfg(not(target_os = "windows"))]
     use crate::outgoing_message::OutgoingMessage;
     use codex_utils_pty::ProcessDriver;
     use codex_utils_pty::spawn_from_driver;
+
+    #[tokio::test]
+    async fn output_delivery_relay_finishes_without_writer_ack_and_preserves_fifo() {
+        let connection_id = ConnectionId(31);
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(2);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            outgoing_tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let (relay, delivery_handle) =
+            spawn_output_delivery_relay(outgoing, connection_id, CancellationToken::new());
+
+        for delta_base64 in ["first", "second"] {
+            relay
+                .enqueue(
+                    ServerNotification::CommandExecOutputDelta(
+                        CommandExecOutputDeltaNotification {
+                            process_id: "fifo".to_string(),
+                            stream: CommandExecOutputStream::Stdout,
+                            delta_base64: delta_base64.to_string(),
+                            cap_reached: false,
+                        },
+                    ),
+                    delta_base64.len(),
+                )
+                .await
+                .expect("queue output delivery");
+        }
+        drop(relay);
+
+        timeout(Duration::from_secs(1), delivery_handle)
+            .await
+            .expect("delivery relay should not wait for writer acknowledgement")
+            .expect("delivery relay task should not panic");
+
+        let mut delivered = Vec::new();
+        for _ in 0..2 {
+            let envelope = outgoing_rx.recv().await.expect("queued notification");
+            let OutgoingEnvelope::ToConnection {
+                connection_id: delivered_connection_id,
+                message:
+                    OutgoingMessage::AppServerNotification(ServerNotification::CommandExecOutputDelta(
+                        notification,
+                    )),
+                write_complete_tx,
+            } = envelope
+            else {
+                panic!("expected targeted command output notification");
+            };
+            assert_eq!(delivered_connection_id, connection_id);
+            assert!(write_complete_tx.is_none());
+            delivered.push(notification.delta_base64);
+        }
+        assert_eq!(delivered, ["first", "second"]);
+    }
 
     fn windows_sandbox_exec_request() -> ExecRequest {
         let cwd = AbsolutePathBuf::current_dir().expect("current dir");
@@ -1138,6 +1239,8 @@ mod tests {
             stream_stdout_stderr: false,
             expiration: ExecExpiration::Cancellation(CancellationToken::new()),
             output_bytes_cap: Some(DEFAULT_OUTPUT_BYTES_CAP),
+            connection_cancellation: CancellationToken::new(),
+            terminal_cleanup: None,
         }));
 
         let (write_response_tx, mut write_response_rx) = oneshot::channel();

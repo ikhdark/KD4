@@ -112,6 +112,46 @@ async fn validation_waiter_is_removed_on_cancellation() {
 }
 
 #[tokio::test]
+async fn validation_waiter_does_not_miss_terminal_transition() {
+    let (coordinator, _codex_home, _repository) = initialized_coordinator().await;
+    let (armed_tx, mut armed_rx) = tokio::sync::mpsc::unbounded_channel();
+    coordinator.set_validation_wait_armed_hook(armed_tx);
+    let cancellation = CancellationToken::new();
+    let waiter_coordinator = coordinator.clone();
+    let waiter_cancellation = cancellation.clone();
+    let waiter = tokio::spawn(async move {
+        waiter_coordinator
+            .wait_for_validation_call_terminal(
+                "armed-validation",
+                &waiter_cancellation,
+                Utc::now() + chrono::Duration::minutes(1),
+            )
+            .await
+    });
+
+    assert_eq!(
+        armed_rx.recv().await.as_deref(),
+        Some("armed-validation"),
+        "waiter must arm its notification before reading persisted state"
+    );
+    coordinator.notify_validation_call("armed-validation");
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), armed_rx.recv())
+            .await
+            .expect("notification should wake the waiter before its deadline")
+            .as_deref(),
+        Some("armed-validation"),
+        "notify_waiters must be observed even when it runs before the select"
+    );
+
+    cancellation.cancel();
+    waiter
+        .await
+        .expect("validation wait task joins")
+        .expect("validation wait succeeds");
+}
+
+#[tokio::test]
 async fn cancelling_one_validation_waiter_keeps_other_waiter_registered() {
     let (coordinator, _codex_home, _repository) = initialized_coordinator().await;
     let first_cancellation = CancellationToken::new();

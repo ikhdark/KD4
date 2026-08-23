@@ -15,6 +15,12 @@ use crate::outgoing_message::ConnectionId;
 
 type BoxFutureUnit = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
+const MAX_TOTAL_QUEUED_REQUESTS: usize = 1024;
+const MAX_QUEUED_REQUESTS_PER_KEY: usize = 64;
+const MAX_TOTAL_QUEUED_BYTES: usize = 8 * 1024 * 1024;
+const MAX_QUEUED_BYTES_PER_KEY: usize = 1024 * 1024;
+const MAX_CONCURRENT_SHARED_READS: usize = 16;
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum RequestSerializationQueueKey {
     Global(&'static str),
@@ -105,6 +111,7 @@ impl RequestSerializationQueueKey {
 
 pub(crate) struct QueuedInitializedRequest {
     gate: Arc<ConnectionRpcGate>,
+    estimated_bytes: usize,
     future: BoxFutureUnit,
 }
 
@@ -115,13 +122,30 @@ impl QueuedInitializedRequest {
     ) -> Self {
         Self {
             gate,
+            estimated_bytes: 0,
+            future: Box::pin(future),
+        }
+    }
+
+    pub(crate) fn new_with_estimated_bytes(
+        gate: Arc<ConnectionRpcGate>,
+        estimated_bytes: usize,
+        future: impl Future<Output = ()> + Send + 'static,
+    ) -> Self {
+        Self {
+            gate,
+            estimated_bytes,
             future: Box::pin(future),
         }
     }
 
     pub(crate) async fn run(self) {
-        let Self { gate, future } = self;
+        let Self { gate, future, .. } = self;
         gate.run(future).await;
+    }
+
+    fn belongs_to_gate(&self, gate: &Arc<ConnectionRpcGate>) -> bool {
+        Arc::ptr_eq(&self.gate, gate)
     }
 }
 
@@ -130,22 +154,149 @@ struct QueuedSerializedRequest {
     request: QueuedInitializedRequest,
 }
 
-#[derive(Clone, Default)]
+impl QueuedSerializedRequest {
+    fn estimated_bytes(&self) -> usize {
+        self.request.estimated_bytes
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RequestSerializationLimits {
+    max_total_queued: usize,
+    max_queued_per_key: usize,
+    max_total_queued_bytes: usize,
+    max_queued_bytes_per_key: usize,
+    max_concurrent_shared_reads: usize,
+}
+
+impl Default for RequestSerializationLimits {
+    fn default() -> Self {
+        Self {
+            max_total_queued: MAX_TOTAL_QUEUED_REQUESTS,
+            max_queued_per_key: MAX_QUEUED_REQUESTS_PER_KEY,
+            max_total_queued_bytes: MAX_TOTAL_QUEUED_BYTES,
+            max_queued_bytes_per_key: MAX_QUEUED_BYTES_PER_KEY,
+            max_concurrent_shared_reads: MAX_CONCURRENT_SHARED_READS,
+        }
+    }
+}
+
+#[derive(Default)]
+struct RequestSerializationState {
+    queues: HashMap<RequestSerializationQueueKey, VecDeque<QueuedSerializedRequest>>,
+    total_queued: usize,
+    total_queued_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RequestAdmissionError {
+    TotalQueueFull,
+    PerKeyQueueFull,
+    TotalBytesFull,
+    PerKeyBytesFull,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RequestAdmission {
+    Accepted,
+    Rejected(RequestAdmissionError),
+}
+
+#[derive(Clone)]
 pub(crate) struct RequestSerializationQueues {
-    inner: Arc<Mutex<HashMap<RequestSerializationQueueKey, VecDeque<QueuedSerializedRequest>>>>,
+    inner: Arc<Mutex<RequestSerializationState>>,
+    limits: RequestSerializationLimits,
+}
+
+impl Default for RequestSerializationQueues {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(RequestSerializationState::default())),
+            limits: RequestSerializationLimits::default(),
+        }
+    }
 }
 
 impl RequestSerializationQueues {
+    #[cfg(test)]
+    fn with_limits(
+        max_total_queued: usize,
+        max_queued_per_key: usize,
+        max_concurrent_shared_reads: usize,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(RequestSerializationState::default())),
+            limits: RequestSerializationLimits {
+                max_total_queued: max_total_queued.max(1),
+                max_queued_per_key: max_queued_per_key.max(1),
+                max_total_queued_bytes: MAX_TOTAL_QUEUED_BYTES,
+                max_queued_bytes_per_key: MAX_QUEUED_BYTES_PER_KEY,
+                max_concurrent_shared_reads: max_concurrent_shared_reads.max(1),
+            },
+        }
+    }
+
+    #[cfg(test)]
+    fn with_limits_and_bytes(
+        max_total_queued: usize,
+        max_queued_per_key: usize,
+        max_total_queued_bytes: usize,
+        max_queued_bytes_per_key: usize,
+        max_concurrent_shared_reads: usize,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(RequestSerializationState::default())),
+            limits: RequestSerializationLimits {
+                max_total_queued: max_total_queued.max(1),
+                max_queued_per_key: max_queued_per_key.max(1),
+                max_total_queued_bytes: max_total_queued_bytes.max(1),
+                max_queued_bytes_per_key: max_queued_bytes_per_key.max(1),
+                max_concurrent_shared_reads: max_concurrent_shared_reads.max(1),
+            },
+        }
+    }
+
     pub(crate) async fn enqueue(
         &self,
         key: RequestSerializationQueueKey,
         access: RequestSerializationAccess,
         request: QueuedInitializedRequest,
-    ) {
+    ) -> RequestAdmission {
         let request = QueuedSerializedRequest { access, request };
         let should_spawn = {
-            let mut queues = self.inner.lock().await;
-            match queues.get_mut(&key) {
+            let mut state = self.inner.lock().await;
+            if state.total_queued >= self.limits.max_total_queued {
+                return RequestAdmission::Rejected(RequestAdmissionError::TotalQueueFull);
+            }
+            if state
+                .queues
+                .get(&key)
+                .is_some_and(|queue| queue.len() >= self.limits.max_queued_per_key)
+            {
+                return RequestAdmission::Rejected(RequestAdmissionError::PerKeyQueueFull);
+            }
+            let request_bytes = request.estimated_bytes();
+            if state.total_queued_bytes.saturating_add(request_bytes)
+                > self.limits.max_total_queued_bytes
+            {
+                return RequestAdmission::Rejected(RequestAdmissionError::TotalBytesFull);
+            }
+            let key_bytes = state
+                .queues
+                .get(&key)
+                .map(|queue| {
+                    queue
+                        .iter()
+                        .map(QueuedSerializedRequest::estimated_bytes)
+                        .fold(0usize, usize::saturating_add)
+                })
+                .unwrap_or(0);
+            if key_bytes.saturating_add(request_bytes) > self.limits.max_queued_bytes_per_key {
+                return RequestAdmission::Rejected(RequestAdmissionError::PerKeyBytesFull);
+            }
+            state.total_queued += 1;
+            state.total_queued_bytes = state.total_queued_bytes.saturating_add(request_bytes);
+            match state.queues.get_mut(&key) {
                 Some(queue) => {
                     queue.push_back(request);
                     false
@@ -153,7 +304,7 @@ impl RequestSerializationQueues {
                 None => {
                     let mut queue = VecDeque::new();
                     queue.push_back(request);
-                    queues.insert(key.clone(), queue);
+                    state.queues.insert(key.clone(), queue);
                     true
                 }
             }
@@ -164,33 +315,72 @@ impl RequestSerializationQueues {
             let span = tracing::debug_span!("app_server.serialized_request_queue", ?key);
             tokio::spawn(async move { queues.drain(key).await }.instrument(span));
         }
+        RequestAdmission::Accepted
+    }
+
+    /// Drops work that has not yet left a serialization queue for a closing
+    /// connection. Requests already handed to a drain are still rejected or
+    /// cancelled by the connection gate itself.
+    pub(crate) async fn cancel_for_gate(&self, gate: &Arc<ConnectionRpcGate>) -> usize {
+        let mut state = self.inner.lock().await;
+        let mut cancelled = 0;
+        let mut cancelled_bytes = 0usize;
+        for queue in state.queues.values_mut() {
+            let previous_len = queue.len();
+            let previous_bytes = queue
+                .iter()
+                .map(QueuedSerializedRequest::estimated_bytes)
+                .fold(0usize, usize::saturating_add);
+            queue.retain(|request| !request.request.belongs_to_gate(gate));
+            cancelled += previous_len - queue.len();
+            let retained_bytes = queue
+                .iter()
+                .map(QueuedSerializedRequest::estimated_bytes)
+                .fold(0usize, usize::saturating_add);
+            cancelled_bytes =
+                cancelled_bytes.saturating_add(previous_bytes.saturating_sub(retained_bytes));
+        }
+        state.total_queued -= cancelled;
+        state.total_queued_bytes = state.total_queued_bytes.saturating_sub(cancelled_bytes);
+        cancelled
     }
 
     async fn drain(self, key: RequestSerializationQueueKey) {
         loop {
             let requests = {
-                let mut queues = self.inner.lock().await;
-                let Some(queue) = queues.get_mut(&key) else {
+                let mut state = self.inner.lock().await;
+                let Some(queue) = state.queues.get_mut(&key) else {
                     return;
                 };
                 match queue.pop_front() {
                     Some(request) => {
+                        let mut popped = 1;
                         let access = request.access;
                         let mut requests = vec![request];
                         if access == RequestSerializationAccess::SharedRead {
-                            while queue.front().is_some_and(|request| {
-                                request.access == RequestSerializationAccess::SharedRead
-                            }) {
+                            while requests.len() < self.limits.max_concurrent_shared_reads
+                                && queue.front().is_some_and(|request| {
+                                    request.access == RequestSerializationAccess::SharedRead
+                                })
+                            {
                                 let Some(request) = queue.pop_front() else {
                                     break;
                                 };
                                 requests.push(request);
+                                popped += 1;
                             }
                         }
+                        state.total_queued -= popped;
+                        state.total_queued_bytes = state.total_queued_bytes.saturating_sub(
+                            requests
+                                .iter()
+                                .map(QueuedSerializedRequest::estimated_bytes)
+                                .fold(0usize, usize::saturating_add),
+                        );
                         requests
                     }
                     None => {
-                        queues.remove(&key);
+                        state.queues.remove(&key);
                         return;
                     }
                 }
@@ -206,6 +396,8 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
     use tokio::sync::broadcast;
     use tokio::sync::mpsc;
     use tokio::sync::oneshot;
@@ -269,6 +461,54 @@ mod tests {
                 THIRD_REQUEST_VALUE
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn queue_rejects_bytes_before_admission() {
+        let queues = RequestSerializationQueues::with_limits_and_bytes(10, 10, 10, 10, 1);
+        let key = RequestSerializationQueueKey::Global("byte-limit");
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let (started_tx, started_rx) = oneshot::channel::<()>();
+
+        assert_eq!(
+            queues
+                .enqueue(
+                    key.clone(),
+                    RequestSerializationAccess::Exclusive,
+                    QueuedInitializedRequest::new(gate(), async move {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.await;
+                    }),
+                )
+                .await,
+            RequestAdmission::Accepted
+        );
+        timeout(queue_drain_timeout(), started_rx)
+            .await
+            .expect("blocker should start")
+            .expect("blocker signal should remain open");
+
+        assert_eq!(
+            queues
+                .enqueue(
+                    key.clone(),
+                    RequestSerializationAccess::Exclusive,
+                    QueuedInitializedRequest::new_with_estimated_bytes(gate(), 6, async {}),
+                )
+                .await,
+            RequestAdmission::Accepted
+        );
+        assert_eq!(
+            queues
+                .enqueue(
+                    key,
+                    RequestSerializationAccess::Exclusive,
+                    QueuedInitializedRequest::new_with_estimated_bytes(gate(), 5, async {}),
+                )
+                .await,
+            RequestAdmission::Rejected(RequestAdmissionError::TotalBytesFull)
+        );
+        let _ = release_tx.send(());
     }
 
     #[tokio::test]
@@ -379,12 +619,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_of_live_gate_skips_already_queued_requests() {
+    async fn shutdown_of_live_gate_cancels_running_and_skips_already_queued_requests() {
         let queues = RequestSerializationQueues::default();
         let key = RequestSerializationQueueKey::Global("test");
         let live_gate = gate();
+        let cancellation = live_gate.cancellation_token();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let (blocked_tx, blocked_rx) = oneshot::channel::<()>();
 
         {
             let tx = tx.clone();
@@ -395,7 +635,7 @@ mod tests {
                     QueuedInitializedRequest::new(Arc::clone(&live_gate), async move {
                         tx.send(FIRST_REQUEST_VALUE)
                             .expect("receiver should be open");
-                        let _ = blocked_rx.await;
+                        cancellation.cancelled().await;
                     }),
                 )
                 .await;
@@ -422,18 +662,17 @@ mod tests {
             Some(FIRST_REQUEST_VALUE)
         );
 
+        live_gate.close().await;
+        assert_eq!(queues.cancel_for_gate(&live_gate).await, 1);
         let gate_for_shutdown = Arc::clone(&live_gate);
         let shutdown_task = tokio::spawn(async move {
             gate_for_shutdown.shutdown().await;
         });
 
-        timeout(shutdown_wait_timeout(), shutdown_task)
+        timeout(queue_drain_timeout(), shutdown_task)
             .await
-            .expect_err("shutdown should wait for the running request");
-
-        blocked_tx
-            .send(())
-            .expect("blocked request should still be waiting");
+            .expect("shutdown should cancel the running request")
+            .expect("shutdown task should complete");
 
         assert_eq!(
             timeout(queue_drain_timeout(), rx.recv())
@@ -441,6 +680,294 @@ mod tests {
                 .expect("timed out waiting for queue to drain"),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn per_key_limit_rejects_without_polling_request() {
+        let queues = RequestSerializationQueues::with_limits(4, 1, 2);
+        let key = RequestSerializationQueueKey::Global("test");
+        let (blocker_started_tx, blocker_started_rx) = oneshot::channel::<()>();
+        let (blocker_release_tx, blocker_release_rx) = oneshot::channel::<()>();
+        let (queued_ran_tx, queued_ran_rx) = oneshot::channel::<()>();
+
+        assert_eq!(
+            queues
+                .enqueue(
+                    key.clone(),
+                    RequestSerializationAccess::Exclusive,
+                    QueuedInitializedRequest::new(gate(), async move {
+                        blocker_started_tx
+                            .send(())
+                            .expect("receiver should be open");
+                        let _ = blocker_release_rx.await;
+                    }),
+                )
+                .await,
+            RequestAdmission::Accepted
+        );
+        timeout(queue_drain_timeout(), blocker_started_rx)
+            .await
+            .expect("blocker should start")
+            .expect("sender should be open");
+
+        assert_eq!(
+            queues
+                .enqueue(
+                    key.clone(),
+                    RequestSerializationAccess::Exclusive,
+                    QueuedInitializedRequest::new(gate(), async move {
+                        queued_ran_tx.send(()).expect("receiver should be open");
+                    }),
+                )
+                .await,
+            RequestAdmission::Accepted
+        );
+
+        let rejected_polled = Arc::new(AtomicBool::new(false));
+        let rejected_polled_for_future = Arc::clone(&rejected_polled);
+        assert_eq!(
+            queues
+                .enqueue(
+                    key,
+                    RequestSerializationAccess::Exclusive,
+                    QueuedInitializedRequest::new(gate(), async move {
+                        rejected_polled_for_future.store(true, Ordering::SeqCst);
+                    }),
+                )
+                .await,
+            RequestAdmission::Rejected(RequestAdmissionError::PerKeyQueueFull)
+        );
+        assert!(!rejected_polled.load(Ordering::SeqCst));
+
+        blocker_release_tx
+            .send(())
+            .expect("blocker should be waiting");
+        timeout(queue_drain_timeout(), queued_ran_rx)
+            .await
+            .expect("queued request should run")
+            .expect("sender should be open");
+        assert!(!rejected_polled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn total_limit_rejects_across_keys() {
+        let queues = RequestSerializationQueues::with_limits(2, 2, 2);
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let (first_release_tx, first_release_rx) = oneshot::channel::<()>();
+        let (second_release_tx, second_release_rx) = oneshot::channel::<()>();
+
+        for (key, value, release_rx) in [
+            (
+                RequestSerializationQueueKey::Global("first"),
+                FIRST_REQUEST_VALUE,
+                first_release_rx,
+            ),
+            (
+                RequestSerializationQueueKey::Global("second"),
+                SECOND_REQUEST_VALUE,
+                second_release_rx,
+            ),
+        ] {
+            let started_tx = started_tx.clone();
+            assert_eq!(
+                queues
+                    .enqueue(
+                        key,
+                        RequestSerializationAccess::Exclusive,
+                        QueuedInitializedRequest::new(gate(), async move {
+                            started_tx.send(value).expect("receiver should be open");
+                            let _ = release_rx.await;
+                        }),
+                    )
+                    .await,
+                RequestAdmission::Accepted
+            );
+        }
+        for _ in 0..2 {
+            timeout(queue_drain_timeout(), started_rx.recv())
+                .await
+                .expect("blocker should start")
+                .expect("sender should be open");
+        }
+
+        for key in [
+            RequestSerializationQueueKey::Global("first"),
+            RequestSerializationQueueKey::Global("second"),
+        ] {
+            assert_eq!(
+                queues
+                    .enqueue(
+                        key,
+                        RequestSerializationAccess::Exclusive,
+                        QueuedInitializedRequest::new(gate(), async {}),
+                    )
+                    .await,
+                RequestAdmission::Accepted
+            );
+        }
+        let rejected_polled = Arc::new(AtomicBool::new(false));
+        let rejected_polled_for_future = Arc::clone(&rejected_polled);
+        assert_eq!(
+            queues
+                .enqueue(
+                    RequestSerializationQueueKey::Global("first"),
+                    RequestSerializationAccess::Exclusive,
+                    QueuedInitializedRequest::new(gate(), async move {
+                        rejected_polled_for_future.store(true, Ordering::SeqCst);
+                    }),
+                )
+                .await,
+            RequestAdmission::Rejected(RequestAdmissionError::TotalQueueFull)
+        );
+        assert!(!rejected_polled.load(Ordering::SeqCst));
+
+        first_release_tx
+            .send(())
+            .expect("blocker should be waiting");
+        second_release_tx
+            .send(())
+            .expect("blocker should be waiting");
+    }
+
+    #[tokio::test]
+    async fn admission_recovers_after_queue_drains() {
+        let queues = RequestSerializationQueues::with_limits(1, 1, 1);
+        let key = RequestSerializationQueueKey::Global("test");
+        let (blocker_started_tx, blocker_started_rx) = oneshot::channel::<()>();
+        let (blocker_release_tx, blocker_release_rx) = oneshot::channel::<()>();
+        let (queued_ran_tx, queued_ran_rx) = oneshot::channel::<()>();
+
+        queues
+            .enqueue(
+                key.clone(),
+                RequestSerializationAccess::Exclusive,
+                QueuedInitializedRequest::new(gate(), async move {
+                    blocker_started_tx
+                        .send(())
+                        .expect("receiver should be open");
+                    let _ = blocker_release_rx.await;
+                }),
+            )
+            .await;
+        timeout(queue_drain_timeout(), blocker_started_rx)
+            .await
+            .expect("blocker should start")
+            .expect("sender should be open");
+        assert_eq!(
+            queues
+                .enqueue(
+                    key.clone(),
+                    RequestSerializationAccess::Exclusive,
+                    QueuedInitializedRequest::new(gate(), async move {
+                        queued_ran_tx.send(()).expect("receiver should be open");
+                    }),
+                )
+                .await,
+            RequestAdmission::Accepted
+        );
+        assert_eq!(
+            queues
+                .enqueue(
+                    key.clone(),
+                    RequestSerializationAccess::Exclusive,
+                    QueuedInitializedRequest::new(gate(), async {}),
+                )
+                .await,
+            RequestAdmission::Rejected(RequestAdmissionError::TotalQueueFull)
+        );
+
+        blocker_release_tx
+            .send(())
+            .expect("blocker should be waiting");
+        timeout(queue_drain_timeout(), queued_ran_rx)
+            .await
+            .expect("queued request should run")
+            .expect("sender should be open");
+
+        let (recovered_tx, recovered_rx) = oneshot::channel::<()>();
+        assert_eq!(
+            queues
+                .enqueue(
+                    key,
+                    RequestSerializationAccess::Exclusive,
+                    QueuedInitializedRequest::new(gate(), async move {
+                        recovered_tx.send(()).expect("receiver should be open");
+                    }),
+                )
+                .await,
+            RequestAdmission::Accepted
+        );
+        timeout(queue_drain_timeout(), recovered_rx)
+            .await
+            .expect("admission should recover")
+            .expect("sender should be open");
+    }
+
+    #[tokio::test]
+    async fn shared_read_batch_respects_concurrency_limit() {
+        let queues = RequestSerializationQueues::with_limits(8, 8, 2);
+        let key = RequestSerializationQueueKey::Global("test");
+        let (blocker_started_tx, blocker_started_rx) = oneshot::channel::<()>();
+        let (blocker_release_tx, blocker_release_rx) = oneshot::channel::<()>();
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let (release_tx, _) = broadcast::channel::<()>(1);
+
+        queues
+            .enqueue(
+                key.clone(),
+                RequestSerializationAccess::Exclusive,
+                QueuedInitializedRequest::new(gate(), async move {
+                    blocker_started_tx
+                        .send(())
+                        .expect("receiver should be open");
+                    let _ = blocker_release_rx.await;
+                }),
+            )
+            .await;
+        timeout(queue_drain_timeout(), blocker_started_rx)
+            .await
+            .expect("blocker should start")
+            .expect("sender should be open");
+
+        for value in [
+            FIRST_REQUEST_VALUE,
+            SECOND_REQUEST_VALUE,
+            THIRD_REQUEST_VALUE,
+        ] {
+            let started_tx = started_tx.clone();
+            let mut release_rx = release_tx.subscribe();
+            queues
+                .enqueue(
+                    key.clone(),
+                    RequestSerializationAccess::SharedRead,
+                    QueuedInitializedRequest::new(gate(), async move {
+                        started_tx.send(value).expect("receiver should be open");
+                        let _ = release_rx.recv().await;
+                    }),
+                )
+                .await;
+        }
+        blocker_release_tx
+            .send(())
+            .expect("blocker should be waiting");
+
+        for _ in 0..2 {
+            timeout(queue_drain_timeout(), started_rx.recv())
+                .await
+                .expect("shared read should start")
+                .expect("sender should be open");
+        }
+        assert!(
+            timeout(shutdown_wait_timeout(), started_rx.recv())
+                .await
+                .is_err()
+        );
+
+        release_tx.send(()).expect("shared reads should be waiting");
+        timeout(queue_drain_timeout(), started_rx.recv())
+            .await
+            .expect("next shared-read batch should start")
+            .expect("sender should be open");
     }
 
     #[tokio::test]

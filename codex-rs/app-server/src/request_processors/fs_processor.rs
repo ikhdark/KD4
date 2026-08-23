@@ -1,3 +1,4 @@
+use crate::connection_rpc_gate::ConnectionRpcGate;
 use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
 use crate::fs_watch::FsWatchManager;
@@ -205,9 +206,12 @@ impl FsRequestProcessor {
         &self,
         connection_id: ConnectionId,
         params: FsWatchParams,
+        rpc_gate: &ConnectionRpcGate,
     ) -> Result<FsWatchResponse, JSONRPCErrorError> {
         self.file_system()?;
-        self.fs_watch_manager.watch(connection_id, params).await
+        self.fs_watch_manager
+            .watch_with_gate(connection_id, params, rpc_gate)
+            .await
     }
 
     pub(crate) async fn unwatch(

@@ -2692,7 +2692,7 @@
     },
     "ReasoningPhaseEfforts": {
       "additionalProperties": false,
-      "description": "Per-logical-request reasoning effort overrides. Deterministic phase tracking is enabled by default; omitted fields inherit the resolved turn effort.",
+      "description": "Per-logical-request reasoning effort overrides. Omitted fields retain the compatibility defaults: high for orient, implement, and diagnose; low for inspect, verify, finalize, and deterministic continuation.",
       "properties": {
         "deterministic_continuation": {
           "allOf": [
@@ -5374,7 +5374,7 @@
     },
     "project_doc_max_bytes": {
       "default": 32768,
-      "description": "Maximum combined source bytes to retain from AGENTS.md project docs. Generated provenance and truncation notices do not consume this budget.",
+      "description": "Maximum combined source bytes to retain from AGENTS.md project docs. The rendered project-doc payload, including generated provenance and notices, is separately capped at this value plus 4 KiB.",
       "format": "uint",
       "minimum": 0.0,
       "type": "integer"

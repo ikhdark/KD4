@@ -5,7 +5,11 @@ pub use env::is_wsl;
 
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::HashSet;
+use std::ffi::OsString;
+use std::fs::File;
+use std::fs::OpenOptions;
 use std::io;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use tempfile::NamedTempFile;
@@ -118,7 +122,64 @@ pub fn resolve_symlink_write_paths(path: &Path) -> io::Result<SymlinkWritePaths>
     }
 }
 
+/// An advisory, cross-process lock for a single persistence target.
+///
+/// All writers of a shared file must acquire this lock before re-reading and
+/// mutating that file. The lock is released when the guard is dropped.
+pub struct AtomicWriteLock {
+    file: File,
+}
+
+impl Drop for AtomicWriteLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
+/// Return the canonical lock-file path shared by writers of `write_path`.
+pub fn atomic_write_lock_path(write_path: &Path) -> io::Result<PathBuf> {
+    let file_name = write_path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path {} has no file name", write_path.display()),
+        )
+    })?;
+    let mut lock_name = OsString::from(".");
+    lock_name.push(file_name);
+    lock_name.push(".lock");
+    Ok(write_path.with_file_name(lock_name))
+}
+
+/// Acquire the canonical advisory lock for `write_path`.
+pub fn acquire_atomic_write_lock(write_path: &Path) -> io::Result<AtomicWriteLock> {
+    let lock_path = atomic_write_lock_path(write_path)?;
+    if let Some(parent) = lock_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)?;
+    fs2::FileExt::lock_exclusive(&file)?;
+    Ok(AtomicWriteLock { file })
+}
+
+/// Durably replace `write_path` with `contents`.
+///
+/// `NamedTempFile` creates the temporary file with create-new semantics in the
+/// target directory. Persisting it is an atomic same-filesystem replacement;
+/// syncing both the file and its parent makes the replacement durable across a
+/// crash. Callers that perform read-modify-write must hold
+/// [`acquire_atomic_write_lock`] across the read, validation, and this write.
 pub fn write_atomically(write_path: &Path, contents: &str) -> io::Result<()> {
+    write_bytes_atomically(write_path, contents.as_bytes())
+}
+
+pub fn write_bytes_atomically(write_path: &Path, contents: &[u8]) -> io::Result<()> {
     let parent = write_path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -126,10 +187,52 @@ pub fn write_atomically(write_path: &Path, contents: &str) -> io::Result<()> {
         )
     })?;
     std::fs::create_dir_all(parent)?;
-    let tmp = NamedTempFile::new_in(parent)?;
-    std::fs::write(tmp.path(), contents)?;
-    tmp.persist(write_path)?;
+    let mut tmp = NamedTempFile::new_in(parent)?;
+    tmp.write_all(contents)?;
+    tmp.flush()?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(write_path).map_err(|error| error.error)?;
+    sync_parent_directory(parent)?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> io::Result<()> {
+    File::open(parent)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(parent: &Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    // FILE_FLAG_BACKUP_SEMANTICS permits opening a directory handle.
+    // Some Windows filesystems still reject flushing directory handles; the
+    // replacement file itself has already been synced in that case.
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let result = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(parent)
+        .and_then(|directory| directory.sync_all());
+    match result {
+        Ok(()) => Ok(()),
+        Err(err)
+            if matches!(
+                err.kind(),
+                io::ErrorKind::PermissionDenied
+                    | io::ErrorKind::Unsupported
+                    | io::ErrorKind::InvalidInput
+            ) =>
+        {
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_parent_directory(parent: &Path) -> io::Result<()> {
+    File::open(parent)?.sync_all()
 }
 
 fn normalize_for_wsl(path: PathBuf) -> PathBuf {

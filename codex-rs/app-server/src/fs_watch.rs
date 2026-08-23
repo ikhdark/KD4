@@ -1,3 +1,4 @@
+use crate::connection_rpc_gate::ConnectionRpcGate;
 use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
 use crate::outgoing_message::ConnectionId;
@@ -23,9 +24,12 @@ use tokio::sync::Mutex as AsyncMutex;
 #[cfg(test)]
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::task::AbortHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 const FS_CHANGED_NOTIFICATION_DEBOUNCE: Duration = Duration::from_millis(200);
+const FS_WATCH_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub(crate) struct FsWatchManager {
@@ -40,9 +44,23 @@ struct FsWatchState {
 }
 
 struct WatchEntry {
-    terminate_tx: oneshot::Sender<oneshot::Sender<()>>,
+    cancellation: CancellationToken,
+    abort_handle: AbortHandle,
+    done_rx: oneshot::Receiver<()>,
     _subscriber: FileWatcherSubscriber,
     _registration: WatchRegistration,
+}
+
+impl WatchEntry {
+    async fn stop(self) {
+        self.cancellation.cancel();
+        if tokio::time::timeout(FS_WATCH_SHUTDOWN_GRACE, self.done_rx)
+            .await
+            .is_err()
+        {
+            self.abort_handle.abort();
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -79,10 +97,11 @@ impl FsWatchManager {
         }
     }
 
-    pub(crate) async fn watch(
+    pub(crate) async fn watch_with_gate(
         &self,
         connection_id: ConnectionId,
         params: FsWatchParams,
+        rpc_gate: &ConnectionRpcGate,
     ) -> Result<FsWatchResponse, JSONRPCErrorError> {
         let watch_id = params.watch_id;
         let watch_key = WatchKey {
@@ -102,61 +121,92 @@ impl FsWatchManager {
                 recursive: false,
             }])
             .map_err(|err| internal_error(format!("failed to register filesystem watch: {err}")))?;
-        let (terminate_tx, terminate_rx) = oneshot::channel();
-
-        match self.state.lock().await.entries.entry(watch_key) {
-            Entry::Occupied(_) => {
-                return Err(invalid_request(format!(
-                    "watchId already exists: {watch_id}"
-                )));
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(WatchEntry {
-                    terminate_tx,
-                    _subscriber: subscriber,
-                    _registration: registration,
-                });
-            }
-        }
-
+        let cancellation = rpc_gate.cancellation_token().child_token();
+        let task_cancellation = cancellation.clone();
         let task_watch_id = watch_id.clone();
-        tokio::spawn(async move {
-            let mut rx = DebouncedWatchReceiver::new(rx, FS_CHANGED_NOTIFICATION_DEBOUNCE);
-            tokio::pin!(terminate_rx);
-            loop {
-                let event = tokio::select! {
-                    biased;
-                    _ = &mut terminate_rx => break,
-                    event = rx.recv() => match event {
-                        Some(event) => event,
-                        None => break,
-                    },
-                };
-                let mut changed_paths = event
-                    .paths
-                    .into_iter()
-                    .map(|path| watch_root.join(path))
-                    .collect::<Vec<_>>();
-                if event.rescan_required {
-                    changed_paths.push(watch_root.clone());
+        let (start_tx, start_rx) = oneshot::channel();
+        let (done_tx, done_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            if start_rx.await.is_ok() {
+                let mut rx = DebouncedWatchReceiver::new(rx, FS_CHANGED_NOTIFICATION_DEBOUNCE);
+                loop {
+                    let event = tokio::select! {
+                        biased;
+                        _ = task_cancellation.cancelled() => break,
+                        event = rx.recv() => match event {
+                            Some(event) => event,
+                            None => break,
+                        },
+                    };
+                    let mut changed_paths = event
+                        .paths
+                        .into_iter()
+                        .map(|path| watch_root.join(path))
+                        .collect::<Vec<_>>();
+                    if event.rescan_required {
+                        changed_paths.push(watch_root.clone());
+                    }
+                    changed_paths.sort_by(|left, right| left.as_path().cmp(right.as_path()));
+                    changed_paths.dedup();
+                    if !changed_paths.is_empty()
+                        && !outgoing
+                            .send_server_notification_to_connection_bounded(
+                                connection_id,
+                                ServerNotification::FsChanged(FsChangedNotification {
+                                    watch_id: task_watch_id.clone(),
+                                    changed_paths,
+                                }),
+                                &task_cancellation,
+                            )
+                            .await
+                    {
+                        break;
+                    }
                 }
-                changed_paths.sort_by(|left, right| left.as_path().cmp(right.as_path()));
-                changed_paths.dedup();
-                if !changed_paths.is_empty() {
-                    outgoing
-                        .send_server_notification_to_connection_and_wait(
-                            connection_id,
-                            ServerNotification::FsChanged(FsChangedNotification {
-                                watch_id: task_watch_id.clone(),
-                                changed_paths,
-                            }),
-                        )
-                        .await;
-                }
+            }
+            let _ = done_tx.send(());
+        });
+        let mut pending_entry = Some(WatchEntry {
+            cancellation,
+            abort_handle: task.abort_handle(),
+            done_rx,
+            _subscriber: subscriber,
+            _registration: registration,
+        });
+        drop(task);
+
+        let mut state = self.state.lock().await;
+        let commit_result = rpc_gate.try_commit(|| match state.entries.entry(watch_key) {
+            Entry::Occupied(_) => Err(invalid_request(format!(
+                "watchId already exists: {watch_id}"
+            ))),
+            Entry::Vacant(entry) => {
+                entry.insert(pending_entry.take().expect("watch entry must be available"));
+                Ok(())
             }
         });
+        drop(state);
+        if commit_result.as_ref().is_some_and(Result::is_ok) {
+            let _ = start_tx.send(());
+        } else {
+            drop(start_tx);
+        }
+        if let Some(entry) = pending_entry {
+            entry.stop().await;
+        }
+        commit_result.ok_or_else(|| invalid_request("connection is closed"))??;
 
         Ok(FsWatchResponse { path: params.path })
+    }
+
+    #[cfg(test)]
+    async fn watch(
+        &self,
+        connection_id: ConnectionId,
+        params: FsWatchParams,
+    ) -> Result<FsWatchResponse, JSONRPCErrorError> {
+        self.watch_with_gate(connection_id, params, &ConnectionRpcGate::new())
+            .await
     }
 
     pub(crate) async fn unwatch(
@@ -170,21 +220,23 @@ impl FsWatchManager {
         };
         let entry = self.state.lock().await.entries.remove(&watch_key);
         if let Some(entry) = entry {
-            // Wait for the oneshot to be destroyed by the task to ensure that no notifications
-            // are send after the unwatch response.
-            let (done_tx, done_rx) = oneshot::channel();
-            let _ = entry.terminate_tx.send(done_tx);
-            let _ = done_rx.await;
+            entry.stop().await;
         }
         Ok(FsUnwatchResponse {})
     }
 
     pub(crate) async fn connection_closed(&self, connection_id: ConnectionId) {
-        let mut state = self.state.lock().await;
-        state
+        let entries = self
+            .state
+            .lock()
+            .await
             .entries
             .extract_if(|key, _| key.connection_id == connection_id)
-            .count();
+            .map(|(_, entry)| entry)
+            .collect::<Vec<_>>();
+        for entry in entries {
+            entry.stop().await;
+        }
     }
 }
 
@@ -250,6 +302,31 @@ mod tests {
             .expect_err("watch should fail");
 
         assert_eq!(error.message, "filesystem watching is unavailable");
+        assert!(manager.state.lock().await.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn closed_connection_gate_rejects_watch_registration() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let head_path = temp_dir.path().join("HEAD");
+        std::fs::write(&head_path, "ref: refs/heads/main\n").expect("write HEAD");
+        let manager = manager_with_noop_watcher();
+        let gate = ConnectionRpcGate::new();
+        gate.close().await;
+
+        let error = manager
+            .watch_with_gate(
+                ConnectionId(1),
+                FsWatchParams {
+                    watch_id: "watch-head".to_string(),
+                    path: absolute_path(head_path),
+                },
+                &gate,
+            )
+            .await
+            .expect_err("closed connection must reject watch registration");
+
+        assert_eq!(error.message, "connection is closed");
         assert!(manager.state.lock().await.entries.is_empty());
     }
 

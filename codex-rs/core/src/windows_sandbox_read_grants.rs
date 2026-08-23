@@ -1,4 +1,4 @@
-use crate::windows_sandbox::run_setup_refresh_with_extra_read_roots;
+use crate::windows_sandbox::run_strict_read_root_grant;
 use anyhow::Result;
 use codex_protocol::models::PermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -25,13 +25,13 @@ pub fn grant_read_root_non_elevated(
     }
 
     let canonical_root = dunce::canonicalize(read_root)?;
-    run_setup_refresh_with_extra_read_roots(
+    run_strict_read_root_grant(
         permission_profile,
         workspace_roots,
         command_cwd,
         env_map,
         codex_home,
-        vec![canonical_root.clone()],
+        canonical_root.clone(),
     )?;
     Ok(canonical_root)
 }

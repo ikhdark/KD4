@@ -49,7 +49,7 @@ an SDK, schema, package, installed binary, or Codex Desktop.
 Update it in the same change whenever the repository materially changes.
 
 <!-- BEGIN TRACKED PATH SNAPSHOT -->
-Tracked repository path snapshot: `count=5504 sha256=76b8023ceb42dc3e2a8d93aedb7154f5d92ff39ffef67ccda939984ed27e8cd9`.
+Tracked repository path snapshot: `count=17260 sha256=27391419c6d166c5298ecc32d7001fb00540fed4876fdc4d447a030a47d98d49`.
 <!-- END TRACKED PATH SNAPSHOT -->
 
 Every repository file or directory add, delete, move, or rename also requires
@@ -154,6 +154,7 @@ below.
 | `.devcontainer/` | Development-container image, bootstrap, and container-local Codex installation inputs |
 | `.vscode/` | Checked-in editor and workspace defaults |
 | `architecture_index.json` | Generated, manifest-keyed source-owner relationship graph consumed by task-scoped architecture discovery |
+| `bugs/` | Historical bug, audit, and evidence corpus organized by implementation language and audit date; records are evidence, not implementation source |
 | `codex-cli/` | npm-facing `@openai/codex` wrapper, native binary discovery, and npm package inputs |
 | `codex-rs/` | Primary Rust workspace and nearly all CLI, runtime, app-server, TUI, tool, protocol, state, plugin, extension, and sandbox behavior |
 | `docs/` | Checked-in documentation contracts and schemas, including investigation-evidence interchange |

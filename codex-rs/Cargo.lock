@@ -2601,7 +2601,6 @@ dependencies = [
  "core-foundation 0.9.4",
  "dns-lookup",
  "dunce",
- "fs2",
  "futures",
  "gethostname",
  "indexmap 2.14.0",
@@ -3666,6 +3665,7 @@ dependencies = [
  "codex-otel",
  "codex-protocol",
  "codex-utils-output-truncation",
+ "codex-utils-path",
  "pretty_assertions",
  "serde",
  "serde_json",
@@ -4433,6 +4433,7 @@ version = "0.0.0"
 dependencies = [
  "codex-utils-absolute-path",
  "dunce",
+ "fs2",
  "pretty_assertions",
  "tempfile",
 ]

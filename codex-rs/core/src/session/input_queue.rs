@@ -11,6 +11,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
 
+const MAX_PENDING_MAILBOX_COMMUNICATIONS: usize = 1_024;
+const MAX_SEEN_MAILBOX_COMMUNICATION_IDS: usize = 4_096;
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum TurnInput {
     UserInput {
@@ -37,8 +40,16 @@ pub(crate) struct TurnInputQueue {
 pub(crate) struct InputQueue {
     activity_tx: watch::Sender<InputQueueActivity>,
     startup_recovery_items: Mutex<VecDeque<TurnInput>>,
-    mailbox_pending_mails: Mutex<VecDeque<InterAgentCommunication>>,
-    seen_mailbox_communication_ids: Mutex<HashSet<codex_protocol::ResponseItemId>>,
+    mailbox: Mutex<MailboxState>,
+    max_pending_mailbox_communications: usize,
+    max_seen_mailbox_communication_ids: usize,
+}
+
+#[derive(Default)]
+struct MailboxState {
+    pending_mails: VecDeque<InterAgentCommunication>,
+    seen_communication_ids: HashSet<codex_protocol::ResponseItemId>,
+    seen_communication_id_order: VecDeque<codex_protocol::ResponseItemId>,
 }
 
 impl InputQueue {
@@ -47,9 +58,18 @@ impl InputQueue {
         Self {
             activity_tx,
             startup_recovery_items: Mutex::new(VecDeque::new()),
-            mailbox_pending_mails: Mutex::new(VecDeque::new()),
-            seen_mailbox_communication_ids: Mutex::new(HashSet::new()),
+            mailbox: Mutex::new(MailboxState::default()),
+            max_pending_mailbox_communications: MAX_PENDING_MAILBOX_COMMUNICATIONS,
+            max_seen_mailbox_communication_ids: MAX_SEEN_MAILBOX_COMMUNICATION_IDS,
         }
+    }
+
+    #[cfg(test)]
+    fn with_mailbox_limits(max_pending: usize, max_seen_ids: usize) -> Self {
+        let mut queue = Self::new();
+        queue.max_pending_mailbox_communications = max_pending;
+        queue.max_seen_mailbox_communication_ids = max_seen_ids;
+        queue
     }
 
     pub(crate) async fn subscribe_activity(
@@ -79,33 +99,45 @@ impl InputQueue {
         &self,
         communication: InterAgentCommunication,
     ) -> bool {
-        if let Some(id) = communication.id.as_ref()
-            && !self
-                .seen_mailbox_communication_ids
-                .lock()
-                .await
-                .insert(id.clone())
+        let mut mailbox = self.mailbox.lock().await;
+        if communication
+            .id
+            .as_ref()
+            .is_some_and(|id| mailbox.seen_communication_ids.contains(id))
         {
             return false;
         }
-        self.mailbox_pending_mails
-            .lock()
-            .await
-            .push_back(communication);
+        if mailbox.pending_mails.len() >= self.max_pending_mailbox_communications {
+            tracing::warn!(
+                max_pending = self.max_pending_mailbox_communications,
+                "rejecting mailbox communication because the session mailbox is full"
+            );
+            return false;
+        }
+        if let Some(id) = communication.id.as_ref() {
+            mailbox.seen_communication_ids.insert(id.clone());
+            mailbox.seen_communication_id_order.push_back(id.clone());
+            compact_seen_mailbox_ids(&mut mailbox, self.max_seen_mailbox_communication_ids);
+        }
+        mailbox.pending_mails.push_back(communication);
+        drop(mailbox);
         self.activity_tx.send_replace(InputQueueActivity::Mailbox);
         true
     }
 
     pub(crate) async fn seed_seen_mailbox_communication_ids(&self, items: &[RolloutItem]) {
-        let mut seen = self.seen_mailbox_communication_ids.lock().await;
+        let mut mailbox = self.mailbox.lock().await;
         for item in items {
             let id = match item {
                 RolloutItem::InterAgentCommunication(communication) => communication.id.as_ref(),
                 RolloutItem::ResponseItem(ResponseItem::AgentMessage { id, .. }) => id.as_ref(),
                 _ => None,
             };
-            if let Some(id) = id {
-                seen.insert(id.clone());
+            if let Some(id) = id
+                && mailbox.seen_communication_ids.insert(id.clone())
+            {
+                mailbox.seen_communication_id_order.push_back(id.clone());
+                compact_seen_mailbox_ids(&mut mailbox, self.max_seen_mailbox_communication_ids);
             }
         }
     }
@@ -116,16 +148,17 @@ impl InputQueue {
             .await
             .iter()
             .any(|item| matches!(item, TurnInput::InterAgentCommunication(_)))
-            || !self.mailbox_pending_mails.lock().await.is_empty()
+            || !self.mailbox.lock().await.pending_mails.is_empty()
     }
 
     pub(crate) async fn has_trigger_turn_mailbox_items(&self) -> bool {
         self.startup_recovery_items.lock().await.iter().any(
             |item| matches!(item, TurnInput::InterAgentCommunication(mail) if mail.trigger_turn),
         ) || self
-            .mailbox_pending_mails
+            .mailbox
             .lock()
             .await
+            .pending_mails
             .iter()
             .any(|mail| mail.trigger_turn)
     }
@@ -153,9 +186,10 @@ impl InputQueue {
     }
 
     pub(crate) async fn drain_mailbox_input_items(&self) -> Vec<TurnInput> {
-        self.mailbox_pending_mails
+        self.mailbox
             .lock()
             .await
+            .pending_mails
             .drain(..)
             .map(TurnInput::InterAgentCommunication)
             .collect()
@@ -312,6 +346,15 @@ impl InputQueue {
             return false;
         }
         self.has_pending_mailbox_items().await
+    }
+}
+
+fn compact_seen_mailbox_ids(mailbox: &mut MailboxState, max_seen_ids: usize) {
+    while mailbox.seen_communication_id_order.len() > max_seen_ids {
+        let Some(expired_id) = mailbox.seen_communication_id_order.pop_front() else {
+            break;
+        };
+        mailbox.seen_communication_ids.remove(&expired_id);
     }
 }
 
@@ -511,5 +554,72 @@ mod tests {
             )])
             .await;
         assert!(!restored.enqueue_mailbox_communication(communication).await);
+    }
+
+    #[tokio::test]
+    async fn mailbox_admission_is_bounded_without_poisoning_retries() {
+        let input_queue =
+            InputQueue::with_mailbox_limits(/*max_pending*/ 1, /*max_seen_ids*/ 4);
+        let first = make_mail(
+            AgentPath::root(),
+            AgentPath::try_from("/root/worker").expect("agent path"),
+            "one",
+            /*trigger_turn*/ false,
+        );
+        let mut retry = make_mail(
+            AgentPath::root(),
+            AgentPath::try_from("/root/worker").expect("agent path"),
+            "retry",
+            /*trigger_turn*/ false,
+        );
+        retry.id = Some(codex_protocol::ResponseItemId::from_server(
+            "bounded-retry".to_string(),
+        ));
+
+        assert!(input_queue.enqueue_mailbox_communication(first).await);
+        assert!(
+            !input_queue
+                .enqueue_mailbox_communication(retry.clone())
+                .await
+        );
+        assert_eq!(input_queue.drain_mailbox_input_items().await.len(), 1);
+        assert!(input_queue.enqueue_mailbox_communication(retry).await);
+    }
+
+    #[tokio::test]
+    async fn seen_mailbox_ids_evict_the_oldest_history_entry() {
+        let input_queue =
+            InputQueue::with_mailbox_limits(/*max_pending*/ 2, /*max_seen_ids*/ 2);
+        let ids = ["mailbox-one", "mailbox-two", "mailbox-three"];
+        let history = ids.map(|id| {
+            let mut communication = make_mail(
+                AgentPath::root(),
+                AgentPath::try_from("/root/worker").expect("agent path"),
+                id,
+                /*trigger_turn*/ false,
+            );
+            communication.id = Some(codex_protocol::ResponseItemId::from_server(id.to_string()));
+            RolloutItem::InterAgentCommunication(communication)
+        });
+        input_queue
+            .seed_seen_mailbox_communication_ids(&history)
+            .await;
+
+        let mut oldest = make_mail(
+            AgentPath::root(),
+            AgentPath::try_from("/root/worker").expect("agent path"),
+            "oldest",
+            /*trigger_turn*/ false,
+        );
+        oldest.id = Some(codex_protocol::ResponseItemId::from_server(
+            ids[0].to_string(),
+        ));
+        let mut newest = oldest.clone();
+        newest.id = Some(codex_protocol::ResponseItemId::from_server(
+            ids[2].to_string(),
+        ));
+
+        assert!(input_queue.enqueue_mailbox_communication(oldest).await);
+        assert!(!input_queue.enqueue_mailbox_communication(newest).await);
     }
 }

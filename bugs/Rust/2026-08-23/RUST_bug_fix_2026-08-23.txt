@@ -325,3 +325,355 @@ REMAINING UNKNOWNS AND FOLLOW-UP
   audited because they were not errors and the final run was green.
 - Desktop binary replacement/restart was not performed; activation was not requested.
 - Upstream synchronization, publication, and distribution were not performed.
+
+PASTED REGRESSION REVIEW FOLLOW-UP (2026-08-23)
+================================================
+
+Project/revision: KD4 local fork at 2546d114ed4125d29edd9eeab5ba9ccb21633f21,
+plus the shared working-tree changes below. Input was the user-provided pasted-text.txt;
+each accepted item was independently traced to its Rust producer and reachable consumer.
+
+RUST-2026-08-23-14 - omitted phase efforts lost compatibility defaults
+Severity/status/confidence: high / fixed / high.
+Affected files: codex-rs/core/src/config/mod.rs and config/config_tests.rs;
+codex-rs/config/src/config_toml.rs and config_explain.rs; core/config.schema.json;
+core/tests/suite/client.rs.
+Trigger and impact: omitted per-phase values used unwrap_or_default and inherited the
+turn effort, changing request behavior. The violated compatibility contract is orient,
+implement, and diagnose High; inspect, verify, finalize, and deterministic continuation
+Low, while explicit field overrides still win.
+Cause/fix: structurally empty defaults replaced compatibility-valued defaults. The
+effective-policy producer now restores those values, descriptions and generated schema
+match them, and config/client tests cover omission and overrides.
+Validation: task-scoped diff checks passed. The focused core Cargo route did not finish
+because of shared concurrent compilation failures; no test pass is claimed.
+
+RUST-2026-08-23-15 - rendered project documents had unbounded generated overhead
+Severity/status/confidence: high / fixed / high.
+Affected files: codex-rs/core/src/agents_md.rs and agents_md_tests.rs.
+Trigger and impact: source selection honored project_doc_max_bytes, but environment
+labels, separators, and per-document notices could grow beyond it with document count.
+The contract requires compatible source-byte semantics and a bounded model-visible
+prompt. Source bytes remain separately limited; generated framing is now capped at 4
+KiB and includes one compact aggregate omission notice. Selection order and UTF-8
+boundaries are preserved. Tests cover adversarial counts, truncation, aggregation, and
+the final rendered bound.
+Validation: scoped consistency checks passed; the direct Cargo filter did not complete
+amid shared core blockers, so no pass is claimed.
+
+RUST-2026-08-23-16 - malformed orchestration markers failed open
+Severity/status/confidence: high / fixed / high.
+Affected file: codex-rs/core/src/context/multi_agent_mode_instructions.rs.
+Trigger and impact: missing/malformed markers returned the whole template, exposing text
+outside the authorized root section. Extraction now requires exactly one ordered,
+nonempty marker pair; failure logs and injects nothing. Tests cover missing, reversed,
+duplicate, and empty markers.
+Validation: scoped diff checks passed. The focused test was not retried after shared
+compilation blockers and the user's direction to finish/report; no pass is claimed.
+
+RUST-2026-08-23-17 - grantReadRoot falsely succeeded for External sandbox ownership
+Severity/status/confidence: high / fixed / high.
+Affected file: codex-rs/app-server/src/request_processors/windows_sandbox_processor.rs.
+Trigger and impact: External profiles could acknowledge a grant KD4 could neither
+perform nor prove. External now returns invalid-request. Disabled and managed
+full-disk-read profiles validate/canonicalize and succeed without ACL mutation; restricted
+managed profiles retain the actual grant path. No new public schema or logical root
+attach/revoke policy was introduced.
+Validation: `cargo test -p codex-app-server
+windows_sandbox_grant_read_root_rejects_external_profile` selected one test, passed 1/1,
+and exited 0.
+
+RUST-2026-08-23-18 - terminal rollout repair lacked durable bounded recovery
+Severity/status/confidence: high / fixed / high for design, direct test incomplete.
+Affected files: codex-rs/core/src/tasks/mod.rs and tasks/mod_tests.rs;
+core/src/task_evidence.rs and task_evidence_tests.rs.
+Trigger and impact: a pre-publication append failure could retry without a finite policy
+or lose its exact repair payload across restart. The authoritative terminal evidence now
+stores the exact ResponseItem repair sequence and missing-call-output requirement before
+the live turn is released. Initial authority-write failure retains the active turn.
+Recovery uses capped exponential retries, per-attempt timeouts, and permanent/transient
+I/O classification. Exhaustion remains durable Pending; restart replays repair before
+terminal publication; success becomes Recovered. Preemptive partial labeling was removed
+so a transient repair that later succeeds is not reported as failed. The intentional
+five-second post-lock terminal deadline origin was not changed. Tests cover retry bounds,
+classification, and restart order.
+Validation: task-scoped diff checks passed. Core compilation advanced past earlier local
+type/import issues but the focused route was then blocked by shared concurrent changes.
+Per user direction, no further Cargo wait/retry was performed and no pass is claimed.
+
+VALIDATION AND DISPOSITION
+
+- Direct regression tests were added for all five contracts. Exactly one runtime route
+  completed: the app-server grantReadRoot test passed 1/1 (exit 0).
+- The schema was produced with its owner command. The accompanying check was blocked at
+  that time by a transient shared terminal-helper compile inconsistency, so no final
+  schema-check pass is claimed.
+- `git diff --check` over task-owned files found no whitespace errors, only expected
+  Windows LF-to-CRLF notices.
+- No broad suite, publication, Desktop activation, destructive operation, or upstream
+  mutation was performed. Speculative review items were not changed where tracing did
+  not establish a producer, violated contract, and reachable consumer.
+
+RUST-2026-08-23-19 - model-manager multi-lock acquisition could deadlock
+Severity/status/confidence: critical / fixed / high.
+Environment/revision: KD4 Rust workspace at baseline revision
+2546d114ed4125d29edd9eeab5ba9ccb21633f21 with concurrent user-owned changes preserved.
+Affected files/symbols: codex-rs/models-manager/src/manager.rs, OpenAiModelsManager
+catalog state; codex-rs/models-manager/src/manager_tests.rs.
+Trigger and execution sequence: concurrent refreshes acquired remote_models, etag, and
+active_cache_identity write guards as separate futures in tokio::join!. A completed
+branch retained its guard while another branch waited; another invocation could retain
+a different first guard, creating circular wait. The violated invariant was that a
+catalog snapshot and its ETag/cache identity must be updated atomically without
+cross-call lock-order cycles.
+Fix: replaced the three locks with one RwLock<ModelState>. Catalog, ETag, cache identity,
+and generation are read or committed as one coherent state. The remaining state-to-
+refresh-worker ordering is documented and no join! collects lock guards.
+Regression evidence: concurrent coherent-snapshot, ETag, and runtime-identity focused
+tests were reported passing in the isolated target (1/1, 5/5, and 1/1 respectively).
+
+RUST-2026-08-23-20 - connection shutdown lost ownership of active RPC handlers
+Severity/status/confidence: critical / fixed by source audit / high.
+Affected files: codex-rs/app-server/src/connection_rpc_gate.rs, message_processor.rs,
+request_serialization.rs, fs_watch.rs, command_exec.rs, and the fs/command/process/thread
+request processors.
+Trigger and impact: the old grace timeout could finish connection cleanup while detached
+handlers continued mutating connection-owned state. The violated terminal invariant was
+that no handler may commit a connection-owned mutation after close and cleanup may not
+discard ownership of executing work.
+Fix: each initialized request runs under a per-connection CancellationToken and a gate-
+owned abort handle. Close atomically rejects admission, removes queued serialized work,
+cancels handlers, waits a bounded grace, aborts stragglers, joins them, and then removes
+resources. Registration paths use try_commit terminal fences; thread subscription also
+checks live connection ownership.
+Validation: direct tests exist for cooperative cancellation, forced abort/join, late-run
+rejection, terminal commit rejection, queue cancellation, closed-watch rejection, and
+in-progress thread/start cancellation. The focused Cargo command spent about five
+minutes in a cold dependency build and was stopped on user direction before test
+execution; no runtime pass is claimed.
+
+RUST-2026-08-23-21 - stalled outbound delivery blocked resource cleanup
+Severity/status/confidence: critical / lifecycle fix implemented, durable replay partial /
+high for established lifecycle paths.
+Affected files: codex-rs/app-server/src/outgoing_message.rs, fs_watch.rs, command_exec.rs,
+and request_processors/process_exec_processor.rs.
+Established symptom: watch, command-output, process-output/exit, and completion paths
+could await writer admission or receipt without a deadline. This kept unwatch waiting,
+readers open, and exited process/session entries live. The violated invariant is that
+server-side cancellation and reaping must not depend on client writer progress.
+Fix disposition: targeted delivery now has bounded queue admission/receipt and connection
+cancellation. Watch tasks have retained cancellation/abort ownership and bounded unwatch.
+Command output uses a bounded relay and command session cleanup precedes terminal response
+delivery. Process supervision now starts before the spawn response; output and exit
+delivery are bounded/cancellable, and the live session is removed before exit delivery.
+Terminal-turn delivery already retains retry state, but durable replay records for
+command completion and process exit are not established and remain follow-up work.
+Validation: direct source tests were added; per user direction no long Cargo route was
+waited on. Compile/runtime proof remains unknown.
+
+RUST-2026-08-23-22 - unbounded request admission and live dedup eviction
+Severity/status/confidence: high / partially fixed / high.
+Affected files: codex-rs/app-server/src/request_serialization.rs, message_processor.rs,
+thread_state.rs, request_processors/turn_processor.rs and tests; related existing changes
+in codex-rs/core/src/session/input_queue.rs and turn_timing.rs.
+Established symptom: per-key VecDeque admission was item-unbounded and shared reads were
+released through an unbounded join_all burst. The 1,024-entry in-flight task map deleted
+still-live fingerprints, allowing a duplicate task to be admitted concurrently.
+Fix: serialization queues now enforce total/per-key item and byte limits at admission and
+execute at most 16 shared reads per batch. Overload is returned deterministically. The
+in-flight map never evicts live correctness state: duplicate fingerprints resolve to the
+original reference and new unique work is rejected at capacity with retryable error data.
+Listener commands already use a bounded channel. Existing workspace changes cap mailbox,
+seen-ID, terminal-ledger, and timing structures, but byte admission and non-evicting
+correctness semantics have not been independently established for every related core
+structure; finding status therefore remains partial.
+Validation: direct byte-admission and live-fingerprint retention tests were added. No
+Cargo result is claimed under the user's stop-waiting direction.
+
+RUST-2026-08-23-23 - config and model-cache cross-process stale writes
+Severity/status/confidence: critical / fixed by source audit / high.
+Affected files: codex-rs/utils/path-utils/src/lib.rs and tests; models-manager/src/cache.rs;
+core/src/config/edit.rs; config/src/mcp_edit.rs, plugin_edit.rs, marketplace_edit.rs;
+app-server/src/config_manager_service.rs and tests; related Cargo manifests/lock.
+Trigger and impact: process-local cache serialization allowed older model metadata or TTL
+renewal to overwrite a newer process. Config expected_version was checked before the
+final write, allowing two writers to pass the same version and lose one update.
+Fix: shared target-derived advisory locking, same-directory create-new temporary files,
+file flush/sync, atomic replacement, and parent durability are centralized in path-utils.
+Model cache uses a backward-compatible revision CAS and rejects stale fetch/TTL commits.
+All identified config.toml writers use the shared lock/write contract, and expected_version
+is authoritatively revalidated under that lock before persistence.
+Validation: the path atomic-replacement test passed. Existing direct tests cover stale
+model writers and concurrent same-version config writers. A combined cold cargo check was
+stopped before completion; compile proof remains pending.
+
+RUST-2026-08-23-24 - durable task-store snapshot I/O serialized SQLite mutations
+Severity/status/confidence: high / partial, performance unmeasured / high for source audit.
+Affected files: codex-rs/agent-task-store/src/local.rs and tests.
+Established symptom: filesystem snapshot copy/hash occurred in the sole SQLite write path,
+and each waiter independently polled durable wake state every roughly 250 ms.
+Current source disposition: snapshot reservation and finalization are split around
+filesystem I/O with generation-checked final CAS; a process-shared DurableWakePoller uses
+SQLite data_version to fan out wake changes. Direct tests cover writer acquisition while
+snapshot capture is paused and shared polling across waiters. The pool still declares
+max_connections(1), so separate read capacity is not established.
+Performance constraint/unknown: repository policy requires an exact workload command,
+quality gate, statistic/threshold, and token metric/budget before modifying or claiming an
+explicit hot-path optimization. Those inputs were not supplied, so no latency improvement
+or benchmark result is claimed and the remaining read-capacity change was not made.
+
+VALIDATION ADDENDUM FOR RUST-2026-08-23-19 THROUGH -24
+
+- Work was delegated as requested, with app-server writers sequenced where files overlap.
+- Long cold Cargo builds were stopped rather than treated as blockers, per user direction.
+- No broad test suite, publish, Desktop activation, destructive cleanup, or upstream action
+  was performed.
+- Remaining unknowns are compile/runtime proof for findings 20-23, durable command/process
+  replay for finding 21, complete byte/correctness limits across every related queue for
+  finding 22, and a repository-approved performance contract/read pool for finding 24.
+
+FOCUSED DIRTY-TREE VALIDATION ADDENDUM (2026-08-23)
+===================================================
+
+Scope and environment
+---------------------
+
+Project: KD4 local fork of openai/codex.
+Revision: main at d125780c12c2 with the user's existing dirty-tree changes preserved.
+Environment: Windows PowerShell; focused Rust tests invoked through `just test-fast` and
+Cargo nextest's fast profile. The user narrowed the session to focused tests from the
+current dirty tree. The previously started workspace test run was stopped and is not
+reported as validation evidence. No workspace-wide Clippy, push, publication, Desktop
+activation, or upstream mutation was performed after that scope change.
+
+RUST-2026-08-23-25 - timing history cap fixture did not model logical generations
+---------------------------------------------------------------------------------
+
+Severity/status/confidence: medium test blocker / fixed / high.
+Affected files and symbols:
+- codex-rs/core/src/turn_timing_tests.rs,
+  timing_histories_evict_oldest_entries_at_their_caps.
+- Producer contract inspected in codex-rs/core/src/turn_timing.rs:
+  TurnTimingState::begin_model_generation, begin_model_request_wait,
+  record_generation_outcome, and the bounded model-request histories.
+
+Trigger and reproduction:
+The focused 32-test core route failed at turn_timing_tests.rs in the assertion that the
+latest retained request contained 64 progress-kind records. The exact observed values
+were left 0 and right 64. The same route showed that request-count and request-history
+eviction assertions before it succeeded.
+
+Expected behavior and violated fixture invariant:
+The cap test must create a sequence of production-valid logical generations when it
+expects each request to own distinct generation outcome metadata. A generation outcome
+is intentionally attached to that logical generation's primary request; creating 1,025
+nominally primary requests without advancing the generation does not represent that
+contract.
+
+Established cause:
+The fixture called begin_model_request_wait repeatedly after only the implicit first
+generation. All retained requests therefore shared one generation index, and
+record_generation_outcome correctly updated that generation's first primary request,
+not the final retained request inspected by the test. No runtime history-cap defect was
+established.
+
+Fix:
+The fixture now begins a model generation before each request. This preserves the cap,
+oldest-entry eviction, physical-attempt-ID eviction, and progress-kind truncation checks
+while modeling the producer's real generation/request relationship.
+
+Regression risk:
+Low. The change is test-only. A possible risk was accidentally weakening the cap
+assertions; those assertions remain exact for the 1,024 request cap, the 64 attempt-ID
+cap, the 64 progress-kind cap, and oldest-entry eviction.
+
+Validation:
+- Two-test focused route: 2 tests run; 2 passed; 4,008 skipped; exit 0.
+- Final focused core route: 32 tests run; 32 passed; 3,978 skipped; exit 0.
+
+RUST-2026-08-23-26 - terminal recovery fixture confused repair events and lacked rollout storage
+------------------------------------------------------------------------------------------------
+
+Severity/status/confidence: medium test blocker / fixed / high.
+Affected files and symbols:
+- codex-rs/core/src/tasks/mod_tests.rs,
+  permanent_rollout_repair_failure_stops_live_retry_and_recovers_after_restart.
+- codex-rs/core/src/session/tests.rs, attach_thread_persistence (test helper visibility).
+- Runtime contracts inspected in codex-rs/core/src/tasks/mod.rs and
+  codex-rs/core/src/session/mod.rs, including recover_bound_terminal_intent,
+  recover_authoritative_terminal_delivery, record_conversation_items_durable, and
+  terminal event fingerprinting.
+
+Trigger and reproduction sequence:
+1. Recovery durably emitted the required pre-terminal developer repair item.
+2. That RawResponseItem event and the later TurnComplete event shared the same turn ID.
+3. The fixture stopped at the first matching turn ID and compared the repair event to
+   TurnComplete, causing the initial focused failure.
+4. After selecting the terminal event by fingerprint, the fixture reached its history
+   assertion and exposed that make_session_and_context_with_rx intentionally has no
+   LiveThread rollout storage.
+5. After attaching test rollout persistence, strict ResponseItem equality still failed
+   because the durable history boundary prepares persisted items with runtime metadata
+   such as the passthrough turn ID; the stable developer role/content remained intact.
+
+Expected behavior and violated fixture invariant:
+Recovery must replay the exact durable repair plan before terminal publication, and a
+test that asserts persisted ordering must use a persistence-backed session. Event
+selection must identify the terminal semantic event rather than assume turn ID uniquely
+identifies an event type. Persisted repair matching must compare stable semantic content,
+not metadata assigned by the normal durable history boundary.
+
+Established cause:
+The newly extended test combined an event-only session helper with rollout-history
+assertions and used equality criteria that were weaker than terminal identity for event
+selection but stronger than semantic identity for prepared ResponseItems. Runtime
+recovery produced the required repair-first sequence; the fixture could not observe it
+correctly. No runtime terminal-recovery defect was established by these failures.
+
+Fix:
+- Select the recovered terminal event by both turn ID and terminal event fingerprint.
+- Reuse the existing attach_thread_persistence helper from the tasks test and expose that
+  helper at crate test scope.
+- Locate the persisted repair item by stable developer role and content while continuing
+  to locate the terminal item by fingerprint and assert repair_position <
+  terminal_position.
+
+Direct consumers and impact:
+The corrected test exercises the persisted authoritative-terminal claim, restart reload,
+pre-terminal repair, live delivery, rollout ordering, and final pending-ledger cleanup.
+Without the fixture fixes, valid recovery behavior was reported as a blocker and the
+ordering contract was not actually reached.
+
+Regression risk:
+Low and test-scoped. Semantic matching intentionally ignores persistence-assigned item
+metadata but still requires the exact developer role/content, exact terminal fingerprint,
+and strict persisted order. The helper performs the same LiveThread creation and rollout
+flush already used by session persistence tests.
+
+Validation:
+- Two-test focused route: 2 tests run; 2 passed; 4,008 skipped; exit 0.
+- Final focused core route: 32 tests run; 32 passed; 3,978 skipped; exit 0.
+
+Focused dirty-tree validation inventory
+---------------------------------------
+
+The following non-overlapping named regression selections completed successfully:
+- codex-agent-task-store: 2/2 passed.
+- codex-app-server: 23/23 passed (one passing test classified leaky by nextest).
+- codex-core: 32/32 passed with --no-fail-fast.
+- codex-file-watcher: 1/1 passed.
+- codex-hooks: 4/4 passed.
+- codex-models-manager: 11/11 passed.
+- codex-utils-path: 2/2 passed.
+
+Total: 75 focused dirty-tree tests passed; zero focused failures remained.
+
+Warnings and remaining unknowns
+-------------------------------
+
+Direct facts: builds emitted existing dead-code warnings in core/app-server and Cargo's
+future-incompatibility advisory for proc-macro-error2 v2.0.1. These were warnings, not
+focused test failures. No claim is made that the entire workspace test suite or the
+entire workspace Clippy gate passes after the dirty-tree changes, because the user
+explicitly narrowed validation before those broad gates completed. No additional runtime
+defect is hypothesized from the two corrected fixture failures.

@@ -25,8 +25,12 @@ use codex_rollout::state_db::StateDbHandle;
 use codex_thread_store::ThreadStore;
 
 use crate::outgoing_message::OutgoingMessageSender;
+#[cfg(test)]
+use crate::thread_state::THREAD_LISTENER_COMMAND_CAPACITY;
 use crate::thread_state::ThreadListenerCommand;
 use crate::thread_state::ThreadStateManager;
+#[cfg(test)]
+use crate::thread_state::thread_listener_command_channel;
 
 pub(crate) struct ThreadExtensionDependencies {
     pub(crate) event_sink: Arc<dyn ExtensionEventSink>,
@@ -126,25 +130,29 @@ impl ExtensionEventSink for AppServerExtensionEventSink {
                         turn_id: turn_id.clone(),
                         goal: goal.clone(),
                     };
-                    if listener_command_tx.send(command).is_ok() {
-                        return;
+                    match listener_command_tx.try_send(command) {
+                        Ok(()) => return,
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            tracing::warn!(
+                                "dropping extension goal update for {thread_id}: listener command queue is full"
+                            );
+                            return;
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            tracing::warn!(
+                                "failed to enqueue extension goal update for {thread_id}: listener command channel is closed"
+                            );
+                        }
                     }
-                    tracing::warn!(
-                        "failed to enqueue extension goal update for {thread_id}: listener command channel is closed"
-                    );
                 }
-                let outgoing = Arc::clone(&self.outgoing);
-                tokio::spawn(async move {
-                    outgoing
-                        .send_server_notification(ServerNotification::ThreadGoalUpdated(
-                            ThreadGoalUpdatedNotification {
-                                thread_id: thread_id.to_string(),
-                                turn_id,
-                                goal,
-                            },
-                        ))
-                        .await;
-                });
+                self.outgoing
+                    .try_send_server_notification(ServerNotification::ThreadGoalUpdated(
+                        ThreadGoalUpdatedNotification {
+                            thread_id: thread_id.to_string(),
+                            turn_id,
+                            goal,
+                        },
+                    ));
             }
             msg => {
                 tracing::debug!(event_id = %event.id, ?msg, "dropping unsupported extension event");
@@ -193,7 +201,7 @@ mod tests {
         ));
         let thread_state_manager = ThreadStateManager::new();
         let thread_id = ThreadId::default();
-        let (listener_command_tx, mut listener_command_rx) = mpsc::unbounded_channel();
+        let (listener_command_tx, mut listener_command_rx) = thread_listener_command_channel();
         thread_state_manager.register_listener_command_tx(thread_id, listener_command_tx.clone());
         let sink = app_server_extension_event_sink(outgoing, thread_state_manager);
 
@@ -202,6 +210,7 @@ mod tests {
         }
         listener_command_tx
             .send(ThreadListenerCommand::EmitThreadGoalCleared)
+            .await
             .expect("listener command channel should be open");
 
         let mut observed = Vec::new();
@@ -229,6 +238,46 @@ mod tests {
             ],
             observed
         );
+    }
+
+    #[tokio::test]
+    async fn listener_command_admission_is_bounded() {
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(4);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            outgoing_tx,
+            AnalyticsEventsClient::disabled(),
+        ));
+        let thread_state_manager = ThreadStateManager::new();
+        let thread_id = ThreadId::default();
+        let (listener_command_tx, mut listener_command_rx) = thread_listener_command_channel();
+        thread_state_manager.register_listener_command_tx(thread_id, listener_command_tx);
+        let sink = app_server_extension_event_sink(outgoing, thread_state_manager);
+
+        for index in 0..THREAD_LISTENER_COMMAND_CAPACITY {
+            sink.emit(thread_goal_updated_event(
+                thread_id,
+                &format!("turn-{index}"),
+            ));
+        }
+        sink.emit(thread_goal_updated_event(thread_id, "overflow"));
+
+        assert_eq!(listener_command_rx.len(), THREAD_LISTENER_COMMAND_CAPACITY);
+        assert!(
+            outgoing_rx.try_recv().is_err(),
+            "an overflowed listener command must not escape FIFO via broadcast fallback"
+        );
+        for index in 0..THREAD_LISTENER_COMMAND_CAPACITY {
+            let command = listener_command_rx
+                .recv()
+                .await
+                .expect("admitted listener command");
+            let ThreadListenerCommand::EmitThreadGoalUpdated { turn_id, .. } = command else {
+                panic!("expected ordered goal update command");
+            };
+            let expected_turn_id = format!("turn-{index}");
+            assert_eq!(turn_id.as_deref(), Some(expected_turn_id.as_str()));
+        }
+        assert!(listener_command_rx.try_recv().is_err());
     }
 
     fn thread_goal_updated_event(thread_id: ThreadId, turn_id: &str) -> Event {

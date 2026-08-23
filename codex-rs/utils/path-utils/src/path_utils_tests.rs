@@ -1,3 +1,29 @@
+use super::acquire_atomic_write_lock;
+use super::atomic_write_lock_path;
+use super::write_bytes_atomically;
+use std::path::Path;
+use std::path::PathBuf;
+
+#[test]
+fn atomic_lock_path_is_stable_for_all_writers() {
+    assert_eq!(
+        atomic_write_lock_path(Path::new("config.toml")).unwrap(),
+        PathBuf::from(".config.toml.lock")
+    );
+}
+
+#[test]
+fn durable_atomic_write_replaces_existing_contents() {
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("state.json");
+    std::fs::write(&target, b"old").unwrap();
+
+    let _lock = acquire_atomic_write_lock(&target).unwrap();
+    write_bytes_atomically(&target, b"new").unwrap();
+
+    assert_eq!(std::fs::read(&target).unwrap(), b"new");
+}
+
 #[cfg(unix)]
 mod symlinks {
     use super::super::resolve_symlink_write_paths;

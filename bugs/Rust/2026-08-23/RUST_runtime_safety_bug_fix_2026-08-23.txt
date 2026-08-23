@@ -1,0 +1,280 @@
+KD4 RUST BUG FIX RECORD
+Date: 2026-08-23
+Project: KD4 local fork of openai/codex
+Baseline revision inspected: 2546d114ed4125d29edd9eeab5ba9ccb21633f21
+Scope: thirteen requested Rust runtime-safety, concurrency, and retention findings
+
+Evidence classification
+=======================
+
+The source paths, violated invariants, consumers, implemented changes, and tests
+listed below were established directly from the KD4 checkout. Test results are
+reported only where the named focused command completed successfully. Several
+codex-core/app-server tests were started in isolated Cargo target directories but
+were interrupted during first-time dependency compilation on the user's instruction
+to finish and report rather than wait on tests. Those tests remain unverified; no
+passing result is inferred. No fork publication, binary activation, or upstream
+state change was performed.
+
+RUST-2026-08-23-01 - ETag refresh worker abnormal exit
+Severity: high
+Status: fixed
+Confidence: high
+Affected files: codex-rs/models-manager/src/manager.rs,
+  codex-rs/models-manager/src/manager_tests.rs
+Producer and sequence: OpenAiModelsManager starts a detached ETag refresh worker and
+  records active/running/pending state shared by future refresh callers. Previously,
+  an unwind or cancellation before normal worker cleanup could leave the state marked
+  active while no worker existed.
+Violated invariant and impact: every state saying a refresh worker is active must have
+  a live owner that will either perform work or clear the state and wake waiters.
+  Otherwise every later waiter can remain stranded.
+Fix: the spawned future now owns EtagRefreshWorkerExitGuard. Its Drop path clears the
+  active/pending/running state and notifies waiters on abnormal exit; the normal idle
+  path explicitly disarms the guard after completing the same transition.
+Regression test: etag_refresh_worker_recovers_after_abnormal_exit.
+Validation: focused models-manager test completed successfully.
+
+RUST-2026-08-23-02 - future model-cache timestamp accepted as fresh
+Severity: medium
+Status: fixed
+Confidence: high
+Affected files: codex-rs/models-manager/src/cache.rs,
+  codex-rs/models-manager/src/manager_tests.rs
+Producer and sequence: cache freshness derives an age from the current clock and the
+  persisted fetch timestamp. A timestamp ahead of the current clock produced a
+  negative age that still satisfied the upper TTL bound.
+Violated invariant and impact: a cache record is fresh only when 0 <= age <= TTL.
+  Clock skew or corrupt metadata could otherwise suppress a required refresh.
+Fix: freshness now requires a non-negative age in addition to the TTL bound.
+Regression test: future_timestamp_is_not_fresh.
+Validation: focused models-manager test completed successfully.
+
+RUST-2026-08-23-03 - unsafe model metadata prefix selection
+Severity: high
+Status: fixed
+Confidence: high
+Affected files: codex-rs/models-manager/src/manager.rs,
+  codex-rs/models-manager/src/manager_tests.rs
+Producer and sequence: model metadata fallback selected a record using an unrestricted
+  starts_with comparison. A model slug that merely began with another slug could
+  inherit unrelated limits or capabilities.
+Violated invariant and impact: prefix fallback is valid only for an exact slug or a
+  structured family suffix separated by '-'. Arbitrary collisions can select unsafe
+  metadata for a reachable model request.
+Fix: lookup accepts exact equality or a '-' delimited suffix only.
+Regression test: get_model_info_rejects_unstructured_prefix_collision.
+Validation: focused models-manager test completed successfully.
+
+RUST-2026-08-23-04 - Desktop startup blocked on inherited raw descriptor
+Severity: high
+Status: fixed
+Confidence: high
+Affected files: codex-rs/app-server/src/desktop_activation.rs
+Producer and sequence: Desktop activation bootstrap reads an inherited descriptor or
+  handle before normal app-server startup. A valid inherited endpoint whose writer
+  stays open without producing data could block the bootstrap indefinitely.
+Violated invariant and impact: optional inherited activation input must be bounded and
+  cannot prevent the server from starting.
+Fix: the inherited endpoint is read non-blockingly with a 250 ms deadline; a stalled,
+  partial, invalid, or closed endpoint falls back without hanging startup.
+Regression test: desktop_activation_stalled_inherited_handle_is_deadline_bounded.
+Validation: cargo test -p codex-app-server desktop_activation completed successfully;
+  2 tests passed.
+
+RUST-2026-08-23-05 - replay raced request resolution on another connection
+Severity: high
+Status: fixed
+Confidence: high
+Affected files: codex-rs/app-server/src/outgoing_message.rs
+Producer and sequence: reconnect replay previously selected unresolved server requests,
+  released callback coordination, and then enqueued them. A response on another
+  authorized connection could resolve and remove the request between selection and
+  replay enqueue, producing a stale replay.
+Violated invariant and impact: a replay may be authorized and enqueued only while the
+  callback is still unresolved under the same synchronization boundary.
+Fix: replay reserves outbound capacity before entering the callback critical section,
+  rechecks unresolved state under the callback lock, authorizes the connection, and
+  sends through the reserved permit before releasing that proof boundary.
+Regression test: replay_does_not_enqueue_request_resolved_on_another_connection.
+Validation: test source and scoped diff check completed; focused Cargo execution was
+  blocked/interrupted by concurrent codex-core compilation and no pass is claimed.
+
+RUST-2026-08-23-06 - attestation ignored a healthy alternate client
+Severity: high
+Status: fixed
+Confidence: high
+Affected files: codex-rs/app-server/src/attestation.rs,
+  codex-rs/app-server/src/thread_state.rs
+Producer and sequence: attestation selected the first capable connection. A stale or
+  nonresponsive first client caused failure even when another subscribed capable
+  connection was healthy.
+Violated invariant and impact: thread attestation succeeds when any currently capable
+  subscribed client provides a valid response; one stale connection must not mask all
+  alternates.
+Fix: ThreadStateManager returns the ordered set of capable connections and attestation
+  targets all of them; the first healthy valid response wins while failed/stale peers
+  do not suppress it.
+Regression test: attestation_uses_healthy_alternate_connection.
+Validation: rustfmt and scoped diff check completed; focused Cargo execution was
+  blocked/interrupted by concurrent codex-core compilation and no pass is claimed.
+
+RUST-2026-08-23-07 - validation waiter missed Notify wake
+Severity: high
+Status: fixed
+Confidence: high
+Affected file: codex-rs/core/src/agent/task_coordinator.rs
+Producer and sequence: validation waiting read persistent state and only afterward
+  awaited Notify. notify_waiters() stores no permit for a future waiter, so a terminal
+  transition in that gap could be lost and the waiter would sleep until its deadline.
+Violated invariant and impact: after observing nonterminal state, the waiter must be
+  registered before a terminal transition can be missed.
+Fix: each loop creates and pins notified(), calls enable() before reading state, then
+  awaits that already-registered future only when state remains nonterminal.
+Regression test: validation_waiter_does_not_miss_terminal_transition, with a test hook
+  forcing the transition after waiter arming.
+Validation: rustfmt and scoped diff check completed; focused Cargo execution was
+  blocked/interrupted by concurrent core changes and no pass is claimed.
+
+RUST-2026-08-23-08 - failed native unwatch orphaned watcher state
+Severity: medium
+Status: fixed
+Confidence: high
+Affected files: codex-rs/file-watcher/src/lib.rs,
+  codex-rs/file-watcher/src/file_watcher_tests.rs
+Producer and sequence: when the last logical subscriber was removed, a native unwatch
+  failure could leave the OS watch installed without a logical owner or retry path.
+Violated invariant and impact: native watches must converge to authoritative logical
+  reference counts even after transient unwatch failures.
+Fix: a failed zero-subscriber unwatch enters a reconciliation loop with bounded
+  exponential retry (25 ms through 1 s), using logical refcounts as the source of truth.
+Regression test: the file-watcher zero-subscriber failed-unwatch reconciliation test.
+Validation: focused cargo test -p codex-file-watcher completed successfully.
+
+RUST-2026-08-23-09 - Windows restricted command survived disconnect
+Severity: high
+Status: fixed in shared runtime-hardening changes and reconciled
+Confidence: high for lifecycle cancellation; platform process-tree execution was not
+  rerun in this session
+Affected files include: codex-rs/app-server/src/connection_rpc_gate.rs,
+  codex-rs/app-server/src/message_processor.rs,
+  codex-rs/app-server/src/command_exec.rs,
+  codex-rs/app-server/src/request_processors/command_exec_processor.rs,
+  codex-rs/app-server/src/request_processors/process_exec_processor.rs,
+  codex-rs/app-server/src/request_serialization.rs
+Producer and sequence: connection teardown previously waited for initialized RPC
+  handlers before invoking command/process connection cleanup. A handler blocked in a
+  restricted-sandbox command path could therefore keep the process alive through the
+  disconnect drain interval.
+Violated invariant and impact: disconnect is a terminal ownership transition; no new
+  connection-owned resource may commit afterward, running request futures must receive
+  cancellation, and registered command/process sessions must be terminated.
+Fix: ConnectionRpcGate now publishes cancellation at close, fences resource registration
+  through try_commit, cancels serialized requests, owns/joins handler tasks, and aborts
+  noncooperative handlers after bounded grace. MessageProcessor observes cancellation
+  before response emission and then runs existing connection-owned command/process
+  termination cleanup. This closes both the in-flight-registration race and the delayed
+  cleanup path.
+Regression tests include cooperative_handler_observes_connection_cancellation,
+  shutdown_aborts_and_joins_noncooperative_handler_after_grace,
+  terminal_fence_rejects_post_close_registration, and
+  connection_close_cancels_in_progress_thread_start_before_post_close_response.
+Validation: tests were present and source was reconciled; this session did not complete
+  a Windows restricted-sandbox process-tree test, so that platform-specific runtime
+  proof remains follow-up evidence.
+
+RUST-2026-08-23-10 - MCP projection lock held across server startup
+Severity: high
+Status: fixed
+Confidence: high
+Affected files: codex-rs/core/src/session/mcp.rs,
+  codex-rs/core/src/session/tests.rs
+Producer and sequence: MCP projection refresh serialized configuration comparison,
+  connection-manager/server startup, and publication under a global projection lock.
+Slow startup therefore blocked unrelated refreshes; moving startup out of the lock also
+required preventing an older build from overwriting a newer publication.
+Violated invariant and impact: slow external server startup must not hold the global
+  projection lock, and only a candidate built from the still-current runtime may publish.
+Fix: refresh captures the exact expected runtime, builds McpConnectionManager outside
+  the lock, then compare-and-publishes under the lock. A stale candidate is canceled and
+  discarded. Startup cancellation-token handoff is serialized, and step projection
+  retries after a competing different-environment publication rather than returning the
+  wrong environment.
+Regression test:
+  concurrent_mcp_refresh_does_not_hold_projection_lock_and_discards_stale_build.
+Validation: rustfmt and git diff --check passed. The focused Cargo test was started in
+  an isolated target and interrupted during first-time dependency compilation; no pass
+  is claimed.
+
+RUST-2026-08-23-11 - repository-wide synchronous validation scan
+Severity: high
+Status: fixed/defense strengthened
+Confidence: high
+Affected file: codex-rs/core/src/task_evidence.rs
+Established baseline fact: directory hashing already executes sha1_directory through
+  tokio::task::spawn_blocking, so ordinary covered-directory scans do not synchronously
+  block the async executor in the inspected revision.
+Remaining reachable risk: an empty generated-artifact path or '.' resolved to the
+  repository root and could trigger an unbounded recursive repository scan.
+Violated invariant and impact: validation artifact hashing must be explicitly scoped;
+  the repository root is not a valid generated artifact.
+Fix: generated-artifact path validation now fails closed with
+  RepositoryWideArtifactScan for empty and '.' paths before filesystem recursion.
+Regression test: directory_hash_rejects_repository_wide_scan.
+Validation: rustfmt and scoped diff check passed. The focused Cargo test was interrupted
+  during first-time dependency compilation at user direction; no pass is claimed.
+
+RUST-2026-08-23-12 - hook spill files had no retention policy
+Severity: medium
+Status: fixed
+Confidence: high
+Affected files: codex-rs/hooks/src/output_spill.rs,
+  codex-rs/hooks/src/output_spill_tests.rs
+Producer and sequence: oversized hook output spills to direct .txt files. Successful
+  spills did not prune old crash leftovers, allowing count and bytes to grow forever.
+Violated invariant and impact: spill storage is diagnostic temporary state and must have
+  bounded age, file count, and byte retention without deleting active writes.
+Fix: after successful spill, cleanup considers direct .txt spill files, preserves a
+  one-hour active-file grace, expires files older than seven days, and prunes oldest
+  files to at most 512 files and 64 MiB.
+Regression tests cover expired/current files and combined count/byte limits.
+Validation: cargo test -p codex-hooks output_spill completed successfully; 5 tests passed.
+
+RUST-2026-08-23-13 - terminal and turn-timing ledgers grew without bounds
+Severity: medium
+Status: fixed
+Confidence: high
+Affected files: codex-rs/app-server/src/thread_state.rs,
+  codex-rs/core/src/turn_timing.rs,
+  codex-rs/core/src/turn_timing_tests.rs
+Producer and sequence: app-server terminal delivery retained acknowledged tombstones for
+  the lifetime of ThreadState, while turn timing retained every per-request diagnostic
+  record and per-request identifier/progress list.
+Violated invariant and impact: long-lived sessions need bounded diagnostic/idempotency
+  history while pending or unreduced terminal deliveries must never be evicted and
+  additive counters must remain authoritative.
+Fix: terminal delivery keeps a duplicate-safe FIFO of acknowledged, payload-cleared,
+  state-reduced tombstones and retains the newest 1,024; pruning never removes pending or
+  unreduced entries. Turn timing retains a 1,024-request diagnostic tail, caps physical
+  attempt IDs and progress kinds at 64 per request, and preserves additive counters as
+  the full-history source of truth.
+Regression tests:
+  terminal_ledger_bounds_acknowledged_tombstones_without_evicting_pending_delivery and
+  timing_histories_evict_oldest_entries_at_their_caps.
+Validation: terminal rustfmt and scoped diff check passed; its focused Cargo test was
+  interrupted during first-time dependency compilation. Timing changes and direct test
+  were supplied by the concurrent runtime-hardening owner; no additional pass is
+  claimed in this session.
+
+Cross-cutting regression risks and follow-up
+============================================
+
+- First-time isolated Cargo builds prevented completion of the focused tests explicitly
+  identified above. Those exact named filters are the remaining validation routes.
+- Windows restricted-sandbox disconnect behavior should receive a platform process-tree
+  integration run on Windows in addition to the deterministic lifecycle tests.
+- MCP refresh correctness relies on exact Arc runtime identity for compare-and-publish;
+  future publication paths must preserve that identity boundary and cancellation handoff.
+- No broad test suite was run, in accordance with repository instructions.
+- No secrets, credentials, publication, Desktop activation, or upstream mutation were
+  involved in this fix session.

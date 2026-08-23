@@ -21,6 +21,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tokio::sync::watch;
 
@@ -151,6 +153,23 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 #[cfg(test)]
 tokio::task_local! {
     static TEST_COMPARISON_NOW: chrono::DateTime<Utc>;
+    static TEST_SNAPSHOT_CAPTURE_PAUSE: Arc<TestSnapshotCapturePause>;
+}
+
+#[cfg(test)]
+pub(crate) struct TestSnapshotCapturePause {
+    pub(crate) started: tokio::sync::Semaphore,
+    pub(crate) release: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+impl TestSnapshotCapturePause {
+    pub(crate) fn new() -> Self {
+        Self {
+            started: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
 }
 
 fn comparison_now() -> chrono::DateTime<Utc> {
@@ -167,6 +186,14 @@ pub(crate) async fn with_test_comparison_now<T>(
     future: impl std::future::Future<Output = T>,
 ) -> T {
     TEST_COMPARISON_NOW.scope(now, future).await
+}
+
+#[cfg(test)]
+pub(crate) async fn with_test_snapshot_capture_pause<T>(
+    pause: Arc<TestSnapshotCapturePause>,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    TEST_SNAPSHOT_CAPTURE_PAUSE.scope(pause, future).await
 }
 
 enum ReceiptHandoffAction {
@@ -198,6 +225,132 @@ pub struct LocalAgentTaskStore {
     coordination_root: Arc<PathBuf>,
     missing_evidence_rejections: Arc<Mutex<HashMap<AttemptId, MissingEvidenceRejection>>>,
     wake_revision: Arc<watch::Sender<u64>>,
+    durable_wake_poller: Arc<DurableWakePoller>,
+}
+
+struct DurableWakePoller {
+    waiter_count: AtomicUsize,
+    active: watch::Sender<bool>,
+    shutdown: watch::Sender<bool>,
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    #[cfg(test)]
+    poll_count: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl DurableWakePoller {
+    fn spawn(
+        pool: SqlitePool,
+        wake_revision: Arc<watch::Sender<u64>>,
+        watermark: i64,
+    ) -> Arc<Self> {
+        let (active, mut active_rx) = watch::channel(false);
+        let (shutdown, mut shutdown_rx) = watch::channel(false);
+        #[cfg(test)]
+        let poll_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        #[cfg(test)]
+        let task_poll_count = Arc::clone(&poll_count);
+        let task = tokio::spawn(async move {
+            let mut watermark = watermark;
+            loop {
+                while !*active_rx.borrow() {
+                    tokio::select! {
+                        changed = active_rx.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                        }
+                        changed = shutdown_rx.changed() => {
+                            if changed.is_err() || *shutdown_rx.borrow() {
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                tokio::select! {
+                    changed = active_rx.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            return;
+                        }
+                    }
+                    _ = tokio::time::sleep(EXTERNAL_WAKE_RECHECK_INTERVAL) => {
+                        #[cfg(test)]
+                        task_poll_count.fetch_add(1, Ordering::Relaxed);
+                        match durable_wake_watermark(&pool).await {
+                            Ok(next_watermark) if next_watermark != watermark => {
+                                watermark = next_watermark;
+                                wake_revision.send_modify(|revision| {
+                                    *revision = revision.saturating_add(1);
+                                });
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                tracing::warn!(
+                                    target: "codex_agent_task_store::wake",
+                                    %error,
+                                    "durable wake poll failed"
+                                );
+                                // Wake consumers so their normal durable read
+                                // observes and reports a persistent database error.
+                                wake_revision.send_modify(|revision| {
+                                    *revision = revision.saturating_add(1);
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        Arc::new(Self {
+            waiter_count: AtomicUsize::new(0),
+            active,
+            shutdown,
+            task: Mutex::new(Some(task)),
+            #[cfg(test)]
+            poll_count,
+        })
+    }
+
+    fn register(self: &Arc<Self>) -> DurableWakeWaiter {
+        if self.waiter_count.fetch_add(1, Ordering::AcqRel) == 0 {
+            self.active.send_replace(true);
+        }
+        DurableWakeWaiter {
+            poller: Arc::clone(self),
+        }
+    }
+
+    async fn close(&self) {
+        self.shutdown.send_replace(true);
+        let task = self.task.lock().ok().and_then(|mut task| task.take());
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+    }
+}
+
+struct DurableWakeWaiter {
+    poller: Arc<DurableWakePoller>,
+}
+
+impl Drop for DurableWakeWaiter {
+    fn drop(&mut self) {
+        if self.poller.waiter_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.poller.active.send_if_modified(|active| {
+                if self.poller.waiter_count.load(Ordering::Acquire) == 0 {
+                    *active = false;
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+    }
 }
 
 impl std::fmt::Debug for LocalAgentTaskStore {
@@ -227,11 +380,19 @@ impl LocalAgentTaskStore {
             .await?;
         MIGRATOR.run(&pool).await?;
         upgrade_legacy_repository_bindings(&pool).await?;
+        let wake_revision = Arc::new(watch::channel(0).0);
+        let durable_wake_watermark = durable_wake_watermark(&pool).await?;
+        let durable_wake_poller = DurableWakePoller::spawn(
+            pool.clone(),
+            Arc::clone(&wake_revision),
+            durable_wake_watermark,
+        );
         let store = Self {
             pool,
             coordination_root: Arc::new(coordination_root),
             missing_evidence_rejections: Arc::new(Mutex::new(HashMap::new())),
-            wake_revision: Arc::new(watch::channel(0).0),
+            wake_revision,
+            durable_wake_poller,
         };
         store
             .drain_snapshot_gc_queue_best_effort("store initialization")
@@ -246,6 +407,7 @@ impl LocalAgentTaskStore {
     }
 
     pub async fn close(&self) {
+        self.durable_wake_poller.close().await;
         self.pool.close().await;
     }
 
@@ -259,6 +421,7 @@ impl LocalAgentTaskStore {
         root_session_id: String,
         after_event_id: Option<WakeEventId>,
     ) -> StoreResult<WakeRead> {
+        let _durable_waiter = self.durable_wake_poller.register();
         let mut wake_rx = self.wake_revision.subscribe();
         loop {
             let current = self
@@ -267,22 +430,17 @@ impl LocalAgentTaskStore {
             if !current.updated_agents.is_empty() {
                 return Ok(current);
             }
-            tokio::select! {
-                changed = wake_rx.changed() => {
-                    changed.map_err(|_| {
-                        StoreError::InvalidAssignment(
-                            "agent-task wake stream closed while waiting".to_string(),
-                        )
-                    })?;
-                }
-                _ = tokio::time::sleep(EXTERNAL_WAKE_RECHECK_INTERVAL) => {
-                    // Independent Codex processes own independent watch
-                    // senders while sharing this durable SQLite stream.
-                    // Recheck it at a bounded cadence so an external commit
-                    // cannot remain hidden indefinitely.
-                }
-            }
+            wake_rx.changed().await.map_err(|_| {
+                StoreError::InvalidAssignment(
+                    "agent-task wake stream closed while waiting".to_string(),
+                )
+            })?;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn durable_wake_poll_count(&self) -> u64 {
+        self.durable_wake_poller.poll_count.load(Ordering::Relaxed)
     }
 
     fn cached_missing_evidence_rejection(
@@ -2862,99 +3020,161 @@ impl LocalAgentTaskStore {
     ) -> StoreResult<MutationEventId> {
         let normalized = normalize_repo_path(repo_root, &path)?;
         let repository = repository_identity(repo_root)?;
-        let transaction_started = Instant::now();
-        let mut transaction = self.pool.begin().await?;
-        lock_attempt_tx(&mut transaction, attempt_id).await?;
-        let attempt = require_active_current_attempt_tx(&mut transaction, attempt_id).await?;
-        let assignment = load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
-        require_repository_identity_tx(&mut transaction, &assignment, &repository).await?;
-        let existing = sqlx::query(
-            "SELECT finalized_at FROM mutation_files WHERE attempt_id = ? AND path = ?",
-        )
-        .bind(attempt_id.to_string())
-        .bind(&normalized)
-        .fetch_optional(&mut *transaction)
-        .await?;
-        if existing
-            .as_ref()
-            .is_some_and(|row| row.get::<Option<String>, _>("finalized_at").is_some())
-        {
-            return Err(StoreError::MutationAlreadyFinalized {
-                attempt_id,
-                path: normalized,
-            });
-        }
-        if existing.is_none() {
-            let start_epoch =
-                assignment_epoch_tx(&mut transaction, assignment.assignment_id).await?;
-            let start_epoch = i64::try_from(start_epoch).map_err(|_| {
-                StoreError::CorruptData("workspace epoch exceeds SQLite integer range".to_string())
+        let (assignment_id, existing, start_epoch) = {
+            let mut transaction = self.pool.begin().await?;
+            let attempt = require_active_current_attempt_tx(&mut transaction, attempt_id).await?;
+            let assignment = load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
+            require_repository_identity_tx(&mut transaction, &assignment, &repository).await?;
+            let existing = sqlx::query(
+                "SELECT finalized_at FROM mutation_files WHERE attempt_id = ? AND path = ?",
+            )
+            .bind(attempt_id.to_string())
+            .bind(&normalized)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            if existing
+                .as_ref()
+                .is_some_and(|row| row.get::<Option<String>, _>("finalized_at").is_some())
+            {
+                return Err(StoreError::MutationAlreadyFinalized {
+                    attempt_id,
+                    path: normalized,
+                });
+            }
+            let start_epoch = if existing.is_none() {
+                let epoch = assignment_epoch_tx(&mut transaction, assignment.assignment_id).await?;
+                Some(i64::try_from(epoch).map_err(|_| {
+                    StoreError::CorruptData(
+                        "workspace epoch exceeds SQLite integer range".to_string(),
+                    )
+                })?)
+            } else {
+                None
+            };
+            transaction.commit().await?;
+            (assignment.assignment_id, existing.is_some(), start_epoch)
+        };
+
+        let snapshot_candidate = if existing {
+            None
+        } else {
+            let start_epoch = start_epoch.ok_or_else(|| {
+                StoreError::CorruptData("new mutation is missing its start epoch".to_string())
             })?;
             let absolute = absolute_repo_path(&repository.canonical_root, &normalized);
-            let snapshot_name = snapshot_name(
-                assignment.assignment_id,
+            let snapshot_name = unique_snapshot_name(snapshot_name(
+                assignment_id,
                 attempt_id,
                 &normalized,
                 MutationSnapshotVersion::PreWrite,
                 absolute.exists(),
-            );
+            ))?;
             let snapshot_name = snapshot_name.to_string_lossy().into_owned();
             let snapshot_path = private_snapshot_path(&self.coordination_root, &snapshot_name)?;
             let snapshot_started = Instant::now();
             let pre_write =
-                capture_snapshot_atomic(absolute, snapshot_path, normalized.clone()).await?;
+                capture_snapshot_atomic(absolute, snapshot_path.clone(), normalized.clone())
+                    .await?;
             record_coordination_timing(
                 "begin_mutation",
                 "snapshot_capture",
                 snapshot_started,
                 None,
             );
-            sqlx::query("INSERT INTO mutation_files (attempt_id, assignment_id, path, pre_write_hash, pre_write_existed, attribution_confidence, snapshot_name, snapshot_retained, first_observed_at, start_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)")
-                .bind(attempt_id.to_string())
-                .bind(assignment.assignment_id.to_string())
-                .bind(&normalized)
-                .bind(pre_write.hash)
-                .bind(i64::from(pre_write.existed))
-                .bind(encode(&confidence)?)
-                .bind(snapshot_name)
-                .bind(encode(&Utc::now())?)
-                .bind(start_epoch)
-                .execute(&mut *transaction)
-                .await?;
-        } else if confidence == AttributionConfidence::Definitive {
-            sqlx::query("UPDATE mutation_files SET attribution_confidence = ? WHERE attempt_id = ? AND path = ?")
-                .bind(encode(&confidence)?)
-                .bind(attempt_id.to_string())
-                .bind(&normalized)
-                .execute(&mut *transaction)
-                .await?;
-        }
-        let event_id = MutationEventId::new();
-        sqlx::query("INSERT INTO mutation_events (event_id, attempt_id, path, created_at) VALUES (?, ?, ?, ?)")
-            .bind(event_id.to_string())
+            Some((pre_write, snapshot_name, snapshot_path, start_epoch))
+        };
+
+        let transaction_started = Instant::now();
+        let result: StoreResult<(MutationEventId, bool)> = async {
+            let mut transaction = self.pool.begin().await?;
+            lock_attempt_tx(&mut transaction, attempt_id).await?;
+            let attempt = require_active_current_attempt_tx(&mut transaction, attempt_id).await?;
+            let assignment = load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
+            require_repository_identity_tx(&mut transaction, &assignment, &repository).await?;
+            let existing = sqlx::query(
+                "SELECT finalized_at FROM mutation_files WHERE attempt_id = ? AND path = ?",
+            )
             .bind(attempt_id.to_string())
             .bind(&normalized)
-            .bind(encode(&Utc::now())?)
-            .execute(&mut *transaction)
+            .fetch_optional(&mut *transaction)
             .await?;
-        append_observation_tx(
-            &mut transaction,
-            &assignment,
-            attempt_id,
-            ObservationKind::Mutation,
-            format!("mutation attributed to {normalized}"),
-            None,
-        )
-        .await?;
-        let commit_result = transaction.commit().await;
+            if existing
+                .as_ref()
+                .is_some_and(|row| row.get::<Option<String>, _>("finalized_at").is_some())
+            {
+                return Err(StoreError::MutationAlreadyFinalized {
+                    attempt_id,
+                    path: normalized.clone(),
+                });
+            }
+            let inserted_snapshot = existing.is_none();
+            if inserted_snapshot {
+                let Some((pre_write, snapshot_name, _, start_epoch)) =
+                    snapshot_candidate.as_ref()
+                else {
+                    return Err(StoreError::CorruptData(
+                        "mutation snapshot candidate is missing".to_string(),
+                    ));
+                };
+                sqlx::query("INSERT INTO mutation_files (attempt_id, assignment_id, path, pre_write_hash, pre_write_existed, attribution_confidence, snapshot_name, snapshot_retained, first_observed_at, start_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)")
+                    .bind(attempt_id.to_string())
+                    .bind(assignment.assignment_id.to_string())
+                    .bind(&normalized)
+                    .bind(&pre_write.hash)
+                    .bind(i64::from(pre_write.existed))
+                    .bind(encode(&confidence)?)
+                    .bind(snapshot_name)
+                    .bind(encode(&Utc::now())?)
+                    .bind(*start_epoch)
+                    .execute(&mut *transaction)
+                    .await?;
+            } else if confidence == AttributionConfidence::Definitive {
+                sqlx::query("UPDATE mutation_files SET attribution_confidence = ? WHERE attempt_id = ? AND path = ?")
+                    .bind(encode(&confidence)?)
+                    .bind(attempt_id.to_string())
+                    .bind(&normalized)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+            let event_id = MutationEventId::new();
+            sqlx::query("INSERT INTO mutation_events (event_id, attempt_id, path, created_at) VALUES (?, ?, ?, ?)")
+                .bind(event_id.to_string())
+                .bind(attempt_id.to_string())
+                .bind(&normalized)
+                .bind(encode(&Utc::now())?)
+                .execute(&mut *transaction)
+                .await?;
+            append_observation_tx(
+                &mut transaction,
+                &assignment,
+                attempt_id,
+                ObservationKind::Mutation,
+                format!("mutation attributed to {normalized}"),
+                None,
+            )
+            .await?;
+            transaction.commit().await?;
+            Ok((event_id, inserted_snapshot))
+        }
+        .await;
+        let timing_error = result.as_ref().err().and_then(|error| match error {
+            StoreError::Sql(error) => Some(error),
+            _ => None,
+        });
         record_coordination_timing(
             "begin_mutation",
             "write_transaction",
             transaction_started,
-            commit_result.as_ref().err(),
+            timing_error,
         );
-        commit_result?;
-        Ok(event_id)
+        let keep_snapshot = matches!(&result, Ok((_, true)));
+        if !keep_snapshot
+            && let Some((_, snapshot_name, snapshot_path, _)) = snapshot_candidate.as_ref()
+        {
+            remove_unpublished_snapshot(&self.pool, snapshot_name, snapshot_path, "begin mutation")
+                .await;
+        }
+        result.map(|(event_id, _)| event_id)
     }
 
     async fn finalize_mutation_impl(
@@ -2965,80 +3185,41 @@ impl LocalAgentTaskStore {
     ) -> StoreResult<MutationEvidence> {
         let normalized = normalize_repo_path(repo_root, &path)?;
         let repository = repository_identity(repo_root)?;
-        let acquire_started = Instant::now();
-        let mut connection = self.pool.acquire().await.inspect_err(|error| {
-            record_coordination_timing(
-                "finalize_mutation",
-                "connection_acquire",
-                acquire_started,
-                Some(error),
-            );
-        })?;
-        record_coordination_timing(
-            "finalize_mutation",
-            "connection_acquire",
-            acquire_started,
-            None,
-        );
-        let begin_started = Instant::now();
-        let mut transaction = connection.begin().await.inspect_err(|error| {
-            record_coordination_timing(
-                "finalize_mutation",
-                "transaction_begin",
-                begin_started,
-                Some(error),
-            );
-        })?;
-        record_coordination_timing(
-            "finalize_mutation",
-            "transaction_begin",
-            begin_started,
-            None,
-        );
-        let transaction_started = Instant::now();
-        let writer_started = Instant::now();
-        let writer_result = lock_attempt_tx(&mut transaction, attempt_id).await;
-        let writer_error = writer_result.as_ref().err().and_then(|error| match error {
-            StoreError::Sql(error) => Some(error),
-            _ => None,
-        });
-        record_coordination_timing(
-            "finalize_mutation",
-            "writer_lock",
-            writer_started,
-            writer_error,
-        );
-        writer_result?;
-        let attempt = require_active_current_attempt_tx(&mut transaction, attempt_id).await?;
-        let assignment = load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
-        require_repository_identity_tx(&mut transaction, &assignment, &repository).await?;
-        let existing = sqlx::query(
-            "SELECT finalized_at FROM mutation_files WHERE attempt_id = ? AND path = ?",
-        )
-        .bind(attempt_id.to_string())
-        .bind(&normalized)
-        .fetch_optional(&mut *transaction)
-        .await?;
-        let Some(existing) = existing else {
-            return Err(StoreError::MutationNotStarted {
-                attempt_id,
-                path: normalized,
-            });
+        let assignment_id = {
+            let mut transaction = self.pool.begin().await?;
+            let attempt = require_active_current_attempt_tx(&mut transaction, attempt_id).await?;
+            let assignment = load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
+            require_repository_identity_tx(&mut transaction, &assignment, &repository).await?;
+            let existing = sqlx::query(
+                "SELECT finalized_at FROM mutation_files WHERE attempt_id = ? AND path = ?",
+            )
+            .bind(attempt_id.to_string())
+            .bind(&normalized)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            let Some(existing) = existing else {
+                return Err(StoreError::MutationNotStarted {
+                    attempt_id,
+                    path: normalized,
+                });
+            };
+            if existing.get::<Option<String>, _>("finalized_at").is_some() {
+                return Err(StoreError::MutationAlreadyFinalized {
+                    attempt_id,
+                    path: normalized,
+                });
+            }
+            transaction.commit().await?;
+            assignment.assignment_id
         };
-        if existing.get::<Option<String>, _>("finalized_at").is_some() {
-            return Err(StoreError::MutationAlreadyFinalized {
-                attempt_id,
-                path: normalized,
-            });
-        }
         let absolute = absolute_repo_path(&repository.canonical_root, &normalized);
-        let final_snapshot_name = snapshot_name(
-            assignment.assignment_id,
+        let final_snapshot_name = unique_snapshot_name(snapshot_name(
+            assignment_id,
             attempt_id,
             &normalized,
             MutationSnapshotVersion::Final,
             absolute.exists(),
-        );
+        ))?;
         let final_snapshot_name = final_snapshot_name.to_string_lossy().into_owned();
         let snapshot_path = private_snapshot_path(&self.coordination_root, &final_snapshot_name)?;
         let snapshot_started = Instant::now();
@@ -3050,38 +3231,130 @@ impl LocalAgentTaskStore {
             snapshot_started,
             None,
         );
-        let finalized_at = Utc::now();
-        let end_epoch = assignment_epoch_tx(&mut transaction, assignment.assignment_id).await?;
-        let end_epoch = i64::try_from(end_epoch).map_err(|_| {
-            StoreError::CorruptData("workspace epoch exceeds SQLite integer range".to_string())
-        })?;
-        let updated = sqlx::query("UPDATE mutation_files SET final_hash = ?, final_write_existed = ?, final_snapshot_name = ?, finalized_at = ?, end_epoch = ? WHERE attempt_id = ? AND path = ? AND finalized_at IS NULL")
-            .bind(&final_write.hash)
-            .bind(i64::from(final_write.existed))
-            .bind(final_snapshot_name)
-            .bind(encode(&finalized_at)?)
-            .bind(end_epoch)
-            .bind(attempt_id.to_string())
-            .bind(&normalized)
-            .execute(&mut *transaction)
-            .await?;
-        if updated.rows_affected() != 1 {
-            let _ = tokio::fs::remove_file(snapshot_path).await;
-            return Err(StoreError::MutationAlreadyFinalized {
-                attempt_id,
-                path: normalized,
+
+        let result: StoreResult<MutationEvidence> = async {
+            let acquire_started = Instant::now();
+            let mut connection = self.pool.acquire().await.inspect_err(|error| {
+                record_coordination_timing(
+                    "finalize_mutation",
+                    "connection_acquire",
+                    acquire_started,
+                    Some(error),
+                );
+            })?;
+            record_coordination_timing(
+                "finalize_mutation",
+                "connection_acquire",
+                acquire_started,
+                None,
+            );
+            let begin_started = Instant::now();
+            let mut transaction = connection.begin().await.inspect_err(|error| {
+                record_coordination_timing(
+                    "finalize_mutation",
+                    "transaction_begin",
+                    begin_started,
+                    Some(error),
+                );
+            })?;
+            record_coordination_timing(
+                "finalize_mutation",
+                "transaction_begin",
+                begin_started,
+                None,
+            );
+            let transaction_started = Instant::now();
+            let writer_started = Instant::now();
+            let writer_result = lock_attempt_tx(&mut transaction, attempt_id).await;
+            let writer_error = writer_result.as_ref().err().and_then(|error| match error {
+                StoreError::Sql(error) => Some(error),
+                _ => None,
             });
+            record_coordination_timing(
+                "finalize_mutation",
+                "writer_lock",
+                writer_started,
+                writer_error,
+            );
+            writer_result?;
+            let write_result: StoreResult<MutationEvidence> = async {
+                let attempt =
+                    require_active_current_attempt_tx(&mut transaction, attempt_id).await?;
+                let assignment =
+                    load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
+                require_repository_identity_tx(&mut transaction, &assignment, &repository).await?;
+                let existing = sqlx::query(
+                    "SELECT finalized_at FROM mutation_files WHERE attempt_id = ? AND path = ?",
+                )
+                .bind(attempt_id.to_string())
+                .bind(&normalized)
+                .fetch_optional(&mut *transaction)
+                .await?;
+                let Some(existing) = existing else {
+                    return Err(StoreError::MutationNotStarted {
+                        attempt_id,
+                        path: normalized.clone(),
+                    });
+                };
+                if existing.get::<Option<String>, _>("finalized_at").is_some() {
+                    return Err(StoreError::MutationAlreadyFinalized {
+                        attempt_id,
+                        path: normalized.clone(),
+                    });
+                }
+                let finalized_at = Utc::now();
+                let end_epoch =
+                    assignment_epoch_tx(&mut transaction, assignment.assignment_id).await?;
+                let end_epoch = i64::try_from(end_epoch).map_err(|_| {
+                    StoreError::CorruptData(
+                        "workspace epoch exceeds SQLite integer range".to_string(),
+                    )
+                })?;
+                let updated = sqlx::query("UPDATE mutation_files SET final_hash = ?, final_write_existed = ?, final_snapshot_name = ?, finalized_at = ?, end_epoch = ? WHERE attempt_id = ? AND path = ? AND finalized_at IS NULL")
+                    .bind(&final_write.hash)
+                    .bind(i64::from(final_write.existed))
+                    .bind(&final_snapshot_name)
+                    .bind(encode(&finalized_at)?)
+                    .bind(end_epoch)
+                    .bind(attempt_id.to_string())
+                    .bind(&normalized)
+                    .execute(&mut *transaction)
+                    .await?;
+                if updated.rows_affected() != 1 {
+                    return Err(StoreError::MutationAlreadyFinalized {
+                        attempt_id,
+                        path: normalized.clone(),
+                    });
+                }
+                let evidence =
+                    load_mutation_evidence_tx(&mut transaction, attempt_id, &normalized).await?;
+                transaction.commit().await?;
+                Ok(evidence)
+            }
+            .await;
+            let timing_error = write_result.as_ref().err().and_then(|error| match error {
+                StoreError::Sql(error) => Some(error),
+                _ => None,
+            });
+            record_coordination_timing(
+                "finalize_mutation",
+                "write_transaction",
+                transaction_started,
+                timing_error,
+            );
+            write_result
         }
-        let evidence = load_mutation_evidence_tx(&mut transaction, attempt_id, &normalized).await?;
-        let commit_result = transaction.commit().await;
-        record_coordination_timing(
-            "finalize_mutation",
-            "write_transaction",
-            transaction_started,
-            commit_result.as_ref().err(),
-        );
-        commit_result?;
-        Ok(evidence)
+        .await;
+        if result.is_err() {
+            remove_unpublished_snapshot(
+                &self.pool,
+                &final_snapshot_name,
+                &snapshot_path,
+                "finalize mutation",
+            )
+            .await;
+        }
+        result
     }
 
     async fn finalize_pending_mutations_impl(
@@ -6857,6 +7130,13 @@ async fn capture_snapshot_atomic(
     snapshot_path: PathBuf,
     logical_path: String,
 ) -> StoreResult<SnapshotCapture> {
+    #[cfg(test)]
+    if let Ok(pause) = TEST_SNAPSHOT_CAPTURE_PAUSE.try_with(|pause| Arc::clone(pause)) {
+        pause.started.add_permits(1);
+        if let Ok(permit) = pause.release.acquire().await {
+            permit.forget();
+        }
+    }
     tokio::task::spawn_blocking(move || {
         let parent = snapshot_path.parent().ok_or_else(|| {
             StoreError::CorruptData("private snapshot has no parent directory".to_string())
@@ -6936,6 +7216,68 @@ async fn capture_snapshot_atomic(
             "snapshot capture task failed: {error}"
         )))
     })?
+}
+
+fn unique_snapshot_name(snapshot_name: PathBuf) -> StoreResult<PathBuf> {
+    let file_name = snapshot_name
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            StoreError::CorruptData("private snapshot name is not valid UTF-8".to_string())
+        })?;
+    Ok(snapshot_name.with_file_name(format!("{file_name}.{}", MutationEventId::new())))
+}
+
+async fn remove_unpublished_snapshot(
+    pool: &SqlitePool,
+    snapshot_name: &str,
+    snapshot_path: &Path,
+    context: &'static str,
+) {
+    let referenced = sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS(
+            SELECT 1 FROM mutation_files
+            WHERE snapshot_name = ? OR final_snapshot_name = ?
+        )",
+    )
+    .bind(snapshot_name)
+    .bind(snapshot_name)
+    .fetch_one(pool)
+    .await;
+    match referenced {
+        Ok(0) => match tokio::fs::remove_file(snapshot_path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(
+                    target: "codex_agent_task_store::snapshot",
+                    %error,
+                    path = %snapshot_path.display(),
+                    %context,
+                    "failed to remove unpublished mutation snapshot"
+                );
+            }
+        },
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(
+                target: "codex_agent_task_store::snapshot",
+                %error,
+                path = %snapshot_path.display(),
+                %context,
+                "could not verify whether mutation snapshot was published; retaining it"
+            );
+        }
+    }
+}
+
+async fn durable_wake_watermark(pool: &SqlitePool) -> StoreResult<i64> {
+    // SQLite increments data_version on this connection whenever another
+    // connection commits. Unlike a MAX(rowid) watermark, it also observes
+    // delete-and-reinsert sequences that reuse a rowid.
+    Ok(sqlx::query_scalar::<_, i64>("PRAGMA data_version")
+        .fetch_one(pool)
+        .await?)
 }
 
 async fn read_verified_snapshot_chunk(

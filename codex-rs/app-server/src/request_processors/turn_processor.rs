@@ -98,6 +98,17 @@ fn identical_task_in_flight_error(
     error
 }
 
+fn in_flight_task_capacity_error() -> JSONRPCErrorError {
+    let mut error = invalid_request(
+        "too many distinct tasks are already running; retry after an active task completes",
+    );
+    error.data = Some(serde_json::json!({
+        "reason": "inFlightTaskCapacityExceeded",
+        "retryable": true,
+    }));
+    error
+}
+
 fn validate_user_input_image_urls(input: &[V2UserInput]) -> Result<(), JSONRPCErrorError> {
     if input.iter().any(|item| {
         matches!(
@@ -739,6 +750,9 @@ impl TurnRequestProcessor {
                 crate::thread_state::InFlightTaskClaim::Claimed => {}
                 crate::thread_state::InFlightTaskClaim::Existing(existing) => {
                     return Err(identical_task_in_flight_error(&existing));
+                }
+                crate::thread_state::InFlightTaskClaim::CapacityExceeded => {
+                    return Err(in_flight_task_capacity_error());
                 }
             }
         }

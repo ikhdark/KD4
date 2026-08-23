@@ -2,6 +2,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
 
+use codex_utils_path::acquire_atomic_write_lock;
 use codex_utils_path::resolve_symlink_write_paths;
 use codex_utils_path::write_atomically;
 use tokio::task;
@@ -56,6 +57,7 @@ fn apply_user_plugin_config_edits_blocking(
     }
 
     let config_path = codex_home.join(CONFIG_TOML_FILE);
+    let _lock = acquire_atomic_write_lock(&config_path)?;
     let write_paths = resolve_symlink_write_paths(&config_path)?;
     let mut doc = read_or_create_document(write_paths.read_path.as_deref())?;
     let mut mutated = false;

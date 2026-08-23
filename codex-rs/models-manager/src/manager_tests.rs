@@ -24,6 +24,7 @@ use tempfile::tempdir;
 use tokio::sync::Semaphore;
 use tokio::time::Duration;
 use tokio::time::sleep;
+use tokio::time::timeout;
 
 #[path = "model_info_overrides_tests.rs"]
 mod model_info_overrides_tests;
@@ -192,6 +193,7 @@ impl ModelsEndpointClient for TestModelsEndpoint {
 enum ControlledResponse {
     Models(Vec<ModelInfo>, Option<String>),
     Failure,
+    Panic,
 }
 
 #[derive(Debug)]
@@ -246,17 +248,18 @@ impl ModelsEndpointClient for ControlledModelsEndpoint {
                 .await
                 .expect("controlled endpoint should remain open")
                 .forget();
-            match self
+            let response = self
                 .responses
                 .lock()
                 .expect("responses lock should not be poisoned")
                 .pop_front()
-                .expect("controlled response")
-            {
+                .expect("controlled response");
+            match response {
                 ControlledResponse::Models(models, etag) => Ok((models, etag)),
                 ControlledResponse::Failure => {
                     Err(std::io::Error::other("controlled model failure").into())
                 }
+                ControlledResponse::Panic => panic!("controlled model panic"),
             }
         })
     }
@@ -368,9 +371,16 @@ async fn etag_refresh_failure_preserves_catalog_and_can_retry() {
         codex_home.path().to_path_buf(),
         endpoint.clone(),
     ));
-    manager
-        .apply_remote_models(vec![remote_model("preserved-model", "Preserved", 1)])
-        .await;
+    let cache_identity = manager.ensure_current_cache_identity().await;
+    assert!(
+        manager
+            .apply_remote_models_and_etag_for_identity(
+                vec![remote_model("preserved-model", "Preserved", 1)],
+                None,
+                &cache_identity,
+            )
+            .await
+    );
 
     let failed_refresh =
         Arc::clone(&manager).notify_etag("notice".to_string(), DEFAULT_HTTP_CLIENT_FACTORY);
@@ -400,6 +410,117 @@ async fn etag_refresh_failure_preserves_catalog_and_can_retry() {
 }
 
 #[tokio::test]
+async fn etag_refresh_worker_recovers_after_abnormal_exit() {
+    let codex_home = tempdir().expect("temp dir");
+    let endpoint = ControlledModelsEndpoint::new(vec![
+        ControlledResponse::Panic,
+        ControlledResponse::Models(
+            vec![remote_model("recovered-etag-model", "Recovered", 1)],
+            Some("etag-recovered".to_string()),
+        ),
+    ]);
+    let manager = Arc::new(openai_manager_for_tests(
+        codex_home.path().to_path_buf(),
+        endpoint.clone(),
+    ));
+
+    let failed_refresh =
+        Arc::clone(&manager).notify_etag("notice".to_string(), DEFAULT_HTTP_CLIENT_FACTORY);
+    endpoint.wait_for_fetches(1).await;
+    endpoint.release_one();
+    timeout(Duration::from_secs(1), failed_refresh)
+        .await
+        .expect("waiters should be released after an abnormal worker exit");
+
+    let retry_refresh =
+        Arc::clone(&manager).notify_etag("notice".to_string(), DEFAULT_HTTP_CLIENT_FACTORY);
+    endpoint.wait_for_fetches(2).await;
+    endpoint.release_one();
+    timeout(Duration::from_secs(1), retry_refresh)
+        .await
+        .expect("a later notice should start a replacement worker");
+
+    assert!(
+        manager
+            .get_remote_models()
+            .await
+            .iter()
+            .any(|model| model.slug == "recovered-etag-model")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn older_openai_manager_fetch_cannot_overwrite_newer_process_cache() {
+    let codex_home = tempdir().expect("temp dir");
+    let older_endpoint = ControlledModelsEndpoint::new(vec![ControlledResponse::Models(
+        vec![remote_model("older-process-model", "Older", 1)],
+        Some("older-process-etag".to_string()),
+    )]);
+    let newer_endpoint = ControlledModelsEndpoint::new(vec![ControlledResponse::Models(
+        vec![remote_model("newer-process-model", "Newer", 1)],
+        Some("newer-process-etag".to_string()),
+    )]);
+    let older = Arc::new(openai_manager_for_tests(
+        codex_home.path().to_path_buf(),
+        older_endpoint.clone(),
+    ));
+    let newer = Arc::new(openai_manager_for_tests(
+        codex_home.path().to_path_buf(),
+        newer_endpoint.clone(),
+    ));
+
+    let older_refresh = tokio::spawn({
+        let older = Arc::clone(&older);
+        async move {
+            older
+                .refresh_available_models(RefreshStrategy::Online, &DEFAULT_HTTP_CLIENT_FACTORY)
+                .await
+        }
+    });
+    older_endpoint.wait_for_fetches(1).await;
+    let newer_refresh = tokio::spawn({
+        let newer = Arc::clone(&newer);
+        async move {
+            newer
+                .refresh_available_models(RefreshStrategy::Online, &DEFAULT_HTTP_CLIENT_FACTORY)
+                .await
+        }
+    });
+    newer_endpoint.wait_for_fetches(1).await;
+    newer_endpoint.release_one();
+    newer_refresh
+        .await
+        .expect("newer refresh task should complete")
+        .expect("newer refresh should succeed");
+    older_endpoint.release_one();
+    older_refresh
+        .await
+        .expect("older refresh task should complete")
+        .expect("older refresh should succeed without replacing the newer cache");
+
+    let verifier = openai_manager_for_tests(
+        codex_home.path().to_path_buf(),
+        TestModelsEndpoint::new(Vec::new()),
+    );
+    assert!(verifier.try_load_cache().await);
+    let persisted = verifier.get_remote_models().await;
+    assert!(
+        persisted
+            .iter()
+            .any(|model| model.slug == "newer-process-model")
+    );
+    assert!(
+        !persisted
+            .iter()
+            .any(|model| model.slug == "older-process-model")
+    );
+    assert_eq!(
+        verifier.get_etag().await.as_deref(),
+        Some("newer-process-etag")
+    );
+}
+
+#[tokio::test]
 async fn matching_etag_renews_ttl_without_fetching() {
     let codex_home = tempdir().expect("temp dir");
     let endpoint = ControlledModelsEndpoint::new(Vec::new());
@@ -423,7 +544,7 @@ async fn matching_etag_renews_ttl_without_fetching() {
         })
         .await
         .expect("age cache");
-    *manager.etag.write().await = Some("same-etag".to_string());
+    manager.state.write().await.etag = Some("same-etag".to_string());
 
     Arc::clone(&manager)
         .notify_etag("same-etag".to_string(), DEFAULT_HTTP_CLIENT_FACTORY)
@@ -757,6 +878,23 @@ async fn get_model_info_uses_custom_catalog() {
     assert!(model_info.supports_image_detail_original);
     assert!(!model_info.supports_parallel_tool_calls);
     assert!(!model_info.used_fallback_model_metadata);
+}
+
+#[tokio::test]
+async fn get_model_info_rejects_unstructured_prefix_collision() {
+    let config = ModelsManagerConfig::default();
+    let mut overlay = remote_model("gpt-overlay", "Overlay", /*priority*/ 0);
+    overlay.supports_image_detail_original = true;
+    let manager = static_manager_for_tests(ModelsResponse {
+        models: vec![overlay],
+    });
+
+    let model_info = manager.get_model_info("gpt-overlayevil", &config).await;
+
+    assert_eq!(model_info.slug, "gpt-overlayevil");
+    assert_eq!(model_info.display_name, "gpt-overlayevil");
+    assert!(!model_info.supports_image_detail_original);
+    assert!(model_info.used_fallback_model_metadata);
 }
 
 #[tokio::test]
@@ -1122,6 +1260,114 @@ async fn runtime_identity_change_does_not_reuse_disk_or_in_memory_catalog() {
             .any(|model| model.slug == second_model.slug)
     );
     assert_eq!(endpoint.fetch_count(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_model_state_access_completes_with_coherent_snapshots() {
+    let codex_home = tempdir().expect("temp dir");
+    let endpoint = TestModelsEndpoint::new(Vec::new());
+    let identity = Arc::new(Mutex::new("scope-initial".to_string()));
+    let identity_for_cache = Arc::clone(&identity);
+    let manager = Arc::new(OpenAiModelsManager::new(
+        codex_home.path().to_path_buf(),
+        endpoint,
+        Some(AuthManager::from_auth_for_testing(
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        )),
+        Arc::new(move || {
+            identity_for_cache
+                .lock()
+                .expect("identity lock should not be poisoned")
+                .clone()
+        }),
+    ));
+
+    timeout(Duration::from_secs(5), async {
+        let identity_manager = Arc::clone(&manager);
+        let identity_writer = Arc::clone(&identity);
+        let identity_task = tokio::spawn(async move {
+            for index in 0..128 {
+                *identity_writer
+                    .lock()
+                    .expect("identity lock should not be poisoned") =
+                    format!("scope-{}", index % 3);
+                identity_manager.ensure_current_cache_identity().await;
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let catalog_manager = Arc::clone(&manager);
+        let catalog_task = tokio::spawn(async move {
+            for index in 0..128 {
+                let catalog_identity = catalog_manager.ensure_current_cache_identity().await;
+                let _ = catalog_manager
+                    .apply_remote_models_and_etag_for_identity(
+                        vec![remote_model(
+                            &format!("coherent-model-{index}"),
+                            "Coherent",
+                            index,
+                        )],
+                        Some(format!("coherent-etag-{index}")),
+                        &catalog_identity,
+                    )
+                    .await;
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let reader_manager = Arc::clone(&manager);
+        let reader_task = tokio::spawn(async move {
+            for _ in 0..512 {
+                let state = reader_manager.state.read().await;
+                if let Some(index) = state
+                    .etag
+                    .as_deref()
+                    .and_then(|etag| etag.strip_prefix("coherent-etag-"))
+                {
+                    let expected_slug = format!("coherent-model-{index}");
+                    assert!(
+                        state
+                            .remote_models
+                            .iter()
+                            .any(|model| model.slug == expected_slug),
+                        "catalog and ETag must come from the same state update"
+                    );
+                }
+                drop(state);
+
+                let _ = reader_manager.get_remote_models().await;
+                let _ = reader_manager.get_etag().await;
+                let _ = reader_manager.try_get_remote_models();
+                tokio::task::yield_now().await;
+            }
+        });
+
+        identity_task.await.expect("identity task should complete");
+        catalog_task.await.expect("catalog task should complete");
+        reader_task.await.expect("reader task should complete");
+    })
+    .await
+    .expect("concurrent model state access should not deadlock");
+
+    *identity
+        .lock()
+        .expect("identity lock should not be poisoned") = "scope-final".to_string();
+    let final_identity = manager.ensure_current_cache_identity().await;
+    assert!(
+        manager
+            .apply_remote_models_and_etag_for_identity(
+                vec![remote_model("coherent-model-final", "Final", 0)],
+                Some("coherent-etag-final".to_string()),
+                &final_identity,
+            )
+            .await
+    );
+
+    let state = manager.state.read().await;
+    assert_eq!(state.active_cache_identity, "scope-final");
+    assert_eq!(state.etag.as_deref(), Some("coherent-etag-final"));
+    assert_eq!(state.remote_models.len(), 1);
+    assert_eq!(state.remote_models[0].slug, "coherent-model-final");
 }
 
 #[tokio::test]

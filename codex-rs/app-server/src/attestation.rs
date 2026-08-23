@@ -70,14 +70,15 @@ async fn request_attestation_header_value_with_timeout(
     thread_id: codex_protocol::ThreadId,
     timeout_duration: Duration,
 ) -> Option<String> {
-    let connection_id = thread_state_manager
-        .first_attestation_capable_connection_for_thread(thread_id)
-        .await?;
-
-    let connection_ids = [connection_id];
+    let connection_ids = thread_state_manager
+        .attestation_capable_connections_for_thread(thread_id)
+        .await;
+    if connection_ids.is_empty() {
+        return None;
+    }
     let (request_id, rx) = outgoing
         .send_request_to_connections(
-            Some(&connection_ids),
+            Some(connection_ids.as_slice()),
             ServerRequestPayload::AttestationGenerate(AttestationGenerateParams {}),
             /*thread_id*/ None,
         )
@@ -175,9 +176,25 @@ fn app_server_attestation_header_value(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
     use super::AppServerAttestationStatus;
     use super::app_server_attestation_header_value;
+    use super::request_attestation_header_value_with_timeout;
+    use crate::outgoing_message::ConnectionId;
+    use crate::outgoing_message::OutgoingEnvelope;
+    use crate::outgoing_message::OutgoingMessage;
+    use crate::outgoing_message::OutgoingMessageSender;
+    use crate::thread_state::ConnectionCapabilities;
+    use crate::thread_state::ThreadStateManager;
+    use codex_app_server_protocol::ServerRequest;
+    use codex_protocol::ThreadId;
     use pretty_assertions::assert_eq;
+    use serde_json::json;
+    use tokio::sync::mpsc;
+    use tokio::time::Duration;
+    use tokio::time::timeout;
 
     #[test]
     fn app_server_attestation_header_value_wraps_opaque_client_payloads() {
@@ -219,6 +236,89 @@ mod tests {
                 /*token*/ None
             ),
             Some(r#"{"v":1,"s":4}"#.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn attestation_uses_healthy_alternate_connection() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let thread_state_manager = ThreadStateManager::new();
+        let thread_id = ThreadId::new();
+        let stale_connection = ConnectionId(1);
+        let healthy_connection = ConnectionId(2);
+
+        for connection_id in [stale_connection, healthy_connection] {
+            outgoing
+                .connection_opened(connection_id, Arc::new(AtomicBool::new(true)))
+                .await;
+            thread_state_manager
+                .connection_initialized(
+                    connection_id,
+                    ConnectionCapabilities {
+                        request_attestation: true,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert!(
+                thread_state_manager
+                    .try_add_connection_to_thread(thread_id, connection_id)
+                    .await
+            );
+        }
+
+        let request_task = tokio::spawn(request_attestation_header_value_with_timeout(
+            Arc::clone(&outgoing),
+            thread_state_manager,
+            thread_id,
+            Duration::from_secs(1),
+        ));
+
+        let first = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("first attestation request should arrive")
+            .expect("outgoing channel should stay open");
+        let second = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("alternate attestation request should arrive")
+            .expect("outgoing channel should stay open");
+        let mut deliveries = [first, second]
+            .into_iter()
+            .map(|envelope| match envelope {
+                OutgoingEnvelope::ToConnection {
+                    connection_id,
+                    message: OutgoingMessage::Request(request),
+                    ..
+                } => (connection_id, request),
+                _ => panic!("attestation should use targeted request delivery"),
+            })
+            .collect::<Vec<_>>();
+        deliveries.sort_by_key(|(connection_id, _)| connection_id.0);
+        assert_eq!(deliveries[0].0, stale_connection);
+        assert_eq!(deliveries[1].0, healthy_connection);
+        let healthy_request_id = match &deliveries[1].1 {
+            ServerRequest::AttestationGenerate { request_id, .. } => request_id.clone(),
+            request => panic!("expected attestation request, got {request:?}"),
+        };
+
+        outgoing
+            .notify_client_response(
+                healthy_connection,
+                healthy_request_id,
+                json!({"token": "healthy-token"}),
+            )
+            .await;
+
+        assert_eq!(
+            timeout(Duration::from_secs(1), request_task)
+                .await
+                .expect("healthy alternate should resolve attestation promptly")
+                .expect("attestation task should not panic"),
+            Some(r#"{"v":1,"s":0,"t":"healthy-token"}"#.to_string())
         );
     }
 }

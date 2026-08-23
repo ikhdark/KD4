@@ -443,7 +443,7 @@ async fn load_config_resolves_experimental_request_user_input_enabled() -> std::
 }
 
 #[tokio::test]
-async fn load_config_defaults_phase_tracking_to_empty_effort_overrides() -> std::io::Result<()> {
+async fn load_config_defaults_phase_tracking_to_compatibility_efforts() -> std::io::Result<()> {
     let codex_home = tempdir()?;
     let config = Config::load_from_base_config_with_overrides(
         ConfigToml {
@@ -458,7 +458,15 @@ async fn load_config_defaults_phase_tracking_to_empty_effort_overrides() -> std:
     assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::High));
     assert_eq!(
         config.reasoning_phase_efforts,
-        Some(ReasoningPhaseEfforts::default())
+        Some(ReasoningPhaseEfforts {
+            orient: Some(ReasoningEffort::High),
+            inspect: Some(ReasoningEffort::Low),
+            implement: Some(ReasoningEffort::High),
+            diagnose: Some(ReasoningEffort::High),
+            verify: Some(ReasoningEffort::Low),
+            finalize: Some(ReasoningEffort::Low),
+            deterministic_continuation: Some(ReasoningEffort::Low),
+        })
     );
     Ok(())
 }
@@ -483,9 +491,13 @@ async fn load_config_preserves_explicit_reasoning_phase_effort_overrides() -> st
     assert_eq!(
         config.reasoning_phase_efforts,
         Some(ReasoningPhaseEfforts {
+            orient: Some(ReasoningEffort::High),
             inspect: Some(ReasoningEffort::Medium),
+            implement: Some(ReasoningEffort::High),
+            diagnose: Some(ReasoningEffort::High),
             verify: Some(ReasoningEffort::High),
-            ..ReasoningPhaseEfforts::default()
+            finalize: Some(ReasoningEffort::Low),
+            deterministic_continuation: Some(ReasoningEffort::Low),
         })
     );
     Ok(())

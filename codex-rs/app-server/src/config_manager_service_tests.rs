@@ -539,6 +539,49 @@ async fn version_conflict_rejected() {
 }
 
 #[tokio::test]
+async fn concurrent_writes_with_the_same_version_have_one_winner() {
+    let tmp = tempdir().expect("tempdir");
+    let user_path = tmp.path().join(CONFIG_TOML_FILE);
+    let initial_toml = "model = \"initial\"\n";
+    std::fs::write(&user_path, initial_toml).expect("seed config");
+    let initial: TomlValue = toml::from_str(initial_toml).expect("parse seed");
+    let expected_version = codex_config::version_for_toml(&initial);
+    let first_service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+    let second_service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+
+    let first = first_service.write_value(ConfigValueWriteParams {
+        file_path: Some(user_path.display().to_string()),
+        key_path: "model".to_string(),
+        value: serde_json::json!("first"),
+        merge_strategy: MergeStrategy::Replace,
+        expected_version: Some(expected_version.clone()),
+    });
+    let second = second_service.write_value(ConfigValueWriteParams {
+        file_path: Some(user_path.display().to_string()),
+        key_path: "model".to_string(),
+        value: serde_json::json!("second"),
+        merge_strategy: MergeStrategy::Replace,
+        expected_version: Some(expected_version),
+    });
+    let results = tokio::join!(first, second);
+    let successes = [&results.0, &results.1]
+        .into_iter()
+        .filter(|result| result.is_ok())
+        .count();
+    let conflicts = [&results.0, &results.1]
+        .into_iter()
+        .filter(|result| {
+            result.as_ref().is_err_and(|error| {
+                error.write_error_code() == Some(ConfigWriteErrorCode::ConfigVersionConflict)
+            })
+        })
+        .count();
+
+    assert_eq!(successes, 1);
+    assert_eq!(conflicts, 1);
+}
+
+#[tokio::test]
 async fn write_value_defaults_to_user_config_path() {
     let tmp = tempdir().expect("tempdir");
     std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "").unwrap();

@@ -31,6 +31,69 @@ const TOOL_SUGGESTION_ACTION_KEY: &str = "suggest_type";
 const TOOL_SUGGESTION_TOOL_ID_KEY: &str = "tool_id";
 const TOOL_SUGGESTION_TOOL_TYPE_KEY: &str = "tool_type";
 
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_MCP_STARTUP_PAUSE: Arc<TestMcpStartupPause>;
+}
+
+#[cfg(test)]
+pub(super) struct TestMcpStartupPause {
+    armed: std::sync::atomic::AtomicBool,
+    pub(super) started: tokio::sync::Semaphore,
+    pub(super) release: tokio::sync::Semaphore,
+    pub(super) token: tokio::sync::Mutex<Option<CancellationToken>>,
+}
+
+#[cfg(test)]
+impl TestMcpStartupPause {
+    pub(super) fn new() -> Self {
+        Self {
+            armed: std::sync::atomic::AtomicBool::new(true),
+            started: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+            token: tokio::sync::Mutex::new(None),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) async fn with_test_mcp_startup_pause<T>(
+    pause: Arc<TestMcpStartupPause>,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    TEST_MCP_STARTUP_PAUSE.scope(pause, future).await
+}
+
+struct McpStartupCancellationGuard {
+    token: CancellationToken,
+    published: bool,
+}
+
+impl McpStartupCancellationGuard {
+    fn new() -> Self {
+        Self {
+            token: CancellationToken::new(),
+            published: false,
+        }
+    }
+
+    fn token(&self) -> CancellationToken {
+        self.token.clone()
+    }
+
+    fn mark_published(&mut self) {
+        self.published = true;
+    }
+}
+
+impl Drop for McpStartupCancellationGuard {
+    fn drop(&mut self) {
+        if !self.published {
+            self.token.cancel();
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum GuardianElicitationReview {
     NotRequested,
@@ -112,10 +175,6 @@ impl Session {
         codex_mcp::configured_mcp_servers(&self.runtime_mcp_config(config).await)
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "MCP runtime comparison and publication must remain serialized"
-    )]
     pub(crate) async fn mcp_runtime_for_step(
         self: &Arc<Self>,
         turn_context: &TurnContext,
@@ -124,67 +183,84 @@ impl Session {
     ) -> Arc<McpRuntimeSnapshot> {
         let available_environment_ids =
             Self::available_selected_environment_ids(selected_capability_roots);
-        let current = self.services.latest_mcp_runtime();
-        if current.available_environment_ids() == available_environment_ids {
-            return current;
-        }
+        loop {
+            let expected_runtime = self.services.latest_mcp_runtime();
+            if expected_runtime.available_environment_ids() == available_environment_ids {
+                return expected_runtime;
+            }
 
-        let _guard = self.services.mcp_projection_lock.lock().await;
-        let current = self.services.latest_mcp_runtime();
-        if current.available_environment_ids() == available_environment_ids {
-            return current;
+            let mcp_projection = self
+                .services
+                .mcp_manager
+                .runtime_config_for_step(
+                    &turn_context.config,
+                    &self.services.mcp_thread_init,
+                    &self.services.thread_extension_data,
+                    &turn_context.originator,
+                    &available_environment_ids,
+                )
+                .await;
+            let expected_runtime = {
+                let _guard = self.services.mcp_projection_lock.lock().await;
+                let current = self.services.latest_mcp_runtime();
+                if current.available_environment_ids() == available_environment_ids {
+                    return current;
+                }
+                if !Arc::ptr_eq(&current, &expected_runtime) {
+                    continue;
+                }
+                let mcp_config = &mcp_projection.config;
+                let changed_environment_is_used_by_mcp = mcp_config
+                    .mcp_server_catalog
+                    .configured_servers()
+                    .values()
+                    .any(|server| {
+                        let was_available = current
+                            .available_environment_ids()
+                            .contains(&server.environment_id);
+                        let is_available =
+                            available_environment_ids.contains(&server.environment_id);
+                        server.enabled && was_available != is_available
+                    });
+                if !changed_environment_is_used_by_mcp
+                    && current
+                        .config()
+                        .mcp_server_catalog
+                        .has_same_servers(&mcp_config.mcp_server_catalog)
+                    && current.config().connector_snapshot == mcp_config.connector_snapshot
+                {
+                    // Availability is only an input to the MCP projection. When that input changes
+                    // but the projected servers and connectors do not, advance the input key without
+                    // replacing the live manager and restarting its processes.
+                    let mut state_owner = self.state.lock().await;
+                    return self.services.publish_mcp_runtime_reusing_manager(
+                        &mut state_owner,
+                        Arc::new(current.config().clone()),
+                        mcp_projection.plugins_available,
+                        current.runtime_context().clone(),
+                        available_environment_ids,
+                        current.manager_arc(),
+                    );
+                }
+                current
+            };
+            let runtime = self
+                .refresh_mcp_servers_inner(
+                    turn_context,
+                    mcp_projection,
+                    environments,
+                    &available_environment_ids,
+                    Some(self.mcp_elicitation_reviewer()),
+                    expected_runtime,
+                )
+                .await;
+            if runtime.available_environment_ids() == available_environment_ids {
+                return runtime;
+            }
+            // A concurrent refresh published a projection for a different environment while this
+            // candidate was starting. Rebuild from that publication instead of returning an MCP
+            // runtime that does not match the step's resolved capability roots.
         }
-        let mcp_projection = self
-            .services
-            .mcp_manager
-            .runtime_config_for_step(
-                &turn_context.config,
-                &self.services.mcp_thread_init,
-                &self.services.thread_extension_data,
-                &turn_context.originator,
-                &available_environment_ids,
-            )
-            .await;
-        let mcp_config = &mcp_projection.config;
-        let changed_environment_is_used_by_mcp = mcp_config
-            .mcp_server_catalog
-            .configured_servers()
-            .values()
-            .any(|server| {
-                let was_available = current
-                    .available_environment_ids()
-                    .contains(&server.environment_id);
-                let is_available = available_environment_ids.contains(&server.environment_id);
-                server.enabled && was_available != is_available
-            });
-        if !changed_environment_is_used_by_mcp
-            && current
-                .config()
-                .mcp_server_catalog
-                .has_same_servers(&mcp_config.mcp_server_catalog)
-            && current.config().connector_snapshot == mcp_config.connector_snapshot
-        {
-            // Availability is only an input to the MCP projection. When that input changes but
-            // the projected servers and connectors do not, advance the input key without
-            // replacing the live manager and restarting its processes.
-            let mut state_owner = self.state.lock().await;
-            return self.services.publish_mcp_runtime_reusing_manager(
-                &mut state_owner,
-                Arc::new(current.config().clone()),
-                mcp_projection.plugins_available,
-                current.runtime_context().clone(),
-                available_environment_ids,
-                current.manager_arc(),
-            );
-        }
-        self.refresh_mcp_servers_inner(
-            turn_context,
-            mcp_projection,
-            environments,
-            &available_environment_ids,
-            Some(self.mcp_elicitation_reviewer()),
-        )
-        .await
     }
 
     pub(crate) async fn resolve_selected_capability_roots_for_step(
@@ -329,6 +405,10 @@ impl Session {
             .await
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the projection lock must serialize the final compare-and-publish state transition"
+    )]
     async fn refresh_mcp_servers_inner(
         &self,
         turn_context: &TurnContext,
@@ -336,6 +416,7 @@ impl Session {
         environments: &TurnEnvironmentSnapshot,
         available_environment_ids: &[String],
         elicitation_reviewer: Option<ElicitationReviewerHandle>,
+        expected_runtime: Arc<McpRuntimeSnapshot>,
     ) -> Arc<McpRuntimeSnapshot> {
         let auth = self.services.auth_manager.auth().await;
         let McpRuntimeProjection {
@@ -365,15 +446,37 @@ impl Session {
             &mcp_runtime_context,
         )
         .await;
-        let mcp_startup_cancellation_token = {
-            let mut guard = self.services.mcp_startup_cancellation_token.lock().await;
-            // The previous runtime owns the old token and may still be serving an in-flight step.
-            // Its manager cancels that token when the last runtime handle is dropped.
-            let cancellation_token = CancellationToken::new();
-            *guard = cancellation_token.clone();
-            cancellation_token
-        };
-        let current_runtime = self.services.latest_mcp_runtime();
+        let mut startup_cancellation = McpStartupCancellationGuard::new();
+        let mcp_startup_cancellation_token = startup_cancellation.token();
+        let published_startup_token = self
+            .services
+            .mcp_startup_cancellation_token
+            .lock()
+            .await
+            .clone();
+        let cancellation_forwarding_stop = CancellationToken::new();
+        let _cancellation_forwarder = tokio::spawn({
+            let candidate_token = mcp_startup_cancellation_token.clone();
+            let forwarding_stop = cancellation_forwarding_stop.clone();
+            async move {
+                tokio::select! {
+                    biased;
+                    _ = forwarding_stop.cancelled() => {}
+                    _ = candidate_token.cancelled() => {}
+                    _ = published_startup_token.cancelled() => candidate_token.cancel(),
+                }
+            }
+        });
+        #[cfg(test)]
+        if let Ok(pause) = TEST_MCP_STARTUP_PAUSE.try_with(|pause| Arc::clone(pause))
+            && pause.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            *pause.token.lock().await = Some(mcp_startup_cancellation_token.clone());
+            pause.started.add_permits(1);
+            if let Ok(permit) = pause.release.acquire().await {
+                permit.forget();
+            }
+        }
         let codex_apps_auth_manager =
             codex_mcp::host_owned_codex_apps_enabled(&mcp_config, auth.as_ref())
                 .then(|| Arc::clone(&self.services.auth_manager));
@@ -385,7 +488,7 @@ impl Session {
             &turn_context.approval_policy,
             turn_context.sub_id.clone(),
             self.get_tx_event(),
-            mcp_startup_cancellation_token,
+            mcp_startup_cancellation_token.clone(),
             turn_context.permission_profile(),
             mcp_runtime_context.clone(),
             mcp_config.codex_home.clone(),
@@ -401,26 +504,46 @@ impl Session {
             codex_apps_auth_manager,
             elicitation_reviewer,
             Some(self.mcp_elicitation_lifecycle()),
-            current_runtime.manager().elicitation_router(),
+            expected_runtime.manager().elicitation_router(),
         )
         .await;
         refreshed_manager
-            .set_elicitations_auto_deny(current_runtime.manager().elicitations_auto_deny());
+            .set_elicitations_auto_deny(expected_runtime.manager().elicitations_auto_deny());
+
+        let projection_guard = self.services.mcp_projection_lock.lock().await;
+        let current_runtime = self.services.latest_mcp_runtime();
+        if !Arc::ptr_eq(&current_runtime, &expected_runtime) {
+            drop(projection_guard);
+            cancellation_forwarding_stop.cancel();
+            drop(refreshed_manager);
+            return current_runtime;
+        }
+        let mut published_token = self.services.mcp_startup_cancellation_token.lock().await;
+        if published_token.is_cancelled() {
+            drop(published_token);
+            drop(projection_guard);
+            cancellation_forwarding_stop.cancel();
+            drop(refreshed_manager);
+            return current_runtime;
+        }
+        *published_token = mcp_startup_cancellation_token;
+        cancellation_forwarding_stop.cancel();
+        drop(published_token);
+        // The previous runtime owns the old token and may still be serving an in-flight step.
+        // Its manager cancels that token when the last runtime handle is dropped.
         let mut state_owner = self.state.lock().await;
-        self.services.publish_mcp_runtime(
+        let runtime = self.services.publish_mcp_runtime(
             &mut state_owner,
             mcp_config,
             plugins_available,
             mcp_runtime_context,
             available_environment_ids.to_vec(),
             refreshed_manager,
-        )
+        );
+        startup_cancellation.mark_published();
+        runtime
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "MCP runtime refresh and publication must remain serialized"
-    )]
     pub(crate) async fn refresh_mcp_servers_if_requested(
         &self,
         turn_context: &TurnContext,
@@ -477,33 +600,41 @@ impl Session {
             return;
         }
 
-        let _guard = self.services.mcp_projection_lock.lock().await;
-        let available_environment_ids = self
-            .services
-            .latest_mcp_runtime()
-            .available_environment_ids()
-            .to_vec();
-        let mut mcp_projection = self
-            .services
-            .mcp_manager
-            .runtime_config_for_step(
-                &refresh_config,
-                &self.services.mcp_thread_init,
-                &self.services.thread_extension_data,
-                &turn_context.originator,
-                &available_environment_ids,
-            )
-            .await;
-        mcp_projection.config.mcp_server_catalog = mcp_projection
-            .config
-            .mcp_server_catalog
-            .with_materialized_servers(mcp_servers);
+        let (mcp_projection, available_environment_ids, expected_runtime) = loop {
+            let expected_runtime = self.services.latest_mcp_runtime();
+            let available_environment_ids = expected_runtime.available_environment_ids().to_vec();
+            let mut mcp_projection = self
+                .services
+                .mcp_manager
+                .runtime_config_for_step(
+                    &refresh_config,
+                    &self.services.mcp_thread_init,
+                    &self.services.thread_extension_data,
+                    &turn_context.originator,
+                    &available_environment_ids,
+                )
+                .await;
+            mcp_projection.config.mcp_server_catalog = mcp_projection
+                .config
+                .mcp_server_catalog
+                .with_materialized_servers(mcp_servers.clone());
+            let expected_runtime = {
+                let _guard = self.services.mcp_projection_lock.lock().await;
+                let current = self.services.latest_mcp_runtime();
+                if !Arc::ptr_eq(&current, &expected_runtime) {
+                    continue;
+                }
+                current
+            };
+            break (mcp_projection, available_environment_ids, expected_runtime);
+        };
         self.refresh_mcp_servers_inner(
             turn_context,
             mcp_projection,
             &turn_context.environments,
             &available_environment_ids,
             elicitation_reviewer,
+            expected_runtime,
         )
         .await;
     }
@@ -536,39 +667,43 @@ impl Session {
         Ok(())
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "MCP runtime refresh and publication must remain serialized"
-    )]
     pub(crate) async fn refresh_mcp_servers_now(
         &self,
         turn_context: &TurnContext,
         refresh_config: &Config,
         elicitation_reviewer: Option<ElicitationReviewerHandle>,
     ) {
-        let _guard = self.services.mcp_projection_lock.lock().await;
-        let available_environment_ids = self
-            .services
-            .latest_mcp_runtime()
-            .available_environment_ids()
-            .to_vec();
-        let mcp_projection = self
-            .services
-            .mcp_manager
-            .runtime_config_for_step(
-                refresh_config,
-                &self.services.mcp_thread_init,
-                &self.services.thread_extension_data,
-                &turn_context.originator,
-                &available_environment_ids,
-            )
-            .await;
+        let (mcp_projection, available_environment_ids, expected_runtime) = loop {
+            let expected_runtime = self.services.latest_mcp_runtime();
+            let available_environment_ids = expected_runtime.available_environment_ids().to_vec();
+            let mcp_projection = self
+                .services
+                .mcp_manager
+                .runtime_config_for_step(
+                    refresh_config,
+                    &self.services.mcp_thread_init,
+                    &self.services.thread_extension_data,
+                    &turn_context.originator,
+                    &available_environment_ids,
+                )
+                .await;
+            let expected_runtime = {
+                let _guard = self.services.mcp_projection_lock.lock().await;
+                let current = self.services.latest_mcp_runtime();
+                if !Arc::ptr_eq(&current, &expected_runtime) {
+                    continue;
+                }
+                current
+            };
+            break (mcp_projection, available_environment_ids, expected_runtime);
+        };
         self.refresh_mcp_servers_inner(
             turn_context,
             mcp_projection,
             &turn_context.environments,
             &available_environment_ids,
             elicitation_reviewer,
+            expected_runtime,
         )
         .await;
     }

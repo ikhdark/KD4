@@ -183,7 +183,18 @@ pub(crate) use resolved_permission_profile::PermissionProfileState;
 fn effective_reasoning_phase_efforts(
     configured: Option<ReasoningPhaseEfforts>,
 ) -> ReasoningPhaseEfforts {
-    configured.unwrap_or_default()
+    let configured = configured.unwrap_or_default();
+    ReasoningPhaseEfforts {
+        orient: configured.orient.or(Some(ReasoningEffort::High)),
+        inspect: configured.inspect.or(Some(ReasoningEffort::Low)),
+        implement: configured.implement.or(Some(ReasoningEffort::High)),
+        diagnose: configured.diagnose.or(Some(ReasoningEffort::High)),
+        verify: configured.verify.or(Some(ReasoningEffort::Low)),
+        finalize: configured.finalize.or(Some(ReasoningEffort::Low)),
+        deterministic_continuation: configured
+            .deterministic_continuation
+            .or(Some(ReasoningEffort::Low)),
+    }
 }
 
 const DEFAULT_IGNORE_LARGE_UNTRACKED_DIRS: i64 = 200;
@@ -209,13 +220,15 @@ impl Default for GhostSnapshotConfig {
 }
 
 /// Maximum number of source bytes retained across project documentation files.
+/// Model-visible separators, provenance labels, and notices receive a separate
+/// fixed 4 KiB allowance, so the rendered project-doc payload is bounded by
+/// this source budget plus 4 KiB.
 ///
-/// Documentation exceeding this limit must not be silently truncated. The
-/// loader must surface an explicit truncation notice containing the source
-/// path, original byte count, retained byte count, and omitted byte count.
-/// Mandatory truncation notices and generated provenance labels do not consume
-/// this source-byte budget.
-///
+/// Any truncated document retained in the model-visible output must include an
+/// explicit notice containing the source path, original byte count, retained
+/// byte count, and omitted byte count. Once individual notices cannot fit the
+/// rendered allowance, a compact aggregate notice reports the remaining
+/// omitted documents and bytes.
 /// When multiple instruction files apply, preserve the complete nearest-scope
 /// instructions before allocating remaining capacity to broader scopes.
 pub(crate) const AGENTS_MD_MAX_BYTES: usize = DEFAULT_PROJECT_DOC_MAX_BYTES; // 32 KiB
@@ -1044,9 +1057,10 @@ pub struct Config {
     pub plan_mode_reasoning_effort: Option<ReasoningEffort>,
 
     /// Per-logical-request reasoning effort overrides. Fork defaults enable
-    /// the deterministic sampling governor even when the table is absent;
-    /// omitted fields remain unset so each request can inherit its resolved
-    /// turn effort.
+    /// the deterministic sampling governor even when the table is absent.
+    /// Omitted fields resolve to the compatibility defaults: high for orient,
+    /// implement, and diagnose; low for inspect, verify, finalize, and
+    /// deterministic continuation.
     pub reasoning_phase_efforts: Option<ReasoningPhaseEfforts>,
 
     /// Optional value to use for `reasoning.summary` when making a request

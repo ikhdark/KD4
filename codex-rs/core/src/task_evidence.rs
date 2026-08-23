@@ -6,6 +6,7 @@ use codex_git_utils::collect_git_info;
 use codex_git_utils::get_git_repo_root;
 use codex_protocol::ThreadId;
 use codex_protocol::mcp::CallToolResult;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::plan_tool::PlanItemArg;
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
@@ -918,6 +919,30 @@ pub(crate) struct AuthoritativeTerminalEventV1 {
     pub(crate) semantic_outcome: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) final_proof_identity: Option<String>,
+    /// Exact pre-terminal rollout mutations that must be durable before the
+    /// terminal event can be mirrored or delivered. This stays attached to
+    /// the authoritative candidate so a process restart can resume the same
+    /// repair instead of publishing a structurally invalid rollout.
+    #[serde(default, skip_serializing_if = "TerminalRolloutRepairV1::is_empty")]
+    pub(crate) rollout_repair: TerminalRolloutRepairV1,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct TerminalRolloutRepairV1 {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) items: Vec<ResponseItem>,
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub(crate) repair_missing_call_outputs: bool,
+}
+
+fn bool_is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl TerminalRolloutRepairV1 {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.items.is_empty() && !self.repair_missing_call_outputs
+    }
 }
 
 const fn authoritative_terminal_event_version() -> u32 {
@@ -15799,6 +15824,12 @@ fn validated_generated_artifact_path(
     normalized: &str,
 ) -> Result<PathBuf, FileHashSnapshot> {
     let normalized = normalize_slashes(normalized);
+    if normalized.is_empty() || normalized == "." {
+        return Err(rejected_generated_artifact_snapshot(
+            &normalized,
+            "RepositoryWideArtifactScan",
+        ));
+    }
     let path = Path::new(&normalized);
     if path.is_absolute() {
         return Err(rejected_generated_artifact_snapshot(
@@ -16112,6 +16143,27 @@ mod tests {
         let ledger =
             TaskEvidenceLedger::load_or_new(codex_home, ThreadId::new(), cwd.as_path()).await;
         (temp, ledger)
+    }
+
+    #[tokio::test]
+    async fn directory_hash_rejects_repository_wide_scan() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        tokio::fs::create_dir_all(repo.path().join("nested"))
+            .await
+            .expect("nested directory");
+        tokio::fs::write(repo.path().join("nested/file.txt"), "must not be scanned")
+            .await
+            .expect("fixture file");
+
+        for repository_wide_path in ["", "."] {
+            let snapshot = snapshot_file(repo.path(), repository_wide_path).await;
+            assert_eq!(
+                snapshot.read_error.as_deref(),
+                Some("RepositoryWideArtifactScan")
+            );
+            assert!(!snapshot.exists);
+            assert!(snapshot.sha1.is_none());
+        }
     }
 
     fn text_source(text: &str) -> UserInput {

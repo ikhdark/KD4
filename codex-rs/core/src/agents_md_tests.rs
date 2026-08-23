@@ -24,6 +24,7 @@ use codex_otel::MetricsConfig;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use core_test_support::PathBufExt;
+use core_test_support::PathExt;
 use core_test_support::TempDirExt;
 use core_test_support::create_directory_symlink;
 use opentelemetry_sdk::metrics::InMemoryMetricExporter;
@@ -794,7 +795,7 @@ async fn project_doc_truncation_preserves_invalid_boundary_bytes_lossily() {
 }
 
 #[tokio::test]
-async fn source_byte_limit_excludes_mandatory_truncation_notice() {
+async fn source_byte_limit_includes_mandatory_truncation_notice() {
     const LIMIT: usize = 1024;
     let tmp = tempfile::tempdir().expect("tempdir");
 
@@ -805,7 +806,7 @@ async fn source_byte_limit_excludes_mandatory_truncation_notice() {
     let res = get_user_instructions(&make_config(&tmp, LIMIT, /*instructions*/ None).await)
         .await
         .expect("doc expected");
-    let retained = LIMIT;
+    let retained = res.bytes().take_while(|byte| *byte == b'A').count();
     let notice = project_doc_truncation_notice(
         &PathUri::from_abs_path(&source.abs()),
         (LIMIT * 2) as u64,
@@ -815,8 +816,85 @@ async fn source_byte_limit_excludes_mandatory_truncation_notice() {
     assert_eq!(res, format!("{}\n\n{notice}", &huge[..retained]));
     assert!(
         res.len() > LIMIT,
-        "the mandatory notice is outside the source-byte budget"
+        "the notice does not consume source budget"
     );
+    assert!(res.len() <= project_doc_rendered_max_bytes(LIMIT));
+}
+
+#[tokio::test]
+async fn rendered_project_doc_overhead_uses_a_bounded_aggregate_omission_notice() {
+    const SOURCE_LIMIT: usize = 1;
+    assert!(
+        aggregate_project_doc_omission_notice(usize::MAX, u64::MAX)
+            .len()
+            .saturating_add(2)
+            <= PROJECT_DOC_AGGREGATE_NOTICE_RESERVE_BYTES
+    );
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut candidates = Vec::new();
+    for index in 0..64 {
+        let path = tmp.path().join(format!("AGENTS-{index:02}.md"));
+        fs::write(&path, if index == 63 { "N" } else { "B" }).unwrap();
+        candidates.push(ProjectDocCandidate {
+            path: PathUri::from_abs_path(&path.abs()),
+            size: 1,
+        });
+    }
+    let nearest_path = candidates.last().expect("nearest candidate").path.clone();
+    let cwd = PathUri::from_abs_path(&tmp.path().abs());
+
+    let rendered =
+        read_discovered_agents_md(LOCAL_FS.as_ref(), "local", &cwd, candidates, SOURCE_LIMIT)
+            .await
+            .expect("project docs should load");
+    let loaded = rendered.loaded.expect("bounded instructions expected");
+    let text = loaded.text();
+
+    assert!(loaded.entries.iter().any(|entry| {
+        entry.contents == "N"
+            && matches!(
+                &entry.provenance,
+                InstructionProvenance::Project { source_path, .. } if source_path == &nearest_path
+            )
+    }));
+    assert!(text.contains("Project documentation omission notice:"));
+    assert!(text.len() <= project_doc_rendered_max_bytes(SOURCE_LIMIT));
+}
+
+#[test]
+fn long_project_doc_provenance_collapses_to_path_independent_aggregate_notice() {
+    let long_path = PathUri::parse(&format!(
+        "file:///workspace/{}/AGENTS.md",
+        "deeply-nested-scope/".repeat(512)
+    ))
+    .expect("long path URI");
+    let cwd = PathUri::parse("file:///workspace").expect("cwd URI");
+    let rendered = render_project_docs(
+        "local",
+        &cwd,
+        vec![LoadedProjectDoc {
+            candidate: ProjectDocCandidate {
+                path: long_path.clone(),
+                size: 2,
+            },
+            read: ProjectDocRead {
+                retained_data: vec![b'x'],
+                original_bytes: 2,
+                utf8_boundary_truncation: None,
+            },
+        }],
+        PROJECT_DOC_AGGREGATE_NOTICE_RESERVE_BYTES,
+    );
+
+    assert!(rendered.loaded.is_none());
+    assert_eq!(rendered.aggregate_omitted_documents, 1);
+    assert_eq!(rendered.aggregate_omitted_bytes, 2);
+    let notice = aggregate_project_doc_omission_notice(
+        rendered.aggregate_omitted_documents,
+        rendered.aggregate_omitted_bytes,
+    );
+    assert!(!notice.contains(&long_path.to_string()));
+    assert!(notice.len().saturating_add(2) <= PROJECT_DOC_AGGREGATE_NOTICE_RESERVE_BYTES);
 }
 
 #[tokio::test]
@@ -914,7 +992,7 @@ async fn read_agents_md_ignores_files_removed_after_discovery() {
 }
 
 #[tokio::test]
-async fn oversized_project_doc_stream_keeps_notice_after_required_prefix() {
+async fn oversized_project_doc_stream_keeps_notice_within_rendered_bound() {
     let tmp = tempfile::tempdir().expect("tempdir");
     fs::write(tmp.path().join("AGENTS.md"), "abcdef").unwrap();
     let config = make_config(&tmp, /*limit*/ 3, /*instructions*/ None).await;
@@ -941,12 +1019,13 @@ async fn oversized_project_doc_stream_keeps_notice_after_required_prefix() {
         /*retained_bytes*/ 3,
     );
     assert_eq!(loaded.text(), format!("abc\n\n{notice}"));
+    assert!(loaded.text().len() <= project_doc_rendered_max_bytes(3));
     assert_eq!(metadata_calls.stream_chunks.load(Ordering::Relaxed), 3);
     assert_eq!(metadata_calls.stream_bytes.load(Ordering::Relaxed), 3);
 }
 
 #[tokio::test]
-async fn oversized_whitespace_prefix_keeps_notice_outside_the_source_budget() {
+async fn oversized_whitespace_prefix_keeps_notice_within_rendered_bound() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let source = tmp.path().join("AGENTS.md");
     let contents = "   content after the retained prefix";
@@ -975,12 +1054,13 @@ async fn oversized_whitespace_prefix_keeps_notice_outside_the_source_budget() {
         /*retained_bytes*/ 3,
     );
     assert_eq!(loaded.text(), format!("   \n\n{notice}"));
+    assert!(loaded.text().len() <= project_doc_rendered_max_bytes(3));
     assert_eq!(metadata_calls.stream_chunks.load(Ordering::Relaxed), 3);
     assert_eq!(metadata_calls.stream_bytes.load(Ordering::Relaxed), 3);
 }
 
 #[tokio::test]
-async fn exhausted_source_budget_still_notices_a_broader_doc() {
+async fn exhausted_source_budget_reports_a_broader_doc_within_rendered_bound() {
     let repo = tempfile::tempdir().expect("tempdir");
     fs::write(repo.path().join(".git"), "gitdir: elsewhere").unwrap();
     let root_doc = repo.path().join("AGENTS.md");
@@ -1012,6 +1092,7 @@ async fn exhausted_source_budget_still_notices_a_broader_doc() {
         /*retained_bytes*/ 0,
     );
     assert_eq!(loaded.text(), format!("{root_notice}\n\nabc"));
+    assert!(loaded.text().len() <= project_doc_rendered_max_bytes(3));
     assert_eq!(metadata_calls.stream_chunks.load(Ordering::Relaxed), 1);
     assert_eq!(metadata_calls.stream_bytes.load(Ordering::Relaxed), 1);
 }
@@ -1494,7 +1575,7 @@ async fn project_doc_byte_limit_is_shared_across_environments() {
             "V".repeat(secondary_retained_bytes)
         )
     );
-    assert!(loaded.text().len() > limit);
+    assert!(loaded.text().len() <= project_doc_rendered_max_bytes(limit));
 }
 
 #[tokio::test]
@@ -1528,7 +1609,7 @@ async fn aggregate_project_doc_limit_prefers_environment_selection_order() {
             .contains("retained byte count: 0; omitted byte count: 32")
     );
     assert!(!loaded.text().contains(&secondary_doc));
-    assert!(loaded.text().len() > limit);
+    assert!(loaded.text().len() <= project_doc_rendered_max_bytes(limit));
 }
 
 #[tokio::test]
@@ -1568,7 +1649,7 @@ async fn aggregate_budget_keeps_a_truncated_secondary_doc_utf8_valid() {
         format!("{}\n\n{secondary_notice}", "🦀".repeat(4))
     );
     assert!(!loaded.entries[1].contents.contains('\u{FFFD}'));
-    assert!(loaded.text().len() > limit);
+    assert!(loaded.text().len() <= project_doc_rendered_max_bytes(limit));
 }
 
 #[tokio::test]

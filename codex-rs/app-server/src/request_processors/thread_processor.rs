@@ -1322,8 +1322,7 @@ impl ThreadRequestProcessor {
                 outgoing.send_error(error_request_id, error).await;
             }
         };
-        self.background_tasks
-            .spawn(thread_start_task.instrument(request_context.span()));
+        thread_start_task.instrument(request_context.span()).await;
         Ok(())
     }
 
@@ -3582,7 +3581,7 @@ impl ThreadRequestProcessor {
                     redact_resume_payloads,
                 }),
             );
-            if listener_command_tx.send(command).is_err() {
+            if listener_command_tx.send(command).await.is_err() {
                 return Err(internal_error(format!(
                     "failed to enqueue running thread resume for thread {existing_thread_id}: thread listener command channel is closed"
                 )));

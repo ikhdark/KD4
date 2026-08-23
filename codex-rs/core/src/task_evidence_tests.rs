@@ -4444,6 +4444,7 @@ fn terminal_decision_claim(terminal_identity: &str) -> TerminalDecisionClaim {
             event,
             semantic_outcome: "passed".to_string(),
             final_proof_identity: None,
+            rollout_repair: TerminalRolloutRepairV1::default(),
         },
         deadline_exhausted_phase: None,
         mutation_quiescent: true,

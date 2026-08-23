@@ -2156,7 +2156,7 @@ async fn skills_are_omitted_from_developer_message_under_budget_pressure() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn initial_turn_reasoning_policy_inherits_resolved_effort() -> anyhow::Result<()> {
+async fn initial_turn_reasoning_policy_uses_compatibility_phase_efforts() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
     let server = MockServer::start().await;
 
@@ -2197,14 +2197,14 @@ async fn initial_turn_reasoning_policy_inherits_resolved_effort() -> anyhow::Res
             .get("reasoning")
             .and_then(|t| t.get("effort"))
             .and_then(|v| v.as_str()),
-        Some("medium")
+        Some("high")
     );
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn includes_inherited_effort_when_no_phase_override_is_configured() -> anyhow::Result<()> {
+async fn includes_governed_effort_when_no_turn_effort_is_configured() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
     let server = MockServer::start().await;
 
@@ -2239,14 +2239,14 @@ async fn includes_inherited_effort_when_no_phase_override_is_configured() -> any
             .get("reasoning")
             .and_then(|t| t.get("effort"))
             .and_then(|v| v.as_str()),
-        Some("medium")
+        Some("high")
     );
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn governed_effort_inherits_model_default_reasoning_effort() -> anyhow::Result<()> {
+async fn governed_effort_overrides_model_default_reasoning_effort() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
     let server = MockServer::start().await;
 
@@ -2281,7 +2281,7 @@ async fn governed_effort_inherits_model_default_reasoning_effort() -> anyhow::Re
             .get("reasoning")
             .and_then(|t| t.get("effort"))
             .and_then(|v| v.as_str()),
-        Some("medium")
+        Some("high")
     );
 
     Ok(())

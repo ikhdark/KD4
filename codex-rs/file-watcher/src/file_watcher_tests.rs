@@ -325,7 +325,7 @@ async fn failed_watch_does_not_commit_a_logical_registration() {
 }
 
 #[tokio::test]
-async fn failed_unwatch_still_removes_the_logical_registration() {
+async fn failed_unwatch_is_reconciled_after_logical_registration_is_removed() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let root = temp_dir.path().join("watched-dir");
     std::fs::create_dir(&root).expect("create root");
@@ -344,19 +344,32 @@ async fn failed_unwatch_still_removes_the_logical_registration() {
     drop(registration);
 
     assert_eq!(watcher.watch_counts_for_test(&root), None);
-    let state = watcher.state.read().expect("state lock");
-    assert!(
-        state
-            .subscribers
-            .get(&subscriber.id)
-            .expect("subscriber")
-            .watched_paths
-            .is_empty()
-    );
-    drop(state);
-    let inner = watcher.inner.as_ref().expect("watcher inner");
-    let inner = inner.lock().expect("inner lock");
-    assert!(inner.degraded_paths.contains(&root));
+    {
+        let state = watcher.state.read().expect("state lock");
+        assert!(
+            state
+                .subscribers
+                .get(&subscriber.id)
+                .expect("subscriber")
+                .watched_paths
+                .is_empty()
+        );
+    }
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let reconciled = {
+                let inner = watcher.inner.as_ref().expect("watcher inner");
+                let inner = inner.lock().expect("inner lock");
+                !inner.watched_paths.contains_key(&root) && !inner.degraded_paths.contains(&root)
+            };
+            if reconciled {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("failed unwatch should be reconciled");
 }
 
 #[tokio::test]
