@@ -25,6 +25,8 @@ use codex_agent_task_store::AssignmentDraft;
 use codex_agent_task_store::AssignmentId;
 use codex_agent_task_store::AssignmentRelation;
 use codex_agent_task_store::Attempt;
+use codex_agent_task_store::AttemptState;
+use codex_agent_task_store::IntegrationPlan;
 use codex_agent_task_store::RelevantHandle;
 use codex_agent_task_store::RepoScope;
 use codex_agent_task_store::StoreError;
@@ -397,6 +399,23 @@ async fn handle_spawn_agent(
         {
             Ok(task) => task,
             Err(error) => {
+                if let StoreError::AdmissionRejected {
+                    reason: AdmissionRejectionReason::DuplicateExplorerInvestigation,
+                    reusable_assignment_id: Some(assignment_id),
+                } = &error
+                {
+                    emit_admission_reuse_metric(&turn.session_telemetry);
+                    if let Some(workspace) = isolated_workspace.take()
+                        && let Err(cleanup_error) = cleanup_isolated_worktree(&workspace).await
+                    {
+                        tracing::warn!(
+                            path = %workspace.path.display(),
+                            %cleanup_error,
+                            "failed to clean isolated worktree after assignment reuse"
+                        );
+                    }
+                    return reusable_spawn_result(coordinator, *assignment_id).await;
+                }
                 emit_admission_rejection_metric(&turn.session_telemetry, &error);
                 if let Some(workspace) = isolated_workspace.take()
                     && let Err(cleanup_error) = cleanup_isolated_worktree(&workspace).await
@@ -645,18 +664,28 @@ async fn handle_spawn_agent(
                 "spawn_agent: durable admission completed without an assignment".to_string(),
             )
         })?;
+    let integration_plan = typed_task
+        .as_ref()
+        .map(|(assignment, _, _)| assignment.integration_plan)
+        .ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "spawn_agent: durable admission completed without an integration plan".to_string(),
+            )
+        })?;
 
     let hide_agent_metadata = turn.config.multi_agent_v2.hide_spawn_agent_metadata;
     if hide_agent_metadata {
         Ok(SpawnAgentResult::HiddenMetadata {
             task_name,
             assignment_id,
+            integration_plan,
         })
     } else {
         Ok(SpawnAgentResult::WithNickname {
             task_name,
             nickname,
             assignment_id,
+            integration_plan,
         })
     }
 }
@@ -726,7 +755,7 @@ fn emit_admission_overlap_metrics(
 
 fn emit_admission_rejection_metric(session_telemetry: &SessionTelemetry, error: &StoreError) {
     let (reason, overlap_kind, overlap_count) = match error {
-        StoreError::AdmissionRejected { reason } => match reason {
+        StoreError::AdmissionRejected { reason, .. } => match reason {
             AdmissionRejectionReason::DuplicateExplorerInvestigation => (
                 "duplicate_explorer_investigation",
                 Some("duplicated_primary_investigation"),
@@ -750,6 +779,54 @@ fn emit_admission_rejection_metric(session_telemetry: &SessionTelemetry, error: 
             &[("kind", kind), ("outcome", "rejected")],
         );
     }
+}
+
+fn emit_admission_reuse_metric(session_telemetry: &SessionTelemetry) {
+    session_telemetry.counter(
+        "codex.multi_agent.admission",
+        1,
+        &[
+            ("outcome", "reused"),
+            ("reason", "duplicate_explorer_investigation"),
+        ],
+    );
+    session_telemetry.counter(
+        "codex.multi_agent.admission_overlap",
+        1,
+        &[
+            ("kind", "duplicated_primary_investigation"),
+            ("outcome", "reused"),
+        ],
+    );
+}
+
+async fn reusable_spawn_result(
+    coordinator: &crate::agent::task_coordinator::AgentTaskCoordinator,
+    assignment_id: AssignmentId,
+) -> Result<SpawnAgentResult, FunctionCallError> {
+    let task = coordinator
+        .get_agent_task(assignment_id, None)
+        .await
+        .map_err(typed_task_store_error)?;
+    let binding = coordinator
+        .get_agent_task_binding(assignment_id)
+        .await
+        .map_err(typed_task_store_error)?;
+    let task_name = binding
+        .as_ref()
+        .map(|binding| binding.agent_path.clone())
+        .unwrap_or_else(|| assignment_id.to_string());
+    Ok(SpawnAgentResult::Reused {
+        task_name,
+        assignment_id: assignment_id.to_string(),
+        attempt_id: task.current_attempt.attempt_id.to_string(),
+        agent_path: binding.as_ref().map(|binding| binding.agent_path.clone()),
+        thread_id: binding.and_then(|binding| binding.thread_id),
+        status: task.current_attempt.state,
+        receipt_available: task.receipt.is_some(),
+        integration_plan: task.assignment.integration_plan,
+        reused: true,
+    })
 }
 
 #[derive(Debug)]
@@ -1342,6 +1419,7 @@ async fn construct_and_attach_task_capsule(
         workspace_strategy: Some(assignment.workspace_strategy),
         relation: assignment.relation.clone(),
         architecture_contract_ref: assignment.architecture_contract_ref.clone(),
+        integration_plan: assignment.integration_plan,
         relevant_handles,
         workspace_epoch: revision.epoch,
         workspace_manifest_hash: revision.manifest_hash,
@@ -1385,9 +1463,20 @@ fn parse_typed_role(agent_type: Option<&str>) -> Result<AgentRole, FunctionCallE
 }
 
 fn typed_assignment_message(assignment: &Assignment, attempt: &Attempt) -> String {
+    let integration_directive = match assignment.integration_plan {
+        IntegrationPlan::SingleWriter => {
+            "Integration plan: single_writer; you own the bounded write scope."
+        }
+        IntegrationPlan::RootOwned => {
+            "Integration plan: root_owned; limit changes to the assigned scope and submit a receipt for root reconciliation."
+        }
+        IntegrationPlan::TypedIntegratorRequired => {
+            "Integration plan: typed_integrator_required; work only in the isolated workspace and publish a versioned receipt handoff for the typed integrator."
+        }
+    };
     format!(
-        "You have a durable typed assignment. assignment_id={} attempt_id={}. Objective: {} Use get_agent_task with this assignment_id for the complete contract and captured validation call ids. Use apply_patch for source edits so mutation evidence is captured, then submit_agent_receipt before finishing.",
-        assignment.assignment_id, attempt.attempt_id, assignment.objective
+        "You have a durable typed assignment. assignment_id={} attempt_id={}. Objective: {} {} Use get_agent_task with this assignment_id for the complete contract and captured validation call ids. Use apply_patch for source edits so mutation evidence is captured, then submit_agent_receipt before finishing.",
+        assignment.assignment_id, attempt.attempt_id, assignment.objective, integration_directive
     )
 }
 
@@ -1412,10 +1501,23 @@ pub(crate) enum SpawnAgentResult {
         task_name: String,
         nickname: Option<String>,
         assignment_id: String,
+        integration_plan: IntegrationPlan,
     },
     HiddenMetadata {
         task_name: String,
         assignment_id: String,
+        integration_plan: IntegrationPlan,
+    },
+    Reused {
+        task_name: String,
+        assignment_id: String,
+        attempt_id: String,
+        agent_path: Option<String>,
+        thread_id: Option<String>,
+        status: AttemptState,
+        receipt_available: bool,
+        integration_plan: IntegrationPlan,
+        reused: bool,
     },
 }
 

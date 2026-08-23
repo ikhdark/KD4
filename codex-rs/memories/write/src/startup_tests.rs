@@ -22,11 +22,14 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::TaskCompletionGate;
+use codex_protocol::protocol::TaskCompletionStatus;
 use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
@@ -45,6 +48,30 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::time::Duration;
 use tokio::time::Instant;
+
+#[test]
+fn phase2_completion_gate_requires_pass_before_resetting_workspace() {
+    let status = |completion_status| AgentStatus::TerminalWithCompletion {
+        last_agent_message: Some("consolidation stopped".to_string()),
+        surfaced_result: None,
+        error: None,
+        completion: TaskCompletionGate {
+            status: completion_status,
+            reasons: vec!["direct validation did not pass".to_string()],
+            evidence_path: None,
+        },
+    };
+
+    assert!(phase2::is_successful_agent_status(&status(
+        TaskCompletionStatus::Passed
+    )));
+    assert!(!phase2::is_successful_agent_status(&status(
+        TaskCompletionStatus::Partial
+    )));
+    assert!(!phase2::is_successful_agent_status(&status(
+        TaskCompletionStatus::Blocked
+    )));
+}
 
 #[tokio::test]
 async fn memories_startup_creates_memory_root() -> anyhow::Result<()> {

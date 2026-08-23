@@ -1,0 +1,433 @@
+KD4 HISTORICAL SESSION AUDIT / BUG / FIX EVIDENCE
+Date: 2026-08-20
+Language classification: TypeScript
+Source scope: Codex sessions under C:\Users\kuh\.codex\sessions\2026\08
+
+This file contains detailed historical evidence migrated from actual user-message and final-answer events. It is not source code and was not independently revalidated during migration. Each record distinguishes what the session directly recorded from what remains a historical technical claim, hypothesis, limitation, or unknown. The KD4 or referenced project repository remains the source of truth for implementation causes.
+================================================================================
+EVIDENCE RECORD: 01a020f3-3cf7-73b0-9975-507bb5f377c1:f66f396fb9eb644a
+================================================================================
+Audit date: 2026-08-20
+Classified language: TypeScript
+Source session UUID: 01a020f3-3cf7-73b0-9975-507bb5f377c1
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T15-53-26-01a020f3-3cf7-73b0-9975-507bb5f377c1.jsonl
+Working directory: c:\Users\kuh\Desktop\mdpwa-main
+Git revision recorded by session: 455e0c7bb0025b4251fad62215863290ffe88f02
+Thread source: user
+Unique relevant conclusions retained from session: 1
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: 60a1724aaf2d15c9661990ce4f27d46e03d9dead118cb13b2fc0186698670d6b
+
+Recorded audit/fix task or prompt:
+"C:\Users\kuh\Desktop\mdpwa-main\LOCALIZATION\_SYSTEM\_AUDIT.txt"
+
+make sure these are all corrected
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+All four localization findings are corrected.
+
+- L10N-01: Calendar links now always include an explicit `locale=en|es` cache dimension in [events.ts](C:/Users/kuh/Desktop/mdpwa-main/src/lib/events.ts:706).
+- L10N-02: Confirmed persisted Spanish authorization; added the missing bilingual authoritative-language notice and improved reviewer/source attribution accessibility in [AlertBroadcastComposer.tsx](C:/Users/kuh/Desktop/mdpwa-main/src/components/AlertBroadcastComposer.tsx:509).
+- L10N-03: Confirmed per-subscription locale delivery and updated stale tests for atomic endpoint migration.
+- L10N-04: Confirmed the localized global boundary and added direct Spanish/English recovery coverage in [global-error.test.tsx](C:/Users/kuh/Desktop/mdpwa-main/src/app/tests/global-error.test.tsx:7).
+
+Validation: 12 focused test files passed, 71/71 tests. Targeted ESLint also passed after correction.
+
+An initially mis-scoped command ran the full suite and exposed unrelated existing failures elsewhere; those were left untouched. No localization-scope checks remain outstanding.
+
+================================================================================
+EVIDENCE RECORD: 01a020f3-84bf-7fd0-9652-bd5151a48e46:3e4118a54fa02cb0
+================================================================================
+Audit date: 2026-08-20
+Classified language: TypeScript
+Source session UUID: 01a020f3-84bf-7fd0-9652-bd5151a48e46
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T15-53-45-01a020f3-84bf-7fd0-9652-bd5151a48e46.jsonl
+Working directory: c:\Users\kuh\Desktop\mdpwa-main
+Git revision recorded by session: 455e0c7bb0025b4251fad62215863290ffe88f02
+Thread source: user
+Unique relevant conclusions retained from session: 1
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: c05b8aef74cc6b3ed5dc3e3f0554bd950fc97c528e428e3903fe5ddde55f4e5a
+
+Recorded audit/fix task or prompt:
+"C:\Users\kuh\Desktop\mdpwa-main\INTERACTIVE\_UI\_ACCESSIBILITY\_REVIEW\.txt"
+
+make sure these are all corrected
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+All 18 accessibility findings are now addressed in the source.
+
+Key corrections include:
+
+- Named, keyboard-operable 44px map markers and controls, with selected state and clearer labels.
+- Correct focus movement/restoration for map selection, menus, install banners, deep links, moderation queues, login errors, and error boundaries.
+- Field-specific alert and moderation validation.
+- Correct success/error announcements and remaining-item counts.
+- Accessible loading states and subscriber-table scrolling.
+- Consistent 44px admin controls and 14–16px essential text.
+- Matching English and Spanish accessibility copy.
+
+Primary updated surfaces include [MapFeedbackMap.tsx](C:/Users/kuh/Desktop/mdpwa-main/src/components/MapFeedbackMap.tsx:342), [MapFeedbackReportForm.tsx](C:/Users/kuh/Desktop/mdpwa-main/src/components/MapFeedbackReportForm.tsx:487), [AlertSignupExperience.tsx](C:/Users/kuh/Desktop/mdpwa-main/src/components/AlertSignupExperience.tsx:152), and [AdminSubscriberPanel.tsx](C:/Users/kuh/Desktop/mdpwa-main/src/components/AdminSubscriberPanel.tsx:222).
+
+I completed a source-level audit against every finding. Per repository policy, I did not run pnpm validation or start the development server because those were not explicitly requested. The review’s physical-device and screen-reader verification queue remains appropriate for final runtime confirmation.
+
+================================================================================
+EVIDENCE RECORD: 01a020f3-e12b-7e31-98b2-7d22a2f6f731:2ab220c9581dc93a
+================================================================================
+Audit date: 2026-08-20
+Classified language: TypeScript
+Source session UUID: 01a020f3-e12b-7e31-98b2-7d22a2f6f731
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T15-54-09-01a020f3-e12b-7e31-98b2-7d22a2f6f731.jsonl
+Working directory: c:\Users\kuh\Desktop\mdpwa-main
+Git revision recorded by session: 455e0c7bb0025b4251fad62215863290ffe88f02
+Thread source: user
+Unique relevant conclusions retained from session: 1
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: c85e19ab1f7964dbbb04c3b5314708286a336f8263525860105a57078ff9f757
+
+Recorded audit/fix task or prompt:
+"C:\Users\kuh\Desktop\mdpwa-main\ALERT\_NOTIFICATION\_AUDIT.txt"
+
+make sure these are all corrected
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+All six audit findings are addressed:
+
+- Push expiry and duplicate-display protection are enforced through bounded TTLs, payload expiry, and service-worker receipt deduplication.
+- Email attempts are claimed before sending and replay safely within Resend’s documented [24-hour idempotency window](https://resend.com/docs/dashboard/emails/idempotency-keys); ambiguous attempts are fenced after 23 hours.
+- Stale workflows are detected, terminal runs reconciled, and unresolved runs have an audited operator recovery path.
+- “Sent” now explicitly means provider acceptance—not resident receipt.
+- Zero-recipient broadcasts use the explicit `no_recipients` terminal state.
+- Focused tests and operational documentation were updated in [alertBroadcastRepository.ts](C:/Users/kuh/Desktop/mdpwa-main/src/lib/alertBroadcastRepository.ts:61), [alertBroadcastDelivery.ts](C:/Users/kuh/Desktop/mdpwa-main/src/workflows/alertBroadcastDelivery.ts:119), [alertBroadcastDispatcher.ts](C:/Users/kuh/Desktop/mdpwa-main/src/lib/alertBroadcastDispatcher.ts:25), and [security-data-operations.md](C:/Users/kuh/Desktop/mdpwa-main/docs/security-data-operations.md:105).
+
+No validation commands were run because repository policy requires checks to be explicitly requested. The referenced audit file is currently marked deleted by a concurrent workspace change; I preserved that deletion.
+
+================================================================================
+EVIDENCE RECORD: 01a020f3-fba5-7b90-992a-b828aa0aed01:ec5976cd82a73e5c
+================================================================================
+Audit date: 2026-08-20
+Classified language: TypeScript
+Source session UUID: 01a020f3-fba5-7b90-992a-b828aa0aed01
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T15-54-15-01a020f3-fba5-7b90-992a-b828aa0aed01.jsonl
+Working directory: c:\Users\kuh\Desktop\mdpwa-main
+Git revision recorded by session: 455e0c7bb0025b4251fad62215863290ffe88f02
+Thread source: user
+Unique relevant conclusions retained from session: 1
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: 01696a0ce422ca76aad8fad9d3d63c11d98ef87b54d965ce978a5a0e10cbfab7
+
+Recorded audit/fix task or prompt:
+"C:\Users\kuh\Desktop\mdpwa-main\storage-audit-findings.txt"
+
+make sure these are all corrected
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+All three findings are already corrected on the current `main`; no edits were necessary.
+
+- Production-like Blob writes require idempotency keys for [community input](/C:/Users/kuh/Desktop/mdpwa-main/src/app/api/community-input/route.ts:185) and [map feedback](/C:/Users/kuh/Desktop/mdpwa-main/src/app/api/map-feedback/route.ts:298).
+- Verified-agency reports [require PostgreSQL in production-like deployments](/C:/Users/kuh/Desktop/mdpwa-main/src/app/api/map-feedback/agency/route.ts:43), preserving atomic report, audit, and outbox persistence.
+- Alert-signup compatibility storage is blocked across production GET/POST/PUT/DELETE operations in [route.ts](/C:/Users/kuh/Desktop/mdpwa-main/src/app/api/alert-signups/route.ts:51), and confirmation submissions are blocked in [link/route.ts](/C:/Users/kuh/Desktop/mdpwa-main/src/app/api/alert-signups/link/route.ts:169).
+- Focused regression cases exist for all three findings.
+
+The task-scoped worktree remains clean. Tests were inspected but not executed because repository policy makes validation commands opt-in.
+
+================================================================================
+EVIDENCE RECORD: 01a020f4-9d69-7a91-9da8-df0507d06c13:101fc5d14ef587da
+================================================================================
+Audit date: 2026-08-20
+Classified language: TypeScript
+Source session UUID: 01a020f4-9d69-7a91-9da8-df0507d06c13
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T15-54-57-01a020f4-9d69-7a91-9da8-df0507d06c13.jsonl
+Working directory: c:\Users\kuh\Desktop\mdpwa-main
+Git revision recorded by session: 455e0c7bb0025b4251fad62215863290ffe88f02
+Thread source: user
+Unique relevant conclusions retained from session: 1
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: f8dff87d53b01db9bf3acd6e636db1fbda3815ef6cfcb31855f9bd9650b301d7
+
+Recorded audit/fix task or prompt:
+"C:\Users\kuh\Desktop\mdpwa-main\RELEASE\_COMPLEXITY\_FINDINGS.txt"
+make sure these are all corrected
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+All three recommended findings are corrected:
+
+- The six reported UUID checks use the shared `isUuid` guard.
+- Alert signup routes/store call `normalizeAlertEmail` directly.
+- Weather now shares one `no-store` header and directly exports `GET` in [route.ts](/C:/Users/kuh/Desktop/mdpwa-main/src/app/api/weather/route.ts:5).
+- Added 503 response coverage in [route.test.ts](/C:/Users/kuh/Desktop/mdpwa-main/src/app/tests/api/weather/route.test.ts:51).
+
+Validation:
+
+- Prettier, ESLint, and `git diff --check`: passed.
+- Weather tests: 2/2 passed.
+- Broader focused tests: 74/76 passed. Two unrelated existing failures remain in [privilegedRoutePermissions.test.ts](/C:/Users/kuh/Desktop/mdpwa-main/src/app/tests/api/privilegedRoutePermissions.test.ts:80) and [alert-signups/route.test.ts](/C:/Users/kuh/Desktop/mdpwa-main/src/app/tests/api/alert-signups/route.test.ts:271); I left them untouched per repository scope policy.
+
+Repo Atlas and `SOURCEMAP.md` confirmed the four “reviewed but not recommended” sections were intentionally outside the requested changes.
+
+================================================================================
+EVIDENCE RECORD: 01a020f6-280c-7f53-a0fc-bcf808e491d4:7c0e7db991b0d907
+================================================================================
+Audit date: 2026-08-20
+Classified language: TypeScript
+Source session UUID: 01a020f6-280c-7f53-a0fc-bcf808e491d4
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T15-56-38-01a020f6-280c-7f53-a0fc-bcf808e491d4.jsonl
+Working directory: c:\Users\kuh\Desktop\mdpwa-main
+Git revision recorded by session: 455e0c7bb0025b4251fad62215863290ffe88f02
+Thread source: user
+Unique relevant conclusions retained from session: 2
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: c4da2a217e923aa7396e28af2d2d18220fede73af8d206a6be3d91234615a74a
+
+Recorded audit/fix task or prompt:
+Audit for features that stop one layer short of observable behavior. Look for code that successfully computes new state or metadata but does not propagate it across the next subsystem boundary.&#x20;
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Found six concrete propagation breaks. The highest-risk gaps are in alert approval and delivery observability.
+
+## Findings
+
+1. **P1 — Recipient preview excludes push recipients.**
+
+   The dry-run handler queries only confirmed email subscribers and returns `emailRecipients`; the final workflow separately loads and snapshots active push subscriptions. The composer treats the email-only preview as sufficient authorization to send. An operator can therefore approve “0 matching recipients” and still deliver to push devices, or substantially undercount the audience.
+   [dry-run handler](C:/Users/kuh/Desktop/mdpwa-main/src/app/api/alert-broadcasts/route.ts:110) · [summary shape](C:/Users/kuh/Desktop/mdpwa-main/src/lib/alertBroadcastNotifications.ts:129) · [final push selection](C:/Users/kuh/Desktop/mdpwa-main/src/workflows/alertBroadcastDelivery.ts:60) · [send gate](C:/Users/kuh/Desktop/mdpwa-main/src/components/AlertBroadcastComposer.tsx:576)
+
+2. **P1 — Broadcast completion stops before the operator UI.**
+
+   The workflow durably computes `sent`, `partial`, `failed`, or `no_recipients`. A dedicated endpoint exposes that state and implements cancellation and failed-target retry. But the composer only shows the initial queued acknowledgment, discards the broadcast ID/run metadata, resets the form, and never polls. Repository search found no production client for `/api/alert-broadcasts/[id]`. Administrators cannot observe final per-broadcast delivery or invoke the implemented recovery actions.
+   [terminal-state computation](C:/Users/kuh/Desktop/mdpwa-main/src/lib/alertBroadcastRepository.ts:1114) · [lifecycle endpoint](<C:/Users/kuh/Desktop/mdpwa-main/src/app/api/alert-broadcasts/[id]/route.ts:27>) · [composer result handling](C:/Users/kuh/Desktop/mdpwa-main/src/components/AlertBroadcastComposer.tsx:233) · [admin page projection](C:/Users/kuh/Desktop/mdpwa-main/src/app/[locale]/admin/alerts/page.tsx:35)
+
+3. **P2 — Newly returned resident outcome metadata is dead on the wire.**
+
+   Current routes return `notificationStatus`, `replayed`, `stored`, `confirmationStatus`, and `signupStatus`, but no component reads any of them. The shared hook always installs a fixed success message, and all three form callbacks ignore `data`.
+
+   Consequences include:
+
+   - A replayed, already-confirmed alert subscriber still sees “check your email to confirm.”
+   - `stored: true` after confirmation-email failure is not explained as partial success.
+   - Failed or unknown map/community staff-notification state produces the same success UI as `sent`.
+
+   [signup outcomes](C:/Users/kuh/Desktop/mdpwa-main/src/app/api/alert-signups/route.ts:389) · [community outcome](C:/Users/kuh/Desktop/mdpwa-main/src/app/api/community-input/route.ts:258) · [map outcome](C:/Users/kuh/Desktop/mdpwa-main/src/app/api/map-feedback/route.ts:369) · [fixed hook result](C:/Users/kuh/Desktop/mdpwa-main/src/components/useResidentFormSubmission.ts:177) · [ignored signup result](C:/Users/kuh/Desktop/mdpwa-main/src/components/AlertSignupForm.tsx:102)
+
+4. **P2 — Map moderation metadata reaches the client model but not the moderation surface.**
+
+   The API accepts and persists `duplicateOf` and `reviewFlags`; the client normalizer preserves them. The admin action sends neither field, and the panel does not display existing flags, duplicate linkage, prior review note, reviewer, or review timestamp. Thus imported or API-authored moderation metadata becomes invisible, while duplicate classification is only usable through handcrafted HTTP.
+   [review handler](C:/Users/kuh/Desktop/mdpwa-main/src/app/api/map-feedback/route.ts:523) · [client normalization](C:/Users/kuh/Desktop/mdpwa-main/src/lib/mapFeedback.ts:358) · [admin request projection](C:/Users/kuh/Desktop/mdpwa-main/src/components/useMapFeedbackAdminActions.ts:107) · [panel](C:/Users/kuh/Desktop/mdpwa-main/src/components/MapFeedbackAdminPanel.tsx:346)
+
+5. **P2 — Deferred workflow starts are reported as successful cron completion.**
+
+   Both dispatchers catch workflow-start failures and return `false`. The cron route calculates `deferred`, but still emits `outbox.dispatch.completed` with status `completed` and HTTP 200. Vercel Cron does not consume the JSON detail, so the actionable state stops at the response body. Operational health eventually notices jobs overdue by 15 minutes, but immediate execution monitoring remains green.
+   [broadcast dispatcher](C:/Users/kuh/Desktop/mdpwa-main/src/lib/alertBroadcastDispatcher.ts:54) · [resident dispatcher](C:/Users/kuh/Desktop/mdpwa-main/src/lib/residentNotificationDispatcher.ts:13) · [cron projection](C:/Users/kuh/Desktop/mdpwa-main/src/app/api/cron/outbox/route.ts:20) · [delayed health detection](C:/Users/kuh/Desktop/mdpwa-main/src/app/api/health/operational/route.ts:56)
+
+6. **P3 — Community-input audit reasons are supported but unreachable from normal UI.**
+
+   The route accepts `reason` and forwards it into the audit mutation, but the panel sends only `{id, status}`. Consequently, ordinary reviewed/closed/reopened actions always lose the rationale despite the persisted audit contract supporting it.
+   [route audit input](C:/Users/kuh/Desktop/mdpwa-main/src/app/api/community-input/route.ts:377) · [panel request](C:/Users/kuh/Desktop/mdpwa-main/src/components/CommunityInputAdminPanel.tsx:196)
+
+This was a read-only audit of the current, concurrently changing worktree; I reconciled the affected files at the end. No validation commands were run because repository policy makes them opt-in.
+
+--- Relevant turn 2 ---
+Conclusion SHA-256: 9bf01f69146423d748c6f3cfe1c53fac62cd1fa5133a4f01bf8feebeedcfd95c
+
+Recorded audit/fix task or prompt:
+fix all
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Implemented all six propagation fixes:
+
+- Broadcast previews now include matching push subscriptions; queued broadcasts remain visible, auto-refresh, and expose cancel/retry actions.
+- Resident forms now surface replay, confirmation, notification queue/failure, and receipt-reference outcomes.
+- Stored-but-unsent alert confirmations are explicitly explained without clearing the draft.
+- Map moderation displays and submits review flags, duplicate IDs, prior notes, reviewer, and timestamp metadata.
+- Community-input status changes now require and submit an audited reason.
+- Deferred workflow starts now emit a degraded event and return HTTP 503 instead of appearing complete.
+
+Focused tests were added or updated across the affected API, component, notification, moderation, and cron paths. I did not execute validation commands because repository policy requires explicit opt-in.
+
+================================================================================
+EVIDENCE RECORD: 01a020f7-6d3a-7052-b765-313cd2c234eb:3f28cea8841dce8a
+================================================================================
+Audit date: 2026-08-20
+Classified language: TypeScript
+Source session UUID: 01a020f7-6d3a-7052-b765-313cd2c234eb
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T15-58-01-01a020f7-6d3a-7052-b765-313cd2c234eb.jsonl
+Working directory: c:\Users\kuh\Desktop\mdpwa-main
+Git revision recorded by session: 455e0c7bb0025b4251fad62215863290ffe88f02
+Thread source: user
+Unique relevant conclusions retained from session: 2
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: 26d29871b9d76673a1882a9e51714ead6781d05346a1463935d063ecdff0b24f
+
+Recorded audit/fix task or prompt:
+find optimization-related structs with fields that are written but never read, read but never written in production, or populated only in tests. Explain whether each is dead design residue or evidence of an incomplete implementation.
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+I found five clear dead-residue groups and two likely incomplete implementations. I treated “optimization-related” as cache, bounded-state, concurrency, diagnostics, and performance-metrics structures.
+
+| Struct / field | Evidence | Verdict |
+|---|---|---|
+| `LocalStoreLock.state` | Initialized and reassigned, but the object field is never read; persisted state uses the function parameter instead. [localJsonStore.ts](</C:/Users/kuh/Desktop/mdpwa-main/src/lib/localJsonStore.ts:42>) | Dead design residue |
+| `LocalStoreLockTicket.owner` | Copied into each listed ticket, but ownership/liveness checks use the parsed payload before constructing the ticket. No later `ticket.owner` read exists. [localJsonStore.ts](</C:/Users/kuh/Desktop/mdpwa-main/src/lib/localJsonStore.ts:52>) | Dead design residue |
+| `SubmissionRateBucket.updatedAt` | Syntactically used as a fallback to the newest hit, but every stored bucket must contain at least one hit because effective limits are positive. The fallback is unreachable. [submissionIntegrity.ts](</C:/Users/kuh/Desktop/mdpwa-main/src/lib/submissionIntegrity.ts:48>) | Dead design residue |
+| `VersionedArrayReadDiagnostics.legacyArray` and `.schemaVersion` | Populated by runtime parsing, but production consumers use only `items`, `invalidCount`, and `totalCount`. These two fields are inspected only by tests. [versionedJson.ts](</C:/Users/kuh/Desktop/mdpwa-main/src/lib/versionedJson.ts:11>) | Test-oriented residue |
+| `NavLink.external` / `SiteHeaderNavLink.external` | Both desktop and mobile renderers read and forward it, but no header navigation entry supplies it. All current header destinations are internal. [SiteHeader.tsx](</C:/Users/kuh/Desktop/mdpwa-main/src/components/SiteHeader.tsx:15>), [SiteHeaderMobileMenu.tsx](</C:/Users/kuh/Desktop/mdpwa-main/src/components/SiteHeaderMobileMenu.tsx:15>) | Dead over-generalization |
+| `MapFeedbackStoreDiagnostics.{invalidCount,totalCount,validCount}` | Every storage backend implements `diagnostics()`, including PostgreSQL, but the repository’s only callers are store tests. No admin, readiness, health, or reporting path consumes it. [mapFeedbackStore.ts](</C:/Users/kuh/Desktop/mdpwa-main/src/lib/mapFeedbackStore.ts:31>) | Likely incomplete operational wiring |
+| `TechMetrics.generatedAt` | The server emits it and the client parser validates and copies it, but the resulting `metrics.generatedAt` is never displayed or otherwise consumed. [techMetrics.ts](</C:/Users/kuh/Desktop/mdpwa-main/src/lib/techMetrics.ts:6>), [TechMetricsPanel.tsx](</C:/Users/kuh/Desktop/mdpwa-main/src/components/TechMetricsPanel.tsx:19>) | Likely incomplete “as of” presentation |
+
+There are also fields populated only by tests that appear intentional, not incomplete:
+
+- `PWARegisterProps.reloadPage`: test injection for observing reload behavior. [pwa-register.tsx](</C:/Users/kuh/Desktop/mdpwa-main/src/app/pwa-register.tsx:38>)
+- `VersionedJsonArrayWriteOptions.backupRetention`: tests use small/zero retention to exercise pruning without creating many backups. [localJsonStore.ts](</C:/Users/kuh/Desktop/mdpwa-main/src/lib/localJsonStore.ts:38>)
+- `SubmissionIntegrityOptions.maxSubmitMs`, `minimumSubmitMs`, `env`, and `nowMs`: deterministic timing/environment seams. `honeypotFields` is the exception—it is never overridden even in tests, so that field is genuine dead flexibility. [submissionIntegrity.ts](</C:/Users/kuh/Desktop/mdpwa-main/src/lib/submissionIntegrity.ts:29>)
+- Injected weather/reverse-geocode fetchers and clocks similarly disable shared caching for deterministic tests; they are legitimate seams.
+
+The actual cache-entry structures—weather, reverse-geocode, map clustering, route-bundle statistics, and the new PWA prompt props—have complete producer/consumer paths.
+
+This was a read-only source, history, and compiler-reference audit using Repo Atlas for structural routing and direct source inspection for final proof. I changed no files and ran no validation commands.
+
+--- Relevant turn 2 ---
+Conclusion SHA-256: 7a97126b8c4801c388e99d9fc87cb4bbb8c800483f0798e58abc8d03f6248669
+
+Recorded audit/fix task or prompt:
+fix all
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Fixed all confirmed issues.
+
+- Removed dead lock, rate-limit, version-diagnostic, honeypot-option, and header-link fields.
+- Updated affected tests and added [techMetrics.test.ts](C:\Users\kuh\Desktop\mdpwa-main\src\lib\tests\techMetrics.test.ts).
+- Wired map-store integrity counts into the protected lead-tech metrics endpoint and UI.
+- Displayed the previously unused metrics timestamp with bilingual copy.
+- Updated [SOURCEMAP.md](C:\Users\kuh\Desktop\mdpwa-main\SOURCEMAP.md).
+- Preserved intentional test-injection seams.
+
+Validation commands were not run because repository policy requires explicit authorization.
+
+================================================================================
+EVIDENCE RECORD: 01a020f8-60c1-7c62-be1a-2718e5006ddd:2123d8c2e9b0f78b
+================================================================================
+Audit date: 2026-08-20
+Classified language: TypeScript
+Source session UUID: 01a020f8-60c1-7c62-be1a-2718e5006ddd
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T15-59-03-01a020f8-60c1-7c62-be1a-2718e5006ddd.jsonl
+Working directory: c:\Users\kuh\Desktop\mdpwa-main
+Git revision recorded by session: 455e0c7bb0025b4251fad62215863290ffe88f02
+Thread source: user
+Unique relevant conclusions retained from session: 2
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: fc90dc688ee5b524a6ee2c4580188cc56d4b0b0e9437aac45d85167e28a9e2b5
+
+Recorded audit/fix task or prompt:
+search for branches documented as temporary, legacy, fallback, compatibility, conservative, TODO, future, or under-development and determine which ones now sit in front of otherwise-complete newer implementations. Rank the cases where removing/completing that transitional wiring would materially affect daily use.
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+I found two clear transitional branches that still obstruct newer behavior, plus one lower-frequency operational gap. No live `TODO`, `FIXME`, temporary, or under-development control-flow branches survived source tracing.
+
+| Rank | Transitional wiring | Daily-use effect |
+|---|---|---|
+| 1 | Legacy admin login/token UX remains in front of named MFA administration | High for staff |
+| 2 | Production PWA recovery is hidden until the third failure | High during update/offline failures |
+| 3 | Admin readiness treats `DATABASE_URL` as proof that an administrator exists | Medium, mainly deployment/cutover |
+
+### 1. Legacy admin UX is internally inconsistent
+
+The completed path is PostgreSQL-backed named administrators with passwords, TOTP, permissions, and revocable sessions. The operations guide explicitly says to remove legacy browser credentials after cutover ([security-data-operations.md](C:/Users/kuh/Desktop/mdpwa-main/docs/security-data-operations.md:35)).
+
+The remaining wiring conflicts with that path:
+
+- The login form always requires email, password, and MFA ([AdminLoginForm.tsx](C:/Users/kuh/Desktop/mdpwa-main/src/components/AdminLoginForm.tsx:105)).
+- Without PostgreSQL, the backend legacy branch only validates the password and ignores email/MFA ([route.ts](C:/Users/kuh/Desktop/mdpwa-main/src/app/api/admin/session/route.ts:164), [route.ts](C:/Users/kuh/Desktop/mdpwa-main/src/app/api/admin/session/route.ts:214)).
+- `MARTINDALE_ADMIN_TOKEN` alone marks admin identity as configured, but it cannot create the browser session the form needs ([adminIdentity.ts](C:/Users/kuh/Desktop/mdpwa-main/src/lib/adminIdentity.ts:123)).
+- The public setup message incorrectly says either the password or API token enables sign-in ([AdminLoginPage.json](C:/Users/kuh/Desktop/mdpwa-main/messages/en/AdminLoginPage.json:3)).
+- The guarded map moderation screen still puts an “Admin token override” ahead of its controls ([MapFeedbackAdminPanel.tsx](C:/Users/kuh/Desktop/mdpwa-main/src/components/MapFeedbackAdminPanel.tsx:318)). With PostgreSQL it is ignored; without PostgreSQL, the page already requires a signed legacy session, making it redundant.
+
+Recommended completion: retire visible browser-token compatibility and stale setup copy, while retaining only explicitly scoped service-token API support. If password-only local login must remain, expose the active auth mode to the form so it does not require meaningless email/MFA fields.
+
+### 2. PWA recovery exists but is conservatively suppressed
+
+A complete bilingual recovery prompt now exists and is loaded globally. However, production only displays it after three recorded failures ([pwa-register.tsx](C:/Users/kuh/Desktop/mdpwa-main/src/app/pwa-register.tsx:99), [pwaServiceWorkerRegistration.ts](C:/Users/kuh/Desktop/mdpwa-main/src/app/pwaServiceWorkerRegistration.ts:20)). This also applies when a resident explicitly presses “Update now” and activation fails.
+
+That leaves the first two failures silent even though the recovery component already explains what happened and how to reopen safely ([PWAUpdatePrompt.tsx](C:/Users/kuh/Desktop/mdpwa-main/src/components/PWAUpdatePrompt.tsx:24)).
+
+Recommended completion: show `updateApplyFailed` immediately because it follows a user action. Retain a threshold for passive background `updateCheckFailed` events if suppressing transient network noise is still desired.
+
+### 3. Admin readiness stops at environment presence
+
+The readiness branch returns `ready` whenever `DATABASE_URL` exists ([deploymentReadiness.ts](C:/Users/kuh/Desktop/mdpwa-main/src/lib/deploymentReadiness.ts:313)). Likewise, named identity is considered configured based solely on transactional storage availability ([adminIdentity.ts](C:/Users/kuh/Desktop/mdpwa-main/src/lib/adminIdentity.ts:117)).
+
+A deployment can therefore appear ready even when no active named administrator has been bootstrapped, while every login attempt fails. Completing this means distinguishing “database connected” from “named administrator verified,” ideally through an async database probe or bootstrap attestation.
+
+### Compatibility paths that are not blocking newer implementations
+
+- PostgreSQL already wins before Blob/local compatibility stores for map feedback, community input, and broadcasts ([mapFeedbackStore.ts](C:/Users/kuh/Desktop/mdpwa-main/src/lib/mapFeedbackStore.ts:1387), [communityInputStore.ts](C:/Users/kuh/Desktop/mdpwa-main/src/lib/communityInputStore.ts:895)).
+- Production alert signups explicitly reject compatibility storage when PostgreSQL is absent.
+- Weather now has shared-cache response headers and a five-minute process cache; older no-cache concerns are stale.
+- Legacy idempotency keys, calendar IDs, versioned JSON readers, the unversioned service-worker sentinel, and manifest copy are active migration/compatibility consumers—not shadows.
+- The Tailwind v3 border-color compatibility layer still has a few real dependents in `LocalCalendar`; removing it now would alter calendar borders rather than unlock newer behavior.
+
+This was a read-only source audit of the current, modified worktree. I made no changes and did not run validation commands.
+
+--- Relevant turn 2 ---
+Conclusion SHA-256: b41b0fae61f3fb5e2139b5de2561335c32c7b9f18d7f81e3c935073d45ba3396
+
+Recorded audit/fix task or prompt:
+fix all
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Fixed all three transitional blockers, ranked by daily-use impact:
+
+1. Admin access: named MFA login now requires an active database administrator. Local fallback is password-only, and API tokens were removed from guarded browser UI.
+2. PWA recovery: user-triggered update failures display recovery immediately; passive background failures retain the conservative threshold.
+3. Deployment readiness: `DATABASE_URL` alone no longer proves admin readiness—an authenticated named-admin session is required.
+
+Updated supporting API guidance, English/Spanish copy, tests, environment documentation, and [SOURCEMAP.md](C:/Users/kuh/Desktop/mdpwa-main/SOURCEMAP.md:90).
+
+Validation commands were not run because repository policy requires explicit requests for checks.

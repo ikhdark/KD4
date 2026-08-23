@@ -3,7 +3,9 @@ use crate::outgoing_message::OutgoingResponse;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
+use codex_app_server_protocol::TurnReasoningPolicySummaryNotification;
 use codex_app_server_protocol::TurnReasoningPolicyUpdatedNotification;
+use codex_protocol::protocol::ReasoningPolicyHistory;
 use codex_protocol::protocol::ReasoningPolicyPhase;
 use codex_protocol::protocol::ReasoningPolicySnapshot;
 use codex_protocol::protocol::ReasoningPolicySource;
@@ -32,6 +34,19 @@ fn reasoning_policy_updated_notification() -> ServerNotification {
             source: ReasoningPolicySource::TurnFallback,
             model: "gpt-5".to_string(),
             trigger: ReasoningPolicyTrigger::UserInput,
+        },
+    })
+}
+
+fn reasoning_policy_summary_notification() -> ServerNotification {
+    ServerNotification::TurnReasoningPolicySummary(TurnReasoningPolicySummaryNotification {
+        thread_id: "thread-1".to_string(),
+        turn_id: "turn-1".to_string(),
+        history: ReasoningPolicyHistory {
+            turn_id: "turn-1".to_string(),
+            entries: Vec::new(),
+            total_entries: 2,
+            truncated: false,
         },
     })
 }
@@ -316,6 +331,63 @@ async fn experimental_notifications_are_preserved_with_capability() {
         notification.snapshot.trigger,
         ReasoningPolicyTrigger::UserInput
     );
+}
+
+#[tokio::test]
+async fn reasoning_policy_summary_notification_respects_capability() {
+    let connection_id = ConnectionId(14);
+    let (writer_tx, mut writer_rx) = mpsc::channel(1);
+    let experimental_api_enabled = Arc::new(AtomicBool::new(false));
+
+    let mut connections = HashMap::new();
+    connections.insert(
+        connection_id,
+        OutboundConnectionState::new(
+            writer_tx,
+            Arc::new(AtomicBool::new(true)),
+            experimental_api_enabled.clone(),
+            Arc::new(RwLock::new(HashSet::new())),
+            /*disconnect_sender*/ None,
+        ),
+    );
+
+    let notification = reasoning_policy_summary_notification();
+    assert_eq!(
+        notification.experimental_reason(),
+        Some("reasoningPolicyVisibility")
+    );
+    route_outgoing_envelope(
+        &mut connections,
+        OutgoingEnvelope::ToConnection {
+            connection_id,
+            message: OutgoingMessage::AppServerNotification(notification),
+            write_complete_tx: None,
+        },
+    )
+    .await;
+    assert!(writer_rx.try_recv().is_err());
+
+    experimental_api_enabled.store(true, std::sync::atomic::Ordering::Release);
+    route_outgoing_envelope(
+        &mut connections,
+        OutgoingEnvelope::ToConnection {
+            connection_id,
+            message: OutgoingMessage::AppServerNotification(
+                reasoning_policy_summary_notification(),
+            ),
+            write_complete_tx: None,
+        },
+    )
+    .await;
+
+    let message = writer_rx
+        .recv()
+        .await
+        .expect("summary should reach opted-in client");
+    assert!(matches!(
+        message.message,
+        OutgoingMessage::AppServerNotification(ServerNotification::TurnReasoningPolicySummary(_))
+    ));
 }
 
 #[tokio::test]

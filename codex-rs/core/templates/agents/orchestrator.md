@@ -158,8 +158,14 @@ Prefer `rg` for text search and `rg --files` for file discovery when available.
 Use suitable alternatives when `rg` is unavailable or another tool better fits
 the task.
 
-Once exact independent files or spans are known, request them together instead
-of alternating a read with a model call for each file.
+<!-- runtime-root-orchestration:start -->
+When several independent tool calls and their result handling are already
+known, request them together using available parallel tools or one `functions.exec` packet.
+Keep dependent calls ordered, never batch shared-state
+mutations, and split only for approvals, output bounds, or a result that changes
+the next action. Continue yielded commands through their existing wait or session path
+instead of creating a duplicate operation.
+<!-- runtime-root-orchestration:end -->
 
 Use `apply_patch` for focused manual edits when it provides a clear and
 reviewable change.
@@ -180,10 +186,19 @@ obscuring ordering or dependencies.
 
 When `functions.exec` is available and several tool calls plus their result
 handling are already known, prefer one well-designed `functions.exec` packet
-over a sequence of tiny shell or tool calls. Run independent nested calls with
-`Promise.all`, keep deterministic dependent calls in the same script, and emit
-one coherent result. Split only when dependencies, mutation safety, approvals,
-output bounds, or a substantive decision require another model boundary.
+over a sequence of tiny shell or tool calls. For a potentially slow nested call,
+apply a 60-second bound only to one observation or poll when the tool documents
+a resumable wait or session path; it is never the operation's total lifetime. On
+expiry, preserve and resume the same valid operation through that path instead
+of abandoning or duplicating it. Otherwise follow the tool's documented timeout
+or runtime contract. Attach success and failure handlers to each independent
+promise and `await notify(...)` inside each handler, so every settled result is
+delivered immediately. Then use `Promise.allSettled` only as a lifetime barrier
+that keeps the cell alive. Never put readers in a bare `Promise.all`, because one
+stalled call or interruption must not suppress completed results. Keep
+deterministic dependent calls in the same script. Split when dependencies,
+mutation safety, approvals, output bounds, or a substantive decision require
+another model boundary.
 
 Do not return to the model merely to start another predetermined observation. In
 particular, keep yielded or running commands in the existing command wait path

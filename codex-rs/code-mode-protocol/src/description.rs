@@ -9,15 +9,15 @@ use crate::PUBLIC_TOOL_NAME;
 const MAX_JS_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
 const DEFERRED_NESTED_TOOLS_GUIDANCE: &str = r#"Some deferred nested tools may be omitted from this description. They are still available on the global `tools` object and listed in `ALL_TOOLS`.
 To find one, filter `ALL_TOOLS` by `name` and `description`."#;
-const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript in a fresh V8 isolate. Input is JS, not JSON or Markdown. Node, filesystem, network, and console APIs are unavailable.
-- Nested tools are normalized `tools` methods (for example `await tools.exec_command(...)`) with documented I/O.
+const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript in a fresh V8 isolate. Input is JS, not JSON/Markdown; Node, filesystem, network, and console are unavailable.
+- Nested tools are normalized `tools` methods (e.g. `await tools.exec_command(...)`) with documented I/O.
 - Only tools listed in `ALL_TOOLS` are callable inside `exec`; direct-only tools stay outside.
-- For a named symbol/config key, query its exact token and direct consumers before broader inventory; search repo/project names only if unresolved, never in the same batch.
-- Batch independent calls with `Promise.allSettled` or per-call catches so one failure preserves other results; keep dependent calls sequential.
-- Plan evidence before crossing the boundary, then synthesize once. Treat eight sampling passes per completed turn as a soft ceiling; exceed it only for decision-changing dependent evidence. Stop when evidence is sufficient or unchanged.
+- For a named symbol/config key, query its exact token and direct consumers first; search repo/project names only if unresolved, never in the same batch.
+- Nested tool operations have a hard 60s default deadline; expiry cancels the operation. Only resume an observation poll when the tool returned a session or cell ID, and never duplicate a timed-out operation. Honor tool contracts. Await `notify` per settlement; use `allSettled`, never bare `Promise.all`. Sequence dependencies.
+- Eight sampling passes per turn is an efficiency target, not a completion/validation cap. Required routing, safety, contract, test, or validation evidence overrides it for dependent or independent work.
 - After deterministic failure, including a session poll, do not repeat the unchanged call; change route or relevant state.
 - Keep evidence bounded: read relevant config/session tables or line ranges, never whole files; after truncation use a retained-artifact selector. Keep long commands in the same awaited evaluation; call `yield_control()` only for a new model decision.
-- Optional first line: `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 10000}`. `yield_time_ms` is compatibility-only; owner waits wake on output or terminal state, never unchanged cells. `max_output_tokens` defaults to 10000.
+- Optional first line: `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 10000}`. `yield_time_ms` is compatibility-only and does not extend nested-tool deadlines; owner waits wake on output or terminal state, never unchanged cells. Pass a nested tool's documented `{ timeout_ms }` option when it needs a longer bound. `max_output_tokens` defaults to 10000.
 - When evaluation ends, unawaited work is discarded.
 
 Global helpers:
@@ -27,7 +27,7 @@ Global helpers:
 - `audio(audioUrlOrItem: string | { audio_url: string } | { type: "audio"; data: string; mimeType: string })` appends a base64 `data:` audio URL or one MCP audio block.
 - `generatedImage(result: { image_url: string; output_hint?: string })` appends generated output; HTTP(S) is unsupported.
 - `store(key: string, value: any)` and `load(key: string)` persist serializable session values.
-- `notify(value: string | number | boolean | undefined | null)` emits an extra tool output.
+- `notify(value: string | number | boolean | undefined | null): Promise<void>` resolves after delivery; await it.
 - `setTimeout(callback: () => void, delayMs?: number)` schedules work; await timers to keep exec alive. `clearTimeout(timeoutId?: number)` cancels one.
 - `ALL_TOOLS` lists `{ name, description }`; `yield_control()` emits output while execution continues."#;
 const WAIT_DESCRIPTION_TEMPLATE: &str = r#"- Use `wait` only after `exec` returns `Script running with cell ID ...`.
@@ -458,7 +458,9 @@ fn render_code_mode_tool_declaration(
     output_type: String,
 ) -> String {
     let tool_name = normalize_code_mode_identifier(tool_name);
-    format!("{tool_name}({input_name}: {input_type}): Promise<{output_type}>;")
+    format!(
+        "{tool_name}({input_name}: {input_type}, options?: {{ timeout_ms?: number }}): Promise<{output_type}>;"
+    )
 }
 
 fn render_tool_heading(global_name: &str, raw_name: &str) -> String {
@@ -831,7 +833,7 @@ mod tests {
         assert!(description.contains("declare const tools"));
         assert!(
             description.contains(
-                "hidden_dynamic_tool(args: { city: string; }): Promise<{ ok: boolean; }>;"
+                "hidden_dynamic_tool(args: { city: string; }, options?: { timeout_ms?: number }): Promise<{ ok: boolean; }>;"
             )
         );
     }
@@ -877,7 +879,7 @@ mod tests {
             r#"weather_tool(args: {
   // look up weather for a given list of locations
   weather: Array<{ location: string; }>;
-}): Promise<{
+}, options?: { timeout_ms?: number }): Promise<{
   // human readable weather forecast
   forecast: string;
 }>;"#
@@ -930,9 +932,24 @@ bar"
         assert!(description.contains("its exact token and direct consumers"));
         assert!(description.contains("search repo/project names only if unresolved"));
         assert!(description.contains("never in the same batch"));
-        assert!(description.contains("Batch independent calls"));
-        assert!(description.contains("Promise.allSettled"));
-        assert!(description.contains("eight sampling passes per completed turn"));
+        assert!(description.contains("hard 60s default deadline"));
+        assert!(description.contains("expiry cancels the operation"));
+        assert!(description.contains("Only resume an observation poll"));
+        assert!(description.contains("returned a session or cell ID"));
+        assert!(description.contains("never duplicate a timed-out operation"));
+        assert!(!description.contains("never an operation"));
+        assert!(description.contains("Honor tool contracts"));
+        assert!(description.contains("Await `notify` per settlement"));
+        assert!(description.contains("use `allSettled`"));
+        assert!(description.contains("resolves after delivery; await it"));
+        assert!(description.contains("never bare `Promise.all`"));
+        assert!(description.contains("Eight sampling passes per turn"));
+        assert!(description.contains("efficiency target, not a completion/validation cap"));
+        assert!(
+            description
+                .contains("Required routing, safety, contract, test, or validation evidence")
+        );
+        assert!(description.contains("dependent or independent work"));
         assert!(description.contains("same awaited evaluation"));
         assert!(description.contains("read relevant config/session tables or line ranges"));
         assert!(description.contains("never whole files"));
@@ -944,14 +961,14 @@ bar"
         );
         assert!(description.contains("including a session poll"));
         assert!(description.contains("change route or relevant state"));
-        assert!(description.contains("keep dependent calls sequential"));
+        assert!(description.contains("Sequence dependencies"));
         assert!(description.contains("Keep evidence bounded"));
         assert!(!description.contains("Shared MCP Types:"));
         assert!(!description.contains("type ImageContent ="));
         assert!(!description.contains("Model projections are capped"));
         const HISTORICAL_COMMON_EXEC_DESCRIPTION_BYTES: usize = 3_337;
         assert!(
-            EXEC_DESCRIPTION_TEMPLATE.len() * 100 <= HISTORICAL_COMMON_EXEC_DESCRIPTION_BYTES * 85,
+            EXEC_DESCRIPTION_TEMPLATE.len() * 100 <= HISTORICAL_COMMON_EXEC_DESCRIPTION_BYTES * 92,
             "information-gain-aware batching guidance takes priority over marginal descriptor savings"
         );
     }
@@ -1054,10 +1071,10 @@ bar"
         assert_eq!(description.matches("## mcp__sample").count(), 1);
         assert!(description.contains("## mcp__sample\nShared namespace guidance."));
         assert!(description.contains(
-            "declare const tools: { mcp__sample__alpha(args: {}): Promise<CallToolResult<{}>>; };"
+            "declare const tools: { mcp__sample__alpha(args: {}, options?: { timeout_ms?: number }): Promise<CallToolResult<{}>>; };"
         ));
         assert!(description.contains(
-            "declare const tools: { mcp__sample__beta(args: {}): Promise<CallToolResult<{}>>; };"
+            "declare const tools: { mcp__sample__beta(args: {}, options?: { timeout_ms?: number }): Promise<CallToolResult<{}>>; };"
         ));
     }
 
@@ -1258,6 +1275,8 @@ bar"
         let wait = build_wait_tool_description();
 
         assert!(exec.contains("`yield_time_ms` is compatibility-only"));
+        assert!(exec.contains("does not extend nested-tool deadlines"));
+        assert!(exec.contains("documented `{ timeout_ms }` option"));
         assert!(exec.contains("wake on output or terminal state"));
         assert!(exec.contains("never unchanged cells"));
         assert!(wait.contains("`yield_time_ms` is retained for compatibility"));

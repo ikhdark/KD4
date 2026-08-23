@@ -1,6 +1,11 @@
 use super::*;
 
 #[test]
+fn turn_clients_use_normal_mcp_elicitation_handling() {
+    assert!(!MCP_ELICITATIONS_AUTO_DENY);
+}
+
+#[test]
 fn flush_transcript_tail_defaults_enabled_and_honors_explicit_opt_out() {
     assert!(flush_transcript_tail_on_session_end(None));
     assert!(flush_transcript_tail_on_session_end(Some(true)));

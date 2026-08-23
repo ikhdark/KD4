@@ -1,8 +1,8 @@
 use crate::function_tool::FunctionCallError;
+use crate::tools::command_output_artifact::RECOVERY_AGGREGATE_TOKEN_CEILING;
 use crate::tools::command_output_artifact::ReadToolOutputError;
 use crate::tools::command_output_artifact::ReadToolOutputResult;
 use crate::tools::command_output_artifact::ToolOutputSelector;
-#[cfg(test)]
 use crate::tools::command_output_artifact::ToolOutputSelectorResult;
 use crate::tools::command_output_artifact::ToolOutputSelectorStatus;
 use crate::tools::command_output_artifact::read_tool_output_selectors_with_ceiling_and_reuse;
@@ -29,6 +29,7 @@ use codex_tools::ToolSpec;
 use serde::Deserialize;
 use serde_json::Value;
 use std::path::Path;
+use tokio_util::sync::CancellationToken;
 
 const DEFAULT_MAX_BYTES: usize = 16_384;
 const DEFAULT_LINE_COUNT: usize = 200;
@@ -41,6 +42,188 @@ const CODE_MODE_RECOVERY_WRAPPER_RESERVE_TOKENS: usize = 1_000;
 const CODE_MODE_RECOVERY_TOKEN_CEILING: usize =
     codex_utils_output_truncation::DEFAULT_SUCCESS_OUTPUT_TOKENS
         .saturating_sub(CODE_MODE_RECOVERY_WRAPPER_RESERVE_TOKENS);
+
+#[derive(Debug)]
+struct DrainedRecoveryTransaction {
+    output: ReadToolOutputResult,
+    reused: bool,
+    drained_continuation_pages: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContinuationStopReason {
+    Budget,
+    IdentityDrift,
+    IncompleteOwnerResult,
+    RepeatedSelector,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ContinuationStep {
+    Complete,
+    Follow {
+        result_index: usize,
+        selector: ToolOutputSelector,
+    },
+    Stop(ContinuationStopReason),
+}
+
+struct RecoveryContinuationState {
+    output: ReadToolOutputResult,
+    reused: bool,
+    followed_selectors: Vec<ToolOutputSelector>,
+    drained_continuation_pages: u32,
+    token_ceiling: usize,
+}
+
+impl RecoveryContinuationState {
+    fn new(output: ReadToolOutputResult, reused: bool, token_ceiling: usize) -> Self {
+        Self {
+            output,
+            reused,
+            followed_selectors: Vec::new(),
+            drained_continuation_pages: 0,
+            token_ceiling,
+        }
+    }
+
+    fn next_step(&self) -> ContinuationStep {
+        if !self.output.unavailable_ranges.is_empty() {
+            return ContinuationStep::Stop(ContinuationStopReason::IncompleteOwnerResult);
+        }
+        for (result_index, result) in self.output.results.iter().enumerate() {
+            let Some(selector) = result.continuation.as_ref() else {
+                if !matches!(
+                    result.status,
+                    ToolOutputSelectorStatus::Ok
+                        | ToolOutputSelectorStatus::SelectorTooLarge
+                        | ToolOutputSelectorStatus::AggregateOmitted
+                ) {
+                    return ContinuationStep::Stop(ContinuationStopReason::IncompleteOwnerResult);
+                }
+                continue;
+            };
+            if !matches!(
+                result.status,
+                ToolOutputSelectorStatus::Ok
+                    | ToolOutputSelectorStatus::SelectorTooLarge
+                    | ToolOutputSelectorStatus::AggregateOmitted
+            ) {
+                return ContinuationStep::Stop(ContinuationStopReason::IncompleteOwnerResult);
+            }
+            if self.followed_selectors.contains(selector) {
+                return ContinuationStep::Stop(ContinuationStopReason::RepeatedSelector);
+            }
+            return ContinuationStep::Follow {
+                result_index,
+                selector: selector.clone(),
+            };
+        }
+        if self.output.results.iter().all(|result| {
+            matches!(
+                result.status,
+                ToolOutputSelectorStatus::Ok
+                    | ToolOutputSelectorStatus::SelectorTooLarge
+                    | ToolOutputSelectorStatus::AggregateOmitted
+            ) && result.continuation.is_none()
+        }) {
+            ContinuationStep::Complete
+        } else {
+            ContinuationStep::Stop(ContinuationStopReason::IncompleteOwnerResult)
+        }
+    }
+
+    fn accept_page(
+        &mut self,
+        result_index: usize,
+        selector: &ToolOutputSelector,
+        page: ReadToolOutputResult,
+        page_reused: bool,
+    ) -> Result<(), ContinuationStopReason> {
+        self.reused &= page_reused;
+        let Some(predecessor) = self.output.results.get(result_index) else {
+            return Err(ContinuationStopReason::IncompleteOwnerResult);
+        };
+        if predecessor.continuation.as_ref() != Some(selector)
+            || page.artifact_id != self.output.artifact_id
+            || page.canonical_sha256 != self.output.canonical_sha256
+        {
+            return Err(ContinuationStopReason::IdentityDrift);
+        }
+        if !page.unavailable_ranges.is_empty()
+            || page.results.len() != 1
+            || &page.results[0].selector != selector
+            || !matches!(
+                page.results[0].status,
+                ToolOutputSelectorStatus::Ok
+                    | ToolOutputSelectorStatus::SelectorTooLarge
+                    | ToolOutputSelectorStatus::AggregateOmitted
+            )
+        {
+            return Err(ContinuationStopReason::IncompleteOwnerResult);
+        }
+
+        let mut candidate = self.output.clone();
+        let predecessor = &mut candidate.results[result_index];
+        predecessor.continuation = next_owner_continuation(predecessor, selector);
+        if predecessor.status == ToolOutputSelectorStatus::Ok {
+            predecessor.complete = predecessor.continuation.is_none();
+        }
+        // Keep already-drained pages in traversal order. Inserting every page
+        // immediately after the owner reverses multi-page continuations.
+        candidate.results.extend(page.results);
+        candidate.complete = candidate.unavailable_ranges.is_empty()
+            && candidate.results.iter().all(|result| {
+                result.status == ToolOutputSelectorStatus::Ok
+                    && result.complete
+                    && result.continuation.is_none()
+            });
+        if !recovery_result_fits_token_ceiling(&candidate, self.token_ceiling) {
+            return Err(ContinuationStopReason::Budget);
+        }
+
+        self.output = candidate;
+        self.followed_selectors.push(selector.clone());
+        self.drained_continuation_pages = self.drained_continuation_pages.saturating_add(1);
+        Ok(())
+    }
+
+    fn finish(self) -> DrainedRecoveryTransaction {
+        DrainedRecoveryTransaction {
+            output: self.output,
+            reused: self.reused,
+            drained_continuation_pages: self.drained_continuation_pages,
+        }
+    }
+}
+
+fn next_owner_continuation(
+    predecessor: &ToolOutputSelectorResult,
+    consumed: &ToolOutputSelector,
+) -> Option<ToolOutputSelector> {
+    if let (
+        Some(plan),
+        ToolOutputSelector::Bytes {
+            end: consumed_end, ..
+        },
+    ) = (predecessor.subdivision_plan.as_ref(), consumed)
+        && *consumed_end < plan.range.end
+    {
+        return Some(ToolOutputSelector::Bytes {
+            start: *consumed_end,
+            end: consumed_end
+                .saturating_add(plan.chunk_bytes.max(1))
+                .min(plan.range.end),
+        });
+    }
+
+    predecessor
+        .child_selectors
+        .iter()
+        .position(|child| child == consumed)
+        .and_then(|index| predecessor.child_selectors.get(index.saturating_add(1)))
+        .cloned()
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -165,15 +348,21 @@ async fn handle_read_tool_output(
             .unwrap_or_default()
             .as_bytes(),
     );
-    let (output, reused) = execute_recovery_transaction(
+    let transaction = execute_recovery_transaction_with_continuations(
         invocation.turn.config.codex_home.as_path(),
         &invocation.session.thread_id.to_string(),
         &args.artifact_id,
         selectors,
         code_mode_recovery,
+        &invocation.cancellation_token,
     )
     .await
     .map_err(|err| FunctionCallError::RespondToModel(err.for_model()))?;
+    let DrainedRecoveryTransaction {
+        output,
+        reused,
+        drained_continuation_pages,
+    } = transaction;
     if !reused {
         invocation
             .turn
@@ -185,8 +374,12 @@ async fn handle_read_tool_output(
         .turn_timing_state
         .record_tool_output_recovery(recovery_retruncation_count(&output));
 
-    let exact_recovery_receipt =
-        exact_code_mode_recovery_receipt(code_mode_recovery, &output, action_bounds_hash);
+    let exact_recovery_receipt = exact_code_mode_recovery_receipt(
+        code_mode_recovery,
+        &output,
+        action_bounds_hash,
+        drained_continuation_pages,
+    );
     let semantic_evidence = read_tool_output_semantic_evidence(&output);
     let output = serde_json::to_value(output).map_err(|err| {
         FunctionCallError::RespondToModel(format!("failed to serialize recovery result: {err}"))
@@ -281,19 +474,86 @@ pub(crate) async fn execute_recovery_transaction(
     }
 }
 
+async fn execute_recovery_transaction_with_continuations(
+    codex_home: &Path,
+    thread_id: &str,
+    artifact_id: &str,
+    selectors: Vec<ToolOutputSelector>,
+    code_mode_recovery: bool,
+    cancellation_token: &CancellationToken,
+) -> Result<DrainedRecoveryTransaction, ReadToolOutputError> {
+    let (output, reused) = execute_recovery_transaction(
+        codex_home,
+        thread_id,
+        artifact_id,
+        selectors,
+        code_mode_recovery,
+    )
+    .await?;
+    let token_ceiling = if code_mode_recovery {
+        CODE_MODE_RECOVERY_TOKEN_CEILING
+    } else {
+        RECOVERY_AGGREGATE_TOKEN_CEILING
+    };
+    let mut state = RecoveryContinuationState::new(output, reused, token_ceiling);
+    loop {
+        let ContinuationStep::Follow {
+            result_index,
+            selector,
+        } = state.next_step()
+        else {
+            break;
+        };
+        if cancellation_token.is_cancelled() {
+            break;
+        }
+        let page = execute_recovery_transaction(
+            codex_home,
+            thread_id,
+            artifact_id,
+            vec![selector.clone()],
+            code_mode_recovery,
+        )
+        .await;
+        if cancellation_token.is_cancelled() {
+            break;
+        }
+        let Ok((page, page_reused)) = page else {
+            break;
+        };
+        if state
+            .accept_page(result_index, &selector, page, page_reused)
+            .is_err()
+        {
+            break;
+        }
+    }
+    Ok(state.finish())
+}
+
+fn recovery_result_fits_token_ceiling(output: &ReadToolOutputResult, token_ceiling: usize) -> bool {
+    serde_json::to_string(output)
+        .is_ok_and(|rendered| codex_utils_string::approx_token_count(&rendered) <= token_ceiling)
+}
+
 fn exact_code_mode_recovery_receipt(
     code_mode_recovery: bool,
     output: &crate::tools::command_output_artifact::ReadToolOutputResult,
     action_bounds_hash: String,
+    suppressed_continuation_count: u32,
 ) -> Option<TurnTimingDeterministicContinuationReceipt> {
     (code_mode_recovery
-        && output.complete
+        && suppressed_continuation_count > 0
         && output.unavailable_ranges.is_empty()
         && !output.results.is_empty()
-        && output
-            .results
-            .iter()
-            .all(|result| result.status == ToolOutputSelectorStatus::Ok && result.complete))
+        && output.results.iter().all(|result| {
+            matches!(
+                result.status,
+                ToolOutputSelectorStatus::Ok
+                    | ToolOutputSelectorStatus::SelectorTooLarge
+                    | ToolOutputSelectorStatus::AggregateOmitted
+            )
+        }))
     .then(|| TurnTimingDeterministicContinuationReceipt {
         class: DeterministicContinuationClass::ArtifactRange,
         wire_identity: String::new(),
@@ -301,7 +561,7 @@ fn exact_code_mode_recovery_receipt(
         state_revision: output.canonical_sha256.clone(),
         host_action: DeterministicContinuationHostAction::DrainArtifactRanges,
         action_bounds_hash,
-        suppressed_continuation_count: 1,
+        suppressed_continuation_count,
     })
 }
 
@@ -426,6 +686,8 @@ fn resolved_max_bytes(max_bytes: Option<usize>) -> Result<usize, FunctionCallErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::command_output_artifact::ByteSubdivisionPlan;
+    use codex_tools::CanonicalByteRange;
 
     fn selector_result(status: ToolOutputSelectorStatus) -> ToolOutputSelectorResult {
         ToolOutputSelectorResult {
@@ -442,6 +704,280 @@ mod tests {
             continuation: None,
             message: None,
         }
+    }
+
+    fn search_selector(start_byte: u64) -> ToolOutputSelector {
+        ToolOutputSelector::Search {
+            query: "needle".to_string(),
+            start_byte,
+            max_results: 1,
+            context_lines: 0,
+        }
+    }
+
+    fn continuation_result(
+        selector: ToolOutputSelector,
+        continuation: Option<ToolOutputSelector>,
+        text: &str,
+    ) -> ToolOutputSelectorResult {
+        ToolOutputSelectorResult {
+            selector,
+            status: ToolOutputSelectorStatus::Ok,
+            complete: continuation.is_none(),
+            exact_bytes: Some(text.len() as u64),
+            canonical_range: None,
+            text: Some(text.to_string()),
+            value: None,
+            data_base64: None,
+            subdivision_plan: None,
+            child_selectors: Vec::new(),
+            continuation,
+            message: None,
+        }
+    }
+
+    fn recovery_output(results: Vec<ToolOutputSelectorResult>) -> ReadToolOutputResult {
+        ReadToolOutputResult {
+            artifact_id: "01900000-0000-7000-8000-000000000000".to_string(),
+            canonical_sha256: "canonical-revision".to_string(),
+            canonical_bytes: 100,
+            retained_bytes: 100,
+            complete: results
+                .iter()
+                .all(|result| result.status == ToolOutputSelectorStatus::Ok && result.complete),
+            unavailable_ranges: Vec::new(),
+            results,
+        }
+    }
+
+    #[test]
+    fn exact_continuation_pages_are_drained_in_selector_order() {
+        let first_selector = search_selector(0);
+        let second_selector = search_selector(10);
+        let initial = recovery_output(vec![continuation_result(
+            first_selector.clone(),
+            Some(second_selector.clone()),
+            "first page",
+        )]);
+        let page = recovery_output(vec![continuation_result(
+            second_selector.clone(),
+            None,
+            "second page",
+        )]);
+        let mut state = RecoveryContinuationState::new(initial, false, usize::MAX);
+
+        assert_eq!(
+            state.next_step(),
+            ContinuationStep::Follow {
+                result_index: 0,
+                selector: second_selector.clone(),
+            }
+        );
+        assert_eq!(state.accept_page(0, &second_selector, page, true), Ok(()));
+        assert_eq!(state.next_step(), ContinuationStep::Complete);
+
+        let transaction = state.finish();
+        assert_eq!(transaction.drained_continuation_pages, 1);
+        assert!(!transaction.reused);
+        assert!(transaction.output.complete);
+        assert_eq!(
+            transaction
+                .output
+                .results
+                .iter()
+                .map(|result| result.selector.clone())
+                .collect::<Vec<_>>(),
+            vec![first_selector, second_selector]
+        );
+        assert!(
+            transaction
+                .output
+                .results
+                .iter()
+                .all(|result| result.continuation.is_none())
+        );
+    }
+
+    #[test]
+    fn continuation_budget_stop_preserves_first_unconsumed_selector() {
+        let first_selector = search_selector(0);
+        let second_selector = search_selector(10);
+        let initial = recovery_output(vec![continuation_result(
+            first_selector,
+            Some(second_selector.clone()),
+            "first page",
+        )]);
+        let initial_tokens = codex_utils_string::approx_token_count(
+            &serde_json::to_string(&initial).expect("serialize initial page"),
+        );
+        let oversized_page = recovery_output(vec![continuation_result(
+            second_selector.clone(),
+            None,
+            &"x".repeat(10_000),
+        )]);
+        let mut state = RecoveryContinuationState::new(initial.clone(), true, initial_tokens + 1);
+
+        assert_eq!(
+            state.accept_page(0, &second_selector, oversized_page, false),
+            Err(ContinuationStopReason::Budget)
+        );
+        let transaction = state.finish();
+        assert_eq!(transaction.output, initial);
+        assert_eq!(transaction.drained_continuation_pages, 0);
+        assert!(!transaction.reused);
+        assert_eq!(
+            transaction.output.results[0].continuation,
+            Some(second_selector)
+        );
+    }
+
+    #[test]
+    fn continuation_identity_drift_stops_without_mutating_the_aggregate() {
+        let second_selector = search_selector(10);
+        let initial = recovery_output(vec![continuation_result(
+            search_selector(0),
+            Some(second_selector.clone()),
+            "first page",
+        )]);
+        let mut drifted_page = recovery_output(vec![continuation_result(
+            second_selector.clone(),
+            None,
+            "second page",
+        )]);
+        drifted_page.canonical_sha256 = "different-revision".to_string();
+        let mut state = RecoveryContinuationState::new(initial.clone(), false, usize::MAX);
+
+        assert_eq!(
+            state.accept_page(0, &second_selector, drifted_page, false),
+            Err(ContinuationStopReason::IdentityDrift)
+        );
+        assert_eq!(state.finish().output, initial);
+    }
+
+    #[test]
+    fn aggregate_omission_may_retry_its_owner_advertised_selector_once() {
+        let selector = ToolOutputSelector::Lines { start: 1, end: 10 };
+        let mut omitted = selector_result(ToolOutputSelectorStatus::AggregateOmitted);
+        omitted.selector = selector.clone();
+        omitted.continuation = Some(selector.clone());
+        let initial = recovery_output(vec![omitted]);
+        let page = recovery_output(vec![continuation_result(
+            selector.clone(),
+            None,
+            "exact retry",
+        )]);
+        let mut state = RecoveryContinuationState::new(initial, false, usize::MAX);
+
+        assert_eq!(
+            state.next_step(),
+            ContinuationStep::Follow {
+                result_index: 0,
+                selector: selector.clone(),
+            }
+        );
+        assert_eq!(state.accept_page(0, &selector, page, false), Ok(()));
+        assert_eq!(state.next_step(), ContinuationStep::Complete);
+    }
+
+    #[test]
+    fn repeated_owner_continuation_is_never_followed_twice() {
+        let second_selector = search_selector(10);
+        let initial = recovery_output(vec![continuation_result(
+            search_selector(0),
+            Some(second_selector.clone()),
+            "first page",
+        )]);
+        let repeated_page = recovery_output(vec![continuation_result(
+            second_selector.clone(),
+            Some(second_selector.clone()),
+            "second page",
+        )]);
+        let mut state = RecoveryContinuationState::new(initial, false, usize::MAX);
+
+        assert_eq!(
+            state.accept_page(0, &second_selector, repeated_page, false),
+            Ok(())
+        );
+        assert_eq!(
+            state.next_step(),
+            ContinuationStep::Stop(ContinuationStopReason::RepeatedSelector)
+        );
+        let transaction = state.finish();
+        assert_eq!(transaction.drained_continuation_pages, 1);
+        assert_eq!(
+            transaction.output.results[1].continuation,
+            Some(second_selector)
+        );
+    }
+
+    #[test]
+    fn selector_overflow_drains_the_owner_subdivision_plan_and_preserves_its_contract() {
+        let parent_selector = ToolOutputSelector::Lines { start: 1, end: 100 };
+        let child_selector = ToolOutputSelector::Bytes { start: 0, end: 10 };
+        let second_child_selector = ToolOutputSelector::Bytes { start: 10, end: 20 };
+        let mut overflow = selector_result(ToolOutputSelectorStatus::SelectorTooLarge);
+        overflow.selector = parent_selector;
+        overflow.canonical_range = Some(CanonicalByteRange { start: 0, end: 20 });
+        overflow.subdivision_plan = Some(ByteSubdivisionPlan {
+            range: CanonicalByteRange { start: 0, end: 20 },
+            chunk_bytes: 10,
+            chunk_count: 2,
+            selector_kind: "bytes".to_string(),
+        });
+        overflow.child_selectors = vec![child_selector.clone()];
+        overflow.continuation = Some(child_selector.clone());
+        let initial = recovery_output(vec![overflow]);
+        let first_page = recovery_output(vec![continuation_result(
+            child_selector.clone(),
+            None,
+            "exact child",
+        )]);
+        let second_page = recovery_output(vec![continuation_result(
+            second_child_selector.clone(),
+            None,
+            "second exact child",
+        )]);
+        let mut state = RecoveryContinuationState::new(initial, false, usize::MAX);
+
+        assert_eq!(
+            state.next_step(),
+            ContinuationStep::Follow {
+                result_index: 0,
+                selector: child_selector.clone(),
+            }
+        );
+        assert_eq!(
+            state.accept_page(0, &child_selector, first_page, false),
+            Ok(())
+        );
+        assert_eq!(
+            state.next_step(),
+            ContinuationStep::Follow {
+                result_index: 0,
+                selector: second_child_selector.clone(),
+            }
+        );
+        assert_eq!(
+            state.accept_page(0, &second_child_selector, second_page, false),
+            Ok(())
+        );
+        assert_eq!(state.next_step(), ContinuationStep::Complete);
+        let transaction = state.finish();
+        assert!(!transaction.output.complete);
+        assert_eq!(
+            transaction.output.results[0].status,
+            ToolOutputSelectorStatus::SelectorTooLarge
+        );
+        assert_eq!(
+            transaction.output.results[0].child_selectors,
+            vec![child_selector]
+        );
+        assert!(transaction.output.results[0].continuation.is_none());
+        assert_eq!(transaction.drained_continuation_pages, 2);
+        assert_eq!(
+            transaction.output.results[2].selector,
+            second_child_selector
+        );
     }
 
     #[test]
@@ -477,23 +1013,18 @@ mod tests {
         };
 
         let receipt =
-            exact_code_mode_recovery_receipt(true, &output, "selector-bounds".to_string())
+            exact_code_mode_recovery_receipt(true, &output, "selector-bounds".to_string(), 2)
                 .expect("exact nested recovery receipt");
 
         assert_eq!(receipt.state_revision, "canonical-revision");
         assert_eq!(receipt.action_bounds_hash, "selector-bounds");
-        assert_eq!(receipt.suppressed_continuation_count, 1);
+        assert_eq!(receipt.suppressed_continuation_count, 2);
         assert!(
-            exact_code_mode_recovery_receipt(false, &output, "selector-bounds".to_string(),)
+            exact_code_mode_recovery_receipt(false, &output, "selector-bounds".to_string(), 2,)
                 .is_none()
         );
-
-        let incomplete = crate::tools::command_output_artifact::ReadToolOutputResult {
-            results: vec![selector_result(ToolOutputSelectorStatus::SelectorTooLarge)],
-            ..output
-        };
         assert!(
-            exact_code_mode_recovery_receipt(true, &incomplete, "selector-bounds".to_string(),)
+            exact_code_mode_recovery_receipt(true, &output, "selector-bounds".to_string(), 0,)
                 .is_none()
         );
     }

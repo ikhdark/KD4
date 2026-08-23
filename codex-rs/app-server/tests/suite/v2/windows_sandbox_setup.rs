@@ -42,6 +42,8 @@ async fn windows_sandbox_setup_start_emits_completion_notification() -> Result<(
         .send_windows_sandbox_setup_start_request(WindowsSandboxSetupStartParams {
             mode: WindowsSandboxSetupMode::Unelevated,
             cwd: None,
+            permission_profile_id: None,
+            permission_profile: None,
         })
         .await?;
     let response: JSONRPCResponse = timeout(
@@ -95,5 +97,37 @@ async fn windows_sandbox_setup_start_rejects_relative_cwd() -> Result<()> {
 
     assert_eq!(err.error.code, -32600);
     assert!(err.error.message.contains("Invalid request"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn windows_sandbox_grant_read_root_rejects_missing_directory() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let missing_path =
+        codex_utils_absolute_path::AbsolutePathBuf::try_from(codex_home.path().join("missing"))?;
+
+    let request_id = mcp
+        .send_raw_request(
+            "windowsSandbox/grantReadRoot",
+            Some(serde_json::json!({
+                "path": missing_path,
+                "cwd": codex_home.path(),
+            })),
+        )
+        .await?;
+    let err = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+
+    assert_eq!(err.error.code, -32600);
+    assert!(err.error.message.contains("path does not exist"));
     Ok(())
 }

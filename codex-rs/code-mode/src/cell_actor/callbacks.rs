@@ -13,6 +13,7 @@ use crate::TaskFailureHandler;
 use crate::runtime::RuntimeCommand;
 
 const CALLBACK_CANCELLATION_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+const NOTIFICATION_DELIVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Clone, Copy)]
 pub(super) enum CallbackCompletion {
@@ -20,26 +21,65 @@ pub(super) enum CallbackCompletion {
     Cancel,
 }
 
+pub(super) struct NotificationInvocation {
+    pub(super) id: Option<String>,
+    pub(super) call_id: String,
+    pub(super) text: String,
+}
+
 pub(super) fn spawn_notification<H: CellHost>(
     tasks: &mut JoinSet<()>,
     host: Arc<H>,
-    call_id: String,
-    text: String,
+    invocation: NotificationInvocation,
+    runtime_tx: std::sync::mpsc::Sender<RuntimeCommand>,
     cancellation_token: CancellationToken,
     task_failure_handler: Option<TaskFailureHandler>,
 ) {
+    let NotificationInvocation { id, call_id, text } = invocation;
     tasks.spawn(async move {
-        let callback =
-            AssertUnwindSafe(async move { host.notify(call_id, text, cancellation_token).await })
-                .catch_unwind()
-                .await;
-        match callback {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => warn!("failed to deliver code mode notification: {err}"),
-            Err(_) => report_task_failure(
-                task_failure_handler.as_ref(),
-                "code mode notification task panicked".to_string(),
+        let timeout_token = cancellation_token.clone();
+        let callback = AssertUnwindSafe(async move {
+            tokio::select! {
+                response = host.notify(call_id, text, cancellation_token) => response,
+                _ = tokio::time::sleep(NOTIFICATION_DELIVERY_TIMEOUT) => {
+                    timeout_token.cancel();
+                    Err(format!(
+                        "code mode notification exceeded its {}ms timeout",
+                        NOTIFICATION_DELIVERY_TIMEOUT.as_millis()
+                    ))
+                }
+            }
+        })
+        .catch_unwind()
+        .await;
+        let (command, failure_reason) = match callback {
+            Ok(Ok(())) => (
+                id.map(|id| RuntimeCommand::NotificationResponse { id }),
+                None,
             ),
+            Ok(Err(error_text)) => {
+                warn!("failed to deliver code mode notification: {error_text}");
+                (
+                    id.map(|id| RuntimeCommand::NotificationError { id, error_text }),
+                    None,
+                )
+            }
+            Err(_) => {
+                let failure_reason = "code mode notification task panicked".to_string();
+                (
+                    id.map(|id| RuntimeCommand::NotificationError {
+                        id,
+                        error_text: failure_reason.clone(),
+                    }),
+                    Some(failure_reason),
+                )
+            }
+        };
+        if let Some(command) = command {
+            let _ = runtime_tx.send(command);
+        }
+        if let Some(failure_reason) = failure_reason {
+            report_task_failure(task_failure_handler.as_ref(), failure_reason);
         }
     });
 }
@@ -55,10 +95,23 @@ pub(super) fn spawn_tool<H: CellHost>(
     tasks.spawn(async move {
         let id = invocation.id.clone();
         let tool_name = invocation.name.name.clone();
-        let callback =
-            AssertUnwindSafe(async move { host.invoke_tool(invocation, cancellation_token).await })
-                .catch_unwind()
-                .await;
+        let timeout_tool_name = tool_name.clone();
+        let timeout = invocation.timeout;
+        let timeout_token = cancellation_token.clone();
+        let callback = AssertUnwindSafe(async move {
+            tokio::select! {
+                response = host.invoke_tool(invocation, cancellation_token) => response,
+                _ = tokio::time::sleep(timeout) => {
+                    timeout_token.cancel();
+                    Err(format!(
+                        "nested tool `{timeout_tool_name}` exceeded its {}ms timeout",
+                        timeout.as_millis()
+                    ))
+                }
+            }
+        })
+        .catch_unwind()
+        .await;
         let wrapper_received_at = std::time::Instant::now();
         let outcome = match &callback {
             Ok(Ok(_)) => "completed",
@@ -116,17 +169,19 @@ pub(super) fn spawn_tool<H: CellHost>(
 }
 
 pub(super) async fn finish_callbacks(
-    cancellation_token: &CancellationToken,
+    notification_cancellation_token: &CancellationToken,
+    tool_cancellation_token: &CancellationToken,
     notification_tasks: &mut JoinSet<()>,
     tool_tasks: &mut JoinSet<()>,
     completion: CallbackCompletion,
     task_failure_handler: Option<&TaskFailureHandler>,
 ) {
     if matches!(completion, CallbackCompletion::Cancel) {
-        cancellation_token.cancel();
+        tool_cancellation_token.cancel();
     }
     drain_tasks_bounded(notification_tasks, "notification", task_failure_handler).await;
-    cancellation_token.cancel();
+    notification_cancellation_token.cancel();
+    tool_cancellation_token.cancel();
     drain_tasks_bounded(tool_tasks, "tool", task_failure_handler).await;
 }
 

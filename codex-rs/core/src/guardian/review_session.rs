@@ -934,6 +934,10 @@ async fn wait_for_guardian_review(
                     Ok(event) if !event_matches_turn(&event, expected_turn_id) => {}
                     Ok(event) => match event.msg {
                         EventMsg::TurnComplete(turn_complete) => {
+                            analytics_result.tool_call_count = turn_complete
+                                .timing
+                                .as_ref()
+                                .map(|timing| u64::from(timing.counters.tool_call_count));
                             analytics_result.time_to_first_token_ms = turn_complete
                                 .time_to_first_token_ms
                                 .and_then(|ms| u64::try_from(ms).ok());
@@ -1195,6 +1199,26 @@ mod tests {
                 timing: None,
             }),
         }
+    }
+
+    fn turn_complete_event_with_tool_count(
+        turn_id: &str,
+        last_agent_message: Option<&str>,
+        time_to_first_token_ms: Option<i64>,
+        tool_call_count: u32,
+    ) -> Event {
+        let mut event = turn_complete_event(turn_id, last_agent_message, time_to_first_token_ms);
+        let EventMsg::TurnComplete(turn_complete) = &mut event.msg else {
+            unreachable!("turn_complete_event must return a turn-complete event");
+        };
+        turn_complete.timing = Some(codex_protocol::protocol::TurnTiming {
+            counters: codex_protocol::protocol::TurnTimingCounters {
+                tool_call_count,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        event
     }
 
     fn turn_aborted_event(turn_id: &str) -> Event {
@@ -1633,7 +1657,12 @@ mod tests {
             .await
             .expect("queue prior turn completion");
         tx_event
-            .send(turn_complete_event("current-turn", Some("fresh"), Some(42)))
+            .send(turn_complete_event_with_tool_count(
+                "current-turn",
+                Some("fresh"),
+                Some(42),
+                3,
+            ))
             .await
             .expect("queue current turn completion");
 
@@ -1652,6 +1681,7 @@ mod tests {
         };
         assert_eq!(last_agent_message.as_deref(), Some("fresh"));
         assert_eq!(analytics_result.time_to_first_token_ms, Some(42));
+        assert_eq!(analytics_result.tool_call_count, Some(3));
         assert!(keep_review_session);
         assert!(capture_token_usage);
     }

@@ -1803,6 +1803,21 @@ pub enum AgentStatus {
         last_agent_message: Option<String>,
         surfaced_result: SurfacedToolResult,
     },
+    /// Agent reached a terminal state with machine-derived completion proof.
+    ///
+    /// This additive variant keeps the legacy no-gate variants wire-compatible
+    /// while retaining every terminal payload that can accompany a completion
+    /// gate, including an error or an authoritative surfaced tool result.
+    TerminalWithCompletion {
+        last_agent_message: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        surfaced_result: Option<SurfacedToolResult>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        error: Option<String>,
+        completion: TaskCompletionGate,
+    },
     /// Agent encountered an error.
     Errored(String),
     /// Agent has been shutdown.
@@ -3265,6 +3280,14 @@ pub struct TurnTimingCounters {
     #[serde(default)]
     pub proven_loop_activation_count: u32,
     #[serde(default)]
+    pub tool_router_reuse_count: u32,
+    #[serde(default)]
+    pub tool_router_rebuild_count: u32,
+    #[serde(default)]
+    pub projection_source_dependencies_reuse_count: u32,
+    #[serde(default)]
+    pub projection_source_dependencies_fallback_count: u32,
+    #[serde(default)]
     pub tool_output_truncation_count: u32,
     #[serde(default)]
     pub tool_output_projected_token_count: u64,
@@ -3280,6 +3303,8 @@ pub struct TurnTimingCounters {
     pub tool_output_model_token_count: u64,
     #[serde(default)]
     pub tool_output_artifact_creation_count: u32,
+    #[serde(default)]
+    pub tool_output_artifact_reuse_count: u32,
     #[serde(default)]
     pub tool_output_projection_truncation_count: u32,
     #[serde(default)]
@@ -6012,6 +6037,10 @@ mod tests {
             "completionReviewTerminalPhaseCount",
             "noProgressDirectiveCount",
             "provenLoopActivationCount",
+            "toolRouterReuseCount",
+            "toolRouterRebuildCount",
+            "projectionSourceDependenciesReuseCount",
+            "projectionSourceDependenciesFallbackCount",
             "toolOutputTruncationCount",
             "toolOutputProjectedTokenCount",
             "toolOutputArtifactRereadCount",
@@ -6020,6 +6049,7 @@ mod tests {
             "toolOutputModelByteCount",
             "toolOutputModelTokenCount",
             "toolOutputArtifactCreationCount",
+            "toolOutputArtifactReuseCount",
             "toolOutputProjectionTruncationCount",
             "toolOutputOmittedSectionCount",
             "toolOutputRecoveryCallCount",
@@ -6070,6 +6100,18 @@ mod tests {
         assert_eq!(decoded.counters.completion_review_terminal_phase_count, 0);
         assert_eq!(decoded.counters.no_progress_directive_count, 0);
         assert_eq!(decoded.counters.proven_loop_activation_count, 0);
+        assert_eq!(decoded.counters.tool_router_reuse_count, 0);
+        assert_eq!(decoded.counters.tool_router_rebuild_count, 0);
+        assert_eq!(
+            decoded.counters.projection_source_dependencies_reuse_count,
+            0
+        );
+        assert_eq!(
+            decoded
+                .counters
+                .projection_source_dependencies_fallback_count,
+            0
+        );
         assert_eq!(decoded.counters.tool_output_truncation_count, 0);
         assert_eq!(decoded.counters.tool_output_projected_token_count, 0);
         assert_eq!(decoded.counters.tool_output_artifact_reread_count, 0);
@@ -6078,6 +6120,7 @@ mod tests {
         assert_eq!(decoded.counters.tool_output_model_byte_count, 0);
         assert_eq!(decoded.counters.tool_output_model_token_count, 0);
         assert_eq!(decoded.counters.tool_output_artifact_creation_count, 0);
+        assert_eq!(decoded.counters.tool_output_artifact_reuse_count, 0);
         assert_eq!(decoded.counters.tool_output_projection_truncation_count, 0);
         assert_eq!(decoded.counters.tool_output_omitted_section_count, 0);
         assert_eq!(decoded.counters.tool_output_recovery_call_count, 0);
@@ -6131,6 +6174,37 @@ mod tests {
         }))?;
         assert!(legacy.completion.is_none());
         assert!(legacy.error.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn agent_status_completion_gate_is_additive_and_legacy_shapes_are_stable() -> Result<()> {
+        assert_eq!(
+            serde_json::to_value(AgentStatus::Completed(Some("done".to_string())))?,
+            json!({"completed": "done"})
+        );
+
+        let completion = TaskCompletionGate {
+            status: TaskCompletionStatus::Passed,
+            reasons: vec!["focused test passed".to_string()],
+            evidence_path: Some("task-evidence/thread.json".to_string()),
+        };
+        let status = AgentStatus::TerminalWithCompletion {
+            last_agent_message: Some("done".to_string()),
+            surfaced_result: Some(SurfacedToolResult {
+                adapter: "owner".to_string(),
+                value: json!({"answer": 42}),
+                canonical_message: None,
+            }),
+            error: None,
+            completion,
+        };
+        let value = serde_json::to_value(&status)?;
+        assert_eq!(
+            value["terminal_with_completion"]["completion"]["status"],
+            json!("passed")
+        );
+        assert_eq!(serde_json::from_value::<AgentStatus>(value)?, status);
         Ok(())
     }
 

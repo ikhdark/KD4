@@ -1,4 +1,5 @@
 use crate::agent::AgentStatus;
+use crate::agent::agent_status_from_task;
 use crate::agent::registry::AgentMetadata;
 use crate::agent::registry::AgentRegistry;
 use crate::agent::role::DEFAULT_ROLE_NAME;
@@ -747,7 +748,7 @@ impl AgentControl {
         };
         let control = self.clone();
         tokio::spawn(async move {
-            let status = match control.subscribe_status(child_thread_id).await {
+            let mut status = match control.subscribe_status(child_thread_id).await {
                 Ok(mut status_rx) => {
                     let mut status = status_rx.borrow().clone();
                     while !is_final(&status) {
@@ -772,6 +773,9 @@ impl AgentControl {
             };
             if let Some(child_agent_path) = child_agent_path.as_ref() {
                 let task_coordinator = control.task_coordinator();
+                let assignment_id = task_coordinator
+                    .binding_for_agent_path(child_agent_path)
+                    .map(|binding| binding.assignment_id);
                 match task_coordinator
                     .seal_missing_receipt(
                         child_agent_path,
@@ -804,6 +808,20 @@ impl AgentControl {
                             %error,
                             "failed to seal missing typed-agent receipt"
                         );
+                    }
+                }
+                if let Some(assignment_id) = assignment_id {
+                    match task_coordinator.get_agent_task(assignment_id, None).await {
+                        Ok(task) => {
+                            if let Some(durable_status) = agent_status_from_task(&task) {
+                                status = durable_status;
+                            }
+                        }
+                        Err(error) => warn!(
+                            %assignment_id,
+                            %error,
+                            "failed to load durable typed-agent outcome for completion watcher"
+                        ),
                     }
                 }
             }

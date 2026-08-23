@@ -4,12 +4,20 @@
 //! and Windows sandbox helper actions that are compiled only on Windows.
 
 use super::*;
+use codex_utils_approval_presets::ApprovalPreset;
 
 #[derive(Default)]
 pub(super) struct WindowsSandboxState {
     pub(super) setup_started_at: Option<Instant>,
+    pub(super) pending_setup: Option<PendingWindowsSandboxSetup>,
     // One-shot suppression of the next world-writable scan after user confirmation.
     pub(super) skip_world_writable_scan_once: bool,
+}
+
+pub(super) struct PendingWindowsSandboxSetup {
+    pub(super) preset: ApprovalPreset,
+    pub(super) profile_selection: Option<PermissionProfileSelection>,
+    pub(super) mode: WindowsSandboxEnableMode,
 }
 
 impl App {

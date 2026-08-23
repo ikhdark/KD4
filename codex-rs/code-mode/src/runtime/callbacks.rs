@@ -34,6 +34,13 @@ pub(super) fn tool_callback(
             return;
         }
     };
+    let timeout_ms = match tool_timeout_ms(scope, args) {
+        Ok(timeout_ms) => timeout_ms,
+        Err(error_text) => {
+            throw_type_error(scope, &error_text);
+            return;
+        }
+    };
 
     let Some(resolver) = v8::PromiseResolver::new(scope) else {
         throw_type_error(scope, "failed to create tool promise");
@@ -67,6 +74,7 @@ pub(super) fn tool_callback(
         name: tool_name,
         kind: tool_kind,
         input,
+        timeout_ms,
     });
     retval.set(promise.into());
 }
@@ -262,13 +270,63 @@ pub(super) fn notify_callback(
         throw_type_error(scope, "notify expects non-empty text");
         return;
     }
-    if let Some(state) = scope.get_slot::<RuntimeState>() {
-        let _ = state.event_tx.send(RuntimeEvent::Notify {
-            call_id: state.tool_call_id.clone(),
-            text,
-        });
+    let Some(resolver) = v8::PromiseResolver::new(scope) else {
+        throw_type_error(scope, "failed to create notification promise");
+        return;
+    };
+    let promise = resolver.get_promise(scope);
+    let resolver = v8::Global::new(scope, resolver);
+    let Some(state) = scope.get_slot_mut::<RuntimeState>() else {
+        throw_type_error(scope, "runtime state unavailable");
+        return;
+    };
+    let id = format!("notify-{}", state.next_notification_id);
+    state.next_notification_id = state.next_notification_id.saturating_add(1);
+    state.pending_notifications.insert(id.clone(), resolver);
+    let _ = state.event_tx.send(RuntimeEvent::Notify {
+        id: Some(id),
+        call_id: state.tool_call_id.clone(),
+        text,
+    });
+    retval.set(promise.into());
+}
+
+fn tool_timeout_ms(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+) -> Result<u64, String> {
+    const MAX_TOOL_TIMEOUT_MS: u64 = 30 * 60 * 1_000;
+
+    let default_timeout_ms = scope
+        .get_slot::<RuntimeState>()
+        .map(|state| state.default_tool_timeout_ms)
+        .ok_or_else(|| "runtime state unavailable".to_string())?;
+    if args.length() < 2 || args.get(1).is_undefined() {
+        return Ok(default_timeout_ms);
     }
-    retval.set(v8::undefined(scope).into());
+    let options = v8::Local::<v8::Object>::try_from(args.get(1))
+        .map_err(|_| "nested tool options must be an object containing `timeout_ms`".to_string())?;
+    let key = v8::String::new(scope, "timeout_ms")
+        .ok_or_else(|| "failed to allocate nested tool option key".to_string())?;
+    let value = options
+        .get(scope, key.into())
+        .ok_or_else(|| "failed to read nested tool timeout_ms".to_string())?;
+    if value.is_undefined() {
+        return Ok(default_timeout_ms);
+    }
+    let timeout_ms = value
+        .number_value(scope)
+        .ok_or_else(|| "nested tool timeout_ms must be a positive integer".to_string())?;
+    if !timeout_ms.is_finite()
+        || timeout_ms.fract() != 0.0
+        || timeout_ms < 1.0
+        || timeout_ms > MAX_TOOL_TIMEOUT_MS as f64
+    {
+        return Err(format!(
+            "nested tool timeout_ms must be a positive integer no greater than {MAX_TOOL_TIMEOUT_MS}"
+        ));
+    }
+    Ok(timeout_ms as u64)
 }
 
 pub(super) fn set_timeout_callback(

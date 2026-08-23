@@ -480,8 +480,8 @@ impl EnabledThreadTraceContext {
                 tool_call_id,
                 payload,
             } => {
-                let runtime_payload = self
-                    .write_json_payload_best_effort(RawPayloadKind::ToolRuntimeEvent, &payload)?;
+                let kind = payload.raw_payload_kind();
+                let runtime_payload = self.write_json_payload_best_effort(kind, &payload)?;
                 Some(RawTraceEventPayload::ToolCallRuntimeStarted {
                     tool_call_id: tool_call_id.to_string(),
                     runtime_payload,
@@ -492,8 +492,8 @@ impl EnabledThreadTraceContext {
                 status,
                 payload,
             } => {
-                let runtime_payload = self
-                    .write_json_payload_best_effort(RawPayloadKind::ToolRuntimeEvent, &payload)?;
+                let kind = payload.raw_payload_kind();
+                let runtime_payload = self.write_json_payload_best_effort(kind, &payload)?;
                 Some(RawTraceEventPayload::ToolCallRuntimeEnded {
                     tool_call_id: tool_call_id.to_string(),
                     status,

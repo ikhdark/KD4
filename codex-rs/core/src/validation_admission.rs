@@ -196,37 +196,45 @@ fn parse_directive(clause: &str) -> Option<ValidationAuthorizationRule> {
         body
     };
 
-    let (operation, minimum_breadth, maximum_breadth) =
-        if body == "tests" || body == "focused tests" || body == "tests for this change" {
-            (
-                ValidationOperation::Test,
-                None,
-                Some(ValidationBreadth::Package),
-            )
-        } else if body == "all tests" {
+    let (operation, minimum_breadth, maximum_breadth) = if body == "tests" {
+        if decision == ValidationAuthorizationDecision::Deny {
             (ValidationOperation::Test, None, None)
-        } else if body == "the full suite" || body == "the workspace suite" || body == "full suite"
-        {
+        } else {
             (
                 ValidationOperation::Test,
-                Some(ValidationBreadth::Repository),
-                None,
-            )
-        } else if body == "checks" {
-            (
-                ValidationOperation::Check,
                 None,
                 Some(ValidationBreadth::Package),
             )
-        } else if body == "lint" {
-            (
-                ValidationOperation::Lint,
-                None,
-                Some(ValidationBreadth::Package),
-            )
-        } else {
-            return None;
-        };
+        }
+    } else if body == "focused tests" || body == "tests for this change" {
+        (
+            ValidationOperation::Test,
+            None,
+            Some(ValidationBreadth::Package),
+        )
+    } else if body == "all tests" {
+        (ValidationOperation::Test, None, None)
+    } else if body == "the full suite" || body == "the workspace suite" || body == "full suite" {
+        (
+            ValidationOperation::Test,
+            Some(ValidationBreadth::Repository),
+            None,
+        )
+    } else if body == "checks" {
+        (
+            ValidationOperation::Check,
+            None,
+            Some(ValidationBreadth::Package),
+        )
+    } else if body == "lint" {
+        (
+            ValidationOperation::Lint,
+            None,
+            Some(ValidationBreadth::Package),
+        )
+    } else {
+        return None;
+    };
     Some(ValidationAuthorizationRule {
         policy_version: VALIDATION_POLICY_VERSION,
         sequence: 0,
@@ -319,9 +327,15 @@ impl ValidationSkippedToolOutput {
         descriptor: &ValidationCommandDescriptor,
         prediction: ValidationPrediction,
     ) -> Self {
+        let cheaper_alternatives = cheaper_alternatives(descriptor);
+        let skip_disposition = if cheaper_alternatives.is_empty() {
+            codex_tools::ToolOutputSkipDisposition::BlockingRequiredOperation
+        } else {
+            codex_tools::ToolOutputSkipDisposition::Deferred
+        };
         Self {
             reason: ValidationSkipReason::PredictedValidationCost,
-            skip_disposition: codex_tools::ToolOutputSkipDisposition::Deferred,
+            skip_disposition,
             command_was_executed: false,
             predicted_duration_ms: Some(prediction.predicted_duration_ms),
             predictive_lower_bound_ms: Some(prediction.predictive_lower_bound_ms),
@@ -331,7 +345,7 @@ impl ValidationSkippedToolOutput {
             effective_sample_count: Some(prediction.effective_sample_count),
             command_family: descriptor.command_family.clone(),
             breadth: descriptor.breadth,
-            cheaper_alternatives: cheaper_alternatives(descriptor),
+            cheaper_alternatives,
         }
     }
 }
@@ -1014,6 +1028,13 @@ pub(crate) fn validation_identity(
     )
 }
 
+/// Configuration dimension for a validation whose implementation identity is
+/// already derived from its declared covered paths. Repository mutations are
+/// intentionally excluded: unrelated changes must not defeat scoped reuse.
+pub(crate) fn scoped_validation_configuration_identity(features: impl std::fmt::Debug) -> String {
+    format!("features={features:?}")
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn validation_identity_with_scope(
     repository: &[u8],
@@ -1060,8 +1081,9 @@ pub(crate) fn validation_identity_with_scope(
 
 /// Canonicalizes runner spelling away from a focused test proof. Cargo and
 /// nextest receipts are equivalent only when package, features, and exact test
-/// IDs are identical; environment, toolchain, configuration, and repository
-/// epoch remain separate `ValidationProofKey` dimensions.
+/// IDs are identical; environment, toolchain, and configuration remain
+/// separate `ValidationProofKey` dimensions. Scoped implementation identity
+/// owns repository freshness for declared covered paths.
 fn canonical_test_proof_route(invocation: &CommandInvocation) -> Option<Vec<u8>> {
     let CommandInvocation::Argv { program, args } = invocation else {
         return None;
@@ -1287,6 +1309,7 @@ fn classify_script(script: &str, depth: usize) -> ValidationClassification {
                     leaf_is_dynamic || cost_certainty == ValidationCostCertainty::Uncertain;
             }
             ValidationClassification::Opaque => uncertain = true,
+            ValidationClassification::NonValidation if leaf_is_dynamic => uncertain = true,
             ValidationClassification::NonValidation => {}
         }
     }
@@ -1310,10 +1333,24 @@ fn classify_script(script: &str, depth: usize) -> ValidationClassification {
 
 fn looks_like_known_validation(words: &[String]) -> bool {
     words.iter().any(|word| {
-        let word = word.trim_matches(['\'', '"']);
         matches!(
-            word,
-            "cargo" | "pytest" | "dotnet" | "go" | "npm" | "pnpm" | "yarn"
+            normalized_program_name(word.trim_matches(['\'', '"'])).as_str(),
+            "cargo"
+                | "pytest"
+                | "python"
+                | "python3"
+                | "dotnet"
+                | "go"
+                | "npm"
+                | "pnpm"
+                | "yarn"
+                | "mvn"
+                | "mvnw"
+                | "gradle"
+                | "gradlew"
+                | "just"
+                | "make"
+                | "task"
         )
     })
 }
@@ -1330,11 +1367,7 @@ fn classify_argv_at_depth(
     if depth > 4 {
         return ValidationClassification::Opaque;
     }
-    let binary = program
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(program)
-        .to_ascii_lowercase();
+    let binary = normalized_program_name(program);
     if matches!(binary.as_str(), "env" | "command" | "time") {
         let Some(index) = args
             .iter()
@@ -1352,7 +1385,7 @@ fn classify_argv_at_depth(
         }
         return ValidationClassification::Opaque;
     }
-    if matches!(binary.as_str(), "pwsh" | "powershell" | "powershell.exe") {
+    if matches!(binary.as_str(), "pwsh" | "powershell") {
         if let Some(index) = args
             .iter()
             .position(|arg| arg.eq_ignore_ascii_case("-command"))
@@ -1362,7 +1395,7 @@ fn classify_argv_at_depth(
         }
         return ValidationClassification::Opaque;
     }
-    if matches!(binary.as_str(), "cmd" | "cmd.exe") {
+    if binary == "cmd" {
         if let Some(index) = args.iter().position(|arg| arg.eq_ignore_ascii_case("/c"))
             && args.get(index + 1).is_some()
         {
@@ -1372,21 +1405,21 @@ fn classify_argv_at_depth(
     }
 
     let descriptor = match (binary.as_str(), args.first().map(String::as_str)) {
-        ("cargo" | "cargo.exe", Some("test")) => cargo_test_descriptor(args),
-        ("cargo" | "cargo.exe", Some("check")) => {
+        ("cargo", Some("test")) => cargo_test_descriptor(args),
+        ("cargo", Some("check")) => {
             descriptor(ValidationOperation::Check, ValidationEcosystem::Rust, args)
         }
-        ("cargo" | "cargo.exe", Some("clippy")) => {
+        ("cargo", Some("clippy")) => {
             descriptor(ValidationOperation::Lint, ValidationEcosystem::Rust, args)
         }
-        ("cargo" | "cargo.exe", Some("bench")) => {
+        ("cargo", Some("bench")) => {
             descriptor(ValidationOperation::Bench, ValidationEcosystem::Rust, args)
         }
-        ("pytest" | "pytest.exe" | "python" | "python3", _)
-            if binary.starts_with("pytest")
-                || args.iter().any(|arg| {
-                    arg == "pytest" || arg == "-m" && args.iter().any(|next| next == "pytest")
-                }) =>
+        ("pytest", _) if !pytest_is_information_only(args) => {
+            descriptor(ValidationOperation::Test, ValidationEcosystem::Python, args)
+        }
+        ("python" | "python3", Some("-m"))
+            if matches!(args.get(1).map(String::as_str), Some("pytest" | "unittest")) =>
         {
             descriptor(ValidationOperation::Test, ValidationEcosystem::Python, args)
         }
@@ -1396,10 +1429,22 @@ fn classify_argv_at_depth(
         ("go", Some("test")) => {
             descriptor(ValidationOperation::Test, ValidationEcosystem::Go, args)
         }
-        ("npm" | "pnpm" | "yarn", Some("test")) => {
-            descriptor(ValidationOperation::Test, ValidationEcosystem::Node, args)
-        }
-        ("make" | "just" | "task", _) => return ValidationClassification::Opaque,
+        ("npm" | "pnpm" | "yarn", _) => match node_test_descriptor(&binary, args) {
+            Some(descriptor) => descriptor,
+            None => return ValidationClassification::NonValidation,
+        },
+        ("mvn" | "mvnw" | "gradle" | "gradlew", _) => match java_test_descriptor(&binary, args) {
+            Some(descriptor) => descriptor,
+            None => return ValidationClassification::NonValidation,
+        },
+        ("just", _) => match just_validation_descriptor(args) {
+            Some(descriptor) => descriptor,
+            None => return ValidationClassification::Opaque,
+        },
+        ("make" | "task", _) => match wrapper_descriptor(&binary, args) {
+            Some(descriptor) => descriptor,
+            None => return ValidationClassification::Opaque,
+        },
         _ => return ValidationClassification::NonValidation,
     };
     ValidationClassification::Validation {
@@ -1413,6 +1458,163 @@ fn classify_argv_at_depth(
             ValidationCostCertainty::Certain
         },
     }
+}
+
+fn normalized_program_name(program: &str) -> String {
+    let mut binary = program
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    for suffix in [".exe", ".cmd", ".bat"] {
+        if binary.ends_with(suffix) {
+            binary.truncate(binary.len() - suffix.len());
+            break;
+        }
+    }
+    binary
+}
+
+fn pytest_is_information_only(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "--version"))
+}
+
+fn node_test_descriptor(binary: &str, args: &[String]) -> Option<ValidationCommandDescriptor> {
+    let selector = match (binary, args.first().map(String::as_str)) {
+        ("npm" | "pnpm" | "yarn", Some("test")) => "test",
+        ("npm" | "pnpm" | "yarn", Some("run")) => args.get(1)?.as_str(),
+        ("yarn", Some(script)) if !script.starts_with('-') => script,
+        _ => return None,
+    };
+    if wrapper_recipe_operation(selector) != Some(ValidationOperation::Test) {
+        return None;
+    }
+    Some(descriptor(
+        ValidationOperation::Test,
+        ValidationEcosystem::Node,
+        args,
+    ))
+}
+
+fn java_test_descriptor(binary: &str, args: &[String]) -> Option<ValidationCommandDescriptor> {
+    let is_test = match binary {
+        "mvn" | "mvnw" => !maven_tests_explicitly_skipped(args) && maven_has_test_goal(args),
+        "gradle" | "gradlew" => !gradle_test_is_excluded(args) && gradle_has_test_task(args),
+        _ => false,
+    };
+    is_test.then(|| descriptor(ValidationOperation::Test, ValidationEcosystem::Java, args))
+}
+
+fn maven_tests_explicitly_skipped(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        let arg = arg.to_ascii_lowercase();
+        arg == "-dskiptests"
+            || arg == "-dmaven.test.skip"
+            || arg
+                .strip_prefix("-dskiptests=")
+                .is_some_and(|value| value != "false")
+            || arg
+                .strip_prefix("-dmaven.test.skip=")
+                .is_some_and(|value| value != "false")
+    })
+}
+
+fn maven_has_test_goal(args: &[String]) -> bool {
+    let mut skip_next = false;
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if matches!(
+            arg.as_str(),
+            "-D" | "-f"
+                | "--file"
+                | "-s"
+                | "--settings"
+                | "-gs"
+                | "--global-settings"
+                | "-t"
+                | "--toolchains"
+                | "-pl"
+                | "--projects"
+                | "-rf"
+                | "--resume-from"
+                | "-P"
+                | "--activate-profiles"
+                | "-T"
+                | "--threads"
+        ) {
+            skip_next = true;
+            continue;
+        }
+        if !arg.starts_with('-') && arg.eq_ignore_ascii_case("test") {
+            return true;
+        }
+    }
+    false
+}
+
+fn gradle_test_is_excluded(args: &[String]) -> bool {
+    args.windows(2).any(|pair| {
+        matches!(pair[0].as_str(), "-x" | "--exclude-task") && is_gradle_test_task(&pair[1])
+    }) || args.iter().any(|arg| {
+        arg.strip_prefix("--exclude-task=")
+            .is_some_and(is_gradle_test_task)
+            || arg
+                .strip_prefix("-x")
+                .filter(|task| !task.is_empty())
+                .is_some_and(is_gradle_test_task)
+    })
+}
+
+fn gradle_has_test_task(args: &[String]) -> bool {
+    let mut skip_next = false;
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if matches!(
+            arg.as_str(),
+            "-x" | "--exclude-task"
+                | "--task"
+                | "-p"
+                | "--project-dir"
+                | "-g"
+                | "--gradle-user-home"
+                | "-I"
+                | "--init-script"
+                | "-c"
+                | "--settings-file"
+                | "--include-build"
+        ) {
+            skip_next = true;
+            continue;
+        }
+        if !arg.starts_with('-') && is_gradle_test_task(arg) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_gradle_test_task(task: &str) -> bool {
+    task.rsplit(':')
+        .next()
+        .is_some_and(|task| task.eq_ignore_ascii_case("test"))
+}
+
+fn just_validation_descriptor(args: &[String]) -> Option<ValidationCommandDescriptor> {
+    let operation = match args.first()?.as_str() {
+        "test-fast" | "test-compile" | "test-lane-main" | "test-lane" | "test-lane-fast"
+        | "test-lane-package" => ValidationOperation::Test,
+        "source-map-check" | "check-lane" => ValidationOperation::Check,
+        "fmt-check" => ValidationOperation::Lint,
+        _ => return None,
+    };
+    Some(descriptor(operation, ValidationEcosystem::Rust, args))
 }
 
 fn cargo_test_descriptor(args: &[String]) -> ValidationCommandDescriptor {
@@ -1613,18 +1815,32 @@ mod tests {
 
     #[test]
     fn recognized_dynamic_validation_is_not_opaque() {
-        let classified = classify_validation(&CommandInvocation::Argv {
-            program: "cargo".into(),
-            args: vec!["test".into(), "$SELECTOR".into()],
-        });
-        assert!(matches!(
-            classified,
-            ValidationClassification::Validation {
-                cost_certainty: ValidationCostCertainty::Uncertain,
-                ref leaves,
-            }
-                if leaves[0].breadth == ValidationBreadth::Unknown
-        ));
+        for (script, ecosystem) in [
+            ("cargo test ${SELECTOR}", ValidationEcosystem::Rust),
+            ("pytest tests/${SELECTOR}", ValidationEcosystem::Python),
+            ("dotnet test ${PROJECT}", ValidationEcosystem::DotNet),
+            ("go test ./${PACKAGE}", ValidationEcosystem::Go),
+            ("npm test -- ${SELECTOR}", ValidationEcosystem::Node),
+            ("mvn test -Dtest=${SELECTOR}", ValidationEcosystem::Java),
+            ("make test TARGET=${SELECTOR}", ValidationEcosystem::Other),
+        ] {
+            let classified = classify_validation(&CommandInvocation::Script(script.into()));
+            assert!(matches!(
+                classified,
+                ValidationClassification::Validation {
+                    cost_certainty: ValidationCostCertainty::Uncertain,
+                    ref leaves,
+                }
+                    if leaves[0].ecosystem == ecosystem
+                        && leaves[0].breadth == ValidationBreadth::Unknown
+            ));
+        }
+
+        assert_eq!(
+            classify_validation(&CommandInvocation::Script("go ${SUBCOMMAND}".into())),
+            ValidationClassification::Opaque,
+            "a known runtime with an unresolved subcommand must remain uncertain"
+        );
     }
 
     #[test]
@@ -1741,6 +1957,31 @@ mod tests {
     }
 
     #[test]
+    fn blocking_required_operation_is_produced_when_predicted_skip_has_no_alternative() {
+        let descriptor = descriptor(
+            ValidationOperation::Bench,
+            ValidationEcosystem::Rust,
+            &["bench".to_string()],
+        );
+        let skipped = ValidationSkippedToolOutput::predicted(
+            &descriptor,
+            ValidationPrediction {
+                tier: "repository_fingerprint".into(),
+                predicted_duration_ms: 45_000,
+                predictive_lower_bound_ms: VALIDATION_COST_THRESHOLD_MS + 1,
+                confidence: MIN_SKIP_CONFIDENCE,
+                effective_sample_count: 8,
+            },
+        );
+
+        assert_eq!(
+            skipped.skip_disposition,
+            codex_tools::ToolOutputSkipDisposition::BlockingRequiredOperation
+        );
+        assert!(skipped.cheaper_alternatives.is_empty());
+    }
+
+    #[test]
     fn compound_keeps_validation_leaf_and_uncertain_cost() {
         let classified = classify_validation(&CommandInvocation::Script(
             "echo preparing && cargo test --workspace".into(),
@@ -1787,6 +2028,191 @@ mod tests {
             classify_validation(&CommandInvocation::Script("just test".into())),
             ValidationClassification::Opaque
         );
+    }
+
+    #[tokio::test]
+    async fn command_runner_classification_routes_are_consistent() {
+        let authorization = Arc::new(RwLock::new(ValidationAuthorization::default()));
+        let cases = [
+            (
+                CommandInvocation::Argv {
+                    program: "just".into(),
+                    args: vec!["test-fast".into(), "-p".into(), "codex-core".into()],
+                },
+                ValidationEcosystem::Rust,
+                ValidationOperation::Test,
+            ),
+            (
+                CommandInvocation::Argv {
+                    program: "just".into(),
+                    args: vec!["check-lane".into(), "codex-core".into()],
+                },
+                ValidationEcosystem::Rust,
+                ValidationOperation::Check,
+            ),
+            (
+                CommandInvocation::Argv {
+                    program: "python".into(),
+                    args: vec!["-m".into(), "unittest".into(), "scripts.test_policy".into()],
+                },
+                ValidationEcosystem::Python,
+                ValidationOperation::Test,
+            ),
+            (
+                CommandInvocation::Argv {
+                    program: "pytest.exe".into(),
+                    args: vec!["tests/test_policy.py".into()],
+                },
+                ValidationEcosystem::Python,
+                ValidationOperation::Test,
+            ),
+            (
+                CommandInvocation::Argv {
+                    program: "dotnet".into(),
+                    args: vec!["test".into(), "tests/TestProject.csproj".into()],
+                },
+                ValidationEcosystem::DotNet,
+                ValidationOperation::Test,
+            ),
+            (
+                CommandInvocation::Argv {
+                    program: "go".into(),
+                    args: vec!["test".into(), "./pkg".into()],
+                },
+                ValidationEcosystem::Go,
+                ValidationOperation::Test,
+            ),
+            (
+                CommandInvocation::Argv {
+                    program: "npm".into(),
+                    args: vec!["test".into(), "--".into(), "tests/policy.test.ts".into()],
+                },
+                ValidationEcosystem::Node,
+                ValidationOperation::Test,
+            ),
+            (
+                CommandInvocation::Argv {
+                    program: "pnpm.cmd".into(),
+                    args: vec!["run".into(), "test:unit".into()],
+                },
+                ValidationEcosystem::Node,
+                ValidationOperation::Test,
+            ),
+            (
+                CommandInvocation::Argv {
+                    program: "yarn".into(),
+                    args: vec!["test".into()],
+                },
+                ValidationEcosystem::Node,
+                ValidationOperation::Test,
+            ),
+            (
+                CommandInvocation::Argv {
+                    program: "mvnw.cmd".into(),
+                    args: vec!["-pl".into(), "core".into(), "test".into()],
+                },
+                ValidationEcosystem::Java,
+                ValidationOperation::Test,
+            ),
+            (
+                CommandInvocation::Argv {
+                    program: "gradlew".into(),
+                    args: vec![":core:test".into()],
+                },
+                ValidationEcosystem::Java,
+                ValidationOperation::Test,
+            ),
+            (
+                CommandInvocation::Argv {
+                    program: "make".into(),
+                    args: vec!["test".into()],
+                },
+                ValidationEcosystem::Other,
+                ValidationOperation::Test,
+            ),
+        ];
+        for (invocation, ecosystem, operation) in &cases {
+            assert!(matches!(
+                classify_validation(invocation),
+                ValidationClassification::Validation { ref leaves, .. }
+                    if leaves[0].ecosystem == *ecosystem && leaves[0].operation == *operation
+            ));
+            assert!(matches!(
+                admit_validation(&authorization, None, b"repo", invocation).await,
+                ValidationAdmission::Execute {
+                    observation: Some(_),
+                    ..
+                }
+            ));
+        }
+
+        let mut prohibited = ValidationAuthorization::default();
+        assert!(prohibited.update_from_user_input("Do not run tests."));
+        let prohibited = Arc::new(RwLock::new(prohibited));
+        for (invocation, _, _) in cases
+            .iter()
+            .filter(|(_, _, operation)| *operation == ValidationOperation::Test)
+        {
+            assert!(
+                matches!(
+                    admit_validation(&prohibited, None, b"repo", invocation).await,
+                    ValidationAdmission::Skip(ValidationSkippedToolOutput {
+                        reason: ValidationSkipReason::UserProhibitedValidation,
+                        ..
+                    })
+                ),
+                "broad test prohibition must suppress {invocation:?}"
+            );
+        }
+
+        for invocation in [
+            CommandInvocation::Argv {
+                program: "pytest".into(),
+                args: vec!["--version".into()],
+            },
+            CommandInvocation::Argv {
+                program: "go".into(),
+                args: vec!["version".into()],
+            },
+            CommandInvocation::Argv {
+                program: "dotnet".into(),
+                args: vec!["build".into(), "src/App.csproj".into()],
+            },
+            CommandInvocation::Argv {
+                program: "npm".into(),
+                args: vec!["run".into(), "build".into()],
+            },
+            CommandInvocation::Argv {
+                program: "mvn".into(),
+                args: vec!["package".into()],
+            },
+            CommandInvocation::Argv {
+                program: "mvn".into(),
+                args: vec!["-DskipTests".into(), "test".into()],
+            },
+            CommandInvocation::Argv {
+                program: "mvn".into(),
+                args: vec!["-Dmaven.test.skip=true".into(), "test".into()],
+            },
+            CommandInvocation::Argv {
+                program: "gradlew".into(),
+                args: vec!["assemble".into()],
+            },
+            CommandInvocation::Argv {
+                program: "gradlew".into(),
+                args: vec!["-x".into(), "test".into(), "build".into()],
+            },
+            CommandInvocation::Argv {
+                program: "gradlew".into(),
+                args: vec!["--exclude-task=:core:test".into(), ":core:test".into()],
+            },
+        ] {
+            assert_eq!(
+                classify_validation(&invocation),
+                ValidationClassification::NonValidation,
+                "ordinary command must not be classified as validation: {invocation:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2070,6 +2496,35 @@ mod tests {
         ] {
             assert_ne!(scoped, mismatch);
         }
+    }
+
+    #[test]
+    fn scoped_validation_reuse_key_ignores_repository_epoch() {
+        let invocation = CommandInvocation::Script("cargo test -p codex-core scoped".into());
+        let identity = |repository_epoch: u64, features: &[&str], implementation: &str| {
+            let _ = repository_epoch;
+            validation_identity_with_scope(
+                b"repo",
+                "codex-rs",
+                &invocation,
+                "env-a",
+                "stable",
+                scoped_validation_configuration_identity(features),
+                implementation,
+                "scoped behavior remains correct",
+                &["core/src/scoped.rs".to_string()],
+                &["scoped-contract".to_string()],
+            )
+        };
+
+        let baseline = identity(4, &["feature-a"], "implementation-a");
+        assert_eq!(
+            baseline,
+            identity(99, &["feature-a"], "implementation-a"),
+            "unrelated repository epochs must not invalidate a scoped proof"
+        );
+        assert_ne!(baseline, identity(4, &["feature-b"], "implementation-a"));
+        assert_ne!(baseline, identity(4, &["feature-a"], "implementation-b"));
     }
 
     #[test]

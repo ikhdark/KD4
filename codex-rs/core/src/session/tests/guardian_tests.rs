@@ -534,7 +534,7 @@ async fn process_compacted_history_preserves_separate_guardian_developer_message
     let world_state = Arc::new(build_world_state_from_turn_context(&session, &turn_context).await);
     let initial_context_injection = InitialContextInjection::BeforeLastUserMessage(world_state);
 
-    let (refreshed, _) = crate::compact_remote::process_compacted_history(
+    let (refreshed, _, _) = crate::compact_remote::process_compacted_history(
         &session,
         &turn_context,
         vec![

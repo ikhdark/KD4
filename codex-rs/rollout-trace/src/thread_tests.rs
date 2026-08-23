@@ -7,15 +7,21 @@ use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ExecCommandBeginEvent;
+use codex_protocol::protocol::ExecCommandEndEvent;
+use codex_protocol::protocol::ExecCommandSource;
+use codex_protocol::protocol::ExecCommandStatus;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use std::time::Duration;
 use tempfile::TempDir;
 
 use super::*;
 use crate::AgentResultTracePayload;
 use crate::CompactionCheckpointTracePayload;
 use crate::ExecutionStatus;
+use crate::RawPayloadKind;
 use crate::RawTraceEventPayload;
 use crate::RolloutStatus;
 use crate::replay_bundle;
@@ -220,6 +226,72 @@ fn protocol_wrapper_records_selected_events_as_raw_payloads() -> anyhow::Result<
     });
 
     assert!(protocol_event_seen);
+    Ok(())
+}
+
+#[test]
+fn terminal_runtime_payloads_use_terminal_runtime_payload_kind() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let thread_id = ThreadId::new();
+    let thread_trace =
+        ThreadTraceContext::start_root_in_root_for_test(temp.path(), minimal_metadata(thread_id))?;
+    let begin = EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
+        call_id: "call-terminal".to_string(),
+        process_id: Some("process-1".to_string()),
+        turn_id: "turn-1".to_string(),
+        started_at_ms: 1234,
+        command: vec!["pwd".to_string()],
+        cwd: "file:///workspace".parse()?,
+        parsed_cmd: Vec::new(),
+        source: ExecCommandSource::Agent,
+        interaction_input: None,
+    });
+    let end = EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+        call_id: "call-terminal".to_string(),
+        process_id: Some("process-1".to_string()),
+        turn_id: "turn-1".to_string(),
+        completed_at_ms: 2345,
+        command: vec!["pwd".to_string()],
+        cwd: "file:///workspace".parse()?,
+        parsed_cmd: Vec::new(),
+        source: ExecCommandSource::Agent,
+        interaction_input: None,
+        stdout: "/workspace".to_string(),
+        stderr: String::new(),
+        aggregated_output: "/workspace".to_string(),
+        exit_code: 0,
+        duration: Duration::from_millis(10),
+        formatted_output: "/workspace".to_string(),
+        status: ExecCommandStatus::Completed,
+    });
+
+    thread_trace.record_tool_call_event("turn-1", &begin);
+    thread_trace.record_tool_call_event("turn-1", &end);
+
+    let event_log = fs::read_to_string(single_bundle_dir(temp.path())?.join("trace.jsonl"))?;
+    let runtime_payload_kinds = event_log
+        .lines()
+        .filter_map(|line| {
+            let event: crate::RawTraceEvent = serde_json::from_str(line).expect("raw trace event");
+            match event.payload {
+                RawTraceEventPayload::ToolCallRuntimeStarted {
+                    runtime_payload, ..
+                }
+                | RawTraceEventPayload::ToolCallRuntimeEnded {
+                    runtime_payload, ..
+                } => Some(runtime_payload.kind),
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        runtime_payload_kinds,
+        vec![
+            RawPayloadKind::TerminalRuntimeEvent,
+            RawPayloadKind::TerminalRuntimeEvent,
+        ]
+    );
     Ok(())
 }
 

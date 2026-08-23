@@ -35,6 +35,10 @@ pub(crate) struct Session {
     pub(super) tx_event: Sender<Event>,
     pub(super) agent_status: watch::Sender<AgentStatus>,
     pub(super) state: Mutex<SessionState>,
+    /// Serializes cancellation-shielded rollout/history commits.
+    pub(super) durable_history_commit_gate: Semaphore,
+    /// Remembers durable commit retry keys after the serialized commit completes.
+    pub(super) durable_history_completed_commits: Mutex<HashSet<String>>,
     /// Serializes completed-tool ledger snapshots with artifact protection changes so
     /// compaction cannot remove a marker while a concurrent candidate is being persisted.
     pub(super) tool_history_io_gate: Semaphore,
@@ -969,7 +973,12 @@ impl Session {
             // retain a `starting` entry and finish initializing without blocking on it.
             let resolved_environments = turn_environments.snapshot().await;
             let git_workspace = GitWorkspaceCache::new();
-            let initial_git_workspace = git_workspace.snapshot(&resolved_environments).await;
+            let initial_git_workspace = git_workspace
+                .snapshot_with_project_discovery(
+                    &resolved_environments,
+                    config.config_layer_stack.project_discovery(),
+                )
+                .await;
             session_telemetry.counter(
                 THREAD_STARTED_METRIC,
                 /*inc*/ 1,
@@ -1265,6 +1274,8 @@ impl Session {
                 tx_event: tx_event.clone(),
                 agent_status,
                 state: Mutex::new(state),
+                durable_history_commit_gate: Semaphore::new(1),
+                durable_history_completed_commits: Mutex::new(HashSet::new()),
                 tool_history_io_gate: Semaphore::new(/*permits*/ 1),
                 managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
                 features: config.features.clone(),

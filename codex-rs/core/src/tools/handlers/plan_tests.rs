@@ -225,102 +225,228 @@ fn recommended_fixes_normalization_identifies_only_changed_steps() {
 }
 
 #[test]
-fn generated_artifact_schema_requires_repository_relative_paths() {
-    let tool = serde_json::to_value(create_update_plan_tool()).expect("serialize update_plan");
-    let artifact_schema = tool
-        .pointer("/parameters/properties/plan/items/properties/generated_artifacts")
-        .expect("generated_artifacts schema");
-    let description = artifact_schema
-        .get("description")
-        .and_then(serde_json::Value::as_str)
-        .expect("generated_artifacts description");
-    let item_description = artifact_schema
-        .pointer("/items/description")
-        .and_then(serde_json::Value::as_str)
-        .expect("generated_artifacts item description");
+fn update_plan_schema_exposes_task_evidence_contract() {
+    fn property_names<'a>(tool: &'a serde_json::Value, pointer: &str) -> Vec<&'a str> {
+        tool.pointer(pointer)
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| panic!("schema properties at {pointer}"))
+            .keys()
+            .map(String::as_str)
+            .collect()
+    }
 
-    assert!(description.contains("Repository-relative"));
-    assert!(description.contains("remain inside the repository"));
-    assert!(item_description.contains("repository-relative"));
-}
+    fn enum_values<'a>(tool: &'a serde_json::Value, pointer: &str) -> Vec<&'a str> {
+        tool.pointer(pointer)
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| panic!("schema enum at {pointer}"))
+            .iter()
+            .map(|value| value.as_str().expect("string enum value"))
+            .collect()
+    }
 
-#[test]
-fn planning_fact_schema_and_parser_require_explicit_provenance() {
-    let tool = serde_json::to_value(create_update_plan_tool()).expect("serialize update_plan");
-    let required = tool
-        .pointer("/parameters/properties/facts/items/required")
-        .and_then(serde_json::Value::as_array)
-        .expect("planning fact required fields");
-    assert!(required.iter().any(|field| field == "provenance"));
-    assert!(required.iter().any(|field| field == "source"));
-    assert!(required.iter().any(|field| field == "depends_on_paths"));
-
-    let without_provenance = serde_json::json!({
-        "facts": [{"id": "owner", "value": "codex-core", "source": "SOURCEMAP.md"}],
-        "plan": []
-    });
-    assert!(parse_update_plan_arguments(&without_provenance.to_string()).is_err());
-
-    let with_provenance = serde_json::json!({
-        "facts": [{
-            "id": "owner",
-            "value": "codex-core",
-            "provenance": "direct_file_read",
-            "source": "SOURCEMAP.md#planning-architecture-runtime",
-            "depends_on_paths": ["SOURCEMAP.md"]
-        }],
-        "plan": []
-    });
-    let parsed =
-        parse_update_plan_arguments(&with_provenance.to_string()).expect("fact with provenance");
-    assert_eq!(parsed.facts[0].provenance, ResultProvenance::DirectFileRead);
-}
-
-#[test]
-fn validation_route_schema_names_the_supported_direct_programs() {
     let tool = serde_json::to_value(create_update_plan_tool()).expect("serialize update_plan");
     let description = tool["description"].as_str().expect("tool description");
-    let argv_description = tool
-        .pointer("/parameters/properties/validation_route/properties/leaves/items/properties/argv/description")
-        .and_then(serde_json::Value::as_str)
-        .expect("validation argv description");
-    let required = tool
-        .pointer("/parameters/properties/validation_route/properties/leaves/items/required")
-        .and_then(serde_json::Value::as_array)
-        .expect("validation leaf required fields");
+    let statuses =
+        tool["parameters"]["properties"]["plan"]["items"]["properties"]["status"]["enum"]
+            .as_array()
+            .expect("plan step status enum");
 
-    assert!(description.contains("only direct cargo, just, python, or python3 leaves"));
-    assert!(argv_description.contains("cargo, just, python, or python3"));
-    assert!(argv_description.contains("formatting or diff checks are not accepted"));
-    assert!(required.iter().any(|field| field == "uncertainty"));
-}
-
-#[test]
-fn plan_description_requires_one_proven_contract_at_a_time() {
-    let tool = serde_json::to_value(create_update_plan_tool()).expect("serialize update_plan");
-    let description = tool["description"].as_str().expect("tool description");
-
-    assert!(description.contains("Complete one coherent contract before starting the next"));
-    assert!(description.contains("cheapest non-overlapping validation leaves"));
-    assert!(description.contains("Do not run a separate compile or check"));
-    assert!(description.contains("selected at least one test"));
-}
-
-#[test]
-fn rollout_workflow_guardrails_describe_a_minimal_valid_plan_payload() {
-    let tool = serde_json::to_value(create_update_plan_tool()).expect("serialize update_plan");
-    let description = tool["description"].as_str().expect("tool description");
-
-    assert!(
-        description.starts_with("Updates the task plan.\nMinimal valid update: send only `plan`.")
+    assert_eq!(
+        property_names(&tool, "/parameters/properties"),
+        vec![
+            "acceptance_criteria",
+            "explanation",
+            "external_validation_route",
+            "facts",
+            "implementation_surfaces",
+            "mutation_obligations",
+            "plan",
+            "removed_facts",
+            "removed_steps",
+            "source_owner",
+            "step_evidence",
+            "tier",
+            "validation_disposition",
+            "validation_route",
+        ]
     );
-    assert!(description.contains(
-        "every fact requires `id`, `value`, `provenance`, `source`, and `depends_on_paths`"
-    ));
-    assert!(
-        description
-            .contains("every obligation requires `id` and `description`; `paths` is optional")
+    assert_eq!(
+        property_names(&tool, "/parameters/properties/plan/items/properties"),
+        vec![
+            "acceptance_criteria",
+            "depends_on",
+            "generated_artifacts",
+            "id",
+            "requires_desktop_activation",
+            "risks",
+            "runtime_paths",
+            "status",
+            "step",
+            "validation_route",
+        ]
     );
+    assert_eq!(
+        statuses,
+        &vec![
+            serde_json::json!("pending"),
+            serde_json::json!("in_progress"),
+            serde_json::json!("implemented"),
+            serde_json::json!("passed"),
+            serde_json::json!("blocked"),
+            serde_json::json!("skipped"),
+            serde_json::json!("completed"),
+        ]
+    );
+    assert_eq!(
+        enum_values(&tool, "/parameters/properties/tier/enum"),
+        vec!["focused", "medium", "complex"]
+    );
+    assert_eq!(
+        enum_values(
+            &tool,
+            "/parameters/properties/facts/items/properties/provenance/enum"
+        ),
+        vec![
+            "direct_file_read",
+            "search_hit",
+            "generated_summary",
+            "cached_observation",
+            "inferred_relationship",
+            "test_result",
+        ]
+    );
+    assert_eq!(
+        enum_values(&tool, "/parameters/properties/validation_disposition/enum"),
+        vec![
+            "executable",
+            "unresolved_discoverable",
+            "unavailable_blocked",
+            "not_required",
+        ]
+    );
+    assert_eq!(
+        enum_values(
+            &tool,
+            "/parameters/properties/validation_route/properties/ordering/enum"
+        ),
+        vec!["stop_on_failure", "run_all"]
+    );
+    assert_eq!(
+        property_names(&tool, "/parameters/properties/facts/items/properties"),
+        vec!["depends_on_paths", "id", "provenance", "source", "value"]
+    );
+    assert!(
+        tool.pointer("/parameters/properties/facts/items/properties/dependencies_current")
+            .is_none(),
+        "dependencies_current is server-owned and must not be caller controlled"
+    );
+    assert_eq!(
+        property_names(
+            &tool,
+            "/parameters/properties/removed_facts/items/properties"
+        ),
+        vec!["id", "reason"]
+    );
+    assert_eq!(
+        property_names(
+            &tool,
+            "/parameters/properties/mutation_obligations/items/properties"
+        ),
+        vec!["description", "id", "paths"]
+    );
+    assert_eq!(
+        property_names(
+            &tool,
+            "/parameters/properties/external_validation_route/properties"
+        ),
+        vec!["server_name", "tool_name"]
+    );
+    assert_eq!(
+        property_names(
+            &tool,
+            "/parameters/properties/step_evidence/items/properties"
+        ),
+        vec![
+            "external_validation_route",
+            "implementation_surfaces",
+            "mutation_obligations",
+            "source_owner",
+            "step_id",
+            "validation_disposition",
+        ]
+    );
+    assert_eq!(
+        property_names(&tool, "/parameters/properties/validation_route/properties"),
+        vec!["leaves", "ordering"]
+    );
+    assert_eq!(
+        property_names(
+            &tool,
+            "/parameters/properties/validation_route/properties/leaves/items/properties"
+        ),
+        vec![
+            "argv",
+            "covered_contracts",
+            "covered_paths",
+            "semantic_timeout",
+            "timeout_ms",
+            "uncertainty",
+        ]
+    );
+
+    for pointer in [
+        "/parameters/additionalProperties",
+        "/parameters/properties/plan/items/additionalProperties",
+        "/parameters/properties/facts/items/additionalProperties",
+        "/parameters/properties/removed_facts/items/additionalProperties",
+        "/parameters/properties/mutation_obligations/items/additionalProperties",
+        "/parameters/properties/external_validation_route/additionalProperties",
+        "/parameters/properties/step_evidence/items/additionalProperties",
+        "/parameters/properties/step_evidence/items/properties/mutation_obligations/items/additionalProperties",
+        "/parameters/properties/step_evidence/items/properties/external_validation_route/additionalProperties",
+        "/parameters/properties/validation_route/additionalProperties",
+        "/parameters/properties/validation_route/properties/leaves/items/additionalProperties",
+        "/parameters/properties/plan/items/properties/validation_route/additionalProperties",
+        "/parameters/properties/plan/items/properties/validation_route/properties/leaves/items/additionalProperties",
+    ] {
+        assert_eq!(
+            tool.pointer(pointer),
+            Some(&serde_json::json!(false)),
+            "{pointer}"
+        );
+    }
+
+    assert!(tool.pointer("/parameters/required").is_none());
+    assert_eq!(
+        tool.pointer("/parameters/properties/plan/items/required"),
+        Some(&serde_json::json!(["step", "status"]))
+    );
+    assert_eq!(
+        tool.pointer("/parameters/properties/validation_route/required"),
+        Some(&serde_json::json!(["leaves"]))
+    );
+    assert_eq!(
+        tool.pointer("/parameters/properties/facts/items/required"),
+        Some(&serde_json::json!([
+            "id",
+            "value",
+            "provenance",
+            "source",
+            "depends_on_paths"
+        ]))
+    );
+    assert_eq!(
+        tool.pointer("/parameters/properties/validation_route/properties/leaves/items/required"),
+        Some(&serde_json::json!([
+            "argv",
+            "uncertainty",
+            "covered_paths",
+            "covered_contracts",
+            "timeout_ms"
+        ]))
+    );
+    assert!(description.contains("All update fields are optional"));
+    assert!(description.contains("Structured validation routes"));
 }
 
 #[test]
@@ -385,12 +511,11 @@ fn default_mode_complexity_selects_only_the_complex_internal_tier() {
 
     let tool = serde_json::to_value(create_update_plan_tool()).expect("serialize update_plan");
     let description = tool["description"].as_str().expect("tool description");
-    assert!(description.contains("Default mode upgrades only this representation"));
     assert!(description.contains("never changes collaboration mode"));
 }
 
 #[tokio::test]
-async fn normalized_plan_output_reports_completed_as_passed() {
+async fn normalized_plan_output_reports_proof_free_completed_as_passed() {
     let (result, persisted) = invoke_normalized_plan_update(plan_update_args(
         Some("step"),
         "Implement the step",
@@ -401,6 +526,10 @@ async fn normalized_plan_output_reports_completed_as_passed() {
     assert_eq!(result["message"], PLAN_UPDATED_MESSAGE);
     assert_eq!(result["normalized_plan"]["plan"][0]["status"], "passed");
     assert_eq!(persisted["plan"][0]["status"], "passed");
+    assert_eq!(
+        persisted["plan"][0]["validation_disposition"],
+        "not_required"
+    );
 }
 
 #[tokio::test]
@@ -488,6 +617,45 @@ async fn normalized_plan_output_returns_the_installed_compatibility_id() {
 #[test]
 fn update_plan_waits_for_runtime_cancellation_commit_cleanup() {
     assert!(PlanHandler.waits_for_runtime_cancellation());
+}
+
+#[tokio::test]
+async fn plan_persistence_failure_is_reported() {
+    let (mut session, turn, events) = make_session_and_context_with_rx().await;
+    let (_temp, evidence_path) = enable_task_evidence(&mut session).await;
+    session
+        .services
+        .task_evidence
+        .set_persistence_failure_for_test(true);
+    let arguments = plan_arguments("Do not acknowledge an unpersisted plan");
+    let result = PlanHandler
+        .handle(ToolInvocation {
+            session,
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn,
+            cancellation_token: CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "failed-plan-persistence".to_string(),
+            tool_name: ToolName::plain("update_plan"),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function { arguments },
+        })
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(FunctionCallError::RespondToModel(message))
+            if message
+                == "update_plan could not be durably persisted; no plan update was acknowledged"
+    ));
+    while let Ok(event) = events.try_recv() {
+        assert!(
+            !matches!(event.msg, EventMsg::PlanUpdate(_)),
+            "a failed persistence attempt must not emit a plan update"
+        );
+    }
+    let evidence = read_persisted_plan(&evidence_path).await;
+    assert_eq!(evidence["plan"], serde_json::json!([]));
 }
 
 #[tokio::test]

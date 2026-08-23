@@ -6,6 +6,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
+use tokio::sync::Semaphore;
 use tokio::sync::broadcast;
 use tokio::sync::oneshot::error::TryRecvError;
 use tokio::sync::watch;
@@ -88,6 +89,7 @@ pub(crate) struct UnifiedExecProcess {
     output_closed_notify: Arc<Notify>,
     cancellation_token: CancellationToken,
     termination_requested: AtomicBool,
+    termination_lock: Semaphore,
     output_drained: CancellationToken,
     interaction_lock: Arc<Mutex<()>>,
     state_tx: watch::Sender<ProcessState>,
@@ -134,6 +136,7 @@ impl UnifiedExecProcess {
             output_closed_notify,
             cancellation_token,
             termination_requested: AtomicBool::new(false),
+            termination_lock: Semaphore::new(1),
             output_drained,
             interaction_lock: Arc::new(Mutex::new(())),
             state_tx,
@@ -268,6 +271,13 @@ impl UnifiedExecProcess {
 
     pub(super) async fn terminate_confirmed(&self) -> Result<(), UnifiedExecError> {
         self.termination_requested.store(true, Ordering::Release);
+        let _termination_permit = self.termination_lock.acquire().await.map_err(|_| {
+            UnifiedExecError::process_failed("termination gate is closed".to_string())
+        })?;
+        if self.has_exited() {
+            self.finish_termination();
+            return Ok(());
+        }
         match &self.process_handle {
             ProcessHandle::Local(process_handle) => process_handle.terminate(),
             ProcessHandle::ExecServer(process_handle) => {
@@ -299,12 +309,13 @@ impl UnifiedExecProcess {
         self.termination_requested.load(Ordering::Acquire)
     }
 
-    pub(super) fn fail_and_terminate(&self, message: String) {
-        let state = self.state_rx.borrow().clone();
+    pub(super) async fn fail_and_terminate(&self, message: String) -> Result<(), UnifiedExecError> {
+        let mut state = self.state_rx.borrow().clone();
         if state.failure_message.is_none() {
-            let _ = self.state_tx.send_replace(state.failed(message));
+            state.failure_message = Some(message);
+            let _ = self.state_tx.send_replace(state);
         }
-        self.terminate();
+        self.terminate_confirmed().await
     }
 
     pub(super) async fn snapshot_output(&self) -> Vec<u8> {

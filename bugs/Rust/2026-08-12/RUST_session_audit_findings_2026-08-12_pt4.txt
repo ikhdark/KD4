@@ -1,0 +1,1257 @@
+CODEX SESSION AUDIT / BUG EVIDENCE CORPUS
+Language: Rust
+Session date: 2026-08-12
+Coverage: Codex sessions under C:\Users\kuh\.codex\sessions\2026\08 for the assigned date range.
+Method: selected explicit audits, defect/bug diagnoses, regressions, bug fixes, and closely related incomplete investigations from actual event_msg user_message events. Preserved event_msg agent_message final_answer reports as primary conclusions. Exact repeated final reports were deduplicated by normalized SHA-256. Developer and AGENTS instruction text was excluded from findings.
+Record count in this part: 3
+====================================================================================================
+STABLE EVIDENCE ID: CODEX-SESSION-019ff85b-63c2-7cc3-942f-a363837e65e3
+DATE: 2026-08-12
+LANGUAGE CLASSIFICATION: Rust
+STATUS: Reported conclusion available
+CONFIDENCE: This record faithfully preserves the session artifact. Repository-level conclusions retain the confidence and qualifications stated by the reporting agent and were not independently re-proven during this extraction.
+
+SOURCE SESSION ARTIFACTS
+- C:\Users\kuh\.codex\sessions\2026\08\12\rollout-2026-08-12T18-42-46-019ff85b-63c2-7cc3-942f-a363837e65e3.jsonl.zst
+Source session UUID: 019ff85b-63c2-7cc3-942f-a363837e65e3
+Session timestamp(s): 8/12/2026 11:42:46 PM
+Working directory/project: c:\Users\kuh\Desktop\kd4
+Recorded Git revision(s): 39d8ab6464d7561426cc3c671e4098a37c129ad8
+Recorded Git branch(es): main
+Recorded lifecycle outcomes: task_complete, turn_aborted
+
+DIRECTLY STATED USER REQUEST / OBSERVED SYMPTOM
+--- User message 1 ---
+# KD4 Source-Discovery Token Waste Audit
+
+Measure the token cost of repeated repository discovery and source reading.
+
+Repository:
+C:\Users\kuh\Desktop\kd4
+
+CODEX_HOME:
+C:\Users\kuh\Desktop\LOCAL-KD
+
+Read-only audit.
+
+Do not modify or rebuild KD4.
+
+For historical coding tasks reconstruct:
+
+- searches before owner resolution;
+- searches after owner resolution;
+- locate_task calls;
+- file reads;
+- repeated files/spans;
+- caller/test/contract reads;
+- broad repository searches;
+- discovery tool outputs;
+- model generations between discovery steps.
+
+Estimate:
+
+- input tokens added by each discovery result;
+- output/reasoning tokens spent interpreting it;
+- cumulative tokens spent rediscovering known ownership;
+- tokens spent rereading already-seen source;
+- truncation-recovery token cost.
+
+Distinguish necessary architecture discovery from repeated investigation.
+
+## Rank
+
+Give me the top 10 source-discovery token wastes.
+
+Prioritize reductions that remove:
+
+- entire tool continuations;
+- repeated source blocks;
+- repeated model interpretation.
+
+Do not focus on shortening filenames or similarly trivial changes.
+
+No files should be changed.
+
+--- User message 2 ---
+
+# Files mentioned by the user:
+
+## # Finish KD4 Long-Task Token Amplification Control Repository: C:\Users\kuh\Des…: C:\Users\kuh\.codex/attachments/0772cea1-85a1-4e73-b140-a8b2f432c40d/pasted-text.txt
+
+The attached pasted text file(s) contain the user's request. Read and act on that content.
+
+## My request:
+
+
+--- User message 3 ---
+
+# Files mentioned by the user:
+
+## # Collapse KD4 Source-Discovery Model Boundaries Repository: C:\Users\kuh\Deskt…: C:\Users\kuh\.codex/attachments/e79829ac-5ace-4033-8dba-7b5212bc5ec8/pasted-text.txt
+
+The attached pasted text file(s) contain the user's request. Read and act on that content.
+
+## My request:
+
+
+--- User message 4 ---
+Keep codex-file-search from owning core-only planning/validation state
+
+OwnerEvidenceBundleV2 currently lives in the file-search locator but contains things such as validated instruction identities, validation routes, artifacts, and unresolved task questions. That risks turning the file-search crate into an owner of codex-core orchestration concepts.
+
+I would amend it to:
+
+Correction: preserve the source-discovery/core layering.
+
+codex-file-search should own the snapshot-backed source-routing portion of the bundle:
+
+- authoritative owner/candidates;
+- primary source regions;
+- one-hop source relationships;
+- caller/test/contract/generated relationships already known to the locator;
+- source snapshot/revision identities;
+- captured source sections and hashes.
+
+codex-core should assemble the final model-visible OwnerEvidenceBundleV2 by joining that locator result with core-owned state:
+
+- applicable validated AGENTS/instruction state;
+- validation route/disposition;
+- task/plan unresolved questions;
+- tool-output artifact identities;
+- projection metadata.
+
+Do not make codex-file-search depend on validation admission, task orchestration, world-state policy, or core artifact lifecycle merely to support bundling.
+
+If the current crate layering already exposes a neutral source-closure DTO suitable for both layers, extend that rather than adding a second representation.
+
+That will make this much easier to maintain.
+
+Do not conflate “owner resolved” with “evidence bundle complete”
+
+The plan replaces the reasoning governor's owner-resolved boolean with a typed owner/closure receipt. That's directionally good, but ownership and implementation closure are distinct states.
+
+An authoritative owner can be known while a caller or contract remains unresolved.
+
+Use:
+
+Correction: the typed receipt must explicitly distinguish:
+
+- owner_unresolved;
+- owner_resolved;
+- bundle_incomplete;
+- bundle_ready / implementation_closure_established.
+
+Do not make the existence of OwnerEvidenceBundleV2 itself mean that implementation closure is complete.
+
+An authoritative owner signal should fire as soon as ownership is proven.
+
+The implementation-phase directive should fire only when the required bundle categories are either:
+
+- materially established; or
+- explicitly represented as unresolved questions that require another evidence action before implementation.
+
+This distinction must remain visible to the reasoning governor and telemetry.
+
+Measure separately:
+
+request → owner_resolved
+owner_resolved → bundle_ready
+bundle_ready → first mutation.
+
+That gives you exactly the timing boundary these audits have been missing.
+
+Enforce one source snapshot across the entire bundle
+
+This is the biggest correctness issue in the hydration design.
+
+The plan says missing captured bytes may use parallel reads. Those reads occur after locator snapshot capture, so source could change between the locator and those fallback reads.
+
+You cannot return one bundle that quietly combines owner data from revision A with caller/test bytes from revision B.
+
+Correction: every source section represented as current evidence in one OwnerEvidenceBundleV2 must belong to one validated source snapshot identity.
+
+When the locator's captured snapshot lacks bytes and fallback parallel reads are required:
+
+1. capture the expected snapshot/repository revision;
+2. perform the bounded reads;
+3. revalidate the relevant revision/freshness identity;
+4. publish the bundle only if all sections can truthfully be bound to that snapshot.
+
+If relevant source changes during hydration:
+
+- do not combine mixed revisions;
+- discard/retry the affected bundle once where existing bounded behavior permits; or
+- return owner resolution plus explicit source_changed/unresolved state.
+
+Do not repeatedly chase a moving workspace.
+
+Each section must carry the exact content/source identity used by the receipt.
+
+This is especially important with concurrent agents and your dirty-worktree workflow.
+
+Use one exact-recovery mechanism instead of two overlapping ones
+
+The plan adds both:
+
+multi-range read_tool_output;
+locate_task(receipt_id, section_ids) recovery.
+
+I would avoid having two different mechanisms recover the same material.
+
+The cleanest architecture is: the owner bundle artifact contains every section that was actually materialized, even if not shown inline; read_tool_output handles recovery.
+
+Correction: use the existing canonical tool-output artifact as the sole recovery path for materialized bundle evidence.
+
+For every section successfully materialized during bundle construction:
+
+- store its exact bytes in the bounded canonical bundle artifact;
+- record section_id → artifact range in the manifest.
+
+Inline projection may omit sections for token budget reasons, but those omitted-inline sections remain directly recoverable with multi-range read_tool_output.
+
+Do not add locate_task receipt_id/section_ids as a second artifact reader for those sections.
+
+If a source section could not be materialized at bundle construction because the canonical artifact/hydration hard bound was exceeded:
+
+- mark it NOT_MATERIALIZED / unresolved;
+- do not claim it is recoverable from the bundle artifact;
+- a later targeted source operation may materialize it if actually needed.
+
+This keeps:
+
+locate_task = discovery/bundle construction
+
+read_tool_output = exact recovery
+
+rather than making locate_task both a locator and an artifact retrieval API.
+
+This also reduces the amount of new locate_task schema you have to expose.
+
+Do not build a new language parser just for hydrate_selected_span
+
+The automatic unique-match hydration is a good optimization. The parser-backed “smallest enclosing definition” is only worth it if KD4 already has authoritative symbol-boundary information available.
+
+Correction: hydrate_selected_span may use parser/symbol-boundary information only when that information already exists in the current source-search/file-search architecture.
+
+Do not introduce a new language parser, AST service, or syntax-indexing layer for this feature.
+
+Preferred order:
+
+1. existing authoritative symbol/definition span, if already available;
+2. existing structured search context sufficient to identify the enclosing definition;
+3. bounded deterministic line window around the unique match.
+
+The optimization target is removal of the search→model→obvious-read boundary, not perfect syntax-aware extraction.
+
+If confidence in the enclosing definition is ambiguous, use the bounded window or skip hydration.
+
+That keeps this task from quietly becoming a parser project.
+
+Do not call whole-request provider tokens “discovery tokens”
+
+This part needs measurement discipline:
+
+provider-reported discovery-related input tokens divided by newly injected discovery-result tokens
+
+Provider usage tells you the whole model request input, not which tokens were “caused by discovery.”
+
+The ratio is still useful, but it needs an honest name and the benchmark should not make a flaky provider-token assertion.
+
+Correction: do not attribute the complete provider-reported request input specifically to source discovery.
+
+Record:
+
+- total provider input on the request immediately following a discovery result/bundle;
+- cached input;
+- newly injected discovery-result tokens;
+- number of discovery model boundaries.
+
+A derived observational metric may be:
+
+post_discovery_request_input / newly_injected_discovery_tokens
+
+and may be labeled discovery replay amplification or continuation amplification.
+
+Do not call the numerator "discovery input tokens".
+
+For deterministic round_trip_batching tests:
+
+assert:
+- equivalent final evidence;
+- model boundary count;
+- tool-call count;
+- prepared model-input size using the deterministic local estimator.
+
+Do not make focused tests depend on live provider-reported token totals.
+
+Provider-reported cumulative input reduction belongs in later controlled/live measurement, not a deterministic unit-test assertion.
+
+That will keep the results credible.
+
+One smaller identity change is also worth making: don't derive the receipt from vaguely normalized “task semantics” if that can change because the user says “continue” or wording changes. Bind it to the existing stable task/contract epoch + owner + source snapshot, with the relevant closure contract/version included.
+
+Everything else I would keep. The 4K soft bundle target makes sense because a 3–4K bundle can be dramatically cheaper than four 600-token reads that each force another ~40K-context generation. Fair category reservation is also a good idea so implementation source doesn't crowd tests/contracts completely out of the result.
+
+I also like that ambiguous routing remains ambiguous, supplied paths are merely locator anchors, specialist searches can still happen afterward, and the round-trip benchmark compares 5 → 3 → 2 model requests for equivalent evidence. That is exactly the metric this change should optimize.
+
+So I would approve this after those six corrections. The most important are: keep source-discovery/core ownership clean, never mix source revisions inside one bundle, and use one canonical artifact-recovery path rather than turning locate_task
+
+--- User message 5 ---
+PLEASE IMPLEMENT THIS PLAN:
+# Collapse KD4 Source-Discovery Model Boundaries
+
+## Summary
+
+- Make `codex-file-search` responsible only for snapshot-backed source routing and closure evidence.
+- Assemble the model-visible `OwnerEvidenceBundleV2` in `codex-core`, where instruction state, validation disposition, task questions, projection, artifacts, and reasoning-state transitions already belong.
+- Preserve the 5 → 3 → 2 model-boundary target while enforcing one source snapshot, one canonical recovery path, and distinct ownership versus implementation-closure states.
+
+## Layering and data ownership
+
+- Extend the existing neutral locator result rather than creating a second file-search representation. `codex-file-search` must not define the final `OwnerEvidenceBundleV2`.
+- The locator DTO owns only:
+  - authoritative owner or candidates;
+  - owner-manifest and closure-contract revisions;
+  - primary source regions and source relationships;
+  - known callers, tests, contracts, and generated-source relationships;
+  - captured source sections, exact spans, content hashes, and one source snapshot ID;
+  - source-specific gaps such as ambiguous or unavailable relationships.
+- Raw owner-manifest declarations may cross the crate boundary as neutral data, but applicability, admission, disposition, and planning interpretations remain core-owned.
+- `codex-core` defines and assembles `OwnerEvidenceBundleV2` by joining the locator DTO with:
+  - the existing validated applicable-instruction state;
+  - core-owned validation route and disposition;
+  - task/plan unresolved questions;
+  - closure-state policy;
+  - canonical tool-output artifact identity and ranges;
+  - projection and telemetry metadata.
+- Core must compare validated instruction hashes with the locator snapshot’s captured identities before treating them as current. Neither crate gains a dependency on a new planner, validation-admission service, AST index, or artifact store.
+
+## Bundle construction and state transitions
+
+- Model ownership and closure as two orthogonal typed states:
+  - `owner_state`: `owner_unresolved | owner_resolved`;
+  - `closure_state`: `bundle_incomplete | bundle_ready`.
+- Fire the authoritative owner signal as soon as routing is proven for a validated snapshot. Do not infer closure readiness from bundle existence.
+- Mark `bundle_ready` only when each required category is:
+  - materially established from the validated snapshot; or
+  - deterministically classified as not applicable.
+- A required category needing another evidence action remains `bundle_incomplete`. Core emits a focused evidence-follow-up directive with stable unresolved IDs, not an implementation directive.
+- The implementation-phase directive fires only after `bundle_ready`.
+- Bind the receipt ID to the existing stable task/contract epoch, owner ID, source snapshot ID, and closure-contract/schema version. Do not incorporate mutable user wording such as “continue.”
+- Store the typed receipt in the existing deterministic dispatch state. Replace it on task/contract epoch or snapshot change; do not add another owner ledger or persistent source cache.
+- Supplied paths remain locator anchors. They skip preliminary broad routing but do not bypass owner validation or force an ambiguous owner.
+
+## Snapshot integrity and bounded evidence
+
+- Every source section represented as current in one bundle must carry the same validated source snapshot ID plus its exact content hash and span.
+- Prefer bytes already captured by the locator. If a required selected section is absent:
+  1. retain the expected repository/source snapshot identity;
+  2. issue all missing bounded reads together through existing parallel-read machinery;
+  3. recompute the relevant freshness identities;
+  4. publish only if the owner and every materialized section still bind to the expected snapshot.
+- On detected change, discard the mixed candidate and retry the complete bounded construction once. If the workspace changes again, return the latest provable owner with `bundle_incomplete`, `source_changed`, and explicit unresolved sections. Never chase a moving workspace repeatedly.
+- Build sections in deterministic priority order: primary implementation, direct callers, focused tests, contracts/generated relationships, then other source context. Core adds instructions, validation, and task questions afterward.
+- Fairly reserve model-visible space for every required non-empty category before secondary implementation context.
+- Keep the soft inline target at 4,000 tokens. Cap source sections at 120 lines/5 KiB and cap the complete canonical bundle artifact to selected bounded spans, never arbitrary full files.
+- Sections beyond the hard materialization bound are marked `NOT_MATERIALIZED`; they are not advertised as artifact-recoverable. A later targeted source operation may fetch them if they remain necessary.
+
+## Projection and exact recovery
+
+- Use the existing core tool-output artifact service as the sole exact-recovery mechanism for bundle evidence.
+- Register one canonical bounded artifact containing the exact serialization of every successfully materialized source and core section.
+- Give every section a stable ID derived from closure-contract version, section kind, normalized path, exact span, content hash, and snapshot ID.
+- The essential inline manifest records:
+  - section state: inline, artifact-only, partial, or not materialized;
+  - section identity and revision;
+  - exact artifact line range for all materialized sections;
+  - blocking unresolved IDs and closure readiness.
+- Extend common projection fragments with optional stable IDs and expose selected, omitted-inline, and partial IDs without changing non-source behavior.
+- Extend `read_tool_output` with a mutually exclusive multi-range argument, supporting up to 16 ranges in one call. Allocate its aggregate bound fairly and return per-range completeness and continuation positions rather than repeatedly returning one truncated prefix.
+- Do not add `receipt_id` or `section_ids` retrieval to `locate_task`. It remains a discovery/bundle constructor, while `read_tool_output` remains the artifact reader.
+
+## Unique-search hydration
+
+- Add `hydrate_selected_span`, enabled by default, to `search_source`.
+- Hydrate only when search coverage is complete and exactly one match is present.
+- Select context in this order:
+  1. an authoritative symbol/definition span already available from existing file-search state;
+  2. existing structured search context that unambiguously identifies the enclosing definition;
+  3. a deterministic bounded line window around the match.
+- If definition confidence is ambiguous, use the bounded window or skip hydration. Do not add a parser, AST service, or syntax-indexing layer.
+- Hydrated content must come from the same observed file bytes as the search match and carry that observation’s content hash. Ambiguous, multi-match, or incomplete searches remain metadata-only with an explicit hydration status.
+
+## Telemetry and measurement
+
+- Extend current timing telemetry with separate timestamps and durations for:
+  - accepted request → authoritative `owner_resolved`;
+  - `owner_resolved` → `bundle_ready`;
+  - `bundle_ready` → first accepted mutating operation.
+- Detect the first mutation through the existing tool/capability and command-safety classification used by the core router. Record mutation-before-ready separately; leave the final duration absent for read-only turns.
+- Record discovery operations and result cells independently, including:
+  - locator, search, read, bundle, and recovery counts;
+  - locator→discovery, discovery→discovery, and recovery→recovery boundaries;
+  - before/after-owner discovery;
+  - materialized and inline sections by category;
+  - avoided singleton reads and bundle generation time.
+- For the request immediately following discovery, record:
+  - total provider-reported input tokens;
+  - cached input tokens;
+  - newly injected discovery-result tokens;
+  - discovery model-boundary count.
+- Name the derived observational ratio `post_discovery_request_input / newly_injected_discovery_tokens`, reported as replay or continuation amplification. Do not label the numerator “discovery tokens,” and emit no ratio when usage or its denominator is unavailable.
+
+## Tests and validation
+
+- Layering tests prove the file-search DTO serializes only neutral source closure evidence and introduces no dependency on core instruction, validation, task, projection, or artifact types.
+- Core assembly tests cover all four owner/closure state combinations, blocking unresolved categories, instruction-hash validation, and implementation-directive gating.
+- Deterministic mutation-hook tests change a caller/test file between capture and hydration:
+  - one stable retry succeeds;
+  - a second change returns `bundle_incomplete/source_changed`;
+  - no result contains mixed snapshot or content identities.
+- Recovery tests verify every materialized section exists exactly in the canonical artifact, multi-range recovery returns several omitted-inline sections in one operation, and `NOT_MATERIALIZED` sections have no false artifact range.
+- Search tests cover unique hydration from existing span data, deterministic window fallback, ambiguous results, and absence of any new parser/index dependency.
+- Extend the controlled round-trip benchmark:
+  - serial locator plus three reads plus final generation: five model requests;
+  - batched reads: three;
+  - owner bundle plus final generation: two.
+- Deterministic tests assert equivalent final evidence, model boundaries, tool-call counts, and prepared model-input size using the local estimator. Provider-reported token reduction is reserved for controlled/live measurements.
+- Run focused file-search, source-tool, artifact-recovery, governor, timing, and round-trip tests; run `python scripts/source_owners.py check`; regenerate and validate protocol schemas if timing fields change. Do not rebuild or publish KD4 Desktop.
+
+## Assumptions
+
+- Existing dirty reasoning-governor, parallel-dispatch, timing, protocol, and round-trip changes are preserved and extended after reinspecting their focused diffs.
+- The existing locator result is the neutral source-closure DTO to extend; no parallel file-search bundle type is introduced.
+- Novel scoped follow-up discovery remains allowed after owner resolution or bundle readiness, while exact unchanged rediscovery continues to be suppressed.
+
+--- User message 6 ---
+continue
+
+--- User message 7 ---
+
+# Files mentioned by the user:
+
+## # Collapse KD4 Source-Discovery Model Boundaries ## Summary - Make `codex-file-…: C:\Users\kuh\.codex/attachments/dc1379ed-bee2-402b-8ff1-6b0a3456d1bd/pasted-text.txt
+
+## My request:
+read fully and finish implementing this. you crashed and now you lost your place.
+
+
+REPORTED AUDIT / DIAGNOSIS / FIX CONCLUSION
+--- Unique final report 1; SHA-256 2CDF8102E0BC3BD97B7C05D22208BE0738CC8F3F46C73E9D981FB173B77E1366 ---
+# KD4 Source-Discovery Token Waste Audit
+
+The dominant waste is not the size of filenames or even the returned source text. It is the repeated model continuation after each small search or read.
+
+Across telemetry-covered turns, discovery results were allocated:
+
+- 350.35M input tokens, including 339.19M cached input.
+- 1.063M output tokens, of which 380.3K were reasoning tokens.
+- 301.64M input tokens specifically between one discovery operation and the next.
+- 5,939 metered discovery-to-discovery continuations; 9,764 observed across the full readable archive.
+
+Removing whole continuations is therefore much more valuable than shortening individual results.
+
+## Scope and method
+
+Audited read-only:
+
+- 115 readable active and archived rollout JSONLs, 156.3 MB.
+- Activity from July 28 through August 12, 2026.
+- 211 distinct historical task/turn IDs.
+- 81 rollouts contained token telemetry; source/result repetition was measurable in all 115.
+- Two corrupt backup rollouts were excluded.
+
+Captured token totals:
+
+| Token category | Tokens |
+|---|---:|
+| Input | 525,751,324 |
+| Cached input | 508,606,592 |
+| Uncached input | 17,144,732 |
+| Output | 1,694,265 |
+| Reasoning output, included in output | 606,594 |
+| Total | 527,445,589 |
+
+Cached input was 96.7% of input. Caching reduces billing/computation impact, but the context still repeatedly passed through model generations.
+
+Direct tool-result sizes were estimated using KD4’s own `approx_token_count` logic from `codex-rs/utils/string/src/truncate.rs`. Per-generation costs were attributed by dividing each turn’s exact cumulative telemetry among its result-fed continuations plus its initial generation. Thus aggregate telemetry is exact, while per-tool attribution is an estimate.
+
+The public documentation was used only to confirm the standard input/cached-input/output accounting taxonomy; local JSONLs supplied the actual measurements. [OpenAI model documentation](https://developers.openai.com/api/docs/models/codex-mini-latest)
+
+## Discovery cost per result
+
+| Result type | All results | Mean direct payload | Metered results | Mean next-generation input | Mean output / reasoning |
+|---|---:|---:|---:|---:|---:|
+| File span | 8,178 | 660 | 5,381 | 42,541 | 127 / 46 |
+| Source search | 3,215 | 417 | 2,279 | 39,824 | 118 / 41 |
+| Truncation recovery | 651 | 751 | 335 | 43,475 | 150 / 55 |
+| Owner locator | 177 | 566 | 123 | 41,411 | 151 / 55 |
+
+A typical 400–750-token result therefore caused roughly 40K–43K input tokens in the following generation because the rest of the conversation and source context was resent.
+
+## Before and after owner resolution
+
+These figures cover turns with an explicit `locate_task` or Repo Atlas task call. Operation totals can exceed result-cell totals because calls were sometimes batched.
+
+| Phase | Result cells | Principal operations | Direct result tokens | Allocated continuation input |
+|---|---:|---|---:|---:|
+| Before first locator | 1,427 | 1,332 reads; 229 searches; 254 recoveries | 1.027M | 45.45M |
+| Locator phase | 234 | 178 explicit locators plus 56 async continuations | 124.9K | 5.15M |
+| After owner resolution | 6,387 | 4,697 reads; 2,111 searches; 257 recoveries | 4.289M | 163.91M |
+
+The post-owner number is not all waste. Parsed post-owner reads included:
+
+- 3,570 implementation/caller reads: 2.545M direct tokens.
+- 189 test/fixture reads: 135.6K.
+- 68 contract/generated reads: 48.4K.
+- 546 ownership/instruction reads: 323.9K.
+- 32 documentation/ledger reads: 21.9K.
+
+Caller, test, and contract evidence is generally necessary. The avoidable component is repeatedly obtaining and interpreting those files one small result at a time.
+
+## Top 10 source-discovery token wastes
+
+These opportunities overlap and must not be added together.
+
+| Rank | Waste | Evidence and estimated cost | Highest-value reduction |
+|---:|---|---|---|
+| 1 | Serial file-reading generations | 3,048 metered read→read transitions consumed 157.22M input, 460.8K output, including 166.8K reasoning | Return the owner, callers, tests, and contract spans as one planned bundle |
+| 2 | Continuing serial discovery after owner resolution | 3,156 metered post-owner result cells consumed 163.91M input; the full phase returned 4.289M direct tokens | Treat owner resolution as a phase boundary and create one bounded evidence plan |
+| 3 | Overlapping and duplicated source delivery | 4,988 reads overlapped a previously read range, carrying 3.493M direct tokens—an upper bound. The definite subset was 232 exact span repeats plus 270 exact search repeats, carrying 227.5K direct tokens and up to about 25.4M continuation input | Cache spans and queries by repository state; subtract already-seen intervals |
+| 4 | Manual discovery before invoking the owner locator | 45.45M allocated input across 1,427 pre-locator result cells | After required instruction discovery, invoke the locator before manual source searches |
+| 5 | Broad repository searches | At least 714 broad searches in the active subset alone, returning at least 278K direct tokens; about 37.2M continuation input at the observed mean | Require owner/path/symbol scope before repository-wide search |
+| 6 | Search→search loops | 760 metered transitions consumed 37.65M input and 108.9K output | Batch independent queries and return deduplicated hits together |
+| 7 | Search→read handoffs | 709 transitions consumed 37.59M input and 112.4K output | Let search results optionally return the relevant bounded spans |
+| 8 | Read→search backtracking | 672 transitions consumed 35.50M input and 104.6K output | Have the locator or call-graph inspection identify callers and tests before reads begin |
+| 9 | Truncation-recovery loops | 651 `read_tool_output` calls returned 489K direct tokens; 366 were themselves truncated. The 335 metered recoveries consumed 14.56M input. Projecting their observed rate over all recoveries gives roughly 28.3M input | Return structured sections with stable cursors and request only missing sections |
+| 10 | Ownership and locator rediscovery | 339 post-owner reads repeated an already-read ownership/instruction path, returning 213.7K tokens. There were 178 explicit locator calls across 110 locator turns, with 68 calls after the first and six literal duplicates. Locator→locator transitions alone consumed 1.84M metered input | Pin one durable owner receipt in turn state and reuse it |
+
+## Necessary discovery versus repetition
+
+Necessary architecture work included:
+
+- The first locator for a task.
+- The first applicable `AGENTS.md`, `SOURCEMAP.md`, `do-not-code.md`, or skill instruction read.
+- First reads of the owning implementation, important callers, focused tests, and affected contracts.
+- Adaptive follow-up where a result genuinely changed the next question.
+
+The strongest definite repetition signals were:
+
+- 232 exact same-span rereads within a task and without an intervening patch epoch.
+- 270 exact repeated source queries.
+- 339 repeated ownership/instruction paths after owner resolution.
+- Six literal-equivalent locator repeats.
+- 103 metered recovery→recovery transitions, consuming 5.13M input.
+- 366 recovery outputs that truncated again.
+
+The 4,988 overlapping reads are only an upper bound: adjacent function context, deliberate verification, and reads following source changes may be legitimate. Cross-task repeats were also excluded from the waste ranking because separate tasks cannot necessarily share model context safely.
+
+## Bottom line
+
+The best target is the 9,764 observed discovery-to-discovery continuations. In the telemetry-covered subset alone, 5,939 such transitions account for an estimated 301.64M input tokens and 898.1K output tokens, including 322.0K reasoning tokens.
+
+The most effective design change would be a reusable “owner plus scoped evidence bundle” containing:
+
+1. Owner and governing instructions.
+2. Relevant implementation spans.
+3. Callers and dependents.
+4. Focused tests.
+5. Contract/generated-output implications.
+
+That, combined with per-repository query/span caching and cursor-based truncation recovery, removes entire tool/model cycles rather than merely making each cycle marginally shorter.
+
+No KD4 files were changed, rebuilt, generated, or published.
+
+FACT / HYPOTHESIS / UNKNOWN BOUNDARY
+- Direct artifact facts: the source paths, UUID, metadata, user messages, lifecycle events, and agent report text above are present in the inspected Codex session records.
+- Reported repository facts: symptoms, causes, affected files/symbols, fixes, commands, and validation results are preserved as claims made by the reporting agent. Treat exact evidence and qualifications inside the report as controlling.
+- Hypotheses: no new implementation cause or language was inferred during corpus extraction. Any hypothesis in the report remains a hypothesis unless the report states and evidences that it was established.
+- Unknowns: anything the preserved report omits—including environment details, reproduction steps, exact cause, validation scope, or residual risk—remains unknown and must be checked against the repository and Git history before relying on it for a new fix.
+
+====================================================================================================
+STABLE EVIDENCE ID: CODEX-SESSION-019ff85b-74fc-7a63-a2af-4c4052f9c0b3
+DATE: 2026-08-12
+LANGUAGE CLASSIFICATION: Rust
+STATUS: Reported conclusion available
+CONFIDENCE: This record faithfully preserves the session artifact. Repository-level conclusions retain the confidence and qualifications stated by the reporting agent and were not independently re-proven during this extraction.
+
+SOURCE SESSION ARTIFACTS
+- C:\Users\kuh\.codex\sessions\2026\08\12\rollout-2026-08-12T18-42-51-019ff85b-74fc-7a63-a2af-4c4052f9c0b3.jsonl.zst
+Source session UUID: 019ff85b-74fc-7a63-a2af-4c4052f9c0b3
+Session timestamp(s): 8/12/2026 11:42:51 PM
+Working directory/project: c:\Users\kuh\Desktop\kd4
+Recorded Git revision(s): 39d8ab6464d7561426cc3c671e4098a37c129ad8
+Recorded Git branch(es): main
+Recorded lifecycle outcomes: task_complete, turn_aborted
+
+DIRECTLY STATED USER REQUEST / OBSERVED SYMPTOM
+--- User message 1 ---
+# KD4 Long-Task Token Amplification Audit
+
+Determine why token consumption accelerates during long KD4 tasks.
+
+Repository:
+C:\Users\kuh\Desktop\kd4
+
+CODEX_HOME:
+C:\Users\kuh\Desktop\LOCAL-KD
+
+Effective context target:
+80K tokens
+
+Read-only audit.
+
+Do not modify or rebuild KD4.
+
+Select long historical tasks and divide them into early, middle, and late phases.
+
+Measure:
+
+- model requests per phase;
+- input tokens/request;
+- cached input where recorded;
+- reasoning tokens;
+- visible output tokens;
+- tool outputs;
+- repeated source material;
+- validation material;
+- completion-review material;
+- compactions;
+- context occupancy.
+
+Look for multiplicative behavior such as:
+
+more history
+→ larger request
+→ more generations
+→ more tool output
+→ larger history
+→ earlier compaction
+→ rediscovery
+→ still more generations.
+
+Identify mechanisms producing **token amplification**, not merely fixed prompt cost.
+
+## Rank
+
+Give me the top 10 mechanisms causing token consumption to grow with task duration.
+
+For each include:
+
+- source owner;
+- early versus late evidence;
+- growth pattern;
+- cumulative token impact;
+- smallest bounded-state/reuse fix.
+
+Prioritize anything capable of saving tens of thousands of cumulative tokens on long tasks.
+
+No files should be changed.
+
+--- User message 2 ---
+
+# Files mentioned by the user:
+
+## # Finish KD4 Long-Task Token Amplification Control Repository: C:\Users\kuh\Des…: C:\Users\kuh\.codex/attachments/bd989fce-61a0-453c-833d-d8bd1cb85f5b/pasted-text.txt
+
+The attached pasted text file(s) contain the user's request. Read and act on that content.
+
+## My request:
+
+
+--- User message 3 ---
+I agree with the plan overall. The sequencing is good: canonical checkpointing and projection correctness first, then activate the 72K/80K envelope only after the estimator is trustworthy.
+
+I would make seven material corrections before implementation.
+
+1. Do not replace the entire compacted conversation with only initial context + checkpoint
+
+This line is too broad:
+
+“replace active history with fresh initial context plus exactly one latest checkpoint.”
+
+A KD4 checkpoint should replace previous KD4 checkpoint/task-state material, not protocol-required or current conversational state.
+
+Use:
+
+Correction: canonical checkpointing modifies only the KD4 task-state/checkpoint portion of compaction.
+
+After compaction, preserve every item required by the existing compaction/provider contract, including as applicable:
+
+- current/recent user messages retained by existing policy;
+- system/developer/initial context;
+- provider-required response/reasoning items;
+- current turn state;
+- other items that the existing compaction implementation intentionally retains.
+
+Guarantee only:
+
+exactly one active KD4 task_checkpoint_v1
+
+rather than:
+
+entire active history = initial context + checkpoint.
+
+Do not change remote opaque-compaction semantics or user-message-retention semantics in this patch.
+
+That keeps this a checkpoint cleanup rather than an accidental compaction rewrite.
+
+2. Do not semantically rebuild requirements from already-projected prompt text
+
+This is the main checkpoint correctness concern.
+
+The plan says checkpoint facts come from:
+
+TaskEvidence snapshot + already-projected prompt state.
+
+That is fine for structured state already present there, but not for re-interpreting/summarizing user requirements from arbitrary projected history.
+
+Correction: task_checkpoint_v1 must be assembled deterministically from authoritative structured state.
+
+Requirements/prohibitions should come from the existing accepted task/contract representation where available.
+
+Do not:
+- infer new requirements from raw historical prose;
+- semantically summarize user instructions;
+- reinterpret tool output;
+- inspect hidden reasoning.
+
+If a current user instruction has not yet been canonicalized into structured task state, preserve that current user message through the existing conversation-retention path rather than pretending the checkpoint replaced it.
+
+Every checkpoint field should have a deterministic source/provenance class.
+
+Conflicting or unresolved requirements remain explicit; never silently reconcile them.
+
+That preserves the distinction between canonical state and a new summarizer.
+
+3. Do not confuse the 80K operating budget with the model's actual capability window
+
+This is important:
+
+“set the repository-local context window to 80K”
+
+If that field means the model's advertised/actual context capacity, don't falsify it just to impose a KD4 working budget.
+
+Correction: preserve the provider/model's actual context-window metadata.
+
+Implement:
+
+soft KD4 working-set budget = 72K
+hard KD4 operating budget = 80K
+
+through the existing effective-budget/auto-compaction controls.
+
+Only set a field named context_window to 80K if source inspection proves that field is specifically KD4's effective working envelope and does not alter:
+
+- provider capability metadata;
+- output-token allowance;
+- model selection;
+- request compatibility;
+- unrelated context-limit behavior.
+
+Otherwise add/use the narrowest existing internal budget field instead.
+
+The objective is an 80K KD4 operating envelope, not pretending the model itself has only an 80K context window.
+4. The occupancy gate must account for provider-managed retained state
+
+This is the most important integration issue with incremental tool-history projection.
+
+A local prepared history of 65K does not necessarily mean the model has only 65K active context when previous_response_id or another provider-managed continuation retains earlier raw state.
+
+Correction: the final estimator must distinguish:
+
+1. local prepared/projected occupancy;
+2. effective provider-context occupancy.
+
+For stateless/manual-history requests:
+→ prepared history can be authoritative.
+
+For provider-managed continuation:
+→ account for retained provider state using the existing server-accounted baseline + known request deltas/rebase state.
+
+Do not subtract locally retired history from effective provider occupancy unless a provider-supported compaction/rebase boundary actually removed or replaced that state.
+
+The 72K trigger and 80K operating gate must use the best trustworthy effective-provider estimate.
+
+If effective occupancy cannot be reconstructed:
+- mark measurement incomplete;
+- do not falsely report the request as below 80K;
+- use the existing compaction/rebase path where available;
+- report budget_unverifiable if it remains unknown.
+
+Keep local projected occupancy as a separate measurement.
+
+Otherwise the feature could report a beautifully bounded 60K local history while Sol is still logically carrying much more.
+
+5. Prevent a 73K unavoidable floor from compacting on every request
+
+The current one-compaction-per-dispatch guard isn't enough.
+
+Suppose mandatory state compacts to 74K. Request 1 tries compaction and allows unavoidable_soft_floor. Request 2 could immediately try another useless compaction against unchanged state.
+
+Add:
+
+Correction: persist a bounded soft-floor receipt for the current context identity.
+
+After compaction results in:
+
+72K <= occupancy < 80K
+and
+the excess is proven mandatory/unavoidable,
+
+record an identity containing the relevant:
+
+- checkpoint generation/hash;
+- mandatory-context identity;
+- tool/capability schema identity;
+- collaboration/instruction identity;
+- provider-state/rebase identity.
+
+While that identity remains unchanged:
+
+do not attempt another compaction merely because occupancy is still above 72K.
+
+Retry compaction only when:
+- new removable history accumulated;
+- mandatory/context composition changed;
+- checkpoint state changed;
+- capability/schema surface changed;
+- provider state was rebased.
+
+This prevents soft-floor compaction loops.
+6. Continuity dedup must hash canonical semantic state in core, not trust the hook
+
+The continuity idea is good, but the replacement rule is only safe if each capsule is a complete replaceable snapshot, not a delta.
+
+Correction: kd4_continuity_capsule_v1 must be a canonical full current-state capsule for the fields it owns.
+
+Core must parse and recompute the semantic identity from canonicalized fields.
+
+Do not trust a hook-supplied semantic_hash as authoritative.
+
+Excluded transport fields may include:
+- timestamps;
+- transcript path;
+- event timestamp;
+- temporary transport metadata.
+
+But any field that can alter recovery/model behavior must participate in the semantic identity.
+
+Within one checkpoint generation:
+
+same semantic identity
+→ drop duplicate
+
+different semantic identity
+→ replace older active capsule only because the capsule is a full state snapshot
+
+Malformed/incomplete newer capsule
+→ retain the last valid active capsule and report the new one as invalid
+
+Do not let a broken hook erase known-good continuity state.
+
+That also gives you safe slow/fast hook parity.
+
+7. Do not put the nonpersistent unique-token digest set inside TaskEvidence
+
+This line should change:
+
+“Attach a nonpersistent, root-shared bounded digest set to the existing TaskEvidence ledger.”
+
+If it's nonpersistent telemetry state, it shouldn't conceptually live in the durable evidence ledger.
+
+Correction: keep unique-model-visible-unit tracking in root-task runtime/telemetry state, not TaskEvidence persistence.
+
+It may be keyed by the existing root task/evidence identity, but must not:
+
+- mutate TaskEvidence;
+- change evidence revisions;
+- affect completion freshness;
+- survive restart as authoritative evidence.
+
+Use canonical unit identities only for measurement.
+
+The 16,384-entry cap remains bounded.
+
+If saturated:
+→ stop producing replay-amplification value;
+→ record saturation/null reason.
+
+For replay amplification, numerator and denominator must cover the same measured request window.
+
+Do not divide:
+all provider input for the root
+by
+unique material measured only for a subset of requests.
+
+If measurement coverage differs, report the ratio unavailable.
+
+I would also label the three savings terms as an algebraic attribution, not causal proof:
+
+request-count term
++ working-set term
++ interaction term
+= observed before/after input difference
+
+Do not call any individual term independently causal.
+
+The formulas themselves are fine.
+
+Everything else I would keep
+
+--- User message 4 ---
+PLEASE IMPLEMENT THIS PLAN:
+# KD4 Long-Task Token Amplification Control
+
+## Summary
+
+Implement the remaining controls in this order:
+
+1. authoritative canonical checkpointing;
+2. continuity validation and deduplication;
+3. separate local/provider occupancy accounting;
+4. soft-floor loop prevention;
+5. root-task amplification telemetry;
+6. activation of the 72K soft budget and 80K hard operating budget.
+
+Preserve the model’s actual context-window metadata, existing compaction/provider contracts, user-message retention, completed projection work, and unrelated dirty changes.
+
+## Canonical Checkpoint and Continuity
+
+- Introduce deterministic `task_checkpoint_v1` with stable slots for requirements, prohibitions, unresolved conflicts, decisions, owners, relevant files/contracts, implementation state, proof IDs, blockers, risks, immediate action, and durable artifact references.
+- Give every slot a provenance class:
+  - requirements/prohibitions: accepted structured task contract;
+  - decisions/current action: active structured plan/task state;
+  - owners/surfaces: collaboration and TaskEvidence records;
+  - implementation/proofs: current implementation identity and receipts;
+  - blockers/risks: explicit structured records;
+  - artifacts: existing durable IDs only.
+- Never infer requirements from historical prose, semantically summarize instructions, reinterpret tool output, inspect hidden reasoning, or silently reconcile conflicts.
+- If a current instruction has not been canonicalized, retain its verbatim user message through the existing conversation-retention path. Do not pretend the checkpoint supersedes it.
+- Bound ordinary checkpoints to 8K tokens by replacing optional duplicate descriptions with stable IDs/hashes/references. Exact mandatory contract material is never truncated; exceeding 8K sets `mandatory_context_floor_exceeded`.
+- Modify only the KD4 task-state/checkpoint segment of token-budget compaction. Preserve all items selected by the existing compaction/provider contract, including applicable user messages, initial context, current turn state, reasoning/response items, and provider-required compaction items.
+- Guarantee exactly one active `task_checkpoint_v1`; do not redefine the entire active history as initial context plus checkpoint. Prior checkpoints remain in durable rollout history.
+- Do not change local/remote user-message-retention rules or remote opaque-compaction semantics.
+- Retain only projected artifact/proof references in the checkpoint. Raw source, search, tool, validation, completed-call, superseded-plan, and artifact payloads remain excluded; exact artifact retrieval continues through the existing retrieval tool.
+- Define `kd4_continuity_capsule_v1` as a complete current-state snapshot for the continuity fields it owns, never a delta.
+- Core parses, validates, canonicalizes, and hashes the capsule. Hook-provided hashes are not authoritative.
+- Exclude only transport-neutral fields such as timestamps, transcript paths, event times, and temporary delivery metadata. Every field affecting recovery/model behavior participates in the core-computed identity.
+- Within one checkpoint generation:
+  - identical semantic identity: drop the duplicate;
+  - changed valid identity: replace the older active capsule;
+  - malformed/incomplete capsule: retain the last valid capsule and emit a privacy-safe invalid-capsule diagnostic.
+- Keep durable hook records unchanged and require slow/fast hook outputs to canonicalize to identical state.
+
+## Effective Occupancy and Budget Control
+
+- Preserve provider/model context capability metadata. Do not set `model_context_window` to 80K.
+- Configure the existing total-scope auto-compaction limit to 72K only after estimator and compaction tests pass.
+- Add a narrow feature-gated KD4 hard operating limit of 80K without changing provider capability, model selection, output allowance, or unrelated context behavior.
+- Produce two explicit estimates before dispatch:
+  - `local_projected_occupancy`: final prepared history, base instructions, projected tool state, continuity, and selected schemas;
+  - `effective_provider_occupancy`: the best trustworthy estimate of the context the provider will actually carry.
+- For full/stateless requests, local projected occupancy is authoritative.
+- For `previous_response_id` or equivalent provider-managed continuation, derive effective occupancy from the existing server-accounted last-request baseline plus known request deltas. Track the baseline generation and rebase identity.
+- Never subtract locally retired history from effective provider occupancy until incremental reuse has been invalidated or a provider-supported compaction/rebase boundary has actually replaced that state.
+- If the provider baseline is missing, stale, or incompatible:
+  - mark the estimate incomplete;
+  - do not report the request below 80K;
+  - invoke the existing compaction/rebase path once;
+  - recompute after incremental-history invalidation;
+  - return `budget_unverifiable` without dispatch if authoritative occupancy still cannot be established.
+- At 72K effective occupancy, compact once before provider dispatch and rebuild the prompt/provider baseline.
+- At or above 80K after compaction/rebase, refuse dispatch with a numeric `mandatory_context_floor_exceeded` or `budget_unverifiable` error. Never drop mandatory requirements to fit.
+- If post-compaction occupancy remains between 72K and 80K and all excess is proven mandatory, record a session-runtime `SoftFloorReceipt`.
+- The receipt identity includes checkpoint generation/hash, mandatory-context identity, instruction/collaboration identity, capability/schema identity, provider baseline/rebase identity, and removable-history generation.
+- While that identity is unchanged, skip further soft-trigger compactions. Invalidate the receipt only when removable history accumulates, mandatory/checkpoint state changes, instruction or schema surfaces change, or provider state rebases.
+- Preserve cache prefixes and invalidate incremental history only for actual checkpoint, continuity, request-property, or provider-rebase changes.
+
+## Telemetry and Analysis Contract
+
+- Keep amplification accounting in a root-shared runtime telemetry object, separate from TaskEvidence. It must not mutate evidence, advance evidence revisions, affect completion freshness, or become authoritative after restart.
+- Propagate the runtime object and root-task ID to child sessions through existing session/agent runtime wiring.
+- Track canonical model-visible units with a bounded 16,384-entry digest set. Store identities only, never payload text or artifact contents.
+- Saturation disables replay-amplification calculation and records a null reason; it must not evict entries and resume with double counting.
+- Tag every covered logical request and physical provider attempt with one measurement-window ID.
+- Replay amplification is available only when exact provider input and unique-new measurement cover the same complete request window. Any missing request, attempt usage, or saturated unit set makes the ratio null.
+- Count retry input in the numerator when the corresponding logical request is fully covered; count its model-visible material once in the denominator.
+- Extend existing telemetry with numeric fields for root task, request/window identity, local and effective occupancy, estimate basis/completeness, checkpoint tokens, receipt tokens, raw output tokens, completed-call tokens, schema tokens, continuity tokens, unique-new tokens, soft-floor status, and compactions.
+- Keep exact provider input/cached-input usage as authoritative consumption data. Do not emit prompts, paths, capsule bodies, user-text hashes, or artifact contents.
+- Report request count, cumulative/cached input, average and percentile request size, peak local/effective occupancy, category totals, compactions, replay amplification/null reason, and observational continuation replay exposure.
+- Label savings strictly as algebraic attribution:
+  - request-count term = `(N_before - N_after) × mean_after`;
+  - working-set term = `N_after × (mean_before - mean_after)`;
+  - interaction term = `(N_before - N_after) × (mean_before - mean_after)`;
+  - their sum equals the observed before/after input difference.
+- Do not describe any individual attribution term as independently causal.
+- Keep app-server/public protocol schemas unchanged; update only internal telemetry and analysis-report contracts.
+
+## Validation and Acceptance
+
+- Test that compaction changes only the KD4 task-state segment, preserves existing protocol/user/current-turn items, and leaves exactly one active checkpoint.
+- Test authoritative provenance, unresolved conflicts, uncategorized current-user retention, deterministic output, the ordinary 8K ceiling, and explicit mandatory-floor overflow.
+- Test repeated compactions: one active checkpoint, durable older replacements, stable unchanged content, and no raw operational or hidden-reasoning material.
+- Test continuity duplicate/update behavior, malformed-newer preservation, timestamp neutrality, full-snapshot validation, core hash recomputation, and slow/fast hook parity.
+- Test local versus provider-effective occupancy with:
+  - stateless full requests;
+  - trustworthy continuation baselines;
+  - local 60K/provider-effective over-80K cases;
+  - stale or missing baselines;
+  - successful rebase;
+  - persistent `budget_unverifiable`.
+- Test a 72–80K unavoidable floor across multiple requests: one compaction for an unchanged identity, then renewed compaction only after each defined invalidator.
+- Test the 80K fixture for retained requirements, one-dispatch compaction bounds, no provider call at/above the hard limit, and stable cache behavior.
+- Test artifact-reference survival and exact retrieval without active-prompt rehydration.
+- Test telemetry coverage matching, retry accounting, root/child grouping, digest saturation, privacy, percentile aggregation, null semantics, and algebraic attribution.
+- Run focused PowerShell parsing, Python unit tests, targeted core/OTEL `cargo nextest` filters, and the KD4 feature/config check. Do not rebuild the full workspace, publish, restart Desktop, or modify `CODEX_HOME`.
+- Use the supplied historical baseline and deterministic legacy-versus-canonical fixtures as observational comparisons, not causal proof.
+- The implementation report will provide exactly: files changed; checkpoint schema/provenance; compaction preservation rules; continuity validation/identity; local versus provider occupancy logic; budget and soft-floor rules; telemetry fields/formulas; focused test results; before/after measurements; and remaining amplification risks/limitations.
+
+--- User message 5 ---
+continue
+
+--- User message 6 ---
+
+# Files mentioned by the user:
+
+## # KD4 Long-Task Token Amplification Control ## Summary Implement the remaining …: C:\Users\kuh\.codex/attachments/ed7caa77-4ef1-4439-bd96-ef03d6abf2cd/pasted-text.txt
+
+## My request:
+read fully, finish implementing this, you crashed and lost your place.,
+
+
+REPORTED AUDIT / DIAGNOSIS / FIX CONCLUSION
+--- Unique final report 1; SHA-256 395BB20308B7AA02D5067CF07A1BC97671B5B799DF39563A24D9FD7E55D397B3 ---
+# Audit result
+
+Token acceleration is primarily **request count × retained-context replay**, not visible output or fresh source reading.
+
+Across four long KD4 tasks:
+
+- 4,289 top-level model-request proxies
+- 159.64M input tokens
+- 155.29M cached input tokens — **97.27%**
+- 470K output tokens, including 171K reasoning tokens
+- About 2.17M tokens of newly returned tool output
+- 50 compactions
+
+Late-phase input/request increased from **35.1K to 39.8K (+13.4%)**, even while new tool output fell 14% and visible assistant prose fell 52%. Prefix caching reduces recomputation/cost, but it does not reduce logical context occupancy or cumulative input-token accounting.
+
+No files were changed or rebuilt.
+
+## Historical tasks sampled
+
+“Requests” below are persisted reasoning-response items, the best durable generation proxy. Exact old request spans were pruned by the 1,000-row/10MB per-thread log retention policy in [logs.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/state/src/runtime/logs.rs:401).
+
+| Task | Request proxy | Input | Cached | Avg input/request | Output / reasoning | Compactions |
+|---|---:|---:|---:|---:|---:|---:|
+| [Fix validated A](/C:/Users/kuh/Desktop/LOCAL-KD/sessions/2026/08/12/rollout-2026-08-12T06-48-55-019ff5cd-c263-7442-a3f3-c2a29221d34b.jsonl) | 1,321 | 64.16M | 97.3% | 48.6K | 183K / 57K | 17 |
+| [Orchestration latency](/C:/Users/kuh/Desktop/LOCAL-KD/sessions/2026/08/12/rollout-2026-08-12T14-43-39-019ff780-5ecf-74e0-8090-b8aa9fd67d5c.jsonl) | 1,820 | 48.31M | 97.5% | 26.5K | 138K / 69K | 20 |
+| [Fix validated B](/C:/Users/kuh/Desktop/LOCAL-KD/sessions/2026/08/12/rollout-2026-08-12T06-51-04-019ff5cf-cc41-7773-a247-d7cdf08e80bb.jsonl) | 675 | 27.08M | 97.6% | 40.1K | 78K / 23K | 7 |
+| [Long-tail latency](/C:/Users/kuh/Desktop/LOCAL-KD/sessions/2026/08/12/rollout-2026-08-12T00-05-22-019ff45c-50a9-7d00-a909-f4371692d208.jsonl) | 473 | 20.08M | 96.4% | 42.5K | 71K / 22K | 6 |
+
+The orchestration task showed the clearest acceleration: approximately **21.9K → 31.9K input/request (+45%)** from early to late.
+
+## Early/middle/late measurements
+
+Phase input and cached values are calibrated reconstructions against exact task totals. Output-material measurements use the repository’s model-visible token estimator.
+
+| Measurement | Early | Middle | Late |
+|---|---:|---:|---:|
+| Request proxy | 1,431 | 1,430 | 1,428 |
+| Input tokens | 50.26M | 52.53M | 56.85M |
+| Input/request | 35.1K | 36.7K | **39.8K** |
+| Cached input | 97.27% | 97.27% | 97.29% |
+| Reasoning tokens | 56.7K | 52.3K | 61.9K |
+| Visible prose | 11.4K | 10.7K | 5.5K |
+| New tool output | 769.8K | 737.2K | 660.8K |
+| New source output | 115.9K | 49.3K | 14.6K |
+| Exact repeated source lines | 4.1K | 1.9K | 1.7K |
+| Validation output | 6.5K | 10.7K | 10.3K |
+| Completion-review receipts | 0 | 2 | 0 |
+| Compactions | 19 | 17 | 14 |
+
+Exact retained occupancy checkpoints reached **104.45K tokens** late in the orchestration task. Other late final checkpoints were 38.7K, 53.4K, and 54.2K.
+
+The active historical configuration is actually **120K**, not the requested effective target of 80K: [config.toml](/C:/Users/kuh/Desktop/LOCAL-KD/config.toml:9). Thus one observed request exceeded the intended target by 24.45K.
+
+## Top 10 amplification mechanisms
+
+The impacts overlap and should not be added together.
+
+1. **Full-history replay on every generation**
+
+   Owner: [history.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/context_manager/history.rs:191), [turn.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/turn.rs:366).
+
+   Early versus late: 35.1K → 39.8K/request while new output decreased. `prepare_history` reconstructs essentially all retained model-visible history for every sample.
+
+   Impact: this is the substrate behind the full **159.64M input tokens**.
+
+   Smallest fix: enforce an 80K bounded live working set containing stable checkpoint slots plus only the unresolved tail; keep older material addressable by artifact ID.
+
+2. **Completed tool outputs remain in every subsequent prompt**
+
+   Owner: [history.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/context_manager/history.rs:478), [context.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/context.rs:577).
+
+   Early versus late: generic tool-output replay grew **16.77M → 23.09M**, even though newly generated tool output declined.
+
+   Impact: **66.31M input tokens, 41.5%** of selected input, are attributable to replayed tool outputs. Existing projection bounds individual results but does not retire old projections.
+
+   Smallest fix: after one consuming generation, replace a completed output with a bounded digest, artifact ID, and narrow reread command.
+
+3. **Every tool result induces another large-context generation**
+
+   Owner: [turn.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/turn.rs:431), particularly the unconditional tool-result continuation at [turn.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/turn.rs:3705).
+
+   Growth: a larger prompt makes each extra tool/reasoning step more expensive; that step then adds another call/output pair to all later prompts.
+
+   Impact: eliminating only 25% of 4,289 generations at the observed average would avoid roughly **40M input tokens**.
+
+   Smallest fix: batch independent tool calls and install a hard no-progress circuit breaker after a small number of generations without new evidence, mutation, or validation progress.
+
+4. **Compaction creates a large replacement baseline and then replays it**
+
+   Owner: [compact.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/compact.rs:234), [compact.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/compact.rs:336).
+
+   Evidence: 50 compactions; late replacement histories started at approximately **15.4K–19.4K tokens**, already 19–24% of an 80K target. Initial context, user history, and summary are injected separately.
+
+   Impact: replacement baselines contributed about **34.90M replayed input tokens, 21.9%**. Compaction itself also requires a full-history generation.
+
+   Smallest fix: one deterministic, deduplicated capsule capped at about 8K total, with stable slots for objective, decisions, evidence, open work, and validation.
+
+5. **Large static instructions and tool schemas multiply by generation count**
+
+   Owner: schema assembly in [client.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/client.rs:1415).
+
+   Early versus late: prefix replay stayed near 8.6M per phase. Session metadata contained roughly 7.9K characters of instructions plus 27.7K characters of tool definitions.
+
+   Impact: approximately **25.88M input tokens, 16.2%**.
+
+   Smallest fix: expose only phase-relevant tools and use deferred schema loading. Serialization caches and incremental transport improve CPU/network behavior but not logical token usage.
+
+6. **Agent fan-out duplicates long reasoning loops**
+
+   Owner: [multi_agents_spec.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/multi_agents_spec.rs:690), [spawn.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs:830).
+
+   Evidence: the orchestration task spawned eight child sessions totaling 464 additional generation proxies. Five children with retained counters consumed **19.17M input tokens**; three more lacked final counters. Known late child consumption was 13.1M versus 6.1M early.
+
+   Impact: at least **+39.7% input** above the parent’s 48.31M. This is a lower bound.
+
+   Smallest fix: budget total child input per root task, hash assignments, reuse sealed receipts for identical work, and allow only one retry for a stable assignment.
+
+7. **Completed tool-call arguments are replayed alongside outputs**
+
+   Owner: [history.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/context_manager/history.rs:655).
+
+   Early versus late: call-argument replay increased **5.75M → 6.75M**.
+
+   Impact: **18.31M input tokens, 11.5%**. Output truncation alone cannot remove this component.
+
+   Smallest fix: once a call is resolved, replace its full arguments with a short immutable receipt containing tool name, argument hash, artifact ID, and result status.
+
+8. **Reasoning history accumulates inside long user turns**
+
+   Owner: reasoning retention at [history.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/context_manager/history.rs:938).
+
+   Early versus late: replayed reasoning rose **2.78M → 4.01M (+44%)**. Only 171K reasoning tokens were generated directly, but they were re-exposed repeatedly.
+
+   Impact: about **9.56M replayed input tokens**.
+
+   Smallest fix: after the associated tool result is settled, replace old reasoning items with a bounded decision/evidence memo.
+
+9. **Continuity capsules are appended repeatedly**
+
+   Owner: [.codex/hooks.json](/C:/Users/kuh/Desktop/kd4/.codex/hooks.json:3), [task-continuity.ps1](/C:/Users/kuh/Desktop/kd4/.codex/hooks/task-continuity.ps1:249).
+
+   Evidence: the orchestration rollout received eight continuity/start capsules, including four near-identical capsules within seconds.
+
+   Impact: approximately **507K replayed input tokens** across the four samples.
+
+   Smallest fix: key capsules by `(thread, compaction-window, capsule-hash)` and replace the prior contextual fragment rather than append another copy.
+
+10. **The configured compaction ceiling exceeds the effective target**
+
+   Owner: [config.toml](/C:/Users/kuh/Desktop/LOCAL-KD/config.toml:9), compaction trigger in [turn.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/turn.rs:485).
+
+   Evidence: configured 120K versus requested 80K; one retained late request reached 104.45K.
+
+   Growth: this permits large late prompts to feed every extra tool/reasoning generation before compaction intervenes.
+
+   Impact: at least 24.45K excess on one observed request; cumulative impact cannot be separated from full-history replay using retained logs.
+
+   Smallest fix: set a soft trigger near 72K and a hard 80K total-context ceiling, paired with the smaller compaction baseline above.
+
+## Measured but not leading causes
+
+- **Source rediscovery:** not confirmed as a major accelerator. New source output fell 115.9K → 14.6K and exact repeated lines fell 4.1K → 1.7K. Replayed old source output still contributed 6.69M tokens, already included under tool-output retention.
+- **Validation:** 27.5K newly returned validation tokens and approximately 77.7K replayed tokens—material, but far below the dominant mechanisms.
+- **Completion review:** only two receipts appeared, both in the middle of one task: a failed reviewer spawn and a partial terminal closure. It was not a top-ten observed contributor. The current owner is [completion_review_v2.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tasks/completion_review_v2.rs:2657).
+
+The observed amplification loop is therefore:
+
+`retained context → full replay → another tool/reasoning generation → retained call/output → larger replay → compaction with a sizable baseline → resumed generations`
+
+The “compaction causes broad source rediscovery” leg was not supported by these traces; the dominant post-compaction cost was continued replay of compacted state and accumulated tool material.
+
+FACT / HYPOTHESIS / UNKNOWN BOUNDARY
+- Direct artifact facts: the source paths, UUID, metadata, user messages, lifecycle events, and agent report text above are present in the inspected Codex session records.
+- Reported repository facts: symptoms, causes, affected files/symbols, fixes, commands, and validation results are preserved as claims made by the reporting agent. Treat exact evidence and qualifications inside the report as controlling.
+- Hypotheses: no new implementation cause or language was inferred during corpus extraction. Any hypothesis in the report remains a hypothesis unless the report states and evidences that it was established.
+- Unknowns: anything the preserved report omits—including environment details, reproduction steps, exact cause, validation scope, or residual risk—remains unknown and must be checked against the repository and Git history before relying on it for a new fix.
+
+====================================================================================================
+STABLE EVIDENCE ID: CODEX-SESSION-019ff93e-92ec-76c2-908a-a24b0ab11d55
+DATE: 2026-08-12
+LANGUAGE CLASSIFICATION: Rust
+STATUS: Reported conclusion available
+CONFIDENCE: This record faithfully preserves the session artifact. Repository-level conclusions retain the confidence and qualifications stated by the reporting agent and were not independently re-proven during this extraction.
+
+SOURCE SESSION ARTIFACTS
+- C:\Users\kuh\.codex\sessions\2026\08\12\rollout-2026-08-12T22-50-55-019ff93e-92ec-76c2-908a-a24b0ab11d55.jsonl.zst
+Source session UUID: 019ff93e-92ec-76c2-908a-a24b0ab11d55
+Session timestamp(s): 8/13/2026 3:50:55 AM
+Working directory/project: c:\Users\kuh\Desktop\kd4
+Recorded Git revision(s): 39d8ab6464d7561426cc3c671e4098a37c129ad8
+Recorded Git branch(es): main
+Recorded lifecycle outcomes: task_complete
+
+DIRECTLY STATED USER REQUEST / OBSERVED SYMPTOM
+--- User message 1 ---
+
+# Files mentioned by the user:
+
+## # Fix KD4 Terminalization and Completion-Gate Failure **Final status:** APPROVE…: C:\Users\kuh\.codex/attachments/389c9200-3130-4cd7-b016-72d2562f5ccd/pasted-text.txt
+
+## My request:
+finish implementing this, you crashed and lost your spot. follow the file exactly. do not run full suite tests. only do your narrow specific tests.
+
+--- User message 2 ---
+continue
+
+
+REPORTED AUDIT / DIAGNOSIS / FIX CONCLUSION
+--- Unique final report 1; SHA-256 DBF049F09A41B2A21413360A3B6711F9888ED713A48F7EF4F077F2BEF72319DE ---
+Implemented the KD4 terminalization and completion-gate changes from the supplied brief.
+
+Key changes:
+
+- Shared five-second terminal deadline, durable claim, one-shot delivery, interaction release, cleanup separation, recovery receipts, and terminal phase timing in [tasks/mod.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tasks/mod.rs:107).
+- Correct review requirement/disposition/outcome handling, including disabled reviewer with an explicit mandatory obligation, in [completion_review_v2.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tasks/completion_review_v2.rs:3137).
+- Persisted workspace facts and scope-bound reclassification, including conservative Unknown handling, in [task_evidence.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/task_evidence.rs:7467).
+- Additive terminal timing protocol and generated schemas in [protocol.rs](C:/Users/kuh/Desktop/kd4/codex-rs/protocol/src/protocol.rs:2094) and [TurnTimingTerminalization.ts](C:/Users/kuh/Desktop/kd4/codex-rs/app-server-protocol/schema/typescript/v2/TurnTimingTerminalization.ts).
+- Added focused deadline, delivery, recovery, review-matrix, scope-expansion, and compatibility tests.
+
+Validation:
+
+- Protocol backward-compatibility test: passed, 1 selected / 266 filtered.
+- Generated schema checks: passed, 2 selected / 269 skipped.
+- Targeted rustfmt and `git diff --check`: passed.
+- The 12 selected core tests could not execute because `codex-core` currently has 41 unrelated dirty-worktree compile errors in other concurrent work. After correcting all errors introduced by this change, none of the remaining diagnostics point to the new terminalization/review/scope code.
+
+No full suite, build, install, publish, or binary run was performed. Repo Atlas kept the implementation within the existing task/session, evidence, timing, and protocol owners.
+
+FACT / HYPOTHESIS / UNKNOWN BOUNDARY
+- Direct artifact facts: the source paths, UUID, metadata, user messages, lifecycle events, and agent report text above are present in the inspected Codex session records.
+- Reported repository facts: symptoms, causes, affected files/symbols, fixes, commands, and validation results are preserved as claims made by the reporting agent. Treat exact evidence and qualifications inside the report as controlling.
+- Hypotheses: no new implementation cause or language was inferred during corpus extraction. Any hypothesis in the report remains a hypothesis unless the report states and evidences that it was established.
+- Unknowns: anything the preserved report omits—including environment details, reproduction steps, exact cause, validation scope, or residual risk—remains unknown and must be checked against the repository and Git history before relying on it for a new fix.

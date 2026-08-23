@@ -55,6 +55,7 @@ const SNAPSHOT_RETENTION: Duration = Duration::from_secs(60 * 60 * 24);
 const SNAPSHOT_DIR: &str = "shell_snapshots";
 const EXCLUDED_EXPORT_VARS: &[&str] = &["PWD", "OLDPWD"];
 pub(crate) const POSIX_SNAPSHOT_FORMAT_HEADER: &str = "# Codex shell snapshot format: 3";
+pub(crate) const POWERSHELL_SNAPSHOT_FORMAT_HEADER: &str = "# Codex PowerShell snapshot format: 1";
 
 impl ShellSnapshot {
     pub(crate) fn new(
@@ -151,7 +152,7 @@ impl ShellSnapshot {
             .join(format!("{session_id}.{nonce}.{extension}"));
         let temp_path = codex_home
             .join(SNAPSHOT_DIR)
-            .join(format!("{session_id}.tmp-{nonce}"));
+            .join(format!("{session_id}.tmp-{nonce}.{extension}"));
 
         // Clean the (unlikely) leaked snapshot files.
         let codex_home = codex_home.clone();
@@ -221,18 +222,19 @@ async fn write_shell_snapshot(
     environment_variables: &HashMap<String, String>,
 ) -> Result<()> {
     let shell_type = shell.shell_type;
-    if shell_type == ShellType::PowerShell || shell_type == ShellType::Cmd {
+    if shell_type == ShellType::Cmd {
         bail!("Shell snapshot not supported yet for {shell_type:?}");
     }
 
     let raw_snapshot = capture_snapshot(shell, cwd, environment_variables).await?;
     let snapshot = strip_snapshot_preamble(&raw_snapshot)?;
-    if matches!(shell_type, ShellType::Bash | ShellType::Zsh | ShellType::Sh)
-        && !snapshot
-            .lines()
-            .any(|line| line == POSIX_SNAPSHOT_FORMAT_HEADER)
-    {
-        bail!("Snapshot output missing format marker {POSIX_SNAPSHOT_FORMAT_HEADER}");
+    let format_header = match shell_type {
+        ShellType::Bash | ShellType::Zsh | ShellType::Sh => POSIX_SNAPSHOT_FORMAT_HEADER,
+        ShellType::PowerShell => POWERSHELL_SNAPSHOT_FORMAT_HEADER,
+        ShellType::Cmd => unreachable!("cmd snapshots are rejected before capture"),
+    };
+    if !snapshot.lines().any(|line| line == format_header) {
+        bail!("Snapshot output missing format marker {format_header}");
     }
 
     if let Some(parent) = output_path.parent() {
@@ -316,21 +318,40 @@ async fn validate_snapshot(
     cwd: &AbsolutePathBuf,
     environment_variables: &HashMap<String, String>,
 ) -> Result<()> {
-    let positional_args = [
-        OsStr::new("codex-shell-snapshot-validation"),
-        snapshot_path.as_os_str(),
-    ];
-    run_script_with_timeout_with_args(
-        shell,
-        r#"\command set -e; \command . "$1""#,
-        &positional_args,
-        SNAPSHOT_TIMEOUT,
-        /*use_login_shell*/ false,
-        cwd,
-        environment_variables,
-    )
-    .await
-    .map(|_| ())
+    match shell.shell_type {
+        ShellType::PowerShell => {
+            let snapshot_path = powershell_single_quote(&snapshot_path.to_string_lossy());
+            let script = format!("$ErrorActionPreference = 'Stop'; . '{snapshot_path}'");
+            run_script_with_timeout(
+                shell,
+                &script,
+                SNAPSHOT_TIMEOUT,
+                /*use_login_shell*/ false,
+                cwd,
+                environment_variables,
+            )
+            .await
+            .map(|_| ())
+        }
+        ShellType::Bash | ShellType::Zsh | ShellType::Sh => {
+            let positional_args = [
+                OsStr::new("codex-shell-snapshot-validation"),
+                snapshot_path.as_os_str(),
+            ];
+            run_script_with_timeout_with_args(
+                shell,
+                r#"\command set -e; \command . "$1""#,
+                &positional_args,
+                SNAPSHOT_TIMEOUT,
+                /*use_login_shell*/ false,
+                cwd,
+                environment_variables,
+            )
+            .await
+            .map(|_| ())
+        }
+        ShellType::Cmd => bail!("Shell snapshot validation is not supported for Cmd"),
+    }
 }
 
 async fn run_shell_script(
@@ -499,6 +520,10 @@ async fn read_snapshot_output_bounded<R: AsyncRead + Unpin>(
 
 fn excluded_exports_regex() -> String {
     EXCLUDED_EXPORT_VARS.join("|")
+}
+
+fn powershell_single_quote(input: &str) -> String {
+    input.replace('\'', "''")
 }
 
 fn zsh_snapshot_script() -> String {
@@ -753,25 +778,53 @@ esac
 
 fn powershell_snapshot_script() -> &'static str {
     r##"$ErrorActionPreference = 'Stop'
-Write-Output '# Snapshot file'
-Write-Output '# Unset all aliases to avoid conflicts with functions'
-Write-Output 'Remove-Item Alias:* -ErrorAction SilentlyContinue'
-Write-Output '# Functions'
-Get-ChildItem Function: | ForEach-Object {
-    "function {0} {{`n{1}`n}}" -f $_.Name, $_.Definition
+try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}
+Microsoft.PowerShell.Utility\Write-Output '# Snapshot file'
+Microsoft.PowerShell.Utility\Write-Output '# Codex PowerShell snapshot format: 1'
+Microsoft.PowerShell.Utility\Write-Output '# Unset all aliases to avoid conflicts with functions'
+Microsoft.PowerShell.Utility\Write-Output 'Microsoft.PowerShell.Management\Remove-Item -Path Alias:* -Force -ErrorAction SilentlyContinue'
+Microsoft.PowerShell.Utility\Write-Output '# Functions'
+Microsoft.PowerShell.Management\Get-ChildItem Function: | Microsoft.PowerShell.Core\ForEach-Object {
+    $encodedName = [System.Convert]::ToBase64String(
+        [System.Text.Encoding]::UTF8.GetBytes([string]$_.Name)
+    )
+    $encodedDefinition = [System.Convert]::ToBase64String(
+        [System.Text.Encoding]::UTF8.GetBytes([string]$_.Definition)
+    )
+    Microsoft.PowerShell.Utility\Write-Output (
+        "Microsoft.PowerShell.Management\Set-Item -LiteralPath ('Function:' + [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{0}'))) -Value ([System.Management.Automation.ScriptBlock]::Create([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{1}'))))" -f $encodedName, $encodedDefinition
+    )
 }
-Write-Output ''
-$aliases = Get-Alias
-Write-Output '# aliases'
-$aliases | ForEach-Object {
-    "Set-Alias -Name {0} -Value {1}" -f $_.Name, $_.Definition
+Microsoft.PowerShell.Utility\Write-Output ''
+$aliases = Microsoft.PowerShell.Utility\Get-Alias
+Microsoft.PowerShell.Utility\Write-Output '# aliases'
+$aliases | Microsoft.PowerShell.Core\ForEach-Object {
+    $encodedName = [System.Convert]::ToBase64String(
+        [System.Text.Encoding]::UTF8.GetBytes([string]$_.Name)
+    )
+    $encodedDefinition = [System.Convert]::ToBase64String(
+        [System.Text.Encoding]::UTF8.GetBytes([string]$_.Definition)
+    )
+    Microsoft.PowerShell.Utility\Write-Output (
+        "Microsoft.PowerShell.Utility\Set-Alias -Name ([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{0}'))) -Value ([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{1}')))" -f $encodedName, $encodedDefinition
+    )
 }
-Write-Output ''
-$envVars = Get-ChildItem Env:
-Write-Output '# exports'
-$envVars | ForEach-Object {
-    $escaped = $_.Value -replace "'", "''"
-    "`$env:{0}='{1}'" -f $_.Name, $escaped
+Microsoft.PowerShell.Utility\Write-Output ''
+$envVars = Microsoft.PowerShell.Management\Get-ChildItem Env:
+Microsoft.PowerShell.Utility\Write-Output '# exports'
+$envVars | Microsoft.PowerShell.Core\ForEach-Object {
+    if ($_.Name -in @('PWD', 'OLDPWD') -or $_.Name -like '__CODEX_SNAPSHOT_*') {
+        return
+    }
+    $encodedName = [System.Convert]::ToBase64String(
+        [System.Text.Encoding]::UTF8.GetBytes([string]$_.Name)
+    )
+    $encodedValue = [System.Convert]::ToBase64String(
+        [System.Text.Encoding]::UTF8.GetBytes([string]$_.Value)
+    )
+    Microsoft.PowerShell.Utility\Write-Output (
+        "Microsoft.PowerShell.Management\Set-Item -LiteralPath ('Env:' + [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{0}'))) -Value ([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{1}')))" -f $encodedName, $encodedValue
+    )
 }
 "##
 }

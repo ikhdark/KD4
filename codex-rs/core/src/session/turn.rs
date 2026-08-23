@@ -124,6 +124,7 @@ use codex_analytics::InvocationType;
 use codex_analytics::SkillInvocation;
 use codex_analytics::TrackEventsContext;
 use codex_analytics::TurnResolvedConfigFact;
+use codex_analytics::TurnSubmissionType;
 use codex_analytics::build_track_events_context;
 use codex_async_utils::OrCancelExt;
 use codex_config::config_toml::AfterAgentPolicy;
@@ -2222,7 +2223,7 @@ async fn track_turn_resolved_config_analytics(
                     matches!(item, UserInput::Image { .. } | UserInput::LocalImage { .. })
                 })
                 .count(),
-            submission_type: None,
+            submission_type: Some(turn_submission_type(input)),
             ephemeral: thread_config.ephemeral,
             session_source: thread_config.session_source,
             model: turn_context.model_info.slug.clone(),
@@ -2245,6 +2246,14 @@ async fn track_turn_resolved_config_analytics(
             workspace_kind: turn_context.turn_metadata_state.workspace_kind(),
             is_first_turn,
         });
+}
+
+fn turn_submission_type(input: &[TurnInput]) -> TurnSubmissionType {
+    if input.is_empty() {
+        TurnSubmissionType::Queued
+    } else {
+        TurnSubmissionType::Default
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2844,9 +2853,20 @@ async fn run_sampling_request(
                 .await?,
             ) =>
         {
+            turn_context.turn_timing_state.record_tool_router_reuse();
             router
         }
-        Some(_) | None => {
+        Some(_) => {
+            turn_context.turn_timing_state.record_tool_router_rebuild();
+            built_tools(
+                sess.as_ref(),
+                step_context.as_ref(),
+                selected_skill_invocations,
+                &cancellation_token,
+            )
+            .await?
+        }
+        None => {
             built_tools(
                 sess.as_ref(),
                 step_context.as_ref(),
@@ -3475,7 +3495,9 @@ impl ProposedPlanItemState {
         delta: &str,
         memory_citation: Option<codex_protocol::memory_citation::MemoryCitation>,
     ) {
-        if self.completed {
+        // A delta without a preceding ItemStarted event produces an invalid
+        // client-visible item stream. Treat both out-of-phase cases as inert.
+        if !self.started || self.completed {
             return;
         }
         if delta.is_empty() && memory_citation.is_none() {
@@ -4340,19 +4362,7 @@ async fn try_run_sampling_request(
     let model_request_timing_guard = turn_context.turn_timing_state.begin_model_request_wait();
     drop(preparation_timing_guard.take());
     let startup_snapshot = sess.startup_timing.complete_snapshot();
-    trace!(
-        startup_timing_schema_version = startup_snapshot.schema_version,
-        startup_timing_correlation_id = %startup_snapshot.correlation_id,
-        startup_timing_duration_ns = startup_snapshot.inclusive_duration_ns,
-        startup_timing_profile_valid = startup_snapshot.profile_valid,
-        startup_prewarm_status = ?startup_snapshot.prewarm_status,
-        startup_transport_preconnect_ns = startup_snapshot.phases.transport_preconnect_ns,
-        startup_prewarm_preparation_ns = startup_snapshot.phases.prewarm_preparation_ns,
-        startup_prewarm_request_ns = startup_snapshot.phases.prewarm_request_ns,
-        startup_first_turn_wait_ns = startup_snapshot.phases.first_turn_prewarm_wait_ns,
-        startup_executor_readiness_ns = startup_snapshot.phases.executor_readiness_ns,
-        "startup timing snapshot frozen at first model send"
-    );
+    startup_snapshot.trace_frozen_at_first_model_send();
     if let Some(recorder) = sess.active_reasoning_policy_recorder().await
         && let Some(snapshot) = recorder.append(
             &request_policy,

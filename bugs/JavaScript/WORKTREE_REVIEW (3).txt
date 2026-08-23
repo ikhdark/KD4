@@ -1,0 +1,131 @@
+REPO ATLAS DIRTY WORKTREE REVIEW
+
+REVIEW METADATA
+Repository: C:/Users/kuh/Desktop/Repo-Atlas
+Branch/HEAD/upstream at freeze: main / 52b652f576f6aa39cae2e82c6ca765afc232dc6b / origin/main same commit
+Frozen baseline: 92 non-ignored paths: 75 unstaged tracked modifications, 17 untracked; 0 staged, deleted, renamed, copied, type-changed, or submodule paths.
+Instructions read completely: C:/Users/kuh/Desktop/LOCAL-KD/skills/worktree-review/SKILL.md; repository AGENTS.md; SOURCEMAP.md; package.json; README.md; skills/repo-atlas/SKILL.md.
+Attribution: ACC = accumulated current user/concurrent implementation or supporting change already present at freeze; REV = review-generated ledger. All ACC paths were preserved except confirmed in-scope repairs within their existing changes.
+Review code: COMPLETE/OK means the complete current path and dirty change were reviewed with its production wiring and the domain's callers/consumers. No source-backed confirmed or possible bug, unfinished wiring, regression, lifecycle/concurrency defect, contradiction, or individual publish blocker remained; disposition KEEP.
+Expected validation: npm run sourcemap:update/check; Node syntax/import analysis over frozen JavaScript; focused node:test files for repaired services/summaries and benchmark wiring; git diff --check. Generic Clippy/cargo-shear/Rust dead-code commands are incompatible because this is a Node ESM repository with no root Cargo workspace; no repository JavaScript dead-code command is documented.
+
+DOMAIN/CALLER MAP
+DOC = repository instructions/public/source-map/skill/package contracts; consumed by contributors, npm scripts, plugin packaging, and release/startup users.
+IDX = transactional index, persistence, freshness, generations, graph/semantic receipts; consumed by services, registry, every structural/semantic tool, and index tests.
+GRAPH = package inventory/ownership/dependency/history/summary derivation; consumed by services, inspect/context/impact/trace and graph/history/summary tests.
+SEM = Rust/TypeScript providers, semantic normalization/call graph, lifecycle/status/cancellation; consumed by services, symbol/context/impact/trace and provider/tool tests.
+REG = registry/server/facades/batch schemas, canonical keys, evidence and isolation; consumed by MCP clients, resources, hooks, and boundary/server tests.
+TASK = task/context/placement/symbol/slice/contract/relevance selection and rendering; consumed through context/symbol/impact/trace facades and corpus/characterization tests.
+TEST = focused test or fixture contract for the named production domain; consumed by node:test or the relevance evaluator.
+BENCH = opt-in benchmark/evaluator instrumentation; consumed by npm benchmark/relevance scripts, not runtime startup.
+
+PRIMARY ENTRIES — EVERY FROZEN PATH EXACTLY ONCE
+001 AGENTS.md | M | ACC | COMPLETE/OK | DOC; repository operating/validation rules; consumers: reviewers and automation | KEEP.
+002 README.md | M | ACC | COMPLETE/OK | DOC; public workflow/tool and benchmark documentation; consumers: users/package readers | KEEP.
+003 SOURCEMAP.md | M | ACC plus repair | COMPLETE | DOC; canonical ownership/invalidation/lifecycle contract; consumers: maintainers and sourcemap checker | Findings repaired: per-package cache wiring/status semantics documented and aggregate material state regenerated | KEEP.
+004 hooks/repo-atlas-hook.js | M | ACC | COMPLETE/OK | REG; Codex hook routing/root selection; consumers: plugin hook host/services | KEEP.
+005 package.json | M | ACC | COMPLETE/OK | DOC/BENCH; scripts/package surface; consumers: npm and publication | KEEP.
+006 scripts/evaluate-relevance.js | M | ACC | COMPLETE/OK | BENCH/TASK; isolated corpus evaluation; consumers: relevance tests/npm script | KEEP.
+007 skills/repo-atlas/SKILL.md | M | ACC | COMPLETE/OK | DOC; installed Repo Atlas guidance; consumers: Codex skill loader/users | KEEP.
+008 src/config.js | M | ACC | COMPLETE/OK | IDX/SEM; root/cache/ignore/planning/semantic configuration; consumers: CLI/services/index | KEEP.
+009 src/core/gitlog.js | M | ACC | COMPLETE/OK | GRAPH; history identity/loading/top-K cochange; consumers: services/cochange | KEEP.
+010 src/core/graph.js | M | ACC | COMPLETE/OK | GRAPH; inventory/enrichment/ownership/receipts; consumers: services and structural tools | KEEP.
+011 src/core/indexer.js | M | ACC plus earlier repair | COMPLETE | IDX; transactional refresh/persistence/planning and narrow generations; consumers: all services/tools | Earlier findings repaired: graphGeneration and language-specific semantic notifications; no remaining issue | KEEP.
+012 src/core/rustAnalyzer.js | M | ACC | COMPLETE/OK | SEM; LSP framing/startup/coverage/query/cancellation; consumers: services/semantic tools | KEEP.
+013 src/core/summaries.js | M | ACC plus repair | COMPLETE | GRAPH; per-package summaries; consumers: services/inspect/batch | Incomplete wiring counterpart repaired in services; stale package cache pruning added | KEEP.
+014 src/core/typescriptProvider.js | M | ACC | COMPLETE/OK | SEM; provider selection/refresh/project authority/cache; consumers: services/semantic tools | KEEP.
+015 src/registry.js | M | ACC plus earlier repair | COMPLETE | REG; dispatch/snapshot/evidence/private child invocation; consumers: server/batch | Earlier batch child verified-read isolation wiring repaired; no remaining issue | KEEP.
+016 src/server.js | M | ACC | COMPLETE/OK | REG; MCP scheduling/framing/cancellation/backpressure; consumers: CLI/clients | KEEP.
+017 src/services.js | M | ACC plus repair | COMPLETE | IDX/GRAPH/SEM; derived caches/history/provider lifecycle/status/receipts; consumers: registry/tools | Confirmed incomplete summary-cache wiring and TypeScript refresh-status defect repaired; earlier graph/semantic/history defects also repaired | KEEP.
+018 src/tools/analysisMemo.js | M | ACC | COMPLETE/OK | TASK/SEM; request-local analysis memo; consumers: semantic/task/trace paths | KEEP.
+019 src/tools/batchTool.js | M | ACC plus earlier repair | COMPLETE | REG; bounded child dispatch/dedup/isolation; consumers: registry/MCP clients | Earlier independent-child verified-read isolation repaired | KEEP.
+020 src/tools/callGraphAnalysis.js | M | ACC | COMPLETE/OK | SEM/TASK; bounded exact/partial graph traversal and ranking; consumers: trace/impact/task | KEEP.
+021 src/tools/cochangeTool.js | M | ACC | COMPLETE/OK | GRAPH/TASK; historical cochange view; consumers: impact facade | KEEP.
+022 src/tools/contextFacadeTool.js | M | ACC | COMPLETE/OK | REG/TASK; context view routing/schema; consumers: registry/batch | KEEP.
+023 src/tools/contextTool.js | M | ACC | COMPLETE/OK | TASK; path guidance/references/verified reads; consumers: context facade/task | KEEP.
+024 src/tools/contractTool.js | M | ACC | COMPLETE/OK | TASK; contract surfaces/resolution; consumers: symbol facade/task | KEEP.
+025 src/tools/facade.js | M | ACC | COMPLETE/OK | REG; facade schema/heading/result composition; consumers: public facade tools | KEEP.
+026 src/tools/factsTool.js | M | ACC | COMPLETE/OK | GRAPH/TASK; receipt-keyed facts/status; consumers: inspect facade | KEEP.
+027 src/tools/graphTools.js | M | ACC | COMPLETE/OK | GRAPH/TASK; package graph rendering/evidence; consumers: inspect facade | KEEP.
+028 src/tools/impactFacadeTool.js | M | ACC | COMPLETE/OK | REG/TASK; impact view routing/schema; consumers: registry/batch | KEEP.
+029 src/tools/inspectTool.js | M | ACC | COMPLETE/OK | REG/GRAPH; inspect routing/canonical package keys; consumers: registry/resources | KEEP.
+030 src/tools/placementTool.js | M | ACC | COMPLETE/OK | TASK/GRAPH/SEM; ownership/change impact/ranking; consumers: context/impact | KEEP.
+031 src/tools/rootTool.js | M | ACC | COMPLETE/OK | REG/IDX; selected-root contracts/receipts; consumers: registry/server | KEEP.
+032 src/tools/semantic.js | M | ACC | COMPLETE/OK | SEM; provider dispatch/normalization/authority/lease validation; consumers: symbol/task/call graph | KEEP.
+033 src/tools/sliceTool.js | M | ACC | COMPLETE/OK | TASK/SEM; bounded symbol slice and reads; consumers: symbol facade | KEEP.
+034 src/tools/symbolTool.js | M | ACC | COMPLETE/OK | REG/TASK; symbol view routing/schema; consumers: registry/batch | KEEP.
+035 src/tools/symbols.js | M | ACC | COMPLETE/OK | TASK/SEM; definition/reference identity resolution; consumers: symbol facade/task | KEEP.
+036 src/tools/taskContextTool.js | M | ACC | COMPLETE/OK | TASK/SEM/GRAPH; evidence collection/escalation/rendering; consumers: context/task | KEEP.
+037 src/tools/taskPlanSelector.js | M | ACC | COMPLETE/OK | TASK; deterministic candidate selection/readiness; consumers: task context | KEEP.
+038 src/tools/taskTool.js | M | ACC | COMPLETE/OK | REG/TASK; task public composition; consumers: registry/batch | KEEP.
+039 src/tools/traceTool.js | M | ACC | COMPLETE/OK | TASK/SEM/GRAPH; exact/heuristic trace; consumers: registry/batch | KEEP.
+040 src/tools/viewSchema.js | M | ACC | COMPLETE/OK | REG; private facade metadata/schema extraction; consumers: registry/batch | KEEP.
+041 src/util/evidence.js | M | ACC | COMPLETE/OK | REG/TASK; evidence schemas/decision invariants; consumers: all tools/registry | KEEP.
+042 src/util/operationKey.js | M | ACC | COMPLETE/OK | REG; stable child operation identity; consumers: facades/batch | KEEP.
+043 src/util/pathRules.js | M | ACC | COMPLETE/OK | IDX/TASK; path provenance/test eligibility; consumers: graph/task/impact | KEEP.
+044 src/util/relevance.js | M | ACC | COMPLETE/OK | TASK; relevance tokenization/scoring; consumers: task/evaluator | KEEP.
+045 src/util/text.js | M | ACC | COMPLETE/OK | TASK; bounded text helpers; consumers: tool renderers | KEEP.
+046 test/agentJTools.test.js | M | ACC | COMPLETE/OK | TEST for TASK/SEM/REG public behavior | KEEP.
+047 test/batchTool.test.js | M | ACC plus earlier repair coverage | COMPLETE/OK | TEST for REG child isolation/dedup/cancellation | KEEP.
+048 test/cochangeTool.test.js | M | ACC | COMPLETE/OK | TEST for GRAPH/TASK cochange behavior | KEEP.
+049 test/contextTool.test.js | M | ACC | COMPLETE/OK | TEST for TASK path guidance/evidence | KEEP.
+050 test/evidenceResults.test.js | M | ACC | COMPLETE/OK | TEST for REG evidence/receipt/envelopes | KEEP.
+051 test/factsTool.test.js | M | ACC | COMPLETE/OK | TEST for GRAPH/TASK facts cache/coverage | KEEP.
+052 test/fixtures/fake-rust-analyzer.js | M | ACC | COMPLETE/OK | TEST fixture for SEM LSP lifecycle/status | KEEP.
+053 test/fixtures/fake-tsserver.js | M | ACC | COMPLETE/OK | TEST fixture for SEM refresh/project behavior | KEEP.
+054 test/fixtures/relevance-corpus/manifest.json | M | ACC | COMPLETE/OK | TEST corpus manifest for TASK relevance/evidence phases | KEEP.
+055 test/fixtures/relevance-corpus/repo-node-workspace/packages/api/src/requestRouter.ts | M | ACC | COMPLETE/OK | TEST corpus production-side routing fixture | KEEP.
+056 test/fixtures/relevance-corpus/repo-node-workspace/packages/consumer/src/requestRouterConsumer.ts | M | ACC | COMPLETE/OK | TEST corpus consumer relation fixture | KEEP.
+057 test/fixtures/relevance-corpus/repo-node-workspace/packages/ui/src/requestRouterNarrative.ts | M | ACC | COMPLETE/OK | TEST corpus lexical-decoy fixture | KEEP.
+058 test/fixtures/toolCharacterization.json | M | ACC | COMPLETE/OK | TEST generated expectation fixture; provenance is characterization tests, schema/content relationship reviewed | KEEP.
+059 test/gitlog.test.js | M | ACC | COMPLETE/OK | TEST for GRAPH history identity/truncation/top-K | KEEP.
+060 test/graph.test.js | M | ACC | COMPLETE/OK | TEST for GRAPH inventory/ownership/enrichment/receipts | KEEP.
+061 test/graphTools.test.js | M | ACC | COMPLETE/OK | TEST for GRAPH inspect rendering/evidence | KEEP.
+062 test/indexer.test.js | M | ACC plus earlier repair coverage | COMPLETE/OK | TEST for IDX refresh/generation/persistence/concurrency | KEEP.
+063 test/placementTool.test.js | M | ACC | COMPLETE/OK | TEST for TASK/GRAPH/SEM impact and placement | KEEP.
+064 test/relevanceEvaluation.test.js | M | ACC | COMPLETE/OK | TEST for BENCH/TASK evaluator isolation and gates | KEEP.
+065 test/rootTool.test.js | M | ACC | COMPLETE/OK | TEST for REG/IDX root confinement/receipts | KEEP.
+066 test/rustAnalyzer.test.js | M | ACC | COMPLETE/OK | TEST for SEM framing/coverage/deadlines/cancellation | KEEP.
+067 test/semanticReal.test.js | M | ACC | COMPLETE/OK | TEST for SEM real-provider integration behavior | KEEP.
+068 test/server.test.js | M | ACC | COMPLETE/OK | TEST for REG scheduling/framing/cancellation/startup | KEEP.
+069 test/services.test.js | M | ACC plus repair coverage | COMPLETE | TEST for IDX/GRAPH/SEM service lifecycle/cache contracts | Extended to prove unaffected package identity/receipt reuse and refresh status warming; earlier repair coverage retained | KEEP.
+070 test/summaries.test.js | M | ACC | COMPLETE/OK | TEST for GRAPH deterministic summary inputs/output | KEEP.
+071 test/symbolsTool.test.js | M | ACC | COMPLETE/OK | TEST for TASK/SEM symbol identities/references | KEEP.
+072 test/taskContextTool.test.js | M | ACC | COMPLETE/OK | TEST for TASK collection/readiness/semantic evidence | KEEP.
+073 test/taskPlanSelector.test.js | M | ACC | COMPLETE/OK | TEST for TASK deterministic selection/escalation | KEEP.
+074 test/typescriptProvider.test.js | M | ACC | COMPLETE/OK | TEST for SEM selection/project authority/refresh/cache | KEEP.
+075 test/util.test.js | M | ACC | COMPLETE/OK | TEST for utility path/text/relevance behavior | KEEP.
+076 WORKTREE_REVIEW.txt | ?? | REV | COMPLETE | Review ledger; consumer: this review/user | Reconciled from stale 73-path draft to exact 92-path baseline and final dispositions | KEEP untracked unless user later chooses publication.
+077 scripts/benchmark-filesystem-persistence.js | ?? | ACC | COMPLETE/OK | BENCH for IDX filesystem/persistence/read reuse; opt-in npm consumer | KEEP.
+078 scripts/benchmark-pruning.js | ?? | ACC | COMPLETE/OK | BENCH for TASK/GRAPH bounded selection work; opt-in npm consumer | KEEP.
+079 scripts/benchmark-semantic-critical-path.js | ?? | ACC plus repair | COMPLETE | BENCH for SEM latency/lifecycle/concurrency; opt-in npm consumer | Confirmed obsolete service injection repaired to current rustInventoryEnricher branch contract | KEEP.
+080 scripts/benchmark-warm-session.js | ?? | ACC | COMPLETE/OK | BENCH for SEM warm-session/request behavior; opt-in npm consumer | KEEP.
+081 src/tools/batchStructuralMemo.js | ?? | ACC | COMPLETE/OK | REG; batch-snapshot structural-only memo; consumers: registry/batch | Production-wired and rejects/evicts failed derived promises | KEEP.
+082 src/tools/contractEvidence.js | ?? | ACC | COMPLETE/OK | TASK; generated/SDK contract evidence; consumers: contract/task tools | Production-wired | KEEP.
+083 src/tools/symbolIdentity.js | ?? | ACC | COMPLETE/OK | TASK/SEM; canonical symbol identity; consumers: symbols/slice | Production-wired | KEEP.
+084 src/util/verifiedRead.js | ?? | ACC | COMPLETE/OK | IDX/TASK; path+hash scoped read memo; consumers: context/facts/task/symbol paths | Production-wired | KEEP.
+085 test/batchStructuralMemo.test.js | ?? | ACC | COMPLETE/OK | TEST for REG structural memo scope/retry | KEEP.
+086 test/evidenceRecallRepairs.test.js | ?? | ACC | COMPLETE/OK | TEST for TASK evidence recall repairs | KEEP.
+087 test/fixtures/relevance-corpus/repo-node-workspace/packages/api/AGENTS.md | ?? | ACC | COMPLETE/OK | TEST guidance fixture for TASK corpus; consumed by evaluator/index | KEEP.
+088 test/indexerDifferential.test.js | ?? | ACC | COMPLETE/OK | TEST for IDX targeted-vs-reconciled differential equivalence | KEEP.
+089 test/operationKey.test.js | ?? | ACC | COMPLETE/OK | TEST for REG canonical operation identity | KEEP.
+090 test/semanticAuthority.test.js | ?? | ACC | COMPLETE/OK | TEST for SEM authority invariants | KEEP.
+091 test/taskDuplicateWork.test.js | ?? | ACC | COMPLETE/OK | TEST for TASK request-local reuse/no-delta escalation | KEEP.
+092 test/verifiedRead.test.js | ?? | ACC | COMPLETE/OK | TEST for IDX/TASK verified-read memo behavior | KEEP.
+
+CONFIRMED FINDINGS AND DISPOSITIONS
+F1 HIGH confidence, medium severity, incomplete wiring. Service summary construction called the new per-package cache-capable builder without a packageCache, while documentation promised package-independent reuse. Trigger: summarize packages A/B, edit A, request B summary; observable failure: B was rebuilt and its dependency receipt was coupled to broad structural/graph state. Smallest fix: retain a root-scoped package cache, pass it to buildSummaries, prune removed identities, and derive exact-package receipts from its exact receipt. Realistic task: repeatedly inspect one package while another is edited. FIXED in summary builder/services with focused identity and receipt assertions.
+F2 HIGH confidence, medium severity, lifecycle/status. During acknowledged retained TypeScript refresh, the entry has targetGeneration=current and state=warming, but semanticStatus accepted only generation=current. Trigger: edit indexed TypeScript after provider readiness and query status before refresh acknowledgement; observable failure: status reported idle although a process was actively warming. Smallest fix: accept current targetGeneration for status publication without treating the lease as ready. Realistic task: index_status during an editor save. FIXED with a focused gated-refresh assertion.
+F3 HIGH confidence, medium severity, benchmark wiring/publish-readiness. The semantic critical-path benchmark injected removed packageInventoryEnricher and replaced packageInventoryBuilder with an invalid empty object. Trigger: run the opt-in benchmark after the graph inventory/enrichment split; observable failure: unintended real enrichment or invalid inventory access instead of controlled graph behavior. Smallest fix: keep the real inventory builder and inject the current rustInventoryEnricher branch shape. FIXED.
+Earlier ledger findings already repaired and reverified in current source: graph-specific generation wiring; language-specific semantic invalidation; successful-null history caching; independent batch-child verified-read isolation. They are not double-counted as new findings in this pass.
+
+POSSIBLE/REJECTED/OUT-OF-SCOPE ITEMS
+- Double-prefixed index diagnostics are reachable pre-existing base behavior outside the dirty hunk; rejected as an in-scope dirty-change finding and left untouched.
+- Reader-cohort admission during later watcher dirtiness was investigated; repository contracts intentionally guarantee one captured snapshot per admitted cohort and writer priority for queued refresh, so no defect was established.
+- No contradictory old/new production implementation remained active. The obsolete benchmark option was a stale caller, resolved by F3 rather than adding another API.
+
+ANALYZER AND VALIDATION RESULTS
+Rust Clippy: not applicable (0 findings). cargo-shear: not applicable (0 findings). Rust dead-code workflow: not applicable (0 findings). Repository-appropriate validation passed: node --check covered all 80 dirty JavaScript paths; the semantic critical-path benchmark passed with --assert after its wiring repair; npm run sourcemap:check, node --check for the finally affected service/test files, node --test test/services.test.js test/summaries.test.js (43 passed, 0 failed), and git diff --check all passed after the last production/test mutation. The expected injected summary-read diagnostics appeared during their passing negative-path tests. A full suite was neither required nor run.
+
+FINAL INVENTORY/PUBLISH READINESS
+Frozen-path count remains 92 and each appears once above. No repair introduced a new path; repairs modified only already-frozen SOURCEMAP.md, services/summary/test files, semantic benchmark, and this ledger. Review totals including the earlier recorded repair pass: 7 confirmed defects, 3 incomplete-wiring findings, 0 contradiction findings, 3 lifecycle/concurrency findings, 0 Clippy findings, 0 cargo-shear findings, 0 dead-code findings, 7 fixed, 0 unresolved. No staging, commit, push, install, release, binary replacement, application restart, or publication occurred. The reviewed dirty worktree is publish-ready with respect to the frozen scope and performed task-scoped validation; publication itself was not requested or performed.

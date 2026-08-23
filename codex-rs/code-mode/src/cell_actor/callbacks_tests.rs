@@ -99,6 +99,7 @@ async fn tool_callback_panic_rejects_the_js_promise_and_reports_failure() {
             },
             kind: ToolKind::Function,
             input: None,
+            timeout: Duration::from_secs(1),
         },
         runtime_tx,
         CancellationToken::new(),
@@ -123,15 +124,105 @@ async fn tool_callback_panic_rejects_the_js_promise_and_reports_failure() {
     assert_eq!(failure_rx.recv().await, Some(error_text));
 }
 
+#[tokio::test(start_paused = true)]
+async fn tool_callback_timeout_rejects_the_js_promise_and_cancels_the_delegate() {
+    let mut tasks = JoinSet::new();
+    let (runtime_tx, runtime_rx) = std_mpsc::channel();
+    let cancellation_token = CancellationToken::new();
+    spawn_tool(
+        &mut tasks,
+        Arc::new(NonCooperativeCallbackHost),
+        CellToolCall {
+            id: "tool-timeout".to_string(),
+            name: ToolName {
+                name: "stuck".to_string(),
+                namespace: None,
+            },
+            kind: ToolKind::Function,
+            input: None,
+            timeout: Duration::from_secs(1),
+        },
+        runtime_tx,
+        cancellation_token.clone(),
+        None,
+    );
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tasks
+        .join_next()
+        .await
+        .expect("tool callback task")
+        .expect("tool callback wrapper");
+
+    let RuntimeCommand::ToolError { id, error_text } = runtime_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("tool timeout command")
+    else {
+        panic!("expected a tool error command");
+    };
+    assert_eq!(id, "tool-timeout");
+    assert_eq!(
+        error_text,
+        "nested tool `stuck` exceeded its 1000ms timeout"
+    );
+    assert!(cancellation_token.is_cancelled());
+}
+
+#[tokio::test(start_paused = true)]
+async fn notification_timeout_rejects_the_js_promise_and_cancels_the_delegate() {
+    let mut tasks = JoinSet::new();
+    let (runtime_tx, runtime_rx) = std_mpsc::channel();
+    let cancellation_token = CancellationToken::new();
+    spawn_notification(
+        &mut tasks,
+        Arc::new(NonCooperativeCallbackHost),
+        NotificationInvocation {
+            id: Some("notify-timeout".to_string()),
+            call_id: "call-1".to_string(),
+            text: "hello".to_string(),
+        },
+        runtime_tx,
+        cancellation_token.clone(),
+        None,
+    );
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(NOTIFICATION_DELIVERY_TIMEOUT).await;
+    tasks
+        .join_next()
+        .await
+        .expect("notification callback task")
+        .expect("notification callback wrapper");
+
+    let RuntimeCommand::NotificationError { id, error_text } = runtime_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("notification timeout command")
+    else {
+        panic!("expected a notification error command");
+    };
+    assert_eq!(id, "notify-timeout");
+    assert_eq!(
+        error_text,
+        "code mode notification exceeded its 60000ms timeout"
+    );
+    assert!(cancellation_token.is_cancelled());
+}
+
 #[tokio::test]
 async fn notification_callback_panic_reports_failure() {
     let mut tasks = JoinSet::new();
+    let (runtime_tx, runtime_rx) = std_mpsc::channel();
     let (failure_tx, mut failure_rx) = mpsc::unbounded_channel();
     spawn_notification(
         &mut tasks,
         Arc::new(PanickingCallbackHost),
-        "notify-1".to_string(),
-        "hello".to_string(),
+        NotificationInvocation {
+            id: Some("notify-1".to_string()),
+            call_id: "call-1".to_string(),
+            text: "hello".to_string(),
+        },
+        runtime_tx,
         CancellationToken::new(),
         Some(Arc::new(move |reason| {
             let _ = failure_tx.send(reason);
@@ -145,6 +236,14 @@ async fn notification_callback_panic_reports_failure() {
         .expect("notification callback wrapper");
     let failure_reason = failure_rx.recv().await.expect("notification failure");
     assert_eq!(failure_reason, "code mode notification task panicked");
+    let RuntimeCommand::NotificationError { id, error_text } = runtime_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("notification error command")
+    else {
+        panic!("expected a notification error command");
+    };
+    assert_eq!(id, "notify-1");
+    assert_eq!(error_text, failure_reason);
 }
 
 #[tokio::test]
@@ -168,7 +267,8 @@ async fn callback_wrapper_join_error_reports_failure() {
 async fn cancellation_aborts_non_cooperative_callback_after_bounded_grace() {
     let mut notification_tasks = JoinSet::new();
     let mut tool_tasks = JoinSet::new();
-    let cancellation_token = CancellationToken::new();
+    let notification_cancellation_token = CancellationToken::new();
+    let tool_cancellation_token = CancellationToken::new();
     let (runtime_tx, _runtime_rx) = std_mpsc::channel();
     let (failure_tx, mut failure_rx) = mpsc::unbounded_channel();
     let task_failure_handler: TaskFailureHandler = Arc::new(move |reason| {
@@ -186,15 +286,17 @@ async fn cancellation_aborts_non_cooperative_callback_after_bounded_grace() {
             },
             kind: ToolKind::Function,
             input: None,
+            timeout: Duration::from_secs(60),
         },
         runtime_tx,
-        cancellation_token.child_token(),
+        tool_cancellation_token.child_token(),
         Some(task_failure_handler.clone()),
     );
 
     let cleanup = tokio::spawn(async move {
         finish_callbacks(
-            &cancellation_token,
+            &notification_cancellation_token,
+            &tool_cancellation_token,
             &mut notification_tasks,
             &mut tool_tasks,
             CallbackCompletion::Cancel,

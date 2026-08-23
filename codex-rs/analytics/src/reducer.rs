@@ -135,6 +135,7 @@ use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SkillScope;
 use codex_protocol::protocol::ThreadSource;
@@ -153,7 +154,7 @@ pub(crate) struct AnalyticsReducer {
     turns: HashMap<String, TurnState>,
     connections: HashMap<u64, ConnectionState>,
     threads: HashMap<String, ThreadAnalyticsState>,
-    tool_items_started_at_ms: HashMap<ToolItemKey, u64>,
+    tool_items_in_progress: HashMap<ToolItemKey, PendingToolItem>,
     pending_reviews: HashMap<RequestId, PendingReviewState>,
     item_review_summaries: HashMap<ToolItemKey, ItemReviewSummary>,
 }
@@ -237,10 +238,14 @@ impl<'a> AnalyticsDropSite<'a> {
         notification: &'a codex_app_server_protocol::ItemCompletedNotification,
         item_id: &'a str,
     ) -> Self {
+        Self::tool_item_parts(&notification.thread_id, &notification.turn_id, item_id)
+    }
+
+    fn tool_item_parts(thread_id: &'a str, turn_id: &'a str, item_id: &'a str) -> Self {
         Self {
             event_name: "tool item",
-            thread_id: &notification.thread_id,
-            turn_id: Some(&notification.turn_id),
+            thread_id,
+            turn_id: Some(turn_id),
             review_id: None,
             item_id: Some(item_id),
         }
@@ -293,6 +298,7 @@ struct ItemReviewSummary {
     guardian_review_count: u64,
     user_review_count: u64,
     final_approval_outcome: Option<FinalApprovalOutcome>,
+    final_failure_kind: Option<ToolItemFailureKind>,
     requested_additional_permissions: bool,
     requested_network_access: bool,
 }
@@ -355,7 +361,7 @@ struct PendingTurnSteerState {
 struct CompletedTurnState {
     status: Option<TurnStatus>,
     turn_error: Option<CodexErrorInfo>,
-    completed_at: u64,
+    completed_at: Option<u64>,
     duration_ms: Option<u64>,
 }
 
@@ -376,11 +382,16 @@ struct TurnState {
     tool_counts: TurnToolCounts,
 }
 
-#[derive(Hash, Eq, PartialEq)]
+#[derive(Clone, Hash, Eq, PartialEq)]
 struct ToolItemKey {
     thread_id: String,
     turn_id: String,
     item_id: String,
+}
+
+struct PendingToolItem {
+    started_at_ms: u64,
+    item: ThreadItem,
 }
 
 #[derive(Default)]
@@ -1239,13 +1250,17 @@ impl AnalyticsReducer {
                 else {
                     return;
                 };
-                self.tool_items_started_at_ms.insert(
+                let item_id = item_id.to_string();
+                self.tool_items_in_progress.insert(
                     ToolItemKey {
                         thread_id: notification.thread_id,
                         turn_id: notification.turn_id,
-                        item_id: item_id.to_string(),
+                        item_id,
                     },
-                    started_at_ms,
+                    PendingToolItem {
+                        started_at_ms,
+                        item: notification.item,
+                    },
                 );
             }
             ServerNotification::ItemCompleted(notification) => {
@@ -1279,7 +1294,7 @@ impl AnalyticsReducer {
                     turn_id: notification.turn_id.clone(),
                     item_id: item_id.to_string(),
                 };
-                let Some(started_at_ms) = self.tool_items_started_at_ms.remove(&key) else {
+                let Some(pending_item) = self.tool_items_in_progress.remove(&key) else {
                     tracing::warn!(
                         thread_id = %notification.thread_id,
                         turn_id = %notification.turn_id,
@@ -1292,6 +1307,11 @@ impl AnalyticsReducer {
                 else {
                     return;
                 };
+                let approval_policy = self
+                    .turns
+                    .get(&notification.turn_id)
+                    .and_then(|turn| turn.resolved_config.as_ref())
+                    .map(|config| &config.approval_policy);
                 let Some((connection_state, thread_state, thread_metadata)) = self
                     .thread_context_or_warn(AnalyticsDropSite::tool_item(&notification, item_id))
                 else {
@@ -1301,8 +1321,10 @@ impl AnalyticsReducer {
                     thread_id: &notification.thread_id,
                     turn_id: &notification.turn_id,
                     item: &notification.item,
-                    started_at_ms,
+                    started_at_ms: pending_item.started_at_ms,
                     completed_at_ms,
+                    terminal_status_override: None,
+                    approval_policy,
                     connection_state,
                     thread_state,
                     thread_metadata,
@@ -1331,24 +1353,46 @@ impl AnalyticsReducer {
                 turn_state.latest_diff = Some(notification.diff);
             }
             ServerNotification::TurnCompleted(notification) => {
-                let turn_state = self.turns.entry(notification.turn.id.clone()).or_default();
+                let thread_id = notification.thread_id;
+                let turn_id = notification.turn.id;
+                let abandoned_tool_status = match &notification.turn.status {
+                    codex_app_server_protocol::TurnStatus::Interrupted => {
+                        Some(ToolItemTerminalStatus::Interrupted)
+                    }
+                    codex_app_server_protocol::TurnStatus::Failed => {
+                        Some(ToolItemTerminalStatus::Failed)
+                    }
+                    codex_app_server_protocol::TurnStatus::Completed
+                    | codex_app_server_protocol::TurnStatus::InProgress => None,
+                };
+                let completed_at = notification
+                    .turn
+                    .completed_at
+                    .and_then(|completed_at| u64::try_from(completed_at).ok());
+                let turn_state = self.turns.entry(turn_id.clone()).or_default();
                 turn_state.completed = Some(CompletedTurnState {
                     status: analytics_turn_status(notification.turn.status),
                     turn_error: notification
                         .turn
                         .error
                         .and_then(|error| error.codex_error_info),
-                    completed_at: notification
-                        .turn
-                        .completed_at
-                        .and_then(|completed_at| u64::try_from(completed_at).ok())
-                        .unwrap_or_default(),
+                    completed_at,
                     duration_ms: notification
                         .turn
                         .duration_ms
                         .and_then(|duration_ms| u64::try_from(duration_ms).ok()),
                 });
-                let turn_id = notification.turn.id;
+                if let (Some(terminal_status), Some(completed_at)) =
+                    (abandoned_tool_status, completed_at)
+                {
+                    self.emit_abandoned_tool_items(
+                        &thread_id,
+                        &turn_id,
+                        completed_at,
+                        terminal_status,
+                        out,
+                    );
+                }
                 self.maybe_emit_turn_event(&turn_id, out).await;
             }
             _ => {}
@@ -1620,8 +1664,66 @@ impl AnalyticsReducer {
             Reviewer::User => summary.user_review_count += 1,
         }
         summary.final_approval_outcome = Some(final_approval_outcome(reviewer, status, resolution));
+        summary.final_failure_kind =
+            review_failure_kind(status, resolution, pending_review.trigger);
         summary.requested_additional_permissions |= pending_review.requested_additional_permissions;
         summary.requested_network_access |= pending_review.requested_network_access;
+    }
+
+    fn emit_abandoned_tool_items(
+        &mut self,
+        thread_id: &str,
+        turn_id: &str,
+        completed_at_ms: u64,
+        terminal_status: ToolItemTerminalStatus,
+        out: &mut Vec<TrackEventRequest>,
+    ) {
+        let keys = self
+            .tool_items_in_progress
+            .keys()
+            .filter(|key| key.thread_id == thread_id && key.turn_id == turn_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            let Some(pending_item) = self.tool_items_in_progress.remove(&key) else {
+                continue;
+            };
+            let review_summary = self.item_review_summaries.remove(&key);
+            let approval_policy = {
+                let Some(turn_state) = self.turns.get_mut(turn_id) else {
+                    continue;
+                };
+                turn_state.tool_counts.record(&pending_item.item);
+                turn_state
+                    .resolved_config
+                    .as_ref()
+                    .map(|config| config.approval_policy)
+            };
+            let Some((connection_state, thread_state, thread_metadata)) = self
+                .thread_context_or_warn(AnalyticsDropSite::tool_item_parts(
+                    thread_id,
+                    turn_id,
+                    &key.item_id,
+                ))
+            else {
+                continue;
+            };
+            if let Some(event) = tool_item_event(ToolItemEventInput {
+                thread_id,
+                turn_id,
+                item: &pending_item.item,
+                started_at_ms: pending_item.started_at_ms,
+                completed_at_ms,
+                terminal_status_override: Some(terminal_status),
+                approval_policy: approval_policy.as_ref(),
+                connection_state,
+                thread_state,
+                thread_metadata,
+                review_summary: review_summary.as_ref(),
+            }) {
+                out.push(event);
+            }
+        }
     }
 
     async fn maybe_emit_turn_event(&mut self, turn_id: &str, out: &mut Vec<TrackEventRequest>) {
@@ -1789,6 +1891,8 @@ struct ToolItemEventInput<'a> {
     item: &'a ThreadItem,
     started_at_ms: u64,
     completed_at_ms: u64,
+    terminal_status_override: Option<ToolItemTerminalStatus>,
+    approval_policy: Option<&'a AskForApproval>,
     connection_state: &'a ConnectionState,
     thread_state: &'a ThreadAnalyticsState,
     thread_metadata: &'a ThreadMetadataState,
@@ -1802,6 +1906,8 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
         item,
         started_at_ms,
         completed_at_ms,
+        terminal_status_override,
+        approval_policy,
         connection_state,
         thread_state,
         thread_metadata,
@@ -1817,7 +1923,10 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
             duration_ms,
             ..
         } => {
-            let (terminal_status, failure_kind) = command_execution_outcome(status)?;
+            let (terminal_status, failure_kind) = override_tool_item_outcome(
+                command_execution_outcome(status),
+                terminal_status_override,
+            )?;
             let action_counts = command_action_counts(command_actions);
             let base = tool_item_base(
                 thread_id,
@@ -1836,6 +1945,7 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
                     thread_state,
                     thread_metadata,
                     review_summary,
+                    approval_policy,
                 },
             );
             Some(TrackEventRequest::CommandExecution(
@@ -1859,7 +1969,8 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
             changes,
             status,
         } => {
-            let (terminal_status, failure_kind) = patch_apply_outcome(status)?;
+            let (terminal_status, failure_kind) =
+                override_tool_item_outcome(patch_apply_outcome(status), terminal_status_override)?;
             let counts = file_change_counts(changes);
             let base = tool_item_base(
                 thread_id,
@@ -1878,6 +1989,7 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
                     thread_state,
                     thread_metadata,
                     review_summary,
+                    approval_policy,
                 },
             );
             Some(TrackEventRequest::FileChange(CodexFileChangeEventRequest {
@@ -1902,7 +2014,10 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
             plugin_id,
             ..
         } => {
-            let (terminal_status, failure_kind) = mcp_tool_call_outcome(status)?;
+            let (terminal_status, failure_kind) = override_tool_item_outcome(
+                mcp_tool_call_outcome(status),
+                terminal_status_override,
+            )?;
             let base = tool_item_base(
                 thread_id,
                 turn_id,
@@ -1920,6 +2035,7 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
                     thread_state,
                     thread_metadata,
                     review_summary,
+                    approval_policy,
                 },
             );
             Some(TrackEventRequest::McpToolCall(
@@ -1944,7 +2060,10 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
             duration_ms,
             ..
         } => {
-            let (terminal_status, failure_kind) = dynamic_tool_call_outcome(status)?;
+            let (terminal_status, failure_kind) = override_tool_item_outcome(
+                dynamic_tool_call_outcome(status),
+                terminal_status_override,
+            )?;
             let counts = content_items
                 .as_ref()
                 .map(|items| dynamic_content_counts(items));
@@ -1965,6 +2084,7 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
                     thread_state,
                     thread_metadata,
                     review_summary,
+                    approval_policy,
                 },
             );
             Some(TrackEventRequest::DynamicToolCall(
@@ -1992,7 +2112,10 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
             agents_states,
             ..
         } => {
-            let (terminal_status, failure_kind) = collab_tool_call_outcome(status)?;
+            let (terminal_status, failure_kind) = override_tool_item_outcome(
+                collab_tool_call_outcome(status),
+                terminal_status_override,
+            )?;
             let base = tool_item_base(
                 thread_id,
                 turn_id,
@@ -2010,6 +2133,7 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
                     thread_state,
                     thread_metadata,
                     review_summary,
+                    approval_policy,
                 },
             );
             Some(TrackEventRequest::CollabAgentToolCall(
@@ -2049,14 +2173,18 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
             ))
         }
         ThreadItem::WebSearch(item) => {
+            let (terminal_status, failure_kind) = override_tool_item_outcome(
+                Some((ToolItemTerminalStatus::Completed, None)),
+                terminal_status_override,
+            )?;
             let base = tool_item_base(
                 thread_id,
                 turn_id,
                 item.id.clone(),
                 "web_search".to_string(),
                 ToolItemOutcome {
-                    terminal_status: ToolItemTerminalStatus::Completed,
-                    failure_kind: None,
+                    terminal_status,
+                    failure_kind,
                     execution_duration_ms: None,
                 },
                 ToolItemContext {
@@ -2066,6 +2194,7 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
                     thread_state,
                     thread_metadata,
                     review_summary,
+                    approval_policy,
                 },
             );
             Some(TrackEventRequest::WebSearch(CodexWebSearchEventRequest {
@@ -2079,7 +2208,10 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
             }))
         }
         ThreadItem::ImageGeneration(item) => {
-            let (terminal_status, failure_kind) = image_generation_outcome(item.status.as_str());
+            let (terminal_status, failure_kind) = override_tool_item_outcome(
+                Some(image_generation_outcome(item.status.as_str())),
+                terminal_status_override,
+            )?;
             let base = tool_item_base(
                 thread_id,
                 turn_id,
@@ -2097,6 +2229,7 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
                     thread_state,
                     thread_metadata,
                     review_summary,
+                    approval_policy,
                 },
             );
             Some(TrackEventRequest::ImageGeneration(
@@ -2153,6 +2286,7 @@ struct ToolItemContext<'a> {
     thread_state: &'a ThreadAnalyticsState,
     thread_metadata: &'a ThreadMetadataState,
     review_summary: Option<&'a ItemReviewSummary>,
+    approval_policy: Option<&'a AskForApproval>,
 }
 
 fn tool_item_base(
@@ -2165,6 +2299,22 @@ fn tool_item_base(
 ) -> CodexToolItemEventBase {
     let thread_metadata = context.thread_metadata;
     let review_summary = context.review_summary.cloned().unwrap_or_default();
+    let terminal_status = outcome.terminal_status;
+    let final_approval_outcome = review_summary.final_approval_outcome.unwrap_or_else(|| {
+        final_approval_outcome_without_review(context.approval_policy, terminal_status)
+    });
+    let failure_kind = if matches!(terminal_status, ToolItemTerminalStatus::Completed) {
+        None
+    } else {
+        review_summary
+            .final_failure_kind
+            .or_else(|| {
+                (review_summary.review_count == 0)
+                    .then(|| failure_kind_without_review(context.approval_policy, terminal_status))
+                    .flatten()
+            })
+            .or(outcome.failure_kind)
+    };
     CodexToolItemEventBase {
         thread_id: thread_id.to_string(),
         turn_id: turn_id.to_string(),
@@ -2187,11 +2337,9 @@ fn tool_item_base(
         review_count: review_summary.review_count,
         guardian_review_count: review_summary.guardian_review_count,
         user_review_count: review_summary.user_review_count,
-        final_approval_outcome: review_summary
-            .final_approval_outcome
-            .unwrap_or(FinalApprovalOutcome::Unknown),
-        terminal_status: outcome.terminal_status,
-        failure_kind: outcome.failure_kind,
+        final_approval_outcome,
+        terminal_status,
+        failure_kind,
         requested_additional_permissions: review_summary.requested_additional_permissions,
         requested_network_access: review_summary.requested_network_access,
     }
@@ -2385,9 +2533,67 @@ fn final_approval_outcome(
             FinalApprovalOutcome::UserApprovedForSession
         }
         (Reviewer::User, ReviewStatus::Approved, _) => FinalApprovalOutcome::UserApproved,
+        (Reviewer::User, ReviewStatus::Denied, ReviewResolution::NetworkPolicyAmendment) => {
+            FinalApprovalOutcome::PolicyForbidden
+        }
         (Reviewer::User, ReviewStatus::Denied, _) => FinalApprovalOutcome::UserDenied,
         (Reviewer::User, _, _) => FinalApprovalOutcome::UserAborted,
     }
+}
+
+fn review_failure_kind(
+    status: ReviewStatus,
+    resolution: ReviewResolution,
+    trigger: ReviewTrigger,
+) -> Option<ToolItemFailureKind> {
+    match (status, resolution, trigger) {
+        (ReviewStatus::Approved, _, _) => None,
+        (ReviewStatus::Aborted | ReviewStatus::TimedOut, _, _) => {
+            Some(ToolItemFailureKind::ApprovalAborted)
+        }
+        (ReviewStatus::Denied, ReviewResolution::NetworkPolicyAmendment, _) => {
+            Some(ToolItemFailureKind::PolicyForbidden)
+        }
+        (ReviewStatus::Denied, _, ReviewTrigger::SandboxDenial) => {
+            Some(ToolItemFailureKind::SandboxDenied)
+        }
+        (ReviewStatus::Denied, _, _) => Some(ToolItemFailureKind::ApprovalDenied),
+    }
+}
+
+fn final_approval_outcome_without_review(
+    approval_policy: Option<&AskForApproval>,
+    terminal_status: ToolItemTerminalStatus,
+) -> FinalApprovalOutcome {
+    match (approval_policy, terminal_status) {
+        (Some(AskForApproval::Never), ToolItemTerminalStatus::Rejected) => {
+            FinalApprovalOutcome::PolicyForbidden
+        }
+        (Some(AskForApproval::Never), _) => FinalApprovalOutcome::ConfigAllowed,
+        (Some(_), _) => FinalApprovalOutcome::NotNeeded,
+        (None, _) => FinalApprovalOutcome::Unknown,
+    }
+}
+
+fn failure_kind_without_review(
+    approval_policy: Option<&AskForApproval>,
+    terminal_status: ToolItemTerminalStatus,
+) -> Option<ToolItemFailureKind> {
+    match (approval_policy, terminal_status) {
+        (Some(AskForApproval::Never), ToolItemTerminalStatus::Rejected) => {
+            Some(ToolItemFailureKind::PolicyForbidden)
+        }
+        _ => None,
+    }
+}
+
+fn override_tool_item_outcome(
+    outcome: Option<(ToolItemTerminalStatus, Option<ToolItemFailureKind>)>,
+    terminal_status_override: Option<ToolItemTerminalStatus>,
+) -> Option<(ToolItemTerminalStatus, Option<ToolItemFailureKind>)> {
+    terminal_status_override
+        .map(|terminal_status| (terminal_status, None))
+        .or(outcome)
 }
 
 fn command_execution_tool_name(source: CommandExecutionSource) -> &'static str {
@@ -2728,7 +2934,7 @@ fn codex_turn_event_params(
         timing: turn_state.timing.clone(),
         duration_ms: completed.duration_ms,
         started_at,
-        completed_at: Some(completed.completed_at),
+        completed_at: completed.completed_at,
     }
 }
 

@@ -95,7 +95,6 @@ mod chat_composer_history;
 mod command_popup;
 pub(crate) mod custom_prompt_view;
 mod experimental_features_view;
-mod file_search_popup;
 mod footer;
 mod list_selection_view;
 mod memories_settings_view;
@@ -330,11 +329,6 @@ impl BottomPane {
 
     pub fn set_token_activity_command_enabled(&mut self, enabled: bool) {
         self.composer.set_token_activity_command_enabled(enabled);
-        self.request_redraw();
-    }
-
-    pub fn set_mentions_v2_enabled(&mut self, enabled: bool) {
-        self.composer.set_mentions_v2_enabled(enabled);
         self.request_redraw();
     }
 

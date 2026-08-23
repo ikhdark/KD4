@@ -613,23 +613,11 @@ fn apply_proxy_env_overrides(
 
     if let Some(mitm_ca_trust_bundle) = mitm_ca_trust_bundle {
         let managed_path = mitm_ca_trust_bundle.path.to_string_lossy().into_owned();
-        for key in crate::certs::CUSTOM_CA_ENV_KEYS {
-            if env
-                .get(key)
-                .filter(|value| !value.is_empty())
-                .is_some_and(|value| {
-                    value != &managed_path
-                        && mitm_ca_trust_bundle.startup_env_values.get(key) != Some(value)
-                })
-            {
-                // TODO(winston): Materialize policy-checked per-child bundles for readable
-                // startup and command-scoped CA overrides. For now startup overrides are
-                // replaced with the default bundle and later command-scoped overrides are
-                // preserved, either of which can make intercepted TLS fail.
-                continue;
-            }
-            env.insert(key.to_string(), managed_path.clone());
-        }
+        // This generated bundle already contains platform roots, configured startup roots, and
+        // the managed MITM CA. Point every supported client at that single policy-readable path;
+        // preserving an inherited alias here can bypass the managed CA or leave a sandboxed child
+        // with a CA path it cannot read.
+        set_env_keys(env, &crate::certs::CUSTOM_CA_ENV_KEYS, &managed_path);
     }
 }
 
@@ -688,7 +676,7 @@ impl NetworkProxy {
     ) -> PreparedManagedNetwork {
         let runtime_settings = self.runtime_settings();
         // Enforce proxying for child processes. Proxy endpoint values are always rewritten;
-        // managed MITM CA vars preserve child-scoped overrides after proxy startup.
+        // managed MITM CA vars all use the merged, sandbox-readable trust bundle.
         apply_proxy_env_overrides(
             &mut env,
             addrs.http_addr,
@@ -1442,16 +1430,27 @@ mod tests {
     }
 
     #[test]
-    fn apply_proxy_env_overrides_preserves_command_scoped_mitm_ca_override() {
-        let command_ca_bundle_path = "/tmp/command-ca.pem".to_string();
+    fn apply_proxy_env_overrides_routes_custom_startup_ca_through_merged_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom_ca_bundle_path = dir.path().join("custom-ca.pem");
+        let mitm_ca_trust_bundle_path = dir.path().join("managed-ca-bundle.pem");
+        std::fs::write(&custom_ca_bundle_path, "custom startup CA\n").unwrap();
+        std::fs::write(
+            &mitm_ca_trust_bundle_path,
+            "custom startup CA\nmanaged MITM CA\n",
+        )
+        .unwrap();
+        let custom_ca_bundle_path = custom_ca_bundle_path.display().to_string();
         let mut env = HashMap::from([(
             "REQUESTS_CA_BUNDLE".to_string(),
-            command_ca_bundle_path.clone(),
+            custom_ca_bundle_path.clone(),
         )]);
-        let mitm_ca_trust_bundle_path = Path::new("/tmp/codex-proxy/ca-bundle.pem");
         let mitm_ca_trust_bundle = crate::certs::ManagedMitmCaTrustBundle {
-            path: mitm_ca_trust_bundle_path.to_path_buf(),
-            startup_env_values: HashMap::new(),
+            path: mitm_ca_trust_bundle_path.clone(),
+            // The startup CA was captured under one supported client variable. A child may select
+            // the same configured CA through another alias; every alias must still route through
+            // the merged bundle.
+            startup_env_values: HashMap::from([("SSL_CERT_FILE", custom_ca_bundle_path)]),
         };
 
         apply_proxy_env_overrides(
@@ -1463,11 +1462,17 @@ mod tests {
             Some(&mitm_ca_trust_bundle),
         );
 
-        assert_eq!(env.get("REQUESTS_CA_BUNDLE"), Some(&command_ca_bundle_path));
-        assert_eq!(
-            env.get("SSL_CERT_FILE"),
-            Some(&mitm_ca_trust_bundle_path.display().to_string())
-        );
+        let managed_path = mitm_ca_trust_bundle_path.display().to_string();
+        for key in crate::certs::CUSTOM_CA_ENV_KEYS {
+            assert_eq!(env.get(key), Some(&managed_path));
+        }
+        let child_visible_bundle = std::fs::read_to_string(
+            env.get("REQUESTS_CA_BUNDLE")
+                .expect("requests CA bundle path"),
+        )
+        .unwrap();
+        assert!(child_visible_bundle.contains("custom startup CA"));
+        assert!(child_visible_bundle.contains("managed MITM CA"));
     }
 
     #[test]

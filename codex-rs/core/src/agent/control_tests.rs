@@ -319,6 +319,21 @@ async fn wait_for_subagent_notification(parent_thread: &Arc<CodexThread>) -> boo
 }
 
 async fn persist_thread_for_tree_resume(thread: &Arc<CodexThread>, message: &str) {
+    // These fixtures exercise the legacy persisted spawn-edge reconstruction path. Pin the
+    // version before materializing the rollout so metadata-less histories remain reserved for
+    // the separate V2 migration coverage.
+    thread
+        .codex
+        .session
+        .set_multi_agent_version_if_unset(MultiAgentVersion::V1);
+    let turn_context = thread.codex.session.new_default_turn().await;
+    thread
+        .codex
+        .session
+        .persist_rollout_items(&[RolloutItem::TurnContext(
+            turn_context.to_turn_context_item(),
+        )])
+        .await;
     thread
         .inject_user_message_without_turn(message.to_string())
         .await;
@@ -1479,6 +1494,11 @@ async fn spawn_agent_hides_child_until_initial_submission() {
             .expect("thread-created notification should arrive")
             .expect("thread-created notification should remain available"),
         spawned_agent.thread_id
+    );
+    assert_eq!(
+        harness.manager.list_thread_created_ids().await,
+        vec![spawned_agent.thread_id],
+        "only the loaded child instance that emitted thread_created should be recoverable"
     );
     assert_eq!(
         harness
@@ -2990,7 +3010,7 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
 #[tokio::test]
 async fn completion_watcher_emits_terminal_metrics_for_missing_typed_receipt() {
     let harness = AgentControlHarness::new().await;
-    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
     let (child_thread_id, child_thread) = harness.start_thread().await;
     let coordinator = harness.control.task_coordinator();
     if coordinator.store().is_none() {
@@ -3062,7 +3082,7 @@ async fn completion_watcher_emits_terminal_metrics_for_missing_typed_receipt() {
         child_thread_id,
         Some(child_source.clone()),
         child_agent_path.to_string(),
-        Some(child_agent_path),
+        Some(child_agent_path.clone()),
     );
 
     let child_turn = child_thread.codex.session.new_default_turn().await;
@@ -3105,6 +3125,26 @@ async fn completion_watcher_emits_terminal_metrics_for_missing_typed_receipt() {
     })
     .await
     .expect("completion watcher should seal and emit the missing-receipt outcome");
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let history_items = parent_thread
+                .codex
+                .session
+                .clone_history()
+                .await
+                .raw_items()
+                .to_vec();
+            if history_contains_text(&history_items, "needs_main")
+                && history_contains_text(&history_items, "blocked")
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("completion watcher should notify the parent with the durable blocked outcome");
 }
 
 #[tokio::test]

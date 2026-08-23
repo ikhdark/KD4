@@ -438,10 +438,15 @@ async fn names_and_limits_are_cache_dependencies() {
 
     config.project_doc_max_bytes = 8;
     manager.refresh(&config, &environments).await;
+    let truncated = manager.get_loaded().await.expect("truncated fallback load");
     assert!(
-        manager.get_loaded().await.is_none(),
-        "the bounded truncation notice cannot fit in eight bytes"
+        truncated
+            .text()
+            .starts_with("fallback\n\n[Project documentation truncation notice: source path:")
     );
+    assert!(truncated.text().contains("original byte count: 21"));
+    assert!(truncated.text().contains("retained byte count: 8"));
+    assert!(truncated.text().contains("omitted byte count: 13"));
 }
 
 #[tokio::test]

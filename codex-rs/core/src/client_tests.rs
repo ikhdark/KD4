@@ -86,6 +86,8 @@ use codex_utils_output_truncation::approx_token_count;
 use futures::StreamExt;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use sha2::Digest;
+use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::pin::Pin;
@@ -1165,9 +1167,7 @@ fn request_schema_serialization_cache_is_keyed_by_model_visible_schema() {
         .request_schema_cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert_eq!(cache.hits, 1);
-    assert_eq!(cache.misses, 2);
-    assert_eq!(cache.entries.len(), 2);
+    assert_eq!(cache.diagnostics(), (1, 2, 2));
 }
 
 #[test]
@@ -1203,7 +1203,78 @@ fn request_schema_cache_reuses_precomputed_tool_digest() {
         .request_schema_cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert_eq!((cache.hits, cache.misses, cache.entries.len()), (1, 2, 2));
+    assert_eq!(cache.diagnostics(), (1, 2, 2));
+}
+
+fn request_schema_cache_test_prompt() -> Prompt {
+    Prompt {
+        tools: vec![codex_tools::ToolSpec::Function(
+            codex_tools::ResponsesApiTool {
+                name: "schema_cache_probe".to_string(),
+                description: "Request schema cache identity probe.".to_string(),
+                strict: false,
+                defer_loading: None,
+                parameters: codex_tools::JsonSchema::default(),
+                output_schema: None,
+            },
+        )],
+        output_schema: Some(json!({"type": "object"})),
+        ..Prompt::default()
+    }
+}
+
+#[test]
+fn request_schema_cache_reuses_equivalent_raw_and_precomputed_tool_schema_identity() {
+    let client = test_model_client(SessionSource::Cli);
+    let raw_prompt = request_schema_cache_test_prompt();
+    let tool_bytes = serde_json::to_vec(raw_prompt.tools.as_slice())
+        .expect("tool schemas should serialize for their cache identity");
+    let tool_digest = Sha256::digest(tool_bytes).into();
+    let digested_prompt = Prompt {
+        digests: crate::client_common::PromptDigests {
+            tools: Some(tool_digest),
+            ..Default::default()
+        },
+        ..raw_prompt.clone()
+    };
+
+    let raw = client
+        .request_schema_components(&raw_prompt, None, /*use_responses_lite*/ false)
+        .expect("raw tool schemas should serialize");
+    let digested = client
+        .request_schema_components(&digested_prompt, None, /*use_responses_lite*/ false)
+        .expect("equivalent precomputed tool identity should hit");
+
+    assert_eq!(raw.tools, digested.tools);
+    assert_eq!(raw.text, digested.text);
+    let cache = client
+        .state
+        .request_schema_cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(cache.diagnostics(), (1, 1, 1));
+}
+
+#[test]
+fn request_schema_cache_reuses_across_responses_lite_modes() {
+    let client = test_model_client(SessionSource::Cli);
+    let prompt = request_schema_cache_test_prompt();
+
+    let regular = client
+        .request_schema_components(&prompt, None, /*use_responses_lite*/ false)
+        .expect("regular request schema should serialize");
+    let lite = client
+        .request_schema_components(&prompt, None, /*use_responses_lite*/ true)
+        .expect("Responses Lite should reuse request schema components");
+
+    assert_eq!(regular.tools, lite.tools);
+    assert_eq!(regular.text, lite.text);
+    let cache = client
+        .state
+        .request_schema_cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(cache.diagnostics(), (1, 1, 1));
 }
 
 #[tokio::test]
@@ -1451,16 +1522,6 @@ fn ultra_reasoning_uses_max_for_requests() {
     ))
     .unwrap();
     assert_eq!(serialized["effort"], json!("max"),);
-}
-
-#[test]
-fn omitted_memory_summary_effort_stays_omitted() {
-    let mut model: serde_json::Value = serde_json::to_value(test_model_info()).unwrap();
-    model["supports_reasoning_summaries"] = json!(true);
-    model["default_reasoning_level"] = json!("high");
-    let model: ModelInfo = serde_json::from_value(model).unwrap();
-
-    assert!(crate::client::memory_summary_reasoning(&model, None).is_none());
 }
 
 fn write_chatgpt_auth_json(codex_home: &std::path::Path) {
@@ -1714,24 +1775,6 @@ fn build_ws_client_metadata_includes_window_lineage_and_turn_metadata() {
             .map(String::as_str),
         Some("collab_spawn")
     );
-}
-
-#[tokio::test]
-async fn summarize_memories_returns_empty_for_empty_input() {
-    let client = test_model_client(SessionSource::Cli);
-    let model_info = test_model_info();
-    let session_telemetry = test_session_telemetry();
-
-    let output = client
-        .summarize_memories(
-            Vec::new(),
-            &model_info,
-            /*effort*/ None,
-            &session_telemetry,
-        )
-        .await
-        .expect("empty summarize request should succeed");
-    assert_eq!(output.len(), 0);
 }
 
 #[tokio::test]

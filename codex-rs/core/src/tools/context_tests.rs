@@ -45,6 +45,19 @@ fn function_payloads_remain_function_outputs() {
 }
 
 #[test]
+fn apply_patch_code_mode_result_preserves_output() {
+    let text = "Success. Updated the following files:\nA code_mode_apply_patch.txt\n".to_string();
+    let output = ApplyPatchToolOutput::from_text(text.clone());
+
+    assert_eq!(
+        output.code_mode_result(&ToolPayload::Function {
+            arguments: "{}".to_string(),
+        }),
+        json!(text)
+    );
+}
+
+#[test]
 fn skipped_function_outputs_remain_typed_and_non_successful() {
     let payload = ToolPayload::Function {
         arguments: "{}".to_string(),
@@ -876,6 +889,50 @@ fn exec_command_tool_output_formats_truncated_response() {
         }
         other => panic!("expected FunctionCallOutput, got {other:?}"),
     }
+}
+
+#[test]
+fn exec_command_projection_metadata_preserves_authoritative_first_output() {
+    let raw_output = "first output line\n".repeat(100);
+    let output = ExecCommandToolOutput {
+        event_call_id: "call-first-output".to_string(),
+        chunk_id: "chunk-first-output".to_string(),
+        wall_time: std::time::Duration::from_millis(1),
+        raw_output: raw_output.as_bytes().to_vec(),
+        truncation_policy: TruncationPolicy::Tokens(10_000),
+        max_output_tokens: Some(20),
+        process_id: Some(42),
+        exit_code: None,
+        original_token_count: Some(300),
+        hook_command: None,
+        raw_output_artifact: None,
+        repair_notice: None,
+    };
+
+    let metadata = output
+        .projection_metadata()
+        .expect("exec output should expose projection metadata");
+
+    assert_eq!(metadata.spillable_text, vec![raw_output.clone()]);
+    assert_eq!(
+        metadata.fragments,
+        vec![
+            ToolOutputProjectionFragment::new(
+                ToolOutputProjectionFragmentKind::ProcessFinalStatus,
+                "process final status: exit_code=None, session_id=Some(42), wall_time_seconds=0.0010",
+            )
+            .with_id("process_status"),
+            ToolOutputProjectionFragment::new(
+                ToolOutputProjectionFragmentKind::ContextualSpillableText,
+                raw_output,
+            )
+            .with_id("output")
+        ]
+    );
+    assert_eq!(metadata.essential_inline["session_id"], json!(42));
+    assert_eq!(metadata.essential_inline["exit_code"], JsonValue::Null);
+    assert_eq!(metadata.essential_inline["wall_time_seconds"], json!(0.001));
+    assert_eq!(metadata.essential_inline["repair_notice"], JsonValue::Null);
 }
 
 #[test]

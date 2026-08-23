@@ -11,6 +11,7 @@ Scenario: additional context is inserted before the user turn input.
 03:message/developer:<PERMISSIONS_INSTRUCTIONS>
 04:message/developer:<skills_usage_instructions>\n## How to use skills\n- Use the smallest skill set named by the user or clearly matched by the task; announce it, state ordering wh...
 05:message/developer:<NO_TEXT>
-06:message/user:<external_context source="browser_info" kind="untrusted">\ntab one\n</external_context>
-07:message/developer:<application_context source="automation_info" kind="application">\nrun one\n</application_context>
-08:message/user:inspect the active tab
+06:message/developer:<root_orchestration_instructions>When several independent tool calls and their result handling are already\nknown, request them together using available paralle...
+07:message/user:<external_context source="browser_info" kind="untrusted">\ntab one\n</external_context>
+08:message/developer:<application_context source="automation_info" kind="application">\nrun one\n</application_context>
+09:message/user:inspect the active tab

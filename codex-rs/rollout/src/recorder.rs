@@ -16,6 +16,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::Ordering;
 
 use chrono::SecondsFormat;
 use codex_protocol::SessionId;
@@ -132,7 +134,16 @@ enum RolloutCmd {
 struct RolloutWriterTask {
     handle: Mutex<Option<JoinHandle<()>>>,
     terminal_failure: Mutex<Option<Arc<IoError>>>,
+    lifecycle: AtomicU8,
+    /// Serializes the lifecycle check with command enqueue across recorder
+    /// clones so no command can be accepted behind Shutdown.
+    enqueue_gate: tokio::sync::Semaphore,
 }
+
+const WRITER_ACTIVE: u8 = 0;
+const WRITER_SHUTTING_DOWN: u8 = 1;
+const WRITER_SHUT_DOWN: u8 = 2;
+const WRITER_FAILED: u8 = 3;
 
 impl RolloutWriterTask {
     /// Create task observability state before spawning the writer.
@@ -140,6 +151,8 @@ impl RolloutWriterTask {
         Self {
             handle: Mutex::new(None),
             terminal_failure: Mutex::new(None),
+            lifecycle: AtomicU8::new(WRITER_ACTIVE),
+            enqueue_gate: tokio::sync::Semaphore::new(1),
         }
     }
 
@@ -154,11 +167,14 @@ impl RolloutWriterTask {
 
     /// Remember a terminal task failure for future recorder API calls.
     fn mark_failed(&self, err: &IoError) {
-        let mut guard = self
-            .terminal_failure
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = Some(Arc::new(clone_io_error(err)));
+        {
+            let mut guard = self
+                .terminal_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *guard = Some(Arc::new(clone_io_error(err)));
+        }
+        self.lifecycle.store(WRITER_FAILED, Ordering::Release);
     }
 
     /// Return the terminal writer-task failure, if the task exited with an error.
@@ -168,6 +184,60 @@ impl RolloutWriterTask {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.as_ref().map(|err| clone_io_error(err.as_ref()))
+    }
+
+    fn ensure_active(&self, operation: &str) -> std::io::Result<()> {
+        match self.lifecycle.load(Ordering::Acquire) {
+            WRITER_ACTIVE => Ok(()),
+            WRITER_SHUTTING_DOWN => Err(IoError::other(format!(
+                "cannot {operation} while rollout shutdown is in progress"
+            ))),
+            WRITER_SHUT_DOWN => Err(IoError::other(format!(
+                "cannot {operation} after rollout shutdown completed"
+            ))),
+            _ => Err(self.writer_task_failure(operation)),
+        }
+    }
+
+    fn writer_task_failure(&self, operation: &str) -> IoError {
+        self.terminal_failure().unwrap_or_else(|| {
+            IoError::other(format!(
+                "cannot {operation} after the rollout writer task failed"
+            ))
+        })
+    }
+
+    fn begin_shutdown(&self) -> std::io::Result<()> {
+        self.lifecycle
+            .compare_exchange(
+                WRITER_ACTIVE,
+                WRITER_SHUTTING_DOWN,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|state| {
+                if state == WRITER_FAILED {
+                    return self.writer_task_failure("shut down the rollout");
+                }
+                let phase = if state == WRITER_SHUTTING_DOWN {
+                    "already in progress"
+                } else {
+                    "already completed"
+                };
+                IoError::other(format!("rollout shutdown is {phase}"))
+            })
+    }
+
+    fn finish_shutdown(&self, succeeded: bool) {
+        self.lifecycle.store(
+            if succeeded {
+                WRITER_SHUT_DOWN
+            } else {
+                WRITER_ACTIVE
+            },
+            Ordering::Release,
+        );
     }
 }
 
@@ -847,6 +917,7 @@ impl RolloutRecorder {
                 known_repository_context,
                 rollout_path_for_spawn.clone(),
                 tool_manifests,
+                Arc::clone(&writer_task_for_spawn),
             )
             .await;
             if let Err(err) = result {
@@ -875,17 +946,27 @@ impl RolloutRecorder {
     }
 
     pub async fn record_canonical_items(&self, items: &[RolloutItem]) -> std::io::Result<()> {
+        let enqueue_guard = self
+            .writer_task
+            .enqueue_gate
+            .acquire()
+            .await
+            .map_err(|_| IoError::other("rollout enqueue gate is closed"))?;
+        self.writer_task.ensure_active("record rollout items")?;
         if items.is_empty() {
             return Ok(());
         }
-        self.tx
+        let result = self
+            .tx
             .send(RolloutCmd::AddItems(items.to_vec()))
             .await
             .map_err(|e| {
                 self.writer_task.terminal_failure().unwrap_or_else(|| {
                     IoError::other(format!("failed to queue rollout items: {e}"))
                 })
-            })
+            });
+        drop(enqueue_guard);
+        result
     }
 
     /// Materialize the rollout file and persist all buffered items.
@@ -893,6 +974,13 @@ impl RolloutRecorder {
     /// This is idempotent. If materialization fails, the recorder keeps all pending items in memory
     /// and a later `persist()` or `flush()` can retry opening and writing the rollout file.
     pub async fn persist(&self) -> std::io::Result<()> {
+        let enqueue_guard = self
+            .writer_task
+            .enqueue_gate
+            .acquire()
+            .await
+            .map_err(|_| IoError::other("rollout enqueue gate is closed"))?;
+        self.writer_task.ensure_active("persist the rollout")?;
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(RolloutCmd::Persist { ack: tx })
@@ -902,6 +990,7 @@ impl RolloutRecorder {
                     IoError::other(format!("failed to queue rollout persist: {e}"))
                 })
             })?;
+        drop(enqueue_guard);
         rx.await.map_err(|e| {
             self.writer_task.terminal_failure().unwrap_or_else(|| {
                 IoError::other(format!("failed waiting for rollout persist: {e}"))
@@ -914,6 +1003,13 @@ impl RolloutRecorder {
     /// If the first writer attempt fails, the writer drops and reopens the file handle before
     /// retrying. This returns an error only when that retry also fails or the writer task is gone.
     pub async fn flush(&self) -> std::io::Result<()> {
+        let enqueue_guard = self
+            .writer_task
+            .enqueue_gate
+            .acquire()
+            .await
+            .map_err(|_| IoError::other("rollout enqueue gate is closed"))?;
+        self.writer_task.ensure_active("flush the rollout")?;
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(RolloutCmd::Flush { ack: tx })
@@ -923,6 +1019,7 @@ impl RolloutRecorder {
                     IoError::other(format!("failed to queue rollout flush: {e}"))
                 })
             })?;
+        drop(enqueue_guard);
         rx.await.map_err(|e| {
             self.writer_task
                 .terminal_failure()
@@ -1046,27 +1143,26 @@ impl RolloutRecorder {
     ///
     /// If draining fails, the writer stays alive so callers can continue retrying flush/shutdown.
     pub async fn shutdown(&self) -> std::io::Result<()> {
+        let enqueue_guard = self
+            .writer_task
+            .enqueue_gate
+            .acquire()
+            .await
+            .map_err(|_| IoError::other("rollout enqueue gate is closed"))?;
+        let permit = self.tx.reserve().await.map_err(|e| {
+            self.writer_task.terminal_failure().unwrap_or_else(|| {
+                IoError::other(format!("failed to reserve rollout shutdown command: {e}"))
+            })
+        })?;
+        self.writer_task.begin_shutdown()?;
         let (tx_done, rx_done) = oneshot::channel();
-        match self.tx.send(RolloutCmd::Shutdown { ack: tx_done }).await {
-            Ok(_) => rx_done.await.map_err(|e| {
-                self.writer_task.terminal_failure().unwrap_or_else(|| {
-                    IoError::other(format!("failed waiting for rollout shutdown: {e}"))
-                })
-            })??,
-            Err(e) => {
-                if let Some(err) = self.writer_task.terminal_failure() {
-                    warn!(
-                        "failed to send rollout shutdown command because writer task failed: {err}"
-                    );
-                    return Err(err);
-                }
-                warn!("failed to send rollout shutdown command: {e}");
-                return Err(IoError::other(format!(
-                    "failed to send rollout shutdown command: {e}"
-                )));
-            }
-        };
-        Ok(())
+        permit.send(RolloutCmd::Shutdown { ack: tx_done });
+        drop(enqueue_guard);
+        rx_done.await.map_err(|e| {
+            self.writer_task.terminal_failure().unwrap_or_else(|| {
+                IoError::other(format!("failed waiting for rollout shutdown: {e}"))
+            })
+        })?
     }
 }
 
@@ -1884,6 +1980,7 @@ async fn rollout_writer(
     known_repository_context: Option<Option<RepositoryContext>>,
     rollout_path: PathBuf,
     tool_manifests: crate::ToolManifestDictionary,
+    writer_task: Arc<RolloutWriterTask>,
 ) -> std::io::Result<()> {
     let mut state = RolloutWriterState::new(
         writer,
@@ -1910,10 +2007,12 @@ async fn rollout_writer(
             }
             RolloutCmd::Shutdown { ack } => match state.shutdown().await {
                 Ok(()) => {
+                    writer_task.finish_shutdown(true);
                     let _ = ack.send(Ok(()));
                     break;
                 }
                 Err(err) => {
+                    writer_task.finish_shutdown(false);
                     let _ = ack.send(Err(err));
                 }
             },

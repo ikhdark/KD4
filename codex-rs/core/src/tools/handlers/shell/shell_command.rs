@@ -44,6 +44,7 @@ use crate::validation_admission::ValidationLeaderOwnership;
 use crate::validation_admission::ValidationRegistration;
 use crate::validation_admission::admit_validation;
 use crate::validation_admission::register_if_absent;
+use crate::validation_admission::scoped_validation_configuration_identity;
 use crate::validation_admission::validation_identity;
 use crate::validation_admission::validation_identity_with_scope;
 use codex_tools::ToolSpec;
@@ -412,6 +413,14 @@ impl ShellCommandHandler {
             .command_execution
             .observe_repository_revision(&turn.sub_id, observed_mutation_revision)
             .await;
+        let workspace_identity = session
+            .services
+            .command_execution
+            .current_workspace_identity_hash(
+                &turn_environment.environment_id,
+                exec_params.cwd.as_path(),
+            )
+            .await;
         let ValidationRegistrationRoles {
             execution: validation_leader,
             worker_waiter: validation_waiter,
@@ -430,13 +439,11 @@ impl ShellCommandHandler {
                 let implementation_identity = session
                     .services
                     .task_evidence
-                    .direct_validation_implementation_identity(&leaf.covered_paths)
+                    .direct_validation_implementation_identity_for_leaf(leaf)
                     .await
                     .map_err(FunctionCallError::RespondToModel)?;
-                let configuration = format!(
-                    "repository_epoch={repository_epoch};features={:?}",
-                    turn.config.features.get()
-                );
+                let configuration =
+                    scoped_validation_configuration_identity(turn.config.features.get());
                 validation_identity_with_scope(
                     repository_key.as_bytes(),
                     exec_params.cwd.to_string_lossy(),
@@ -513,7 +520,8 @@ impl ShellCommandHandler {
         .with_sandbox_context(&sandbox_context)
         .with_input_context(&prefix_rule)
         .with_runtime_context(&runtime_context)
-        .with_repository_epoch(repository_epoch);
+        .with_repository_epoch(repository_epoch)
+        .with_workspace_identity(workspace_identity.as_deref());
         let search = classify_rg_search_narrowing(
             &safety_command,
             shell_type,

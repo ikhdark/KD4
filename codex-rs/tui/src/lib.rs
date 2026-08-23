@@ -1689,21 +1689,17 @@ async fn run_ratatui_app(
     #[cfg(target_os = "windows")]
     let windows_sandbox_level = crate::windows_sandbox::level_from_config(&config);
     #[cfg(target_os = "windows")]
-    let required_elevated_sandbox_needs_setup = windows_sandbox_level
-        == WindowsSandboxLevel::Elevated
-        && config
-            .config_layer_stack
-            .requirements()
-            .windows_sandbox_mode
-            .source
-            .is_some()
-        && !crate::windows_sandbox::sandbox_setup_is_complete(config.codex_home.as_path());
-    #[cfg(target_os = "windows")]
-    let should_prompt_windows_sandbox_nux_at_startup = (trust_decision_was_made
+    let should_check_windows_sandbox_readiness = (trust_decision_was_made
         && windows_sandbox_level == WindowsSandboxLevel::Disabled)
-        || required_elevated_sandbox_needs_setup;
+        || (windows_sandbox_level == WindowsSandboxLevel::Elevated
+            && config
+                .config_layer_stack
+                .requirements()
+                .windows_sandbox_mode
+                .source
+                .is_some());
     #[cfg(not(target_os = "windows"))]
-    let should_prompt_windows_sandbox_nux_at_startup = false;
+    let should_check_windows_sandbox_readiness = false;
 
     let Cli {
         prompt,
@@ -1742,6 +1738,25 @@ async fn run_ratatui_app(
                 return Err(err);
             }
         },
+    };
+
+    let should_prompt_windows_sandbox_nux_at_startup = if should_check_windows_sandbox_readiness {
+        match app_server.windows_sandbox_readiness().await {
+            Ok(response) => matches!(
+                response.status,
+                codex_app_server_protocol::WindowsSandboxReadiness::NotConfigured
+                    | codex_app_server_protocol::WindowsSandboxReadiness::UpdateRequired
+            ),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to query app-server Windows sandbox readiness during startup"
+                );
+                false
+            }
+        }
+    } else {
+        false
     };
 
     // Persistent app-server resumes may attach to an already-running thread,

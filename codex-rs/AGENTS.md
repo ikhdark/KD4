@@ -27,6 +27,12 @@
 - Use the smallest documented [validation route](../SOURCEMAP.md#validation-routes)
   and check-only schema route unless changing a generated contract. Inspect
   generated diffs; documentation checks are not runtime proof.
+- Whenever a full Cargo test or workspace test run is performed, use Cargo's
+  `--no-fail-fast` mode and let the run finish before making fixes. Apply the
+  same inventory-first rule to full-workspace Clippy, `cargo shear`, and other
+  lint, analyzer, or quality-gate runs: complete the requested run and inventory
+  every failing target, test, assertion, and diagnostic before implementation
+  fixes begin.
 
 ## Rust test conventions
 

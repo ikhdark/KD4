@@ -1,0 +1,327 @@
+KD4 RUST WORKSPACE BUG AUDIT AND FIX RECORD
+
+Audit/fix date: 2026-08-23
+Project: KD4 local fork of openai/codex
+Repository revision inspected: d125780c12c2
+Environment: Windows PowerShell; Rust workspace under codex-rs; repository test and
+analyzer entry points invoked through just.
+Session scope: full Rust workspace test repair, workspace Clippy, and cargo-shear.
+
+WORKING-TREE NOTE
+
+The checkout already contained a large set of unrelated and concurrent modifications.
+Those changes were preserved. This record is limited to failures observed in this audit,
+the fixes evaluated or implemented for those failures, and the validation commands run
+after the fixes. It does not attribute every dirty working-tree path to this session.
+
+BASELINE DIRECT EVIDENCE
+
+Command: just test
+Result: exit failure.
+Harness summary: 13,542 tests run; 13,379 passed; 161 failed; 2 timed out;
+91 skipped.
+
+The failures clustered around context-fragment identity and compaction expectations,
+multi-agent resume metadata, task-evidence plan normalization, hidden legacy shell-tool
+dispatch, realtime websocket test connection ownership, and unified-exec output timing.
+The repairs were made as a batch and the complete workspace was rerun after the focused
+routes passed, per the user's instruction not to stop after each individual repair.
+
+FINDING KD4-RUST-2026-08-23-001
+
+Severity: high
+Status: fixed
+Confidence: high
+Component: codex-core initial model context, compaction, resume/fork, model-visible
+context refresh
+Affected implementation and consumers:
+- codex-rs/core/src/session/mod.rs, including digest_context_fragments,
+  InitialContextBuild, build_context_fragment_digests, and
+  build_initial_context_with_world_state_and_mcp.
+- codex-rs/core/src/compact.rs, codex-rs/core/src/compact_remote.rs, and
+  codex-rs/core/src/compact_remote_v2.rs.
+- session, compaction, remote-compaction, resume/fork, and model-visible-layout tests
+  and snapshots under codex-rs/core/src and codex-rs/core/tests/suite.
+
+Observed symptom:
+Numerous compaction and context-layout tests disagreed about whether semantically
+unchanged model context had changed, and snapshots contained duplicated or stale
+context-fragment representations after compaction and resume/fork paths.
+
+Violated invariant:
+Runtime context fragments that are semantically identical must have stable identities
+and digests across construction, compaction, and reinjection. Dynamic identifiers and
+opaque skill locators must not make an otherwise identical fragment appear changed.
+The same accepted fragment baseline must be available to every compaction variant and
+to subsequent model turns.
+
+Established cause:
+The initial-context construction boundary did not propagate one canonical stable
+fragment digest set through all consumers. Dynamic context data participated in
+identity comparison, and remote compaction did not consistently use the same V2
+initial-context representation. Model-visible AGENTS context could also retain a stale
+snapshot between turns.
+
+Fix/disposition:
+- Canonicalized context-fragment digest inputs so dynamic identifiers and opaque skill
+  locators do not invalidate semantic equality.
+- Carried stable fragment digests through InitialContextBuild and the compaction
+  injection paths.
+- Aligned remote compaction expectations with the V2 path.
+- Refreshed the model-visible AGENTS snapshot between turns.
+- Accepted the nine context-fragment deduplication snapshots produced by the corrected
+  canonical representation.
+
+Reachable effect and regression risk:
+Without this repair, users can receive duplicated/stale hidden context, lose prompt
+cache stability, or observe inconsistent behavior after compaction, resume, or fork.
+The main regression risk is over-canonicalizing genuinely distinct context; the direct
+session/compaction tests and the full workspace run cover this boundary.
+
+Validation evidence:
+The relevant session, compaction, remote-compaction, and model-visible-layout tests
+passed in focused and final workspace runs. Final full-workspace result is recorded
+below.
+
+FINDING KD4-RUST-2026-08-23-002
+
+Severity: high
+Status: fixed
+Confidence: high
+Component: codex-core multi-agent resume and restored metadata
+Affected implementation and tests:
+- codex-rs/core/src/agent and codex-rs/core/src/tools/handlers/multi_agents_v2.
+- codex-rs/core/src/tools/handlers/multi_agents_tests.rs and related session tests.
+
+Observed symptom:
+Resume-related tests failed because restored agents did not consistently retain the
+expected effective mode/defaults and V1/V2 metadata used by later send/resume consumers.
+
+Violated invariant:
+A persisted agent that is resumed must expose the same effective role, model, mode, and
+protocol metadata that its downstream tool handlers and session consumers use. A live
+V1 agent must not require construction of an unnecessary resume configuration.
+
+Established cause:
+The restored metadata/default path and V1/V2 resume behavior were not normalized at the
+same ownership boundary.
+
+Fix/disposition:
+Normalized resume defaults and preserved the protocol-specific metadata required by
+the V1 and V2 consumers. The live V1 send path skips eager resume-config construction.
+
+Reachable effect and regression risk:
+The defect could reject input to resumable agents or restore an agent with inconsistent
+model-visible metadata. Tests cover active, closed, registered-shutdown, and V1 resume
+paths.
+
+Validation evidence:
+The focused multi-agent/resume tests and the final full workspace run passed.
+
+FINDING KD4-RUST-2026-08-23-003
+
+Severity: medium
+Status: fixed
+Confidence: high
+Component: codex-core task evidence and update_plan normalization
+Affected implementation and tests:
+- codex-rs/core/src/task_evidence.rs.
+- codex-rs/core/src/task_evidence_tests.rs.
+- codex-rs/core/src/tools/handlers/plan.rs,
+  codex-rs/core/src/tools/handlers/plan_tests.rs, and plan schema tests.
+
+Observed symptom:
+Plan tests expected completed steps without an explicit proof route to remain
+in-progress/unresolved, while the task-evidence contract normalized completed work that
+does not structurally require validation to passed/not_required. Dependency-cycle and
+normalized-output expectations therefore failed.
+
+Violated invariant:
+Proof-free completed work is valid only when validation is not structurally required;
+such work must normalize to status passed with validation_disposition not_required.
+Structurally required work must remain unresolved until evidence is present.
+
+Established cause:
+Test expectations represented the older semantics and did not distinguish
+proof-optional work from structurally required work.
+
+Fix/disposition:
+Updated the direct plan normalization expectations to passed/not_required for
+proof-optional completed work while retaining unresolved behavior for structurally
+required work. Added/retained schema and durable-persistence coverage at the plan tool
+boundary.
+
+Validation evidence:
+The focused plan tests passed 3/3. The final workspace run passed all plan and
+task-evidence tests.
+
+FINDING KD4-RUST-2026-08-23-004
+
+Severity: high
+Status: fixed
+Confidence: high
+Component: codex-core tool plan and compatibility dispatch
+Affected implementation and tests:
+- codex-rs/core/src/tools/spec_plan.rs, add_shell_tools.
+- codex-rs/core/src/tools/registry.rs and codex-rs/core/src/tools/spec_plan_tests.rs.
+
+Observed symptom:
+Under UnifiedExec, compatibility tests failed because persisted or delegated calls that
+still name shell_command could no longer reach a registered handler.
+
+Violated invariant:
+UnifiedExec may replace the legacy shell tool in the model-visible tool list, but
+persisted/delegated legacy calls must remain dispatchable across the compatibility
+boundary.
+
+Established cause:
+The legacy shell handler was absent from the dispatch plan when UnifiedExec was active.
+
+Fix/disposition:
+Registered ShellCommandHandler as dispatch-only/ToolExposure::Hidden while keeping it
+out of newly generated model-visible tool specifications.
+
+Reachable effect and regression risk:
+Without the hidden registration, replayed or delegated legacy calls fail at runtime.
+The risk of accidentally re-exposing the legacy tool is covered by explicit Hidden
+exposure assertions.
+
+Validation evidence:
+Tool-plan/registry compatibility tests and the final workspace run passed.
+
+FINDING KD4-RUST-2026-08-23-005
+
+Severity: medium (test infrastructure; could mask runtime regressions)
+Status: fixed
+Confidence: high
+Component: codex-core realtime conversation integration test topology
+Affected file and symbol:
+- codex-rs/core/tests/suite/realtime_conversation.rs,
+  conversation_second_start_replaces_runtime (current source near line 1558).
+
+Observed symptom:
+The test timed out twice at codex-rs/core/tests/common/lib.rs:365 while waiting for the
+expected event. Direct websocket evidence showed the old realtime session on connection
+1, followed by a normal Responses response.create on connection 2, rather than the
+second scripted realtime session.
+
+Expected behavior:
+Starting a second realtime conversation replaces the old runtime, establishes exactly
+the new realtime connection, and routes the subsequent audio append to it.
+
+Established cause:
+The test used one scripted websocket server for both the normal Responses transport and
+the realtime sideband. A normal Responses reconnect could consume the scripted
+connection intended for the new realtime runtime, so connection indices and events were
+nondeterministic under the full workspace run.
+
+Fix/disposition:
+The test now uses start_mock_server for the normal API transport and a separate scripted
+websocket server for experimental_realtime_ws_base_url. It explicitly selects realtime
+V1 and asserts two isolated realtime connections (old then new), their session IDs,
+instructions, and the audio append.
+
+Validation evidence:
+Focused command:
+just test -p codex-core conversation_second_start_replaces_runtime
+Result: passed; the combined focused run completed this test in 0.331 seconds.
+The same test passed in the final full workspace run.
+
+FINDING KD4-RUST-2026-08-23-006
+
+Severity: medium (test infrastructure; timeout obscured lifecycle result)
+Status: fixed
+Confidence: high
+Component: codex-core unified-exec integration wait policy
+Affected files and symbols:
+- codex-rs/core/tests/common/lib.rs, wait_for_event_match and the added
+  wait_for_event_match_with_timeout (current source near lines 344-360).
+- codex-rs/core/tests/suite/unified_exec.rs, wait_for_raw_unified_exec_output and
+  UNIFIED_EXEC_LAGGED_OUTPUT_TIMEOUT (current source near lines 53 and 173-190).
+
+Observed symptom:
+exec_command_controlled_lifecycle_trio_completes_without_stale_processes timed out twice
+at the common event wait helper during a loaded full-workspace run.
+
+Expected behavior:
+The controlled lifecycle trio may take longer under load but must emit its raw function
+output within the suite's declared 30-second lagged-output timeout and leave no stale
+processes.
+
+Established cause:
+wait_for_raw_unified_exec_output used the common match helper, whose effective event
+deadline was 10 seconds, instead of the suite's existing
+UNIFIED_EXEC_LAGGED_OUTPUT_TIMEOUT of 30 seconds.
+
+Fix/disposition:
+Added wait_for_event_match_with_timeout while preserving the existing default helper's
+behavior. Unified-exec raw-output waits now use the already-declared 30-second timeout.
+
+Validation evidence:
+Focused command:
+just test -p codex-core exec_command_controlled_lifecycle_trio_completes_without_stale_processes
+Result: passed; the combined focused run completed this test in 3.499 seconds.
+The same test passed in the final full workspace run.
+
+VALIDATION HISTORY AND FINAL EVIDENCE
+
+Batch progression:
+- Initial full run: 13,542 run; 13,379 passed; 161 failed; 2 timed out;
+  91 skipped.
+- Intermediate full run: 13,543 run; 13,481 passed; 61 failed; 1 timed out;
+  91 skipped.
+- Intermediate full run: 13,543 run; 13,540 passed; 3 failed; 91 skipped.
+- Intermediate full run: 13,543 run; 13,541 passed; 2 failed; 91 skipped.
+- Focused plan/HTTP sanitizer route: 3/3 passed.
+- Broader focused regression route: 607 passed.
+- Focused realtime/unified-exec combined route: 2/2 passed; 3,993 skipped.
+
+Final command: just test
+Final result: exit 0.
+Final harness summary:
+Summary [1591.349s] 13543 tests run: 13543 passed (2 slow, 49 leaky),
+91 skipped
+
+The slow and leaky labels are harness classifications, not failures. No test retried or
+failed in the final run.
+
+Final command: just clippy-workspace
+Final result: exit 0; finished dev profile in 1m 37s.
+No Clippy errors were reported. The command emitted advisory warnings, including
+dead-code, let-and-return, while-let-loop, too-many-arguments, type-complexity,
+assertions-on-constants, single-match, needless-borrows-for-generic-args, and
+cloned-ref-to-slice-refs. The workspace analyzer does not promote these warnings to
+errors. They were not changed because the requested error gate passed and unrelated
+cleanup would expand the dirty-worktree scope.
+
+Final command: just cargo-shear
+Final result: exit 0.
+Exact summary: "✓ no issues found".
+
+Formatting and integrity:
+- cargo fmt --all completed successfully before the final full test run. The formatter
+  emitted stable-toolchain notices about imports_granularity but no format failure.
+- just source-map-check completed successfully after this dated record was added. Its
+  source-map structure, ASCII, table-of-contents marker, and owner checks all exited 0.
+- git diff --check returned exit 0. Its only output was Windows LF-to-CRLF working-copy
+  notices; no whitespace errors were reported.
+
+HYPOTHESES CONSIDERED AND REJECTED
+
+- Simply increasing the realtime test timeout was considered. It did not address the
+  deterministic evidence that the wrong transport consumed the scripted connection;
+  the transport topology was isolated instead.
+- Treating every proof-free completed plan step as unresolved was rejected because it
+  contradicts the task-evidence contract for work whose validation is structurally not
+  required. The distinction remains enforced for structurally required work.
+- Removing the legacy shell handler entirely under UnifiedExec was rejected because
+  persisted and delegated legacy calls remain reachable compatibility consumers.
+
+REMAINING UNKNOWNS AND FOLLOW-UP
+
+- This session did not attempt to eliminate advisory Clippy warnings that the configured
+  workspace command accepts. No Clippy errors remain.
+- The harness's 49 leaky and 2 slow classifications passed and were not independently
+  audited because they were not errors and the final run was green.
+- Desktop binary replacement/restart was not performed; activation was not requested.
+- Upstream synchronization, publication, and distribution were not performed.

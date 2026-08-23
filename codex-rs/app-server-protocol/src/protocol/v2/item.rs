@@ -6,6 +6,7 @@ use super::NetworkApprovalContext;
 use super::NetworkApprovalProtocol;
 use super::NetworkPolicyAmendment;
 use super::RequestPermissionProfile;
+use super::TaskCompletionGate;
 use super::UserInput;
 use super::shared::v2_enum_from_core;
 use crate::protocol::item_builders::command_actions_for_path_uri;
@@ -1200,6 +1201,12 @@ pub struct CollabAgentState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub surfaced_result: Option<SurfacedToolResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub completion: Option<TaskCompletionGate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub last_agent_message: Option<String>,
 }
 
 impl From<CoreAgentStatus> for CollabAgentState {
@@ -1209,44 +1216,90 @@ impl From<CoreAgentStatus> for CollabAgentState {
                 status: CollabAgentStatus::PendingInit,
                 message: None,
                 surfaced_result: None,
+                completion: None,
+                last_agent_message: None,
             },
             CoreAgentStatus::Running => Self {
                 status: CollabAgentStatus::Running,
                 message: None,
                 surfaced_result: None,
+                completion: None,
+                last_agent_message: None,
             },
             CoreAgentStatus::Interrupted => Self {
                 status: CollabAgentStatus::Interrupted,
                 message: None,
                 surfaced_result: None,
+                completion: None,
+                last_agent_message: None,
             },
-            CoreAgentStatus::Completed(message) => Self {
-                status: CollabAgentStatus::Completed,
-                message,
-                surfaced_result: None,
-            },
+            CoreAgentStatus::Completed(message) => {
+                let last_agent_message = message.clone();
+                Self {
+                    status: CollabAgentStatus::Completed,
+                    message,
+                    surfaced_result: None,
+                    completion: None,
+                    last_agent_message,
+                }
+            }
             CoreAgentStatus::CompletedWithSurface {
                 last_agent_message,
                 surfaced_result,
-            } => Self {
-                status: CollabAgentStatus::Completed,
-                message: last_agent_message,
-                surfaced_result: Some(surfaced_result),
+            } => {
+                let message = last_agent_message.clone();
+                Self {
+                    status: CollabAgentStatus::Completed,
+                    message,
+                    surfaced_result: Some(surfaced_result),
+                    completion: None,
+                    last_agent_message,
+                }
+            }
+            CoreAgentStatus::TerminalWithCompletion {
+                last_agent_message,
+                surfaced_result,
+                error,
+                completion,
+            } => match error {
+                Some(error) => Self {
+                    status: CollabAgentStatus::Errored,
+                    message: Some(error),
+                    surfaced_result,
+                    completion: Some(completion.into()),
+                    last_agent_message,
+                },
+                None => {
+                    let message = last_agent_message.clone();
+                    Self {
+                        status: CollabAgentStatus::Completed,
+                        message,
+                        surfaced_result,
+                        completion: Some(completion.into()),
+                        last_agent_message,
+                    }
+                }
             },
             CoreAgentStatus::Errored(message) => Self {
                 status: CollabAgentStatus::Errored,
                 message: Some(message),
                 surfaced_result: None,
+                completion: None,
+                last_agent_message: None,
             },
             CoreAgentStatus::Shutdown => Self {
                 status: CollabAgentStatus::Shutdown,
                 message: None,
                 surfaced_result: None,
+                completion: None,
+                last_agent_message: None,
             },
             CoreAgentStatus::NotFound => Self {
                 status: CollabAgentStatus::NotFound,
                 message: None,
                 surfaced_result: None,
+                completion: None,
+                last_agent_message: None,
             },
         }
     }

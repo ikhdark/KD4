@@ -1,11 +1,19 @@
 use super::*;
 
+use codex_config::ProjectDiscoveryContext;
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::ExecServerRuntimePaths;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
+use codex_exec_server::LOCAL_FS;
+use codex_otel::MetricsClient;
+use codex_otel::MetricsConfig;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_utils_path_uri::PathUri;
+use opentelemetry_sdk::metrics::InMemoryMetricExporter;
+use opentelemetry_sdk::metrics::data::AggregatedMetrics;
+use opentelemetry_sdk::metrics::data::MetricData;
 use pretty_assertions::assert_eq;
+use std::collections::BTreeSet;
 use tempfile::TempDir;
 
 use crate::environment_selection::ThreadEnvironments;
@@ -145,6 +153,124 @@ async fn root_snapshot_invalidates_git_marker_creation_and_removal() {
     std::fs::remove_dir_all(cwd.join(".git")).expect("remove git marker");
     let removed = cache.snapshot(&environments).await;
     assert_eq!(removed.primary_is_git(), Some(false));
+}
+
+#[tokio::test]
+async fn git_workspace_snapshot_reuses_matching_local_discovery() {
+    let (_temp_dir, repo) = create_clean_git_repo().await;
+    let cwd = repo.join("src").join("nested");
+    std::fs::create_dir_all(&cwd).expect("nested cwd");
+    let environments = local_snapshot(cwd.clone(), 8).await;
+    let discovery = ProjectDiscoveryContext::new(
+        cwd,
+        repo.clone(),
+        vec![".git".to_string()],
+        Some(repo.clone()),
+        Some(repo),
+        LOCAL_FS.as_ref(),
+    );
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+
+    let snapshot = cache
+        .snapshot_with_project_discovery(&environments, Some(&discovery))
+        .await;
+
+    assert_eq!(snapshot.primary_is_git(), Some(true));
+    assert_eq!(cache.root_resolution_count(), 0);
+}
+
+#[tokio::test]
+async fn activation_metric_distinguishes_git_project_discovery_hit_and_miss() {
+    let (_temp_dir, repo) = create_clean_git_repo().await;
+    let cwd = repo.join("src").join("nested");
+    std::fs::create_dir_all(&cwd).expect("nested cwd");
+    let environments = local_snapshot(cwd.clone(), 9).await;
+    let discovery = ProjectDiscoveryContext::new(
+        cwd,
+        repo.clone(),
+        vec![".git".to_string()],
+        Some(repo.clone()),
+        Some(repo),
+        LOCAL_FS.as_ref(),
+    );
+    let metrics = MetricsClient::new(
+        MetricsConfig::in_memory(
+            "test",
+            "codex-core",
+            env!("CARGO_PKG_VERSION"),
+            InMemoryMetricExporter::default(),
+        )
+        .with_runtime_reader(),
+    )
+    .expect("in-memory metrics client");
+
+    let hit_cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let hit = hit_cache
+        .snapshot_with_project_discovery_and_metrics(
+            &environments,
+            Some(&discovery),
+            Some(&metrics),
+        )
+        .await;
+    assert_eq!(hit.primary_is_git(), Some(true));
+    assert_eq!(hit_cache.root_resolution_count(), 0);
+
+    let miss_cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let miss = miss_cache
+        .snapshot_with_project_discovery_and_metrics(&environments, None, Some(&metrics))
+        .await;
+    assert_eq!(miss.primary_is_git(), Some(true));
+    assert_eq!(miss_cache.root_resolution_count(), 1);
+
+    let snapshot = metrics.snapshot().expect("metrics snapshot");
+    let metric = snapshot
+        .scope_metrics()
+        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+        .find(|metric| metric.name() == PROJECT_DISCOVERY_REUSE_METRIC)
+        .expect("project discovery reuse metric");
+    let points = match metric.data() {
+        AggregatedMetrics::U64(data) => match data {
+            MetricData::Sum(sum) => sum
+                .data_points()
+                .map(|point| {
+                    let tags = point
+                        .attributes()
+                        .map(|attribute| {
+                            (
+                                attribute.key.as_str().to_string(),
+                                attribute.value.as_str().to_string(),
+                            )
+                        })
+                        .collect::<std::collections::BTreeMap<_, _>>();
+                    (
+                        tags.get("consumer").cloned().unwrap_or_default(),
+                        tags.get("result").cloned().unwrap_or_default(),
+                        tags.get("reason").cloned().unwrap_or_default(),
+                        point.value(),
+                    )
+                })
+                .collect::<BTreeSet<_>>(),
+            _ => panic!("unexpected project discovery metric aggregation"),
+        },
+        _ => panic!("unexpected project discovery metric type"),
+    };
+    assert_eq!(
+        points,
+        BTreeSet::from([
+            (
+                "git".to_string(),
+                "hit".to_string(),
+                "matched".to_string(),
+                1,
+            ),
+            (
+                "git".to_string(),
+                "miss".to_string(),
+                "context_unavailable".to_string(),
+                1,
+            ),
+        ])
+    );
 }
 
 #[tokio::test]

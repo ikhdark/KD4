@@ -30,6 +30,7 @@ use codex_core::config::ConfigBuilder;
 use codex_exec_server::EnvironmentManager;
 use codex_feedback::CodexFeedback;
 use codex_login::AuthManager;
+use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::W3cTraceContext;
 use opentelemetry::global;
@@ -44,6 +45,7 @@ use opentelemetry_sdk::trace::SpanData;
 use pretty_assertions::assert_eq;
 use serial_test::serial;
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
@@ -54,6 +56,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use wiremock::MockServer;
 
 const TEST_CONNECTION_ID: ConnectionId = ConnectionId(7);
+const SECOND_TEST_CONNECTION_ID: ConnectionId = ConnectionId(8);
 
 struct TestTracing {
     exporter: InMemorySpanExporter,
@@ -296,6 +299,81 @@ where
         Ok(result) => result,
         Err(_) => Err(anyhow::anyhow!("{name} thread panicked")),
     }
+}
+
+#[test]
+#[serial(app_server_tracing)]
+fn thread_created_lag_resync_uses_only_missed_broadcast_instances() -> Result<()> {
+    run_current_thread_test_with_stack(
+        "thread_created_lag_resync_uses_only_missed_broadcast_instances",
+        async {
+            let mut harness = TracingHarness::new().await?;
+            // The tracing harness drives `process_request` directly and therefore does
+            // not execute the transport loop's post-initialize connection registration.
+            harness
+                .processor
+                .connection_initialized(
+                    TEST_CONNECTION_ID,
+                    /*request_attestation*/ false,
+                    /*experimental_api*/ true,
+                )
+                .await;
+            harness
+                .processor
+                .connection_initialized(
+                    SECOND_TEST_CONNECTION_ID,
+                    /*request_attestation*/ false,
+                    /*experimental_api*/ false,
+                )
+                .await;
+
+            let top_level_thread = harness
+                .start_thread(/*request_id*/ 30_001, /*trace*/ None)
+                .await;
+            let top_level_thread_id = ThreadId::from_string(&top_level_thread.thread.id)?;
+            harness
+                .processor
+                .resync_thread_listeners(vec![TEST_CONNECTION_ID, SECOND_TEST_CONNECTION_ID])
+                .await;
+
+            assert_eq!(
+                harness
+                    .processor
+                    .subscribed_connection_ids_for_test(top_level_thread_id)
+                    .await
+                    .into_iter()
+                    .collect::<HashSet<_>>(),
+                HashSet::from([TEST_CONNECTION_ID]),
+                "lag recovery must not attach unrelated top-level threads to other connections"
+            );
+
+            let missed_thread = harness
+                .start_thread(/*request_id*/ 30_002, /*trace*/ None)
+                .await;
+            let missed_thread_id = ThreadId::from_string(&missed_thread.thread.id)?;
+            harness
+                .processor
+                .set_thread_created_resync_override_for_test(missed_thread_id)
+                .await;
+            harness
+                .processor
+                .resync_thread_listeners(vec![TEST_CONNECTION_ID, SECOND_TEST_CONNECTION_ID])
+                .await;
+            assert_eq!(
+                harness
+                    .processor
+                    .subscribed_connection_ids_for_test(missed_thread_id)
+                    .await
+                    .into_iter()
+                    .collect::<HashSet<_>>(),
+                HashSet::from([TEST_CONNECTION_ID, SECOND_TEST_CONNECTION_ID]),
+                "lag recovery must attach every initialized connection to a missed broadcast instance"
+            );
+
+            harness.shutdown().await;
+            Ok(())
+        },
+    )
 }
 
 fn span_attr<'a>(span: &'a SpanData, key: &str) -> Option<&'a str> {

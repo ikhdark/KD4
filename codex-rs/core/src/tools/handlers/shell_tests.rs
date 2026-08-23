@@ -68,6 +68,97 @@ fn structured_cargo_leaf() -> ValidationRouteLeaf {
 }
 
 #[test]
+fn command_runner_structured_validation_distinguishes_feature_scope_from_target_scope() {
+    let repo = std::path::Path::new(".");
+    let mut leaf = structured_cargo_leaf();
+    leaf.argv.insert(4, "--all-features".into());
+    assert!(super::validate_structured_validation_leaf(&leaf, repo).is_ok());
+
+    leaf.argv[4] = "--all-targets".into();
+    assert!(
+        super::validate_structured_validation_leaf(&leaf, repo)
+            .expect_err("all targets is a broad validation route")
+            .contains("must remain focused")
+    );
+}
+
+#[test]
+fn command_runner_admission_routes_are_consistent() {
+    let repo = std::path::Path::new(".");
+
+    for argv in [
+        vec![
+            "just".into(),
+            "test-fast".into(),
+            "-p".into(),
+            "codex-core".into(),
+            "--all-targets".into(),
+            "-E".into(),
+            "test(=focused_case)".into(),
+        ],
+        vec![
+            "just".into(),
+            "check-lane".into(),
+            "codex-core".into(),
+            "--workspace".into(),
+        ],
+    ] {
+        let mut leaf = structured_cargo_leaf();
+        leaf.argv = argv;
+        assert!(
+            super::validate_structured_validation_leaf(&leaf, repo).is_err(),
+            "broad Just route must be rejected: {:?}",
+            leaf.argv
+        );
+    }
+
+    for argv in [
+        vec![
+            "cargo".into(),
+            "test".into(),
+            "focused_case".into(),
+            "--".into(),
+            "-p".into(),
+            "codex-core".into(),
+            "--exact".into(),
+        ],
+        vec![
+            "cargo".into(),
+            "check".into(),
+            "--".into(),
+            "--package".into(),
+            "codex-core".into(),
+        ],
+    ] {
+        let mut leaf = structured_cargo_leaf();
+        leaf.argv = argv;
+        assert!(
+            super::validate_structured_validation_leaf(&leaf, repo).is_err(),
+            "Cargo package scope after `--` must not satisfy admission: {:?}",
+            leaf.argv
+        );
+    }
+
+    let pytest_repo = tempfile::tempdir().expect("pytest repository tempdir");
+    std::fs::create_dir(pytest_repo.path().join("tests"))
+        .expect("pytest test directory is created");
+    for selector in [".", "tests"] {
+        let mut leaf = structured_cargo_leaf();
+        leaf.argv = vec![
+            "python".into(),
+            "-m".into(),
+            "pytest".into(),
+            selector.into(),
+        ];
+        assert!(
+            super::validate_structured_validation_leaf(&leaf, pytest_repo.path())
+                .expect_err("directory-wide pytest selector must be rejected")
+                .contains("not a directory")
+        );
+    }
+}
+
+#[test]
 fn orchestration_correctness_stall_timeout_is_opt_in() {
     assert_eq!(effective_stall_timeout_ms(None, None), None);
     assert_eq!(effective_stall_timeout_ms(Some(60_001), None), None);
@@ -388,6 +479,20 @@ fn validation_execution_outcome_distinguishes_success_from_not_executed() {
         ))
     );
     assert!(!projected.success_for_logging());
+
+    let not_applicable = super::shell_command::validation_structured_output(serde_json::json!({
+        "text": "running 0 tests",
+        "execution_outcome": "executed_not_applicable",
+        "command_was_executed": true,
+        "skip_disposition": "not_applicable",
+    }));
+    assert_eq!(
+        not_applicable.outcome_context(),
+        codex_tools::ToolOutputOutcomeContext::skipped(Some(
+            codex_tools::ToolOutputSkipDisposition::NotApplicable,
+        ))
+    );
+    assert!(!not_applicable.success_for_logging());
 }
 
 #[test]
@@ -1762,6 +1867,64 @@ async fn shell_command_active_path_applies_read_only_repair_and_retains_output()
     assert!(rendered.contains("known_flag_typo"));
     assert!(rendered.contains("Raw output artifact:"));
     assert!(rendered.contains("ripgrep"));
+}
+
+#[tokio::test]
+async fn shell_command_repeated_apply_patch_environment_mismatch_is_suppressed() {
+    let (session, turn) = make_session_and_context().await;
+    let selected_environment_id = turn
+        .environments
+        .primary()
+        .expect("primary environment")
+        .environment_id
+        .clone();
+    let patch_environment_id = format!("{selected_environment_id}-mismatch");
+    let patch = format!(
+        "*** Begin Patch\n*** Environment ID: {patch_environment_id}\n*** Add File: must-not-exist.txt\n+must not be written\n*** End Patch"
+    );
+    let payload = ToolPayload::Function {
+        arguments: json!({
+            "kind": "argv",
+            "program": "apply_patch",
+            "args": [patch]
+        })
+        .to_string(),
+    };
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let handler = ShellCommandHandler::from(codex_tools::ShellCommandBackendConfig::Classic);
+    let invoke = |call_id: &str| ToolInvocation {
+        session: Arc::clone(&session),
+        step_context: StepContext::for_test(Arc::clone(&turn)),
+        turn: Arc::clone(&turn),
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
+        tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+        call_id: call_id.to_string(),
+        tool_name: codex_tools::ToolName::plain("shell_command"),
+        source: ToolCallSource::Direct,
+        payload: payload.clone(),
+    };
+
+    let first_error = match handler
+        .handle(invoke("shell-environment-mismatch-first"))
+        .await
+    {
+        Ok(_) => panic!("the mismatched patch environment must fail verification"),
+        Err(error) => error.to_string(),
+    };
+    assert!(first_error.contains("apply_patch verification failed"));
+    assert!(first_error.contains("does not match selected shell environment"));
+    assert!(!first_error.contains("execution was suppressed"));
+
+    let second_error = match handler
+        .handle(invoke("shell-environment-mismatch-second"))
+        .await
+    {
+        Ok(_) => panic!("the exact repeated environment mismatch must be suppressed"),
+        Err(error) => error.to_string(),
+    };
+    assert!(second_error.contains("apply_patch environment mismatch"));
+    assert!(second_error.contains("execution was suppressed"));
 }
 
 #[tokio::test]

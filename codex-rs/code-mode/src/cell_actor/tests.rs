@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
 use codex_code_mode_protocol::ExecuteRequest;
@@ -91,7 +90,6 @@ struct CellActorHarness {
     handle: CellHandle,
     initial_event_rx: oneshot::Receiver<Result<CellEvent, CellError>>,
     task: tokio::task::JoinHandle<()>,
-    runtime_control_rx: std_mpsc::Receiver<RuntimeControlCommand>,
     _runtime_event_rx: mpsc::UnboundedReceiver<RuntimeEvent>,
 }
 
@@ -119,7 +117,7 @@ fn spawn_cell_actor_harness_with_host_and_failure_handler<H: CellHost>(
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (initial_event_tx, initial_event_rx) = oneshot::channel();
     let (runtime_event_tx, runtime_event_rx) = mpsc::unbounded_channel();
-    let (runtime_tx, _runtime_control_tx, runtime_terminate_handle) = spawn_runtime(
+    let (runtime_tx, runtime_terminate_handle) = spawn_runtime(
         HashMap::new(),
         ExecuteRequest {
             tool_call_id: "call-1".to_string(),
@@ -128,19 +126,17 @@ fn spawn_cell_actor_harness_with_host_and_failure_handler<H: CellHost>(
             yield_time_ms: None,
             max_output_tokens: None,
         },
+        60_000,
         runtime_event_tx,
-        PendingRuntimeMode::PauseUntilResumed,
         /*task_failure_handler*/ None,
     )
     .unwrap();
-    let (runtime_control_tx, runtime_control_rx) = std_mpsc::channel();
     let cell_state = Arc::new(CellState::new(CancellationToken::new()));
     let handle = CellHandle::new(command_tx, Arc::clone(&cell_state));
     let task = tokio::spawn(run_cell(
         host,
         CellContext {
             runtime_tx,
-            runtime_control_tx,
             runtime_terminate_handle,
             cell_state,
         },
@@ -158,7 +154,6 @@ fn spawn_cell_actor_harness_with_host_and_failure_handler<H: CellHost>(
         handle,
         initial_event_rx,
         task,
-        runtime_control_rx,
         _runtime_event_rx: runtime_event_rx,
     }
 }
@@ -320,6 +315,7 @@ async fn orchestration_correctness_state_change_delivers_already_buffered_output
     harness
         .event_tx
         .send(RuntimeEvent::Notify {
+            id: None,
             call_id: "notification-barrier".to_string(),
             text: "processed".to_string(),
         })
@@ -429,6 +425,7 @@ async fn observation_dropped_before_dequeue_does_not_consume_output() {
     harness
         .event_tx
         .send(RuntimeEvent::Notify {
+            id: None,
             call_id: "after-dropped-command".to_string(),
             text: "barrier".to_string(),
         })
@@ -491,6 +488,7 @@ async fn dropped_yield_observer_preserves_output_for_the_next_observation() {
     harness
         .event_tx
         .send(RuntimeEvent::Notify {
+            id: None,
             call_id: "after-dropped-observer".to_string(),
             text: "barrier".to_string(),
         })
@@ -508,67 +506,6 @@ async fn dropped_yield_observer_preserves_output_for_the_next_observation() {
             }],
         })
     );
-
-    let termination = harness.handle.terminate();
-    drop(harness.event_tx);
-    assert_eq!(
-        termination.await,
-        Ok(CellEvent::Terminated {
-            content_items: Vec::new(),
-        })
-    );
-    harness.task.await.unwrap();
-}
-
-#[tokio::test]
-async fn dropped_pending_observer_preserves_the_frontier_for_the_next_observation() {
-    let host = Arc::new(RecordingHost::default());
-    let harness = spawn_cell_actor_harness_with_host(
-        ObserveMode::YieldAfter(Duration::from_secs(60)),
-        Arc::clone(&host),
-    );
-    harness.event_tx.send(RuntimeEvent::YieldRequested).unwrap();
-    assert!(harness.initial_event_rx.await.unwrap().is_ok());
-
-    let dropped_observation = harness.handle.observe(ObserveMode::PendingFrontier);
-    assert_eq!(
-        harness.handle.observe(ObserveMode::PendingFrontier).await,
-        Err(CellError::Busy)
-    );
-    drop(dropped_observation);
-    harness
-        .event_tx
-        .send(RuntimeEvent::ToolCall {
-            id: "tool-1".to_string(),
-            name: codex_protocol::ToolName {
-                name: "echo".to_string(),
-                namespace: None,
-            },
-            kind: codex_code_mode_protocol::CodeModeToolKind::Function,
-            input: Some(serde_json::json!({})),
-        })
-        .unwrap();
-    harness.event_tx.send(RuntimeEvent::Pending).unwrap();
-    harness
-        .event_tx
-        .send(RuntimeEvent::Notify {
-            call_id: "after-dropped-pending".to_string(),
-            text: "barrier".to_string(),
-        })
-        .unwrap();
-    wait_for_notification(&host).await;
-
-    assert_eq!(
-        harness.handle.observe(ObserveMode::PendingFrontier).await,
-        Ok(CellEvent::Pending {
-            content_items: Vec::new(),
-            pending_tool_call_ids: vec!["tool-1".to_string()],
-        })
-    );
-    assert!(matches!(
-        harness.runtime_control_rx.try_recv(),
-        Err(std_mpsc::TryRecvError::Empty)
-    ));
 
     let termination = harness.handle.terminate();
     drop(harness.event_tx);
@@ -698,103 +635,6 @@ fn buffered_initial_yield_precedes_buffered_completion_for_yield_observer() {
     assert!(matches!(
         cell_state.deliver_completion(/*response_tx*/ None),
         CompletionDelivery::Buffered
-    ));
-
-    let (response_tx, mut response_rx) = oneshot::channel();
-    assert!(matches!(
-        cell_state.route_observation(ObserveMode::YieldAfter(Duration::ZERO), response_tx),
-        ObservationDelivery::Buffered
-    ));
-    assert_eq!(
-        response_rx.try_recv(),
-        Ok(Ok(CellEvent::Yielded {
-            content_items: vec![OutputItem::Text {
-                text: "before".to_string(),
-            }],
-        }))
-    );
-
-    let (response_tx, mut response_rx) = oneshot::channel();
-    assert!(matches!(
-        cell_state.route_observation(ObserveMode::YieldAfter(Duration::ZERO), response_tx),
-        ObservationDelivery::Delivered
-    ));
-    assert_eq!(response_rx.try_recv(), Ok(Ok(completion)));
-}
-
-#[test]
-fn pending_observer_merges_initial_yield_and_completion_output() {
-    let cell_state = CellState::new(CancellationToken::new());
-    assert_eq!(
-        cell_state.commit_completion(
-            CellEvent::Completed {
-                content_items: vec![OutputItem::Text {
-                    text: "after".to_string(),
-                }],
-                error_text: None,
-            },
-            Some(vec![OutputItem::Text {
-                text: "before".to_string(),
-            }]),
-            || {}
-        ),
-        CompletionCommit::Committed
-    );
-    assert!(matches!(
-        cell_state.deliver_completion(/*response_tx*/ None),
-        CompletionDelivery::Buffered
-    ));
-
-    let (response_tx, mut response_rx) = oneshot::channel();
-    assert!(matches!(
-        cell_state.route_observation(ObserveMode::PendingFrontier, response_tx),
-        ObservationDelivery::Delivered
-    ));
-    assert_eq!(
-        response_rx.try_recv(),
-        Ok(Ok(CellEvent::Completed {
-            content_items: vec![
-                OutputItem::Text {
-                    text: "before".to_string(),
-                },
-                OutputItem::Text {
-                    text: "after".to_string(),
-                },
-            ],
-            error_text: None,
-        }))
-    );
-}
-
-#[test]
-fn dropped_pending_observation_preserves_the_initial_yield_boundary() {
-    let cell_state = CellState::new(CancellationToken::new());
-    let completion = CellEvent::Completed {
-        content_items: vec![OutputItem::Text {
-            text: "after".to_string(),
-        }],
-        error_text: None,
-    };
-    assert_eq!(
-        cell_state.commit_completion(
-            completion.clone(),
-            Some(vec![OutputItem::Text {
-                text: "before".to_string(),
-            }]),
-            || {}
-        ),
-        CompletionCommit::Committed
-    );
-    assert!(matches!(
-        cell_state.deliver_completion(/*response_tx*/ None),
-        CompletionDelivery::Buffered
-    ));
-
-    let (response_tx, response_rx) = oneshot::channel();
-    drop(response_rx);
-    assert!(matches!(
-        cell_state.route_observation(ObserveMode::PendingFrontier, response_tx),
-        ObservationDelivery::Buffered
     ));
 
     let (response_tx, mut response_rx) = oneshot::channel();

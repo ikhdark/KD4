@@ -262,8 +262,9 @@ fn reconcile_environment_id_requires_selection_when_enabled() {
 }
 
 #[tokio::test]
-async fn intercepted_patch_rejects_mismatched_environment_without_mutation() {
+async fn input_state_determined_environment_mismatch_blocks_exact_retry_without_mutation() {
     let (session, mut turn) = make_session_and_context().await;
+    let session = Arc::new(session);
     let turn_environment = turn
         .environments
         .primary()
@@ -299,13 +300,25 @@ async fn intercepted_patch_rejects_mismatched_environment_without_mutation() {
     );
     let command = vec!["apply_patch".to_string(), patch];
     let fs = turn_environment.environment.get_filesystem();
+    let attempt_key = CommandAttemptKey::new(
+        "shell",
+        &selected_environment_id,
+        &cwd.to_string(),
+        &command,
+    );
+    session
+        .services
+        .command_execution
+        .begin_attempt(&attempt_key, false)
+        .await
+        .expect("first attempt");
 
     let result = intercept_apply_patch(
         &command,
         &cwd,
         fs.as_ref(),
         turn_environment,
-        Arc::new(session),
+        session.clone(),
         Arc::new(turn),
         /*tracker*/ None,
         "phase31-call",
@@ -313,8 +326,14 @@ async fn intercepted_patch_rejects_mismatched_environment_without_mutation() {
     )
     .await;
 
-    let Err(FunctionCallError::RespondToModel(message)) = result else {
+    let Err(error) = result else {
         panic!("expected an environment mismatch error");
+    };
+    error
+        .record_attempt_failure(&session.services.command_execution, &attempt_key)
+        .await;
+    let FunctionCallError::RespondToModel(message) = error.into_error() else {
+        panic!("expected a model-visible environment mismatch error");
     };
     assert_eq!(
         message,
@@ -329,6 +348,88 @@ async fn intercepted_patch_rejects_mismatched_environment_without_mutation() {
     assert!(
         !other_target_path.exists(),
         "mismatched patch must not redirect mutation to environment B"
+    );
+    let blocked = session
+        .services
+        .command_execution
+        .begin_attempt(&attempt_key, false)
+        .await
+        .expect_err("the unchanged environment mismatch must be suppressed");
+    assert!(
+        blocked
+            .render_for_model()
+            .contains("apply_patch environment mismatch")
+    );
+}
+
+#[tokio::test]
+async fn input_state_determined_implicit_patch_blocks_exact_retry_without_mutation() {
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let turn_environment = turn
+        .environments
+        .primary()
+        .expect("primary environment")
+        .clone();
+    let cwd = turn_environment.cwd().clone();
+    let target_path = cwd
+        .to_abs_path()
+        .expect("local environment cwd")
+        .join("phase-input-determined-implicit.txt");
+    let command = vec![
+        "*** Begin Patch\n*** Add File: phase-input-determined-implicit.txt\n+must not be written\n*** End Patch"
+            .to_string(),
+    ];
+    let attempt_key = CommandAttemptKey::new(
+        "shell",
+        &turn_environment.environment_id,
+        &cwd.to_string(),
+        &command,
+    );
+    session
+        .services
+        .command_execution
+        .begin_attempt(&attempt_key, false)
+        .await
+        .expect("first attempt");
+
+    let error = match intercept_apply_patch(
+        &command,
+        &cwd,
+        turn_environment.environment.get_filesystem().as_ref(),
+        turn_environment,
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        /*tracker*/ None,
+        "implicit-patch-call",
+        "shell",
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("a raw patch body must require an explicit apply_patch invocation"),
+    };
+    error
+        .record_attempt_failure(&session.services.command_execution, &attempt_key)
+        .await;
+    let first_message = error.into_error().to_string();
+    assert!(first_message.contains("explicit call to apply_patch"));
+    assert!(
+        !target_path.exists(),
+        "implicit patch must not mutate the workspace"
+    );
+
+    let blocked = session
+        .services
+        .command_execution
+        .begin_attempt(&attempt_key, false)
+        .await
+        .expect_err("the unchanged implicit invocation must be suppressed");
+    assert!(
+        blocked
+            .render_for_model()
+            .contains("apply_patch implicit invocation")
     );
 }
 

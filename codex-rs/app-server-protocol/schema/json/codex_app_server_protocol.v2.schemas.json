@@ -258,7 +258,7 @@
       "properties": {
         "entries": {
           "items": {
-            "$ref": "#/definitions/FileSystemSandboxEntry"
+            "$ref": "#/definitions/V2FileSystemSandboxEntry"
           },
           "type": [
             "array",
@@ -3087,6 +3087,30 @@
             },
             "method": {
               "enum": [
+                "windowsSandbox/grantReadRoot"
+              ],
+              "title": "WindowsSandbox/grantReadRootRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/WindowsSandboxGrantReadRootParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "WindowsSandbox/grantReadRootRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "enum": [
                 "account/login/start"
               ],
               "title": "Account/login/startRequestMethod",
@@ -3748,6 +3772,22 @@
     },
     "CollabAgentState": {
       "properties": {
+        "completion": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TaskCompletionGate"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lastAgentMessage": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "message": {
           "type": [
             "string",
@@ -6338,25 +6378,36 @@
       "type": "object"
     },
     "FileSystemAccessMode": {
-      "enum": [
-        "read",
-        "write",
-        "deny"
-      ],
-      "type": "string"
+      "description": "Access mode for a filesystem entry.\n\nWhen two equally specific entries target the same path, we compare these by conflict precedence rather than by capability breadth: `deny` beats `write`, and `write` beats `read`.",
+      "oneOf": [
+        {
+          "enum": [
+            "read",
+            "write"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "`none` is a legacy input alias retained temporarily for compatibility.",
+          "enum": [
+            "deny"
+          ],
+          "type": "string"
+        }
+      ]
     },
-    "FileSystemPath": {
+    "FileSystemPath_for_AbsolutePathBuf": {
       "oneOf": [
         {
           "properties": {
             "path": {
-              "$ref": "#/definitions/LegacyAppPathString"
+              "$ref": "#/definitions/AbsolutePathBuf"
             },
             "type": {
               "enum": [
                 "path"
               ],
-              "title": "PathFileSystemPathType",
+              "title": "PathFileSystemPath_for_AbsolutePathBufType",
               "type": "string"
             }
           },
@@ -6364,10 +6415,11 @@
             "path",
             "type"
           ],
-          "title": "PathFileSystemPath",
+          "title": "PathFileSystemPath_for_AbsolutePathBuf",
           "type": "object"
         },
         {
+          "description": "A git-style glob pattern. Pattern entries currently support FileSystemAccessMode::Deny only.",
           "properties": {
             "pattern": {
               "type": "string"
@@ -6376,7 +6428,7 @@
               "enum": [
                 "glob_pattern"
               ],
-              "title": "GlobPatternFileSystemPathType",
+              "title": "GlobPatternFileSystemPath_for_AbsolutePathBufType",
               "type": "string"
             }
           },
@@ -6384,7 +6436,7 @@
             "pattern",
             "type"
           ],
-          "title": "GlobPatternFileSystemPath",
+          "title": "GlobPatternFileSystemPath_for_AbsolutePathBuf",
           "type": "object"
         },
         {
@@ -6393,7 +6445,7 @@
               "enum": [
                 "special"
               ],
-              "title": "SpecialFileSystemPathType",
+              "title": "SpecialFileSystemPath_for_AbsolutePathBufType",
               "type": "string"
             },
             "value": {
@@ -6404,18 +6456,18 @@
             "type",
             "value"
           ],
-          "title": "SpecialFileSystemPath",
+          "title": "SpecialFileSystemPath_for_AbsolutePathBuf",
           "type": "object"
         }
       ]
     },
-    "FileSystemSandboxEntry": {
+    "FileSystemSandboxEntry_for_AbsolutePathBuf": {
       "properties": {
         "access": {
           "$ref": "#/definitions/FileSystemAccessMode"
         },
         "path": {
-          "$ref": "#/definitions/FileSystemPath"
+          "$ref": "#/definitions/FileSystemPath_for_AbsolutePathBuf"
         }
       },
       "required": [
@@ -6508,6 +6560,7 @@
           "type": "object"
         },
         {
+          "description": "WARNING: `:special_path` tokens are part of config compatibility. Do not make older runtimes reject newly introduced tokens. New parser support should be additive, while unknown values must stay representable so config from a newer Codex degrades to warn-and-ignore instead of failing to load. Codex 0.112.0 rejected unknown values here, which broke forward compatibility for newer config. Preserves future special-path tokens so older runtimes can ignore them without rejecting config authored by a newer release.",
           "properties": {
             "kind": {
               "enum": [
@@ -8608,6 +8661,60 @@
       "title": "LogoutAccountResponse",
       "type": "object"
     },
+    "ManagedFileSystemPermissions_for_AbsolutePathBuf": {
+      "description": "Filesystem permissions for profiles where Codex owns sandbox construction.",
+      "oneOf": [
+        {
+          "description": "Apply a managed filesystem sandbox from the listed entries.",
+          "properties": {
+            "entries": {
+              "items": {
+                "$ref": "#/definitions/FileSystemSandboxEntry_for_AbsolutePathBuf"
+              },
+              "type": "array"
+            },
+            "glob_scan_max_depth": {
+              "format": "uint",
+              "minimum": 1.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "type": {
+              "enum": [
+                "restricted"
+              ],
+              "title": "RestrictedManagedFileSystemPermissions_for_AbsolutePathBufType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "entries",
+            "type"
+          ],
+          "title": "RestrictedManagedFileSystemPermissions_for_AbsolutePathBuf",
+          "type": "object"
+        },
+        {
+          "description": "Apply a managed sandbox that allows all filesystem access.",
+          "properties": {
+            "type": {
+              "enum": [
+                "unrestricted"
+              ],
+              "title": "UnrestrictedManagedFileSystemPermissions_for_AbsolutePathBufType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "UnrestrictedManagedFileSystemPermissions_for_AbsolutePathBuf",
+          "type": "object"
+        }
+      ]
+    },
     "ManagedHooksRequirements": {
       "properties": {
         "PermissionRequest": {
@@ -9959,6 +10066,13 @@
       },
       "type": "object"
     },
+    "NetworkSandboxPolicy": {
+      "enum": [
+        "restricted",
+        "enabled"
+      ],
+      "type": "string"
+    },
     "NetworkUnixSocketPermission": {
       "enum": [
         "allow",
@@ -10170,6 +10284,74 @@
         "id"
       ],
       "type": "object"
+    },
+    "PermissionProfile_for_AbsolutePathBuf": {
+      "description": "Canonical active runtime permissions for a conversation, turn, or command.",
+      "oneOf": [
+        {
+          "description": "Codex owns sandbox construction for this profile.",
+          "properties": {
+            "file_system": {
+              "$ref": "#/definitions/ManagedFileSystemPermissions_for_AbsolutePathBuf"
+            },
+            "network": {
+              "$ref": "#/definitions/NetworkSandboxPolicy"
+            },
+            "type": {
+              "enum": [
+                "managed"
+              ],
+              "title": "ManagedPermissionProfile_for_AbsolutePathBufType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "file_system",
+            "network",
+            "type"
+          ],
+          "title": "ManagedPermissionProfile_for_AbsolutePathBuf",
+          "type": "object"
+        },
+        {
+          "description": "Do not apply an outer sandbox.",
+          "properties": {
+            "type": {
+              "enum": [
+                "disabled"
+              ],
+              "title": "DisabledPermissionProfile_for_AbsolutePathBufType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "DisabledPermissionProfile_for_AbsolutePathBuf",
+          "type": "object"
+        },
+        {
+          "description": "Filesystem isolation is enforced by an external caller.",
+          "properties": {
+            "network": {
+              "$ref": "#/definitions/NetworkSandboxPolicy"
+            },
+            "type": {
+              "enum": [
+                "external"
+              ],
+              "title": "ExternalPermissionProfile_for_AbsolutePathBufType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "network",
+            "type"
+          ],
+          "title": "ExternalPermissionProfile_for_AbsolutePathBuf",
+          "type": "object"
+        }
+      ]
     },
     "Personality": {
       "enum": [
@@ -13648,6 +13830,26 @@
             "params"
           ],
           "title": "Turn/reasoningPolicy/updatedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
+                "turn/reasoningPolicy/summary"
+              ],
+              "title": "Turn/reasoningPolicy/summaryNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/TurnReasoningPolicySummaryNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Turn/reasoningPolicy/summaryNotification",
           "type": "object"
         },
         {
@@ -19049,6 +19251,27 @@
       "title": "TurnPlanUpdatedNotification",
       "type": "object"
     },
+    "TurnReasoningPolicySummaryNotification": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "history": {
+          "$ref": "#/definitions/ReasoningPolicyHistory"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "history",
+        "threadId",
+        "turnId"
+      ],
+      "title": "TurnReasoningPolicySummaryNotification",
+      "type": "object"
+    },
     "TurnReasoningPolicyUpdatedNotification": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -19791,6 +20014,18 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "projectionSourceDependenciesFallbackCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "projectionSourceDependenciesReuseCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
         "provenLoopActivationCount": {
           "default": 0,
           "format": "uint32",
@@ -19867,6 +20102,12 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "toolOutputArtifactReuseCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
         "toolOutputCanonicalByteCount": {
           "default": 0,
           "format": "uint64",
@@ -19928,6 +20169,18 @@
           "type": "integer"
         },
         "toolOutputTruncationCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "toolRouterRebuildCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "toolRouterReuseCount": {
           "default": 0,
           "format": "uint32",
           "minimum": 0.0,
@@ -21823,6 +22076,202 @@
         }
       ]
     },
+    "V2FileSystemAccessMode": {
+      "enum": [
+        "read",
+        "write",
+        "deny"
+      ],
+      "type": "string"
+    },
+    "V2FileSystemPath": {
+      "oneOf": [
+        {
+          "properties": {
+            "path": {
+              "$ref": "#/definitions/LegacyAppPathString"
+            },
+            "type": {
+              "enum": [
+                "path"
+              ],
+              "title": "PathV2FileSystemPathType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "type"
+          ],
+          "title": "PathV2FileSystemPath",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "pattern": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "glob_pattern"
+              ],
+              "title": "GlobPatternV2FileSystemPathType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "pattern",
+            "type"
+          ],
+          "title": "GlobPatternV2FileSystemPath",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "special"
+              ],
+              "title": "SpecialV2FileSystemPathType",
+              "type": "string"
+            },
+            "value": {
+              "$ref": "#/definitions/V2FileSystemSpecialPath"
+            }
+          },
+          "required": [
+            "type",
+            "value"
+          ],
+          "title": "SpecialV2FileSystemPath",
+          "type": "object"
+        }
+      ]
+    },
+    "V2FileSystemSandboxEntry": {
+      "properties": {
+        "access": {
+          "$ref": "#/definitions/V2FileSystemAccessMode"
+        },
+        "path": {
+          "$ref": "#/definitions/V2FileSystemPath"
+        }
+      },
+      "required": [
+        "access",
+        "path"
+      ],
+      "type": "object"
+    },
+    "V2FileSystemSpecialPath": {
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "root"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "title": "RootV2FileSystemSpecialPath",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "minimal"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "title": "MinimalV2FileSystemSpecialPath",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "project_roots"
+              ],
+              "type": "string"
+            },
+            "subpath": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "title": "KindV2FileSystemSpecialPath",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "tmpdir"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "title": "TmpdirV2FileSystemSpecialPath",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "slash_tmp"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "title": "SlashTmpV2FileSystemSpecialPath",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "unknown"
+              ],
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "subpath": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "path"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "Verbosity": {
       "description": "Controls output length/detail on GPT-5 models via the Responses API. Serialized with lowercase values to match the OpenAI API.",
       "enum": [
@@ -22036,11 +22485,48 @@
       },
       "type": "object"
     },
+    "WindowsSandboxGrantReadRootParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "cwd": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AbsolutePathBuf"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "path": {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "title": "WindowsSandboxGrantReadRootParams",
+      "type": "object"
+    },
+    "WindowsSandboxGrantReadRootResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "path": {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "title": "WindowsSandboxGrantReadRootResponse",
+      "type": "object"
+    },
     "WindowsSandboxReadiness": {
       "enum": [
         "ready",
         "notConfigured",
-        "updateRequired"
+        "updateRequired",
+        "unsupported"
       ],
       "type": "string"
     },
@@ -22102,6 +22588,24 @@
         },
         "mode": {
           "$ref": "#/definitions/WindowsSandboxSetupMode"
+        },
+        "permissionProfile": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PermissionProfile_for_AbsolutePathBuf"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Inline permission profile used when setup precedes persisting a preset."
+        },
+        "permissionProfileId": {
+          "description": "Named permission profile to resolve on the app-server before setup.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

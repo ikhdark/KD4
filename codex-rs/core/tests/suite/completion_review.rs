@@ -27,12 +27,13 @@ use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::user_input::UserInput;
 use core_test_support::hooks::trust_discovered_hooks;
+use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ev_apply_patch_custom_tool_call;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
-use core_test_support::responses::mount_sse_sequence;
+use core_test_support::responses::mount_sse_sequence as mount_raw_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
@@ -57,6 +58,7 @@ const RELATIONSHIP_RESOLUTION_REQUEST_MARKER: &str =
     "KD4_SOURCE_RELATIONSHIP_RESOLUTION_REQUEST_V1";
 const REVIEW_REQUEST_MARKER: &str = "KD4_COMPLETION_REVIEW_REQUEST_V2";
 const REPAIR_MARKER: &str = "<kd4_completion_repair>";
+const RESPONSE_BUNDLE_SEPARATOR: &str = "\n<KD4_TEST_RESPONSE_BOUNDARY>\n";
 
 fn completion_review_builder() -> TestCodexBuilder {
     completion_review_builder_with_role(true)
@@ -81,7 +83,17 @@ fn completion_review_builder_with_role(register_reviewer_role: bool) -> TestCode
         fs::create_dir_all(config.cwd.join("src")).expect("create completion fixture root");
         fs::write(
             config.cwd.join("src/lib.rs"),
-            "pub fn completion_state() -> &'static str { \"before\" }\n",
+            concat!(
+                "pub fn completion_state() -> &'static str { \"before\" }\n",
+                "\n",
+                "#[cfg(test)]\n",
+                "mod tests {\n",
+                "    #[test]\n",
+                "    fn completion_state_is_available() {\n",
+                "        assert!(!super::completion_state().is_empty());\n",
+                "    }\n",
+                "}\n",
+            ),
         )
         .expect("write completion fixture source");
         fs::write(
@@ -338,21 +350,38 @@ Set-Content -LiteralPath (Join-Path $Workspace 'finalizer.txt') -Value 'finalize
 }
 
 fn plan_response(response_id: &str, call_id: &str, status: &str) -> String {
+    if status == "passed" {
+        let implemented = plan_response(
+            &format!("{response_id}-implemented"),
+            &format!("{call_id}-implemented"),
+            "implemented",
+        );
+        let validation = validation_response(response_id, call_id);
+        return format!("{implemented}{RESPONSE_BUNDLE_SEPARATOR}{validation}");
+    }
     let args = json!({
         "explanation": "completion review test",
         "plan": [{
             "id": "completion-step",
             "step": "Implement the requested completion behavior",
-            "status": if status == "passed" { "implemented" } else { status },
+            "status": status,
             "depends_on": [],
             "acceptance_criteria": ["The requested file behavior is present"],
             "runtime_paths": ["src/lib.rs"],
             "generated_artifacts": [],
-            "risks": ["concurrency"],
+            "risks": [],
             "requires_desktop_activation": false,
             "validation_route": {
                 "leaves": [{
-                    "argv": ["cargo", "test", "-p", "codex-core", "focused_case", "--quiet"],
+                    "argv": [
+                        "cargo",
+                        "test",
+                        "-p",
+                        "completion-review-fixture",
+                        "tests::completion_state_is_available",
+                        "--",
+                        "--exact"
+                    ],
                     "uncertainty": "the requested file behavior remains present",
                     "covered_paths": ["src/lib.rs"],
                     "covered_contracts": ["The requested file behavior is present"],
@@ -367,6 +396,49 @@ fn plan_response(response_id: &str, call_id: &str, status: &str) -> String {
         ev_function_call(call_id, "update_plan", &args),
         ev_completed(response_id),
     ])
+}
+
+fn validation_response(response_id: &str, call_id: &str) -> String {
+    let validation_args = json!({
+        "kind": "argv",
+        "program": "cargo",
+        "args": [
+            "test",
+            "-p",
+            "completion-review-fixture",
+            "tests::completion_state_is_available",
+            "--",
+            "--exact"
+        ],
+        "yield_time_ms": 30_000,
+        "validation": {
+            "uncertainty": "the requested file behavior remains present",
+            "covered_paths": ["src/lib.rs"],
+            "covered_contracts": ["The requested file behavior is present"]
+        }
+    })
+    .to_string();
+    sse(vec![
+        ev_response_created(response_id),
+        ev_function_call(call_id, "exec_command", &validation_args),
+        ev_completed(response_id),
+    ])
+}
+
+fn expand_response_bundles(responses: Vec<String>) -> Vec<String> {
+    responses
+        .into_iter()
+        .flat_map(|response| {
+            response
+                .split(RESPONSE_BUNDLE_SEPARATOR)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+async fn mount_sse_sequence(server: &wiremock::MockServer, responses: Vec<String>) -> ResponseMock {
+    mount_raw_sse_sequence(server, expand_response_bundles(responses)).await
 }
 
 fn patch_response(response_id: &str, call_id: &str, patch: &str) -> String {
@@ -584,6 +656,7 @@ async fn mount_completion_review_sequence(
     scenario: ReviewScenario,
 ) -> Arc<CompletionReviewProbe> {
     let probe = Arc::new(CompletionReviewProbe::default());
+    let ordinary_responses = expand_response_bundles(ordinary_responses);
     Mock::given(method("POST"))
         .and(path_regex(".*/responses$"))
         .respond_with(CompletionReviewResponder {
@@ -1017,7 +1090,7 @@ async fn clean_review_finishes_without_a_repair_continuation() -> Result<()> {
     );
     assert_no_additional_turn_complete(&test).await;
 
-    assert_eq!(probe.total_requests.load(Ordering::SeqCst), 6);
+    assert_eq!(probe.total_requests.load(Ordering::SeqCst), 7);
     assert_eq!(probe.classification_requests.load(Ordering::SeqCst), 1);
     assert_eq!(probe.review_requests.load(Ordering::SeqCst), 1);
     assert_eq!(probe.rereview_requests.load(Ordering::SeqCst), 0);
@@ -1075,7 +1148,7 @@ async fn manifest_gap_rebuilds_the_manifest_and_starts_a_fresh_initial_review() 
 
     assert_eq!(
         probe.total_requests.load(Ordering::SeqCst),
-        8,
+        9,
         "classifications={}, relationships={}, reviews={}, rereviews={}, repairs={}",
         probe.classification_requests.load(Ordering::SeqCst),
         probe
@@ -1115,6 +1188,11 @@ async fn reviewer_finding_injects_one_repair_and_repair_mutation_cannot_rearm_re
             ),
             plan_response("plan-pass", "plan-pass-call", "passed"),
             message_response("candidate", "candidate-message", "implementation complete"),
+            plan_response(
+                "repair-plan-start",
+                "repair-plan-start-call",
+                "in_progress",
+            ),
             patch_response(
                 "repair-patch",
                 "repair-patch-call",
@@ -1145,11 +1223,11 @@ async fn reviewer_finding_injects_one_repair_and_repair_mutation_cannot_rearm_re
     );
     assert_no_additional_turn_complete(&test).await;
 
-    assert_eq!(probe.total_requests.load(Ordering::SeqCst), 10);
+    assert_eq!(probe.total_requests.load(Ordering::SeqCst), 13);
     assert_eq!(probe.classification_requests.load(Ordering::SeqCst), 1);
     assert_eq!(probe.review_requests.load(Ordering::SeqCst), 2);
     assert_eq!(probe.rereview_requests.load(Ordering::SeqCst), 1);
-    assert_eq!(probe.repair_requests.load(Ordering::SeqCst), 3);
+    assert_eq!(probe.repair_requests.load(Ordering::SeqCst), 5);
     let repair_payloads = probe.repair_payloads.lock().expect("repair payloads");
     assert!(
         repair_payloads
@@ -1165,7 +1243,7 @@ async fn reviewer_finding_injects_one_repair_and_repair_mutation_cannot_rearm_re
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ordinary_nonpassed_evidence_is_admitted_to_supplemental_review() -> Result<()> {
+async fn ordinary_nonpassed_evidence_remains_partial_after_supplemental_review() -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
     let probe = mount_completion_review_sequence(
@@ -1178,8 +1256,6 @@ async fn ordinary_nonpassed_evidence_is_admitted_to_supplemental_review() -> Res
                 "*** Begin Patch\n*** Add File: completed.txt\n+done\n*** End Patch",
             ),
             message_response("candidate", "candidate-message", "implementation complete"),
-            plan_response("repair-plan-pass", "repair-plan-pass-call", "passed"),
-            message_response("repaired", "repaired-message", "evidence repaired"),
         ],
         ReviewScenario::Clean,
     )
@@ -1192,7 +1268,7 @@ async fn ordinary_nonpassed_evidence_is_admitted_to_supplemental_review() -> Res
             .await?;
     assert_eq!(
         completion.completion.as_ref().map(|gate| gate.status),
-        Some(TaskCompletionStatus::Passed),
+        Some(TaskCompletionStatus::Partial),
         "reviews={}, rereviews={}, repairs={}, total_requests={}, gate={:?}",
         probe.review_requests.load(Ordering::SeqCst),
         probe.rereview_requests.load(Ordering::SeqCst),
@@ -1273,7 +1349,7 @@ async fn unresolved_rereview_stops_after_one_correction() -> Result<()> {
     );
     assert_eq!(probe.review_requests.load(Ordering::SeqCst), 2);
     assert_eq!(probe.rereview_requests.load(Ordering::SeqCst), 1);
-    assert_eq!(probe.repair_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(probe.repair_requests.load(Ordering::SeqCst), 3);
     assert!(
         probe
             .repair_payloads
@@ -1397,7 +1473,7 @@ async fn supplemental_reviewer_spawn_failure_does_not_worsen_completion() -> Res
         probe.review_requests.load(Ordering::SeqCst),
     );
     assert!(gate.reasons.is_empty());
-    assert_eq!(probe.total_requests.load(Ordering::SeqCst), 4);
+    assert_eq!(probe.total_requests.load(Ordering::SeqCst), 5);
     assert_eq!(probe.classification_requests.load(Ordering::SeqCst), 0);
     assert_eq!(probe.review_requests.load(Ordering::SeqCst), 0);
     Ok(())
@@ -1435,7 +1511,7 @@ async fn explicit_stop_exits_before_reviewer_without_a_false_pass() -> Result<()
         completion.completion
     );
     let requests = response_mock.requests();
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 5);
     assert_eq!(reviewer_request_count(&requests), 0);
     Ok(())
 }
@@ -1476,7 +1552,7 @@ async fn stop_hook_continuation_runs_before_the_single_reviewer() -> Result<()> 
         completion.completion.as_ref().map(|gate| gate.status),
         Some(TaskCompletionStatus::Passed)
     );
-    assert_eq!(probe.total_requests.load(Ordering::SeqCst), 7);
+    assert_eq!(probe.total_requests.load(Ordering::SeqCst), 8);
     assert_eq!(probe.classification_requests.load(Ordering::SeqCst), 1);
     assert_eq!(probe.review_requests.load(Ordering::SeqCst), 1);
     assert!(
@@ -1595,6 +1671,11 @@ async fn mutating_finalizer_does_not_rerun_during_review_repair() -> Result<()> 
             ),
             plan_response("plan-pass", "plan-pass-call", "passed"),
             message_response("candidate", "candidate-message", "implementation complete"),
+            plan_response(
+                "repair-plan-start",
+                "repair-plan-start-call",
+                "in_progress",
+            ),
             patch_response(
                 "repair-patch",
                 "repair-patch-call",
@@ -1711,7 +1792,7 @@ async fn disabled_feature_skips_review_without_changing_the_evidence_gate() -> R
         completion.completion
     );
     let requests = response_mock.requests();
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 5);
     assert_eq!(reviewer_request_count(&requests), 0);
     Ok(())
 }
@@ -1734,7 +1815,7 @@ async fn read_only_turn_skips_review() -> Result<()> {
 
     submit_turn_and_capture_completion(&test, "Inspect the requested behavior").await?;
     let requests = response_mock.requests();
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 4);
     assert_eq!(reviewer_request_count(&requests), 0);
     Ok(())
 }
@@ -1764,7 +1845,7 @@ async fn non_kd4_repository_skips_review() -> Result<()> {
 
     submit_turn_and_capture_completion(&test, "Implement the requested behavior").await?;
     let requests = response_mock.requests();
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 5);
     assert_eq!(reviewer_request_count(&requests), 0);
     Ok(())
 }

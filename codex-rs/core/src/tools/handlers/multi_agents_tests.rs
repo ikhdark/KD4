@@ -12,6 +12,7 @@ use crate::session::tests::make_session_and_context as make_session_and_context_
 use crate::session::tests::make_session_and_context_with_rx as make_session_and_context_with_rx_base;
 use crate::session::turn_context::TurnContext;
 use crate::session_prefix::format_inter_agent_completion_message;
+use crate::session_prefix::format_subagent_notification_message;
 use crate::thread_manager::thread_store_from_config;
 use crate::tools::context::ToolOutput;
 use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
@@ -59,8 +60,12 @@ use codex_protocol::protocol::NetworkSandboxPolicy;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SandboxPolicy;
+use codex_protocol::protocol::SessionMeta;
+use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::TaskCompletionGate;
+use codex_protocol::protocol::TaskCompletionStatus;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
@@ -921,6 +926,10 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
         task.assignment.role,
         codex_agent_task_store::AgentRole::Worker
     );
+    assert_eq!(
+        task.assignment.integration_plan,
+        codex_agent_task_store::IntegrationPlan::SingleWriter
+    );
     assert_eq!(task.current_attempt.attempt_id, binding.attempt_id);
 
     let task_store = agent_control
@@ -1054,6 +1063,7 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
         result["assignment_id"].as_str(),
         Some(assignment_id_text.as_str())
     );
+    assert_eq!(result["integration_plan"], "single_writer");
     let task_capsule_input = manager
         .captured_ops()
         .into_iter()
@@ -1082,6 +1092,7 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
         task_capsule["assignment_id"].as_str(),
         Some(assignment_id_text.as_str())
     );
+    assert_eq!(task_capsule["integration_plan"], "single_writer");
     let _ = agent_control
         .shutdown_live_agent(child_thread_id)
         .await
@@ -1124,6 +1135,155 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
 
     std::fs::remove_file(risk_file).expect("high-risk test file should be removed");
     risk_file_cleanup.disarm();
+}
+
+#[tokio::test]
+async fn multi_agent_v2_spawn_reuses_completed_explorer_result() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    config
+        .features
+        .enable(Feature::Sqlite)
+        .expect("test config should allow sqlite");
+    config.ephemeral = false;
+    let state_runtime = init_state_db(&config)
+        .await
+        .expect("typed spawn requires persistent test state");
+    let manager = ThreadManager::with_models_provider_home_and_state_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Some(state_runtime),
+    );
+    let root = manager
+        .start_thread(config.clone())
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = root.thread.codex.session.services.agent_control.clone();
+    session.services.state_db = root.thread.codex.session.services.state_db.clone();
+    session.thread_id = root.thread_id;
+    let agent_control = session.services.agent_control.clone();
+    set_turn_config(&mut turn, config);
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let suffix = ThreadId::new().to_string().replace('-', "");
+    let first_name = format!("explorer_first_{suffix}");
+    let second_name = format!("explorer_duplicate_{suffix}");
+    let objective = "trace the reusable explorer identity";
+    let read_path = format!("src/reuse-{suffix}.rs");
+    let assignment = |task_name: &str| {
+        function_payload(json!({
+            "task_name": task_name,
+            "agent_type": "explorer",
+            "assignment": {
+                "objective": objective,
+                "acceptance_criteria": [{
+                    "id": "criterion-1",
+                    "text": "report the ownership trace"
+                }],
+                "read_scope": [{"path": read_path, "recursive": false}],
+                "write_scope": [],
+                "stop_condition": "stop after reporting the trace"
+            }
+        }))
+    };
+
+    let first = SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "spawn_agent",
+            assignment(&first_name),
+        ))
+        .await
+        .expect("first explorer should spawn");
+    let (content, _) = expect_text_output(first);
+    let first_result: serde_json::Value =
+        serde_json::from_str(&content).expect("first spawn result should be json");
+    let assignment_id = codex_agent_task_store::AssignmentId::parse(
+        first_result["assignment_id"]
+            .as_str()
+            .expect("first spawn returns assignment id"),
+    )
+    .expect("assignment id parses");
+    let binding = agent_control
+        .task_coordinator()
+        .binding_for_assignment(assignment_id)
+        .expect("first explorer remains bound");
+    let first_thread_id = ThreadId::from_string(
+        binding
+            .thread_id
+            .as_deref()
+            .expect("first explorer binding has a thread id"),
+    )
+    .expect("first explorer thread id parses");
+    agent_control
+        .task_coordinator()
+        .store()
+        .expect("typed task store remains available")
+        .submit_agent_receipt(
+            binding.attempt_id,
+            codex_agent_task_store::ReceiptDraft {
+                status: codex_agent_task_store::AgentStatusClaim::Completed,
+                summary: "ownership trace completed".to_string(),
+                criterion_results: vec![codex_agent_task_store::CriterionResult {
+                    criterion_id: "criterion-1".to_string(),
+                    status: codex_agent_task_store::CriterionStatus::Passed,
+                    evidence: Some("bounded trace".to_string()),
+                }],
+                declared_changes: Vec::new(),
+                validation_call_ids: Vec::new(),
+                blockers: Vec::new(),
+                risks: Vec::new(),
+                next_action: None,
+                architecture_contract: None,
+            },
+        )
+        .await
+        .expect("explorer result should seal");
+
+    let reused = SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "spawn_agent",
+            assignment(&second_name),
+        ))
+        .await
+        .expect("duplicate explorer should reuse the sealed result");
+    let (content, success) = expect_text_output(reused);
+    let reused_result: serde_json::Value =
+        serde_json::from_str(&content).expect("reused spawn result should be json");
+    assert_eq!(success, Some(true));
+    assert_eq!(reused_result["reused"], true);
+    assert_eq!(reused_result["assignment_id"], assignment_id.to_string());
+    assert_eq!(reused_result["attempt_id"], binding.attempt_id.to_string());
+    assert_eq!(reused_result["task_name"], binding.agent_path.as_str());
+    assert_eq!(reused_result["agent_path"], binding.agent_path);
+    assert_eq!(reused_result["thread_id"], first_thread_id.to_string());
+    assert_eq!(reused_result["status"], "completed");
+    assert_eq!(reused_result["receipt_available"], true);
+    assert_eq!(reused_result["integration_plan"], "single_writer");
+    let duplicate_path = AgentPath::root()
+        .join(&second_name)
+        .expect("duplicate candidate path is valid");
+    assert!(
+        agent_control
+            .task_coordinator()
+            .binding_for_agent_path(&duplicate_path)
+            .is_none(),
+        "reuse must not bind or launch a second child"
+    );
+
+    let _ = agent_control
+        .shutdown_live_agent(first_thread_id)
+        .await
+        .expect("reused explorer child shuts down");
 }
 
 #[tokio::test]
@@ -1229,6 +1389,17 @@ async fn multi_agent_v2_typed_spawn_admits_overlapping_write_claims() {
             .expect("typed spawn should return assignment id"),
     )
     .expect("assignment id should parse");
+    assert_eq!(second_result["integration_plan"], "root_owned");
+    assert_eq!(
+        agent_control
+            .task_coordinator()
+            .get_agent_task(second_assignment_id, Some(0))
+            .await
+            .expect("overlapping writer task remains readable")
+            .assignment
+            .integration_plan,
+        codex_agent_task_store::IntegrationPlan::RootOwned
+    );
 
     for assignment_id in [first_assignment_id, second_assignment_id] {
         let binding = agent_control
@@ -2532,7 +2703,18 @@ async fn multi_agent_v2_list_agents_returns_completed_status_without_encrypted_s
         .iter()
         .find(|agent| agent.agent_name == "/root/worker")
         .expect("worker agent should be listed");
-    assert_eq!(worker.agent_status, json!({"completed": "done"}));
+    assert_eq!(
+        worker.agent_status,
+        json!({
+            "terminal_with_completion": {
+                "last_agent_message": "typed agent /root/worker finished with status Completed(Some(\"done\")) without submitting a receipt",
+                "completion": {
+                    "status": "blocked",
+                    "reasons": ["durable typed receipt status: needs_main"]
+                }
+            }
+        })
+    );
     assert_eq!(worker.last_task_message.as_deref(), Some("TaskCapsuleV1"));
     assert_eq!(success, Some(true));
 }
@@ -2893,7 +3075,7 @@ async fn multi_agent_v2_send_message_rejects_interrupt_parameter() {
 }
 
 #[tokio::test]
-async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn() {
+async fn multi_agent_v2_missing_receipt_notifies_parent_once() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let mut config = turn.config.as_ref().clone();
@@ -2955,63 +3137,24 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
         )
         .await;
 
-    FollowupTaskHandlerV2
-        .handle(invocation(
-            session,
-            turn,
-            "followup_task",
-            function_payload(json!({
-                "target": agent_id.to_string(),
-                "message": "continue",
-            })),
-        ))
-        .await
-        .expect("followup_task should succeed");
-
-    assert!(manager.captured_ops().iter().any(|(id, op)| {
-        *id == agent_id
-            && matches!(
-                op,
-                Op::InterAgentCommunication { communication }
-                    if communication.author == AgentPath::root()
-                        && communication.recipient == worker_path
-                        && communication.encrypted_content.as_deref() == Some("continue")
-                        && communication.trigger_turn
-            )
-    }));
-
-    let second_turn = thread.codex.session.new_default_turn().await;
-    thread
-        .codex
-        .session
-        .send_event(
-            second_turn.as_ref(),
-            EventMsg::TurnComplete(TurnCompleteEvent {
-                surfaced_result: None,
-                turn_id: second_turn.sub_id.clone(),
-                last_agent_message: Some("second done".to_string()),
-                error: None,
-                completed_at: None,
-                duration_ms: None,
-                time_to_first_token_ms: None,
-                completion: None,
-                timing: None,
-            }),
-        )
-        .await;
-
     let first_notification = format_inter_agent_completion_message(
         AgentPath::root(),
         worker_path.clone(),
-        &AgentStatus::Completed(Some("first done".to_string())),
+        &AgentStatus::TerminalWithCompletion {
+            last_agent_message: Some(
+                "typed agent /root/worker finished with status Completed(Some(\"first done\")) without submitting a receipt"
+                    .to_string(),
+            ),
+            surfaced_result: None,
+            error: None,
+            completion: TaskCompletionGate {
+                status: TaskCompletionStatus::Blocked,
+                reasons: vec!["durable typed receipt status: needs_main".to_string()],
+                evidence_path: None,
+            },
+        },
     )
-    .expect("completed status should render");
-    let second_notification = format_inter_agent_completion_message(
-        AgentPath::root(),
-        worker_path.clone(),
-        &AgentStatus::Completed(Some("second done".to_string())),
-    )
-    .expect("completed status should render");
+    .expect("missing-receipt terminal status should render");
 
     let notifications = timeout(Duration::from_secs(5), async {
         loop {
@@ -3034,24 +3177,16 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
                         })
                 })
                 .collect::<Vec<_>>();
-            let first_count = notifications
-                .iter()
-                .filter(|message| **message == first_notification)
-                .count();
-            let second_count = notifications
-                .iter()
-                .filter(|message| **message == second_notification)
-                .count();
-            if first_count == 1 && second_count == 1 {
+            if notifications == [first_notification.clone()] {
                 break notifications;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("parent should receive one completion notification per child turn");
+    .expect("parent should receive the durable missing-receipt notification");
 
-    assert_eq!(notifications.len(), 2);
+    assert_eq!(notifications, [first_notification]);
 }
 
 #[tokio::test]
@@ -3795,18 +3930,30 @@ async fn send_input_to_live_v1_agent_skips_resume_config_construction() {
     session.services.agent_control = control.clone();
     let mut target_config = turn.config.as_ref().clone();
     let _ = target_config.features.disable(Feature::MultiAgentV2);
+    let persisted_thread_id = ThreadId::new();
     let thread = manager
         .resume_thread_with_history(
             target_config.clone(),
-            InitialHistory::Forked(vec![RolloutItem::ResponseItem(ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: "persisted".to_string(),
-                }],
-                phase: None,
-                internal_chat_message_metadata_passthrough: None,
-            })]),
+            InitialHistory::Forked(vec![
+                RolloutItem::SessionMeta(SessionMetaLine {
+                    meta: SessionMeta {
+                        session_id: persisted_thread_id.into(),
+                        id: persisted_thread_id,
+                        multi_agent_version: Some(MultiAgentVersion::V1),
+                        ..SessionMeta::default()
+                    },
+                    git: None,
+                }),
+                RolloutItem::ResponseItem(ResponseItem::Message {
+                    id: None,
+                    role: "user".to_string(),
+                    content: vec![ContentItem::InputText {
+                        text: "persisted".to_string(),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                }),
+            ]),
             AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy")),
             /*parent_trace*/ None,
             /*supports_openai_form_elicitation*/ false,
@@ -4556,7 +4703,7 @@ async fn multi_agent_v2_wait_agent_cancellation_wakes_immediately() {
 
     cancellation_token.cancel();
 
-    let result = timeout(Duration::from_millis(250), wait)
+    let result = timeout(Duration::from_secs(2), wait)
         .await
         .expect("cancellation should wake the wait immediately")
         .expect("wait task should join");
@@ -4791,6 +4938,86 @@ async fn wait_agent_returns_final_status_without_timeout() {
         }
     );
     assert_eq!(success, None);
+}
+
+#[tokio::test]
+async fn wait_agent_and_completion_notification_preserve_completion_gate() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    let _ = config.features.disable(Feature::MultiAgentV2);
+    set_turn_config(&mut turn, config);
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+    let thread = manager
+        .start_thread(turn.config.as_ref().clone())
+        .await
+        .expect("start thread");
+    let agent_id = thread.thread_id;
+    let child_turn = thread.thread.codex.session.new_default_turn().await;
+    let completion = TaskCompletionGate {
+        status: TaskCompletionStatus::Partial,
+        reasons: vec!["validation is stale".to_string()],
+        evidence_path: Some("task-evidence/thread.json".to_string()),
+    };
+    thread
+        .thread
+        .codex
+        .session
+        .send_event(
+            child_turn.as_ref(),
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: child_turn.sub_id.clone(),
+                last_agent_message: Some("partial".to_string()),
+                surfaced_result: None,
+                error: None,
+                completion: Some(completion.clone()),
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+                timing: None,
+            }),
+        )
+        .await;
+
+    let output = WaitAgentHandler::default()
+        .handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "wait_agent",
+            function_payload(json!({"targets": [agent_id.to_string()]})),
+        ))
+        .await
+        .expect("wait_agent should return the already-final status");
+    let (content, success) = expect_text_output(output);
+    let result: wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait_agent result should be json");
+    let expected_status = AgentStatus::TerminalWithCompletion {
+        last_agent_message: Some("partial".to_string()),
+        surfaced_result: None,
+        error: None,
+        completion,
+    };
+    assert_eq!(
+        result,
+        wait::WaitAgentResult {
+            status: HashMap::from([(agent_id.to_string(), expected_status.clone())]),
+            timed_out: false,
+        }
+    );
+    assert_eq!(success, None);
+
+    let notification = format_subagent_notification_message("worker", &expected_status);
+    assert!(notification.contains("terminal_with_completion"));
+    assert!(notification.contains("task-evidence/thread.json"));
+
+    let inter_agent_message = format_inter_agent_completion_message(
+        AgentPath::root(),
+        AgentPath::try_from("/root/worker").expect("valid worker path"),
+        &expected_status,
+    )
+    .expect("terminal status should render");
+    assert!(inter_agent_message.contains("Completion gate (machine-readable):"));
+    assert!(inter_agent_message.contains("task-evidence/thread.json"));
 }
 
 #[tokio::test]

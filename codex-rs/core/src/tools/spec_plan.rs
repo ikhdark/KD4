@@ -734,7 +734,8 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Planne
             planned_tools.add(WriteStdinHandler);
 
             // Keep the legacy shell tool registered while unified exec is
-            // model-visible.
+            // model-visible. Persisted and delegated calls may still target
+            // the legacy tool name even though new model turns must not see it.
             planned_tools.add_dispatch_only(ShellCommandHandler::new(shell_command_options));
         }
         ConfigShellToolType::Disabled => {}

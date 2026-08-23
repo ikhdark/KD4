@@ -17,7 +17,6 @@ use codex_sandboxing::SandboxType;
 use codex_sandboxing::is_likely_sandbox_denied;
 use codex_utils_pty::ExecCommandSession;
 use codex_utils_pty::ProcessSignal as PtyProcessSignal;
-use codex_utils_pty::TerminalSize;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
@@ -236,10 +235,7 @@ impl LocalProcess {
         let process_id = params.process_id.clone();
         let prepared =
             prepare_exec_request(&params, child_env(&params), self.runtime_paths.as_ref())?;
-        let (program, args) = prepared
-            .command
-            .split_first()
-            .ok_or_else(|| invalid_params("argv must not be empty".to_string()))?;
+        let sandbox = prepared.sandbox;
 
         let start = Arc::new(ProcessStart);
         {
@@ -255,35 +251,7 @@ impl LocalProcess {
             );
         }
 
-        let spawned_result = if params.tty {
-            codex_utils_pty::spawn_pty_process(
-                program,
-                args,
-                prepared.cwd.as_path(),
-                &prepared.env,
-                &prepared.arg0,
-                TerminalSize::default(),
-            )
-            .await
-        } else if params.pipe_stdin {
-            codex_utils_pty::spawn_pipe_process(
-                program,
-                args,
-                prepared.cwd.as_path(),
-                &prepared.env,
-                &prepared.arg0,
-            )
-            .await
-        } else {
-            codex_utils_pty::spawn_pipe_process_no_stdin(
-                program,
-                args,
-                prepared.cwd.as_path(),
-                &prepared.env,
-                &prepared.arg0,
-            )
-            .await
-        };
+        let spawned_result = prepared.spawn(params.tty, params.pipe_stdin).await;
         let spawned = match spawned_result {
             Ok(spawned) => spawned,
             Err(err) => {
@@ -336,7 +304,7 @@ impl LocalProcess {
                     closed: false,
                     metrics: Some(self.inner.telemetry.process_started()),
                     termination_requested: false,
-                    sandbox: prepared.sandbox,
+                    sandbox,
                     sandbox_denied: false,
                 })),
             );

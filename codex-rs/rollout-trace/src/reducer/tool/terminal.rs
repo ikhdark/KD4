@@ -24,6 +24,7 @@ use crate::model::TerminalRequest;
 use crate::model::TerminalResult;
 use crate::model::TerminalSession;
 use crate::model::ToolCallKind;
+use crate::model::ToolCallRequester;
 use crate::payload::RawPayloadRef;
 use crate::raw_event::RawEventSeq;
 use crate::reducer::TraceReducer;
@@ -287,13 +288,68 @@ impl TraceReducer {
         let Some(operation_id) = tool_call.terminal_operation_id.clone() else {
             return Ok(());
         };
+        let requester = tool_call.requester.clone();
         let call_item_ids = tool_call.model_visible_call_item_ids.clone();
         let output_item_ids = tool_call.model_visible_output_item_ids.clone();
+
+        if let ToolCallRequester::CodeCell { code_cell_id } = requester {
+            return self.sync_code_cell_terminal_observations(&code_cell_id);
+        }
         if call_item_ids.is_empty() && output_item_ids.is_empty() {
             return Ok(());
         }
 
-        let Some(operation) = self.rollout.terminal_operations.get_mut(&operation_id) else {
+        self.upsert_terminal_model_observation(
+            &operation_id,
+            call_item_ids,
+            output_item_ids,
+            TerminalObservationSource::DirectToolCall,
+        )
+    }
+
+    /// Mirrors a code cell's model-visible source and outputs onto all nested
+    /// terminal operations once the cell output has actually been observed.
+    pub(in crate::reducer) fn sync_code_cell_terminal_observations(
+        &mut self,
+        code_cell_id: &str,
+    ) -> Result<()> {
+        let Some(code_cell) = self.rollout.code_cells.get(code_cell_id) else {
+            return Ok(());
+        };
+        if code_cell.output_item_ids.is_empty() {
+            return Ok(());
+        }
+        let call_item_ids = vec![code_cell.source_item_id.clone()];
+        let output_item_ids = code_cell.output_item_ids.clone();
+        let nested_tool_call_ids = code_cell.nested_tool_call_ids.clone();
+
+        for tool_call_id in nested_tool_call_ids {
+            let Some(operation_id) = self
+                .rollout
+                .tool_calls
+                .get(&tool_call_id)
+                .and_then(|tool_call| tool_call.terminal_operation_id.clone())
+            else {
+                continue;
+            };
+            self.upsert_terminal_model_observation(
+                &operation_id,
+                call_item_ids.clone(),
+                output_item_ids.clone(),
+                TerminalObservationSource::CodeCellOutput,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn upsert_terminal_model_observation(
+        &mut self,
+        operation_id: &str,
+        call_item_ids: Vec<String>,
+        output_item_ids: Vec<String>,
+        source: TerminalObservationSource,
+    ) -> Result<()> {
+        let Some(operation) = self.rollout.terminal_operations.get_mut(operation_id) else {
             bail!("terminal operation {operation_id} disappeared during observation linking");
         };
         // A terminal result and a model-visible tool output are intentionally
@@ -302,7 +358,7 @@ impl TraceReducer {
         if let Some(observation) = operation
             .model_observations
             .iter_mut()
-            .find(|observation| observation.source == TerminalObservationSource::DirectToolCall)
+            .find(|observation| observation.source == source)
         {
             observation.call_item_ids = call_item_ids;
             observation.output_item_ids = output_item_ids;
@@ -310,7 +366,7 @@ impl TraceReducer {
             operation.model_observations.push(TerminalModelObservation {
                 call_item_ids,
                 output_item_ids,
-                source: TerminalObservationSource::DirectToolCall,
+                source,
             });
         }
         Ok(())

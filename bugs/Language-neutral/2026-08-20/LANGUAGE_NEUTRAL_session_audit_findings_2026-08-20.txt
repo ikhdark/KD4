@@ -1,0 +1,128 @@
+KD4 HISTORICAL SESSION AUDIT / BUG / FIX EVIDENCE
+Date: 2026-08-20
+Language classification: Language-neutral
+Source scope: Codex sessions under C:\Users\kuh\.codex\sessions\2026\08
+
+This file contains detailed historical evidence migrated from actual user-message and final-answer events. It is not source code and was not independently revalidated during migration. Each record distinguishes what the session directly recorded from what remains a historical technical claim, hypothesis, limitation, or unknown. The KD4 or referenced project repository remains the source of truth for implementation causes.
+================================================================================
+EVIDENCE RECORD: 01a020f3-ae8f-75b2-ba12-e8689d84fb63:631dc29c959f779c
+================================================================================
+Audit date: 2026-08-20
+Classified language: Language-neutral
+Source session UUID: 01a020f3-ae8f-75b2-ba12-e8689d84fb63
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T15-53-56-01a020f3-ae8f-75b2-ba12-e8689d84fb63.jsonl
+Working directory: c:\Users\kuh\Desktop\mdpwa-main
+Git revision recorded by session: 455e0c7bb0025b4251fad62215863290ffe88f02
+Thread source: user
+Unique relevant conclusions retained from session: 1
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: 9eee90aff67e45f40bd92e3a222c25b1db099aea0577ed128f1c99f7a427ead4
+
+Recorded audit/fix task or prompt:
+"C:\Users\kuh\Desktop\mdpwa-main\EXTERNAL\_DEPENDENCY\_AUDIT.txt"
+
+make sure these are all corrected
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+All 11 audit findings are now addressed in the implementation:
+
+- Bounded Neon, Blob, Resend, Web Push, NWS, Nominatim, rate-limit, and backup operations.
+- Durable outbox owns email retries, respects capped `Retry-After`, and dead-letters permanent 4xx failures.
+- Cron dispatch uses a 45-second internal budget within a 60-second platform limit. Ambiguous Workflow starts remain fenced for stale recovery.
+- NWS metadata is cached for 24 hours; malformed Nominatim responses are not cached.
+- OpenStreetMap tile failures have an accessible UI status and privacy disclosure.
+- Rate-limit-store outages return localized `rate_limit_unavailable` responses with `Retry-After: 60`.
+- [SOURCEMAP.md](C:/Users/kuh/Desktop/mdpwa-main/SOURCEMAP.md) reflects the new contracts.
+
+Touched files were formatted. Tests, lint, typecheck, and builds were not run because repository policy requires those checks to be explicitly requested.
+
+Note: [EXTERNAL_DEPENDENCY_AUDIT.txt](C:/Users/kuh/Desktop/mdpwa-main/EXTERNAL_DEPENDENCY_AUDIT.txt) was deleted by concurrent worktree changes while I was working; I preserved that deletion rather than restoring the review artifact.
+
+================================================================================
+EVIDENCE RECORD: 01a020f4-37de-7ef2-a5ce-8fed8d1c70fd:933fabbfabe66c09
+================================================================================
+Audit date: 2026-08-20
+Classified language: Language-neutral
+Source session UUID: 01a020f4-37de-7ef2-a5ce-8fed8d1c70fd
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T15-54-31-01a020f4-37de-7ef2-a5ce-8fed8d1c70fd.jsonl
+Working directory: c:\Users\kuh\Desktop\mdpwa-main
+Git revision recorded by session: 455e0c7bb0025b4251fad62215863290ffe88f02
+Thread source: user
+Unique relevant conclusions retained from session: 1
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: b6ccab2f437cd7ca76b25a6acd078b525c1d38964224e16fc9eea8417b11e3eb
+
+Recorded audit/fix task or prompt:
+"C:\Users\kuh\Desktop\mdpwa-main\resident-write-workflow-audit.txt"
+make sure these are all corrected
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Completed all findings from the resident-write workflow audit:
+
+- Durable idempotency, replay-before-rate-limiting, conflict detection, and deterministic notification delivery.
+- Retry-safe alert confirmation, preferences, compatibility credentials, and unsubscribe tombstones.
+- Atomic push endpoint migration and recoverable push-disable workflows.
+- Draft-specific idempotency keys, abort handling, draft recovery, and honest unknown-outcome messaging.
+- Updated focused tests, English/Spanish copy, and [SOURCEMAP.md](C:/Users/kuh/Desktop/mdpwa-main/SOURCEMAP.md).
+
+Per repository policy, I did not run opt-in validation commands, so no test-pass claim is made. Unrelated concurrent changes were preserved. The audit text file itself is currently marked deleted in the shared worktree; I did not restore or overwrite that concurrent change.
+
+================================================================================
+EVIDENCE RECORD: 01a021ba-4cbd-74a0-b825-eaf199365912:9353dc725fd0b9f2
+================================================================================
+Audit date: 2026-08-20
+Classified language: Language-neutral
+Source session UUID: 01a021ba-4cbd-74a0-b825-eaf199365912
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T19-30-52-01a021ba-4cbd-74a0-b825-eaf199365912.jsonl
+Working directory: c:\Users\kuh\Desktop\kd4
+Git revision recorded by session: c4aea76f7784d718657add4cec5e7e1de24a9edf
+Thread source: user
+Unique relevant conclusions retained from session: 1
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: cf8346cd295c0fc04d8dda9faa7463d5c9f7593788876aadb84eac6104f64f3c
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: c:\Users\kuh\Desktop\LOCAL-KD\config.toml
+
+## Open tabs:
+- config.toml: c:\Users\kuh\Desktop\LOCAL-KD\config.toml
+- config.toml: .codex/config.toml
+- config.toml: c:\Users\kuh\.codex\config.toml
+- WORKTREE_REVIEW.txt: WORKTREE_REVIEW.txt
+- SOURCEMAP.md: SOURCEMAP.md
+
+## My request:
+debloat and update local-kd\config
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Debloated and updated [`LOCAL-KD\config.toml`](C:/Users/kuh/Desktop/LOCAL-KD/config.toml:1).
+
+- Reduced from 1,211 lines / 65,954 bytes to 204 lines / 7,049 bytes.
+- Removed 322 missing project trust entries, including 307 benchmark workspaces.
+- Removed nine stale hook records and one unavailable plugin entry.
+- Removed the obsolete `codexKD2` editor mapping.
+- Preserved all active model, feature, runtime, plugin, Desktop, and KD4 settings—consistent with [OpenAI’s user-config guidance](https://learn.chatgpt.com/docs/config-file/config-reference).
+
+Validation passed: exact semantic comparison succeeded, TOML parses, and `codex doctor --strict-config` reported `config loaded`.
+
+Backup: [`config.toml.backup-20260820-193640`](C:/Users/kuh/Desktop/LOCAL-KD/config.toml.backup-20260820-193640:1). Restart Desktop to reload the cleaned config.

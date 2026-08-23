@@ -157,10 +157,11 @@ async fn thread_rollback_drops_last_turns_and_persists_to_rollout() -> Result<()
             num_turns: 1,
         })
         .await?;
-    let deprecation_notice = timeout(DEFAULT_READ_TIMEOUT, mcp.read_next_message()).await??;
-    let JSONRPCMessage::Notification(deprecation_notice) = deprecation_notice else {
-        panic!("thread/rollback should emit deprecationNotice before its response");
-    };
+    let deprecation_notice = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("deprecationNotice"),
+    )
+    .await??;
     assert_eq!(deprecation_notice.method, "deprecationNotice");
     let deprecation_notice: DeprecationNoticeNotification = serde_json::from_value(
         deprecation_notice

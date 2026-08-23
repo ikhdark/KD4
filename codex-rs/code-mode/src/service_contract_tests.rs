@@ -16,6 +16,7 @@ use crate::ToolDefinition;
 #[derive(Debug, PartialEq)]
 enum DelegateEvent {
     NotificationStarted,
+    NotificationDelivered,
     NotificationCancelled,
     ToolStarted,
     ToolCancelled,
@@ -58,7 +59,9 @@ impl CodeModeSessionDelegate for HeldNotificationDelegate {
         cancellation_token: CancellationToken,
     ) -> ToolInvocationFuture<'a> {
         Box::pin(async move {
+            let _ = self.events_tx.send(DelegateEvent::ToolStarted);
             cancellation_token.cancelled().await;
+            let _ = self.events_tx.send(DelegateEvent::ToolCancelled);
             Err("cancelled".to_string())
         })
     }
@@ -72,10 +75,16 @@ impl CodeModeSessionDelegate for HeldNotificationDelegate {
     ) -> NotificationFuture<'a> {
         Box::pin(async move {
             let _ = self.events_tx.send(DelegateEvent::NotificationStarted);
-            cancellation_token.cancelled().await;
-            let _ = self.events_tx.send(DelegateEvent::NotificationCancelled);
-            self.notification_release.notified().await;
-            Ok(())
+            tokio::select! {
+                _ = self.notification_release.notified() => {
+                    let _ = self.events_tx.send(DelegateEvent::NotificationDelivered);
+                    Ok(())
+                }
+                _ = cancellation_token.cancelled() => {
+                    let _ = self.events_tx.send(DelegateEvent::NotificationCancelled);
+                    Err("cancelled".to_string())
+                }
+            }
         })
     }
 
@@ -98,10 +107,6 @@ impl BlockingDelegate {
             }),
             events_rx,
         )
-    }
-
-    fn release_tool(&self) {
-        self.tool_release.notify_one();
     }
 }
 
@@ -222,50 +227,36 @@ async fn yields_and_resumes() {
 }
 
 #[tokio::test]
-async fn returns_and_resumes_from_the_pending_frontier() {
+async fn bounded_parallel_nested_tool_timeout_rejects_only_the_expired_call() {
     let (delegate, mut events_rx) = BlockingDelegate::new();
-    let service = InProcessCodeModeSession::with_delegate(delegate.clone());
-
-    assert_eq!(
-        service
-            .execute_to_pending(ExecuteRequest {
-                enabled_tools: vec![blocking_tool()],
-                source: r#"
-await tools.block({});
-text("after");
+    let service = InProcessCodeModeSession::with_delegate(delegate);
+    let cell = service
+        .execute(ExecuteRequest {
+            enabled_tools: vec![blocking_tool()],
+            source: r#"
+const outcome = await tools.block({}, { timeout_ms: 10 }).then(
+  () => "unexpected success",
+  (error) => String(error),
+);
+text(outcome);
 "#
-                .to_string(),
-                yield_time_ms: Some(60_000),
-                ..execute_request("")
-            })
-            .await
-            .unwrap(),
-        ExecuteToPendingOutcome::Pending {
-            cell_id: cell_id("1"),
-            content_items: Vec::new(),
-            pending_tool_call_ids: vec!["tool-1".to_string()],
-        }
-    );
+            .to_string(),
+            yield_time_ms: Some(60_000),
+            ..execute_request("")
+        })
+        .await
+        .unwrap();
 
     assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolStarted);
-    delegate.release_tool();
-
     assert_eq!(
-        service
-            .wait_to_pending(WaitToPendingRequest {
-                cell_id: cell_id("1"),
-            })
-            .await
-            .unwrap(),
-        WaitToPendingOutcome::LiveCell(ExecuteToPendingOutcome::Completed(
-            RuntimeResponse::Result {
-                cell_id: cell_id("1"),
-                content_items: vec![FunctionCallOutputContentItem::InputText {
-                    text: "after".to_string(),
-                }],
-                error_text: None,
-            }
-        ))
+        cell.initial_response().await.unwrap(),
+        RuntimeResponse::Result {
+            cell_id: cell_id("1"),
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: "nested tool `block` exceeded its 10ms timeout".to_string(),
+            }],
+            error_text: None,
+        }
     );
 }
 
@@ -326,16 +317,27 @@ async fn observed_natural_completion_wins_over_termination() {
 }
 
 #[tokio::test]
-async fn termination_cancels_pending_callbacks_before_responding() {
-    let (delegate, mut events_rx) = BlockingDelegate::new();
+async fn bounded_parallel_termination_delivers_pending_notification_before_responding() {
+    let (delegate, mut events_rx) = HeldNotificationDelegate::new();
     let service = InProcessCodeModeSession::with_delegate(delegate.clone());
     let cell = service
-        .execute(execute_request(
-            r#"notify("pending"); await new Promise(() => {});"#,
-        ))
+        .execute(ExecuteRequest {
+            enabled_tools: vec![blocking_tool()],
+            source: r#"
+const reported = Promise.resolve("fast").then(async (value) => {
+  await notify(`fast:${value}`);
+  return value;
+});
+const stalled = tools.block({}, { timeout_ms: 30_000 });
+await Promise.allSettled([reported, stalled]);
+"#
+            .to_string(),
+            ..execute_request("")
+        })
         .await
         .unwrap();
 
+    assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolStarted);
     assert_eq!(
         next_event(&mut events_rx).await,
         DelegateEvent::NotificationStarted
@@ -347,17 +349,28 @@ async fn termination_cancels_pending_callbacks_before_responding() {
             content_items: Vec::new(),
         }
     );
+    let mut termination = Box::pin(service.terminate(cell_id("1")));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut termination)
+            .await
+            .is_err(),
+        "termination must wait for an issued notification to finish"
+    );
     assert_eq!(
-        service.terminate(cell_id("1")).await.unwrap(),
+        next_event(&mut events_rx).await,
+        DelegateEvent::ToolCancelled
+    );
+    delegate.release_notification();
+    assert_eq!(
+        next_event(&mut events_rx).await,
+        DelegateEvent::NotificationDelivered
+    );
+    assert_eq!(
+        termination.await.unwrap(),
         WaitOutcome::LiveCell(RuntimeResponse::Terminated {
             cell_id: cell_id("1"),
             content_items: Vec::new(),
         })
-    );
-    assert!(delegate.notification_finished.load(Ordering::Acquire));
-    assert_eq!(
-        next_event(&mut events_rx).await,
-        DelegateEvent::NotificationCancelled
     );
     assert_eq!(
         next_event(&mut events_rx).await,
@@ -366,7 +379,7 @@ async fn termination_cancels_pending_callbacks_before_responding() {
 }
 
 #[tokio::test]
-async fn shutdown_cancels_notifications_while_natural_completion_is_draining() {
+async fn shutdown_delivers_notifications_while_natural_completion_is_draining() {
     let (delegate, mut events_rx) = HeldNotificationDelegate::new();
     let service = Arc::new(InProcessCodeModeSession::with_delegate(delegate.clone()));
     service
@@ -382,11 +395,11 @@ async fn shutdown_cancels_notifications_while_natural_completion_is_draining() {
     let shutdown_service = Arc::clone(&service);
     let shutdown = tokio::spawn(async move { shutdown_service.shutdown().await });
 
+    delegate.release_notification();
     assert_eq!(
         next_event(&mut events_rx).await,
-        DelegateEvent::NotificationCancelled
+        DelegateEvent::NotificationDelivered
     );
-    delegate.release_notification();
 
     assert_eq!(shutdown.await.unwrap(), Ok(()));
     assert_eq!(
@@ -418,23 +431,27 @@ async fn repeated_termination_is_rejected_while_callback_cleanup_is_pending() {
         }
     );
 
-    let terminating_service = Arc::clone(&service);
-    let first_termination =
-        tokio::spawn(async move { terminating_service.terminate(cell_id("1")).await });
-    assert_eq!(
-        next_event(&mut events_rx).await,
-        DelegateEvent::NotificationCancelled
+    let first_termination = service.terminate(cell_id("1"));
+    tokio::pin!(first_termination);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut first_termination)
+            .await
+            .is_err(),
+        "the first termination remains pending while notification cleanup is held"
     );
-
     let repeated_termination = service.terminate(cell_id("1")).await;
     delegate.release_notification();
+    assert_eq!(
+        next_event(&mut events_rx).await,
+        DelegateEvent::NotificationDelivered
+    );
 
     assert_eq!(
         repeated_termination.unwrap_err(),
         "exec cell 1 is already terminating"
     );
     assert_eq!(
-        first_termination.await.unwrap().unwrap(),
+        first_termination.await.unwrap(),
         WaitOutcome::LiveCell(RuntimeResponse::Terminated {
             cell_id: cell_id("1"),
             content_items: Vec::new(),

@@ -3107,6 +3107,23 @@ async fn skills_menu_default_mentions_shortcut_snapshot() {
 }
 
 #[tokio::test]
+async fn removed_mentions_feature_cannot_restore_legacy_skills_shortcuts() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    assert!(
+        chat.config.features.disable(Feature::MentionsV2).is_ok(),
+        "the mentions feature should be configurable in this test"
+    );
+
+    chat.open_skills_list();
+    assert_eq!(chat.bottom_pane.composer_text(), "@");
+
+    chat.open_skills_menu();
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(popup.contains("Tip: press @ to open this list directly."));
+    assert!(!popup.contains("Tip: press $ to open this list directly."));
+}
+
+#[tokio::test]
 async fn model_picker_hides_show_in_picker_false_models_from_cache() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("test-visible-model")).await;
     chat.thread_id = Some(ThreadId::new());

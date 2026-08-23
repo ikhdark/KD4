@@ -1,0 +1,1307 @@
+KD4 HISTORICAL SESSION AUDIT / BUG / FIX EVIDENCE
+Date: 2026-08-20
+Language classification: Multi-language
+Source scope: Codex sessions under C:\Users\kuh\.codex\sessions\2026\08
+
+This file contains detailed historical evidence migrated from actual user-message and final-answer events. It is not source code and was not independently revalidated during migration. Each record distinguishes what the session directly recorded from what remains a historical technical claim, hypothesis, limitation, or unknown. The KD4 or referenced project repository remains the source of truth for implementation causes.
+================================================================================
+EVIDENCE RECORD: 01a01e67-e7ae-70d1-b19a-78d64c99d5e4:801d300e3310b6f0
+================================================================================
+Audit date: 2026-08-20
+Classified language: Multi-language
+Source session UUID: 01a01e67-e7ae-70d1-b19a-78d64c99d5e4
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T18-49-59-01a02194-dd04-7372-9ec0-210652da4d49.jsonl
+Working directory: c:\Users\kuh\Desktop\kd4
+Git revision recorded by session: c4aea76f7784d718657add4cec5e7e1de24a9edf
+Thread source: user
+Unique relevant conclusions retained from session: 1
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: f5068cebe3ed5927d5f0f22498b5147ff9ea27c4239584b7e5f64ff4d8d7c7e3
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Open tabs:
+- WORKTREE_REVIEW.txt: WORKTREE_REVIEW.txt
+- SOURCEMAP.md: SOURCEMAP.md
+- round_trip_batching.rs: codex-rs/core/tests/round_trip_batching.rs
+- gpt-5.6.md: codex-rs/models-manager/prompts/gpt-5.6.md
+- kd4_first_useful_action_analysis.py: scripts/kd4_first_useful_action_analysis.py
+
+## My request:
+use a subagent if it will help workflow
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Read-only triage complete.
+
+Initial report:
+
+- 306 total failures.
+- 251 remain after excluding only `suite::compact` and `suite::compact_remote`.
+- 243 remain after excluding every compaction-named suite, including resume/parity groups.
+- This JUnit is stale relative to current fixes.
+
+Prioritized root causes:
+
+1. Session continuation/acceptance and provider reconstruction
+
+   - Nineteen non-compaction failures were timeouts; eight more reported zero requests.
+   - Directly covers round-trip batching, resume, request-user-input, pending input, subagents, approvals, and some code-mode tests.
+   - Current `turn.rs` fixes address terminal-continuation suppression and streams lacking `ResponseEvent::Created`.
+   - The four explicit `persisted model provider 'test-provider' is not configured` failures share the provider-registry test-support defect that root confirmed fixed.
+
+2. Workspace-evidence invalidation
+
+   - Eight failures explicitly returned `{"stale_workspace_evidence":true,...}`.
+   - About eighteen adjacent shell/apply-patch/exec-policy/unified-exec failures have the same output replacement as their likely cause.
+   - Current `parallel.rs` and `tool_history.rs` changes directly target this.
+   - The lenient heredoc recognizer is a separate but already-focused apply-patch issue.
+
+3. Premature fresh-rollout materialization
+
+   - Eleven failures explicitly say fresh/unmaterialized rollouts already existed, including app-server thread start/read/fork/resume/archive, core override updates, and SQLite state.
+   - Updated-at failures are the same side effect.
+   - Current raw startup-event persistence and removal of the fresh settings snapshot directly target this cluster.
+
+4. New startup/model-visible context versus stale assertions
+
+   - Fourteen non-compaction failures contain the new `<task_model_guidance>` verbatim.
+   - Additional failures/snapshots assume older AGENTS/environment ordering or omit provenance.
+   - `turn.rs:1558` deliberately injects guidance; tracked model-layout and pending-input snapshots already show the new structure.
+   - Most of this cluster is stale test selection/snapshots, except the byte-cap defect, which current context-fragments changes fixed.
+
+5. Reasoning governor/config contamination
+
+   - Eight non-compaction expectations receive `"high"` where they expect `max`, `xhigh`, `medium`, or no effort: client reasoning tests, app model-list tests, and multi-agent-mode tests.
+   - This correlates directly with `.codex/config.toml` phase efforts plus the new reasoning governor.
+   - Treat as one test-isolation/policy root, not eight defects.
+
+6. Code-mode/MCP readiness or export
+
+   - Twenty-two code-mode failures form one important unresolved cluster.
+   - Six explicitly say `tools.mcp__... is not a function`; others show missing `wait`, wrong direct-tool visibility, absent standalone search, or changed execute/wait envelopes.
+   - First prove one namespaced MCP export, one standalone tool, and one wait-envelope case before touching individual expectations.
+
+7. Calendar-aged fixtures
+
+   - At least six failures use fixed January/February 2025 rollouts against the August 2026 runtime:
+     app-server thread-list tests, two conversation-summary tests, and TUI latest-session fallback.
+   - Retention/backfill behavior makes these fixtures stale. Use recent generated timestamps while preserving deterministic relative ordering.
+
+8. Independent leaf defects after systemic reruns
+
+   - Completion-review gate state: 6.
+   - Models cache TTL/identity: 3.
+   - Goal extension surface: 2.
+   - Memories instruction budget: 2.
+   - TUI rate-limit/credits behavior: 5, plus 2 legacy fast-tier cases.
+   - CLI feature-warning expectation: 1.
+   - Code-mode protocol description contract: 1.
+   - App-server tracing Windows stack overflow: 1.
+
+Recommended first focused batch:
+
+```powershell
+cargo nextest run -p codex-core -E 'test(/(shell_command_works|apply_patch_shell_command_heredoc_with_cd_updates_relative_workdir|unified_exec_runs_on_all_platforms|diagnosis_and_dynamic_validation_keep_model_boundaries|resume_model_switch_is_not_duplicated_after_pre_turn_override|history_dedupes_streamed_and_final_messages_across_turns|snapshot_model_visible_layout_turn_overrides|ultra_reasoning_uses_max_and_requires_explicit_request|code_mode_exposes_mcp_tools_on_global_tools_object|code_mode_can_call_standalone_web_search|code_mode_wait_returns_error_for_unknown_session|stdio_mcp_parallel_tool_calls_opt_in_runs_concurrently|ordinary_nonpassed_evidence_prevents_review_and_stays_partial)/)' --retries 0 --no-fail-fast
+```
+
+App-server lifecycle/date representatives:
+
+```powershell
+cargo nextest run -p codex-app-server -E 'test(/(thread_start_creates_thread_and_emits_started|thread_resume_defers_updated_at_until_turn_start|thread_list_created_at_tie_breaks_by_uuid|get_conversation_summary_by_thread_id_reads_rollout|turn_start_file_change_approval_v2)/)' --retries 0 --no-fail-fast
+```
+
+Leaf representatives:
+
+```powershell
+cargo nextest run -p codex-tui -p codex-models-manager -p codex-memories-extension -p codex-goal-extension -p codex-code-mode-protocol -p codex-cli -E 'test(/(rate_limit_snapshot_keeps_prior_credits_when_missing_from_headers|cache_renewal_requires_exact_identity_and_fresh_ttl|memory_tool_developer_instructions_have_a_firm_total_budget|goal_tool_surface_tracks_inactive_and_active_state|yield_time_descriptions_define_internal_cadence_without_changing_fields|features_enable_under_development_feature_or_alias_prints_canonical_warning)/)' --retries 0 --no-fail-fast
+```
+
+No files, build artifacts, harness state, Git state, or publication state were changed.
+
+================================================================================
+EVIDENCE RECORD: 01a01e67-e7ae-70d1-b19a-78d64c99d5e4:6e2b9c58a06ed13c
+================================================================================
+Audit date: 2026-08-20
+Classified language: Multi-language
+Source session UUID: 01a01e67-e7ae-70d1-b19a-78d64c99d5e4
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T18-57-42-01a0219b-ed07-7f10-aab2-7700be0186f2.jsonl
+Working directory: c:\Users\kuh\Desktop\kd4
+Git revision recorded by session: c4aea76f7784d718657add4cec5e7e1de24a9edf
+Thread source: user
+Unique relevant conclusions retained from session: 3
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: e6cfad1ce6ed8551d2e97f2bddbc2bb102dc337da53388db3bc6c94249bf01a5
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: .codex/config.toml
+
+## Open tabs:
+- config.toml: .codex/config.toml
+- config.toml: c:\Users\kuh\.codex\config.toml
+- WORKTREE_REVIEW.txt: WORKTREE_REVIEW.txt
+- SOURCEMAP.md: SOURCEMAP.md
+- round_trip_batching.rs: codex-rs/core/tests/round_trip_batching.rs
+
+## My request:
+i updated config.toml, you can use another subagent now
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Read-only triage complete. The 24 JUnit failures reduce to two real defects plus stale expectations:
+
+- Deferred tools are filtered before the JS cell starts at `core/src/tools/code_mode/execute_handler.rs:54`. This makes same-cell `tool_search` + call impossible and causes nearly every MCP, web-search, app, and hidden-dynamic failure. Runtime-enable all deferred specs while keeping their schemas omitted from the prompt.
+- `core/src/tools/code_mode/delegate.rs:333` closes every live cell when a per-sampling worker drops. Remove that close-all behavior; otherwise `wait` can never survive to the next sampling boundary. Avoid cancelling live cell callbacks on ordinary worker turnover as well.
+
+Update stale tests for dynamic `wait` visibility, structured `update_plan` results, current yield-time wording, output-triggered `Script running` status, Windows `exec_command` availability, and deterministic live-cell fixtures. The Windows hook test must drain a returned nested exec session before checking output.
+
+Recommended focused checks:
+
+```powershell
+cargo nextest run -p codex-core -E 'test(/^suite::code_mode::/) | test(/^suite::hooks_windows::pre_tool_use_rewrites_code_mode_nested_exec_command_before_execution$/)' --retries 0 --no-fail-fast
+cargo nextest run -p codex-code-mode-protocol -E 'test(yield_time_descriptions_define_internal_cadence_without_changing_fields)' --retries 0
+```
+
+I did not edit files or run Cargo, per assignment.
+
+--- Relevant turn 2 ---
+Conclusion SHA-256: 54da4eb8cf50e17294f647eec2801b3216a48ab005ddadb65b7f8fe53aed5db6
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: .codex/config.toml
+
+## Open tabs:
+- config.toml: .codex/config.toml
+- config.toml: c:\Users\kuh\.codex\config.toml
+- WORKTREE_REVIEW.txt: WORKTREE_REVIEW.txt
+- SOURCEMAP.md: SOURCEMAP.md
+- round_trip_batching.rs: codex-rs/core/tests/round_trip_batching.rs
+
+## My request:
+i updated config.toml, you can use another subagent now
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Root cause confirmed: the continuation request had no staged context candidate, so the new first-event commit logic treated a valid unchanged-context path as fatal before processing `Completed`. Its 80k usage was therefore never recorded, and the next turn correctly saw the older token state and skipped compaction.
+
+The current `bound_context_attempts` fix correctly distinguishes:
+
+- No candidate bound: unchanged context; process the response.
+- Candidate bound but commit fails/mismatches: remain fail-closed.
+
+The summary concatenations are production-correct. Both failing expectations were stale:
+
+- Manual compaction: `previous_summary + "\n\n" + incremental_update`, with no label.
+- Multiple auto-compaction: later mock responses must be incremental deltas, then progressively appended.
+
+Recommended focused validation:
+
+```text
+cargo nextest run -p codex-core --test all -E 'test(/suite::compact::(auto_compact_allows_multiple_attempts_when_interleaved_with_other_turn_events|multiple_auto_compact_per_task_runs_after_token_limit_hit|manual_compact_twice_preserves_latest_user_messages)/)'
+```
+
+I made no edits or build/test runs.
+
+--- Relevant turn 3 ---
+Conclusion SHA-256: 2dcc67214d29b15a77177014d530d76566be37cef6caf19f904f2c991d7e8a01
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: .codex/config.toml
+
+## Open tabs:
+- config.toml: .codex/config.toml
+- config.toml: c:\Users\kuh\.codex\config.toml
+- WORKTREE_REVIEW.txt: WORKTREE_REVIEW.txt
+- SOURCEMAP.md: SOURCEMAP.md
+- round_trip_batching.rs: codex-rs/core/tests/round_trip_batching.rs
+
+## My request:
+i updated config.toml, you can use another subagent now
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+All 17 failures are stale tests or snapshots; I found no production defect.
+
+Exact fixes:
+
+- Reasoning assertions near original lines 462 and 820:
+  - Exclude `reasoning` from normal-vs-compact body parity.
+  - Assert compact effort against `harness.test().session_configured.reasoning_effort`, because governed sampling may use `high` while compaction correctly uses the turn baseline `medium`.
+  - Prefer this over the current weaker `reasoning.is_object()` checks.
+
+- Original-user assertion near original line 1017:
+  - Flip to assert `"hello remote compact"` is absent.
+  - `compact_remote.rs:368-383` explicitly treats raw messages as consumed evidence after opaque remote compaction.
+
+- Model-switch assertion near original line 3558:
+  - Flip to assert `BEFORE_SWITCH_USER` is absent.
+  - Keep assertions that `AFTER_SWITCH_USER` and `<model_switch>` are present.
+
+Snapshot audit:
+
+- The current tree has 12 unique remote `.snap.new` files, not 13.
+- All 12 are safe to accept.
+- Their changes consistently reflect:
+  - removal of redundant no-op environment/startup envelopes;
+  - removal of `/root` and `<multi_agent_mode>` envelopes after the test harness intentionally disabled default MultiAgentV2;
+  - eviction of raw remote-compacted messages;
+  - reinjection of fresh canonical permissions, skills, realtime, environment, and task-guidance context.
+- The realtime resume reordering is correct.
+- The model-switch tracked snapshot already expects the older user to be absent and should remain unchanged after fixing its pre-snapshot assertion.
+
+No files were edited and no Cargo command was run.
+
+================================================================================
+EVIDENCE RECORD: 01a01e67-e7ae-70d1-b19a-78d64c99d5e4:63a90eaecd4137cc
+================================================================================
+Audit date: 2026-08-20
+Classified language: Multi-language
+Source session UUID: 01a01e67-e7ae-70d1-b19a-78d64c99d5e4
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T22-20-43-01a02255-ce53-7c13-ac4e-2c5c7d23a52e.jsonl
+Working directory: c:\Users\kuh\Desktop\kd4
+Git revision recorded by session: c4aea76f7784d718657add4cec5e7e1de24a9edf
+Thread source: user
+Unique relevant conclusions retained from session: 1
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: 4fc71dcaae6266971971dfca709cbea1632ee9e04095194bb1b4e5f45a47860b
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: .codex/config.toml
+
+## Open tabs:
+- config.toml: .codex/config.toml
+
+## My request:
+you can use another agent if it helps &#x20;
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Prepublication audit complete. Current findings:
+
+Commit blockers:
+
+- One unresolved snapshot remains:
+  `codex-rs/core/src/session/snapshots/codex_core__codex_tests__fork_startup_context_then_first_turn_diff.snap.new`
+- App-server schema provenance/freshness remains conditional until the planned commands complete:
+  `just app-server-schema-regenerate <owner>`
+  followed by
+  `just app-server-schema-check`
+  The 19 modified and two new generated TypeScript/JSON outputs match the new `TurnTimingToolCall` protocol sources, so they do not look hand-edited.
+- Because the tree adds three permanent files and deletes `WORKTREE_REVIEW.txt`, rerun and record `just source-map-check` after edits settle. The stale `WORKTREE_REVIEW.txt` ownership row has now been removed from `SOURCEMAP.md`.
+
+Nonblockers:
+
+- Canonical `git diff --check` exits 0. CRLF conversion notices are warnings, not whitespace failures.
+- No high-confidence API keys, tokens, private keys, or credentials were found in changed or untracked content.
+- The only added workstation paths are intentional fork policy text/tests for `C:\Users\kuh\Desktop\LOCAL-KD` versus `C:\Users\kuh\.codex`.
+- No dirty logs, build directories, executable/binary artifacts, archives, databases, JSONL sessions, caches, or temporary files were found.
+- No binary diffs exist.
+- Large dirty files are expected source/generated files: two combined schema JSON files and `codex-rs/core/src/task_evidence.rs`.
+- `scripts/cargo-workspace-analyzer.ps1` is intentional source, wired into `justfile` and tooling-policy tests, and contains no absolute checkout path.
+- No unexplained additions/deletions remain beyond the intended analyzer, two generated TS files, deleted historical review ledger, and the unresolved `.snap.new`.
+- Branch is `main`; `origin` is the fork `https://github.com/ikhdark/KD4.git`. Do not push `upstream`.
+
+Current publication boundary is not active yet:
+
+- Process-, user-, and machine-level `CODEX_HOME` are currently unset.
+- `C:\Users\kuh\Desktop\LOCAL-KD\codex.exe` exists with SHA-256 `8C58138139F16BD49038B5B3188DF30BCB80F711AE2DBE60ACE3022E663F0848`, timestamped before these repairs.
+- The currently running Desktop app-server is the packaged WindowsApps `codex.exe`, not LOCAL-KD. This is expected before republishing but prevents any claim that the repairs are currently active.
+- LOCAL-KD’s config correctly contains `CODEX_HOME` and `CODEX_CLI_PATH` pointing to LOCAL-KD and the 120,000-token compaction setting.
+
+Exact completion sequence:
+
+1. Remove/reconcile the final `.snap.new`.
+2. Complete schema regeneration/check and `just source-map-check`.
+3. Confirm all requested validation results, then run `git diff --check`.
+4. Stage only the reviewed final set; inspect `git diff --cached --name-status`, `git diff --cached --stat`, and `git diff --cached --check`.
+5. Commit and run `git push origin main`.
+6. Compare `git rev-parse HEAD` with `git ls-remote --heads origin refs/heads/main`.
+7. Require a clean `git status --porcelain`.
+8. Run:
+   `just publish-local-codex-final -DryRun -RuntimeProof -RestartDesktop`
+9. Then publish and activate:
+   `just publish-local-codex-final -RuntimeProof -RestartDesktop`
+10. Require proof output showing matching source/target SHA-256, all post-publish hash checks successful, doctor success, `publishCommitted=true`, `desktopRestart=restarted`, and `restartFailed=false`.
+11. Verify user environment values are exactly:
+   - `CODEX_HOME=C:\Users\kuh\Desktop\LOCAL-KD`
+   - `CODEX_CLI_PATH=C:\Users\kuh\Desktop\LOCAL-KD\codex.exe`
+12. Verify a Desktop-launched app-server process now runs the LOCAL-KD binary, and confirm its hash/version matches the publish proof.
+
+================================================================================
+EVIDENCE RECORD: 01a01e67-e7ae-70d1-b19a-78d64c99d5e4:e41b1390609aba2c
+================================================================================
+Audit date: 2026-08-20
+Classified language: Multi-language
+Source session UUID: 01a01e67-e7ae-70d1-b19a-78d64c99d5e4
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T22-58-21-01a02278-413b-7910-aabd-63995a38901e.jsonl
+Working directory: c:\Users\kuh\Desktop\kd4
+Git revision recorded by session: c4aea76f7784d718657add4cec5e7e1de24a9edf
+Thread source: user
+Unique relevant conclusions retained from session: 2
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: 29c3f006e062d9e64f63751aa8d2b908134d98b6d53445ce544550739531323f
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: .codex/config.toml
+
+## Open tabs:
+- config.toml: .codex/config.toml
+
+## My request:
+continue
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Static repair handed off.
+
+Changes:
+
+- `agent_websocket.rs`: synchronized the startup `generate=false` prewarm before model-switch assertions.
+- `turn_state.rs`: synchronized prewarm in both WebSocket turn-state fixtures, preventing the warmup response from being consumed as a real turn.
+- `unified_exec.rs`: replaced fragile nested Windows PowerShell quoting with native `powershell_script`; Unix uses structured `argv`.
+- Existing `tasks/mod.rs` change releases/detaches the completed turn before `TurnComplete` becomes observable.
+
+Root causes:
+
+- WebSocket request-count failures were startup-prewarm fixture races.
+- Unified-exec failed in ~0.3s because the nested Windows shell command exited before the delayed marker, not because owner-wait resumed early.
+- Run 802 used an integration artifact predating the `tasks/mod.rs` terminal-ordering build; root is rerunning against the current artifact.
+
+Static checks passed:
+
+- `rustfmt --edition 2024 --check`
+- `git diff --check`
+
+No Cargo/build commands were run in this lane.
+
+--- Relevant turn 2 ---
+Conclusion SHA-256: a678ab84c28f88caf6a92a78db2ae2f527d85e3a4a023cac04e6a789022b2d5a
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: .codex/config.toml
+
+## Open tabs:
+- config.toml: .codex/config.toml
+
+## My request:
+continue
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Completed the four-failure repair lane and handed it back to root.
+
+All four focused integration tests pass, plus the direct client unit test. Scoped `git diff --check` and targeted `rustfmt --check` also pass. Cargo lane is free.
+
+================================================================================
+EVIDENCE RECORD: 01a01e67-e7ae-70d1-b19a-78d64c99d5e4:3513680dc3d8f1dd
+================================================================================
+Audit date: 2026-08-20
+Classified language: Multi-language
+Source session UUID: 01a01e67-e7ae-70d1-b19a-78d64c99d5e4
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T23-49-31-01a022a7-1990-7c20-9a51-543b7b0dad21.jsonl
+Working directory: c:\Users\kuh\Desktop\kd4
+Git revision recorded by session: c4aea76f7784d718657add4cec5e7e1de24a9edf
+Thread source: user
+Unique relevant conclusions retained from session: 3
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: 0e50eca36ea15f264983ba6d36a02c20c7ffa03db7c06d93eeed689b1c358b19
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: codex-rs/core/src/turn_timing.rs
+
+## Open tabs:
+- turn_timing.rs: codex-rs/core/src/turn_timing.rs
+
+## My request:
+how much longer
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Cause evidenced: the test fixture is not authorized to expose `agents.spawn_agent`.
+
+- [`agent_execution.rs`](C:/Users/kuh/Desktop/kd4/codex-rs/core/tests/suite/agent_execution.rs:15) uses `"spawn the first worker"` and line 16 uses `"spawn the second worker"`.
+- [`multi_agents.rs`](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/multi_agents.rs:105) recognizes agent targets containing `agent`, `sub-agent`, `subagent`, `child`, or `delegat`; it does not recognize `worker`.
+- Therefore explicit-request-only authorization remains false. [`turn.rs`](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/turn.rs:3287) derives `AgentSurfaceStage::Prohibited`, and [`spec_plan.rs`](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/spec_plan.rs:882) omits the V2 spawn runtime.
+- The model still emits `agents.spawn_agent`; [`registry.rs`](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/registry.rs:2978) consequently reports `unsupported call: agentsspawn_agent`.
+
+This is not a stale router, exposure-identity, namespace, or capacity defect:
+
+- Authorization is updated before turn execution in [`handlers.rs`](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/handlers.rs:216).
+- Surface stage participates in exposure identity and router rebuilding in [`turn.rs`](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/turn.rs:2827).
+- Configured capacity `2` correctly becomes one V2 subagent slot in [`config/mod.rs`](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/config/mod.rs:1513), so a nested spawn should hit the intended shared-capacity error after the first agent is active.
+- Passing V2 fixtures use recognized wording, e.g. `"spawn a child and continue"` in [`subagent_notifications.rs`](C:/Users/kuh/Desktop/kd4/codex-rs/core/tests/suite/subagent_notifications.rs:48).
+
+Smallest safe fix: change the test prompts to `"spawn the first agent"` and `"spawn the second agent"`. Also change the new task-capsule parser unit test’s `"spawn the second worker"` objective to `"spawn the second agent"`. Do not broaden production authorization to generic `worker`; that could authorize delegation for ordinary background-worker requests. The model change to `gpt-5.4` is unrelated and can be reverted.
+
+Focused validation:
+
+```powershell
+cargo nextest run -p codex-core --test all --no-fail-fast --retries 0 --no-capture -E 'test(v2_nested_spawn_checks_shared_active_execution_capacity)'
+```
+
+No files or harness state were modified, and Cargo was not run.
+
+--- Relevant turn 2 ---
+Conclusion SHA-256: 704d7fecab88bd637f1272206f06bfc8ea72049778d9e6ebaea4b207e0a43c3b
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: codex-rs/core/src/turn_timing.rs
+
+## Open tabs:
+- turn_timing.rs: codex-rs/core/src/turn_timing.rs
+
+## My request:
+how much longer
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+The capacity expectation is correct; this is a production router regression.
+
+Every public V2 spawn is now durably bound, including message-shaped legacy calls. The distinction is `AssignmentAdmissionOrigin::LegacyMessage`, not absence of a binding. The spawn handler explicitly permits those legacy-message agents to spawn another message-shaped child:
+
+- [`spawn.rs:136`](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs:136) distinguishes legacy parents.
+- [`spawn.rs:149`](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs:149) rejects explicitly typed parents.
+- [`spawn.rs:1173`](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs:1173) constructs the legacy assignment.
+- [`tests.rs:832`](C:/Users/kuh/Desktop/kd4/codex-rs/agent-task-store/src/tests.rs:832) explicitly verifies nested legacy-message assignments.
+
+The router blocks that intended path before the handler:
+
+- [`router.rs:631`](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/router.rs:631) finds the legacy binding.
+- [`router.rs:671`](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/router.rs:671) applies the blanket typed-tool policy.
+- [`task_capabilities.rs:357`](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/agent/task_capabilities.rs:357) classifies `spawn_agent` as root task control, which line 269 always denies.
+
+Smallest safe fix: exempt only collaboration-classified `spawn_agent` calls whose bound assignment has `LegacyMessage` origin. Keep every other root task-control operation denied and continue the existing heartbeat. The handler then remains the second enforcement layer and the nested attempt reaches shared-capacity admission.
+
+Focused validation:
+
+```powershell
+cargo nextest run -p codex-core --test all --no-fail-fast --retries 0 --no-capture -E 'test(v2_nested_spawn_checks_shared_active_execution_capacity)'
+```
+
+No files were changed and Cargo was not run.
+
+--- Relevant turn 3 ---
+Conclusion SHA-256: 898ec8d4fcfa4bb14e43b2a0662e519bbd7dc344269b4e6790be4784ac222e06
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: codex-rs/core/src/turn_timing.rs
+
+## Open tabs:
+- turn_timing.rs: codex-rs/core/src/turn_timing.rs
+
+## My request:
+how much longer
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Read-only diagnosis delivered to the parent with exact source locations and fixes:
+
+- State: add migration `0043` extending visible created/updated indexes with `id DESC`.
+- Core: current production changes should fix all three `override_updates`; also route the startup service-tier warning through the non-materializing event helper.
+- App-server: make `write_models_cache()` use the complete bundled `ModelsResponse`, preserving hidden models and personality metadata.
+
+No files were edited and no Cargo commands were run.
+
+================================================================================
+EVIDENCE RECORD: 01a020f2-e227-7fb3-863c-dfa02a958fd7:6cbd42bdc7657c7c
+================================================================================
+Audit date: 2026-08-20
+Classified language: Multi-language
+Source session UUID: 01a020f2-e227-7fb3-863c-dfa02a958fd7
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T15-53-03-01a020f2-e227-7fb3-863c-dfa02a958fd7.jsonl
+Working directory: c:\Users\kuh\Desktop\mdpwa-main
+Git revision recorded by session: 455e0c7bb0025b4251fad62215863290ffe88f02
+Thread source: user
+Unique relevant conclusions retained from session: 1
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: 15d55049d1bb166ae8c558655d1601e1529b9d67340bcb4725e89fceaa1b065b
+
+Recorded audit/fix task or prompt:
+"C:\Users\kuh\Desktop\mdpwa-main\PERFORMANCE\_ARCHITECTURE\_FINDINGS.txt"
+
+make sure these are all corrected
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+All eight performance findings are now covered:
+
+- Homepage map and Leaflet CSS defer until near the viewport.
+- Report and abuse forms load only after user intent.
+- Weather responses use shared caching.
+- PWA update, native-install, and iOS UI are eligibility-gated.
+- Google Analytics remains idle-gated with `lazyOnload`.
+- Zod/phone validation stays outside resident client bundles.
+- Desktop navigation is server-rendered; the mobile dialog loads on first open.
+- Homepage and meetings server reads run concurrently.
+
+Key changes are in [MapFeedbackMap.tsx](/C:/Users/kuh/Desktop/mdpwa-main/src/components/MapFeedbackMap.tsx), [MapFeedbackReportForm.tsx](/C:/Users/kuh/Desktop/mdpwa-main/src/components/MapFeedbackReportForm.tsx), [DeferredClientRuntime.tsx](/C:/Users/kuh/Desktop/mdpwa-main/src/components/DeferredClientRuntime.tsx), [pwa-register.tsx](/C:/Users/kuh/Desktop/mdpwa-main/src/app/pwa-register.tsx), and [SiteHeader.tsx](/C:/Users/kuh/Desktop/mdpwa-main/src/components/SiteHeader.tsx). The architecture map was updated accordingly. Leaflet CSS colocation follows Next.js App Router’s supported external-stylesheet and production CSS-splitting model. [Next.js CSS documentation](https://nextjs.org/docs/app/getting-started/css)
+
+I performed a focused source/diff audit and formatting. Per repository policy, I did not run opt-in lint, typecheck, tests, build, or bundle analysis.
+
+One workspace caveat: unrelated concurrent changes appeared during the work, including deletion of the findings file itself. I left those unrelated changes untouched.
+
+================================================================================
+EVIDENCE RECORD: 01a020f3-23ae-7612-b944-b009c3c1372d:9dc6a679e80dd58d
+================================================================================
+Audit date: 2026-08-20
+Classified language: Multi-language
+Source session UUID: 01a020f3-23ae-7612-b944-b009c3c1372d
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T15-53-20-01a020f3-23ae-7612-b944-b009c3c1372d.jsonl
+Working directory: c:\Users\kuh\Desktop\mdpwa-main
+Git revision recorded by session: 455e0c7bb0025b4251fad62215863290ffe88f02
+Thread source: user
+Unique relevant conclusions retained from session: 1
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: 565f0794db8c8e00d107336f66f5992f4099b083845456069137b5f7694b8526
+
+Recorded audit/fix task or prompt:
+"C:\Users\kuh\Desktop\mdpwa-main\MDPWA\_INTERNAL\_API\_CONTRACT\_AUDIT.txt"
+
+make sure these are all corrected
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Implemented all three audit corrections:
+
+- `Retry-After` now safely handles delta-seconds and HTTP dates, preserves the longest active delay, disables affected actions, and shows localized retry guidance.
+- Protected `401` responses now unmount protected state across every admin surface through [AdminSessionBoundary.tsx](C:/Users/kuh/Desktop/mdpwa-main/src/components/AdminSessionBoundary.tsx), including alerts and map feedback.
+- All browser API calls use the shared 15-second deadline in [clientJson.ts](C:/Users/kuh/Desktop/mdpwa-main/src/lib/clientJson.ts). Aborted response bodies can no longer be mistaken for success.
+- Service-worker push API calls now have the same deadline via the canonical template; `public/sw.js` and its asset manifest were regenerated successfully.
+- Added focused tests and updated [SOURCEMAP.md](C:/Users/kuh/Desktop/mdpwa-main/SOURCEMAP.md).
+
+Per repository policy, tests, lint, and typecheck were not run because they were not explicitly requested. The audit text file was deleted by concurrent workspace changes, so I left that deletion untouched rather than restoring it.
+
+================================================================================
+EVIDENCE RECORD: 01a020f4-5211-7891-8e28-bd4125916009:68d0f4ff88973b24
+================================================================================
+Audit date: 2026-08-20
+Classified language: Multi-language
+Source session UUID: 01a020f4-5211-7891-8e28-bd4125916009
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T15-54-37-01a020f4-5211-7891-8e28-bd4125916009.jsonl
+Working directory: c:\Users\kuh\Desktop\mdpwa-main
+Git revision recorded by session: 455e0c7bb0025b4251fad62215863290ffe88f02
+Thread source: user
+Unique relevant conclusions retained from session: 1
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: 490633097475370fc325a215ae264819dae134a9eae8a7f91aa2d850bdf21023
+
+Recorded audit/fix task or prompt:
+"C:\Users\kuh\Desktop\mdpwa-main\PRODUCTION\_TEST\_GAPS.txt"
+"C:\Users\kuh\Desktop\mdpwa-main\production-readiness-review\.txt"
+"C:\Users\kuh\Desktop\mdpwa-main\PWA\_AUDIT\_FINDINGS.txt"
+make sure these are all corrected
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+All actionable findings from the three audits are addressed in the current tree.
+
+Key corrections include:
+
+- Race-safe alert signup tokens and confirmation delivery in [subscriberRepository.ts](C:/Users/kuh/Desktop/mdpwa-main/src/lib/subscriberRepository.ts:132) and [route.ts](C:/Users/kuh/Desktop/mdpwa-main/src/app/api/alert-signups/route.ts:387).
+- Session-only resident drafts; legacy `localStorage` drafts are removed.
+- Push-subscription decryption failures remain fail-closed without disabling subscriptions.
+- Real PostgreSQL coverage for concurrent writes, atomic outboxes, lease fencing, Resend webhook replay, retention, rollback, and every supported prior migration in [productionPersistence.postgres.test.ts](C:/Users/kuh/Desktop/mdpwa-main/src/lib/tests/productionPersistence.postgres.test.ts:155).
+- Exact permission and audited-identity tests in [privilegedRoutePermissions.test.ts](C:/Users/kuh/Desktop/mdpwa-main/src/app/tests/api/privilegedRoutePermissions.test.ts:60).
+- Broadcast cancellation/retry race coverage.
+- Real production-template PWA upgrade, old-tab chunk, cache retention, and bilingual offline coverage in [pwa-upgrade.spec.ts](C:/Users/kuh/Desktop/mdpwa-main/e2e/pwa-upgrade.spec.ts:42).
+- Hardened Next 16 service-worker generation and isolated generator tests in [generate-service-worker.mjs](C:/Users/kuh/Desktop/mdpwa-main/scripts/generate-service-worker.mjs:98).
+- Real replay-safe resident form/API browser coverage in [resident-submission-contract.spec.ts](C:/Users/kuh/Desktop/mdpwa-main/e2e/resident-submission-contract.spec.ts:18).
+- Disposable-PostgreSQL and browser coverage wired into [data-operations-tests.yml](C:/Users/kuh/Desktop/mdpwa-main/.github/workflows/data-operations-tests.yml:65).
+
+I did not run pnpm tests or builds because this repository’s policy permits checks only when explicitly requested.
+
+The three audit `.txt` files were deleted by a separate concurrent workspace update while I was working. I preserved that external deletion and addressed the findings from the contents already read. Unrelated concurrent changes were left untouched.
+
+================================================================================
+EVIDENCE RECORD: 01a020f5-ef46-7f73-a8fe-cb57f1c53f42:90f09b20f8732b57
+================================================================================
+Audit date: 2026-08-20
+Classified language: Multi-language
+Source session UUID: 01a020f5-ef46-7f73-a8fe-cb57f1c53f42
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T15-56-23-01a020f5-ef46-7f73-a8fe-cb57f1c53f42.jsonl
+Working directory: c:\Users\kuh\Desktop\mdpwa-main
+Git revision recorded by session: 455e0c7bb0025b4251fad62215863290ffe88f02
+Thread source: user
+Unique relevant conclusions retained from session: 2
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: 1eb50739418eae482525fcc279e5c9ad54203161bc1c27b87486d67678cd010d
+
+Recorded audit/fix task or prompt:
+Audit for producer/consumer gaps. Find structured fields, receipts, identities, revisions, ranges, evidence, or classifications that a consumer is capable of using but no production producer currently populates—or that producers populate but no production consumer reads.
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Found eight confirmed in-repository production gaps: one missing producer and seven producer-only contracts.
+
+## Findings
+
+1. **Resident submission receipts are discarded.**
+   Community input, map feedback, and alert signup return structured outcomes including `stored`, `replayed`, notification/confirmation status, and saved entity identity/state: [community input](/C:/Users/kuh/Desktop/mdpwa-main/src/app/api/community-input/route.ts:254), [map feedback](/C:/Users/kuh/Desktop/mdpwa-main/src/app/api/map-feedback/route.ts:366), [alert signup](/C:/Users/kuh/Desktop/mdpwa-main/src/app/api/alert-signups/route.ts:389). The shared hook passes response data to `onSuccess` [here](/C:/Users/kuh/Desktop/mdpwa-main/src/components/useResidentFormSubmission.ts:167), but all three callbacks ignore it: [CommunityInputForm](/C:/Users/kuh/Desktop/mdpwa-main/src/components/CommunityInputForm.tsx:139), [MapFeedbackReportForm](/C:/Users/kuh/Desktop/mdpwa-main/src/components/MapFeedbackReportForm.tsx:242), [AlertSignupForm](/C:/Users/kuh/Desktop/mdpwa-main/src/components/AlertSignupForm.tsx:102).
+   **Effect:** fixed success messages cannot distinguish a new save from a replay, expose a reference ID, or report failed/unknown notification delivery.
+
+2. **Phone and SMS-consent support has no new-signup producer.**
+   `NewAlertSignupInput` declares `phone` and `smsConsent` [here](/C:/Users/kuh/Desktop/mdpwa-main/src/lib/alerts.ts:46), but `createAlertSignup` never reads either field [here](/C:/Users/kuh/Desktop/mdpwa-main/src/lib/alerts.ts:133), and the form state has neither field [here](/C:/Users/kuh/Desktop/mdpwa-main/src/components/AlertSignupForm.tsx:27). Downstream storage and notifications are already capable of using them: [subscriberRepository.ts](/C:/Users/kuh/Desktop/mdpwa-main/src/lib/subscriberRepository.ts:158), [alertSignupNotifications.ts](/C:/Users/kuh/Desktop/mdpwa-main/src/lib/alertSignupNotifications.ts:199).
+   **Effect:** only imported or historical records can populate those fields; current production signup cannot. Either implement explicit bilingual consent collection or narrow the public input contract.
+
+3. **Alert-broadcast responses expose receipts and evidence the composer never reads.**
+   Test responses serialize the broadcast plus the complete email result [here](/C:/Users/kuh/Desktop/mdpwa-main/src/app/api/alert-broadcasts/route.ts:133); final sends additionally return `publicationStatus`, `workflowStarted`, and `workflowRunId` [here](/C:/Users/kuh/Desktop/mdpwa-main/src/app/api/alert-broadcasts/route.ts:223). The composer reads only aggregate delivery status/counts and `queued` [here](/C:/Users/kuh/Desktop/mdpwa-main/src/components/AlertBroadcastComposer.tsx:241). It ignores `skipped`, `reason`, `failures`, audit recipient identities, and `sentAt`, whose contract is defined [here](/C:/Users/kuh/Desktop/mdpwa-main/src/lib/alertBroadcastNotifications.ts:38).
+   **Effect:** useful failure evidence is invisible, while recipient email/timestamp details unnecessarily cross the API boundary.
+
+4. **Civic source-verification evidence is populated but never consumed.**
+   `civicContactSourceNotes` contains source URLs [here](/C:/Users/kuh/Desktop/mdpwa-main/src/lib/civicContacts.ts:30), and meeting groups and links populate `lastVerifiedSourceUrl` [here](/C:/Users/kuh/Desktop/mdpwa-main/src/lib/meetingDocuments.ts:162). Production search found no reader; the meetings page renders only `href` [here](/C:/Users/kuh/Desktop/mdpwa-main/src/app/[locale]/meetings/page.tsx:207).
+   **Effect:** structured provenance can drift without affecting presentation or a production freshness check.
+
+5. **Admin session display identity is returned but discarded.**
+   Both session GET and login POST return `actor.displayName`: [GET](/C:/Users/kuh/Desktop/mdpwa-main/src/app/api/admin/session/route.ts:87), [POST](/C:/Users/kuh/Desktop/mdpwa-main/src/app/api/admin/session/route.ts:195). The dashboard retains only permissions [here](/C:/Users/kuh/Desktop/mdpwa-main/src/components/AdminDashboard.tsx:40), while login ignores the response body [here](/C:/Users/kuh/Desktop/mdpwa-main/src/components/AdminLoginForm.tsx:71).
+   **Effect:** the identity field is wire-contract overhead unless the UI is meant to identify the active administrator.
+
+6. **Two readiness classifications are calculated but unused.**
+   `summarizeDeploymentReadiness` returns `missing` and `warning` counts [here](/C:/Users/kuh/Desktop/mdpwa-main/src/lib/deploymentReadiness.ts:673). The live panel uses advisories, blockers, ready, total, status, and deployability, but not those two counts [here](/C:/Users/kuh/Desktop/mdpwa-main/src/components/DeploymentReadinessPanel.tsx:107).
+   **Effect:** redundant classification contract and computation.
+
+7. **Database identity returns two unused fields.**
+   `createDatabaseIdentity` returns `databaseName` and `serverVersionNum` alongside the useful `databaseId` and `serverMajor` [here](/C:/Users/kuh/Desktop/mdpwa-main/scripts/lib/database-identity.mjs:28). Production backup, restore, and rehearsal callers read only the latter pair, for example [database-backup.mjs](/C:/Users/kuh/Desktop/mdpwa-main/scripts/database-backup.mjs:245) and [database-restore.mjs](/C:/Users/kuh/Desktop/mdpwa-main/scripts/database-restore.mjs:322).
+   **Effect:** an unnecessarily wide operational identity contract.
+
+8. **Map-store diagnostics have implementations but no production caller.**
+   Every `MapFeedbackStore` must implement `diagnostics()` and its three counts [here](/C:/Users/kuh/Desktop/mdpwa-main/src/lib/mapFeedbackStore.ts:31); file, Blob, Postgres, and unavailable stores all implement it, including [the Postgres implementation](/C:/Users/kuh/Desktop/mdpwa-main/src/lib/mapFeedbackStore.ts:1013). Repository-wide search found calls only in tests.
+   **Effect:** orphaned diagnostics infrastructure; wire it into operational health/doctor tooling or remove it.
+
+I excluded fields with plausible external consumers—CLI JSON, persisted audit metadata, workflow-engine step results—and partial consumers such as cursors used solely as “has more” signals. No files were changed and no validation commands were run; this was a source-level audit of the current, concurrently modified working tree.
+
+--- Relevant turn 2 ---
+Conclusion SHA-256: b0c4efc922a71153c4e830e7894bbdb78014147a969c45e78d37d3a23a0be6c6
+
+Recorded audit/fix task or prompt:
+fix all &#x20;
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Closed all audited producer/consumer gaps.
+
+- Resident APIs now return minimal receipts that community input, map feedback, and alert signup forms parse and display.
+- Broadcast APIs expose only consumed aggregate/lifecycle fields; recipient evidence stays server-side.
+- Removed unsupported alert-signup phone/SMS inputs and narrowed subscriber admin responses.
+- Removed dead provenance and database-identity fields.
+- Admin names and readiness missing/warning counts are rendered.
+- Map diagnostics are consumed through protected lead-tech metrics.
+- Updated paired English/Spanish copy, focused tests, and [SOURCEMAP.md](C:/Users/kuh/Desktop/mdpwa-main/SOURCEMAP.md).
+
+Repo Atlas helped bound the changes to direct producers, consumers, and contract tests. No pnpm validation suite was run because repository policy makes checks explicitly opt-in.
+
+================================================================================
+EVIDENCE RECORD: 01a020f6-1033-72b0-919f-1688a79f43f4:00973ab9985c8f34
+================================================================================
+Audit date: 2026-08-20
+Classified language: Multi-language
+Source session UUID: 01a020f6-1033-72b0-919f-1688a79f43f4
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T15-56-32-01a020f6-1033-72b0-919f-1688a79f43f4.jsonl
+Working directory: c:\Users\kuh\Desktop\mdpwa-main
+Git revision recorded by session: 455e0c7bb0025b4251fad62215863290ffe88f02
+Thread source: user
+Unique relevant conclusions retained from session: 2
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: 22835115d9d52b15c10d55f1796b9a783b4f0b20bde046d18f631886520ea53e
+
+Recorded audit/fix task or prompt:
+find optimization code whose telemetry remains permanently zero because its production activation path is missing. Trace counters, dispositions, receipts, cache-hit states, reuse states, owner-drain states, suppression states, and fast paths from their recording point back to the code that should trigger them.
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+## Confirmed finding
+
+The shared weather-cache optimization is disabled in the current worktree.
+
+Production flow:
+
+`SiteHeader` → [`HeaderWeather`](/C:/Users/kuh/Desktop/mdpwa-main/src/components/HeaderWeather.tsx:51) → `/api/weather` → [`getMartindaleWeather()`](/C:/Users/kuh/Desktop/mdpwa-main/src/lib/nwsWeather.ts:575)
+
+The final response should activate browser/CDN reuse, but [`route.ts`](/C:/Users/kuh/Desktop/mdpwa-main/src/app/api/weather/route.ts:5) now sends `Cache-Control: no-store` for both success and failure. The accompanying [test](/C:/Users/kuh/Desktop/mdpwa-main/src/app/tests/api/weather/route.test.ts:20) explicitly requires successful responses not to be cached.
+
+Consequences:
+
+- Browser and Vercel edge cache hits cannot occur.
+- The documented cache-hit ratio in [PERFORMANCE_ARCHITECTURE_FINDINGS.txt](/C:/Users/kuh/Desktop/mdpwa-main/PERFORMANCE_ARCHITECTURE_FINDINGS.txt:95) will remain zero.
+- The change contradicts [SOURCEMAP.md](/C:/Users/kuh/Desktop/mdpwa-main/SOURCEMAP.md:329), which describes only the failure response as `no-store`.
+- `HEAD` had the intended success policy: `public, max-age=60, s-maxage=300, stale-while-revalidate=300`; the current uncommitted change removed it.
+
+The internal optimization is still reachable:
+
+- Warm-process cache hit: [`weatherCache`](/C:/Users/kuh/Desktop/mdpwa-main/src/lib/nwsWeather.ts:583)
+- Concurrent-request reuse: [`weatherInFlight`](/C:/Users/kuh/Desktop/mdpwa-main/src/lib/nwsWeather.ts:592)
+- Stale-on-error reuse: [lines 613–629](/C:/Users/kuh/Desktop/mdpwa-main/src/lib/nwsWeather.ts:613)
+
+Those are instance-local and do not restore cross-instance/browser/CDN reuse.
+
+## Other traced states
+
+| State | Production reachability |
+| --- | --- |
+| PWA install counter | Reachable: `appinstalled` → `/api/pwa-installs` → [`recordObservedPwaInstall`](/C:/Users/kuh/Desktop/mdpwa-main/src/lib/pwaInstallMetrics.ts:80). Browser coverage is intentionally incomplete. |
+| Delivery dispositions | Reachable: Vercel cron → dispatcher → workflow → [`recordDeliveryAttempts`](/C:/Users/kuh/Desktop/mdpwa-main/src/lib/alertBroadcastRepository.ts:492). |
+| Push receipts | Reachable in the registered worker’s push handler; receipt lookup and storage occur in [`sw.js`](/C:/Users/kuh/Desktop/mdpwa-main/public/sw.js:404). |
+| Reverse-geocode cache/reuse | Reachable through `/api/reverse-geocode`; hit and in-flight reuse begin at [`reverseGeocode.ts`](/C:/Users/kuh/Desktop/mdpwa-main/src/lib/reverseGeocode.ts:350). |
+| Owner-drain state | Reachable only through local JSON nested mutations at [`localJsonStore.ts`](/C:/Users/kuh/Desktop/mdpwa-main/src/lib/localJsonStore.ts:348). Production deliberately rejects file storage, so production activity here should be zero. |
+| Subscriber suppression | Reachable through Resend webhook SQL and admin actions. The exported [`suppressSubscriber`](/C:/Users/kuh/Desktop/mdpwa-main/src/lib/subscriberRepository.ts:714) helper itself has no production call site, but suppression does not depend on it. |
+| Map lazy-load fast path | Reachable: the homepage passes `deferUntilVisible`, activating [`IntersectionObserver`](/C:/Users/kuh/Desktop/mdpwa-main/src/components/MapFeedbackShell.tsx:44). |
+
+Two live requests to the [weather endpoint](https://martindaletx.app/api/weather) also returned `503`, `Age: 0`, `Cache-Control: no-store`, and `X-Vercel-Cache: MISS`. Failure responses should remain uncached, so this live result supports the failure path but the success-path defect is established statically.
+
+No files were modified and no validation commands were run.
+
+--- Relevant turn 2 ---
+Conclusion SHA-256: e0803fe1ecdab152aff76c7b0b2e48759b87822effa61fb5762423fcaf81d2a1
+
+Recorded audit/fix task or prompt:
+fix all
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Fixed all missing-path issues found:
+
+- Restored production caching for successful weather responses in [route.ts](C:/Users/kuh/Desktop/mdpwa-main/src/app/api/weather/route.ts:5): browser cache 60 seconds, CDN cache 5 minutes, stale revalidation 5 minutes. Failures remain `no-store`. This matches [Vercel’s cache-control behavior](https://vercel.com/docs/caching/cache-control-headers).
+- Updated the focused regression coverage in [route.test.ts](C:/Users/kuh/Desktop/mdpwa-main/src/app/tests/api/weather/route.test.ts:20).
+- Removed the unreferenced `suppressSubscriber` repository API from [subscriberRepository.ts](C:/Users/kuh/Desktop/mdpwa-main/src/lib/subscriberRepository.ts:652). Production webhook and admin suppression paths remain intact.
+- Confirmed counters, delivery dispositions, push receipts, reuse/cache states, owner-drain behavior, suppression flows, and fast paths otherwise have reachable production callers.
+
+Completed a task-scoped diff and reference audit. Per repository policy, no test/build commands were run because checks weren’t explicitly requested.
+
+================================================================================
+EVIDENCE RECORD: 01a020f6-a40a-72b1-8266-fdc4f736ab43:77f6fa50d0a735f6
+================================================================================
+Audit date: 2026-08-20
+Classified language: Multi-language
+Source session UUID: 01a020f6-a40a-72b1-8266-fdc4f736ab43
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T15-57-09-01a020f6-a40a-72b1-8266-fdc4f736ab43.jsonl
+Working directory: c:\Users\kuh\Desktop\mdpwa-main
+Git revision recorded by session: 455e0c7bb0025b4251fad62215863290ffe88f02
+Thread source: user
+Unique relevant conclusions retained from session: 2
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: ff5947ddb4e9e75f3b7214163e2b5d586c097ba7baf0a40522e0a11342531525
+
+Recorded audit/fix task or prompt:
+trace recently added configuration fields from parsing to observable runtime behavior. Find options that parse successfully but are never consumed, are shadowed by defaults, are overridden later, only affect tests, or reach a branch that production never executes.&#x20;
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+I found four material configuration gaps in the current worktree, including the uncommitted format-2 attestation changes.
+
+1. **High — new release-attestation fields are authenticated, but not independently verified.**
+
+   `candidateDeploymentId`, `evidenceRecordId`, `migrationVersion`, `backupArtifactSha256`, `pgDumpMajor`, and `postgresServerMajor` are shape-checked and included in the HMAC in [database-release-attestation.mjs](C:/Users/kuh/Desktop/mdpwa-main/scripts/lib/database-release-attestation.mjs:24). However, the only values compared with trusted runtime inputs are `candidateCommit`, `environment`, and `databaseId` at [line 126](C:/Users/kuh/Desktop/mdpwa-main/scripts/lib/database-release-attestation.mjs:126).
+
+   The sole production caller passes only those three expected values in [database-release-gate.mjs](C:/Users/kuh/Desktop/mdpwa-main/scripts/database-release-gate.mjs:24), and the workflow supplies no independently sourced deployment ID, migration version, backup checksum, evidence record, or PostgreSQL versions in [data-release-gate.yml](C:/Users/kuh/Desktop/mdpwa-main/.github/workflows/data-release-gate.yml:50).
+
+   Consequently, any shape-valid values signed with the attestation key pass. The tests similarly use arbitrary values without proving a connection to a deployment, database manifest, Blob artifact, or evidence record in [database-release-gate.test.ts](C:/Users/kuh/Desktop/mdpwa-main/scripts/database-release-gate.test.ts:14). The gate authenticates the issuer’s claims; it does not verify the claimed evidence.
+
+2. **Medium — rehearsal timestamps can make deployment readiness green forever.**
+
+   `MARTINDALE_RESTORE_REHEARSAL_AT` and `MARTINDALE_ROLLBACK_REHEARSAL_AT` are checked only for parseable date syntax in [envValidation.ts](C:/Users/kuh/Desktop/mdpwa-main/src/lib/envValidation.ts:164). Deployment readiness then treats their mere presence as sufficient for `backupRecovery: ready` in [deploymentReadiness.ts](C:/Users/kuh/Desktop/mdpwa-main/src/lib/deploymentReadiness.ts:353).
+
+   There is no age, database identity, or successful-rehearsal check. An arbitrarily old timestamp remains ready. The newer 100-day attestation freshness rule does not repair this separate admin readiness path.
+
+3. **Medium — PWA metrics storage options bypass the main configuration surfaces and are usually shadowed in production.**
+
+   `PWA_INSTALL_METRICS_BLOB_PATHNAME` and `PWA_INSTALL_METRICS_STORAGE_PATH` were added in [envGroups.ts](C:/Users/kuh/Desktop/mdpwa-main/src/lib/envGroups.ts:82), but are absent from:
+
+   - [src/env.ts](C:/Users/kuh/Desktop/mdpwa-main/src/env.ts:11), so they bypass the typed environment schema.
+   - [.env.example](C:/Users/kuh/Desktop/mdpwa-main/.env.example:1).
+   - The deployment-readiness keys and storage checks in [deploymentReadiness.ts](C:/Users/kuh/Desktop/mdpwa-main/src/lib/deploymentReadiness.ts:39).
+
+   They do reach storage resolution, but a configured database returns first in both metrics operations in [pwaInstallMetrics.ts](C:/Users/kuh/Desktop/mdpwa-main/src/lib/pwaInstallMetrics.ts:80). Therefore both overrides are ignored in normal production, and the file override is categorically disabled in production-like runtimes by [storage.ts](C:/Users/kuh/Desktop/mdpwa-main/src/lib/storage.ts:118). The Blob pathname only matters when Blob is configured and PostgreSQL is absent.
+
+4. **Medium — malformed admin session lifetime silently becomes the default.**
+
+   `MARTINDALE_ADMIN_SESSION_MAX_AGE_SECONDS` is parsed as unrestricted non-empty text in [env.ts](C:/Users/kuh/Desktop/mdpwa-main/src/env.ts:50), and the secondary environment validator never validates it. Non-integer values silently become the 12-hour default, while out-of-range integers are silently clamped to 5 minutes–24 hours in [adminAuth.ts](C:/Users/kuh/Desktop/mdpwa-main/src/lib/adminAuth.ts:85). This reader is used for production database-backed admin sessions, so a typo is accepted but does not produce the requested behavior.
+
+Other confirmed scopes:
+
+- `MARTINDALE_RELEASE_CANDIDATE` is intentionally unreachable in the GitHub production workflow because `GITHUB_SHA` always wins in [database-release-gate.mjs](C:/Users/kuh/Desktop/mdpwa-main/scripts/database-release-gate.mjs:26).
+- Legacy environment admin credentials are deliberately disabled in production and superseded by database identities in [adminIdentity.ts](C:/Users/kuh/Desktop/mdpwa-main/src/lib/adminIdentity.ts:123).
+- `MARTINDALE_DATABASE_TEST_URL`, `MARTINDALE_ADMIN_E2E_BASE_URL`, `cacheDeleteEntry`, and `cacheEntryKeys` affect only test/rehearsal harnesses.
+- `NEXT_ADAPTER_PATH` is overridden by the repository adapter, but is not dead: the wrapper explicitly reloads it and delegates both adapter hooks in [next-build-adapter.mjs](C:/Users/kuh/Desktop/mdpwa-main/scripts/next-build-adapter.mjs:12).
+
+No files were changed and no tests/builds were run; repository policy makes validation opt-in.
+
+--- Relevant turn 2 ---
+Conclusion SHA-256: f8b9a7bb4999e8553b92e75c93d21faef34b97b4947cb426276b72cfae96b219
+
+Recorded audit/fix task or prompt:
+fix all &#x20;
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Fixed all material configuration-path defects found:
+
+- Release attestations now bind deployment, evidence record, migration, backup fingerprint, and PostgreSQL compatibility to workflow/repository expectations.
+- Restore and rollback readiness expires after 100 days and rejects future timestamps.
+- PWA metrics storage variables are typed, documented, and visible in bilingual readiness with database precedence.
+- Invalid admin session lifetimes now fail validation/readiness and return 503 instead of silently defaulting or clamping.
+- Updated focused tests, workflow inputs, `SOURCEMAP.md`, and operational runbooks.
+
+Explicit test-only and local-only settings remain intentionally scoped. Files were formatted; tests, typecheck, and builds were not run because repository policy requires an explicit request for checks.
+
+================================================================================
+EVIDENCE RECORD: 01a020f6-df72-7753-b591-e55c0dd813b3:639e6b1da200d419
+================================================================================
+Audit date: 2026-08-20
+Classified language: Multi-language
+Source session UUID: 01a020f6-df72-7753-b591-e55c0dd813b3
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T15-57-25-01a020f6-df72-7753-b591-e55c0dd813b3.jsonl
+Working directory: c:\Users\kuh\Desktop\mdpwa-main
+Git revision recorded by session: 455e0c7bb0025b4251fad62215863290ffe88f02
+Thread source: user
+Unique relevant conclusions retained from session: 2
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: 20ab72594f143ee03ec2287958c2f516a8791a13c564cc17fc6b488079fef896
+
+Recorded audit/fix task or prompt:
+trace public/internal APIs that have producers and tests but no real production callers. Exclude intentional library surface. Prioritize APIs that appear to have been introduced specifically for latency, token usage, deterministic continuation, validation reuse, source reuse, caching, or completion behavior.
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Found 11 high-confidence test-backed surfaces with no current in-repo production caller. The most consequential are:
+
+| Priority | Stranded API | Trace |
+|---|---|---|
+| High | `assertSubmissionIntegrity` | The composite validator remains exported and heavily unit-tested at [submissionIntegrity.ts:712](C:/Users/kuh/Desktop/mdpwa-main/src/lib/submissionIntegrity.ts:712), but every production route now calls `assertSubmissionIntegrityPayload` plus rate limiting separately. One route test still mocks the old symbol, indicating an incomplete validation-reuse migration. |
+| High | `GET/PATCH /api/alert-broadcasts/[id]` | [route.ts:27](C:/Users/kuh/Desktop/mdpwa-main/src/app/api/alert-broadcasts/[id]/route.ts:27) implements detail, cancellation, failed-target retry, dispatch, and cache invalidation. Tests exercise authorization and cancellation, but production only posts to the collection endpoint from [AlertBroadcastComposer.tsx:234](C:/Users/kuh/Desktop/mdpwa-main/src/components/AlertBroadcastComposer.tsx:234). No application client calls the `[id]` route, so its completion/retry behavior is UI-unreachable. |
+| High | `DELETE /api/map-feedback` | Fully implemented at [route.ts:692](C:/Users/kuh/Desktop/mdpwa-main/src/app/api/map-feedback/route.ts:692) and tested, but all three admin actions now use `PATCH` at [useMapFeedbackAdminActions.ts:95](C:/Users/kuh/Desktop/mdpwa-main/src/components/useMapFeedbackAdminActions.ts:95). Git history shows the DELETE caller was replaced by publication review in commit `3785ce2`; the route remained. |
+| High | `WeatherPanel` | The 500-line component still contains refresh/caching/error behavior and tests at [WeatherPanel.tsx:55](C:/Users/kuh/Desktop/mdpwa-main/src/components/WeatherPanel.tsx:55), but nothing renders or imports it outside its test. Its production import was removed in `6e9a35d`; `HeaderWeather` is now the live client. |
+| Medium | `renderRowsTable` and `escapeHtml` | The manual HTML renderer at [notificationEmail.ts:90](C:/Users/kuh/Desktop/mdpwa-main/src/lib/notificationEmail.ts:90) is called only by its test. Production notifications use the React Email implementation beginning at line 116. Its callers were migrated in `1018d10`, leaving duplicate source and tests behind. |
+| Medium | Admin phone-recipient pipeline | `readAdminNotificationPhones`, `readPhoneRecipients`, and the default-phone constants remain implemented and tested at [adminContact.ts:65](C:/Users/kuh/Desktop/mdpwa-main/src/lib/adminContact.ts:65), with environment fields still declared, but there is no notification sender consuming them. The last consumer disappeared when `adminSmsNotifications.ts` was deleted in `1348d54`. |
+| Medium | `isLocalDateBefore` | Tested at [localDate.ts:251](C:/Users/kuh/Desktop/mdpwa-main/src/lib/localDate.ts:251), but production event logic now uses `compareLocalDateStrings` and `isLocalDateOnOrAfter`. Its last caller was removed in `6e9a35d`. |
+| Medium | `resolveMapFeedbackStoragePath` | The wrapper at [mapFeedbackStore.ts:119](C:/Users/kuh/Desktop/mdpwa-main/src/lib/mapFeedbackStore.ts:119) is test-only. Runtime storage selection moved to `resolveMapFeedbackStorageConfig`; the old direct-path callers disappeared in `bf31ac8`. |
+| Low | `readJsonResponseOrThrow` / `readResponseRecord` | Both wrappers at [clientJson.ts:149](C:/Users/kuh/Desktop/mdpwa-main/src/lib/clientJson.ts:149) have direct tests but no production imports. Production consumers use `readJsonResponse` and `readRequiredRecordField`. History shows these were introduced with tests, not with a production caller. |
+| Low | `getDeploymentReadinessReport` | Tested combined-report API at [deploymentReadiness.ts:717](C:/Users/kuh/Desktop/mdpwa-main/src/lib/deploymentReadiness.ts:717). Production instead calls `getDeploymentReadiness` in the admin page and summarizes it again inside `DeploymentReadinessPanel`. |
+| Low | `isAdminAuthUsingLegacySecret` | The legacy-token diagnostic at [adminAuth.ts:76](C:/Users/kuh/Desktop/mdpwa-main/src/lib/adminAuth.ts:76), and its `readLegacyAdminAuthSecret` dependency, are test-only. Actual legacy authorization flows through the service-token-name handling in `isAdminRequestAuthConfigured`. |
+
+The newer APIs matching your priority themes are otherwise wired: outbox dispatch budgets are consumed by both dispatchers; unknown-write-outcome classification is used by resident forms; claimed email completion is used by the broadcast workflow; payload-only integrity validation is used by four routes; and request-hash helpers are used by both routes and stores.
+
+I excluded:
+
+- Next.js convention exports such as route handlers, `global-error`, `maxDuration`, robots, and sitemap when the framework is the caller.
+- Explicit test seams such as cache resets, bucket counters, and store factories.
+- Test-time civic invariant validators such as `validateCityEvents` and `isValidMeetingDocumentRow`.
+- `/api/map-feedback/agency`, because its scoped service-token design indicates an intentional external automation surface even though no in-repo client exists.
+- Cron and webhook routes with documented external callers.
+
+One structural reason these persist: the repository is private, while [knip.json:4](C:/Users/kuh/Desktop/mdpwa-main/knip.json:4) explicitly excludes unused exports and types.
+
+This was a static trace of the live, concurrently changing worktree. I made no edits and ran no validation commands.
+
+--- Relevant turn 2 ---
+Conclusion SHA-256: a4fd59163dc7c35755366620019b29b561e78c73a652583c71adb87abed74065
+
+Recorded audit/fix task or prompt:
+fix all
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Implemented all reported cleanups.
+
+- Removed the unused map-feedback `DELETE` route and storage removal chain; audited removal remains available through `PATCH`.
+- Removed orphaned validation, JSON-response, deployment-readiness, date, storage-path, email-rendering, and legacy-auth wrappers.
+- Removed the unused admin-phone configuration pipeline and environment variables.
+- Deleted the unused `WeatherPanel`, its tests, and EN/ES catalogs. These tracked deletions remain recoverable through Git.
+- Migrated affected tests to the production APIs.
+- Preserved the already-wired alert-broadcast GET/PATCH lifecycle in [AlertBroadcastComposer.tsx](C:/Users/kuh/Desktop/mdpwa-main/src/components/AlertBroadcastComposer.tsx:214).
+- Updated [SOURCEMAP.md](C:/Users/kuh/Desktop/mdpwa-main/SOURCEMAP.md:339) to revision 10.
+
+A final reference scan found no remaining exported definitions or callers for the reported dead surfaces. Tests were not run because repository policy makes validation opt-in.
+
+================================================================================
+EVIDENCE RECORD: 01a020f7-12b4-7563-a0fb-c69889802e58:e30c0b3e0ff56e5d
+================================================================================
+Audit date: 2026-08-20
+Classified language: Multi-language
+Source session UUID: 01a020f7-12b4-7563-a0fb-c69889802e58
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T15-57-38-01a020f7-12b4-7563-a0fb-c69889802e58.jsonl
+Working directory: c:\Users\kuh\Desktop\mdpwa-main
+Git revision recorded by session: 455e0c7bb0025b4251fad62215863290ffe88f02
+Thread source: user
+Unique relevant conclusions retained from session: 2
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: 04897167ed065ef0a76d01bb03bdf8e9b709fcbd93016228aa699cc3917c778e
+
+Recorded audit/fix task or prompt:
+Look for placeholder branches, default fallbacks, constant revisions, empty metadata, None/false defaults that are never upgraded, temporary compatibility behavior, hard-coded ModelRequired, and functions that return conservative placeholders despite richer state already existing.
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Found five actionable issues, four in the legacy database importer.
+
+1. High — Alert-signup import downgrades Spanish residents and invalidates existing links. The stored contract accepts `locale` and `preferenceToken`, but `normalizeSubscriber()` discards both and the SQL omits `locale`, allowing PostgreSQL’s `"en"` default to win. No corresponding `subscriber_action_tokens` are created, so previously emailed confirmation/preferences links stop working after migration. See [dataContracts.mjs:152](/C:/Users/kuh/Desktop/mdpwa-main/src/lib/dataContracts.mjs:152), [database-import-legacy.mjs:278](/C:/Users/kuh/Desktop/mdpwa-main/scripts/database-import-legacy.mjs:278), [database-import-legacy.mjs:593](/C:/Users/kuh/Desktop/mdpwa-main/scripts/database-import-legacy.mjs:593), and [0004_bilingual_alert_broadcasts.up.sql:6](/C:/Users/kuh/Desktop/mdpwa-main/migrations/0004_bilingual_alert_broadcasts.up.sql:6).
+
+2. High — Web-push import converts every subscription into an unexpired English subscription. The validator accepts `locale` and `expirationTime`, but normalization drops them; the insert omits both columns and hard-codes `status = 'active'`. An expired source subscription can therefore become deliverable again, while Spanish subscriptions inherit `"en"`. See [database-import-legacy.mjs:425](/C:/Users/kuh/Desktop/mdpwa-main/scripts/database-import-legacy.mjs:425), [database-import-legacy.mjs:666](/C:/Users/kuh/Desktop/mdpwa-main/scripts/database-import-legacy.mjs:666), [dataContracts.mjs:273](/C:/Users/kuh/Desktop/mdpwa-main/src/lib/dataContracts.mjs:273), and [pushSubscriptionRepository.ts:191](/C:/Users/kuh/Desktop/mdpwa-main/src/lib/pushSubscriptionRepository.ts:191).
+
+3. High — Broadcast import erases Spanish authorization provenance. `spanishAuthorization` is validated in the source record but omitted from normalization and SQL. The importer also hard-codes `reviewed_language_notice` to false, whereas the normal creation path derives it from the authorization. Imported bilingual civic messages consequently lose their professional-review or official-source attribution. See [dataContracts.mjs:229](/C:/Users/kuh/Desktop/mdpwa-main/src/lib/dataContracts.mjs:229), [database-import-legacy.mjs:330](/C:/Users/kuh/Desktop/mdpwa-main/scripts/database-import-legacy.mjs:330), [database-import-legacy.mjs:633](/C:/Users/kuh/Desktop/mdpwa-main/scripts/database-import-legacy.mjs:633), and [alert-broadcasts/route.ts:201](/C:/Users/kuh/Desktop/mdpwa-main/src/app/api/alert-broadcasts/route.ts:201).
+
+4. Medium — Community-input import collapses reviewed/closed records into incomplete state. Compatibility storage retains `reviewedBy`, `reviewedAt`, `closedAt`, `updatedAt`, and append-only `auditEvents`; the importer ignores all of them and sets `updated_at = created_at`. A row may therefore say `status = 'closed'` while having no closure timestamp or review history. See [communityInputStore.ts:75](/C:/Users/kuh/Desktop/mdpwa-main/src/lib/communityInputStore.ts:75), [communityInputStore.ts:277](/C:/Users/kuh/Desktop/mdpwa-main/src/lib/communityInputStore.ts:277), [database-import-legacy.mjs:231](/C:/Users/kuh/Desktop/mdpwa-main/scripts/database-import-legacy.mjs:231), and [database-import-legacy.mjs:579](/C:/Users/kuh/Desktop/mdpwa-main/scripts/database-import-legacy.mjs:579).
+
+5. Medium — “Active push subscriptions” metrics count expired records. The PostgreSQL metric checks only `status = 'active'`, while the compatibility path returns the raw store length. Both ignore the already-stored expiration timestamp, even though delivery queries correctly filter it. See [techMetrics.ts:27](/C:/Users/kuh/Desktop/mdpwa-main/src/lib/techMetrics.ts:27) and [webPushSubscriptions.ts:631](/C:/Users/kuh/Desktop/mdpwa-main/src/lib/webPushSubscriptions.ts:631).
+
+The importer’s current tests cover only broadcast date normalization, leaving these preservation contracts untested: [database-import-legacy.test.ts:24](/C:/Users/kuh/Desktop/mdpwa-main/scripts/database-import-legacy.test.ts:24).
+
+No `ModelRequired` or Python-style `None` occurrence was present. The fixed schema/backup format revisions appeared to be enforced compatibility contracts, and the unavailable-store empty-list fallbacks were explicitly guarded or surfaced as unavailable, so I did not classify those as defects.
+
+This was a read-only audit; no validation commands or file changes were made.
+
+--- Relevant turn 2 ---
+Conclusion SHA-256: fc46ff6e78d6192e4de41fbc3df056e77d365e98252f22c1feb8cbe497395592
+
+Recorded audit/fix task or prompt:
+fix all &#x20;
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Implemented the placeholder/default-state fixes.
+
+- Legacy imports now preserve locale, preference-token continuity, push expiration, Spanish authorization, moderation timestamps, reviewer provenance, and audit history in [database-import-legacy.mjs](C:/Users/kuh/Desktop/mdpwa-main/scripts/database-import-legacy.mjs:276).
+- Invalid nested audit history now fails closed instead of being silently discarded.
+- Imported preference links transition securely into PostgreSQL management sessions in [route.ts](C:/Users/kuh/Desktop/mdpwa-main/src/app/api/alert-signups/route.ts:236).
+- Push registrations and imports derive `active`/`expired` from actual expiration state; metrics exclude expired subscriptions in [pushSubscriptionRepository.ts](C:/Users/kuh/Desktop/mdpwa-main/src/lib/pushSubscriptionRepository.ts:88) and [techMetrics.ts](C:/Users/kuh/Desktop/mdpwa-main/src/lib/techMetrics.ts:31).
+- Added regression coverage for each corrected contract.
+- Fixed the misplaced `signupStored` declaration found during final review.
+- No `ModelRequired` occurrences remain to address.
+
+Validation commands were not run because repository policy requires them to be explicitly requested. Unrelated shared-worktree changes were preserved.
+
+================================================================================
+EVIDENCE RECORD: 01a02101-f6b9-7fa2-a184-9715a0619d7f:632b2be16d1bb57d
+================================================================================
+Audit date: 2026-08-20
+Classified language: Multi-language
+Source session UUID: 01a02101-f6b9-7fa2-a184-9715a0619d7f
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T16-09-31-01a02101-f6b9-7fa2-a184-9715a0619d7f.jsonl
+Working directory: c:\Users\kuh\Desktop\mdpwa-main
+Git revision recorded by session: 455e0c7bb0025b4251fad62215863290ffe88f02
+Thread source: user
+Unique relevant conclusions retained from session: 1
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: a6173e68ebd2dedbb0f51b0e2fe03085ccf3e9aea80a8c9d1776d246f7042574
+
+Recorded audit/fix task or prompt:
+audit fully for alert signups function
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+## Audit result
+
+The current alert-signup implementation is not release-ready. I found 3 high-severity and 4 medium-severity issues in the current uncommitted working tree.
+
+### High severity
+
+1. **Stored idempotency replays execute the signup workflow again.**
+
+   `subscriber_signup_requests` stores only the payload hash, not the completed outcome. A matching replay therefore calls `createPendingSubscriber` again and can create tokens or send email again ([route.ts:357](C:/Users/kuh/Desktop/mdpwa-main/src/app/api/alert-signups/route.ts:357), [migration:1](C:/Users/kuh/Desktop/mdpwa-main/migrations/0007_alert_signup_idempotency.up.sql:1)).
+
+   Consequences include:
+
+   - Replaying an originally confirmed signup generates management links and invokes another email.
+   - Replaying after unsubscribe changes the subscriber back to `pending`, clears unsubscribe state, and records a misleading `restored` consent event ([subscriberRepository.ts:190](C:/Users/kuh/Desktop/mdpwa-main/src/lib/subscriberRepository.ts:190), [subscriberRepository.ts:217](C:/Users/kuh/Desktop/mdpwa-main/src/lib/subscriberRepository.ts:217)).
+   - The route can then return 503 because its deterministic confirmation token was already revoked.
+   - This directly conflicts with the documented rule that a stored replay returns its durable outcome without repeating notification side effects ([SOURCEMAP.md:97](C:/Users/kuh/Desktop/mdpwa-main/SOURCEMAP.md:97)).
+
+   The durable ledger should record the subscriber/outcome and delivery-acceptance state. Lifecycle mutation must never be reconstructed from an old POST replay.
+
+2. **Expired or revoked sessions remain valid after unsubscribe.**
+
+   The session lookup requires a live session for confirmed or suppressed subscribers, but the unconditional `OR subscriber.status = 'unsubscribed'` bypasses both expiry and revocation ([subscriberRepository.ts:481](C:/Users/kuh/Desktop/mdpwa-main/src/lib/subscriberRepository.ts:481)).
+
+   Anyone retaining an old session cookie can retrieve the unsubscribed resident’s name, email, locale, topics, and status until retention eventually deletes that session—despite the advertised 30-minute session lifetime. The same bypass exists in repeated-unsubscribe authorization ([subscriberRepository.ts:555](C:/Users/kuh/Desktop/mdpwa-main/src/lib/subscriberRepository.ts:555)).
+
+   GET access should always require an unexpired, unrevoked session. Idempotent DELETE replay needs a separately bounded mechanism.
+
+3. **Suppression and administrative revocation leave consumed email links usable.**
+
+   Consumed action tokens are intentionally replayable and mint a fresh management session ([subscriberRepository.ts:404](C:/Users/kuh/Desktop/mdpwa-main/src/lib/subscriberRepository.ts:404)). However:
+
+   - Resend bounce/complaint suppression revokes only tokens where `consumed_at IS NULL` ([resend route.ts:149](C:/Users/kuh/Desktop/mdpwa-main/src/app/api/webhooks/resend/route.ts:149)).
+   - Administrator suppression/unsubscribe has the same filter ([subscriberRepository.ts:690](C:/Users/kuh/Desktop/mdpwa-main/src/lib/subscriberRepository.ts:690)).
+
+   A previously opened link therefore survives the operation that claims to revoke the subscriber’s credentials and can continue producing sessions for up to its 24-hour or 7-day lifetime. Both revocation paths need to revoke every action token.
+
+### Medium severity
+
+4. **The public POST endpoint exposes whether an email is already confirmed.**
+
+   The response contains `signupStatus` without proving ownership ([route.ts:418](C:/Users/kuh/Desktop/mdpwa-main/src/app/api/alert-signups/route.ts:418)), and the UI explicitly reports that the address was already confirmed ([AlertSignupForm.tsx:132](C:/Users/kuh/Desktop/mdpwa-main/src/components/AlertSignupForm.tsx:132)). Confirmed, pending, and suppressed addresses also take observably different 201/503 paths.
+
+   This enables subscriber enumeration and conflicts with the repository’s rule not to expose alert signups. Return a generic public result and perform state recovery only through email.
+
+5. **A pending resident cannot request a replacement confirmation for up to 24 hours.**
+
+   For an already-pending email submitted with a new key, the repository refuses to create another token while an active confirmation token exists, but it cannot recover the raw existing token ([subscriberRepository.ts:261](C:/Users/kuh/Desktop/mdpwa-main/src/lib/subscriberRepository.ts:261)). The route consequently returns 503 ([route.ts:412](C:/Users/kuh/Desktop/mdpwa-main/src/app/api/alert-signups/route.ts:412)) and tells the resident to retry after 15 minutes, even though the blockage can last for the token’s full 24-hour lifetime.
+
+   A controlled replacement flow should revoke/rotate the prior token and send a new one without revealing subscriber state.
+
+6. **Deployment readiness permits production without required signup confirmation email.**
+
+   Every email check is advisory ([deploymentReadiness.ts:632](C:/Users/kuh/Desktop/mdpwa-main/src/lib/deploymentReadiness.ts:632)), so `canDeploy` remains true when confirmation email is entirely unavailable. That contradicts the source-of-truth designation of resident signup confirmation as a required release capability ([SOURCEMAP.md:96](C:/Users/kuh/Desktop/mdpwa-main/SOURCEMAP.md:96)).
+
+   The check also combines optional administrator notification settings with the required resident confirmation sender. These should be split into a production-blocking confirmation check and an advisory administrator-notification check.
+
+7. **The signup idempotency ledger has no retention path.**
+
+   The table has a `created_at` index but no deletion or redaction logic ([migration:9](C:/Users/kuh/Desktop/mdpwa-main/migrations/0007_alert_signup_idempotency.up.sql:9)). The retention job covers subscribers, tokens, sessions, and deliveries but not `subscriber_signup_requests` ([retention.mjs:216](C:/Users/kuh/Desktop/mdpwa-main/src/lib/retention.mjs:216)).
+
+   Rows and deterministic hashes of names, emails, locale, phone presence, and topics accumulate indefinitely. Add a bounded retention period and corresponding candidate counts, deletion evidence, and tests.
+
+### Controls that are working well
+
+- Input normalization, bounded JSON parsing, integrity tokens, honeypot timing, and rate limiting are present.
+- Production-like deployments fail closed without PostgreSQL.
+- Per-email advisory locking and database uniqueness handle concurrent signups.
+- Confirmation GET is inert against automated mail scanners; state changes require POST.
+- Tokens are stored as hashes, cookies are HttpOnly/SameSite, and sensitive responses use no-store headers.
+- Broadcast selection is restricted to confirmed subscribers.
+- English and Spanish signup paths are paired, and the form has solid accessibility behavior.
+
+No files were changed. I did not run tests or builds because repository policy requires checks to be explicitly requested; this was a source-level audit of the current, actively modified working tree. Existing tests also encode some of the unsafe behavior, particularly consumed-token replay and public `signupStatus`, so passing them would not clear these findings.
+
+================================================================================
+EVIDENCE RECORD: 01a0214c-40d1-76c2-b786-bb9123d585c8:18ff65916a3efeb2
+================================================================================
+Audit date: 2026-08-20
+Classified language: Multi-language
+Source session UUID: 01a0214c-40d1-76c2-b786-bb9123d585c8
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T17-30-40-01a0214c-40d1-76c2-b786-bb9123d585c8.jsonl
+Working directory: c:\Users\kuh\Desktop\mdpwa-main
+Git revision recorded by session: 455e0c7bb0025b4251fad62215863290ffe88f02
+Thread source: user
+Unique relevant conclusions retained from session: 3
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: faf48508f21dfc987e3fc33fefd964a69e65cde75519f2dad18594fb3a9a1360
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: .codex/AGENTS.md
+
+## Open tabs:
+- AGENTS.md: .codex/AGENTS.md
+
+## My request:
+fix all at the end, dont fix 1 by 1
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+`pnpm build` now passes completely, including TypeScript, all 41 static pages, and service-worker generation.
+
+Fixed the collected blockers across:
+
+- Broadcast lifecycle type narrowing and async state safety.
+- Optional backup helper parameters.
+- Sitemap, migration, and meeting-document test types.
+- Neon PostgreSQL query result typing.
+
+Lint and tests were not run, per your updated request.
+
+--- Relevant turn 2 ---
+Conclusion SHA-256: 1de3a200f81b8a444b05321611bf4bbe9a12ce9cda3f8a83e4313ed3d181116b
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: .codex/AGENTS.md
+
+## Open tabs:
+- AGENTS.md: .codex/AGENTS.md
+
+## My request:
+fix this
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Root cause found: production PostgreSQL is missing `subscriber_signup_requests`, causing `/api/alert-signups` to fail.
+
+The required schema already exists in [migration 0007](C:/Users/kuh/Desktop/mdpwa-main/migrations/0007_alert_signup_idempotency.up.sql:1). No code change is appropriate; bypassing it would break replay-safe signups.
+
+Applying it requires the protected production sequence: encrypted backup, restore verification, dry migration plan, then migration. This changes live data, so I need explicit authorization: should I proceed with the production migration procedure?
+
+--- Relevant turn 3 ---
+Conclusion SHA-256: c07b3a99bfef8ba0154d107aabd2e9d0d5cec06fc6e99213568488fce4095dbb
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: .codex/AGENTS.md
+
+## Open tabs:
+- AGENTS.md: .codex/AGENTS.md
+
+## My request:
+fix
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+The code isn’t the blocker. Production is missing migration `0007`, so `subscriber_signup_requests` does not exist.
+
+I cannot safely migrate yet because Vercel will not export these Sensitive values:
+
+- `DATABASE_URL`
+- `MARTINDALE_BACKUP_ENCRYPTION_KEY`
+
+Add them securely to `.env.local`—do not paste them here—then reply **done**. I’ll create and verify the required encrypted backup, apply all pending migrations together, and verify signup. No production writes or code changes were made yet.
+
+================================================================================
+EVIDENCE RECORD: 01a02153-af3f-7e83-90af-9162ba2d90ec:5afc3d9729554b41
+================================================================================
+Audit date: 2026-08-20
+Classified language: Multi-language
+Source session UUID: 01a02153-af3f-7e83-90af-9162ba2d90ec
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T17-38-47-01a02153-af3f-7e83-90af-9162ba2d90ec.jsonl
+Working directory: c:\Users\kuh\Desktop\mdpwa-main
+Git revision recorded by session: 47df5f8410f7c88044c58ec892328d04e79ed739
+Thread source: user
+Unique relevant conclusions retained from session: 2
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: 3b7b275b6fee863108d3c103dcd520850223eca2003f58a3767b9460d8782e9c
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: .codex/AGENTS.md
+
+## Open tabs:
+- AGENTS.md: .codex/AGENTS.md
+
+## My request:
+fix this
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Found the production cause: `push_subscriptions.locale` is missing, causing notification saves to return HTTP 500.
+
+Added an idempotent repair migration:
+
+- [0012 up migration](C:/Users/kuh/Desktop/mdpwa-main/migrations/0012_push_subscription_locale_repair.up.sql)
+- [0012 rollback](C:/Users/kuh/Desktop/mdpwa-main/migrations/0012_push_subscription_locale_repair.down.sql)
+- Updated [migration manifest](C:/Users/kuh/Desktop/mdpwa-main/migrations/manifest.json:126) and [SOURCEMAP.md](C:/Users/kuh/Desktop/mdpwa-main/SOURCEMAP.md:404)
+
+The manifest generator and whitespace check passed. Tests were not run per repository policy.
+
+The live site still requires the production migration. From an approved operator environment with `DATABASE_URL` configured:
+
+```powershell
+pnpm database:backup --kind=pre-migration
+pnpm database:migration-plan
+pnpm database:migrate
+```
+
+I couldn’t apply it because this workspace has no production database credentials. Do not paste those credentials into chat.
+
+--- Relevant turn 2 ---
+Conclusion SHA-256: 009ab0c42b763038501c2a227a66b3308ee80cf650398a9168d69bf6c7b8d85b
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: src/lib/martindaleCityLimits.ts
+
+## Open tabs:
+- martindaleCityLimits.ts: src/lib/martindaleCityLimits.ts
+- AGENTS.md: .codex/AGENTS.md
+
+## My request:
+run it
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+I couldn’t run the production migration safely.
+
+- No database writes or migrations occurred.
+- Vercel withholds the Sensitive `DATABASE_URL` and `MARTINDALE_BACKUP_ENCRYPTION_KEY` from both CLI and API access.
+- No existing workflow performs the required pre-migration backup, verification, and production migration.
+- The repair migration is prepared, and `git diff --check` passes.
+- The temporary PostgreSQL client was moved to the Recycle Bin.
+
+To continue, add the production `DATABASE_URL` and `MARTINDALE_BACKUP_ENCRYPTION_KEY` to the ignored `.env.local` file—do not paste them here—then tell me **ready**. I’ll run backup → verification → migration plan → migration.

@@ -11,6 +11,7 @@ pub struct CodeModeConfigToml {
     pub enabled: Option<bool>,
     /// Deprecated compatibility field. Its value is ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
     pub waiting_policy: Option<CodeModeWaitingPolicy>,
     /// Exact tool namespaces to omit from the code-mode nested tool surface.
     #[serde(skip_serializing_if = "Option::is_none")]

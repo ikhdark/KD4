@@ -99,6 +99,12 @@ fn terminal_powershell_failure_keeps_recovery_advisory_out_of_raw_output() {
         .expect("PowerShell failure should expose model recovery guidance");
     assert!(repair_notice.starts_with(existing_repair_notice));
     assert!(repair_notice.contains("retry with `kind: \"powershell_script\"`"));
+    assert!(projection.fragments.iter().any(|fragment| {
+        fragment.kind == codex_tools::ToolOutputProjectionFragmentKind::ErrorOrDiagnostic
+            && fragment.text == repair_notice
+    }));
+    assert_eq!(projection.essential_inline["repair_notice"], repair_notice);
+    assert_eq!(projection.essential_inline["wall_time_seconds"], 0.01);
 
     assert_eq!(
         output.post_tool_use_response("call-parser-failure", &payload),
@@ -236,12 +242,23 @@ fn test_get_command_launches_structured_argv_without_shell_wrapping() -> anyhow:
 }
 
 #[tokio::test]
-async fn repeated_rg_miss_is_suppressed_without_a_second_process_launch() {
-    let (session, turn) = make_session_and_context().await;
+async fn repeated_rg_miss_uses_workspace_identity_across_epoch_advance() {
+    let (mut session, turn) = make_session_and_context().await;
+    let workspace_cwd = turn
+        .environments
+        .single_local_environment_cwd()
+        .expect("test turn has one local environment");
+    session.services.command_execution =
+        crate::tools::command_execution::CommandExecutionLedger::load_or_new(
+            turn.config.codex_home.to_path_buf(),
+            session.thread_id.to_string(),
+            workspace_cwd.as_path(),
+        )
+        .await;
     let session = Arc::new(session);
     let turn = Arc::new(turn);
-    #[allow(deprecated)]
-    let repo_root = get_git_repo_root(turn.cwd.as_path()).expect("test cwd is in a git repository");
+    let repo_root =
+        get_git_repo_root(workspace_cwd.as_path()).expect("test cwd is in a git repository");
     let search_target = repo_root.join("codex-rs/core/src/tools/command_execution.rs");
     let payload = ToolPayload::Function {
         arguments: serde_json::json!({
@@ -255,6 +272,8 @@ async fn repeated_rg_miss_is_suppressed_without_a_second_process_launch() {
         })
         .to_string(),
     };
+    let second_tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+    second_tracker.lock().await.record_unknown_mutation();
 
     let ((first, second), launches) =
         crate::tools::runtimes::unified_exec::test_observation::observe(async {
@@ -271,7 +290,7 @@ async fn repeated_rg_miss_is_suppressed_without_a_second_process_launch() {
                     step_context: StepContext::for_test(Arc::clone(&turn)),
                     turn: Arc::clone(&turn),
                     cancellation_token: tokio_util::sync::CancellationToken::new(),
-                    tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+                    tracker: Arc::clone(&second_tracker),
                     call_id: "negative-cache-repeated-miss".to_string(),
                     tool_name: codex_tools::ToolName::plain("exec_command"),
                     source: ToolCallSource::Direct,
@@ -291,6 +310,75 @@ async fn repeated_rg_miss_is_suppressed_without_a_second_process_launch() {
     let message = second_error.to_string();
     assert!(message.contains("equivalent search already produced a negative result"));
     assert!(message.contains("execution was suppressed"));
+}
+
+#[tokio::test]
+async fn rg_miss_in_alternate_repository_is_invalidated_after_mutation() {
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let alternate_repository = tempfile::tempdir().expect("create alternate repository");
+    let git_init = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(alternate_repository.path())
+        .output()
+        .expect("initialize alternate repository");
+    assert!(git_init.status.success());
+    let search_target = alternate_repository.path().join("search-target.txt");
+    tokio::fs::write(&search_target, "before\n")
+        .await
+        .expect("write initial search target");
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "kind": "argv",
+            "program": "rg",
+            "args": ["-n", "after", search_target],
+            "workdir": alternate_repository.path(),
+        })
+        .to_string(),
+    };
+
+    let ((first, second), launches) =
+        crate::tools::runtimes::unified_exec::test_observation::observe(async {
+            let first = run_exec_command_for_test(
+                &session,
+                &turn,
+                "alternate-repository-first-miss",
+                payload.clone(),
+            )
+            .await;
+            tokio::fs::write(&search_target, "after\n")
+                .await
+                .expect("mutate alternate repository search target");
+            let second_tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+            second_tracker.lock().await.record_unknown_mutation();
+            let second = ExecCommandHandler::default()
+                .handle(ToolInvocation {
+                    session: Arc::clone(&session),
+                    step_context: StepContext::for_test(Arc::clone(&turn)),
+                    turn: Arc::clone(&turn),
+                    cancellation_token: tokio_util::sync::CancellationToken::new(),
+                    tracker: second_tracker,
+                    call_id: "alternate-repository-after-mutation".to_string(),
+                    tool_name: codex_tools::ToolName::plain("exec_command"),
+                    source: ToolCallSource::Direct,
+                    payload: payload.clone(),
+                })
+                .await
+                .expect("mutated alternate-repository search should execute");
+            (first, second)
+        })
+        .await;
+
+    assert_eq!(launches.process_launches, 2);
+    assert_eq!(first.code_mode_result(&payload)["exit_code"], 1);
+    let second_result = second.code_mode_result(&payload);
+    assert_eq!(second_result["exit_code"], 0);
+    assert!(
+        second_result["output"]
+            .as_str()
+            .is_some_and(|output| output.contains("after"))
+    );
 }
 
 #[tokio::test]
@@ -824,6 +912,80 @@ async fn intercepted_apply_patch_failure_releases_process_id_and_remains_retryab
             .await
             .expect("inspect artifact directory")
     );
+}
+
+#[tokio::test]
+async fn repeated_apply_patch_environment_mismatch_is_suppressed_before_process_launch() {
+    let (session, turn) = make_session_and_context().await;
+    let selected_environment_id = turn
+        .environments
+        .primary()
+        .expect("primary environment")
+        .environment_id
+        .clone();
+    let patch_environment_id = format!("{selected_environment_id}-mismatch");
+    let patch = format!(
+        "*** Begin Patch\n*** Environment ID: {patch_environment_id}\n*** Add File: must-not-exist.txt\n+must not be written\n*** End Patch"
+    );
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "kind": "argv",
+            "program": "apply_patch",
+            "args": [patch]
+        })
+        .to_string(),
+    };
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let handler = ExecCommandHandler::default();
+
+    let invoke = |call_id: &str| ToolInvocation {
+        session: Arc::clone(&session),
+        step_context: StepContext::for_test(Arc::clone(&turn)),
+        turn: Arc::clone(&turn),
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
+        tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+        call_id: call_id.to_string(),
+        tool_name: codex_tools::ToolName::plain("exec_command"),
+        source: ToolCallSource::Direct,
+        payload: payload.clone(),
+    };
+
+    let ((first_result, second_result), launches) =
+        crate::tools::runtimes::unified_exec::test_observation::observe(async {
+            let first = handler.handle(invoke("environment-mismatch-first")).await;
+            let second = handler.handle(invoke("environment-mismatch-second")).await;
+            (first, second)
+        })
+        .await;
+
+    let first_error = match first_result {
+        Ok(_) => panic!("the mismatched patch environment must fail verification"),
+        Err(error) => error.to_string(),
+    };
+    assert!(first_error.contains("apply_patch verification failed"));
+    assert!(first_error.contains("does not match selected shell environment"));
+    assert!(!first_error.contains("execution was suppressed"));
+
+    let second_error = match second_result {
+        Ok(_) => panic!("the exact repeated environment mismatch must be suppressed"),
+        Err(error) => error.to_string(),
+    };
+    assert!(second_error.contains("apply_patch environment mismatch"));
+    assert!(second_error.contains("execution was suppressed"));
+    assert_eq!(launches.process_launches, 0);
+
+    let process_id = session
+        .services
+        .unified_exec_manager
+        .allocate_process_id()
+        .await;
+    assert_eq!(process_id, 1000, "interception must not launch a process");
+    session
+        .services
+        .unified_exec_manager
+        .release_process_id(process_id)
+        .await;
 }
 
 #[tokio::test]

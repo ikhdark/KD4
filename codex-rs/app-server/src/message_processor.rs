@@ -711,6 +711,29 @@ impl MessageProcessor {
             .await;
     }
 
+    pub(crate) async fn resync_thread_listeners(&self, connection_ids: Vec<ConnectionId>) {
+        self.thread_processor
+            .resync_thread_listeners(connection_ids)
+            .await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn subscribed_connection_ids_for_test(
+        &self,
+        thread_id: ThreadId,
+    ) -> Vec<ConnectionId> {
+        self.thread_processor
+            .subscribed_connection_ids_for_test(thread_id)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_thread_created_resync_override_for_test(&self, thread_id: ThreadId) {
+        self.thread_processor
+            .set_thread_created_resync_override_for_test(thread_id)
+            .await;
+    }
+
     pub(crate) async fn drain_background_tasks(&self) {
         self.bug_worker_shutdown.cancel();
         self.models_refresh_worker.shutdown();
@@ -1397,6 +1420,11 @@ impl MessageProcessor {
                     .windows_sandbox_setup_start(&request_id, params)
                     .await
             }
+            ClientRequest::WindowsSandboxGrantReadRoot { params, .. } => self
+                .windows_sandbox_processor
+                .windows_sandbox_grant_read_root(params)
+                .await
+                .map(|response| Some(response.into())),
             ClientRequest::LoginAccount { params, .. } => {
                 self.account_processor
                     .login_account(request_id.clone(), params)

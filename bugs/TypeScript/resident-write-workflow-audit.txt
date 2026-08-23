@@ -1,0 +1,565 @@
+MDPWA RESIDENT WRITE WORKFLOW AUDIT
+Date: 2026-08-07
+Scope: source-level end-to-end trace of resident-originated writes
+
+Workflows reviewed
+  1. Community input
+  2. Map feedback
+  3. Map feedback abuse reports
+  4. Alert signup and alert preferences
+  5. Push preferences
+
+Method and limits
+  - Traced each browser UI through its API route, validation/integrity gates,
+    persistence implementation, and notification/outbox path where present.
+  - Focused on duplicate writes, reloads/retries, idempotency loss, partial
+    persistence, request aborts, client/server mismatch, provider failure after
+    persistence, misleading success/failure, and retry-created duplicate state.
+  - This is a source audit. No server was started and no tests or checks were
+    run, in accordance with the repository policy requiring explicit requests
+    for validation commands.
+
+
+EXECUTIVE FINDINGS
+==================
+
+HIGH 1 - Alert signup sends an idempotency key that the server ignores.
+  The shared alert signup form generates and persists an Idempotency-Key, but
+  POST /api/alert-signups never reads or validates it. Subscriber persistence
+  occurs before required confirmation email delivery. A provider failure can
+  therefore return 503 after the subscriber, consent record, and action token
+  have committed. The form retains its draft/key and encourages a retry, but
+  the retry is not an idempotent replay: it can update pending preferences,
+  create another consent event/action token, and send another email. A retry
+  for an already-confirmed subscriber also generates renewed management links.
+
+HIGH 2 - Push key migration is a non-atomic two-write replacement.
+  VAPID-key migration saves the new endpoint and then deletes the old endpoint.
+  If the request is aborted, the app reloads, or deletion fails after the new
+  endpoint is saved, both server rows can remain. Migration recovery exists
+  only in an in-memory ref, so a reload forgets the old endpoint. This can leave
+  duplicate push-delivery state and no automatic cleanup path.
+
+MEDIUM 1 - Community/map nontransactional notification failure is hidden.
+  Local/Blob storage saves the submission first, then sends an admin email
+  directly. Provider errors are logged and swallowed. The API still returns
+  success and the UI clears the draft, while the notification has been lost
+  and no outbox retry exists. The resident submission itself remains durable.
+
+MEDIUM 2 - Nontransactional alert preference UI and API contracts do not match.
+  In local/Blob mode the API requires email and token credentials for GET, PUT,
+  and DELETE. AlertSignupExperience reads only the action parameter, discards
+  the email/token URL credentials, and calls the API without them. Therefore
+  legacy management links cannot load or save preferences through that UI.
+
+MEDIUM 3 - Several committed operations report failure on a lost response.
+  Alert action-token exchange is single-use; a lost redirect/cookie response
+  leaves a confirmed subscription but the same link is invalid on retry.
+  Unsubscribe revokes the session before returning; a lost response leaves the
+  browser cookie, and retry is denied even though unsubscribe committed. The
+  nontransactional equivalent returns not-found after a successful deletion.
+
+MEDIUM 4 - Browser-stored idempotency is useful but not durable identity.
+  Community input, map feedback, and abuse-report safety depends on localStorage
+  and a seven-day UUID lifetime. Storage denial, clearing, expiry, or another
+  device generates a new identity and permits a duplicate logical submission.
+  Abuse reports also have no persisted draft: after a lost response/reload the
+  key may survive but the payload does not, making a conflict/rotation/resubmit
+  sequence capable of creating a second row.
+
+LOW 1 - Rate limiting runs before persistence idempotency lookup.
+  Integrity/rate-limit checks precede store replay detection. A fast retry of a
+  response-lost but already-committed request can receive 429 rather than the
+  stored successful result. The retained key protects a later retry, but the
+  immediate failure is misleading.
+
+LOW 2 - Successful replays have ambiguous notification metadata.
+  Community and map endpoints return 201 for both new writes and exact replays.
+  notificationQueued is false on a replay because no new job was created; it
+  does not state whether the original job remains queued, completed, or failed.
+
+
+SHARED RESIDENT FORM INFRASTRUCTURE
+===================================
+
+Client submission contract
+  - useResidentFormSubmission creates one UUID per endpoint and stores it under
+    martindale-resident-idempotency:<endpoint>.
+  - A synchronous ref prevents duplicate submit-handler entry in one mounted
+    component.
+  - Every request carries JSON, elapsedMs, a signed integrity token, and an
+    Idempotency-Key.
+  - Success rotates the key and invokes the form's success callback.
+  - HTTP 409 also rotates the key; other errors retain it for retry.
+  - submitResidentJson calls fetch without an AbortSignal. Navigation or reload
+    can discard the response while the server continues and commits.
+  - Drafts use localStorage, a 300 ms save delay, schema version 1, and a
+    seven-day lifetime. They are cleared only by success callbacks.
+
+Source:
+  src/components/useResidentFormSubmission.ts:64-153
+  src/components/residentSubmission.ts:15-32
+  src/components/useResidentFormDraft.ts
+  src/components/persistentIdempotencyKey.ts:20-60
+
+Idempotency-key integrity
+  - The server accepts only normalized UUID versions 1-5.
+  - localStorage failures are caught and fall back to an in-memory key. That
+    preserves retry behavior only until reload/unmount.
+  - A key is shared by endpoint, not by a durable logical draft identity.
+
+Source:
+  src/lib/requestIdempotency.ts:1-11
+  src/components/persistentIdempotencyKey.ts:20-60
+
+Submission integrity
+  - Community, map, and signup POSTs require a signed, scope-specific token.
+  - The server checks honeypot, minimum/maximum token age, signature/scope, and
+    a per-scope request rate limit.
+  - The client supplies elapsedMs, but server integrity is based on signed-token
+    age; elapsedMs is not a server trust signal.
+  - Rate-limit consumption occurs before persistence replay detection.
+
+Source:
+  src/lib/submissionIntegrity.ts:730-795
+
+
+1. COMMUNITY INPUT
+==================
+
+End-to-end trace
+
+UI
+  CommunityInputForm validates kind, subject, message, name, and resident
+  contact rules, requires email or phone, persists a draft, obtains integrity
+  scope community-input, and POSTs to /api/community-input through the shared
+  resident submission hook. Success clears the draft and resets the form.
+
+Source:
+  src/components/CommunityInputForm.tsx:101-162
+
+API and validation/integrity
+  POST /api/community-input reads bounded JSON, runs the shared integrity gate,
+  parses the Idempotency-Key, validates and normalizes the domain payload, and
+  constructs a submission whose ID is the idempotency UUID. Transactional
+  Postgres requires the caller's key. A nontransactional store can fall back to
+  a newly generated UUID if the key is absent or invalid.
+
+Source:
+  src/app/api/community-input/route.ts:180-228
+  src/lib/communityInput.ts:141-208
+
+Persistence and duplicate control
+  Local/Blob storage compares the existing ID's request hash. Equal content is
+  an exact replay; unequal content under the same ID is a conflict. Blob writes
+  retry ETag precondition conflicts; local writes serialize mutation/write.
+  Postgres performs submission insertion and outbox insertion in one SQL
+  statement. INSERT ... ON CONFLICT(id) DO NOTHING plus request-hash comparison
+  distinguishes replay from key reuse. Its deterministic outbox key is:
+    resident-notification:community-input:<submission-id>
+
+Source:
+  src/lib/communityInputStore.ts:441-478
+  src/lib/communityInputStore.ts:511-538
+  src/lib/communityInputStore.ts:601-613
+  src/lib/communityInputStore.ts:720-811
+
+Notification/outbox
+  Transactional storage atomically creates the outbox row, then the route asks
+  the dispatcher to start it. A dispatch-start failure is logged; the outbox
+  remains retryable. The workflow claims the job, loads the stored submission,
+  and sends admin email with deterministic provider idempotency:
+    <outbox-job-id>/email/admin
+  Failed jobs are released/failed for bounded retry (up to five attempts).
+
+  Nontransactional storage has no outbox. The route saves first and invokes the
+  admin email provider directly. Provider errors are caught and logged, and the
+  route still returns success.
+
+Source:
+  src/app/api/community-input/route.ts:200-228
+  src/lib/residentNotificationDispatcher.ts:13-70
+  src/workflows/residentSubmissionNotification.ts:15-93
+  src/lib/resendEmail.ts
+
+Retry and failure assessment
+  - Same-key/same-payload retry: safe replay; no duplicate row or outbox job.
+  - Same-key/different-payload retry: 409; client rotates to a new key.
+  - Lost response: a later same-key retry is safe, unless the browser lost the
+    key or its seven-day lifetime elapsed.
+  - Immediate lost-response retry can be rate-limited before replay lookup.
+  - New/lost key: creates another submission and notification.
+  - Postgres partial persistence: submission and outbox are atomic.
+  - Local/Blob partial persistence: submission can commit while notification
+    fails permanently; API/UI still report success and clear the draft.
+  - API returns 201 for exact replay. notificationQueued=false on replay means
+    only that this request did not create another job.
+
+
+2. MAP FEEDBACK
+===============
+
+End-to-end trace
+
+UI
+  MapFeedbackMap collects category, title, description, address, contact,
+  coordinates, visibility, and website. It requires a selected pin, category,
+  description, and address, persists a draft, obtains integrity scope
+  map-feedback, and POSTs to /api/map-feedback via the shared hook. Success
+  clears the draft, pin, and form state.
+
+Source:
+  src/components/MapFeedbackMap.tsx:608-617
+  src/components/MapFeedbackMap.tsx:675-715
+
+API and validation/integrity
+  POST /api/map-feedback reads bounded JSON, applies the shared integrity gate,
+  parses the Idempotency-Key, performs domain normalization/validation, and
+  uses the key as report ID. Transactional Postgres requires it; a
+  nontransactional store may generate an ID when absent.
+
+Source:
+  src/app/api/map-feedback/route.ts:280-359
+
+Persistence and duplicate control
+  Local/Blob storage treats matching ID+request hash as replay and different
+  content as conflict. Postgres inserts the report and deterministic outbox job
+  atomically in one statement, with optional audit data:
+    resident-notification:map-report:<report-id>
+
+Source:
+  src/lib/mapFeedbackStore.ts:414-447
+  src/lib/mapFeedbackStore.ts:1040-1161
+
+Notification/outbox
+  The transactional path uses the same claimed outbox/workflow and provider
+  idempotency model as community input. The nontransactional path saves first,
+  then sends direct admin email; provider failure is logged and swallowed.
+
+Source:
+  src/app/api/map-feedback/route.ts:280-359
+  src/lib/residentNotificationDispatcher.ts:13-70
+  src/workflows/residentSubmissionNotification.ts:15-93
+
+Retry and failure assessment
+  - Same-key retries are safe replays; mismatched payload under the key is 409.
+  - A lost/expired browser key permits a duplicate report and notification.
+  - No client write AbortSignal; reload/navigation may lose only the response.
+  - Postgres report+outbox insertion is atomic and dispatch-start failure is
+    recoverable from the outbox.
+  - Local/Blob provider failure after save is unrecoverable by this path but is
+    still presented as submission success; the form draft is cleared.
+  - Rate limiting can temporarily mask a successful replay.
+  - Replayed 201 plus notificationQueued=false is status-ambiguous.
+
+
+3. MAP FEEDBACK ABUSE REPORTS
+=============================
+
+End-to-end trace
+
+UI
+  MapFeedbackAbuseForm collects report ID, reason, details, and optional contact
+  email. It obtains integrity scope map-feedback-abuse and POSTs to
+  /api/map-feedback/abuse. Its idempotency key is per map report:
+    martindale-map-feedback-abuse-idempotency:<report-id>
+  Success or 409 rotates the key. Other errors retain it. A pending state guards
+  the mounted UI, and the write has no AbortSignal. Unlike the other resident
+  forms, abuse-report field values have no persisted draft.
+
+Source:
+  src/components/MapFeedbackAbuseForm.tsx:28-111
+
+API and validation/integrity
+  The route is available only with transactional storage. It requires a valid
+  UUID idempotency key, bounded JSON, the shared integrity gate, an existing
+  approved/public target report, a valid reason enum, details up to 1,000
+  characters, and a valid optional email.
+
+Source:
+  src/app/api/map-feedback/abuse/route.ts:170-296
+
+Persistence
+  One SQL insert selects the approved/public target and uses
+  ON CONFLICT(idempotency_key) DO NOTHING. A matching normalized request hash
+  returns the stored success; a different hash returns 409. A non-public or
+  absent target returns 404. There is no notification or outbox for this flow.
+
+Source:
+  src/app/api/map-feedback/abuse/route.ts:234-296
+
+Retry and failure assessment
+  - Same key and payload: safe atomic replay, no duplicate abuse row.
+  - Same key and changed payload: 409, then the client rotates the key.
+  - localStorage denial/clearing/reload fallback can produce a new key and a
+    duplicate abuse row for the same target.
+  - Lost response plus reload is awkward: the key may survive but the fields do
+    not. Re-entering changed/default values produces 409; rotation and another
+    submit then creates a second row even though the first committed.
+  - No client write AbortSignal; server commit can outlive navigation.
+  - Rate limiting can reject a safe replay before the SQL lookup.
+  - Persistence is one insert and has no provider-side partial state.
+
+
+4. ALERT SIGNUP AND ALERT PREFERENCES
+=====================================
+
+4A. Signup
+
+UI
+  AlertSignupForm validates resident identity/contact/topics, persists draft
+  martindale-alert-signup-draft-v1, obtains integrity scope alert-signups, and
+  uses the shared submission hook to POST /api/alert-signups with a persistent
+  Idempotency-Key. Success clears the draft.
+
+Source:
+  src/components/AlertSignupForm.tsx:60-145
+
+API contract gap
+  POST /api/alert-signups reads bounded JSON, applies integrity, and validates
+  createAlertSignup, but it never reads Idempotency-Key. The client's retry key
+  therefore has no server effect.
+
+Source:
+  src/app/api/alert-signups/route.ts:238-391
+
+Transactional persistence
+  createPendingSubscriber takes an advisory lock by normalized email and runs a
+  transaction that inserts or updates the subscriber, records requested or
+  restored consent, and creates a fresh confirmation action token for pending
+  subscriptions. Email uniqueness prevents duplicate subscriber rows. The
+  route commits this transaction before sending required confirmation email.
+
+Source:
+  src/lib/subscriberRepository.ts:79-198
+  src/app/api/alert-signups/route.ts:264-295
+
+Nontransactional persistence
+  AlertSignupStore deduplicates by email. Pending/unsubscribed entries are
+  reconciled with the latest fields/topics; confirmed entries remain confirmed.
+  The store write occurs before confirmation delivery.
+
+Source:
+  src/lib/alertSignupStore.ts:98-157
+  src/app/api/alert-signups/route.ts:296-328
+
+Notification behavior
+  A newly created subscriber may trigger an admin email; failure is logged and
+  swallowed. Resident confirmation email is required. If that provider call
+  fails, the route returns 503 with Retry-After even though subscriber state has
+  already persisted. These direct emails have no atomic outbox with the write.
+  A confirmed-email retry instead creates and sends renewed manage/unsubscribe
+  links.
+
+Retry and failure assessment
+  - Duplicate subscriber rows are prevented by normalized-email uniqueness.
+  - Logical retry is not idempotent: it can add consent history, replace/create
+    action tokens, reconcile pending topics, and send additional emails.
+  - Provider failure after persistence returns a misleading overall failure.
+    The retained draft invites another non-idempotent attempt.
+  - No client write AbortSignal. A lost 201/503 response can leave committed
+    subscriber/token state that the browser cannot distinguish.
+  - A retry for a confirmed address creates new management action tokens and
+    another email even when the submitted preferences are unchanged.
+
+4B. Confirmation and management-link exchange
+
+  Transactional action exchange consumes the single-use token, confirms the
+  subscriber/records consent when applicable, and creates a management session
+  in one SQL CTE. The response then sets a browser cookie and redirects. Follow-
+  up email is best-effort.
+
+  If the committed response/redirect is lost, the browser may not receive the
+  session cookie. Retrying the same link cannot replay success because the token
+  is already consumed, so the resident sees an invalid/expired link although
+  confirmation succeeded.
+
+Source:
+  src/app/api/alert-signups/link/route.ts:126-254
+  src/lib/subscriberRepository.ts:292-344
+
+4C. Preference update
+
+UI
+  AlertSignupExperience GETs current state with an AbortController, but its PUT
+  {locale, topics} and DELETE {} writes have no idempotency key and no
+  AbortSignal. A synchronous ref prevents duplicate handler entry in one mount.
+
+Source:
+  src/components/AlertSignupExperience.tsx:126-202
+  src/components/AlertSignupExperience.tsx:217-309
+
+Transactional PUT
+  One CTE updates subscriber topics/locale and inserts a topics_changed consent
+  event. The route then creates fresh management links and sends them
+  best-effort. Repeating the PUT converges the subscriber's current values but
+  duplicates consent history, action tokens, and possibly email. A provider
+  failure does not roll back the saved preference and is not surfaced as a
+  failed preference save.
+
+Source:
+  src/app/api/alert-signups/route.ts:418-480
+  src/lib/subscriberRepository.ts:381-410
+
+Transactional DELETE
+  One transaction sets unsubscribed status, records consent, and revokes action
+  tokens/sessions. The successful response expires the browser cookie. If the
+  response is lost after commit, the browser retains a now-revoked cookie and a
+  retry fails authorization even though unsubscribe succeeded.
+
+Source:
+  src/app/api/alert-signups/route.ts:496-589
+  src/lib/subscriberRepository.ts:412-447
+
+Nontransactional client/server mismatch
+  The API requires email and token query/body credentials in nontransactional
+  mode. Legacy links include them, but AlertSignupExperience reads only action
+  and calls /api/alert-signups without email/token. GET cannot load and PUT or
+  DELETE cannot authenticate. A successful nontransactional delete physically
+  removes the record, so a lost-response retry reports not-found.
+
+Source:
+  src/app/api/alert-signups/route.ts:193-237
+  src/components/AlertSignupExperience.tsx:80-114
+  src/components/AlertSignupExperience.tsx:160-168
+  src/lib/alertSignupNotifications.ts:123-137
+
+
+5. PUSH PREFERENCES
+===================
+
+End-to-end trace
+
+UI and browser provider
+  PushNotificationSignup first creates or reads a browser PushManager
+  subscription, then POSTs its endpoint/keys/topics to
+  /api/push-subscriptions. Disable DELETEs the server row first and only then
+  calls browser subscription.unsubscribe().
+
+  VAPID-key migration unsubscribes/replaces the browser subscription, POSTs the
+  replacement endpoint, and then DELETEs the prior endpoint. The previous
+  endpoint is retained only in pendingMigrationRef, which does not survive a
+  reload. Startup migration uses an AbortController and passes its signal into
+  the server writes. User-triggered enable/disable writes have no signal.
+
+Source:
+  src/components/PushNotificationSignup.tsx:157-202
+  src/components/PushNotificationSignup.tsx:217-336
+  src/components/PushNotificationSignup.tsx:349-449
+
+API and validation
+  POST reads bounded JSON, checks delivery/storage configuration, applies a
+  rate limit, validates/normalizes the Web Push subscription, and saves it.
+  It has no shared integrity token or Idempotency-Key. PUT is a state lookup by
+  endpoint despite its HTTP verb; it does not persist. DELETE validates the
+  endpoint, deletes by endpoint hash, ignores whether a row existed, and always
+  returns removed:true, making repeated DELETEs response-idempotent.
+
+Source:
+  src/app/api/push-subscriptions/route.ts:50-137
+  src/app/api/push-subscriptions/route.ts:159-224
+
+Persistence
+  Endpoint hash is the natural key. Postgres uses INSERT ... ON CONFLICT
+  (endpoint_hash) DO UPDATE; Local/Blob likewise upserts by endpoint. Repeated
+  POST for the same endpoint updates one row rather than duplicating it. Delete
+  is by the same hash. There is no notification/outbox for preference writes;
+  the provider is exercised later by alert delivery.
+
+Source:
+  src/lib/pushSubscriptionRepository.ts:83-191
+  src/lib/webPushSubscriptions.ts:324-359
+  src/lib/webPushSubscriptions.ts:550-594
+
+Retry and failure assessment
+  - Same-endpoint POST retry is safe because persistence is an upsert.
+  - Repeated DELETE is safe and always reports removed:true.
+  - Browser subscription can succeed while server POST fails/aborts, leaving a
+    browser-only subscription. Reload can rediscover it, but the resident must
+    retry enable/save to repair server state.
+  - Migration is partial across new POST and old DELETE. Failure after POST
+    leaves both endpoint rows. Reload loses pendingMigrationRef and regards the
+    new endpoint as current, so the stale row has no automatic cleanup path and
+    can cause duplicate delivery attempts.
+  - If the old browser subscription is removed before replacement/server save
+    fails, a stale old server row can coexist with no usable browser endpoint.
+  - Disable can delete server state and then fail browser unsubscribe. The UI
+    reports an error although server delivery is disabled; retry is safe and can
+    attempt browser cleanup again.
+  - Aborting startup migration does not roll back a server write that already
+    committed; it can trigger the same split-state case.
+
+
+CROSS-FLOW RETRY MATRIX
+=======================
+
+Flow                         Same-key retry             Lost key/reload              Provider fails after save
+---------------------------  -------------------------  ---------------------------  ----------------------------
+Community input              Safe hash-checked replay   Duplicate row possible       Postgres: outbox retries;
+                                                                                     Local/Blob: notification lost
+Map feedback                 Safe hash-checked replay   Duplicate row possible       Postgres: outbox retries;
+                                                                                     Local/Blob: notification lost
+Map abuse report             Safe hash-checked replay   Duplicate row possible;      Not applicable
+                                                        no draft complicates replay
+Alert signup                 Key ignored; side effects  Same behavior as retry;      503 after committed state;
+                             can repeat                 email uniqueness only        retry repeats side effects
+Alert preference PUT         No key; values converge,   Session/link may be lost     Email is best-effort after save
+                             side effects repeat
+Alert unsubscribe            No key; committed retry    Stale/revoked browser cookie Not applicable
+                             can fail authorization
+Push same endpoint           Natural-key upsert         Browser-only/server-only     Not on preference write
+Push endpoint migration      Two-step, non-atomic       In-memory recovery lost      Not on preference write
+
+
+RECOMMENDED FIX ORDER
+=====================
+
+1. Make alert signup idempotency real end-to-end.
+   Read/require the UUID, bind it to a normalized request hash, store a replay
+   result, and ensure repeated requests cannot add consent/action-token/email
+   side effects. Prefer an atomically created email outbox job with deterministic
+   provider idempotency rather than direct required delivery after commit.
+
+2. Make push replacement one durable server operation.
+   Add a replace/migrate contract that upserts the new endpoint and deletes the
+   prior endpoint atomically where possible. Carry a durable device/migration
+   identity so reload can finish cleanup; do not rely only on an in-memory ref.
+
+3. Align nontransactional alert management credentials.
+   Preserve email/token from legacy links and pass them in GET/PUT/DELETE, or
+   explicitly disable that UI in modes where its authentication contract cannot
+   be met. Add tests for both transactional-cookie and legacy-token modes.
+
+4. Separate persistence success from notification success.
+   For nontransactional community/map writes, use a durable retry mechanism if
+   available. Otherwise return explicit fields that distinguish stored from
+   notified, and avoid copy that implies admin delivery was guaranteed.
+
+5. Make committed alert actions replay-aware.
+   Confirmation exchange and unsubscribe should return the already-achieved
+   state for safe repeats where identity can be proven, instead of turning a
+   lost response into an invalid-link/access-denied/not-found experience.
+
+6. Tighten replay behavior around rate limits and browser storage.
+   Resolve exact known idempotent replays before consuming a new-write rate-limit
+   slot, or retain a bounded replay result cache. Tie keys to durable draft
+   identity, and persist abuse-report drafts so payload and key survive together.
+
+7. Define abort semantics in UI contracts.
+   Use AbortSignal consistently for lifecycle cancellation, while treating abort
+   as unknown server outcome rather than proof of non-persistence. On reload,
+   retry with the same durable identity or query current state before creating a
+   new identity.
+
+
+BOTTOM LINE
+===========
+
+Community input and map feedback have strong Postgres-side atomicity and replay
+protection, including deterministic outbox/provider identities. Their largest
+gap is the nontransactional save-then-email path. Abuse reporting is atomic but
+depends on browser storage and lacks a paired draft. Alert signup is the most
+important contract defect because its advertised client idempotency is discarded
+at the API boundary and provider failure occurs after committed state. Push
+preference upserts are individually safe, but VAPID endpoint replacement is not
+an atomic workflow and can leave duplicate server subscriptions across reloads.

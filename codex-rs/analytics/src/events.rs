@@ -368,8 +368,7 @@ impl GuardianReviewTrackContext {
             guardian_model_provider_id: result.guardian_model_provider_id,
             had_prior_review_context: result.had_prior_review_context,
             review_timeout_ms: self.review_timeout_ms,
-            // TODO(rhan-oai): plumb nested Guardian review session tool-call counts.
-            tool_call_count: None,
+            tool_call_count: result.tool_call_count,
             time_to_first_token_ms: result.time_to_first_token_ms,
             completion_latency_ms: Some(self.started_instant.elapsed().as_millis() as u64),
             started_at: self.started_at_ms / 1_000,
@@ -410,6 +409,7 @@ pub struct GuardianReviewAnalyticsResult {
     pub had_prior_review_context: Option<bool>,
     pub reviewed_action_truncated: bool,
     pub token_usage: Option<TokenUsage>,
+    pub tool_call_count: Option<u64>,
     pub time_to_first_token_ms: Option<u64>,
 }
 
@@ -435,6 +435,7 @@ impl GuardianReviewAnalyticsResult {
             had_prior_review_context: None,
             reviewed_action_truncated: false,
             token_usage: None,
+            tool_call_count: None,
             time_to_first_token_ms: None,
         }
     }

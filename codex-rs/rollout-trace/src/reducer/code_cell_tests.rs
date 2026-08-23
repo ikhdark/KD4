@@ -6,6 +6,7 @@ use crate::model::CodeCellRuntimeStatus;
 use crate::model::ConversationItemKind;
 use crate::model::ExecutionStatus;
 use crate::model::ProducerRef;
+use crate::model::TerminalObservationSource;
 use crate::model::ToolCallKind;
 use crate::model::ToolCallSummary;
 use crate::payload::RawPayloadKind;
@@ -20,7 +21,7 @@ use crate::reducer::test_support::trace_context_for_thread;
 use crate::replay_bundle;
 
 #[test]
-fn code_cell_lifecycle_links_nested_tools_waits_and_outputs() -> anyhow::Result<()> {
+fn code_cell_terminal_observation_links_nested_tools_waits_and_outputs() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
@@ -91,6 +92,22 @@ fn code_cell_lifecycle_links_nested_tools_waits_and_outputs() -> anyhow::Result<
                 output_preview: None,
             },
             invocation_payload: None,
+        },
+    )?;
+    let runtime_start_payload = writer.write_json_payload(
+        RawPayloadKind::TerminalRuntimeEvent,
+        &json!({
+            "call_id": "nested-tool-1",
+            "turn_id": "turn-1",
+            "command": ["pwd"],
+            "cwd": "/repo"
+        }),
+    )?;
+    writer.append_with_context(
+        trace_context("turn-1"),
+        RawTraceEventPayload::ToolCallRuntimeStarted {
+            tool_call_id: "nested-tool-1".to_string(),
+            runtime_payload: runtime_start_payload,
         },
     )?;
     writer.append_with_context(
@@ -184,6 +201,24 @@ fn code_cell_lifecycle_links_nested_tools_waits_and_outputs() -> anyhow::Result<
     assert_eq!(
         rollout.conversation_items[&cell.source_item_id].kind,
         ConversationItemKind::CustomToolCall,
+    );
+    let operation_id = rollout.tool_calls["nested-tool-1"]
+        .terminal_operation_id
+        .as_ref()
+        .expect("nested terminal operation");
+    let observations = &rollout.terminal_operations[operation_id].model_observations;
+    assert_eq!(observations.len(), 1);
+    assert_eq!(
+        observations[0].source,
+        TerminalObservationSource::CodeCellOutput
+    );
+    assert_eq!(
+        observations[0].call_item_ids,
+        vec![cell.source_item_id.clone()]
+    );
+    assert_eq!(
+        observations[0].output_item_ids,
+        vec![output_item_id.clone()]
     );
 
     Ok(())

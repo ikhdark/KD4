@@ -201,7 +201,7 @@ struct SessionBinding {
 
 struct SessionInner {
     process_host: Arc<OwnedProcessHost>,
-    _host_lease: HostSessionLease,
+    host_lease: StdMutex<Option<HostSessionLease>>,
     delegate: Arc<dyn CodeModeSessionDelegate>,
     state: StdMutex<SessionState>,
     next_generation: AtomicU64,
@@ -231,7 +231,7 @@ impl ProcessOwnedCodeModeSession {
         Self {
             inner: Arc::new(SessionInner {
                 process_host,
-                _host_lease: host_lease,
+                host_lease: StdMutex::new(Some(host_lease)),
                 delegate,
                 state: StdMutex::new(SessionState::New),
                 next_generation: AtomicU64::new(1),
@@ -382,7 +382,7 @@ impl SessionInner {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 match &*state {
                     SessionState::New => {
-                        *state = SessionState::Closed;
+                        *state = SessionState::Closing;
                         ShutdownAction::Finish
                     }
                     SessionState::Opening { result_rx, .. } => {
@@ -410,15 +410,13 @@ impl SessionInner {
                 }
                 ShutdownAction::Finish => {
                     self.wait_for_retired_cleanups().await;
+                    self.transition_to_closed();
                     return Ok(());
                 }
                 ShutdownAction::WaitForSessionCleanup(cleanup) => {
                     cleanup.wait().await;
                     self.wait_for_retired_cleanups().await;
-                    *self
-                        .state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = SessionState::Closed;
+                    self.transition_to_closed();
                     return Ok(());
                 }
                 ShutdownAction::Close(binding) => {
@@ -427,14 +425,24 @@ impl SessionInner {
                         binding.cleanup.wait().await;
                     }
                     self.wait_for_retired_cleanups().await;
-                    *self
-                        .state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = SessionState::Closed;
+                    self.transition_to_closed();
                     return result;
                 }
             }
         }
+    }
+
+    fn transition_to_closed(&self) {
+        let lease = self
+            .host_lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(lease);
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SessionState::Closed;
     }
 
     fn retain_cleanup(&self, cleanup: SessionCleanup) {

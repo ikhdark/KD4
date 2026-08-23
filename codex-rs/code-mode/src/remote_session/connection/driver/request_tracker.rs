@@ -67,7 +67,14 @@ impl RequestTracker {
         pending: PendingRequest,
         event_tx: &mpsc::Sender<DriverEvent>,
     ) {
-        self.pending.insert(id, pending);
+        assert!(
+            !self.pending.contains_key(&id)
+                && !self.initial_responses.contains_key(&id)
+                && !self.unclaimed_executes.contains_key(&id),
+            "cannot reuse a live code-mode request ID: {id:?}"
+        );
+        let replaced = self.pending.insert(id, pending);
+        debug_assert!(replaced.is_none());
         if let Some(cancellation) = self
             .pending
             .get_mut(&id)
@@ -82,7 +89,14 @@ impl RequestTracker {
     }
 
     pub(super) fn insert_initial_response(&mut self, id: RequestId, response: InitialResponse) {
-        self.initial_responses.insert(id, response);
+        assert!(
+            !self.pending.contains_key(&id)
+                && !self.initial_responses.contains_key(&id)
+                && !self.unclaimed_executes.contains_key(&id),
+            "cannot install a duplicate or premature initial response: {id:?}"
+        );
+        let replaced = self.initial_responses.insert(id, response);
+        debug_assert!(replaced.is_none());
     }
 
     pub(super) fn remove_initial_response(&mut self, id: RequestId) -> Option<InitialResponse> {
@@ -90,7 +104,14 @@ impl RequestTracker {
     }
 
     pub(super) fn insert_unclaimed_execute(&mut self, id: RequestId, execute: UnclaimedExecute) {
-        self.unclaimed_executes.insert(id, execute);
+        assert!(
+            !self.pending.contains_key(&id)
+                && self.initial_responses.contains_key(&id)
+                && !self.unclaimed_executes.contains_key(&id),
+            "cannot install a duplicate or premature execute result: {id:?}"
+        );
+        let replaced = self.unclaimed_executes.insert(id, execute);
+        debug_assert!(replaced.is_none());
     }
 
     pub(super) fn claim_execute(&mut self, id: RequestId) {

@@ -18,6 +18,7 @@ use crate::protocol::v2::ReasoningSummaryTextDeltaNotification;
 use crate::protocol::v2::ReasoningTextDeltaNotification;
 use crate::protocol::v2::TerminalInteractionNotification;
 use crate::protocol::v2::ThreadItem;
+use crate::protocol::v2::TurnReasoningPolicySummaryNotification;
 use crate::protocol::v2::TurnReasoningPolicyUpdatedNotification;
 use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem as CoreDynamicToolCallOutputContentItem;
 use codex_protocol::protocol::EventMsg;
@@ -41,6 +42,13 @@ pub fn item_event_to_server_notification(
                 thread_id,
                 turn_id,
                 snapshot,
+            })
+        }
+        EventMsg::ReasoningPolicySummary(history) => {
+            ServerNotification::TurnReasoningPolicySummary(TurnReasoningPolicySummaryNotification {
+                thread_id,
+                turn_id,
+                history,
             })
         }
         EventMsg::DynamicToolCallResponse(response) => {
@@ -104,6 +112,10 @@ pub fn item_event_to_server_notification(
             let has_receiver = end_event.new_thread_id.is_some();
             let status = match &end_event.status {
                 codex_protocol::protocol::AgentStatus::Errored(_)
+                | codex_protocol::protocol::AgentStatus::TerminalWithCompletion {
+                    error: Some(_),
+                    ..
+                }
                 | codex_protocol::protocol::AgentStatus::NotFound => {
                     CollabAgentToolCallStatus::Failed
                 }
@@ -162,6 +174,10 @@ pub fn item_event_to_server_notification(
         EventMsg::CollabAgentInteractionEnd(end_event) => {
             let status = match &end_event.status {
                 codex_protocol::protocol::AgentStatus::Errored(_)
+                | codex_protocol::protocol::AgentStatus::TerminalWithCompletion {
+                    error: Some(_),
+                    ..
+                }
                 | codex_protocol::protocol::AgentStatus::NotFound => {
                     CollabAgentToolCallStatus::Failed
                 }
@@ -230,6 +246,10 @@ pub fn item_event_to_server_notification(
                 matches!(
                     status,
                     codex_protocol::protocol::AgentStatus::Errored(_)
+                        | codex_protocol::protocol::AgentStatus::TerminalWithCompletion {
+                            error: Some(_),
+                            ..
+                        }
                         | codex_protocol::protocol::AgentStatus::NotFound
                 )
             }) {
@@ -283,6 +303,10 @@ pub fn item_event_to_server_notification(
         EventMsg::CollabCloseEnd(end_event) => {
             let status = match &end_event.status {
                 codex_protocol::protocol::AgentStatus::Errored(_)
+                | codex_protocol::protocol::AgentStatus::TerminalWithCompletion {
+                    error: Some(_),
+                    ..
+                }
                 | codex_protocol::protocol::AgentStatus::NotFound => {
                     CollabAgentToolCallStatus::Failed
                 }
@@ -335,6 +359,10 @@ pub fn item_event_to_server_notification(
         EventMsg::CollabResumeEnd(end_event) => {
             let status = match &end_event.status {
                 codex_protocol::protocol::AgentStatus::Errored(_)
+                | codex_protocol::protocol::AgentStatus::TerminalWithCompletion {
+                    error: Some(_),
+                    ..
+                }
                 | codex_protocol::protocol::AgentStatus::NotFound => {
                     CollabAgentToolCallStatus::Failed
                 }
@@ -481,12 +509,14 @@ pub fn item_event_to_server_notification(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::v2::CollabAgentStatus;
     use codex_protocol::ThreadId;
     use codex_protocol::protocol::AgentMessageContentDeltaEvent;
     use codex_protocol::protocol::CollabResumeBeginEvent;
     use codex_protocol::protocol::CollabResumeEndEvent;
     use codex_protocol::protocol::ExecCommandOutputDeltaEvent;
     use codex_protocol::protocol::ExecOutputStream;
+    use codex_protocol::protocol::ReasoningPolicyHistory;
     use pretty_assertions::assert_eq;
 
     fn assert_item_started_server_notification(
@@ -559,6 +589,34 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_policy_summary_maps_to_live_notification() {
+        let history = ReasoningPolicyHistory {
+            turn_id: "turn-1".to_string(),
+            entries: Vec::new(),
+            total_entries: 3,
+            truncated: true,
+        };
+
+        let notification = item_event_to_server_notification(
+            EventMsg::ReasoningPolicySummary(history.clone()),
+            "thread-1",
+            "turn-1",
+        );
+
+        let ServerNotification::TurnReasoningPolicySummary(notification) = notification else {
+            panic!("expected reasoning-policy summary notification");
+        };
+        assert_eq!(
+            notification,
+            TurnReasoningPolicySummaryNotification {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                history,
+            }
+        );
+    }
+
+    #[test]
     fn collab_resume_end_maps_to_item_completed_resume_agent() {
         let event = CollabResumeEndEvent {
             call_id: "call-2".to_string(),
@@ -599,6 +657,58 @@ mod tests {
                     .collect(),
                 },
             },
+        );
+    }
+
+    #[test]
+    fn collab_resume_end_preserves_terminal_completion_gate() {
+        let receiver_thread_id = ThreadId::new();
+        let event = CollabResumeEndEvent {
+            call_id: "call-gated".to_string(),
+            completed_at_ms: 789,
+            sender_thread_id: ThreadId::new(),
+            receiver_thread_id,
+            receiver_agent_nickname: None,
+            receiver_agent_role: None,
+            status: codex_protocol::protocol::AgentStatus::TerminalWithCompletion {
+                last_agent_message: Some("implemented".to_string()),
+                surfaced_result: None,
+                error: None,
+                completion: codex_protocol::protocol::TaskCompletionGate {
+                    status: codex_protocol::protocol::TaskCompletionStatus::Partial,
+                    reasons: vec!["validation did not pass".to_string()],
+                    evidence_path: Some("task-evidence/completion.json".to_string()),
+                },
+            },
+        };
+
+        let notification = item_event_to_server_notification(
+            EventMsg::CollabResumeEnd(event),
+            "thread-gated",
+            "turn-gated",
+        );
+        let ServerNotification::ItemCompleted(ItemCompletedNotification { item, .. }) =
+            notification
+        else {
+            panic!("expected item completed notification");
+        };
+        let ThreadItem::CollabAgentToolCall { agents_states, .. } = item else {
+            panic!("expected collab agent tool call");
+        };
+
+        assert_eq!(
+            agents_states.get(&receiver_thread_id.to_string()),
+            Some(&CollabAgentState {
+                status: CollabAgentStatus::Completed,
+                message: Some("implemented".to_string()),
+                surfaced_result: None,
+                completion: Some(crate::protocol::v2::TaskCompletionGate {
+                    status: crate::protocol::v2::TaskCompletionStatus::Partial,
+                    reasons: vec!["validation did not pass".to_string()],
+                    evidence_path: Some("task-evidence/completion.json".to_string()),
+                }),
+                last_agent_message: Some("implemented".to_string()),
+            })
         );
     }
 

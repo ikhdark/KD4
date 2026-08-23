@@ -3246,7 +3246,12 @@ async fn code_mode_can_apply_patch_via_nested_tool() -> Result<()> {
         ),
         text_item(&items, /*index*/ 0),
     );
-    assert_eq!(text_item(&items, /*index*/ 1), "{}");
+    assert_eq!(
+        text_item(&items, /*index*/ 1),
+        format!(
+            "Exit code: 0\nWall time: 0 seconds\nOutput:\nSuccess. Updated the following files:\nA {file_name}\n"
+        )
+    );
 
     let file_path = test.cwd_path().join(file_name);
     assert_eq!(fs::read_to_string(&file_path)?, "hello from code_mode\n");
@@ -3612,7 +3617,7 @@ text(JSON.stringify(tool));
         parsed,
         serde_json::json!({
             "name": "view_image",
-            "description": "View a local image file from the filesystem when visual inspection is needed. Use this for images already available on disk.\n\nexec tool declaration:\n```ts\ndeclare const tools: { view_image(args: {\n  // Local filesystem path to an image file.\n  path: string;\n}): Promise<{\n  // Image detail hint returned by view_image. Returns `high` for default resized behavior or `original` when original resolution is preserved.\n  detail: \"high\" | \"original\";\n  // Data URL for the loaded image.\n  image_url: string;\n}>; };\n```",
+            "description": "View a local image file from the filesystem when visual inspection is needed. Use this for images already available on disk.\n\nexec tool declaration:\n```ts\ndeclare const tools: { view_image(args: {\n  // Local filesystem path to an image file.\n  path: string;\n}, options?: { timeout_ms?: number }): Promise<{\n  // Image detail hint returned by view_image. Returns `high` for default resized behavior or `original` when original resolution is preserved.\n  detail: \"high\" | \"original\";\n  // Data URL for the loaded image.\n  image_url: string;\n}>; };\n```",
         })
     );
 
@@ -3655,7 +3660,7 @@ text(JSON.stringify(tool));
                 "Echo back the provided message and include environment data.\n\n",
                 "exec tool declaration:\n",
                 "```ts\n",
-                "declare const tools: { mcp__rmcp__echo(args: { env_var?: string; message: string; }): ",
+                "declare const tools: { mcp__rmcp__echo(args: { env_var?: string; message: string; }, options?: { timeout_ms?: number }): ",
                 "Promise<CallToolResult<{ echo: string; env: string | null; }>>; };\n",
                 "```",
             ),

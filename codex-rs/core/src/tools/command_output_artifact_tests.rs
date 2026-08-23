@@ -760,6 +760,60 @@ async fn stale_artifact_metadata_version_is_rejected_without_partial_success() {
 
 #[tokio::test]
 #[serial_test::serial(command_output_artifact)]
+async fn retained_prefix_recovery_reports_the_unavailable_canonical_suffix() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let canonical = CanonicalToolResult::text("retained\nunavailable\n");
+    let artifact = create_canonical_output_artifact(temp.path(), "thread", &canonical).await;
+    let artifact_id = artifact.artifact_id().expect("canonical artifact ID");
+    let artifact_path = temp
+        .path()
+        .join("tool-output/thread")
+        .join(format!("{artifact_id}.log"));
+    let metadata_path = logical_metadata_path(&artifact_path);
+    let retained = b"retained\n";
+    std::fs::write(&artifact_path, retained).expect("truncate artifact to retained prefix");
+    let mut metadata: LogicalArtifactMetadata =
+        serde_json::from_slice(&std::fs::read(&metadata_path).expect("read logical metadata"))
+            .expect("decode logical metadata");
+    metadata.retained_bytes = retained.len() as u64;
+    metadata.retained_sha256 = Some(format!("{:x}", Sha256::digest(retained)));
+    metadata.complete = false;
+    metadata.unavailable_ranges = vec![CanonicalByteRange::new(
+        retained.len() as u64,
+        canonical.exact_bytes,
+    )];
+    metadata.line_starts = canonical_line_starts(retained);
+    metadata.segments[0].range = CanonicalByteRange::new(0, retained.len() as u64);
+    std::fs::write(
+        &metadata_path,
+        serde_json::to_vec(&metadata).expect("encode partial metadata"),
+    )
+    .expect("write partial metadata");
+
+    let recovered = read_tool_output_selectors(
+        temp.path(),
+        "thread",
+        &artifact_id,
+        vec![ToolOutputSelector::Bytes {
+            start: 0,
+            end: retained.len() as u64,
+        }],
+    )
+    .await
+    .expect("recover retained canonical prefix");
+
+    assert!(recovered.complete);
+    assert_eq!(recovered.retained_bytes, retained.len() as u64);
+    assert_eq!(recovered.unavailable_ranges, metadata.unavailable_ranges);
+    assert_eq!(recovered.results[0].text.as_deref(), Some("retained\n"));
+    assert_eq!(
+        recovered.results[0].canonical_range,
+        Some(CanonicalByteRange::new(0, retained.len() as u64))
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn stale_artifact_sha_is_rejected_without_partial_success() {
     let temp = tempfile::tempdir().expect("tempdir");
     let canonical = CanonicalToolResult::text("sha identity\n");

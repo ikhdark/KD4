@@ -122,8 +122,7 @@ pub enum Feature {
     WebSearchCached,
     /// Expose the extension-backed standalone web search tool.
     StandaloneWebSearch,
-    /// Use the legacy Landlock Linux sandbox fallback instead of the default
-    /// bubblewrap pipeline.
+    /// Removed compatibility flag. Bubblewrap is always used for Linux sandboxing.
     UseLegacyLandlock,
     /// Experimental shell snapshotting.
     ShellSnapshot,
@@ -209,7 +208,7 @@ pub enum Feature {
     SkillMcpDependencyInstall,
     /// Removed compatibility flag for deleted skill env var dependency prompting.
     SkillEnvVarDependencyPrompt,
-    /// Enable the unified mention popup used by default in the TUI.
+    /// Removed compatibility flag. The unified mention popup is always enabled.
     MentionsV2,
     /// Allow request_user_input in Default collaboration mode.
     DefaultModeRequestUserInput,
@@ -235,7 +234,7 @@ pub enum Feature {
     RealtimeConversation,
     /// Prevent idle system sleep while a turn is actively running.
     PreventIdleSleep,
-    /// Enable remote compaction v2 over the normal Responses API.
+    /// Removed user-config compatibility flag. User sessions always use the V2 path.
     RemoteCompactionV2,
     /// Use Agent Identity for ChatGPT-authenticated sessions.
     UseAgentIdentity,
@@ -377,7 +376,7 @@ impl Features {
     }
 
     pub fn use_legacy_landlock(&self) -> bool {
-        self.enabled(Feature::UseLegacyLandlock)
+        false
     }
 
     pub fn enable(&mut self, f: Feature) -> &mut Self {
@@ -483,14 +482,11 @@ impl Features {
                 "skill_env_var_dependency_prompt" => {
                     continue;
                 }
-                "terminal_resize_reflow" => {
+                "terminal_resize_reflow"
+                | "use_legacy_landlock"
+                | "mentions_v2"
+                | "remote_compaction_v2" => {
                     continue;
-                }
-                "use_legacy_landlock" => {
-                    self.record_legacy_usage_force(
-                        "features.use_legacy_landlock",
-                        Feature::UseLegacyLandlock,
-                    );
                 }
                 _ => {}
             }
@@ -578,19 +574,6 @@ fn legacy_usage_notice(alias: &str, feature: Feature) -> (String, Option<String>
             let summary =
                 format!("`{label}` is deprecated because web search is enabled by default.");
             (summary, Some(web_search_details().to_string()))
-        }
-        Feature::UseLegacyLandlock => {
-            let label = match alias {
-                "features.use_legacy_landlock" | "use_legacy_landlock" => {
-                    "[features].use_legacy_landlock"
-                }
-                _ => alias,
-            };
-            let summary = format!("`{label}` is deprecated and will be removed soon.");
-            let details =
-                "Remove this setting to stop opting into the legacy Linux sandbox behavior."
-                    .to_string();
-            (summary, Some(details))
         }
         _ => {
             let label = if alias.contains('.') || alias.starts_with('[') {
@@ -972,7 +955,7 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::UseLegacyLandlock,
         key: "use_legacy_landlock",
-        stage: Stage::Deprecated,
+        stage: Stage::Removed,
         default_enabled: false,
     },
     FeatureSpec {
@@ -1192,7 +1175,7 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::MentionsV2,
         key: "mentions_v2",
-        stage: Stage::Stable,
+        stage: Stage::Removed,
         default_enabled: true,
     },
     FeatureSpec {
@@ -1336,7 +1319,7 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::RemoteCompactionV2,
         key: "remote_compaction_v2",
-        stage: Stage::Stable,
+        stage: Stage::Removed,
         default_enabled: true,
     },
     FeatureSpec {

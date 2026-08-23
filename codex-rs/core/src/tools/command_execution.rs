@@ -8,8 +8,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+#[cfg(test)]
 use std::time::Duration;
-use std::time::SystemTime;
 
 use codex_protocol::plan_tool::ValidationRoute;
 use codex_protocol::protocol::ToolExecutionId;
@@ -19,7 +19,10 @@ use codex_protocol::validation::ValidationResult;
 use codex_protocol::validation::ValidationTerminalStatus;
 use serde::Deserialize;
 use serde::Serialize;
+use sha2::Digest;
+use sha2::Sha256;
 use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
 use crate::tools::command_output_artifact::RawOutputArtifact;
@@ -162,6 +165,13 @@ impl CommandAttemptKey {
         self.with_context_fingerprint("repository_epoch", &epoch)
     }
 
+    pub(crate) fn with_workspace_identity(self, identity: Option<&str>) -> Self {
+        match identity {
+            Some(identity) => self.with_context_fingerprint("workspace_identity", identity),
+            None => self,
+        }
+    }
+
     pub(crate) fn with_search_narrowing(
         mut self,
         turn_id: &str,
@@ -187,6 +197,10 @@ impl CommandAttemptKey {
         if !search.can_record_miss {
             return None;
         }
+        let has_workspace_identity = self
+            .command
+            .iter()
+            .any(|argument| argument.starts_with("\0kd4-context:workspace_identity:"));
         Some(SearchMissCacheKey {
             environment_id: search.environment_id.clone(),
             repository_identity: search.repository_identity.clone(),
@@ -194,7 +208,11 @@ impl CommandAttemptKey {
             execution_context: self
                 .command
                 .iter()
-                .filter(|argument| argument.starts_with('\0'))
+                .filter(|argument| {
+                    argument.starts_with('\0')
+                        && !(has_workspace_identity
+                            && argument.starts_with("\0kd4-context:repository_epoch:"))
+                })
                 .cloned()
                 .collect(),
         })
@@ -250,71 +268,53 @@ impl CommandAttemptBlocked {
     }
 }
 
-mod deterministic_failure_proof {
-    /// Sealed proof that a failure outcome is determined by captured inputs
-    /// and state. Production deliberately has no constructor until an
-    /// authoritative classifier can define and capture its complete
-    /// dependency identity.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub(super) struct InputStateDetermined {
-        outcome_class: String,
-        _proof_identity: String,
+/// Closed proof classes whose outcome is determined before a process starts or
+/// mutable filesystem state is inspected. Keep this enum closed: ordinary
+/// command failures and filesystem-dependent patch verification must remain
+/// retryable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InputStateDetermined {
+    ApplyPatchImplicitInvocation,
+    ApplyPatchEnvironmentIdMismatch,
+}
+
+impl InputStateDetermined {
+    fn outcome_class(self) -> &'static str {
+        match self {
+            Self::ApplyPatchImplicitInvocation => "apply_patch implicit invocation",
+            Self::ApplyPatchEnvironmentIdMismatch => "apply_patch environment mismatch",
+        }
     }
 
-    impl InputStateDetermined {
-        #[cfg(test)]
-        pub(super) fn for_test(outcome_class: &str, proof_identity: &str) -> Self {
-            Self {
-                outcome_class: outcome_class.to_string(),
-                _proof_identity: proof_identity.to_string(),
+    pub(crate) fn evidence_description(self) -> &'static str {
+        match self {
+            Self::ApplyPatchImplicitInvocation => {
+                "input-determined apply_patch rejection: explicit invocation required"
             }
-        }
-
-        pub(super) fn outcome_class(&self) -> &str {
-            &self.outcome_class
-        }
-
-        #[cfg(test)]
-        pub(super) fn proof_identity(&self) -> &str {
-            &self._proof_identity
+            Self::ApplyPatchEnvironmentIdMismatch => {
+                "input-determined apply_patch rejection: selected environment mismatch"
+            }
         }
     }
 }
-
-use deterministic_failure_proof::InputStateDetermined;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DeterministicFailureRecord {
     proof: InputStateDetermined,
     pub(crate) evidence: RawOutputArtifact,
     pub(crate) exit_code: i32,
-    pub(crate) execution_started_at: SystemTime,
-    pub(crate) execution_ended_at: SystemTime,
-    pub(crate) execution_duration: Duration,
-    pub(crate) termination_drain_duration: Option<Duration>,
 }
 
 impl DeterministicFailureRecord {
-    #[cfg(test)]
     fn from_input_state_determined(
         proof: InputStateDetermined,
         evidence: RawOutputArtifact,
         exit_code: i32,
-        execution_ended_at: SystemTime,
-        execution_duration: Duration,
-        termination_drain_duration: Option<Duration>,
     ) -> Self {
-        let execution_started_at = execution_ended_at
-            .checked_sub(execution_duration)
-            .unwrap_or(execution_ended_at);
         Self {
             proof,
             evidence,
             exit_code,
-            execution_started_at,
-            execution_ended_at,
-            execution_duration,
-            termination_drain_duration,
         }
     }
 }
@@ -326,7 +326,6 @@ struct AttemptEntry {
     consecutive_failures: u8,
     last_exit_code: Option<i32>,
     deterministic_failure: Option<DeterministicFailureRecord>,
-    last_diagnosis_identity: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -355,11 +354,26 @@ struct CommandCompletionReceipt {
 struct CompletedValidationProof {
     result: ValidationResult,
     artifact: RawOutputArtifact,
+    artifact_thread_id: String,
+}
+
+impl RunningCommand {
+    pub(crate) fn completed_validation_skip_disposition(
+        &self,
+        output: &[u8],
+        exit_code: i32,
+    ) -> Option<codex_tools::ToolOutputSkipDisposition> {
+        self.validation_launch
+            .as_ref()
+            .and_then(|launch| launch.structured_route.as_ref())
+            .and_then(|route| completed_validation_skip_disposition(route, output, exit_code))
+    }
 }
 
 #[derive(Debug, Clone)]
 struct CommandExecutionPersistence {
     cache_path: PathBuf,
+    shared_validation_cache_path: PathBuf,
     codex_home: PathBuf,
     thread_id: String,
     cwd: PathBuf,
@@ -368,6 +382,14 @@ struct CommandExecutionPersistence {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedValidationProof {
     result: ValidationResult,
+    #[serde(default)]
+    artifact_thread_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedValidationCacheDocument {
+    schema_version: u32,
+    completed_validations: Vec<PersistedValidationProof>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -431,81 +453,48 @@ impl CommandExecutionLedger {
             cache_path: codex_home
                 .join("command-execution-cache")
                 .join(format!("{thread_id}.json")),
+            shared_validation_cache_path: shared_validation_cache_path(
+                &codex_home,
+                &workspace_identity,
+                cwd,
+            ),
             codex_home,
             thread_id,
             cwd: cwd.to_path_buf(),
         };
-        let mut ledger = Self {
+        let ledger = Self {
             state: Mutex::new(CommandExecutionState {
                 observed_workspace_identity: Some((0, workspace_identity.clone())),
                 ..CommandExecutionState::default()
             }),
             persistence: Some(persistence.clone()),
         };
-        let Ok(bytes) = tokio::fs::read(&persistence.cache_path).await else {
-            return ledger;
-        };
-        let Ok(document) = serde_json::from_slice::<CommandExecutionCacheDocument>(&bytes) else {
-            return ledger;
-        };
-        if document.schema_version != COMMAND_EXECUTION_CACHE_SCHEMA_VERSION
-            || document.workspace_identity != workspace_identity
+        if let Ok(bytes) = tokio::fs::read(&persistence.cache_path).await
+            && let Ok(document) = serde_json::from_slice::<CommandExecutionCacheDocument>(&bytes)
+            && document.schema_version == COMMAND_EXECUTION_CACHE_SCHEMA_VERSION
+            && document.workspace_identity == workspace_identity
         {
-            return ledger;
-        }
-
-        let mut state = CommandExecutionState {
-            repository_epoch: document.repository_epoch,
-            observed_workspace_identity: Some((document.repository_epoch, workspace_identity)),
-            ..CommandExecutionState::default()
-        };
-        for search_miss in document
-            .search_misses
-            .into_iter()
-            .take(MAX_TRACKED_COMMANDS)
-        {
-            if state.search_misses.insert(search_miss.clone()) {
-                state.search_miss_order.push_back(search_miss);
+            let mut state = ledger.state.lock().await;
+            state.repository_epoch = document.repository_epoch;
+            state.observed_workspace_identity =
+                Some((document.repository_epoch, workspace_identity));
+            for search_miss in document
+                .search_misses
+                .into_iter()
+                .take(MAX_TRACKED_COMMANDS)
+            {
+                if state.search_misses.insert(search_miss.clone()) {
+                    state.search_miss_order.push_back(search_miss);
+                }
             }
-        }
-        for persisted in document
-            .completed_validations
-            .into_iter()
-            .take(MAX_COMPLETED_VALIDATION_PROOFS)
-        {
-            let result = persisted.result;
-            if result.status != ValidationTerminalStatus::Succeeded {
-                continue;
-            }
-            let Some(artifact_ref) = result.raw_artifact_ref.as_deref() else {
-                continue;
-            };
-            let Some(artifact) = RawOutputArtifact::restore_validation(
+            restore_persisted_validations(
+                &mut state,
                 &persistence.codex_home,
                 &persistence.thread_id,
-                artifact_ref,
-            ) else {
-                continue;
-            };
-            let proof_key = result.proof_key.clone();
-            state
-                .completed_validation_order
-                .push_back(proof_key.clone());
-            state.completed_validations.insert(
-                proof_key,
-                CompletedValidationProof {
-                    result: result.clone(),
-                    artifact,
-                },
+                document.completed_validations,
             );
-            state
-                .validation_result_call_order
-                .push_back(result.call_id.clone());
-            state
-                .validation_results_by_call
-                .insert(result.call_id.clone(), result);
         }
-        ledger.state = Mutex::new(state);
+        ledger.refresh_shared_validation_cache().await;
         ledger
     }
 
@@ -543,13 +532,18 @@ impl CommandExecutionLedger {
         &self,
         key: &ValidationProofKey,
     ) -> Option<ValidationResult> {
-        let proof = self
-            .state
-            .lock()
-            .await
-            .completed_validations
-            .get(key)
-            .cloned()?;
+        let mut proof = {
+            let mut state = self.state.lock().await;
+            supersede_validation_proofs_for_new_implementation(&mut state, key);
+            state.completed_validations.get(key).cloned()
+        };
+        if proof.is_none() {
+            self.refresh_shared_validation_cache().await;
+            let mut state = self.state.lock().await;
+            supersede_validation_proofs_for_new_implementation(&mut state, key);
+            proof = state.completed_validations.get(key).cloned();
+        }
+        let proof = proof?;
         let Some((artifact_ref, artifact_sha256)) = proof.artifact.validation_integrity().await
         else {
             let mut state = self.state.lock().await;
@@ -572,6 +566,62 @@ impl CommandExecutionLedger {
         let mut result = proof.result;
         result.freshness = ValidationFreshness::Reused;
         Some(result)
+    }
+
+    async fn refresh_shared_validation_cache(&self) {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return;
+        };
+        let Ok(bytes) = tokio::fs::read(&persistence.shared_validation_cache_path).await else {
+            return;
+        };
+        let Ok(document) = serde_json::from_slice::<PersistedValidationCacheDocument>(&bytes)
+        else {
+            return;
+        };
+        if document.schema_version != COMMAND_EXECUTION_CACHE_SCHEMA_VERSION {
+            return;
+        }
+        let mut state = self.state.lock().await;
+        restore_persisted_validations(
+            &mut state,
+            &persistence.codex_home,
+            &persistence.thread_id,
+            document.completed_validations,
+        );
+    }
+
+    async fn persist_shared_validation(&self, proof: PersistedValidationProof) {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return;
+        };
+        let Ok(_permit) = shared_validation_cache_write_gate().acquire().await else {
+            return;
+        };
+        let mut proofs = tokio::fs::read(&persistence.shared_validation_cache_path)
+            .await
+            .ok()
+            .and_then(|bytes| {
+                serde_json::from_slice::<PersistedValidationCacheDocument>(&bytes).ok()
+            })
+            .filter(|document| document.schema_version == COMMAND_EXECUTION_CACHE_SCHEMA_VERSION)
+            .map(|document| document.completed_validations)
+            .unwrap_or_default();
+        proofs.retain(|candidate| {
+            candidate.result.status == ValidationTerminalStatus::Succeeded
+                && candidate.result.proof_key != proof.result.proof_key
+        });
+        proofs.push(proof);
+        let excess = proofs.len().saturating_sub(MAX_COMPLETED_VALIDATION_PROOFS);
+        proofs.drain(..excess);
+        let document = PersistedValidationCacheDocument {
+            schema_version: COMMAND_EXECUTION_CACHE_SCHEMA_VERSION,
+            completed_validations: proofs,
+        };
+        let Ok(bytes) = serde_json::to_vec_pretty(&document) else {
+            return;
+        };
+        write_cache_document(persistence.shared_validation_cache_path.clone(), bytes).await;
     }
 
     pub(crate) async fn validation_result_for_call(
@@ -634,6 +684,25 @@ impl CommandExecutionLedger {
         state.repository_epoch
     }
 
+    pub(crate) async fn current_workspace_identity_hash(
+        &self,
+        environment_id: &str,
+        cwd: &Path,
+    ) -> Option<String> {
+        if environment_id != codex_exec_server::LOCAL_ENVIRONMENT_ID
+            || self.persistence.as_ref()?.cwd != cwd
+        {
+            return None;
+        }
+        let state = self.state.lock().await;
+        let (epoch, identity) = state.observed_workspace_identity.as_ref()?;
+        if *epoch != state.repository_epoch {
+            return None;
+        }
+        let bytes = serde_json::to_vec(identity).ok()?;
+        Some(format!("{:x}", Sha256::digest(bytes)))
+    }
+
     #[cfg(test)]
     pub(crate) async fn begin_attempt(
         &self,
@@ -679,53 +748,26 @@ impl CommandExecutionLedger {
         Ok(())
     }
 
-    /// Claims one diagnosis for an exact synthetically proven deterministic
-    /// failure and selected hypothesis/recovery identity.
-    #[cfg(test)]
-    pub(crate) async fn claim_failure_diagnosis(
-        &self,
-        key: &CommandAttemptKey,
-        selected_hypothesis_recovery_identity: &str,
-    ) -> bool {
-        let mut state = self.state.lock().await;
-        let Some(entry) = state.attempts.get_mut(key) else {
-            return false;
-        };
-        let Some(failure) = entry.deterministic_failure.as_ref() else {
-            return false;
-        };
-        let diagnosis_identity = format!(
-            "{}:{}:{}:{}:{}",
-            key.fingerprint(),
-            failure.proof.outcome_class(),
-            failure.proof.proof_identity(),
-            failure.exit_code,
-            selected_hypothesis_recovery_identity,
-        );
-        if entry.last_diagnosis_identity.as_deref() == Some(&diagnosis_identity) {
-            return false;
-        }
-        entry.last_diagnosis_identity = Some(diagnosis_identity);
-        true
-    }
-
     pub(crate) async fn record_exit(&self, key: &CommandAttemptKey, exit_code: i32) {
         let mut state = self.state.lock().await;
         record_search_result_locked(&mut state, key, exit_code);
         record_exit_locked(&mut state, key, exit_code);
     }
 
-    #[cfg(test)]
-    pub(crate) async fn record_deterministic_failure(
+    pub(crate) async fn record_input_state_determined_failure(
         &self,
         key: &CommandAttemptKey,
-        failure: DeterministicFailureRecord,
+        proof: InputStateDetermined,
+        evidence: RawOutputArtifact,
+        exit_code: i32,
     ) {
         let mut state = self.state.lock().await;
         let entry = attempt_entry_locked(&mut state, key);
-        entry.last_exit_code = Some(failure.exit_code);
+        entry.last_exit_code = Some(exit_code);
         entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
-        entry.deterministic_failure = Some(failure);
+        entry.deterministic_failure = Some(
+            DeterministicFailureRecord::from_input_state_determined(proof, evidence, exit_code),
+        );
     }
 
     #[cfg(test)]
@@ -857,6 +899,7 @@ impl CommandExecutionLedger {
                     .filter_map(|key| state.completed_validations.get(key))
                     .map(|proof| PersistedValidationProof {
                         result: proof.result.clone(),
+                        artifact_thread_id: proof.artifact_thread_id.clone(),
                     })
                     .collect::<Vec<_>>(),
             )
@@ -886,21 +929,7 @@ impl CommandExecutionLedger {
         let Ok(bytes) = serde_json::to_vec_pretty(&document) else {
             return;
         };
-        let cache_path = persistence.cache_path;
-        let _ = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            let Some(parent) = cache_path.parent() else {
-                return Err(std::io::Error::other("command cache path has no parent"));
-            };
-            std::fs::create_dir_all(parent)?;
-            let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-            temporary.write_all(&bytes)?;
-            temporary.as_file().sync_all()?;
-            temporary
-                .persist(&cache_path)
-                .map_err(|error| error.error)?;
-            Ok(())
-        })
-        .await;
+        write_cache_document(persistence.cache_path, bytes).await;
     }
 
     async fn forget_turn_repository_revision(&self, turn_id: &str) {
@@ -919,33 +948,16 @@ impl CommandExecutionLedger {
         {
             let mut state = self.state.lock().await;
             debug_assert_command_execution_invariants(&state);
-            let mut update_artifact = |running: &mut RunningCommand| {
+            if let Some(running) = state.running.get_mut(&process_id) {
                 running.artifact = artifact.clone();
-                running
-                    .completed_exit_code
-                    .filter(|exit_code| *exit_code != 0 && running.validation_launch.is_some())
-                    .map(|exit_code| (running.key.clone(), exit_code))
-            };
-            let deterministic_completion = if state.running.contains_key(&process_id) {
-                state
-                    .running
-                    .get_mut(&process_id)
-                    .and_then(&mut update_artifact)
             } else {
-                state
+                if let Some(pending) = state
                     .pending_by_execution_id
                     .values_mut()
                     .find(|pending| pending.process_id == process_id)
-                    .and_then(|pending| update_artifact(&mut pending.command))
-            };
-            if let Some((key, exit_code)) = deterministic_completion
-                && let Some(failure) = state
-                    .attempts
-                    .get_mut(&key)
-                    .and_then(|entry| entry.deterministic_failure.as_mut())
-                && failure.exit_code == exit_code
-            {
-                failure.evidence = artifact;
+                {
+                    pending.command.artifact = artifact;
+                }
             }
             debug_assert_command_execution_invariants(&state);
         }
@@ -1222,9 +1234,9 @@ impl CommandExecutionLedger {
         let selected_test_count = validation_route_is_test(&route)
             .then(|| selected_test_count(&retained_output))
             .flatten();
-        let missing_selected_tests = exit_code == 0
-            && validation_route_is_test(&route)
-            && selected_test_count.is_none_or(|count| count == 0);
+        let missing_selected_tests =
+            completed_validation_skip_disposition(&route, &retained_output, exit_code)
+                == Some(codex_tools::ToolOutputSkipDisposition::NotApplicable);
         let succeeded = exit_code == 0 && !missing_selected_tests;
         let result = ValidationResult {
             proof_key: proof_key.clone(),
@@ -1267,6 +1279,15 @@ impl CommandExecutionLedger {
             freshness: ValidationFreshness::Executed,
         };
         let duration_ms = result.duration_ms;
+        let artifact_thread_id = self
+            .persistence
+            .as_ref()
+            .map(|persistence| persistence.thread_id.clone())
+            .unwrap_or_default();
+        let persisted_success = succeeded.then(|| PersistedValidationProof {
+            result: result.clone(),
+            artifact_thread_id: artifact_thread_id.clone(),
+        });
         {
             let mut state = self.state.lock().await;
             if state.validation_results_by_call.contains_key(&call_id) {
@@ -1296,9 +1317,16 @@ impl CommandExecutionLedger {
                     .push_back(proof_key.clone());
                 state.completed_validations.insert(
                     proof_key.clone(),
-                    CompletedValidationProof { result, artifact },
+                    CompletedValidationProof {
+                        result,
+                        artifact,
+                        artifact_thread_id,
+                    },
                 );
             }
+        }
+        if let Some(persisted_success) = persisted_success {
+            self.persist_shared_validation(persisted_success).await;
         }
         if let Some(turn_timing_state) = turn_timing_state {
             turn_timing_state.record_executed_validation(duration_ms, force_fresh);
@@ -1530,7 +1558,6 @@ fn record_exit_locked(state: &mut CommandExecutionState, key: &CommandAttemptKey
     if exit_code == 0 {
         entry.consecutive_failures = 0;
         entry.deterministic_failure = None;
-        entry.last_diagnosis_identity = None;
     } else {
         entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
     }
@@ -1592,6 +1619,174 @@ fn validation_route_is_test(route: &ValidationRoute) -> bool {
     })
 }
 
+pub(crate) fn completed_validation_skip_disposition(
+    route: &ValidationRoute,
+    output: &[u8],
+    exit_code: i32,
+) -> Option<codex_tools::ToolOutputSkipDisposition> {
+    (exit_code == 0
+        && validation_route_is_test(route)
+        && selected_test_count(output).is_none_or(|count| count == 0))
+    .then_some(codex_tools::ToolOutputSkipDisposition::NotApplicable)
+}
+
+fn shared_validation_cache_path(
+    codex_home: &Path,
+    workspace_identity: &crate::git_workspace::WorkspaceEvidenceIdentity,
+    cwd: &Path,
+) -> PathBuf {
+    let repository = workspace_identity
+        .repository_root
+        .as_deref()
+        .map(str::to_owned)
+        .unwrap_or_else(|| cwd.to_string_lossy().into_owned());
+    let repository = if cfg!(windows) {
+        repository.replace('\\', "/").to_ascii_lowercase()
+    } else {
+        repository
+    };
+    let identity = format!("{:x}", Sha256::digest(repository.as_bytes()));
+    codex_home
+        .join("command-execution-cache")
+        .join(format!("validation-{identity}.json"))
+}
+
+fn restore_persisted_validations(
+    state: &mut CommandExecutionState,
+    codex_home: &Path,
+    fallback_thread_id: &str,
+    persisted_validations: Vec<PersistedValidationProof>,
+) {
+    for persisted in persisted_validations
+        .into_iter()
+        .rev()
+        .take(MAX_COMPLETED_VALIDATION_PROOFS)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        let result = persisted.result;
+        if result.status != ValidationTerminalStatus::Succeeded
+            || state.completed_validations.contains_key(&result.proof_key)
+        {
+            continue;
+        }
+        let Some(artifact_ref) = result.raw_artifact_ref.as_deref() else {
+            continue;
+        };
+        let artifact_thread_id = if persisted.artifact_thread_id.is_empty() {
+            fallback_thread_id.to_string()
+        } else {
+            persisted.artifact_thread_id
+        };
+        let Some(artifact) =
+            RawOutputArtifact::restore_validation(codex_home, &artifact_thread_id, artifact_ref)
+        else {
+            continue;
+        };
+        while state.completed_validations.len() >= MAX_COMPLETED_VALIDATION_PROOFS {
+            let Some(oldest) = state.completed_validation_order.pop_front() else {
+                break;
+            };
+            state.completed_validations.remove(&oldest);
+        }
+        let proof_key = result.proof_key.clone();
+        state
+            .completed_validation_order
+            .push_back(proof_key.clone());
+        state.completed_validations.insert(
+            proof_key,
+            CompletedValidationProof {
+                result: result.clone(),
+                artifact,
+                artifact_thread_id,
+            },
+        );
+        if !state
+            .validation_results_by_call
+            .contains_key(&result.call_id)
+        {
+            while state.validation_results_by_call.len() >= MAX_COMPLETED_VALIDATION_PROOFS {
+                let Some(oldest) = state.validation_result_call_order.pop_front() else {
+                    break;
+                };
+                state.validation_results_by_call.remove(&oldest);
+            }
+            state
+                .validation_result_call_order
+                .push_back(result.call_id.clone());
+            state
+                .validation_results_by_call
+                .insert(result.call_id.clone(), result);
+        }
+    }
+}
+
+fn shared_validation_cache_write_gate() -> &'static Semaphore {
+    static WRITE_GATE: std::sync::OnceLock<Semaphore> = std::sync::OnceLock::new();
+    WRITE_GATE.get_or_init(|| Semaphore::new(1))
+}
+
+async fn write_cache_document(cache_path: PathBuf, bytes: Vec<u8>) {
+    let _ = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        let Some(parent) = cache_path.parent() else {
+            return Err(std::io::Error::other("command cache path has no parent"));
+        };
+        std::fs::create_dir_all(parent)?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        temporary.write_all(&bytes)?;
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist(&cache_path)
+            .map_err(|error| error.error)?;
+        Ok(())
+    })
+    .await;
+}
+
+fn supersede_validation_proofs_for_new_implementation(
+    state: &mut CommandExecutionState,
+    requested: &ValidationProofKey,
+) {
+    let superseded_keys = state
+        .completed_validations
+        .keys()
+        .filter(|candidate| {
+            candidate.repository == requested.repository
+                && candidate.cwd == requested.cwd
+                && candidate.canonical_route_hash == requested.canonical_route_hash
+                && candidate.coverage_identity == requested.coverage_identity
+                && candidate.environment_identity == requested.environment_identity
+                && candidate.toolchain_identity == requested.toolchain_identity
+                && candidate.configuration_identity == requested.configuration_identity
+                && candidate.validation_contract_version == requested.validation_contract_version
+                && candidate.implementation_identity != requested.implementation_identity
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    for superseded_key in superseded_keys {
+        let Some(proof) = state.completed_validations.remove(&superseded_key) else {
+            continue;
+        };
+        state
+            .completed_validation_order
+            .retain(|entry| entry != &superseded_key);
+        let Some(result) = state
+            .validation_results_by_call
+            .get_mut(&proof.result.call_id)
+        else {
+            continue;
+        };
+        result.status = ValidationTerminalStatus::Superseded;
+        result.freshness = ValidationFreshness::Superseded;
+        result.summary = Some(format!(
+            "focused validation was superseded by implementation identity {}",
+            requested.implementation_identity
+        ));
+    }
+}
+
 fn selected_test_count(output: &[u8]) -> Option<u64> {
     let output = String::from_utf8_lossy(output);
     let cargo_count = output.lines().filter_map(|line| {
@@ -1620,17 +1815,6 @@ mod tests {
 
     fn key(command: &str) -> CommandAttemptKey {
         CommandAttemptKey::new("exec_command", "local", "C:/repo", &[command.to_string()])
-    }
-
-    fn deterministic_failure(class: &str, exit_code: i32) -> DeterministicFailureRecord {
-        DeterministicFailureRecord::from_input_state_determined(
-            InputStateDetermined::for_test(class, "synthetic-complete-identity-v1"),
-            RawOutputArtifact::unavailable("original deterministic failure fixture"),
-            exit_code,
-            SystemTime::now(),
-            Duration::from_millis(170),
-            None,
-        )
     }
 
     fn validation_launch() -> ValidationLaunchPlan {
@@ -1694,7 +1878,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_misses_and_successful_validations_survive_safe_reopen() {
+    async fn workspace_identity_is_available_only_for_captured_local_cwd() {
+        let temp = tempfile::tempdir().expect("workspace identity fixture");
+        let repository = temp.path().join("repo");
+        let alternate_repository = temp.path().join("alternate-repo");
+        let codex_home = temp.path().join("codex-home");
+        initialize_git_repository(&repository);
+        initialize_git_repository(&alternate_repository);
+        let ledger = CommandExecutionLedger::load_or_new(
+            codex_home,
+            "workspace-scope".to_string(),
+            &repository,
+        )
+        .await;
+
+        assert!(
+            ledger
+                .current_workspace_identity_hash(
+                    codex_exec_server::LOCAL_ENVIRONMENT_ID,
+                    &repository,
+                )
+                .await
+                .is_some()
+        );
+        assert!(
+            ledger
+                .current_workspace_identity_hash(
+                    codex_exec_server::LOCAL_ENVIRONMENT_ID,
+                    &alternate_repository,
+                )
+                .await
+                .is_none()
+        );
+        assert!(
+            ledger
+                .current_workspace_identity_hash("remote-environment", &repository)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_validation_reuse_survives_unrelated_workspace_change() {
         let temp = tempfile::tempdir().expect("cache fixture");
         let repository = temp.path().join("repo");
         let codex_home = temp.path().join("codex-home");
@@ -1765,12 +1990,18 @@ mod tests {
 
         std::fs::write(repository.join("external-change.txt"), "changed")
             .expect("mutate repository");
-        let stale =
+        let changed_workspace =
             CommandExecutionLedger::load_or_new(codex_home, thread_id.to_string(), &repository)
                 .await;
-        assert!(stale.reusable_validation(&proof_key).await.is_none());
         assert!(
-            stale
+            changed_workspace
+                .reusable_validation(&proof_key)
+                .await
+                .is_some(),
+            "an unrelated workspace mutation must not invalidate a scoped proof"
+        );
+        assert!(
+            changed_workspace
                 .begin_attempt_with_freshness(&equivalent, false, false)
                 .await
                 .is_ok()
@@ -1778,7 +2009,199 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mutation_before_finish_turn_does_not_rebase_persisted_results() {
+    async fn scoped_validation_reuse_is_immediately_available_to_later_thread() {
+        let temp = tempfile::tempdir().expect("cache fixture");
+        let repository = temp.path().join("repo");
+        let codex_home = temp.path().join("codex-home");
+        initialize_git_repository(&repository);
+        let producer = CommandExecutionLedger::load_or_new(
+            codex_home.clone(),
+            "producer-thread".to_string(),
+            &repository,
+        )
+        .await;
+        let consumer = CommandExecutionLedger::load_or_new(
+            codex_home.clone(),
+            "consumer-thread".to_string(),
+            &repository,
+        )
+        .await;
+        let proof_key = validation_proof_key("cross-thread");
+        let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
+            &codex_home,
+            "producer-thread",
+            b"running 1 test\ntest cross_thread_case ... ok\n",
+        )
+        .await;
+        assert!(
+            producer
+                .publish_completed_validation(
+                    proof_key.clone(),
+                    focused_cargo_route(),
+                    "producer-call".to_string(),
+                    artifact,
+                    Instant::now(),
+                    0,
+                    None,
+                )
+                .await
+        );
+
+        std::fs::write(repository.join("unrelated.txt"), "changed")
+            .expect("mutate an unrelated path");
+        let reused = consumer
+            .reusable_validation(&proof_key)
+            .await
+            .expect("later thread reuses the producer's completed validation");
+        assert_eq!(reused.call_id, "producer-call");
+        assert_eq!(reused.freshness, ValidationFreshness::Reused);
+    }
+
+    #[tokio::test]
+    async fn scoped_validation_reuse_never_persists_failures() {
+        let temp = tempfile::tempdir().expect("cache fixture");
+        let repository = temp.path().join("repo");
+        let codex_home = temp.path().join("codex-home");
+        initialize_git_repository(&repository);
+        let producer = CommandExecutionLedger::load_or_new(
+            codex_home.clone(),
+            "failed-producer".to_string(),
+            &repository,
+        )
+        .await;
+        let proof_key = validation_proof_key("failed-cross-thread");
+        let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
+            &codex_home,
+            "failed-producer",
+            b"running 1 test\ntest focused_case ... FAILED\n",
+        )
+        .await;
+        assert!(
+            producer
+                .publish_completed_validation(
+                    proof_key.clone(),
+                    focused_cargo_route(),
+                    "failed-call".to_string(),
+                    artifact,
+                    Instant::now(),
+                    1,
+                    None,
+                )
+                .await
+        );
+
+        let consumer = CommandExecutionLedger::load_or_new(
+            codex_home,
+            "failed-consumer".to_string(),
+            &repository,
+        )
+        .await;
+        assert!(consumer.reusable_validation(&proof_key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn scoped_validation_reuse_rejects_cross_thread_artifact_tampering() {
+        let temp = tempfile::tempdir().expect("cache fixture");
+        let repository = temp.path().join("repo");
+        let codex_home = temp.path().join("codex-home");
+        initialize_git_repository(&repository);
+        let producer_thread = "tamper-producer";
+        let producer = CommandExecutionLedger::load_or_new(
+            codex_home.clone(),
+            producer_thread.to_string(),
+            &repository,
+        )
+        .await;
+        let proof_key = validation_proof_key("tampered-cross-thread");
+        let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
+            &codex_home,
+            producer_thread,
+            b"running 1 test\ntest focused_case ... ok\n",
+        )
+        .await;
+        assert!(
+            producer
+                .publish_completed_validation(
+                    proof_key.clone(),
+                    focused_cargo_route(),
+                    "tamper-call".to_string(),
+                    artifact,
+                    Instant::now(),
+                    0,
+                    None,
+                )
+                .await
+        );
+        let artifact_ref = producer
+            .validation_result_for_call("tamper-call")
+            .await
+            .and_then(|result| result.raw_artifact_ref)
+            .expect("retained artifact reference");
+        drop(producer);
+        std::fs::write(
+            codex_home
+                .join("tool-output")
+                .join(producer_thread)
+                .join(format!("{artifact_ref}.log")),
+            "tampered output",
+        )
+        .expect("tamper retained artifact");
+
+        let consumer = CommandExecutionLedger::load_or_new(
+            codex_home,
+            "tamper-consumer".to_string(),
+            &repository,
+        )
+        .await;
+        assert!(consumer.reusable_validation(&proof_key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn superseded_validation_freshness_marks_outdated_implementation_proof() {
+        let temp = tempfile::tempdir().expect("artifact directory");
+        let ledger = CommandExecutionLedger::default();
+        let old_key = validation_proof_key("old-implementation");
+        let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
+            temp.path(),
+            "superseded-validation",
+            b"running 1 test\ntest focused_case ... ok\n",
+        )
+        .await;
+        assert!(
+            ledger
+                .publish_completed_validation(
+                    old_key.clone(),
+                    focused_cargo_route(),
+                    "superseded-call".to_string(),
+                    artifact,
+                    Instant::now(),
+                    0,
+                    None,
+                )
+                .await
+        );
+
+        let mut current_key = old_key.clone();
+        current_key.implementation_identity = "current-implementation".to_string();
+        assert!(ledger.reusable_validation(&current_key).await.is_none());
+
+        let superseded = ledger
+            .validation_result_for_call("superseded-call")
+            .await
+            .expect("superseded result remains addressable by its production call id");
+        assert_eq!(superseded.status, ValidationTerminalStatus::Superseded);
+        assert_eq!(superseded.freshness, ValidationFreshness::Superseded);
+        assert!(
+            superseded
+                .summary
+                .as_deref()
+                .is_some_and(|summary| summary.contains("current-implementation"))
+        );
+        assert!(ledger.reusable_validation(&old_key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn scoped_validation_reuse_persists_before_finish_turn() {
         let temp = tempfile::tempdir().expect("cache fixture");
         let repository = temp.path().join("repo");
         let codex_home = temp.path().join("codex-home");
@@ -1841,7 +2264,7 @@ mod tests {
                 .await
                 .is_ok()
         );
-        assert!(reopened.reusable_validation(&proof_key).await.is_none());
+        assert!(reopened.reusable_validation(&proof_key).await.is_some());
     }
 
     #[tokio::test]
@@ -1856,6 +2279,14 @@ mod tests {
             b"running 0 tests\n\ntest result: ok. 0 passed; 0 failed\n",
         )
         .await;
+        assert_eq!(
+            completed_validation_skip_disposition(
+                &route,
+                b"running 0 tests\n\ntest result: ok. 0 passed; 0 failed\n",
+                0,
+            ),
+            Some(codex_tools::ToolOutputSkipDisposition::NotApplicable)
+        );
         assert!(
             ledger
                 .publish_completed_validation(
@@ -1960,7 +2391,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn equivalent_search_miss_is_cached_until_context_changes() {
+    async fn equivalent_search_miss_is_cached_for_unchanged_workspace_identity() {
         let ledger = CommandExecutionLedger::default();
         let search = |search_identity: &str| RgSearchNarrowing {
             breadth: RgSearchBreadth::Narrow,
@@ -1972,9 +2403,11 @@ mod tests {
         };
         let first = key("rg needle src")
             .with_repository_epoch(1)
+            .with_workspace_identity(Some("workspace-a"))
             .with_search_narrowing("turn-a", "repo-a", Some(search("needle:src")));
         let equivalent = key("rg needle ./src")
-            .with_repository_epoch(1)
+            .with_repository_epoch(2)
+            .with_workspace_identity(Some("workspace-a"))
             .with_search_narrowing("turn-b", "repo-a", Some(search("needle:src")));
         let compound = key("rg needle ./src; echo finished")
             .with_repository_epoch(1)
@@ -2024,12 +2457,13 @@ mod tests {
         ledger
             .begin_attempt(
                 &key("rg needle src")
-                    .with_repository_epoch(2)
+                    .with_repository_epoch(3)
+                    .with_workspace_identity(Some("workspace-b"))
                     .with_search_narrowing("turn-b", "repo-a", Some(search("needle:src"))),
                 false,
             )
             .await
-            .expect("changed repository epoch executes");
+            .expect("changed exact workspace identity executes");
     }
 
     #[tokio::test]
@@ -2191,7 +2625,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn synthetic_input_state_proof_blocks_exact_retry_but_freshness_bypasses() {
+    async fn input_state_determined_failure_blocks_exact_retry_but_freshness_bypasses() {
         let ledger = CommandExecutionLedger::default();
         let attempt_key = key("fails.exe").with_repository_epoch(1);
 
@@ -2200,26 +2634,20 @@ mod tests {
             .await
             .expect("first attempt");
         ledger
-            .record_deterministic_failure(
+            .record_input_state_determined_failure(
                 &attempt_key,
-                deterministic_failure("focused-validation", 7),
+                InputStateDetermined::ApplyPatchImplicitInvocation,
+                RawOutputArtifact::unavailable(
+                    InputStateDetermined::ApplyPatchImplicitInvocation.evidence_description(),
+                ),
+                -1,
             )
             .await;
 
-        assert!(
-            ledger
-                .claim_failure_diagnosis(&attempt_key, "hypothesis-a/recovery-a")
-                .await
-        );
-        assert!(
-            !ledger
-                .claim_failure_diagnosis(&attempt_key, "hypothesis-a/recovery-a")
-                .await
-        );
         ledger
             .begin_attempt(&attempt_key, false)
             .await
-            .expect_err("the synthetic closed proof blocks an exact retry");
+            .expect_err("the closed production proof blocks an exact retry");
         ledger
             .begin_attempt(&attempt_key, true)
             .await
@@ -2228,12 +2656,6 @@ mod tests {
             .begin_attempt_with_freshness(&attempt_key, false, true)
             .await
             .expect("force_fresh bypasses the retained proof");
-        assert!(
-            ledger
-                .claim_failure_diagnosis(&attempt_key, "hypothesis-b/recovery-b")
-                .await
-        );
-
         ledger
             .begin_attempt(&key("fails.exe --changed").with_repository_epoch(1), false)
             .await
@@ -2475,9 +2897,13 @@ mod tests {
         let ledger = CommandExecutionLedger::default();
         let command_key = key("cargo test --test recovered");
         ledger
-            .record_deterministic_failure(
+            .record_input_state_determined_failure(
                 &command_key,
-                deterministic_failure("focused-validation", 7),
+                InputStateDetermined::ApplyPatchEnvironmentIdMismatch,
+                RawOutputArtifact::unavailable(
+                    InputStateDetermined::ApplyPatchEnvironmentIdMismatch.evidence_description(),
+                ),
+                -1,
             )
             .await;
         ledger

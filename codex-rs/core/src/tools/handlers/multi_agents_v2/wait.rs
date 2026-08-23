@@ -502,20 +502,12 @@ impl Handler {
         )
         .await
         .map_err(FunctionCallError::RespondToModel)?;
-        let owner_states = owner_assignments
-            .tasks
-            .values()
-            .map(|task| {
-                (
-                    task.assignment.assignment_id.to_string(),
-                    task.current_attempt.attempt_id.to_string(),
-                    task.current_attempt.state,
-                    task.workspace_status.epoch,
-                    task.workspace_status.next_required_action.clone(),
-                    task.receipt.is_some(),
-                )
-            })
-            .collect::<Vec<_>>();
+        let owner_states = authoritative_wait_states(&owner_assignments).ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "wait_agent could not bind its authoritative wait to exact task revisions"
+                    .to_string(),
+            )
+        })?;
         for event in &wake_read.updated_agents {
             let task = &hydrated_assignments
                 .tasks
@@ -893,13 +885,16 @@ async fn hydrate_assignments(
             .get_agent_task(*assignment_id, Some(0))
             .await
             .map_err(|error| format!("assignment {assignment_id}: {error}"))?;
-        let revision = serde_json::to_vec(&task)
-            .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+        let revision = agent_task_revision(&task)
             .map_err(|error| format!("assignment {assignment_id} revision: {error}"))?;
         hydrated.revisions.insert(*assignment_id, revision);
         hydrated.tasks.insert(*assignment_id, task);
     }
     Ok(hydrated)
+}
+
+fn agent_task_revision(task: &AgentTask) -> Result<String, serde_json::Error> {
+    serde_json::to_vec(task).map(|bytes| format!("{:x}", Sha256::digest(bytes)))
 }
 
 async fn hydrate_wait_owner_assignments(
@@ -926,13 +921,14 @@ async fn hydrate_wait_owner_assignments(
 fn wait_owner_is_settled(assignments: &HydratedAssignments) -> bool {
     !assignments.tasks.is_empty()
         && assignments.tasks.values().all(|task| {
-            matches!(
-                task.current_attempt.state,
-                AttemptState::Completed
-                    | AttemptState::Violated
-                    | AttemptState::Abandoned
-                    | AttemptState::NeedsMain
-            )
+            task.workspace_status.pending_gates.is_empty()
+                && matches!(
+                    task.current_attempt.state,
+                    AttemptState::Completed
+                        | AttemptState::Violated
+                        | AttemptState::Abandoned
+                        | AttemptState::NeedsMain
+                )
         })
 }
 
@@ -1017,15 +1013,39 @@ mod tests {
         );
     }
 
+    fn test_authoritative_wait_state(
+        assignment_id: &str,
+        attempt_id: &str,
+        state: AttemptState,
+        epoch: u64,
+        next_required_action: Option<&str>,
+        receipt_available: bool,
+        has_pending_gates: bool,
+        task_revision: &str,
+    ) -> AuthoritativeWaitState {
+        AuthoritativeWaitState {
+            assignment_id: assignment_id.to_string(),
+            attempt_id: attempt_id.to_string(),
+            state,
+            epoch,
+            next_required_action: next_required_action.map(str::to_string),
+            receipt_available,
+            has_pending_gates,
+            task_revision: task_revision.to_string(),
+        }
+    }
+
     #[test]
     fn authoritative_signal_requires_unambiguous_typed_blocked_or_terminal_state() {
-        let blocked = vec![(
-            "assignment-1".to_string(),
-            "attempt-1".to_string(),
+        let blocked = vec![test_authoritative_wait_state(
+            "assignment-1",
+            "attempt-1",
             AttemptState::NeedsMain,
             7,
-            Some("main agent action".to_string()),
+            Some("main agent action"),
             true,
+            false,
+            "task-revision-1",
         )];
         assert_eq!(
             authoritative_wait_signal(Some("root"), "/root", &blocked, Some("blocked message"))
@@ -1043,13 +1063,15 @@ mod tests {
             "blocked owner output must never be promoted into terminal assistant text"
         );
 
-        let terminal = vec![(
-            "assignment-1".to_string(),
-            "attempt-1".to_string(),
+        let terminal = vec![test_authoritative_wait_state(
+            "assignment-1",
+            "attempt-1",
             AttemptState::Completed,
             8,
             None,
             true,
+            false,
+            "task-revision-2",
         )];
         assert_eq!(
             authoritative_wait_signal(Some("root"), "/root", &terminal, Some("Wait completed."))
@@ -1066,28 +1088,139 @@ mod tests {
             Some(json!("Wait completed."))
         );
 
-        let active = vec![(
-            "assignment-1".to_string(),
-            "attempt-1".to_string(),
+        let active = vec![test_authoritative_wait_state(
+            "assignment-1",
+            "attempt-1",
             AttemptState::Active,
             9,
             None,
             false,
+            false,
+            "task-revision-3",
         )];
         assert!(
             authoritative_wait_signal(Some("root"), "/root", &active, Some("active")).is_none()
         );
 
-        let with_receipt =
-            authoritative_wait_snapshot(Some("root"), "/root", &blocked).expect("blocked snapshot");
-        let mut without_receipt = blocked;
-        without_receipt[0].5 = false;
-        let without_receipt = authoritative_wait_snapshot(Some("root"), "/root", &without_receipt)
-            .expect("receipt-only snapshot");
-        assert_eq!(
-            without_receipt.state_revision, with_receipt.state_revision,
-            "receipt availability alone must not advance the owner revision"
+        let pending_gate = vec![test_authoritative_wait_state(
+            "assignment-1",
+            "attempt-1",
+            AttemptState::Completed,
+            10,
+            Some("review required"),
+            true,
+            true,
+            "task-revision-4",
+        )];
+        assert!(
+            authoritative_wait_signal(
+                Some("root"),
+                "/root",
+                &pending_gate,
+                Some("premature completion"),
+            )
+            .is_none(),
+            "a completed attempt with pending gates is not terminal"
         );
+    }
+
+    #[test]
+    fn authoritative_wait_snapshot_tracks_complete_task_revision() {
+        let assignment_id = AssignmentId::new();
+        let attempt_id = codex_agent_task_store::AttemptId::new();
+        let now = chrono::Utc::now();
+        let mut task = AgentTask {
+            assignment: codex_agent_task_store::Assignment {
+                assignment_id,
+                root_session_id: "root".to_string(),
+                admission_origin: codex_agent_task_store::AssignmentAdmissionOrigin::Typed,
+                repository_id: "repository".to_string(),
+                workspace_id: "workspace".to_string(),
+                role: codex_agent_task_store::AgentRole::Worker,
+                capability_profile: codex_agent_task_store::CapabilityProfile::ScopedSourceWrite,
+                objective: "complete task".to_string(),
+                acceptance_criteria: vec![codex_agent_task_store::AcceptanceCriterion {
+                    id: "criterion".to_string(),
+                    text: "criterion passes".to_string(),
+                }],
+                read_scope: Vec::new(),
+                write_scope: Vec::new(),
+                stop_condition: "done".to_string(),
+                dependencies: Vec::new(),
+                risk_hints: Vec::new(),
+                required_evidence: Vec::new(),
+                prohibited_changes: Vec::new(),
+                contract_claims: Vec::new(),
+                workspace_strategy: codex_agent_task_store::WorkspaceStrategy::Shared,
+                start_epoch: 7,
+                relation: None,
+                architecture_contract_ref: None,
+                integration_plan: codex_agent_task_store::IntegrationPlan::SingleWriter,
+                task_capsule: None,
+                created_at: now,
+            },
+            current_attempt: codex_agent_task_store::Attempt {
+                attempt_id,
+                assignment_id,
+                ordinal: 0,
+                amendment: None,
+                state: AttemptState::NeedsMain,
+                created_at: now,
+                sealed_at: Some(now),
+            },
+            gates: Vec::new(),
+            receipt: None,
+            validation_calls: Vec::new(),
+            workspace_status: codex_agent_task_store::WorkspaceTaskStatus {
+                epoch: 7,
+                next_required_action: Some("main agent action".to_string()),
+                ..Default::default()
+            },
+            isolation_handoff: None,
+            integration_handoffs: Vec::new(),
+            observations: Vec::new(),
+        };
+        let before_state =
+            authoritative_wait_state(&task, agent_task_revision(&task).expect("task serializes"));
+        let before = authoritative_wait_snapshot(Some("root"), "/root", &[before_state.clone()])
+            .expect("blocked snapshot");
+
+        task.gates.push(codex_agent_task_store::AgentGate {
+            assignment_id,
+            kind: codex_agent_task_store::GateKind::Review,
+            status: codex_agent_task_store::GateStatus::Pending,
+            reason: "review required".to_string(),
+            waiver_reason: None,
+            evidence_epoch: 7,
+            updated_at: now,
+            sealed_at: None,
+        });
+        let after_state = authoritative_wait_state(
+            &task,
+            agent_task_revision(&task).expect("changed task serializes"),
+        );
+        let after = authoritative_wait_snapshot(Some("root"), "/root", &[after_state.clone()])
+            .expect("changed blocked snapshot");
+
+        assert_eq!(after_state.state, before_state.state);
+        assert_eq!(after_state.epoch, before_state.epoch);
+        assert_eq!(
+            after_state.next_required_action,
+            before_state.next_required_action
+        );
+        assert_ne!(after.state_revision, before.state_revision);
+
+        task.current_attempt.state = AttemptState::Completed;
+        task.workspace_status.pending_gates = vec![codex_agent_task_store::GateKind::Review];
+        let mut assignments = HydratedAssignments::default();
+        assignments.tasks.insert(assignment_id, task.clone());
+        assert!(
+            !wait_owner_is_settled(&assignments),
+            "pending gates keep a terminal attempt unsettled"
+        );
+        task.workspace_status.pending_gates.clear();
+        assignments.tasks.insert(assignment_id, task);
+        assert!(wait_owner_is_settled(&assignments));
     }
 
     #[test]
@@ -1385,7 +1518,45 @@ impl WaitAgentResult {
     }
 }
 
-type AuthoritativeWaitState = (String, String, AttemptState, u64, Option<String>, bool);
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AuthoritativeWaitState {
+    assignment_id: String,
+    attempt_id: String,
+    state: AttemptState,
+    epoch: u64,
+    next_required_action: Option<String>,
+    receipt_available: bool,
+    has_pending_gates: bool,
+    task_revision: String,
+}
+
+fn authoritative_wait_states(
+    assignments: &HydratedAssignments,
+) -> Option<Vec<AuthoritativeWaitState>> {
+    assignments
+        .tasks
+        .iter()
+        .map(|(assignment_id, task)| {
+            Some(authoritative_wait_state(
+                task,
+                assignments.revisions.get(assignment_id)?.clone(),
+            ))
+        })
+        .collect()
+}
+
+fn authoritative_wait_state(task: &AgentTask, task_revision: String) -> AuthoritativeWaitState {
+    AuthoritativeWaitState {
+        assignment_id: task.assignment.assignment_id.to_string(),
+        attempt_id: task.current_attempt.attempt_id.to_string(),
+        state: task.current_attempt.state,
+        epoch: task.workspace_status.epoch,
+        next_required_action: task.workspace_status.next_required_action.clone(),
+        receipt_available: task.receipt.is_some(),
+        has_pending_gates: !task.workspace_status.pending_gates.is_empty(),
+        task_revision,
+    }
+}
 
 fn authoritative_wait_signal(
     root_session_id: Option<&str>,
@@ -1393,15 +1564,15 @@ fn authoritative_wait_signal(
     states: &[AuthoritativeWaitState],
     surfaceable_message: Option<&str>,
 ) -> Option<JsonValue> {
-    if states.is_empty() {
+    if states.is_empty() || states.iter().any(|state| state.has_pending_gates) {
         return None;
     }
     let disposition = if states
         .iter()
-        .any(|(_, _, state, _, _, _)| *state == AttemptState::NeedsMain)
-        && states.iter().all(|(_, _, state, _, _, _)| {
+        .any(|state| state.state == AttemptState::NeedsMain)
+        && states.iter().all(|state| {
             matches!(
-                state,
+                state.state,
                 AttemptState::Completed
                     | AttemptState::Violated
                     | AttemptState::Abandoned
@@ -1409,9 +1580,9 @@ fn authoritative_wait_signal(
             )
         }) {
         "blocked"
-    } else if states.iter().all(|(_, _, state, _, _, _)| {
+    } else if states.iter().all(|state| {
         matches!(
-            state,
+            state.state,
             AttemptState::Completed | AttemptState::Violated | AttemptState::Abandoned
         )
     }) {
@@ -1420,22 +1591,24 @@ fn authoritative_wait_signal(
         return None;
     };
     let mut states = states.to_vec();
-    states.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    states.sort_by(|left, right| {
+        left.assignment_id
+            .cmp(&right.assignment_id)
+            .then_with(|| left.attempt_id.cmp(&right.attempt_id))
+    });
     let snapshot = authoritative_wait_snapshot(root_session_id, consuming_agent_path, &states)?;
     let receipt_identity = sha256_text(
         &serde_json::to_string(
             &states
                 .iter()
-                .map(
-                    |(assignment_id, attempt_id, _, epoch, _, receipt_available)| {
-                        json!({
-                            "assignment_id": assignment_id,
-                            "attempt_id": attempt_id,
-                            "epoch": epoch,
-                            "receipt_available": receipt_available,
-                        })
-                    },
-                )
+                .map(|state| {
+                    json!({
+                        "assignment_id": state.assignment_id,
+                        "attempt_id": state.attempt_id,
+                        "epoch": state.epoch,
+                        "receipt_available": state.receipt_available,
+                    })
+                })
                 .collect::<Vec<_>>(),
         )
         .ok()?,
@@ -1470,20 +1643,19 @@ fn authoritative_wait_snapshot(
         return None;
     }
     let mut states = states.to_vec();
-    states.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    states.sort_by(|left, right| {
+        left.assignment_id
+            .cmp(&right.assignment_id)
+            .then_with(|| left.attempt_id.cmp(&right.attempt_id))
+    });
     let owner_revision_state = states
         .iter()
-        .map(
-            |(assignment_id, attempt_id, state, epoch, next_required_action, _)| {
-                json!({
-                    "assignment_id": assignment_id,
-                    "attempt_id": attempt_id,
-                    "state": state,
-                    "epoch": epoch,
-                    "next_required_action": next_required_action,
-                })
-            },
-        )
+        .map(|state| {
+            json!({
+                "assignment_id": state.assignment_id,
+                "task_revision": state.task_revision,
+            })
+        })
         .collect::<Vec<_>>();
     Some(AuthoritativeWaitSnapshot {
         owner: sha256_text(&format!(
@@ -1510,22 +1682,29 @@ pub(crate) async fn inspect_authoritative_wait_snapshot(
         .get_agent_path()
         .unwrap_or_else(AgentPath::root)
         .to_string();
-    let mut states = Vec::with_capacity(assignment_ids.len());
-    for assignment_id in assignment_ids {
-        let assignment_id = AssignmentId::parse(assignment_id).ok()?;
-        let task = coordinator
-            .get_agent_task(assignment_id, Some(0))
-            .await
-            .ok()?;
-        states.push((
-            task.assignment.assignment_id.to_string(),
-            task.current_attempt.attempt_id.to_string(),
-            task.current_attempt.state,
-            task.workspace_status.epoch,
-            task.workspace_status.next_required_action.clone(),
-            task.receipt.is_some(),
-        ));
+    let guarded_assignment_ids = assignment_ids
+        .iter()
+        .map(|assignment_id| AssignmentId::parse(assignment_id).ok())
+        .collect::<Option<BTreeSet<_>>>()?;
+    let store = coordinator.store()?;
+    let mut assignments = hydrate_wait_owner_assignments(
+        coordinator,
+        Some(&store),
+        Some(&root_session_id),
+        &consuming_agent_path,
+    )
+    .await
+    .ok()?;
+    assignments
+        .tasks
+        .retain(|assignment_id, _| guarded_assignment_ids.contains(assignment_id));
+    assignments
+        .revisions
+        .retain(|assignment_id, _| guarded_assignment_ids.contains(assignment_id));
+    if assignments.tasks.len() != guarded_assignment_ids.len() {
+        return None;
     }
+    let states = authoritative_wait_states(&assignments)?;
     authoritative_wait_snapshot(Some(&root_session_id), &consuming_agent_path, &states)
 }
 

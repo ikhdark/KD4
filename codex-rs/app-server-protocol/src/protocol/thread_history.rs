@@ -922,7 +922,9 @@ impl ThreadHistoryBuilder {
     ) {
         let has_receiver = payload.new_thread_id.is_some();
         let status = match &payload.status {
-            AgentStatus::Errored(_) | AgentStatus::NotFound => CollabAgentToolCallStatus::Failed,
+            AgentStatus::Errored(_)
+            | AgentStatus::TerminalWithCompletion { error: Some(_), .. }
+            | AgentStatus::NotFound => CollabAgentToolCallStatus::Failed,
             _ if has_receiver => CollabAgentToolCallStatus::Completed,
             _ => CollabAgentToolCallStatus::Failed,
         };
@@ -973,7 +975,9 @@ impl ThreadHistoryBuilder {
         payload: &codex_protocol::protocol::CollabAgentInteractionEndEvent,
     ) {
         let status = match &payload.status {
-            AgentStatus::Errored(_) | AgentStatus::NotFound => CollabAgentToolCallStatus::Failed,
+            AgentStatus::Errored(_)
+            | AgentStatus::TerminalWithCompletion { error: Some(_), .. }
+            | AgentStatus::NotFound => CollabAgentToolCallStatus::Failed,
             _ => CollabAgentToolCallStatus::Completed,
         };
         let receiver_id = payload.receiver_thread_id.to_string();
@@ -1029,11 +1033,14 @@ impl ThreadHistoryBuilder {
         &mut self,
         payload: &codex_protocol::protocol::CollabWaitingEndEvent,
     ) {
-        let status = if payload
-            .statuses
-            .values()
-            .any(|status| matches!(status, AgentStatus::Errored(_) | AgentStatus::NotFound))
-        {
+        let status = if payload.statuses.values().any(|status| {
+            matches!(
+                status,
+                AgentStatus::Errored(_)
+                    | AgentStatus::TerminalWithCompletion { error: Some(_), .. }
+                    | AgentStatus::NotFound
+            )
+        }) {
             CollabAgentToolCallStatus::Failed
         } else {
             CollabAgentToolCallStatus::Completed
@@ -1079,7 +1086,9 @@ impl ThreadHistoryBuilder {
 
     fn handle_collab_close_end(&mut self, payload: &codex_protocol::protocol::CollabCloseEndEvent) {
         let status = match &payload.status {
-            AgentStatus::Errored(_) | AgentStatus::NotFound => CollabAgentToolCallStatus::Failed,
+            AgentStatus::Errored(_)
+            | AgentStatus::TerminalWithCompletion { error: Some(_), .. }
+            | AgentStatus::NotFound => CollabAgentToolCallStatus::Failed,
             _ => CollabAgentToolCallStatus::Completed,
         };
         let receiver_id = payload.receiver_thread_id.to_string();
@@ -1125,7 +1134,9 @@ impl ThreadHistoryBuilder {
         payload: &codex_protocol::protocol::CollabResumeEndEvent,
     ) {
         let status = match &payload.status {
-            AgentStatus::Errored(_) | AgentStatus::NotFound => CollabAgentToolCallStatus::Failed,
+            AgentStatus::Errored(_)
+            | AgentStatus::TerminalWithCompletion { error: Some(_), .. }
+            | AgentStatus::NotFound => CollabAgentToolCallStatus::Failed,
             _ => CollabAgentToolCallStatus::Completed,
         };
         let receiver_id = payload.receiver_thread_id.to_string();
@@ -4135,11 +4146,72 @@ mod tests {
                         status: crate::protocol::v2::CollabAgentStatus::Completed,
                         message: None,
                         surfaced_result: None,
+                        completion: None,
+                        last_agent_message: None,
                     },
                 )]
                 .into_iter()
                 .collect(),
             }
+        );
+    }
+
+    #[test]
+    fn reconstructs_collab_resume_end_preserves_terminal_completion_gate() {
+        let receiver_thread_id = ThreadId::try_from("00000000-0000-0000-0000-000000000002")
+            .expect("valid receiver thread id");
+        let events = vec![
+            EventMsg::UserMessage(UserMessageEvent {
+                client_id: None,
+                message: "resume agent".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+                ..Default::default()
+            }),
+            EventMsg::CollabResumeEnd(codex_protocol::protocol::CollabResumeEndEvent {
+                call_id: "resume-gated".into(),
+                completed_at_ms: 0,
+                sender_thread_id: ThreadId::try_from("00000000-0000-0000-0000-000000000001")
+                    .expect("valid sender thread id"),
+                receiver_thread_id,
+                receiver_agent_nickname: None,
+                receiver_agent_role: None,
+                status: AgentStatus::TerminalWithCompletion {
+                    last_agent_message: Some("partial result".to_string()),
+                    surfaced_result: None,
+                    error: None,
+                    completion: codex_protocol::protocol::TaskCompletionGate {
+                        status: codex_protocol::protocol::TaskCompletionStatus::Partial,
+                        reasons: vec!["validation did not pass".to_string()],
+                        evidence_path: Some("task-evidence/completion.json".to_string()),
+                    },
+                },
+            }),
+        ];
+
+        let items = events
+            .into_iter()
+            .map(RolloutItem::EventMsg)
+            .collect::<Vec<_>>();
+        let turns = build_turns_from_rollout_items(&items);
+        let ThreadItem::CollabAgentToolCall { agents_states, .. } = &turns[0].items[1] else {
+            panic!("expected collab agent tool call");
+        };
+
+        assert_eq!(
+            agents_states.get(&receiver_thread_id.to_string()),
+            Some(&CollabAgentState {
+                status: crate::protocol::v2::CollabAgentStatus::Completed,
+                message: Some("partial result".to_string()),
+                surfaced_result: None,
+                completion: Some(TaskCompletionGate {
+                    status: crate::protocol::v2::TaskCompletionStatus::Partial,
+                    reasons: vec!["validation did not pass".to_string()],
+                    evidence_path: Some("task-evidence/completion.json".to_string()),
+                }),
+                last_agent_message: Some("partial result".to_string()),
+            })
         );
     }
 
@@ -4196,6 +4268,8 @@ mod tests {
                         status: crate::protocol::v2::CollabAgentStatus::Running,
                         message: None,
                         surfaced_result: None,
+                        completion: None,
+                        last_agent_message: None,
                     },
                 )]
                 .into_iter()
@@ -4269,6 +4343,8 @@ mod tests {
                         status: crate::protocol::v2::CollabAgentStatus::Interrupted,
                         message: None,
                         surfaced_result: None,
+                        completion: None,
+                        last_agent_message: None,
                     },
                 )]
                 .into_iter()

@@ -414,6 +414,48 @@ async fn completed_plan_table_tail_skips_provisional_history_insert() {
 }
 
 #[tokio::test]
+async fn completed_plan_consolidates_streamed_cell_with_authoritative_final_text() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let cwd = chat.config.cwd.to_path_buf();
+
+    let mut controller = crate::streaming::controller::PlanStreamController::new(
+        Some(80),
+        cwd.as_path(),
+        HistoryRenderMode::Rich,
+    );
+    assert!(controller.push("- Streamed draft\n"));
+    assert!(
+        !controller.has_live_tail(),
+        "expected a finalized streamed cell for this regression",
+    );
+    chat.plan_stream_controller = Some(controller);
+    chat.transcript.plan_delta_buffer = "- Streamed draft\n".to_string();
+
+    while rx.try_recv().is_ok() {}
+
+    let final_plan = "- Authoritative final plan\n";
+    chat.on_plan_item_completed(final_plan.to_string());
+
+    let mut saw_streamed_cell = false;
+    let mut consolidated_source = None;
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            AppEvent::InsertHistoryCell(cell) => {
+                saw_streamed_cell |= cell.as_any().is::<history_cell::ProposedPlanStreamCell>();
+            }
+            AppEvent::ConsolidateProposedPlan(source) => consolidated_source = Some(source),
+            _ => {}
+        }
+    }
+
+    assert!(
+        saw_streamed_cell,
+        "expected the provisional streamed cell to retain consolidation bookkeeping",
+    );
+    assert_eq!(consolidated_source.as_deref(), Some(final_plan));
+}
+
+#[tokio::test]
 #[cfg_attr(target_os = "windows", ignore = "disabled on windows")]
 async fn configured_pet_load_is_deferred_until_after_construction() {
     let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();

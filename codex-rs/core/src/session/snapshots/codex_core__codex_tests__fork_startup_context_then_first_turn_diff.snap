@@ -1,5 +1,6 @@
 ---
 source: core/src/session/tests.rs
+assertion_line: 3429
 expression: snapshot
 ---
 Scenario: First request after fork when startup preserves the parent baseline, the fork changes approval policy, and the first forked turn enters plan mode.
@@ -10,6 +11,7 @@ Scenario: First request after fork when startup preserves the parent baseline, t
 02:message/developer:<PERMISSIONS_INSTRUCTIONS>
 03:message/developer:<skills_usage_instructions>\n## How to use skills\n- Use the smallest skill set named by the use...
 04:message/developer:<NO_TEXT>
-05:message/user:fork seed
-06:message/user:<ENVIRONMENT_CONTEXT>
-07:message/user:after fork
+05:message/developer:<root_orchestration_instructions>When several independent tool calls and their result handling a...
+06:message/user:fork seed
+07:message/user:<ENVIRONMENT_CONTEXT>
+08:message/user:after fork

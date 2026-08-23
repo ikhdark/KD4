@@ -61,6 +61,7 @@ fn runtime_response_paths_preserve_status_success_and_output_limits() {
             5,
             /*original_image_detail_supported*/ true,
             Instant::now(),
+            Vec::new(),
         );
 
         assert_eq!(output.success, expected_success);
@@ -86,18 +87,54 @@ fn runtime_response_sampling_identity_excludes_wall_time() {
         }],
         error_text: None,
     };
-    let recent = format_runtime_response(response(), None, usize::MAX, true, Instant::now());
+    let recent = format_runtime_response(
+        response(),
+        None,
+        usize::MAX,
+        true,
+        Instant::now(),
+        Vec::new(),
+    );
     let older = format_runtime_response(
         response(),
         None,
         usize::MAX,
         true,
         Instant::now() - Duration::from_secs(5),
+        Vec::new(),
     );
 
     assert_ne!(recent.body, older.body);
     assert_eq!(
         recent.sampling_request_signal(),
         older.sampling_request_signal(),
+    );
+}
+
+#[test]
+fn post_tool_feedback_survives_code_mode_projection() {
+    let output = format_runtime_response(
+        RuntimeResponse::Result {
+            cell_id: CellId::new("cell-feedback".to_string()),
+            content_items: Vec::new(),
+            error_text: None,
+        },
+        None,
+        usize::MAX,
+        true,
+        Instant::now(),
+        vec![FunctionCallOutputContentItem::InputText {
+            text: "hook feedback".to_string(),
+        }],
+    );
+
+    assert!(output.body.iter().any(|item| matches!(
+        item,
+        FunctionCallOutputContentItem::InputText { text } if text == "hook feedback"
+    )));
+    assert!(
+        output
+            .sampling_request_signal()
+            .is_some_and(|signal| signal.to_string().contains("hook feedback"))
     );
 }

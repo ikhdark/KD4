@@ -1,0 +1,1020 @@
+KD4 HISTORICAL SESSION AUDIT / BUG / FIX EVIDENCE
+Date: 2026-08-19
+Language classification: Multi-language
+Source scope: Codex sessions under C:\Users\kuh\.codex\sessions\2026\08
+
+This file contains detailed historical evidence migrated from actual user-message and final-answer events. It is not source code and was not independently revalidated during migration. Each record distinguishes what the session directly recorded from what remains a historical technical claim, hypothesis, limitation, or unknown. The KD4 or referenced project repository remains the source of truth for implementation causes.
+================================================================================
+EVIDENCE RECORD: 01a018cb-c912-7c72-8004-dc0e777a83e7:0513e051438a4b1a
+================================================================================
+Audit date: 2026-08-19
+Classified language: Multi-language
+Source session UUID: 01a018cb-c912-7c72-8004-dc0e777a83e7
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\19\rollout-2026-08-19T01-53-23-01a018cb-c912-7c72-8004-dc0e777a83e7.jsonl
+Working directory: c:\Users\kuh\Desktop\kd4
+Git revision recorded by session: 652c08e8e557ec2abdf7aeabe99a1e12875e62a8
+Thread source: user
+Unique relevant conclusions retained from session: 2
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: a0aacce73edb43abc646e62954baf0d5c7e327f2161077f75227e087643e27ef
+
+Recorded audit/fix task or prompt:
+01a018c7-a357-7c11-a7ca-9248dd075f22
+audit why the turns and time to finish task is so slow.\
+give only meaningful impact suggestions
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Root cause: orchestration overhead. One user request became 13 serial model passes and 13 tool calls, ran 250.9 seconds, and was interrupted before producing a final answer.
+
+Highest-impact fixes:
+
+1. Build a single-shot audit path: UUID → rollout snapshot → one bounded parser. The repeated parsing phase consumed 167.2 seconds; five unnecessary follow-up parses occupied roughly 140 seconds and caused truncation, encoding failure, and cancellation. This also skips the 21.9-second tool-discovery/read-thread detour.
+
+2. Fix or bypass nested `exec_command` latency. Six trivial local parses each took 14.4–15.2 seconds, totaling 90.2 seconds. Use the direct shell path, or make the nested runner return immediately when the process exits instead of waiting for its observation interval.
+
+3. Fix the command-session ID contract. `exec_command` returned session ID `2374420115`, but `write_stdin` rejected it as exceeding signed `i32`. Use a wider integer or string ID. This prevented reuse of the running command and forced another search pass.
+
+4. Use low/medium reasoning and a lean tool context for deterministic log aggregation. High effort plus repeated context produced 222,749 input tokens—only 81,152 cached—and consumed 128.7 seconds in model generation and post-tool handoffs. Reserve high effort for the final synthesis. This aligns with [official OpenAI guidance](https://developers.openai.com/api/docs/guides/latest-model) on latency-sensitive reasoning, lean prompts, and bounded programmatic tool workflows.
+
+--- Relevant turn 2 ---
+Conclusion SHA-256: a3967447c230757d17d6e531229597edade81dd2aaa5bc94789112fcec7f2acf
+
+Recorded audit/fix task or prompt:
+fix 1-3
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Implemented fixes 1–3:
+
+- UUID audit now resolves the exact rollout and emits one bounded summary. Actual workload: **67.74 ms**, **5,980 bytes**, all **13/13 tool calls paired**. [kd4_turn_latency_audit.py](C:/Users/kuh/Desktop/kd4/scripts/kd4_turn_latency_audit.py:749)
+- `exec_command` now reacts immediately to process exit, then uses a resettable **250 ms** drain window for trailing output. [process.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/unified_exec/process.rs:576)
+- Session IDs are `u32` end-to-end; regression coverage includes the previously rejected `2374420115`. [write_stdin.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/unified_exec/write_stdin.rs:238)
+
+Validation: 8 Python tests passed; performance, formatting, and diff checks passed. Focused Rust tests could not finish because the command runner interrupted Cargo at 5s and again at 64s; repository policy prevented another build retry.
+
+Desktop requires a binary rebuild/replacement and restart before these source changes become active.
+
+Skills used: [openai-docs](C:/Users/kuh/.codex/skills/.system/openai-docs/SKILL.md), [repo-atlas](C:/Users/kuh/.codex/plugins/cache/repo-atlas-local/repo-atlas/7.0.0/skills/repo-atlas/SKILL.md).
+
+================================================================================
+EVIDENCE RECORD: 01a018cd-07d3-7842-a0a3-c9ea57cd7695:499b1b17dc6427d9
+================================================================================
+Audit date: 2026-08-19
+Classified language: Multi-language
+Source session UUID: 01a018cd-07d3-7842-a0a3-c9ea57cd7695
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\19\rollout-2026-08-19T01-54-45-01a018cd-07d3-7842-a0a3-c9ea57cd7695.jsonl
+Working directory: c:\Users\kuh\Desktop\kd4
+Git revision recorded by session: 652c08e8e557ec2abdf7aeabe99a1e12875e62a8
+Thread source: user
+Unique relevant conclusions retained from session: 2
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: 3b62daa30a5deaf0430ce17ff64ae5a4ae7a4fe5bfa42a223b9fde239c5767fb
+
+Recorded audit/fix task or prompt:
+01a018c7-a357-7c11-a7ca-9248dd075f22\
+audit why the turns and time to finish task is so slow.\
+give only meaningful impact suggestions
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+The session was slow because the audit itself became a serial investigation. It ran for 250.9 seconds, made 13 model generations and 25 tool calls, then was interrupted without a final answer.
+
+Timing attribution:
+
+- 162.1s (64.6%): host/orchestration overhead
+- 82.7s (33.0%): model generation
+- 6.0s (2.4%): actual tool execution
+- 0s: approvals, user waits, retries, or validation
+
+Only high-impact changes:
+
+1. Build a one-shot session analyzer. Six separate Python passes over a 174KB rollout caused truncation, a Unicode failure, repeated inspection, and roughly 90 seconds of command latency. One UTF-8-safe script should return bounded timing, call, failure, and token summaries. This would also eliminate approximately five model continuations—likely saving around two minutes here.
+
+2. Remove the short-command 15-second floor. Trivial parsers repeatedly reported 15.1–15.2 seconds while the profiler attributed almost no active tool time to them. Fix the command completion/polling path or route short noninteractive commands through the synchronous shell lane. This is the largest platform-level issue.
+
+3. Enforce an audit stop condition. At 202.6 seconds the agent had already identified the dominant cause, but spent another 48 seconds inspecting counters and timing-schema keys. Once timing attribution and representative slow calls agree, finalize.
+
+4. Reduce per-generation context and use a latency-appropriate model setting. Thirteen requests consumed 222,749 input tokens; the last request alone had 31,111, including about 10.6k tool-schema and 19.6k repeated-context tokens. Expose only the thread-reader and shell tools, and test medium effort for routine audits. This follows [official OpenAI guidance](https://developers.openai.com/api/docs/guides/latest-model) to keep prompts/tool sets lean and use low or medium effort for latency-sensitive work.
+
+The savings estimates overlap; the priority order is one-shot analysis, command-lane repair, then context/model tuning.
+
+--- Relevant turn 2 ---
+Conclusion SHA-256: 4f750c303a914f507a192e8c7c0dd71265f933f2c681dd414000383ee23391f3
+
+Recorded audit/fix task or prompt:
+fix 1-3
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Implemented fixes 1–3.
+
+- One-shot audit: accepts a session UUID directly, snapshots safely, reports bounded execution-loop/slow-call evidence, and avoids raw command/output leakage. [kd4_turn_latency_audit.py](C:/Users/kuh/Desktop/kd4/scripts/kd4_turn_latency_audit.py:164)
+- Stop enforcement: repository instructions now require the analyzer and require finalizing when `readyToFinalize=true`. [AGENTS.md](C:/Users/kuh/Desktop/kd4/AGENTS.md:63)
+- Command delay: exited processes now wait only for a 250 ms output-quiescence window instead of the full requested yield, resetting the window when late output arrives. [process_manager.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/unified_exec/process_manager.rs:1980)
+- Added coverage for immediate and delayed post-exit output. [process_manager_tests.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/unified_exec/process_manager_tests.rs:249)
+
+Validation:
+
+- 8 focused Python tests passed.
+- Real 286 KB rollout probe: 67 ms, 922-character output, versus the <1 second and <1,200-token budgets. Sample count: 1; this proves the analyzer workload only, not general runtime performance.
+- Focused files pass Ruff, rustfmt, and `git diff --check`.
+- Rust tests could not execute because unrelated concurrent changes introduce four `i32`/`u32` process-ID compilation errors in `process_manager.rs`, `tools/runtimes/unified_exec.rs`, and `tasks/mod.rs`. I did not modify those unrelated changes or rerun the build.
+
+The one-shot workflow and explicit stopping rule align with [official OpenAI tool-orchestration guidance](https://developers.openai.com/api/docs/guides/latest-model). Source changes still require rebuilding/publishing the local binary and restarting Desktop before runtime activation.
+
+================================================================================
+EVIDENCE RECORD: 01a01d39-0f00-7be0-8db3-9c5a7e808095:c9c2ae3b810148f1
+================================================================================
+Audit date: 2026-08-19
+Classified language: Multi-language
+Source session UUID: 01a01d39-0f00-7be0-8db3-9c5a7e808095
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\19\rollout-2026-08-19T22-31-13-01a01d39-0f00-7be0-8db3-9c5a7e808095.jsonl
+Working directory: c:\Users\kuh\Desktop\kd4
+Git revision recorded by session: c4aea76f7784d718657add4cec5e7e1de24a9edf
+Thread source: user
+Unique relevant conclusions retained from session: 2
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: 57d06e1c4737552c3566b795b8fe8d46cb1129c912d7b62845d1e7eed3fa1ffe
+
+Recorded audit/fix task or prompt:
+"C:\Users\kuh\Desktop\LOCAL-KD\sessions\2026\08\19\rollout-2026-08-19T22-16-28-01a01d2b-8778-7ed3-a04d-87cbcd3a4188.jsonl"\
+"C:\Users\kuh\Desktop\LOCAL-KD\sessions\2026\08\19\rollout-2026-08-19T22-14-03-01a01d29-52f0-77c3-b3e8-8ddf016cec17.jsonl"\
+"C:\Users\kuh\Desktop\LOCAL-KD\sessions\2026\08\19\rollout-2026-08-19T19-25-10-01a01c8e-a688-7890-9c19-4d73117f04e7.jsonl"\
+"C:\Users\kuh\Desktop\LOCAL-KD\sessions\2026\08\19\rollout-2026-08-19T22-18-45-01a01d2d-8805-73d2-9a2c-04359d4002c2.jsonl"\
+"C:\Users\kuh\Desktop\LOCAL-KD\sessions\2026\08\19\rollout-2026-08-19T19-53-04-01a01ca8-3f32-7ec0-9df9-a5da40548492.jsonl"
+
+audit these for improvements related to turns, clockwall, tokens, wasted turns, long turns, wrong behavior etc.
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+The dominant problem is orchestration latency, not command execution. Across the three finalized audits, orchestration consumed about 49½ of 89¾ audited minutes. The two unfinished sessions show similar symptoms but remain provisional.
+
+| Rollout | State | Audit time / valid turn | Orchestration | Slow calls ≥5s | Unchanged work |
+|---|---:|---:|---:|---:|---:|
+| [22:16](C:/Users/kuh/Desktop/LOCAL-KD/sessions/2026/08/19/rollout-2026-08-19T22-16-28-01a01d2b-8778-7ed3-a04d-87cbcd3a4188.jsonl) | Final, 2/2 | ≈12:45 / 6:22 | 403s, 52.7% | 18/28 | 187s |
+| [22:14](C:/Users/kuh/Desktop/LOCAL-KD/sessions/2026/08/19/rollout-2026-08-19T22-14-03-01a01d29-52f0-77c3-b3e8-8ddf016cec17.jsonl) | Final, 2/2 | ≈15:09 / 7:35 | 575s, 63.2% | 15/20 | 31s |
+| [19:25](C:/Users/kuh/Desktop/LOCAL-KD/sessions/2026/08/19/rollout-2026-08-19T19-25-10-01a01c8e-a688-7890-9c19-4d73117f04e7.jsonl) | Open, 9/10 | ≈82:12+ / 9:08+ | 2,545s, 51.6% | 175/217 | 735s |
+| [22:18](C:/Users/kuh/Desktop/LOCAL-KD/sessions/2026/08/19/rollout-2026-08-19T22-18-45-01a01d2d-8805-73d2-9a2c-04359d4002c2.jsonl) | Open, 7/8 | ≈5:17+ / 0:45+ | No majority | 9/12 | 53s |
+| [19:53](C:/Users/kuh/Desktop/LOCAL-KD/sessions/2026/08/19/rollout-2026-08-19T19-53-04-01a01ca8-3f32-7ec0-9df9-a5da40548492.jsonl) | Final, 13/14 | ≈61:46 / 4:45 | 1,994s, 53.8% | 68/76 | 204s |
+
+Key findings:
+
+- The clearest defect is time between child execution and result delivery. In the two two-turn rollouts, command round-trips totaled 850.7 seconds while the children themselves ran for only 2.7 seconds.
+- The 19:25 rollout is the worst efficiency case: 227 sampling passes, 217 paired tools, 1,875 model seconds, 1,077 seconds of handoff time, and 735 seconds in an unchanged state/action stream.
+- The 19:53 rollout contains probable process-management waste: a `write_stdin` call remained running for 311 seconds, an `exec_command` failed after 254 seconds, and another completed after 125 seconds.
+- The two-turn rollouts used 10–14 tools per turn despite almost no child runtime. These are oversized internal turns rather than excessive user turns.
+- The 22:18 rollout should not be lumped into the same diagnosis yet. It had no majority attribution, and 46.7 seconds came from `request_user_input`—human response time that should be excluded from agent-latency SLOs.
+- All files had zero parse errors and near-complete decision coverage. However, 19:53 had 14 terminal turns but only 13 valid completions, while 19:25 and 22:18 each remained non-terminal after the permitted blocker follow-up.
+
+Recommended improvements, in order:
+
+1. Instrument and fix orchestration boundaries: separately timestamp dispatch, child start/end, output collection, result delivery, and model resumption.
+2. Replace repeated unchanged-state polling with one awaited wait operation; batch independent calls and consolidate read-only checks.
+3. Add fail-fast command handling: bounded timeouts, explicit terminal states, and no repeated broad validation after the same blocker.
+4. Add a turn-efficiency guard for high tool-call counts with negligible child runtime or consecutive unchanged samples.
+5. Finalize canceled, failed, and abandoned turns explicitly; distinguish running-process, user-waiting, and leaked-turn states.
+6. Exclude human-input wait time from agent/system wall-clock reporting.
+
+Exact token counts were not exposed by the prescribed auditor, so token waste cannot be measured honestly from these reports. The strongest token-risk proxies are the 19:25 rollout’s 227 sampling passes and 1,875 model seconds, followed by 19:53. The auditor should add cached input, uncached input, reasoning, output, and total tokens per turn plus tokens spent during unchanged-state intervals.
+
+--- Relevant turn 2 ---
+Conclusion SHA-256: 7d8d8cc7d7f51a0e0a36ce185336665af01e0c5feeedce6fae267b416c80d1d9
+
+Recorded audit/fix task or prompt:
+fix all 6
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Implemented all six in source:
+
+- Persisted per-tool orchestration boundaries and exact token diagnostics.
+- Replaced unchanged polling with event-driven waits and batching.
+- Added progress-aware 60-second command/background stall handling.
+- Added an eight-pass turn guard and repeated-action convergence.
+- Added explicit completion, cancellation, waiting, and open-turn lifecycle states.
+- Separated human wait from agent-active wall time throughout the auditor.
+
+Validation:
+
+- Python auditor: 8/8 passed.
+- Rust timing: 44/45 passed, including the new relay lifecycle coverage.
+- `git diff --check`: passed.
+- Remaining failure is an unchanged pre-existing test, `deterministic_primary_retry_and_fallback_attempts_reconcile_without_inflating_generations`, which expects stream-wait time while creating only request-wait guards.
+
+The main reporting changes are in [kd4_turn_latency_audit.py](C:/Users/kuh/Desktop/kd4/scripts/kd4_turn_latency_audit.py), with runtime instrumentation in [turn_timing.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/turn_timing.rs) and [parallel.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/parallel.rs). Repo Atlas guided the owner mapping across these paths.
+
+This is not yet installed into Desktop; publishing/restarting and a live before/after rollout remain necessary for real latency/token proof.
+
+================================================================================
+EVIDENCE RECORD: 01a01d3a-25c3-7ba3-8a0e-3de0aed328ab:44788afe5b81fdec
+================================================================================
+Audit date: 2026-08-19
+Classified language: Multi-language
+Source session UUID: 01a01d3a-25c3-7ba3-8a0e-3de0aed328ab
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\19\rollout-2026-08-19T22-32-25-01a01d3a-25c3-7ba3-8a0e-3de0aed328ab.jsonl
+Working directory: c:\Users\kuh\Desktop\kd4
+Git revision recorded by session: c4aea76f7784d718657add4cec5e7e1de24a9edf
+Thread source: user
+Unique relevant conclusions retained from session: 3
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: cdac74a4d0426c8d67c6dd7e4749202c195160eff46fd3577bcc33c58e6f9360
+
+Recorded audit/fix task or prompt:
+"C:\Users\kuh\Desktop\LOCAL-KD\sessions\2026\08\19\rollout-2026-08-19T22-16-28-01a01d2b-8778-7ed3-a04d-87cbcd3a4188.jsonl"\
+"C:\Users\kuh\Desktop\LOCAL-KD\sessions\2026\08\19\rollout-2026-08-19T22-14-03-01a01d29-52f0-77c3-b3e8-8ddf016cec17.jsonl"\
+"C:\Users\kuh\Desktop\LOCAL-KD\sessions\2026\08\19\rollout-2026-08-19T19-25-10-01a01c8e-a688-7890-9c19-4d73117f04e7.jsonl"\
+"C:\Users\kuh\Desktop\LOCAL-KD\sessions\2026\08\19\rollout-2026-08-19T22-18-45-01a01d2d-8805-73d2-9a2c-04359d4002c2.jsonl"\
+"C:\Users\kuh\Desktop\LOCAL-KD\sessions\2026\08\19\rollout-2026-08-19T19-53-04-01a01ca8-3f32-7ec0-9df9-a5da40548492.jsonl"
+
+audit these for improvements related to turns, clockwall, tokens, wasted turns, long turns, wrong behavior etc.
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+The main problem is orchestration latency, not command execution. In the four sessions with child-runtime attribution, at least **3,053 seconds** were orchestration gap versus **765 seconds** of actual child work—about 4× more waiting than execution.
+
+| Session | Turn state | Main findings |
+|---|---:|---|
+| `01a01d2b…a4188` | 2/2 complete | Orchestration 403.0s (52.7%). Command round trips took 281.6s for only 1.5s of child work. Model time was 346.4s versus 12.9s tool time; 187.3s was unchanged-state activity. |
+| `01a01d29…cec17` | 2/2 complete | Worst pure wrapper overhead: 569.1s round trip for 1.2s child work. Orchestration was 574.7s (63.2%); 15 of 20 calls exceeded 5s. |
+| `01a01c8e…04e7` | 9/10 complete; 1 still live | Worst overall: 175 slow calls, 2,544.8s orchestration, 1,874.9s model time, 1,077.1s handoff delay, and 734.5s unchanged-state activity. One failed command consumed 109.4s. |
+| `01a01d2d…02c2` | 7/8 complete; 1 still live | Smallest workload and no majority latency source. A 46.7s `request_user_input` should be classified as human wait, not agent waste. One execution remained non-terminal. |
+| `01a01ca8…48492` | 13 valid completions / 14 terminal | Orchestration was 1,993.9s (53.8%). Unlike the others, 723.4s was real child work, but another 1,189.6s was gap. Includes a 253.8s failed command and a `write_stdin` reported running for 311.4s. One terminal turn was not a valid completion. |
+
+Priority improvements:
+
+1. Instrument and fix the tool relay path. Record enqueue, child-start, child-end, and result-delivery timestamps. The enormous `exec → exec_command` gap is otherwise invisible as to whether it is scheduling, serialization, or backpressure.
+2. Batch independent tool calls and reduce serialized sampling loops. The worst session used 227 model sampling passes and 218 tool calls.
+3. Add a no-progress guard: after two identical state fingerprints or equivalent results, stop polling/reasoning and either wait eventfully or conclude. This targets the 734.5s and 187.3s unchanged-state streams.
+4. Bound long commands with progress reporting, cancellation, and failure cleanup. The 109–311s failed/running calls are concrete wasted-clock candidates.
+5. Shorten post-tool reasoning and handoff. The `c8e` session alone spent 1,077.1s between tool completion and the next effective handoff.
+6. Separate human wait from agent latency, particularly `request_user_input`.
+7. Add token accounting to the auditor: input, cached input, output, and reasoning tokens per turn and between tool calls. The current reports contain no token counts, so token waste cannot be measured honestly from these audits; model seconds are not a valid substitute.
+8. Add per-turn timing output. The reports identify the problematic sessions and slow calls, but not the exact longest turn boundaries.
+
+Behaviorally, the reports establish failed calls, one invalid terminal completion, and two still-live turns. They do **not** inspect semantic correctness, so they cannot determine whether answers or edits were wrong. Parsing health was good—zero parse errors—and decision coverage was 312/315.
+
+The two live-session blockers remained unchanged on the permitted follow-up audit, so I stopped rather than repeatedly re-auditing active files.
+
+--- Relevant turn 2 ---
+Conclusion SHA-256: cad7010a76ab3506c2222a38093aa511bbaead9c45cccba5f57e2b7091648567
+
+Recorded audit/fix task or prompt:
+fix all 8
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Implemented all eight source-level fixes, but verification is partial because an unrelated pre-existing timing test blocks the remaining build checks.
+
+| Area | Fix |
+|---|---|
+| Tool relay | Schema v21 now records acceptance, polling, gate, handler, process, output, delivery, and model-resume boundaries. |
+| Batching | Added evidence-packet batching guidance and an eight-pass soft ceiling. |
+| Wasted turns | Exact unchanged action/result cycles converge on the second observation; repeated failures/source passes are suppressed. |
+| Long calls | Added output-driven progress watchdogs, owner-held waiting, cancellation, teardown, and cleanup. |
+| Handoff | Measures output-collected → delivered → model-resumed latency plus post-handler work. |
+| Human wait | Separates human-only/union wait from agent-active wall time. |
+| Tokens | Reports input/cache/output/reasoning, coverage, billable totals, and between-tool peaks. |
+| Per-turn audit | Adds boundaries, lifecycle state, failures, leaks, batching, tokens, and behavior signals. |
+
+Primary changes are in [parallel.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/parallel.rs:390), [turn_timing.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/turn_timing.rs:1283), [protocol.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/protocol/src/protocol.rs:2082), [reasoning_governor.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/reasoning_governor.rs:2178), and [kd4_turn_latency_audit.py](/C:/Users/kuh/Desktop/kd4/scripts/kd4_turn_latency_audit.py). Repo Atlas kept the implementation within these existing owners.
+
+Validation:
+
+- Auditor unit tests: 6 passed.
+- Rust: 27 passed, including relay persistence, all convergence cases, and source correlation.
+- Formatting and targeted diff checks passed.
+- All five rollouts reached `audit decision: finalize` with zero parse errors.
+- Baseline workload: 39 turns, 411 sampling passes, 375 paired tool calls, zero multi-call passes, 301 tool calls ≥5 seconds, 12,154.9 seconds agent-active time, and about 6.48M tokens in unchanged-state/action intervals.
+- Telemetry adds zero model-visible tokens.
+
+Remaining blocker: `deterministic_primary_retry_and_fallback_attempts_reconcile_without_inflating_generations` failed twice because the baseline test expects request-wait time in `model_stream_wait_ns`—10,000,000 expected, 0 observed—even though baseline code separates request wait from stream wait. Consequently, 21 Rust tests, app-server schema regeneration, and the final app-server check could not run.
+
+The Desktop binary was not published or restarted, so these fixes are not live yet and no post-change runtime benchmark is claimed.
+
+--- Relevant turn 3 ---
+Conclusion SHA-256: 917268de413dfd2d0d1c55392beedf7e121f0128cb3a0114079a5ec922caaa60
+
+Recorded audit/fix task or prompt:
+make sure these are implemented correctly.
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+The eight improvements are correctly wired at the source and contract level. I found and fixed four remaining edge defects:
+
+- Retry/fallback attempts are now grouped into one logical token interval, avoiding duplicated tool-batch attribution in [kd4_turn_latency_audit.py](/C:/Users/kuh/Desktop/kd4/scripts/kd4_turn_latency_audit.py:360).
+- Slow-tool detection now includes pre-poll queue time, measuring acceptance through delivery [here](/C:/Users/kuh/Desktop/kd4/scripts/kd4_turn_latency_audit.py:511).
+- Suppressed tool responses now record their output-collected lifecycle boundary [here](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/parallel.rs:496).
+- Non-cooperative remote code-mode delegates now receive a bounded two-second cleanup window instead of leaving an indefinitely running detached task [here](/C:/Users/kuh/Desktop/kd4/codex-rs/code-mode/src/remote_session/connection/driver/delegate_runtime.rs:33).
+
+Verified:
+
+- All 10 audit-script tests pass.
+- Targeted Rust formatting and `git diff --check` pass.
+- Generated JSON schemas parse and TypeScript exports are present.
+- `just source-map-check` passes.
+- Lifecycle persistence, process/cancellation handling, state-change waits, batching guidance, convergence guards, token/human-wait reporting, and app-server compatibility were inspected directly.
+- Repo Atlas routed the ownership review; direct source/schema inspection was authoritative because its semantic index degraded.
+
+Final Cargo proof remains partial: the earlier focused run passed 27 tests but twice hit the unrelated pre-existing test `deterministic_primary_retry_and_fallback_attempts_reconcile_without_inflating_generations`—expected `model_stream_wait_ns=10_000_000`, received `0`. Per repository policy, I did not start another Cargo build or run the remaining 21 tests/app-server schema build check.
+
+These changes are not Desktop-visible until the fork is rebuilt, installed, and Desktop restarted.
+
+================================================================================
+EVIDENCE RECORD: 01a01d3a-2b8d-7441-98fd-a4443fc68dfb:549c417fabb99f31
+================================================================================
+Audit date: 2026-08-19
+Classified language: Multi-language
+Source session UUID: 01a01d3a-2b8d-7441-98fd-a4443fc68dfb
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\19\rollout-2026-08-19T22-32-26-01a01d3a-2b8d-7441-98fd-a4443fc68dfb.jsonl
+Working directory: c:\Users\kuh\Desktop\kd4
+Git revision recorded by session: c4aea76f7784d718657add4cec5e7e1de24a9edf
+Thread source: user
+Unique relevant conclusions retained from session: 3
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: 14700574e63d5b178b2567661c7a6ab753bfb0a2884f453f1752c6e25b5e4865
+
+Recorded audit/fix task or prompt:
+"C:\Users\kuh\Desktop\LOCAL-KD\sessions\2026\08\19\rollout-2026-08-19T22-16-28-01a01d2b-8778-7ed3-a04d-87cbcd3a4188.jsonl"\
+"C:\Users\kuh\Desktop\LOCAL-KD\sessions\2026\08\19\rollout-2026-08-19T22-14-03-01a01d29-52f0-77c3-b3e8-8ddf016cec17.jsonl"\
+"C:\Users\kuh\Desktop\LOCAL-KD\sessions\2026\08\19\rollout-2026-08-19T19-25-10-01a01c8e-a688-7890-9c19-4d73117f04e7.jsonl"\
+"C:\Users\kuh\Desktop\LOCAL-KD\sessions\2026\08\19\rollout-2026-08-19T22-18-45-01a01d2d-8805-73d2-9a2c-04359d4002c2.jsonl"\
+"C:\Users\kuh\Desktop\LOCAL-KD\sessions\2026\08\19\rollout-2026-08-19T19-53-04-01a01ca8-3f32-7ec0-9df9-a5da40548492.jsonl"
+
+audit these for improvements related to turns, clockwall, tokens, wasted turns, long turns, wrong behavior etc.
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+## Audit result
+
+The dominant issue is orchestration latency, not actual command execution. Four of five sessions attribute roughly 52–63% of measured delay to orchestration. Across the latest reports:
+
+- 355 paired tool calls; 286 (80.6%) took at least 5 seconds.
+- About 51 minutes of accumulated command-wrapper gap versus 12m45s of actual child-process work.
+- 20m10s occurred in unchanged-state/action streams—a strong proxy for stalled or unproductive time.
+- Two turns remained non-terminal across two audit passes.
+- Zero parse errors; decision coverage was 312/315 (99.0%).
+
+Timing values are accumulated attribution buckets, not literal start-to-finish wall clock; they may overlap.
+
+| Session suffix | Valid/started turns | Calls ≥5s | Model/tool time | Unchanged stream | Main issue |
+|---|---:|---:|---:|---:|---|
+| `01a01d2b…` | 2/2 | 18/28 | 346.4s / 12.9s | 187.3s | 403.0s orchestration; 280.1s wrapper gap around only 1.5s child work |
+| `01a01d29…` | 2/2 | 15/20 | 267.8s / 61.5s | 31.4s | 574.7s orchestration; 567.9s gap around 1.2s child work |
+| `01a01c8e…` | 9/10 | 176/218 | 1874.9s / 165.2s | 734.5s | Worst overall: 2544.8s orchestration, 1022.4s gap, one persistent open turn |
+| `01a01d2d…` | 7/8 | 9/13 | 115.5s / 17.2s | 52.6s | One persistent open turn; no majority attribution. The 46.7s user-input wait should be excluded from agent latency |
+| `01a01ca8…` | 13/14 | 68/76 | 803.3s / 907.4s | 204.1s | 1993.9s orchestration; 1189.6s wrapper gap. One terminal turn was not classified as valid complete |
+
+The strongest long-turn proxies are `01a01c8e…`, `01a01d2b…`, and `01a01d29…`, averaging respectively 208.3s, 173.2s, and 133.9s of model attribution per valid completed turn. These are averages, not per-turn maximums.
+
+Recommended improvements, in order:
+
+1. Make `exec → exec_command` result propagation event-driven. Instrument dispatch, child start/end, wrapper receipt, and tool-result delivery separately. The near-zero child work in the first two sessions proves the delay is outside the command.
+2. Guarantee terminalization and cancellation propagation. The open turns in `01a01c8e…` and `01a01d2d…` persisted across both audits.
+3. Reduce micro-call count by batching safe reads/searches and parallelizing independent operations. `01a01c8e…` used about 24 calls per valid turn.
+4. Add timeouts and cleanup for failed or still-running cells. Notable cases were a 253.8s failed exec, a 109.4s failed exec, a 311.4s running `write_stdin`, and a 40.8s running exec.
+5. Treat unchanged-state duration as a regression metric, especially the 734.5s in `01a01c8e…` and 187.3s across only two turns in `01a01d2b…`.
+6. Separate genuine child runtime and user-response waits from agent/orchestrator latency.
+
+Token counts were not emitted by the required analyzer, so token efficiency cannot be quantified honestly from these reports. Add per-turn input, cached-input, output, reasoning, and tool-payload tokens, plus tokens per completed turn and per sampling pass. Timing ratios are not valid token substitutes.
+
+No semantic wrong-answer conclusion is supported by this timing-only audit. Confirmed operational problems are the persistent non-terminal turns, long failed/running tool calls, and excessive wrapper delay. Three sessions finalized; the other two remained partial because the same open-turn blocker persisted on the permitted follow-up.
+
+--- Relevant turn 2 ---
+Conclusion SHA-256: 7887fed3de26a9a3f07a233474276946c72e4784842098b524f670abd145016d
+
+Recorded audit/fix task or prompt:
+fix all 6
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Implemented all six improvement areas, but final status is **partial** due one validation blocker.
+
+- Event-driven nested-tool, code-cell, and durable-agent wakeups.
+- Bounded cancellation, callback cleanup, and terminalization.
+- Tool batching and unchanged-cycle convergence.
+- Stall detection and safe long-command waiting.
+- Schema-21 latency, relay, token, and unchanged-state metrics.
+- Separate agent-active, child-runtime, and human-wait accounting.
+
+Validation:
+
+- Analyzer: 8/8 passed.
+- Background-wait compatibility: 5/5 passed.
+- Consolidated runtime proof: 15/16 passed.
+- Formatting and diff checks passed.
+
+The remaining test failed twice because valid stall-timeout output was replaced with `stale_workspace_evidence`. The owner is exact workspace-identity revalidation in [tool_history.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tool_history.rs:769). Per repository rules, I stopped further builds after the duplicate failure. Schema validation could not run afterward.
+
+Repo Atlas guided the changes through code-mode, unified exec, turn timing, protocol, and analyzer ownership. Nothing was published or restarted.
+
+--- Relevant turn 3 ---
+Conclusion SHA-256: 4afc97b8e5e328f7f2316c10b1fa1883f36fc1576ceda2b83004e87500c2d9a5
+
+Recorded audit/fix task or prompt:
+make sure these are implemented correctly.
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+All six fixes are implemented, and I repaired four correctness gaps found during the final audit:
+
+- Explicit empty `yield_control()` events are no longer swallowed by resampling ([wait_handler.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/code_mode/wait_handler.rs:292)).
+- Nested tool cancellation now retains the owner future through cleanup ([delegate.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/code_mode/delegate.rs:262)).
+- Non-cooperative cleanup is bounded to two seconds, while workspace evidence again uses authoritative before/after captures and supports non-Git workspaces ([parallel.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/parallel.rs:98)).
+- Cancellation and user steering take priority over agent-store events ([wait.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs:962)).
+- The analyzer correctly separates child runtime, machine waits, human waits, lifecycle state, tokens, and unchanged-state duration ([kd4_turn_latency_audit.py](/C:/Users/kuh/Desktop/kd4/scripts/kd4_turn_latency_audit.py:875)).
+
+Validation:
+
+- 5 focused Rust runtime tests passed.
+- 11 analyzer tests passed.
+- Targeted Rust formatting passed.
+- `git diff --check` passed.
+- Generated protocol/schema proof had already passed.
+
+One limitation remains: the stall-timeout integration run was invalidated twice because another overlapping edit changed workspace evidence while the test was running. After reconciling that regression, repository policy prohibited another Cargo run. Thus the final stall integration retest is not certified in this turn.
+
+No binary was published and Desktop was not restarted.
+
+================================================================================
+EVIDENCE RECORD: 01a01d3a-5c0a-73a2-8755-d4e209da35cd:e2a51e2bba4bdbdd
+================================================================================
+Audit date: 2026-08-19
+Classified language: Multi-language
+Source session UUID: 01a01d3a-5c0a-73a2-8755-d4e209da35cd
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\19\rollout-2026-08-19T22-32-39-01a01d3a-5c0a-73a2-8755-d4e209da35cd.jsonl
+Working directory: c:\Users\kuh\Desktop\kd4
+Git revision recorded by session: c4aea76f7784d718657add4cec5e7e1de24a9edf
+Thread source: user
+Unique relevant conclusions retained from session: 2
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: e870aca0a7a7f32970e333e4f0ea88b15949425d39954ec292cce9fd5ab9dab6
+
+Recorded audit/fix task or prompt:
+**Eliminate orchestration idle gaps.** `[test_result]`\
+Orchestration dominated both sessions: **51.6%** and **59.2%**. Outer command gaps consumed **641s** and **1,168s**, far exceeding child-work time.\
+**Change:** keep long-running commands inside one await/poll loop and return to the model only on meaningful state changes.
+
+1. **Adopt the second session’s lower-generation pattern.** `[generated_summary]`\
+   Despite completing more turns, session 2 used **80 sampling passes / 70 tool calls**, versus **176 / 166** in session 1. Model time fell from **1,874.9s to 729.3s**, while unchanged-state time fell from **734.5s to 167.1s**.\
+   **Change:** batch independent calls, avoid model generations during unchanged polling, and target roughly **≤8 sampling passes per completed turn**.
+2. **Fail fast on stalled commands.** `[test_result]`\
+   Session 2 spent **606.1s** in tools despite only 70 calls; one failed command took **253.8s—42% of total tool time**.\
+   **Change:** add command-specific deadlines, cancellation, and progress-based stall detection. Do not wait several minutes for failures that can be identified earlier.
+
+fix these
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Implemented in the working tree, with final validation still partial.
+
+- Long-running code-mode/background waits now remain owner-held until output, completion, cancellation, or user steering: [wait_handler.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/code_mode/wait_handler.rs:142).
+- Independent evidence batching and the ≤8 sampling-pass target are encoded in the GPT-5.6 prompt: [gpt-5.6.md](C:/Users/kuh/Desktop/kd4/codex-rs/models-manager/prompts/gpt-5.6.md:42).
+- Shell commands support `stall_timeout_ms`; long commands default to a 60-second no-output deadline with cancellation and exit 124: [shell_command.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/shell/shell_command.rs:64), [shell.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/runtimes/shell.rs:138).
+- Per-call relay lifecycle timings and model/tool overlap are now recorded and audited: [protocol.rs](C:/Users/kuh/Desktop/kd4/codex-rs/protocol/src/protocol.rs:2086), [kd4_turn_latency_audit.py](C:/Users/kuh/Desktop/kd4/scripts/kd4_turn_latency_audit.py:170).
+
+Validation:
+
+- Latency analyzer: 8/8 tests passed.
+- Rust packages compiled successfully.
+- Focused Rust run reached 5 passing tests before two test-only assertion/lifetime defects failed twice; both were corrected. Nine selected tests were skipped by fail-fast.
+- `git diff --check` passed.
+- Per repository policy, I did not start another build after the repeated failure. Generated app-server schemas therefore still require regeneration, and the corrected tests require a final rerun.
+- No binary rollout or Desktop restart was performed. Runtime A/B proof also requires an exact session UUID/path.
+
+--- Relevant turn 2 ---
+Conclusion SHA-256: 248ba2be32c7cd998de8151903eaa8be66a24c3b9f7cf32fa8944ee0d159e74d
+
+Recorded audit/fix task or prompt:
+make sure these are implemented correctly.
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Status: **partial but materially corrected**. The implementation is structurally sound, and I found and fixed one real defect: stalled shell timeouts could return before recording validation cancellation. They now pass through the common cleanup path in [shell.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/runtimes/shell.rs:504).
+
+Verified behavior includes:
+
+- Event-driven owner waits with no periodic empty polling.
+- One final tool-free synthesis after unchanged evidence converges.
+- Batched-evidence guidance with an eight-pass soft target.
+- Progress-based stall cancellation with bounded process cleanup.
+- Persisted tool-relay timing and generated protocol contracts.
+
+Passed checks:
+
+- Latency-audit tests: **11/11**
+- `just source-map-check`
+- Targeted `rustfmt --check`
+- `git diff --check`
+- All **279** generated JSON schemas parsed
+- Generated TypeScript timing types and exports present
+
+Full proof remains blocked by two unrelated, five-hour-old shared Cargo lanes:
+
+- `cargo test -p codex-core orchestration_correctness --lib`
+- `cargo test -p codex-core typed_deterministic_generation_records_exact_disposition_and_nonprogress -- --exact`
+
+Per repository policy, I did not start a competing build. Therefore the focused Rust behavior suite, `just app-server-schema-check`, and runtime A/B latency/token benchmark remain unrun. I can’t honestly claim the performance thresholds are fully proven until those lanes clear and the same real workload is rerun. Repo Atlas helped confirm the protocol change’s app-server schema ownership boundary.
+
+================================================================================
+EVIDENCE RECORD: 01a01d3a-8f63-7222-9b4c-2a5cae7a940c:8377605bf9e82529
+================================================================================
+Audit date: 2026-08-19
+Classified language: Multi-language
+Source session UUID: 01a01d3a-8f63-7222-9b4c-2a5cae7a940c
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\19\rollout-2026-08-19T22-32-52-01a01d3a-8f63-7222-9b4c-2a5cae7a940c.jsonl
+Working directory: c:\Users\kuh\Desktop\kd4
+Git revision recorded by session: c4aea76f7784d718657add4cec5e7e1de24a9edf
+Thread source: user
+Unique relevant conclusions retained from session: 2
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: 140556098722c5a066a91c50325d4bd2c7d198b1daa02cfed6f2e45ecf95be56
+
+Recorded audit/fix task or prompt:
+Fix tool orchestration latency first.\
+Orchestration dominated both sessions: 2,544.8s (51.6%) and 1,933.7s (59.8%). Parent/child command gaps alone consumed 607.1s and 1,168.0s. Complete outer tool calls promptly after child exit, reduce polling/wakeup delay, and bypass unnecessary wrapper hops. This is the largest measured opportunity.\
+Provenance: test\_result; recommendation: inferred\_relationship.\
+Reduce slow round-trips, not merely call count.\
+Calls taking ≥5s were 133/157 (84.7%) and 65/70 (92.9%). Although the later session made 55% fewer calls, mean round-trip worsened from approximately 14.7s to 32.8s. Batch independent operations where safe, but prioritize per-call dispatch/completion latency and fail-fast cancellation. Failed calls alone lasted 109.4s and 253.8s.\
+Provenance: test\_result and generated\_summary.\
+Preserve the later session’s model-generation behavior.\
+Per completed turn, the later session achieved approximately:
+
+- 47% fewer sampling passes
+- 58% less model time
+- 80% less unchanged-state/action time\
+  Codify this behavior: generate only on meaningful state transitions, avoid repeated reasoning while tools remain active, and stop once sufficient evidence exists. This should reduce token cost, but the audit reports contain no token counts, so savings cannot be quantified from these sessions.\
+  Provenance: generated\_summary; token effect: inferred\_relationship.\
+  Fix all 3
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Implemented all three source fixes. Performance proof remains partial until the rebuilt Desktop binary is exercised on the audited workload.
+
+1. Orchestration latency: shared model-boundary Git evidence snapshots replace repeated per-child captures, event-driven waits replace polling loops, and nested dispatch avoids serial wrapper blocking. See [parallel.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/parallel.rs:94) and [process_manager.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/unified_exec/process_manager.rs:1245).
+
+2. Slow/failing round trips: cancellation now propagates through code-mode dispatch; non-cooperative callbacks are aborted after a two-second grace period; stalled commands have bounded progress deadlines. See [callbacks.rs](C:/Users/kuh/Desktop/kd4/codex-rs/code-mode/src/cell_actor/callbacks.rs:15) and [shell_command.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/shell/shell_command.rs:66).
+
+3. Generation behavior: new evidence remains decision-bearing, but an identical second observation allows one terminal, tool-free synthesis pass. Sampling, unchanged-state tokens, batching, and exit-to-delivery phases are now audited. See [reasoning_governor.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/reasoning_governor.rs:113), [turn.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/turn.rs:598), and [kd4_turn_latency_audit.py](C:/Users/kuh/Desktop/kd4/scripts/kd4_turn_latency_audit.py:275).
+
+Validation passed:
+
+- Workspace orchestration regression: zero per-child Git captures after baseline.
+- Convergence regression: 1/1 passed.
+- Event wakeup, bounded cancellation, watchdog reset, and relay timing: 4/4 passed.
+- Audit tests: 7/7 passed.
+- Core/code-mode formatting and `git diff --check` passed.
+
+No release A/B benchmark or Desktop rollout was performed, so actual latency and token reductions are not yet quantified. The native Desktop binary still needs rebuilding, replacement, restart, and a fresh session audit.
+
+--- Relevant turn 2 ---
+Conclusion SHA-256: 8f7179704c197d4df2634861a0e8eb70a83c366dfe9682b6e2e1ffd21969a406
+
+Recorded audit/fix task or prompt:
+make sure these are implemented correctly.
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Not fully correct yet. I would not roll this out as complete.
+
+Findings:
+
+- P1 — Tool completion still waits for expensive Git scans. Direct calls finish their handler at [parallel.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/parallel.rs:630), then await another workspace capture at [parallel.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/parallel.rs:681). Nested calls repeat this at lines 901–972. Each capture launches four Git operations, including binary diffs and untracked-file hashing, in [git_workspace.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/git_workspace.rs:162). The regression test explicitly requires four captures for two calls at [parallel.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/parallel.rs:1557). Nonfatal failures also incur the post-child scan. This directly preserves the largest measured orchestration delay.
+
+- P1 — Explicit empty `yield_control()` is incorrectly swallowed. The runtime converts `YieldRequested` into an empty yielded event at [cell_actor/mod.rs](C:/Users/kuh/Desktop/kd4/codex-rs/code-mode/src/cell_actor/mod.rs:406), while [wait_handler.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/code_mode/wait_handler.rs:331) treats every empty yield as an unchanged heartbeat and waits again. An existing workflow uses `store(...); yield_control();` before blocking work at [code_mode.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/tests/suite/code_mode.rs:2042). The outer `exec` can therefore remain blocked instead of returning control to the model. Timer heartbeats and explicit yields need distinct causes.
+
+- P2 — Background lifecycle proof is incomplete. Tool timing is persisted once when the outer result is delivered at [parallel.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/parallel.rs:1163). The later process exit is recorded only in tracing at [async_watcher.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/unified_exec/async_watcher.rs:250), without updating the persisted turn timing. Consequently, the session audit cannot calculate eventual background exit-to-delivery timing.
+
+The event-driven output/exit wakeups, concurrent nested dispatch, bounded callback cancellation, token accounting, and unchanged-state convergence guard otherwise look structurally sound.
+
+Validation: all 8 latency-audit Python tests passed, and `git diff --check` passed. I did not start Rust validation because another process is currently running `cargo test -p codex-core orchestration_correctness --lib` in the shared worktree. No equivalent baseline/candidate runtime benchmark has proven the latency or token contract yet. No files were changed during this review.
+
+================================================================================
+EVIDENCE RECORD: 01a01d3a-c70d-7a81-8bf5-f5f498c6936e:0d84692e2bd7045e
+================================================================================
+Audit date: 2026-08-19
+Classified language: Multi-language
+Source session UUID: 01a01d3a-c70d-7a81-8bf5-f5f498c6936e
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\19\rollout-2026-08-19T22-33-06-01a01d3a-c70d-7a81-8bf5-f5f498c6936e.jsonl
+Working directory: c:\Users\kuh\Desktop\kd4
+Git revision recorded by session: c4aea76f7784d718657add4cec5e7e1de24a9edf
+Thread source: user
+Unique relevant conclusions retained from session: 2
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: 057c04c0217bb3a5f40b0312c942b97665351bca8971d8b0ae510e8081bb37ac
+
+Recorded audit/fix task or prompt:
+Remove parent-side exec\_command orchestration delays.\
+Across both sessions, command round-trips contained 1,740.5s of orchestration gap versus 457.5s of actual child work. Instrument request → spawn → exit → delivery, return session handles promptly, and eliminate unnecessary polling/waiting. Optimizing the child commands themselves is lower priority. (generated\_summary)
+
+1. Collapse model/tool iteration into fewer evidence batches.\
+   Session 1 used 161 model sampling passes and 152 paired tool calls for 8 completed turns, with 1,759.2s model time—11.33× tool time. Batch independent reads/calls, synthesize once, and enforce stop conditions when evidence is sufficient or unchanged. This is also the strongest likely token-cost reduction, although the audit emitted no direct token totals. (generated\_summary)
+2. Reduce tool-boundary crossings and slow round-trips.\
+   130/152 paired calls in session 1 and 65/70 in session 2 took at least five seconds. Combine related commands and parallelize independent operations rather than alternating model generation with single calls. (generated\_summary)\
+   Fix all 3 of these
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Implemented all three fixes.
+
+- Exec orchestration is event-driven: prompt session-handle return, state-change wakeups, 250 ms output quiescence, and no repeated empty polling. Lifecycle timing now records request/accept → spawn → exit → delivery.
+- Evidence collection now batches independent reads, parallelizes safe observations, synthesizes once, and uses convergence guards plus an eight-sampling-pass soft ceiling.
+- The audit now reports lifecycle gaps, batching efficiency, model sampling passes, tool relays, and token usage when present.
+- Direct commands have a 60-second no-progress cutoff; `stall_timeout_ms: 0` disables it.
+
+Key implementations: [process_manager.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/unified_exec/process_manager.rs:1913), [tool_dispatch_trace.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/tool_dispatch_trace.rs:50), [gpt-5.6.md](C:/Users/kuh/Desktop/kd4/codex-rs/models-manager/prompts/gpt-5.6.md:42), and [kd4_turn_latency_audit.py](C:/Users/kuh/Desktop/kd4/scripts/kd4_turn_latency_audit.py:1208).
+
+Validation passed:
+
+- Event-driven process and agent-wait tests
+- Lifecycle delivery/correlation tests
+- Batching and convergence-governor tests
+- Shell progress/stall tests
+- Audit suite: 8 tests
+- Focused formatting and `git diff --check`
+
+The original 1,740.5s/457.5s workload was not numerically rerun because no source session UUID/path was supplied. These are fork source changes; Desktop still needs a binary rebuild/replacement and restart before they become active.
+
+--- Relevant turn 2 ---
+Conclusion SHA-256: 5e0c45ab4d7cecaf0cb222eaf96b3edac98ccb8489c0e332c968a1f6e4fc3abb
+
+Recorded audit/fix task or prompt:
+make sure these are implemented correctly.
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Implemented and audited. I corrected five issues:
+
+- Fixed two missed-wakeup races in exec output and code-mode state-change delivery.
+- Stop conditions now consolidate distinct evidence without discarding it; terminalization requires an identical repeated cycle.
+- Silent-command stall cancellation is opt-in.
+- Spawn timing is recorded at the actual child-launch boundary.
+- Confirmed event-driven owner waits, prompt session handles, batching guidance, and cross-process agent wake fallback.
+
+Validation passed:
+
+- 3 focused `codex-core` regressions.
+- 1 focused `codex-code-mode` regression.
+- 11 latency-audit tests.
+- `rustfmt --check` and `git diff --check`.
+
+The agent-store wake test and final post-marker compile could not run because an unrelated concurrent `cargo nextest` held the shared build lane. The Desktop binary has not been rebuilt/restarted, and runtime A/B measurements still require the exact session UUIDs.
+
+================================================================================
+EVIDENCE RECORD: 01a01d3a-f96b-7d32-8060-399f28cb1e12:38d32263de78c6df
+================================================================================
+Audit date: 2026-08-19
+Classified language: Multi-language
+Source session UUID: 01a01d3a-f96b-7d32-8060-399f28cb1e12
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\19\rollout-2026-08-19T22-33-19-01a01d3a-f96b-7d32-8060-399f28cb1e12.jsonl
+Working directory: c:\Users\kuh\Desktop\kd4
+Git revision recorded by session: c4aea76f7784d718657add4cec5e7e1de24a9edf
+Thread source: user
+Unique relevant conclusions retained from session: 2
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: 4aa155a5bb976d4d069965f69eae89605ac420a309b80e6edd5d36953726f682
+
+Recorded audit/fix task or prompt:
+1. Eliminate orchestration idle gaps. [test\_result]\
+   Orchestration dominated both sessions: 51.6% and 59.2%. Outer command gaps consumed 641s and 1,168s, far exceeding child-work time.\
+   Change: keep long-running commands inside one await/poll loop and return to the model only on meaningful state changes.
+2. Adopt the second session’s lower-generation pattern. [generated\_summary]\
+   Despite completing more turns, session 2 used 80 sampling passes / 70 tool calls, versus 176 / 166 in session 1. Model time fell from 1,874.9s to 729.3s, while unchanged-state time fell from 734.5s to 167.1s.\
+   Change: batch independent calls, avoid model generations during unchanged polling, and target roughly ≤8 sampling passes per completed turn.
+3. Fail fast on stalled commands. [test\_result]\
+   Session 2 spent 606.1s in tools despite only 70 calls; one failed command took 253.8s—42% of total tool time.\
+   Change: add command-specific deadlines, cancellation, and progress-based stall detection. Do not wait several minutes for failures that can be identified earlier.\
+   Token-cost limitation: the audit reports generation counts but no input, cached-input, output, or billable token totals. [generated\_summary] Add those fields per turn; until then, reduced sampling passes are only a cost proxy, not measured savings.\
+   Session 2 finalized. Session 1 still had one non-terminal turn after the permitted recheck, so its figures cover the nine completed turns. [test\_result]
+
+Fix these
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Implemented all four remediations:
+
+- Long-running work now remains in state-change-driven await loops; unchanged/whitespace polling no longer resumes the model.
+- Independent evidence calls are batched, fixed-point convergence stops redundant generations, and the audit tracks an eight-pass soft target.
+- Shell commands support progress-based `stall_timeout_ms`, cancellation, hard deadlines, and a 60-second default stall limit for long commands. See [shell.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/runtimes/shell.rs:138).
+- Per-turn auditing now reports input, cached-input, output, reasoning, observed billable and complete billable tokens. Incomplete provider coverage produces `null`, not misleading totals. See [kd4_turn_latency_audit.py](C:/Users/kuh/Desktop/kd4/scripts/kd4_turn_latency_audit.py:32).
+- Fixed stale workspace evidence replacing valid command results when no repository identity exists. See [parallel.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/parallel.rs:235).
+
+Validation:
+
+- 8 focused Rust orchestration tests passed.
+- All 7 audit tests passed.
+- Targeted `rustfmt --check` passed.
+- `git diff --check` passed.
+- The shell-stall integration initially exposed the stale-evidence defect above. That fix was inspected and formatted, but repository policy prohibited a third build-based retry after the same blocker occurred twice.
+
+Repo Atlas guided the changes to the actual orchestration owners. The source is fixed; I did not replace the `LOCAL-KD` binary or restart Desktop.
+
+--- Relevant turn 2 ---
+Conclusion SHA-256: b38acbeba0b83d4a6ecd36e846f3d8c4fb0e84cf785fc3ea38bcb93c060205b9
+
+Recorded audit/fix task or prompt:
+make sure these are implemented correctly.
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Implemented and audited. Three correctness gaps were resolved:
+
+- Efficiency limiting is advisory only; terminal completion requires an exact repeated action/result cycle, so new evidence is never discarded.
+- Token audit schema v7 now counts internal provider retries conservatively, reports total billed token volume separately from non-cached “blended” tokens, and leaves totals incomplete when retry usage is missing. Cached input is billed at a distinct rate, per [official OpenAI pricing](https://platform.openai.com/pricing).
+- Non-Git workspace evidence now remains valid across `None → None` repository identities, but is still invalidated by recorded mutations.
+
+State-change waiting, event-driven unified-exec polling, batching, the ≤8-pass audit target, and opt-in progress-based command cancellation were also verified.
+
+Validation:
+
+- Python audit suite: 11/11 passed.
+- Focused token/retry Rust test: passed.
+- Targeted nextest: 18/19 passed. The sole integration failure exposed the non-Git defect above and failed twice; repository policy therefore prohibited another build after fixing it.
+- Post-fix `rustfmt --check` and `git diff --check`: passed.
+
+The remaining proof is one post-fix rerun of `unified_exec_owner_wait_delivers_terminal_output_before_model_resumes` when validation policy permits. Changes are source-only; Desktop still requires rebuild/publish and restart. Repo Atlas narrowed the review to the orchestration owners, while OpenAI Docs informed the corrected billing semantics.
+
+================================================================================
+EVIDENCE RECORD: 01a01d3b-3f66-7d81-98ed-37ab15187fcd:a693053cdc57d2c8
+================================================================================
+Audit date: 2026-08-19
+Classified language: Multi-language
+Source session UUID: 01a01d3b-3f66-7d81-98ed-37ab15187fcd
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\19\rollout-2026-08-19T22-33-37-01a01d3b-3f66-7d81-98ed-37ab15187fcd.jsonl
+Working directory: c:\Users\kuh\Desktop\kd4
+Git revision recorded by session: c4aea76f7784d718657add4cec5e7e1de24a9edf
+Thread source: user
+Unique relevant conclusions retained from session: 2
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: dfcce7325b2a91eaa754555142bfd86b229c39f0f722ebcd8a850df808ac7a97
+
+Recorded audit/fix task or prompt:
+Remove parent-side exec\_command orchestration delays.\
+Across both sessions, command round-trips contained 1,740.5s of orchestration gap versus 457.5s of actual child work. Instrument request → spawn → exit → delivery, return session handles promptly, and eliminate unnecessary polling/waiting. Optimizing the child commands themselves is lower priority. (generated\_summary)
+
+1. Collapse model/tool iteration into fewer evidence batches.\
+   Session 1 used 161 model sampling passes and 152 paired tool calls for 8 completed turns, with 1,759.2s model time—11.33× tool time. Batch independent reads/calls, synthesize once, and enforce stop conditions when evidence is sufficient or unchanged. This is also the strongest likely token-cost reduction, although the audit emitted no direct token totals. (generated\_summary)
+2. Reduce tool-boundary crossings and slow round-trips.\
+   130/152 paired calls in session 1 and 65/70 in session 2 took at least five seconds. Combine related commands and parallelize independent operations rather than alternating model generation with single calls. (generated\_summary)\
+   Fix all 3 of these
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Implemented all three fixes in the current working tree:
+
+1. `exec_command` orchestration now records request, spawn, exit, and delivery timings. Silent or whitespace-only commands return a live session handle after the 250 ms quiet window. Background waits are event-driven instead of repeated polling. For live handles—where delivery necessarily precedes exit—the record marks the process alive at delivery and the watcher emits the final exit lifecycle event. See [process_manager.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/unified_exec/process_manager.rs:793), [tool_dispatch_trace.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/tool_dispatch_trace.rs:25), and [async_watcher.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/unified_exec/async_watcher.rs:383).
+
+2. Model/tool iteration now encourages complete parallel evidence batches, one synthesis pass, an eight-sampling-pass soft ceiling, and stopping on sufficient or unchanged evidence. The reasoning governor suppresses exact repeated cycles. See [gpt-5.6.md](/C:/Users/kuh/Desktop/kd4/codex-rs/models-manager/prompts/gpt-5.6.md:42) and [reasoning_governor.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/reasoning_governor.rs:2192).
+
+3. Tool-boundary crossings are reduced through state-change owner waits and independently dispatched nested code-mode tools. The audit now reports per-phase relay timing, lifecycle coverage, sampling-target violations, and token accounting when sessions provide it. See [description.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/code-mode-protocol/src/description.rs:18), [protocol.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/protocol/src/protocol.rs:2128), and [kd4_turn_latency_audit.py](/C:/Users/kuh/Desktop/kd4/scripts/kd4_turn_latency_audit.py:782).
+
+Validation on working tree based on `c4aea76f7784`:
+
+- Focused Rust tests: 5/5 passed.
+- Audit parser tests: 8/8 passed.
+- `git diff --check`: passed.
+- Broad formatting remains blocked only by unrelated concurrent formatting in [local.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/agent-task-store/src/local.rs:3411).
+
+The fork was not rebuilt or restarted in Desktop, and the original session UUIDs were not supplied, so I’m not claiming a measured end-to-end reduction of the historical 1,740.5-second gap until those sessions are replayed against a deployed build.
+
+--- Relevant turn 2 ---
+Conclusion SHA-256: a1d6f41b4c1f09fe220b293e4f4462ab9d4e03588a908af44496cb246cd15d78
+
+Recorded audit/fix task or prompt:
+make sure these are implemented correctly.
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Status: **partial verification**. All three areas are corrected in source, but the final post-fix Rust/runtime gate was not rerun because the same fidelity failure occurred twice, triggering the repository’s validation stop rule.
+
+Implemented:
+
+- Request → spawn now starts at request acceptance, including queue/orchestration delay. Background exits are persisted even when a live handle was delivered first, including exit/delivery races. See [tool_dispatch_trace.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/tool_dispatch_trace.rs:207) and [turn_timing.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/turn_timing.rs:1379).
+- Fixed the model-facing output defect: unchanged commands no longer have their result incorrectly replaced with a stale-workspace receipt. Mutation tracking and sampling-time revalidation still protect against actual changes. See [parallel.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/parallel.rs:136).
+- High tool-call volume now issues one consolidation advisory; it cannot force completion merely because calls were fast. Exact unchanged cycles remain the terminal stop condition. See [reasoning_governor.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/reasoning_governor.rs:4951).
+- Batching fixtures now represent genuinely distinct actions, and the owner-wait test checks that terminal output reaches the resumed model request. See [round_trip_batching.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/tests/round_trip_batching.rs:87) and [unified_exec.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/tests/suite/unified_exec.rs:1294).
+- The audit reports direct request→spawn, exit→delivery, and live-delivery→exit durations. See [kd4_turn_latency_audit.py](C:/Users/kuh/Desktop/kd4/scripts/kd4_turn_latency_audit.py:570).
+
+Validation:
+
+- 17/20 focused Rust behaviors passed before the final fidelity repair.
+- Both background-exit persistence/race tests passed.
+- 12/12 latency-audit tests pass.
+- Targeted `rustfmt --check` and `git diff --check` pass.
+- Still unproven post-fix: owner-wait E2E, two batching integrations, protocol crate tests, and `just app-server-schema-check`.
+- No release benchmark, token comparison, publish, rollout, or Desktop restart was performed. The historical 1,740.5s orchestration gap therefore cannot yet be claimed as measured away.
+
+================================================================================
+EVIDENCE RECORD: 01a01d47-7348-7501-8e53-a75c78281c7b:f7caf78e68667930
+================================================================================
+Audit date: 2026-08-19
+Classified language: Multi-language
+Source session UUID: 01a01d47-7348-7501-8e53-a75c78281c7b
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\19\rollout-2026-08-19T22-46-57-01a01d47-7348-7501-8e53-a75c78281c7b.jsonl
+Working directory: c:\Users\kuh\Desktop\kd4
+Git revision recorded by session: c4aea76f7784d718657add4cec5e7e1de24a9edf
+Thread source: user
+Unique relevant conclusions retained from session: 1
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: 04f322a347eeb2389a307f06e4a49e55ea4d1b33feb65337bc5a6b999faeaa9f
+
+Recorded audit/fix task or prompt:
+Instrument and fix orchestration boundaries: separately timestamp dispatch, child start/end, output collection, result delivery, and model resumption.
+
+1. Replace repeated unchanged-state polling with one awaited wait operation; batch independent calls and consolidate read-only checks.
+2. Add fail-fast command handling: bounded timeouts, explicit terminal states, and no repeated broad validation after the same blocker.
+3. Add a turn-efficiency guard for high tool-call counts with negligible child runtime or consecutive unchanged samples.
+4. Finalize canceled, failed, and abandoned turns explicitly; distinguish running-process, user-waiting, and leaked-turn states.
+5. Exclude human-input wait time from agent/system wall-clock reporting.
+
+
+
+fix these
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Implemented the orchestration-boundary fixes:
+
+- Added distinct dispatch, child start/end, output-collected, delivered, and model-resumed timestamps in [turn_timing.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/turn_timing.rs:1051) and [protocol.rs](C:/Users/kuh/Desktop/kd4/codex-rs/protocol/src/protocol.rs:2151).
+- Replaced fixed-interval unchanged polling with event-driven durable wakeups in [wait.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs:1710) and [local.rs](C:/Users/kuh/Desktop/kd4/codex-rs/agent-task-store/src/local.rs:256).
+- Added bounded command/stall handling and explicit terminal outcomes across shell, code-mode, and process management.
+- Added a high-tool-count/negligible-runtime convergence guard in [reasoning_governor.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/reasoning_governor.rs:2051).
+- Classified completed, failed, canceled, abandoned, running-process, user-waiting, and leaked turns in [kd4_turn_latency_audit.py](C:/Users/kuh/Desktop/kd4/scripts/kd4_turn_latency_audit.py:248).
+- Agent/system duration now subtracts interactive-only human wait time.
+
+Validation:
+
+- Python latency-audit tests: 8 passed.
+- `git diff --check`: passed.
+- `cargo fmt --all`: completed.
+- Focused Rust tests were not duplicated because the shared warmed Cargo lane was already running the relevant `codex-core` timing/orchestration tests and compilation. Per repository policy, I stopped after repeatedly observing that blocker instead of launching another broad build.
+
+================================================================================
+EVIDENCE RECORD: 01a01d47-9c82-7c42-80c4-897f5dca1050:4c5a5c6e9d5c4220
+================================================================================
+Audit date: 2026-08-19
+Classified language: Multi-language
+Source session UUID: 01a01d47-9c82-7c42-80c4-897f5dca1050
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\19\rollout-2026-08-19T22-47-07-01a01d47-9c82-7c42-80c4-897f5dca1050.jsonl
+Working directory: c:\Users\kuh\Desktop\kd4
+Git revision recorded by session: c4aea76f7784d718657add4cec5e7e1de24a9edf
+Thread source: user
+Unique relevant conclusions retained from session: 1
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: df04529db16be85e7b1ec820b2ea05650c1f0683616bc78fcead3c17d6e82079
+
+Recorded audit/fix task or prompt:
+Instrument and fix the tool relay path. Record enqueue, child-start, child-end, and result-delivery timestamps. The enormous `exec → exec_command` gap is otherwise invisible as to whether it is scheduling, serialization, or backpressure.
+
+1. Batch independent tool calls and reduce serialized sampling loops. The worst session used 227 model sampling passes and 218 tool calls.
+2. Add a no-progress guard: after two identical state fingerprints or equivalent results, stop polling/reasoning and either wait eventfully or conclude. This targets the 734.5s and 187.3s unchanged-state streams.
+3. Bound long commands with progress reporting, cancellation, and failure cleanup. The 109–311s failed/running calls are concrete wasted-clock candidates.
+4. Shorten post-tool reasoning and handoff. The `c8e` session alone spent 1,077.1s between tool completion and the next effective handoff.
+5. Separate human wait from agent latency, particularly `request_user_input`.
+6. Add token accounting to the auditor: input, cached input, output, and reasoning tokens per turn and between tool calls. The current reports contain no token counts, so token waste cannot be measured honestly from these audits; model seconds are not a valid substitute.
+7. Add per-turn timing output. The reports identify the problematic sessions and slow calls, but not the exact longest turn boundaries.
+
+Fix these
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Implemented the tool-relay and latency fixes across the runtime and auditor.
+
+Key changes:
+
+- Added per-call relay timestamps from acceptance through handler/process execution, output collection, delivery, and model resume in [protocol.rs](C:/Users/kuh/Desktop/kd4/codex-rs/protocol/src/protocol.rs:2128) and [turn_timing.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/turn_timing.rs:1064).
+- Added batching guidance, eager parallel dispatch, event-driven waits, and reduced serialized polling.
+- Added two-identical-observation convergence and high-volume tool-packet guards in [reasoning_governor.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/reasoning_governor.rs:2067).
+- Added bounded command stall detection, progress resets, cancellation, and cleanup in [shell.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/runtimes/shell.rs:138).
+- Replaced multi-agent polling with store wake events in [local.rs](C:/Users/kuh/Desktop/kd4/codex-rs/agent-task-store/src/local.rs:256).
+- Extended [kd4_turn_latency_audit.py](C:/Users/kuh/Desktop/kd4/scripts/kd4_turn_latency_audit.py:360) with per-turn boundaries, relay phases, token intervals, cached/input/output/reasoning tokens, and human-only wait accounting.
+- Repo Atlas guided the ownership and impact analysis across these runtime surfaces.
+
+Validation:
+
+- Auditor tests: 8 passed.
+- Focused Rust suite: 8 relevant checks passed, including relay timing, no-progress convergence, progress watchdog, event-driven waits, and prompt batching.
+- `cargo fmt --all -- --check`: passed.
+- `git diff --check`: passed.
+- Stall integration reached the expected cancellation contract; its Windows-sensitive assertion was corrected afterward but not rerun, per the repository’s repeated-failure rule.
+- A broader timing check found one unrelated pre-existing mismatch at `turn_timing_tests.rs:1295`; therefore the app-server schema check and further Cargo reruns were not performed.
+
+The fork binary was not published or Desktop-restarted, so these changes are not live yet.
+
+================================================================================
+EVIDENCE RECORD: 01a01d85-5696-7a43-8ae8-815275b73bdc:bf232f4f56398417
+================================================================================
+Audit date: 2026-08-19
+Classified language: Multi-language
+Source session UUID: 01a01d85-5696-7a43-8ae8-815275b73bdc
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\19\rollout-2026-08-19T23-54-32-01a01d85-5696-7a43-8ae8-815275b73bdc.jsonl
+Working directory: c:\Users\kuh\Desktop\kd4
+Git revision recorded by session: c4aea76f7784d718657add4cec5e7e1de24a9edf
+Thread source: user
+Unique relevant conclusions retained from session: 2
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: f21962ce3decf173ff06f04ee7c05045fcf017adde95defa2e3ccb418a4ffa8a
+
+Recorded audit/fix task or prompt:
+The full formatter check exposed repository/environment blockers outside this review: its Rust wrapper invokes cargo +toolchain without Rustup, the Prettier glob finds no docs/*.md, and 22 unrelated Python scripts are already unformatted. I won’t rewrite those unrelated files; I’ll format and check only the Rust workspace and the two touched audit scripts with their underlying tools.
+
+There are no unrelated files, fix everything
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Worktree review completed and repairs applied. Full ledger: [WORKTREE_REVIEW.txt](C:/Users/kuh/Desktop/kd4/WORKTREE_REVIEW.txt).
+
+Results:
+
+- Repaired all 5 review findings and 3 Clippy diagnostics.
+- Regenerated app-server schemas and refreshed `SOURCEMAP.md`.
+- Fixed formatter infrastructure and formatted all 23 outstanding Python files.
+- Workspace Clippy, all targets/default features: passed.
+- `cargo-shear`: passed, no issues.
+- Full formatter check: passed.
+- Focused validation: 108 tests passed, 3 skipped.
+- Schema fixtures: 2 passed.
+- `git diff --check`: passed.
+- Final inventory: 100 modified tracked files and 2 generated untracked TypeScript files.
+- No commit, push, publication, binary replacement, or Desktop restart performed.
+
+The only incomplete certification is the all-features Clippy/dead-code matrix. Both independently reached the same upstream V8 failure: the Windows `rusty_v8_ptrcomp_sandbox` archive returns HTTP 404. Repository policy requires stopping after that blocker repeats twice, so no further build retry or cold Cargo lane was started.
+
+--- Relevant turn 2 ---
+Conclusion SHA-256: 942fd6ccb8389bd05ced903b6a79ffd0dc253c72e5a16e2fd04c2fc25ce30fb1
+
+Recorded audit/fix task or prompt:
+"C:\Users\kuh\Desktop\LOCAL-KD\sessions\2026\08\19\rollout-2026-08-19T19-25-10-01a01c8e-a688-7890-9c19-4d73117f04e7.jsonl"
+
+why is this broken. stop breaking my shit and just improve it properly
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+You’re right: the session behavior is broken. The JSONL itself is intact—15/15 turns parsed with zero errors—but the execution loop wasted enormous time and tokens.
+
+The audit found:
+
+- 3h15m agent-active time, with 2h24m (73.9%) attributed to orchestration.
+- One aborted turn lasted 92 minutes: only 101s model time and 32s tool time; 90 minutes were orchestration.
+- 138 command calls contained only 39.7s of child work but accumulated 1,093s of unexplained round-trip gap.
+- 194 tool calls took at least five seconds.
+- 259 sampling passes produced 245 calls, with zero multi-call batches.
+- 1,130s and 4.29 million tokens were spent repeating unchanged-state observations.
+- Total input reached 15.3 million tokens.
+- 30 tools were reported as still running, 17 failed, and one lifecycle remained unpaired.
+
+So this was not “slow because the work was difficult.” It was primarily serial dispatch, relay/orchestration delay, and repeated observational passes without progress.
+
+I also shouldn’t call source-level analyzer success a runtime improvement. The current checkout changes have not been rebuilt into the Desktop binary or validated against this workload, so they are not proven to fix what you experienced. The review ledger now correctly marks runtime certification incomplete rather than implying otherwise.

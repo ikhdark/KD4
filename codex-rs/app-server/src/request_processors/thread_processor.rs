@@ -286,6 +286,37 @@ fn should_finalize_failed_fork(rollback_succeeded: bool, thread_id_still_loaded:
     rollback_succeeded || !thread_id_still_loaded
 }
 
+struct HandledThreadCreationInstances<T: ?Sized> {
+    by_id: HashMap<ThreadId, std::sync::Weak<T>>,
+}
+
+impl<T: ?Sized> Default for HandledThreadCreationInstances<T> {
+    fn default() -> Self {
+        Self {
+            by_id: HashMap::new(),
+        }
+    }
+}
+
+impl<T: ?Sized> HandledThreadCreationInstances<T> {
+    /// Records that the creation event for this loaded instance is being handled.
+    ///
+    /// Returns whether this is the first handler for the current instance.
+    fn mark_handled(&mut self, thread_id: ThreadId, thread: &Arc<T>) -> bool {
+        let already_handled = self
+            .by_id
+            .get(&thread_id)
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|handled| Arc::ptr_eq(&handled, thread));
+        self.by_id.insert(thread_id, Arc::downgrade(thread));
+        !already_handled
+    }
+
+    fn forget(&mut self, thread_id: ThreadId) {
+        self.by_id.remove(&thread_id);
+    }
+}
+
 fn validate_dynamic_tools(tools: &[DynamicToolSpec]) -> Result<(), String> {
     const DYNAMIC_TOOL_NAME_MAX_LEN: usize = 128;
     const DYNAMIC_TOOL_NAMESPACE_MAX_LEN: usize = 64;
@@ -457,6 +488,10 @@ pub(crate) struct ThreadRequestProcessor {
         Arc<crate::desktop_activation::DesktopActivationBootstrap>,
     pub(super) desktop_activation_challenge_owners:
         Arc<Mutex<HashMap<String, (String, ConnectionId)>>>,
+    handled_thread_creation_instances:
+        Arc<std::sync::Mutex<HandledThreadCreationInstances<CodexThread>>>,
+    #[cfg(test)]
+    thread_created_resync_override: Arc<Mutex<Option<Vec<(ThreadId, Arc<CodexThread>)>>>>,
 }
 
 /// Outcome of trying to satisfy a resume request from an already loaded thread.
@@ -511,7 +546,26 @@ impl ThreadRequestProcessor {
             initial_config_warnings: Arc::new(initial_config_warnings),
             desktop_activation_bootstrap,
             desktop_activation_challenge_owners: Arc::new(Mutex::new(HashMap::new())),
+            handled_thread_creation_instances: Arc::new(std::sync::Mutex::new(
+                HandledThreadCreationInstances::default(),
+            )),
+            #[cfg(test)]
+            thread_created_resync_override: Arc::new(Mutex::new(None)),
         }
+    }
+
+    fn mark_thread_creation_handled(&self, thread_id: ThreadId, thread: &Arc<CodexThread>) -> bool {
+        self.handled_thread_creation_instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .mark_handled(thread_id, thread)
+    }
+
+    fn forget_handled_thread_creation(&self, thread_id: ThreadId) {
+        self.handled_thread_creation_instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .forget(thread_id);
     }
 
     pub(crate) async fn thread_start(
@@ -1030,21 +1084,18 @@ impl ThreadRequestProcessor {
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
     ) -> Result<(), JSONRPCErrorError> {
-        let mcp_elicitations_auto_deny = xcode_26_4_mcp_elicitations_auto_deny(
-            app_server_client_name.as_deref(),
-            app_server_client_version.as_deref(),
-        );
         thread
             .set_app_server_client_info(
                 app_server_client_name,
                 app_server_client_version,
-                mcp_elicitations_auto_deny,
+                MCP_ELICITATIONS_AUTO_DENY,
             )
             .await
             .map_err(|err| internal_error(format!("failed to set app server client info: {err}")))
     }
 
     async fn finalize_thread_teardown(&self, thread_id: ThreadId) {
+        self.forget_handled_thread_creation(thread_id);
         self.pending_thread_unloads.finish(&thread_id).await;
         self.outgoing
             .cancel_requests_for_thread(thread_id, /*error*/ None)
@@ -1131,6 +1182,23 @@ impl ThreadRequestProcessor {
         super::thread_lifecycle::ensure_conversation_listener(
             self.listener_task_context(),
             conversation_id,
+            connection_id,
+            raw_events_enabled,
+        )
+        .await
+    }
+
+    async fn ensure_conversation_listener_for_instance(
+        &self,
+        conversation_id: ThreadId,
+        conversation: Arc<CodexThread>,
+        connection_id: ConnectionId,
+        raw_events_enabled: bool,
+    ) -> Result<EnsureConversationListenerResult, JSONRPCErrorError> {
+        super::thread_lifecycle::ensure_conversation_listener_for_instance(
+            self.listener_task_context(),
+            conversation_id,
+            conversation,
             connection_id,
             raw_events_enabled,
         )
@@ -2904,33 +2972,116 @@ impl ThreadRequestProcessor {
         thread_id: ThreadId,
         connection_ids: Vec<ConnectionId>,
     ) {
-        let mut raw_events_enabled = false;
-        if let Ok(thread) = self.thread_manager.get_thread(thread_id).await {
-            let config_snapshot = thread.config_snapshot().await;
-            let loaded_thread = build_thread_from_snapshot(
-                thread_id,
-                thread.session_configured().session_id.to_string(),
-                &config_snapshot,
-                thread.rollout_path(),
-            );
-            self.thread_watch_manager.upsert_thread(loaded_thread).await;
-            if let Some(parent_thread_id) = config_snapshot.parent_thread_id {
-                raw_events_enabled = self
-                    .thread_state_manager
-                    .thread_state(parent_thread_id)
-                    .await
-                    .lock()
-                    .await
-                    .experimental_raw_events;
+        let Some(thread_guard) = self
+            .thread_manager
+            .acquire_thread_created_thread(thread_id)
+            .await
+        else {
+            return;
+        };
+        let thread = Arc::clone(thread_guard.thread());
+        self.attach_created_thread_listeners(thread_id, thread, &connection_ids)
+            .await;
+        drop(thread_guard);
+    }
+
+    /// Reconciles loaded thread instances whose creation broadcasts were missed.
+    pub(crate) async fn resync_thread_listeners(&self, connection_ids: Vec<ConnectionId>) {
+        #[cfg(test)]
+        let created_threads = { self.thread_created_resync_override.lock().await.take() };
+        #[cfg(test)]
+        if let Some(created_threads) = created_threads {
+            for (thread_id, thread) in created_threads {
+                self.attach_created_thread_listeners(thread_id, thread, &connection_ids)
+                    .await;
             }
+            return;
         }
+
+        for thread_id in self.thread_manager.list_thread_created_ids().await {
+            let Some(thread_guard) = self
+                .thread_manager
+                .acquire_thread_created_thread(thread_id)
+                .await
+            else {
+                continue;
+            };
+            let thread = Arc::clone(thread_guard.thread());
+            self.attach_created_thread_listeners(thread_id, thread, &connection_ids)
+                .await;
+            drop(thread_guard);
+        }
+    }
+
+    async fn attach_created_thread_listeners(
+        &self,
+        thread_id: ThreadId,
+        thread: Arc<CodexThread>,
+        connection_ids: &[ConnectionId],
+    ) {
+        if connection_ids.is_empty() || !self.mark_thread_creation_handled(thread_id, &thread) {
+            return;
+        }
+        self.attach_thread_listeners(thread_id, thread, connection_ids)
+            .await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn subscribed_connection_ids_for_test(
+        &self,
+        thread_id: ThreadId,
+    ) -> Vec<ConnectionId> {
+        self.thread_state_manager
+            .subscribed_connection_ids(thread_id)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_thread_created_resync_override_for_test(&self, thread_id: ThreadId) {
+        let thread = self
+            .thread_manager
+            .get_thread(thread_id)
+            .await
+            .expect("thread-created resync override requires a loaded thread");
+        *self.thread_created_resync_override.lock().await = Some(vec![(thread_id, thread)]);
+    }
+
+    async fn attach_thread_listeners(
+        &self,
+        thread_id: ThreadId,
+        thread: Arc<CodexThread>,
+        connection_ids: &[ConnectionId],
+    ) {
+        let config_snapshot = thread.config_snapshot().await;
+        let loaded_thread = build_thread_from_snapshot(
+            thread_id,
+            thread.session_configured().session_id.to_string(),
+            &config_snapshot,
+            thread.rollout_path(),
+        );
+        self.thread_watch_manager.upsert_thread(loaded_thread).await;
+        let raw_events_enabled = if let Some(parent_thread_id) = config_snapshot.parent_thread_id {
+            self.thread_state_manager
+                .thread_state(parent_thread_id)
+                .await
+                .lock()
+                .await
+                .experimental_raw_events
+        } else {
+            false
+        };
 
         for connection_id in connection_ids {
             log_listener_attach_result(
-                self.ensure_conversation_listener(thread_id, connection_id, raw_events_enabled)
-                    .await,
+                self.ensure_conversation_listener_for_instance(
+                    thread_id,
+                    Arc::clone(&thread),
+                    *connection_id,
+                    raw_events_enabled,
+                )
+                .await,
                 thread_id,
-                connection_id,
+                *connection_id,
                 "thread",
             );
         }
@@ -4173,16 +4324,7 @@ impl ThreadRequestProcessor {
     }
 }
 
-fn xcode_26_4_mcp_elicitations_auto_deny(
-    client_name: Option<&str>,
-    client_version: Option<&str>,
-) -> bool {
-    // Xcode 26.4 shipped before app-server MCP elicitation requests were
-    // client-visible. Keep elicitations auto-denied for that client line.
-    // TODO: Remove this compatibility hack once Xcode 26.4 ages out.
-    client_name == Some("Xcode")
-        && client_version.is_some_and(|version| version.starts_with("26.4"))
-}
+const MCP_ELICITATIONS_AUTO_DENY: bool = false;
 
 const THREAD_TURNS_DEFAULT_LIMIT: usize = 25;
 const THREAD_TURNS_MAX_LIMIT: usize = 100;
@@ -5043,6 +5185,29 @@ fn build_thread_from_loaded_snapshot(
         config_snapshot,
         loaded_thread.rollout_path(),
     )
+}
+
+#[cfg(test)]
+mod thread_created_lag_tests {
+    use super::*;
+
+    fn thread_id(value: &str) -> ThreadId {
+        ThreadId::from_string(value).expect("valid thread id")
+    }
+
+    #[test]
+    fn thread_creation_handling_tracks_loaded_instance_identity() {
+        let id = thread_id("00000000-0000-0000-0000-000000000001");
+        let first_instance = Arc::new(());
+        let mut handled = HandledThreadCreationInstances::default();
+
+        assert!(handled.mark_handled(id, &first_instance));
+        assert!(!handled.mark_handled(id, &first_instance));
+
+        let replacement_instance = Arc::new(());
+        assert!(handled.mark_handled(id, &replacement_instance));
+        assert!(!handled.mark_handled(id, &replacement_instance));
+    }
 }
 
 #[cfg(test)]

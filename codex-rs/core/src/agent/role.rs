@@ -183,7 +183,8 @@ mod reload {
             layers,
             config.config_layer_stack.requirements().clone(),
             config.config_layer_stack.requirements_toml().clone(),
-        )?)
+        )?
+        .with_project_discovery_from(&config.config_layer_stack))
     }
 
     fn deserialize_effective_config(

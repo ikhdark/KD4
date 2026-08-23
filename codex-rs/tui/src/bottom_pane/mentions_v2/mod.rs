@@ -1,7 +1,4 @@
-//! The unified mention popup used by default in the TUI.
-//!
-//! The `mentions_v2` feature flag remains temporarily as a rollback path: disabling it restores
-//! the legacy split mention and file-search popups.
+//! The unified mention popup used for `@` mentions in the TUI.
 
 mod candidate;
 mod filter;

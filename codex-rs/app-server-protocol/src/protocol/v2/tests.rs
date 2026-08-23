@@ -43,6 +43,8 @@ use codex_protocol::protocol::GranularApprovalConfig as CoreGranularApprovalConf
 use codex_protocol::protocol::NetworkAccess as CoreNetworkAccess;
 use codex_protocol::protocol::SubAgentActivityKind as CoreSubAgentActivityKind;
 use codex_protocol::protocol::SurfacedToolResult;
+use codex_protocol::protocol::TaskCompletionGate as CoreTaskCompletionGate;
+use codex_protocol::protocol::TaskCompletionStatus as CoreTaskCompletionStatus;
 use codex_protocol::request_permissions::RequestPermissionProfile as CoreRequestPermissionProfile;
 use codex_protocol::user_input::UserInput as CoreUserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -358,6 +360,8 @@ fn collab_agent_state_maps_interrupted_status() {
             status: CollabAgentStatus::Interrupted,
             message: None,
             surfaced_result: None,
+            completion: None,
+            last_agent_message: None,
         }
     );
 }
@@ -379,7 +383,90 @@ fn collab_agent_state_preserves_authoritative_surfaced_result() {
             status: CollabAgentStatus::Completed,
             message: None,
             surfaced_result: Some(surfaced_result),
+            completion: None,
+            last_agent_message: None,
         }
+    );
+}
+
+#[test]
+fn collab_agent_state_preserves_terminal_completion_payloads() {
+    let surfaced_result = SurfacedToolResult {
+        adapter: "completion-owner".to_string(),
+        value: json!({"artifact": "report.json"}),
+        canonical_message: Some("authoritative result".to_string()),
+    };
+
+    assert_eq!(
+        CollabAgentState::from(CoreAgentStatus::TerminalWithCompletion {
+            last_agent_message: Some("implemented".to_string()),
+            surfaced_result: Some(surfaced_result.clone()),
+            error: None,
+            completion: CoreTaskCompletionGate {
+                status: CoreTaskCompletionStatus::Partial,
+                reasons: vec!["direct validation did not run".to_string()],
+                evidence_path: Some("artifacts/completion.json".to_string()),
+            },
+        }),
+        CollabAgentState {
+            status: CollabAgentStatus::Completed,
+            message: Some("implemented".to_string()),
+            surfaced_result: Some(surfaced_result.clone()),
+            completion: Some(TaskCompletionGate {
+                status: TaskCompletionStatus::Partial,
+                reasons: vec!["direct validation did not run".to_string()],
+                evidence_path: Some("artifacts/completion.json".to_string()),
+            }),
+            last_agent_message: Some("implemented".to_string()),
+        }
+    );
+
+    assert_eq!(
+        CollabAgentState::from(CoreAgentStatus::TerminalWithCompletion {
+            last_agent_message: Some("finished the available work".to_string()),
+            surfaced_result: Some(surfaced_result.clone()),
+            error: Some("dependency unavailable".to_string()),
+            completion: CoreTaskCompletionGate {
+                status: CoreTaskCompletionStatus::Blocked,
+                reasons: vec!["waiting for credentials".to_string()],
+                evidence_path: None,
+            },
+        }),
+        CollabAgentState {
+            status: CollabAgentStatus::Errored,
+            message: Some("dependency unavailable".to_string()),
+            surfaced_result: Some(surfaced_result),
+            completion: Some(TaskCompletionGate {
+                status: TaskCompletionStatus::Blocked,
+                reasons: vec!["waiting for credentials".to_string()],
+                evidence_path: None,
+            }),
+            last_agent_message: Some("finished the available work".to_string()),
+        }
+    );
+}
+
+#[test]
+fn collab_agent_state_legacy_wire_shape_omits_terminal_metadata() {
+    let state: CollabAgentState = serde_json::from_value(json!({
+        "status": "running",
+        "message": null
+    }))
+    .expect("legacy collab agent state should deserialize");
+
+    assert_eq!(
+        state,
+        CollabAgentState {
+            status: CollabAgentStatus::Running,
+            message: None,
+            surfaced_result: None,
+            completion: None,
+            last_agent_message: None,
+        }
+    );
+    assert_eq!(
+        serde_json::to_value(state).expect("collab agent state should serialize"),
+        json!({"status": "running", "message": null})
     );
 }
 
@@ -2808,6 +2895,8 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
                     status: CollabAgentStatus::Completed,
                     message: None,
                     surfaced_result: None,
+                    completion: None,
+                    last_agent_message: None,
                 },
             )]
             .into_iter()

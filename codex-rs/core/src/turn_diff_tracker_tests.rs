@@ -871,6 +871,47 @@ fn metadata_mutation_makes_successful_validation_stale() {
     );
 }
 
+#[test]
+fn validation_identity_survives_exact_revert() {
+    let identity = crate::git_workspace::WorkspaceEvidenceIdentity {
+        repository_root: Some("repo".to_string()),
+        head_identity: Some("head".to_string()),
+        index_identity: Some("index".to_string()),
+        worktree_identity: Some("worktree".to_string()),
+    };
+    let mut tracker = TurnDiffTracker::new();
+    tracker.record_unknown_mutation();
+    tracker.record_exec_command_end_at(&["cargo".into(), "check".into()], 0, false, "local", None);
+    tracker.record_workspace_freshness_observation(
+        Some("proof-key-a".to_string()),
+        Some(identity.clone()),
+    );
+
+    tracker.record_exec_command_end_at(
+        &["chmod".into(), "+x".into(), "run.sh".into()],
+        0,
+        false,
+        "local",
+        None,
+    );
+    assert!(tracker.has_unvalidated_mutation());
+    tracker.record_workspace_freshness_observation(None, Some(identity));
+
+    assert!(!tracker.has_unvalidated_mutation());
+    assert_eq!(
+        tracker.validation_freshness_status(),
+        ValidationFreshnessStatus::PassedAfterLastMutation
+    );
+    assert_eq!(
+        tracker.last_successful_validation_identity(),
+        Some("proof-key-a")
+    );
+    assert_eq!(
+        tracker.last_successful_validation_revision(),
+        Some(tracker.current_mutation_revision())
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn executable_add_uses_the_filesystem_mode_in_generated_diff() {

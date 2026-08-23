@@ -1,0 +1,58 @@
+Repo Atlas validated issue ledger
+Created from: C:\Users\kuh\Desktop\New Text Document.txt
+
+Scope rule: this file lists only findings validated against the current working tree.
+Status values: TODO, FIXED, VERIFIED.
+
+01 FIXED Rust-analyzer document readiness can consume the whole query deadline while
+         waiting for publishDiagnostics, even when the server is otherwise responsive.
+         Owner: src/core/rustAnalyzer.js. Proof: no-diagnostics responsive-server test.
+02 FIXED Compact task output drops applicable repository instruction files.
+         Owner: task planning/output contract. Proof: compact task instruction test.
+03 FIXED task.maxFiles incorrectly starves independent validation candidates.
+         Owner: task planning/output contract. Proof: capped-source validation test.
+04 FIXED profile:auto retries a futile thorough pass when only the hard file cap caused
+         critical_cap_omission. Owner: task planning/output contract. Proof: pass-count test.
+05 FIXED Compact task output always says not to call task again, including needs_attention.
+         Owner: task planning/output contract. Proof: needs-attention rendering test.
+06 FIXED Compact task builds and discards the full context Markdown rendering.
+         Owner: task planning/output contract. Proof: structured planner/rendering test.
+07 FIXED batch schema, preflight, dispatch, and typo suggestions disagree on batchable tools.
+         Owner: batch public contract. Proof: canonical batchable-set consistency test.
+08 FIXED batch drops valid canonical resolution reason-code pairs.
+         Owner: batch/evidence contract. Proof: direct-versus-batch pair parity test.
+09 FIXED Failed batch children leave aggregate completeness unknown rather than partial.
+         Owner: batch/evidence contract. Proof: child-failure aggregate test.
+10 FIXED PostToolUse hook ignores nested batch failures, resolution failures, truncation,
+         and degraded diagnostics. Owner: hook policy/state contract. Proof: nested batch tests.
+11 FIXED Hook warning dedupe omits arguments and workspace/snapshot identity.
+         Owner: hook policy/state contract. Proof: distinct-input/workspace dedupe tests.
+12 FIXED Corrupt, oversized, or wrong-type hook state is not safely recovered/quarantined.
+         Owner: hook policy/state contract. Proof: malformed-state recovery tests.
+13 FIXED Hook ignores actionable payloadCompleteness=partial limitations.
+         Owner: hook policy/state contract. Proof: partial-result follow-up test.
+14 FIXED hooks.json contains a Codex-incompatible top-level description and the Codex
+         manifest does not declare the hooks entry. Owner: plugin integration contract.
+         Proof: packaging plus installed-plugin hook-discovery test.
+15 FIXED Successful MCP responses omit structuredContent.text, breaking 6.x consumers.
+         Owner: server response contract. Proof: integration/server compatibility tests.
+16 FIXED Release versions drift across npm, Claude, marketplace, and Codex manifests.
+         Owner: release/packaging contract. Proof: one-source version-sync check.
+17 FIXED Conditional PATH launcher cannot hand ownership to a newer live build with the
+         same semantic version. Owner: installation ownership contract. Proof: live-root
+         same-version, newer-build takeover test.
+18 FIXED The repository has no compensating cross-platform full-suite CI gate.
+         Owner: validation/release contract. Proof: checked-in Linux/Windows workflow.
+19 FIXED Full test runner stops after the first failed phase instead of reporting all phases.
+         Owner: validation/release contract. Proof: isolated phase-aggregation test.
+20 FIXED Batch tests maintain a stale hand-written tool catalog instead of the registry's
+         canonical batchable set. Owner: batch public contract. Proof: registry parity test.
+21 FIXED Ignore-directory basename matching is case-sensitive on Windows.
+         Owner: config/walker path contract. Proof: injected-win32 mixed-case test.
+22 FIXED Repository cache namespace uses only 32 bits of SHA-1 and has no legacy fallback.
+         Owner: cache identity contract. Proof: SHA-256 namespace and legacy migration test.
+23 FIXED Hook state read-modify-write can lose concurrent dedupe updates.
+         Owner: hook policy/state contract. Proof: two-process concurrency test.
+
+Completion rule: each entry moves to VERIFIED only after its focused proof passes. The
+canonical architecture and material-state record remain in SOURCEMAP.md, not this ledger.

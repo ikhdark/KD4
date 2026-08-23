@@ -22,10 +22,12 @@ use crate::events::CodexToolItemEventBase;
 use crate::events::CodexTurnEventRequest;
 use crate::events::FinalApprovalOutcome;
 use crate::events::GuardianApprovalRequestSource;
+use crate::events::GuardianReviewAnalyticsResult;
 use crate::events::GuardianReviewDecision;
 use crate::events::GuardianReviewEventParams;
 use crate::events::GuardianReviewFailureReason;
 use crate::events::GuardianReviewTerminalStatus;
+use crate::events::GuardianReviewTrackContext;
 use crate::events::GuardianReviewedAction;
 use crate::events::ReviewResolution;
 use crate::events::ReviewStatus;
@@ -87,6 +89,7 @@ use crate::facts::TurnTokenUsageFact;
 use crate::reducer::AnalyticsReducer;
 use crate::reducer::normalize_path_for_skill_id;
 use crate::reducer::skill_id_for_local_skill;
+use codex_app_server_protocol::AdditionalPermissionProfile;
 use codex_app_server_protocol::ApprovalsReviewer as AppServerApprovalsReviewer;
 use codex_app_server_protocol::AskForApproval as AppServerAskForApproval;
 use codex_app_server_protocol::ClientInfo;
@@ -114,6 +117,8 @@ use codex_app_server_protocol::ItemGuardianApprovalReviewCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::McpToolCallStatus;
+use codex_app_server_protocol::NetworkPolicyAmendment;
+use codex_app_server_protocol::NetworkPolicyRuleAction;
 use codex_app_server_protocol::NonSteerableTurnKind;
 use codex_app_server_protocol::PatchApplyStatus;
 use codex_app_server_protocol::PermissionsRequestApprovalParams;
@@ -766,6 +771,24 @@ async fn ingest_completed_command_execution_item(
     thread_id: &str,
     item_id: &str,
 ) {
+    ingest_command_execution_item_lifecycle(
+        reducer,
+        events,
+        thread_id,
+        item_id,
+        CommandExecutionStatus::Completed,
+    )
+    .await;
+}
+
+async fn ingest_command_execution_item_lifecycle(
+    reducer: &mut AnalyticsReducer,
+    events: &mut Vec<TrackEventRequest>,
+    thread_id: &str,
+    item_id: &str,
+    terminal_status: CommandExecutionStatus,
+) {
+    let exit_code = matches!(&terminal_status, CommandExecutionStatus::Completed).then_some(0);
     reducer
         .ingest(
             AnalyticsFact::Notification(Box::new(sample_turn_started_notification(
@@ -801,8 +824,8 @@ async fn ingest_completed_command_execution_item(
                     completed_at_ms: 1_042,
                     item: sample_command_execution_item_with_id(
                         item_id,
-                        CommandExecutionStatus::Completed,
-                        Some(0),
+                        terminal_status,
+                        exit_code,
                         Some(42),
                     ),
                 },
@@ -945,6 +968,36 @@ fn sample_command_approval_response(
         request_id: RequestId::Integer(request_id),
         response: CommandExecutionRequestApprovalResponse { decision },
     }
+}
+
+async fn declined_command_item_payload_after_review(
+    request: ServerRequest,
+    review_completion: AnalyticsFact,
+) -> serde_json::Value {
+    let mut reducer = AnalyticsReducer::default();
+    let mut events = Vec::new();
+    ingest_review_prerequisites(&mut reducer, &mut events).await;
+    reducer
+        .ingest(
+            AnalyticsFact::ServerRequest {
+                connection_id: 7,
+                request: Box::new(request),
+            },
+            &mut events,
+        )
+        .await;
+    reducer.ingest(review_completion, &mut events).await;
+    events.clear();
+    ingest_command_execution_item_lifecycle(
+        &mut reducer,
+        &mut events,
+        "thread-1",
+        "item-1",
+        CommandExecutionStatus::Declined,
+    )
+    .await;
+    assert_eq!(events.len(), 1);
+    serde_json::to_value(&events[0]).expect("serialize declined command item event")
 }
 
 fn sample_permissions_approval_request(request_id: i64) -> ServerRequest {
@@ -2404,6 +2457,274 @@ async fn item_lifecycle_notifications_publish_command_execution_event() {
         "codex-tui"
     );
     assert_eq!(payload[0]["event_params"]["thread_source"], "user");
+}
+
+#[tokio::test]
+async fn final_approval_outcome_maps_known_no_review_policies() {
+    for (approval_policy, terminal_status, expected_outcome, expected_failure) in [
+        (
+            AskForApproval::OnRequest,
+            CommandExecutionStatus::Completed,
+            "not_needed",
+            serde_json::Value::Null,
+        ),
+        (
+            AskForApproval::Never,
+            CommandExecutionStatus::Completed,
+            "config_allowed",
+            serde_json::Value::Null,
+        ),
+        (
+            AskForApproval::Never,
+            CommandExecutionStatus::Declined,
+            "policy_forbidden",
+            json!("policy_forbidden"),
+        ),
+    ] {
+        let mut reducer = AnalyticsReducer::default();
+        let mut events = Vec::new();
+        ingest_review_prerequisites(&mut reducer, &mut events).await;
+        let mut resolved_config = sample_turn_resolved_config("thread-1", "turn-1");
+        resolved_config.approval_policy = approval_policy;
+        reducer
+            .ingest(
+                AnalyticsFact::Custom(CustomAnalyticsFact::TurnResolvedConfig(Box::new(
+                    resolved_config,
+                ))),
+                &mut events,
+            )
+            .await;
+        ingest_command_execution_item_lifecycle(
+            &mut reducer,
+            &mut events,
+            "thread-1",
+            "item-1",
+            terminal_status,
+        )
+        .await;
+
+        assert_eq!(events.len(), 1);
+        let payload = serde_json::to_value(&events[0]).expect("serialize command item event");
+        assert_eq!(
+            payload["event_params"]["final_approval_outcome"],
+            expected_outcome
+        );
+        assert_eq!(payload["event_params"]["failure_kind"], expected_failure);
+    }
+}
+
+#[tokio::test]
+async fn interrupted_tool_item_is_flushed_with_original_context() {
+    let mut reducer = AnalyticsReducer::default();
+    let mut events = Vec::new();
+    ingest_review_prerequisites(&mut reducer, &mut events).await;
+    reducer
+        .ingest(
+            AnalyticsFact::Custom(CustomAnalyticsFact::TurnResolvedConfig(Box::new(
+                sample_turn_resolved_config("thread-1", "turn-1"),
+            ))),
+            &mut events,
+        )
+        .await;
+    reducer
+        .ingest(
+            AnalyticsFact::Notification(Box::new(sample_turn_started_notification(
+                "thread-1", "turn-1",
+            ))),
+            &mut events,
+        )
+        .await;
+    reducer
+        .ingest(
+            AnalyticsFact::Notification(Box::new(ServerNotification::ItemStarted(
+                ItemStartedNotification {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    started_at_ms: 400,
+                    item: sample_command_execution_item(
+                        CommandExecutionStatus::InProgress,
+                        None,
+                        None,
+                    ),
+                },
+            ))),
+            &mut events,
+        )
+        .await;
+    reducer
+        .ingest(
+            AnalyticsFact::Notification(Box::new(sample_turn_completed_notification(
+                "thread-1",
+                "turn-1",
+                AppServerTurnStatus::Interrupted,
+                None,
+            ))),
+            &mut events,
+        )
+        .await;
+
+    assert_eq!(events.len(), 1);
+    let payload = serde_json::to_value(&events[0]).expect("serialize interrupted tool item event");
+    assert_eq!(payload["event_type"], "codex_command_execution_event");
+    assert_eq!(payload["event_params"]["item_id"], "item-1");
+    assert_eq!(payload["event_params"]["terminal_status"], "interrupted");
+    assert_eq!(
+        payload["event_params"]["final_approval_outcome"],
+        "not_needed"
+    );
+    assert_eq!(payload["event_params"]["failure_kind"], json!(null));
+    assert_eq!(payload["event_params"]["started_at_ms"], 400);
+    assert_eq!(payload["event_params"]["completed_at_ms"], 456);
+    assert_eq!(payload["event_params"]["duration_ms"], 56);
+}
+
+#[tokio::test]
+async fn failed_turn_flushes_in_progress_tool_item() {
+    let mut reducer = AnalyticsReducer::default();
+    let mut events = Vec::new();
+    ingest_review_prerequisites(&mut reducer, &mut events).await;
+    reducer
+        .ingest(
+            AnalyticsFact::Custom(CustomAnalyticsFact::TurnResolvedConfig(Box::new(
+                sample_turn_resolved_config("thread-1", "turn-1"),
+            ))),
+            &mut events,
+        )
+        .await;
+    reducer
+        .ingest(
+            AnalyticsFact::Notification(Box::new(sample_turn_started_notification(
+                "thread-1", "turn-1",
+            ))),
+            &mut events,
+        )
+        .await;
+    reducer
+        .ingest(
+            AnalyticsFact::Notification(Box::new(ServerNotification::ItemStarted(
+                ItemStartedNotification {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    started_at_ms: 400,
+                    item: sample_command_execution_item(
+                        CommandExecutionStatus::InProgress,
+                        None,
+                        None,
+                    ),
+                },
+            ))),
+            &mut events,
+        )
+        .await;
+    reducer
+        .ingest(
+            AnalyticsFact::Notification(Box::new(sample_turn_completed_notification(
+                "thread-1",
+                "turn-1",
+                AppServerTurnStatus::Failed,
+                None,
+            ))),
+            &mut events,
+        )
+        .await;
+
+    assert_eq!(events.len(), 1);
+    let payload = serde_json::to_value(&events[0]).expect("serialize failed tool item event");
+    assert_eq!(payload["event_type"], "codex_command_execution_event");
+    assert_eq!(payload["event_params"]["item_id"], "item-1");
+    assert_eq!(payload["event_params"]["terminal_status"], "failed");
+    assert_eq!(payload["event_params"]["started_at_ms"], 400);
+    assert_eq!(payload["event_params"]["completed_at_ms"], 456);
+    assert_eq!(payload["event_params"]["duration_ms"], 56);
+}
+
+#[tokio::test]
+async fn tool_item_failure_kind_uses_terminal_review_provenance() {
+    let approval_aborted = declined_command_item_payload_after_review(
+        sample_command_approval_request(/*request_id*/ 81, /*approval_id*/ None),
+        AnalyticsFact::ServerRequestAborted {
+            completed_at_ms: 1_042,
+            request_id: RequestId::Integer(81),
+        },
+    )
+    .await;
+    assert_eq!(
+        approval_aborted["event_params"]["final_approval_outcome"],
+        "user_aborted"
+    );
+    assert_eq!(
+        approval_aborted["event_params"]["failure_kind"],
+        "approval_aborted"
+    );
+
+    let mut sandbox_request =
+        sample_command_approval_request(/*request_id*/ 82, /*approval_id*/ None);
+    let ServerRequest::CommandExecutionRequestApproval { params, .. } = &mut sandbox_request else {
+        unreachable!("sample approval request should be command execution")
+    };
+    params.additional_permissions = Some(AdditionalPermissionProfile {
+        network: None,
+        file_system: None,
+    });
+    let sandbox_denied = declined_command_item_payload_after_review(
+        sandbox_request,
+        AnalyticsFact::ServerResponse {
+            completed_at_ms: 1_042,
+            response: Box::new(sample_command_approval_response(
+                /*request_id*/ 82,
+                CommandExecutionApprovalDecision::Decline,
+            )),
+        },
+    )
+    .await;
+    assert_eq!(
+        sandbox_denied["event_params"]["final_approval_outcome"],
+        "user_denied"
+    );
+    assert_eq!(
+        sandbox_denied["event_params"]["failure_kind"],
+        "sandbox_denied"
+    );
+    assert_eq!(
+        sandbox_denied["event_params"]["requested_additional_permissions"],
+        true
+    );
+
+    let network_policy_amendment = NetworkPolicyAmendment {
+        host: "example.com".to_string(),
+        action: NetworkPolicyRuleAction::Deny,
+    };
+    let mut policy_request =
+        sample_command_approval_request(/*request_id*/ 83, /*approval_id*/ None);
+    let ServerRequest::CommandExecutionRequestApproval { params, .. } = &mut policy_request else {
+        unreachable!("sample approval request should be command execution")
+    };
+    params.proposed_network_policy_amendments = Some(vec![network_policy_amendment.clone()]);
+    let policy_forbidden = declined_command_item_payload_after_review(
+        policy_request,
+        AnalyticsFact::ServerResponse {
+            completed_at_ms: 1_042,
+            response: Box::new(sample_command_approval_response(
+                /*request_id*/ 83,
+                CommandExecutionApprovalDecision::ApplyNetworkPolicyAmendment {
+                    network_policy_amendment,
+                },
+            )),
+        },
+    )
+    .await;
+    assert_eq!(
+        policy_forbidden["event_params"]["final_approval_outcome"],
+        "policy_forbidden"
+    );
+    assert_eq!(
+        policy_forbidden["event_params"]["failure_kind"],
+        "policy_forbidden"
+    );
+    assert_eq!(
+        policy_forbidden["event_params"]["requested_network_access"],
+        true
+    );
 }
 
 #[tokio::test]
@@ -4428,6 +4749,71 @@ async fn turn_lifecycle_emits_turn_event() {
         json!(13)
     );
     assert_eq!(payload["event_params"]["total_tokens"], json!(321));
+}
+
+#[tokio::test]
+async fn turn_lifecycle_preserves_missing_completion_timestamp() {
+    let mut reducer = AnalyticsReducer::default();
+    let mut out = Vec::new();
+
+    ingest_turn_prerequisites(
+        &mut reducer,
+        &mut out,
+        /*include_initialize*/ true,
+        /*include_resolved_config*/ true,
+        /*include_started*/ true,
+        /*include_token_usage*/ false,
+    )
+    .await;
+    let mut notification = sample_turn_completed_notification(
+        "thread-2",
+        "turn-2",
+        AppServerTurnStatus::Completed,
+        /*codex_error_info*/ None,
+    );
+    let ServerNotification::TurnCompleted(completed) = &mut notification else {
+        unreachable!("sample helper must return turn/completed");
+    };
+    completed.turn.completed_at = None;
+
+    reducer
+        .ingest(
+            AnalyticsFact::Notification(Box::new(notification)),
+            &mut out,
+        )
+        .await;
+
+    let event = out
+        .iter()
+        .find(|event| matches!(event, TrackEventRequest::TurnEvent(_)))
+        .expect("turn event should be emitted");
+    let payload = serde_json::to_value(event).expect("serialize turn event");
+    assert_eq!(payload["event_params"]["completed_at"], json!(null));
+}
+
+#[test]
+fn guardian_review_event_uses_nested_session_tool_call_count() {
+    let context = GuardianReviewTrackContext::new(
+        "thread-guardian".to_string(),
+        "turn-guardian".to_string(),
+        "review-guardian".to_string(),
+        None,
+        GuardianApprovalRequestSource::DelegatedSubagent,
+        GuardianReviewedAction::NetworkAccess {
+            protocol: NetworkApprovalProtocol::Https,
+            port: 443,
+        },
+        90_000,
+    );
+    let params = context.event_params(
+        GuardianReviewAnalyticsResult {
+            tool_call_count: Some(7),
+            ..GuardianReviewAnalyticsResult::without_session()
+        },
+        context.started_at_ms,
+    );
+
+    assert_eq!(params.tool_call_count, Some(7));
 }
 
 #[tokio::test]

@@ -295,6 +295,8 @@ impl EventProcessorWithJsonOutput {
                                     },
                                     message: state.message,
                                     surfaced_result: state.surfaced_result,
+                                    completion: state.completion,
+                                    last_agent_message: state.last_agent_message,
                                 },
                             )
                         })

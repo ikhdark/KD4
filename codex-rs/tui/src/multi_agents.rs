@@ -12,6 +12,7 @@ use codex_app_server_protocol::CollabAgentStatus;
 use codex_app_server_protocol::CollabAgentTool;
 use codex_app_server_protocol::CollabAgentToolCallStatus;
 use codex_app_server_protocol::SubAgentActivityKind;
+use codex_app_server_protocol::TaskCompletionStatus;
 use codex_app_server_protocol::ThreadItem;
 use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
@@ -625,8 +626,16 @@ fn status_summary_spans(status: &CollabAgentState) -> Vec<Span<'static>> {
         // Allow `.yellow()`
         #[allow(clippy::disallowed_methods)]
         CollabAgentStatus::Interrupted => vec![Span::from("Interrupted").yellow()],
+        // Allow `.yellow()`.
+        #[allow(clippy::disallowed_methods)]
         CollabAgentStatus::Completed => {
-            let mut spans = vec![Span::from("Completed").green()];
+            let mut spans = match status.completion.as_ref().map(|gate| gate.status) {
+                Some(TaskCompletionStatus::Partial) => vec![Span::from("Partial").yellow()],
+                Some(TaskCompletionStatus::Blocked) => vec![Span::from("Blocked").red()],
+                Some(TaskCompletionStatus::Passed) | None => {
+                    vec![Span::from("Completed").green()]
+                }
+            };
             if let Some(message) = status.message.as_ref() {
                 let message_preview = truncate_text(
                     &message.split_whitespace().collect::<Vec<_>>().join(" "),
@@ -912,11 +921,41 @@ mod tests {
         assert_snapshot!("collab_resume_interrupted", cell_to_text(&cell));
     }
 
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn collab_completion_gate_status_is_not_flattened() {
+        for (completion_status, expected_label, expected_color) in [
+            (TaskCompletionStatus::Partial, "Partial", Color::Yellow),
+            (TaskCompletionStatus::Blocked, "Blocked", Color::Red),
+        ] {
+            let state = CollabAgentState {
+                status: CollabAgentStatus::Completed,
+                message: Some("finished the available work".to_string()),
+                surfaced_result: None,
+                completion: Some(codex_app_server_protocol::TaskCompletionGate {
+                    status: completion_status,
+                    reasons: vec!["validation unavailable".to_string()],
+                    evidence_path: None,
+                }),
+                last_agent_message: Some("finished the available work".to_string()),
+            };
+
+            let spans = status_summary_spans(&state);
+            assert_eq!(spans[0].content.as_ref(), expected_label);
+            assert_eq!(spans[0].style.fg, Some(expected_color));
+            assert_eq!(spans[1].content.as_ref(), " - ");
+            assert!(spans[1].style.add_modifier.contains(Modifier::DIM));
+            assert_eq!(spans[2].content.as_ref(), "finished the available work");
+        }
+    }
+
     fn agent_state(status: CollabAgentStatus, message: Option<&str>) -> CollabAgentState {
         CollabAgentState {
             status,
             message: message.map(str::to_string),
             surfaced_result: None,
+            completion: None,
+            last_agent_message: None,
         }
     }
 

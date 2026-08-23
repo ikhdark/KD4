@@ -93,6 +93,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use tokio::sync::OwnedRwLockReadGuard;
 use tokio::sync::RwLock;
 use tokio::sync::broadcast;
 use tracing::instrument;
@@ -203,6 +204,23 @@ pub struct ThreadManager {
     _test_codex_home_guard: Option<TempCodexHomeGuard>,
 }
 
+/// Keeps the exact notified thread instance loaded while a consumer registers it.
+pub struct ThreadCreatedThreadGuard {
+    thread_id: ThreadId,
+    thread: Arc<CodexThread>,
+    _threads: OwnedRwLockReadGuard<HashMap<ThreadId, Arc<CodexThread>>>,
+}
+
+impl ThreadCreatedThreadGuard {
+    pub fn thread_id(&self) -> ThreadId {
+        self.thread_id
+    }
+
+    pub fn thread(&self) -> &Arc<CodexThread> {
+        &self.thread
+    }
+}
+
 pub struct StartThreadOptions {
     pub config: Config,
     pub allow_provider_model_fallback: bool,
@@ -258,6 +276,7 @@ pub(crate) struct ResumeThreadWithHistoryOptions {
 pub(crate) struct ThreadManagerState {
     threads: Arc<RwLock<HashMap<ThreadId, Arc<CodexThread>>>>,
     thread_created_tx: broadcast::Sender<ThreadId>,
+    thread_created_instances: std::sync::Mutex<HashMap<ThreadId, std::sync::Weak<CodexThread>>>,
     auth_manager: Arc<AuthManager>,
     models_manager: SharedModelsManager,
     environment_manager: Arc<EnvironmentManager>,
@@ -556,6 +575,7 @@ impl ThreadManager {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
                 thread_created_tx,
+                thread_created_instances: std::sync::Mutex::new(HashMap::new()),
                 models_manager: build_models_manager(config, auth_manager.clone()),
                 environment_manager,
                 skills_service,
@@ -675,6 +695,7 @@ impl ThreadManager {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
                 thread_created_tx,
+                thread_created_instances: std::sync::Mutex::new(HashMap::new()),
                 models_manager: create_model_provider(provider, Some(auth_manager.clone()))
                     .models_manager(
                         OPENAI_PROVIDER_ID,
@@ -786,6 +807,19 @@ impl ThreadManager {
 
     pub fn subscribe_thread_created(&self) -> broadcast::Receiver<ThreadId> {
         self.state.thread_created_tx.subscribe()
+    }
+
+    /// Returns IDs whose current loaded instance emitted a `thread_created` notification.
+    pub async fn list_thread_created_ids(&self) -> Vec<ThreadId> {
+        self.state.list_thread_created_ids().await
+    }
+
+    /// Acquires the current notified instance and prevents replacement until the guard is dropped.
+    pub async fn acquire_thread_created_thread(
+        &self,
+        thread_id: ThreadId,
+    ) -> Option<ThreadCreatedThreadGuard> {
+        self.state.acquire_thread_created_thread(thread_id).await
     }
 
     pub async fn get_thread(&self, thread_id: ThreadId) -> CodexResult<Arc<CodexThread>> {
@@ -1266,7 +1300,7 @@ impl ThreadManager {
     /// as `Arc<CodexThread>`, it is possible that other references to it exist elsewhere.
     /// Returns the thread if the thread was found and removed.
     pub async fn remove_thread(&self, thread_id: &ThreadId) -> Option<Arc<CodexThread>> {
-        self.state.threads.write().await.remove(thread_id)
+        self.state.remove_thread(thread_id).await
     }
 
     /// Remove a thread only when the currently loaded instance is the expected one.
@@ -1655,7 +1689,11 @@ impl ThreadManagerState {
 
     /// Remove a thread from the manager by ID, returning it when present.
     pub(crate) async fn remove_thread(&self, thread_id: &ThreadId) -> Option<Arc<CodexThread>> {
-        self.threads.write().await.remove(thread_id)
+        let removed = self.threads.write().await.remove(thread_id);
+        if let Some(thread) = removed.as_ref() {
+            self.forget_thread_created_instance_if_same(thread_id, thread);
+        }
+        removed
     }
 
     /// Remove a thread only when the currently loaded instance is the expected one.
@@ -1672,7 +1710,65 @@ impl ThreadManagerState {
             return false;
         }
         threads.remove(thread_id);
+        self.forget_thread_created_instance_if_same(thread_id, expected_thread);
         true
+    }
+
+    async fn list_thread_created_ids(&self) -> Vec<ThreadId> {
+        let threads = self.threads.read().await;
+        let mut created_instances = self
+            .thread_created_instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        created_instances.retain(|thread_id, notified_thread| {
+            let Some(notified_thread) = notified_thread.upgrade() else {
+                return false;
+            };
+            threads
+                .get(thread_id)
+                .is_some_and(|loaded_thread| Arc::ptr_eq(loaded_thread, &notified_thread))
+        });
+        created_instances.keys().copied().collect()
+    }
+
+    async fn acquire_thread_created_thread(
+        &self,
+        thread_id: ThreadId,
+    ) -> Option<ThreadCreatedThreadGuard> {
+        let threads = Arc::clone(&self.threads).read_owned().await;
+        let loaded_thread = Arc::clone(threads.get(&thread_id)?);
+        let created_instances = self
+            .thread_created_instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let notified_thread = created_instances
+            .get(&thread_id)
+            .and_then(std::sync::Weak::upgrade)
+            .filter(|notified_thread| Arc::ptr_eq(notified_thread, &loaded_thread))?;
+        drop(created_instances);
+        Some(ThreadCreatedThreadGuard {
+            thread_id,
+            thread: notified_thread,
+            _threads: threads,
+        })
+    }
+
+    fn forget_thread_created_instance_if_same(
+        &self,
+        thread_id: &ThreadId,
+        expected_thread: &Arc<CodexThread>,
+    ) {
+        let mut created_instances = self
+            .thread_created_instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if created_instances
+            .get(thread_id)
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|notified_thread| Arc::ptr_eq(&notified_thread, expected_thread))
+        {
+            created_instances.remove(thread_id);
+        }
     }
 
     pub(crate) async fn effective_multi_agent_version_for_spawn(
@@ -2201,7 +2297,22 @@ impl ThreadManagerState {
         )))
     }
 
-    pub(crate) fn notify_thread_created(&self, thread_id: ThreadId) {
+    pub(crate) async fn notify_thread_created(
+        &self,
+        thread_id: ThreadId,
+        thread: &Arc<CodexThread>,
+    ) {
+        let threads = self.threads.read().await;
+        if !threads
+            .get(&thread_id)
+            .is_some_and(|loaded_thread| Arc::ptr_eq(loaded_thread, thread))
+        {
+            return;
+        }
+        self.thread_created_instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(thread_id, Arc::downgrade(thread));
         let _ = self.thread_created_tx.send(thread_id);
     }
 

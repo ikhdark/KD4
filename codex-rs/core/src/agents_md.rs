@@ -27,6 +27,7 @@ use codex_exec_server::ExecutorFileSystem;
 use codex_extension_api::UserInstructions;
 use codex_file_system::FindUpErrorPolicy;
 use codex_file_system::find_nearest_ancestor_with_markers;
+use codex_otel::MetricsClient;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use futures::StreamExt;
@@ -53,6 +54,12 @@ const AGENTS_MD_SEPARATOR: &str = "\n\n--- project-doc ---\n\n";
 const MAX_CONCURRENT_DIRECTORY_SEARCHES: usize = 8;
 const MAX_UTF8_BOUNDARY_LOOKAHEAD_BYTES: usize = 3;
 const STABLE_CONTEXT_RENDER_CACHE_CAPACITY: usize = 64;
+const PROJECT_DISCOVERY_REUSE_METRIC: &str = "codex.project_discovery_reuse";
+
+enum ProjectDiscoveryReuse {
+    Hit(PathUri),
+    Miss(&'static str),
+}
 
 #[derive(Default)]
 struct StableContextRenderCache {
@@ -108,7 +115,7 @@ impl AgentsMdFreshness {
 
 struct EnvironmentProjectInstructions {
     loaded: Option<LoadedAgentsMd>,
-    retained_bytes: usize,
+    retained_source_bytes: usize,
 }
 
 struct LoadedProjectDoc {
@@ -143,9 +150,9 @@ pub(crate) async fn load_project_instructions(
     environments: &TurnEnvironmentSnapshot,
 ) -> ProjectInstructionsLoad {
     let mut loaded = LoadedAgentsMd::from_user_instructions(user_instructions);
-    let mut remaining = config.project_doc_max_bytes;
+    let mut remaining_source_bytes = config.project_doc_max_bytes;
     let mut complete = true;
-    if remaining == 0 {
+    if remaining_source_bytes == 0 {
         return ProjectInstructionsLoad {
             loaded: (!loaded.is_empty()).then_some(loaded),
             complete,
@@ -158,44 +165,18 @@ pub(crate) async fn load_project_instructions(
         let environment = turn_environment.environment.clone();
         let cwd = turn_environment.cwd().clone();
         let filesystem = environment.get_filesystem();
-        let result = agents_md_paths(config, &cwd, filesystem.as_ref()).await;
+        let result =
+            agents_md_paths(config, &cwd, filesystem.as_ref(), !environment.is_remote()).await;
         discoveries.push((environment_id, cwd, filesystem, result));
     }
 
-    let contributing_environments = discoveries
-        .iter()
-        .filter(|(_, _, _, result)| matches!(result, Ok(paths) if !paths.is_empty()))
-        .count();
-    let mut first_project_environment = true;
     for (environment_id, cwd, filesystem, result) in discoveries {
         match result {
             Ok(candidates) if !candidates.is_empty() => {
-                let mut generated_overhead = 0usize;
-                if first_project_environment && loaded.user_instructions.is_some() {
-                    generated_overhead += AGENTS_MD_SEPARATOR.len();
-                }
-                if contributing_environments > 1 {
-                    if !first_project_environment {
-                        generated_overhead += 2;
-                    }
-                    generated_overhead += format!(
-                        "for `{}` with root {}\n\n",
-                        environment_id,
-                        cwd.inferred_native_path_string()
-                    )
-                    .len();
-                }
-                if generated_overhead >= remaining {
-                    remaining = 0;
-                    first_project_environment = false;
-                    continue;
-                }
-                remaining -= generated_overhead;
-
                 let project_docs = match read_discovered_project_docs(
                     filesystem.as_ref(),
                     candidates,
-                    remaining,
+                    remaining_source_bytes,
                     /*prefetch_utf8_boundary_slack*/ false,
                 )
                 .await
@@ -210,13 +191,12 @@ pub(crate) async fn load_project_instructions(
                         continue;
                     }
                 };
-                let environment_load =
-                    render_project_docs(&environment_id, &cwd, project_docs, remaining);
-                remaining = remaining.saturating_sub(environment_load.retained_bytes);
+                let environment_load = render_project_docs(&environment_id, &cwd, project_docs);
+                remaining_source_bytes =
+                    remaining_source_bytes.saturating_sub(environment_load.retained_source_bytes);
                 if let Some(docs) = environment_load.loaded {
                     loaded.entries.extend(docs.entries);
                 }
-                first_project_environment = false;
             }
             Ok(_) => {}
             Err(err) => {
@@ -254,7 +234,7 @@ async fn read_agents_md(
         return Ok(None);
     }
 
-    let paths = agents_md_paths(config, cwd, fs).await?;
+    let paths = agents_md_paths(config, cwd, fs, /*reuse_project_discovery*/ false).await?;
     Ok(
         read_discovered_agents_md(fs, environment_id, cwd, paths, max_total)
             .await?
@@ -274,12 +254,7 @@ async fn read_discovered_agents_md(
         fs, paths, max_total, /*prefetch_utf8_boundary_slack*/ false,
     )
     .await?;
-    Ok(render_project_docs(
-        environment_id,
-        cwd,
-        project_docs,
-        max_total,
-    ))
+    Ok(render_project_docs(environment_id, cwd, project_docs))
 }
 
 async fn read_discovered_project_docs(
@@ -316,6 +291,7 @@ async fn read_discovered_project_docs(
             project_doc.retained_data.truncate(valid_up_to);
         }
         let retained_bytes = retained_project_doc_bytes(&project_doc.retained_data, remaining);
+        project_doc.retained_data.truncate(retained_bytes);
         project_docs.push(LoadedProjectDoc {
             candidate,
             read: project_doc,
@@ -330,29 +306,26 @@ fn render_project_docs(
     environment_id: &str,
     cwd: &PathUri,
     project_docs: Vec<LoadedProjectDoc>,
-    max_total: usize,
 ) -> EnvironmentProjectInstructions {
-    let mut remaining = max_total;
     let mut loaded = LoadedAgentsMd::default();
-    let mut entries = Vec::new();
+    let mut retained_source_bytes = 0usize;
 
-    // Reapply the shared budget nearest-first. Each environment was prefetched with at least
-    // this much local capacity, so narrowing a retained prefix never requires more I/O.
-    for LoadedProjectDoc {
-        candidate,
-        mut read,
-    } in project_docs.into_iter().rev()
-    {
-        let separator_bytes = usize::from(!entries.is_empty()) * 2;
-        let Some((text, retained_bytes)) = render_project_doc_to_budget(
-            &mut read,
-            &candidate.path,
-            remaining.saturating_sub(separator_bytes),
-        ) else {
-            continue;
-        };
+    // Source bytes consume the configured budget. Mandatory truncation notices and provenance
+    // labels do not: charging them to the same budget could silently erase the only evidence that
+    // a broader instruction file was omitted.
+    for LoadedProjectDoc { candidate, read } in project_docs {
+        let retained_bytes = read.retained_data.len();
         let omitted_bytes = read.original_bytes.saturating_sub(retained_bytes as u64);
+        let mut text = String::from_utf8_lossy(&read.retained_data).to_string();
         if omitted_bytes > 0 {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(&project_doc_truncation_notice(
+                &candidate.path,
+                read.original_bytes,
+                retained_bytes,
+            ));
             tracing::warn!(
                 path = %candidate.path,
                 original_bytes = read.original_bytes,
@@ -362,8 +335,7 @@ fn render_project_docs(
             );
         }
 
-        let rendered_bytes = text.len();
-        entries.push(InstructionEntry {
+        loaded.entries.push(InstructionEntry {
             contents: text,
             provenance: InstructionProvenance::Project {
                 source_path: candidate.path,
@@ -371,51 +343,13 @@ fn render_project_docs(
                 cwd: cwd.clone(),
             },
         });
-        remaining = remaining.saturating_sub(rendered_bytes + separator_bytes);
+        retained_source_bytes = retained_source_bytes.saturating_add(retained_bytes);
     }
-    entries.reverse();
-    loaded.entries.extend(entries);
 
     EnvironmentProjectInstructions {
         loaded: (!loaded.is_empty()).then_some(loaded),
-        retained_bytes: max_total.saturating_sub(remaining),
+        retained_source_bytes,
     }
-}
-
-fn render_project_doc_to_budget(
-    read: &mut ProjectDocRead,
-    path: &PathUri,
-    max_bytes: usize,
-) -> Option<(String, usize)> {
-    truncate_project_doc_to_budget(read, max_bytes);
-    loop {
-        let retained_bytes = read.retained_data.len();
-        let omitted_bytes = read.original_bytes.saturating_sub(retained_bytes as u64);
-        let mut text = String::from_utf8_lossy(&read.retained_data).to_string();
-        if omitted_bytes > 0 {
-            if !text.is_empty() {
-                text.push_str("\n\n");
-            }
-            text.push_str(&project_doc_truncation_notice(
-                path,
-                read.original_bytes,
-                retained_bytes,
-            ));
-        }
-        if text.len() <= max_bytes {
-            return Some((text, retained_bytes));
-        }
-        if retained_bytes == 0 {
-            return None;
-        }
-        let excess = text.len().saturating_sub(max_bytes).max(1);
-        truncate_project_doc_to_budget(read, retained_bytes.saturating_sub(excess));
-    }
-}
-
-fn truncate_project_doc_to_budget(project_doc: &mut ProjectDocRead, max_bytes: usize) {
-    let retained_bytes = retained_project_doc_bytes(&project_doc.retained_data, max_bytes);
-    project_doc.retained_data.truncate(retained_bytes);
 }
 
 fn retained_project_doc_bytes(retained_data: &[u8], max_bytes: usize) -> usize {
@@ -627,18 +561,59 @@ async fn agents_md_paths(
     config: &Config,
     cwd: &PathUri,
     fs: &dyn ExecutorFileSystem,
+    reuse_project_discovery: bool,
+) -> io::Result<Vec<ProjectDocCandidate>> {
+    let metrics = codex_otel::global();
+    agents_md_paths_with_metrics(config, cwd, fs, reuse_project_discovery, metrics.as_ref()).await
+}
+
+async fn agents_md_paths_with_metrics(
+    config: &Config,
+    cwd: &PathUri,
+    fs: &dyn ExecutorFileSystem,
+    reuse_project_discovery: bool,
+    metrics: Option<&MetricsClient>,
 ) -> io::Result<Vec<ProjectDocCandidate>> {
     let dir = cwd.clone();
 
     let project_root_markers = effective_project_root_markers(config);
-    let project_root = find_nearest_ancestor_with_markers(
-        fs,
-        &dir,
-        project_root_markers,
-        FindUpErrorPolicy::Propagate,
-        /*sandbox*/ None,
-    )
-    .await?;
+    let reuse = if !reuse_project_discovery {
+        ProjectDiscoveryReuse::Miss("reuse_disabled")
+    } else if let Ok(cwd) = dir.to_abs_path() {
+        match config.config_layer_stack.project_discovery() {
+            None => ProjectDiscoveryReuse::Miss("context_unavailable"),
+            Some(discovery) if !discovery.matches_cwd(&cwd) => {
+                ProjectDiscoveryReuse::Miss("cwd_mismatch")
+            }
+            Some(discovery)
+                if discovery.project_root_markers() != project_root_markers.as_slice() =>
+            {
+                ProjectDiscoveryReuse::Miss("markers_mismatch")
+            }
+            Some(discovery) => {
+                ProjectDiscoveryReuse::Hit(PathUri::from_abs_path(discovery.project_root()))
+            }
+        }
+    } else {
+        ProjectDiscoveryReuse::Miss("cwd_unavailable")
+    };
+    let project_root = match reuse {
+        ProjectDiscoveryReuse::Hit(root) => {
+            record_project_discovery_reuse(metrics, "agents_md", "hit", "matched");
+            Some(root)
+        }
+        ProjectDiscoveryReuse::Miss(reason) => {
+            record_project_discovery_reuse(metrics, "agents_md", "miss", reason);
+            find_nearest_ancestor_with_markers(
+                fs,
+                &dir,
+                project_root_markers,
+                FindUpErrorPolicy::Propagate,
+                /*sandbox*/ None,
+            )
+            .await?
+        }
+    };
     let search_dirs = if let Some(root) = project_root {
         let mut dirs = Vec::new();
         let mut cursor = dir.clone();
@@ -691,6 +666,28 @@ async fn agents_md_paths(
         }
     }
     Ok(found)
+}
+
+fn record_project_discovery_reuse(
+    metrics: Option<&MetricsClient>,
+    consumer: &'static str,
+    result: &'static str,
+    reason: &'static str,
+) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    if let Err(err) = metrics.counter(
+        PROJECT_DISCOVERY_REUSE_METRIC,
+        /*inc*/ 1,
+        &[
+            ("consumer", consumer),
+            ("result", result),
+            ("reason", reason),
+        ],
+    ) {
+        tracing::warn!("project discovery reuse metric failed: {err}");
+    }
 }
 
 pub(crate) fn effective_project_root_markers(config: &Config) -> Vec<String> {

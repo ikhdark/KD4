@@ -27,7 +27,7 @@ async fn process_compacted_history_with_test_session(
         .build_initial_context_with_world_state(&turn_context, world_state.as_ref())
         .await;
     let initial_context_injection = InitialContextInjection::BeforeLastUserMessage(world_state);
-    let (refreshed, _) = crate::compact_remote::process_compacted_history(
+    let (refreshed, _, _) = crate::compact_remote::process_compacted_history(
         &session,
         &turn_context,
         compacted_history,
@@ -58,7 +58,7 @@ async fn compaction_initial_context_carries_only_delivered_world_state_snapshot(
     let world_state = Arc::new(world_state);
     let injection = InitialContextInjection::BeforeLastUserMessage(Arc::clone(&world_state));
 
-    let (_, Some(delivered_snapshot)) =
+    let (_, Some(delivered_snapshot), _) =
         build_compaction_initial_context(&session, &turn_context, &injection).await
     else {
         panic!("mid-turn compaction should carry a delivered world-state snapshot");
@@ -828,7 +828,7 @@ async fn process_compacted_history_restates_custom_realtime_start_for_active_ref
     let world_state = Arc::new(build_world_state_from_turn_context(&session, &turn_context).await);
     let initial_context_injection = InitialContextInjection::BeforeLastUserMessage(world_state);
 
-    let (refreshed, _) = crate::compact_remote::process_compacted_history(
+    let (refreshed, _, _) = crate::compact_remote::process_compacted_history(
         &session,
         &turn_context,
         vec![user_message("summary")],

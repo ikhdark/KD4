@@ -1,0 +1,603 @@
+CODEX SESSION AUDIT / BUG EVIDENCE CORPUS
+Language: Rust
+Session date: 2026-08-15
+Coverage: Codex sessions under C:\Users\kuh\.codex\sessions\2026\08 for the assigned date range.
+Method: selected explicit audits, defect/bug diagnoses, regressions, bug fixes, and closely related incomplete investigations from actual event_msg user_message events. Preserved event_msg agent_message final_answer reports as primary conclusions. Exact repeated final reports were deduplicated by normalized SHA-256. Developer and AGENTS instruction text was excluded from findings.
+Record count in this part: 6
+====================================================================================================
+STABLE EVIDENCE ID: CODEX-SESSION-01a003ef-2b21-7243-845f-b7591d32cb52
+DATE: 2026-08-15
+LANGUAGE CLASSIFICATION: Rust
+STATUS: Incomplete session; no final answer recorded
+CONFIDENCE: This record faithfully preserves the session artifact. Repository-level conclusions retain the confidence and qualifications stated by the reporting agent and were not independently re-proven during this extraction.
+
+SOURCE SESSION ARTIFACTS
+- C:\Users\kuh\.codex\sessions\2026\08\15\rollout-2026-08-15T00-40-00-01a003ef-2b21-7243-845f-b7591d32cb52.jsonl.zst
+Source session UUID: 01a003ef-2b21-7243-845f-b7591d32cb52
+Session timestamp(s): 8/15/2026 5:40:00 AM
+Working directory/project: c:\Users\kuh\Desktop\kd4
+Recorded Git revision(s): 52be9e924db6daf0f220db2c705b38418e6e6a6a
+Recorded Git branch(es): main
+Recorded lifecycle outcomes: turn_aborted
+
+DIRECTLY STATED USER REQUEST / OBSERVED SYMPTOM
+--- User message 1 ---
+solve the mutation blocking also, its out of control. i do not want it anymore, the leanest verison needed. ask me questions
+
+
+REPORTED AUDIT / DIAGNOSIS / FIX CONCLUSION
+[No final-answer event was recorded. The following is the last available progress statement and must not be treated as a completed diagnosis.]
+[No progress statement was recoverable.]
+
+FACT / HYPOTHESIS / UNKNOWN BOUNDARY
+- Direct artifact facts: the source paths, UUID, metadata, user messages, lifecycle events, and agent report text above are present in the inspected Codex session records.
+- Reported repository facts: symptoms, causes, affected files/symbols, fixes, commands, and validation results are preserved as claims made by the reporting agent. Treat exact evidence and qualifications inside the report as controlling.
+- Hypotheses: no new implementation cause or language was inferred during corpus extraction. Any hypothesis in the report remains a hypothesis unless the report states and evidences that it was established.
+- Unknowns: root cause, final disposition, fix completeness, and validation outcome remain unknown because this session has no final report.
+
+====================================================================================================
+STABLE EVIDENCE ID: CODEX-SESSION-01a003ef-b09e-7770-8884-bff4d97d6c57
+DATE: 2026-08-15
+LANGUAGE CLASSIFICATION: Rust
+STATUS: Reported conclusion available
+CONFIDENCE: This record faithfully preserves the session artifact. Repository-level conclusions retain the confidence and qualifications stated by the reporting agent and were not independently re-proven during this extraction.
+
+SOURCE SESSION ARTIFACTS
+- C:\Users\kuh\.codex\sessions\2026\08\15\rollout-2026-08-15T00-40-35-01a003ef-b09e-7770-8884-bff4d97d6c57.jsonl.zst
+- C:\Users\kuh\.codex\sessions\2026\08\15\rollout-2026-08-15T00-41-16-01a003f0-513f-7331-b824-56f984c1dd05.jsonl.zst
+- C:\Users\kuh\.codex\sessions\2026\08\15\rollout-2026-08-15T01-44-11-01a00429-ed1e-7b40-abc8-92108041c148.jsonl.zst
+- C:\Users\kuh\.codex\sessions\2026\08\15\rollout-2026-08-15T01-54-15-01a00433-22d4-7862-bf6c-b964ab9250a4.jsonl.zst
+Source session UUID: 01a003ef-b09e-7770-8884-bff4d97d6c57
+Session timestamp(s): 8/15/2026 5:40:35 AM
+Working directory/project: c:\Users\kuh\Desktop\kd4
+Recorded Git revision(s): 52be9e924db6daf0f220db2c705b38418e6e6a6a
+Recorded Git branch(es): main
+Recorded lifecycle outcomes: task_complete, turn_aborted
+
+DIRECTLY STATED USER REQUEST / OBSERVED SYMPTOM
+--- User message 1 ---
+solve the mutation blocking also, its out of control. i do not want it anymore, the leanest verison needed. ask me questions
+
+--- User message 2 ---
+PLEASE IMPLEMENT THIS PLAN:
+# Lean Removal of Mutation Blocking
+
+## Summary
+
+Delete the workspace mutation-blocking subsystem unconditionally. Shell, unified exec, `apply_patch`, hooks, and concurrent agents will no longer wait for leases, CAS checks, ownership claims, or finalization fences. Preserve lightweight mutation tracking, completion review, validation evidence, task lifecycle, and read-only reviewers.
+
+## Implementation Changes
+
+- Remove repository and exact-path mutation reservations, manifest preparation, SQLite leases, heartbeats, authority-loss cancellation, CAS rejection, and command-finalization waits.
+- Remove both workspace finalization fences and the in-process completion-activity fence. Completion evaluates a current snapshot without freezing writers.
+- Let `apply_patch` execute after typed-task lifecycle validation. Owner-packet and mutation-evidence capture become best-effort; failures produce warnings or later completion issues, never tool rejection.
+- Invalidate workspace caches without scans: mark possible shell/exec mutations at launch and termination, use exact patch paths, and retain the existing known-mutator classifier.
+- Replace completion-hook leases with a watcher-generation token. Detected or uncertain changes invalidate caches and refresh completion review; no database access, manifest scan, or wait.
+- Non-review typed agents inherit the root turn’s tool, sandbox, approval, and connector authority. Allow shell mutation, `write_stdin`, out-of-scope patches, unknown tools, and mutating external tools. Keep active-assignment checks and root-only task control.
+- Keep independent reviewers strictly read-only.
+- Admit overlapping path and contract claims. Claims remain stored as diagnostic/risk metadata, but cannot block assignment admission, writes, evidence capture, receipt submission, validation, or quiescence.
+- Preserve plan, reviewer, validation, active-task, and pending-gate completion checks. Scope mismatches may inform completion risk/review but cannot prevent the write itself.
+
+## Interfaces and Persistent State
+
+- Remove lease/fence/manifest-preparation methods, models, errors, and `active_mutation_lease_ids` from the internal `AgentTaskStore` API. Preserve workspace revision/path-event tracking and task mutation evidence.
+- Add migration `0016` that removes every finalization trigger, then drops `workspace_manifest_payloads`, `workspace_mutation_leases`, and `workspace_finalization_fences`. Keep historical migrations unchanged for checksum compatibility.
+- Remove lease-specific repository-manifest caching while retaining watcher/source-freshness caching.
+- Change workflow preflight so path, contract, and Cargo-lane overlaps return success with an `advisories` array. Remove its concurrent-workspace fingerprint rejection while retaining malformed-input and generated-output ownership validation.
+- Update fork feature metadata and workflow documentation to describe advisory coordination. Add no config switch and make no app-server wire-protocol change.
+
+## Test Plan
+
+- Verify concurrent shell, unified exec, background processes, and patches proceed without coordination waits or lease-loss termination.
+- Verify patches succeed when CAS, owner-packet, or evidence bookkeeping would previously fail, while cache invalidation and completion diagnostics remain.
+- Verify non-review typed agents have root-like mutation authority, lifecycle/root-control limits remain, and reviewers cannot mutate locally or externally.
+- Verify hook changes refresh review, unchanged hooks do not, and unreliable watcher state conservatively refreshes without blocking.
+- Verify overlapping assignments and claims are admitted and claims no longer affect quiescence.
+- Migrate a legacy database and confirm obsolete tables/triggers are gone while assignments, receipts, validations, workspace events, and evidence remain usable.
+- Verify preflight overlaps produce advisories and structural manifest errors still fail.
+- Run only focused `codex-core`, `codex-agent-task-store`, and workflow-preflight tests, followed by task-scoped Cargo checks, formatting checks, and `git diff --check`.
+
+## Assumptions
+
+- This is source-and-tests work only; no LOCAL-KD binary replacement or Desktop restart.
+- External provider authentication and native Desktop permissions remain host-owned; typed agents merely receive the same authority available to the root turn.
+- Preserve unrelated changes in `.codex/config.toml`. Reconcile the existing uncommitted `hook_runtime.rs` lease optimization by replacing only its now-obsolete lease-based observation.
+
+--- User message 3 ---
+do not publish, just finish the task
+
+
+REPORTED AUDIT / DIAGNOSIS / FIX CONCLUSION
+--- Unique final report 1; SHA-256 F764ACC4C0400E3C1BCB16521A420865791AB4E2FB05F04B8FC3D2E50A44178C ---
+Implemented the lean mutation-blocking removal. Nothing was published, installed, committed, or pushed.
+
+Key results:
+
+- Removed workspace leases, CAS checks, reservations, heartbeats, manifest preparation, and finalization fences.
+- Shell, unified exec, background commands, and `apply_patch` no longer wait on mutation coordination.
+- Cache invalidation now uses launch/termination signals, exact patch paths, and watcher generations.
+- Mutation-evidence failures only warn; committed patches are not rejected.
+- Completion reviews current state without freezing writers.
+- Typed agents inherit root-like tool permissions except root task control; reviewers remain read-only.
+- Path, contract, and Cargo-lane overlaps are advisory.
+- Added migration `0016`, dropping all 31 finalization triggers and the three obsolete tables.
+- Updated runtime guidance and workflow documentation to match advisory coordination.
+- Preserved the unrelated `.codex/config.toml` change.
+- Reconciled concurrent source-tools cleanup: its removal of the old owner-packet implementation was preserved, leaving no owner-packet write gate.
+
+Validation:
+
+- Workflow preflight: 14 tests passed.
+- `codex-agent-task-store` Cargo check passed.
+- Focused corrected store test passed.
+- Migration chain applied successfully; obsolete schema verified absent.
+- Stale mutation-coordination reference audit: zero results.
+- `git diff --check`: passed.
+- The broader store run had one unrelated wake-stream retention failure.
+- `codex-core` check could not complete after the permitted retry because of unrelated concurrent compilation errors in reasoning/source-locator work; no mutation-removal errors appeared in either run.
+
+Primary changes include [migration 0016](C:/Users/kuh/Desktop/kd4/codex-rs/agent-task-store/migrations/0016_remove_workspace_mutation_blocking.sql), [apply_patch.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/runtimes/apply_patch.rs:82), [git_workspace.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/git_workspace.rs:644), and [workflow_preflight.py](C:/Users/kuh/Desktop/kd4/scripts/workflow_preflight.py:435).
+
+No LOCAL-KD binary replacement or Desktop restart was performed.
+--- Unique final report 2; SHA-256 16DC0177A4E8B8F665EDF4E0DAF4A5407E2423CB48DDD775974B48CA931BEF18 ---
+The feature is the fork’s shared-worktree lease system, not the separate “unfinished mutation obligation” logic.
+
+Key findings:
+
+- Every ordinary local shell command is pessimistically treated as repository-wide mutation unless it is a typed command, independent review, known inspection, intercepted `apply_patch`, or admitted nonmutating validation: `codex-rs/core/src/tools/command_execution.rs:46-70`, `codex-rs/core/src/tools/handlers/shell.rs:555-759`.
+- Unified exec is broader: every local non-inspection, non-`apply_patch` command takes the lease: `codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs:920-949`.
+- Admission can wait 10 seconds for an in-process reservation, then another bounded manifest/lease path; successful commands can subsequently be converted into tool errors when finalization fails: `command_execution.rs:39-43,478-612`, `shell.rs:1219-1249`.
+- A running unified process retains the lease, heartbeats every 30 seconds, and can be terminated if authority is lost: `command_execution.rs:679-840`.
+- There is no off switch. `kd4_features.toml:718-755` declares `shared-worktree-reliability` with `config_keys=[]`. `.codex/config.toml:7` only enables completion review; disabling it does not disable shell/unified admission and does not necessarily disable final-proof fencing.
+- Actual fork sessions show repeated failures:
+  - `LOCAL-KD/sessions/2026/08/14/fork2.jsonl:32`
+  - `LOCAL-KD/sessions/2026/08/14/fork1.jsonl:38,68,102...`
+  - Error: `repository-wide mutation lease ... repository manifest preparation did not become ready`.
+  - `LOCAL-KD/sessions/2026/08/13/...45a9...jsonl:9` is the earlier manifest-race request.
+  - Other August 13 sessions show completion blocked/partial by active mutation leases and workspace finalization.
+
+The strongest design flaw is asymmetric scope:
+
+- Mutation overlap and claim conflicts only consider the same `root_session_id`: `codex-rs/agent-task-store/src/workspace.rs:2366-2442,2445-2534`.
+- Therefore repository-wide leases do not prevent two different root sessions from editing concurrently.
+- Terminal finalization checks all active workspace leases, without a root filter, and its fence rejects all new mutations: `workspace.rs:575-587,783-850`.
+- The system consequently does not provide cross-session collision safety, but it can let one session’s lease block another session’s completion.
+
+Other blocking producers:
+
+- Exact-path `apply_patch` leases and CAS/typed-claim checks: `core/src/tools/runtimes/apply_patch.rs:107-419,812-912`.
+- Stop/AfterAgent completion-hook observer takes a repository-wide lease: `core/src/hook_runtime.rs:555-715`; callers are in `core/src/session/turn.rs:670-698,851-869`.
+- Final-proof workspace fencing and lease quiescence: `core/src/tasks/mod.rs:590-922,2074-2153,2730-2897,3219-3299`.
+- Auto-validation defers around active leases: `core/src/tools/handlers/plan.rs:289-325`.
+- Typed receipt submission waits for command leases: `core/src/tools/handlers/multi_agents_v2/task.rs:249-265`.
+- Background process polling/finalization plumbing: `core/src/unified_exec/mod.rs:143-178`, `core/src/tools/handlers/unified_exec/write_stdin.rs:104-131`.
+
+Persistent state is at:
+
+- `C:\Users\kuh\Desktop\LOCAL-KD\agent-task-coordination\agent_tasks.sqlite`
+- Tables/migrations: `0005_workspace_reliability.sql`, `0010_authoritative_workspace_leases.sql`, `0011_workspace_finalization_fences.sql`, `0012_workspace_finalization_fence_expiry.sql`, `0014_workspace_manifest_payloads.sql`.
+- Lease TTL is 120 seconds; SQLite has one connection and a 30-second busy timeout: `agent-task-store/src/model.rs:33`, `local.rs:103-109,213-245`.
+- Existing migrations should remain for compatibility even if runtime producers become unused.
+
+No public protocol change is inherently required. Lease types are internal to `agent-task-store`; only error text and existing completion-gate reasons surface publicly. `TaskCompletionGate` shapes in `protocol/src/protocol.rs:3022-3035` and `app-server-protocol/src/protocol/v2/turn.rs:441-466` can remain unchanged.
+
+Recommended lean, coherent design:
+
+1. Remove repository-wide admission from classic shell and unified exec.
+2. Delete the now-dead reservation, `RunningWorkspaceMutation`, structural-admission cache, cancellation/finalization, heartbeat, and request-drop plumbing—not merely bypass it.
+3. Remove the Stop/AfterAgent repository lease and use a nonblocking freshness signal.
+4. Remove terminal workspace finalization fencing and active-command-lease quiescence. Once raw shell commands no longer honor the fence, retaining it would only block `apply_patch`/typed-store writes without actually freezing the repository.
+5. Retain exact-path `apply_patch` CAS and typed ownership checks. They are synchronous and preserve useful same-root task attribution.
+6. Preserve nonblocking mutation tracking through `tools/events.rs:667-736`, `turn_diff_tracker.rs:399-417,1738-1854`, and `task_evidence.rs:5542-5653`. Conservatively invalidate host/cache freshness after formerly coordinated non-inspection commands so unknown scripts cannot leave stale evidence.
+7. Leave task-evidence `MutationObligationInput` and reasoning governor `pending_mutation_obligation` untouched; those are a separate planning/validation concept.
+
+A smaller patch that only skips shell/unified leases would fix the observed command error, but hook leases and completion fencing could still produce blockers, and the finalization fence would no longer provide a coherent seal.
+
+Focused tests affected:
+
+- `core/src/tools/command_execution.rs` inline lease/reservation/cleanup tests.
+- `core/src/tools/handlers/unified_exec_tests.rs:631-805`.
+- `core/src/tools/handlers/shell_tests.rs`.
+- `core/src/session/tests.rs:10225`.
+- `core/src/hook_runtime.rs:1105-1270`.
+- `core/src/tasks/mod_tests.rs`.
+- `agent-task-store/src/tests.rs` only if store-level exact lease/fence behavior is changed.
+- `core/src/turn_diff_tracker_tests.rs` if command freshness classification becomes conservative.
+
+Important dirty overlap: `core/src/hook_runtime.rs` already has an uncommitted change replacing cached completion-hook manifest preparation with a direct single-pass lease. It still blocks and must be reconciled intentionally. `.codex/config.toml` is also dirty from unrelated rollout-budget removal.
+
+Questions to ask the user:
+
+1. Keep exact-path `apply_patch` CAS/typed ownership protection while removing every repository-wide blocker? Recommended: yes.
+2. Remove terminal finalization fencing too, accepting snapshot-based completion rather than freezing the workspace? Recommended: yes; otherwise the remaining fence cannot stop raw shell edits.
+3. For Stop/AfterAgent hooks, keep nonblocking mutation detection or remove hook mutation observation entirely? Recommended: keep lightweight nonblocking detection if those hooks can edit files.
+--- Unique final report 3; SHA-256 3675BB9670A5E72F2C5164B4AE133BFCC422E94D2AAA12BD81B6926AADF229CA ---
+Implemented the `codex-agent-task-store` portion.
+
+- Removed workspace mutation lease/fence/prepared-manifest APIs, models, errors, runtime, storage module, and obsolete tests.
+- Added migration `0016_remove_workspace_mutation_blocking.sql`; it drops all 31 finalization triggers, then the three requested tables. Historical migrations remain unchanged.
+- Overlapping path and contract claims are admitted and retained as metadata.
+- Claims no longer gate mutation evidence, receipts, or quiescence. Lifecycle, dependency, review, validation, and correctness-sensitive read gates remain.
+- Preserved `WorkspaceRevision`, workspace paths/events, supporting reads, and task mutation evidence.
+- Updated focused tests for schema removal, overlapping claims, claim-independent evidence/receipts, and claim-independent quiescence.
+
+Changed files:
+
+- `migrations/0016_remove_workspace_mutation_blocking.sql`
+- `src/error.rs`
+- `src/lib.rs`
+- `src/local.rs`
+- `src/model.rs`
+- `src/store.rs`
+- `src/tests.rs`
+- `src/workspace.rs`
+- Deleted `src/manifest_storage.rs`
+
+Validation:
+
+- Rustfmt parsed all changed Rust files.
+- `git diff --check` passes.
+- Migrations 0001–0016 applied successfully to in-memory SQLite; removed tables/triggers were absent.
+- No Cargo build or test was run.
+--- Unique final report 4; SHA-256 3BF7485811E61EC15960AB7365564E32B6EAF09B9AA04929E357B0C5050F0682 ---
+Completed core test cleanup.
+
+Changed:
+
+- Removed obsolete lease/fence/wait tests from task, session, shell, and unified-exec tests.
+- Removed stale process request fields.
+- Replaced finalized-mutation source invalidation with exact-path host invalidation.
+- Removed obsolete CAS excerpt test.
+- Updated typed authority tests for the lean signature: all classes allowed except root task control.
+- Preserved independent reviewer read-only tests.
+
+Checks passed:
+
+- Targeted `rustfmt --check`
+- Targeted `git diff --check`
+- No removed mutation/finalization API references remain in core.
+
+Untouched per scope: `overlapping_mutation_lease` remains in `turn_diff_tracker.rs` and its tests. No Cargo commands were run.
+
+FACT / HYPOTHESIS / UNKNOWN BOUNDARY
+- Direct artifact facts: the source paths, UUID, metadata, user messages, lifecycle events, and agent report text above are present in the inspected Codex session records.
+- Reported repository facts: symptoms, causes, affected files/symbols, fixes, commands, and validation results are preserved as claims made by the reporting agent. Treat exact evidence and qualifications inside the report as controlling.
+- Hypotheses: no new implementation cause or language was inferred during corpus extraction. Any hypothesis in the report remains a hypothesis unless the report states and evidences that it was established.
+- Unknowns: anything the preserved report omits—including environment details, reproduction steps, exact cause, validation scope, or residual risk—remains unknown and must be checked against the repository and Git history before relying on it for a new fix.
+
+====================================================================================================
+STABLE EVIDENCE ID: CODEX-SESSION-01a00410-13ba-7592-a84b-83b9aa75621d
+DATE: 2026-08-15
+LANGUAGE CLASSIFICATION: Rust
+STATUS: Reported conclusion available
+CONFIDENCE: This record faithfully preserves the session artifact. Repository-level conclusions retain the confidence and qualifications stated by the reporting agent and were not independently re-proven during this extraction.
+
+SOURCE SESSION ARTIFACTS
+- C:\Users\kuh\.codex\sessions\2026\08\15\rollout-2026-08-15T01-15-57-01a00410-13ba-7592-a84b-83b9aa75621d.jsonl.zst
+Source session UUID: 01a00410-13ba-7592-a84b-83b9aa75621d
+Session timestamp(s): 8/15/2026 6:15:57 AM
+Working directory/project: c:\Users\kuh\Desktop\kd4
+Recorded Git revision(s): 52be9e924db6daf0f220db2c705b38418e6e6a6a
+Recorded Git branch(es): main
+Recorded lifecycle outcomes: task_complete
+
+DIRECTLY STATED USER REQUEST / OBSERVED SYMPTOM
+--- User message 1 ---
+The fork is currently optimizing bytes per result while multiplying model generations. Reverse that priority.
+
+## Governing optimization priority
+
+Optimize in this exact order:
+
+1. Eliminate an entire model generation when the next operation is deterministic.
+2. Eliminate physical tool work when authoritative equivalent evidence already exists.
+3. Batch new evidence into sufficiently large coherent packets.
+4. Only then minimize model-visible tokens.
+
+A larger evidence packet is preferable to another GPT-5.6 Sol generation.
+
+Do not optimize for minimum tokens per individual tool result if doing so increases:
+- model requests;
+- tool/model boundaries;
+- recovery calls;
+- rereads;
+- total context exposure;
+- wall time.
+
+You are explicitly allowed to revert or relax experimental token/output-projection changes where they caused this regression.
+
+Do NOT revert useful foundations such as:
+- canonical raw artifacts;
+- typed structured output;
+- source/content identities;
+- hashes;
+- ToolHistory receipts;
+- selective invalidation;
+- exact recoverability;
+- deterministic continuation ownership.
+
+
+give top 5 changes
+
+--- User message 2 ---
+do all 5
+
+
+REPORTED AUDIT / DIAGNOSIS / FIX CONCLUSION
+--- Unique final report 1; SHA-256 3E7895AD4DA893F39AA3B4CD9076915DFE04670F39444772833544BF772A3E6C ---
+The rollout audit confirms the inversion: one turn recorded 243 sampling boundaries and 239 `exec` calls; 238 contained only one nested-tool reference, while 176 results contained truncation/omission markers. These are rollout counts, not a runtime benchmark. ([fork2.jsonl](C:/Users/kuh/Desktop/LOCAL-KD/sessions/2026/08/14/fork2.jsonl))
+
+1. **Host-complete exact deterministic actions.**
+   `ResidualDeterministicAction::CompleteProtocolTurn` is already proven, but the runtime still sends a lower-effort generation. Execute it directly in `run_turn`; do not optimize the unnecessary request’s effort. ([reasoning_governor.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/reasoning_governor.rs:3468), [turn.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/turn.rs:440))
+
+2. **Execute deterministic tool continuations before resampling.**
+   Remove the assumption that every tool result requires model interpretation. Consume owner-validated continuation receipts—artifact subdivision, missing source ranges, unchanged waits, source bundles—inside the owning host loop. Resample only when evidence creates a genuine decision. ([reasoning_governor.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/reasoning_governor.rs:3494), [turn.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/turn.rs:4464), [parallel.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/parallel.rs:401))
+
+3. **Expose the whole evidence frontier, not one obligation.**
+   `model_evidence_guidance()` deliberately emits only `.primary()`, encouraging one-tool generations. Return all independent unblocked obligations and instruct code mode to satisfy them in one `exec` using parallel calls and deterministic dependent steps. ([reasoning_governor.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/reasoning_governor.rs:3536), [description.rs](C:/Users/kuh/Desktop/kd4/codex-rs/code-mode-protocol/src/description.rs:12))
+
+4. **Make authoritative evidence the physical-work admission gate.**
+   Before execution, consult source/content identity, state revision, ToolHistory, and canonical-artifact receipts. Replay exact evidence across generations; make `force_fresh` an internal mutation-driven escape hatch rather than a model-controlled cache bypass. This should also fuse hash/search/verification passes around the same observed bytes. ([reasoning_governor.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/reasoning_governor.rs:2168), [source.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/source.rs:2302), [registry.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/registry.rs:208))
+
+5. **Budget one coherent evidence packet, then trim.**
+   Aggregate batched tool projections by generation, coalesce adjacent ranges/sections, and apply a packet-level ceiling only afterward. The dirty worktree’s increase from `1K/2K/4K` to `4K/8K/10K` is directionally correct, but packet formation—not larger independent caps—should own the policy. Keep canonical artifacts and exact recovery unchanged. ([output-truncation](C:/Users/kuh/Desktop/kd4/codex-rs/utils/output-truncation/src/lib.rs:12), [read_tool_output_spec.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/read_tool_output_spec.rs:107))
+
+No files were changed.
+--- Unique final report 2; SHA-256 7A33179DFC24998A557577A0691E92EE9A545F9CD7542FC88CF24A25CBF5F154 ---
+Implemented all five priority reversals:
+
+1. Proven deterministic terminal continuations now complete host-side without another model generation: [turn.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/turn.rs:588).
+2. Owner-drained deterministic continuations receive the full safe packet budget before resampling: [registry.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/registry.rs:1226).
+3. The full evidence frontier is exposed, with explicit generation-level batching and `Promise.all` guidance: [reasoning_governor.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/reasoning_governor.rs:3567), [description.rs](C:/Users/kuh/Desktop/kd4/codex-rs/code-mode-protocol/src/description.rs:15).
+4. Authoritative source evidence is now the advertised physical-work admission gate; `force_fresh` is no longer model-exposed, while selective mutation invalidation remains: [source_spec.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/source_spec.rs:184).
+5. Default evidence packets are 10,000 tokens, with trimming applied after coherent packet formation: [lib.rs](C:/Users/kuh/Desktop/kd4/codex-rs/utils/output-truncation/src/lib.rs:15).
+
+Canonical artifacts, hashes, typed output, ToolHistory receipts, exact recovery, and deterministic continuation ownership remain intact. Repo Atlas kept the change confined to these runtime and contract surfaces.
+
+Validation:
+
+- Output-truncation focused test: passed.
+- Code-mode protocol focused test: passed.
+- `rustfmt --check` and `git diff --check`: passed.
+- Core filtered tests could not run because the warmed retry encountered unrelated compilation errors:
+  - missing `StoreError` variants in [task_coordinator.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/agent/task_coordinator.rs:170) and [spawn.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs:738);
+  - `ToolError` lacks `Display` in [apply_patch.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/runtimes/apply_patch.rs:166).
+
+These are source changes only; the Desktop binary was not rebuilt or replaced.
+
+FACT / HYPOTHESIS / UNKNOWN BOUNDARY
+- Direct artifact facts: the source paths, UUID, metadata, user messages, lifecycle events, and agent report text above are present in the inspected Codex session records.
+- Reported repository facts: symptoms, causes, affected files/symbols, fixes, commands, and validation results are preserved as claims made by the reporting agent. Treat exact evidence and qualifications inside the report as controlling.
+- Hypotheses: no new implementation cause or language was inferred during corpus extraction. Any hypothesis in the report remains a hypothesis unless the report states and evidences that it was established.
+- Unknowns: anything the preserved report omits—including environment details, reproduction steps, exact cause, validation scope, or residual risk—remains unknown and must be checked against the repository and Git history before relying on it for a new fix.
+
+====================================================================================================
+STABLE EVIDENCE ID: CODEX-SESSION-01a00413-bcb8-78b0-9023-c8b220191892
+DATE: 2026-08-15
+LANGUAGE CLASSIFICATION: Rust
+STATUS: Reported conclusion available
+CONFIDENCE: This record faithfully preserves the session artifact. Repository-level conclusions retain the confidence and qualifications stated by the reporting agent and were not independently re-proven during this extraction.
+
+SOURCE SESSION ARTIFACTS
+- C:\Users\kuh\.codex\sessions\2026\08\15\rollout-2026-08-15T01-19-57-01a00413-bcb8-78b0-9023-c8b220191892.jsonl.zst
+Source session UUID: 01a00413-bcb8-78b0-9023-c8b220191892
+Session timestamp(s): 8/15/2026 6:19:57 AM
+Working directory/project: c:\Users\kuh\Desktop\kd4
+Recorded Git revision(s): 52be9e924db6daf0f220db2c705b38418e6e6a6a
+Recorded Git branch(es): main
+Recorded lifecycle outcomes: task_complete
+
+DIRECTLY STATED USER REQUEST / OBSERVED SYMPTOM
+--- User message 1 ---
+627 nested artifact-recovery operations, repeatedly scanning the same 1,082-line historical artifact in approximately ten-line pieces because read_tool_output has a very small projection ceiling.
+
+audit and inspect and fix this
+
+
+REPORTED AUDIT / DIAGNOSIS / FIX CONCLUSION
+--- Unique final report 1; SHA-256 02358284533CC208C1BA72B9415EEBA07DFEB4C8F9A0B5BABA6E54CE759BF5AC ---
+Fixed the artifact-recovery loop in `codex-core`.
+
+- Raised nested recovery capacity from 512 to 3,488 tokens while retaining outer-envelope headroom: [read_tool_output.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/read_tool_output.rs:29).
+- Added ceiling-aware fixed-string search with advancing continuations and batched exact selectors: [command_output_artifact.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/command_output_artifact.rs:3104).
+- Updated the model-facing notice to recommend one search or batched ranges instead of tiny line reads: [command_output_artifact.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/command_output_artifact.rs:1333).
+- Added regressions for ceiling-safe pagination and a sparse 1,082-line historical artifact: [command_output_artifact_tests.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/command_output_artifact_tests.rs:338).
+
+Exact-file `rustfmt --check` and `git diff --check` passed. Focused tests were blocked before execution by unrelated existing missing task-store APIs, including `PreparedWorkspaceManifest`, `WorkspaceMutationLease`, and `WorkspaceFinalizationFence`.
+
+The source change is not published or hot-applied to Codex Desktop.
+
+FACT / HYPOTHESIS / UNKNOWN BOUNDARY
+- Direct artifact facts: the source paths, UUID, metadata, user messages, lifecycle events, and agent report text above are present in the inspected Codex session records.
+- Reported repository facts: symptoms, causes, affected files/symbols, fixes, commands, and validation results are preserved as claims made by the reporting agent. Treat exact evidence and qualifications inside the report as controlling.
+- Hypotheses: no new implementation cause or language was inferred during corpus extraction. Any hypothesis in the report remains a hypothesis unless the report states and evidences that it was established.
+- Unknowns: anything the preserved report omits—including environment details, reproduction steps, exact cause, validation scope, or residual risk—remains unknown and must be checked against the repository and Git history before relying on it for a new fix.
+
+====================================================================================================
+STABLE EVIDENCE ID: CODEX-SESSION-01a00419-c5aa-7123-93e2-769e58dbc64e
+DATE: 2026-08-15
+LANGUAGE CLASSIFICATION: Rust
+STATUS: Reported conclusion available
+CONFIDENCE: This record faithfully preserves the session artifact. Repository-level conclusions retain the confidence and qualifications stated by the reporting agent and were not independently re-proven during this extraction.
+
+SOURCE SESSION ARTIFACTS
+- C:\Users\kuh\.codex\sessions\2026\08\15\rollout-2026-08-15T01-26-33-01a00419-c5aa-7123-93e2-769e58dbc64e.jsonl.zst
+Source session UUID: 01a00419-c5aa-7123-93e2-769e58dbc64e
+Session timestamp(s): 8/15/2026 6:26:33 AM
+Working directory/project: c:\Users\kuh\Desktop\kd4
+Recorded Git revision(s): 52be9e924db6daf0f220db2c705b38418e6e6a6a
+Recorded Git branch(es): main
+Recorded lifecycle outcomes: task_complete
+
+DIRECTLY STATED USER REQUEST / OBSERVED SYMPTOM
+--- User message 1 ---
+Governing optimization priority
+Optimize in this exact order:
+Eliminate an entire model generation when the next operation is deterministic.
+Eliminate physical tool work when authoritative equivalent evidence already exists.
+Batch new evidence into sufficiently large coherent packets.
+Only then minimize model-visible tokens.
+A larger evidence packet is preferable to another GPT-5.6 Sol generation.
+Do not optimize for minimum tokens per individual tool result if doing so increases:
+model requests;
+tool/model boundaries;
+recovery calls;
+rereads;
+total context exposure;
+wall time.
+You are explicitly allowed to revert or relax experimental token/output-projection changes where they caused this regression.
+Do NOT revert useful foundations such as:
+canonical raw artifacts;
+typed structured output;
+source/content identities;
+hashes;
+ToolHistory receipts;
+selective invalidation;
+exact recoverability;
+deterministic continuation ownership.
+give top 5 changes
+
+--- User message 2 ---
+do all 5
+
+
+REPORTED AUDIT / DIAGNOSIS / FIX CONCLUSION
+--- Unique final report 1; SHA-256 9393E3382ABFFC1006AD91B55D0B58B8432A12D1CF828EE45EF6A203F6367B94 ---
+The top five changes, ranked by your governing priority:
+
+1. **Apply projection once, after the complete `exec` packet is assembled.**
+   Do not truncate nested results before JavaScript can compose them. The `fork2` rollout batched four source reads, but the result was reduced to ~1,000 model-visible tokens and then reread across later generations. Keep the new 10K coherent-packet default in [output-truncation](C:/Users/kuh/Desktop/kd4/codex-rs/utils/output-truncation/src/lib.rs:15). Fix the current inconsistency where [read_tool_output.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/read_tool_output.rs:29) derives a 6,000-token recovery ceiling but its test expects 3,488.
+
+2. **Execute deterministic artifact continuations host-side.**
+   Artifact search currently returns `child_selectors` and a continuation, requiring another tool call and usually another generation. Search, merge ranges, and hydrate fitting exact values inside the same call; likewise drain deterministic subdivisions automatically. In `fork1`, 23 generations recovered artifacts, including 13 calls against one artifact. The continuation-producing path is [command_output_artifact.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/command_output_artifact.rs:3104).
+
+3. **Keep and broaden proof-based generation elision.**
+   Preserve the new fast path that skips a protocol resample when completion is already proved in [turn.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/turn.rs:588). Extend the same ownership model beyond `CompleteProtocolTurn` to exact artifact-range drains, covered source spans, missing-range reads, and unchanged waits. Unknown or ambiguous actions must still fall back to the model.
+
+4. **Replace physical rereads and repository manifests with authoritative identity reuse.**
+   Keep captured locator bytes, immutable replay artifacts, snapshot/content/obligation identities, selective invalidation, and mutation receipts. The relevant foundations are [source.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/source.rs:3963), [turn_diff_tracker.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/turn_diff_tracker.rs:621), and [git_workspace.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/git_workspace.rs:794). Remove full-manifest/CAS work only where these receipts provide equivalent evidence.
+
+5. **Make `locate_task` return a genuinely sufficient evidence packet.**
+   The locator captures up to 16 MiB but renders only 8 KiB, encouraging long `read_file_span` chains. Raise the model-visible envelope to the coherent-packet limit—up to 10K tokens—and coalesce owner implementation, callers, contracts, focused tests, instructions, and validation routes. Preserve excess material in canonical artifacts. The current 8 KiB cap is documented in [source-tools.md](C:/Users/kuh/Desktop/kd4/docs/source-tools.md:38).
+
+The rollout evidence is strong: `fork2` contains 243 sampling boundaries and 239 `exec` cells; `fork1` contains 116 boundaries and 114 cells. The dominant regression is boundary multiplication from early projection and deterministic recovery, not raw token volume. No files were changed.
+--- Unique final report 2; SHA-256 997BCC2AC9A6CE9BD6551C18A383AEABD10C240195823E9D1867E8A3D69A5F9F ---
+Implemented all five optimizations:
+
+1. Exec evidence is now batched into coherent packets and projected only after aggregation, with a 10K-token default. Empty wait observations remain host-internal. [description.rs](C:/Users/kuh/Desktop/kd4/codex-rs/code-mode-protocol/src/description.rs:12)
+
+2. Artifact searches hydrate merged exact contexts in the same physical read and return deterministic selectors/continuations as recovery receipts. [command_output_artifact.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/command_output_artifact.rs:3104)
+
+3. Proven unchanged residual work can deterministically complete the protocol turn without another model generation; new evidence fails open to normal sampling. [reasoning_governor.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/reasoning_governor.rs:5368)
+
+4. Authoritative source coverage and workspace watcher identities are reused before filesystem work, while retaining selective invalidation and exact snapshot identities. [source.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/source.rs:2324) [git_workspace.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/git_workspace.rs:794)
+
+5. `locate_task` now retains a coherent 40 KiB evidence packet and uses the shared 10K-token projection limit, with overflow preserved in canonical artifacts. [task_locator.rs](C:/Users/kuh/Desktop/kd4/codex-rs/file-search/src/task_locator.rs:38) [source-tools.md](C:/Users/kuh/Desktop/kd4/docs/source-tools.md:38)
+
+Validation passed:
+
+- Output truncation: 24 tests
+- File-search locator: 4 focused tests
+- Code-mode protocol: 25 tests
+- Task-scoped `git diff --check`
+
+The `codex-core` tests could not start because unrelated dirty-worktree code does not compile: missing `StoreError` variants in task coordination/spawning and a missing `Display` implementation for `ToolError` in apply-patch logging. I left those out-of-scope errors untouched. The Desktop app still requires a binary rebuild and restart for these source changes to take effect.
+
+FACT / HYPOTHESIS / UNKNOWN BOUNDARY
+- Direct artifact facts: the source paths, UUID, metadata, user messages, lifecycle events, and agent report text above are present in the inspected Codex session records.
+- Reported repository facts: symptoms, causes, affected files/symbols, fixes, commands, and validation results are preserved as claims made by the reporting agent. Treat exact evidence and qualifications inside the report as controlling.
+- Hypotheses: no new implementation cause or language was inferred during corpus extraction. Any hypothesis in the report remains a hypothesis unless the report states and evidences that it was established.
+- Unknowns: anything the preserved report omits—including environment details, reproduction steps, exact cause, validation scope, or residual risk—remains unknown and must be checked against the repository and Git history before relying on it for a new fix.
+
+====================================================================================================
+STABLE EVIDENCE ID: CODEX-SESSION-01a00419-d19b-7ab1-b273-efed948e6514
+DATE: 2026-08-15
+LANGUAGE CLASSIFICATION: Rust
+STATUS: Reported conclusion available
+CONFIDENCE: This record faithfully preserves the session artifact. Repository-level conclusions retain the confidence and qualifications stated by the reporting agent and were not independently re-proven during this extraction.
+
+SOURCE SESSION ARTIFACTS
+- C:\Users\kuh\.codex\sessions\2026\08\15\rollout-2026-08-15T01-26-36-01a00419-d19b-7ab1-b273-efed948e6514.jsonl.zst
+Source session UUID: 01a00419-d19b-7ab1-b273-efed948e6514
+Session timestamp(s): 8/15/2026 6:26:36 AM
+Working directory/project: c:\Users\kuh\Desktop\kd4
+Recorded Git revision(s): 52be9e924db6daf0f220db2c705b38418e6e6a6a
+Recorded Git branch(es): main
+Recorded lifecycle outcomes: task_complete
+
+DIRECTLY STATED USER REQUEST / OBSERVED SYMPTOM
+--- User message 1 ---
+Governing optimization priority
+Optimize in this exact order:
+Eliminate an entire model generation when the next operation is deterministic.
+Eliminate physical tool work when authoritative equivalent evidence already exists.
+Batch new evidence into sufficiently large coherent packets.
+Only then minimize model-visible tokens.
+A larger evidence packet is preferable to another GPT-5.6 Sol generation.
+Do not optimize for minimum tokens per individual tool result if doing so increases:
+model requests;
+tool/model boundaries;
+recovery calls;
+rereads;
+total context exposure;
+wall time.
+You are explicitly allowed to revert or relax experimental token/output-projection changes where they caused this regression.
+Do NOT revert useful foundations such as:
+canonical raw artifacts;
+typed structured output;
+source/content identities;
+hashes;
+ToolHistory receipts;
+selective invalidation;
+exact recoverability;
+deterministic continuation ownership.
+give top 5 changes
+
+--- User message 2 ---
+do all 5
+
+
+REPORTED AUDIT / DIAGNOSIS / FIX CONCLUSION
+--- Unique final report 1; SHA-256 AF9E0DFEE006CFEE07FC2565827511BC6D2E632F5E871CA4A8FE8FA4E5FCAD5C ---
+The top five changes, in priority order:
+
+1. **Drain deterministic artifact continuations before returning to the model.**
+   Resolve predetermined ranges/JSON pointers from the canonical artifact, merge them into the owner response, and acknowledge receipts only after the content survives projection. Fall back to the model only for ambiguity, hash mismatch, or genuine budget overflow. This removes `read_tool_output` generations while preserving raw artifacts, hashes, selectors, and ToolHistory receipts. The worktree partially implements this in [registry.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/registry.rs:1766).
+
+2. **Elide protocol-only terminal generations.**
+   When there is no pending input, tool result, mutation, validation change, source-closure change, or unknown identity—and the only remaining action is protocol completion—finish the turn host-side. The current worktree sketches this in [turn.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/turn.rs:577) and [reasoning_governor.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/reasoning_governor.rs:202).
+
+3. **Fuse `search_source` revision hashing and matching into one physical scan.**
+   Currently `complete_search_scope_revision` reads/hashes the scope, then `scan_source_roots` rereads it for matches: [source.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/source.rs:1987), [source.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/source.rs:2135). Build one canonical snapshot containing path, metadata identity, bytes, and hash; use those same bytes for both the revision receipt and matching.
+
+4. **Promote locator-captured bytes into authoritative reusable source evidence.**
+   After final snapshot verification, retain the already captured bytes in the source replay/coverage ledger so later `read_file_span` calls do not reopen the file. Keep selective invalidation based on content hash, watcher generation, stable identity, and mutation generation. This is partially present in [source.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/source.rs:1795), while the locator still performs a separate full verification read in [task_locator.rs](C:/Users/kuh/Desktop/kd4/codex-rs/file-search/src/task_locator.rs:1130).
+
+5. **Make projection generation-sized and packet-first.**
+   One code-mode `exec` should collect every independent obligation concurrently, continue deterministic dependent reads internally, and return one coherent packet. Apply token minimization only afterward. Replacing the 1K success ceiling with a model-hard-limited packet budget—currently 10K in [output-truncation](C:/Users/kuh/Desktop/kd4/codex-rs/utils/output-truncation/src/lib.rs:15)—is directionally correct. Keep any token accounting telemetry-only instead of injecting reminders or forcing premature stopping.
+
+Why this order: [fork2.jsonl](C:/Users/kuh/Desktop/LOCAL-KD/sessions/2026/08/14/fork2.jsonl) recorded 243 physical sampling boundaries for 242 tool calls; [fork1.jsonl](C:/Users/kuh/Desktop/LOCAL-KD/sessions/2026/08/14/fork1.jsonl) recorded 116 for 115, including 22 artifact-recovery calls. That is primarily a model-boundary regression, not a per-result token problem.
+
+One immediate inconsistency to resolve: the current 10K default makes the code-mode recovery ceiling 6K, but [read_tool_output.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/read_tool_output.rs:311) still asserts 3,488. No files were changed or tests run.
+--- Unique final report 2; SHA-256 6F4D9ED7C88B3E55759FE63F8FFA79A06865A58C7032E6EF2B6FF284EB9FBE35 ---
+Implemented all five:
+
+1. Deterministic protocol completion now skips the otherwise-empty follow-up generation ([turn.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/turn.rs:588)).
+2. Predetermined artifact selectors are drained into the current continuation using the real token ceiling, preserving receipts and recoverability ([registry.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/registry.rs:2057)).
+3. Search revision and matching share a bounded authoritative content snapshot, eliminating duplicate file-content reads. Topology scanning remains separate for exact replay identity ([source.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/source.rs:4719)).
+4. Locator-captured bytes become reusable canonical artifacts, avoiding subsequent worktree rereads ([source.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/source.rs:4151)).
+5. Evidence-packet guidance and default success/failure/diagnostic budgets now support coherent 10,000-token packets ([description.rs](C:/Users/kuh/Desktop/kd4/codex-rs/code-mode-protocol/src/description.rs:15), [lib.rs](C:/Users/kuh/Desktop/kd4/codex-rs/utils/output-truncation/src/lib.rs:15)).
+
+Validation:
+
+- Targeted `rustfmt --check`: passed.
+- Targeted `git diff --check`: passed.
+- Focused Rust tests were attempted twice in the same warmed build lane, but both timed out after 64 seconds without compiler or test output. Per repository policy, I did not start another build lane or retry again.
+
+Nothing was published. Desktop activation still requires `just publish-local-codex-final` followed by an app restart.
+
+FACT / HYPOTHESIS / UNKNOWN BOUNDARY
+- Direct artifact facts: the source paths, UUID, metadata, user messages, lifecycle events, and agent report text above are present in the inspected Codex session records.
+- Reported repository facts: symptoms, causes, affected files/symbols, fixes, commands, and validation results are preserved as claims made by the reporting agent. Treat exact evidence and qualifications inside the report as controlling.
+- Hypotheses: no new implementation cause or language was inferred during corpus extraction. Any hypothesis in the report remains a hypothesis unless the report states and evidences that it was established.
+- Unknowns: anything the preserved report omits—including environment details, reproduction steps, exact cause, validation scope, or residual risk—remains unknown and must be checked against the repository and Git history before relying on it for a new fix.

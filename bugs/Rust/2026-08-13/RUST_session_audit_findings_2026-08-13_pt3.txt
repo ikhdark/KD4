@@ -1,0 +1,1159 @@
+CODEX SESSION AUDIT / BUG EVIDENCE CORPUS
+Language: Rust
+Session date: 2026-08-13
+Coverage: Codex sessions under C:\Users\kuh\.codex\sessions\2026\08 for the assigned date range.
+Method: selected explicit audits, defect/bug diagnoses, regressions, bug fixes, and closely related incomplete investigations from actual event_msg user_message events. Preserved event_msg agent_message final_answer reports as primary conclusions. Exact repeated final reports were deduplicated by normalized SHA-256. Developer and AGENTS instruction text was excluded from findings.
+Record count in this part: 8
+====================================================================================================
+STABLE EVIDENCE ID: CODEX-SESSION-019ffe94-2bc8-75d2-83f7-1bfa5b8b01f5
+DATE: 2026-08-13
+LANGUAGE CLASSIFICATION: Rust
+STATUS: Reported conclusion available
+CONFIDENCE: This record faithfully preserves the session artifact. Repository-level conclusions retain the confidence and qualifications stated by the reporting agent and were not independently re-proven during this extraction.
+
+SOURCE SESSION ARTIFACTS
+- C:\Users\kuh\.codex\sessions\2026\08\13\rollout-2026-08-13T23-42-31-019ffe94-2bc8-75d2-83f7-1bfa5b8b01f5.jsonl.zst
+Source session UUID: 019ffe94-2bc8-75d2-83f7-1bfa5b8b01f5
+Session timestamp(s): 8/14/2026 4:42:31 AM
+Working directory/project: c:\Users\kuh\Desktop\kd4
+Recorded Git revision(s): 7f08c056cd0b70b4428908744285550b08762df8
+Recorded Git branch(es): main
+Recorded lifecycle outcomes: task_complete
+
+DIRECTLY STATED USER REQUEST / OBSERVED SYMPTOM
+--- User message 1 ---
+Audit codex-rs for validation optimizations that are only half implemented. Find proof keys, validation receipts, freshness identities, reusable results, singleflight state, predetermined validation routes, or dependency information that exists but does not actually prevent redundant validation execution.
+
+
+REPORTED AUDIT / DIAGNOSIS / FIX CONCLUSION
+--- Unique final report 1; SHA-256 9FDB93237C48E345BA5CD97FF3829945AFB2BA455A7B85019AB345CDE536651D ---
+Found six concrete half-implemented optimization paths in the current working tree.
+
+## Findings
+
+1. P1 — Multi-leaf validation routes can never produce an accepted proof.
+
+   Each automatic leaf records a `ValidationResult` containing a one-leaf route ([command_execution.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/command_execution.rs:263)), while task evidence accepts it only when that route equals the complete multi-leaf route ([task_evidence.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/task_evidence.rs:14147)). The aggregate result is only JSON; it is not persisted as a validation receipt ([plan.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/plan.rs:370)).
+
+   Result: all leaves may succeed, but the step remains `Implemented` rather than `Passed`, allowing the route to be scheduled again.
+
+2. P1 — Completed-proof reuse is unreachable for ordinary shell validation and unified exec.
+
+   The shell path queries `reusable_validation` only for an auto-bound plan leaf ([shell_command.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/shell/shell_command.rs:458)) and only then fills `proof_key`, `structured_route`, and `validation_call_id` ([shell_command.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/shell/shell_command.rs:474)).
+
+   Unified exec initializes all three fields to `None` ([exec_command.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs:555)), computes an identity only for in-flight joining, and never attaches it to the launch. The publisher silently declines to create a completed proof when any field is absent ([command_execution.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/command_execution.rs:1299)).
+
+   Result: repeated manual `cargo test`, `cargo check`, etc. execute again even with unchanged inputs. Unified exec never populates the completed-validation cache at all.
+
+3. P1 — Durable cross-agent singleflight keys include the unique thread ID.
+
+   Shell environments inject `CODEX_THREAD_ID` ([shell_command.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/shell/shell_command.rs:160)), and `validation_environment_hash` hashes every environment entry ([shell.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/shell.rs:1214)). That hash is placed into durable validation evidence ([shell.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/shell.rs:743)) and participates in both the in-flight fingerprint and completed-evidence key ([local.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/agent-task-store/src/local.rs:4996)).
+
+   Result: two agents validating identical content receive different keys solely because they have different thread IDs. The durable `validation_singleflight` table and completed-result scan therefore cannot coalesce the primary cross-agent case they appear designed for.
+
+4. P1 — Joined and reused results are not reminted into a current-call receipt.
+
+   `reusable_validation` returns a clone of the old result, retaining its old `call_id`, and does not insert an entry for the current call ([command_execution.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/command_execution.rs:899)). Shell then returns early ([shell_command.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/shell/shell_command.rs:459)). The plan executor subsequently looks up the new synthetic call ID and gets no settled result ([plan.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/plan.rs:491)).
+
+   Non-typed singleflight followers have the same issue: they receive structured output but no current-call `ValidationResult` or command receipt.
+
+   Result: process execution may be avoided once, but the current step’s validation obligation is not closed. After cache eviction, restart, or forced freshness, the validation runs again.
+
+5. P2 — The “dependency manifest” is not dependency-aware and over-invalidates every focused proof.
+
+   Focused evidence sets both `covered_input_manifest_hash` and `dependency_manifest_hash` to the same workspace revision hash ([local.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/agent-task-store/src/local.rs:4232)). Actual assignment dependencies are not included.
+
+   Additionally, every focused validation scope is extended with every repository-wide `Cargo.toml`, lockfile, package manifest, schema, and similar file ([local.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/agent-task-store/src/local.rs:4213), [local.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/agent-task-store/src/local.rs:4793)).
+
+   Result: an unrelated package’s manifest change invalidates a focused proof and forces another execution, while real dependency relationships are not represented precisely.
+
+6. P2 — Predetermined locator routes and their receipts are metadata-only.
+
+   Source discovery preserves exact route IDs, working directories, and argv, but labels them `available_not_executed` ([source.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/source.rs:680)). Owner packets track the route and whether a matching command passed, but that state is not promoted into the executable `ValidationRoute` used by `update_plan`, nor consulted during shell admission.
+
+   Result: a route can already be known and already have a successful owner-packet receipt, yet an identical manual invocation still executes. Only a separately model-authored structured plan route reaches automatic reuse.
+
+The turn-diff freshness machinery reinforces the same disconnect: it records `PassedAfterLastMutation` and the exact mutation revision ([turn_diff_tracker.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/turn_diff_tracker.rs:493)), but its production consumers are completion/governor logic, not validation admission.
+
+No files were changed and no builds were run; this was a static call-site and identity-flow audit, routed with [Repo Atlas](/C:/Users/kuh/.codex/plugins/cache/repo-atlas-local/repo-atlas/6.0.1/skills/repo-atlas/SKILL.md).
+
+FACT / HYPOTHESIS / UNKNOWN BOUNDARY
+- Direct artifact facts: the source paths, UUID, metadata, user messages, lifecycle events, and agent report text above are present in the inspected Codex session records.
+- Reported repository facts: symptoms, causes, affected files/symbols, fixes, commands, and validation results are preserved as claims made by the reporting agent. Treat exact evidence and qualifications inside the report as controlling.
+- Hypotheses: no new implementation cause or language was inferred during corpus extraction. Any hypothesis in the report remains a hypothesis unless the report states and evidences that it was established.
+- Unknowns: anything the preserved report omits—including environment details, reproduction steps, exact cause, validation scope, or residual risk—remains unknown and must be checked against the repository and Git history before relying on it for a new fix.
+
+====================================================================================================
+STABLE EVIDENCE ID: CODEX-SESSION-019ffe94-44ab-7693-8203-3e30123976a3
+DATE: 2026-08-13
+LANGUAGE CLASSIFICATION: Rust
+STATUS: Reported conclusion available
+CONFIDENCE: This record faithfully preserves the session artifact. Repository-level conclusions retain the confidence and qualifications stated by the reporting agent and were not independently re-proven during this extraction.
+
+SOURCE SESSION ARTIFACTS
+- C:\Users\kuh\.codex\sessions\2026\08\13\rollout-2026-08-13T23-42-37-019ffe94-44ab-7693-8203-3e30123976a3.jsonl.zst
+Source session UUID: 019ffe94-44ab-7693-8203-3e30123976a3
+Session timestamp(s): 8/14/2026 4:42:37 AM
+Working directory/project: c:\Users\kuh\Desktop\kd4
+Recorded Git revision(s): 7f08c056cd0b70b4428908744285550b08762df8
+Recorded Git branch(es): main
+Recorded lifecycle outcomes: task_complete
+
+DIRECTLY STATED USER REQUEST / OBSERVED SYMPTOM
+--- User message 1 ---
+Audit codex-rs for deterministic continuation work that is only partially wired. Find owner-proven waits, artifact ranges, source ranges, validation evidence, agent events, or pagination where the lower-level owner knows the exact continuation but the production turn path still requests another model generation.
+
+--- User message 2 ---
+fix #2
+
+
+REPORTED AUDIT / DIAGNOSIS / FIX CONCLUSION
+--- Unique final report 1; SHA-256 BFA3BE12E28887298C06E49AFAC28A9AE21006D4F724BE96151CB1E06F0C5452 ---
+Audit result: four confirmed deterministic-continuation gaps in the current, uncommitted worktree.
+
+The common cause is that accepted continuation receipts affect timing only ([reasoning_governor.rs:1739](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/reasoning_governor.rs:1739), [turn_timing.rs:1378](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/turn_timing.rs:1378)). The production turn loop supports only `ModelRequired` or `SurfaceExistingResult` ([reasoning_governor.rs:161](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/reasoning_governor.rs:161)); any tool result normally schedules another generation ([turn.rs:549](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/turn.rs:549), [reasoning_governor.rs:2638](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/reasoning_governor.rs:2638)).
+
+| Area | Status | Consequence |
+|---|---|---|
+| Terminal agent waits | Confirmed gap, high | One redundant model/tool cycle before surfacing an exact terminal result |
+| Agent-event pages | Confirmed gap, high | One model generation per retained 50-event page |
+| Artifact selector recovery | Confirmed gap, medium | Exact byte/range continuation is delegated back to the model |
+| MCP pagination | Confirmed gap, high | Exact cursors/server calls require model generations; some cursorless tails are lost |
+| Source ranges | Properly wired | Exact requested spans and missing coverage are host-drained |
+| Validation evidence | Mostly wired | Bound routes auto-run; final-proof planner is verification-only |
+
+### Findings
+
+1. **Terminal `wait_agent` results require two identical observations.**
+
+   The wait owner derives `terminal` directly from typed attempt states and hashes the authoritative state ([wait.rs:691](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs:691)). Nevertheless, convergence returns its default decision on the first observation and surfaces the result only when `observations >= 2` ([reasoning_governor.rs:2853](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/reasoning_governor.rs:2853), [reasoning_governor.rs:2895](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/reasoning_governor.rs:2895)). The turn loop suppresses generation only after that second terminal observation ([turn.rs:561](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/turn.rs:561)).
+
+   The unit test explicitly codifies “second exact authoritative wait” ([reasoning_governor.rs:5285](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/reasoning_governor.rs:5285)). The first typed terminal result should be sufficient to surface the existing result without another provider call.
+
+2. **Agent wake-event backlogs are owner-paginated but model-drained.**
+
+   The store limits each read to 50 events while retaining 256 ([model.rs:23](C:/Users/kuh/Desktop/kd4/codex-rs/agent-task-store/src/model.rs:23)). It returns the exact next event cursor plus a `truncated_count` ([local.rs:2487](C:/Users/kuh/Desktop/kd4/codex-rs/agent-task-store/src/local.rs:2487)). The store test itself drains the retained stream by repeatedly passing `latest_event_id` ([tests.rs:3282](C:/Users/kuh/Desktop/kd4/codex-rs/agent-task-store/src/tests.rs:3282)).
+
+   Production `wait_agent` advances the automatic cursor once and immediately breaks ([wait.rs:256](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs:256)), returning `truncated_count` to the model ([wait.rs:359](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs:359)). It does not loop while retained events remain. A full retained backlog can therefore require six wait pages and up to five avoidable continuation generations.
+
+   The emitted `AgentEventWait` receipt covers unchanged polling only, not deterministic backlog pagination ([wait.rs:373](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs:373)).
+
+3. **Generic artifact recovery exposes an exact plan but has no owner-drain path.**
+
+   For oversized selectors, the artifact owner computes the canonical byte range, chunk size/count, child selectors, and first exact continuation ([command_output_artifact.rs:2853](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/command_output_artifact.rs:2853)). Aggregate omissions likewise preserve the original selector as the continuation ([command_output_artifact.rs:110](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/command_output_artifact.rs:110), [command_output_artifact.rs:3043](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/command_output_artifact.rs:3043)).
+
+   `read_tool_output` simply serializes that continuation and returns it to the model ([read_tool_output.rs:94](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/read_tool_output.rs:94), [read_tool_output.rs:129](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/read_tool_output.rs:129)). It neither follows the selector nor emits an owner continuation.
+
+   This is clearly partial wiring because producer-declared artifact ranges already use an internal drain and receipt path ([registry.rs:1897](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/registry.rs:1897), [registry.rs:1941](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/registry.rs:1941)).
+
+4. **MCP resource and template pagination is explicitly delegated to the model.**
+
+   Single-server results retain the exact `nextCursor`; aggregate results retain per-server `nextCursors` and exact `remainingServers` ([mcp_resource.rs:137](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/mcp_resource.rs:137), [mcp_resource.rs:255](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/mcp_resource.rs:255)). Each production handler performs only one page request ([list_mcp_resources.rs:86](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/mcp_resource/list_mcp_resources.rs:86), [list_mcp_resource_templates.rs:86](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/mcp_resource/list_mcp_resource_templates.rs:86)).
+
+   The tool description literally instructs the model to pass cursors back or issue calls for every remaining server ([mcp_resource_spec.rs:15](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/mcp_resource_spec.rs:15)). Those arguments are already known to the owner.
+
+   Adjacent correctness issue: an oversized cursorless single-server page discards its exact in-memory tail and returns no continuation; the test asserts that behavior ([mcp_resource_tests.rs:432](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/mcp_resource_tests.rs:432)).
+
+### Lanes that are already complete
+
+- Source reads retain the exact requested content as a canonical artifact and declare predetermined ranges ([source.rs:496](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/source.rs:496)). Coverage reuse computes and returns only missing intervals in the same invocation ([source.rs:2519](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/source.rs:2519)). I found no owner-proven source-range continuation left for the model.
+- Bound validation routes are executed inside `update_plan` without a generation between route selection and execution ([plan.rs:249](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/plan.rs:249)). Validation diagnostics also use predetermined artifact ranges ([shell.rs:241](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/shell.rs:241)).
+- The final-proof validation plan is only a verifier: it derives exact `argv` steps ([task_evidence.rs:8610](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/task_evidence.rs:8610)) and scans existing receipts ([task_evidence.rs:8730](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/task_evidence.rs:8730)). The test named `batches_run_all_without_generation` tests plan construction, not command execution ([task_evidence_tests.rs:6351](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/task_evidence_tests.rs:6351)). That is partial wiring, but it currently produces missing-proof gating rather than the exact extra-generation pattern.
+
+The clean architectural seam is a typed internal owner-continuation disposition, carrying owner-held bounds—not reconstructing actions from telemetry receipts, whose exact bounds are intentionally redacted. I made no edits and ran no builds; this was a source-and-test-contract audit of the current dirty worktree.
+--- Unique final report 2; SHA-256 4CA997157B160DA4FDB70D8A99ABD511B88DA72BD78AF0BD8E52C343420340F1 ---
+Fixed #2.
+
+- Wake reads now distinguish true retention loss from retained unread events in [model.rs](C:/Users/kuh/Desktop/kd4/codex-rs/agent-task-store/src/model.rs:1480).
+- `wait_agent` internally drains up to six retained pages for both explicit and automatic cursors, using CAS for automatic cursor ownership in [wait.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs:273).
+- Partial results are preserved if a later page read or cursor advance fails.
+- Internally avoided page generations are included in deterministic-continuation telemetry.
+- Added retention and bounded-drain regression tests.
+
+`git diff --check` passes. The focused Cargo test could not compile because unrelated existing matches in `protocol.rs` do not cover `RolloutItem::SamplingBoundary` at lines 3536 and 3873. Per repository policy, I did not repair that unrelated blocker or start another build lane.
+
+FACT / HYPOTHESIS / UNKNOWN BOUNDARY
+- Direct artifact facts: the source paths, UUID, metadata, user messages, lifecycle events, and agent report text above are present in the inspected Codex session records.
+- Reported repository facts: symptoms, causes, affected files/symbols, fixes, commands, and validation results are preserved as claims made by the reporting agent. Treat exact evidence and qualifications inside the report as controlling.
+- Hypotheses: no new implementation cause or language was inferred during corpus extraction. Any hypothesis in the report remains a hypothesis unless the report states and evidences that it was established.
+- Unknowns: anything the preserved report omits—including environment details, reproduction steps, exact cause, validation scope, or residual risk—remains unknown and must be checked against the repository and Git history before relying on it for a new fix.
+
+====================================================================================================
+STABLE EVIDENCE ID: CODEX-SESSION-019ffe94-58e1-72f2-8262-e72f258a1ac4
+DATE: 2026-08-13
+LANGUAGE CLASSIFICATION: Rust
+STATUS: Reported conclusion available
+CONFIDENCE: This record faithfully preserves the session artifact. Repository-level conclusions retain the confidence and qualifications stated by the reporting agent and were not independently re-proven during this extraction.
+
+SOURCE SESSION ARTIFACTS
+- C:\Users\kuh\.codex\sessions\2026\08\13\rollout-2026-08-13T23-42-42-019ffe94-58e1-72f2-8262-e72f258a1ac4.jsonl.zst
+Source session UUID: 019ffe94-58e1-72f2-8262-e72f258a1ac4
+Session timestamp(s): 8/14/2026 4:42:42 AM
+Working directory/project: c:\Users\kuh\Desktop\kd4
+Recorded Git revision(s): 7f08c056cd0b70b4428908744285550b08762df8
+Recorded Git branch(es): main
+Recorded lifecycle outcomes: task_complete, turn_aborted
+
+DIRECTLY STATED USER REQUEST / OBSERVED SYMPTOM
+--- User message 1 ---
+
+Audit codex-rs for completion/finalization mechanisms that calculate terminal state but fail to make the runtime terminal. Look for durable decisions, completion candidates, terminal memos, delivery claims, interaction-release state, fences, or final-proof state that exist but do not reliably end the active turn.
+
+--- User message 2 ---
+1,2,3
+
+--- User message 3 ---
+fix 1,2,3
+
+--- User message 4 ---
+The switch to at-least-once live terminal delivery + app-server deduplication by turn ID is a reasonable way to close the core-detached/app-server-still-running failure mode. The recovery work also correctly recognizes that AlreadyClaimed must still converge status, parent notification, cleanup, and live turn state.
+
+The required correction is this part:
+
+“If a success event was persisted before its claim failed, append the degraded correction when possible.”
+
+Do not change the semantic terminal decision after an authoritative terminal event has already been durably persisted. A delivery/claim failure is infrastructure failure in delivering an already-decided result; it does not retroactively make the completed task unsuccessful.
+
+Use this invariant:
+
+Once a terminal decision/event is durably authoritative, its semantic outcome is immutable. Recovery may re-emit that exact cached terminal event at least once until delivery is known, but must never append a conflicting TurnComplete for the same turn ID merely because claim, dispatch, notification, or post-dispatch work failed.
+
+A degraded failed terminal event is appropriate only when terminalization fails before any authoritative terminal event/decision has been durably established.
+
+That also makes the app-server dedupe model much safer:
+
+same turn ID + same authoritative terminal event → duplicate delivery, suppress it;
+there should not be two conflicting terminal outcomes competing for the same turn ID.
+
+I agree with the rest of the design, especially:
+
+AlreadyClaimed means reuse/re-deliver the cached authoritative result, not “detach and do nothing.”
+Live app-server state and agent_status must converge before/reliably alongside interactive release.
+Parent notification/post-terminal effects must be independently idempotent and cannot depend on whether this process performed the original live delivery.
+Durable final-proof/memo recovery is worth adding, but only for an exact associated turn; legacy unbound evidence must never be guessed onto an active turn.
+App-server terminal dedupe belongs before state reduction/client notification so an at-least-once replay cannot close a newer turn.
+
+For #3, preserve one important existing safety rule during implementation: on restart, a terminal intent/memo should re-enter the existing terminalization path only if its implementation/evidence/workspace identity is still current and required quiescence can be re-established. A sealed memo is a recovery input, not unconditional permission to manufacture success.
+
+--- User message 5 ---
+Right now the plan says:
+
+first terminal event → reduce state, attempt client notification, record/ack
+duplicate same fingerprint → suppress all reduction and notification, then acknowledge
+
+That can lose the client completion permanently:
+
+app-server accepts the terminal event and closes its internal turn;
+outgoing turn/completed notification fails/backpressures before reaching the client;
+app-server nevertheless records the terminal fingerprint;
+core retries because delivery was uncertain;
+dedupe sees the same fingerprint and suppresses the notification;
+client can remain visually stuck even though both core and app-server are terminal.
+
+Change the app-server ledger to distinguish state application from client notification completion:
+
+For each accepted terminal fingerprint, track state-reduced and client-notification status separately. An identical replay must never re-run ThreadHistoryBuilder or terminal state reduction, but if the original client notification was not successfully accepted by the app-server’s outbound delivery path, the replay may retry that notification.
+
+Acknowledge terminal delivery back to core only once the app-server has durably/authoritatively accepted the terminal state and the client notification has at least been successfully handed to the existing outbound delivery owner. A failed enqueue/send attempt must not produce an acknowledgement that prevents retry.
+
+So duplicate handling becomes:
+
+same fingerprint + state already reduced + notification already accepted → suppress everything, ACK;
+same fingerprint + state already reduced + notification still undelivered/unaccepted → do not reduce again; retry only notification;
+different fingerprint → diagnose/reject;
+stale older turn → never alter newer active-turn state.
+
+That preserves at-least-once delivery without double-applying terminal state.
+
+--- User message 6 ---
+PLEASE IMPLEMENT THIS PLAN:
+# Fix terminalization gaps 1–3
+
+## Summary
+
+- Make terminal delivery at least once without changing a semantic outcome after it becomes durably authoritative.
+- Deduplicate app-server state reduction separately from client-notification delivery, allowing identical replays to repair failed notification handoff.
+- Recover exact authoritative events unchanged; recover final-proof memos only after exact turn association, identity validation, and renewed quiescence.
+
+## Implementation changes
+
+### 1. Immutable authority and runtime convergence
+
+- Add a versioned authoritative terminal record containing thread/turn identity, exact serialized `EventMsg`, canonical fingerprint, semantic outcome, and associated final-proof identity.
+- Establish authority by durably writing the event to task evidence or the rollout. Reconcile both stores after ambiguous write errors before concluding no authority exists.
+- Once authority exists:
+  - Always reuse its exact event and outcome.
+  - Make `AlreadyClaimed` return that record for replay instead of suppressing delivery.
+  - Reject any same-turn candidate with a different fingerprint.
+  - Record claim, persistence, dispatch, acknowledgement, notification, or cleanup failures as infrastructure diagnostics only; never emit a conflicting or status-changing terminal result.
+- Emit a degraded failed terminal event only when neither durable store contains an authoritative decision/event.
+- Track live delivery, app-server acknowledgement, runtime/status convergence, rollout mirroring, parent notification, and cleanup independently in terminal receipts.
+- Route normal completion, `AlreadyClaimed`, fail-safe, and restart recovery through one convergence path that:
+  - Applies `agent_status` from the authoritative event.
+  - Replays the exact event while app-server acknowledgement is absent or delivery is uncertain.
+  - Releases the matching active turn only after status and live terminal handoff have converged.
+  - Retries post-terminal effects independently.
+- Give child-to-parent completion envelopes a deterministic existing communication ID derived from terminal identity, fingerprint, and effect kind. Deduplicate that ID in the parent input path.
+- Map a genuinely failed `TurnComplete` carrying an embedded error to `Errored`; a successful authoritative completion remains `Completed` despite later infrastructure failures.
+
+### 2. App-server state and notification deduplication
+
+- Add a per-thread terminal ledger keyed by turn ID. Each entry stores:
+  - Accepted terminal fingerprint.
+  - Whether terminal state has been reduced.
+  - The exact generated terminal client notification.
+  - Notification targets and their outbound-acceptance status.
+  - Whether acknowledgement was sent to core.
+- Classify terminal events before `ThreadHistoryBuilder`, `ThreadState`, bespoke reduction, or client notification:
+  - New terminal for the matching active turn: reduce state exactly once, cache the generated notification, then attempt outbound delivery.
+  - Same fingerprint with state reduced and notification accepted: suppress reduction and notification, then ACK.
+  - Same fingerprint with state reduced but notification unaccepted or incomplete: do not reduce again; retry only the cached terminal notification.
+  - Different fingerprint for the same turn: preserve the first event, diagnose, and reject the conflicting event.
+  - Older turn while a newer turn is active: never alter the newer turn’s state; only retry an already-cached notification where appropriate.
+- Refactor terminal bespoke handling so state projection and notification dispatch are separate operations. Replays call only the notification-dispatch operation.
+- Change the existing terminal outbound sender to return per-target enqueue acceptance:
+  - Success means the notification was accepted by the existing outbound delivery owner.
+  - A blocked, cancelled, closed, or failed send remains pending and does not permit acknowledgement.
+  - Transport write receipts remain analytics and are not required for core acknowledgement.
+- Retry only targets that have not accepted the notification. Prune disconnected targets and include currently subscribed replacement connections; an empty current target set is considered accepted because terminal state remains available through thread history.
+- ACK core only after:
+  - The fingerprint matches core’s authoritative record.
+  - Terminal state was reduced successfully.
+  - Every currently targeted connection accepted the terminal notification into the outbound delivery path, or no connection is currently subscribed.
+- If the ACK itself fails, retain the completed ledger entry. A later identical replay suppresses state reduction, confirms notification acceptance, and retries the ACK.
+- Seed terminal fingerprints and state-reduced status from retained rollout history. Notification acceptance is not inferred after restart; it remains pending until replay hands the notification to the current outbound owner.
+- Add an internal Rust acknowledgement method using `(turn_id, fingerprint)`; no external client wire schema changes are required.
+
+### 3. Safe restart recovery
+
+- Separate persisted recovery data into:
+  - An authoritative terminal record, replayed exactly without semantic reconsideration.
+  - A turn-bound terminal intent/finalization memo, which is not authoritative.
+- Bind new intents to an exact thread and turn plus implementation, evidence, workspace, diff, environment, toolchain, configuration, reviewer, child-gate, and terminal-hook identities.
+- Recover an intent as success only after re-entering the existing terminalization path and:
+  - Confirming the exact associated rollout turn remains open.
+  - Recomputing and matching all stored identities.
+  - Acquiring completion-finalization admission and draining relevant activity.
+  - Reconciling typed and default children and proving quiescence.
+  - Re-establishing the workspace finalization fence.
+  - Rebuilding and passing the existing completion dossier checks.
+  - Sealing the fence immediately before authority is established.
+- Do not rerun mutation-capable terminal hooks during restart recovery. Missing or incomplete hook evidence forbids success recovery.
+- If validation fails and no authoritative event exists, terminalize that exact open turn through the existing non-success path with the stale or non-quiescent reason.
+- Ignore legacy unbound proof or memo data for success recovery.
+- Bump the task-evidence schema and migrate legacy data as non-authoritative and unbound.
+
+## Test plan
+
+- Core:
+  - Persisted success plus claim failure still delivers the exact success.
+  - `AlreadyClaimed` replays the cached event and converges status, release, parent notification, and cleanup.
+  - Conflicting same-turn candidates are rejected.
+  - Failure before authority produces one degraded failed outcome.
+  - Crash-point tests cover authority, rollout mirroring, delivery, ACK, and each post-terminal effect.
+  - Repeated parent notification produces one parent input.
+- App-server:
+  - First terminal reduces state and successfully enqueues one completion notification before ACK.
+  - Failed outbound enqueue records state as reduced but notification as pending and sends no ACK.
+  - Identical replay after failed enqueue retries only notification and never re-runs state reduction.
+  - Identical replay after successful enqueue suppresses both and retries only a missing ACK.
+  - Partial multi-connection acceptance retries only unaccepted/current targets.
+  - Conflicting replay is rejected and diagnosed.
+  - An old replay cannot close a newer active turn.
+  - Restart reconstruction does not infer notification acceptance.
+- Recovery:
+  - Authoritative events replay unchanged even if the workspace later differs.
+  - Current, exact, quiescent memos may recover success.
+  - Stale identity, lost quiescence, incomplete hooks, wrong turn, and legacy unbound evidence never manufacture success.
+- Run focused `codex-core` and `codex-app-server` tests for these paths, followed by task-scoped formatting and diff checks.
+
+## Assumptions
+
+- The first durably authoritative event for a terminal identity always wins.
+- App-server acknowledgement means authoritative state acceptance plus successful handoff to the outbound delivery owner—not confirmation that a client transport wrote or rendered the notification.
+- Terminal notification retries are at least once; terminal state reduction remains exactly once per accepted fingerprint.
+
+
+REPORTED AUDIT / DIAGNOSIS / FIX CONCLUSION
+--- Unique final report 1; SHA-256 80583B02A2BCE415BB0AF5FE87A7362E68A21309610CF2EF840A9B77F9F0CC0C ---
+## Findings
+
+1. **P1 — Terminalization failure paths detach core state without closing the live app-server turn.**
+   Rollout-persistence failure and terminal-claim failure send an `Error`—or nothing for `AlreadyClaimed`—then call `detach_terminal_turn` and return without emitting `TurnComplete`/`TurnAborted` ([tasks/mod.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tasks/mod.rs:1415), [tasks/mod.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tasks/mod.rs:1474)). The app-server reducer marks an erroring turn failed but only closes its current turn on an explicit terminal event ([thread_history.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/app-server-protocol/src/protocol/thread_history.rs:1194), [thread_history.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/app-server-protocol/src/protocol/thread_history.rs:1258)). Result: core admission reopens while clients may never receive `turn/completed`, and live thread state retains a current turn.
+
+2. **P1 — Durable-claim recovery can leave agent status `Running` and omit parent completion.**
+   `AlreadyClaimed` deliberately suppresses live delivery and only detaches ([tasks/mod.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tasks/mod.rs:1489)). The fail-safe does the same after a panic once the in-memory delivery state is claimed ([tasks/mod.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tasks/mod.rs:3045)). Detachment itself does not update `agent_status`; that transition normally occurs during event dispatch ([session/mod.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/mod.rs:1910), [status.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/agent/status.rs:6)). Post-terminal parent notification also runs only when live delivery was attempted ([tasks/mod.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tasks/mod.rs:2869)). A panic after durable claim but before dispatch can therefore release the active-turn slot while status watchers, app-server state, and a V2 parent still see a running child.
+
+3. **P2 — Final-proof decisions and terminal memos are durable, but are not terminal-recovery inputs.**
+   Final-proof `terminal_decision` and finalization memos are persisted before terminal-event persistence ([task_evidence.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/task_evidence.rs:7130), [task_evidence.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/task_evidence.rs:7222)). On reload, recovery examines only terminalization receipts and merely flips their detached/released flags ([task_evidence.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/task_evidence.rs:2783)); it never converts a sealed proof or memo into a terminal rollout event. A crash after proof/memo persistence but before `persist_terminal_event_for_dispatch` can consequently resume with durable completion evidence while the rollout’s last turn remains in progress.
+
+The current worktree does correctly stop repeated authoritative terminal waits by clearing `needs_follow_up` ([session/turn.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/turn.rs:561)), so I did not count that as an open defect.
+
+Coverage currently tests receipt flags and a panic before worker cancellation, but not panic/failure after durable claim or app-server terminal reduction ([task_evidence_tests.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/task_evidence_tests.rs:3663), [session/tests.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/tests.rs:10361)).
+
+This was a read-only audit of the current dirty worktree; I made no changes and ran no build tests.
+--- Unique final report 2; SHA-256 7C4C92A6D048DF6F507208127D6AD897DBCF31196E6018B23A3BF0C74B6527EA ---
+Implemented terminalization fixes 1–3.
+
+Key changes:
+
+- Versioned, immutable authoritative terminal records with exact event fingerprints and task-evidence/rollout reconciliation in [task_evidence.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/task_evidence.rs:1167).
+- At-least-once exact-event replay, delayed interaction release until live handoff, fail-safe convergence, durable parent-message dedupe, and guarded restart recovery in [tasks/mod.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tasks/mod.rs:1446).
+- App-server per-turn ledger separates state reduction, cached notification delivery, per-connection acceptance, and core ACK in [thread_state.rs](C:/Users/kuh/Desktop/kd4/codex-rs/app-server/src/thread_state.rs:291).
+- Backpressure now leaves notification targets pending rather than acknowledging them in [outgoing_message.rs](C:/Users/kuh/Desktop/kd4/codex-rs/app-server/src/outgoing_message.rs:1031).
+- Restart intents are bound to exact implementation, evidence, workspace, diff, environment, toolchain, configuration, reviewer, child-gate, and terminal-hook identities.
+- Embedded terminal errors now produce `Errored`/failed app-server status.
+- Added focused authority-conflict, delivery retry, backpressure, restart-ledger, parent dedupe, and interaction-release tests.
+
+Validation:
+
+- `rustfmt --check`: passed.
+- `git diff --check`: passed.
+- `cargo check -p codex-core --lib`: blocked before compiling the changed crates by the unrelated existing `#[ts(optional)]`-on-`bool` error in `protocol/src/request_user_input.rs:139`.
+- Per repository instructions, I did not modify that unrelated error or repeat Cargo validation through another cold lane.
+
+FACT / HYPOTHESIS / UNKNOWN BOUNDARY
+- Direct artifact facts: the source paths, UUID, metadata, user messages, lifecycle events, and agent report text above are present in the inspected Codex session records.
+- Reported repository facts: symptoms, causes, affected files/symbols, fixes, commands, and validation results are preserved as claims made by the reporting agent. Treat exact evidence and qualifications inside the report as controlling.
+- Hypotheses: no new implementation cause or language was inferred during corpus extraction. Any hypothesis in the report remains a hypothesis unless the report states and evidences that it was established.
+- Unknowns: anything the preserved report omits—including environment details, reproduction steps, exact cause, validation scope, or residual risk—remains unknown and must be checked against the repository and Git history before relying on it for a new fix.
+
+====================================================================================================
+STABLE EVIDENCE ID: CODEX-SESSION-019ffe98-277d-7dc0-a173-81fcaa96025b
+DATE: 2026-08-13
+LANGUAGE CLASSIFICATION: Rust
+STATUS: Reported conclusion available
+CONFIDENCE: This record faithfully preserves the session artifact. Repository-level conclusions retain the confidence and qualifications stated by the reporting agent and were not independently re-proven during this extraction.
+
+SOURCE SESSION ARTIFACTS
+- C:\Users\kuh\.codex\sessions\2026\08\13\rollout-2026-08-13T23-46-52-019ffe98-277d-7dc0-a173-81fcaa96025b.jsonl.zst
+Source session UUID: 019ffe98-277d-7dc0-a173-81fcaa96025b
+Session timestamp(s): 8/14/2026 4:46:52 AM
+Working directory/project: c:\Users\kuh\Desktop\kd4
+Recorded Git revision(s): 7f08c056cd0b70b4428908744285550b08762df8
+Recorded Git branch(es): main
+Recorded lifecycle outcomes: task_complete
+
+DIRECTLY STATED USER REQUEST / OBSERVED SYMPTOM
+--- User message 1 ---
+Audit codex-rs for convergence/loop-detection code that recognizes repetition but only logs it or instructs the model instead of changing runtime behavior. Identify cases where exact structured proof already exists but the enforcement half of the feature was never implemented.
+
+
+--- User message 2 ---
+#3 — Real cleanup/fix
+
+--- User message 3 ---
+Before deleting it, verify that no part of PlanningSnapshotIdentity participates in stale-plan correctness beyond the repeated-digest machinery. If it currently protects against stale application after user steering, plan replacement, or another authoritative planning-state change, preserve that protection with explicit generation invalidation.
+
+I'd state the invariant as:
+
+planning_generation must advance on every authoritative change that can make an existing PendingTurnPlan stale, not merely on completed semantic effects. A plan created under generation N may be applied only while N remains current. Removing the digest must not weaken stale-plan rejection.
+
+--- User message 4 ---
+he only point that must be real—not just documented—is this boundary:
+
+“final generation check immediately before the first persistence mutation”
+
+That check must be linearized with persistence using the existing turn/persistence ownership mechanism. A plain:
+
+check generation == N → unlock/yield → begin persistence
+
+would leave a race where generation advances between the check and the first write.
+
+Use the existing lock/transaction/owner so either:
+
+the final generation comparison and beginning of persistence are one protected operation; or
+persistence performs an equivalent compare-and-commit against generation N.
+
+If existing single-owner semantics already guarantee that, just prove it in the focused test; no new mechanism is needed.
+
+--- User message 5 ---
+PLEASE IMPLEMENT THIS PLAN:
+# Remove Planning Digests With an Atomic Generation Commit Boundary
+
+## Summary
+
+- `state_digest` only drives repetition counting; it provides no stale-plan rejection.
+- The current active-turn ownership does not linearize the final generation check with persistence: generation-changing refreshes can run without holding `active_turn`.
+- Reuse the existing `Session::state` persistence mutex. No new lock is needed: the generation comparison, initial history mutation, and context-baseline staging will occur under one `SessionState` guard.
+
+## Implementation Changes
+
+- Replace `PlanningSnapshotIdentity` with `planning_generation: u64` on `PendingTurnPlan`; retain post-build and fixed-point generation validation.
+- Refactor the first persistence operation into a compare-and-commit method:
+  - Build context items and the baseline candidate without mutation.
+  - Acquire `Session::state`.
+  - Compare the current generation with the plan’s generation.
+  - On mismatch, release the guard and return `Stale` without modifying history, staging a baseline, or appending rollout items.
+  - On equality, append any initial context items and stage the existing `ContextBaselineCandidate` while still holding that same guard. This is the plan’s linearization point.
+  - Release the guard, then perform rollout append and client notification using the already-committed items.
+- Route every runtime generation advancement through the same persistence owner:
+  - Require a mutable `SessionState` guard/token when advancing `planning_generation`.
+  - Publish MCP runtime state and advance its generation while that guard is held.
+  - Publish environment selections and advance generation while that guard is held.
+  - Replace compacted history and advance generation in the same state critical section.
+  - Keep startup MCP initialization separate because it occurs before the `Session` is exposed and no pending plan can exist.
+- On a stale compare-and-commit result, rebuild inside the fixed-point loop while retaining completed-effect state so semantic effects and observability are not replayed.
+- Remove digest computation, digest history preparation, digest visit tracking, and repeated-digest diagnostics. Keep the global iteration bound, completed-effect ledger, and invalidating-effect generation requirement.
+- Remove `planningRepeatedDigestCount` and `planningIdentityNs`, remove the corresponding timing phase, bump timing schema 10→11, and regenerate app-server schemas.
+
+## Tests and Validation
+
+- Add deterministic owner-ordering tests for both races:
+  - Invalidation acquires `Session::state` first: generation advances, the generation-N plan is rejected, and history, baseline candidate, and rollout remain unchanged.
+  - Plan commit acquires `Session::state` first: generation-N context and baseline staging complete atomically; invalidation advances only after the guard is released.
+- Add a stale-during-planning test proving a generation change causes reconstruction before commit.
+- Test each guarded invalidation path: MCP publication, environment publication, and compacted-history replacement.
+- Preserve steering behavior tests: steering remains queued for later sampling and does not replace the active turn’s frozen planning inputs.
+- Update fixed-point and timing tests, verify legacy timing payload deserialization, regenerate/check schemas, run focused `codex-core` tests, `rustfmt --check`, and `git diff --check`.
+
+## Assumptions
+
+- The successful `SessionState` transaction that records initial history and stages `ContextBaselineCandidate` is the authoritative start of pending-plan persistence.
+- Generation changes that acquire the same owner after that transaction are subsequent state changes and do not retroactively stale the committed plan.
+- `update_plan` remains outside this boundary because it cannot execute until after the initial pending plan has been committed and sent.
+
+
+REPORTED AUDIT / DIAGNOSIS / FIX CONCLUSION
+--- Unique final report 1; SHA-256 5B28E268ED0BB653E0E3B9BDB627868A2D599BF110C3DA1391DF64285613CCD8 ---
+Found two confirmed missing-enforcement paths and one lower-severity dead detector.
+
+1. High — Exact deterministic command failures never block identical retries.
+
+`CommandAttemptKey` captures the command, environment, cwd, repository epoch, sandbox, permissions, input, and runtime context. A trusted `DeterministicFailureRecord` then stores the failure class, exit code, timing, and output artifact ([command_execution.rs:84](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/command_execution.rs:84), [command_execution.rs:193](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/command_execution.rs:193)).
+
+The enforcement API is fully scaffolded: `CommandAttemptBlocked` even renders “execution was suppressed” for the model. But nothing constructs this type, and `begin_attempt()` unconditionally increments counters and returns `Ok(())` ([command_execution.rs:174](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/command_execution.rs:174), [command_execution.rs:1047](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/command_execution.rs:1047)). Both shell execution paths already handle a possible `Err(CommandAttemptBlocked)`, but it is unreachable ([shell.rs:2290](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/shell.rs:2290), [exec_command.rs:713](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs:713)).
+
+The only duplicate-diagnosis suppression helper is `#[cfg(test)]`, so it cannot affect production. The unit test explicitly requires three identical deterministic retries to execute ([command_execution.rs:1061](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/command_execution.rs:1061), [command_execution.rs:1902](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/command_execution.rs:1902)).
+
+Impact: an unchanged, trusted deterministic validation failure can be rerun indefinitely despite the ledger already possessing everything necessary to reject it safely.
+
+2. High — “Proven loop activation” does not govern the sampling loop.
+
+The sampling governor builds a strong proof:
+
+- Canonical tool name, arguments, and state revision form the dispatch identity.
+- Canonical result bodies are paired with those identities in ordinal order.
+- A loop is declared only when that exact ordered cycle repeats against the identical settled state, after a prior convergence directive.
+
+See [reasoning_governor.rs:1959](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/reasoning_governor.rs:1959), [reasoning_governor.rs:2137](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/reasoning_governor.rs:2137), and [reasoning_governor.rs:2945](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/reasoning_governor.rs:2945).
+
+Once proved, however, the decision still says `ContinuationDisposition::ModelRequired`; only `proven_loop_activated` and a developer-message directive change ([reasoning_governor.rs:2963](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/reasoning_governor.rs:2963)). The turn loop merely increments telemetry, records that directive into conversation history, and continues sampling ([turn.rs:938](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/turn.rs:938)).
+
+Exact repeated tool executions may already be replayed/suppressed separately, but provider generations can continue without a host-side bound. The model is therefore responsible for obeying the detector that just proved it is not converging.
+
+3. Medium — Repeated planning-state detection is observational; its specific failure branch is unreachable.
+
+Pending-turn planning computes a SHA-256 identity over the model-visible planning inputs ([turn.rs:1933](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/turn.rs:1933)). `FixedPointPlanningState` recognizes every repeated digest, but returns only a boolean ([pending_turn_plan.rs:42](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/pending_turn_plan.rs:42)). The caller uses that boolean exclusively to increment `planning_repeated_digest_count` ([turn.rs:1650](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/turn.rs:1650), [turn_timing.rs:1154](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/turn_timing.rs:1154)).
+
+The intended same-digest failure checks `visits > 8`, but the preceding total-iteration check already fails when total iterations exceed eight. Since visits cannot exceed total iterations, the digest-specific enforcement and diagnostic can never execute. The loop remains bounded by the coarse global cap, but exact recurrence never changes behavior.
+
+I excluded repeated discovery and authoritative-wait detection: those paths now have actual dispatch replay, wait suppression, or terminal-result surfacing. No files were changed and no build was run; this was a source-and-test audit of the current dirty working tree.
+--- Unique final report 2; SHA-256 6F901D1918EB197E1BF8724AE544DBF9A399D384D565A8F2D0222A3D80B456F4 ---
+Implemented the runtime and test changes.
+
+Key outcomes:
+
+- Removed `PlanningSnapshotIdentity`, state digests, digest visits, and repeated-digest diagnostics.
+- Added generation-only pending plans and retained post-build/fixed-point stale checks in [turn.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/turn.rs:1304).
+- Linearized the final generation comparison with history mutation and baseline staging under `Session::state` in [mod.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/mod.rs:4194).
+- Required `SessionState` ownership for runtime generation advancement. Covered MCP publication—including the manager-reuse fast path—environment publication, and compaction in [service.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/state/service.rs:158).
+- Preserved completed-effect state across stale commit rebuilds.
+- Removed obsolete timing fields and bumped schema version to 11 in [turn_timing.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/turn_timing.rs:50).
+- Added deterministic owner-ordering, stale-rebuild, invalidation-path, and legacy timing tests in [turn_tests.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/turn_tests.rs:1189) and [turn_timing_tests.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/turn_timing_tests.rs:99).
+
+Validation is incomplete due to unrelated concurrent work. The first focused Cargo test stopped before compiling `codex-core` on syntax errors in:
+
+- `app-server-protocol/src/protocol/thread_history.rs:4845`
+- `model-provider/src/provider.rs:331`
+
+Other Cargo processes continued modifying/validating the shared tree, so repository policy prohibited further builds. Consequently, focused tests and schema regeneration/check could not run; generated schemas still contain the removed timing fields. Targeted formatting was applied, and the non-building diff check passed before the final warning-only test cleanup.
+
+FACT / HYPOTHESIS / UNKNOWN BOUNDARY
+- Direct artifact facts: the source paths, UUID, metadata, user messages, lifecycle events, and agent report text above are present in the inspected Codex session records.
+- Reported repository facts: symptoms, causes, affected files/symbols, fixes, commands, and validation results are preserved as claims made by the reporting agent. Treat exact evidence and qualifications inside the report as controlling.
+- Hypotheses: no new implementation cause or language was inferred during corpus extraction. Any hypothesis in the report remains a hypothesis unless the report states and evidences that it was established.
+- Unknowns: anything the preserved report omits—including environment details, reproduction steps, exact cause, validation scope, or residual risk—remains unknown and must be checked against the repository and Git history before relying on it for a new fix.
+
+====================================================================================================
+STABLE EVIDENCE ID: CODEX-SESSION-019ffe98-3a9c-7a91-9857-5f4556f4d152
+DATE: 2026-08-13
+LANGUAGE CLASSIFICATION: Rust
+STATUS: Reported conclusion available
+CONFIDENCE: This record faithfully preserves the session artifact. Repository-level conclusions retain the confidence and qualifications stated by the reporting agent and were not independently re-proven during this extraction.
+
+SOURCE SESSION ARTIFACTS
+- C:\Users\kuh\.codex\sessions\2026\08\13\rollout-2026-08-13T23-46-57-019ffe98-3a9c-7a91-9857-5f4556f4d152.jsonl.zst
+Source session UUID: 019ffe98-3a9c-7a91-9857-5f4556f4d152
+Session timestamp(s): 8/14/2026 4:46:57 AM
+Working directory/project: c:\Users\kuh\Desktop\kd4
+Recorded Git revision(s): 7f08c056cd0b70b4428908744285550b08762df8
+Recorded Git branch(es): main
+Recorded lifecycle outcomes: task_complete
+
+DIRECTLY STATED USER REQUEST / OBSERVED SYMPTOM
+--- User message 1 ---
+Audit codex-rs for multi-agent improvements that exist structurally but do not affect spawning behavior. Trace authorization, mode selection, task identity, overlap detection, wait ownership, result reuse, and completion state. Find checks that are computed but not enforced or only exercised by tests.
+
+--- User message 2 ---
+Act on: 1 → 2 → 4
+Cleanup: 5 → 6
+
+
+REPORTED AUDIT / DIAGNOSIS / FIX CONCLUSION
+--- Unique final report 1; SHA-256 5FC00AC62BC569E6579B35D3586D3988EF8F3721A47F8F36588F182DE9063FC6 ---
+Audit result: the stronger coordination system is real, but it is opt-in. Ordinary `message` spawning still follows the legacy path and bypasses authorization, task identity, and overlap enforcement.
+
+## Findings
+
+1. **High — explicit-request authorization is prompt-only.**
+
+   `effective_multi_agent_mode` selects `ExplicitRequestOnly`, but tool exposure reduces the mode to `is_some()`. The `spawn_agent` handler never receives or checks user authorization, and root calls bypass typed capability authorization entirely.
+
+   - Mode selection: [multi_agents.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/multi_agents.rs:38)
+   - Variant erased during exposure: [turn.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/turn.rs:3460)
+   - Spawn tool registered regardless of explicit/custom policy: [spec_plan.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/spec_plan.rs:896)
+   - Handler begins spawning without an authorization check: [spawn.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs:82)
+   - Router authorization returns immediately for unbound root agents: [router.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/router.rs:570)
+
+   Existing mode tests verify developer text, not that an unauthorized call is rejected: [multi_agent_mode.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/tests/suite/multi_agent_mode.rs:96).
+
+2. **High — identity and overlap enforcement only apply to typed assignments.**
+
+   `message` and `assignment` are mutually exclusive. The legacy `message` branch creates no `AssignmentId`, objective identity, read/write scope, or admission record. Only the typed branch calls `create_admitted_assignment`.
+
+   - Legacy/typed split: [spawn.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs:127)
+   - Typed admission begins here: [spawn.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs:239)
+   - Overlap enforcement call: [spawn.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs:340)
+   - Explorer investigation identity: [model.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/agent-task-store/src/model.rs:373)
+   - Actual duplicate/write/read checks: [local.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/agent-task-store/src/local.rs:6195)
+
+   Legacy `task_name` only provides canonical path uniqueness. A different name can spawn semantically duplicate or overlapping work. The production tests proving conflict rejection all explicitly construct typed assignments: [multi_agents_tests.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/multi_agents_tests.rs:1069).
+
+3. **Medium — mode-selection wire fields are intentionally inert, while configuration remains advisory.**
+
+   App-server `multi_agent_mode` is documented as deprecated and ignored, then destructured into `_multi_agent_mode`. Current configuration produces developer guidance, not an execution policy. Even an empty custom hint remains `Some`, so spawning stays exposed with no built-in instruction text.
+
+   - Deprecated contract: [thread.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/app-server-protocol/src/protocol/v2/thread.rs:103)
+   - Ignored input: [thread_processor.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/app-server/src/request_processors/thread_processor.rs:944)
+   - Empty/custom mode selection: [multi_agents.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/multi_agents.rs:45)
+   - Test explicitly confirms ignored proactive input: [turn_start.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/app-server/tests/suite/v2/turn_start.rs:1897)
+
+4. **Medium — authoritative wait result reuse is only partially reachable and does not consume the saved result.**
+
+   Wait ownership signals are built only from durable typed wake events. Automatic cursors advance after delivering those events, while the governor requires two identical observations before enforcement. Normal automatic waiting therefore does not produce the second identical terminal observation; that requires explicit cursor replay or another specialized owner path.
+
+   - Automatic cursor advancement: [wait.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs:256)
+   - Signal only from current typed wake deltas: [wait.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs:310)
+   - Two-observation threshold: [reasoning_governor.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/reasoning_governor.rs:2853)
+   - Unit test injects the observation directly: [reasoning_governor.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/reasoning_governor.rs:5254)
+
+   Additionally, `AuthoritativeWaitOwnerResult` stores the adapter and result value, but production only matches `Terminal(_)` and sets `needs_follow_up = false`; it never reads or surfaces that payload: [turn.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/turn.rs:561). Blocked-wait suppression is genuinely enforced for typed assignments.
+
+5. **Medium — the completion-review turn baseline is computed and passed, but unused.**
+
+   Every eligible turn captures implementation and dossier identity, then sets `complete_reuse_identity` to `None`. `coordinate_completion_review` receives it as `_turn_baseline` and never reads it.
+
+   - Baseline capture on every turn: [turn.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/turn.rs:245)
+   - Captured identity with reuse disabled: [completion_review_v2.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tasks/completion_review_v2.rs:3781)
+   - Unused production parameter: [completion_review_v2.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tasks/completion_review_v2.rs:3411)
+
+   Persisted reuse based on a freshly recomputed review-attempt identity does work later in the review path, but the turn-start baseline itself has no behavioral effect.
+
+6. **Low — three successful-admission overlap counters can never become nonzero.**
+
+   `AdmissionOverlapSummary` declares duplicate, write/read, and write/write counters, but admission increments only benign read overlap. All conflicting cases return errors immediately. Successful-admission telemetry reads the three unreachable counters.
+
+   - Counter structure: [model.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/agent-task-store/src/model.rs:177)
+   - Only benign counter incremented: [local.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/agent-task-store/src/local.rs:6222)
+   - Dead counters consumed by telemetry: [spawn.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs:661)
+
+## What is genuinely enforced
+
+Completion state is not test-only. Default-child status and typed-store quiescence are refreshed and can block or downgrade terminal completion:
+
+- Default-child status check: [control.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/agent/control.rs:400)
+- Typed quiescence check: [completion_review_v2.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tasks/completion_review_v2.rs:3862)
+- Final completion recheck: [mod.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tasks/mod.rs:1990)
+
+That enforcement happens at review/finalization time; it does not authorize or deduplicate the original spawn.
+
+No files were changed and no build was run; this was a production/test call-site audit of the current dirty checkout.
+--- Unique final report 2; SHA-256 C6B88D3413448CD6EA4C891F0921812CD21AF3C05797D098D41D2589B5A0AB6E ---
+Implemented 1 → 2 → 4 and cleaned up 5 → 6.
+
+- Spawn authorization is now enforced per turn. Explicit-request mode rejects spawning without a direct user grant; later denial revokes it. See [multi_agents.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/multi_agents.rs:73) and [spawn.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs:162).
+- Legacy `message` spawns now become durable repository-wide worker assignments, receive assignment IDs, and pass through overlap admission. Structured origin metadata permits only the explicit legacy parent/child exception; typed agents cannot delegate. See [model.rs](C:/Users/kuh/Desktop/kd4/codex-rs/agent-task-store/src/model.rs:57), [local.rs](C:/Users/kuh/Desktop/kd4/codex-rs/agent-task-store/src/local.rs:6245), and [spawn.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs:1188). Concurrent legacy siblings now conservatively conflict; typed assignments can declare narrower scopes.
+- Quiet automatic waits now hydrate all descendant task owners and terminate when they are settled. Repeated authoritative terminal waits reuse and surface the retained first result. See [wait.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs:905) and [reasoning_governor.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/reasoning_governor.rs:3685).
+- Removed completion-baseline plumbing and dead rejected-overlap counters. Only the exercised benign-read overlap counter remains.
+
+Validation:
+
+- Focused `rustfmt --check`: passed.
+- `git diff --check`: passed.
+- Dead-symbol search: passed.
+- Core test was blocked by unrelated missing `EventMsg::TurnTerminalizationComplete` match arms in [policy.rs](C:/Users/kuh/Desktop/kd4/codex-rs/rollout/src/policy.rs:89) and [protocol_event.rs](C:/Users/kuh/Desktop/kd4/codex-rs/rollout-trace/src/protocol_event.rs:261).
+- Task-store test was blocked by an unrelated undefined `assignment` in [tests.rs](C:/Users/kuh/Desktop/kd4/codex-rs/agent-task-store/src/tests.rs:1951).
+
+Per repository policy, I did not repair those unrelated failures or rerun Cargo. Repo Atlas guided the change boundary across spawning, durable admission, and wait ownership.
+
+FACT / HYPOTHESIS / UNKNOWN BOUNDARY
+- Direct artifact facts: the source paths, UUID, metadata, user messages, lifecycle events, and agent report text above are present in the inspected Codex session records.
+- Reported repository facts: symptoms, causes, affected files/symbols, fixes, commands, and validation results are preserved as claims made by the reporting agent. Treat exact evidence and qualifications inside the report as controlling.
+- Hypotheses: no new implementation cause or language was inferred during corpus extraction. Any hypothesis in the report remains a hypothesis unless the report states and evidences that it was established.
+- Unknowns: anything the preserved report omits—including environment details, reproduction steps, exact cause, validation scope, or residual risk—remains unknown and must be checked against the repository and Git history before relying on it for a new fix.
+
+====================================================================================================
+STABLE EVIDENCE ID: CODEX-SESSION-019ffe98-3ac5-75e0-943b-2452ffcbc216
+DATE: 2026-08-13
+LANGUAGE CLASSIFICATION: Rust
+STATUS: Reported conclusion available
+CONFIDENCE: This record faithfully preserves the session artifact. Repository-level conclusions retain the confidence and qualifications stated by the reporting agent and were not independently re-proven during this extraction.
+
+SOURCE SESSION ARTIFACTS
+- C:\Users\kuh\.codex\sessions\2026\08\13\rollout-2026-08-13T23-46-57-019ffe98-3ac5-75e0-943b-2452ffcbc216.jsonl.zst
+Source session UUID: 019ffe98-3ac5-75e0-943b-2452ffcbc216
+Session timestamp(s): 8/14/2026 4:46:57 AM
+Working directory/project: c:\Users\kuh\Desktop\kd4
+Recorded Git revision(s): 7f08c056cd0b70b4428908744285550b08762df8
+Recorded Git branch(es): main
+Recorded lifecycle outcomes: task_complete
+
+DIRECTLY STATED USER REQUEST / OBSERVED SYMPTOM
+--- User message 1 ---
+Audit codex-rs for context/token optimizations that calculate projected savings without ever realizing them in provider-facing requests. Distinguish canonical local history, projected history, provider baseline, and actual transmitted context. Find optimizations that currently exist only as accounting or hypothetical projection.
+
+--- User message 2 ---
+1 → 3 → then clean up/repair the measurable parts of 2 and 4.
+
+--- User message 3 ---
+If completed-tool receipt substitution changes any portion of history already represented by a provider-managed baseline, invalidate that baseline for the next request. Do not send previous_response_id, WebSocket prefix inheritance, or any equivalent incremental-provider reference whose inherited prefix still contains the unreplaced bounded output. Establish a new baseline from a full request that actually contains the receipt-substituted history. If the transport cannot establish such a fresh baseline, fail open and retain the unreplaced history rather than claiming realized receipt substitution.
+
+--- User message 4 ---
+PLEASE IMPLEMENT THIS PLAN:
+# Transactional Tool-History Receipt Rebase and Honest Accounting
+
+## Summary
+
+Implement repairs in the requested order: realize completed-tool receipts through an explicit provider-baseline rebase, stop counting nested code-mode projections, then remove hypothetical accounting and relabel measurable telemetry. Receipt substitution is transactional: canonical history stays unreplaced, and a provider-managed baseline is considered updated only after a successful full receipt-bearing request.
+
+## Implementation Changes
+
+1. **Receipt substitution with provider-baseline invalidation**
+   - Match candidates against their bounded model-visible output, not the raw artifact hash. Support plain-text and MCP content-item output carriers while preserving non-text modalities.
+   - Keep paired prepared histories for every stable-context variant:
+     - receipt-substituted history intended for provider delivery;
+     - unreplaced bounded history used for fail-open delivery.
+   - Record substitution metadata containing the affected item position, call ID, bounded-output fingerprint, receipt ID, and substituted fingerprint. This is control metadata, not savings accounting.
+   - Before calculating an incremental request, compare affected positions with the exact provider-managed prefix. If any substituted item is already inherited:
+     - call the central provider-history invalidation path;
+     - clear `previous_response_id`, WebSocket prefix history, prepared startup inheritance, prompt-context baseline, and equivalent provider/cache inheritance state;
+     - forbid incremental retry paths from resurrecting the invalidated reference;
+     - send a full non-inheriting request containing the receipt-substituted history.
+   - Receipt substitutions located wholly after the inherited prefix may remain in the new incremental tail.
+   - Establish the replacement baseline only after the full request succeeds and, for provider-managed inheritance, returns a usable response ID. Until then, the attempted request is not an authoritative provider baseline.
+   - If a route cannot emit a full non-inheriting request, use the paired unreplaced history and retain an old provider reference only when its exact prefix is still proven. If neither is possible, surface the normal request failure.
+   - Network/provider failure after a full-rebase attempt keeps inheritance invalidated and canonical history unreplaced; retries remain full receipt-bearing attempts. Never label the failed attempt as established or realized.
+
+2. **Completed-tool receipt lifecycle**
+   - Mark a candidate consumed only after a successful generation used the bounded output.
+   - Apply receipts only to cloned sampling history; never rewrite canonical local history, rollout items, or raw artifacts.
+   - Validate receipt JSON structurally using version, outer/inner call ID agreement, receipt-ID derivation, and artifact identity.
+   - Preserve ledger compatibility by retaining existing serialized keys while correcting their internal semantics.
+
+3. **Nested code-mode accounting**
+   - Continue materializing nested projections required for native code-mode results and deterministic continuation carriers.
+   - Restrict provider-facing projection counters, discovery-result injection accounting, and tool-history candidate registration to direct tool calls.
+   - Count/register only the outer `functions.exec` projection that can enter provider-visible history.
+
+4. **Honest measurable accounting**
+   - Remove unwired provider provenance, authoritative-output sets, effective-provider-token fields, realized-savings fields, and unused token-accounting sidecars.
+   - Retain substitution metadata solely where required for baseline invalidation and fail-open selection.
+   - Structurally measure final logical-request contents and rename telemetry:
+     - `completed_tool_receipt_tokens` → `logical_tool_history_receipt_tokens`
+     - `raw_tool_output_tokens` → `logical_non_receipt_tool_output_tokens`
+     - `unique_new_tokens` → `novel_logical_material_tokens`
+     - `component_cache_hits` → `local_component_reuse_count`
+     - `projection_savings_eligible` → `local_projection_policy_active`
+   - Keep provider baseline mode, attempt outcome, response-ID establishment, logical request size, and actual wire bytes as separate observations. Receipt-bearing attempts and successful fresh baselines must remain distinguishable.
+   - On the unreplaced fail-open path, logical receipt counts are zero and no telemetry may imply substitution.
+   - Remove `avoided_token_usage` from deterministic-continuation receipts and its aggregation because no production paired-counterfactual producer exists.
+
+## Interfaces and Compatibility
+
+- Add internal prompt/projection metadata for paired receipt-substituted and unreplaced histories plus affected-prefix identities.
+- Update public `codex-otel` field names to the exact local/logical terminology above.
+- Remove optional `avoidedTokenUsage` from protocol and regenerated app-server schemas. Historical payloads containing it must still deserialize and reserialize without it.
+- Keep the tool-history ledger version unchanged and accept legacy ledger fields.
+- Do not change provider request wire APIs, canonical rollout history, artifact retrieval, or deterministic continuation behavior.
+
+## Test and Acceptance Plan
+
+- Verify text and MCP outputs complete the bounded-output → consumed → receipt lifecycle while canonical history remains byte-for-byte unchanged.
+- Verify tampered, incomplete, unconsumed, or mismatched outputs never become receipts.
+- Verify a substitution inside a WebSocket/provider prefix centrally invalidates all inheritance, sends no `previous_response_id`, transmits the full receipt-bearing input, and establishes a new baseline only after a successful response ID.
+- Verify retries after failed rebase never reuse the stale baseline; an incapable route selects unreplaced history and reports zero logical receipt tokens.
+- Verify a receipt introduced only in the new tail can use proven incremental inheritance.
+- Verify generic prefix mismatches and stable-context fallback continue to produce full non-inheriting requests.
+- Verify nested code-mode projections produce no provider-facing projection counters or history candidates, while the outer projection is counted once and retains continuation content.
+- Verify structural receipt classification rejects receipt-like strings and telemetry contains only the renamed request facts.
+- Verify legacy protocol and ledger payload compatibility, regenerate schemas, then run focused `codex-core`, `codex-otel`, and `codex-protocol` tests, `just app-server-schema-check`, scoped rustfmt, and `git diff --check` under the repository’s validation retry rules.
+
+## Assumptions
+
+- “Realized” is not emitted as a savings metric. The strongest recorded fact is a successful receipt-bearing full request and, separately, establishment of a fresh provider-managed response ID.
+- Stateless full requests may deliver receipts successfully but do not establish a reusable provider-managed baseline.
+- Work remains fork-local source repair only; no publishing or Desktop binary replacement is included.
+
+
+REPORTED AUDIT / DIAGNOSIS / FIX CONCLUSION
+--- Unique final report 1; SHA-256 7ECEFC1354B320AA212E71058BE836F6E1CF7DB1852645AA5F26BFC44559F600 ---
+Audit result: one enabled optimization is effectively inert, one accounting path overcounts non-transmitted projections, and several “savings” metrics are telemetry or counterfactuals rather than realized provider reductions.
+
+## The four context layers
+
+| Layer | Source of truth | Meaning |
+|---|---|---|
+| Canonical local history | [`ContextManager.items`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/context_manager/history.rs:107) | Persistent model-visible conversation history. For projected tool outputs, this already contains the bounded envelope; exact raw output lives in an artifact. |
+| Projected history | [`PreparedPromptInput.items`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/context_manager/history.rs:63) | A normalized, sampling-only view. Stable-context supersession and completed-tool receipt replacement happen here without rewriting canonical history. |
+| Provider baseline | [`WebsocketHistoryBaseline`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/client.rs:1068) plus the previous logical request/response | Context already retained behind `previous_response_id`. This is separate from the unused similarly named state in `tool_history.rs`. |
+| Actual transmission | [`ResponsesApiRequest.input`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/client.rs:1924), or websocket delta input plus `previous_response_id` | HTTP sends the full projected request. Websocket may send only the incremental suffix, while the provider still carries the inherited prefix. |
+
+## Findings
+
+1. High: completed-tool-history receipt projection cannot activate in the normal lifecycle.
+
+The feature is enabled by default at [`config/mod.rs:4001`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/config/mod.rs:4001), but its representation identities do not line up:
+
+- Candidate creation hashes the raw, unprojected tool output at [`registry.rs:1264`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/registry.rs:1264).
+- The candidate separately stores the rendered bounded envelope as `bounded_digest` at [`registry.rs:1738`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/registry.rs:1738).
+- The output actually recorded into conversation history has its body replaced by that bounded envelope at [`registry.rs:1770`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/registry.rs:1770).
+- Both consumption marking and later receipt projection compare history against the raw-output hash, at [`tool_history.rs:191`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tool_history.rs:191) and [`tool_history.rs:236`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tool_history.rs:236).
+
+Therefore the stored bounded envelope cannot match `original_output_sha256`. `consumed_by_generation` remains unset and `candidate.receipt()` rejects the candidate. Normal execution never emits the intended `thr1-*` receipt into a provider request.
+
+The first-stage projection—raw tool output to bounded artifact envelope—does work. The broken part is the second-stage “consumed historical output to small receipt” optimization.
+
+2. High: tool-history provider realization accounting is scaffolding only.
+
+[`ToolHistoryTokenAccounting`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tool_history.rs:53) calculates canonical tokens, projected tokens, and theoretical savings. But:
+
+- `tool_history_accounting` is assigned and cloned, never consumed: [`history.rs:71`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/context_manager/history.rs:71).
+- `effective_provider_tokens` and `realized_provider_savings` are always initialized to `None` and have no writers: [`tool_history.rs:253`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tool_history.rs:253).
+- `ProviderBaselineProvenance` has no producer: [`tool_history.rs:42`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tool_history.rs:42).
+- `provider_authoritative_outputs` is checked and retained but never populated.
+- `transmitted_receipt_ids` is only an internal set; it is never reconciled with the serialized request, response identity, or provider token usage.
+
+The real websocket baseline machinery lives independently in `client.rs`. Nothing connects it to this tool-history accounting. Thus even after repairing receipt eligibility, the existing “realized provider savings” layer would still remain hypothetical.
+
+Additionally, the receipt classifier at [`client.rs:486`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/client.rs:486) does not recognize `ToolHistoryReceiptV1`’s `receipt_id`/`thr1-*` shape, so working receipts would likely be counted as raw tool-output tokens.
+
+3. Medium: nested code-mode projections are counted although they are not provider-facing.
+
+Every nested code-mode tool is dispatched with `ToolCallSource::CodeMode` at [`code_mode/mod.rs:345`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/code_mode/mod.rs:345). The registry nevertheless constructs a model projection and records projected/canonical/model token counters without checking the call source at [`registry.rs:983`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/registry.rs:983).
+
+But code mode then calls `result.code_mode_result()` at [`code_mode/mod.rs:393`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/code_mode/mod.rs:393), and [`AnyToolResult::code_mode_result`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/registry.rs:377) explicitly ignores `model_projection`.
+
+Consequences:
+
+- Inner projected-token and model-byte counters can describe material never transmitted.
+- Ignored nested results can still create artifacts and tool-history candidates.
+- If the script emits a result, the provider sees the outer `functions.exec` output and its separate projection—not the inner projection being counted.
+- Some inner continuation metadata can be merged into the outer projection, but its inner projected byte/token totals still are not actual provider payload totals.
+
+4. Accounting-only or explicitly hypothetical metrics
+
+These should not be presented as realized token savings:
+
+- `unique_new_tokens` hashes logical request components and reports repeated units as zero, but does not change request construction: [`amplification.rs:45`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/amplification.rs:45). On websocket requests it is deliberately calculated from the full logical request, while the separately measured wire request is the actual delta: [`client.rs:3155`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/client.rs:3155).
+- Stable-context `local_reused_bytes` and `component_cache_hits` measure in-process preparation/hash cache reuse, such as [`cached_base_component`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/stable_context.rs:726). The base instructions are still serialized into the provider request.
+- `projection_savings_eligible` is only a telemetry eligibility flag at [`client.rs:398`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/client.rs:398); it is not a measured reduction.
+- `avoided_token_usage` is explicitly counterfactual. Production receipts set it to `None` at [`registry.rs:1941`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/registry.rs:1941); nonzero values occur only in synthetic tests such as [`turn_timing_tests.rs:688`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/turn_timing_tests.rs:688).
+
+## Optimizations that are actually realized
+
+- Stable-context supersession is real: sampling projection rewrites `PreparedPromptInput.items`, which becomes `Prompt.input` and then `ResponsesApiRequest.input`. A changed stable-context fingerprint invalidates websocket inheritance and forces a fresh projected replay.
+- First-stage tool-output artifact projection is real for direct model tool calls: `into_response()` places the bounded projection into canonical history and subsequent requests.
+- Compaction is real: it replaces local history and invalidates incremental inheritance before the rebuilt request.
+- Websocket incremental delivery is real wire compression, but not provider-context removal. The transmitted suffix is smaller while `previous_response_id` preserves the provider baseline.
+
+No files were changed and no build was run; this was a read-only source and request-path audit of the current dirty checkout.
+--- Unique final report 2; SHA-256 DAFD397C612EA98254A14C9A62A1351C613C62B5B1B157BF2E468B09565F828E ---
+Implemented the transactional receipt rebase and accounting cleanup.
+
+Key outcomes:
+
+- Receipt projection now uses cloned paired histories—receipt-substituted and unreplaced—while canonical history remains unchanged. Metadata records position, call ID, bounded fingerprint, receipt ID, and substituted fingerprint in [tool_history.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tool_history.rs:147).
+- Receipt qualification and consumption match the bounded model-visible output. MCP content-item carriers preserve images and encrypted content.
+- Substitutions intersecting a provider-managed prefix invoke central invalidation, clear all inheritance state, and send a full request without `previous_response_id` in [client.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/client.rs:2594). Tail-only receipts retain proven incremental inheritance.
+- Nested code-mode projections remain materialized, but only direct calls register provider-facing counters and candidates in [registry.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/registry.rs:1006).
+- Hypothetical savings/provenance accounting was removed. OTel now exposes only the requested logical/local names in [session_telemetry.rs](C:/Users/kuh/Desktop/kd4/codex-rs/otel/src/events/session_telemetry.rs:269).
+- `avoidedTokenUsage` was removed from current protocol and regenerated schemas while legacy payloads remain accepted and reserialize without it in [protocol.rs](C:/Users/kuh/Desktop/kd4/codex-rs/protocol/src/protocol.rs:7813).
+- Added lifecycle, MCP, tampering, ledger compatibility, fail-open, stale-prefix rebase, retry, and tail-inheritance tests in [tool_history_tests.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tool_history_tests.rs:1) and [client_tests.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/client_tests.rs:692).
+
+Validation:
+
+- `codex-protocol` focused tests: 2 passed.
+- `cargo check -p codex-otel`: passed.
+- `git diff --check`: passed.
+- Generated schemas no longer contain `avoidedTokenUsage`.
+- Core tests were blocked by unrelated existing errors in [thread_history.rs](C:/Users/kuh/Desktop/kd4/codex-rs/app-server-protocol/src/protocol/thread_history.rs:4845) and [policy.rs](C:/Users/kuh/Desktop/kd4/codex-rs/rollout/src/policy.rs:89).
+- The schema command produced updated outputs but timed out and left a stale generated-output lock; its retry and `just app-server-schema-check` could not run under the repository retry rules.
+- Scoped rustfmt reported an unrelated concurrent formatting defect in [source.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/source.rs:3411).
+
+FACT / HYPOTHESIS / UNKNOWN BOUNDARY
+- Direct artifact facts: the source paths, UUID, metadata, user messages, lifecycle events, and agent report text above are present in the inspected Codex session records.
+- Reported repository facts: symptoms, causes, affected files/symbols, fixes, commands, and validation results are preserved as claims made by the reporting agent. Treat exact evidence and qualifications inside the report as controlling.
+- Hypotheses: no new implementation cause or language was inferred during corpus extraction. Any hypothesis in the report remains a hypothesis unless the report states and evidences that it was established.
+- Unknowns: anything the preserved report omits—including environment details, reproduction steps, exact cause, validation scope, or residual risk—remains unknown and must be checked against the repository and Git history before relying on it for a new fix.
+
+====================================================================================================
+STABLE EVIDENCE ID: CODEX-SESSION-019ffe98-5a68-7393-8e10-bb2fe66c8058
+DATE: 2026-08-13
+LANGUAGE CLASSIFICATION: Rust
+STATUS: Reported conclusion available
+CONFIDENCE: This record faithfully preserves the session artifact. Repository-level conclusions retain the confidence and qualifications stated by the reporting agent and were not independently re-proven during this extraction.
+
+SOURCE SESSION ARTIFACTS
+- C:\Users\kuh\.codex\sessions\2026\08\13\rollout-2026-08-13T23-47-05-019ffe98-5a68-7393-8e10-bb2fe66c8058.jsonl.zst
+Source session UUID: 019ffe98-5a68-7393-8e10-bb2fe66c8058
+Session timestamp(s): 8/14/2026 4:47:05 AM
+Working directory/project: c:\Users\kuh\Desktop\kd4
+Recorded Git revision(s): 7f08c056cd0b70b4428908744285550b08762df8
+Recorded Git branch(es): main
+Recorded lifecycle outcomes: task_complete
+
+DIRECTLY STATED USER REQUEST / OBSERVED SYMPTOM
+--- User message 1 ---
+In codex-rs, find model-facing projection features that preserve exact canonical data internally but still cause the model to request the omitted data manually. Determine whether the missing step is projection metadata, owner recovery, continuation wiring, or sampling orchestration.
+
+
+--- User message 2 ---
+search_source, Agent task/receipt projection
+Fix these
+
+--- User message 3 ---
+Approve with one required change.
+
+The JSON-Pointer extension itself is sound. It fits the architecture you already have: producers declare exact recoverable evidence, the existing owner drains it, and sampling stays unchanged/fail-open.
+
+The required change is in search_source:
+
+Do not automatically declare every omitted search match as a predetermined JSON Pointer merely because it was omitted.
+
+An omitted search match is not necessarily predetermined evidence the model needs. Automatically recovering all of them could effectively undo the bounded-search/hydration budget and turn:
+
+bounded search → model chooses relevant evidence
+
+into:
+
+bounded search → host stuffs omitted matches back in automatically
+
+That crosses the deterministic/judgment boundary you've been preserving.
+
+Change it to:
+
+search_source may declare predetermined JSON Pointers only for producer-selected exact evidence whose necessity is already deterministic—such as exact hydrated spans already selected by the hydration policy and required issue/details associated with those selected spans. Ordinary omitted/unselected search matches remain manually recoverable through read_tool_output unless an existing structured search policy proves they are required as a bounded set.
+
+The agent-task/receipt side is fine because the plan explicitly limits recovery to actionable exact fields and prioritizes unresolved obligations/blockers under the 64-selector ceiling.
+
+--- User message 4 ---
+PLEASE IMPLEMENT THIS PLAN:
+# Automatic Recovery for Search and Agent Projections
+
+## Summary
+
+Extend projection metadata with producer-owned JSON Pointer selectors so `search_source` and agent task/receipt projections can recover deterministic, decision-bearing canonical JSON before model sampling. Preserve existing line-range recovery; do not change sampling or continuation orchestration.
+
+## Implementation Changes
+
+- Add `ToolOutputProjectionJsonPointer { id, pointer }` and `predetermined_json_pointers` alongside existing line ranges in `codex-tools`.
+- Generalize registry recovery to validate and drain mixed line and JSON Pointer selectors:
+  - Require pointers to exist in the immutable canonical artifact.
+  - Enforce unique IDs/selectors and existing aggregate/count ceilings.
+  - Recover only omitted or partially included declared evidence.
+  - Require complete successful results; otherwise retain the fail-open `read_tool_output` path.
+  - Include both selector kinds in deterministic recovery content and receipt hashing.
+
+- For `search_source`, declare pointers only for evidence already selected deterministically by the structured hydration policy:
+  - Exact bounded-packet and unique hydrated spans.
+  - Required issue/details associated with those selected spans.
+  - Do not declare ordinary omitted or unselected search matches.
+  - Allow match recovery only when an existing structured policy explicitly proves a bounded match set is required; otherwise leave it manually recoverable.
+
+- For agent task/receipt projections, generate pointers only for actionable exact data:
+  - Assignment objective, scopes, stop condition, dependencies, risks, prohibitions, contract claims, relationship, and cold-review context.
+  - Omitted unresolved acceptance criteria and required evidence.
+  - Exact unresolved gates, active attempt amendment, next required action, recent projected observations, and referenced validation calls.
+  - Receipt summary, failed/not-run criterion evidence, declared changes, proof references, blockers, risks, next action, and architecture contract.
+  - Reuse receipt selection with a `/task/receipt` prefix for embedded receipts.
+  - Prioritize unresolved obligations and blockers at the 64-selector ceiling; leave bulk history and summarized passed criteria manually recoverable.
+
+## Test Plan
+
+- `codex-tools`: pointer metadata construction and proof that generic/untrusted JSON cannot self-declare owner selectors.
+- Registry tests:
+  - Exact pointer recovery appears in the original projected result.
+  - Included evidence is not duplicated.
+  - Mixed line/pointer recovery produces stable receipts and survives code-mode continuation merging.
+  - Invalid, duplicate, stale, oversized, or over-ceiling selectors fail open.
+- Source tests:
+  - Policy-selected packet and unique hydration emit correct canonical pointers.
+  - Associated required issue details are recovered.
+  - Ordinary omitted search matches do not receive predetermined selectors and remain advertised for manual recovery.
+- Agent tests:
+  - Exact actionable task and receipt fields are recovered.
+  - Historical observations and summarized passed criteria remain bounded.
+  - Selector prioritization is deterministic at the cap.
+- Run each focused command once: `just test-fast -p codex-tools`, `just test-fast -p codex-core projection_owner_recovery`, and `just test-fast -p codex-core source_tools`; then package-scoped formatting checks.
+
+## Assumptions
+
+- Producer metadata may recover only evidence whose necessity was decided before projection; it must not make relevance judgments for the model.
+- Recovery remains subject to existing response and artifact ceilings; oversized evidence fails open safely.
+- Existing line-range producers and protocol timing enums remain compatible.
+- No configuration, persistence migration, sampling-governor, or Desktop-shell changes are required.
+
+
+REPORTED AUDIT / DIAGNOSIS / FIX CONCLUSION
+--- Unique final report 1; SHA-256 DEA0DC0D79F60100C3B41027466A77F5222460C4FE25BE6B39435412F8172D59 ---
+The missing step is primarily **projection metadata**.
+
+- Exact canonical data and artifact retention already exist in [tool_output.rs](</C:/Users/kuh/Desktop/kd4/codex-rs/tools/src/tool_output.rs:357>).
+- Owner recovery already drains declared `predetermined_ranges` before returning the original tool result in [registry.rs](</C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/registry.rs:1696>).
+- Nested/code-mode continuations are already carried across tool boundaries in [code_mode/mod.rs](</C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/code_mode/mod.rs:138>) and merged before sampling in [parallel.rs](</C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/parallel.rs:354>).
+- Sampling deliberately remains model-required for ambiguous or new evidence because owners are expected to drain deterministic omissions first in [reasoning_governor.rs](</C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/reasoning_governor.rs:2670>).
+
+The projections still falling back to manual `read_tool_output` are:
+
+- Generic JSON and MCP outputs, whose metadata leaves `predetermined_ranges` empty in [tool_output.rs](</C:/Users/kuh/Desktop/kd4/codex-rs/tools/src/tool_output.rs:586>).
+- `search_source`, despite retaining exact canonical JSON and hydration information, in [source.rs](</C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/source.rs:2906>).
+- Bounded agent task and receipt projections in [task.rs](</C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/multi_agents_v2/task.rs:1444>).
+- Completed tool-history projection, which explicitly tells the model to call `read_tool_output` in [tool_history.rs](</C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tool_history.rs:153>).
+
+The current working tree now fills this gap for `read_file_span` and `locate_task`: both construct producer-owned exact line ranges in [source.rs](</C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/source.rs:531>) and [source.rs](</C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/source.rs:972>). That change appeared while I was auditing the tree.
+
+So the classification is:
+
+| Candidate | Status |
+|---|---|
+| Projection metadata | **Missing for affected producers** |
+| Owner recovery | Implemented |
+| Continuation wiring | Implemented |
+| Sampling orchestration | Implemented; correctly fails open |
+
+For JSON/history projections, automatic recovery may require richer producer-owned selectors than the current line-range metadata. Sampling changes should come only after those deterministic selectors exist.
+
+This was a read-only diagnosis; I did not run tests because the relevant working-tree files were changing concurrently.
+--- Unique final report 2; SHA-256 4BE464E41B74098C1756604162033151B8D5BB103DBE967053EB680054CEEBD3 ---
+Implemented automatic recovery for search and agent projections. The missing pieces were projection metadata and owner recovery—not continuation wiring or sampling orchestration.
+
+Key changes:
+
+- Added producer-owned JSON Pointer selectors in [tool_output.rs](</C:/Users/kuh/Desktop/kd4/codex-rs/tools/src/tool_output.rs:403>).
+- Generalized mixed line/JSON Pointer validation, draining, receipt hashing, and fail-open handling in [registry.rs](</C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/registry.rs:1726>).
+- `search_source` declares selectors only for policy-selected hydration spans and associated issues. Ordinary matches never receive automatic selectors in [source.rs](</C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/source.rs:3095>).
+- Added prioritized, capped actionable task/receipt selectors in [task.rs](</C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/multi_agents_v2/task.rs:1524>).
+- Added pointer validation, exact recovery, mixed-selector receipt hashing/code-mode continuation, search-policy, and agent-prioritization tests.
+
+Validation:
+
+- `just test-fast -p codex-tools`: passed, 93/93.
+- Final scoped `git diff --check`: passed.
+- Focused rustfmt check for the final test changes: passed.
+- Core tests could not execute because compilation stops at an unrelated dirty-tree error: missing `surfaced_result` in [export.rs](</C:/Users/kuh/Desktop/kd4/codex-rs/external-agent-sessions/src/export.rs:181>). Consequently, both `projection_owner_recovery` and `source_tools` core test filters remain unrun.
+
+Repo Atlas confirmed the shared metadata, registry, source, and task projection ownership boundaries used for the implementation.
+
+FACT / HYPOTHESIS / UNKNOWN BOUNDARY
+- Direct artifact facts: the source paths, UUID, metadata, user messages, lifecycle events, and agent report text above are present in the inspected Codex session records.
+- Reported repository facts: symptoms, causes, affected files/symbols, fixes, commands, and validation results are preserved as claims made by the reporting agent. Treat exact evidence and qualifications inside the report as controlling.
+- Hypotheses: no new implementation cause or language was inferred during corpus extraction. Any hypothesis in the report remains a hypothesis unless the report states and evidences that it was established.
+- Unknowns: anything the preserved report omits—including environment details, reproduction steps, exact cause, validation scope, or residual risk—remains unknown and must be checked against the repository and Git history before relying on it for a new fix.
+
+====================================================================================================
+STABLE EVIDENCE ID: CODEX-SESSION-019ffea0-214a-73e2-a499-e246b4c43295
+DATE: 2026-08-13
+LANGUAGE CLASSIFICATION: Rust
+STATUS: Reported conclusion available
+CONFIDENCE: This record faithfully preserves the session artifact. Repository-level conclusions retain the confidence and qualifications stated by the reporting agent and were not independently re-proven during this extraction.
+
+SOURCE SESSION ARTIFACTS
+- C:\Users\kuh\.codex\sessions\2026\08\13\rollout-2026-08-13T23-55-35-019ffea0-214a-73e2-a499-e246b4c43295.jsonl.zst
+Source session UUID: 019ffea0-214a-73e2-a499-e246b4c43295
+Session timestamp(s): 8/14/2026 4:55:35 AM
+Working directory/project: c:\Users\kuh\Desktop\kd4
+Recorded Git revision(s): 7f08c056cd0b70b4428908744285550b08762df8
+Recorded Git branch(es): main
+Recorded lifecycle outcomes: task_complete
+
+DIRECTLY STATED USER REQUEST / OBSERVED SYMPTOM
+--- User message 1 ---
+Drain Bounded Multi-Agent Event Backlogs Inside the Wait Owner
+
+Audit and fix the current multi_agent_v2 wait path where retained durable agent events are paginated in pages of 50 but each additional page requires another model-mediated wait.
+
+The task store already provides an exact durable event cursor, task/assignment revision, retained-event bounds, and a maximum retained backlog of 256 events.
+
+Extend the existing multi-agent wait owner so that, after the model has requested the wait:
+
+read the first event page normally;
+when the result proves more retained events exist, advance the exact durable cursor internally;
+continue draining additional retained pages inside the same wait invocation;
+stop when the retained backlog is exhausted, owner/task revision changes, cancellation/steering occurs, a terminal/error state occurs, or an existing aggregate output/action bound is reached;
+preserve deterministic event ordering and CAS/revision checks;
+return one bounded aggregated owner result to the model.
+
+Do not add another pagination framework, scheduler, or generic continuation executor.
+
+Fail open to the existing model-mediated path if cursor identity, task revision, ordering, or bounded completion cannot be proven.
+
+Emit the existing deterministic continuation receipt only for pages actually drained internally. Do not count ordinary polling heartbeats as backlog pagination.
+
+Keep the existing convergence behavior for terminal waits: the first authoritative terminal result remains model-visible so the model gets one opportunity to choose a different action; only an exact repeated wait against unchanged authoritative state is suppressed.
+
+Do not change generic read_tool_output subdivision behavior or ordinary MCP cursor pagination. Those remain model-mediated by design.
+
+Add narrow tests proving:
+
+1 event page behaves unchanged;
+2–6 retained pages drain within one wait invocation;
+each event appears exactly once and in order;
+changed task/event revision fails open;
+cancellation and user steering wake immediately;
+an aggregate bound stops internal draining safely;
+model-generation count does not increase per internally drained event page
+
+
+REPORTED AUDIT / DIAGNOSIS / FIX CONCLUSION
+--- Unique final report 1; SHA-256 1C5B7FAC9FBD3F2A63BA7412C43F2C98624F4D8EFC8FC55BCC9D2E077A9E7742 ---
+Implemented bounded retained-event draining inside the `multi_agent_v2` wait owner.
+
+Key changes:
+
+- Drains 2–6 retained pages within one invocation, bounded by 256 events.
+- Preserves store ordering without treating UUIDv7 IDs as sequence numbers.
+- Uses one final automatic-cursor CAS after aggregate proof.
+- Fails open to the first page on cursor, ordering, task-revision, hydration, or read uncertainty.
+- Cancellation and steering interrupt internal draining.
+- Stops for terminal states and aggregate bounds.
+- Continuation receipts and timing count only internally accepted pages—not polling heartbeats.
+- Terminal-wait convergence behavior remains intact.
+- Generic tool-output and MCP pagination paths were untouched.
+
+Tests were added in [wait.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs:1156), [multi_agents_tests.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/multi_agents_tests.rs:4520), and [turn_timing_tests.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/turn_timing_tests.rs:608).
+
+Validation:
+
+- `rustfmt`: passed.
+- `git diff --check`: passed.
+- Focused core tests were blocked by unrelated missing `TurnTerminalizationComplete` match arms in `rollout-trace/src/protocol_event.rs:261` and `:414`.
+- The task-store wake test was blocked by unrelated undefined `assignment` references in `agent-task-store/src/tests.rs:1936` and `:1954`.
+
+The fork binary was not rebuilt or installed; Desktop use still requires `just publish-local-codex-final` and a restart.
+
+FACT / HYPOTHESIS / UNKNOWN BOUNDARY
+- Direct artifact facts: the source paths, UUID, metadata, user messages, lifecycle events, and agent report text above are present in the inspected Codex session records.
+- Reported repository facts: symptoms, causes, affected files/symbols, fixes, commands, and validation results are preserved as claims made by the reporting agent. Treat exact evidence and qualifications inside the report as controlling.
+- Hypotheses: no new implementation cause or language was inferred during corpus extraction. Any hypothesis in the report remains a hypothesis unless the report states and evidences that it was established.
+- Unknowns: anything the preserved report omits—including environment details, reproduction steps, exact cause, validation scope, or residual risk—remains unknown and must be checked against the repository and Git history before relying on it for a new fix.

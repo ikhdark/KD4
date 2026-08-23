@@ -13,6 +13,10 @@ use crate::function_tool::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
+use crate::tools::command_execution::CommandAttemptKey;
+use crate::tools::command_execution::CommandExecutionLedger;
+use crate::tools::command_execution::InputStateDetermined;
+use crate::tools::command_output_artifact::RawOutputArtifact;
 use crate::tools::context::ApplyPatchToolOutput;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::SharedTurnDiffTracker;
@@ -58,6 +62,61 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 
 const APPLY_PATCH_ARGUMENT_DIFF_BUFFER_INTERVAL: Duration = Duration::from_millis(500);
+
+pub(crate) struct ApplyPatchInterceptionError {
+    error: FunctionCallError,
+    proof: Option<InputStateDetermined>,
+}
+
+impl ApplyPatchInterceptionError {
+    fn correctness(error: codex_apply_patch::ApplyPatchError) -> Self {
+        let proof = match &error {
+            codex_apply_patch::ApplyPatchError::ImplicitInvocation => {
+                Some(InputStateDetermined::ApplyPatchImplicitInvocation)
+            }
+            codex_apply_patch::ApplyPatchError::EnvironmentIdMismatch { .. } => {
+                Some(InputStateDetermined::ApplyPatchEnvironmentIdMismatch)
+            }
+            _ => None,
+        };
+        Self {
+            error: FunctionCallError::RespondToModel(format!(
+                "apply_patch verification failed: {error}"
+            )),
+            proof,
+        }
+    }
+
+    pub(crate) async fn record_attempt_failure(
+        &self,
+        ledger: &CommandExecutionLedger,
+        key: &CommandAttemptKey,
+    ) {
+        if let Some(proof) = self.proof {
+            ledger
+                .record_input_state_determined_failure(
+                    key,
+                    proof,
+                    RawOutputArtifact::unavailable(proof.evidence_description()),
+                    -1,
+                )
+                .await;
+        } else {
+            ledger.record_exit(key, -1).await;
+        }
+    }
+
+    pub(crate) fn into_error(self) -> FunctionCallError {
+        self.error
+    }
+}
+
+impl From<FunctionCallError> for ApplyPatchInterceptionError {
+    fn from(error: FunctionCallError) -> Self {
+        Self { error, proof: None }
+    }
+}
+
 /// Handles freeform `apply_patch` requests and routes verified patches to the
 /// selected environment filesystem.
 #[derive(Default)]
@@ -601,7 +660,7 @@ pub(crate) async fn intercept_apply_patch(
     tracker: Option<&SharedTurnDiffTracker>,
     call_id: &str,
     tool_name: &str,
-) -> Result<Option<FunctionToolOutput>, FunctionCallError> {
+) -> Result<Option<FunctionToolOutput>, ApplyPatchInterceptionError> {
     let sandbox = turn.file_system_sandbox_context(/*additional_permissions*/ None, cwd);
     match codex_apply_patch::maybe_parse_apply_patch_verified_for_environment(
         command,
@@ -702,9 +761,7 @@ pub(crate) async fn intercept_apply_patch(
             }
         }
         codex_apply_patch::MaybeApplyPatchVerified::CorrectnessError(parse_error) => {
-            Err(FunctionCallError::RespondToModel(format!(
-                "apply_patch verification failed: {parse_error}"
-            )))
+            Err(ApplyPatchInterceptionError::correctness(parse_error))
         }
         codex_apply_patch::MaybeApplyPatchVerified::ShellParseError(error) => {
             tracing::trace!("Failed to parse apply_patch input, {error:?}");

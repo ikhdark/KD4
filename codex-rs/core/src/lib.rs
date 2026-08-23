@@ -129,6 +129,7 @@ pub(crate) mod windows_sandbox_read_grants;
 pub use thread_manager::ForkSnapshot;
 pub use thread_manager::NewThread;
 pub use thread_manager::StartThreadOptions;
+pub use thread_manager::ThreadCreatedThreadGuard;
 pub use thread_manager::ThreadManager;
 pub use thread_manager::ThreadSettingsReconstruction;
 pub use thread_manager::ThreadShutdownReport;

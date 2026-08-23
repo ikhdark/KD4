@@ -344,7 +344,18 @@ pub async fn wait_for_event_match<T, F>(codex: &CodexThread, matcher: F) -> T
 where
     F: Fn(&codex_protocol::protocol::EventMsg) -> Option<T>,
 {
-    let ev = wait_for_event(codex, |ev| matcher(ev).is_some()).await;
+    wait_for_event_match_with_timeout(codex, matcher, tokio::time::Duration::from_secs(1)).await
+}
+
+pub async fn wait_for_event_match_with_timeout<T, F>(
+    codex: &CodexThread,
+    matcher: F,
+    wait_time: tokio::time::Duration,
+) -> T
+where
+    F: Fn(&codex_protocol::protocol::EventMsg) -> Option<T>,
+{
+    let ev = wait_for_event_with_timeout(codex, |ev| matcher(ev).is_some(), wait_time).await;
     matcher(&ev).expect("EventMsg should match matcher predicate")
 }
 

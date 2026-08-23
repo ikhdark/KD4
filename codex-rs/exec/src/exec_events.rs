@@ -248,6 +248,12 @@ pub struct CollabAgentState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub surfaced_result: Option<codex_protocol::protocol::SurfacedToolResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub completion: Option<codex_app_server_protocol::TaskCompletionGate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub last_agent_message: Option<String>,
 }
 
 /// A call to a collab tool.

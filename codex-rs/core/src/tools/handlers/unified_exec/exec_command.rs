@@ -46,6 +46,7 @@ use crate::validation_admission::ValidationLaunchPlan;
 use crate::validation_admission::ValidationRegistration;
 use crate::validation_admission::admit_validation;
 use crate::validation_admission::register_if_absent;
+use crate::validation_admission::scoped_validation_configuration_identity;
 use crate::validation_admission::validation_identity;
 use crate::validation_admission::validation_identity_with_scope;
 use codex_features::Feature;
@@ -96,6 +97,23 @@ fn validation_structured_output(value: serde_json::Value) -> FunctionToolOutput 
     }
     output.post_tool_use_response = Some(value);
     output
+}
+
+pub(super) fn completed_validation_not_applicable_output(
+    response: &ExecCommandToolOutput,
+    validation_result: Option<codex_protocol::validation::ValidationResult>,
+) -> FunctionToolOutput {
+    let value = serde_json::json!({
+        "text": response.response_text(),
+        "success": null,
+        "execution_outcome": "executed_not_applicable",
+        "command_was_executed": true,
+        "exit_code": response.exit_code,
+        "skip_disposition": codex_tools::ToolOutputSkipDisposition::NotApplicable,
+        "validation_result": validation_result,
+    });
+    validation_structured_output(value)
+        .with_skip_disposition(codex_tools::ToolOutputSkipDisposition::NotApplicable)
 }
 
 fn joined_validation_structured_output(
@@ -613,6 +631,19 @@ impl ExecCommandHandler {
             .command_execution
             .observe_repository_revision(&turn.sub_id, observed_mutation_revision)
             .await;
+        let workspace_identity = match cwd.to_abs_path() {
+            Ok(cwd) => {
+                session
+                    .services
+                    .command_execution
+                    .current_workspace_identity_hash(
+                        &turn_environment.environment_id,
+                        cwd.as_path(),
+                    )
+                    .await
+            }
+            Err(_) => None,
+        };
         let attempt_key = CommandAttemptKey::new(
             self.tool_name().name.as_str(),
             &turn_environment.environment_id,
@@ -625,7 +656,8 @@ impl ExecCommandHandler {
         .with_permission_context(&sandbox_context)
         .with_input_context(&input_context)
         .with_runtime_context(&runtime_context)
-        .with_repository_epoch(repository_epoch);
+        .with_repository_epoch(repository_epoch)
+        .with_workspace_identity(workspace_identity.as_deref());
         let attempt_key = if let Some((repository_identity, search)) = search_narrowing {
             attempt_key.with_search_narrowing(&turn.sub_id, &repository_identity, Some(search))
         } else {
@@ -699,7 +731,7 @@ impl ExecCommandHandler {
                 let implementation_identity = session
                     .services
                     .task_evidence
-                    .direct_validation_implementation_identity(&leaf.covered_paths)
+                    .direct_validation_implementation_identity_for_leaf(leaf)
                     .await
                     .map_err(FunctionCallError::RespondToModel)?;
                 validation_identity_with_scope(
@@ -708,10 +740,7 @@ impl ExecCommandHandler {
                     &command_invocation,
                     environment,
                     toolchain,
-                    format!(
-                        "repository_epoch={repository_epoch};features={:?}",
-                        turn.config.features.get()
-                    ),
+                    scoped_validation_configuration_identity(turn.config.features.get()),
                     implementation_identity,
                     &leaf.uncertainty,
                     &leaf.covered_paths,
@@ -797,6 +826,7 @@ impl ExecCommandHandler {
                                     .unwrap_or_else(|| match execution_outcome {
                                         super::super::shell::ValidationExecutionOutcome::ExecutedSuccess => 0,
                                         super::super::shell::ValidationExecutionOutcome::ExecutedFailure => 1,
+                                        super::super::shell::ValidationExecutionOutcome::ExecutedNotApplicable => 0,
                                         super::super::shell::ValidationExecutionOutcome::NotExecuted => unreachable!(
                                             "not-executed validation was filtered before exit bookkeeping"
                                         ),
@@ -875,13 +905,10 @@ impl ExecCommandHandler {
             Ok(None) => {}
             Err(err) => {
                 if !known_delta_hit {
-                    session
-                        .services
-                        .command_execution
-                        .record_exit(&attempt_key, -1)
+                    err.record_attempt_failure(&session.services.command_execution, &attempt_key)
                         .await;
                 }
-                return Err(err);
+                return Err(err.into_error());
             }
         }
 
@@ -993,7 +1020,27 @@ impl ExecCommandHandler {
                     }
                 }
                 attach_powershell_failure_advisory(&mut response, shell_type, is_powershell_script);
-                Ok(boxed_tool_output(response))
+                let skip_disposition = direct_validation_route.as_ref().and_then(|route| {
+                    response.exit_code.and_then(|exit_code| {
+                        crate::tools::command_execution::completed_validation_skip_disposition(
+                            route,
+                            &response.raw_output,
+                            exit_code,
+                        )
+                    })
+                });
+                if skip_disposition == Some(codex_tools::ToolOutputSkipDisposition::NotApplicable) {
+                    let validation_result = session
+                        .services
+                        .command_execution
+                        .validation_result_for_call(&call_id)
+                        .await;
+                    Ok(boxed_tool_output(
+                        completed_validation_not_applicable_output(&response, validation_result),
+                    ))
+                } else {
+                    Ok(boxed_tool_output(response))
+                }
             }
             Err(UnifiedExecError::SandboxDenied { output, .. }) => {
                 let output_text = output.aggregated_output.text;

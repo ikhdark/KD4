@@ -100,6 +100,42 @@ pub(super) fn resolve_tool_response(
     Ok(())
 }
 
+pub(super) fn resolve_notification_response(
+    scope: &mut v8::PinScope<'_, '_>,
+    id: &str,
+    response: Result<(), String>,
+) -> Result<(), String> {
+    let resolver = {
+        let state = scope
+            .get_slot_mut::<RuntimeState>()
+            .ok_or_else(|| "runtime state unavailable".to_string())?;
+        state.pending_notifications.remove(id)
+    }
+    .ok_or_else(|| format!("unknown notification `{id}`"))?;
+
+    let tc = std::pin::pin!(v8::TryCatch::new(scope));
+    let mut tc = tc.init();
+    let resolver = v8::Local::new(&tc, &resolver);
+    match response {
+        Ok(()) => {
+            let value = v8::undefined(&tc);
+            resolver.resolve(&tc, value.into());
+        }
+        Err(error_text) => {
+            let value = v8::String::new(&tc, &error_text)
+                .ok_or_else(|| "failed to allocate notification error".to_string())?;
+            resolver.reject(&tc, value.into());
+        }
+    }
+    if tc.has_caught() {
+        return Err(tc
+            .exception()
+            .map(|exception| value_to_error_text(&mut tc, exception))
+            .unwrap_or_else(|| "unknown code mode exception".to_string()));
+    }
+    Ok(())
+}
+
 pub(super) fn completion_state(
     scope: &mut v8::PinScope<'_, '_>,
     pending_promise: Option<&v8::Global<v8::Promise>>,

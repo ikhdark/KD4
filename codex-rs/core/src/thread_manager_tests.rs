@@ -1949,10 +1949,9 @@ async fn interrupted_fork_snapshot_does_not_synthesize_turn_id_for_legacy_histor
         .iter()
         .filter(|item| !matches!(item, RolloutItem::SessionMeta(_)))
         .collect();
-    let interrupted_marker_json = serde_json::to_value(RolloutItem::ResponseItem(
-        contextual_user_interrupted_marker(),
-    ))
-    .expect("serialize interrupted marker");
+    let interrupted_marker_json =
+        serde_json::to_value(RolloutItem::ResponseItem(developer_interrupted_marker()))
+            .expect("serialize interrupted marker");
     let interrupted_abort_json = serde_json::to_value(RolloutItem::EventMsg(
         EventMsg::TurnAborted(TurnAbortedEvent {
             turn_id: expected_turn_id,
@@ -2158,10 +2157,9 @@ async fn interrupted_fork_snapshot_uses_persisted_mid_turn_history_without_live_
         .iter()
         .filter(|item| !matches!(item, RolloutItem::SessionMeta(_)))
         .collect();
-    let interrupted_marker_json = serde_json::to_value(RolloutItem::ResponseItem(
-        contextual_user_interrupted_marker(),
-    ))
-    .expect("serialize interrupted marker");
+    let interrupted_marker_json =
+        serde_json::to_value(RolloutItem::ResponseItem(developer_interrupted_marker()))
+            .expect("serialize interrupted marker");
     assert_eq!(
         forked_rollout_items
             .iter()

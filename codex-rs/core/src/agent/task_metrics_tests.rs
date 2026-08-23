@@ -123,6 +123,7 @@ fn completed_task_with_validation(
             relation: None,
             task_capsule: None,
             architecture_contract_ref: None,
+            integration_plan: codex_agent_task_store::IntegrationPlan::SingleWriter,
             created_at: now,
         },
         current_attempt: Attempt {

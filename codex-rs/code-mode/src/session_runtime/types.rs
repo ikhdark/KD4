@@ -32,7 +32,6 @@ pub(crate) enum ObserveMode {
     /// Wake on model-visible output or terminal completion without periodic
     /// empty observations.
     StateChange,
-    PendingFrontier,
 }
 
 /// An observable cell lifecycle event.
@@ -40,10 +39,6 @@ pub(crate) enum ObserveMode {
 pub(crate) enum CellEvent {
     Yielded {
         content_items: Vec<OutputItem>,
-    },
-    Pending {
-        content_items: Vec<OutputItem>,
-        pending_tool_call_ids: Vec<String>,
     },
     Completed {
         content_items: Vec<OutputItem>,
@@ -82,6 +77,7 @@ pub(crate) struct CreateCellRequest {
     pub(crate) tool_call_id: String,
     pub(crate) enabled_tools: Vec<ToolDefinition>,
     pub(crate) source: String,
+    pub(crate) default_tool_timeout_ms: u64,
 }
 
 /// Tool metadata exposed to code running inside a cell.

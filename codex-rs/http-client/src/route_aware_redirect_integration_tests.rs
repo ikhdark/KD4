@@ -98,6 +98,7 @@ fn spawn_response(
                 Err(error) => panic!("HTTP listener should accept: {error}"),
             }
         };
+        stream.set_nonblocking(false).expect("set stream blocking");
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("read timeout");
@@ -105,6 +106,10 @@ fn spawn_response(
         stream
             .write_all(response.as_bytes())
             .expect("write response");
+        stream.flush().expect("flush response");
+        stream
+            .shutdown(std::net::Shutdown::Write)
+            .expect("shutdown response write side");
         request
     });
     (address, thread)

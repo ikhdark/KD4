@@ -1,5 +1,5 @@
 {
-  "manifest_sha256": "3c5decfcf89873f1f2cf63742a654086ed5fa5e8207d453347f342ad81011e59",
+  "manifest_sha256": "cfe5b481db6c34c607bef05d83b53c6e7cd196302857b20fc0fdb848add67ab9",
   "omitted": {
     "relationships": 0
   },
@@ -1004,7 +1004,7 @@
       "target": "path:codex-rs/core/src/tools/command_output_artifact_tests.rs"
     }
   ],
-  "repository_revision": "manifest:3c5decfcf89873f1f2cf63742a654086ed5fa5e8207d453347f342ad81011e59",
+  "repository_revision": "manifest:cfe5b481db6c34c607bef05d83b53c6e7cd196302857b20fc0fdb848add67ab9",
   "schema_version": 2,
   "status": "complete",
   "unresolved": []

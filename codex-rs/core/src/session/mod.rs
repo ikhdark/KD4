@@ -15,6 +15,7 @@ use std::time::UNIX_EPOCH;
 use crate::agent::AgentControl;
 use crate::agent::AgentStatus;
 use crate::agent::agent_status_from_event;
+use crate::agent::agent_status_from_task;
 use crate::agent::status::is_final;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
@@ -32,6 +33,7 @@ use crate::context::MultiAgentModeInstructions;
 use crate::context::NetworkRuleSaved;
 use crate::context::PermissionsInstructions;
 use crate::context::PersonalitySpecInstructions;
+use crate::context::RootOrchestrationInstructions;
 use crate::context::SkillsUsageInstructions;
 use crate::context::world_state::WorldState;
 use crate::context::world_state::WorldStateSnapshot;
@@ -199,6 +201,7 @@ use crate::config::PermissionProfileState;
 use crate::config::StartedNetworkProxy;
 use crate::config::resolve_web_search_mode_for_turn;
 use crate::context_manager::ContextManager;
+use crate::context_manager::missing_call_outputs;
 use crate::thread_rollout_truncation::initial_history_has_prior_user_turns;
 use codex_config::CONFIG_TOML_FILE;
 use codex_config::ConfigLayerSource;
@@ -257,18 +260,53 @@ pub(super) const EXTENSION_CONTEXT_CONTRIBUTOR_TIMEOUT: Duration = Duration::fro
 
 const CONTEXT_FRAGMENT_DIGEST_DOMAIN: &[u8] = b"codex.context-fragment.v1";
 
+fn normalize_opaque_skill_locators(text: &str) -> String {
+    const PREFIX: &str = "skill:";
+    const LOCATOR_LEN: usize = 24;
+
+    let bytes = text.as_bytes();
+    let mut normalized = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while let Some(relative_start) = text[cursor..].find(PREFIX) {
+        let start = cursor + relative_start;
+        let locator_start = start + PREFIX.len();
+        let locator_end = locator_start + LOCATOR_LEN;
+        let is_opaque_locator = locator_end <= bytes.len()
+            && bytes[locator_start..locator_end]
+                .iter()
+                .all(u8::is_ascii_hexdigit)
+            && bytes
+                .get(locator_end)
+                .is_none_or(|byte| !byte.is_ascii_hexdigit());
+        if is_opaque_locator {
+            normalized.push_str(&text[cursor..locator_start]);
+            normalized.push_str("<opaque>");
+            cursor = locator_end;
+        } else {
+            normalized.push_str(&text[cursor..locator_start]);
+            cursor = locator_start;
+        }
+    }
+    normalized.push_str(&text[cursor..]);
+    normalized
+}
+
 fn digest_context_fragments(items: &[ResponseItem]) -> Vec<ContextFragmentDigest> {
     fn canonicalize(value: serde_json::Value) -> serde_json::Value {
         match value {
             serde_json::Value::Object(object) => {
                 let sorted = object
                     .into_iter()
+                    .filter(|(key, _)| key != "id" && key != "turn_id")
                     .map(|(key, value)| (key, canonicalize(value)))
                     .collect::<BTreeMap<_, _>>();
                 serde_json::Value::Object(sorted.into_iter().collect())
             }
             serde_json::Value::Array(values) => {
                 serde_json::Value::Array(values.into_iter().map(canonicalize).collect())
+            }
+            serde_json::Value::String(text) => {
+                serde_json::Value::String(normalize_opaque_skill_locators(&text))
             }
             value => value,
         }
@@ -309,6 +347,12 @@ fn digest_context_fragments(items: &[ResponseItem]) -> Vec<ContextFragmentDigest
             }
         })
         .collect()
+}
+
+struct InitialContextBuild {
+    items: Vec<ResponseItem>,
+    world_state_snapshot: WorldStateSnapshot,
+    fragment_digests: Vec<ContextFragmentDigest>,
 }
 
 fn context_snapshot_matches(
@@ -546,8 +590,8 @@ pub(crate) fn resolve_multi_agent_version(
         .or(inherited_multi_agent_version)
         .or(match conversation_history {
             InitialHistory::New | InitialHistory::Cleared => None,
-            // Threads created before runtime metadata existed keep the legacy V1 tool surface.
-            InitialHistory::Resumed(_) | InitialHistory::Forked(_) => Some(MultiAgentVersion::V1),
+            // Threads created before runtime metadata existed join the current V2 tool surface.
+            InitialHistory::Resumed(_) | InitialHistory::Forked(_) => Some(MultiAgentVersion::V2),
         })
 }
 
@@ -1071,13 +1115,10 @@ async fn thread_title_from_thread_store(
     (!title.is_empty() && thread.preview.trim() != title).then(|| title.to_string())
 }
 
-fn push_prompt_fragment(
+fn take_prompt_fragment(
     fragment: PromptFragment,
     budget: &mut ModelContextBudget,
-    developer_sections: &mut Vec<String>,
-    contextual_user_sections: &mut Vec<String>,
-    separate_developer_sections: &mut Vec<String>,
-) {
+) -> Option<(PromptSlot, String)> {
     let categorized = crate::context::CategorizedPromptFragment::from_extension(fragment);
     let category = categorized.category();
     let fragment = categorized.into_fragment();
@@ -1087,10 +1128,17 @@ fn push_prompt_fragment(
         }
         _ => fragment.text().to_string(),
     };
-    let Some(text) = budget.take(&rendered) else {
-        return;
-    };
-    match fragment.slot() {
+    budget.take(&rendered).map(|text| (fragment.slot(), text))
+}
+
+fn push_rendered_prompt_fragment(
+    slot: PromptSlot,
+    text: String,
+    developer_sections: &mut Vec<String>,
+    contextual_user_sections: &mut Vec<String>,
+    separate_developer_sections: &mut Vec<String>,
+) {
+    match slot {
         PromptSlot::DeveloperPolicy | PromptSlot::DeveloperCapabilities => {
             developer_sections.push(text);
         }
@@ -1101,6 +1149,25 @@ fn push_prompt_fragment(
             separate_developer_sections.push(text);
         }
     }
+}
+
+fn push_prompt_fragment(
+    fragment: PromptFragment,
+    budget: &mut ModelContextBudget,
+    developer_sections: &mut Vec<String>,
+    contextual_user_sections: &mut Vec<String>,
+    separate_developer_sections: &mut Vec<String>,
+) {
+    let Some((slot, text)) = take_prompt_fragment(fragment, budget) else {
+        return;
+    };
+    push_rendered_prompt_fragment(
+        slot,
+        text,
+        developer_sections,
+        contextual_user_sections,
+        separate_developer_sections,
+    );
 }
 
 impl Session {
@@ -2199,7 +2266,7 @@ impl Session {
             return true;
         };
 
-        let status = match turn_context.terminal_error.lock().await.clone() {
+        let mut status = match turn_context.terminal_error.lock().await.clone() {
             Some(error) => {
                 let status = AgentStatus::Errored(error.message);
                 self.agent_status.send_replace(status.clone());
@@ -2236,6 +2303,19 @@ impl Session {
             );
         }
         if let Some(assignment_id) = assignment_id {
+            match task_coordinator.get_agent_task(assignment_id, None).await {
+                Ok(task) => {
+                    if let Some(durable_status) = agent_status_from_task(&task) {
+                        status = durable_status;
+                        self.agent_status.send_replace(status.clone());
+                    }
+                }
+                Err(error) => warn!(
+                    %assignment_id,
+                    %error,
+                    "failed to load durable typed-agent outcome for parent notification"
+                ),
+            }
             task_coordinator
                 .maybe_emit_terminal_metrics(assignment_id, &turn_context.session_telemetry)
                 .await;
@@ -2750,11 +2830,11 @@ impl Session {
         }
 
         let requested_permissions = args.permissions;
-        // TODO(anp): Migrate request_permissions to support paths from foreign environments.
-        let Ok(native_environment_cwd) = environment.cwd.to_abs_path() else {
+        let native_environment_cwd = environment.cwd.to_abs_path().ok();
+        if native_environment_cwd.is_none() && requested_permissions.file_system.is_some() {
             warn!(
                 cwd = %environment.cwd,
-                "request_permissions requires a cwd native to the Codex host"
+                "request_permissions file-system grants require a cwd native to the Codex host"
             );
             return Some(RequestPermissionsResponse {
                 permissions: RequestPermissionProfile::default(),
@@ -2829,7 +2909,9 @@ impl Session {
             let response = Self::normalize_request_permissions_response(
                 requested_permissions,
                 response,
-                native_environment_cwd.as_path(),
+                native_environment_cwd
+                    .as_ref()
+                    .map(AbsolutePathBuf::as_path),
             );
             self.record_granted_request_permissions_for_turn(
                 &response,
@@ -2870,7 +2952,7 @@ impl Session {
             started_at_ms: now_unix_timestamp_ms(),
             reason: args.reason,
             permissions: requested_permissions,
-            cwd: Some(native_environment_cwd),
+            cwd: native_environment_cwd,
         });
         self.send_event(turn_context.as_ref(), event).await;
         let _interactive_wait_guard = turn_context
@@ -3035,26 +3117,14 @@ impl Session {
         };
         match entry {
             Some(entry) => {
-                // TODO(anp): Migrate request_permissions to support paths from foreign environments.
-                let response = match entry.environment.cwd.to_abs_path() {
-                    Ok(native_environment_cwd) => Self::normalize_request_permissions_response(
-                        entry.requested_permissions,
-                        response,
-                        native_environment_cwd.as_path(),
-                    ),
-                    Err(err) => {
-                        warn!(
-                            cwd = %entry.environment.cwd,
-                            %err,
-                            "request_permissions requires a cwd native to the Codex host"
-                        );
-                        RequestPermissionsResponse {
-                            permissions: RequestPermissionProfile::default(),
-                            scope: PermissionGrantScope::Turn,
-                            strict_auto_review: false,
-                        }
-                    }
-                };
+                let native_environment_cwd = entry.environment.cwd.to_abs_path().ok();
+                let response = Self::normalize_request_permissions_response(
+                    entry.requested_permissions,
+                    response,
+                    native_environment_cwd
+                        .as_ref()
+                        .map(AbsolutePathBuf::as_path),
+                );
                 self.record_granted_request_permissions_for_turn(
                     &response,
                     &entry.environment.environment_id,
@@ -3072,7 +3142,7 @@ impl Session {
     fn normalize_request_permissions_response(
         requested_permissions: RequestPermissionProfile,
         response: RequestPermissionsResponse,
-        cwd: &Path,
+        cwd: Option<&Path>,
     ) -> RequestPermissionsResponse {
         if response.strict_auto_review && matches!(response.scope, PermissionGrantScope::Session) {
             return RequestPermissionsResponse {
@@ -3086,11 +3156,19 @@ impl Session {
             return response;
         }
 
+        if requested_permissions.file_system.is_some() && cwd.is_none() {
+            return RequestPermissionsResponse {
+                permissions: RequestPermissionProfile::default(),
+                scope: PermissionGrantScope::Turn,
+                strict_auto_review: false,
+            };
+        }
+
         RequestPermissionsResponse {
             permissions: intersect_permission_profiles(
                 requested_permissions.into(),
                 response.permissions.into(),
-                cwd,
+                cwd.unwrap_or_else(|| Path::new(".")),
             )
             .into(),
             scope: response.scope,
@@ -3307,29 +3385,91 @@ impl Session {
     }
 
     pub(crate) async fn record_conversation_items_durable(
-        &self,
-        turn_context: &TurnContext,
+        self: &Arc<Self>,
+        turn_context: &Arc<TurnContext>,
         items: &[ResponseItem],
     ) -> std::io::Result<()> {
-        let items = self.prepare_conversation_items_for_history(turn_context, items);
-        let items = items.as_ref();
-        {
-            let mut state = self.state.lock().await;
-            state.current_time_reminder.note_recorded_items(items);
-            state.record_items(
-                items.iter(),
-                turn_context.model_info.truncation_policy.into(),
-            );
-        }
-        let rollout_items = items
+        // Build the retry key before assigning generated item IDs so the same
+        // logical commit remains stable across repeated calls.
+        let serialized_items = serde_json::to_vec(items).map_err(std::io::Error::other)?;
+        let commit_key = format!(
+            "{}:{:x}",
+            turn_context.sub_id,
+            Sha256::digest(serialized_items)
+        );
+        let items = self
+            .prepare_conversation_items_for_history(turn_context, items)
+            .into_owned();
+        let session = Arc::clone(self);
+        let turn_context = Arc::clone(turn_context);
+        let commit = tokio::spawn(async move {
+            // Once started, this task owns the commit. A terminal deadline may
+            // stop waiting for it, but cannot split rollout durability from the
+            // corresponding live-history mutation.
+            let commit_permit = session
+                .durable_history_commit_gate
+                .acquire()
+                .await
+                .map_err(|_| std::io::Error::other("durable history commit gate is closed"))?;
+            {
+                let completed_commits = session.durable_history_completed_commits.lock().await;
+                if completed_commits.contains(&commit_key) {
+                    return Ok(());
+                }
+            }
+            let rollout_items = items
+                .iter()
+                .cloned()
+                .map(RolloutItem::ResponseItem)
+                .collect::<Vec<_>>();
+            // Keep the dedicated commit gate across the durability barrier so
+            // concurrent durable commits preserve identical rollout/history order.
+            session
+                .persist_rollout_items_durable(&rollout_items)
+                .await?;
+            {
+                let mut state = session.state.lock().await;
+                state.current_time_reminder.note_recorded_items(&items);
+                state.record_items(
+                    items.iter(),
+                    turn_context.model_info.truncation_policy.into(),
+                );
+            }
+            session
+                .durable_history_completed_commits
+                .lock()
+                .await
+                .insert(commit_key);
+            drop(commit_permit);
+            Self::record_persisted_tool_outputs(&turn_context, &items);
+            session.send_raw_response_items(&turn_context, &items).await;
+            Ok(())
+        });
+        commit
+            .await
+            .map_err(|err| std::io::Error::other(format!("durable history commit failed: {err}")))?
+    }
+
+    pub(crate) async fn persist_missing_call_outputs_durable(
+        self: &Arc<Self>,
+        turn_context: &Arc<TurnContext>,
+    ) -> std::io::Result<usize> {
+        let history = self.clone_history().await;
+        let current_turn_items = history
+            .raw_items()
             .iter()
+            .filter(|item| item.turn_id() == Some(turn_context.sub_id.as_str()))
             .cloned()
-            .map(RolloutItem::ResponseItem)
             .collect::<Vec<_>>();
-        self.persist_rollout_items_durable(&rollout_items).await?;
-        Self::record_persisted_tool_outputs(turn_context, items);
-        self.send_raw_response_items(turn_context, items).await;
-        Ok(())
+        let missing_outputs = missing_call_outputs(&current_turn_items);
+        let output_count = missing_outputs.len();
+        if output_count == 0 {
+            return Ok(0);
+        }
+
+        self.record_conversation_items_durable(turn_context, &missing_outputs)
+            .await?;
+        Ok(output_count)
     }
 
     pub(crate) async fn record_step_world_state_if_changed(
@@ -3360,14 +3500,13 @@ impl Session {
         }
 
         if world_state_item.is_some() || !items.is_empty() {
-            let complete_context_items = self
+            let initial_context = self
                 .build_initial_context_with_world_state_and_mcp(
                     turn_context,
                     world_state.as_ref(),
                     false,
                 )
-                .await
-                .0;
+                .await;
             self.state
                 .lock()
                 .await
@@ -3375,7 +3514,7 @@ impl Session {
                     turn_context_item: turn_context.to_turn_context_item(),
                     world_state_snapshot,
                     world_state_item,
-                    fragment_digests: digest_context_fragments(&complete_context_items),
+                    fragment_digests: initial_context.fragment_digests,
                     bound_sampling_request_id: None,
                     bound_physical_attempt_id: None,
                 });
@@ -3545,6 +3684,7 @@ impl Session {
         items: Vec<ResponseItem>,
         reference_context_item: Option<TurnContextItem>,
         world_state_baseline: Option<WorldStateSnapshot>,
+        fragment_digests: Vec<ContextFragmentDigest>,
         compacted_item: CompactedItem,
     ) {
         let _tool_history_io_permit = if turn_context.config.completed_tool_history_projection {
@@ -3576,7 +3716,7 @@ impl Session {
                     turn_context_item,
                     world_state_snapshot: snapshot.clone(),
                     world_state_item: Some(WorldStateItem::full(snapshot.into_value())),
-                    fragment_digests: digest_context_fragments(&items),
+                    fragment_digests,
                     bound_sampling_request_id: None,
                     bound_physical_attempt_id: None,
                 });
@@ -3806,18 +3946,39 @@ impl Session {
         turn_context: &TurnContext,
         world_state: &WorldState,
     ) -> Vec<ResponseItem> {
-        self.build_initial_context_with_world_state_and_snapshot(turn_context, world_state)
+        self.build_initial_context_with_world_state_and_mcp(turn_context, world_state, false)
             .await
-            .0
+            .items
     }
 
-    pub(crate) async fn build_initial_context_with_world_state_and_snapshot(
+    #[cfg(test)]
+    pub(crate) async fn build_context_fragment_digests(
         &self,
         turn_context: &TurnContext,
         world_state: &WorldState,
-    ) -> (Vec<ResponseItem>, WorldStateSnapshot) {
+    ) -> Vec<ContextFragmentDigest> {
         self.build_initial_context_with_world_state_and_mcp(turn_context, world_state, false)
             .await
+            .fragment_digests
+    }
+
+    pub(crate) async fn build_initial_context_with_world_state_and_provenance(
+        &self,
+        turn_context: &TurnContext,
+        world_state: &WorldState,
+    ) -> (
+        Vec<ResponseItem>,
+        WorldStateSnapshot,
+        Vec<ContextFragmentDigest>,
+    ) {
+        let built = self
+            .build_initial_context_with_world_state_and_mcp(turn_context, world_state, false)
+            .await;
+        (
+            built.items,
+            built.world_state_snapshot,
+            built.fragment_digests,
+        )
     }
 
     async fn build_initial_context_with_world_state_and_mcp(
@@ -3825,10 +3986,16 @@ impl Session {
         turn_context: &TurnContext,
         world_state: &WorldState,
         estimate: bool,
-    ) -> (Vec<ResponseItem>, WorldStateSnapshot) {
+    ) -> InitialContextBuild {
         let mut developer_sections = Vec::<String>::with_capacity(8);
         let mut contextual_user_sections = Vec::<String>::with_capacity(2);
         let mut separate_developer_sections = Vec::<String>::new();
+        // Settings and world state have typed baselines and dedicated diff protocols. Fragment
+        // receipts intentionally cover only unstructured prompt material that cannot otherwise be
+        // compared safely.
+        let mut stable_developer_sections = Vec::<String>::with_capacity(4);
+        let mut stable_contextual_user_sections = Vec::<String>::with_capacity(2);
+        let mut stable_separate_developer_sections = Vec::<String>::new();
         let (
             reference_context_item,
             previous_turn_settings,
@@ -3889,7 +4056,9 @@ impl Session {
             && let Some(developer_instructions) = turn_context.developer_instructions.as_deref()
             && !developer_instructions.is_empty()
         {
-            developer_sections.push(developer_instructions.to_string());
+            let developer_instructions = developer_instructions.to_string();
+            developer_sections.push(developer_instructions.clone());
+            stable_developer_sections.push(developer_instructions);
         }
         // Add developer instructions from collaboration_mode if they exist and are non-empty
         if turn_context.config.include_collaboration_mode_instructions
@@ -3897,6 +4066,11 @@ impl Session {
                 CollaborationModeInstructions::from_collaboration_mode(&collaboration_mode)
         {
             developer_sections.push(collab_instructions.render());
+        }
+        if !session_source.is_non_root_agent() {
+            let root_orchestration = RootOrchestrationInstructions.render();
+            developer_sections.push(root_orchestration.clone());
+            stable_developer_sections.push(root_orchestration);
         }
         if let Some(realtime_update) = crate::context_manager::updates::build_initial_realtime_item(
             reference_context_item.as_ref(),
@@ -3936,7 +4110,9 @@ impl Session {
             );
             if let Some(available_skills) = available_skills {
                 if turn_context.model_info.include_skills_usage_instructions {
-                    developer_sections.push(SkillsUsageInstructions.render());
+                    let skills_usage = SkillsUsageInstructions.render();
+                    developer_sections.push(skills_usage.clone());
+                    stable_developer_sections.push(skills_usage);
                 }
                 let warning_message = available_skills.warning_message.clone();
                 let skills_instructions =
@@ -3950,29 +4126,53 @@ impl Session {
                     })
                     .await;
                 }
-                developer_sections.push(skills_instructions.render());
+                let skills_instructions = skills_instructions.render();
+                developer_sections.push(skills_instructions.clone());
+                stable_developer_sections.push(skills_instructions);
             }
         }
         let mut extension_context_budget = ModelContextBudget::default();
         for fragment in self.poll_thread_context_contributors(estimate).await {
-            push_prompt_fragment(
-                fragment,
-                &mut extension_context_budget,
+            let Some((slot, text)) = take_prompt_fragment(fragment, &mut extension_context_budget)
+            else {
+                continue;
+            };
+            push_rendered_prompt_fragment(
+                slot,
+                text.clone(),
                 &mut developer_sections,
                 &mut contextual_user_sections,
                 &mut separate_developer_sections,
+            );
+            push_rendered_prompt_fragment(
+                slot,
+                text,
+                &mut stable_developer_sections,
+                &mut stable_contextual_user_sections,
+                &mut stable_separate_developer_sections,
             );
         }
         for fragment in self
             .poll_turn_context_contributors(turn_context, estimate)
             .await
         {
-            push_prompt_fragment(
-                fragment,
-                &mut extension_context_budget,
+            let Some((slot, text)) = take_prompt_fragment(fragment, &mut extension_context_budget)
+            else {
+                continue;
+            };
+            push_rendered_prompt_fragment(
+                slot,
+                text.clone(),
                 &mut developer_sections,
                 &mut contextual_user_sections,
                 &mut separate_developer_sections,
+            );
+            push_rendered_prompt_fragment(
+                slot,
+                text,
+                &mut stable_developer_sections,
+                &mut stable_contextual_user_sections,
+                &mut stable_separate_developer_sections,
             );
         }
         let (world_state_fragments, delivered_world_state_snapshot) =
@@ -4030,12 +4230,35 @@ impl Session {
                 ])
         {
             items.push(guardian_developer_message);
+            stable_separate_developer_sections.push(developer_instructions.to_string());
         }
         // New context windows and compaction install these items directly into replacement history.
         for item in &mut items {
             item.set_turn_id_if_missing(&turn_context.sub_id);
         }
-        (items, delivered_world_state_snapshot)
+        let mut stable_items = Vec::new();
+        if let Some(message) =
+            crate::context_manager::updates::build_developer_update_item(stable_developer_sections)
+        {
+            stable_items.push(message);
+        }
+        stable_items.extend(
+            stable_separate_developer_sections
+                .into_iter()
+                .filter_map(|section| {
+                    crate::context_manager::updates::build_developer_update_item(vec![section])
+                }),
+        );
+        if let Some(message) = crate::context_manager::updates::build_contextual_user_message(
+            stable_contextual_user_sections,
+        ) {
+            stable_items.push(message);
+        }
+        InitialContextBuild {
+            items,
+            world_state_snapshot: delivered_world_state_snapshot,
+            fragment_digests: digest_context_fragments(&stable_items),
+        }
     }
 
     #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
@@ -4372,12 +4595,19 @@ impl Session {
         let turn_context_changed =
             !context_snapshot_matches(reference_context_item.as_ref(), &turn_context_item);
         let world_state = self.estimate_world_state_for_step(step_context).await;
+        let complete_context = self
+            .build_initial_context_with_world_state_and_mcp(turn_context, &world_state, true)
+            .await;
+        let realized_fragment_digests = reference_context_item
+            .as_ref()
+            .and_then(|item| item.context_provenance.as_ref())
+            .map(|provenance| provenance.fragment_digests.as_slice());
 
-        if reference_context_item.is_none() {
-            return self
-                .build_initial_context_with_world_state_and_mcp(turn_context, &world_state, true)
-                .await
-                .0;
+        if reference_context_item.is_none()
+            || realized_fragment_digests
+                .is_some_and(|realized| realized != complete_context.fragment_digests.as_slice())
+        {
+            return complete_context.items;
         }
 
         let mut context_items = self
@@ -4462,23 +4692,38 @@ impl Session {
         let turn_context_item = turn_context.to_turn_context_item();
         let turn_context_changed =
             !context_snapshot_matches(reference_context_item.as_ref(), &turn_context_item);
-        let should_inject_full_context = reference_context_item.is_none();
         let world_state = Arc::new(self.build_world_state_for_step(step_context).await);
+        let complete_context = self
+            .build_initial_context_with_world_state_and_mcp(
+                turn_context,
+                world_state.as_ref(),
+                false,
+            )
+            .await;
+        let fragment_digests = complete_context.fragment_digests.clone();
+        let realized_fragment_digests = reference_context_item
+            .as_ref()
+            .and_then(|item| item.context_provenance.as_ref())
+            .map(|provenance| provenance.fragment_digests.as_slice());
+        // TurnContextItem covers the structured settings baseline, while the
+        // accepted fragment receipts cover every other model-visible initial
+        // input (developer instructions, skills, and context contributors).
+        // If those receipts no longer describe the context we would build now,
+        // replay the authoritative full context instead of silently retaining
+        // the previous turn's text.
+        let should_inject_full_context = reference_context_item.is_none()
+            || realized_fragment_digests
+                .is_some_and(|realized| realized != fragment_digests.as_slice());
         // Build a candidate without advancing either realized baseline. The
         // exact physical request that accepts these items commits it later.
         let (mut context_items, world_state_item, world_state_snapshot) =
             if should_inject_full_context {
-                let (context_items, snapshot) = self
-                    .build_initial_context_with_world_state_and_mcp(
-                        turn_context,
-                        world_state.as_ref(),
-                        false,
-                    )
-                    .await;
                 (
-                    context_items,
-                    Some(WorldStateItem::full(snapshot.clone().into_value())),
-                    snapshot,
+                    complete_context.items.clone(),
+                    Some(WorldStateItem::full(
+                        complete_context.world_state_snapshot.clone().into_value(),
+                    )),
+                    complete_context.world_state_snapshot,
                 )
             } else {
                 // Steady-state path: append only built-in context diffs here; turn-scoped extension
@@ -4505,21 +4750,9 @@ impl Session {
                     .await,
             );
         }
-        let complete_context_items = if should_inject_full_context {
-            context_items.clone()
-        } else {
-            self.build_initial_context_with_world_state_and_mcp(
-                turn_context,
-                world_state.as_ref(),
-                false,
-            )
-            .await
-            .0
-        };
         let context_items = self
             .prepare_conversation_items_for_history(turn_context, &context_items)
             .into_owned();
-        let fragment_digests = digest_context_fragments(&complete_context_items);
         {
             let mut state = self.state.lock().await;
             self.compare_and_commit_planning_state(

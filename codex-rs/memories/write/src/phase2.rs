@@ -21,6 +21,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::SandboxPolicy;
+use codex_protocol::protocol::TaskCompletionStatus;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::user_input::UserInput;
 use codex_state::Stage1Output;
@@ -387,10 +388,7 @@ mod agent {
             let final_status =
                 loop_agent(db.clone(), claim.token.clone(), thread_id, &thread).await;
 
-            if matches!(
-                final_status,
-                AgentStatus::Completed(_) | AgentStatus::CompletedWithSurface { .. }
-            ) {
+            if is_successful_agent_status(&final_status) {
                 if let Some(token_usage) = thread
                     .token_usage_info()
                     .await
@@ -545,6 +543,20 @@ fn is_final_agent_status(status: &AgentStatus) -> bool {
     !matches!(
         status,
         AgentStatus::PendingInit | AgentStatus::Running | AgentStatus::Interrupted
+    )
+}
+
+pub(super) fn is_successful_agent_status(status: &AgentStatus) -> bool {
+    matches!(
+        status,
+        AgentStatus::Completed(_) | AgentStatus::CompletedWithSurface { .. }
+    ) || matches!(
+        status,
+        AgentStatus::TerminalWithCompletion {
+            error: None,
+            completion,
+            ..
+        } if completion.status == TaskCompletionStatus::Passed
     )
 }
 

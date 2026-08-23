@@ -336,6 +336,23 @@ pub(super) async fn ensure_conversation_listener(
             )));
         }
     };
+    ensure_conversation_listener_for_instance(
+        listener_task_context,
+        conversation_id,
+        conversation,
+        connection_id,
+        raw_events_enabled,
+    )
+    .await
+}
+
+pub(super) async fn ensure_conversation_listener_for_instance(
+    listener_task_context: ListenerTaskContext,
+    conversation_id: ThreadId,
+    conversation: Arc<CodexThread>,
+    connection_id: ConnectionId,
+    raw_events_enabled: bool,
+) -> Result<EnsureConversationListenerResult, JSONRPCErrorError> {
     let thread_state = {
         if listener_task_context
             .pending_thread_unloads

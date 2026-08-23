@@ -1,0 +1,181 @@
+MDPWA RELEASE COMPLEXITY FINDINGS
+Date: 2026-08-07
+
+Purpose
+-------
+Identify unnecessary complexity that creates a concrete maintenance or
+correctness risk before release. This is not a general refactor plan.
+
+Recommendation filter
+---------------------
+Every recommendation below meets all three conditions:
+1. Existing behavior can remain unchanged.
+2. The complexity has a specific maintenance or correctness cost.
+3. The change is small enough to justify before release.
+
+
+1. Centralize the duplicated UUID predicate
+============================================
+
+Priority: HIGH
+Estimated scope: one shared guard plus six small call-site updates
+
+Evidence
+--------
+The same UUID regular expression is implemented independently in six places:
+
+- src/app/api/community-input/route.ts:42-46
+- src/app/api/map-feedback/route.ts:50-56
+- src/app/api/alert-broadcasts/[id]/route.ts:19-23
+- src/app/api/admin/subscribers/route.ts:15-19
+- src/lib/mapFeedbackStore.ts:1001-1008
+- src/app/api/map-feedback/abuse/route.ts:60-67 (inside readUuid)
+
+These copies protect API identifiers, pagination cursors, moderation data, and
+values passed to persistence. The abuse route also applies text parsing before
+the same predicate; that parsing is distinct behavior and should remain local.
+
+Concrete cost
+-------------
+Any correction to accepted UUID versions, variants, or casing must be made in
+six security- and persistence-adjacent locations. A partial update would make
+the same identifier valid in one route and invalid in another, or allow an API
+value that its store later rejects. The copies already differ in their input
+types, which makes visual comparison less reliable even though the predicate is
+the same.
+
+Small simplification
+--------------------
+Export one predicate from src/lib/guards.ts and have all six implementations
+call it. Keep each caller's current parsing, optional-value handling, and error
+response unchanged. In particular, retain readUuid in the abuse route as the
+bounded/trimmed input adapter, but delegate only its UUID test to the shared
+predicate.
+
+Behavior preserved
+------------------
+Use the exact existing regular expression. This changes ownership of the rule,
+not which values pass or fail.
+
+
+2. Remove the weather route's identity wrapper and duplicate header constants
+=============================================================================
+
+Priority: MEDIUM
+Estimated scope: one route file
+
+Evidence
+--------
+src/app/api/weather/route.ts contains:
+
+- weatherResponseHeaders and unavailableResponseHeaders, both equal to
+  { "Cache-Control": "no-store" } (lines 5-11),
+- getWeatherResponse, which contains the actual handler (lines 13-30),
+- defineWeatherGetHandler, which returns its argument unchanged (lines 32-34),
+- weatherGetHandler, which only applies that identity function (line 36), and
+- an aliased GET export (line 38).
+
+Concrete cost
+-------------
+The two constants represent one cache policy as if success and failure had
+different policies. A future edit can update one and accidentally leave the
+other stale. The identity function and alias add three names between the route
+contract and its implementation, making a very small handler harder to inspect
+without adding validation, typing, instrumentation, or reuse.
+
+Small simplification
+--------------------
+Use one no-store header constant and export the async GET handler directly.
+Keep the current success payload, unavailable payload, status code, and error
+handling exactly as they are.
+
+Behavior preserved
+------------------
+Both branches continue returning Cache-Control: no-store. The existing route
+test at src/app/tests/api/weather/route.test.ts loads GET and asserts the
+successful response and cache header; the failure branch should retain its
+current response during the edit.
+
+
+3. Remove two pass-through alert email helpers
+================================================
+
+Priority: LOW
+Estimated scope: two files and five call-site substitutions
+
+Evidence
+--------
+Both of these helpers do nothing except return normalizeAlertEmail(value):
+
+- src/app/api/alert-signups/route.ts:48-50
+- src/lib/alertSignupStore.ts:150-152
+
+The route uses its wrapper at lines 204, 410, and 513. The store uses its
+wrapper at lines 199 and 290, while already calling normalizeAlertEmail
+directly at line 155.
+
+Concrete cost
+-------------
+The local readEmail name suggests route- or store-specific parsing that does
+not exist. A maintainer has to inspect each wrapper before knowing the same
+canonical validator owns all behavior. The store's mix of wrapped and direct
+calls also creates two apparent paths for the same normalization rule.
+
+Small simplification
+--------------------
+Call normalizeAlertEmail directly at those five sites and delete the two local
+identity helpers. Do not change normalizeAlertEmail itself.
+
+Behavior preserved
+------------------
+The same function receives the same value at every call site, so accepted email
+syntax, lowercasing, maximum length, and undefined handling remain unchanged.
+
+
+Reviewed but not recommended before release
+===========================================
+
+Proxy matcher duplication
+-------------------------
+src/proxy.ts repeats the matcher also represented by PROXY_MATCHER and
+EXCLUDED_PROXY_SEGMENTS in src/i18n/proxyPolicy.ts. This looks like duplicated
+route knowledge, but the route config must remain statically analyzable by
+Next.js. Tests explicitly compare the literal with the shared policy. Replacing
+the literal with a computed value risks build-time route discovery, so this is
+not a safe pre-release simplification.
+
+createUnavailableStore
+----------------------
+src/lib/storage.ts uses a mapped fallback type and an internal cast to construct
+unavailable stores in five persistence modules. Removing the abstraction would
+touch alert broadcasts, alert signups, community input, map feedback, and web
+push persistence. The mapped input still checks method names and signatures,
+so the broad persistence blast radius is not justified by the limited gain
+before release.
+
+Compatibility manifests and legacy import/quarantine tools
+----------------------------------------------------------
+The additional manifest and legacy data commands are documented active
+compatibility or migration surfaces in SOURCEMAP.md and package scripts. There
+is no evidence that supported consumers or recovery workflows no longer use
+them. Removing them would change behavior or require external verification, so
+they are not simplification candidates for this release.
+
+Map-feedback abuse email parsing
+--------------------------------
+The abuse route has a local email expression that is not equivalent to
+normalizeAlertEmail's schema. Consolidating them could change accepted input.
+That fails the behavior-preservation requirement and is intentionally excluded.
+
+
+Suggested release order
+=======================
+
+1. Centralize the UUID predicate because inconsistent validation has the
+   clearest correctness cost.
+2. Simplify the weather route because the change is isolated and removes a
+   duplicated cache-policy representation.
+3. Remove the alert email pass-through helpers only if those two files are
+   already being touched; the gain is real but lower priority.
+
+No application source was modified as part of this audit.

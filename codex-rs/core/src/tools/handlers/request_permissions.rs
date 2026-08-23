@@ -16,6 +16,7 @@ use crate::tools::registry::ToolExecutionTiming;
 use crate::tools::registry::ToolExecutor;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
+use codex_utils_path_uri::PathUri;
 use serde::Deserialize;
 
 pub struct RequestPermissionsHandler;
@@ -74,16 +75,7 @@ impl RequestPermissionsHandler {
                 "request_permissions requires a primary environment".to_string(),
             ));
         };
-        // TODO(anp): Migrate request_permissions parsing and permission profiles to PathUri so
-        // environment-native foreign paths do not require host conversion.
-        let native_cwd = turn_environment.cwd().to_abs_path().map_err(|err| {
-            FunctionCallError::RespondToModel(format!(
-                "request_permissions cwd `{}` is not native to the Codex host: {err}",
-                turn_environment.cwd()
-            ))
-        })?;
-        let mut args: RequestPermissionsArgs =
-            parse_arguments_with_base_path(&arguments, &native_cwd)?;
+        let mut args = parse_request_permissions_args(&arguments, turn_environment.cwd())?;
         args.permissions = normalize_additional_permissions(args.permissions.into())
             .map(codex_protocol::request_permissions::RequestPermissionProfile::from)
             .map_err(FunctionCallError::RespondToModel)?;
@@ -121,8 +113,53 @@ impl RequestPermissionsHandler {
     }
 }
 
+fn parse_request_permissions_args(
+    arguments: &str,
+    environment_cwd: &PathUri,
+) -> Result<RequestPermissionsArgs, FunctionCallError> {
+    match environment_cwd.to_abs_path() {
+        Ok(native_cwd) => parse_arguments_with_base_path(arguments, &native_cwd),
+        Err(err) => {
+            let args: RequestPermissionsArgs = parse_arguments(arguments)?;
+            if args.permissions.file_system.is_some() {
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "request_permissions file-system grants require a cwd native to the Codex host; `{environment_cwd}` is foreign: {err}"
+                )));
+            }
+            Ok(args)
+        }
+    }
+}
+
 impl CoreToolRuntime for RequestPermissionsHandler {
     fn tool_execution_timing(&self) -> ToolExecutionTiming {
         ToolExecutionTiming::Interactive
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_protocol::models::NetworkPermissions;
+
+    #[test]
+    fn foreign_environment_accepts_network_only_permission_request() {
+        #[cfg(windows)]
+        let cwd = PathUri::parse("file:///home/remote/project").expect("foreign POSIX cwd");
+        #[cfg(not(windows))]
+        let cwd = PathUri::parse("file:///C:/remote/project").expect("foreign Windows cwd");
+        assert!(cwd.to_abs_path().is_err());
+
+        let args =
+            parse_request_permissions_args(r#"{"permissions":{"network":{"enabled":true}}}"#, &cwd)
+                .expect("network-only request should not require host path conversion");
+
+        assert_eq!(
+            args.permissions.network,
+            Some(NetworkPermissions {
+                enabled: Some(true),
+            })
+        );
+        assert!(args.permissions.file_system.is_none());
     }
 }

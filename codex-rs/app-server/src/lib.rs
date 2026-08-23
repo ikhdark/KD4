@@ -1166,12 +1166,20 @@ pub async fn run_main_with_transport_options(
                                     )
                                     .await;
                             }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                                // TODO(jif) handle lag.
-                                // Assumes thread creation volume is low enough that lag never happens.
-                                // If it does, we log and continue without resyncing to avoid attaching
-                                // listeners for threads that should remain unsubscribed.
-                                warn!("thread_created receiver lagged; skipping resync");
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                warn!(skipped, "thread_created receiver lagged; resyncing listeners");
+                                let initialized_connection_ids = connections
+                                    .iter()
+                                    .filter_map(|(connection_id, connection_state)| {
+                                        connection_state
+                                            .session
+                                            .initialized()
+                                            .then_some(*connection_id)
+                                    })
+                                    .collect();
+                                processor
+                                    .resync_thread_listeners(initialized_connection_ids)
+                                    .await;
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                                 listen_for_threads = false;

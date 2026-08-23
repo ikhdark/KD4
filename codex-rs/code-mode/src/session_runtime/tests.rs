@@ -152,6 +152,7 @@ async fn termination_rejects_a_waiting_store_commit_before_the_next_cell_can_loa
                 tool_call_id: "reader".to_string(),
                 enabled_tools: Vec::new(),
                 source: r#"text(String(load("candidate")));"#.to_string(),
+                default_tool_timeout_ms: 60_000,
             },
             ObserveMode::YieldAfter(Duration::from_secs(1)),
         )
@@ -174,6 +175,7 @@ fn execute_request(source: &str) -> CreateCellRequest {
         tool_call_id: "call-1".to_string(),
         enabled_tools: Vec::new(),
         source: source.to_string(),
+        default_tool_timeout_ms: 60_000,
     }
 }
 
@@ -202,12 +204,13 @@ async fn terminal_result_remains_observable_after_active_cell_removal() {
     .await
     .expect("cell should leave the active registry");
 
-    assert_eq!(
-        runtime
-            .observe(&cell_id, ObserveMode::PendingFrontier)
-            .await,
-        Ok(completed.clone())
-    );
+    let observed = runtime
+        .begin_observe(&cell_id, ObserveMode::YieldAfter(Duration::ZERO))
+        .await
+        .unwrap()
+        .event()
+        .await;
+    assert_eq!(observed, Ok(completed.clone()));
     assert_eq!(runtime.terminate(&cell_id).await, Ok(completed));
 }
 

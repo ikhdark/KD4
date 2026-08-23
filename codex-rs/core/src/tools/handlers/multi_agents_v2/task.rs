@@ -2452,6 +2452,7 @@ mod projection_tests {
             workspace_strategy: None,
             relation: None,
             architecture_contract_ref: None,
+            integration_plan: codex_agent_task_store::IntegrationPlan::SingleWriter,
             relevant_handles: Vec::new(),
             workspace_epoch: 11,
             workspace_manifest_hash: "a".repeat(64),
@@ -2528,6 +2529,7 @@ mod projection_tests {
                     start_epoch: 11,
                     relation: None,
                     architecture_contract_ref: None,
+                    integration_plan: codex_agent_task_store::IntegrationPlan::SingleWriter,
                     task_capsule: Some(
                         serde_json::to_string(&capsule).expect("task capsule serializes"),
                     ),

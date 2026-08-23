@@ -724,6 +724,29 @@ async fn emit_exec_end(
     }
     let possible_mutation = mutation.may_have_mutated();
     let mutation_paths = mutation.paths();
+    let validation_result = ctx
+        .session
+        .services
+        .command_execution
+        .validation_result_for_call(ctx.call_id)
+        .await;
+    let successful_validation_identity = validation_result
+        .as_ref()
+        .filter(|result| result.status.is_success())
+        .and_then(|result| serde_json::to_string(&result.proof_key).ok());
+    let current_workspace_identity = if (possible_mutation
+        && exec_result.status != ExecCommandStatus::Declined)
+        || successful_validation_identity.is_some()
+    {
+        match native_cwd.as_ref() {
+            Some(cwd) => {
+                crate::git_workspace::capture_workspace_evidence_identity(cwd.as_path()).await
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
     if possible_mutation && exec_result.status != ExecCommandStatus::Declined {
         if let Some(paths) = mutation_paths {
             let paths = paths
@@ -745,16 +768,6 @@ async fn emit_exec_end(
                 .git_workspace
                 .note_host_workspace_mutation();
         }
-        let current_workspace_identity = if mutation_paths.is_some() {
-            match native_cwd.as_ref() {
-                Some(cwd) => {
-                    crate::git_workspace::capture_workspace_evidence_identity(cwd.as_path()).await
-                }
-                None => None,
-            }
-        } else {
-            None
-        };
         ctx.session
             .invalidate_tool_history_source_dependencies(
                 ctx.turn.config.codex_home.as_path(),
@@ -766,17 +779,19 @@ async fn emit_exec_end(
     if exec_result.status != ExecCommandStatus::Declined
         && let Some(tracker) = ctx.turn_diff_tracker
     {
-        tracker
-            .lock()
-            .await
-            .record_exec_command_end_with_mutation_at(
-                exec_input.command,
-                exec_result.exit_code,
-                exec_result.timed_out,
-                exec_input.environment_id,
-                native_cwd.as_ref().map(AbsolutePathBuf::as_path),
-                mutation.clone(),
-            );
+        let mut tracker = tracker.lock().await;
+        tracker.record_exec_command_end_with_mutation_at(
+            exec_input.command,
+            exec_result.exit_code,
+            exec_result.timed_out,
+            exec_input.environment_id,
+            native_cwd.as_ref().map(AbsolutePathBuf::as_path),
+            mutation.clone(),
+        );
+        tracker.record_workspace_freshness_observation(
+            successful_validation_identity,
+            current_workspace_identity.clone(),
+        );
     }
     let (ledger, provenance) = ctx
         .session
@@ -788,12 +803,6 @@ async fn emit_exec_end(
             &ctx.session.services.task_evidence,
         )
         .await;
-    let validation_result = ctx
-        .session
-        .services
-        .command_execution
-        .validation_result_for_call(ctx.call_id)
-        .await;
     let implementation_identity_hash = if possible_mutation {
         None
     } else if let Some(validation_result) = validation_result.as_ref() {
@@ -801,6 +810,24 @@ async fn emit_exec_end(
     } else {
         crate::tasks::completion_review::implementation_identity_for_evidence(ctx.session, &ledger)
             .await
+    };
+    let bound_plan_step = if let Some(validation_result) = validation_result.as_ref()
+        && validation_result.status.is_success()
+    {
+        ledger
+            .auto_validation_candidate()
+            .await
+            .and_then(|candidate| {
+                let proof_identity = &validation_result.proof_key.implementation_identity;
+                (candidate.implementation_identity == *proof_identity
+                    || candidate
+                        .leaf_implementation_identities
+                        .iter()
+                        .any(|identity| identity == proof_identity))
+                .then_some((candidate.step_id, candidate.step_revision))
+            })
+    } else {
+        None
     };
     ledger
         .record_command_bound_with_validation_result(
@@ -814,7 +841,9 @@ async fn emit_exec_end(
             provenance.as_ref(),
             implementation_identity_hash.as_deref(),
             validation_result,
-            None,
+            bound_plan_step
+                .as_ref()
+                .map(|(step_id, revision)| (step_id.as_str(), *revision)),
         )
         .await;
     ctx.session

@@ -19,6 +19,12 @@
 
 - Read every applicable `AGENTS.md` from the repository root through each path
   touched. Read every user-provided or user-named file in full.
+- Before reading `SOURCEMAP.md` broadly, query the smallest named owner slice:
+  `python scripts/source_owners.py slice --owner <owner-id> --focus "<task
+  description>" --max-relationships 32`. Require an untruncated result with no
+  omitted relationships or material unknowns, then read its exact evidence
+  locations. Read the broad map only when no owner matches or the slice leaves
+  an unresolved boundary.
 - [`SOURCEMAP.md`](SOURCEMAP.md) owns repository inventory, runtime entrypoints,
   package and Rust-domain routing, `codex-rs` edit and upstream-sync
   classification, generated contracts, validation routes, and cross-cutting
@@ -81,6 +87,12 @@
   proof requires the direct contract test or a user-approved end-to-end gate
   that executes the changed path.
 - Do not run broad tests.
+- Whenever a full Cargo test or workspace test run is explicitly required or
+  otherwise performed, use Cargo's `--no-fail-fast` mode and let the run finish
+  before making fixes. Apply the same inventory-first rule to full-workspace
+  Clippy, `cargo shear`, and other lint, analyzer, or quality-gate runs: complete
+  the requested run and inventory every failing target, test, assertion, and
+  diagnostic before implementation fixes begin.
 
 ## Sessions and rollout audits
 

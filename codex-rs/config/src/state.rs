@@ -12,6 +12,7 @@ use crate::ConfigLayerSource;
 use crate::ProfileV2Name;
 use codex_features::feature_for_key;
 use codex_features::legacy_feature_keys;
+use codex_file_system::ExecutorFileSystem;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
@@ -238,6 +239,73 @@ pub enum ConfigLayerStackOrdering {
     HighestPrecedenceFirst,
 }
 
+/// Project-boundary evidence captured while loading a configuration snapshot.
+///
+/// The filesystem identity keeps this process-local evidence from being reused
+/// against a different executor filesystem that happens to expose the same
+/// path strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectDiscoveryContext {
+    cwd: AbsolutePathBuf,
+    project_root: AbsolutePathBuf,
+    project_root_markers: Vec<String>,
+    git_checkout_root: Option<AbsolutePathBuf>,
+    git_trust_root: Option<AbsolutePathBuf>,
+    filesystem_identity: usize,
+}
+
+impl ProjectDiscoveryContext {
+    pub fn new(
+        cwd: AbsolutePathBuf,
+        project_root: AbsolutePathBuf,
+        project_root_markers: Vec<String>,
+        git_checkout_root: Option<AbsolutePathBuf>,
+        git_trust_root: Option<AbsolutePathBuf>,
+        fs: &dyn ExecutorFileSystem,
+    ) -> Self {
+        Self {
+            cwd,
+            project_root,
+            project_root_markers,
+            git_checkout_root,
+            git_trust_root,
+            filesystem_identity: filesystem_identity(fs),
+        }
+    }
+
+    pub fn matches(&self, cwd: &AbsolutePathBuf, fs: &dyn ExecutorFileSystem) -> bool {
+        self.matches_cwd(cwd) && self.filesystem_identity == filesystem_identity(fs)
+    }
+
+    pub fn matches_cwd(&self, cwd: &AbsolutePathBuf) -> bool {
+        self.cwd == *cwd
+    }
+
+    pub fn cwd(&self) -> &AbsolutePathBuf {
+        &self.cwd
+    }
+
+    pub fn project_root(&self) -> &AbsolutePathBuf {
+        &self.project_root
+    }
+
+    pub fn project_root_markers(&self) -> &[String] {
+        &self.project_root_markers
+    }
+
+    pub fn git_checkout_root(&self) -> Option<&AbsolutePathBuf> {
+        self.git_checkout_root.as_ref()
+    }
+
+    pub fn git_trust_root(&self) -> Option<&AbsolutePathBuf> {
+        self.git_trust_root.as_ref()
+    }
+}
+
+fn filesystem_identity(fs: &dyn ExecutorFileSystem) -> usize {
+    std::ptr::from_ref(fs).cast::<()>() as usize
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ConfigLayerStack {
     /// Layers are listed from lowest precedence (base) to highest (top), so
@@ -269,6 +337,9 @@ pub struct ConfigLayerStack {
     /// `None` means the loader did not check for stack-level warnings, while
     /// `Some(vec![])` means it checked and found nothing to report.
     startup_warnings: Option<Vec<String>>,
+
+    /// Discovery results that were used to construct this exact layer stack.
+    project_discovery: Option<ProjectDiscoveryContext>,
 }
 
 impl ConfigLayerStack {
@@ -285,7 +356,22 @@ impl ConfigLayerStack {
             requirements_toml,
             ignore_user_and_project_exec_policy_rules: false,
             startup_warnings: None,
+            project_discovery: None,
         })
+    }
+
+    pub fn with_project_discovery(mut self, discovery: ProjectDiscoveryContext) -> Self {
+        self.project_discovery = Some(discovery);
+        self
+    }
+
+    pub fn with_project_discovery_from(mut self, other: &Self) -> Self {
+        self.project_discovery.clone_from(&other.project_discovery);
+        self
+    }
+
+    pub fn project_discovery(&self) -> Option<&ProjectDiscoveryContext> {
+        self.project_discovery.as_ref()
     }
 
     pub fn with_user_and_project_exec_policy_rules_ignored(
@@ -433,6 +519,7 @@ impl ConfigLayerStack {
             ignore_user_and_project_exec_policy_rules: self
                 .ignore_user_and_project_exec_policy_rules,
             startup_warnings: self.startup_warnings.clone(),
+            project_discovery: self.project_discovery.clone(),
         }
     }
 
@@ -475,6 +562,7 @@ impl ConfigLayerStack {
             ignore_user_and_project_exec_policy_rules: self
                 .ignore_user_and_project_exec_policy_rules,
             startup_warnings: self.startup_warnings.clone(),
+            project_discovery: self.project_discovery.clone(),
         }
     }
 

@@ -1,0 +1,330 @@
+MDPWA PWA INSTALLED-CLIENT AUDIT
+================================
+
+Audit date: 2026-08-07
+Scope: service-worker generation, registration, install/activation/update lifecycle,
+cache versioning and retention, localized offline navigation, recovery behavior,
+generated public artifacts, and the existing PWA unit/E2E tests.
+
+This is an audit ledger only. No PWA implementation files were changed.
+
+
+EXECUTIVE RESULT
+----------------
+
+The currently generated worker is internally consistent with the existing local
+Next.js build, and the focused PWA test suite passes. Normal document navigations
+are network-only, so the worker does not broadly cache stale application HTML.
+Mandatory precache failure also fails closed: the incomplete new cache is deleted
+and the previously active worker remains available.
+
+The installed-client upgrade path is not fully safe, however. A newly activated
+worker deletes all previous release caches and immediately claims already-open
+tabs. An old tab can then request an old lazy-loaded chunk that the new worker no
+longer recognizes and the current deployment no longer serves. A second update
+race can leave the same old tab running without a reload after the user dismisses
+a timed-out activation. In addition, superseded waiting-worker caches have no TTL
+or size bound, and the fallback reads search all Cache Storage rather than the
+active release cache.
+
+The repository also has a generation-validation split: the documented
+`pnpm pwa:check` fails against the committed build-aware artifacts, while the
+build-aware form passes. The normal verification commands do not close that gap,
+and worker unit tests execute before the production build regenerates the worker.
+
+
+FINDINGS
+--------
+
+PWA-01 - HIGH - A new worker can strand old open tabs' JavaScript chunks
+
+Evidence:
+- `scripts/templates/service-worker.js:199-211` deletes every cache whose name
+  starts with `martindale-static-` except the new cache, then calls
+  `self.clients.claim()`.
+- `scripts/templates/service-worker.js:19-25` only handles exact paths in the
+  newly generated required/runtime allowlists.
+- `scripts/templates/service-worker.js:229-249` therefore cannot fall back to an
+  old cached hashed chunk after activation if that chunk is absent from the new
+  allowlist.
+- `src/app/tests/service-worker.test.ts:285-309` positively requires old-cache
+  deletion and immediate claiming, but does not model a tab that still runs the
+  previous build and later requests one of its lazy chunks.
+
+Installed-client failure mode:
+1. A resident leaves an installed PWA tab open on build A.
+2. Build B installs and activates.
+3. B deletes A's cache and claims the build-A tab.
+4. The tab requests a build-A lazy chunk. If the current origin no longer serves
+   that hashed asset, the request fails. The new worker neither recognizes the old
+   pathname nor has A's cache.
+
+This is the main stale-JS/old-worker-new-asset mismatch. Cache cleanup correctly
+removes deleted assets, but it does so before existing clients have stopped using
+them.
+
+Recommended repair direction:
+- Make cache retirement client-aware (for example, retain the immediately prior
+  release until old clients close/reload), or do not claim existing clients until
+  the application has completed a coordinated reload.
+- Add a two-release browser test in which an old controlled page requests an old
+  lazy chunk after the new worker activates.
+
+
+PWA-02 - HIGH - Timed-out activation can complete after deferral without reload
+
+Evidence:
+- `src/app/pwa-register.tsx:272-303` sets `updateRequestedRef` before posting
+  `SKIP_WAITING`. Its eight-second timeout deliberately leaves the flag armed and
+  merely re-enables the update controls.
+- `src/app/pwa-register.tsx:258-270` lets Later/dismissal clear that flag.
+- `src/app/pwa-register.tsx:128-136` reloads on `controllerchange` only when the
+  flag is still set.
+- The registration tests contain no fake-timer activation-timeout or
+  `controllerchange`/reload case (`src/app/tests/pwa-register.test.tsx:153-388`).
+
+Installed-client failure mode:
+1. The resident accepts an update, but activation/claim takes longer than eight
+   seconds.
+2. The controls become active again; the resident chooses Later.
+3. Activation then finishes. `controllerchange` does not reload because dismissal
+   cleared the request flag.
+4. The old React/Next page now runs under the new worker, recreating the chunk
+   mismatch in PWA-01.
+
+Recommended repair direction:
+- Once `SKIP_WAITING` has been sent, do not treat Later as a safe cancellation.
+  Reconcile the actual registration/controller state and reload when the requested
+  activation eventually claims the page.
+- Add deterministic timeout, dismissal, late-controllerchange, and reload-once
+  tests.
+
+
+PWA-03 - MEDIUM - Repeated mandatory-precache/update failure has no production
+resident recovery path
+
+Evidence:
+- `scripts/templates/service-worker.js:186-197` uses one mandatory
+  `cache.addAll(PRECACHE_ASSETS)`. Any required manifest, localized offline route,
+  or generated Next asset failure deletes the new cache and rejects installation.
+  This is a good fail-closed behavior and preserves the previous active worker.
+- `src/app/pwa-register.tsx:169-194` records background `registration.update()`
+  failures only through the existing tracking call; it does not surface the
+  persisted failure/recovery flow.
+- `src/app/pwa-register.tsx:31` and the render path make registration/activation
+  issue text development-only. The existing test explicitly confirms that policy
+  (`src/app/tests/pwa-register.test.tsx:369-387`).
+- The service-worker test covers deletion/rethrow for one failed install
+  (`src/app/tests/service-worker.test.ts:259-283`) but not repeated deployments
+  that can never install for an already-controlled production user.
+
+Impact:
+- A broken mandatory URL correctly cannot replace the working worker, but an
+  installed resident can remain on the old release indefinitely without a visible
+  recovery action or explanation.
+- This is especially important when the old release itself needs urgent repair.
+
+Recommended repair direction:
+- Keep background checks non-disruptive initially, but provide a bounded,
+  production-safe recovery path after repeated install/update failures (retry,
+  refresh, or carefully scoped unregister/reload guidance).
+- Test repeated install failure followed by a repaired deployment.
+
+
+PWA-04 - MEDIUM - Superseded/deferred release caches have no expiration and
+fallback reads are not confined to the active release
+
+Evidence:
+- Cache entries have no age, entry-count, or byte limit. Cleanup occurs only in a
+  successfully activating worker (`scripts/templates/service-worker.js:199-211`).
+- Every installed waiting worker creates its complete versioned cache during
+  install (`scripts/templates/service-worker.js:186-197`). If a waiting worker is
+  superseded before it activates, its cache has no independent cleanup hook.
+- Asset and offline fallbacks use global `caches.match(...)`, not
+  `cache.match(...)` on the active release cache
+  (`scripts/templates/service-worker.js:46-50, 243-248`).
+- The tests provide a single synthetic cache match result; they do not create
+  multiple active/waiting/superseded release caches.
+
+Impact:
+- Residents who repeatedly defer releases can accumulate complete precaches for
+  superseded waiting workers until some later worker successfully activates.
+- If no later activation succeeds, those caches can remain indefinitely.
+- A network failure can resolve a matching asset or offline document from an
+  older cache selected by global Cache Storage order rather than from the active
+  release. Deleted assets can likewise remain available as old-worker fallback
+  content until successful cleanup.
+
+This is not an unbounded navigation-HTML cache: ordinary pages are never stored.
+It is an unbounded lifetime for release-shell/runtime entries when activation is
+deferred or repeatedly fails.
+
+Recommended repair direction:
+- Scope fallback reads to the active worker's `CACHE`.
+- Add explicit retention for abandoned/superseded release caches while preserving
+  the client-safety window needed by PWA-01.
+- Test three releases: active A, deferred B, superseding C, including storage and
+  fallback selection.
+
+
+PWA-05 - MEDIUM - Production worker generation and validation use incompatible
+modes
+
+Evidence observed on 2026-08-07:
+- `package.json:19` builds with `next build` and then runs
+  `generate-service-worker.mjs --from-build`.
+- `package.json:38-39` defines `pwa:generate` and `pwa:check` without
+  `--from-build`.
+- `pnpm pwa:check` FAILED with "Committed service-worker output is stale."
+- `pnpm exec node scripts/generate-service-worker.mjs --from-build --check`
+  PASSED with "Service-worker output is current."
+- The current `public/sw-assets.json` release is
+  `martindale-static-855cb0b0fa51bbcc`, with 18 mandatory entries, including 13
+  `/_next/static/` files. All 13 exist in the current `.next/static` tree.
+- `scripts/generate-service-worker.mjs:117-158` includes build assets only in
+  `--from-build` mode, so the two check results are expected but contradictory as
+  repository commands.
+- `package.json:61-64` does not include `pwa:check` in `verify:fast` or
+  `verify:full`. `verify:full` runs unit tests before `pnpm build`, while the build
+  regenerates `public/sw.js` afterward. The production-generated worker is
+  therefore not the worker exercised by that test step.
+- `scripts/check-generated-output.mjs` does not compare the worker/template/build
+  inputs. `scripts/check-public-assets.mjs` passed, but it is a structural public
+  asset guardrail rather than a build-aware generation check.
+
+Impact:
+- The committed artifact is current today, but the default drift check reports the
+  good build-aware artifact as bad.
+- A contributor can generate fallback output that omits build chunks, or CI can
+  test one worker and regenerate a different production worker after the tests.
+- Next.js manifest/output-schema drift is caught only when the post-build generator
+  happens to fail, not by a focused generator contract test.
+
+Recommended repair direction:
+- Establish one explicit contract for fallback source artifacts versus post-build
+  deploy artifacts, with separate unambiguous command names if both are needed.
+- Run a build-aware check/test against the exact post-build worker before promotion.
+- Add generator tests for manifest schema changes, missing localized offline HTML,
+  missing chunks, exact template substitution, and build-ID-driven cache rollover.
+
+
+PWA-06 - LOW - A legacy waiting worker without the version protocol cannot be
+meaningfully deferred
+
+Evidence:
+- `src/app/pwaServiceWorkerRegistration.ts:157-187` returns `undefined` when a
+  waiting worker does not answer `GET_VERSION` within two seconds.
+- `src/app/pwaServiceWorkerRegistration.ts:79-97` intentionally does not persist a
+  Later/dismissal choice for an undefined version.
+- The current tests use workers that implement the current version handshake; no
+  test supplies a genuinely older waiting worker without `GET_VERSION`.
+
+Impact:
+- An already-installed user carrying a legacy waiting worker can choose Later, but
+  the prompt can return on the next mount because there is no stable version key.
+  This is a prompt/update-deferral loop, not an automatic page-reload loop.
+
+Recommended repair direction:
+- Define a bounded legacy-worker identity/dismissal strategy, while ensuring a
+  newer worker still supersedes the legacy dismissal.
+- Add a migration test starting from a worker that lacks the current message
+  protocol.
+
+
+CONFIRMED CONTROLS AND NON-FINDINGS
+-----------------------------------
+
+1. General stale HTML is avoided.
+   `scripts/templates/service-worker.js:214-228` handles navigations network-first
+   and never writes ordinary HTML responses to Cache Storage. On network rejection
+   or HTTP 5xx it uses the localized offline document. HTTP 4xx remains the server
+   response. Unit tests cover rejection, 5xx, and 4xx behavior.
+
+2. English/Spanish route selection is correct for the current route model.
+   `/es` and `/es/...` select `/es/offline`; all other paths select `/offline`.
+   Both documents are mandatory precache entries. Tests cover `/es` and a nested
+   Spanish path. The English and Spanish manifests both use scope `/`; English
+   starts at `/`, Spanish at `/es`. `manifest.json` and `site.webmanifest` are
+   byte-identical as required.
+
+3. Missing Spanish offline content degrades to English.
+   The fallback is explicit at `scripts/templates/service-worker.js:46-50`.
+   This avoids a blank error response, although the multiple-cache selection risk
+   in PWA-04 still applies.
+
+4. Mandatory precache is atomic from the worker lifecycle's perspective.
+   A failed `addAll` deletes the incomplete release cache and rejects install, so a
+   partial shell does not activate. The old active worker remains in control.
+
+5. Automatic reload loops were not found in the current path.
+   The app does not call `skipWaiting()` automatically. `controllerchange` reloads
+   only after an explicit resident update request, and an in-effect `didRefresh`
+   guard prevents repeated reloads. The uncovered late-activation race is PWA-02.
+
+6. Successful activation removes prior Martindale caches.
+   Deleted/renamed assets do not remain in those caches after a successful
+   activation. The concern is cleanup timing for still-open clients (PWA-01) and
+   indefinite retention when no worker activates (PWA-04), not failure to delete
+   on the successful path.
+
+7. The cache version changes with the build-aware release inputs.
+   `scripts/generate-service-worker.mjs:160-179` hashes the Next build ID, optional
+   deployment commit identifier, required/runtime asset lists, and worker template.
+   The current generated artifact matches those current local inputs.
+
+
+TEST AND ARTIFACT EVIDENCE
+--------------------------
+
+Executed successfully:
+- `pnpm exec vitest run src/app/tests/service-worker.test.ts
+  src/app/tests/pwa-register.test.tsx src/app/tests/manifest.test.ts`
+  Result: 3 files passed, 36 tests passed.
+- `pnpm public:check`
+  Result: public asset guardrails passed for 14 referenced assets.
+- `pnpm exec node scripts/generate-service-worker.mjs --from-build --check`
+  Result: service-worker output is current.
+
+Executed and failed as an audit finding:
+- `pnpm pwa:check`
+  Result: "Committed service-worker output is stale." See PWA-05.
+
+Inspected but not executed:
+- `e2e/pwa-recovery.spec.ts` has two useful browser checks: a Spanish offline
+  navigation after installation and the release-specific version handshake.
+- It does not cover English offline navigation, two-version upgrades, open old
+  tabs, cache retention across deferred/superseded workers, install recovery, or
+  activation timeout/dismissal.
+- The E2E suite was not run because it requires a live local server/build, and the
+  repository policy permits starting the server only when explicitly requested.
+
+
+REQUESTED-RISK COVERAGE MAP
+---------------------------
+
+- stale HTML or JS after deployment: ordinary HTML is safe; old-tab JS is PWA-01.
+- old worker/new asset mismatches: PWA-01 and PWA-02.
+- failed mandatory precache: fail-closed control plus recovery gap PWA-03.
+- cache entries that never expire: PWA-04.
+- localized /en and /es caching mistakes: route selection passes; cross-release
+  global-cache risk and missing multi-cache/English E2E coverage are in PWA-04.
+- update loops: no reload loop found; legacy deferral prompt loop is PWA-06.
+- update deferral bugs: PWA-02, PWA-04, and PWA-06.
+- offline navigation inconsistencies: confirmed controls 1-3; multiple-cache
+  fallback ambiguity is PWA-04.
+- deleted/renamed assets remaining cached: successful cleanup is confirmed;
+  unsafe early cleanup is PWA-01 and indefinite pre-activation retention is PWA-04.
+- worker generation drifting from the Next.js build: current build-aware artifact
+  passes, but command/CI/test drift is PWA-05.
+
+
+AUDIT LIMITATIONS
+-----------------
+
+- No production deployment, browser-upgrade sequence, or live server was exercised.
+- The local `.next` build may not be the exact artifact currently deployed to
+  Vercel; the audit proves consistency only with the local build present during
+  the checks.
+- Browser storage eviction can remove caches under pressure, but it is not an
+  application retention policy and must not be relied upon for deterministic
+  cleanup or upgrade safety.

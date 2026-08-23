@@ -16,6 +16,25 @@ const IMAGE_CONTENT_OMITTED_PLACEHOLDER: &str =
 const SYNTHETIC_OUTPUT_ID_NAMESPACE: Uuid = Uuid::from_u128(0x90d38d3e_6a5b_4d52_bfe2_2f1e634bfac4);
 
 pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
+    let missing_outputs_to_insert = collect_missing_call_outputs(items, true);
+
+    // Insert synthetic outputs in reverse index order to avoid re-indexing.
+    for (idx, output_item) in missing_outputs_to_insert.into_iter().rev() {
+        items.insert(idx + 1, output_item);
+    }
+}
+
+pub(crate) fn missing_call_outputs(items: &[ResponseItem]) -> Vec<ResponseItem> {
+    collect_missing_call_outputs(items, false)
+        .into_iter()
+        .map(|(_, output)| output)
+        .collect()
+}
+
+fn collect_missing_call_outputs(
+    items: &[ResponseItem],
+    report_prompt_invariant_violations: bool,
+) -> Vec<(usize, ResponseItem)> {
     let mut function_output_ids = HashSet::new();
     let mut tool_search_output_ids = HashSet::new();
     let mut custom_tool_output_ids = HashSet::new();
@@ -80,9 +99,11 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
             ResponseItem::CustomToolCall { id, call_id, .. }
                 if !custom_tool_output_ids.contains(call_id.as_str()) =>
             {
-                error_or_panic(format!(
-                    "Custom tool call output is missing for call id: {call_id}"
-                ));
+                if report_prompt_invariant_violations {
+                    error_or_panic(format!(
+                        "Custom tool call output is missing for call id: {call_id}"
+                    ));
+                }
                 missing_outputs_to_insert.push((
                     idx,
                     ResponseItem::CustomToolCallOutput {
@@ -100,9 +121,11 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
                 call_id: Some(call_id),
                 ..
             } if !function_output_ids.contains(call_id.as_str()) => {
-                error_or_panic(format!(
-                    "Local shell call output is missing for call id: {call_id}"
-                ));
+                if report_prompt_invariant_violations {
+                    error_or_panic(format!(
+                        "Local shell call output is missing for call id: {call_id}"
+                    ));
+                }
                 missing_outputs_to_insert.push((
                     idx,
                     ResponseItem::FunctionCallOutput {
@@ -121,11 +144,7 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
         tool_search_output_ids,
         custom_tool_output_ids,
     ));
-
-    // Insert synthetic outputs in reverse index order to avoid re-indexing.
-    for (idx, output_item) in missing_outputs_to_insert.into_iter().rev() {
-        items.insert(idx + 1, output_item);
-    }
+    missing_outputs_to_insert
 }
 
 /// Derives a stable ID for a prompt-only output from its source call's item ID.

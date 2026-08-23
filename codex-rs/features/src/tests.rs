@@ -43,8 +43,8 @@ fn default_enabled_features_are_stable() {
 }
 
 #[test]
-fn use_legacy_landlock_is_deprecated_and_disabled_by_default() {
-    assert_eq!(Feature::UseLegacyLandlock.stage(), Stage::Deprecated);
+fn use_legacy_landlock_is_removed_and_disabled_by_default() {
+    assert_eq!(Feature::UseLegacyLandlock.stage(), Stage::Removed);
     assert_eq!(Feature::UseLegacyLandlock.default_enabled(), false);
 }
 
@@ -377,25 +377,19 @@ fn canonical_feature_toggles_win_over_every_legacy_alias_within_a_source() {
 }
 
 #[test]
-fn use_legacy_landlock_config_records_deprecation_notice() {
-    let mut entries = BTreeMap::new();
-    entries.insert("use_legacy_landlock".to_string(), true);
-
+fn removed_transitional_features_are_no_op() {
+    let entries = BTreeMap::from([
+        ("use_legacy_landlock".to_string(), true),
+        ("mentions_v2".to_string(), false),
+        ("remote_compaction_v2".to_string(), false),
+    ]);
     let mut features = Features::with_defaults();
     features.apply_map(&entries);
 
-    let usages = features.legacy_feature_usages().collect::<Vec<_>>();
-    assert_eq!(usages.len(), 1);
-    assert_eq!(usages[0].alias, "features.use_legacy_landlock");
-    assert_eq!(usages[0].feature, Feature::UseLegacyLandlock);
-    assert_eq!(
-        usages[0].summary,
-        "`[features].use_legacy_landlock` is deprecated and will be removed soon."
-    );
-    assert_eq!(
-        usages[0].details.as_deref(),
-        Some("Remove this setting to stop opting into the legacy Linux sandbox behavior.")
-    );
+    assert!(!features.use_legacy_landlock());
+    assert!(features.enabled(Feature::MentionsV2));
+    assert!(features.enabled(Feature::RemoteCompactionV2));
+    assert_eq!(features.legacy_feature_usages().count(), 0);
 }
 
 #[test]
@@ -437,10 +431,20 @@ fn auth_elicitation_is_stable_and_enabled_by_default() {
 }
 
 #[test]
-fn mentions_v2_is_stable_and_enabled_by_default() {
-    assert_eq!(Feature::MentionsV2.stage(), Stage::Stable);
+fn mentions_v2_is_removed_and_enabled_by_default() {
+    assert_eq!(Feature::MentionsV2.stage(), Stage::Removed);
     assert_eq!(Feature::MentionsV2.default_enabled(), true);
     assert_eq!(feature_for_key("mentions_v2"), Some(Feature::MentionsV2));
+}
+
+#[test]
+fn remote_compaction_v2_is_removed_and_enabled_by_default() {
+    assert_eq!(Feature::RemoteCompactionV2.stage(), Stage::Removed);
+    assert_eq!(Feature::RemoteCompactionV2.default_enabled(), true);
+    assert_eq!(
+        feature_for_key("remote_compaction_v2"),
+        Some(Feature::RemoteCompactionV2)
+    );
 }
 
 #[test]

@@ -708,7 +708,7 @@ impl TraceReducer {
         if !item.produced_by.contains(&producer) {
             item.produced_by.push(producer);
         }
-        Ok(())
+        self.sync_code_cell_terminal_observations(code_cell_id)
     }
 }
 

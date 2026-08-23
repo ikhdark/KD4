@@ -12,6 +12,8 @@ Scenario: Manual /compact with no prior user turn currently still issues a compa
 01:message/developer:<PERMISSIONS_INSTRUCTIONS>
 02:message/developer:<skills_usage_instructions>\n## How to use skills\n- Use the sma...
 03:message/developer:<NO_TEXT>
-04:message/user:<COMPACTION_SUMMARY>\nMANUAL_EMPTY_SUMMARY
-05:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-06:message/user:AFTER_MANUAL_EMPTY_COMPACT
+04:message/developer:<root_orchestration_instructions>When several independent tool c...
+05:message/user:<COMPACTION_SUMMARY>\nMANUAL_EMPTY_SUMMARY
+06:message/developer:<root_orchestration_instructions>When several independent tool c...
+07:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
+08:message/user:AFTER_MANUAL_EMPTY_COMPACT

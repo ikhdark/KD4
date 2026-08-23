@@ -13,7 +13,11 @@ pub enum StoreError {
     #[error("invalid assignment: {0}")]
     InvalidAssignment(String),
     #[error("typed assignment admission rejected: {reason}")]
-    AdmissionRejected { reason: AdmissionRejectionReason },
+    AdmissionRejected {
+        reason: AdmissionRejectionReason,
+        /// Existing assignment whose active work or sealed result satisfies this request.
+        reusable_assignment_id: Option<AssignmentId>,
+    },
     #[error("assignment {0} does not exist")]
     AssignmentNotFound(AssignmentId),
     #[error("attempt {0} does not exist")]

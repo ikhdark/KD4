@@ -60,6 +60,59 @@ fn shared_host_lease_is_released_after_the_final_session_drops() {
     );
 }
 
+#[tokio::test]
+async fn shutdown_releases_final_host_lease() {
+    let provider = ProcessOwnedCodeModeSessionProvider::default();
+    let process_host = provider.process_host();
+    let first = ProcessOwnedCodeModeSession::with_process_host(
+        Arc::new(NoopCodeModeSessionDelegate),
+        Arc::clone(&process_host),
+    );
+    let second = ProcessOwnedCodeModeSession::with_process_host(
+        Arc::new(NoopCodeModeSessionDelegate),
+        Arc::clone(&process_host),
+    );
+
+    first.shutdown().await.expect("shutdown first session");
+    first
+        .shutdown()
+        .await
+        .expect("repeated shutdown remains idempotent");
+    assert_eq!(
+        process_host
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active_sessions,
+        1
+    );
+
+    second.shutdown().await.expect("shutdown second session");
+    assert_eq!(
+        process_host
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active_sessions,
+        0
+    );
+
+    let error = match second
+        .execute(codex_code_mode_protocol::ExecuteRequest {
+            tool_call_id: "call-after-shutdown".to_string(),
+            enabled_tools: Vec::new(),
+            source: "text('unreachable')".to_string(),
+            yield_time_ms: None,
+            max_output_tokens: None,
+        })
+        .await
+    {
+        Ok(_) => panic!("closed session should remain alive and reject execution"),
+        Err(error) => error,
+    };
+    assert_eq!(error, "code mode session is shutting down");
+}
+
 #[test]
 fn host_program_override_takes_precedence() {
     assert_eq!(

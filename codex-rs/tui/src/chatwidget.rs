@@ -255,8 +255,6 @@ use crate::app_event::AppEvent;
 use crate::app_event::ExitMode;
 use crate::app_event::PermissionProfileSelection;
 use crate::app_event::RateLimitRefreshOrigin;
-#[cfg(target_os = "windows")]
-use crate::app_event::WindowsSandboxEnableMode;
 use crate::app_event_sender::AppEventSender;
 use crate::auto_review_denials;
 use crate::auto_review_denials::RecentAutoReviewDenials;
@@ -1877,7 +1875,6 @@ impl ChatWidget {
         self.config.config_layer_stack = config.config_layer_stack.clone();
         self.config.memories = config.memories.clone();
         self.config.terminal_resize_reflow = config.terminal_resize_reflow;
-        self.sync_mentions_v2_enabled();
     }
 
     pub(crate) fn token_usage(&self) -> TokenUsage {

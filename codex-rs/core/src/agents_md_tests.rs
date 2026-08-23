@@ -19,12 +19,18 @@ use codex_exec_server::ReadDirectoryEntry;
 use codex_exec_server::RemoveOptions;
 use codex_extension_api::UserInstructions;
 use codex_features::Feature;
+use codex_otel::MetricsClient;
+use codex_otel::MetricsConfig;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use core_test_support::PathBufExt;
 use core_test_support::TempDirExt;
 use core_test_support::create_directory_symlink;
+use opentelemetry_sdk::metrics::InMemoryMetricExporter;
+use opentelemetry_sdk::metrics::data::AggregatedMetrics;
+use opentelemetry_sdk::metrics::data::MetricData;
 use pretty_assertions::assert_eq;
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::ops::Deref;
@@ -321,6 +327,7 @@ async fn agents_md_paths(config: &TestConfig) -> std::io::Result<Vec<PathUri>> {
         &config.config,
         &PathUri::from_abs_path(&config.cwd),
         LOCAL_FS.as_ref(),
+        /*reuse_project_discovery*/ true,
     )
     .await?;
     Ok(project_doc_paths(candidates))
@@ -787,7 +794,7 @@ async fn project_doc_truncation_preserves_invalid_boundary_bytes_lossily() {
 }
 
 #[tokio::test]
-async fn doc_larger_than_limit_includes_explicit_truncation_notice() {
+async fn source_byte_limit_excludes_mandatory_truncation_notice() {
     const LIMIT: usize = 1024;
     let tmp = tempfile::tempdir().expect("tempdir");
 
@@ -798,7 +805,7 @@ async fn doc_larger_than_limit_includes_explicit_truncation_notice() {
     let res = get_user_instructions(&make_config(&tmp, LIMIT, /*instructions*/ None).await)
         .await
         .expect("doc expected");
-    let retained = res.bytes().take_while(|byte| *byte == b'A').count();
+    let retained = LIMIT;
     let notice = project_doc_truncation_notice(
         &PathUri::from_abs_path(&source.abs()),
         (LIMIT * 2) as u64,
@@ -806,7 +813,10 @@ async fn doc_larger_than_limit_includes_explicit_truncation_notice() {
     );
 
     assert_eq!(res, format!("{}\n\n{notice}", &huge[..retained]));
-    assert!(res.len() <= LIMIT);
+    assert!(
+        res.len() > LIMIT,
+        "the mandatory notice is outside the source-byte budget"
+    );
 }
 
 #[tokio::test]
@@ -823,16 +833,27 @@ async fn total_byte_limit_preserves_nearest_doc_and_notices_broader_truncation()
     config.cwd = nested.abs();
 
     let loaded = load_agents_md(&config).await.expect("project instructions");
+    let root_notice = project_doc_truncation_notice(
+        &PathUri::from_abs_path(&root_doc.abs()),
+        /*original_bytes*/ 4,
+        /*retained_bytes*/ 1,
+    );
     let expected = LoadedAgentsMd {
         user_instructions: None,
-        entries: vec![InstructionEntry {
-            contents: "abcdef".to_string(),
-            provenance: project_provenance(config.cwd.join("AGENTS.md"), config.cwd.clone()),
-        }],
+        entries: vec![
+            InstructionEntry {
+                contents: format!("r\n\n{root_notice}"),
+                provenance: project_provenance(root_doc.abs(), config.cwd.clone()),
+            },
+            InstructionEntry {
+                contents: "abcdef".to_string(),
+                provenance: project_provenance(config.cwd.join("AGENTS.md"), config.cwd.clone()),
+            },
+        ],
     };
 
     assert_eq!(loaded, expected);
-    assert_eq!(loaded.text(), "abcdef");
+    assert_eq!(loaded.text(), format!("r\n\n{root_notice}\n\nabcdef"));
 }
 
 #[tokio::test]
@@ -893,7 +914,7 @@ async fn read_agents_md_ignores_files_removed_after_discovery() {
 }
 
 #[tokio::test]
-async fn oversized_project_doc_stream_stops_after_required_prefix() {
+async fn oversized_project_doc_stream_keeps_notice_after_required_prefix() {
     let tmp = tempfile::tempdir().expect("tempdir");
     fs::write(tmp.path().join("AGENTS.md"), "abcdef").unwrap();
     let config = make_config(&tmp, /*limit*/ 3, /*instructions*/ None).await;
@@ -913,19 +934,23 @@ async fn oversized_project_doc_stream_stops_after_required_prefix() {
     .await
     .expect("streamed read");
 
-    assert!(
-        loaded.is_none(),
-        "the truncation notice cannot fit the budget"
+    let loaded = loaded.expect("truncation notice must remain model-visible");
+    let notice = project_doc_truncation_notice(
+        &PathUri::from_abs_path(&tmp.path().join("AGENTS.md").abs()),
+        /*original_bytes*/ 6,
+        /*retained_bytes*/ 3,
     );
+    assert_eq!(loaded.text(), format!("abc\n\n{notice}"));
     assert_eq!(metadata_calls.stream_chunks.load(Ordering::Relaxed), 3);
     assert_eq!(metadata_calls.stream_bytes.load(Ordering::Relaxed), 3);
 }
 
 #[tokio::test]
-async fn oversized_whitespace_prefix_stops_at_the_budget_and_keeps_a_notice() {
+async fn oversized_whitespace_prefix_keeps_notice_outside_the_source_budget() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let source = tmp.path().join("AGENTS.md");
-    fs::write(&source, "   content after the retained prefix").unwrap();
+    let contents = "   content after the retained prefix";
+    fs::write(&source, contents).unwrap();
     let config = make_config(&tmp, /*limit*/ 3, /*instructions*/ None).await;
     let metadata_calls = Arc::new(MetadataCallCounts::default());
     let fs = FailingFileSystem {
@@ -943,16 +968,19 @@ async fn oversized_whitespace_prefix_stops_at_the_budget_and_keeps_a_notice() {
     .await
     .expect("streamed read");
 
-    assert!(
-        loaded.is_none(),
-        "the truncation notice cannot fit the budget"
+    let loaded = loaded.expect("truncation notice must remain model-visible");
+    let notice = project_doc_truncation_notice(
+        &PathUri::from_abs_path(&source.abs()),
+        contents.len() as u64,
+        /*retained_bytes*/ 3,
     );
+    assert_eq!(loaded.text(), format!("   \n\n{notice}"));
     assert_eq!(metadata_calls.stream_chunks.load(Ordering::Relaxed), 3);
     assert_eq!(metadata_calls.stream_bytes.load(Ordering::Relaxed), 3);
 }
 
 #[tokio::test]
-async fn zero_budget_broader_doc_stops_after_first_non_whitespace_byte() {
+async fn exhausted_source_budget_still_notices_a_broader_doc() {
     let repo = tempfile::tempdir().expect("tempdir");
     fs::write(repo.path().join(".git"), "gitdir: elsewhere").unwrap();
     let root_doc = repo.path().join("AGENTS.md");
@@ -978,7 +1006,12 @@ async fn zero_budget_broader_doc_stops_after_first_non_whitespace_byte() {
     .await
     .expect("streamed read")
     .expect("project instructions");
-    assert_eq!(loaded.text(), "abc");
+    let root_notice = project_doc_truncation_notice(
+        &PathUri::from_abs_path(&root_doc.abs()),
+        /*original_bytes*/ 7,
+        /*retained_bytes*/ 0,
+    );
+    assert_eq!(loaded.text(), format!("{root_notice}\n\nabc"));
     assert_eq!(metadata_calls.stream_chunks.load(Ordering::Relaxed), 1);
     assert_eq!(metadata_calls.stream_bytes.load(Ordering::Relaxed), 1);
 }
@@ -1008,7 +1041,12 @@ async fn marker_search_does_not_wait_for_a_higher_ancestor() {
 
     let paths = tokio::time::timeout(
         std::time::Duration::from_secs(1),
-        super::agents_md_paths(&config.config, &cwd, &fs),
+        super::agents_md_paths(
+            &config.config,
+            &cwd,
+            &fs,
+            /*reuse_project_discovery*/ false,
+        ),
     )
     .await
     .expect("nearest marker should complete")
@@ -1047,8 +1085,15 @@ async fn project_root_marker_search_pipelines_bounded_window_and_continues() {
         metadata_calls: Arc::clone(&metadata_calls),
     };
 
-    let search =
-        tokio::spawn(async move { super::agents_md_paths(&config.config, &cwd, &fs).await });
+    let search = tokio::spawn(async move {
+        super::agents_md_paths(
+            &config.config,
+            &cwd,
+            &fs,
+            /*reuse_project_discovery*/ false,
+        )
+        .await
+    });
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let started = metadata_calls.started.notified();
@@ -1115,9 +1160,14 @@ async fn empty_project_root_markers_only_probe_cwd_candidates() {
     };
     let cwd = PathUri::from_abs_path(&config.cwd);
 
-    let paths = super::agents_md_paths(&config.config, &cwd, &fs)
-        .await
-        .expect("AGENTS.md discovery");
+    let paths = super::agents_md_paths(
+        &config.config,
+        &cwd,
+        &fs,
+        /*reuse_project_discovery*/ false,
+    )
+    .await
+    .expect("AGENTS.md discovery");
     let paths = project_doc_paths(paths);
 
     let override_path = cwd.join(LOCAL_AGENTS_MD_FILENAME).expect("override path");
@@ -1417,18 +1467,13 @@ async fn project_doc_byte_limit_is_shared_across_environments() {
     let secondary_doc_path = secondary.path().join("AGENTS.md");
     fs::write(primary.path().join("AGENTS.md"), primary_doc).unwrap();
     fs::write(&secondary_doc_path, &secondary_doc).unwrap();
+    let secondary_retained_bytes = 16;
     let secondary_notice = project_doc_truncation_notice(
         &PathUri::from_abs_path(&secondary_doc_path.abs()),
         secondary_doc.len() as u64,
-        /*retained_bytes*/ 0,
+        secondary_retained_bytes,
     );
-    let secondary_budget = secondary_notice.len() + 16;
-    let primary_label = format!("for `primary` with root {}\n\n", primary.path().display());
-    let secondary_label = format!(
-        "\n\nfor `secondary` with root {}\n\n",
-        secondary.path().display()
-    );
-    let limit = primary_label.len() + primary_doc.len() + secondary_label.len() + secondary_budget;
+    let limit = primary_doc.len() + secondary_retained_bytes;
     let config = make_config(&primary, limit, /*instructions*/ None).await;
     let environments = resolved_local_environments([
         ("primary", config.cwd.clone()),
@@ -1442,13 +1487,14 @@ async fn project_doc_byte_limit_is_shared_across_environments() {
         .expect("instructions expected");
     assert_eq!(loaded.entries.len(), 2);
     assert_eq!(loaded.entries[0].contents, primary_doc);
-    assert!(loaded.entries[1].contents.len() <= secondary_budget);
-    assert!(
-        loaded.entries[1]
-            .contents
-            .contains("Project documentation truncation notice")
+    assert_eq!(
+        loaded.entries[1].contents,
+        format!(
+            "{}\n\n{secondary_notice}",
+            "V".repeat(secondary_retained_bytes)
+        )
     );
-    assert!(loaded.text().len() <= limit);
+    assert!(loaded.text().len() > limit);
 }
 
 #[tokio::test]
@@ -1459,49 +1505,7 @@ async fn aggregate_project_doc_limit_prefers_environment_selection_order() {
     let secondary_doc = "S".repeat(32);
     fs::write(primary.path().join("AGENTS.md"), &primary_doc).unwrap();
     fs::write(secondary.path().join("AGENTS.md"), &secondary_doc).unwrap();
-    let primary_label = format!("for `primary` with root {}\n\n", primary.path().display());
-    let limit = primary_label.len() + primary_doc.len();
-    let config = make_config(&primary, limit, /*instructions*/ None).await;
-    let environments = resolved_local_environments([
-        ("primary", config.cwd.clone()),
-        ("secondary", secondary.abs()),
-    ]);
-
-    let loaded = load_project_instructions(
-        &config.config,
-        /*user_instructions*/ None,
-        &environments,
-    )
-    .await
-    .loaded
-    .expect("instructions expected");
-    assert_eq!(loaded.entries.len(), 1);
-    assert_eq!(loaded.entries[0].contents, primary_doc);
-    assert!(!loaded.text().contains(&secondary_doc));
-    assert!(loaded.text().len() <= limit);
-}
-
-#[tokio::test]
-async fn aggregate_budget_keeps_a_truncated_secondary_doc_utf8_valid() {
-    let primary = tempfile::tempdir().expect("primary tempdir");
-    let secondary = tempfile::tempdir().expect("secondary tempdir");
-    let primary_doc = "12345";
-    let secondary_doc = "🦀".repeat(100);
-    let secondary_doc_path = secondary.path().join("AGENTS.md");
-    fs::write(primary.path().join("AGENTS.md"), primary_doc).unwrap();
-    fs::write(&secondary_doc_path, &secondary_doc).unwrap();
-    let secondary_notice = project_doc_truncation_notice(
-        &PathUri::from_abs_path(&secondary_doc_path.abs()),
-        secondary_doc.len() as u64,
-        /*retained_bytes*/ 0,
-    );
-    let secondary_budget = secondary_notice.len() + 16;
-    let primary_label = format!("for `primary` with root {}\n\n", primary.path().display());
-    let secondary_label = format!(
-        "\n\nfor `secondary` with root {}\n\n",
-        secondary.path().display()
-    );
-    let limit = primary_label.len() + primary_doc.len() + secondary_label.len() + secondary_budget;
+    let limit = primary_doc.len();
     let config = make_config(&primary, limit, /*instructions*/ None).await;
     let environments = resolved_local_environments([
         ("primary", config.cwd.clone()),
@@ -1518,14 +1522,53 @@ async fn aggregate_budget_keeps_a_truncated_secondary_doc_utf8_valid() {
     .expect("instructions expected");
     assert_eq!(loaded.entries.len(), 2);
     assert_eq!(loaded.entries[0].contents, primary_doc);
-    assert!(loaded.entries[1].contents.len() <= secondary_budget);
     assert!(
         loaded.entries[1]
             .contents
-            .contains("Project documentation truncation notice")
+            .contains("retained byte count: 0; omitted byte count: 32")
+    );
+    assert!(!loaded.text().contains(&secondary_doc));
+    assert!(loaded.text().len() > limit);
+}
+
+#[tokio::test]
+async fn aggregate_budget_keeps_a_truncated_secondary_doc_utf8_valid() {
+    let primary = tempfile::tempdir().expect("primary tempdir");
+    let secondary = tempfile::tempdir().expect("secondary tempdir");
+    let primary_doc = "12345";
+    let secondary_doc = "🦀".repeat(100);
+    let secondary_doc_path = secondary.path().join("AGENTS.md");
+    fs::write(primary.path().join("AGENTS.md"), primary_doc).unwrap();
+    fs::write(&secondary_doc_path, &secondary_doc).unwrap();
+    let secondary_retained_bytes = 16;
+    let secondary_notice = project_doc_truncation_notice(
+        &PathUri::from_abs_path(&secondary_doc_path.abs()),
+        secondary_doc.len() as u64,
+        secondary_retained_bytes,
+    );
+    let limit = primary_doc.len() + secondary_retained_bytes;
+    let config = make_config(&primary, limit, /*instructions*/ None).await;
+    let environments = resolved_local_environments([
+        ("primary", config.cwd.clone()),
+        ("secondary", secondary.abs()),
+    ]);
+
+    let loaded = load_project_instructions(
+        &config.config,
+        /*user_instructions*/ None,
+        &environments,
+    )
+    .await
+    .loaded
+    .expect("instructions expected");
+    assert_eq!(loaded.entries.len(), 2);
+    assert_eq!(loaded.entries[0].contents, primary_doc);
+    assert_eq!(
+        loaded.entries[1].contents,
+        format!("{}\n\n{secondary_notice}", "🦀".repeat(4))
     );
     assert!(!loaded.entries[1].contents.contains('\u{FFFD}'));
-    assert!(loaded.text().len() <= limit);
+    assert!(loaded.text().len() > limit);
 }
 
 #[tokio::test]
@@ -1646,6 +1689,144 @@ async fn project_root_markers_are_honored_for_agents_discovery() {
 
     let res = get_user_instructions(&cfg).await.expect("doc expected");
     assert_eq!(res, "parent doc\n\nchild doc");
+}
+
+#[tokio::test]
+async fn agents_md_uses_matching_config_project_root() {
+    let root = tempfile::tempdir().expect("tempdir");
+    fs::write(root.path().join(".codex-root"), "").expect("project marker");
+    fs::write(root.path().join("AGENTS.md"), "root doc").expect("root doc");
+    let nested = root.path().join("src").join("nested");
+    fs::create_dir_all(&nested).expect("nested cwd");
+
+    let codex_home = TempDir::new().expect("codex home");
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(nested.clone()))
+        .cli_overrides(vec![(
+            "project_root_markers".to_string(),
+            TomlValue::Array(vec![TomlValue::String(".codex-root".to_string())]),
+        )])
+        .build()
+        .await
+        .expect("config with project discovery");
+    fs::remove_file(root.path().join(".codex-root")).expect("remove marker after snapshot");
+    let config = TestConfig {
+        config,
+        user_instructions: None,
+    };
+
+    let discovery = agents_md_paths(&config).await.expect("discover paths");
+    assert_eq!(
+        discovery,
+        vec![PathUri::from_abs_path(&root.path().join("AGENTS.md").abs())]
+    );
+}
+
+#[tokio::test]
+async fn activation_metric_distinguishes_agents_md_project_discovery_hit_and_miss() {
+    let root = tempfile::tempdir().expect("tempdir");
+    fs::write(root.path().join(".codex-root"), "").expect("project marker");
+    fs::write(root.path().join("AGENTS.md"), "root doc").expect("root doc");
+    let nested = root.path().join("src").join("nested");
+    fs::create_dir_all(&nested).expect("nested cwd");
+    let codex_home = TempDir::new().expect("codex home");
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(nested.clone()))
+        .cli_overrides(vec![(
+            "project_root_markers".to_string(),
+            TomlValue::Array(vec![TomlValue::String(".codex-root".to_string())]),
+        )])
+        .build()
+        .await
+        .expect("config with project discovery");
+    fs::remove_file(root.path().join(".codex-root")).expect("remove marker after snapshot");
+
+    let metrics = MetricsClient::new(
+        MetricsConfig::in_memory(
+            "test",
+            "codex-core",
+            env!("CARGO_PKG_VERSION"),
+            InMemoryMetricExporter::default(),
+        )
+        .with_runtime_reader(),
+    )
+    .expect("in-memory metrics client");
+    let cwd = PathUri::from_abs_path(&nested.abs());
+    let hit = super::agents_md_paths_with_metrics(
+        &config,
+        &cwd,
+        LOCAL_FS.as_ref(),
+        /*reuse_project_discovery*/ true,
+        Some(&metrics),
+    )
+    .await
+    .expect("reuse discovery");
+    assert_eq!(
+        project_doc_paths(hit),
+        vec![PathUri::from_abs_path(&root.path().join("AGENTS.md").abs())]
+    );
+    let miss = super::agents_md_paths_with_metrics(
+        &config,
+        &cwd,
+        LOCAL_FS.as_ref(),
+        /*reuse_project_discovery*/ false,
+        Some(&metrics),
+    )
+    .await
+    .expect("fallback discovery");
+    assert!(miss.is_empty());
+
+    let snapshot = metrics.snapshot().expect("metrics snapshot");
+    let metric = snapshot
+        .scope_metrics()
+        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+        .find(|metric| metric.name() == PROJECT_DISCOVERY_REUSE_METRIC)
+        .expect("project discovery reuse metric");
+    let points = match metric.data() {
+        AggregatedMetrics::U64(data) => match data {
+            MetricData::Sum(sum) => sum
+                .data_points()
+                .map(|point| {
+                    let tags = point
+                        .attributes()
+                        .map(|attribute| {
+                            (
+                                attribute.key.as_str().to_string(),
+                                attribute.value.as_str().to_string(),
+                            )
+                        })
+                        .collect::<std::collections::BTreeMap<_, _>>();
+                    (
+                        tags.get("consumer").cloned().unwrap_or_default(),
+                        tags.get("result").cloned().unwrap_or_default(),
+                        tags.get("reason").cloned().unwrap_or_default(),
+                        point.value(),
+                    )
+                })
+                .collect::<BTreeSet<_>>(),
+            _ => panic!("unexpected project discovery metric aggregation"),
+        },
+        _ => panic!("unexpected project discovery metric type"),
+    };
+    assert_eq!(
+        points,
+        BTreeSet::from([
+            (
+                "agents_md".to_string(),
+                "hit".to_string(),
+                "matched".to_string(),
+                1,
+            ),
+            (
+                "agents_md".to_string(),
+                "miss".to_string(),
+                "reuse_disabled".to_string(),
+                1,
+            ),
+        ])
+    );
 }
 
 #[tokio::test]

@@ -112,6 +112,7 @@ impl WriteStdinHandler {
             FunctionCallError::RespondToModel(format!("write_stdin failed: {err}"))
         })?;
 
+        let mut completed_validation_skip_disposition = None;
         if let Some(running) = session
             .services
             .command_execution
@@ -121,7 +122,7 @@ impl WriteStdinHandler {
             let artifact = response
                 .raw_output_artifact
                 .clone()
-                .unwrap_or(running.artifact);
+                .unwrap_or_else(|| running.artifact.clone());
             response.raw_output_artifact = Some(artifact.clone());
             if response.process_id.is_some() {
                 session
@@ -130,6 +131,9 @@ impl WriteStdinHandler {
                     .update_running_artifact(args.session_id, artifact)
                     .await;
             } else {
+                completed_validation_skip_disposition = response.exit_code.and_then(|exit_code| {
+                    running.completed_validation_skip_disposition(&response.raw_output, exit_code)
+                });
                 session
                     .services
                     .command_execution
@@ -157,6 +161,22 @@ impl WriteStdinHandler {
             session
                 .send_event(turn.as_ref(), EventMsg::TerminalInteraction(interaction))
                 .await;
+        }
+
+        if completed_validation_skip_disposition
+            == Some(codex_tools::ToolOutputSkipDisposition::NotApplicable)
+        {
+            let validation_result = session
+                .services
+                .command_execution
+                .validation_result_for_call(&response.event_call_id)
+                .await;
+            return Ok(boxed_tool_output(
+                super::exec_command::completed_validation_not_applicable_output(
+                    &response,
+                    validation_result,
+                ),
+            ));
         }
 
         Ok(boxed_tool_output(response))

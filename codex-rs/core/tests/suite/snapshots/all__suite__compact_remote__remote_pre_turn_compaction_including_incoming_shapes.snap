@@ -1,5 +1,6 @@
 ---
 source: core/tests/suite/compact_remote.rs
+assertion_line: 3451
 expression: "format_labeled_requests_snapshot(\"Remote pre-turn auto-compaction with a context override emits the context diff in the compact request while excluding the incoming user message.\",\n&[(\"Remote Compaction Request\", &compact_request),\n(\"Remote Post-Compaction History Layout\", &requests[2]),])"
 ---
 Scenario: Remote pre-turn auto-compaction with a context override emits the context diff in the compact request while excluding the incoming user message.
@@ -9,17 +10,20 @@ Scenario: Remote pre-turn auto-compaction with a context override emits the cont
 01:message/developer:<PERMISSIONS_INSTRUCTIONS>
 02:message/developer:<skills_usage_instructions>\n## How to use skills\n- Use the sma...
 03:message/developer:<NO_TEXT>
-04:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-05:message/user:USER_ONE
-06:message/assistant:REMOTE_FIRST_REPLY
-07:message/user:USER_TWO
-08:message/assistant:REMOTE_SECOND_REPLY
+04:message/developer:<root_orchestration_instructions>When several independent tool c...
+05:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
+06:message/user:USER_ONE
+07:message/assistant:REMOTE_FIRST_REPLY
+08:message/user:USER_TWO
+09:message/assistant:REMOTE_SECOND_REPLY
 
 ## Remote Post-Compaction History Layout
 00:message/user:<task_model_guidance>Before acting, form and maintain a working ...
 01:message/developer:<PERMISSIONS_INSTRUCTIONS>
 02:message/developer:<skills_usage_instructions>\n## How to use skills\n- Use the sma...
 03:message/developer:<NO_TEXT>
-04:compaction:encrypted=true
-05:message/user:<ENVIRONMENT_CONTEXT:cwd=PRETURN_CONTEXT_DIFF_CWD>
-06:message/user:USER_THREE
+04:message/developer:<root_orchestration_instructions>When several independent tool c...
+05:compaction:encrypted=true
+06:message/developer:<root_orchestration_instructions>When several independent tool c...
+07:message/user:<ENVIRONMENT_CONTEXT:cwd=PRETURN_CONTEXT_DIFF_CWD>
+08:message/user:USER_THREE

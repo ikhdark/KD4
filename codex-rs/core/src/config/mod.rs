@@ -183,18 +183,7 @@ pub(crate) use resolved_permission_profile::PermissionProfileState;
 fn effective_reasoning_phase_efforts(
     configured: Option<ReasoningPhaseEfforts>,
 ) -> ReasoningPhaseEfforts {
-    let configured = configured.unwrap_or_default();
-    ReasoningPhaseEfforts {
-        orient: configured.orient.or(Some(ReasoningEffort::High)),
-        inspect: configured.inspect.or(Some(ReasoningEffort::Low)),
-        implement: configured.implement.or(Some(ReasoningEffort::High)),
-        diagnose: configured.diagnose.or(Some(ReasoningEffort::High)),
-        verify: configured.verify.or(Some(ReasoningEffort::Low)),
-        finalize: configured.finalize.or(Some(ReasoningEffort::Low)),
-        deterministic_continuation: configured
-            .deterministic_continuation
-            .or(Some(ReasoningEffort::Low)),
-    }
+    configured.unwrap_or_default()
 }
 
 const DEFAULT_IGNORE_LARGE_UNTRACKED_DIRS: i64 = 200;
@@ -219,12 +208,13 @@ impl Default for GhostSnapshotConfig {
     }
 }
 
-/// Maximum number of bytes of project documentation embedded into the model
-/// context.
+/// Maximum number of source bytes retained across project documentation files.
 ///
 /// Documentation exceeding this limit must not be silently truncated. The
 /// loader must surface an explicit truncation notice containing the source
 /// path, original byte count, retained byte count, and omitted byte count.
+/// Mandatory truncation notices and generated provenance labels do not consume
+/// this source-byte budget.
 ///
 /// When multiple instruction files apply, preserve the complete nearest-scope
 /// instructions before allocating remaining capacity to broader scopes.
@@ -949,7 +939,8 @@ pub struct Config {
     /// Combined provider map (defaults plus user-defined providers).
     pub model_providers: HashMap<String, ModelProviderInfo>,
 
-    /// Maximum number of bytes to include from an AGENTS.md project doc file.
+    /// Maximum combined source bytes to retain from AGENTS.md project docs.
+    /// Generated provenance and truncation notices do not consume this budget.
     pub project_doc_max_bytes: usize,
 
     /// Additional filenames to try when looking for project-level docs.
@@ -1053,7 +1044,9 @@ pub struct Config {
     pub plan_mode_reasoning_effort: Option<ReasoningEffort>,
 
     /// Per-logical-request reasoning effort overrides. Fork defaults enable
-    /// the deterministic sampling governor even when the table is absent.
+    /// the deterministic sampling governor even when the table is absent;
+    /// omitted fields remain unset so each request can inherit its resolved
+    /// turn effort.
     pub reasoning_phase_efforts: Option<ReasoningPhaseEfforts>,
 
     /// Optional value to use for `reasoning.summary` when making a request
@@ -1457,7 +1450,8 @@ impl ConfigBuilder {
                 vec![lock_layer],
                 config_layer_stack.requirements().clone(),
                 config_layer_stack.requirements_toml().clone(),
-            )?;
+            )?
+            .with_project_discovery_from(&config_layer_stack);
             let mut config = Config::load_config_with_layer_stack(
                 LOCAL_FS.as_ref(),
                 lock_config_toml,
@@ -1736,6 +1730,7 @@ impl Config {
                 .requirements_toml()
                 .clone(),
         )?
+        .with_project_discovery_from(&refreshed_config.config_layer_stack)
         .with_user_and_project_exec_policy_rules_ignored(
             refreshed_config
                 .config_layer_stack
@@ -2564,8 +2559,17 @@ fn resolve_orchestrator_feature_enabled(
     feature.and_then(|feature| feature.enabled).unwrap_or(true)
 }
 
-fn resolve_code_mode_config(config_toml: &ConfigToml) -> CodeModeConfig {
+fn resolve_code_mode_config(
+    config_toml: &ConfigToml,
+    startup_warnings: &mut Vec<String>,
+) -> CodeModeConfig {
     let base = code_mode_toml_config(config_toml.features.as_ref());
+    if base.and_then(|config| config.waiting_policy).is_some() {
+        startup_warnings.push(
+            "`features.code_mode.waiting_policy` is deprecated and ignored; remove this setting."
+                .to_string(),
+        );
+    }
 
     CodeModeConfig {
         excluded_tool_namespaces: base
@@ -3104,7 +3108,14 @@ impl Config {
             .into_iter()
             .map(|path| AbsolutePathBuf::resolve_path_against_base(path, resolved_cwd.as_path()))
             .collect();
-        let repo_root = resolve_root_git_project_for_trust(fs, &resolved_cwd).await;
+        let repo_root = if let Some(discovery) = config_layer_stack
+            .project_discovery()
+            .filter(|discovery| discovery.matches(&resolved_cwd, fs))
+        {
+            discovery.git_trust_root().cloned()
+        } else {
+            resolve_root_git_project_for_trust(fs, &resolved_cwd).await
+        };
         let active_project = cfg
             .get_active_project(
                 resolved_cwd.as_path(),
@@ -3395,7 +3406,7 @@ impl Config {
         let web_search_config = resolve_web_search_config(&cfg);
         let experimental_request_user_input_enabled =
             resolve_experimental_request_user_input_enabled(&cfg);
-        let code_mode = resolve_code_mode_config(&cfg);
+        let code_mode = resolve_code_mode_config(&cfg, &mut startup_warnings);
         let multi_agent_v2 = resolve_multi_agent_v2_config(&cfg);
         let current_time_reminder = resolve_current_time_reminder_config(&cfg, &features)?;
         let terminal_resize_reflow = resolve_terminal_resize_reflow_config(&cfg);

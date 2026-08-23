@@ -30,6 +30,7 @@ use crate::tools::tool_dispatch_trace::record_history_persistence;
 use crate::tools::tool_dispatch_trace::record_output_projection;
 use crate::tools::tool_dispatch_trace::record_post_tool_hook;
 use crate::tools::tool_dispatch_trace::record_pre_tool_hook;
+use crate::turn_timing::TurnTimingState;
 use crate::util::error_or_panic;
 use codex_extension_api::ToolCallOutcome;
 use codex_otel::TOOL_LIFECYCLE_PHASE_DURATION_METRIC;
@@ -236,6 +237,9 @@ pub(crate) struct AnyToolResult {
     pub(crate) result: Box<dyn ToolOutput>,
     pub(crate) post_tool_use_payload: Option<PostToolUsePayload>,
     pub(crate) model_projection: Option<ModelToolProjection>,
+    pub(crate) source_dependencies:
+        Option<std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>>,
+    pub(crate) code_mode_feedback: Vec<FunctionCallOutputContentItem>,
 }
 
 pub(crate) struct ModelToolProjection {
@@ -249,10 +253,12 @@ pub(crate) struct ModelToolProjection {
     canonical_tokens: u64,
     model_bytes: u64,
     artifact_created: bool,
+    artifact_reused: bool,
     projection_truncated: bool,
     omitted_sections: u64,
     deterministic_continuation_receipt: Option<TurnTimingDeterministicContinuationReceipt>,
     deterministic_continuation_content: Vec<Value>,
+    source_dependencies: std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
     applied_token_limit: usize,
 }
 
@@ -316,6 +322,14 @@ impl BoundedModelProjection {
 }
 
 impl AnyToolResult {
+    fn install_model_projection(&mut self, model_projection: Option<ModelToolProjection>) {
+        self.source_dependencies = model_projection
+            .as_ref()
+            .map(|projection| projection.source_dependencies.clone())
+            .or_else(precomputed_projection_source_dependencies);
+        self.model_projection = model_projection;
+    }
+
     pub(crate) fn response(&self) -> ResponseInputItem {
         if let Some(projection) = self.model_projection.as_ref() {
             return projection.response();
@@ -341,6 +355,16 @@ impl AnyToolResult {
 
     pub(crate) fn requires_canonical_artifact(&self) -> bool {
         self.result.requires_canonical_artifact()
+    }
+
+    pub(crate) fn projected_source_dependencies(
+        &self,
+    ) -> Option<&std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>> {
+        self.source_dependencies.as_ref()
+    }
+
+    pub(crate) fn take_code_mode_feedback(&mut self) -> Vec<FunctionCallOutputContentItem> {
+        std::mem::take(&mut self.code_mode_feedback)
     }
 
     pub(crate) fn deterministic_continuation_receipts(
@@ -1113,12 +1137,12 @@ impl ToolRegistry {
                         return Err(err);
                     }
                     if let Some(feedback_message) = outcome.feedback_message {
+                        let model_visible =
+                            FunctionToolOutput::from_text(feedback_message, /*success*/ None);
+                        result.code_mode_feedback = model_visible.body.clone();
                         result.result = Box::new(PostToolUseFeedbackOutput {
                             original: result.result,
-                            model_visible: FunctionToolOutput::from_text(
-                                feedback_message,
-                                /*success*/ None,
-                            ),
+                            model_visible,
                         });
                     }
                 }
@@ -1177,6 +1201,7 @@ impl ToolRegistry {
                             projection.model_bytes,
                             projection.projected_tokens,
                             projection.artifact_created,
+                            projection.artifact_reused,
                             projection.projection_truncated,
                             projection.omitted_sections,
                             provider_visible,
@@ -1193,7 +1218,7 @@ impl ToolRegistry {
                         record_history_persistence(phase_started.elapsed());
                     }
                 }
-                result.model_projection = model_projection;
+                result.install_model_projection(model_projection);
                 dispatch_trace.record_completed(
                     &invocation,
                     &result.call_id,
@@ -1273,6 +1298,8 @@ async fn handle_any_tool(
         result: output,
         post_tool_use_payload,
         model_projection: None,
+        source_dependencies: None,
+        code_mode_feedback: Vec::new(),
     })
 }
 
@@ -1301,6 +1328,57 @@ struct ModelProjectionInput {
     predetermined_json_pointers: Vec<ToolOutputProjectionJsonPointer>,
     original_response: ResponseInputItem,
     materialization: ProjectionMaterialization,
+}
+
+tokio::task_local! {
+    static PRECOMPUTED_PROJECTION_SOURCE_DEPENDENCIES:
+        std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>;
+}
+
+pub(crate) async fn with_precomputed_projection_source_dependencies<F>(
+    source_dependencies: Option<
+        std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
+    >,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    match source_dependencies {
+        Some(source_dependencies) => {
+            PRECOMPUTED_PROJECTION_SOURCE_DEPENDENCIES
+                .scope(source_dependencies, future)
+                .await
+        }
+        None => future.await,
+    }
+}
+
+fn precomputed_projection_source_dependencies()
+-> Option<std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>> {
+    PRECOMPUTED_PROJECTION_SOURCE_DEPENDENCIES
+        .try_with(Clone::clone)
+        .ok()
+}
+
+fn resolve_projection_source_dependencies<F>(
+    turn_timing_state: &TurnTimingState,
+    precomputed: Option<std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>>,
+    fallback: F,
+) -> std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>
+where
+    F: FnOnce() -> std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
+{
+    match precomputed {
+        Some(source_dependencies) => {
+            turn_timing_state.record_projection_source_dependencies_reuse();
+            source_dependencies
+        }
+        None => {
+            turn_timing_state.record_projection_source_dependencies_fallback();
+            fallback()
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1483,10 +1561,16 @@ fn prepare_model_projection(
             ToolOutputOutcome::Success | ToolOutputOutcome::Skipped => "tool_output",
         }
     };
-    let source_dependencies = crate::tool_history::source_dependencies_for_tool_call(
-        flat_tool_name(&invocation.tool_name).as_ref(),
-        &invocation.payload,
-        invocation.turn.config.cwd.as_path(),
+    let source_dependencies = resolve_projection_source_dependencies(
+        invocation.turn.turn_timing_state.as_ref(),
+        precomputed_projection_source_dependencies(),
+        || {
+            crate::tool_history::source_dependencies_for_tool_call(
+                flat_tool_name(&invocation.tool_name).as_ref(),
+                &invocation.payload,
+                invocation.turn.config.cwd.as_path(),
+            )
+        },
     );
     let original_output_sha256 = crate::tool_history::sha256(original_output_text.as_bytes());
     let original_output_tokens = if generic_projection.was_truncated {
@@ -2126,10 +2210,12 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
             canonical_tokens: canonical.approximate_tokens,
             model_bytes: rendered.len().saturating_add(retained_non_text_bytes) as u64,
             artifact_created: false,
+            artifact_reused: false,
             projection_truncated,
             omitted_sections: 0,
             deterministic_continuation_receipt: None,
             deterministic_continuation_content: Vec::new(),
+            source_dependencies,
             applied_token_limit: total_applied_token_limit,
         });
     }
@@ -2151,10 +2237,12 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
             canonical_tokens: canonical.approximate_tokens,
             model_bytes: original_output_text.len().saturating_add(non_text_bytes) as u64,
             artifact_created: false,
+            artifact_reused: false,
             projection_truncated: false,
             omitted_sections: 0,
             deterministic_continuation_receipt: None,
             deterministic_continuation_content: Vec::new(),
+            source_dependencies: source_dependencies.clone(),
             applied_token_limit: total_applied_token_limit,
         }
     };
@@ -2179,7 +2267,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
                 call_id: origin_call_id,
                 tool_identity: tool_name,
                 semantic_class,
-                source_dependencies,
+                source_dependencies: source_dependencies.clone(),
                 source_dependencies_current: true,
                 artifact_id,
                 artifact_bytes: canonical.exact_bytes,
@@ -2200,10 +2288,12 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
             canonical_tokens: canonical.approximate_tokens,
             model_bytes: original_output_text.len().saturating_add(non_text_bytes) as u64,
             artifact_created,
+            artifact_reused: !artifact_created,
             projection_truncated: false,
             omitted_sections: 0,
             deterministic_continuation_receipt: None,
             deterministic_continuation_content: Vec::new(),
+            source_dependencies,
             applied_token_limit: total_applied_token_limit,
         });
     }
@@ -2310,7 +2400,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
             call_id: origin_call_id,
             tool_identity: tool_name,
             semantic_class,
-            source_dependencies,
+            source_dependencies: source_dependencies.clone(),
             source_dependencies_current: true,
             artifact_id,
             artifact_bytes: canonical.exact_bytes,
@@ -2330,10 +2420,12 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         canonical_tokens: canonical.approximate_tokens,
         model_bytes,
         artifact_created,
+        artifact_reused: !artifact_created,
         projection_truncated,
         omitted_sections: omitted_section_count,
         deterministic_continuation_receipt,
         deterministic_continuation_content,
+        source_dependencies,
         applied_token_limit: total_applied_token_limit,
     })
 }
@@ -2795,8 +2887,10 @@ fn serialize_projection_with_limit(
     output: &str,
     token_limit: usize,
 ) -> Option<BoundedModelProjection> {
-    // A JSON value cannot represent zero tokens. Keep that degenerate request to
-    // the smallest valid JSON value while enforcing every positive limit exactly.
+    // Spillable text remains subject to the requested limit. Structured control
+    // state is not spillable, so the smallest typed carrier containing
+    // `essential` defines a safe floor when that carrier alone exceeds the
+    // request.
     let effective_limit = token_limit.max(1);
     let mut output_limit = effective_limit;
     loop {
@@ -2815,24 +2909,19 @@ fn serialize_projection_with_limit(
             .min(output_limit - 1);
     }
 
-    // Exceptionally large metadata (for example an inline image) can exceed the
-    // limit without any text body. Retain the artifact locator when it fits, then
-    // fall back to the smallest valid JSON projection.
-    let artifact_id = envelope.artifact_id.clone();
-    for fallback in [
-        serde_json::json!({ "artifact_id": artifact_id }),
-        serde_json::json!({}),
-        Value::Null,
-    ] {
-        let rendered = serde_json::to_string(&fallback).ok()?;
-        if approx_token_count(&rendered) <= effective_limit {
-            return Some(BoundedModelProjection::Fallback {
-                value: fallback,
-                rendered,
-            });
-        }
-    }
-    None
+    let essential = envelope
+        .result
+        .get("essential")
+        .cloned()
+        .unwrap_or(Value::Null);
+    envelope.sections.clear();
+    envelope.omitted_sections.clear();
+    envelope.result = serde_json::json!({
+        "essential": essential,
+        "selected_text": "",
+    });
+    let rendered = serialize_projection_with_exact_metrics(&mut envelope)?;
+    Some(BoundedModelProjection::Envelope { envelope, rendered })
 }
 
 fn serialize_projection_with_exact_metrics(envelope: &mut ToolProjectionV1) -> Option<String> {

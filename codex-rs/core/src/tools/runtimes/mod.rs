@@ -10,6 +10,7 @@ use crate::sandboxing::SandboxPermissions;
 use crate::shell::Shell;
 use crate::shell::ShellType;
 use crate::shell_snapshot::POSIX_SNAPSHOT_FORMAT_HEADER;
+use crate::shell_snapshot::POWERSHELL_SNAPSHOT_FORMAT_HEADER;
 use crate::tools::sandboxing::ToolError;
 #[cfg(unix)]
 use codex_install_context::InstallContext;
@@ -21,15 +22,19 @@ use codex_network_proxy::PROXY_ENV_KEYS;
 #[cfg(target_os = "macos")]
 use codex_network_proxy::PROXY_GIT_SSH_COMMAND_ENV_KEY;
 use codex_network_proxy::is_managed_mitm_ca_trust_bundle_path;
+use codex_otel::MetricsClient;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_sandboxing::SandboxCommand;
 use codex_sandboxing::SandboxType;
+use codex_shell_command::powershell::extract_powershell_command;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::path::Path;
+
+const SHELL_SNAPSHOT_REPLAY_METRIC: &str = "codex.shell_snapshot_replay";
 
 pub(crate) mod apply_patch;
 pub(crate) mod shell;
@@ -227,19 +232,18 @@ pub(crate) fn disable_powershell_profile_for_elevated_windows_sandbox(
     command
 }
 
-/// POSIX-only helper: for commands produced by `Shell::derive_exec_args`
-/// for Bash/Zsh/sh of the form `[shell_path, "-lc", "<script>"]`, and
-/// when a snapshot is configured on the session shell, rewrite the argv
-/// to a clean login shell that sources the snapshot before running the
-/// original script in that initialized shell when the executables match:
+/// For commands produced by `Shell::derive_exec_args` and a snapshot configured
+/// on the matching session shell, rewrite the argv to a clean shell that loads
+/// the snapshot before running the original script.
 ///
 ///   shell -lc "<script>"
 ///   => user_shell <clean-startup flags> -lc ". SNAPSHOT (best effort); eval <script>"
 ///
-/// This wrapper script uses POSIX constructs so it can be run by Bash/Zsh/sh.
-/// A non-matching command is left unchanged because shell-local snapshot state
-/// can only be reused safely by the matching executable. Cwd mismatch is
-/// filtered by the caller before a snapshot path reaches this helper.
+/// Bash/Zsh/sh use a POSIX wrapper. PowerShell uses `-NoProfile` and a native
+/// PowerShell wrapper. Cmd remains unsupported. A non-matching command is left
+/// unchanged because shell-local snapshot state can only be reused safely by
+/// the matching executable. Cwd mismatch is filtered by the caller before a
+/// snapshot path reaches this helper.
 ///
 /// `explicit_env_overrides` and `env` are intentionally separate inputs.
 /// `explicit_env_overrides` contains policy-driven shell env overrides that
@@ -259,36 +263,72 @@ pub(crate) fn maybe_wrap_shell_lc_with_snapshot(
     env: &HashMap<String, String>,
     runtime_path_prepends: &RuntimePathPrepends,
 ) -> Vec<String> {
-    if cfg!(windows) {
-        return command.to_vec();
-    }
+    let metrics = codex_otel::global();
+    maybe_wrap_shell_lc_with_snapshot_and_metrics(
+        command,
+        session_shell,
+        shell_snapshot,
+        explicit_env_overrides,
+        env,
+        runtime_path_prepends,
+        metrics.as_ref(),
+    )
+}
 
+fn maybe_wrap_shell_lc_with_snapshot_and_metrics(
+    command: &[String],
+    session_shell: &Shell,
+    shell_snapshot: Option<&AbsolutePathBuf>,
+    explicit_env_overrides: &HashMap<String, String>,
+    env: &HashMap<String, String>,
+    runtime_path_prepends: &RuntimePathPrepends,
+    metrics: Option<&MetricsClient>,
+) -> Vec<String> {
+    let record_powershell_skip = |reason| {
+        if matches!(session_shell.shell_type, ShellType::PowerShell) {
+            record_shell_snapshot_replay(metrics, "skipped", reason);
+        }
+    };
     let Some(snapshot) = shell_snapshot else {
+        record_powershell_skip("snapshot_unavailable");
         return command.to_vec();
     };
 
     if !snapshot.exists() {
+        record_powershell_skip("snapshot_missing");
         return command.to_vec();
     }
 
-    if command.len() < 3 {
+    let Ok(snapshot_contents) = std::fs::read_to_string(snapshot) else {
+        record_powershell_skip("snapshot_unreadable");
+        return command.to_vec();
+    };
+
+    match session_shell.shell_type {
+        ShellType::PowerShell => {
+            return maybe_wrap_powershell_with_snapshot(
+                command,
+                session_shell,
+                snapshot,
+                &snapshot_contents,
+                explicit_env_overrides,
+                env,
+                metrics,
+            );
+        }
+        ShellType::Cmd => return command.to_vec(),
+        ShellType::Bash | ShellType::Zsh | ShellType::Sh => {}
+    }
+
+    if command.len() < 3 || command[1] != "-lc" {
         return command.to_vec();
     }
 
-    let flag = command[1].as_str();
-    if flag != "-lc" {
-        return command.to_vec();
-    }
-
-    let snapshot_path = snapshot.to_string_lossy();
     let shell_path = session_shell.shell_path.to_string_lossy();
     let reuse_initialized_shell = command[0].as_str() == shell_path.as_ref();
     if !reuse_initialized_shell {
         return command.to_vec();
     }
-    let Ok(snapshot_contents) = std::fs::read_to_string(snapshot) else {
-        return command.to_vec();
-    };
     let has_functions_section = snapshot_contents
         .lines()
         .any(|line| line.starts_with("# Functions"));
@@ -303,6 +343,7 @@ pub(crate) fn maybe_wrap_shell_lc_with_snapshot(
     }
     let original_shell = shell_single_quote(&command[0]);
     let original_script = shell_single_quote(&command[2]);
+    let snapshot_path = snapshot.to_string_lossy();
     let snapshot_path = shell_single_quote(snapshot_path.as_ref());
     let trailing_args = command[3..]
         .iter()
@@ -402,10 +443,142 @@ pub(crate) fn maybe_wrap_shell_lc_with_snapshot(
             rewritten_script,
         ],
         ShellType::Sh => vec![shell_path.to_string(), "-lc".to_string(), rewritten_script],
-        ShellType::PowerShell | ShellType::Cmd => return command.to_vec(),
+        ShellType::PowerShell | ShellType::Cmd => {
+            unreachable!("non-POSIX shells return before POSIX snapshot wrapping")
+        }
     };
     rewritten.extend(command[3..].iter().cloned());
     rewritten
+}
+
+fn maybe_wrap_powershell_with_snapshot(
+    command: &[String],
+    session_shell: &Shell,
+    snapshot: &AbsolutePathBuf,
+    snapshot_contents: &str,
+    explicit_env_overrides: &HashMap<String, String>,
+    env: &HashMap<String, String>,
+    metrics: Option<&MetricsClient>,
+) -> Vec<String> {
+    if !snapshot_contents
+        .lines()
+        .any(|line| line == POWERSHELL_SNAPSHOT_FORMAT_HEADER)
+    {
+        record_shell_snapshot_replay(metrics, "skipped", "unsupported_format");
+        return command.to_vec();
+    }
+
+    let Some((command_shell, original_script)) = extract_powershell_command(command) else {
+        record_shell_snapshot_replay(metrics, "skipped", "unsupported_command");
+        return command.to_vec();
+    };
+    let session_shell_path = session_shell.shell_path.to_string_lossy();
+    if !command_shell.eq_ignore_ascii_case(&session_shell_path) {
+        record_shell_snapshot_replay(metrics, "skipped", "shell_mismatch");
+        return command.to_vec();
+    }
+
+    let mut override_keys = explicit_env_overrides
+        .keys()
+        .map(String::as_str)
+        .filter(|key| is_valid_powershell_env_name(key))
+        .collect::<Vec<_>>();
+    for key in [CODEX_THREAD_ID_ENV_VAR, CODEX_PERMISSION_PROFILE_ENV_VAR] {
+        if key == CODEX_PERMISSION_PROFILE_ENV_VAR || powershell_env_value(env, key).is_some() {
+            override_keys.push(key);
+        }
+    }
+    override_keys.sort_unstable_by_key(|key| key.to_ascii_lowercase());
+    override_keys.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    let override_restores = build_powershell_env_restores(&override_keys, env);
+
+    let mut proxy_keys = PROXY_ENV_KEYS
+        .iter()
+        .copied()
+        .chain(CUSTOM_CA_ENV_KEYS)
+        .filter(|key| is_valid_powershell_env_name(key))
+        .collect::<Vec<_>>();
+    proxy_keys.sort_unstable_by_key(|key| key.to_ascii_lowercase());
+    proxy_keys.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    let proxy_restores = build_powershell_env_restores(&proxy_keys, env);
+    let live_proxy_active = powershell_env_value(env, PROXY_ACTIVE_ENV_KEY).is_some();
+    let proxy_restore = format!(
+        "if ({} -or (Microsoft.PowerShell.Management\\Test-Path -LiteralPath 'Env:{}')) {{\n{}\n}}",
+        if live_proxy_active { "$true" } else { "$false" },
+        powershell_single_quote(PROXY_ACTIVE_ENV_KEY),
+        proxy_restores
+    );
+
+    let snapshot_path = powershell_single_quote(&snapshot.to_string_lossy());
+    let rewritten_script = format!(
+        "try {{ . '{snapshot_path}' *> $null }} catch {{}}\n{override_restores}\n{proxy_restore}\n& {{\n{original_script}\n}}"
+    );
+
+    let rewritten = vec![
+        session_shell_path.into_owned(),
+        "-NoProfile".to_string(),
+        "-Command".to_string(),
+        rewritten_script,
+    ];
+    record_shell_snapshot_replay(metrics, "applied", "matched");
+    rewritten
+}
+
+fn record_shell_snapshot_replay(
+    metrics: Option<&MetricsClient>,
+    result: &'static str,
+    reason: &'static str,
+) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    if let Err(err) = metrics.counter(
+        SHELL_SNAPSHOT_REPLAY_METRIC,
+        /*inc*/ 1,
+        &[
+            ("shell", "powershell"),
+            ("result", result),
+            ("reason", reason),
+        ],
+    ) {
+        tracing::warn!("shell snapshot replay metric failed: {err}");
+    }
+}
+
+fn build_powershell_env_restores(keys: &[&str], env: &HashMap<String, String>) -> String {
+    keys.iter()
+        .map(|key| {
+            let path = powershell_single_quote(&format!("Env:{key}"));
+            match powershell_env_value(env, key) {
+                Some(value) => {
+                    let value = powershell_single_quote(value);
+                    format!(
+                        "Microsoft.PowerShell.Management\\Set-Item -LiteralPath '{path}' -Value '{value}'"
+                    )
+                }
+                None => format!(
+                    "Microsoft.PowerShell.Management\\Remove-Item -LiteralPath '{path}' -Force -ErrorAction SilentlyContinue"
+                ),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn powershell_env_value<'a>(env: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
+    env.iter().find_map(|(candidate, value)| {
+        candidate
+            .eq_ignore_ascii_case(key)
+            .then_some(value.as_str())
+    })
+}
+
+fn is_valid_powershell_env_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains(['\0', '='])
+}
+
+fn powershell_single_quote(input: &str) -> String {
+    input.replace('\'', "''")
 }
 
 fn build_override_exports(
@@ -651,6 +824,167 @@ mod disable_powershell_profile_tests {
         );
 
         assert_eq!(rewritten, command);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod powershell_snapshot_tests {
+    use super::*;
+    use codex_otel::MetricsConfig;
+    use opentelemetry_sdk::metrics::InMemoryMetricExporter;
+    use opentelemetry_sdk::metrics::data::AggregatedMetrics;
+    use opentelemetry_sdk::metrics::data::MetricData;
+    use pretty_assertions::assert_eq;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn powershell_snapshot_replays_state_and_restores_live_overrides() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let snapshot_path = AbsolutePathBuf::from_absolute_path(dir.path().join("snapshot.ps1"))
+            .expect("absolute snapshot path");
+        std::fs::write(
+            &snapshot_path,
+            format!(
+                "# Snapshot file\n{POWERSHELL_SNAPSHOT_FORMAT_HEADER}\n\
+                 function Invoke-CodexSnapshotFunction {{ 'from-snapshot' }}\n\
+                 Microsoft.PowerShell.Management\\Set-Item -LiteralPath 'Env:CODEX_TEST_OVERRIDE' -Value 'stale'\n\
+                 Microsoft.PowerShell.Management\\Set-Item -LiteralPath 'Env:{CODEX_PERMISSION_PROFILE_ENV_VAR}' -Value 'stale-profile'\n"
+            ),
+        )
+        .expect("write PowerShell snapshot");
+        let shell = crate::shell::get_shell(ShellType::PowerShell, /*path*/ None)
+            .expect("PowerShell is required on Windows");
+        let original = shell.derive_exec_args(
+            &format!(
+                "Microsoft.PowerShell.Utility\\Write-Output ((Invoke-CodexSnapshotFunction) + '|' + $env:CODEX_TEST_OVERRIDE + '|' + (Microsoft.PowerShell.Management\\Test-Path -LiteralPath 'Env:{CODEX_PERMISSION_PROFILE_ENV_VAR}'))"
+            ),
+            /*use_login_shell*/ true,
+        );
+        let explicit_overrides =
+            HashMap::from([("CODEX_TEST_OVERRIDE".to_string(), "current".to_string())]);
+        let mut env = std::env::vars().collect::<HashMap<_, _>>();
+        env.insert("CODEX_TEST_OVERRIDE".to_string(), "current".to_string());
+        env.retain(|key, _| !key.eq_ignore_ascii_case(CODEX_PERMISSION_PROFILE_ENV_VAR));
+
+        let rewritten = maybe_wrap_shell_lc_with_snapshot(
+            &original,
+            &shell,
+            Some(&snapshot_path),
+            &explicit_overrides,
+            &env,
+            &RuntimePathPrepends::default(),
+        );
+
+        assert_eq!(rewritten.get(1).map(String::as_str), Some("-NoProfile"));
+        let output = std::process::Command::new(&rewritten[0])
+            .args(&rewritten[1..])
+            .env_clear()
+            .envs(&env)
+            .current_dir(dir.path())
+            .output()
+            .expect("run wrapped PowerShell command");
+        assert!(output.status.success(), "command failed: {output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "from-snapshot|current|False"
+        );
+    }
+
+    #[test]
+    fn activation_metric_distinguishes_powershell_snapshot_replay_applied_and_skipped() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let snapshot_path = AbsolutePathBuf::from_absolute_path(dir.path().join("snapshot.ps1"))
+            .expect("absolute snapshot path");
+        std::fs::write(
+            &snapshot_path,
+            format!("# Snapshot file\n{POWERSHELL_SNAPSHOT_FORMAT_HEADER}\n"),
+        )
+        .expect("write PowerShell snapshot");
+        let shell = crate::shell::get_shell(ShellType::PowerShell, /*path*/ None)
+            .expect("PowerShell is required on Windows");
+        let command = shell.derive_exec_args("Write-Output ok", /*use_login_shell*/ true);
+        let env = std::env::vars().collect::<HashMap<_, _>>();
+        let metrics = MetricsClient::new(
+            MetricsConfig::in_memory(
+                "test",
+                "codex-core",
+                env!("CARGO_PKG_VERSION"),
+                InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("in-memory metrics client");
+
+        let applied = maybe_wrap_shell_lc_with_snapshot_and_metrics(
+            &command,
+            &shell,
+            Some(&snapshot_path),
+            &HashMap::new(),
+            &env,
+            &RuntimePathPrepends::default(),
+            Some(&metrics),
+        );
+        assert_ne!(applied, command);
+        let skipped = maybe_wrap_shell_lc_with_snapshot_and_metrics(
+            &command,
+            &shell,
+            None,
+            &HashMap::new(),
+            &env,
+            &RuntimePathPrepends::default(),
+            Some(&metrics),
+        );
+        assert_eq!(skipped, command);
+
+        let snapshot = metrics.snapshot().expect("metrics snapshot");
+        let metric = snapshot
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+            .find(|metric| metric.name() == SHELL_SNAPSHOT_REPLAY_METRIC)
+            .expect("shell snapshot replay metric");
+        let points = match metric.data() {
+            AggregatedMetrics::U64(data) => match data {
+                MetricData::Sum(sum) => sum
+                    .data_points()
+                    .map(|point| {
+                        let tags = point
+                            .attributes()
+                            .map(|attribute| {
+                                (
+                                    attribute.key.as_str().to_string(),
+                                    attribute.value.as_str().to_string(),
+                                )
+                            })
+                            .collect::<std::collections::BTreeMap<_, _>>();
+                        (
+                            tags.get("shell").cloned().unwrap_or_default(),
+                            tags.get("result").cloned().unwrap_or_default(),
+                            tags.get("reason").cloned().unwrap_or_default(),
+                            point.value(),
+                        )
+                    })
+                    .collect::<BTreeSet<_>>(),
+                _ => panic!("unexpected shell snapshot metric aggregation"),
+            },
+            _ => panic!("unexpected shell snapshot metric type"),
+        };
+        assert_eq!(
+            points,
+            BTreeSet::from([
+                (
+                    "powershell".to_string(),
+                    "applied".to_string(),
+                    "matched".to_string(),
+                    1,
+                ),
+                (
+                    "powershell".to_string(),
+                    "skipped".to_string(),
+                    "snapshot_unavailable".to_string(),
+                    1,
+                ),
+            ])
+        );
     }
 }
 

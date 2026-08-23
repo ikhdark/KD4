@@ -33,30 +33,9 @@ pub struct WaitRequest {
     pub yield_time_ms: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct WaitToPendingRequest {
-    pub cell_id: CellId,
-}
-
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
 pub enum WaitOutcome {
     LiveCell(RuntimeResponse),
-    MissingCell(RuntimeResponse),
-}
-
-#[derive(Debug, Deserialize, PartialEq, Serialize)]
-pub enum ExecuteToPendingOutcome {
-    Pending {
-        cell_id: CellId,
-        content_items: Vec<FunctionCallOutputContentItem>,
-        pending_tool_call_ids: Vec<String>,
-    },
-    Completed(RuntimeResponse),
-}
-
-#[derive(Debug, Deserialize, PartialEq, Serialize)]
-pub enum WaitToPendingOutcome {
-    LiveCell(ExecuteToPendingOutcome),
     MissingCell(RuntimeResponse),
 }
 

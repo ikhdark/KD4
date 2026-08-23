@@ -493,7 +493,7 @@ impl ToolOutput for ApplyPatchToolOutput {
     }
 
     fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
-        JsonValue::Object(serde_json::Map::new())
+        JsonValue::String(self.text.clone())
     }
 }
 
@@ -639,7 +639,34 @@ impl ToolOutput for ExecCommandToolOutput {
             .as_ref()
             .and_then(RawOutputArtifact::retention_limit_reason);
         let outcome = self.outcome_for_logging();
-        let response_text = self.response_text();
+        let mut fragments = vec![
+            ToolOutputProjectionFragment::new(
+                ToolOutputProjectionFragmentKind::ProcessFinalStatus,
+                format!(
+                    "process final status: exit_code={:?}, session_id={:?}, wall_time_seconds={:.4}",
+                    self.exit_code,
+                    self.process_id,
+                    self.wall_time.as_secs_f64(),
+                ),
+            )
+            .with_id("process_status"),
+        ];
+        if let Some(repair_notice) = &self.repair_notice {
+            fragments.push(
+                ToolOutputProjectionFragment::new(
+                    ToolOutputProjectionFragmentKind::ErrorOrDiagnostic,
+                    repair_notice.clone(),
+                )
+                .with_id("repair_notice"),
+            );
+        }
+        fragments.push(
+            ToolOutputProjectionFragment::new(
+                ToolOutputProjectionFragmentKind::ContextualSpillableText,
+                raw_output.clone(),
+            )
+            .with_id("output"),
+        );
         Some(ToolOutputProjectionMetadata {
             outcome,
             diagnostic_class: match classify_diagnostic(self.hook_command.as_deref(), &raw_output) {
@@ -650,28 +677,19 @@ impl ToolOutput for ExecCommandToolOutput {
                     ToolOutputDiagnosticClass::HighSignal
                 }
             },
-            fragments: vec![
-                ToolOutputProjectionFragment::new(
-                    ToolOutputProjectionFragmentKind::ProcessFinalStatus,
-                    format!(
-                        "process final status: exit_code={:?}, session_id={:?}",
-                        self.exit_code, self.process_id
-                    ),
-                ),
-                ToolOutputProjectionFragment::new(
-                    ToolOutputProjectionFragmentKind::ContextualSpillableText,
-                    response_text.clone(),
-                ),
-            ],
-            // Unified exec has already sent the exact raw bytes through the
-            // existing artifact path. Project its current model text here so
-            // the common boundary does not create a duplicate raw artifact.
-            spillable_text: vec![response_text],
+            fragments,
+            // Give the shared projection boundary the authoritative output so
+            // it applies the model budget exactly once. The process status is
+            // already preserved below as essential inline metadata, and the
+            // existing artifact ID lets the boundary reuse the raw artifact.
+            spillable_text: vec![raw_output.clone()],
             essential_inline: serde_json::json!({
                 "chunk_id": &self.chunk_id,
                 "exit_code": self.exit_code,
                 "session_id": self.process_id,
+                "wall_time_seconds": self.wall_time.as_secs_f64(),
                 "original_token_count": self.original_token_count,
+                "repair_notice": &self.repair_notice,
                 "raw_output_artifact_id": raw_output_artifact_id,
                 "raw_output_artifact_bytes": raw_output_artifact_bytes,
                 "raw_output_artifact_error": raw_output_artifact_error,
@@ -1146,7 +1164,7 @@ impl ExecCommandToolOutput {
         output
     }
 
-    fn response_text(&self) -> String {
+    pub(crate) fn response_text(&self) -> String {
         let raw_output = String::from_utf8_lossy(&self.raw_output);
         let max_tokens = self.model_output_limits(raw_output.as_ref()).applied_limit;
         let mut sections = Vec::new();

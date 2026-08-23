@@ -548,6 +548,31 @@ impl TestCodexBuilder {
         .await
     }
 
+    pub async fn resume_with_websocket_server(
+        &mut self,
+        server: &WebSocketTestServer,
+        home: Arc<TempDir>,
+        rollout_path: PathBuf,
+    ) -> anyhow::Result<TestCodex> {
+        let base_url = format!("{}/v1", server.uri());
+        let base_url_clone = base_url.clone();
+        self.config_mutators.push(Box::new(move |config| {
+            config.model_provider.base_url = Some(base_url_clone);
+            config.model_provider.supports_websockets = true;
+            config.experimental_realtime_ws_model = Some("realtime-test-model".to_string());
+            config.realtime.version = RealtimeWsVersion::V1;
+        }));
+        let test_env = TestEnv::local().await?;
+        Box::pin(self.build_with_home_and_base_url(
+            base_url,
+            home,
+            Some(rollout_path),
+            test_env,
+            /*include_local_environment*/ false,
+        ))
+        .await
+    }
+
     async fn build_with_home_and_base_url(
         &mut self,
         base_url: String,

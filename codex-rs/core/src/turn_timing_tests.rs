@@ -29,6 +29,7 @@ use pretty_assertions::assert_eq;
 use super::ClockSample;
 use super::ContinuationCause;
 use super::InteractiveWaitKind;
+use super::RESERVED_TOOL_OUTPUT_RECURSIVE_SPILL_COUNT;
 use super::TimeSample;
 use super::TurnClock;
 use super::TurnLocalPhase;
@@ -781,7 +782,7 @@ fn decision_latency_records_dispatch_actionable_output_and_completion() {
     });
 
     let timing = state.complete_snapshot().protocol_timing();
-    assert_eq!(timing.schema_version, 23);
+    assert_eq!(timing.schema_version, 24);
     assert_eq!(timing.model_requests.len(), 2);
     assert_eq!(timing.model_requests[0].dispatch_ms, Some(20));
     assert_eq!(timing.model_requests[0].first_model_output_ms, Some(25));
@@ -1558,7 +1559,7 @@ fn exclusive_ledger_partitions_every_nanosecond_and_subtracts_only_interactive_o
     clock.set_ms(140);
 
     let profile = state.complete_snapshot().profile;
-    assert_eq!(profile.schema_version, 23);
+    assert_eq!(profile.schema_version, 24);
     assert!(profile.profile_valid);
     assert!(profile.classification_complete);
     assert_eq!(profile.inclusive_duration_ns, 140 * NS_PER_MS);
@@ -1626,6 +1627,33 @@ fn completion_snapshot_is_immutable() {
 }
 
 #[test]
+fn duplicate_start_is_rejected_without_resetting_elapsed_time() {
+    let (clock, state) = timing();
+    let first_started_at = state.mark_turn_started();
+    clock.set_ms(5);
+    let duplicate_started_at = state.mark_turn_started();
+    clock.set_ms(10);
+
+    let snapshot = state.complete_snapshot();
+    assert_eq!(duplicate_started_at, first_started_at);
+    assert_eq!(snapshot.duration_ms, Some(10));
+    assert_eq!(snapshot.profile.counters.invalid_transition_count, 1);
+}
+
+#[test]
+fn start_after_completion_is_rejected_without_changing_frozen_snapshot() {
+    let (clock, state) = timing();
+    let started_at = state.mark_turn_started();
+    clock.set_ms(10);
+    let completed = state.complete_snapshot();
+    clock.set_ms(20);
+
+    assert_eq!(state.mark_turn_started(), started_at);
+    assert_eq!(state.complete_snapshot().profile, completed.profile);
+    assert_eq!(state.state().counters.invalid_transition_count, 1);
+}
+
+#[test]
 fn wait_and_tool_output_counters_are_additive() {
     let (_clock, state) = timing();
 
@@ -1641,8 +1669,8 @@ fn wait_and_tool_output_counters_are_additive() {
     state.record_completion_review_terminal_phase();
     state.record_no_progress_directive();
     state.record_proven_loop_activation();
-    state.record_tool_output_projection_facts(1_000, 250, 400, 100, true, true, 3, true);
-    state.record_tool_output_projection_facts(500, 125, 200, 50, false, false, 1, true);
+    state.record_tool_output_projection_facts(1_000, 250, 400, 100, true, false, true, 3, true);
+    state.record_tool_output_projection_facts(500, 125, 200, 50, false, true, false, 1, true);
     state.record_tool_output_artifact_reread();
     state.record_tool_output_recovery(2);
     state.record_truncation_induced_continuation();
@@ -1672,6 +1700,7 @@ fn wait_and_tool_output_counters_are_additive() {
     assert_eq!(counters.tool_output_model_byte_count, 600);
     assert_eq!(counters.tool_output_model_token_count, 150);
     assert_eq!(counters.tool_output_artifact_creation_count, 1);
+    assert_eq!(counters.tool_output_artifact_reuse_count, 1);
     assert_eq!(counters.tool_output_projection_truncation_count, 1);
     assert_eq!(counters.tool_output_omitted_section_count, 4);
     assert_eq!(counters.tool_output_recovery_call_count, 1);
@@ -1681,11 +1710,41 @@ fn wait_and_tool_output_counters_are_additive() {
 }
 
 #[test]
+fn optimization_activation_decision_counters_are_additive() {
+    let (_clock, state) = timing();
+
+    state.record_tool_router_reuse();
+    state.record_tool_router_rebuild();
+    state.record_projection_source_dependencies_reuse();
+    state.record_projection_source_dependencies_fallback();
+
+    let counters = state.complete_snapshot().protocol_timing().counters;
+    assert_eq!(counters.tool_router_reuse_count, 1);
+    assert_eq!(counters.tool_router_rebuild_count, 1);
+    assert_eq!(counters.projection_source_dependencies_reuse_count, 1);
+    assert_eq!(counters.projection_source_dependencies_fallback_count, 1);
+}
+
+#[test]
+fn reserved_recursive_spill_counter_remains_zero_in_protocol() {
+    let (_clock, state) = timing();
+
+    state.record_tool_output_recovery(2);
+
+    let counters = state.complete_snapshot().protocol_timing().counters;
+    assert_eq!(
+        counters.tool_output_recursive_spill_count,
+        RESERVED_TOOL_OUTPUT_RECURSIVE_SPILL_COUNT
+    );
+    assert_eq!(counters.tool_output_recursive_spill_count, 0);
+}
+
+#[test]
 fn projected_output_counts_only_the_next_tool_result_generation_as_recovery() {
     let (_clock, state) = timing();
 
     let record_projection = |tokens| {
-        state.record_tool_output_projection_facts(0, 0, 0, tokens, false, true, 0, true);
+        state.record_tool_output_projection_facts(0, 0, 0, tokens, false, false, true, 0, true);
     };
     record_projection(40);
     record_projection(20);

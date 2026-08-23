@@ -94,6 +94,26 @@ async fn ledger_fixture() -> (tempfile::TempDir, PathBuf, TaskEvidenceLedger) {
     (temp, repo, ledger)
 }
 
+async fn ledger_fixture_with_source_owners(
+    source_owners: &str,
+) -> (tempfile::TempDir, PathBuf, TaskEvidenceLedger) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    let codex_home = temp.path().join("home");
+    tokio::fs::create_dir_all(repo.join(".git"))
+        .await
+        .expect("git dir");
+    tokio::fs::write(repo.join("kd4_features.toml"), "# fixture")
+        .await
+        .expect("manifest");
+    tokio::fs::write(repo.join("source_owners.toml"), source_owners)
+        .await
+        .expect("source owners");
+    let cwd = AbsolutePathBuf::from_absolute_path(&repo).expect("absolute repo");
+    let ledger = TaskEvidenceLedger::load_or_new(codex_home, ThreadId::new(), cwd.as_path()).await;
+    (temp, repo, ledger)
+}
+
 fn text_input(text: &str) -> UserInput {
     UserInput::Text {
         text: text.to_string(),
@@ -247,7 +267,18 @@ async fn classified_requirement_fixture() -> (
 ) {
     let (temp, repo, ledger) = ledger_fixture().await;
     ledger
-        .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Passed)]))
+        .record_planning_update(PlanningUpdateInput {
+            plan: vec![proof_free_plan_item("step", StepStatus::Passed)],
+            step_evidence: vec![PlanStepEvidenceInput {
+                step_id: "step".to_string(),
+                validation_disposition: Some(ValidationDisposition::NotRequired),
+                source_owner: None,
+                implementation_surfaces: Vec::new(),
+                mutation_obligations: Vec::new(),
+                external_validation_route: None,
+            }],
+            ..PlanningUpdateInput::default()
+        })
         .await;
     assert!(
         ledger
@@ -1323,6 +1354,12 @@ fn plan_item(id: &str, status: StepStatus) -> PlanItemArg {
     }
 }
 
+fn proof_free_plan_item(id: &str, status: StepStatus) -> PlanItemArg {
+    let mut item = plan_item(id, status);
+    item.runtime_paths.clear();
+    item
+}
+
 fn plan_with(items: Vec<PlanItemArg>) -> UpdatePlanArgs {
     UpdatePlanArgs {
         explanation: None,
@@ -1469,7 +1506,74 @@ async fn read_only_command_alone_does_not_create_compaction_recovery_state() {
         )
         .await;
 
-    assert!(ledger.compaction_task_state().await.is_none());
+    let state = ledger.compaction_task_state().await;
+    assert!(state.is_none(), "unexpected compaction state: {state:#?}");
+}
+
+#[tokio::test]
+async fn compaction_task_state_retains_source_context_for_unresolved_work() {
+    let manifest = r#"
+schema_version = 2
+
+[[owners]]
+id = "core-agent-runtime"
+roots = ["codex-rs/core/src/task_evidence.rs"]
+
+[[owners]]
+id = "planning-architecture-runtime"
+roots = ["codex-rs/core/src/task_evidence_tests.rs"]
+"#;
+    let (_temp, _repo, ledger) = ledger_fixture_with_source_owners(manifest).await;
+    let mut item = plan_item("implement", StepStatus::InProgress);
+    item.runtime_paths = vec!["codex-rs/core/src/task_evidence.rs".to_string()];
+    ledger
+        .record_planning_update(PlanningUpdateInput {
+            tier: Some(PlanningTier::Medium),
+            step_evidence: vec![PlanStepEvidenceInput {
+                step_id: "implement".to_string(),
+                source_owner: Some("core-agent-runtime".to_string()),
+                implementation_surfaces: vec!["codex-rs/core/src/task_evidence.rs".to_string()],
+                mutation_obligations: Vec::new(),
+                validation_disposition: None,
+                external_validation_route: None,
+            }],
+            plan: vec![item],
+            ..PlanningUpdateInput::default()
+        })
+        .await;
+
+    let compacted_plan = ledger
+        .compaction_task_state()
+        .await
+        .expect("compaction task state for unresolved plan");
+    assert!(
+        compacted_plan.contains("- implement source owner: core-agent-runtime"),
+        "unexpected compaction state: {compacted_plan}"
+    );
+    assert!(
+        compacted_plan
+            .contains("- implement implementation surfaces: codex-rs/core/src/task_evidence.rs")
+    );
+
+    let (_temp, _repo, focused_ledger) = ledger_fixture_with_source_owners(manifest).await;
+    focused_ledger
+        .record_planning_update(PlanningUpdateInput {
+            tier: Some(PlanningTier::Focused),
+            source_owner: Some("planning-architecture-runtime".to_string()),
+            implementation_surfaces: vec!["codex-rs/core/src/task_evidence_tests.rs".to_string()],
+            ..PlanningUpdateInput::default()
+        })
+        .await;
+
+    let compacted_work_unit = focused_ledger
+        .compaction_task_state()
+        .await
+        .expect("compaction task state for unresolved focused work unit");
+    assert!(compacted_work_unit.contains("source owner: planning-architecture-runtime"));
+    assert!(
+        compacted_work_unit
+            .contains("implementation surfaces: codex-rs/core/src/task_evidence_tests.rs")
+    );
 }
 
 #[tokio::test]
@@ -1944,6 +2048,11 @@ async fn multi_leaf_validation_passes_only_after_every_leaf_has_current_proof() 
         let guard = ledger.document.lock().await;
         guard.as_ref().expect("document").plan[0].revision
     };
+    let initial_candidate = ledger
+        .auto_validation_candidate()
+        .await
+        .expect("initial validation candidate");
+    assert_eq!(initial_candidate.leaf_implementation_identities.len(), 2);
     let cwd = AbsolutePathBuf::from_absolute_path(&repo).expect("repo");
     let cwd_uri = PathUri::from_abs_path(&cwd);
     let repository = repo.to_string_lossy().into_owned();
@@ -1992,8 +2101,11 @@ async fn multi_leaf_validation_passes_only_after_every_leaf_has_current_proof() 
             false,
             None,
             None,
-            Some("identity-first"),
-            Some(validation_result(0, "identity-first")),
+            Some(&initial_candidate.leaf_implementation_identities[0]),
+            Some(validation_result(
+                0,
+                &initial_candidate.leaf_implementation_identities[0],
+            )),
             Some(("step", step_revision)),
         )
         .await;
@@ -2014,8 +2126,11 @@ async fn multi_leaf_validation_passes_only_after_every_leaf_has_current_proof() 
             false,
             None,
             None,
-            Some("identity-second"),
-            Some(validation_result(1, "identity-second")),
+            Some(&initial_candidate.leaf_implementation_identities[1]),
+            Some(validation_result(
+                1,
+                &initial_candidate.leaf_implementation_identities[1],
+            )),
             Some(("step", step_revision)),
         )
         .await;
@@ -2055,6 +2170,9 @@ async fn multi_leaf_validation_passes_only_after_every_leaf_has_current_proof() 
         );
     }
 
+    tokio::fs::write(repo.join("src/first.rs"), "changed")
+        .await
+        .expect("first implementation mutation");
     ledger
         .record_command_bound_with_validation_result(
             &["touch".to_string(), "src/first.rs".to_string()],
@@ -2070,16 +2188,63 @@ async fn multi_leaf_validation_passes_only_after_every_leaf_has_current_proof() 
             None,
         )
         .await;
+    {
+        let guard = ledger.document.lock().await;
+        let document = guard.as_ref().expect("document");
+        assert_eq!(document.plan[0].status, StepStatus::Implemented);
+        assert!(
+            document
+                .command_receipts
+                .iter()
+                .filter(|receipt| receipt.step_id.as_deref() == Some("step"))
+                .all(|receipt| !command_receipt_has_current_proof_identity(document, receipt)),
+            "the mutation invalidates the old batch acknowledgement"
+        );
+    }
+
+    ledger
+        .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::InProgress)]))
+        .await;
+    ledger
+        .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Implemented)]))
+        .await;
+    let candidate = ledger
+        .auto_validation_candidate()
+        .await
+        .expect("changed leaf should remain a validation candidate");
+    assert_eq!(candidate.route.leaves, vec![route.leaves[0].clone()]);
+    assert_eq!(candidate.leaf_implementation_identities.len(), 1);
+
+    ledger
+        .record_command_bound_with_validation_result(
+            &route.leaves[0].argv,
+            &cwd_uri,
+            0,
+            false,
+            1,
+            false,
+            None,
+            None,
+            Some(&candidate.leaf_implementation_identities[0]),
+            Some(validation_result(
+                0,
+                &candidate.leaf_implementation_identities[0],
+            )),
+            Some(("step", candidate.step_revision)),
+        )
+        .await;
     let guard = ledger.document.lock().await;
     let document = guard.as_ref().expect("document");
-    assert_eq!(document.plan[0].status, StepStatus::Implemented);
+    assert_eq!(document.plan[0].status, StepStatus::Passed);
     assert!(
         document
             .command_receipts
             .iter()
             .filter(|receipt| receipt.step_id.as_deref() == Some("step"))
-            .all(|receipt| !command_receipt_has_current_proof_identity(document, receipt)),
-        "an overlapping edit must invalidate the step's retained receipts"
+            .filter(|receipt| command_receipt_has_current_proof_identity(document, receipt))
+            .count()
+            >= 2,
+        "the changed and unchanged leaves must jointly close the step"
     );
 }
 
@@ -2355,8 +2520,8 @@ async fn missing_dependency_blocks_completion() {
 async fn passed_or_skipped_dependency_allows_completion() {
     for dependency_status in [StepStatus::Passed, StepStatus::Skipped] {
         let (_temp, _repo, ledger) = ledger_fixture().await;
-        let parent = plan_item("parent", dependency_status);
-        let mut child = plan_item("child", StepStatus::Passed);
+        let parent = proof_free_plan_item("parent", dependency_status);
+        let mut child = proof_free_plan_item("child", StepStatus::Passed);
         child.depends_on = vec!["parent".to_string()];
         ledger
             .record_plan_update(&plan_with(vec![parent, child]))
@@ -2394,9 +2559,9 @@ async fn cyclic_dependency_blocks_completion_even_when_steps_are_passed() {
 async fn dependencies_declared_by_skipped_steps_do_not_form_cycles() {
     for first_status in [StepStatus::Skipped, StepStatus::Passed] {
         let (_temp, _repo, ledger) = ledger_fixture().await;
-        let mut first = plan_item("first", first_status);
+        let mut first = proof_free_plan_item("first", first_status);
         first.depends_on = vec!["second".to_string()];
-        let mut second = plan_item("second", StepStatus::Skipped);
+        let mut second = proof_free_plan_item("second", StepStatus::Skipped);
         second.depends_on = vec!["first".to_string()];
         ledger
             .record_plan_update(&plan_with(vec![first, second]))
@@ -2564,11 +2729,287 @@ async fn migration_drops_unattributed_legacy_file_hashes() {
 }
 
 #[tokio::test]
+async fn completed_plan_step_requires_validation_proof() {
+    let (_temp, _repo, proof_free_ledger) = ledger_fixture().await;
+    let mut proof_free = plan_item("non-code", StepStatus::Completed);
+    proof_free.runtime_paths.clear();
+    let proof_free_update = proof_free_ledger
+        .record_planning_update(PlanningUpdateInput {
+            plan: vec![proof_free],
+            ..PlanningUpdateInput::default()
+        })
+        .await;
+    assert_eq!(
+        proof_free_update.public_update.plan[0].status,
+        StepStatus::Passed
+    );
+    {
+        let guard = proof_free_ledger.document.lock().await;
+        assert_eq!(
+            guard.as_ref().expect("document").plan[0].validation_disposition,
+            ValidationDisposition::NotRequired
+        );
+    }
+    assert_eq!(
+        proof_free_ledger
+            .completion_gate()
+            .await
+            .expect("gate")
+            .status,
+        TaskCompletionStatus::Passed
+    );
+
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    let unproved = ledger
+        .record_planning_update(PlanningUpdateInput {
+            plan: vec![plan_item("step", StepStatus::Completed)],
+            ..PlanningUpdateInput::default()
+        })
+        .await;
+
+    assert_eq!(
+        unproved.public_update.plan[0].status,
+        StepStatus::InProgress
+    );
+    {
+        let guard = ledger.document.lock().await;
+        let step = &guard.as_ref().expect("document").plan[0];
+        assert_eq!(
+            step.validation_disposition,
+            ValidationDisposition::UnresolvedDiscoverable
+        );
+    }
+    assert_eq!(
+        ledger.completion_gate().await.expect("gate").status,
+        TaskCompletionStatus::Partial
+    );
+
+    let explicitly_unvalidated = ledger
+        .record_planning_update(PlanningUpdateInput {
+            step_evidence: vec![PlanStepEvidenceInput {
+                step_id: "step".to_string(),
+                source_owner: None,
+                implementation_surfaces: vec!["src/step.rs".to_string()],
+                mutation_obligations: Vec::new(),
+                validation_disposition: Some(ValidationDisposition::NotRequired),
+                external_validation_route: None,
+            }],
+            plan: vec![plan_item("step", StepStatus::Completed)],
+            ..PlanningUpdateInput::default()
+        })
+        .await;
+
+    assert_eq!(
+        explicitly_unvalidated.public_update.plan[0].status,
+        StepStatus::InProgress
+    );
+    {
+        let guard = ledger.document.lock().await;
+        assert_eq!(
+            guard.as_ref().expect("document").plan[0].validation_disposition,
+            ValidationDisposition::UnresolvedDiscoverable
+        );
+    }
+    assert_eq!(
+        ledger.completion_gate().await.expect("gate").status,
+        TaskCompletionStatus::Partial
+    );
+
+    let (_temp, _repo, focused_ledger) = ledger_fixture().await;
+    focused_ledger
+        .record_planning_update(PlanningUpdateInput {
+            tier: Some(PlanningTier::Focused),
+            implementation_surfaces: vec!["src/focused.rs".to_string()],
+            ..PlanningUpdateInput::default()
+        })
+        .await;
+    {
+        let guard = focused_ledger.document.lock().await;
+        assert_eq!(
+            guard
+                .as_ref()
+                .expect("document")
+                .planning
+                .work_unit
+                .as_ref()
+                .expect("focused work unit")
+                .validation_disposition,
+            ValidationDisposition::UnresolvedDiscoverable
+        );
+    }
+    let gate = focused_ledger.completion_gate().await.expect("gate");
+    assert_eq!(gate.status, TaskCompletionStatus::Partial);
+    assert!(
+        gate.reasons
+            .iter()
+            .any(|reason| reason.contains("lacks current validation proof"))
+    );
+}
+
+#[tokio::test]
+async fn source_owner_is_derived_from_implementation_surfaces() {
+    let manifest = r#"
+schema_version = 2
+
+[[owners]]
+id = "broad"
+roots = ["codex-rs/core/src"]
+
+[[owners]]
+id = "narrow"
+roots = ["codex-rs/core/src/tools/handlers"]
+
+[[owners]]
+id = "other"
+roots = ["codex-rs/app-server"]
+"#;
+    let (_temp, repo, ledger) = ledger_fixture_with_source_owners(manifest).await;
+    ledger
+        .record_planning_update(PlanningUpdateInput {
+            step_evidence: vec![PlanStepEvidenceInput {
+                step_id: "owned".to_string(),
+                source_owner: Some("caller-authored-owner".to_string()),
+                implementation_surfaces: vec![
+                    "codex-rs/core/src/tools/handlers/plan.rs".to_string(),
+                ],
+                mutation_obligations: Vec::new(),
+                validation_disposition: None,
+                external_validation_route: None,
+            }],
+            plan: vec![plan_item("owned", StepStatus::InProgress)],
+            ..PlanningUpdateInput::default()
+        })
+        .await;
+    {
+        let guard = ledger.document.lock().await;
+        let step = &guard.as_ref().expect("document").plan[0];
+        assert_eq!(step.source_owner.as_deref(), Some("narrow"));
+        assert_eq!(
+            step.implementation_surfaces,
+            vec!["codex-rs/core/src/tools/handlers/plan.rs".to_string()]
+        );
+    }
+
+    ledger
+        .record_planning_update(PlanningUpdateInput {
+            step_evidence: vec![PlanStepEvidenceInput {
+                step_id: "owned".to_string(),
+                source_owner: Some("narrow".to_string()),
+                implementation_surfaces: vec![
+                    "codex-rs/core/src/task_evidence.rs".to_string(),
+                    "codex-rs/app-server/src/lib.rs".to_string(),
+                ],
+                mutation_obligations: Vec::new(),
+                validation_disposition: None,
+                external_validation_route: None,
+            }],
+            plan: vec![plan_item("owned", StepStatus::InProgress)],
+            ..PlanningUpdateInput::default()
+        })
+        .await;
+    {
+        let guard = ledger.document.lock().await;
+        assert!(
+            guard.as_ref().expect("document").plan[0]
+                .source_owner
+                .is_none()
+        );
+    }
+
+    let codex_home = ledger.codex_home.clone().expect("codex home");
+    let thread_id = ledger.thread_id.clone().expect("thread id");
+    let snapshot = {
+        let mut guard = ledger.document.lock().await;
+        let document = guard.as_mut().expect("document");
+        document.plan[0].source_owner = Some("legacy-fixture-owner".to_string());
+        document.plan[0].implementation_surfaces = vec!["unowned/file.rs".to_string()];
+        document.revision = document.revision.saturating_add(1);
+        document.clone()
+    };
+    assert_eq!(
+        ledger.persist_document(&snapshot).await,
+        PersistOutcome::Persisted
+    );
+    drop(ledger);
+    let reloaded = TaskEvidenceLedger::load_or_new(
+        codex_home,
+        ThreadId::from_string(&thread_id).expect("thread id"),
+        &repo,
+    )
+    .await;
+    {
+        let guard = reloaded.document.lock().await;
+        assert!(
+            guard.as_ref().expect("document").plan[0]
+                .source_owner
+                .is_none()
+        );
+    }
+
+    let ambiguous_manifest = r#"
+schema_version = 2
+
+[[owners]]
+id = "first"
+roots = ["src"]
+
+[[owners]]
+id = "second"
+roots = ["src"]
+"#;
+    let (_temp, _repo, ambiguous) = ledger_fixture_with_source_owners(ambiguous_manifest).await;
+    ambiguous
+        .record_planning_update(PlanningUpdateInput {
+            source_owner: Some("first".to_string()),
+            implementation_surfaces: vec!["src/lib.rs".to_string()],
+            tier: Some(PlanningTier::Focused),
+            ..PlanningUpdateInput::default()
+        })
+        .await;
+    {
+        let guard = ambiguous.document.lock().await;
+        assert!(
+            guard
+                .as_ref()
+                .expect("document")
+                .planning
+                .work_unit
+                .as_ref()
+                .expect("work unit")
+                .source_owner
+                .is_none()
+        );
+    }
+
+    let (_temp, _repo, missing_manifest) = ledger_fixture().await;
+    missing_manifest
+        .record_planning_update(PlanningUpdateInput {
+            source_owner: Some("caller-authored-owner".to_string()),
+            implementation_surfaces: vec!["src/lib.rs".to_string()],
+            tier: Some(PlanningTier::Focused),
+            ..PlanningUpdateInput::default()
+        })
+        .await;
+    let guard = missing_manifest.document.lock().await;
+    assert!(
+        guard
+            .as_ref()
+            .expect("document")
+            .planning
+            .work_unit
+            .as_ref()
+            .expect("work unit")
+            .source_owner
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn explicit_passed_and_completed_are_authoritative_success_states() {
     for requested in [StepStatus::Passed, StepStatus::Completed] {
         let (_temp, _repo, ledger) = ledger_fixture().await;
         let normalized = ledger
-            .record_plan_update(&plan_with(vec![plan_item("step", requested)]))
+            .record_plan_update(&plan_with(vec![proof_free_plan_item("step", requested)]))
             .await;
         assert_eq!(normalized.plan[0].status, StepStatus::Passed);
         assert_eq!(
@@ -2582,9 +3023,12 @@ async fn explicit_passed_and_completed_are_authoritative_success_states() {
 async fn material_plan_update_can_pass_in_the_same_update() {
     let (_temp, _repo, ledger) = ledger_fixture().await;
     ledger
-        .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Pending)]))
+        .record_plan_update(&plan_with(vec![proof_free_plan_item(
+            "step",
+            StepStatus::Pending,
+        )]))
         .await;
-    let mut changed = plan_item("step", StepStatus::Passed);
+    let mut changed = proof_free_plan_item("step", StepStatus::Passed);
     changed.step = "Implement the materially revised step".to_string();
 
     let normalized = ledger.record_plan_update(&plan_with(vec![changed])).await;
@@ -2606,8 +3050,19 @@ async fn later_file_and_command_mutations_reopen_passed_steps() {
         .await
         .expect("source");
     ledger
-        .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Passed)]))
+        .record_plan_update(&plan_with(vec![proof_free_plan_item(
+            "step",
+            StepStatus::Passed,
+        )]))
         .await;
+    ledger
+        .document
+        .lock()
+        .await
+        .as_mut()
+        .expect("document")
+        .plan[0]
+        .runtime_paths = vec!["src/step.rs".to_string()];
     ledger
         .record_edit_intent("edit", &repo, &[PathBuf::from("src/step.rs")])
         .await;
@@ -2624,8 +3079,19 @@ async fn later_file_and_command_mutations_reopen_passed_steps() {
     }
 
     ledger
-        .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Passed)]))
+        .record_plan_update(&plan_with(vec![proof_free_plan_item(
+            "step",
+            StepStatus::Passed,
+        )]))
         .await;
+    ledger
+        .document
+        .lock()
+        .await
+        .as_mut()
+        .expect("document")
+        .plan[0]
+        .runtime_paths = vec!["src/step.rs".to_string()];
     let cwd = AbsolutePathBuf::from_absolute_path(&repo).expect("repo");
     ledger
         .record_command(
@@ -2647,7 +3113,7 @@ async fn later_file_and_command_mutations_reopen_passed_steps() {
 #[tokio::test]
 async fn generated_artifact_gate_checks_current_file_state() {
     let (_missing_temp, _missing_repo, missing_ledger) = ledger_fixture().await;
-    let mut missing = plan_item("step", StepStatus::Passed);
+    let mut missing = proof_free_plan_item("step", StepStatus::Passed);
     missing.generated_artifacts = vec!["generated/output.json".to_string()];
     missing_ledger
         .record_plan_update(&plan_with(vec![missing]))
@@ -2671,18 +3137,21 @@ async fn generated_artifact_gate_checks_current_file_state() {
     tokio::fs::write(repo.join("generated/output.json"), "{}")
         .await
         .expect("artifact");
-    let mut present = plan_item("step", StepStatus::Passed);
+    let mut present = proof_free_plan_item("step", StepStatus::Passed);
     present.generated_artifacts = vec!["generated/output.json".to_string()];
     present_ledger
         .record_plan_update(&plan_with(vec![present]))
         .await;
-    assert_eq!(
-        present_ledger
-            .completion_gate()
-            .await
-            .expect("present gate")
-            .status,
-        TaskCompletionStatus::Passed
+    let present_gate = present_ledger
+        .completion_gate()
+        .await
+        .expect("present gate");
+    assert_eq!(present_gate.status, TaskCompletionStatus::Partial);
+    assert!(
+        present_gate
+            .reasons
+            .iter()
+            .all(|reason| !reason.contains("missing, unreadable, or unhashable"))
     );
 
     tokio::fs::remove_file(repo.join("generated/output.json"))
@@ -2693,10 +3162,16 @@ async fn generated_artifact_gate_checks_current_file_state() {
         .await
         .expect("deleted gate");
     assert_eq!(deleted_gate.status, TaskCompletionStatus::Partial);
+    assert!(
+        deleted_gate
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("missing, unreadable, or unhashable"))
+    );
     let guard = present_ledger.document.lock().await;
     assert_eq!(
         guard.as_ref().expect("document").plan[0].status,
-        StepStatus::Implemented
+        StepStatus::InProgress
     );
 }
 
@@ -2790,7 +3265,7 @@ async fn generated_artifact_gate_rejects_repository_escape_paths() {
         "../outside/output.json".to_string(),
         "artifact-link/output.json".to_string(),
     ] {
-        let mut step = plan_item("step", StepStatus::Passed);
+        let mut step = proof_free_plan_item("step", StepStatus::Passed);
         step.generated_artifacts = vec![artifact];
         ledger.record_plan_update(&plan_with(vec![step])).await;
         let gate = ledger.completion_gate().await.expect("escape gate");
@@ -2808,16 +3283,16 @@ async fn generated_artifact_gate_rejects_repository_escape_paths() {
     tokio::fs::write(repo.join("generated/output.json"), "{}")
         .await
         .expect("in-repository artifact");
-    let mut valid = plan_item("step", StepStatus::Passed);
+    let mut valid = proof_free_plan_item("step", StepStatus::Passed);
     valid.generated_artifacts = vec!["generated/output.json".to_string()];
     ledger.record_plan_update(&plan_with(vec![valid])).await;
-    assert_eq!(
-        ledger
-            .completion_gate()
-            .await
-            .expect("valid artifact gate")
-            .status,
-        TaskCompletionStatus::Passed
+    let valid_gate = ledger.completion_gate().await.expect("valid artifact gate");
+    assert_eq!(valid_gate.status, TaskCompletionStatus::Partial);
+    assert!(
+        valid_gate
+            .reasons
+            .iter()
+            .all(|reason| !reason.contains("missing, unreadable, or unhashable"))
     );
 }
 
@@ -2893,6 +3368,7 @@ async fn v3_obsolete_validation_state_is_discarded_during_shape_migration() {
         .clone();
     let mut legacy = serde_json::to_value(document).expect("serialize");
     legacy["schema_version"] = serde_json::json!(3);
+    legacy["plan"][0]["status"] = serde_json::json!("passed");
     legacy["validation_epoch"] = serde_json::json!(0);
     legacy["next_validation_receipt_sequence"] = serde_json::json!(2);
     legacy["validation_receipts"] = serde_json::json!([{
@@ -2961,7 +3437,10 @@ async fn v3_obsolete_validation_state_is_discarded_during_shape_migration() {
 async fn v3_to_current_discards_obsolete_repair_counter_without_reopening_passed_work() {
     let (_temp, repo, ledger) = ledger_fixture().await;
     ledger
-        .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Passed)]))
+        .record_plan_update(&plan_with(vec![proof_free_plan_item(
+            "step",
+            StepStatus::Passed,
+        )]))
         .await;
     let gate = ledger.completion_gate().await.expect("completion gate");
     assert_eq!(gate.status, TaskCompletionStatus::Passed);
@@ -3025,7 +3504,10 @@ async fn v3_to_current_discards_obsolete_repair_counter_without_reopening_passed
 async fn completion_review_receipts_are_bounded_and_never_change_completion_control_flow() {
     let (_temp, _repo, ledger) = ledger_fixture().await;
     ledger
-        .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Passed)]))
+        .record_plan_update(&plan_with(vec![proof_free_plan_item(
+            "step",
+            StepStatus::Passed,
+        )]))
         .await;
     assert_eq!(
         ledger.completion_gate().await.expect("initial gate").status,
@@ -3504,7 +3986,10 @@ async fn terminal_acknowledgement_resolves_only_recoverable_nonblocking_risks() 
     }
 
     ledger
-        .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Passed)]))
+        .record_plan_update(&plan_with(vec![proof_free_plan_item(
+            "step",
+            StepStatus::Passed,
+        )]))
         .await;
 
     let guard = ledger.document.lock().await;
@@ -4581,7 +5066,10 @@ async fn wait_persistence_barrier(barrier: Arc<std::sync::Barrier>) {
 async fn completion_persistence_retries_reuse_one_completion_proof_scan() {
     let (_temp, repo, ledger) = ledger_fixture().await;
     ledger
-        .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Passed)]))
+        .record_plan_update(&plan_with(vec![proof_free_plan_item(
+            "step",
+            StepStatus::Passed,
+        )]))
         .await;
     install_tracked_freshness_file(&ledger, &repo, "tracked.txt", b"unchanged\n").await;
     install_persistence_supersede_control(&ledger, 2);
@@ -4637,7 +5125,10 @@ async fn trusted_token_change_between_persistence_retries_starts_new_proof() {
 async fn evidence_change_between_persistence_retries_starts_new_proof() {
     let (_temp, repo, ledger) = ledger_fixture().await;
     ledger
-        .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Passed)]))
+        .record_plan_update(&plan_with(vec![proof_free_plan_item(
+            "step",
+            StepStatus::Passed,
+        )]))
         .await;
     install_tracked_freshness_file(&ledger, &repo, "tracked.txt", b"unchanged\n").await;
     let ledger = Arc::new(ledger);
@@ -4670,7 +5161,10 @@ async fn evidence_change_between_persistence_retries_starts_new_proof() {
 async fn completion_persistence_failure_is_partial_then_recovers_when_storage_returns() {
     let (_temp, _repo, ledger) = ledger_fixture().await;
     ledger
-        .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Passed)]))
+        .record_plan_update(&plan_with(vec![proof_free_plan_item(
+            "step",
+            StepStatus::Passed,
+        )]))
         .await;
     let ledger = Arc::new(ledger);
     let (started, release) = install_persistence_test_control(&ledger, true);
@@ -5716,7 +6210,12 @@ async fn terminal_closure_is_atomic_and_reload_preserves_v2_lineage() {
         AtomicReviewTransition::Persisted(gate) => gate,
         other => panic!("terminal closure did not persist: {other:?}"),
     };
-    assert_eq!(gate.status, TaskCompletionStatus::Passed);
+    assert_eq!(
+        gate.status,
+        TaskCompletionStatus::Passed,
+        "unexpected completion gate reasons: {:?}",
+        gate.reasons
+    );
 
     let thread_id = ledger.thread_id.clone().expect("thread ID");
     {
@@ -5764,6 +6263,127 @@ async fn terminal_closure_is_atomic_and_reload_preserves_v2_lineage() {
         .await
         .expect("reloaded dossier");
     assert!(reloaded.passed_completion_matches_dossier(&dossier).await);
+}
+
+#[tokio::test]
+async fn invalid_repair_lineage_reaches_the_production_rereview_dossier() {
+    let (temp, repo, ledger, initial_dossier) = classified_requirement_fixture().await;
+    assert!(matches!(
+        ledger.begin_completion_review_cycle(&initial_dossier).await,
+        AtomicReviewTransition::Persisted(_)
+    ));
+    let review_dossier = ledger
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
+        .await
+        .expect("review dossier");
+    let findings = vec![CompletionReviewFindingInput {
+        local_ordinal: 1,
+        requirement_ids: vec![review_dossier.requirements[0].requirement_id.clone()],
+        lens: COMPLETION_REVIEW_LENSES[0].to_string(),
+        contract_surface: "bounded owner".to_string(),
+        severity: "high".to_string(),
+        evidence: "the active requirement is not met".to_string(),
+        smallest_correction: "implement the missing behavior".to_string(),
+        proof_route: "cargo test focused_case".to_string(),
+    }];
+    let initial_review = match ledger
+        .record_completion_review_attempt_v2(
+            &review_dossier,
+            CompletionReviewAttemptInput {
+                attempt_kind: CompletionReviewAttemptKind::InitialReview,
+                parent_review_id: review_dossier.cycle_parent_review_id.clone(),
+                superseded_review_id: None,
+                findings,
+                dispositions: Vec::new(),
+                manifest_gaps: Vec::new(),
+                repair_instruction: Some("{}".to_string()),
+                repair_instruction_hash: None,
+                infrastructure_outcome: "ok".to_string(),
+                review_clean: false,
+                terminal_outcome: None,
+                attempt_identity: "test-attempt-identity".to_string(),
+                reviewer_contract_hash: "test-reviewer-contract".to_string(),
+            },
+        )
+        .await
+    {
+        AtomicReviewTransition::Persisted(recorded) => recorded,
+        other => panic!("initial finding review did not persist: {other:?}"),
+    };
+    let thread_id = ledger.thread_id.clone().expect("thread ID");
+    drop(ledger);
+    let ledger = TaskEvidenceLedger::load_or_new(
+        temp.path().join("home"),
+        ThreadId::from_string(&thread_id).expect("thread ID parses"),
+        &repo,
+    )
+    .await;
+    let correction_dossier = ledger
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
+        .await
+        .expect("correction dossier");
+    assert!(matches!(
+        ledger
+            .record_completion_review_attempt_v2(
+                &correction_dossier,
+                CompletionReviewAttemptInput {
+                    attempt_kind: CompletionReviewAttemptKind::CorrectionEvidence,
+                    parent_review_id: Some(initial_review.review_id),
+                    superseded_review_id: None,
+                    findings: Vec::new(),
+                    dispositions: Vec::new(),
+                    manifest_gaps: Vec::new(),
+                    repair_instruction: None,
+                    repair_instruction_hash: correction_dossier
+                        .initial_repair_instruction_hash
+                        .clone(),
+                    infrastructure_outcome: "ok".to_string(),
+                    review_clean: false,
+                    terminal_outcome: None,
+                    attempt_identity: "test-attempt-identity".to_string(),
+                    reviewer_contract_hash: "test-reviewer-contract".to_string(),
+                },
+            )
+            .await,
+        AtomicReviewTransition::Persisted(_)
+    ));
+
+    let rereview_dossier = ledger
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
+        .await
+        .expect("rereview dossier");
+    let rereview_input = rereview_dossier
+        .rereview_input
+        .expect("rereview input after correction evidence");
+    assert_eq!(rereview_input.input_mode, RereviewInputMode::FullFallback);
+    assert_eq!(
+        rereview_input.fallback_reasons,
+        vec![RereviewFallbackReason::InvalidRepairLineage]
+    );
 }
 
 #[tokio::test]
@@ -6014,6 +6634,120 @@ async fn last_second_mutation_invalidates_a_provisional_clean_review() {
         .expect("V2 ledger");
     assert!(review.review_risk.unresolved);
     assert!(review.last_terminal_closure.is_none());
+}
+
+#[tokio::test]
+async fn implemented_below_ignored_above_stale_supersession_retries_current_revision() {
+    let (_temp, repo, ledger, initial_dossier) = classified_requirement_fixture().await;
+    assert!(matches!(
+        ledger.begin_completion_review_cycle(&initial_dossier).await,
+        AtomicReviewTransition::Persisted(_)
+    ));
+    let review_dossier = ledger
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
+        .await
+        .expect("review dossier");
+    assert!(matches!(
+        ledger
+            .record_completion_review_attempt_v2(
+                &review_dossier,
+                CompletionReviewAttemptInput {
+                    attempt_kind: CompletionReviewAttemptKind::InitialReview,
+                    parent_review_id: review_dossier.cycle_parent_review_id.clone(),
+                    superseded_review_id: None,
+                    findings: Vec::new(),
+                    dispositions: Vec::new(),
+                    manifest_gaps: Vec::new(),
+                    repair_instruction: None,
+                    repair_instruction_hash: None,
+                    infrastructure_outcome: "ok".to_string(),
+                    review_clean: true,
+                    terminal_outcome: None,
+                    attempt_identity: "test-attempt-identity".to_string(),
+                    reviewer_contract_hash: "test-reviewer-contract".to_string(),
+                },
+            )
+            .await,
+        AtomicReviewTransition::Persisted(_)
+    ));
+    let stale_dossier = ledger
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
+        .await
+        .expect("provisional dossier");
+    let cwd = AbsolutePathBuf::from_absolute_path(&repo).expect("repo path");
+    ledger
+        .record_command(
+            &["late-mutating-command".to_string()],
+            &PathUri::from_abs_path(&cwd),
+            0,
+            false,
+            1,
+            true,
+        )
+        .await;
+
+    assert_eq!(
+        ledger
+            .supersede_provisional_completion_review(&stale_dossier)
+            .await,
+        AtomicReviewTransition::Superseded
+    );
+    install_persistence_supersede_control(&ledger, 0);
+    set_persistence_test_failure(&ledger, true);
+    assert_eq!(
+        ledger
+            .supersede_current_provisional_completion_review()
+            .await,
+        AtomicReviewTransition::Failed
+    );
+    {
+        let guard = ledger.document.lock().await;
+        let review = guard
+            .as_ref()
+            .expect("task evidence")
+            .completion_review_v2
+            .as_ref()
+            .expect("V2 ledger");
+        assert_eq!(
+            review.active_review_cycle.as_ref().map(|cycle| cycle.phase),
+            Some(CompletionReviewCyclePhase::InitialReviewPending)
+        );
+    }
+    set_persistence_test_failure(&ledger, false);
+    assert_eq!(
+        ledger
+            .supersede_current_provisional_completion_review()
+            .await,
+        AtomicReviewTransition::Persisted(())
+    );
+    let guard = ledger.document.lock().await;
+    let document = guard.as_ref().expect("task evidence");
+    let review = document.completion_review_v2.as_ref().expect("V2 ledger");
+    let cycle = review.active_review_cycle.as_ref().expect("review cycle");
+    assert_eq!(
+        cycle.phase,
+        CompletionReviewCyclePhase::InitialReviewPending
+    );
+    assert!(cycle.accepted_review_id.is_none());
+    assert!(cycle.accepted_dossier_snapshot_id.is_none());
+    assert!(review.review_risk.unresolved);
+    assert!(document.completion.is_none());
 }
 
 #[tokio::test]
@@ -6772,6 +7506,7 @@ fn final_proof_input() -> FinalProofSealInputV1 {
         configuration_identity: "configuration-a".to_string(),
         child_gate_state: Vec::new(),
         reviewer_configuration_identity: "reviewer-a".to_string(),
+        typed_validation_proofs: Vec::new(),
         diff_snapshot: CandidateDiffSnapshotV1 {
             candidate_id: String::new(),
             diff_identity: "diff-a".to_string(),
@@ -6789,7 +7524,7 @@ fn final_proof_input() -> FinalProofSealInputV1 {
 }
 
 #[tokio::test]
-async fn final_candidate_identity_ignores_observational_writes_and_covers_correctness_inputs() {
+async fn completion_candidate_basis_ignores_orchestration_epochs() {
     let (_temp, _repo, ledger) = ledger_fixture().await;
     let document = ledger
         .document
@@ -6811,15 +7546,22 @@ async fn final_candidate_identity_ignores_observational_writes_and_covers_correc
 
     let mut evidence_changed = document.clone();
     evidence_changed.evidence_epoch = evidence_changed.evidence_epoch.saturating_add(1);
-    assert_ne!(
+    assert_eq!(
         basis.basis_id,
         completion_candidate_basis(&evidence_changed, &input).basis_id
     );
     let mut host_changed = document.clone();
     host_changed.host_mutation_revision = host_changed.host_mutation_revision.saturating_add(1);
-    assert_ne!(
+    assert_eq!(
         basis.basis_id,
         completion_candidate_basis(&host_changed, &input).basis_id
+    );
+    let mut workspace_epoch_changed = input.clone();
+    workspace_epoch_changed.workspace_epoch =
+        workspace_epoch_changed.workspace_epoch.saturating_add(1);
+    assert_eq!(
+        basis.basis_id,
+        completion_candidate_basis(&document, &workspace_epoch_changed).basis_id
     );
 
     for changed in [
@@ -6855,6 +7597,266 @@ async fn final_candidate_identity_ignores_observational_writes_and_covers_correc
             changed.0
         );
     }
+}
+
+#[tokio::test]
+async fn final_proof_observation_survives_exact_candidate_revert() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    let mut document = ledger
+        .document
+        .lock()
+        .await
+        .as_ref()
+        .expect("document")
+        .clone();
+    let basis = completion_candidate_basis(&document, &final_proof_input());
+    let plan = ValidationPlanV1 {
+        plan_id: "plan-a".to_string(),
+        basis_id: basis.basis_id.clone(),
+        steps: vec![ValidationPlanStepV1 {
+            step_id: "step-a".to_string(),
+            obligation_id: "obligation-a".to_string(),
+            ..ValidationPlanStepV1::default()
+        }],
+        ..ValidationPlanV1::default()
+    };
+    let candidate = completion_candidate_for(&basis, &plan);
+    document.final_proof.candidate = Some(candidate.clone());
+    document.final_proof.checkpoint = Some(CompletionCheckpointV1::default());
+    document.final_proof.proof_observations = vec![FinalProofObservationV1 {
+        candidate_id: candidate.candidate_id.clone(),
+        plan_step_id: "step-a".to_string(),
+        obligation_id: "obligation-a".to_string(),
+        successful: true,
+        complete_identity: true,
+        evidence_revision: document.evidence_epoch,
+        ..FinalProofObservationV1::default()
+    }];
+    let prior_epoch = document.evidence_epoch;
+
+    invalidate_for_mutation(
+        &mut document,
+        Some(&BTreeSet::from(["src/lib.rs".to_string()])),
+    );
+    assert!(document.final_proof.checkpoint.is_none());
+    assert_eq!(document.final_proof.candidate.as_ref(), Some(&candidate));
+    let (observations, _, _) =
+        current_final_proof_observations(&document, &basis, &candidate, &plan, &[]);
+
+    assert_eq!(document.evidence_epoch, prior_epoch.saturating_add(1));
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].evidence_revision, document.evidence_epoch);
+}
+
+fn typed_validation_proof_fixture(
+    repository_root: &Path,
+    workspace_epoch: u64,
+    step: &ValidationPlanStepV1,
+) -> TypedValidationProofInputV1 {
+    let repository_root = repository_root.to_string_lossy().into_owned();
+    let implementation_identity = "child-implementation".to_string();
+    let coverage_identity = "child-coverage".to_string();
+    let call_id = "child-validation-call".to_string();
+    TypedValidationProofInputV1 {
+        assignment_id: "child-assignment".to_string(),
+        attempt_id: "child-attempt".to_string(),
+        call_id: call_id.clone(),
+        receipt_evidence_epoch: workspace_epoch,
+        workspace_epoch,
+        validation_end_epoch: workspace_epoch,
+        implementation_identity: implementation_identity.clone(),
+        coverage_identity: coverage_identity.clone(),
+        recorded_cwd: repository_root.clone(),
+        retained_output_digest: "child-output-digest".to_string(),
+        retained_output_ref: "artifact://child-output".to_string(),
+        covered_manifest: Vec::new(),
+        current_workspace_manifest_identity: None,
+        validation_result: codex_protocol::validation::ValidationResult {
+            proof_key: codex_protocol::validation::ValidationProofKey {
+                repository: repository_root.clone(),
+                cwd: repository_root,
+                canonical_route_hash: "child-route".to_string(),
+                implementation_identity,
+                coverage_identity,
+                environment_identity: "child-environment".to_string(),
+                toolchain_identity: "child-toolchain".to_string(),
+                configuration_identity: "child-configuration".to_string(),
+                validation_contract_version:
+                    codex_protocol::validation::VALIDATION_CONTRACT_VERSION,
+            },
+            route: ValidationRoute {
+                leaves: vec![codex_protocol::plan_tool::ValidationRouteLeaf {
+                    argv: step.argv.clone(),
+                    uncertainty: "root final-proof obligation".to_string(),
+                    covered_paths: step.covered_paths.clone(),
+                    covered_contracts: step.covered_contracts.clone(),
+                    timeout_ms: step.timeout_ms,
+                    semantic_timeout: step.semantic_timeout,
+                }],
+                ordering: ValidationRouteOrdering::RunAll,
+            },
+            call_id,
+            process_id: None,
+            status: codex_protocol::validation::ValidationTerminalStatus::Succeeded,
+            duration_ms: 17,
+            summary: Some("child validation passed".to_string()),
+            failure_excerpt: None,
+            raw_artifact_ref: Some("artifact://child-raw-output".to_string()),
+            raw_artifact_sha256: Some("child-raw-output-sha256".to_string()),
+            freshness: codex_protocol::validation::ValidationFreshness::Executed,
+        },
+    }
+}
+
+#[tokio::test]
+async fn typed_child_validation_receipt_satisfies_final_proof_without_root_command_receipt() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    let covered_path = repo.join("codex-rs/core/src/task_evidence.rs");
+    tokio::fs::create_dir_all(covered_path.parent().expect("covered path parent"))
+        .await
+        .expect("create covered path parent");
+    tokio::fs::write(&covered_path, b"validated child contents")
+        .await
+        .expect("write covered path");
+    let document = ledger
+        .document
+        .lock()
+        .await
+        .as_ref()
+        .expect("document")
+        .clone();
+    assert!(document.command_receipts.is_empty());
+    let basis = completion_candidate_basis(&document, &final_proof_input());
+    let plan = ValidationPlanV1 {
+        plan_id: "typed-plan".to_string(),
+        basis_id: basis.basis_id.clone(),
+        steps: vec![ValidationPlanStepV1 {
+            step_id: "typed-step".to_string(),
+            obligation_id: "typed-obligation".to_string(),
+            argv: vec![
+                "cargo".to_string(),
+                "test".to_string(),
+                "typed-proof".to_string(),
+            ],
+            covered_paths: vec!["codex-rs/core/src/task_evidence.rs".to_string()],
+            covered_contracts: vec!["typed-child-final-proof".to_string()],
+            timeout_ms: 120_000,
+            semantic_timeout: false,
+            batch_group: 0,
+        }],
+        ..ValidationPlanV1::default()
+    };
+    let candidate = completion_candidate_for(&basis, &plan);
+    let mut proof = typed_validation_proof_fixture(&repo, 7, &plan.steps[0]);
+    proof.covered_manifest = vec![codex_agent_task_store::WorkspaceManifestEntry {
+        path: plan.steps[0].covered_paths[0].clone(),
+        content_hash: Some(sha256_file(&covered_path).await.expect("hash covered path")),
+        existed: true,
+    }];
+    let child_cwd = repo.join("codex-rs").to_string_lossy().into_owned();
+    proof.recorded_cwd.clone_from(&child_cwd);
+    proof.validation_result.proof_key.cwd = child_cwd;
+    let proofs = current_typed_validation_proofs(
+        Some(&repo),
+        &basis.workspace_manifest_identity,
+        vec![proof],
+    )
+    .await;
+
+    let (observations, launch_count, process_ns) =
+        current_final_proof_observations(&document, &basis, &candidate, &plan, &proofs);
+
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].plan_step_id, "typed-step");
+    assert!(observations[0].successful);
+    assert!(observations[0].complete_identity);
+    assert_eq!(
+        observations[0].retained_output_ref.as_deref(),
+        Some("artifact://child-output")
+    );
+    assert_eq!(launch_count, 0, "child proof is not a root process launch");
+    assert_eq!(process_ns, 0, "child proof is not root process time");
+
+    tokio::fs::write(&covered_path, b"mutated after child validation")
+        .await
+        .expect("mutate covered path");
+    assert!(
+        current_typed_validation_proofs(Some(&repo), &basis.workspace_manifest_identity, proofs,)
+            .await
+            .is_empty(),
+        "a child receipt cannot cross a covered-manifest mutation"
+    );
+}
+
+#[tokio::test]
+async fn typed_child_validation_receipt_rejects_stale_or_scope_mismatched_proof() {
+    let (temp, repo, ledger) = ledger_fixture().await;
+    let document = ledger
+        .document
+        .lock()
+        .await
+        .as_ref()
+        .expect("document")
+        .clone();
+    let basis = completion_candidate_basis(&document, &final_proof_input());
+    let plan = ValidationPlanV1 {
+        plan_id: "typed-plan".to_string(),
+        basis_id: basis.basis_id.clone(),
+        steps: vec![ValidationPlanStepV1 {
+            step_id: "typed-step".to_string(),
+            obligation_id: "typed-obligation".to_string(),
+            argv: vec![
+                "cargo".to_string(),
+                "test".to_string(),
+                "typed-proof".to_string(),
+            ],
+            covered_paths: vec!["codex-rs/core/src/task_evidence.rs".to_string()],
+            covered_contracts: vec!["typed-child-final-proof".to_string()],
+            timeout_ms: 120_000,
+            semantic_timeout: false,
+            batch_group: 0,
+        }],
+        ..ValidationPlanV1::default()
+    };
+    let candidate = completion_candidate_for(&basis, &plan);
+    let mut stale = typed_validation_proof_fixture(&repo, 7, &plan.steps[0]);
+    stale.validation_end_epoch = 6;
+    assert!(
+        current_final_proof_observations(&document, &basis, &candidate, &plan, &[stale])
+            .0
+            .is_empty()
+    );
+
+    let mut scope_mismatched = typed_validation_proof_fixture(&repo, 7, &plan.steps[0]);
+    scope_mismatched.validation_result.route.leaves[0]
+        .covered_paths
+        .clear();
+    assert!(
+        current_final_proof_observations(
+            &document,
+            &basis,
+            &candidate,
+            &plan,
+            &[scope_mismatched],
+        )
+        .0
+        .is_empty()
+    );
+
+    let mut wrong_repository = typed_validation_proof_fixture(&repo, 7, &plan.steps[0]);
+    wrong_repository.validation_result.proof_key.repository =
+        temp.path().to_string_lossy().into_owned();
+    assert!(
+        current_final_proof_observations(
+            &document,
+            &basis,
+            &candidate,
+            &plan,
+            &[wrong_repository],
+        )
+        .0
+        .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -7004,6 +8006,42 @@ async fn sealed_checkpoint_is_complete_and_finalization_is_exactly_memoized() {
             .expect("basis")
             .implementation_identity = "stale-implementation".to_string();
     }
+    assert!(ledger.completion_recovery_intent("turn-1").await.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn implemented_below_ignored_above_failed_finalization_memo_write_is_not_visible() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    let sealed = ledger
+        .seal_final_proof_candidate(final_proof_input())
+        .await
+        .expect("KD4 final proof enabled");
+    assert!(matches!(sealed, FinalProofSealResultV1::Sealed { .. }));
+    let ledger = Arc::new(ledger);
+    let (started, release) = install_persistence_test_control(&ledger, true);
+
+    let memo_ledger = Arc::clone(&ledger);
+    let memo = tokio::spawn(async move {
+        memo_ledger
+            .record_finalization_result(
+                "turn-1".to_string(),
+                "final answer".to_string(),
+                true,
+                true,
+            )
+            .await
+    });
+    wait_persistence_barrier(started).await;
+    wait_persistence_barrier(release).await;
+
+    assert!(!memo.await.expect("memo task"));
+    assert!(
+        ledger
+            .memoized_finalization_result("turn-1")
+            .await
+            .is_none()
+    );
+    assert!(ledger.current_finalization_memo_identity().await.is_none());
     assert!(ledger.completion_recovery_intent("turn-1").await.is_none());
 }
 

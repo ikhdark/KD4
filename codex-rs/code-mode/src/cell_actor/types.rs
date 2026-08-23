@@ -30,6 +30,7 @@ pub(crate) struct CellToolCall {
     pub(crate) name: ToolName,
     pub(crate) kind: ToolKind,
     pub(crate) input: Option<JsonValue>,
+    pub(crate) timeout: std::time::Duration,
 }
 
 /// Connects a cell actor to session-owned callbacks and stored values.
@@ -419,16 +420,6 @@ fn prepend_initial_yield(
             pending_initial_yield_items.append(&mut content_items);
             CellEvent::Yielded {
                 content_items: pending_initial_yield_items,
-            }
-        }
-        CellEvent::Pending {
-            mut content_items,
-            pending_tool_call_ids,
-        } => {
-            pending_initial_yield_items.append(&mut content_items);
-            CellEvent::Pending {
-                content_items: pending_initial_yield_items,
-                pending_tool_call_ids,
             }
         }
         CellEvent::Completed {

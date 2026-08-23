@@ -8,10 +8,13 @@ use codex_protocol::protocol::McpInvocation;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 
+use rmcp::model::ListResourceTemplatesResult;
 use rmcp::model::PaginatedRequestParams;
+use rmcp::model::ResourceTemplate;
 
 use super::ListResourceTemplatesArgs;
 use super::ListResourceTemplatesPayload;
+use super::McpServerCollection;
 use super::canonical_all_list_resource_templates;
 use super::canonical_single_list_resource_templates;
 use super::ensure_model_can_access_mcp_server;
@@ -22,6 +25,42 @@ use super::parse_arguments;
 use super::serialize_function_output;
 
 pub struct ListMcpResourceTemplatesHandler;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ListResourceTemplatesStrategy {
+    Exhaustive,
+    ExplicitPage,
+}
+
+fn list_resource_templates_strategy(cursor: Option<&str>) -> ListResourceTemplatesStrategy {
+    if cursor.is_some() {
+        ListResourceTemplatesStrategy::ExplicitPage
+    } else {
+        ListResourceTemplatesStrategy::Exhaustive
+    }
+}
+
+fn exhaustive_resource_template_pages(
+    collection: McpServerCollection<Vec<ResourceTemplate>>,
+) -> McpServerCollection<ListResourceTemplatesResult> {
+    McpServerCollection {
+        results: collection
+            .results
+            .into_iter()
+            .map(|(server, resource_templates)| {
+                (
+                    server,
+                    ListResourceTemplatesResult {
+                        meta: None,
+                        next_cursor: None,
+                        resource_templates,
+                    },
+                )
+            })
+            .collect(),
+        errors: collection.errors,
+    }
+}
 
 impl ToolExecutor<ToolInvocation> for ListMcpResourceTemplatesHandler {
     fn tool_name(&self) -> ToolName {
@@ -87,17 +126,43 @@ impl ListMcpResourceTemplatesHandler {
             async {
                 let (payload, canonical) = if let Some(server_name) = server.clone() {
                     ensure_model_can_access_mcp_server(turn.as_ref(), &server_name)?;
-                    let params = cursor
-                        .clone()
-                        .map(|value| PaginatedRequestParams::default().with_cursor(Some(value)));
-                    let result = manager
-                        .list_resource_templates(&server_name, params)
-                        .await
-                        .map_err(|err| {
-                            FunctionCallError::RespondToModel(format!(
-                                "resources/templates/list failed: {err:#}"
-                            ))
-                        })?;
+                    let result = match list_resource_templates_strategy(cursor.as_deref()) {
+                        ListResourceTemplatesStrategy::Exhaustive => {
+                            let collection = manager
+                                .list_all_resource_templates(|candidate| candidate == server_name)
+                                .await;
+                            let mut pages = exhaustive_resource_template_pages(collection);
+                            pages.results.remove(&server_name).ok_or_else(|| {
+                                pages
+                                    .errors
+                                    .into_iter()
+                                    .find(|error| error.server == server_name)
+                                    .map_or_else(
+                                        || {
+                                            FunctionCallError::RespondToModel(format!(
+                                                "resources/templates/list failed: unknown MCP server '{server_name}'"
+                                            ))
+                                        },
+                                        |error| {
+                                            FunctionCallError::RespondToModel(error.message)
+                                        },
+                                    )
+                            })?
+                        }
+                        ListResourceTemplatesStrategy::ExplicitPage => {
+                            let params = cursor.clone().map(|value| {
+                                PaginatedRequestParams::default().with_cursor(Some(value))
+                            });
+                            manager
+                                .list_resource_templates(&server_name, params)
+                                .await
+                                .map_err(|err| {
+                                    FunctionCallError::RespondToModel(format!(
+                                        "resources/templates/list failed: {err:#}"
+                                    ))
+                                })?
+                        }
+                    };
                     let canonical =
                         canonical_single_list_resource_templates(&server_name, &result)?;
                     let payload = ListResourceTemplatesPayload::from_single_server(
@@ -113,11 +178,12 @@ impl ListMcpResourceTemplatesHandler {
                         ));
                     }
 
-                    let pages = manager
-                        .list_resource_template_pages(|server_name| {
+                    let collection = manager
+                        .list_all_resource_templates(|server_name| {
                             model_can_access_mcp_server(turn.as_ref(), server_name)
                         })
                         .await;
+                    let pages = exhaustive_resource_template_pages(collection);
                     let canonical = canonical_all_list_resource_templates(&pages)?;
                     let payload =
                         ListResourceTemplatesPayload::from_all_servers(pages, truncation_policy)?;
@@ -133,5 +199,22 @@ impl ListMcpResourceTemplatesHandler {
 impl CoreToolRuntime for ListMcpResourceTemplatesHandler {
     fn waits_for_runtime_cancellation(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn omitted_cursor_uses_exhaustive_owner_collection() {
+        assert_eq!(
+            list_resource_templates_strategy(None),
+            ListResourceTemplatesStrategy::Exhaustive
+        );
+        assert_eq!(
+            list_resource_templates_strategy(Some("opaque-cursor")),
+            ListResourceTemplatesStrategy::ExplicitPage
+        );
     }
 }

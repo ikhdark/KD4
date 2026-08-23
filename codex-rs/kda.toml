@@ -1,5 +1,109 @@
 version = 1
 
+# Small runtime protocols whose legal calls depend on prior calls. These are
+# consumed by kda's bounded semantic typestate pass; helper transitions with an
+# argument index are reusable interprocedural summaries.
+[[typestate-protocol]]
+id = "pending-process-registration"
+states = ["prepared", "attached", "active", "committed", "cleaned"]
+initial = "prepared"
+terminal = ["committed", "cleaned"]
+constructors = ["PendingProcessRegistration::new"]
+max-states = 512
+
+[[typestate-protocol.transitions]]
+operation = "attach_process"
+from = ["prepared"]
+to = "attached"
+
+[[typestate-protocol.transitions]]
+operation = "set_initial_exec_command_active"
+from = ["attached"]
+to = "active"
+
+[[typestate-protocol.transitions]]
+operation = "store_process"
+from = ["active"]
+to = "committed"
+argument = 16
+outcome = "success"
+
+[[typestate-protocol.transitions]]
+operation = "cleanup"
+from = ["prepared", "attached", "active"]
+to = "cleaned"
+outcome = "success"
+
+[[typestate-protocol]]
+id = "proposed-plan-item"
+states = ["new", "started", "completed"]
+initial = "new"
+terminal = ["completed"]
+constructors = ["ProposedPlanItemState::new"]
+max-states = 256
+
+[[typestate-protocol.transitions]]
+operation = "start"
+from = ["new"]
+to = "started"
+
+[[typestate-protocol.transitions]]
+operation = "push_delta"
+from = ["started"]
+to = "started"
+
+[[typestate-protocol.transitions]]
+operation = "complete_with_text"
+from = ["started"]
+to = "completed"
+
+[[typestate-protocol]]
+id = "turn-timing"
+states = ["fresh", "started", "completed"]
+initial = "fresh"
+terminal = ["completed"]
+constructors = ["TurnTimingState::default", "TurnTimingState::with_clock"]
+max-states = 512
+
+[[typestate-protocol.transitions]]
+operation = "mark_turn_started"
+from = ["fresh"]
+to = "started"
+
+[[typestate-protocol.transitions]]
+operation = "complete_snapshot"
+from = ["started", "completed"]
+to = "completed"
+
+[[typestate-protocol]]
+id = "rollout-recorder"
+states = ["active", "shutdown"]
+initial = "active"
+terminal = ["shutdown"]
+constructors = ["RolloutRecorder::new"]
+max-states = 1024
+
+[[typestate-protocol.transitions]]
+operation = "record_canonical_items"
+from = ["active"]
+to = "active"
+
+[[typestate-protocol.transitions]]
+operation = "persist"
+from = ["active"]
+to = "active"
+
+[[typestate-protocol.transitions]]
+operation = "flush"
+from = ["active"]
+to = "active"
+
+[[typestate-protocol.transitions]]
+operation = "shutdown"
+from = ["active"]
+to = "shutdown"
+outcome = "success"
+
 # Autonomous changes are admitted only when every changed path resolves through
 # the repository's generated ownership index and all declared consequences have
 # current, source-bound proof.

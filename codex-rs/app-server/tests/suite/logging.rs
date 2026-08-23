@@ -218,6 +218,11 @@ async fn app_server_emits_structured_tool_call_timing_event() -> Result<()> {
                 "execution_started": true,
                 "eager": false,
                 "exec_process_alive_at_delivery": false,
+                "exec_cleanup_state_observed": true,
+                "outcome": "failure",
+                "exec_running_process_stale": false,
+                "exec_running_process_after_cleanup": false,
+                "exec_background_process_expected": false,
             },
             "target": "codex_core::tools::parallel",
         })

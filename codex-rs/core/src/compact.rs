@@ -101,29 +101,33 @@ pub(crate) async fn build_compaction_initial_context(
     sess: &Session,
     turn_context: &TurnContext,
     initial_context_injection: &InitialContextInjection,
-) -> (Vec<ResponseItem>, Option<WorldStateSnapshot>) {
+) -> (
+    Vec<ResponseItem>,
+    Option<WorldStateSnapshot>,
+    Vec<codex_protocol::protocol::ContextFragmentDigest>,
+) {
     // Return the rendered state with its items so history and its baseline stay identical.
     match initial_context_injection {
         InitialContextInjection::AtStart(world_state) => {
-            let (items, delivered_snapshot) = sess
-                .build_initial_context_with_world_state_and_snapshot(
+            let (items, delivered_snapshot, fragment_digests) = sess
+                .build_initial_context_with_world_state_and_provenance(
                     turn_context,
                     world_state.as_ref(),
                 )
                 .await;
-            (items, Some(delivered_snapshot))
+            (items, Some(delivered_snapshot), fragment_digests)
         }
         #[cfg(test)]
         InitialContextInjection::BeforeLastUserMessage(world_state) => {
-            let (items, delivered_snapshot) = sess
-                .build_initial_context_with_world_state_and_snapshot(
+            let (items, delivered_snapshot, fragment_digests) = sess
+                .build_initial_context_with_world_state_and_provenance(
                     turn_context,
                     world_state.as_ref(),
                 )
                 .await;
-            (items, Some(delivered_snapshot))
+            (items, Some(delivered_snapshot), fragment_digests)
         }
-        InitialContextInjection::DoNotInject => (Vec::new(), None),
+        InitialContextInjection::DoNotInject => (Vec::new(), None, Vec::new()),
     }
 }
 
@@ -432,12 +436,13 @@ async fn run_compact_task_inner_impl(
     }
     let (window_number, window_ids) = sess.advance_auto_compact_window().await;
 
-    let (initial_context, world_state_baseline) = build_compaction_initial_context(
-        sess.as_ref(),
-        turn_context.as_ref(),
-        &initial_context_injection,
-    )
-    .await;
+    let (initial_context, world_state_baseline, fragment_digests) =
+        build_compaction_initial_context(
+            sess.as_ref(),
+            turn_context.as_ref(),
+            &initial_context_injection,
+        )
+        .await;
     if !initial_context.is_empty() {
         new_history = insert_compaction_initial_context(
             new_history,
@@ -468,6 +473,7 @@ async fn run_compact_task_inner_impl(
         new_history,
         reference_context_item,
         world_state_baseline,
+        fragment_digests,
         compacted_item,
     )
     .await;

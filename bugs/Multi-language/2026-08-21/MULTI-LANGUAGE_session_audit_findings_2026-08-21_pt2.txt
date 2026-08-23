@@ -1,0 +1,1669 @@
+KD4 HISTORICAL SESSION AUDIT / BUG / FIX EVIDENCE
+Language group: Multi-language
+Audit date: 2026-08-21
+Part: 2 of 2
+
+Purpose: detailed diagnostic evidence migrated from Codex session logs. Session
+conclusions are preserved as historical claims, not independently revalidated facts
+about the current repository. Use the evidence IDs and source-session provenance to
+trace each item back to its original record.
+================================================================================
+FINDING 0018
+Evidence ID: SHA256:06FDEC779B618A47FD7B0D2FD1BFE4F6706D42482D1E99D03933FB7580F647BA
+Audit date: 2026-08-21
+Language classification: Multi-language
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\21\rollout-2026-08-21T23-08-01-01a027a7-76c8-7742-b884-5fa5a393aa23.jsonl
+Source session UUID: 01a027a7-76c8-7742-b884-5fa5a393aa23
+Logical session UUID: 01a027a7-76c8-7742-b884-5fa5a393aa23
+Event timestamp: 08/22/2026 04:14:39
+Working directory: c:\Users\kuh\Documents\ChatGPT\kd-analzyer
+Git revision: 10be550978d388a16d87e2611c827fdd8820b1ed
+Git branch: main
+Thread source: user
+
+TASK / PROMPT
+(Extracted from the nearest preceding actual event_msg user_message. IDE tab context,
+when present, was removed while retaining the explicit "My request" text.)
+
+Assume the easy and obvious lint ideas are already taken.
+
+Review my analyzer and KD4 and identify what the next major capability jump should be.
+
+I am looking for something comparable to moving from syntax matching to semantic identity: a capability that fundamentally increases what the analyzer can know.
+
+Do not optimize for implementation simplicity.
+
+At the same time, avoid proposing a full compiler, general symbolic execution engine, or research project with unclear payoff.
+
+Give me 3 plausible "next level" directions.
+
+For each:
+
+- describe what becomes possible that is impossible today;
+- show multiple KD4 problems it could address;
+- describe the minimum viable version;
+- identify the boundary where complexity should stop;
+- estimate how much existing analyzer architecture would need to change.
+
+Recommend one direction.
+
+DIRECTLY STATED HISTORICAL FINDING / FIX / VALIDATION
+(Faithful final_answer conclusion from the source session.)
+
+## Recommendation
+
+Build a shared, typed, path-sensitive control/data-flow IR—“KDA MIR,” but deliberately smaller than Rust MIR.
+
+That is the next true capability jump. KDA already knows semantic identity: its `ProgramIndex` records resolved functions, calls, and references ([analysis_context.rs](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/analysis_context.rs:79)). Its current ceiling is that each lint must rediscover execution and value flow from syntax. The shared flow helper explicitly says it is not a complete CFG and only understands nearby guards ([flow.rs](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/flow.rs:1)); lifecycle and reverse-wiring passes then build separate mini-interpreters such as `ReverseFlow` ([reverse_wiring.rs](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/reverse_wiring.rs:527)).
+
+The fundamental transition is:
+
+> From “what definition is this?” to “what facts and obligations hold at this exact program point, on every feasible path?”
+
+KD4’s deliberately faulty investigation cases are unusually good acceptance tests for this decision. They are fixtures, not claims that current production code is broken.
+
+| Direction | New knowledge | KD4 payoff | Architecture impact |
+|---|---|---|---|
+| 1. Typed path/data-flow IR | Facts and obligations at each program point | Broadest; catches 3 major investigation fault classes | Large |
+| 2. Closed-world dynamic-target analysis | Which concrete implementations and keyed handlers can reach a call | Excellent for tools, extensions, registries | Medium-large |
+| 3. Finite relational ADT analysis | Whether conversions preserve semantic variants and fields | Excellent for protocol/config/schema boundaries | Medium |
+
+## 1. Typed path-sensitive program IR
+
+### What becomes possible
+
+KDA could reason about:
+
+- Dominance and post-dominance: whether validation or cleanup happens before every relevant use or exit.
+- Loop invariants and exit conditions.
+- Field-sensitive state: `state.phase`, `document.next_id`, and `child` as distinct semantic places.
+- Reaching definitions across assignments, branches, matches, `?`, early returns, and loops.
+- Resource obligations: acquired, transferred, terminalized, killed, awaited, persisted.
+- Bounded interprocedural effects: “this helper terminalizes argument 0” or “return value is at least the maximum input ID plus one.”
+
+Today, the analyzer can recognize selected local shapes or run purpose-built structured traversal, but it cannot expose these facts as one reusable substrate.
+
+### KD4 problems it addresses
+
+1. **Dropped final batches.** The bad loop uses `start.saturating_add(width) < items.len()` and skips exact-size or trailing partial batches ([local-logic-last-batch-dropped.patch](C:/Users/kuh/Desktop/kd4/scripts/investigation_eval/patches/local-logic-last-batch-dropped.patch:11)). Detecting this requires relating the loop condition, update, slice bounds, and unprocessed range—not merely identifying calls.
+
+2. **Persistent-ID collisions.** The migration derives the next ID from collection length rather than the maximum existing identifier ([persistence-receipt-sequence-collision.patch](C:/Users/kuh/Desktop/kd4/scripts/investigation_eval/patches/persistence-receipt-sequence-collision.patch:13)). A value-domain analysis could verify invariants such as `next_id > every persisted id`.
+
+3. **Cancellation leaks.** The fixture returns from a `tokio::select!` cancellation arm without killing and reaping its child ([lifecycle-cancelled-child-leak.patch](C:/Users/kuh/Desktop/kd4/scripts/investigation_eval/patches/lifecycle-cancelled-child-leak.patch:11)). Conversely, KDA could prove that KD4’s real process path kills and waits on cancellation ([exec.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/exec.rs:1145)).
+
+4. **Tool lifecycle completeness.** KD4’s registry has numerous pre-handler failures, cancellation handling, hooks, projection, persistence, and terminal outcome paths ([registry.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/registry.rs:826)). A shared obligation analysis could prove that every successful start reaches exactly one terminal outcome across helpers and early returns.
+
+5. **Durability boundaries.** KD4 explicitly requires committed plan updates to reach durable evidence before response emission ([architecture_index.json](C:/Users/kuh/Desktop/kd4/architecture_index.json:288)). That is naturally a post-dominance and effect-ordering contract.
+
+### Minimum viable version
+
+Build a KDA-owned IR from rust-analyzer’s typed HIR:
+
+- Basic blocks for `if`, `match`, loops, `break`, `continue`, `return`, `?`, calls, and awaits.
+- Typed semantic places: locals, parameters, fields, and conservative wildcard places for indexes and opaque dereferences.
+- SSA-like value versions or reaching-definition sets.
+- Correct normal and exceptional/control exits.
+- Initial abstract domains:
+  - enum/`Option`/`Result` state;
+  - integer intervals plus simple affine/difference constraints;
+  - initialized/moved/escaped state;
+  - configurable resource and lifecycle obligations.
+- Workspace-local function summaries for returns, mutations, transfers, and terminalization.
+- Source mapping back to authored syntax, retaining KDA’s existing diagnostic format.
+
+Do not migrate every lint initially. Prove the substrate with the bad/clean batching pair, cancellation leak, and one real KD4 lifecycle contract.
+
+### Where complexity should stop
+
+- No borrow-checker reimplementation.
+- No general SMT solver; support intervals, equality, inequalities, and a small affine fragment.
+- No precise arbitrary heap aliasing. Unknown mutable calls kill affected facts.
+- No thread-interleaving or async schedule exploration. Model control transfer, cancellation, spawn/join, and ownership obligations only.
+- No exact panic unwinding initially.
+- No analysis of opaque dependency bodies except configured summaries.
+- Cap recursive summary iterations and widen loops deterministically.
+
+### Architecture change
+
+**Large: roughly 35–50% of the analysis core over time.**
+
+The workspace loader, semantic identity index, configuration, diagnostics, baselines, and reporting can remain. The major change is a new cached `BodyIr`/summary layer in `AnalysisContext`, followed by migration of perhaps 20–30 existing passes. `flow`, lifecycle, authority, taint, async, reverse-wiring, loop enforcement, and state provenance would become clients of shared facts instead of separate syntax interpreters.
+
+KDA’s existing fixed-point taint summaries ([taint.rs](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/taint.rs:71)) are a useful prototype for summary convergence, but not yet a shared execution model.
+
+## 2. Closed-world dynamic-target and registry analysis
+
+### What becomes possible
+
+KDA could determine finite sets of concrete runtime targets behind:
+
+- `Arc<dyn Trait>` and `Box<dyn Trait>`;
+- closure and function-pointer values;
+- builder and registry collections;
+- keyed `insert`, `register`, `push`, and immutable `build` flows;
+- trait method calls whose receiver originated at known construction sites.
+
+Calls would resolve to `{target A, target B}`, empty, or explicitly unknown—not just “unresolved dynamic dispatch.”
+
+### KD4 problems it addresses
+
+1. **Advertised-but-undispatched operations.** KD4’s missing-handler fixture advertises both `inspect` and `repair`, but dispatches only `inspect` ([static-wiring-missing-handler.patch](C:/Users/kuh/Desktop/kd4/scripts/investigation_eval/patches/static-wiring-missing-handler.patch:6)).
+
+2. **Tool-plan consistency.** KD4 accumulates `Arc<dyn CoreToolRuntime>` values, builds visible specs, and separately constructs a `ToolRegistry` ([spec_plan.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/spec_plan.rs:111), [spec_plan.rs](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/spec_plan.rs:270)). The analyzer could prove key-by-key that every visible tool has a reachable compatible runtime and that dispatch-only tools remain hidden.
+
+3. **Extension installation.** The extension registry stores many categories of trait objects—tool, lifecycle, context, config, approval, and turn contributors ([registry.rs](C:/Users/kuh/Desktop/kd4/codex-rs/ext/extension-api/src/registry.rs:21)). Target sets would show which concrete contributors are installed in each host and whether their trait entrypoints are ever invoked.
+
+4. **Lifecycle attachment.** It could connect concrete `ToolLifecycleContributor` implementations to the iteration sites that invoke them, instead of merely seeing a trait-object boundary.
+
+5. **Closure/task activation.** Spawned closure bodies and callback values could become real call-graph edges when their origins are workspace-local.
+
+### Minimum viable version
+
+- Allocation-site identities for concrete-to-trait coercions.
+- Flow through locals, assignments, returns, `Arc`/`Box`, struct fields, and simple aggregates.
+- Models for `Vec::push`, map insertion, builder registration, and build/freeze patterns.
+- Literal enum/string keys tied to registered values.
+- Workspace-local function summaries for passed-through or stored values.
+- Trait method resolution from each concrete target set.
+- A target-set cap with explicit `unknown` widening.
+
+### Where complexity should stop
+
+- Closed-world workspace analysis only.
+- External plugins, MCP inventories, reflection-like discovery, and deserialized implementations remain unknown.
+- No fully precise mutable heap graph or concurrency-sensitive container contents.
+- Do not distinguish individual elements after arbitrary collection mutation.
+- Do not attempt whole-program monomorphization.
+- When target sets exceed the cap, retain sound “some compatible target may exist” evidence rather than exploding the graph.
+
+### Architecture change
+
+**Medium-large: approximately 20–30% of the analysis core.**
+
+`ProgramIndex` would gain value origins, coercions, receiver target sets, registry membership, and keyed dispatch facts. The current activation graph already admits semantic, syntax, and heuristic edges and an `UnresolvedDynamicDispatch` result ([runtime_activation_graph.rs](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/runtime_activation_graph.rs:51)); this direction would replace much of that heuristic layer rather than replace the whole analyzer.
+
+## 3. Finite relational analysis for protocol and data transformations
+
+### What becomes possible
+
+KDA could understand a converter as a relation between two finite data models:
+
+- which input variant maps to which output variant;
+- where every output field came from;
+- which fields are dropped, defaulted, widened, or narrowed;
+- whether forward and reverse conversions round-trip;
+- whether serialized names, internal variants, and generated schema identities agree.
+
+The compiler proves that a match is exhaustive. It does not prove that `"read-only"` means `ReadOnly`.
+
+### KD4 problems it addresses
+
+1. **Protocol meaning swaps.** The investigation fixture maps `"read-only"` to `WorkspaceWrite` and vice versa ([protocol-sandbox-mode-swap.patch](C:/Users/kuh/Desktop/kd4/scripts/investigation_eval/patches/protocol-sandbox-mode-swap.patch:12)).
+
+2. **Core/app-server conversion drift.** KD4 has explicit `SandboxMode` conversions in both directions ([shared.rs](C:/Users/kuh/Desktop/kd4/codex-rs/app-server-protocol/src/protocol/v2/shared.rs:289)). The analyzer could verify semantic variant correspondence, not just exhaustiveness.
+
+3. **Nested permission loss.** `SandboxPolicy` and permission-profile conversions copy nested fields and translate nested enums in both directions ([permissions.rs](C:/Users/kuh/Desktop/kd4/codex-rs/app-server-protocol/src/protocol/v2/permissions.rs:621)). It could detect omitted roots, swapped access modes, dropped flags, or asymmetric round trips.
+
+4. **Schema/source parity.** KD4 already declares that JSON Schema and TypeScript fixtures must match protocol source ([architecture_index.json](C:/Users/kuh/Desktop/kd4/architecture_index.json:25)). Relational analysis could check semantic field and discriminant parity before or alongside generator snapshots.
+
+5. **Compatibility migrations.** For supported structural migrations, it could verify preservation of unchanged fields and explicitly account for each introduced or discarded field.
+
+### Minimum viable version
+
+- Build a semantic ADT graph for enums, structs, tuples, `Option`, and `Result`.
+- Interpret pure, terminating conversion functions into normalized value-shape expressions.
+- Support matches, constructors, field projection, literals, simple helper calls, and `map`/`transpose`-style combinators.
+- Track field provenance and variant correspondence.
+- Establish expected meaning from serde names, same-name identities, inverse conversions, generated declarations, or explicit KDA contracts.
+- Check:
+  - discriminant preservation;
+  - field preservation;
+  - forward/reverse round trips;
+  - documented intentional loss;
+  - wire-name-to-variant consistency.
+
+### Where complexity should stop
+
+- Only bounded, first-order data transformations.
+- No loops, I/O, allocation-sensitive behavior, arbitrary collections, crypto, or general program equivalence.
+- Helper calls must be analyzable pure conversions or configured opaque mappings.
+- Intentional lossy conversions require an explicit contract rather than an attempted proof.
+- Do not turn this into general symbolic execution.
+
+### Architecture change
+
+**Medium: approximately 15–25% of the analysis core.**
+
+This needs a reusable type/field identity index, normalized symbolic values, and a relational contract engine. Existing semantic resolution, schema inspection, authority checks, and diagnostics remain useful. It would touch fewer current passes than direction 1, although its branch handling could later reuse the shared IR.
+
+## Why direction 1 wins
+
+Direction 1 changes KDA’s center of gravity. Directions 2 and 3 add powerful new verticals; direction 1 creates a horizontal substrate that improves a large fraction of the analyzer.
+
+It also covers three of KD4’s five deliberately injected fault classes immediately:
+
+- local loop boundary failure;
+- persistent state invariant failure;
+- cancellation/resource lifecycle failure.
+
+More importantly, it reduces architectural duplication. KDA currently has semantic identity, interprocedural taint summaries, activation graphs, and several independent “all paths” interpreters. A shared body IR turns those into interoperable analyses: target analysis can propagate values over it, and relational conversion analysis can interpret its pure subset.
+
+I would sequence the work as:
+
+1. Typed CFG and semantic-place layer.
+2. Resource/lifecycle obligations plus interval constraints.
+3. Bounded function summaries.
+4. Closed-world target sets.
+5. Relational ADT checking.
+
+I considered symbolic `cfg`-world formulas as another candidate, but did not rank them in the top three: KDA already evaluates configured profiles independently and reports profile registration gaps ([README.md](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/README.md:513)). Formula-level presence reasoning would be valuable, especially across KD4’s platform code, but its marginal knowledge gain is smaller than acquiring an actual reusable execution model.
+
+EVIDENCE BOUNDARY
+Direct fact established by this migration: the source session recorded the task and
+conclusion above at the stated time and provenance. Statements inside the conclusion
+are historical audit/fix claims, including any cited files, symptoms, invariants,
+causes, edits, commands, and validation results.
+
+Hypotheses requiring repository investigation: any causal explanation, ownership or
+timing mechanism, inferred invariant, or implementation mapping not explicitly proved
+by the cited source and validation must be retraced in the actual project source and
+Git history before being treated as current truth.
+
+Unknown after this migration: whether the current repository still contains the
+reported defect, whether cited line numbers still match, and whether the reported
+validation remains reproducible. This migration did not independently re-run the
+source audit, tests, benchmarks, or reproduction steps.
+================================================================================
+FINDING 0019
+Evidence ID: SHA256:77431B06F7431A4958B93613B9282A5ECC2E8601AA1FBAA26F44E8322DCC8170
+Audit date: 2026-08-21
+Language classification: Multi-language
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\21\rollout-2026-08-21T23-07-36-01a027a7-14a7-7ef2-9cc6-d237af6fdc8b.jsonl
+Source session UUID: 01a027a7-14a7-7ef2-9cc6-d237af6fdc8b
+Logical session UUID: 01a027a7-14a7-7ef2-9cc6-d237af6fdc8b
+Event timestamp: 08/22/2026 04:15:07
+Working directory: c:\Users\kuh\Documents\ChatGPT\kd-analzyer
+Git revision: 10be550978d388a16d87e2611c827fdd8820b1ed
+Git branch: main
+Thread source: user
+
+TASK / PROMPT
+(Extracted from the nearest preceding actual event_msg user_message. IDE tab context,
+when present, was removed while retaining the explicit "My request" text.)
+
+Investigate KD4 for cases where two or more pieces of Rust code represent the same conceptual information but can drift independently.
+
+Examples might include duplicated mappings, enum-to-enum conversions, capability tables, dispatch tables, error classifications, feature mappings, state transitions, protocol translations, or wrapper layers.
+
+Do not assume those exact examples exist.
+
+Find real semantic duplication and determine whether my analyzer could verify consistency.
+
+For each candidate:
+
+- identify the duplicated concept;
+- explain how drift could occur while everything still compiles;
+- show what semantic relationship could be checked;
+- decide whether a general analyzer rule can cover it rather than hard-coding KD4;
+- estimate value and false-positive risk.
+
+Do not implement anything.
+
+DIRECTLY STATED HISTORICAL FINDING / FIX / VALIDATION
+(Faithful final_answer conclusion from the source session.)
+
+I found six credible semantic-duplication candidates. Two already show possible drift in the current tree; the others are aligned today but remain compile-safe failure surfaces.
+
+## Highest-value candidates
+
+### 1. `Feature` enum ↔ `FEATURES` metadata registry
+
+The feature identity is declared in [`Feature`](</C:/Users/kuh/Desktop/kd4/codex-rs/features/src/lib.rs:82>), while its configuration key, lifecycle stage, and default are independently recorded in [`FEATURES`](</C:/Users/kuh/Desktop/kd4/codex-rs/features/src/lib.rs:784>). [`Feature::info`](</C:/Users/kuh/Desktop/kd4/codex-rs/features/src/lib.rs:309>) joins them with a runtime search.
+
+- Drift: adding an enum variant without a registry entry compiles, then panics when metadata is requested. Duplicate IDs or keys also compile; first-match lookup can hide the duplicate.
+- Check: enum variants must equal registry `id` values; every ID and key must be unique; every registry ID must resolve to the same variant.
+- General rule: yes. An `enum-registry-parity` rule could recognize a registry record containing an enum discriminator, especially when a lookup method establishes that the registry is total.
+- Current state: aligned—92 variants, 92 unique IDs, and 92 unique keys.
+- Value: very high.
+- False-positive risk: low once the total-registry relationship is inferred or configured.
+
+The existing line-oriented [`relation` mechanism](</C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/relations.rs:1>) could approximate this, but multiline record initializers and attributes make a semantic AST/HIR rule substantially safer.
+
+### 2. Tool JSON schema ↔ actual Serde parser
+
+`update_plan` has a manually constructed schema in [`create_update_plan_tool`](</C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/plan_spec.rs:7>), but arguments are parsed into [`PlanningUpdateInput`](</C:/Users/kuh/Desktop/kd4/codex-rs/core/src/task_evidence.rs:216>) by [`parse_update_plan_arguments`](</C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/plan.rs:347>). Nested plan-step fields and enum value lists are also repeated manually.
+
+- Drift: a schema property can be renamed or added without the parser accepting it; a required parser field can be added without advertising it; an enum value can exist on only one side. Everything compiles, but model-generated calls fail or fields become unreachable.
+- Check:
+  - Every advertised property and enum value must be accepted by the deserializer.
+  - Every non-defaulted parser field must be advertised and required.
+  - Parser-only internal fields should remain allowed; the relationship is directional, not strict equality.
+- General rule: yes. Associate a `ToolSpec` with the type passed to `serde_json::from_str`, then compare schema keys, requiredness, enum literals, Serde renames, aliases, and defaults.
+- Current state: the model-visible fields inspected appear aligned. Parser-only values such as internal bookkeeping demonstrate why strict equality would be wrong.
+- Value: very high.
+- False-positive risk: low to medium, principally around custom `Deserialize` implementations and dynamically assembled schemas.
+
+### 3. Persistence classifier ↔ history reducer coverage
+
+[`should_persist_event_msg`](</C:/Users/kuh/Desktop/kd4/codex-rs/rollout/src/policy.rs:88>) decides which `EventMsg` variants can enter rollout files. [`ThreadHistoryBuilder::handle_event`](</C:/Users/kuh/Desktop/kd4/codex-rs/app-server-protocol/src/protocol/thread_history.rs:345>) says it handles all persistable variants, but ends with `_ => {}`.
+
+- Present gap: 21 variants can be persisted; the reducer names 44 variants overall, but does not name `ThreadGoalUpdated` or `ThreadSettingsApplied`. Both currently fall through the wildcard.
+- Drift: the persistence match is exhaustive, so adding a new event forces a persistence decision. Marking it persistent does not force the wildcard-based reducer to make a corresponding decision.
+- Check: every variant whose classifier arm can return `true` must have a named consumer arm. An intentional ignore can be an explicit empty arm or configured exemption.
+- General rule: yes. This is a reusable `classifier-consumer-coverage` relationship between a predicate match and a downstream consumer match.
+- Value: high, particularly for persistence, replay, indexing, authorization, and capability classifiers.
+- False-positive risk: low when the relationship is declared; medium if inferred globally.
+
+The current [`protocol-adapter-parity`](</C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/protocol_parity.rs:1>) would complain about every unnamed `EventMsg`, including transient ones. Comparing only the classifier’s positive set would be much more precise.
+
+### 4. Core plan DTO ↔ app-server plan DTO
+
+[`PlanItemArg`](</C:/Users/kuh/Desktop/kd4/codex-rs/protocol/src/plan_tool.rs:136>) is projected into [`TurnPlanStep`](</C:/Users/kuh/Desktop/kd4/codex-rs/app-server-protocol/src/protocol/v2/turn.rs:507>) through a manual [`From` implementation](</C:/Users/kuh/Desktop/kd4/codex-rs/app-server-protocol/src/protocol/v2/turn.rs:541>).
+
+- Present difference: `PlanItemArg` has `validation_route`; `TurnPlanStep` and the conversion omit it.
+- Drift: adding a source field does not affect construction of the smaller destination struct, so it compiles silently. Clients may receive an incomplete projection.
+- Check: for a declared full mirror, field sets, wire names, compatible types, and conversion consumption should agree. For a projection, every omitted field must be explicitly listed as intentionally private or lossy.
+- General rule: yes, but it should be opt-in or evidence-based. One-way `From` implementations are frequently intentional projections.
+- Value: high.
+- False-positive risk: medium to high without a “mirror” or “projection with exclusions” contract; low with one.
+
+The current [`conversion-field-drop`](</C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/data_contracts.rs:584>) catches a destination field being defaulted when the same field exists on both types. It cannot detect a new source field for which no destination field exists, which is exactly this case.
+
+### 5. `ApprovalsReviewer` wire domain across Serde, schema, TypeScript, and mirrors
+
+The core declaration repeats its accepted values in Serde attributes, a TS literal type, and a custom JSON Schema implementation in [`config_types.rs`](</C:/Users/kuh/Desktop/kd4/codex-rs/protocol/src/config_types.rs:159>). The app-server repeats the same representations and manual conversions in [`shared.rs`](</C:/Users/kuh/Desktop/kd4/codex-rs/app-server-protocol/src/protocol/v2/shared.rs:222>).
+
+The conceptual domain currently is:
+
+- Canonical output: `user`, `auto_review`
+- Accepted input: those values plus legacy alias `guardian_subagent`
+
+Drift can compile if an alias is added only to Serde, the TS literal changes without the schema, one mirror drops a value, or conversions map canonical variants incorrectly.
+
+A general rule could compare:
+
+- Serde accepted-input values against schema/TS input domains.
+- Serde canonical-output values against output representations.
+- Paired types connected by `From`/`to_core` for equal wire domains and canonical round trips.
+
+Value is high and false-positive risk low to medium if input aliases are distinguished from canonical output. The current representation-parity rule only compares explicit metadata conflicts; it does not inspect custom schema bodies or literal-union contents.
+
+### 6. `CodexErr` ↔ public error classification
+
+[`CodexErr`](</C:/Users/kuh/Desktop/kd4/codex-rs/protocol/src/error.rs:68>) has an exhaustive retryability decision in [`is_retryable`](</C:/Users/kuh/Desktop/kd4/codex-rs/protocol/src/error.rs:173>), but [`to_codex_protocol_error`](</C:/Users/kuh/Desktop/kd4/codex-rs/protocol/src/error.rs:220>) and [`http_status_code_value`](</C:/Users/kuh/Desktop/kd4/codex-rs/protocol/src/error.rs:261>) use wildcard defaults.
+
+- Drift: a new error forces an explicit retry decision but can silently become public `Other` and lose an HTTP status.
+- Check: every source variant must receive an explicit public classification; intentional `Other` mappings can share named pattern arms.
+- General rule: yes. This is the existing “adapter catch-all hides variants” pattern.
+- Value: high because classifications affect client behavior and diagnostics.
+- False-positive risk: medium on the initial inventory because many fallback classifications are intentional; low for newly added variants with a stored baseline.
+
+This is already largely coverable by `protocol-adapter-parity` or the diff-aware [`catch-all-hides-new-variant`](</C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/diff_consumers.rs:1>). It likely needs baselining and scoping rather than a new specialized rule.
+
+## Recommended analyzer priorities
+
+1. Enum-to-registry completeness and uniqueness.
+2. Tool-schema-to-deserializer compatibility.
+3. Configured classifier-positive-set-to-consumer coverage.
+4. Direction-aware Serde/schema/TS value-domain parity.
+5. Explicit mirror/projection contracts for DTO field parity.
+
+I would not prioritize KD4-specific hard-coding. All five relationships recur naturally in Rust systems, while configuration or lightweight annotations can express the few places where intent cannot be inferred.
+
+I also excluded several tempting false candidates: slash-command registration is generated through enum iteration, many v2 enum mirrors share one macro variant list, and tool specs and runtimes are now paired through `CoreToolRuntime`. Those areas already derive the representations from one source closely enough that ordinary compiler exhaustiveness provides meaningful protection.
+
+This was a read-only investigation; no files were changed and no build was run.
+
+EVIDENCE BOUNDARY
+Direct fact established by this migration: the source session recorded the task and
+conclusion above at the stated time and provenance. Statements inside the conclusion
+are historical audit/fix claims, including any cited files, symptoms, invariants,
+causes, edits, commands, and validation results.
+
+Hypotheses requiring repository investigation: any causal explanation, ownership or
+timing mechanism, inferred invariant, or implementation mapping not explicitly proved
+by the cited source and validation must be retraced in the actual project source and
+Git history before being treated as current truth.
+
+Unknown after this migration: whether the current repository still contains the
+reported defect, whether cited line numbers still match, and whether the reported
+validation remains reproducible. This migration did not independently re-run the
+source audit, tests, benchmarks, or reproduction steps.
+================================================================================
+FINDING 0020
+Evidence ID: SHA256:D4DFBA93ECB7CC7224F9D7B6DC0BE8DF1F0A138276DC0BE4A7053DB0957DFE8C
+Audit date: 2026-08-21
+Language classification: Multi-language
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\21\rollout-2026-08-21T23-08-49-01a027a8-3259-7833-9a9f-b50187cc9026.jsonl
+Source session UUID: 01a027a2-8047-7570-a387-db1ae174564b
+Logical session UUID: 01a027a2-8047-7570-a387-db1ae174564b
+Event timestamp: 08/22/2026 04:16:08
+Working directory: c:\Users\kuh\Documents\ChatGPT\kd-analzyer
+Git revision: 10be550978d388a16d87e2611c827fdd8820b1ed
+Git branch: main
+Thread source: user
+
+TASK / PROMPT
+(Extracted from the nearest preceding actual event_msg user_message. IDE tab context,
+when present, was removed while retaining the explicit "My request" text.)
+
+add all with agents
+
+DIRECTLY STATED HISTORICAL FINDING / FIX / VALIDATION
+(Faithful final_answer conclusion from the source session.)
+
+Implemented three isolated analyzer modules:
+
+- `legacy_default_provenance.rs`
+  - `serde-default-erases-provenance`
+  - Tracks resolved `#[serde(default)]` fields into equality, hashing, lookup-key, and control-flow consumers.
+
+- `generated_derivation_closure.rs`
+  - `incomplete-generated-artifact-closure`
+  - `stale-generated-artifact`
+  - Maps unique `JsonSchema`/`TS` source types to definition-bearing JSON/TypeScript outputs, checks member coverage, and reports generator commands.
+
+- `enum_consumer_matrix.rs`
+  - `shared-enum-variant-wildcard-ignore`
+  - `shared-enum-consumer-disposition-gap`
+  - Exposes full disposition matrices plus baseline-aware `run_changed(...)` for added enum variants.
+
+All expose `LINT_IDS` and `run_all(snapshot, config)`, with focused unit tests. Targeted rustfmt and `git diff --check` passed. Cargo validation was intentionally deferred while agents were editing.
+
+Integration requires module declarations, lint registration, normal `run_all` scheduling, and calling `enum_consumer_matrix::run_changed(...)` beside the existing surface-diff pass.
+
+EVIDENCE BOUNDARY
+Direct fact established by this migration: the source session recorded the task and
+conclusion above at the stated time and provenance. Statements inside the conclusion
+are historical audit/fix claims, including any cited files, symptoms, invariants,
+causes, edits, commands, and validation results.
+
+Hypotheses requiring repository investigation: any causal explanation, ownership or
+timing mechanism, inferred invariant, or implementation mapping not explicitly proved
+by the cited source and validation must be retraced in the actual project source and
+Git history before being treated as current truth.
+
+Unknown after this migration: whether the current repository still contains the
+reported defect, whether cited line numbers still match, and whether the reported
+validation remains reproducible. This migration did not independently re-run the
+source audit, tests, benchmarks, or reproduction steps.
+================================================================================
+FINDING 0021
+Evidence ID: SHA256:A0C6E427D2A1A814BE7305AD8EAFC0A7D882BBB0D290FDF6CF6E4BA523AD82B5
+Audit date: 2026-08-21
+Language classification: Multi-language
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\21\rollout-2026-08-21T23-07-46-01a027a7-3d5e-78b1-94c8-8ceb8866d507.jsonl
+Source session UUID: 01a027a7-3d5e-78b1-94c8-8ceb8866d507
+Logical session UUID: 01a027a7-3d5e-78b1-94c8-8ceb8866d507
+Event timestamp: 08/22/2026 04:16:11
+Working directory: c:\Users\kuh\Documents\ChatGPT\kd-analzyer
+Git revision: 10be550978d388a16d87e2611c827fdd8820b1ed
+Git branch: main
+Thread source: user
+
+TASK / PROMPT
+(Extracted from the nearest preceding actual event_msg user_message. IDE tab context,
+when present, was removed while retaining the explicit "My request" text.)
+
+Inspect KD4's validation and test failures from the perspective of my Rust analyzer.
+
+Identify classes of defects that currently require compiling or running tests but could plausibly be rejected earlier by semantic analysis.
+
+Do not try to replace tests.
+
+I want analyzer checks where:
+
+- the required fact already exists in the source;
+- runtime execution adds little information;
+- an earlier diagnostic would shorten the development loop.
+
+For each opportunity:
+
+- show what test or validation currently catches it;
+- explain what semantic fact would be sufficient;
+- estimate analyzer cost versus saved validation cost;
+- explain any cases where static analysis cannot replace the test.
+
+Rank by expected time saved for Codex during iterative development.
+
+Do not implement anything.
+
+DIRECTLY STATED HISTORICAL FINDING / FIX / VALIDATION
+(Faithful final_answer conclusion from the source session.)
+
+I found seven strong analyzer opportunities. The best targets are protocol omissions in KD4’s async orchestration: the necessary facts are already explicit in types, call order, guards, counters, and identity tokens, while the current regression tests mostly confirm those source-level contracts at runtime.
+
+One architectural issue comes first: KDA currently runs `cargo check --workspace --all-targets` before starting semantic analysis ([loading policy](/C:/Users/kuh/Documents/ChatGPT/kd-analzyer/README.md:1011)). These checks only shorten the loop if they can run in a source-first preflight phase. Added after the existing cargo-check gate, they improve diagnostics but save essentially no validation time.
+
+Cost bands below are marginal estimates:
+
+- Low: intraprocedural/type-aware rule, roughly days.
+- Medium: configured interprocedural protocol using KDA’s existing lifecycle/field-flow machinery, roughly one or two weeks.
+- High: path-sensitive ownership/cancellation analysis across `await` and `Drop`, likely several weeks.
+
+## Ranked opportunities
+
+| Rank | Proposed check | Analyzer cost | Validation saved when hit |
+|---:|---|---:|---:|
+| 1 | Tool-call lifecycle completeness and identity | Medium | Very high |
+| 2 | Command-process retirement state machine | Medium–high | Very high |
+| 3 | Sampling/terminalization requires all blockers resolved | Medium–high | Very high |
+| 4 | Cancellation-safe ownership transfer across `await` | High | Very high |
+| 5 | Generation-fenced wakeups and cancellation-safe waiter counts | Medium | High |
+| 6 | Late-subscriber-safe completion signals | Low–medium | High |
+| 7 | Telemetry counter provenance and balance | Medium | Medium–high |
+
+### 1. Tool-call lifecycle completeness and identity
+
+Current detection:
+
+- [`tool_lifecycle_uses_one_clock_and_records_all_boundaries`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/tool_dispatch_trace_tests.rs:36) asserts the complete ordered boundary sequence.
+- [`record_conversation_items_records_tool_output_model_visibility_boundary`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/tests.rs:2059) catches missing model-visibility recording.
+- [`exec_command_controlled_lifecycle_trio_completes_without_stale_processes`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/tests/suite/unified_exec.rs:266) checks the same protocol end-to-end for success, failure, and background execution.
+
+Sufficient semantic fact:
+
+For every accepted tool execution, enforce a configured partial-order protocol:
+
+```text
+request-created
+  → admitted
+  → handler-start
+  → process-spawn → process-exit       [process tools]
+  → handler-return
+  → relay-enqueue → relay-delivery
+  → persisted/model-visible
+  → next-model-sample
+```
+
+Each phase should occur at most once for the same `ToolExecutionId`; enqueue/delivery must balance in the same scope; and every tool-output variant accepted by conversation persistence must record model visibility after the persistence call. The current helper explicitly enumerates those variants ([session/mod.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/mod.rs:3261)) and records visibility after persistence ([session/mod.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/mod.rs:3303)).
+
+Cost versus savings:
+
+Medium. KDA already has `incomplete-lifecycle-protocol`, `unbalanced-lifecycle-event`, `cross-scope-event-leak`, and `correlation-identity-drift` ([lint inventory](/C:/Users/kuh/Documents/ChatGPT/kd-analzyer/README.md:793)). This is primarily a richer KD4 contract plus interprocedural dominance/order checking. A hit avoids building the large `codex-core` test target and potentially the 15-second integration scenario.
+
+Static boundary:
+
+Keep the tests. Analysis cannot prove that recorded timestamps reflect real elapsed time, persistence actually succeeds, an OS process exits, or concurrent delivery happens in the observed runtime order.
+
+### 2. Command-process retirement state machine
+
+Current detection:
+
+- [`kd4_latency_unpolled_background_failure_retires_live_metadata`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/handlers/unified_exec_tests.rs:893) launches a failing process, waits through a 2.5-second delay, and checks artifact retention, failure counting, and metadata retirement.
+- The controlled lifecycle integration test also checks that no stale process state survives.
+
+Sufficient semantic fact:
+
+Model command execution as a keyed linear state machine:
+
+```text
+Running(process_id, execution_id, parent_id)
+  → PendingCompletion(execution_id, parent_id)
+  → CompletionReceipt(execution_id, parent_id)
+```
+
+A completion may mutate state only after both execution identity and parent tool identity match. Every success, failure, cancellation, and background completion path must reach retirement exactly once, and retirement must postdominate terminal output/artifact handling.
+
+Those transitions are already explicit in [`mark_process_exited`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/command_execution.rs:997), [`retire_completed_process`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/command_execution.rs:1062), and the watcher’s finalization path ([async_watcher.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/unified_exec/async_watcher.rs:459)).
+
+Cost versus savings:
+
+Medium–high. This fits KDA’s keyed-protocol and lifecycle concepts, but requires interprocedural postdomination and exhaustiveness over terminal branches. It would reject forgotten cleanup before compiling and running an external-process test.
+
+Static boundary:
+
+Analysis cannot verify OS exit behavior, output draining, retained artifact contents, the actual failure count, or races with process polling. The runtime tests remain essential.
+
+### 3. Sampling and terminalization require all blockers resolved
+
+Current detection:
+
+- [`tool_relay_reconciliation_advances_without_watchdog`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/turn_tests.rs:63) checks gate, relay-delivery, and ready-to-sample states.
+- The post-run audit rejects a terminal turn with an unresolved tool call in [`test_terminal_turn_with_unresolved_tool_call_is_inconsistent`](/C:/Users/kuh/Desktop/kd4/scripts/test_kd4_turn_latency_audit.py:604).
+
+Sufficient semantic fact:
+
+Any path returning `ReadyToSample` must be dominated by proof that all of these are zero:
+
+- Active tool count
+- Relay queue depth
+- Parallel and sampling gate waiters
+- Process-output waiters
+- Pending tool count
+
+The current predicate makes that source contract visible in [`reconcile_turn_progress`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/turn.rs:4057). A companion check should ensure every mutation of one of those blocker classes reaches reconciliation, and terminalization requires the outstanding tool-lifecycle set to be empty.
+
+Cost versus savings:
+
+Medium–high. The zero-state predicate itself is cheap; proving that every producer and consumer participates is an interprocedural field-flow/lifecycle problem. This has excellent payoff because omissions often manifest as watchdog delays, 15-second test timeouts, or only in a post-run telemetry audit.
+
+Static boundary:
+
+Static analysis can prove that the gate is present and complete, not that runtime counters are accurate or that the necessary wakeup is delivered under every schedule.
+
+### 4. Cancellation-safe ownership transfer across `await`
+
+Current detection:
+
+[`kd4_latency_cancelled_task_start_preserves_input_and_clears_placeholder_once`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/tests.rs:10847) aborts startup while a lifecycle callback is suspended, then verifies that input is restored once, the placeholder is cleared, and no false idle event is emitted.
+
+Sufficient semantic fact:
+
+When pending input is moved from the session queue into turn state before a cancellation point:
+
+- An armed rollback guard must already own the recovery obligation.
+- Its `Drop` path must recover the same payload and clear only the matching placeholder identity.
+- The guard may be disarmed only after both the running task and terminal coordinator are installed.
+- No earlier return after the transfer may bypass rollback.
+
+That transaction is visible around guard creation, input transfer, and the awaited lifecycle hook ([tasks/mod.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tasks/mod.rs:929)); installation and disarming happen later ([tasks/mod.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tasks/mod.rs:1010)); recovery checks the exact `Arc` identity ([tasks/mod.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tasks/mod.rs:1043)).
+
+Cost versus savings:
+
+High. This needs async cancellation points, ownership-transfer annotations, RAII cleanup, and path-sensitive disarm analysis. It would nevertheless save a costly compile plus a multi-threaded two-second timeout test for a defect whose essential obligation is structural.
+
+Static boundary:
+
+The test is still needed for executor behavior, asynchronous work spawned from `Drop`, lock interaction, FIFO preservation, and exactly-once behavior under a real abort schedule.
+
+### 5. Generation-fenced wakeups and cancellation-safe waiter counts
+
+Current detection:
+
+[`terminal_wakeups_are_generation_aware_and_waiter_counts_are_cancellation_safe`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tasks/mod_tests.rs:382) checks stale-generation rejection and verifies that aborting a waiter decrements its count.
+
+Sufficient semantic fact:
+
+- Every state-mutating operation accepting a `SamplingGenerationId` must compare it with the current generation before any store or notification.
+- Any waiter counter spanning an `await` must be represented by an RAII guard, not a raw increment/decrement pair.
+- The guard must dominate the wait and its `Drop` must perform the inverse update.
+
+KD4 already embodies these facts in [`TerminalWaiterGuard`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/state/turn.rs:155), generation validation before mutation ([state/turn.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/state/turn.rs:316)), and the guarded wait loop ([state/turn.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/state/turn.rs:348)).
+
+Cost versus savings:
+
+Medium. Generation-token validation is a natural keyed-protocol rule; the waiter portion is a specialized owned-lifecycle check. It would catch forgotten fencing or cancellation leaks before compiling the Tokio test.
+
+Static boundary:
+
+It cannot establish that the chosen atomic memory ordering is sufficient or exercise notification races between threads.
+
+### 6. Late-subscriber-safe completion signals
+
+Current detection:
+
+[`exit_before_watcher_registration_is_observed_once`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/unified_exec/async_watcher_tests.rs:27) completes exit and output signals before watcher registration and then checks idempotent observation and retirement.
+
+Sufficient semantic fact:
+
+A lifecycle-completion signal consumed by a potentially late subscriber must be sticky:
+
+- Use a stateful primitive such as `CancellationToken` or `watch`; or
+- Register the waiter before checking latched state, then await that registered waiter.
+
+KD4’s helper creates the cancellation future before checking `is_cancelled()` ([async_watcher.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/unified_exec/async_watcher.rs:220)). Replacing this with a bare `Notify::notified().await` would be statically suspicious.
+
+Cost versus savings:
+
+Low–medium. This can start as a narrowly scoped type-and-order check over configured completion-signal functions. It avoids compiling and running an async regression test for a classic lost-wakeup defect.
+
+Static boundary:
+
+The rule proves the primitive and ordering pattern, not actual scheduling or exactly-once ledger behavior.
+
+### 7. Telemetry counter provenance and balance
+
+Current detection:
+
+- [`lifecycle_serialization_counters_separate_emission_polling_and_admission_peak`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/turn_timing_tests.rs:523) checks that model emissions, accepted calls, executor admissions, and concurrency peak remain distinct.
+- The controlled integration test checks the same counters against three real calls ([unified_exec.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/tests/suite/unified_exec.rs:425)).
+
+Sufficient semantic fact:
+
+- The source-emission counter is incremented only for direct model-issued calls.
+- The accepted-call counter is incremented for every dispatched tool call.
+- Every executor admission has a release on all exits.
+- Active count never underflows.
+- Peak is updated as `max(previous_peak, active_count)`.
+- Nested code-mode calls do not increment the direct-model counter.
+
+The distinct update sites and formulas already exist in [`turn_timing.rs`](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/turn_timing.rs:1310) and the admission logic ([turn_timing.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/turn_timing.rs:1373)).
+
+Cost versus savings:
+
+Medium. KDA’s field-flow and balanced-transition support provides a base, but call-site classification requires KD4-specific semantic roles. Runtime test execution is short; the main saving is avoiding compilation of the core test target.
+
+Static boundary:
+
+Analysis cannot prove the observed number of runtime calls, the actual concurrency peak, or serialized telemetry values.
+
+## Checks I would not move into semantic analysis
+
+Generated schema freshness is a poor analyzer target. KD4 currently validates it by compiling and executing `schemars`/`ts-rs` generation in [`typescript_schema_fixtures_match_generated`](/C:/Users/kuh/Desktop/kd4/codex-rs/app-server-protocol/tests/schema_fixtures.rs:12) and the [`app-server-schema-protocol-check`](/C:/Users/kuh/Desktop/kd4/justfile:662). Reproducing proc-macro and generator semantics inside KDA would be expensive and less trustworthy than the generator itself.
+
+Likewise, keep dynamic coverage for:
+
+- Real process exit codes, signals, output draining, and retained artifacts.
+- Real monotonic durations and timeout behavior.
+- Atomic-memory-ordering and scheduler races.
+- Serialization compatibility and generated-file byte equality.
+- Cross-process and persistence failures.
+
+## Inspection status
+
+This was read-only; I made no changes. I did not launch Rust validation because KD4 already had concurrent `rustc`/`sccache` compilation in the same tree, and the repository instructions prohibit competing validation runs. `git diff --check` passed. Consequently, “currently catches” above refers to the regression tests and validation contracts present in the current KD4 worktree, not a newly replayed failure transcript.
+
+EVIDENCE BOUNDARY
+Direct fact established by this migration: the source session recorded the task and
+conclusion above at the stated time and provenance. Statements inside the conclusion
+are historical audit/fix claims, including any cited files, symptoms, invariants,
+causes, edits, commands, and validation results.
+
+Hypotheses requiring repository investigation: any causal explanation, ownership or
+timing mechanism, inferred invariant, or implementation mapping not explicitly proved
+by the cited source and validation must be retraced in the actual project source and
+Git history before being treated as current truth.
+
+Unknown after this migration: whether the current repository still contains the
+reported defect, whether cited line numbers still match, and whether the reported
+validation remains reproducible. This migration did not independently re-run the
+source audit, tests, benchmarks, or reproduction steps.
+================================================================================
+FINDING 0022
+Evidence ID: SHA256:4EF80A6D97980747070BDCF29283CE5DBF27483FA0850A79C0DDAF8D3278F543
+Audit date: 2026-08-21
+Language classification: Multi-language
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\21\rollout-2026-08-21T23-28-05-01a027b9-d4b1-7020-a628-60dae8e07030.jsonl
+Source session UUID: 01a027b9-d4b1-7020-a628-60dae8e07030
+Logical session UUID: 01a027b9-d4b1-7020-a628-60dae8e07030
+Event timestamp: 08/22/2026 04:34:09
+Working directory: c:\Users\kuh\Documents\ChatGPT\kd-analzyer
+Git revision: 30c158754a64aa076e09acca943227669e74e34a
+Git branch: main
+Thread source: user
+
+TASK / PROMPT
+(Extracted from the nearest preceding actual event_msg user_message. IDE tab context,
+when present, was removed while retaining the explicit "My request" text.)
+
+Temporarily ignore the current implementation of my Rust analyzer.
+
+If you were designing a semantic quality gate specifically for autonomous agents modifying KD4 codex-rs, what capabilities would you build?
+
+Derive the design entirely from the repository's actual failure surface and architecture.
+
+Then compare that ideal design against my existing analyzer.
+
+Classify the differences as:
+
+- already covered;
+- partially covered;
+- important missing capability;
+- unnecessary complexity.
+
+Use the comparison to recommend the highest-value additions to the analyzer I already have.
+
+Do not propose rewriting the project from scratch.
+
+Do not implement anything.
+
+DIRECTLY STATED HISTORICAL FINDING / FIX / VALIDATION
+(Faithful final_answer conclusion from the source session.)
+
+## Conclusion
+
+The ideal KD4 quality gate is a **change-scoped contract-closure and proof-validity system**, not a larger collection of generic Rust lints.
+
+Your analyzer already contains many of the necessary semantic primitives. Its biggest weakness is that KD4’s authoritative architecture—the source-owner graph, compatibility routes, generated outputs, and validation commands—is mostly advisory. The gate does not yet make “the change is architecturally complete and proved by exactly applicable evidence” its central decision.
+
+I derived this design from:
+
+- KD4’s required pre-edit ownership and consumer analysis in [AGENTS.md](C:/Users/kuh/Desktop/kd4/AGENTS.md:26).
+- Its direct-test requirement in [AGENTS.md](C:/Users/kuh/Desktop/kd4/AGENTS.md:68).
+- The persistence, generated-artifact, and cross-cutting routes in [SOURCEMAP.md](C:/Users/kuh/Desktop/kd4/SOURCEMAP.md:354) and [SOURCEMAP.md](C:/Users/kuh/Desktop/kd4/SOURCEMAP.md:475).
+- The twelve confirmed defects recorded before commit `37f7f9bf36`: proof-scope collisions, lost enum state, unsafe PowerShell classification, detached persistence, stale watcher evidence, unbounded retained bytes, hidden output, scoped-ID collisions, and invalid parallel-time arithmetic.
+
+## The ideal KD4 gate
+
+It would provide these capabilities:
+
+1. **Diff-to-contract closure**
+
+   Every changed path resolves to an owner, entrypoint, direct callers and consumers, compatibility boundary, generated mirrors, focused tests, and validation route. Missing ownership or an unexamined affected route is a gate failure or explicit unknown.
+
+2. **Production wiring and activation proof**
+
+   New handlers, tools, contributors, variants, features, and config fields must be registered and reachable on every required production path—not merely compile.
+
+3. **Wire, persistence, and generated-representation closure**
+
+   Serde shapes, JSON Schema, TypeScript/Python projections, stored rollouts, migrations, defaults, aliases, and legacy round trips are treated as one compatibility surface.
+
+4. **Lifecycle and durability contracts**
+
+   Important KD4 flows are modeled as state machines: begin/terminal pairing, commit-before-response, await-before-observe, cancellation, process-tree shutdown, output drain, cache publication, and exactly-once completion.
+
+5. **Identity and information-preservation checks**
+
+   The gate rejects lossy state projections such as enum-to-boolean conversion, incomplete composite keys, reminted scope IDs, and claims of currentness based on advisory generations rather than content identity.
+
+6. **Authority-aware command classification**
+
+   Shell classification is dialect-specific and conservative. Unknown PowerShell constructs, method invocation, quoting loss, sandbox transitions, and approval boundaries cannot silently acquire read-only authority.
+
+7. **Compositional quantitative contracts**
+
+   Bounds must compose across nesting: per-entry and aggregate bytes, visible-yield latency, total deadline versus per-operation timeout, model-visible token budgets, and parallel elapsed time versus summed work.
+
+8. **Exact validation-proof semantics**
+
+   A proof identity includes package, target kind/name, feature set, profile, toolchain, filter semantics, working directory, candidate/content identity, and selected-test count. Equality and directional proof coverage are separate concepts.
+
+9. **Static-to-runtime escalation**
+
+   Static analysis should identify the smallest authoritative runtime test whenever scheduling, OS processes, persistence ordering, notification delivery, or output draining cannot be proved statically.
+
+10. **Agent-oriented output**
+
+    Diagnostics should state the violated contract, owner, affected route, counterexample path, unknowns, required proof, and the smallest next action.
+
+## Comparison with the existing analyzer
+
+### Already covered
+
+- **Production registration:** KD4’s config enforces `CoreToolRuntime` wiring and exact-once registration of extension facets in [kda.toml](C:/Users/kuh/Desktop/kd4/codex-rs/kda.toml:6).
+- **Extension event disposition:** Produced `EventMsg` variants must receive explicit host handling.
+- **Public boundary ownership:** Protocol, tools, and extension APIs are prevented from leaking host implementation types.
+- **Focused KD4 negative guarantees:** The analyzer already checks fourteen named constraints involving validation reuse, cross-turn sessions, speculative cache publication, blocked waits, recursive delegation, provider scope, and other KD4-specific behavior, documented in [README.md](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/README.md:1157).
+- **Useful agent interfaces:** Impact, slice, explain, boundary-diff, scenario, and test-plan already provide deterministic semantic evidence and explicit unknowns.
+
+These are valuable and should remain.
+
+### Partially covered
+
+| Ideal capability | Current state |
+|---|---|
+| Architecture closure | `impact` loads and validates `architecture_index.json` and reports owners, invariants, generated outputs, and validation commands. However, this is an advisory mode, not a core gate obligation. The current managed index also represents only a small fraction of KD4’s owners. See [impact_command.rs](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/impact_command.rs:440). |
+| Direct-test proof | `test-plan` finds reachable tests and estimates oracle strength. It does not enforce KD4’s “test changed in the same change and fails without it” requirement. |
+| Exact test selection | Commands are emitted as `cargo test -p package simple_name`, which is a substring-style filter without target identity. This recreates the class of mistakes behind historical F3/F12. See [test_plan.rs](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/test_plan.rs:242). |
+| Protocol/generated/persistence closure | Strong configurable engines already exist for change consequences, persistence continuity, and generated provenance. KD4’s current `kda.toml` does not configure them. |
+| Lifecycle and concurrency | The analyzer has extensive generic lifecycle, process, freshness, detached-task, and keyed-protocol checks, plus several KD4 point checks. These do not yet express the principal KD4 transactions end-to-end. |
+| Identity preservation | Scope, causal identity, authority, and enum-domain checks exist, but they are mostly heuristic. They do not reliably prove that `Uncertain` was not collapsed to `bool`, or that request-local IDs were qualified by complete question identity. |
+| Resource bounds | Generic aggregate-bound and retained-state checks exist. They are not connected to KD4’s declared byte/token/yield budgets and may miss “entry-count bounded but aggregate bytes effectively 4 GiB.” |
+| Shell safety | PowerShell and shell-boundary checks exist, but the KD4 mutation classifier’s closed-world read-only semantics are not an explicit project contract. |
+| Static/runtime boundary | The documentation correctly admits that scheduling and process behavior need runtime proof, but the gate does not consistently turn an analysis unknown into a mandatory owner-specific runtime route. |
+
+### Important missing capabilities
+
+1. **An authoritative change-closure decision**
+
+   The gate does not currently fail a change because an owner, consumer, compatibility projection, generated mirror, or required validation route is missing from its closure.
+
+2. **Canonical validation identity**
+
+   The historical proof defects—contains versus equality filters and discarded `--test`/`--bin`/`--example`/`--bench` selectors—show that proof identity needs its own semantic model, not shell-string comparison.
+
+3. **KD4 transaction-level state machines**
+
+   The high-risk contracts are multi-function and asynchronous: persist before reuse, retire before publish, commit before terminal response, drain before completion, cancel without starting new work. Generic local lints are insufficient.
+
+4. **First-class distinction between observed, possible, and unknown state**
+
+   F4 and F7 both came from promoting weaker evidence into stronger claims. The gate needs an explicit evidence lattice and should reject authority gained through lossy conversion.
+
+5. **Topology-aware quantitative reasoning**
+
+   F11 demonstrates that summed child work and critical-path elapsed time are semantically different. The current quantitative checks do not model that distinction as a KD4 contract.
+
+6. **Repository-specific direct-test validity**
+
+   Reachability to a test is not enough. The gate needs proof that the precise test ran, selected at least one case, exercised the changed contract, and is bound to the current content identity.
+
+### Unnecessary complexity
+
+The unnecessary complexity is primarily **breadth on the default critical path**, not the existence of the machinery.
+
+- The analyzer exposes roughly 279 built-in lint IDs and registers most passes with always-applicable activation. Many duplicate rustc/Clippy concerns or rely on broad naming and shape heuristics that are less valuable than KD4’s explicit owner contracts.
+- Several overlapping generic families cover lifecycle, authority, identity, transitions, derivation, propagation, and optimization. Adding more such families would dilute confidence without addressing the confirmed failures.
+- Mutation/history analysis and speculative optimization contracts are useful on demand, but they should not compete with architecture closure and proof validity in the default agent gate.
+- A second architecture manifest or general theorem engine would be counterproductive. KD4 already owns `source_owners.toml` and `architecture_index.json`.
+
+## Highest-value additions
+
+In priority order:
+
+1. **Promote architecture facts into gate obligations.**
+
+   Reuse `architecture_facts`, impact analysis, and change-consequence support. For every diff, require an owner match, complete downstream closure, explicit unknown disposition, and the owner’s named validation route. Expand the existing source-owner manifest incrementally around changed/high-risk areas.
+
+2. **Build exact validation-proof identity.**
+
+   Represent commands structurally. Preserve package, target, features, profile, exact-filter semantics, selected count, working directory, and content/worktree identity. Keep “same proof” distinct from “this broader proof covers that requirement.”
+
+3. **Configure a small set of end-to-end KD4 lifecycle contracts.**
+
+   Start with the flows repeatedly implicated by history:
+
+   - tool begin → lifecycle record → terminal result;
+   - mutation observation → evidence invalidation;
+   - durable state update → subsequent sampling/resume;
+   - process output → visible yield → drain → retirement;
+   - speculative creation → ownership transfer → cache publication.
+
+4. **Add evidence-strength and state-preservation contracts.**
+
+   Detect enum-to-boolean information loss, incomplete scoped identities, advisory-to-authoritative freshness promotion, and untracked durability work. This directly targets F4, F6, F7, and F10.
+
+5. **Make KD4’s quantitative budgets declarative.**
+
+   Encode per-item plus aggregate byte limits, prompt token budgets, output thresholds, caller-visible yield boundaries, and elapsed-time topology. Relate constants to their contract tests so F1-style contradictions become change-time failures.
+
+6. **Populate existing compatibility mechanisms.**
+
+   Configure `change-consequence`, `persistence-continuity`, and `generated-artifact` entries from the actual SOURCEMAP routes. Require schema/projection freshness and legacy/new-shape round-trip proof when relevant.
+
+7. **Make PowerShell mutation classification a closed project contract.**
+
+   Treat unsupported invocation forms as unknown/mutating, then require invalidation or stronger proof. This is higher value than adding more generic shell-pattern lints.
+
+The best near-term sequence is **architecture closure → exact proof identity → five or fewer transaction-level lifecycle contracts**. That would address most of the confirmed high-severity failure surface while reusing the analyzer you already have.
+
+This was a read-only assessment; I did not modify files or run builds/tests.
+
+EVIDENCE BOUNDARY
+Direct fact established by this migration: the source session recorded the task and
+conclusion above at the stated time and provenance. Statements inside the conclusion
+are historical audit/fix claims, including any cited files, symptoms, invariants,
+causes, edits, commands, and validation results.
+
+Hypotheses requiring repository investigation: any causal explanation, ownership or
+timing mechanism, inferred invariant, or implementation mapping not explicitly proved
+by the cited source and validation must be retraced in the actual project source and
+Git history before being treated as current truth.
+
+Unknown after this migration: whether the current repository still contains the
+reported defect, whether cited line numbers still match, and whether the reported
+validation remains reproducible. This migration did not independently re-run the
+source audit, tests, benchmarks, or reproduction steps.
+================================================================================
+FINDING 0023
+Evidence ID: SHA256:E5803FD8ECED8EDD1CF91DAECBAE7BACDB4A15005287346BBFFF176B7F2321C9
+Audit date: 2026-08-21
+Language classification: Multi-language
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\21\rollout-2026-08-21T23-29-22-01a027bb-031f-7dc3-97f0-e5fb6b5ce67b.jsonl
+Source session UUID: 01a027bb-031f-7dc3-97f0-e5fb6b5ce67b
+Logical session UUID: 01a027bb-031f-7dc3-97f0-e5fb6b5ce67b
+Event timestamp: 08/22/2026 04:36:20
+Working directory: c:\Users\kuh\Documents\ChatGPT\kd-analzyer
+Git revision: 30c158754a64aa076e09acca943227669e74e34a
+Git branch: main
+Thread source: user
+
+TASK / PROMPT
+(Extracted from the nearest preceding actual event_msg user_message. IDE tab context,
+when present, was removed while retaining the explicit "My request" text.)
+
+Compare what my Rust analyzer could realistically do for KD4 against rustc, Clippy, rust-analyzer, tests, and ordinary repository search.
+
+Then answer:
+
+Where can cargo kda develop a genuine advantage instead of duplicating existing tools?
+
+Inspect the actual analyzer and KD4 codebase before answering.
+
+Find areas where combining full-workspace Rust semantics with an agent-oriented quality gate creates capabilities the other tools are not designed to provide.
+
+For each opportunity:
+
+- describe the developer or Codex problem;
+- explain why existing tooling does not solve it well;
+- show real KD4 evidence;
+- describe the semantic capability cargo kda would need;
+- give examples of checks or outputs it could enable;
+- estimate how defensible that advantage would remain as other Rust tooling improves.
+
+Rank the opportunities by long-term value.
+
+End with the 3 capabilities that would most clearly give cargo kda its own reason to exist.
+
+Do not implement anything.
+
+DIRECTLY STATED HISTORICAL FINDING / FIX / VALIDATION
+(Faithful final_answer conclusion from the source session.)
+
+## Bottom line
+
+`cargo kda` can earn a genuine advantage by becoming KD4’s semantic completion and contract-closure engine—not by becoming another collection of Rust lints.
+
+Its durable niche is the layer above normal Rust semantics:
+
+> Given this exact change, which KD4-specific runtime, compatibility, persistence, ownership, configuration, generated-artifact, and validation obligations must still be closed—and what evidence proves they are closed in the current worktree?
+
+rustc, Clippy, rust-analyzer, tests, and search each provide essential facts. None is designed to combine those facts into a deterministic, change-scoped proof suitable for an autonomous coding agent.
+
+## Reality check on the current analyzer
+
+The foundations are real:
+
+- KDA embeds exact-version rust-analyzer HIR/IDE crates, Cargo metadata, and a workspace model ([Cargo.toml](/C:/Users/kuh/Documents/ChatGPT/kd-analzyer/Cargo.toml:27)).
+- `ProgramIndex` records canonical functions, resolved calls, semantic references, and production/test classifications ([analysis_context.rs](/C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/analysis_context.rs:137)).
+- Registration checks already reason from trait implementations through reachable composition roots to dispatchers ([registration.rs](/C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/registration.rs:210)).
+- Impact, architecture-index enrichment, boundary diffs, test planning, profiles, and explicit unknowns exist as concrete code or interfaces ([README.md](/C:/Users/kuh/Documents/ChatGPT/kd-analzyer/README.md:73)).
+
+But this is still a `0.1.0` prototype, and much of the expanded analyzer is untracked in the inspected worktree. Several current analyses remain approximations:
+
+- Change impact stops after eight semantic edges or 500 symbols and explicitly cannot fully resolve generated code, external code, or dynamic dispatch ([change_impact.rs](/C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/change_impact.rs:155)).
+- Test detection and oracle strength currently include textual checks for `#[test]`, `assert!`, `unwrap()`, and similar markers ([test_plan.rs](/C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/test_plan.rs:213)).
+- Several security checks are syntax-local and depend on curated names such as `approval`, `sandbox`, and `identity` ([security_contracts.rs](/C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/security_contracts.rs:1)).
+- An all-features snapshot is not the same as covering every configuration: Rust removes inactive `cfg` code from a particular crate instance, so meaningful target/feature combinations need separate profiles. [Rust’s conditional-compilation reference](https://doc.rust-lang.org/reference/conditional-compilation.html)
+
+Also, rust-analyzer access itself is not a moat. rust-analyzer is principally an IDE semantic engine for references, definitions, completion, and refactoring, and its internal HIR crates are explicitly not stable API boundaries. [rust-analyzer introduction](https://rust-analyzer.github.io/book/), [architecture](https://rust-analyzer.github.io/book/contributing/architecture.html)
+
+## Tool comparison
+
+| Tool | What it should remain authoritative for | Gap KDA can fill |
+|---|---|---|
+| rustc | Type correctness, borrow checking, exhaustiveness, trait obligations, compilation for one selected configuration, built-in lints. [rustc lint documentation](https://doc.rust-lang.org/rustc/lints/index.html) | It does not know that a KD4 implementation must be installed in a registry, that an event must survive a projection, or that a validation receipt became stale. |
+| Clippy | General correctness, suspicious constructs, idiom, performance, and policy-style source lints. [Clippy categories](https://doc.rust-lang.org/stable/clippy/index.html) | Its rules are normally code-pattern-oriented and broadly applicable. It is not a repository-specific change-consequence or runtime-wiring engine. |
+| rust-analyzer | Incremental name resolution, types, references, implementations, navigation, and editor feedback. [rust-analyzer features](https://rust-analyzer.github.io/book/features.html) | It answers questions around a symbol. It does not ordinarily enforce declared composition roots, persistence stages, generated artifacts, owner facets, or proof freshness. |
+| Tests | Actual behavior for the paths, profiles, platforms, inputs, and assertions executed. Cargo can select packages, targets, features, and test filters. [Cargo test documentation](https://doc.rust-lang.org/cargo/commands/cargo-test.html) | Tests do not themselves prove that the right test was selected, that an exact filter ran anything relevant, that an untested branch is wired, or that the result is still current after later edits. |
+| Repository search | Fast discovery across Rust, TOML, JSON, schemas, scripts, generated files, strings, and dynamic keys. | Search cannot reliably distinguish two same-named symbols, aliases, resolved trait calls, production from test reachability, or use from mere mention. |
+| cargo kda | Project-specific semantic composition | It should consume and organize the evidence from all five, not imitate their individual jobs. |
+
+## Ranked opportunities
+
+### 1. Change-scoped completion proofs and validation freshness
+
+**Developer/Codex problem.** An agent must decide what a change affects, which checks are necessary, whether the selected tests actually observe the changed behavior, and whether subsequent edits invalidated the result. “Build succeeded” is not enough.
+
+**Why existing tools fall short.** rustc and Clippy evaluate the source they receive. Tests execute the commands chosen by the developer. rust-analyzer helps find references. None maintains a transaction-like relationship between changed semantic subjects, project obligations, validation dependencies, and current worktree state.
+
+**KD4 evidence.**
+
+- KD4 requires owner slices to cover callers, configuration, registration, tests, generated artifacts, and invariants; absent facets are insufficient, and heuristic evidence cannot close the task ([SOURCEMAP.md](/C:/Users/kuh/Desktop/kd4/SOURCEMAP.md:85)).
+- KD4’s task ledger explicitly distinguishes direct reads, search hits, generated summaries, inferred relationships, test results, and unverified evidence ([task_evidence.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/task_evidence.rs:132)).
+- Planning evidence carries source owners, implementation surfaces, mutation obligations, and validation routes ([task_evidence.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/task_evidence.rs:198)).
+- The agent task store invalidates validation when covered files/contracts change, event coverage has gaps, or a repository-wide proof ran against an earlier epoch ([local.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/agent-task-store/src/local.rs:4439)).
+- KD4 explicitly says green tooling alone is not runtime proof and that an exact test filter must select relevant tests ([SOURCEMAP.md](/C:/Users/kuh/Desktop/kd4/SOURCEMAP.md:430)).
+
+**Semantic capability needed.**
+
+- Stable identities across base and current revisions, including renamed and deleted declarations.
+- Change closure over resolved calls, trait consumers, constructors, patterns, registration, Serde containment, persistence stages, features, and declared architecture relationships.
+- Test-to-behavior reachability plus meaningful oracle classification.
+- Validation receipts bound to command, profile, selected tests, source/dependency hashes, repository epoch, and analyzer version.
+- Semantic invalidation: a later change invalidates only the proof whose dependency closure it intersects.
+- Explicit uncovered obligations and unknown boundaries.
+
+**Example outputs.**
+
+```text
+CHANGE: TurnContextItem::permission_profile
+
+Required consequences:
+  proven  live producer: TurnContext::to_rollout_item
+  proven  persisted wire field: codex_protocol::TurnContextItem
+  missing resume consumer: persisted_thread_settings::restore
+  required config schema check
+  required legacy missing-field round-trip test
+
+Selected proof:
+  cargo nextest run -p codex-protocol permission_profile_resume
+  oracle: strong
+  witnesses: test -> deserialize -> restore -> permission_profile
+
+Completion: BLOCKED (1 uncovered persistence stage)
+```
+
+Or:
+
+```text
+proof-stale:
+  receipt core-focused@epoch-418 covered ToolRouter::dispatch
+  workspace event 421 changed a reachable terminal-outcome branch
+```
+
+**Defensibility: very high.** Better compiler and IDE semantics improve KDA’s inputs. They do not remove the need for repository policy, agent provenance, validation freshness, or change-specific completion decisions.
+
+---
+
+### 2. Production realization and capability parity across profiles
+
+**Developer/Codex problem.** A handler, tool, extension contributor, or feature can compile and have tests while never being installed in production—or only being installed under some entrypoints, modes, or targets.
+
+**Why existing tools fall short.** To Rust, an unused implementation can be perfectly valid. Clippy can notice some dead code but does not understand a project’s registry semantics. rust-analyzer can show references without proving that a composition root reaches a registration and a dispatcher. Tests only cover configurations that were instantiated.
+
+**KD4 evidence.**
+
+- KD4 declares that every production `CoreToolRuntime` must reach both the tool plan and terminal dispatcher because implementations can compile while omitted ([kda.toml](/C:/Users/kuh/Desktop/kd4/codex-rs/kda.toml:3)).
+- Eleven extension contributor facets must each be installed exactly once at `thread_extensions` ([kda.toml](/C:/Users/kuh/Desktop/kd4/codex-rs/kda.toml:22)).
+- Actual tool dispatch terminates through `dispatch_any_with_terminal_outcome` ([router.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/router.rs:420)).
+- Tool planning conditionally adds built-in, MCP, agent, code-mode, and extension tools, so presence is profile- and mode-dependent ([spec_plan.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/spec_plan.rs:1123)).
+
+**Semantic capability needed.**
+
+- Exact trait-implementor discovery.
+- Constructor and argument identity through aliases, wrappers, and builders.
+- Per-entrypoint call-graph proof from production root to registration site and from that root to the consuming dispatcher.
+- Duplicate, registration-key collision, orphan, and test-only detection.
+- Separate Cargo/profile snapshots for relevant feature, target, and mode combinations.
+- Conditional verdicts and explicit dynamic-dispatch unknowns.
+
+**Example checks.**
+
+- `CoreToolRuntime implementation-not-registered`.
+- `extension contributor registered twice at app-server composition root`.
+- `tool visible in direct mode but absent in code-mode route`.
+- `registered-but-never-dispatched`.
+- `profile-registration-gap: Windows + UnifiedExec`.
+- A capability matrix showing `defined / registered / model-visible / invokable / terminalized / tested` per profile.
+
+**Defensibility: high.** Call graphs and cfg handling will improve elsewhere, but “what counts as installed,” “which roots matter,” and “which runtime stages constitute realization” are application contracts, not Rust language rules.
+
+---
+
+### 3. Cross-representation protocol and persistence evolution
+
+**Developer/Codex problem.** A Rust enum or struct change can compile while silently breaking wire names, legacy payloads, stored sessions, replay, schema generation, SDK projections, or wildcard consumers.
+
+**Why existing tools fall short.** rustc checks exhaustiveness only where matches are exhaustive; `_` arms deliberately suppress that signal. Serde tags, aliases, defaults, manual conversions, and generated outputs are outside Rust source compatibility. Search cannot reliably distinguish meaningful consumption from a mention. Tests require someone to know which legacy fixtures and projections matter.
+
+**KD4 evidence.**
+
+- Protocol policy treats Serde names, tags, defaults, aliases, and skipped fields as wire or persistence contracts and requires alignment across `Serialize`, `Deserialize`, `JsonSchema`, and `TS` ([protocol/AGENTS.md](/C:/Users/kuh/Desktop/kd4/codex-rs/protocol/AGENTS.md:11)).
+- `EventMsg` is a large tagged wire enum with aliases such as `task_started`/`turn_started` ([protocol.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/protocol/src/protocol.rs:1348)).
+- An extension constructs `EventMsg::ThreadGoalUpdated` ([events.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/ext/goal/src/events.rs:19)), while the app-server extension sink has one explicit arm and otherwise logs that it is dropping unsupported events ([extensions.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/app-server/src/extensions.rs:114)).
+- KD4 declares explicit live → persist → replay/resume continuity contracts for `TurnContextItem` fields ([kda.toml](/C:/Users/kuh/Desktop/kd4/codex-rs/kda.toml:133)).
+- The repository treats migrations, rollout records, serialized protocol items, metadata, and resume as one compatibility surface ([SOURCEMAP.md](/C:/Users/kuh/Desktop/kd4/SOURCEMAP.md:352)).
+
+**Semantic capability needed.**
+
+- Base/current comparison of public Rust and Serde representations.
+- Variant and field construction/consumption matrices, distinguishing explicit handling from wildcard acceptance.
+- Type-containment closure for nested serialized payloads.
+- Detection of actual serialization and deserialization boundaries, rather than assuming every derived type is persisted.
+- Conversion and projection graphs into app-server types, legacy events, TypeScript/Python schemas, and stored representations.
+- Declared stage contracts such as live → write → read → replay → resume.
+- Generator/input/output provenance and explicit external-consumer unknowns.
+
+**Example checks.**
+
+- `extension EventMsg variant constructed but wildcard-dropped by app-server host`.
+- `required field added without default or accepted legacy fixture`.
+- `Serde rename changed while TS/schema projection remained old`.
+- `field written to rollout but not restored on resume`.
+- `generated schema stale for changed canonical Rust type`.
+- A boundary diff separated into Rust source, wire, persistence, and client-projection compatibility.
+
+**Defensibility: high.** API-diff and Serde tooling may improve, but KD4’s combined persistence lifecycle, wildcard meaning, conversion graph, generated artifacts, and external projections remain repository-specific.
+
+---
+
+### 4. Stateful lifecycle and causal-completion contracts
+
+**Developer/Codex problem.** Async orchestration frequently requires “every accepted start receives exactly one terminal outcome,” “the terminal outcome uses the same identity,” or “cancellation cannot leave an owner, waiter, or receipt stranded.” Missing one error or cancellation path is easy during agent edits.
+
+**Why existing tools fall short.** Rust’s ownership system prevents many memory-safety errors, not application-level protocol leaks. Clippy usually sees local constructs. Tests sample executions and may never trigger a rare cancellation/error interleaving. Search finds calls without control-flow or identity relationships.
+
+**KD4 evidence.**
+
+- `ToolLifecycleContributor` promises a finish callback after return, block, failure, or cancellation ([contributors.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/ext/extension-api/src/contributors.rs:288)).
+- KD4 has separate start, finish, and aborted paths carrying `call_id`, tool name, source, and terminal outcome ([lifecycle.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/lifecycle.rs:12)).
+- Network approval contains multiple policy, guardian, user-decision, persistence, and terminal paths keyed by environment and approval identity ([network_approval.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/network_approval.rs:620)).
+- Lifecycle/concurrency and persistence/rollback are explicit completion-review lenses ([task_evidence.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/core/src/task_evidence.rs:95)).
+
+**Semantic capability needed.**
+
+- Interprocedural control-flow and effect summaries.
+- Dominance/post-dominance or equivalent path-sensitive obligation analysis.
+- Same-value identity tracking for `call_id`, turn, environment, and resource keys.
+- Async handoff models for `spawn`, channels, tasks, callbacks, and cancellation tokens.
+- Result/variant-sensitive transitions and exactly-once/at-least-once obligations.
+- Bounded state-machine verification with unknowns at dynamic boundaries.
+
+**Example checks.**
+
+- `accepted tool call can return without on_tool_finish`.
+- `cancellation and error paths can both terminalize the same call`.
+- `finish callback uses a different call_id provenance`.
+- `spawned operation loses its cancellation authority`.
+- `approval decision is cached under a broader identity than the request it authorized`.
+
+**Defensibility: medium-high.** MIR-based analyzers and model checkers could eventually cover more of the mechanics. KDA remains differentiated if the protocols are declarative, KD4-specific, and connected to change and completion evidence.
+
+---
+
+### 5. Effective configuration, feature, and authority-flow verification
+
+**Developer/Codex problem.** A config field may deserialize but never affect behavior; a feature may expose only half a capability; a retry may drop sandbox or approval context; a telemetry branch may accidentally change behavior.
+
+**Why existing tools fall short.** Types prove that configuration values fit their declarations, not that they reach the correct effect. Clippy cannot infer KD4’s policy lattice. Tests struggle with the combinatorial feature/profile matrix. Search cannot distinguish configuration propagation from effective enforcement.
+
+**KD4 evidence.**
+
+- KD4 has a large typed `Feature` registry, including explicitly documented composition gates that must not enable their component capabilities by themselves ([features/src/lib.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/features/src/lib.rs:80)).
+- It separately represents the effective feature set, overrides, legacy inputs, and flattened TOML keys ([features/src/lib.rs](/C:/Users/kuh/Desktop/kd4/codex-rs/features/src/lib.rs:325), [FeaturesToml](/C:/Users/kuh/Desktop/kd4/codex-rs/features/src/lib.rs:640)).
+- The source map requires config/default changes to trace through features, runtime consumers, CLI/TUI/app-server exposure, schemas, protobuf, help, and tests ([SOURCEMAP.md](/C:/Users/kuh/Desktop/kd4/SOURCEMAP.md:471)).
+- Core policy requires telemetry to remain behavior-neutral and diagnostics to exclude prompts, bodies, secrets, tokens, and raw headers ([core/AGENTS.md](/C:/Users/kuh/Desktop/kd4/codex-rs/core/AGENTS.md:26)).
+
+**Semantic capability needed.**
+
+- Provenance from parsed field through normalization/defaulting/overrides to effective runtime state.
+- Flow-sensitive boolean and small-enum reasoning.
+- Capability lattices such as disabled < read-only < workspace-write < unrestricted.
+- Same-context propagation through retry, resume, builders, and async handoffs.
+- Effect sinks for tool exposure, filesystem/network operations, prompts, and diagnostics.
+- Profile-matrix comparison and proof that a decision dominates its protected effect.
+
+**Example checks.**
+
+- `config-field-has-no-effective-consumer`.
+- `composition gate enables UnifiedExec without ShellZshFork`.
+- `permission profile widens after resume`.
+- `retry reconstructs request without original sandbox context`.
+- `telemetry export result controls model-visible behavior`.
+- `secret-derived value reaches tracing field`.
+
+**Defensibility: medium-high.** Generic taint and dataflow tools will improve. The enduring part is KD4’s declared capability lattice, normalization rules, allowed sinks, and profile semantics. KDA’s current name-based security rules are not yet strong enough to establish this advantage.
+
+---
+
+### 6. Semantic architecture ownership and bounded agent context
+
+**Developer/Codex problem.** An agent needs a small, trustworthy slice of the repository: owners, definitions, callers, configurations, registrations, invariants, generated artifacts, and focused validation. Raw search often returns too much, while ordinary symbol navigation omits non-code contracts.
+
+**Why existing tools fall short.** rust-analyzer is symbol-centric. Search is text-centric. rustc enforces visibility and dependencies, not architectural intent or owner completeness.
+
+**KD4 evidence.**
+
+- KD4’s machine-readable architecture index distinguishes exact/declared evidence from heuristic evidence and requires every applicable facet to be represented ([SOURCEMAP.md](/C:/Users/kuh/Desktop/kd4/SOURCEMAP.md:85)).
+- The owner index includes relationships, invariants, entrypoints, generated outputs, and focused validation routes ([SOURCEMAP.md](/C:/Users/kuh/Desktop/kd4/SOURCEMAP.md:494)).
+- KDA already enriches semantic impact with owners, invariants, generated artifacts, configuration relationships, tests, and validation commands ([README.md](/C:/Users/kuh/Documents/ChatGPT/kd-analzyer/README.md:73)).
+- KD4 also declares public-boundary ownership rules preventing host implementation types from leaking through extension and protocol APIs ([kda.toml](/C:/Users/kuh/Desktop/kd4/codex-rs/kda.toml:172)).
+
+**Semantic capability needed.**
+
+- Resolve public signature and re-export types back to their defining crates.
+- Join Cargo dependencies, Rust symbols, source-owner declarations, invariants, and generated relationships.
+- Validate architecture-index freshness and detect relationships contradicted by current semantics.
+- Produce bounded slices with evidence provenance, truncation, and unresolved facets.
+- Preserve non-Rust declared edges without pretending they were inferred from Rust.
+
+**Example outputs.**
+
+- `public API in codex-extension-api leaks codex_core::Session`.
+- `changed runtime entrypoint has no declared owner or validation route`.
+- A 20-symbol context slice for `ThreadGoalUpdated` containing its constructor, host sink, protocol representation, schema owner, wildcard risk, and focused tests.
+- `declared registration relationship stale: root no longer reaches builder`.
+
+**Defensibility: medium.** Code-intelligence products will increasingly generate architectural graphs. KDA’s advantage survives where the graph is checked against KD4’s explicit owners and completion requirements, but architecture browsing alone is not enough reason for a separate tool.
+
+## What KDA should avoid competing on
+
+KDA will mostly duplicate stronger tools if it prioritizes:
+
+- general syntax, style, idiom, or performance lints;
+- borrow, lifetime, unsafe, exhaustiveness, or ordinary type errors;
+- generic unused-code and dead-code detection;
+- editor navigation, rename, completion, or per-symbol references;
+- simply wrapping `cargo test`;
+- checks that are only configurable `rg` patterns;
+- large catalogs of name-based security heuristics without identity and flow semantics.
+
+Those may be useful supporting checks, but they are not the product’s reason to exist.
+
+## The clearest three reasons for cargo kda to exist
+
+1. **Semantic change-to-proof closure:** derive the exact KD4 obligations and smallest credible validation plan for a change, then invalidate proofs when their semantic dependencies become stale.
+
+2. **Production realization and profile parity:** prove that every declared capability is constructed, registered, reachable, dispatched, terminalized, and tested across the relevant entrypoints and configurations.
+
+3. **Cross-representation compatibility closure:** trace Rust type evolution through Serde, wildcard consumers, conversions, persistence/replay/resume, generated schemas, and client projections—reporting both broken stages and explicit unknowns.
+
+Those three form a coherent product: KDA tells an agent what a change means, whether it can actually happen in production, and whether the current evidence is sufficient to finish.
+
+EVIDENCE BOUNDARY
+Direct fact established by this migration: the source session recorded the task and
+conclusion above at the stated time and provenance. Statements inside the conclusion
+are historical audit/fix claims, including any cited files, symptoms, invariants,
+causes, edits, commands, and validation results.
+
+Hypotheses requiring repository investigation: any causal explanation, ownership or
+timing mechanism, inferred invariant, or implementation mapping not explicitly proved
+by the cited source and validation must be retraced in the actual project source and
+Git history before being treated as current truth.
+
+Unknown after this migration: whether the current repository still contains the
+reported defect, whether cited line numbers still match, and whether the reported
+validation remains reproducible. This migration did not independently re-run the
+source audit, tests, benchmarks, or reproduction steps.
+================================================================================
+FINDING 0024
+Evidence ID: SHA256:91776AF4C14D30A876F78F3634E4D43DD0F6C8D8669F9D4592D87E485670A060
+Audit date: 2026-08-21
+Language classification: Multi-language
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\21\rollout-2026-08-21T23-27-02-01a027b8-de76-7821-a887-6cec4950e8cc.jsonl
+Source session UUID: 01a027b8-de76-7821-a887-6cec4950e8cc
+Logical session UUID: 01a027b8-de76-7821-a887-6cec4950e8cc
+Event timestamp: 08/22/2026 04:36:48
+Working directory: c:\Users\kuh\Documents\ChatGPT\kd-analzyer
+Git revision: 30c158754a64aa076e09acca943227669e74e34a
+Git branch: main
+Thread source: user
+
+TASK / PROMPT
+(Extracted from the nearest preceding actual event_msg user_message. IDE tab context,
+when present, was removed while retaining the explicit "My request" text.)
+
+Review each major concept my analyzer already models and determine whether its current representation is too shallow for KD4.
+
+Examples might include:
+
+- callable identity;
+- type identity;
+- call graphs;
+- panic paths;
+- blocking operations;
+- unsafe operations;
+- diagnostics.
+
+Do not assume those are the only concepts.
+
+For each existing concept:
+
+- show what the analyzer understands today;
+- find real KD4 patterns where that model loses important information;
+- explain what richer representation would enable;
+- identify multiple future checks unlocked by the improvement.
+
+Rank semantic-model upgrades ahead of adding isolated lints when the upgrade has greater leverage.
+
+Do not implement anything.
+
+DIRECTLY STATED HISTORICAL FINDING / FIX / VALIDATION
+(Faithful final_answer conclusion from the source session.)
+
+# Semantic-model review
+
+## Bottom line
+
+KDA’s main limitation is not a lack of semantic machinery. It already has credible primitives for identities, control flow, provenance, effects, resources, async relationships, predicates, boundary relations, and uncertainty.
+
+The problem is that those primitives form several partially overlapping semantic universes:
+
+- Legacy analyses use canonical strings.
+- Newer dispatch analysis uses stable executable identities.
+- Value provenance defines another callable identity.
+- Runtime activation, dynamic targets, async protocols, and finite ADT relations are mostly outside the shared `AnalysisContext`.
+- Many KD4-specific checks consequently reconstruct local approximations instead of composing shared facts.
+
+The shared context currently exposes program calls, executable dispatch, local CFGs, body IR, value provenance, resource obligations, async relationships, and predicates ([analysis_context.rs:464](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/analysis_context.rs:464)). It does not unify `DynamicTargetIndex`, `RuntimeActivationGraph`, `AsyncProtocolGraph`, boundary projections, or authority facts.
+
+That fragmentation is the highest-leverage issue. A unified semantic substrate should rank ahead of more isolated lints.
+
+## Recommended upgrade order
+
+| Rank | Semantic-model upgrade | Why it comes first |
+|---|---|---|
+| P0.1 | Unified callable, executable, type, and subject identity | Every interprocedural analysis inherits current collisions and string matching. |
+| P0.2 | One composed executable/activation graph | Unlocks effects and reachability through trait objects, registries, closures, spawns, and handlers. |
+| P0.3 | CFG-sensitive value, place, alias, and key provenance | KD4 lifecycle correctness frequently depends on preserving the same composite key or resource instance. |
+| P0.4 | Ordered temporal effects and ownership obligations | KD4 invariants depend on sequence, Drop, cancellation, and all-exit behavior—not unordered effect sets. |
+| P1.1 | Structured async task and synchronization model | Needed for select cancellation, handle ownership, notifications, channels, and happens-before reasoning. |
+| P1.2 | Unified outcome model | Panic, error, cancellation, timeout, abort, and task failure currently live in separate approximations. |
+| P1.3 | Profile/predicate-aware semantics | KD4’s platform and feature structure makes all-features reachability materially misleading. |
+| P1.4 | Boundary and representation graph | Protocol, serde, TS/schema generation, conversions, and persistence should be related semantically. |
+| P1.5 | Typed blocking and unsafe effect models | Current API catalogs and comment checks cannot support reliable transitive reasoning. |
+| P2.1 | Authority/security provenance lattice | Valuable, but should reuse the stronger identity, flow, and graph layers first. |
+| P2.2 | Extensible semantic-domain algebra | Generalizes quantities, paths, dialects, identities, and wire domains. |
+| P2.3 | Proof-bearing diagnostic schema | Important for agent use and baselines, but does not compensate for weak underlying semantics. |
+
+## Concept-by-concept findings
+
+### 1. Callable and executable identity — critically shallow
+
+**Today.** `canonical_function` constructs an identity from crate, module, the simple self-type or trait name, and method name ([semantic.rs:388](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/semantic.rs:388)). Newer executable identities additionally distinguish named functions, closures, async closures, and async blocks ([semantic_identity.rs:36](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/semantic_identity.rs:36)). `ProgramIndex` also adds file and range to form a function instance.
+
+**KD4 information loss.** KD4 contains many implementations such as `impl From<CollabAgentSpawnBeginEvent> for EventMsg` and adjacent `From<...>` implementations ([protocol.rs:1721](C:/Users/kuh/Desktop/kd4/codex-rs/protocol/src/protocol.rs:1721)). They all reduce to the equivalent of `EventMsg::from`: the trait identity and its source-type argument are absent. Trait implementations, generic instantiations, reexports, and same-named ADTs in different modules can therefore collide or become indistinguishable between analyses.
+
+**Richer representation.** Introduce one `CallableId` shared by every model, carrying:
+
+- crate/package/target and module identity;
+- inherent versus trait implementation;
+- canonical self type and full trait path;
+- method signature, generic parameters, and relevant substitutions;
+- ABI, safety, asyncness, and source anchor;
+- stable lexical child identity for closures and async blocks.
+
+Compiler identities can be used during a run, with a structural serialized identity for baselines.
+
+**Checks unlocked.** Exact effect propagation through trait implementations; trait-implementation parity; correct panic/blocking/unsafe paths; per-implementation impact analysis; duplicate registration detection; implementation-specific suppressions and baselines.
+
+### 2. Type identity — critically shallow
+
+**Today.** Body IR strips references, then stores only an ADT’s simple name or a primitive name ([body_ir.rs:135](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/body_ir.rs:135)). `ValueExpr` and call facts retain that optional string.
+
+**KD4 information loss.** Types such as `Arc<OnceCell<Arc<dyn AgentTaskStore>>>`, `Arc<RwLock<BindingIndex>>`, and `Arc<Mutex<HashMap<String, Arc<Notify>>>>` become merely `Arc` ([task_coordinator.rs:99](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/agent/task_coordinator.rs:99)). `JoinHandle<io::Result<StreamOutput<Vec<u8>>>>` loses its task result and payload structure ([exec.rs:1246](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/exec.rs:1246)). Aliases such as `SharedValidationSingleflight` hide both lock and keyed-resource semantics ([validation_admission.rs:606](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/validation_admission.rs:606)).
+
+**Richer representation.** Use a recursive type term containing nominal definition identity, generic and const arguments, references and mutability, raw pointers, trait-object bounds, associated types, function types, and both authored and normalized aliases. Add derived capabilities such as `Send`, `Sync`, lock kind, channel kind, task handle, and ownership wrapper.
+
+**Checks unlocked.** Lock-kind-aware await checks; channel payload compatibility; join-result handling; `Send`/`Sync` boundary checks; alias-aware resource ownership; generic effect specialization; FFI layout validation; unsafe-contract checking.
+
+### 3. Call graphs, dynamic dispatch, and runtime activation — strong pieces, insufficient composition
+
+**Today.** `ProgramIndex` records semantically resolved direct calls and methods. The legacy graph remains keyed by canonical strings. `ExecutableDispatchGraph` is considerably richer: direct calls, callable references, closure invocation, registered handlers, trait-object dispatch, and explicit unknowns ([semantic_identity.rs:164](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/semantic_identity.rs:164)). `DynamicTargetIndex` models bounded trait-object and keyed-registry targets ([dynamic_targets.rs:1](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/dynamic_targets.rs:1)), while `RuntimeActivationGraph` models registration, spawn, join, select, channels, watches, notification, and cancellation ([runtime_activation_graph.rs:55](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/runtime_activation_graph.rs:55)).
+
+The shared context, however, builds the dispatch graph with default options and directs project registration rules to a separate graph ([analysis_context.rs:525](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/analysis_context.rs:525)).
+
+**KD4 information loss.** `ToolRegistry` stores `Arc<dyn CoreToolRuntime>` under keys returned by `tool_name()` and later retrieves the trait object by name ([registry.rs:743](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tools/registry.rs:743)). This combines value-derived keys, trait coercion, dynamic lookup, and method dispatch. No single shared KDA graph represents that entire path.
+
+**Richer representation.** Compose the existing models into one typed multi-edge graph:
+
+- direct call and method dispatch;
+- function/closure/future values;
+- finite trait-object target sets;
+- keyed registration and lookup;
+- spawn, join, abort, select, channel, notify, and cancellation edges;
+- production root and test reachability;
+- profile predicate, confidence, and explicit unknown frontier on every edge.
+
+**Checks unlocked.** Panic/blocking/unsafe propagation through registered handlers; registered-but-unreachable tools; dispatched-without-registration; effect parity across handler implementations; spawned-task impact analysis; handler-specific test selection; production wiring gaps.
+
+### 4. Control flow and expression semantics — too shallow for KD4’s macro-heavy async code
+
+**Today.** `LocalCfg` provides bounded source-level branches, loops, exits, dominance, and common effects. It explicitly excludes macro expansion, unwinding, lexical drop order, and cross-call behavior ([local_cfg.rs:1](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/local_cfg.rs:1)). Body IR adds calls, assignments, comparisons, returns, and bounded affine expressions ([body_ir.rs:223](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/body_ir.rs:223)).
+
+**KD4 information loss.** KD4 uses `tokio::select!` for cancellation, timeout, process exit, and notification races. For example, process supervision selects between cancellation and process completion inside a spawned task ([process_manager.rs:647](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/unified_exec/process_manager.rs:647)). Treating that macro as opaque loses branch cancellation, future-drop behavior, and cleanup ordering.
+
+It also weakens reasoning about `join!`, `try_join!`, `let else`, match guards, destructuring, short-circuiting, `?`, and compiler-inserted drops.
+
+**Richer representation.** Add targeted HIR/MIR-like lowering for important constructs, especially async macros:
+
+- explicit suspension and cancellation edges;
+- lexical and unwind drop scopes;
+- `select!`, `join!`, and `try_join!` branch semantics;
+- match guards, `let-else`, and short-circuit expressions;
+- macro callsite plus expansion provenance;
+- typed normal/error/unwind exits.
+
+**Checks unlocked.** Select cancellation safety; cleanup on timeout/cancellation branches; guard lifetime across macro-generated awaits; panic/unwind cleanup; terminal notification on every branch; error-path resource discharge; publish/unlink order across expanded control flow.
+
+### 5. Place, value, alias, and correlation-key provenance — too shallow
+
+**Today.** `PlaceFlow` models ordered local definitions and projections but requires consumers to fork and join branches manually ([place_flow.rs:1](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/place_flow.rs:1)). `ValueProvenance` is flow-insensitive and context-insensitive ([value_provenance.rs:1](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/value_provenance.rs:1)). Collection index projections deliberately do not retain the key ([value_provenance.rs:109](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/value_provenance.rs:109)).
+
+Several specialized identity passes compensate with local heuristics for composite IDs, scope IDs, and causal identities.
+
+**KD4 information loss.** Correctness frequently depends on removing exactly the registration that was inserted:
+
+- `ValidationLeader` removes an entry only when the key and `Arc::ptr_eq` generation still match ([validation_admission.rs:501](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/validation_admission.rs:501)).
+- Pending callbacks disarm an `Option<RequestId>` and otherwise remove that same ID during `Drop` ([outgoing_message.rs:140](C:/Users/kuh/Desktop/kd4/codex-rs/app-server/src/outgoing_message.rs:140)).
+- Execution permits use composite thread/submission identities ([execution.rs:203](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/agent/control/execution.rs:203)).
+
+Current provenance cannot generally prove same-key, same-generation, or compare-before-remove behavior.
+
+**Richer representation.** Build bounded CFG-sensitive SSA/def-use facts with alias sets, symbolic collection keys, composite-key terms, discriminant state, destructive reads such as `take`, and summaries for `entry`, `insert`, `remove`, `retain`, and guarded mutation. Preserve generation or allocation identity separately from logical keys.
+
+**Checks unlocked.** Wrong-key cleanup; strict-subset composite lookup; stale waiter/callback leaks; ABA-unsafe removal; compare-before-remove omissions; duplicate insertion; take-once violations; disarm-before-transfer; key continuity through helpers.
+
+### 6. Effects, resources, ownership, and typestate — good vocabulary, shallow temporal semantics
+
+**Today.** KDA has reusable effects for acquire, terminalize, commit, rollback-on-drop, transfer, alias return, publish, and durability barriers ([effects.rs:20](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/effects.rs:20)). Summaries distinguish must/may effects and a scalar cancellation-safety status. Resource obligations track a small configured catalog and explicitly retain escapes ([resource_obligations.rs:1](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/resource_obligations.rs:1)). The effect/typestate bridge correctly preserves rollback-on-drop as a policy rather than an eager event ([effect_typestate.rs:1](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/effect_typestate.rs:1)).
+
+The weakness is that sequential composition unions effect sets, losing temporal order.
+
+**KD4 information loss.** `ValidationLeaderOwnership` has conditional rollback in `Drop`, asynchronous cleanup, explicit abandon, and a success path where the result must be published before the registry entry is unlinked ([validation_admission.rs:537](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/validation_admission.rs:537), [validation_admission.rs:572](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/validation_admission.rs:572)). Clone count, cancellation, notification, key identity, and Drop behavior are all part of one protocol.
+
+**Richer representation.** Model ordered temporal events over the CFG:
+
+- resource instance and owner/alias set;
+- acquire, borrow, clone, transfer, disarm, commit, rollback, drop;
+- lexical, return, error, panic, cancellation, and timeout exits;
+- conditional Drop policies;
+- keyed generations;
+- interprocedural event-sequence summaries rather than unordered effect sets.
+
+**Checks unlocked.** Commit-or-rollback on all exits; use after terminalization; RAII guard escape; abort-on-drop preservation; clone-count cancellation correctness; stale registry cleanup; publish-before-unlink; durability-barrier ordering; double terminalization.
+
+### 7. Async tasks, synchronization, and happens-before — too fragmented
+
+**Today.** `AsyncRelationshipIndex` records bounded spawn, await, channel, and cancellation relationships but does not model executor interleavings ([async_relationships.rs:1](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/async_relationships.rs:1)). `AsyncProtocolGraph` has task-local order and synchronization events ([async_protocol.rs:1](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/async_protocol.rs:1)). Its collector explicitly does not infer channel or cancellation happens-before edges merely from shared resources ([async_protocol_collector.rs:1](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/async_protocol_collector.rs:1)). Concurrency lints remain deliberately lexical.
+
+**KD4 information loss.** KD4 distinguishes a raw Tokio handle, which detaches on drop, from wrappers that abort on drop ([turn.rs:4138](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/session/turn.rs:4138)). It also uses Notify, CancellationToken, atomics, locks, spawned Drop cleanup, and select races in one lifecycle.
+
+Endpoints represented as place strings cannot express cloned sender sets, watch generations, notification permits, handle wrappers, or which message completed a wait.
+
+**Richer representation.** Introduce a structured task graph with future identity, task scope, handle ownership state, wrapper semantics, join/abort/drop transitions, select branches, channel endpoint/payload identity, notify permits, watch versions, lock scopes, atomic order, and execution domain.
+
+**Checks unlocked.** Detached task leaks; discarded `JoinError`; abort-on-drop wrapper loss; select-cancel-unsafe futures; bounded-channel deadlocks; send without live receiver; lost Notify wakeups; stale watch observations; lock inversion through helpers; cancellation not propagated or observed.
+
+### 8. Panic, error, cancellation, timeout, and unwind outcomes — materially shallow
+
+**Today.** Panic recognition covers `panic!`, `todo!`, `unimplemented!`, and `Option`/`Result` `unwrap` or `expect` ([semantic.rs:80](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/semantic.rs:80)). Constant-flow checks can prove a few arithmetic and indexing panics. The legacy call graph reduces panic behavior to a Boolean.
+
+**KD4 information loss.** KD4 uses real panic boundaries: `catch_unwind` around async work, cleanup/finalization after caught panics, and deliberate `resume_unwind`, including transport and task code ([tasks/mod.rs:1233](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tasks/mod.rs:1233), [remote_control/mod.rs:1035](C:/Users/kuh/Desktop/kd4/codex-rs/app-server-transport/src/transport/remote_control/mod.rs:1035)). A panic inside a spawned task becomes a `JoinError`; a resumed panic differs from a swallowed one.
+
+**Richer representation.** Use an explicit outcome algebra: normal return, typed error class, panic kind, resumed panic, abort, cancellation, timeout, task failure, and process exit. Add catch boundaries, unwind edges, cleanup state, and profile predicates.
+
+**Checks unlocked.** Actual panic crossing FFI; swallowed panic after partial state mutation; invalid cleanup before `resume_unwind`; ignored task panic; panic in Drop during unwind; retrying permanent errors; cancellation reported as success; timeout misclassified as transport failure.
+
+### 9. Blocking operations — catalog too shallow
+
+**Today.** Blocking detection uses a fixed catalog of selected `std::fs`, thread, process, lock, channel, and I/O functions ([semantic.rs:93](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/semantic.rs:93)). Trait recognition is mostly `Read::read` and `Write::write`.
+
+**KD4 information loss.** KD4 performs `OpenOptions`, `write_all`, and `flush` inside `spawn_blocking` in installation and history paths ([installation_id.rs:22](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/installation_id.rs:22), [tool_history.rs:1058](C:/Users/kuh/Desktop/kd4/codex-rs/core/src/tool_history.rs:1058)). It also uses synchronous `canonicalize`, directory removal, subprocess wrappers, and helper APIs. Current representation cannot express that an operation is blocking but deliberately moved to the blocking pool, or propagate blocking behavior through wrappers and trait objects.
+
+**Richer representation.** Make blocking a typed, transitive effect with dimensions such as OS-thread blocking, synchronous I/O, CPU-heavy work, process wait, and lock contention. Track execution domains: async executor, sync code, `spawn_blocking`, `block_in_place`, and dedicated thread.
+
+**Checks unlocked.** Sync I/O on async executors; blocking work hidden behind helpers or trait objects; nested/redundant `spawn_blocking`; blocking locks in async tasks; unbounded CPU on executor threads; I/O in Drop; blocking-pool saturation risks.
+
+### 10. Unsafe operations and FFI — critically shallow for the Windows sandbox
+
+**Today.** The central semantic catalog recognizes `transmute` and `transmute_copy` ([semantic.rs:113](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/semantic.rs:113)). General unsafe checks largely enforce nearby `SAFETY` comments and Safety documentation. Some dedicated FFI lints exist, but there is no reusable unsafe-operation graph.
+
+**KD4 information loss.** Windows sandbox code combines FFI calls, returned allocation ownership, raw slices, zeroed structures, unaligned reads, retained pointers, and explicit free functions ([winutil.rs:78](C:/Users/kuh/Desktop/kd4/codex-rs/windows-sandbox-rs/src/winutil.rs:78), [token.rs:143](C:/Users/kuh/Desktop/kd4/codex-rs/windows-sandbox-rs/src/token.rs:143), [wfp.rs:105](C:/Users/kuh/Desktop/kd4/codex-rs/windows-sandbox-rs/src/wfp.rs:105)). A comment-presence model cannot connect these operations to their actual preconditions and ownership obligations.
+
+**Richer representation.** Classify unsafe operations explicitly: raw dereference/arithmetic, FFI call, union access, mutable static, unsafe trait implementation, zero-initialization, transmute, ownership conversion, and lifetime extension. Attach operand types, allocation family, null/alignment/length requirements, containment boundary, and safety-contract references.
+
+**Checks unlocked.** Allocator/free mismatch; handle double-close or leak; raw slice length/null/alignment gaps; invalid `zeroed`; unsafe operation in unsafe function without local containment; unsound `Send`/`Sync`; FFI buffer lifetime escape; safe wrapper failing to validate documented preconditions.
+
+### 11. Predicates, profiles, targets, and feature reachability — useful but too weak
+
+**Today.** `PredicateIndex` records test, feature, target, compile-time, runtime, constant, and unknown atoms. It simplifies constants and exact opposites but deliberately avoids general Boolean solving ([predicate_context.rs:1](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/predicate_context.rs:1)). Many older models retain only test-versus-production booleans.
+
+**KD4 information loss.** KD4 has substantial target-specific implementations, including Linux and Windows sandbox surfaces ([linux-sandbox/src/lib.rs:6](C:/Users/kuh/Desktop/kd4/codex-rs/linux-sandbox/src/lib.rs:6), [windows-sandbox-rs/src/lib.rs:89](C:/Users/kuh/Desktop/kd4/codex-rs/windows-sandbox-rs/src/lib.rs:89)). An all-features snapshot can join call or producer/consumer evidence that cannot coexist in a real build.
+
+**Richer representation.** Attach a normalized Boolean predicate to every symbol, implementation, edge, effect, and diagnostic. Analyze a bounded set of declared profiles and merge identities across profiles while distinguishing “not compiled” from “compiled but unreachable.”
+
+**Checks unlocked.** Platform API parity; feature-interaction reachability; profile-specific panic/blocking/unsafe paths; cfg-gated implementation coverage; accurate production/test separation; impossible producer-consumer pairing suppression; missing fallback implementations.
+
+### 12. Fields, variants, boundaries, schemas, and conversions — promising scaffolding, shallow discovery
+
+**Today.** Surface snapshots retain authored public declarations, fields/variants, and common serde attributes ([surface.rs:31](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/surface.rs:31)). Field flow distinguishes production/test producers and consumers with open-world escape reasons ([field_flow.rs:37](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/field_flow.rs:37)). Boundary diff separates Rust, wire, conversion, persistence, schema, and external-consumer projections ([boundary_diff.rs:20](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/boundary_diff.rs:20)). `RelationalAdt` can analyze finite transformations and round trips, but lowering must be supplied.
+
+**KD4 information loss.** Protocol types commonly derive Serialize, Deserialize, JSON Schema, and TypeScript together, while other types use manual serialization that computes fields such as `wire_identity` ([protocol.rs:2812](C:/Users/kuh/Desktop/kd4/codex-rs/protocol/src/protocol.rs:2812)). Authored syntax alone cannot establish agreement between serde, schema/TS generation, manual conversions, persistence, and consumers.
+
+**Richer representation.** Build a boundary graph linking Rust fields and variants to serde wire names, generated schemas/TS, manual serializers, conversion arms, persistence fields, and producer/consumer endpoints. Carry provenance and explicit opacity for custom code or unavailable generators.
+
+**Checks unlocked.** Serde/schema/TS drift; lossy `From`/`TryFrom`; renamed/defaulted-field compatibility; persisted enum evolution; variant produced but never handled; stale generated projection; input/output asymmetry; round-trip field loss.
+
+### 13. Security, taint, authority, and execution provenance — fragmented and locally shallow
+
+**Today.** Taint summaries record parameter/source flows into returns and sinks ([taint.rs:32](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/taint.rs:32)). Separate passes model typed authority ordering, cancellation ancestry, scope freshness, security-context forwarding, sensitive values, path domains, and execution dialects. These are intentionally narrow and conservative; for example, typed authority is limited to explicit enum orders and nearby approval/effect relationships ([typed_authority.rs:1](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/typed_authority.rs:1)).
+
+**KD4 information loss.** Authority and security context travel through invocation objects, trait-object tool runtimes, spawned tasks, adapters, and dynamic registry dispatch. Local linear-block or naming-based flow cannot establish that the approved request is the one eventually executed after those boundaries.
+
+**Richer representation.** Add labeled value provenance with a configurable authority lattice, validator/sanitizer transformations, capability derivation, scope and expiry, control dependence, and cross-task/dispatch propagation. Reuse the unified type, graph, and key models.
+
+**Checks unlocked.** Approval bypass through alternate dispatch; execution of a different request than the approved one; privilege widening through conversion or merge; stale turn/session authority after await; secret propagation to logs or persistence; unvalidated path-to-process flow; cancellation authority misuse.
+
+### 14. Numeric and representation-domain meaning — too lint-specific
+
+**Today.** `semantic_quantities` recognizes only milliseconds versus seconds and zero-based attempts versus one-based retry numbers, using naming and API evidence ([semantic_quantities.rs:21](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/semantic_quantities.rs:21)). Separate passes independently model paths, wire domains, command dialects, identities, and cache keys.
+
+**KD4 information loss.** KD4 has strongly meaningful primitive-backed values such as `timeout_ms`, refresh intervals, attempt identities, counts, byte offsets, token limits, revisions, and durations. Some are converted correctly into `Duration` ([config_types.rs:531](C:/Users/kuh/Desktop/kd4/codex-rs/protocol/src/config_types.rs:531)), but their meanings are not reusable facts after the direct boundary check.
+
+**Richer representation.** Generalize this to semantic domains with unit, scale, ordinal base, identity scope, representation, valid range, and accepted conversions. Infer domains from resolved newtypes and APIs first, with names as secondary evidence.
+
+**Checks unlocked.** Unit mismatch through helpers; retry-index/count confusion; byte-versus-character offsets; token-versus-byte budgets; duration truncation or overflow; path-domain loss; identifier scope mixing; cache keys omitting semantically relevant inputs.
+
+### 15. Diagnostics, evidence, uncertainty, and proofs — too flat for the semantics KDA is approaching
+
+**Today.** `DiagnosticRecord` contains arbitrary JSON identity and a string-keyed semantic-facts map ([model.rs:49](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/model.rs:49)). The typed envelope adds one subject plus flat related locations ([model.rs:98](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/model.rs:98)). In contrast, semantic queries already distinguish exact, conditional, ambiguous, incomplete, and not-found results and can carry evidence paths ([semantic_query/model.rs:51](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/semantic_query/model.rs:51)).
+
+**KD4 information loss.** A violation such as “publish before unlink” is not adequately explained by one subject and unordered related locations. It needs an ordered counterexample containing a resource generation, key, calls, branches, predicates, and an unknown frontier.
+
+**Richer representation.** Use a versioned proof-bearing diagnostic:
+
+- stable typed subjects and related subjects;
+- proved/possible/unknown verdict;
+- ordered proof or counterexample graph;
+- profile and predicate;
+- assumptions, bounds, and precision losses;
+- typed event/edge references;
+- fix preconditions and source-context hash.
+
+**Checks and capabilities unlocked.** Reliable cross-revision deduplication; SARIF code flows; profile-aware diagnostic merging; agent-readable explanations; confidence gating; subject-based suppressions; safe-fix eligibility; precise regression triage.
+
+### 16. Architecture, impact, tests, and generated-artifact provenance — mixed assessment
+
+**Today.** Architecture facts carry declared owners, invariants, relationships, and validation commands ([architecture_facts.rs:1](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/architecture_facts.rs:1)). Change impact walks changed functions, callers, registration references, and runtime activation ([change_impact.rs:1](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/change_impact.rs:1)). Semantic slices retain bounded calls, references, tests, activation, and unresolved evidence ([semantic_slice.rs:1](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/semantic_slice.rs:1)).
+
+These are limited by the same string identities and incomplete graphs, but their report-oriented representation is directionally sound.
+
+Generated-artifact provenance is the exception: its exact input/output inventories, generator identity, command, version, and digests are appropriately explicit for its purpose ([generated_provenance.rs:25](C:/Users/kuh/Documents/ChatGPT/kd-analzyer/src/generated_provenance.rs:25)). I would not redesign that model before the higher priorities.
+
+**Richer representation.** Resolve architecture subjects and tests into the common semantic graph and attach dependency provenance at type, field, variant, implementation, profile, and artifact granularity. Keep generated receipts as authoritative external evidence.
+
+**Checks unlocked.** Field/variant-level test selection; invariant coverage; dead declared relationships; generated-artifact obligations from semantic changes; owner routing by semantic subject; profile-aware blast radius; identification of tests that exercise only an obsolete implementation.
+
+## Practical roadmap
+
+The best next architectural move is not “replace everything with MIR.” It is:
+
+1. Define shared typed identities and predicate-bearing semantic nodes.
+2. Promote existing dispatch, dynamic-target, runtime-activation, and async-protocol facts into one graph.
+3. Make CFG-sensitive provenance and ordered temporal events the common interface consumed by effects, resources, authority, blocking, unsafe, and boundary analyses.
+4. Migrate existing lints onto that substrate incrementally, retaining explicit unknowns and bounded analysis.
+5. Upgrade diagnostics once the shared graph can emit real proof paths.
+
+That path reuses much of KDA’s existing work. It primarily removes parallel identity systems and local semantic reconstructions.
+
+This was a read-only review: I made no repository changes and ran no build or validation commands.
+
+EVIDENCE BOUNDARY
+Direct fact established by this migration: the source session recorded the task and
+conclusion above at the stated time and provenance. Statements inside the conclusion
+are historical audit/fix claims, including any cited files, symptoms, invariants,
+causes, edits, commands, and validation results.
+
+Hypotheses requiring repository investigation: any causal explanation, ownership or
+timing mechanism, inferred invariant, or implementation mapping not explicitly proved
+by the cited source and validation must be retraced in the actual project source and
+Git history before being treated as current truth.
+
+Unknown after this migration: whether the current repository still contains the
+reported defect, whether cited line numbers still match, and whether the reported
+validation remains reproducible. This migration did not independently re-run the
+source audit, tests, benchmarks, or reproduction steps.

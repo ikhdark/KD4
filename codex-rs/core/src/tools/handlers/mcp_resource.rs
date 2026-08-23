@@ -18,6 +18,7 @@ use codex_protocol::protocol::TruncationPolicy;
 use codex_tools::CanonicalToolResult;
 use codex_tools::ToolOutput;
 use codex_tools::ToolOutputOutcome;
+use codex_tools::ToolOutputProjectionJsonPointer;
 use codex_tools::ToolOutputProjectionMetadata;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::truncate_text;
@@ -42,6 +43,7 @@ use crate::tools::context::boxed_tool_output;
 use codex_protocol::protocol::McpInvocation;
 
 const MCP_RESOURCE_CALL_CANCELLED_MESSAGE: &str = "MCP resource call cancelled";
+const MAX_PREDETERMINED_MCP_RESOURCE_POINTERS: usize = 64;
 
 struct McpResourceToolOutput {
     visible: FunctionToolOutput,
@@ -68,6 +70,14 @@ impl ToolOutput for McpResourceToolOutput {
     fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
         let mut metadata = self.visible.projection_metadata()?;
         metadata.merge_essential_from_json(&self.canonical);
+        if let Some(visible) = metadata
+            .spillable_text
+            .first()
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        {
+            metadata.predetermined_json_pointers =
+                mcp_resource_recovery_json_pointers(&visible, &self.canonical);
+        }
         Some(metadata)
     }
 
@@ -89,6 +99,117 @@ impl ToolOutput for McpResourceToolOutput {
 
     fn code_mode_result(&self, payload: &ToolPayload) -> Value {
         self.visible.code_mode_result(payload)
+    }
+}
+
+fn mcp_resource_recovery_json_pointers(
+    visible: &Value,
+    canonical: &Value,
+) -> Vec<ToolOutputProjectionJsonPointer> {
+    let mut selectors = Vec::new();
+    for key in ["resources", "resourceTemplates", "errors"] {
+        append_omitted_array_entry_pointers(&mut selectors, visible, canonical, key);
+    }
+    append_omitted_content_pointers(&mut selectors, visible, canonical);
+    selectors
+}
+
+fn append_omitted_array_entry_pointers(
+    selectors: &mut Vec<ToolOutputProjectionJsonPointer>,
+    visible: &Value,
+    canonical: &Value,
+    key: &str,
+) {
+    let Some(canonical_values) = canonical.get(key).and_then(Value::as_array) else {
+        return;
+    };
+    let visible_values = visible
+        .get(key)
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut matched_visible = vec![false; visible_values.len()];
+    for (index, canonical_value) in canonical_values.iter().enumerate() {
+        if let Some(visible_index) =
+            visible_values
+                .iter()
+                .enumerate()
+                .position(|(visible_index, visible_value)| {
+                    !matched_visible[visible_index] && visible_value == canonical_value
+                })
+        {
+            matched_visible[visible_index] = true;
+            continue;
+        }
+        push_mcp_resource_pointer(
+            selectors,
+            format!("mcp-resource:{key}:{index}"),
+            format!("/{key}/{index}"),
+        );
+    }
+}
+
+fn append_omitted_content_pointers(
+    selectors: &mut Vec<ToolOutputProjectionJsonPointer>,
+    visible: &Value,
+    canonical: &Value,
+) {
+    let Some(canonical_contents) = canonical.get("contents").and_then(Value::as_array) else {
+        return;
+    };
+    let visible_contents = visible
+        .get("contents")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    for (index, canonical_content) in canonical_contents.iter().enumerate() {
+        let Some(visible_content) = visible_contents.get(index) else {
+            push_mcp_resource_pointer(
+                selectors,
+                format!("mcp-resource:contents:{index}"),
+                format!("/contents/{index}"),
+            );
+            continue;
+        };
+        if visible_content == canonical_content {
+            continue;
+        }
+        let field = if canonical_content.get("blob").is_some()
+            && visible_content.get("blob") != canonical_content.get("blob")
+        {
+            Some("blob")
+        } else if canonical_content.get("text").is_some()
+            && visible_content.get("text") != canonical_content.get("text")
+        {
+            Some("text")
+        } else {
+            None
+        };
+        let (id, pointer) = field.map_or_else(
+            || {
+                (
+                    format!("mcp-resource:contents:{index}"),
+                    format!("/contents/{index}"),
+                )
+            },
+            |field| {
+                (
+                    format!("mcp-resource:contents:{index}:{field}"),
+                    format!("/contents/{index}/{field}"),
+                )
+            },
+        );
+        push_mcp_resource_pointer(selectors, id, pointer);
+    }
+}
+
+fn push_mcp_resource_pointer(
+    selectors: &mut Vec<ToolOutputProjectionJsonPointer>,
+    id: String,
+    pointer: String,
+) {
+    if selectors.len() < MAX_PREDETERMINED_MCP_RESOURCE_POINTERS {
+        selectors.push(ToolOutputProjectionJsonPointer { id, pointer });
     }
 }
 

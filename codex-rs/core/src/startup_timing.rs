@@ -76,6 +76,35 @@ pub(crate) struct StartupTimingSnapshot {
     pub(crate) saturation_count: u32,
 }
 
+impl StartupTimingSnapshot {
+    pub(crate) fn trace_frozen_at_first_model_send(&self) {
+        tracing::trace!(
+            target: "codex_core::session::turn",
+            startup_timing_schema_version = self.schema_version,
+            startup_timing_correlation_id = %self.correlation_id,
+            startup_timing_started_at_unix_ms = self.started_at_unix_ms,
+            startup_timing_completed_at_unix_ms = self.completed_at_unix_ms,
+            startup_timing_duration_ns = self.inclusive_duration_ns,
+            startup_timing_profile_valid = self.profile_valid,
+            startup_prewarm_status = ?self.prewarm_status,
+            startup_session_initialization_ns = self.phases.session_initialization_ns,
+            startup_transport_preconnect_ns = self.phases.transport_preconnect_ns,
+            startup_prewarm_preparation_ns = self.phases.prewarm_preparation_ns,
+            startup_prewarm_request_ns = self.phases.prewarm_request_ns,
+            startup_first_turn_wait_ns = self.phases.first_turn_prewarm_wait_ns,
+            startup_executor_readiness_ns = self.phases.executor_readiness_ns,
+            startup_preconnect_preparation_overlap_ns = self
+                .phases
+                .preconnect_preparation_overlap_ns,
+            startup_preconnect_executor_overlap_ns = self.phases.preconnect_executor_overlap_ns,
+            startup_timing_invalid_transition_count = self.invalid_transition_count,
+            startup_timing_clock_regression_count = self.clock_regression_count,
+            startup_timing_saturation_count = self.saturation_count,
+            "startup timing snapshot frozen at first model send"
+        );
+    }
+}
+
 pub(crate) struct StartupTimingState {
     clock: Arc<dyn StartupClock>,
     inner: Mutex<StartupTimingInner>,
@@ -376,6 +405,8 @@ mod tests {
     use std::sync::atomic::AtomicI64;
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
+    use tracing::Level;
+    use tracing_test::internal::MockWriter;
 
     #[derive(Debug, Default)]
     struct ManualClock {
@@ -426,5 +457,75 @@ mod tests {
 
         clock.advance(100);
         assert_eq!(timing.complete_snapshot(), snapshot);
+    }
+
+    #[test]
+    fn startup_snapshot_trace_includes_every_snapshot_field() {
+        let snapshot = StartupTimingSnapshot {
+            schema_version: 1,
+            correlation_id: "trace-thread".to_string(),
+            started_at_unix_ms: 101,
+            completed_at_unix_ms: 202,
+            inclusive_duration_ns: 303,
+            profile_valid: false,
+            prewarm_status: Some("ready".to_string()),
+            phases: StartupPhaseTiming {
+                session_initialization_ns: 401,
+                transport_preconnect_ns: 402,
+                prewarm_preparation_ns: 403,
+                prewarm_request_ns: 404,
+                first_turn_prewarm_wait_ns: 405,
+                executor_readiness_ns: 406,
+                preconnect_preparation_overlap_ns: 407,
+                preconnect_executor_overlap_ns: 408,
+            },
+            invalid_transition_count: 501,
+            clock_regression_count: 502,
+            saturation_count: 503,
+        };
+        let buffer: &'static Mutex<Vec<u8>> = Box::leak(Box::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(Level::TRACE)
+            .with_writer(MockWriter::new(buffer))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        snapshot.trace_frozen_at_first_model_send();
+
+        let logs = String::from_utf8(
+            buffer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        )
+        .expect("startup timing trace should be UTF-8");
+        for expected in [
+            "codex_core::session::turn",
+            "startup_timing_schema_version=1",
+            "startup_timing_correlation_id=trace-thread",
+            "startup_timing_started_at_unix_ms=101",
+            "startup_timing_completed_at_unix_ms=202",
+            "startup_timing_duration_ns=303",
+            "startup_timing_profile_valid=false",
+            "startup_prewarm_status=Some(\"ready\")",
+            "startup_session_initialization_ns=401",
+            "startup_transport_preconnect_ns=402",
+            "startup_prewarm_preparation_ns=403",
+            "startup_prewarm_request_ns=404",
+            "startup_first_turn_wait_ns=405",
+            "startup_executor_readiness_ns=406",
+            "startup_preconnect_preparation_overlap_ns=407",
+            "startup_preconnect_executor_overlap_ns=408",
+            "startup_timing_invalid_transition_count=501",
+            "startup_timing_clock_regression_count=502",
+            "startup_timing_saturation_count=503",
+            "startup timing snapshot frozen at first model send",
+        ] {
+            assert!(
+                logs.contains(expected),
+                "missing {expected:?} in trace: {logs}"
+            );
+        }
     }
 }

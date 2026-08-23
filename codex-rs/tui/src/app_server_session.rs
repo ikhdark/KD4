@@ -107,6 +107,11 @@ use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnSteerParams;
 use codex_app_server_protocol::TurnSteerResponse;
 use codex_app_server_protocol::UserInput;
+use codex_app_server_protocol::WindowsSandboxGrantReadRootParams;
+use codex_app_server_protocol::WindowsSandboxGrantReadRootResponse;
+use codex_app_server_protocol::WindowsSandboxReadinessResponse;
+use codex_app_server_protocol::WindowsSandboxSetupStartParams;
+use codex_app_server_protocol::WindowsSandboxSetupStartResponse;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::ThreadId;
 use codex_protocol::approvals::GuardianAssessmentEvent;
@@ -386,6 +391,41 @@ impl AppServerSession {
             })
             .await
             .map_err(|err| bootstrap_request_error("account/read failed during TUI bootstrap", err))
+    }
+
+    pub(crate) async fn windows_sandbox_readiness(
+        &mut self,
+    ) -> Result<WindowsSandboxReadinessResponse> {
+        let request_id = self.next_request_id();
+        self.client
+            .request_typed(ClientRequest::WindowsSandboxReadiness {
+                request_id,
+                params: None,
+            })
+            .await
+            .wrap_err("windowsSandbox/readiness failed")
+    }
+
+    pub(crate) async fn windows_sandbox_setup_start(
+        &mut self,
+        params: WindowsSandboxSetupStartParams,
+    ) -> Result<WindowsSandboxSetupStartResponse> {
+        let request_id = self.next_request_id();
+        self.client
+            .request_typed(ClientRequest::WindowsSandboxSetupStart { request_id, params })
+            .await
+            .wrap_err("windowsSandbox/setupStart failed")
+    }
+
+    pub(crate) async fn windows_sandbox_grant_read_root(
+        &mut self,
+        params: WindowsSandboxGrantReadRootParams,
+    ) -> Result<WindowsSandboxGrantReadRootResponse> {
+        let request_id = self.next_request_id();
+        self.client
+            .request_typed(ClientRequest::WindowsSandboxGrantReadRoot { request_id, params })
+            .await
+            .wrap_err("windowsSandbox/grantReadRoot failed")
     }
 
     pub(crate) async fn external_agent_config_detect(

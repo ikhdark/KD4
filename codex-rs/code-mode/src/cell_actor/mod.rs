@@ -13,6 +13,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use self::callbacks::CallbackCompletion;
+use self::callbacks::NotificationInvocation;
 use self::callbacks::finish_callbacks;
 use self::callbacks::report_task_result;
 use self::callbacks::spawn_notification;
@@ -31,9 +32,7 @@ pub(crate) use self::types::CompletionCommit;
 use self::types::CompletionDelivery;
 use self::types::ObservationDelivery;
 use crate::TaskFailureHandler;
-use crate::runtime::PendingRuntimeMode;
 use crate::runtime::RuntimeCommand;
-use crate::runtime::RuntimeControlCommand;
 use crate::runtime::RuntimeEvent;
 use crate::runtime::spawn_runtime;
 use crate::session_runtime::CellEvent;
@@ -60,14 +59,15 @@ impl CellActor {
         ),
         String,
     > {
+        let default_tool_timeout_ms = request.default_tool_timeout_ms;
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (initial_response_tx, initial_response_rx) = oneshot::channel();
-        let (runtime_tx, runtime_control_tx, runtime_terminate_handle) = spawn_runtime(
+        let (runtime_tx, runtime_terminate_handle) = spawn_runtime(
             stored_values,
             runtime_request(request),
+            default_tool_timeout_ms,
             event_tx,
-            PendingRuntimeMode::PauseUntilResumed,
             task_failure_handler.clone(),
         )?;
         let handle = CellHandle::new(command_tx, Arc::clone(&cell_state));
@@ -75,7 +75,6 @@ impl CellActor {
             host,
             CellContext {
                 runtime_tx,
-                runtime_control_tx,
                 runtime_terminate_handle,
                 cell_state,
             },
@@ -95,7 +94,6 @@ impl CellActor {
 
 struct CellContext {
     runtime_tx: std::sync::mpsc::Sender<RuntimeCommand>,
-    runtime_control_tx: std::sync::mpsc::Sender<RuntimeControlCommand>,
     runtime_terminate_handle: v8::IsolateHandle,
     cell_state: Arc<CellState>,
 }
@@ -115,19 +113,16 @@ async fn run_cell<H: CellHost>(
 ) {
     let CellContext {
         runtime_tx,
-        runtime_control_tx,
         runtime_terminate_handle,
         cell_state,
     } = context;
     let cancellation_token = cell_state.cancellation_token();
-    let callback_cancellation_token = cancellation_token.child_token();
+    let tool_cancellation_token = cancellation_token.child_token();
+    let notification_cancellation_token = CancellationToken::new();
     let mut content_items = Vec::new();
-    let mut pending_tool_call_ids = Vec::new();
-    let mut pending_frontier_ready = false;
     let mut observer = Some(initial_observer);
     let mut termination = false;
     let mut runtime_closed = false;
-    let mut runtime_paused = false;
     let mut runtime_failure_reported = false;
     let mut yield_timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
     let mut notification_tasks = JoinSet::new();
@@ -145,13 +140,13 @@ async fn run_cell<H: CellHost>(
                 drop(command_rx.take());
                 begin_termination(
                     &runtime_tx,
-                    &runtime_control_tx,
                     &runtime_terminate_handle,
                     &cancellation_token,
                 );
                 if runtime_closed {
                     finish_callbacks(
-                        &callback_cancellation_token,
+                        &notification_cancellation_token,
+                        &tool_cancellation_token,
                         &mut notification_tasks,
                         &mut tool_tasks,
                         CallbackCompletion::Cancel,
@@ -196,30 +191,6 @@ async fn run_cell<H: CellHost>(
                     let _ = response_tx.send(Err(CellError::Busy));
                     continue;
                 }
-                if matches!(mode, ObserveMode::PendingFrontier) && pending_frontier_ready {
-                    pending_frontier_ready = false;
-                    match send_cell_event(
-                        response_tx,
-                        CellEvent::Pending {
-                            content_items: std::mem::take(&mut content_items),
-                            pending_tool_call_ids: std::mem::take(&mut pending_tool_call_ids),
-                        },
-                    ) {
-                        Ok(()) => {}
-                        Err(CellEvent::Pending {
-                            content_items: undelivered_items,
-                            pending_tool_call_ids: undelivered_tool_call_ids,
-                        }) => {
-                            content_items = undelivered_items;
-                            pending_tool_call_ids = undelivered_tool_call_ids;
-                            pending_frontier_ready = true;
-                        }
-                        Err(event) => {
-                            panic!("pending delivery returned an unexpected event: {event:?}")
-                        }
-                    }
-                    continue;
-                }
                 // State-change observations have no fallback timer. Deliver
                 // content that arrived after the previous observer completed
                 // but before this command reached the actor; otherwise that
@@ -239,18 +210,6 @@ async fn run_cell<H: CellHost>(
                 }
                 observer = Some(Observer { mode, response_tx });
                 yield_timer = observer.as_ref().and_then(observer_timer);
-                if runtime_paused
-                    && matches!(mode, ObserveMode::YieldAfter(_) | ObserveMode::StateChange)
-                {
-                    pending_frontier_ready = false;
-                    pending_tool_call_ids.clear();
-                }
-                resume_for_observation(
-                    mode,
-                    &mut runtime_paused,
-                    &runtime_tx,
-                    &runtime_control_tx,
-                );
             }
             _ = async {
                 if let Some(yield_timer) = yield_timer.as_mut() {
@@ -281,7 +240,8 @@ async fn run_cell<H: CellHost>(
                     runtime_closed = true;
                     if termination || cancellation_token.is_cancelled() {
                         finish_callbacks(
-                            &callback_cancellation_token,
+                            &notification_cancellation_token,
+                            &tool_cancellation_token,
                             &mut notification_tasks,
                             &mut tool_tasks,
                             CallbackCompletion::Cancel,
@@ -305,7 +265,8 @@ async fn run_cell<H: CellHost>(
                         );
                     }
                     finish_callbacks(
-                        &callback_cancellation_token,
+                        &notification_cancellation_token,
+                        &tool_cancellation_token,
                         &mut notification_tasks,
                         &mut tool_tasks,
                         CallbackCompletion::DrainNotifications,
@@ -350,42 +311,6 @@ async fn run_cell<H: CellHost>(
                     RuntimeEvent::Started => {
                         yield_timer = observer.as_ref().and_then(observer_timer);
                     }
-                    RuntimeEvent::Pending => {
-                        runtime_paused = true;
-                        if matches!(
-                            observer.as_ref().map(|observer| observer.mode),
-                            Some(ObserveMode::PendingFrontier)
-                        ) {
-                            yield_timer = None;
-                            pending_frontier_ready = false;
-                            match send_observer_event(
-                                observer.take(),
-                                CellEvent::Pending {
-                                    content_items: std::mem::take(&mut content_items),
-                                    pending_tool_call_ids: std::mem::take(
-                                        &mut pending_tool_call_ids,
-                                    ),
-                                },
-                            ) {
-                                Ok(()) => {}
-                                Err(CellEvent::Pending {
-                                    content_items: undelivered_items,
-                                    pending_tool_call_ids: undelivered_tool_call_ids,
-                                }) => {
-                                    content_items = undelivered_items;
-                                    pending_tool_call_ids = undelivered_tool_call_ids;
-                                    pending_frontier_ready = true;
-                                }
-                                Err(event) => {
-                                    panic!("pending delivery returned an unexpected event: {event:?}")
-                                }
-                            }
-                        } else {
-                            pending_tool_call_ids.clear();
-                            let _ = runtime_control_tx.send(RuntimeControlCommand::Continue);
-                            runtime_paused = false;
-                        }
-                    }
                     RuntimeEvent::ContentItem(item) => {
                         content_items.push(output_item(item));
                         if matches!(
@@ -421,18 +346,17 @@ async fn run_cell<H: CellHost>(
                             );
                         }
                     }
-                    RuntimeEvent::Notify { call_id, text } => {
+                    RuntimeEvent::Notify { id, call_id, text } => {
                         spawn_notification(
                             &mut notification_tasks,
                             Arc::clone(&host),
-                            call_id,
-                            text,
-                            callback_cancellation_token.child_token(),
+                            NotificationInvocation { id, call_id, text },
+                            runtime_tx.clone(),
+                            notification_cancellation_token.child_token(),
                             task_failure_handler.clone(),
                         );
                     }
-                    RuntimeEvent::ToolCall { id, name, kind, input } => {
-                        pending_tool_call_ids.push(id.clone());
+                    RuntimeEvent::ToolCall { id, name, kind, input, timeout_ms } => {
                         spawn_tool(
                             &mut tool_tasks,
                             Arc::clone(&host),
@@ -444,9 +368,10 @@ async fn run_cell<H: CellHost>(
                                 },
                                 kind: cell_tool_kind(kind),
                                 input,
+                                timeout: std::time::Duration::from_millis(timeout_ms),
                             },
                             runtime_tx.clone(),
-                            callback_cancellation_token.child_token(),
+                            tool_cancellation_token.child_token(),
                             task_failure_handler.clone(),
                         );
                     }
@@ -455,7 +380,8 @@ async fn run_cell<H: CellHost>(
                         yield_timer = None;
                         if termination || cancellation_token.is_cancelled() {
                             finish_callbacks(
-                                &callback_cancellation_token,
+                                &notification_cancellation_token,
+                                &tool_cancellation_token,
                                 &mut notification_tasks,
                                 &mut tool_tasks,
                                 CallbackCompletion::Cancel,
@@ -471,7 +397,8 @@ async fn run_cell<H: CellHost>(
                             break;
                         }
                         finish_callbacks(
-                            &callback_cancellation_token,
+                            &notification_cancellation_token,
+                            &tool_cancellation_token,
                             &mut notification_tasks,
                             &mut tool_tasks,
                             CallbackCompletion::DrainNotifications,
@@ -531,14 +458,10 @@ async fn run_cell<H: CellHost>(
     // Reject requests that arrive while asynchronous terminal cleanup runs.
     cell_state.tombstone();
     drop(command_rx.take());
-    begin_termination(
-        &runtime_tx,
-        &runtime_control_tx,
-        &runtime_terminate_handle,
-        &cancellation_token,
-    );
+    begin_termination(&runtime_tx, &runtime_terminate_handle, &cancellation_token);
     finish_callbacks(
-        &callback_cancellation_token,
+        &notification_cancellation_token,
+        &tool_cancellation_token,
         &mut notification_tasks,
         &mut tool_tasks,
         CallbackCompletion::Cancel,
@@ -602,39 +525,17 @@ fn finish_termination(
 fn observer_timer(observer: &Observer) -> Option<std::pin::Pin<Box<tokio::time::Sleep>>> {
     match observer.mode {
         ObserveMode::YieldAfter(duration) => Some(Box::pin(tokio::time::sleep(duration))),
-        ObserveMode::StateChange | ObserveMode::PendingFrontier => None,
-    }
-}
-
-fn resume_for_observation(
-    mode: ObserveMode,
-    runtime_paused: &mut bool,
-    runtime_tx: &std::sync::mpsc::Sender<RuntimeCommand>,
-    runtime_control_tx: &std::sync::mpsc::Sender<RuntimeControlCommand>,
-) {
-    if *runtime_paused {
-        let control = match mode {
-            ObserveMode::YieldAfter(_) | ObserveMode::StateChange => {
-                RuntimeControlCommand::Continue
-            }
-            ObserveMode::PendingFrontier => RuntimeControlCommand::Resume,
-        };
-        let _ = runtime_control_tx.send(control);
-        *runtime_paused = false;
-    } else if matches!(mode, ObserveMode::PendingFrontier) {
-        let _ = runtime_tx.send(RuntimeCommand::ObservePendingFrontier);
+        ObserveMode::StateChange => None,
     }
 }
 
 fn begin_termination(
     runtime_tx: &std::sync::mpsc::Sender<RuntimeCommand>,
-    runtime_control_tx: &std::sync::mpsc::Sender<RuntimeControlCommand>,
     runtime_terminate_handle: &v8::IsolateHandle,
     cancellation_token: &CancellationToken,
 ) {
     cancellation_token.cancel();
     let _ = runtime_tx.send(RuntimeCommand::Terminate);
-    let _ = runtime_control_tx.send(RuntimeControlCommand::Terminate);
     let _ = runtime_terminate_handle.terminate_execution();
 }
 

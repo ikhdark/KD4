@@ -14,6 +14,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::SystemTime;
 
+use codex_config::ProjectDiscoveryContext;
+use codex_file_system::ExecutorFileSystem;
 use codex_file_watcher::FileWatcher;
 use codex_file_watcher::FileWatcherSubscriber;
 use codex_file_watcher::WatchPath;
@@ -23,7 +25,9 @@ use codex_git_utils::get_git_repo_root;
 use codex_git_utils::get_git_repo_root_with_fs;
 use codex_git_utils::get_has_changes;
 use codex_git_utils::get_head_commit_hash;
+use codex_otel::MetricsClient;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
@@ -39,6 +43,7 @@ const GIT_DEPENDENCY_TIMEOUT: Duration = Duration::from_secs(5);
 const DISABLED_HOOKS_PATH: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 const SOURCE_CHANGE_JOURNAL_CAPACITY: usize = 4_096;
 const GENERATED_CODEX_EVAL_PATHSPEC: &str = ":(exclude).codex/evals/**";
+const PROJECT_DISCOVERY_REUSE_METRIC: &str = "codex.project_discovery_reuse";
 static NEXT_WATCHER_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -520,6 +525,8 @@ pub(crate) struct GitWorkspaceCache {
     workspace_evidence_capture_sequence: AtomicU64,
     #[cfg(test)]
     workspace_evidence_capture_count: AtomicU64,
+    #[cfg(test)]
+    root_resolution_count: AtomicU64,
 }
 
 pub(crate) struct WorkspaceChangeObservation {
@@ -594,6 +601,8 @@ impl GitWorkspaceCache {
             workspace_evidence_capture_sequence: AtomicU64::new(0),
             #[cfg(test)]
             workspace_evidence_capture_count: AtomicU64::new(0),
+            #[cfg(test)]
+            root_resolution_count: AtomicU64::new(0),
         });
         if let Some(mut receiver) = receiver
             && let Ok(runtime) = tokio::runtime::Handle::try_current()
@@ -690,6 +699,30 @@ impl GitWorkspaceCache {
         self: &Arc<Self>,
         environments: &TurnEnvironmentSnapshot,
     ) -> GitWorkspaceSnapshot {
+        self.snapshot_with_project_discovery(environments, None)
+            .await
+    }
+
+    pub(crate) async fn snapshot_with_project_discovery(
+        self: &Arc<Self>,
+        environments: &TurnEnvironmentSnapshot,
+        project_discovery: Option<&ProjectDiscoveryContext>,
+    ) -> GitWorkspaceSnapshot {
+        let metrics = codex_otel::global();
+        self.snapshot_with_project_discovery_and_metrics(
+            environments,
+            project_discovery,
+            metrics.as_ref(),
+        )
+        .await
+    }
+
+    async fn snapshot_with_project_discovery_and_metrics(
+        self: &Arc<Self>,
+        environments: &TurnEnvironmentSnapshot,
+        project_discovery: Option<&ProjectDiscoveryContext>,
+        metrics: Option<&MetricsClient>,
+    ) -> GitWorkspaceSnapshot {
         let key = RootCacheKey {
             environment_generation: environments.generation,
             environments: environments
@@ -739,11 +772,17 @@ impl GitWorkspaceCache {
             .filter(|environment| environment.cwd().to_abs_path().is_ok())
             .zip(&key.environments)
         {
-            let repo_root = get_git_repo_root_with_fs(
-                environment.environment.get_filesystem().as_ref(),
-                &key_environment.cwd,
-            )
-            .await;
+            let fs = environment.environment.get_filesystem();
+            let repo_root = if let Some(repo_root) =
+                matching_checkout_root(project_discovery, key_environment, fs.as_ref(), metrics)
+                    .await
+            {
+                Some(repo_root)
+            } else {
+                #[cfg(test)]
+                self.root_resolution_count.fetch_add(1, Ordering::AcqRel);
+                get_git_repo_root_with_fs(fs.as_ref(), &key_environment.cwd).await
+            };
             entries.push(GitWorkspaceEntry {
                 environment_id: key_environment.environment_id.clone(),
                 cwd: key_environment.cwd.clone(),
@@ -774,6 +813,11 @@ impl GitWorkspaceCache {
             entries,
             cache: Arc::clone(self),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn root_resolution_count(&self) -> u64 {
+        self.root_resolution_count.load(Ordering::Acquire)
     }
 
     async fn stable_metadata(&self, source: &GitWorkspaceMetadataSource) -> StableGitMetadata {
@@ -1072,6 +1116,64 @@ impl GitWorkspaceCache {
         }
         self.host_mutation_generation.fetch_add(1, Ordering::AcqRel);
         self.record_source_change_event((!paths.is_empty()).then_some(paths));
+    }
+}
+
+async fn matching_checkout_root(
+    project_discovery: Option<&ProjectDiscoveryContext>,
+    environment: &EnvironmentWorkspaceKey,
+    fs: &dyn ExecutorFileSystem,
+    metrics: Option<&MetricsClient>,
+) -> Option<AbsolutePathBuf> {
+    if environment.remote {
+        record_project_discovery_reuse(metrics, "git", "miss", "remote_environment");
+        return None;
+    }
+    let Some(discovery) = project_discovery else {
+        record_project_discovery_reuse(metrics, "git", "miss", "context_unavailable");
+        return None;
+    };
+    if !discovery.matches_cwd(&environment.cwd) {
+        record_project_discovery_reuse(metrics, "git", "miss", "cwd_mismatch");
+        return None;
+    }
+    let Some(checkout_root) = discovery.git_checkout_root() else {
+        record_project_discovery_reuse(metrics, "git", "miss", "checkout_root_unavailable");
+        return None;
+    };
+    let marker = PathUri::from_abs_path(&checkout_root.join(".git"));
+    let Ok(metadata) = fs.get_metadata(&marker, /*sandbox*/ None).await else {
+        record_project_discovery_reuse(metrics, "git", "miss", "git_marker_unavailable");
+        return None;
+    };
+    if metadata.is_directory || metadata.is_file {
+        record_project_discovery_reuse(metrics, "git", "hit", "matched");
+        Some(checkout_root.clone())
+    } else {
+        record_project_discovery_reuse(metrics, "git", "miss", "git_marker_invalid");
+        None
+    }
+}
+
+fn record_project_discovery_reuse(
+    metrics: Option<&MetricsClient>,
+    consumer: &'static str,
+    result: &'static str,
+    reason: &'static str,
+) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    if let Err(err) = metrics.counter(
+        PROJECT_DISCOVERY_REUSE_METRIC,
+        /*inc*/ 1,
+        &[
+            ("consumer", consumer),
+            ("result", result),
+            ("reason", reason),
+        ],
+    ) {
+        warn!("project discovery reuse metric failed: {err}");
     }
 }
 

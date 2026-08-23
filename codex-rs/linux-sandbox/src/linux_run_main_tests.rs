@@ -583,55 +583,19 @@ fn resolve_permission_profile_rejects_missing_configuration() {
 }
 
 #[test]
-fn apply_seccomp_then_exec_with_legacy_landlock_panics() {
-    let result = std::panic::catch_unwind(|| {
-        ensure_inner_stage_mode_is_valid(
-            /*apply_seccomp_then_exec*/ true, /*use_legacy_landlock*/ true,
-        )
-    });
-    assert!(result.is_err());
-}
+fn legacy_landlock_flag_selects_the_bubblewrap_backend() {
+    let command = LandlockCommand::try_parse_from([
+        "codex-linux-sandbox",
+        "--sandbox-policy-cwd",
+        "/tmp",
+        "--use-legacy-landlock",
+        "echo",
+    ])
+    .expect("removed compatibility flag should remain parseable");
 
-#[test]
-fn legacy_landlock_rejects_split_only_filesystem_policies() {
-    let temp_dir = tempfile::TempDir::new().expect("tempdir");
-    let docs = temp_dir.path().join("docs");
-    std::fs::create_dir_all(&docs).expect("create docs");
-    let docs = AbsolutePathBuf::from_absolute_path(&docs).expect("absolute docs");
-    let policy = FileSystemSandboxPolicy::restricted(vec![
-        codex_protocol::permissions::FileSystemSandboxEntry {
-            path: codex_protocol::permissions::FileSystemPath::Special {
-                value: codex_protocol::permissions::FileSystemSpecialPath::Root,
-            },
-            access: codex_protocol::permissions::FileSystemAccessMode::Read,
-        },
-        codex_protocol::permissions::FileSystemSandboxEntry {
-            path: codex_protocol::permissions::FileSystemPath::Path { path: docs },
-            access: codex_protocol::permissions::FileSystemAccessMode::Write,
-        },
-    ]);
-
-    let result = std::panic::catch_unwind(|| {
-        ensure_legacy_landlock_mode_supports_policy(
-            /*use_legacy_landlock*/ true,
-            &policy,
-            NetworkSandboxPolicy::Restricted,
-            temp_dir.path(),
-        );
-    });
-
-    assert!(result.is_err());
-}
-
-#[test]
-fn valid_inner_stage_modes_do_not_panic() {
-    ensure_inner_stage_mode_is_valid(
-        /*apply_seccomp_then_exec*/ false, /*use_legacy_landlock*/ false,
-    );
-    ensure_inner_stage_mode_is_valid(
-        /*apply_seccomp_then_exec*/ false, /*use_legacy_landlock*/ true,
-    );
-    ensure_inner_stage_mode_is_valid(
-        /*apply_seccomp_then_exec*/ true, /*use_legacy_landlock*/ false,
+    assert!(command.use_legacy_landlock);
+    assert_eq!(
+        linux_sandbox_backend(command.use_legacy_landlock),
+        LinuxSandboxBackend::Bubblewrap
     );
 }

@@ -4010,6 +4010,10 @@ async fn remote_mid_turn_compact_v2_sends_turn_state_over_websocket() -> Result<
             responses::ev_assistant_message("m1", "FINAL_REPLY"),
             responses::ev_completed_with_tokens("r3", /*total_tokens*/ 80_000),
         ],
+        vec![
+            responses::ev_assistant_message("m2", "NEXT_TURN_REPLY"),
+            responses::ev_completed_with_tokens("r4", /*total_tokens*/ 80_000),
+        ],
     ]])
     .await;
     let mut builder = test_codex()
@@ -4035,9 +4039,23 @@ async fn remote_mid_turn_compact_v2_sends_turn_state_over_websocket() -> Result<
         })
         .await?;
     wait_for_turn_complete(&test.codex).await;
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "NEXT_TURN_AFTER_WS_COMPACT_V2".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    wait_for_turn_complete(&test.codex).await;
 
     let requests = server.single_connection();
-    assert_eq!(requests.len(), 5);
+    assert_eq!(server.handshakes().len(), 1);
+    assert_eq!(requests.len(), 6);
     assert_eq!(requests[0].body_json()["generate"].as_bool(), Some(false));
     // Phase 2: the v2 compact request replays the state already established by sampling.
     assert!(
@@ -4058,8 +4076,16 @@ async fn remote_mid_turn_compact_v2_sends_turn_state_over_websocket() -> Result<
             json!("sampling-state"),
             json!("sampling-state"),
             json!("sampling-state"),
+            json!(null),
         ]
     );
+    // Phase 4: a new logical turn keeps the healthy socket but resets response-chain and
+    // turn-scoped state, so the compacted history is sent as a fresh request.
+    let next_turn = requests[5].body_json();
+    assert_eq!(next_turn.get("previous_response_id"), None);
+    let next_turn_body = next_turn.to_string();
+    assert!(next_turn_body.contains("V2_WS_COMPACT_SUMMARY"));
+    assert!(next_turn_body.contains("NEXT_TURN_AFTER_WS_COMPACT_V2"));
 
     server.shutdown().await;
     Ok(())

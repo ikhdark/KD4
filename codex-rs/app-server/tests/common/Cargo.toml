@@ -17,7 +17,6 @@ base64 = { workspace = true }
 chrono = { workspace = true }
 codex-app-server-protocol = { workspace = true }
 codex-config = { workspace = true }
-codex-core = { workspace = true }
 codex-exec-server = { workspace = true }
 codex-features = { workspace = true }
 codex-login = { workspace = true }

@@ -53,9 +53,10 @@ use crate::stream_events_utils::raw_assistant_output_text_from_item;
 use crate::tools::tool_dispatch_trace::ToolDispatchTimingSnapshot;
 
 const NANOS_PER_MILLISECOND: u128 = 1_000_000;
-const TIMING_SCHEMA_VERSION: u16 = 23;
+const TIMING_SCHEMA_VERSION: u16 = 24;
 const MAX_DETERMINISTIC_CONTINUATION_RECEIPTS: usize = 64;
 const MAX_TOOL_CALL_TIMINGS: usize = 1_024;
+const RESERVED_TOOL_OUTPUT_RECURSIVE_SPILL_COUNT: u32 = 0;
 
 fn adjust_counter(counter: &AtomicU32, delta: i32) {
     if delta >= 0 {
@@ -543,6 +544,14 @@ impl TurnTimingSnapshot {
             internally_drained_wait_count: profile.counters.internally_drained_wait_count,
             no_progress_directive_count: profile.counters.no_progress_directive_count,
             proven_loop_activation_count: profile.counters.proven_loop_activation_count,
+            tool_router_reuse_count: profile.counters.tool_router_reuse_count,
+            tool_router_rebuild_count: profile.counters.tool_router_rebuild_count,
+            projection_source_dependencies_reuse_count: profile
+                .counters
+                .projection_source_dependencies_reuse_count,
+            projection_source_dependencies_fallback_count: profile
+                .counters
+                .projection_source_dependencies_fallback_count,
             tool_output_truncation_count: profile.counters.tool_output_truncation_count,
             tool_output_projected_token_count: profile.counters.tool_output_projected_token_count,
             tool_output_artifact_reread_count: profile.counters.tool_output_artifact_reread_count,
@@ -553,6 +562,7 @@ impl TurnTimingSnapshot {
             tool_output_artifact_creation_count: profile
                 .counters
                 .tool_output_artifact_creation_count,
+            tool_output_artifact_reuse_count: profile.counters.tool_output_artifact_reuse_count,
             tool_output_projection_truncation_count: profile
                 .counters
                 .tool_output_projection_truncation_count,
@@ -561,7 +571,7 @@ impl TurnTimingSnapshot {
             tool_output_recovery_retruncation_count: profile
                 .counters
                 .tool_output_recovery_retruncation_count,
-            tool_output_recursive_spill_count: profile.counters.tool_output_recursive_spill_count,
+            tool_output_recursive_spill_count: RESERVED_TOOL_OUTPUT_RECURSIVE_SPILL_COUNT,
             attributable_recovery_generation_count: profile
                 .counters
                 .attributable_recovery_generation_count,
@@ -823,6 +833,10 @@ pub(crate) struct TimingCounters {
     pub(crate) internally_drained_wait_count: u32,
     pub(crate) no_progress_directive_count: u32,
     pub(crate) proven_loop_activation_count: u32,
+    pub(crate) tool_router_reuse_count: u32,
+    pub(crate) tool_router_rebuild_count: u32,
+    pub(crate) projection_source_dependencies_reuse_count: u32,
+    pub(crate) projection_source_dependencies_fallback_count: u32,
     pub(crate) tool_output_truncation_count: u32,
     pub(crate) tool_output_projected_token_count: u64,
     pub(crate) tool_output_artifact_reread_count: u32,
@@ -831,11 +845,11 @@ pub(crate) struct TimingCounters {
     pub(crate) tool_output_model_byte_count: u64,
     pub(crate) tool_output_model_token_count: u64,
     pub(crate) tool_output_artifact_creation_count: u32,
+    pub(crate) tool_output_artifact_reuse_count: u32,
     pub(crate) tool_output_projection_truncation_count: u32,
     pub(crate) tool_output_omitted_section_count: u64,
     pub(crate) tool_output_recovery_call_count: u32,
     pub(crate) tool_output_recovery_retruncation_count: u32,
-    pub(crate) tool_output_recursive_spill_count: u32,
     pub(crate) attributable_recovery_generation_count: u32,
     pub(crate) truncation_induced_continuation_count: u32,
     pub(crate) invalid_transition_count: u32,
@@ -1084,8 +1098,7 @@ impl TurnTimingState {
 
     pub(crate) fn mark_turn_started(&self) -> i64 {
         let sample = self.clock.sample();
-        self.state().start(sample);
-        sample.time.wall_unix_ms
+        self.state().start(sample)
     }
 
     pub(crate) async fn started_at_unix_secs(&self) -> Option<i64> {
@@ -1477,10 +1490,21 @@ impl TurnTimingState {
             return;
         }
 
+        let observed_at_ms = state
+            .elapsed_since_start(sample.time.monotonic_ns)
+            .map(u128_to_u64_ms);
+        let legacy_first_poll_at_ms = observed_at_ms
+            .zip(timing.total_duration_ms)
+            .map(|(observed, total)| observed.saturating_sub(total));
         let accepted_at_ms = lifecycle_boundary_at(
             &timing.lifecycle_events,
             ToolLifecycleBoundary::RequestCreated,
-        );
+        )
+        .or_else(|| {
+            legacy_first_poll_at_ms
+                .zip(timing.item_to_first_poll_ms)
+                .map(|(first_poll, queued)| first_poll.saturating_sub(queued))
+        });
         let parallel_gate_admitted_at_ms =
             lifecycle_boundary_at(&timing.lifecycle_events, ToolLifecycleBoundary::Admitted);
         let handler_entry_at_ms = lifecycle_boundary_at(
@@ -1494,7 +1518,12 @@ impl TurnTimingState {
         let process_spawned_at_ms = lifecycle_boundary_at(
             &timing.lifecycle_events,
             ToolLifecycleBoundary::ProcessSpawn,
-        );
+        )
+        .or_else(|| {
+            accepted_at_ms
+                .zip(timing.exec_request_to_spawn_ms)
+                .map(|(accepted, request_to_spawn)| accepted.saturating_add(request_to_spawn))
+        });
         let process_exited_at_ms =
             lifecycle_boundary_at(&timing.lifecycle_events, ToolLifecycleBoundary::ProcessExit);
         let delivered_at_ms = lifecycle_boundary_at(
@@ -1503,7 +1532,8 @@ impl TurnTimingState {
         );
         let first_poll_at_ms = accepted_at_ms
             .zip(timing.item_to_first_poll_ms)
-            .map(|(accepted, queued)| accepted.saturating_add(queued));
+            .map(|(accepted, queued)| accepted.saturating_add(queued))
+            .or(legacy_first_poll_at_ms);
         let output_collected_at_ms = lifecycle_boundary_at(
             &timing.lifecycle_events,
             ToolLifecycleBoundary::RelayEnqueue,
@@ -1907,6 +1937,34 @@ impl TurnTimingState {
             .saturating_add(1);
     }
 
+    pub(crate) fn record_tool_router_reuse(&self) {
+        let mut state = self.state();
+        state.counters.tool_router_reuse_count =
+            state.counters.tool_router_reuse_count.saturating_add(1);
+    }
+
+    pub(crate) fn record_tool_router_rebuild(&self) {
+        let mut state = self.state();
+        state.counters.tool_router_rebuild_count =
+            state.counters.tool_router_rebuild_count.saturating_add(1);
+    }
+
+    pub(crate) fn record_projection_source_dependencies_reuse(&self) {
+        let mut state = self.state();
+        state.counters.projection_source_dependencies_reuse_count = state
+            .counters
+            .projection_source_dependencies_reuse_count
+            .saturating_add(1);
+    }
+
+    pub(crate) fn record_projection_source_dependencies_fallback(&self) {
+        let mut state = self.state();
+        state.counters.projection_source_dependencies_fallback_count = state
+            .counters
+            .projection_source_dependencies_fallback_count
+            .saturating_add(1);
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_tool_output_projection_facts(
         &self,
@@ -1915,6 +1973,7 @@ impl TurnTimingState {
         model_bytes: u64,
         model_tokens: u64,
         artifact_created: bool,
+        artifact_reused: bool,
         projection_truncated: bool,
         omitted_sections: u64,
         provider_visible: bool,
@@ -1948,6 +2007,10 @@ impl TurnTimingState {
             .counters
             .tool_output_artifact_creation_count
             .saturating_add(u32::from(artifact_created));
+        state.counters.tool_output_artifact_reuse_count = state
+            .counters
+            .tool_output_artifact_reuse_count
+            .saturating_add(u32::from(artifact_reused));
         state.counters.tool_output_projection_truncation_count = state
             .counters
             .tool_output_projection_truncation_count
@@ -2405,13 +2468,26 @@ impl TurnTimingStateInner {
         self.next_attempt_kind = TurnTimingAttemptKind::Primary;
     }
 
-    fn start(&mut self, sample: ClockSample) {
+    fn start(&mut self, sample: ClockSample) -> i64 {
+        if self.started_sample.is_some() || self.completed_snapshot.is_some() {
+            self.invalid_transition();
+            return self
+                .started_sample
+                .map(|started| started.time.wall_unix_ms)
+                .or_else(|| {
+                    self.completed_snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.started_at_unix_ms)
+                })
+                .unwrap_or(sample.time.wall_unix_ms);
+        }
         *self = Self {
             started_sample: Some(sample),
             last_monotonic_ns: Some(sample.time.monotonic_ns),
             legacy: LegacyProfileState::new(sample.time.monotonic_ns),
             ..Self::default()
         };
+        sample.time.wall_unix_ms
     }
 
     fn begin_guard(&mut self, now_ns: u128, kind: GuardKind) -> bool {

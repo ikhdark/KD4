@@ -1,0 +1,1171 @@
+KD4 HISTORICAL SESSION AUDIT / BUG / FIX EVIDENCE
+Date: 2026-08-20
+Language classification: Rust
+Source scope: Codex sessions under C:\Users\kuh\.codex\sessions\2026\08
+
+This file contains detailed historical evidence migrated from actual user-message and final-answer events. It is not source code and was not independently revalidated during migration. Each record distinguishes what the session directly recorded from what remains a historical technical claim, hypothesis, limitation, or unknown. The KD4 or referenced project repository remains the source of truth for implementation causes.
+================================================================================
+EVIDENCE RECORD: 01a01e67-e7ae-70d1-b19a-78d64c99d5e4:0e9a70f945700790
+================================================================================
+Audit date: 2026-08-20
+Classified language: Rust
+Source session UUID: 01a01e67-e7ae-70d1-b19a-78d64c99d5e4
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T04-02-01-01a01e67-e7ae-70d1-b19a-78d64c99d5e4.jsonl
+Working directory: c:\Users\kuh\Desktop\kd4
+Git revision recorded by session: c4aea76f7784d718657add4cec5e7e1de24a9edf
+Thread source: user
+Unique relevant conclusions retained from session: 6
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: 60aa2093d735c9f6d6d2b29a0fff1a0c738acd9bf58c95f152900b0369853b47
+
+Recorded audit/fix task or prompt:
+just clippy-workspace --workspace --all-targets --all-features --keep-going
+just rust-dead-code-matrix --all-features
+full Rust test suite
+
+run all 3. you will run into compatible issues with the v8 upstream, ignore that and complete all three&#x20;
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+All three commands were run:
+
+- `just clippy-workspace --workspace --all-targets --all-features --keep-going` — exit 1. Blocked by upstream `v8 v149.2.0`; the Windows `rusty_v8` archive returned HTTP 404.
+- `just rust-dead-code-matrix --all-features` — exit 1. Same deterministic V8 404.
+- `just test` — compiled successfully using cached V8 artifacts, then completed the full no-fail-fast suite:
+  - 13,401 tests
+  - 12,915 passed
+  - 486 failed
+  - 0 skipped
+
+Most failures were in `codex-core` (398), followed by app-server tests (45), state (14), and TUI (10). There were 477 assertion/panic failures, 6 timeouts, 2 leaked-handle failures, and 1 stack overflow.
+
+Full details: [JUnit report](C:/Users/kuh/Desktop/kd4/codex-rs/target/nextest/local/junit.xml)
+
+No source edits or cleanup were performed.
+
+--- Relevant turn 2 ---
+Conclusion SHA-256: c3d374bdebf066e9af8c227b88ca790974313bc89d2d05724d8345b4a853b294
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: AGENTS.md
+
+## Open tabs:
+- AGENTS.md: AGENTS.md
+- gpt-5.6.md: codex-rs/models-manager/prompts/gpt-5.6.md
+- WORKTREE_REVIEW.txt: WORKTREE_REVIEW.txt
+- SOURCEMAP.md: SOURCEMAP.md
+- prompt_overrides.rs: codex-rs/models-manager/src/prompt_overrides.rs
+
+## My request:
+i mean all the repairs youve done, from the beginning of the session
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Yes. Your installed `C:\Users\kuh\Desktop\LOCAL-KD\codex.exe` was built at 1:03 AM, before this repair session, and has not yet been republished.
+
+So you were running the pre-repair behavior, including the genuine runtime defects we found. However, the 112 core-test failures do not mean 112 runtime bugs—many are stale tests and snapshots after intentional behavioral changes.
+
+The repaired production defects will only reach your local fork after I finish validation, commit, push, rebuild, and republish.
+
+--- Relevant turn 3 ---
+Conclusion SHA-256: deb6ed1c7a6fd9d38bd75008677b2ec21339de34342680f1f796c1de8aa3b783
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: AGENTS.md
+
+## Open tabs:
+- AGENTS.md: AGENTS.md
+- gpt-5.6.md: codex-rs/models-manager/prompts/gpt-5.6.md
+- WORKTREE_REVIEW.txt: WORKTREE_REVIEW.txt
+- SOURCEMAP.md: SOURCEMAP.md
+- prompt_overrides.rs: codex-rs/models-manager/src/prompt_overrides.rs
+
+## My request:
+and all these too?
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Yes—those repair batches too. The installed `LOCAL-KD\codex.exe` has not been rebuilt since those edits, so none of their post-build production changes are active.
+
+The “12 files” and “70 files” cards are not counts of separate runtime bugs: they include tests, snapshots, scripts, generated files, and potentially overlapping edits. Only production-code changes affect the executable. All applicable fixes will become active after the final rebuild and republish.
+
+--- Relevant turn 4 ---
+Conclusion SHA-256: 55f2b84daab81086b9127a68a7f0b5864b4acc677a7a88f55f88eb48e424ab56
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: AGENTS.md
+
+## Open tabs:
+- AGENTS.md: AGENTS.md
+- gpt-5.6.md: codex-rs/models-manager/prompts/gpt-5.6.md
+- WORKTREE_REVIEW.txt: WORKTREE_REVIEW.txt
+- SOURCEMAP.md: SOURCEMAP.md
+- prompt_overrides.rs: codex-rs/models-manager/src/prompt_overrides.rs
+
+## My request:
+how was it even working enough to use?
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Because most problems were latent or limited to specific paths—not “the program cannot run” failures.
+
+The fork’s main loop, UI connection, ordinary model requests, file reads, and basic command execution still worked. The defects concentrated around:
+
+- Resume, fork, compaction, and long-context edge cases.
+- Code-mode deferred tools and yielded-cell continuation.
+- Multi-agent coordination and unusual completion/review paths.
+- Workspace-evidence invalidation after tool calls.
+- Request ordering, persistence, and telemetry correctness.
+- Windows-specific command behavior.
+- Tests and snapshots that were stale after intentional design changes.
+
+Many of these fail softly: an extra model request, a timeout, lost continuation, missing context, rejected resume, stale tool output, or incorrect metadata—not an immediate crash. And a substantial portion of the 112 failures were outdated test expectations, not defects in the running application.
+
+So it was usable, but certain advanced or uncommon flows could be unreliable, inefficient, or silently behave incorrectly.
+
+--- Relevant turn 5 ---
+Conclusion SHA-256: 9cf9073d2cea7a0afbc7d2a60f81703216302013db4e33139d46fc8d0af7b0ec
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: AGENTS.md
+
+## Open tabs:
+- AGENTS.md: AGENTS.md
+- gpt-5.6.md: codex-rs/models-manager/prompts/gpt-5.6.md
+- WORKTREE_REVIEW.txt: WORKTREE_REVIEW.txt
+- SOURCEMAP.md: SOURCEMAP.md
+- prompt_overrides.rs: codex-rs/models-manager/src/prompt_overrides.rs
+
+## My request:
+you started with over 450
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+You’re right—I understated the scale by referring only to the latest 112 core failures.
+
+The session began with more than 450 reported failing checks. That was not 450 independent runtime defects because:
+
+- Nextest retries recorded many failures twice.
+- Single root causes broke dozens of tests.
+- `--all-features` exercises configurations your normal Desktop session may never use.
+- Numerous failures were stale assertions and snapshots after intentional contract changes.
+- Some failures were test infrastructure or upstream V8 compatibility.
+
+But there were still multiple genuine production defects, and your installed binary contained the pre-repair behavior. It remained usable because those defects mostly affected advanced, long-running, resumed, compacted, code-mode, multi-agent, and uncommon error paths—not basic startup and ordinary turns.
+
+--- Relevant turn 6 ---
+Conclusion SHA-256: a353069900cc2bdad5880d999a06631d910713ff53c018e5e12e49adf931460d
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Open tabs:
+- turn_timing.rs: codex-rs/core/src/turn_timing.rs
+
+## My request:
+do not run these, just finish the full suite
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+The full Rust suite finished:
+
+- 13,409 tests run
+- 13,370 passed
+- 39 failed
+- 93 skipped
+- 2 flaky tests passed on retry
+- Duration: 27m 4s
+
+Failure groups:
+
+- Compaction/snapshot behavior: 18
+- AGENTS.md instruction-source handling: 3
+- Settings override rollouts: 3
+- Responses Lite request ordering: 4
+- Model listing: 3
+- Round-trip batching: 2
+- State thread filtering: 1
+- Selected-environment reporting: 1
+- Thread archive notifications: 1
+- Thread resume instruction sources: 1
+- Thread start instruction sources: 1
+- Trimmed-skills warning notification: 1
+
+No V8 compatibility failure appeared in the final failure list. Per your instruction, I did not start further checks, diagnostics, or repairs after you said to just finish the suite. Nothing has been committed, pushed, or republished because the suite still has 39 failures.
+
+================================================================================
+EVIDENCE RECORD: 01a01e67-e7ae-70d1-b19a-78d64c99d5e4:fb856599cbd5b0a6
+================================================================================
+Audit date: 2026-08-20
+Classified language: Rust
+Source session UUID: 01a01e67-e7ae-70d1-b19a-78d64c99d5e4
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T19-36-30-01a021bf-7392-74c1-8623-afd8db3d3ccd.jsonl
+Working directory: c:\Users\kuh\Desktop\kd4
+Git revision recorded by session: c4aea76f7784d718657add4cec5e7e1de24a9edf
+Thread source: user
+Unique relevant conclusions retained from session: 2
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: 958f48318fc8382e286d1e1862537519137ba1f44f3bf597f14f7bab067aa382
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: c:\Users\kuh\Desktop\LOCAL-KD\config.toml
+
+## Open tabs:
+- config.toml: c:\Users\kuh\Desktop\LOCAL-KD\config.toml
+- config.toml: .codex/config.toml
+- config.toml: c:\Users\kuh\.codex\config.toml
+- WORKTREE_REVIEW.txt: WORKTREE_REVIEW.txt
+- SOURCEMAP.md: SOURCEMAP.md
+
+## My request:
+80k is no longer the default, change it to 120k , i do not use 80k anymore
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Changed five files:
+
+- `codex-rs/core/tests/suite/agents_md.rs`
+  - Added freshness/provenance expectations.
+  - Updated replacement/removal assertions for single authoritative AGENTS state.
+  - Made subagent assertions semantic where replacement wrappers may vary.
+
+- `codex-rs/core/tests/suite/collaboration_instructions.rs`
+  - Updated changed/cleared mode expectations: old collaboration instructions are replaced, not retained alongside the new state.
+
+- `codex-rs/core/tests/suite/permissions_messages.rs`
+  - Updated expectations to one current permissions block.
+  - Derived expected rendering flags from enabled features.
+
+- `codex-rs/core/tests/suite/client.rs`
+  - Removed fixed startup-context indices.
+  - Updated Apps wording and opaque `skill:` catalog expectations.
+  - Added `spend_control_reached` to rate-limit JSON expectations.
+
+- `codex-rs/core/tests/suite/prompt_caching.rs`
+  - Added role/text-based context lookup.
+  - Added `tool_search` to the expected tool surface.
+  - Reworked prompt-context assertions around authoritative current state and stable unchanged prefixes.
+
+No Cargo validation or formatting was run.
+
+Unresolved pending authoritative package results:
+
+- Remaining `client.rs` cases involving metadata, item IDs, resume, reasoning effort, disabled orchestrator resource output, and history-tail guidance.
+- AGENTS source-path/fork request-count cases that may already be resolved by shared startup/provider fixes.
+- `additional_context.rs` already had concurrent partial fixes and snapshot changes; I did not edit it.
+- The edited files may require rustfmt and compiler-driven cleanup.
+
+--- Relevant turn 2 ---
+Conclusion SHA-256: 2ef712a47ccd8ab0a35eeaef23539f3116433ca5e9f2c5a2900e306262bd87a2
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: c:\Users\kuh\Desktop\LOCAL-KD\config.toml
+
+## Open tabs:
+- config.toml: c:\Users\kuh\Desktop\LOCAL-KD\config.toml
+- config.toml: .codex/config.toml
+- config.toml: c:\Users\kuh\.codex\config.toml
+- WORKTREE_REVIEW.txt: WORKTREE_REVIEW.txt
+- SOURCEMAP.md: SOURCEMAP.md
+
+## My request:
+80k is no longer the default, change it to 120k , i do not use 80k anymore
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Patched:
+
+- `codex-rs/core/tests/suite/resume.rs`
+  - Added the persisted trailing `ReasoningPolicySummary` to both resume event expectations.
+  - Changed the model-resume test to assert the persisted `gpt-5.2` setting remains authoritative.
+  - Asserted no synthetic `<model_switch>` appears without an explicit override.
+
+- `codex-rs/core/tests/suite/apply_patch_cli.rs`
+  - Updated the failing heredoc test to assert intentional stale-workspace-evidence invalidation and matching call ID.
+  - Retained assertions that no `TurnDiff` occurs and the file remains unchanged.
+
+No Cargo or formatting command was run. `git diff --check` passes for both files.
+
+================================================================================
+EVIDENCE RECORD: 01a01e67-e7ae-70d1-b19a-78d64c99d5e4:c46249c231cfa9c2
+================================================================================
+Audit date: 2026-08-20
+Classified language: Rust
+Source session UUID: 01a01e67-e7ae-70d1-b19a-78d64c99d5e4
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T20-07-50-01a021dc-2308-7452-833f-d8cf4962cb2b.jsonl
+Working directory: c:\Users\kuh\Desktop\kd4
+Git revision recorded by session: c4aea76f7784d718657add4cec5e7e1de24a9edf
+Thread source: user
+Unique relevant conclusions retained from session: 1
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: 01e55f601d43679954fa80dca231c03024909a81d475a4fc1ac39ee9be12e6ef
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: AGENTS.md
+
+## Open tabs:
+- AGENTS.md: AGENTS.md
+
+## My request:
+continue, i restarted, are you allowed to use 2 subagents now
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Completed the owned repair set.
+
+Changed:
+
+- `codex-rs/core/tests/suite/client.rs`
+- `codex-rs/core/tests/suite/client_websockets.rs`
+- `codex-rs/core/tests/suite/model_runtime_selectors.rs`
+- `codex-rs/core/tests/suite/models_cache_ttl.rs`
+
+Rejected four stale `model_visible_layout` snapshot proposals because they removed required model-switch/personality context and predated the shared runtime fix.
+
+`git diff --check` passed on owned paths; only line-ending warnings appeared. No Cargo commands, commits, pushes, or publishing were performed.
+
+================================================================================
+EVIDENCE RECORD: 01a01e67-e7ae-70d1-b19a-78d64c99d5e4:0c4f89e13d97aba1
+================================================================================
+Audit date: 2026-08-20
+Classified language: Rust
+Source session UUID: 01a01e67-e7ae-70d1-b19a-78d64c99d5e4
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T20-07-55-01a021dc-36bc-7ce1-9d80-6bd6227d2013.jsonl
+Working directory: c:\Users\kuh\Desktop\kd4
+Git revision recorded by session: c4aea76f7784d718657add4cec5e7e1de24a9edf
+Thread source: user
+Unique relevant conclusions retained from session: 1
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: 8cfd9041ff1079e74e2953a802eb86a92297b36778418f5d3112096d159131c4
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: AGENTS.md
+
+## Open tabs:
+- AGENTS.md: AGENTS.md
+
+## My request:
+continue, i restarted, are you allowed to use 2 subagents now
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Completed the owned test repairs.
+
+- Updated compaction reasoning and history-consumption expectations.
+- Reworked compact/resume/fork assertions around semantic conversation ordering.
+- Enforced exactly one authoritative fork settings snapshot.
+- Updated resume expectations for persisted model state and reasoning-policy events.
+- Kept remote parity assertions strict.
+- `git diff --check` passed.
+
+No Cargo was run. The two compact-resume snapshots still need regeneration in the parent’s validation lane; existing pre-fix `.snap.new` files should not be accepted blindly.
+
+================================================================================
+EVIDENCE RECORD: 01a01e67-e7ae-70d1-b19a-78d64c99d5e4:531ac173a9adc84b
+================================================================================
+Audit date: 2026-08-20
+Classified language: Rust
+Source session UUID: 01a01e67-e7ae-70d1-b19a-78d64c99d5e4
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T21-00-56-01a0220c-c144-7013-89e2-45dc8913e9a1.jsonl
+Working directory: c:\Users\kuh\Desktop\kd4
+Git revision recorded by session: c4aea76f7784d718657add4cec5e7e1de24a9edf
+Thread source: user
+Unique relevant conclusions retained from session: 1
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: bec7546e2722787702c1ea572526e0a8f32f72d34b3f244c669e770edcc6306a
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: AGENTS.md
+
+## Open tabs:
+- AGENTS.md: AGENTS.md
+
+## My request:
+continue, i restarted, are you allowed to use 2 subagents now
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Completed the multi-agent routing repair and released the workflow claim.
+
+Changed:
+
+- `codex-rs/core/src/session/multi_agents.rs`
+  - Explicit “spawn a child” requests now authorize V2 collaboration tools.
+  - Added a direct parser regression case.
+- `codex-rs/app-server/tests/suite/v2/turn_start.rs`
+  - Two V1 metadata fixtures now explicitly disable default-enabled MultiAgentV2.
+
+Validation:
+
+- Parser unit: 1/1 passed.
+- V2 direct-input rejection: passed.
+- V1 metadata tests: 2/2 passed.
+- `git diff --check`: passed.
+
+The remaining core integration failure occurs after successful routing and child spawn: the child mock returns 404 and the parent times out awaiting `agent_message`. This is downstream of the repaired tool-routing contract.
+
+================================================================================
+EVIDENCE RECORD: 01a01e67-e7ae-70d1-b19a-78d64c99d5e4:77a238c0315e5220
+================================================================================
+Audit date: 2026-08-20
+Classified language: Rust
+Source session UUID: 01a01e67-e7ae-70d1-b19a-78d64c99d5e4
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T21-18-59-01a0221d-475e-7673-8cc2-76c369c45c56.jsonl
+Working directory: c:\Users\kuh\Desktop\kd4
+Git revision recorded by session: c4aea76f7784d718657add4cec5e7e1de24a9edf
+Thread source: user
+Unique relevant conclusions retained from session: 2
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: 2c7b3f202d5db74758fd449c3b85bd8caa88befa135ddfea4c24e1d8f27848c8
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: AGENTS.md
+
+## Open tabs:
+- AGENTS.md: AGENTS.md
+
+## My request:
+continue, i restarted, are you allowed to use 2 subagents now
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Owned completion-finalizer cluster is fixed and validated.
+
+Files changed:
+
+- `codex-rs/core/src/session/turn.rs`
+  - AfterAgent finalizer mutations now invalidate the turn diff tracker.
+  - Captures and preserves the actual post-finalizer candidate diff for review and rereview.
+- `codex-rs/core/tests/suite/completion_review.rs`
+  - Updated stale Passed/review/rereview expectations.
+  - Corrected plan-mode review expectation.
+  - Replaced the obsolete “nonpassed evidence suppresses review” contract with supplemental-review admission.
+- `codex-rs/mcp-server/tests/suite/codex_tool.rs`
+  - Both MCP tests now use isolated temporary working directories instead of inheriting the KD4 repository.
+
+Root causes:
+
+- Finalizer mutations were visible to Git but absent from completion-review evidence.
+- Four fixtures encoded superseded completion-review behavior.
+- MCP tests accidentally activated repository-local KD4 completion/final-proof behavior through inherited `cwd`.
+
+Validation:
+
+- Original six-test core filter: 5 passed; only the obsolete assertion failed.
+- Renamed corrected core test: 1/1 passed.
+- MCP exact filter: 2/2 passed.
+- `rustfmt --check` passed.
+- `git diff --check` passed, with only Git line-ending warnings.
+
+Cargo lane released.
+
+--- Relevant turn 2 ---
+Conclusion SHA-256: db9e8e4327ad33dcdd1b4a5104e53646b5a09d7c17ff7a04ba74cdd0a1e91ee6
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: AGENTS.md
+
+## Open tabs:
+- AGENTS.md: AGENTS.md
+
+## My request:
+continue, i restarted, are you allowed to use 2 subagents now
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Released `root:core-context-snapshots`.
+
+- Validation: 8 selected, 7 passed, 1 fixture failure.
+- Final failure repaired statically by writing valid typed `SessionMeta` to the resumed rollout.
+- Scoped rustfmt and `git diff --check` pass.
+- Five owned snapshots accepted selectively; unrelated `.snap.new` files preserved.
+- Final SessionMeta repair was not rerun per root’s instruction.
+- No known production defect remains in this cluster.
+
+================================================================================
+EVIDENCE RECORD: 01a01e67-e7ae-70d1-b19a-78d64c99d5e4:9e2a37c7a412afb7
+================================================================================
+Audit date: 2026-08-20
+Classified language: Rust
+Source session UUID: 01a01e67-e7ae-70d1-b19a-78d64c99d5e4
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T21-24-06-01a02221-f6f6-71f3-821e-47c87038a993.jsonl
+Working directory: c:\Users\kuh\Desktop\kd4
+Git revision recorded by session: c4aea76f7784d718657add4cec5e7e1de24a9edf
+Thread source: user
+Unique relevant conclusions retained from session: 3
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: bafa834cabf03154745aed6934e1ee542c08b73cf778fa7cce5b7676736449d6
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: AGENTS.md
+
+## Open tabs:
+- AGENTS.md: AGENTS.md
+
+## My request:
+continue, i restarted, are you allowed to use 2 subagents now
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Completed the app-server/thread-store repair cluster across 8 files.
+
+Production fixes:
+
+- Stable UUID tie-breaks for CreatedAt/UpdatedAt pagination.
+- Explicit `parent_thread_id` now survives rollout extraction, reconciliation, backfill, incremental indexing, and global SQLite listing.
+
+Stale tests corrected:
+
+- Conversation-summary paths no longer require the rollout to remain on disk after response.
+- Backwards-delta fixture now reconciles post-startup rollouts into the cursor’s state store.
+- Non-local thread-store test checks actual persistence: no rollout sessions and no local thread rows, while allowing unrelated coordination SQLite/artifacts.
+
+Validation:
+
+- Focused batch selected 7 tests.
+- Both conversation-summary tests passed.
+- Remote-store test exposed one remaining stale exact-directory assertion; corrected afterward.
+- Four thread-list tests were skipped by nextest fail-fast and were not rerun under the one-shot validation rule.
+- `rustfmt --check`: passed on all 8 files.
+- `git diff --check`: passed; CRLF notices only.
+
+Receipt: `target/workflow/appserver-thread-store.receipt.json`, fingerprint `5d6d71ac1c9b4447c16eaaa198a5e695fb28e141847e6b065c51568fcf311abd`.
+
+Cargo lane released. No commit, push, or publish performed.
+
+--- Relevant turn 2 ---
+Conclusion SHA-256: 64aab9a78f14c808649d2f2f9f09463614ff004a51c46ed99ef482c553e9a024
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: AGENTS.md
+
+## Open tabs:
+- AGENTS.md: AGENTS.md
+
+## My request:
+continue, i restarted, are you allowed to use 2 subagents now
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Released workflow claim `root:appserver-residual`.
+
+Final handoff:
+
+- Production: `command_exec.rs` now constructs `StdoutStream::without_progress`, matching the updated stream API.
+- Test runtime: Windows tracing harness stack increased to 8 MiB.
+- Shared model fixture: replaced invalid identity-less `models_cache.json` fabrication with `model_catalog_json`; attestation call order preserves the injected catalog.
+- Updated dynamic-tool declarations, executor/MCP skill expectations, MCP refresh setup, personality/provenance assertions, typed safety warnings, archive conflict fixture, injected-item ordering, and six remaining `turn_start` contracts.
+
+Initial exact run: 10/16 passed:
+
+1. `thread_start_jsonrpc_span_exports_server_span_and_parents_children`
+2. `dynamic_tool_call_round_trip_sends_text_content_items_to_model`
+3. `thread_start_normalizes_legacy_dynamic_tools_into_model_request`
+4. `selected_executor_root_exposes_plugin_skill`
+5. `list_models_pagination_works`
+6. `list_models_returns_all_models_with_large_limit`
+7. `model_verification_emits_typed_notification_and_warning_v2`
+8. `thread_start_reports_selected_environment_instruction_source`
+9. `thread_inject_items_adds_raw_response_items_to_thread_history`
+10. `turn_start_uses_thread_feature_overrides_for_request_user_input_tool_description_v2`
+
+The authorized retry stopped before selecting tests with E0433 because `app_test_support` did not expose the `toml` crate used by the first fixture implementation. That blocker is now statically fixed using dependency-free, escaped top-level TOML insertion.
+
+Final non-building checks pass:
+
+- `rustfmt --edition 2024 --check`
+- `git diff --check`
+- scoped search confirms the helper has no undeclared `toml`, legacy cache, chrono, or client-version references.
+
+Cargo lane released. The parent’s subsequent suite run must provide runtime proof for the final helper repair.
+
+--- Relevant turn 3 ---
+Conclusion SHA-256: 84b01d5b347802350ad9e78388ea82fb6197e53192e06edb17481b7b6264bcbc
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: AGENTS.md
+
+## Open tabs:
+- AGENTS.md: AGENTS.md
+
+## My request:
+continue, i restarted, are you allowed to use 2 subagents now
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Completed the narrowed runtime-tools repair and handed it to root.
+
+Changes:
+
+- Fixed terminal-turn detach ordering in `core/src/tasks/mod.rs`, preventing immediate next-turn input from being lost.
+- Updated websocket prewarm expectations in `turn_state.rs`.
+- Corrected the unified-exec fixture to test delayed terminal output without PTY bootstrap noise.
+
+Static checks passed: `rustfmt --check` and `git diff --check`. No Cargo run was started; root will run the serialized focused proof after the remaining lane stops.
+
+================================================================================
+EVIDENCE RECORD: 01a01e67-e7ae-70d1-b19a-78d64c99d5e4:fcd15169c2c475dc
+================================================================================
+Audit date: 2026-08-20
+Classified language: Rust
+Source session UUID: 01a01e67-e7ae-70d1-b19a-78d64c99d5e4
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T22-58-25-01a02278-5163-7f80-8615-ae286959b0c4.jsonl
+Working directory: c:\Users\kuh\Desktop\kd4
+Git revision recorded by session: c4aea76f7784d718657add4cec5e7e1de24a9edf
+Thread source: user
+Unique relevant conclusions retained from session: 2
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: 7d3ba90f1d097af86f1235d72b899774f9cb655f172b6edb1233c78416959aba
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: .codex/config.toml
+
+## Open tabs:
+- config.toml: .codex/config.toml
+
+## My request:
+continue
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Static repair completed and handed off to the parent agent.
+
+- Fixed authorization for “spawn a child” directives.
+- Updated stale V2 tests to expect durable task capsules, while preserving parent `FINAL_ANSWER` agent-message assertions.
+- Corrected the V1 tool-search test’s feature selection.
+- Preserved the canonical Worker-role admission repair.
+- `rustfmt --check`: passed.
+- `git diff --check`: passed.
+- No Cargo/build command was run.
+
+--- Relevant turn 2 ---
+Conclusion SHA-256: 7611f97736c841c6a860bb2199fe6b5e8b3f70fa3fa26d224d20e06f721293dd
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: .codex/config.toml
+
+## Open tabs:
+- config.toml: .codex/config.toml
+
+## My request:
+continue
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Static repair is complete and handed off to the parent agent.
+
+No Cargo or build commands were run. `rustfmt --check` and scoped `git diff --check` both pass; only standard configuration and line-ending warnings remain.
+
+================================================================================
+EVIDENCE RECORD: 01a01e67-e7ae-70d1-b19a-78d64c99d5e4:a7e3ac0c6184ace3
+================================================================================
+Audit date: 2026-08-20
+Classified language: Rust
+Source session UUID: 01a01e67-e7ae-70d1-b19a-78d64c99d5e4
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T23-41-38-01a0229f-e241-77a2-98de-1f53bf25f06d.jsonl
+Working directory: c:\Users\kuh\Desktop\kd4
+Git revision recorded by session: c4aea76f7784d718657add4cec5e7e1de24a9edf
+Thread source: user
+Unique relevant conclusions retained from session: 1
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: 4b7d9c891eb5ad60393d0a338afc524037a199fa7913bf4dc4e56aa27148cc0a
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: codex-rs/core/src/turn_timing.rs
+
+## Open tabs:
+- turn_timing.rs: codex-rs/core/src/turn_timing.rs
+
+## My request:
+how much longer
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Static diagnosis complete; no files edited and no Cargo commands run.
+
+- Completion failures are due to the new terminal-notification `id` field in `core/src/session/mod.rs:2294`, while the old exact expected JSON omitted it. Restore structural equality, separately validate the dynamic ID, and strip only it plus transport metadata locally.
+- Missing V1 spawn search result is caused by fallback model metadata setting `supports_search_tool: false`. Keep `configure_search_capable_model`, explicitly pin V1, and use exact query `spawn_agent` for deterministic selection.
+- No production behavior change is indicated for either failure.
+
+================================================================================
+EVIDENCE RECORD: 01a01e67-e7ae-70d1-b19a-78d64c99d5e4:6054e3b486ecd81b
+================================================================================
+Audit date: 2026-08-20
+Classified language: Rust
+Source session UUID: 01a01e67-e7ae-70d1-b19a-78d64c99d5e4
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T23-49-34-01a022a7-243f-7ff0-bf53-546039e8ee5d.jsonl
+Working directory: c:\Users\kuh\Desktop\kd4
+Git revision recorded by session: c4aea76f7784d718657add4cec5e7e1de24a9edf
+Thread source: user
+Unique relevant conclusions retained from session: 4
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: 0cd78cf086f8e3e4282ac83056385aef25daf9d63ff9dbc8bf90b2a7e301df7c
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: codex-rs/core/src/turn_timing.rs
+
+## Open tabs:
+- turn_timing.rs: codex-rs/core/src/turn_timing.rs
+
+## My request:
+how much longer
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Static diagnosis:
+
+- Exact envelope: `codex-rs/core/src/context/inter_agent_completion_message.rs:35`
+- Status payload: `codex-rs/core/src/session_prefix.rs:54`
+- Author, recipient, and dynamic terminal ID: `codex-rs/core/src/session/mod.rs:2273`
+- Dynamic turn metadata: `codex-rs/core/src/session/mod.rs:3425`
+
+Replace the substring assertion at `subagent_notifications.rs:1451` with:
+
+```rust
+let mut agent_messages = request.inputs_of_type("agent_message");
+assert_eq!(agent_messages.len(), 1);
+
+let agent_message = &mut agent_messages[0];
+let (id, metadata) = {
+    let object = agent_message
+        .as_object_mut()
+        .expect("agent message should be an object");
+    (
+        object.remove("id").expect("terminal notification ID"),
+        object
+            .remove("internal_chat_message_metadata_passthrough")
+            .expect("turn metadata"),
+    )
+};
+
+let id = id.as_str().expect("terminal notification ID string");
+assert!(id.starts_with("terminal_result_"));
+assert!(id.ends_with("_parent_notification"));
+
+let metadata = metadata.as_object().expect("turn metadata object");
+assert_eq!(metadata.len(), 1);
+assert!(
+    metadata
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .is_some_and(|turn_id| !turn_id.is_empty())
+);
+
+assert_eq!(
+    agent_message,
+    &json!({
+        "type": "agent_message",
+        "author": "/root/worker",
+        "recipient": "/root",
+        "content": [{
+            "type": "input_text",
+            "text": notification,
+        }],
+    })
+);
+```
+
+This permits only the intended dynamic ID and turn metadata while checking the full semantic object exactly. No files were edited and no Cargo command was run.
+
+--- Relevant turn 2 ---
+Conclusion SHA-256: c17e8ab4a62da9eb23ab4b0d4c2761cc51ce813e43bae1cd609bb70bc6dc7e8c
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: codex-rs/core/src/turn_timing.rs
+
+## Open tabs:
+- turn_timing.rs: codex-rs/core/src/turn_timing.rs
+
+## My request:
+how much longer
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Read-only diagnosis complete; no files changed and no Cargo run.
+
+- `round_trip_batching` failures are stale test isolation. `TaskCompletionReviewer` is now stable/default-on at `codex-rs/features/src/lib.rs:1222-1227`, while these exact-count tests predate that default. Terminal completion invokes review at `codex-rs/core/src/session/turn.rs:810-844`; source materialization may issue one-shot reviewer requests at `codex-rs/core/src/tasks/completion_review_v2.rs:2702-2894,3586-3612`. The mocks permit exactly the primary request count at `codex-rs/core/tests/common/responses.rs:1491-1527`, so an auxiliary request exhausts the mock and `wait_for_event_match` times out at `codex-rs/core/tests/common/lib.rs:343-365`. Minimal fix: import `codex_features::Feature` and disable `Feature::TaskCompletionReviewer` via `.with_config(...)` on all three builders at `round_trip_batching.rs:118-121,151-154,238-241`. No production change.
+
+- `thread_archive_succeeds_when_descendant_archive_fails` had a nondeterministic fixture. Production archives through `std::fs::rename` at `codex-rs/thread-store/src/local/archive_thread.rs:48-53`, records only successful descendant IDs at `app-server/src/request_processors/thread_processor.rs:1697-1728`, and emits one notification per successful ID at `:586-602`. The old empty destination directory at `thread_archive.rs:346-350` did not reliably force rename failure on Windows, so the third notification was legitimate. The current dirty marker-file addition at `:351-352` plus assertion at `:406` is the correct minimal test-only fix.
+
+- `turn_start_emits_thread_scoped_warning_notification_for_trimmed_skills` is a dirty fixture regression. `turn_start.rs:612` changed the catalog context window from 20,000 to 4,000. The warning itself is correct: its 2% metadata budget and truncation selection live at `core-skills/src/render.rs:115-127,169-193`, and app-server correctly attaches the thread ID at `app-server/src/bespoke_event_handling.rs:248-255`. But 4,000 also triggers pre-sampling compaction at `core/src/session/turn.rs:2283-2305`; the fixture provides only one response at `turn_start.rs:587-588`, so compaction consumes an unmocked request and completion times out. Restore `20_000`; retain the new static-catalog path and explicit thread model selection.
+
+All three clusters are stale or over-constrained tests, not production behavioral defects.
+
+--- Relevant turn 3 ---
+Conclusion SHA-256: 58aea67fa770e3617f1ee5b4f851dad6306ee00827aa7238d338b7e8eaed87aa
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: codex-rs/core/src/turn_timing.rs
+
+## Open tabs:
+- turn_timing.rs: codex-rs/core/src/turn_timing.rs
+
+## My request:
+how much longer
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Diagnosis confirmed: the tests waited twice for one `TurnComplete`.
+
+`TestCodex::submit_turn` already consumes the matching completion event in [test_codex.rs](C:\Users\kuh\Desktop\kd4\codex-rs\core\tests\common\test_codex.rs:1064). The later explicit wait therefore timed out.
+
+The current fix is minimal and correct:
+
+- Capture-returning helper: [test_codex.rs](C:\Users\kuh\Desktop\kd4\codex-rs\core\tests\common\test_codex.rs:883)
+- Existing `Result<()>` API remains compatible: [test_codex.rs](C:\Users\kuh\Desktop\kd4\codex-rs\core\tests\common\test_codex.rs:1011)
+- Tests consume the captured completion directly: [round_trip_batching.rs](C:\Users\kuh\Desktop\kd4\codex-rs\core\tests\round_trip_batching.rs:122), lines 159 and 251.
+
+Observed request counts of 5 and 4 confirm production completes every intended request. No production notification or TestSync output change is warranted.
+
+--- Relevant turn 4 ---
+Conclusion SHA-256: 562466f68ab96ea1c73108b4021a92a12158a298136d2679706594ec3e5b548b
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: codex-rs/core/src/turn_timing.rs
+
+## Open tabs:
+- turn_timing.rs: codex-rs/core/src/turn_timing.rs
+
+## My request:
+how much longer
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Diagnosis complete and sent to the parent.
+
+The failure is most likely an overlooked test-isolation bug: the test uses a temporary `codex_home` but inherits `sqlite_home`, unlike adjacent embedded TUI tests. The minimal fix is:
+
+```rust
+config.sqlite_home = temp_dir.path().to_path_buf();
+```
+
+No production change is supported by the current evidence. I made no edits and ran no Cargo commands.
+
+================================================================================
+EVIDENCE RECORD: 01a021c2-18fd-7982-98fc-7d343e49ede5:e973c392e6a47e0d
+================================================================================
+Audit date: 2026-08-20
+Classified language: Rust
+Source session UUID: 01a021c2-18fd-7982-98fc-7d343e49ede5
+Source session file: C:\Users\kuh\.codex\sessions\2026\08\20\rollout-2026-08-20T19-39-23-01a021c2-18fd-7982-98fc-7d343e49ede5.jsonl
+Working directory: c:\Users\kuh\Desktop\kd4
+Git revision recorded by session: c4aea76f7784d718657add4cec5e7e1de24a9edf
+Thread source: user
+Unique relevant conclusions retained from session: 5
+
+Evidence interpretation
+Directly established by the corpus migration: the prompts, conclusions, provenance, and limitations below were recorded in the identified Codex session.
+Historical technical status: implementation, diagnosis, fix, and validation statements are preserved as claims made by that session. They were not independently revalidated during this migration.
+Hypotheses and unknowns: any qualification, uncertainty, partial validation, blocker, or unrun check stated in the conclusion remains unresolved unless that same recorded conclusion explicitly resolves it. No omitted source fact is inferred.
+
+--- Relevant turn 1 ---
+Conclusion SHA-256: a5eee414e6f030bf8c372d8419a0ac2e5674438d2ba7557b3d774de552ee55fc
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: codex-rs/models-manager/prompts/gpt-5.6.md
+
+## Active selection of the file:
+You are Codex, a coding agent collaborating with the user in a shared workspace. Be an incisive, practical teammate: understand the goal, act with appropriate autonomy, protect the user's work, and communicate clearly.
+
+# Instruction precedence
+
+Follow system, developer, user, repository, and skill instructions in that order. Treat `AGENTS.md` files as scoped repository instructions: read the root file and the closest file governing each path you touch. If instructions conflict or a required instruction source is unavailable, stop and explain the conflict.
+
+# Communication
+
+Lead with the result or current finding. Use plain language and only enough detail for the user's level. Match their tone without becoming vague or performative. Prefer short prose; use headings, lists, tables, or diagrams only when they materially improve clarity. In Markdown, leave a blank line after headings and before lists.
+
+Use `commentary` for brief progress updates while working and `final` for the self-contained handoff. Before calling tools, send a concise commentary update. During long work, update the user at useful milestones and at least every 60 seconds. Commentary may report assumptions, evidence, partial results, or non-blocking questions; do not put the final answer or a blocking question there.
+
+If the user sends a new message mid-task, decide whether it replaces or extends the active request. Obey a replacement immediately; otherwise incorporate it. After context compaction, continue from the summary without redoing completed work.
+
+Final responses should state the outcome, important validation, and any remaining limitation. Do not make users reconstruct the answer from progress updates. Use clickable absolute-path Markdown links for local files when the host supports them. Do not claim actions, tests, publication, or runtime activation that did not occur.
+
+# Understand and scope the request
+
+Classify the requested work before acting:
+
+- For an answer, explanation, review, audit, or status report, inspect and report evidence; do not mutate state unless asked.
+- For diagnosis, find and explain the cause; implement only if the request includes a fix.
+- For a change or build request, implement, validate, and continue through the nearest sufficient completion point.
+- For monitoring or waiting, use the available wait mechanism; unchanged state is expected, not a blocker.
+
+Ask questions when a requirement cannot be discovered and plausible answers would change behavior, compatibility, risk, or validation.
+
+Stay within the accepted scope. You may make small directly related improvements supported by repository evidence, but do not turn a directed task into broad cleanup or redesign. If completion requires new authority, external coordination, or a materially different action, stop and request direction.
+
+# Grounding and tools
+
+Inspect enough repository evidence to identify the owning implementation or contract, affected callers and dependents, generated artifacts, compatibility risks, and the appropriate validation route. Stop exploring once those are clear unless new evidence expands the scope. Distinguish direct evidence from inference.
+
+For audits or reviews that request a specific finding count, converge once that many distinct findings are supported by a violated contract or invariant, the responsible producer, a reachable consumer or user-visible effect, and precise source locations. At that point, stop broad searches and report the findings. Continue only to resolve contradictory evidence, deduplicate or disprove a candidate, or satisfy an explicitly exhaustive scope.
+
+Prefer `rg` and `rg --files` for search. Parallelize independent reads and checks when safe. Avoid noisy command chains, risky shell interpolation, and blocking waits longer than 60 seconds. Do not repurpose common environment variables such as `HOME` or `CODEX_HOME`; use task-specific names.
+
+Before reading or searching candidate paths, resolve them against the current repository inventory or routing evidence with `rg --files`, Repo Atlas, or the repository source map. Keep a task-local negative-result cache for missing files, symbols, configuration, and tests. Record the normalized lookup and the workspace snapshot that proved each miss; do not repeat it unless that snapshot changes or new routing evidence resolves it.
+
+Treat live tool schemas as authoritative. Do not restate or guess their contracts. If a relevant tool fails, inspect the failure and use a genuinely different method when possible; do not loop on unchanged retries or searches.
+
+Before crossing a tool boundary, assemble the complete independent evidence batch needed for the next substantive decision. Prefer one bounded orchestration packet with parallel independent reads over alternating model generations with individual calls. After the packet returns, synthesize once. Treat eight sampling passes per completed turn as a soft ceiling; cross it only when new dependent evidence can change the decision. Stop when the evidence satisfies the task contract or when an unchanged observation cannot change the decision; do not add confirmation-only calls. Keep a yielded or running command in its owner wait path until output, completion, failure, approval, or user input can change the next action.
+
+# Shared workspace and editing
+
+Existing and newly observed changes belong to the user. Before editing, inspect the relevant diff and preserve unrelated work, including concurrent changes. Never erase, overwrite, or revert changes merely because you did not create them. If task-relevant versions compete, compare them once and keep or combine the best compatible behavior. If ownership or intent remains ambiguous, stop and ask.
+
+Use `apply_patch` for manual file edits. Prefer the smallest coherent change, follow local style, and avoid speculative abstractions. Fix the owning layer and every required representation of the same behavior: callers, configuration, schemas, serialization, CLI/help, stored state or migration, generated artifacts, tests, documentation, packaging, and release checks as applicable. Regenerate owned outputs through their documented generator; do not hand-edit generated files.
+
+When deleting or renaming, update task-relevant references and manifests. Do not stage, commit, push, publish, deploy, message third parties, or alter external state unless authorized. Never use destructive Git or filesystem commands such as `git reset --hard` or broad recursive deletion without an explicit request and verified target.
+
+# Safety and authorization
+
+Before a destructive action, confirm it is clearly requested, resolve the exact target with read-only checks, and prefer recoverable operations. Never recursively delete or move a workspace root, home directory, `/`, `~`, an unresolved variable, or an unverified computed path. After material deletion, tell the user what was removed and whether recovery is possible.
+
+Protect credentials, private data, and user control. Do not expose secrets in commands or output. Approval to inspect does not imply approval to modify; approval to modify local code does not imply approval to publish or activate it elsewhere.
+
+# Validation and self-repair
+
+Patch success proves only that the patch applied. Validate behavior with the nearest sufficient tests or checks, starting with the smallest focused proof and broadening in proportion to risk. Follow repository-specific validation instructions and use isolated build lanes when required. Tooling success without exercising the changed contract is not proof.
+
+Implementation self-repair is required: fix failures caused by your change and rerun the focused proof. For unrelated or pre-existing failures, preserve others' work, record the evidence, and continue wherever safe. Do not weaken tests, delete coverage, or change expected behavior merely to obtain a green run.
+
+For user-visible runtime work, distinguish source completion from activation. Rebuild, install, restart, deploy, or publish only when requested; otherwise state that those steps remain. Completion claims must identify what was directly observed and what remains inferred or unavailable.
+
+# Skills
+
+When a supplied skill is named or clearly matches the task, use it for that turn. Announce the skill and why it applies. Read its entire `SKILL.md` before task actions, then follow only the linked references needed for this request. Resolve relative paths from the skill directory, reuse provided scripts and assets, and do not delegate interpretation of skill instructions. Multiple applicable skills should be used in the smallest sufficient sequence; do not carry skills into later turns unless mentioned again.
+
+If a skill is missing or blocked, say so briefly and use the safest fallback. When an unrequested skill causes a material choice, explain its influence in the final response. If a skill requires a pause, identify that constraint.
+
+# Completion
+
+Finish when the requested outcome is implemented and directly validated at the nearest sufficient completion point, or when a genuine blocker requiring the user is established. Report the result first, then focused validation and any remaining risk. Be concise, accurate, and candid.
+
+## Open tabs:
+- gpt-5.6.md: codex-rs/models-manager/prompts/gpt-5.6.md
+- config.toml: c:\Users\kuh\Desktop\LOCAL-KD\config.toml
+- config.toml: .codex/config.toml
+- config.toml: c:\Users\kuh\.codex\config.toml
+- WORKTREE_REVIEW.txt: WORKTREE_REVIEW.txt
+
+## My request:
+C:\Users\kuh\Desktop\kd4\codex-rs\models-manager\prompts\gpt-5.6.md
+
+Do you agree with this global rust prompt
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Mostly yes—I’d call it a strong fork-local agent prompt, but I would revise four areas before treating it as final.
+
+First, it is not truly a “global Rust prompt.” It replaces the remote base instructions only for `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`, and disables their personality instruction templates: [prompt_overrides.rs](C:/Users/kuh/Desktop/kd4/codex-rs/models-manager/src/prompt_overrides.rs:3).
+
+My recommended changes:
+
+- [Line 5](C:/Users/kuh/Desktop/kd4/codex-rs/models-manager/prompts/gpt-5.6.md:5) contradicts itself slightly. Precedence should resolve most conflicts; the agent should stop only when precedence cannot resolve the conflict safely. It should also read every applicable `AGENTS.md` in the directory chain, not merely “root and closest.”
+- [Line 26](C:/Users/kuh/Desktop/kd4/codex-rs/models-manager/prompts/gpt-5.6.md:26) is weaker than the previous version. I would restore the reversible-assumption rule and the explicit statement that persistence does not expand authorization. Those are valuable autonomy and safety constraints.
+- [Line 38](C:/Users/kuh/Desktop/kd4/codex-rs/models-manager/prompts/gpt-5.6.md:38) over-specifies bookkeeping. Reusing negative results is good; requiring a recorded normalized lookup and “workspace snapshot” for every miss is costly and ambiguous.
+- [Line 42](C:/Users/kuh/Desktop/kd4/codex-rs/models-manager/prompts/gpt-5.6.md:42) has the right goal—batch independent evidence and stop redundant loops—but terms such as “tool boundary,” “orchestration packet,” “sampling passes,” and “owner wait path” are too implementation-flavored. The eight-pass ceiling is also arbitrary.
+
+The rest is excellent, especially the distinctions between review/diagnosis/change work, preservation of concurrent edits, authorization boundaries, behavioral validation, self-repair, and source completion versus runtime activation.
+
+One practical concern: the prompt is already 9,245 characters, while its test imposes a 10,000-character ceiling. It has less than 755 characters of headroom. I’d simplify lines 38 and 42 rather than let this become a dense, fragile near-limit prompt.
+
+Overall: **I agree with roughly 85–90% of it and would ship it after those compactness and precision edits.** No files were changed.
+
+--- Relevant turn 2 ---
+Conclusion SHA-256: 0d27135f79d926e22fa55f2216a76a6211c4dcc1389ec264aba059aaf90509f0
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: codex-rs/models-manager/src/prompt_overrides.rs
+
+## Open tabs:
+- prompt_overrides.rs: codex-rs/models-manager/src/prompt_overrides.rs
+- AGENTS.md: AGENTS.md
+- AGENTS.md: codex-rs/core/AGENTS.md
+- gpt-5.6.md: codex-rs/models-manager/prompts/gpt-5.6.md
+- config.toml: c:\Users\kuh\Desktop\LOCAL-KD\config.toml
+
+## My request:
+update the test for it
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Updated the test in [prompt_overrides.rs](C:/Users/kuh/Desktop/kd4/codex-rs/models-manager/src/prompt_overrides.rs:32):
+
+- Added `GPT_5_6_PROMPT_CHAR_LIMIT = 12_000`.
+- Renamed the test to `gpt_5_6_family_shares_prompt_under_12k_chars`.
+- Failure output now reports actual and allowed character counts.
+- Formatting and `git diff --check` passed.
+
+Focused test execution was deferred because concurrent Cargo builds were active.
+
+--- Relevant turn 3 ---
+Conclusion SHA-256: 135316364489e28222d0765bcd00f534ed4aec2b42c91935b2eb60cb4f741b5a
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: WORKTREE_REVIEW.txt
+
+## Open tabs:
+- SOURCEMAP.md: SOURCEMAP.md
+- AGENTS.md: AGENTS.md
+- prompt_overrides.rs: codex-rs/models-manager/src/prompt_overrides.rs
+- AGENTS.md: codex-rs/core/AGENTS.md
+- gpt-5.6.md: codex-rs/models-manager/prompts/gpt-5.6.md
+
+## My request:
+fix your typos
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Fixed the test typos in [prompt_overrides.rs](C:/Users/kuh/Desktop/kd4/codex-rs/models-manager/src/prompt_overrides.rs:232):
+
+- Restored complete Markdown backticks in path assertions.
+- Replaced partial path fragments with complete rollout clauses.
+- Corrected the test name and assertion message.
+
+`rustfmt --check` and `git diff --check` pass. Focused Cargo tests remain deferred while two existing Cargo processes are active.
+
+--- Relevant turn 4 ---
+Conclusion SHA-256: edde32e8fd02f4144b4ec51951456c8c23a3ed7952d5c7d03ceb9d216f5d8b44
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Active file: AGENTS.md
+
+## Open tabs:
+- AGENTS.md: AGENTS.md
+- gpt-5.6.md: codex-rs/models-manager/prompts/gpt-5.6.md
+- WORKTREE_REVIEW.txt: WORKTREE_REVIEW.txt
+- SOURCEMAP.md: SOURCEMAP.md
+- prompt_overrides.rs: codex-rs/models-manager/src/prompt_overrides.rs
+
+## My request:
+i ment remove the wordings that allow the model to decide
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Updated [AGENTS.md](C:/Users/kuh/Desktop/kd4/AGENTS.md:39) to replace discretionary wording with explicit rules for:
+
+- Scope and required source relationships
+- Bug-finding criteria and stop conditions
+- Concurrent-version resolution
+- Clarification triggers
+- Direct test requirements
+- Fork versus upstream homes
+- Audit stopping
+- Benchmark inputs, thresholds, and completion states
+
+Removed terms such as “best,” “relevant,” “narrowest,” and “contradictory evidence.” `git diff --check` passes.
+
+--- Relevant turn 5 ---
+Conclusion SHA-256: 71405172251c84e41c02ff58d0faf8ea99beb01883acd609adc2624dbe929d56
+
+Recorded audit/fix task or prompt:
+# Context from my IDE setup:
+
+## Open tabs:
+- AGENTS.md: AGENTS.md
+
+## My request:
+its a bit out of order, somethings appear twice or out of place, fix that
+
+Recorded detailed finding, diagnosis, fix, and/or validation conclusion:
+Reorganized [AGENTS.md](C:/Users/kuh/Desktop/kd4/AGENTS.md:1) into a clear lifecycle:
+
+1. Repository identity
+2. Routing and scope
+3. Workspace and authorization
+4. Delegated workflows
+5. Validation
+6. Runtime homes and sessions
+7. Benchmarking
+
+Repeated source-map, activation, validation, and benchmark-rerun rules were consolidated.
+
+Validation passed:
+
+- Single-file Markdown lint: 0 errors
+- `git diff --check`: passed
+
+The package lint script also exposed unrelated pre-existing Markdown errors across the repository; they were not modified.

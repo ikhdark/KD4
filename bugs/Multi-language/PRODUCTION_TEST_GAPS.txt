@@ -1,0 +1,338 @@
+MDPWA PRODUCTION TEST GAP REVIEW
+Reviewed: 2026-08-07
+
+PURPOSE
+
+This review identifies the ten missing tests most likely to prevent a production
+incident. The ranking is based on the consequence and plausibility of a failure,
+not on increasing a coverage percentage.
+
+REVIEW METHOD AND CURRENT COVERAGE
+
+- Source/configuration review only. Test commands were not run; repository policy
+  makes validation opt-in, and this task asked for a coverage review rather than
+  test execution.
+- The configured Vitest suite contains 111 test files. It is broad and notably
+  risk-aware: API validation and fail-closed behavior, local/Blob idempotency and
+  concurrency, resident form replay keys, admin auth primitives, notification
+  recipient selection, durable delivery state transitions, environment/storage
+  validation, retention SQL behavior, generated service-worker policies, and PWA
+  registration UI are all represented.
+- Most database/provider "integration" coverage is still module integration with
+  mocked SQL tags, mocked workflow/provider calls, or in-memory/local adapters.
+  That is useful, but it cannot prove PostgreSQL constraints, transaction locking,
+  executable migration SQL, competing workers, or provider/webhook boundaries.
+- Playwright has two specs and five scenarios total. They cover English/Spanish
+  page landmarks, community-input draft recovery, map viewport querying, initial
+  service-worker install/offline fallback, and GET_VERSION reporting. They do not
+  submit a resident write, exercise an admin workflow, send/retry a notification,
+  or upgrade from one installed service-worker version to another.
+- Several sensitive route owners have no direct test reference: admin/subscribers,
+  alert-broadcasts/[id], map-feedback/agency, cron/retention, and webhooks/resend.
+  cron/outbox has one focused cache-invalidation test, not end-to-end dispatch
+  behavior.
+
+THE TEN HIGHEST-VALUE MISSING TESTS (HIGHEST RISK FIRST)
+
+1. Concurrent transactional resident submission creates one record and one outbox job
+
+Production behavior protected:
+Two simultaneous, byte-identical community-input or map-feedback POSTs using the
+same replay key must commit exactly one resident record and exactly one durable
+resident-notification outbox job. Both responses may resolve to the same safe
+record, but neither duplicate records nor duplicate notification work may exist.
+A same-key/different-body race must return a conflict without changing the first
+record.
+
+Test shape:
+Run the community-input and map-feedback cases against a disposable PostgreSQL
+database with two requests released at the same barrier. Assert database rows,
+outbox rows, response status/body, and the conflicting-payload result after both
+transactions settle. Include rollback/failure injection between aggregate and
+outbox creation to prove atomicity.
+
+Existing code exercised:
+- src/app/api/community-input/route.ts (POST)
+- src/app/api/map-feedback/route.ts (POST)
+- src/lib/communityInputStore.ts
+- src/lib/mapFeedbackStore.ts
+- src/lib/residentNotificationRepository.ts
+- src/lib/postgres.ts
+- migrations/0001_security_reliability_foundation.up.sql
+- migrations/0005_shared_outbox_retry_policy.up.sql
+
+Why this is still missing/high value:
+Current route tests cover sequential replay, and store tests cover local/Blob
+locking and conflicts. They do not prove the production PostgreSQL uniqueness and
+transaction boundary under genuinely competing transactions. This single test
+can catch data corruption, duplicate resident actions, duplicate notifications,
+and a broken aggregate/outbox atomicity contract.
+
+2. Resident notification workers are lease-fenced and provider retries are exactly once
+
+Production behavior protected:
+If two cron/dispatcher workers race for one resident-notification job, only the
+current lease owner may send and finalize it. A workflow-start failure must release
+the claim for retry; a stale or superseded workflow run must not mark a newer run
+complete. A transient email-provider failure must become bounded retry work without
+creating a second successful admin email.
+
+Test shape:
+Use the real repository state machine with controlled workflow/email fakes. Race two
+dispatchers, expire/reclaim the first lease, and resolve the stale run after the new
+run. Also fail workflow start and the first provider attempt. Assert one successful
+provider idempotency key, legal state transitions, retained attempt history, and no
+stale finalization.
+
+Existing code exercised:
+- src/lib/residentNotificationDispatcher.ts
+- src/workflows/residentSubmissionNotification.ts
+- src/lib/residentNotificationRepository.ts
+- src/lib/communityInputNotifications.ts
+- src/lib/mapFeedbackNotifications.ts
+- src/app/api/cron/outbox/route.ts
+
+Why this is still missing/high value:
+There is no direct test for residentNotificationDispatcher or
+residentSubmissionNotification. Existing durable-repository tests validate many
+individual transitions, but not the production dispatcher/workflow handoff or the
+race between lease generations. This is the most important unproved notification
+exactly-once boundary.
+
+3. Concurrent alert signups cannot duplicate subscribers, consent history, or confirmation email
+
+Production behavior protected:
+Two simultaneous signups for the same normalized email must produce one subscriber,
+one active pending preference set, one appropriate consent history, and at most one
+confirmation email. An existing confirmed or suppressed subscriber must remain
+unchanged when an unauthenticated duplicate signup races in.
+
+Test shape:
+Drive two real POST requests against disposable PostgreSQL using case/whitespace
+variants of the same email. Hold both transactions at the conflict point. Assert the
+final subscriber and consent rows, returned public contract, and confirmation/admin
+provider call counts. Repeat with pre-existing confirmed and suppressed rows.
+
+Existing code exercised:
+- src/app/api/alert-signups/route.ts
+- src/lib/subscriberRepository.ts (createPendingSubscriber)
+- src/lib/alertSignupNotifications.ts
+- src/lib/alertSignupStore.ts
+- migrations/0001_security_reliability_foundation.up.sql
+
+Why this is still missing/high value:
+alertSignupStore tests cover local serialization and route tests cover ordinary
+duplicates. subscriberRepository.test.ts uses a fake SQL harness and sequential
+results. No current test proves the real unique/transaction behavior or notification
+cardinality under concurrent requests.
+
+4. Broadcast partial failure and concurrent retry never resend a successful target
+
+Production behavior protected:
+When one channel/recipient succeeds and another fails, a retry must use the frozen
+audience and resend only failed or provider-skipped targets. Two retry workers, or a
+retry racing cancellation, must not duplicate an already successful email/push and
+must not add subscribers who joined after publication.
+
+Test shape:
+Create a durable bilingual broadcast with email and push targets, inject a partial
+provider failure, then race two retry dispatches (and a cancellation variant).
+Assert provider idempotency keys and calls per target, immutable recipient snapshots,
+legal broadcast/outbox states, cache invalidation, and final aggregate counts.
+
+Existing code exercised:
+- src/workflows/alertBroadcastDelivery.ts
+- src/lib/alertBroadcastDispatcher.ts
+- src/lib/alertBroadcastRepository.ts
+- src/lib/alertBroadcastNotifications.ts
+- src/lib/alertBroadcastCancellation.ts
+- src/app/api/alert-broadcasts/[id]/route.ts
+- src/app/api/cron/outbox/route.ts
+
+Why this is still missing/high value:
+Existing tests separately cover frozen recipients, provider-skipped retry selection,
+stable idempotency strings, and atomic snapshot failure. They do not prove the full
+repository/workflow behavior with competing retry/cancel actors. A defect here could
+send duplicate civic alerts or send after an administrator cancels them.
+
+5. Resend webhook rejects forged events and applies duplicate bounce/complaint once
+
+Production behavior protected:
+An invalid or missing webhook signature must never suppress a resident. A valid
+bounce, complaint, or suppression event must update only the matching delivery and
+subscriber; replaying the same provider event concurrently must be idempotent. A
+database failure must leave the event reclaimable rather than falsely processed.
+
+Test shape:
+Call the route with a real signed fixture and tampered signature/body, then submit the
+same valid event concurrently. Verify HTTP results plus webhook-event, delivery, and
+subscriber rows. Inject a failure after claim and confirm a later retry can finish.
+Use only fake addresses and provider IDs.
+
+Existing code exercised:
+- src/app/api/webhooks/resend/route.ts
+- src/lib/subscriberRepository.ts
+- src/lib/postgres.ts
+- migrations/0001_security_reliability_foundation.up.sql
+
+Why this is still missing/high value:
+No test references the Resend webhook route. This boundary combines external
+authentication, provider payload drift, idempotency, and a resident's future alert
+eligibility; a forged or half-applied event can silently suppress the wrong person.
+
+6. Untested privileged routes enforce their exact permission, not merely any valid credential
+
+Production behavior protected:
+Subscriber management, broadcast cancel/retry, and verified agency map submission
+must reject anonymous, expired, tampered, legacy-cookie, system-only, and valid-but-
+wrong-scope credentials. Only the specifically required named permission may perform
+the mutation, and every accepted mutation must carry the authenticated actor/request
+ID into its audit write.
+
+Test shape:
+Use a table-driven route contract test over each method on the three route owners.
+For every credential class, assert status and zero repository mutation. For the
+correct permission, assert the exact repository call and audit identity. Include the
+agency rule that a generic system credential is not a verified agency source.
+
+Existing code exercised:
+- src/app/api/admin/subscribers/route.ts (GET and PATCH)
+- src/app/api/alert-broadcasts/[id]/route.ts (GET and PATCH)
+- src/app/api/map-feedback/agency/route.ts (POST)
+- src/lib/adminRoute.ts
+- src/lib/adminAuth.ts
+- src/lib/subscriberRepository.ts
+- src/lib/alertBroadcastCancellation.ts
+- src/lib/mapFeedbackStore.ts
+- src/lib/audit.ts
+
+Why this is still missing/high value:
+adminAuth and adminRouteGuard have strong primitive tests, but none of these three
+routes has a direct test reference. Primitive correctness does not prove that a route
+requested the right permission or forwarded the audit actor. This test catches
+authorization wiring regressions at the actual mutation boundary.
+
+7. A real browser upgrades service worker version N to N+1 without a stale shell or reload loop
+
+Production behavior protected:
+An installed client on version N must discover N+1, show the update prompt, honor
+"Later" without activating prematurely, activate after acceptance, transfer control,
+reload at most once, delete obsolete caches, and remain usable/offline in the active
+locale. Open tabs must not stay pinned to an incompatible old app shell.
+
+Test shape:
+Playwright should install a fixture build with cache version N, keep the browser
+context/profile, serve fixture build N+1, and exercise both defer and accept paths.
+Inspect service-worker controller/version and cache names before/after; then go
+offline and load an English and Spanish route. Count reload/controllerchange events
+to detect loops.
+
+Existing code exercised:
+- public/sw.js (generated service worker)
+- src/app/pwa-register.tsx
+- src/app/pwaServiceWorkerMessages.ts
+- scripts/generate-service-worker.mjs
+- public/manifest.json and public/site.webmanifest where install metadata participates
+
+Why this is still missing/high value:
+Vitest tests mock registration/update events and inspect generated worker behavior.
+e2e/pwa-recovery.spec.ts proves only initial install, offline fallback, and
+GET_VERSION. No current browser test crosses an actual version boundary, where cache
+cleanup, waiting-worker activation, and reload coordination can fail together.
+
+8. Playwright proves the resident form and API share one replay-safe submission contract
+
+Production behavior protected:
+The shipped community-input form must obtain its integrity token, send the expected
+idempotency header/body, interpret the server's safe response and stable issue codes,
+ignore a repeated in-flight click, clear the recovered draft only after confirmed
+success, and show a recoverable message on provider/network failure. The browser must
+never expose private fields returned accidentally by the server.
+
+Test shape:
+Submit the real form through the real route with fake resident data and an isolated
+test store. Hold the first response while double-clicking, then verify one stored
+record/request key and one success transition. Add a server validation-code case and
+a dropped-response/retry case that resolves to the same record. Assert both English
+and Spanish error mapping for the same code.
+
+Existing code exercised:
+- src/app/[locale]/community-input/page.tsx and its form components
+- src/components/useResidentFormSubmission.ts
+- src/lib/clientJson.ts
+- src/app/api/submission-integrity-token/route.ts
+- src/app/api/community-input/route.ts
+- src/lib/communityInput.ts
+- src/lib/communityInputStore.ts
+- messages/en and messages/es resident-form entries
+
+Why this is still missing/high value:
+The hook and route are well tested independently, while current Playwright only saves
+and recovers a draft. A client can therefore drift from headers, issue codes, safe
+response shape, or retry semantics while both isolated suites remain green.
+
+9. Every migration executes against the previous schema and preserves seeded civic data
+
+Production behavior protected:
+A clean database must migrate to the current manifest, and each supported prior
+version must upgrade using the real SQL without syntax/order/constraint failures.
+Seeded resident submissions, subscribers/consents, broadcasts, deliveries, outbox
+leases, audit events, and map-abuse idempotency rows must retain identity and required
+relationships. Down/up rehearsal must not silently lose data the down migration is
+contracted to preserve.
+
+Test shape:
+In disposable PostgreSQL, apply migrations one at a time, seed boundary rows at each
+version, run scripts/database-migrate.mjs to current, and query invariants/foreign
+keys/index-backed uniqueness afterward. Exercise the latest supported down plan and
+reapply it. Keep fixtures fake and schema-valid.
+
+Existing code exercised:
+- scripts/database-migrate.mjs
+- scripts/lib/database-migration-plan.mjs
+- migrations/manifest.json
+- migrations/0001_security_reliability_foundation.*.sql through
+  migrations/0006_retire_unused_admin_permissions.*.sql
+- src/lib/postgres.ts and production repository queries that depend on the schema
+
+Why this is still missing/high value:
+database-migrate.test.ts verifies manifest alignment, plans, pending selection, and
+checksum drift, but does not execute the migration SQL on PostgreSQL. SQL that parses
+incorrectly, constraints production queries cannot satisfy, or a destructive upgrade
+can pass a plan-only test and corrupt or block production data.
+
+10. Retention cron is unauthorized by default and cannot delete without explicit approval
+
+Production behavior protected:
+An unauthenticated cron request must execute no retention work. With valid cron auth
+but absent, malformed, or partial deletion approval, the route must force dry-run.
+Only the exact approved production configuration may apply deletions, with push-state
+transitions occurring before deletion in one transaction. A failure must return 503
+without reporting completion or leaving partial destructive work.
+
+Test shape:
+Directly test the route with an instrumented retention runner across unauthorized,
+dry-run, approved, and thrown-error cases; then add one disposable-PostgreSQL approved
+case with eligible/ineligible boundary rows. Assert Cache-Control, operational event
+status, counts, and unchanged rows in every non-approved/failure case.
+
+Existing code exercised:
+- src/app/api/cron/retention/route.ts
+- src/lib/cronAuth.ts
+- src/lib/retention.mjs (isRetentionDeletionApproved and runRetention)
+- migrations/0001_security_reliability_foundation.up.sql
+
+Why this is still missing/high value:
+retention.postgres.test.ts uses a mocked SQL tag to inspect transition/deletion query
+ordering, and cron auth/config primitives have separate coverage. The route itself has
+no direct test reference, so a one-line inversion of dryRun, auth wiring, or approval
+interpretation could turn maintenance into unauthorized data deletion.
+
+RECOMMENDED EXECUTION ORDER
+
+Implement 1-3 first because they protect resident data and exactly-once actions at
+the production transaction boundary. Implement 4-6 next because they protect alert
+delivery and privileged/provider entry points. Implement 7-10 before launch to close
+the browser upgrade, client/server, schema deployment, and destructive maintenance
+gaps. Prefer disposable PostgreSQL and deterministic provider/workflow fakes; do not
+call live providers or use real resident data.

@@ -27,6 +27,7 @@ use crate::state::ConfigLayerEntry;
 use crate::state::ConfigLayerStack;
 use crate::state::ConfigLoadOptions;
 use crate::state::LoaderOverrides;
+use crate::state::ProjectDiscoveryContext;
 use crate::strict_config::config_error_from_ignored_toml_value_fields;
 use crate::strict_config::ignored_toml_value_field;
 use crate::strict_config::unknown_feature_toml_value_field;
@@ -289,6 +290,7 @@ pub async fn load_config_layers_state(
     }
 
     let mut startup_warnings = None;
+    let mut project_discovery = None;
     if let Some(cwd) = cwd {
         let mut merged_so_far = TomlValue::Table(toml::map::Map::new());
         for layer in &layers {
@@ -346,6 +348,14 @@ pub async fn load_config_layers_state(
             strict_config,
         )
         .await?;
+        project_discovery = Some(ProjectDiscoveryContext::new(
+            cwd.clone(),
+            project_trust_context.project_root.clone(),
+            project_root_markers,
+            project_trust_context.checkout_root.clone(),
+            project_trust_context.repo_root.clone(),
+            fs,
+        ));
         layers.extend(project_layers.layers);
         startup_warnings = Some(project_layers.startup_warnings);
     }
@@ -408,12 +418,15 @@ pub async fn load_config_layers_state(
         ));
     }
 
-    let config_layer_stack = ConfigLayerStack::new(
+    let mut config_layer_stack = ConfigLayerStack::new(
         layers,
         config_requirements_toml.clone().try_into()?,
         config_requirements_toml.into_toml(),
     )?
     .with_user_and_project_exec_policy_rules_ignored(ignore_user_and_project_exec_policy_rules);
+    if let Some(project_discovery) = project_discovery {
+        config_layer_stack = config_layer_stack.with_project_discovery(project_discovery);
+    }
     Ok(match startup_warnings {
         Some(startup_warnings) => config_layer_stack.with_startup_warnings(startup_warnings),
         None => config_layer_stack,

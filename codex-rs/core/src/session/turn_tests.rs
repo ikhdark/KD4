@@ -60,6 +60,23 @@ use wiremock::matchers::method;
 use wiremock::matchers::path;
 
 #[test]
+fn turn_submission_type_distinguishes_queued_continuations() {
+    assert!(matches!(
+        turn_submission_type(&[]),
+        TurnSubmissionType::Queued
+    ));
+
+    let input = [TurnInput::UserInput {
+        content: Vec::new(),
+        client_id: None,
+    }];
+    assert!(matches!(
+        turn_submission_type(&input),
+        TurnSubmissionType::Default
+    ));
+}
+
+#[test]
 fn tool_relay_reconciliation_advances_without_watchdog() {
     let timing = TurnTimingState::default();
     timing.mark_turn_started();

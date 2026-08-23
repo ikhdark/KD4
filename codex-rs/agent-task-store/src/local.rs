@@ -368,25 +368,9 @@ impl LocalAgentTaskStore {
         crate::workspace::ensure_workspace_tx(&mut transaction, &repository).await?;
         assignment.start_epoch =
             crate::workspace::current_epoch_tx(&mut transaction, &repository.workspace_id).await?;
-        // The assignment insert acquires SQLite's writer lock before dependency and coordination
-        // validation. Any validation failure rolls the row back, so no dormant task is exposed.
-        sqlx::query(
-            "INSERT INTO assignments (assignment_id, root_session_id, body_json, created_at) VALUES (?, ?, ?, ?)",
-        )
-        .bind(assignment.assignment_id.to_string())
-        .bind(&assignment.root_session_id)
-        .bind(encode(&assignment)?)
-        .bind(encode(&assignment.created_at)?)
-        .execute(&mut *transaction)
-        .await?;
-        sqlx::query("INSERT INTO assignment_repositories (assignment_id, repository_id, canonical_root, bound_at, workspace_id) VALUES (?, ?, ?, ?, ?)")
-            .bind(assignment.assignment_id.to_string())
-            .bind(&repository.id)
-            .bind(&repository.canonical_path)
-            .bind(encode(&assignment.created_at)?)
-            .bind(&repository.workspace_id)
-            .execute(&mut *transaction)
-            .await?;
+        // Orphan release acquires SQLite's writer lock before dependency and coordination
+        // validation. The immutable assignment row is inserted only after admission has selected
+        // its final integration plan, and any validation failure rolls the transaction back.
         release_orphaned_claims_tx(&mut transaction, &repository.workspace_id).await?;
         let allowed_pending_gate = assignment.relation.as_ref().and_then(|relation| {
             let gate = match (assignment.role, relation.kind) {
@@ -408,7 +392,12 @@ impl LocalAgentTaskStore {
             allowed_pending_gate,
         )
         .await?;
-        validate_architecture_contract_reference_tx(&mut transaction, &assignment).await?;
+        validate_architecture_contract_reference_tx(
+            &mut transaction,
+            &assignment,
+            Path::new(&repository.canonical_path),
+        )
+        .await?;
         let (overlaps, integration_plan) = if selective {
             selective_admission_tx(&mut transaction, &assignment, isolated_integrator_available)
                 .await?
@@ -418,6 +407,24 @@ impl LocalAgentTaskStore {
                 IntegrationPlan::SingleWriter,
             )
         };
+        assignment.integration_plan = integration_plan;
+        sqlx::query(
+            "INSERT INTO assignments (assignment_id, root_session_id, body_json, created_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(assignment.assignment_id.to_string())
+        .bind(&assignment.root_session_id)
+        .bind(encode(&assignment)?)
+        .bind(encode(&assignment.created_at)?)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query("INSERT INTO assignment_repositories (assignment_id, repository_id, canonical_root, bound_at, workspace_id) VALUES (?, ?, ?, ?, ?)")
+            .bind(assignment.assignment_id.to_string())
+            .bind(&repository.id)
+            .bind(&repository.canonical_path)
+            .bind(encode(&assignment.created_at)?)
+            .bind(&repository.workspace_id)
+            .execute(&mut *transaction)
+            .await?;
         let supersedes = planned_claim_supersessions_tx(&mut transaction, &assignment).await?;
         insert_attempt(&mut transaction, &attempt).await?;
         claim_isolated_handoffs_tx(&mut transaction, &assignment).await?;
@@ -538,6 +545,11 @@ impl LocalAgentTaskStore {
         let mut transaction = self.pool.begin().await?;
         lock_assignment_tx(&mut transaction, assignment_id).await?;
         let mut assignment = load_assignment_tx(&mut transaction, assignment_id).await?;
+        if capsule.integration_plan != assignment.integration_plan {
+            return Err(StoreError::InvalidTaskCapsule(
+                "integration plan does not match the admitted assignment".to_string(),
+            ));
+        }
         let attempt = load_current_attempt_tx(&mut transaction, assignment_id).await?;
         if attempt.attempt_id != attempt_id || attempt.state != AttemptState::Active {
             return Err(StoreError::AttemptNotActive(attempt_id));
@@ -1421,8 +1433,8 @@ impl LocalAgentTaskStore {
         &self,
         attempt_id: AttemptId,
         validation_call_ids: &[String],
-    ) -> StoreResult<Vec<String>> {
-        let mut stale_call_ids = Vec::new();
+    ) -> StoreResult<ValidationRefreshResult> {
+        let mut result = ValidationRefreshResult::default();
         for call_id in validation_call_ids {
             let Some(body) = sqlx::query_scalar::<_, String>(
                 "SELECT body_json FROM validation_calls WHERE call_id = ?",
@@ -1442,11 +1454,15 @@ impl LocalAgentTaskStore {
             refreshed.recorded_at = Utc::now();
             refreshed = prepare_validation_call(&self.pool, refreshed).await?;
             if refreshed.status == crate::ValidationCallStatus::Superseded {
-                stale_call_ids.push(call_id.clone());
+                result.stale_call_ids.push(call_id.clone());
                 self.record_validation_call_impl(refreshed).await?;
+            } else if validation_has_complete_exact_snapshot(&refreshed)?
+                && let Some(end_epoch) = refreshed.evidence.end_epoch
+            {
+                result.exact_fresh_epochs.insert(call_id.clone(), end_epoch);
             }
         }
-        Ok(stale_call_ids)
+        Ok(result)
     }
 
     async fn replay_required_evidence_missing_impl(
@@ -1549,7 +1565,8 @@ impl LocalAgentTaskStore {
                     receipt.attempt_id,
                     &receipt.validation_call_ids,
                 )
-                .await?,
+                .await?
+                .stale_call_ids,
             );
             for call_id in &receipt.validation_call_ids {
                 let call = self
@@ -1591,16 +1608,19 @@ impl LocalAgentTaskStore {
                 "receipt summary cannot be empty".to_string(),
             ));
         }
-        if draft.status == AgentStatusClaim::Completed {
-            let stale_call_ids = self
+        let validation_refresh = if draft.status == AgentStatusClaim::Completed {
+            let refresh = self
                 .refresh_validation_calls_impl(attempt_id, &draft.validation_call_ids)
                 .await?;
-            if !stale_call_ids.is_empty() {
+            if !refresh.stale_call_ids.is_empty() {
                 return Err(StoreError::EvidenceSuperseded {
-                    call_ids: stale_call_ids,
+                    call_ids: refresh.stale_call_ids,
                 });
             }
-        }
+            refresh
+        } else {
+            ValidationRefreshResult::default()
+        };
         let handoff_action = if draft.status == AgentStatusClaim::Completed {
             self.prepare_receipt_handoff_action(attempt_id).await?
         } else {
@@ -1661,8 +1681,13 @@ impl LocalAgentTaskStore {
             }
             if draft.status == AgentStatusClaim::Completed
                 && call.status == crate::ValidationCallStatus::Succeeded
-                && let Some((reason, current_epoch)) =
-                    validation_stale_event_reason_tx(&mut transaction, &assignment, &call).await?
+                && let Some((reason, current_epoch)) = validation_stale_event_reason_tx(
+                    &mut transaction,
+                    &assignment,
+                    &call,
+                    validation_refresh.exact_fresh_epochs.get(call_id).copied(),
+                )
+                .await?
             {
                 let mut superseded = call.clone();
                 superseded.status = crate::ValidationCallStatus::Superseded;
@@ -2205,28 +2230,35 @@ impl LocalAgentTaskStore {
                 gate: kind.to_string(),
             });
         }
-        if status.is_sealed()
+        let validation_refresh = if status.is_sealed()
             && let Some((target_attempt_id, validation_call_ids)) =
                 assignment_receipt_validation_ids(&self.pool, assignment_id).await?
         {
-            let stale_call_ids = self
+            let refresh = self
                 .refresh_validation_calls_impl(target_attempt_id, &validation_call_ids)
                 .await?;
-            if !stale_call_ids.is_empty() {
+            if !refresh.stale_call_ids.is_empty() {
                 return Err(StoreError::EvidenceSuperseded {
-                    call_ids: stale_call_ids,
+                    call_ids: refresh.stale_call_ids,
                 });
             }
-        }
+            refresh
+        } else {
+            ValidationRefreshResult::default()
+        };
         let mut transaction = self.pool.begin().await?;
         lock_assignment_tx(&mut transaction, assignment_id).await?;
         let assignment = load_assignment_tx(&mut transaction, assignment_id).await?;
         require_gate_actor_tx(&mut transaction, actor, &assignment, kind).await?;
         let attempt = load_current_attempt_tx(&mut transaction, assignment_id).await?;
         if status.is_sealed() {
-            let stale_call_ids =
-                supersede_stale_receipt_validations_tx(&mut transaction, &assignment, &attempt)
-                    .await?;
+            let stale_call_ids = supersede_stale_receipt_validations_tx(
+                &mut transaction,
+                &assignment,
+                &attempt,
+                &validation_refresh.exact_fresh_epochs,
+            )
+            .await?;
             if !stale_call_ids.is_empty() {
                 transaction.commit().await?;
                 return Err(StoreError::EvidenceSuperseded {
@@ -2327,24 +2359,32 @@ impl LocalAgentTaskStore {
                 "waiver reason cannot be empty".to_string(),
             ));
         }
-        if let Some((target_attempt_id, validation_call_ids)) =
+        let validation_refresh = if let Some((target_attempt_id, validation_call_ids)) =
             assignment_receipt_validation_ids(&self.pool, assignment_id).await?
         {
-            let stale_call_ids = self
+            let refresh = self
                 .refresh_validation_calls_impl(target_attempt_id, &validation_call_ids)
                 .await?;
-            if !stale_call_ids.is_empty() {
+            if !refresh.stale_call_ids.is_empty() {
                 return Err(StoreError::EvidenceSuperseded {
-                    call_ids: stale_call_ids,
+                    call_ids: refresh.stale_call_ids,
                 });
             }
-        }
+            refresh
+        } else {
+            ValidationRefreshResult::default()
+        };
         let mut transaction = self.pool.begin().await?;
         lock_assignment_tx(&mut transaction, assignment_id).await?;
         let assignment = load_assignment_tx(&mut transaction, assignment_id).await?;
         let attempt = load_current_attempt_tx(&mut transaction, assignment_id).await?;
-        let stale_call_ids =
-            supersede_stale_receipt_validations_tx(&mut transaction, &assignment, &attempt).await?;
+        let stale_call_ids = supersede_stale_receipt_validations_tx(
+            &mut transaction,
+            &assignment,
+            &attempt,
+            &validation_refresh.exact_fresh_epochs,
+        )
+        .await?;
         if !stale_call_ids.is_empty() {
             transaction.commit().await?;
             return Err(StoreError::EvidenceSuperseded {
@@ -4023,45 +4063,67 @@ async fn prepare_validation_call(
             };
             let current =
                 crate::workspace::capture_revision(pool, &context.repo_root, paths).await?;
-            let execution_current = Some(
-                crate::workspace::capture_revision(
-                    pool,
-                    &context.repo_root,
-                    vec![crate::workspace::REPOSITORY_WIDE_PATH.to_string()],
-                )
-                .await?,
-            );
-            let execution_changes = execution_current
-                .as_ref()
-                .zip(existing.evidence.execution_snapshot.as_deref())
-                .filter(|(_, snapshot)| !snapshot.manifest_hash.is_empty())
-                .map(|(execution_current, snapshot)| {
+            let execution_current = crate::workspace::capture_revision(
+                pool,
+                &context.repo_root,
+                vec![crate::workspace::REPOSITORY_WIDE_PATH.to_string()],
+            )
+            .await?;
+            let exact_snapshot_complete = validation_has_complete_exact_snapshot(&existing)?;
+            let execution_changes = existing
+                .evidence
+                .execution_snapshot
+                .as_deref()
+                .map(|snapshot| {
                     crate::workspace::changed_manifest_paths(
                         &snapshot.manifest,
                         &execution_current.files,
                     )
                 })
                 .unwrap_or_default();
-            let stale_reason = if execution_changes.is_empty() {
+            let dependency_changed = if exact_snapshot_complete {
+                validation_dependency_manifest_hash(
+                    &existing.command_summary,
+                    &execution_current.files,
+                    &existing.evidence.covered_scopes,
+                    existing.evidence.repository_wide,
+                )? != existing.evidence.dependency_manifest_hash
+            } else {
+                !execution_changes.is_empty()
+            };
+            let stale_reason = if !dependency_changed {
                 validation_stale_reason(
                     pool,
                     &context.repo_root,
                     &context.assignment,
                     &existing,
                     &current,
+                    exact_snapshot_complete,
                 )
                 .await?
             } else {
+                let dependency_changes = execution_changes
+                    .iter()
+                    .filter(|path| {
+                        validation_dependency_affects_path(
+                            &existing.command_summary,
+                            &existing.evidence.covered_scopes,
+                            existing.evidence.repository_wide,
+                            path,
+                        )
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
                 Some(format!(
                     "repository contents changed while validation was running: {}",
-                    execution_changes.join(", ")
+                    if dependency_changes.is_empty() {
+                        "validation dependency manifest".to_string()
+                    } else {
+                        dependency_changes.join(", ")
+                    }
                 ))
             };
-            call.evidence.end_epoch = Some(
-                execution_current
-                    .as_ref()
-                    .map_or(current.epoch, |revision| revision.epoch),
-            );
+            call.evidence.end_epoch = Some(execution_current.epoch);
             call.evidence.retained_output_ref =
                 retained_output_ref.or(existing.evidence.retained_output_ref);
             call.evidence.output_summary = output_summary.or(existing.evidence.output_summary);
@@ -4122,8 +4184,12 @@ async fn prepare_validation_call(
     )
     .await?;
     let covered_input_manifest_hash = revision.manifest_hash.clone();
-    let dependency_manifest_hash =
-        validation_dependency_manifest_hash(&call.command_summary, &execution_revision.files)?;
+    let dependency_manifest_hash = validation_dependency_manifest_hash(
+        &call.command_summary,
+        &execution_revision.files,
+        &covered_scopes,
+        repository_wide,
+    )?;
     let normalized_invocation = validation_normalized_invocation(&call)?;
     let coverage_identity =
         validation_coverage_identity(&covered_scopes, &covered_contracts, repository_wide)?;
@@ -4305,6 +4371,12 @@ struct ValidationContext {
     repo_root: PathBuf,
 }
 
+#[derive(Default)]
+struct ValidationRefreshResult {
+    stale_call_ids: Vec<String>,
+    exact_fresh_epochs: HashMap<String, u64>,
+}
+
 async fn assignment_receipt_validation_ids(
     pool: &SqlitePool,
     assignment_id: AssignmentId,
@@ -4359,6 +4431,7 @@ async fn supersede_stale_receipt_validations_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     assignment: &Assignment,
     attempt: &Attempt,
+    exact_fresh_epochs: &HashMap<String, u64>,
 ) -> StoreResult<Vec<String>> {
     let receipt = sqlx::query_scalar::<_, String>(
         "SELECT body_json FROM receipts WHERE assignment_id = ? AND attempt_id = ?",
@@ -4404,8 +4477,13 @@ async fn supersede_stale_receipt_validations_tx(
                 call_ids: vec![call_id.clone()],
             });
         }
-        let Some((reason, current_epoch)) =
-            validation_stale_event_reason_tx(transaction, assignment, &call).await?
+        let Some((reason, current_epoch)) = validation_stale_event_reason_tx(
+            transaction,
+            assignment,
+            &call,
+            exact_fresh_epochs.get(call_id).copied(),
+        )
+        .await?
         else {
             continue;
         };
@@ -4442,8 +4520,12 @@ async fn validation_stale_reason(
     assignment: &Assignment,
     call: &ValidationCall,
     current: &WorkspaceRevision,
+    exact_snapshot_complete: bool,
 ) -> StoreResult<Option<String>> {
-    if call.evidence.repository_wide && current.epoch != call.evidence.start_epoch {
+    if !exact_snapshot_complete
+        && call.evidence.repository_wide
+        && current.epoch != call.evidence.start_epoch
+    {
         return Ok(Some(format!(
             "repository-wide validation started at epoch {} but workspace is at epoch {}",
             call.evidence.start_epoch, current.epoch
@@ -4475,6 +4557,9 @@ async fn validation_stale_reason(
             "covered validation inputs changed: {}",
             changed.join(", ")
         )));
+    }
+    if exact_snapshot_complete {
+        return Ok(None);
     }
     if current.epoch > call.evidence.start_epoch {
         let rows = sqlx::query(
@@ -4537,9 +4622,11 @@ async fn validation_stale_event_reason_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     assignment: &Assignment,
     call: &ValidationCall,
+    exact_fresh_epoch: Option<u64>,
 ) -> StoreResult<Option<(String, u64)>> {
     let current_epoch = assignment_epoch_tx(transaction, assignment.assignment_id).await?;
-    let evidence_epoch = call.evidence.end_epoch.unwrap_or(call.evidence.start_epoch);
+    let evidence_epoch = exact_fresh_epoch
+        .unwrap_or_else(|| call.evidence.end_epoch.unwrap_or(call.evidence.start_epoch));
     if current_epoch < evidence_epoch {
         return Ok(Some((
             format!(
@@ -4551,7 +4638,9 @@ async fn validation_stale_event_reason_tx(
     if current_epoch == evidence_epoch {
         return Ok(None);
     }
-    if call.evidence.repository_wide || call.evidence.execution_snapshot.is_some() {
+    if exact_fresh_epoch.is_none()
+        && (call.evidence.repository_wide || call.evidence.execution_snapshot.is_some())
+    {
         return Ok(Some((
             format!(
                 "validation dependency snapshot ended at epoch {evidence_epoch} but workspace is at epoch {current_epoch}"
@@ -4586,7 +4675,18 @@ async fn validation_stale_event_reason_tx(
         let event_paths: Vec<String> = decode(&row.get::<String, _>("paths_json"))?;
         let changed_paths = event_paths
             .into_iter()
-            .filter(|path| validation_event_affects_path(&call.evidence, path))
+            .filter(|path| {
+                if exact_fresh_epoch.is_some() {
+                    validation_dependency_affects_path(
+                        &call.command_summary,
+                        &call.evidence.covered_scopes,
+                        call.evidence.repository_wide,
+                        path,
+                    )
+                } else {
+                    validation_event_affects_path(&call.evidence, path)
+                }
+            })
             .collect::<Vec<_>>();
         let event_contracts: Vec<String> = decode(&row.get::<String, _>("contracts_json"))?;
         let changed_contracts = event_contracts
@@ -4623,7 +4723,10 @@ async fn validation_stale_event_reason_tx(
 }
 
 fn validation_event_affects_path(evidence: &ValidationEvidence, path: &str) -> bool {
-    if path == crate::REPOSITORY_WIDE_PATH || validation_event_is_repository_global(path) {
+    if evidence.repository_wide
+        || path == crate::REPOSITORY_WIDE_PATH
+        || validation_event_is_repository_global(path)
+    {
         return true;
     }
     let event_scope = RepoScope {
@@ -4877,20 +4980,85 @@ fn validation_candidate_identity(
 fn validation_dependency_manifest_hash(
     command_summary: &str,
     execution_manifest: &[crate::WorkspaceManifestEntry],
+    covered_scopes: &[RepoScope],
+    repository_wide: bool,
 ) -> StoreResult<String> {
+    let manifest = execution_manifest
+        .iter()
+        .filter(|entry| {
+            validation_dependency_affects_path(
+                command_summary,
+                covered_scopes,
+                repository_wide,
+                &entry.path,
+            )
+        })
+        .collect::<Vec<_>>();
+    Ok(hash_bytes(encode(&manifest)?.as_bytes()))
+}
+
+fn validation_has_complete_exact_snapshot(call: &ValidationCall) -> StoreResult<bool> {
+    let Some(snapshot) = call.evidence.execution_snapshot.as_deref() else {
+        return Ok(false);
+    };
+    if call.evidence.candidate_id.is_empty()
+        || call.evidence.implementation_identity.is_empty()
+        || call.evidence.normalized_invocation.is_empty()
+        || call.evidence.coverage_identity.is_empty()
+        || call.evidence.features_configuration_identity.is_empty()
+        || call.evidence.manifest_hash.is_empty()
+        || call.evidence.dependency_manifest_hash.is_empty()
+        || snapshot.manifest_hash.is_empty()
+    {
+        return Ok(false);
+    }
+    if hash_bytes(encode(&snapshot.manifest)?.as_bytes()) != snapshot.manifest_hash
+        || hash_bytes(encode(&call.evidence.covered_manifest)?.as_bytes())
+            != call.evidence.manifest_hash
+    {
+        return Ok(false);
+    }
+    Ok(validation_dependency_manifest_hash(
+        &call.command_summary,
+        &snapshot.manifest,
+        &call.evidence.covered_scopes,
+        call.evidence.repository_wide,
+    )? == call.evidence.dependency_manifest_hash)
+}
+
+fn validation_dependency_affects_path(
+    command_summary: &str,
+    covered_scopes: &[RepoScope],
+    repository_wide: bool,
+    path: &str,
+) -> bool {
     let command = command_summary.to_ascii_lowercase();
     let is_cargo = command.split_whitespace().any(|argument| {
         argument == "cargo" || argument.ends_with("/cargo") || argument.ends_with("\\cargo.exe")
     });
-    let manifest = if is_cargo {
-        execution_manifest
-            .iter()
-            .filter(|entry| !is_cargo_inert_documentation_path(&entry.path))
-            .collect::<Vec<_>>()
-    } else {
-        execution_manifest.iter().collect::<Vec<_>>()
+    if !is_cargo {
+        return true;
+    }
+    if repository_wide {
+        return true;
+    }
+    let dependency_scope = RepoScope {
+        path: path.to_string(),
+        recursive: true,
     };
-    Ok(hash_bytes(encode(&manifest)?.as_bytes()))
+    if covered_scopes
+        .iter()
+        .any(|scope| dependency_scope.overlaps(scope))
+    {
+        return true;
+    }
+    if is_cargo_inert_documentation_path(path) {
+        return false;
+    }
+    if path == crate::REPOSITORY_WIDE_PATH {
+        return false;
+    }
+    validation_event_is_repository_global(path)
 }
 
 fn is_cargo_inert_documentation_path(path: &str) -> bool {
@@ -5520,6 +5688,7 @@ async fn seal_architecture_contract_for_receipt_tx(
 async fn validate_architecture_contract_reference_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     worker: &Assignment,
+    repo_root: &Path,
 ) -> StoreResult<()> {
     let mut architect_dependency_ids = Vec::new();
     for dependency_id in &worker.dependencies {
@@ -5588,13 +5757,6 @@ async fn validate_architecture_contract_reference_tx(
             "architecture contract version or hash does not match the sealed receipt".to_string(),
         ));
     }
-    let canonical_root = sqlx::query_scalar::<_, String>(
-        "SELECT canonical_root FROM assignment_repositories WHERE assignment_id = ?",
-    )
-    .bind(worker.assignment_id.to_string())
-    .fetch_one(&mut **transaction)
-    .await?;
-    let repo_root = Path::new(&canonical_root);
     let sealed_contract = canonicalize_architecture_contract(repo_root, sealed.contract)?;
     let sealed_hash = format!(
         "{:x}",
@@ -6112,14 +6274,14 @@ async fn selective_admission_tx(
     isolated_integrator_available: bool,
 ) -> StoreResult<(AdmissionOverlapSummary, IntegrationPlan)> {
     let rows = sqlx::query(
-        "SELECT assignments.body_json, repositories.workspace_id
+        "SELECT assignments.body_json, repositories.workspace_id, attempts.state,
+                attempts.sealed_at, receipts.status AS receipt_status
          FROM assignments
          JOIN assignment_repositories repositories USING (assignment_id)
          JOIN attempts ON attempts.assignment_id = assignments.assignment_id
+         LEFT JOIN receipts ON receipts.attempt_id = attempts.attempt_id
          WHERE repositories.repository_id = ?
            AND assignments.root_session_id = ?
-           AND attempts.state = ?
-           AND attempts.sealed_at IS NULL
            AND attempts.ordinal = (
                SELECT MAX(current.ordinal)
                FROM attempts current
@@ -6129,17 +6291,38 @@ async fn selective_admission_tx(
     )
     .bind(&assignment.repository_id)
     .bind(&assignment.root_session_id)
-    .bind(encode(&AttemptState::Active)?)
     .fetch_all(&mut **transaction)
     .await?;
 
     let candidate_identity = assignment.primary_investigation_identity();
     let mut overlaps = AdmissionOverlapSummary::default();
-    let mut active_writer_count = 0_u32;
-    let mut writer_in_another_workspace = false;
+    let mut conflicting_writer_count = 0_u32;
+    let mut conflicting_writer_in_another_workspace = false;
     for row in rows {
         let existing: Assignment = decode(row.get::<String, _>("body_json").as_str())?;
         let existing_workspace_id = row.get::<String, _>("workspace_id");
+        let existing_state: AttemptState = decode(row.get::<String, _>("state").as_str())?;
+        let existing_is_active = existing_state == AttemptState::Active
+            && row.try_get::<Option<String>, _>("sealed_at")?.is_none();
+        let completed_receipt_available = row
+            .try_get::<Option<String>, _>("receipt_status")?
+            .map(|status| decode::<AgentStatusClaim>(&status))
+            .transpose()?
+            == Some(AgentStatusClaim::Completed);
+
+        if candidate_identity.is_some()
+            && candidate_identity == existing.primary_investigation_identity()
+            && (existing_is_active || completed_receipt_available)
+        {
+            return Err(StoreError::AdmissionRejected {
+                reason: AdmissionRejectionReason::DuplicateExplorerInvestigation,
+                reusable_assignment_id: Some(existing.assignment_id),
+            });
+        }
+
+        if !existing_is_active {
+            continue;
+        }
         let read_overlaps = existing.read_scope.iter().any(|existing_scope| {
             assignment
                 .read_scope
@@ -6150,29 +6333,45 @@ async fn selective_admission_tx(
             overlaps.benign_read_overlap_count =
                 overlaps.benign_read_overlap_count.saturating_add(1);
         }
-
-        if candidate_identity.is_some()
-            && candidate_identity == existing.primary_investigation_identity()
-        {
-            return Err(StoreError::AdmissionRejected {
-                reason: AdmissionRejectionReason::DuplicateExplorerInvestigation,
-            });
+        if existing.write_scope.is_empty() {
+            continue;
         }
-
-        if !existing.write_scope.is_empty() {
-            active_writer_count = active_writer_count.saturating_add(1);
-            writer_in_another_workspace |= existing_workspace_id != assignment.workspace_id;
+        let write_scope_overlaps = existing.write_scope.iter().any(|existing_scope| {
+            assignment
+                .write_scope
+                .iter()
+                .any(|scope| existing_scope.overlaps(scope))
+        });
+        let contract_overlaps = existing.contract_claims.iter().any(|existing_contract| {
+            assignment
+                .contract_claims
+                .iter()
+                .any(|contract| contract == existing_contract)
+        });
+        if write_scope_overlaps || contract_overlaps {
+            conflicting_writer_count = conflicting_writer_count.saturating_add(1);
+            conflicting_writer_in_another_workspace |=
+                existing_workspace_id != assignment.workspace_id;
         }
     }
 
-    let integration_plan = if assignment.write_scope.is_empty() || active_writer_count == 0 {
+    let integration_plan = if assignment.write_scope.is_empty() {
         IntegrationPlan::SingleWriter
-    } else if assignment.workspace_strategy == WorkspaceStrategy::Isolated
-        || writer_in_another_workspace
-    {
+    } else if assignment.workspace_strategy == WorkspaceStrategy::Isolated {
         if !isolated_integrator_available {
             return Err(StoreError::AdmissionRejected {
                 reason: AdmissionRejectionReason::IsolatedIntegratorUnavailable,
+                reusable_assignment_id: None,
+            });
+        }
+        IntegrationPlan::TypedIntegratorRequired
+    } else if conflicting_writer_count == 0 {
+        IntegrationPlan::SingleWriter
+    } else if conflicting_writer_in_another_workspace {
+        if !isolated_integrator_available {
+            return Err(StoreError::AdmissionRejected {
+                reason: AdmissionRejectionReason::IsolatedIntegratorUnavailable,
+                reusable_assignment_id: None,
             });
         }
         IntegrationPlan::TypedIntegratorRequired

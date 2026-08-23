@@ -14,7 +14,6 @@ pub use codex_protocol::protocol::GitSha;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
-use codex_protocol::protocol::TurnAbortReason;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -251,10 +250,4 @@ pub struct SandboxSettings {
     pub network_access: Option<bool>,
     pub exclude_tmpdir_env_var: Option<bool>,
     pub exclude_slash_tmp: Option<bool>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-pub struct InterruptConversationResponse {
-    pub abort_reason: TurnAbortReason,
 }

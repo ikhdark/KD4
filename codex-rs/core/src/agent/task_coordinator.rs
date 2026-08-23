@@ -88,6 +88,36 @@ struct TaskMetricIndex {
     configured_capacity: Option<u32>,
 }
 
+struct ValidationWaiterEntry {
+    notify: Arc<Notify>,
+    registrations: usize,
+}
+
+struct ValidationWaitRegistration {
+    call_id: String,
+    waiters: Arc<Mutex<HashMap<String, ValidationWaiterEntry>>>,
+    notify: Arc<Notify>,
+}
+
+impl Drop for ValidationWaitRegistration {
+    fn drop(&mut self) {
+        let mut waiters = self
+            .waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let remove = waiters.get_mut(&self.call_id).is_some_and(|entry| {
+            if !Arc::ptr_eq(&entry.notify, &self.notify) {
+                return false;
+            }
+            entry.registrations = entry.registrations.saturating_sub(1);
+            entry.registrations == 0
+        });
+        if remove {
+            waiters.remove(&self.call_id);
+        }
+    }
+}
+
 const MAX_DIAGNOSTIC_ATTEMPT_IDENTITIES: usize = 4_096;
 
 /// Shared typed-task persistence and identity index for one root agent tree.
@@ -101,7 +131,7 @@ pub(crate) struct AgentTaskCoordinator {
     root_session_id: Arc<OnceCell<String>>,
     bindings: Arc<RwLock<BindingIndex>>,
     metrics: Arc<Mutex<TaskMetricIndex>>,
-    validation_waiters: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+    validation_waiters: Arc<Mutex<HashMap<String, ValidationWaiterEntry>>>,
 }
 
 impl AgentTaskCoordinator {
@@ -478,7 +508,7 @@ impl AgentTaskCoordinator {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(call_id)
-            .cloned();
+            .map(|entry| Arc::clone(&entry.notify));
         if let Some(waiter) = waiter {
             waiter.notify_waiters();
         }
@@ -495,26 +525,32 @@ impl AgentTaskCoordinator {
         cancellation: &CancellationToken,
         deadline: chrono::DateTime<Utc>,
     ) -> StoreResult<Option<ValidationCall>> {
-        let waiter = {
+        let registration = {
             let mut waiters = self
                 .validation_waiters
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            waiters
-                .entry(call_id.to_string())
-                .or_insert_with(|| Arc::new(Notify::new()))
-                .clone()
+            let entry =
+                waiters
+                    .entry(call_id.to_string())
+                    .or_insert_with(|| ValidationWaiterEntry {
+                        notify: Arc::new(Notify::new()),
+                        registrations: 0,
+                    });
+            entry.registrations = entry.registrations.saturating_add(1);
+            ValidationWaitRegistration {
+                call_id: call_id.to_string(),
+                waiters: Arc::clone(&self.validation_waiters),
+                notify: Arc::clone(&entry.notify),
+            }
         };
+        let waiter = Arc::clone(&registration.notify);
         loop {
             let current = self.get_validation_call(call_id.to_string()).await?;
             if current
                 .as_ref()
                 .is_some_and(|call| call.status.is_terminal())
             {
-                self.validation_waiters
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(call_id);
                 return Ok(current);
             }
             let Ok(remaining) = (deadline - Utc::now()).to_std() else {

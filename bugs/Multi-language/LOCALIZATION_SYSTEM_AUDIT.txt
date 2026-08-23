@@ -1,0 +1,271 @@
+MDPWA ENGLISH/SPANISH SYSTEM AUDIT
+Date: 2026-08-07
+Scope: Implementation behavior across locale routing, navigation, redirects,
+metadata, manifests, offline behavior, outbound communications, calendar
+downloads, admin flows, errors, and resident-form recovery.
+
+AUDIT METHOD AND BOUNDARY
+
+This was a static source audit of system behavior, not a translation-quality or
+catalog-parity review. It does not rewrite or judge translations. Findings below
+are implementation gaps only. Line numbers identify the inspected revision and
+may move as the worktree changes.
+
+EXECUTIVE RESULT
+
+Four confirmed implementation gaps were found:
+
+  L10N-01  HIGH    Calendar downloads from Spanish pages are English-only and
+                     use a locale-neutral, publicly cached URL.
+  L10N-02  HIGH    Dynamic high-risk Spanish alert text has no persisted,
+                     distinguishable professional-review or official-source
+                     provenance.
+  L10N-03  MEDIUM  Web-push clicks can send Spanish residents to the default
+                     English announcements route.
+  L10N-04  MEDIUM  Locale-layout failures have no parent/global localized error
+                     boundary and can fall back to framework English UI.
+
+
+L10N-01 - SPANISH CALENDAR DOWNLOADS RESOLVE TO AN ENGLISH-ONLY ARTIFACT
+Severity: HIGH
+Surfaces: internal links, Spanish URLs, calendar downloads, caching, generated
+          content, error responses
+
+Observed behavior
+
+* The localized calendar component uses translated interface labels but builds
+  every event-download link with getEventCalendarHref(event)
+  (src/components/LocalCalendar.tsx:104-116).
+* getEventCalendarHref always returns /calendar.ics?event=... and has no locale
+  input or locale-bearing path/query value (src/lib/events.ts:706-708).
+* The route reads only the event parameter. Its not-found response is the
+  English string "Calendar event not found." and the successful response is public/CDN
+  cacheable (src/app/calendar.ics/route.ts:13-37).
+* The generated ICS identifies itself as English and emits English application
+  labels: PRODID ends in //EN, X-WR-CALNAME is "Martindale City Events", and
+  DESCRIPTION labels include "Source:" and "Last verified:"
+  (src/lib/events.ts:733-784).
+
+Impact
+
+A resident using /es/calendar sees a Spanish download action but receives an
+English calendar file. Because English and Spanish requests use the same URL
+shape and cache representation, the route and intermediary cache have no locale
+dimension with which to return the correct variant. The route's direct error is
+also English inside a Spanish workflow.
+
+Implementation requirement
+
+Make locale an explicit part of the calendar-download contract and cache key,
+then generate locale-consistent ICS metadata, event display content, field
+labels, and error behavior. Preserve the project's English/official-source
+authority rule for legal or high-risk source wording; this finding does not
+request new translations.
+
+
+L10N-02 - HIGH-RISK DYNAMIC SPANISH ALERTS LACK AUDITABLE REVIEW PROVENANCE
+Severity: HIGH
+Surfaces: email, push notifications, alert pages, professional-review policy
+
+Observed behavior
+
+* The catalog review register says professional Spanish review is pending and
+  identifies high-risk namespaces including AlertEmails, AlertsPage,
+  PublicSafetyCard, and OfflinePage
+  (messages/catalog-review-status.json:1-20).
+* An alert broadcast may carry Spanish subject/message fields and public-safety
+  topics, but its stored model contains no review status, reviewer identity,
+  review date, source attribution, or authorization basis
+  (src/lib/alertBroadcasts.ts:10-44).
+* Submission requires only one transient reviewedLanguageNotice boolean. The
+  validation message treats "reviewed" and "official-source language" as one
+  interchangeable acknowledgement (src/lib/alertBroadcasts.ts:207-216).
+* That acknowledgement is not persisted in the returned broadcast record
+  (src/lib/alertBroadcasts.ts:236-248). The composer likewise models only the
+  one boolean (src/components/AlertBroadcastComposer.tsx:18-26).
+* Delivery uses the stored Spanish subject/message for recipient-localized
+  alert email and broadcast surfaces; push delivery can also include it
+  (src/lib/alertBroadcastNotifications.ts:500-579 and 670-754;
+  src/workflows/alertBroadcastDelivery.ts:238-251).
+
+Impact
+
+The implementation cannot prove whether high-risk dynamic Spanish text was
+professionally reviewed, copied from a controlling official source, or merely
+self-attested at submission time. It also cannot later audit who made that
+determination or which rule authorized publication. Catalog-level authoritative
+language notices reduce reader risk but do not enforce or record the provenance
+of newly authored alert text.
+
+Implementation requirement
+
+Represent professional review and controlling-official-source use as distinct,
+persisted authorization paths with the minimum provenance needed for audit and
+enforce them before publishing high-risk Spanish content. Keep the existing
+English/official-source fallback when professional review is not current. No
+translation rewrite is part of this requirement.
+
+
+L10N-03 - WEB-PUSH CLICK-THROUGH CAN SWITCH A SPANISH USER TO ENGLISH
+Severity: MEDIUM
+Surfaces: notifications, internal links, locale continuity
+
+Observed behavior
+
+* Web-push subscription records store endpoint, keys, topics, and timestamps,
+  but no locale (src/lib/webPushSubscriptions.ts:42-52).
+* normalizeNotificationUrl falls back to /announcements when a link is absent,
+  invalid, or outside the site origin (src/lib/webPushSubscriptions.ts:600-633).
+* One payload URL is created for delivery, with no per-subscriber localization
+  (src/lib/webPushSubscriptions.ts:632-669;
+  src/workflows/alertBroadcastDelivery.ts:238-251).
+* The service worker opens notification.data.url exactly as supplied
+  (scripts/templates/service-worker.js:287-300).
+
+Impact
+
+The notification body is deliberately bilingual, so this is not a body-copy
+leak. The navigation target is the gap: a Spanish resident clicking a broadcast
+without a valid explicit link lands on English /announcements rather than
+/es/announcements. An administrator-provided internal link can have the same
+problem because delivery has no recipient locale with which to normalize it.
+
+Implementation requirement
+
+Carry or derive a locale for notification navigation and localize both fallback
+and same-site internal targets before payload delivery. Continue rejecting
+outside-origin targets.
+
+
+L10N-04 - LOCALE-LAYOUT FAILURES HAVE NO LOCALIZED OUTER ERROR BOUNDARY
+Severity: MEDIUM
+Surfaces: error pages, metadata/message loading, locale continuity
+
+Observed behavior
+
+* The repository has a localized src/app/[locale]/error.tsx, which uses paired
+  messages for ordinary errors below the locale layout
+  (src/app/[locale]/error.tsx:1-78).
+* That boundary is inside the same [locale] segment as the layout. Errors while
+  executing src/app/[locale]/layout.tsx itself--including locale validation,
+  message loading, metadata/provider setup, or other layout initialization--
+  cannot be handled by that segment's own error boundary.
+* There is no src/app/error.tsx or src/app/global-error.tsx to provide a
+  locale-aware outer fallback. If locale data is unavailable, the existing
+  helper also defaults to English (src/app/[locale]/error.tsx:40-45).
+
+Impact
+
+A failure early in a Spanish route can escape the localized boundary and show
+the framework's generic fallback, which may be English and breaks locale
+continuity at the moment recovery guidance is most important.
+
+Implementation requirement
+
+Add the appropriate outer/global error ownership for failures above the locale
+segment and preserve the requested locale when it can be safely derived. Keep
+the current localized segment boundary for errors it already owns.
+
+
+REQUESTED-SURFACE COVERAGE
+
+Surface                         Result
+------------------------------  ----------------------------------------------
+Localized routes                No additional confirmed gap. Locale prefixes
+                                and route maps are centralized; detection is
+                                disabled, preventing implicit locale switching.
+Internal links                  Gap L10N-01 (calendar) and L10N-03 (push target).
+                                Ordinary app navigation uses the locale-aware
+                                navigation wrappers.
+Redirects                       No additional confirmed gap. Public locale
+                                middleware and signup confirmation redirects
+                                preserve or explicitly derive locale.
+Metadata                        No confirmed gap. Canonicals, language
+                                alternates, Open Graph locale, and localized
+                                page metadata use the supported locale.
+Manifests                       No confirmed disagreement. The localized layout
+                                selects manifest.es.json for Spanish; the two
+                                English manifest files are byte-identical; the
+                                Spanish manifest declares es-US and /es.
+Service worker/offline          No confirmed locale mixing. Both offline pages
+                                and manifests are installation requirements;
+                                navigation uses network-first with a path-based
+                                Spanish offline fallback. Calendar response
+                                caching remains the separate L10N-01 gap.
+Emails                          Gap L10N-02 (review provenance). Signup and
+                                broadcast email selection otherwise follows the
+                                stored recipient locale and uses localized URLs.
+Notifications                   Gaps L10N-02 and L10N-03. Push body generation is
+                                bilingual rather than silently English-only.
+Calendar downloads              Gap L10N-01.
+Admin redirects                 No confirmed gap. Login, return, and sign-out
+                                paths localize /admin for Spanish and constrain
+                                accepted return targets.
+Error pages                     Gap L10N-04. The ordinary localized not-found
+                                and segment error surfaces are paired.
+Resident form recovery          No confirmed locale bug. Community-input and
+                                map-feedback drafts contain resident input and
+                                stable values, while recovery UI follows the
+                                active route locale. Alert-signup recovery may
+                                retain a delivery-language value, but that value
+                                is an explicit resident preference exposed in
+                                the form rather than an implicit route switch.
+Professional-review enforcement Gap L10N-02. Existing catalog tests and reader
+                                notices cover static high-risk namespaces but do
+                                not supply dynamic broadcast provenance.
+
+
+NOTABLE CONTROLS THAT HELD
+
+* src/i18n/routing.ts uses locales en/es, defaultLocale en,
+  localePrefix "as-needed", and localeDetection false.
+* src/i18n/metadata.ts and src/app/[locale]/layout.tsx select localized canonical,
+  alternate, Open Graph, and manifest values.
+* public/manifest.json and public/site.webmanifest are byte-identical, while
+  public/manifest.es.json carries the Spanish start URL and language.
+* scripts/generate-service-worker.mjs requires both locale offline documents and
+  both manifests before generation; the service worker does not cache successful
+  navigation documents into a shared locale-neutral navigation cache.
+* Admin return targets are constrained to /admin and localized before use.
+* Alert-signup links carry locale and confirmation responses explicitly disable
+  caching.
+
+
+LIMITATIONS
+
+This is source-level evidence from the current worktree. It did not send real
+email or push notifications, install the PWA, exercise a production CDN, or run
+a browser/build/test suite. Repository policy makes validation commands opt-in,
+and this request asked for an audit rather than test execution. "No confirmed
+gap" means the inspected implementation did not expose one; it is not a claim
+about an independently exercised production deployment.
+
+
+IMPLEMENTATION STATUS - 2026-08-07
+
+L10N-01 IMPLEMENTED
+Calendar download links now carry locale. The route validates that locale,
+localizes the iCalendar name, summary, category, source/verification labels and
+404 response, and varies its cache key by the locale-bearing URL.
+
+L10N-02 IMPLEMENTED
+New Spanish alert broadcasts now require a structured authorization basis
+(professional review or controlling official source) and attribution. Both are
+validated and persisted with the broadcast. Legacy rows remain readable but do
+not satisfy the creation requirement.
+
+L10N-03 IMPLEMENTED
+Push subscriptions now persist and refresh the resident's locale. Delivery
+localizes same-origin click targets and its fallback path while preserving
+query strings and fragments. Legacy subscriptions default to English until a
+Spanish client refreshes its existing registration.
+
+L10N-04 IMPLEMENTED
+A root global error boundary now detects Spanish paths and uses the existing
+paired error-page catalog for its language, recovery action, and home target.
+
+IMPLEMENTATION VALIDATION LIMITS
+Scoped diff, catalog-key parity, JSON parsing, and migration-manifest hashes
+were checked. Per repository policy, no pnpm, browser, PWA install, production
+CDN, email, or real push-delivery validation was run without an explicit
+validation request.

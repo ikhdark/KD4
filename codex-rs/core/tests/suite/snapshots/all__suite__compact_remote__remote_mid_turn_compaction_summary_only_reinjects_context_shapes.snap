@@ -9,14 +9,16 @@ Scenario: Remote mid-turn compaction where compact output has only a compaction 
 01:message/developer:<PERMISSIONS_INSTRUCTIONS>
 02:message/developer:<skills_usage_instructions>\n## How to use skills\n- Use the sma...
 03:message/developer:<NO_TEXT>
-04:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-05:message/user:USER_ONE
-06:function_call/test_tool
-07:function_call_output:unsupported call: test_tool
+04:message/developer:<root_orchestration_instructions>When several independent tool c...
+05:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
+06:message/user:USER_ONE
+07:function_call/test_tool
+08:function_call_output:unsupported call: test_tool
 
 ## Remote Post-Compaction History Layout
 00:message/developer:<PERMISSIONS_INSTRUCTIONS>
 01:message/developer:<skills_usage_instructions>\n## How to use skills\n- Use the sma...
 02:message/developer:<NO_TEXT>
-03:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-04:compaction:encrypted=true
+03:message/developer:<root_orchestration_instructions>When several independent tool c...
+04:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
+05:compaction:encrypted=true

@@ -610,24 +610,33 @@ fn aggregate_resource_errors_are_disclosed_and_all_failure_is_not_success() {
 fn serialize_function_output_bounds_large_read_inside_text_field() {
     let truncation_policy = TruncationPolicy::Bytes(8_000);
     let original_text = "x".repeat(16_000);
+    let result = ReadResourceResult::new(vec![ResourceContents::TextResourceContents {
+        uri: "skill://large/SKILL.md".to_string(),
+        mime_type: Some("text/markdown".to_string()),
+        text: original_text.clone(),
+        meta: None,
+    }]);
+    let canonical = canonical_read_resource("hosted", "skill://large/SKILL.md", &result)
+        .expect("serialize canonical read result");
     let payload = ReadResourcePayload::new(
         "hosted".to_string(),
         "skill://large/SKILL.md".to_string(),
-        ReadResourceResult::new(vec![ResourceContents::TextResourceContents {
-            uri: "skill://large/SKILL.md".to_string(),
-            mime_type: Some("text/markdown".to_string()),
-            text: original_text.clone(),
-            meta: None,
-        }]),
+        result,
         truncation_policy,
     )
     .expect("build bounded read payload");
-    let canonical = serde_json::to_value(&payload).expect("serialize canonical payload");
     let output = serialize_function_output(payload, canonical, truncation_policy)
-        .expect("serialize bounded function output")
-        .visible
-        .into_text();
-    let value: Value = serde_json::from_str(&output).expect("bounded read must remain valid JSON");
+        .expect("serialize bounded function output");
+    let metadata = output.projection_metadata().expect("projection metadata");
+    assert_eq!(
+        metadata.predetermined_json_pointers,
+        vec![ToolOutputProjectionJsonPointer {
+            id: "mcp-resource:contents:0:text".to_string(),
+            pointer: "/contents/0/text".to_string(),
+        }]
+    );
+    let visible = output.visible.into_text();
+    let value: Value = serde_json::from_str(&visible).expect("bounded read must remain valid JSON");
     let bounded_text = value["contents"][0]["text"]
         .as_str()
         .expect("bounded text content");
@@ -662,21 +671,81 @@ fn mcp_resource_wrapper_keeps_canonical_cursor_in_projection_metadata() {
 }
 
 #[test]
-fn oversized_blob_is_replaced_by_explicit_bounded_metadata() {
+fn mcp_resource_wrapper_selects_only_exact_omitted_array_entries() {
+    let canonical = serde_json::json!({
+        "resources": [
+            {"server": "alpha", "uri": "resource://one"},
+            {"server": "beta", "uri": "resource://two"},
+            {"server": "beta", "uri": "resource://two"},
+        ],
+        "errors": [
+            {"server": "gamma", "message": "offline"},
+        ],
+    });
+    let output = McpResourceToolOutput {
+        visible: FunctionToolOutput::from_text(
+            serde_json::json!({
+                "resources": [
+                    {"server": "alpha", "uri": "resource://one"},
+                    {"server": "beta", "uri": "resource://two"},
+                ],
+                "truncated": true,
+                "omittedCount": 1,
+                "omittedErrorCount": 1,
+            })
+            .to_string(),
+            Some(true),
+        ),
+        canonical,
+    };
+
+    let metadata = output.projection_metadata().expect("projection metadata");
+
+    assert_eq!(
+        metadata.predetermined_json_pointers,
+        vec![
+            ToolOutputProjectionJsonPointer {
+                id: "mcp-resource:resources:2".to_string(),
+                pointer: "/resources/2".to_string(),
+            },
+            ToolOutputProjectionJsonPointer {
+                id: "mcp-resource:errors:0".to_string(),
+                pointer: "/errors/0".to_string(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn oversized_blob_is_replaced_by_explicit_bounded_metadata_and_owned_recovery() {
     let truncation_policy = TruncationPolicy::Bytes(512);
+    let result = ReadResourceResult::new(vec![ResourceContents::BlobResourceContents {
+        uri: "blob://large".to_string(),
+        mime_type: Some("application/octet-stream".to_string()),
+        blob: "a".repeat(8_000),
+        meta: None,
+    }]);
+    let canonical = canonical_read_resource("hosted", "blob://large", &result)
+        .expect("serialize canonical blob result");
     let payload = ReadResourcePayload::new(
         "hosted".to_string(),
         "blob://large".to_string(),
-        ReadResourceResult::new(vec![ResourceContents::BlobResourceContents {
-            uri: "blob://large".to_string(),
-            mime_type: Some("application/octet-stream".to_string()),
-            blob: "a".repeat(8_000),
-            meta: None,
-        }]),
+        result,
         truncation_policy,
     )
     .expect("build bounded blob payload");
-    let value = serde_json::to_value(payload).expect("serialize bounded blob payload");
+    let output = serialize_function_output(payload, canonical, truncation_policy)
+        .expect("serialize bounded blob output");
+    let metadata = output.projection_metadata().expect("projection metadata");
+    assert_eq!(
+        metadata.predetermined_json_pointers,
+        vec![ToolOutputProjectionJsonPointer {
+            id: "mcp-resource:contents:0:blob".to_string(),
+            pointer: "/contents/0/blob".to_string(),
+        }]
+    );
+    let value: Value = serde_json::from_str(&output.visible.into_text())
+        .expect("bounded blob output must remain valid JSON");
 
     assert_eq!(value["contents"][0]["uri"], json!("blob://large"));
     assert_eq!(value["contents"][0]["omitted"], json!(true));

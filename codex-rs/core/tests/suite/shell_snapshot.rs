@@ -717,42 +717,68 @@ async fn macos_unified_exec_uses_shell_snapshot() -> Result<()> {
     Ok(())
 }
 
-// #[cfg_attr(not(target_os = "windows"), ignore)]
-#[ignore]
+#[cfg_attr(not(target_os = "windows"), ignore)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn windows_unified_exec_uses_shell_snapshot() -> Result<()> {
-    let command = "Write-Output snapshot-windows";
-    let run = run_snapshot_command(command).await?;
+    let builder = test_codex().with_config(|config| {
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+        config
+            .features
+            .enable(Feature::ShellSnapshot)
+            .expect("test config should allow feature update");
+    });
+    let harness = TestCodexHarness::with_builder(builder).await?;
+    let codex_home = harness.test().home.path().to_path_buf();
+    run_tool_turn_on_harness(
+        &harness,
+        "warm up PowerShell snapshot",
+        "powershell-snapshot-warmup",
+        "exec_command",
+        json!({
+            "cmd": "Microsoft.PowerShell.Utility\\Write-Output warmup",
+            "yield_time_ms": 1_000,
+        }),
+    )
+    .await?;
+    let snapshot_path = wait_for_snapshot(&codex_home).await?;
+    let snapshot_content = fs::read_to_string(&snapshot_path).await?;
 
-    let snapshot_index = run
-        .begin
-        .command
-        .iter()
-        .position(|arg| arg.contains("shell_snapshots"))
-        .expect("snapshot argument exists");
-    assert!(run.begin.command.iter().any(|arg| arg == "-NoProfile"));
-    assert!(
-        run.begin
-            .command
-            .iter()
-            .any(|arg| arg == "param($snapshot) . $snapshot; & @args")
-    );
-    assert!(snapshot_index > 0);
-    assert_eq!(run.begin.command.last(), Some(&command.to_string()));
-
-    assert!(run.snapshot_path.starts_with(&run.codex_home));
+    assert!(snapshot_path.starts_with(&codex_home));
     for section in ["# Snapshot file", "# Functions", "# aliases", "# exports"] {
         assert!(
-            run.snapshot_content.lines().any(|line| line == section),
-            "snapshot should contain exact section header {section:?}; snapshot={:?}",
-            run.snapshot_content
+            snapshot_content.lines().any(|line| line == section),
+            "snapshot should contain exact section header {section:?}; snapshot={snapshot_content:?}"
         );
     }
-    assert_eq!(
-        normalize_newlines(&run.end.stdout).trim(),
-        "snapshot-windows"
+    assert!(
+        snapshot_content
+            .lines()
+            .any(|line| line == "# Codex PowerShell snapshot format: 1")
     );
-    assert_eq!(run.end.exit_code, 0);
+
+    fs::write(
+        &snapshot_path,
+        "# Snapshot file\n# Codex PowerShell snapshot format: 1\n# Functions\nfunction Invoke-CodexSnapshotE2E { Microsoft.PowerShell.Utility\\Write-Output 'snapshot-windows' }\n# aliases\n# exports\n",
+    )
+    .await?;
+    let end = run_tool_turn_on_harness(
+        &harness,
+        "verify PowerShell snapshot replay",
+        "powershell-snapshot-replay",
+        "exec_command",
+        json!({
+            "cmd": "Invoke-CodexSnapshotE2E",
+            "yield_time_ms": 1_000,
+        }),
+    )
+    .await?;
+
+    assert_eq!(normalize_newlines(&end.stdout).trim(), "snapshot-windows");
+    assert_eq!(end.exit_code, 0);
 
     Ok(())
 }

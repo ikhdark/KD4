@@ -1332,7 +1332,7 @@ enum CompletionScenario {
 #[test_case(CompletionScenario::Completed ; "completed")]
 #[test_case(CompletionScenario::TerminalError ; "terminal_error")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn plaintext_multi_agent_v2_completion_sends_agent_message(
+async fn plaintext_multi_agent_v2_completion_without_receipt_sends_blocked_agent_message(
     scenario: CompletionScenario,
 ) -> Result<()> {
     let server = start_mock_server().await;
@@ -1384,15 +1384,15 @@ async fn plaintext_multi_agent_v2_completion_sends_agent_message(
     )
     .await;
     let error = "stream disconnected before completion: stream closed before response.completed";
-    let (payload, expected_text) = match scenario {
-        CompletionScenario::Completed => ("child done".to_string(), "child done"),
-        CompletionScenario::TerminalError => (
-            format!(
-                "Agent errored: {error}\n\nThis agent's turn failed. If you still need this agent, use the available collaboration tools to give it another task."
-            ),
-            error,
-        ),
+    let (status, expected_text) = match scenario {
+        CompletionScenario::Completed => {
+            ("Completed(Some(\"child done\"))".to_string(), "child done")
+        }
+        CompletionScenario::TerminalError => (format!("Errored(\"{error}\")"), error),
     };
+    let payload = format!(
+        "typed agent /root/worker finished with status {status} without submitting a receipt\n\nCompletion gate (machine-readable):\n{{\"status\":\"blocked\",\"reasons\":[\"durable typed receipt status: needs_main\"]}}"
+    );
     let notification = format!(
         "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/worker\nPayload:\n{payload}"
     );

@@ -12,3 +12,4 @@ pub(crate) use control::AgentControl;
 pub(crate) use registry::exceeds_thread_spawn_depth_limit;
 pub(crate) use registry::next_thread_spawn_depth;
 pub(crate) use status::agent_status_from_event;
+pub(crate) use status::agent_status_from_task;

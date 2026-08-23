@@ -50,7 +50,9 @@ function Remove-WorkspaceFeatureArgs {
     return $filtered.ToArray()
 }
 
-$forwarded = @($ForwardedArgs)
+$forwarded = @(
+    $ForwardedArgs | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+)
 $hasAllFeatures = $forwarded -contains "--all-features"
 $hasExplicitPackage =
     ($forwarded -contains "-p") -or

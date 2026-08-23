@@ -460,7 +460,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRunti
                 .cwd
                 .to_abs_path()
                 .map_err(|err| ToolError::Rejected(err.to_string()))?;
-            req.turn_environment.shell_snapshot(&native_cwd)
+            req.turn_environment.shell_snapshot(&native_cwd).await
         };
         let (file_system_sandbox_policy, _) = attempt.permissions.to_runtime_permissions();
         let launch_sandbox_permissions = sandbox_permissions_preserving_denied_reads(

@@ -510,6 +510,7 @@ export type { TurnModerationMetadataNotification } from "./TurnModerationMetadat
 export type { TurnPlanStep } from "./TurnPlanStep";
 export type { TurnPlanStepStatus } from "./TurnPlanStepStatus";
 export type { TurnPlanUpdatedNotification } from "./TurnPlanUpdatedNotification";
+export type { TurnReasoningPolicySummaryNotification } from "./TurnReasoningPolicySummaryNotification";
 export type { TurnReasoningPolicyUpdatedNotification } from "./TurnReasoningPolicyUpdatedNotification";
 export type { TurnStartParams } from "./TurnStartParams";
 export type { TurnStartResponse } from "./TurnStartResponse";
@@ -550,6 +551,8 @@ export type { TurnsPage } from "./TurnsPage";
 export type { UserInput } from "./UserInput";
 export type { WarningNotification } from "./WarningNotification";
 export type { WebSearchAction } from "./WebSearchAction";
+export type { WindowsSandboxGrantReadRootParams } from "./WindowsSandboxGrantReadRootParams";
+export type { WindowsSandboxGrantReadRootResponse } from "./WindowsSandboxGrantReadRootResponse";
 export type { WindowsSandboxReadiness } from "./WindowsSandboxReadiness";
 export type { WindowsSandboxReadinessResponse } from "./WindowsSandboxReadinessResponse";
 export type { WindowsSandboxSetupCompletedNotification } from "./WindowsSandboxSetupCompletedNotification";

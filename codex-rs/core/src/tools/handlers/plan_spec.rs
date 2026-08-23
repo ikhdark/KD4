@@ -202,15 +202,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
         ),
         (
             "validation_disposition".to_string(),
-            JsonSchema::string_enum(
-                vec![
-                    json!("executable"),
-                    json!("unresolved_discoverable"),
-                    json!("unavailable_blocked"),
-                    json!("not_required"),
-                ],
-                Some("Validation feasibility, distinct from proof identity.".to_string()),
-            ),
+            validation_disposition_schema("Validation feasibility, distinct from proof identity."),
         ),
         ("validation_route".to_string(), validation_route_schema()),
         (
@@ -237,24 +229,20 @@ pub fn create_update_plan_tool() -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "update_plan".to_string(),
         description: r#"Updates the task plan.
-Minimal valid update: send only `plan`. When adding facts, every fact requires `id`, `value`, `provenance`, `source`, and `depends_on_paths`. When adding mutation obligations, every obligation requires `id` and `description`; `paths` is optional.
+All update fields are optional; send only the facts, removals, work-unit evidence, or plan patches that changed. Facts require `id`, `value`, `provenance`, `source`, and `depends_on_paths`. Mutation obligations require `id` and `description`; `paths` is optional.
 Use focused only for one atomic owner/scope with no cross-owner contract, one mutation obligation, and one feasible validation route; it uses a stable internal work unit and an empty plan.
 Use a short evidence-first medium plan for bounded multi-surface work. Use the complete complex representation for multi-owner, architectural, generated-contract, migration, high-risk, or dependent-validation work.
-Internal tier selection never changes collaboration mode. Complexity escalation in Default mode upgrades only this representation. Omitted facts and steps remain active; removals need reasons.
-Stop exploration once owner, call path, affected contract/scope, validation route, and material risks are established. Keep focused work checklist-free and medium plans short.
+Internal tier selection never changes collaboration mode. Omitted facts and steps remain active; removals need reasons.
 At most one step can be in_progress at a time.
-Complete one coherent contract before starting the next. State each unresolved uncertainty, then select the cheapest non-overlapping validation leaves that resolve it. Do not run a separate compile or check when the exact behavioral test already compiles the same owner and configuration; add another leaf only when it proves a distinct contract. Record that every focused test leaf selected at least one test.
 Structured validation routes accept only direct cargo, just, python, or python3 leaves; run formatting and diff checks separately outside the route.
-Use stable ids, owners, bounded surfaces, dependencies, obligations, and acceptance criteria. Edits
-record partial obligation progress. Set a step to passed only when applicable fresh proof exists; completion
-still checks declared artifacts, Desktop activation, plan structure, and blocking risks.
+Use stable ids, owners, bounded surfaces, dependencies, obligations, and acceptance criteria. Set a step to passed only when applicable fresh proof exists; completion still checks declared artifacts, Desktop activation, plan structure, and blocking risks.
 "#
         .to_string(),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(
             properties,
-            Some(vec!["plan".to_string()]),
+            None,
             Some(false.into()),
         ),
         output_schema: None,
@@ -284,6 +272,18 @@ fn mutation_obligations_schema(description: &str) -> JsonSchema {
             Some(vec!["id".to_string(), "description".to_string()]),
             Some(false.into()),
         ),
+        Some(description.to_string()),
+    )
+}
+
+fn validation_disposition_schema(description: &str) -> JsonSchema {
+    JsonSchema::string_enum(
+        vec![
+            json!("executable"),
+            json!("unresolved_discoverable"),
+            json!("unavailable_blocked"),
+            json!("not_required"),
+        ],
         Some(description.to_string()),
     )
 }
@@ -330,14 +330,8 @@ fn step_evidence_schema() -> JsonSchema {
                 ),
                 (
                     "validation_disposition".to_string(),
-                    JsonSchema::string_enum(
-                        vec![
-                            json!("executable"),
-                            json!("unresolved_discoverable"),
-                            json!("unavailable_blocked"),
-                            json!("not_required"),
-                        ],
-                        Some("Step validation feasibility, distinct from proof.".to_string()),
+                    validation_disposition_schema(
+                        "Step validation feasibility, distinct from proof.",
                     ),
                 ),
                 (
@@ -386,7 +380,7 @@ fn validation_route_schema() -> JsonSchema {
                 "covered_contracts".to_string(),
                 JsonSchema::array(
                     JsonSchema::string(Some("Explicit covered contract.".to_string())),
-                    Some("Covered validation contracts.".to_string()),
+                    Some("Non-empty covered validation contracts.".to_string()),
                 ),
             ),
             ("timeout_ms".to_string(), timeout),
@@ -424,7 +418,7 @@ fn validation_route_schema() -> JsonSchema {
                 ),
             ),
         ]),
-        Some(vec!["leaves".to_string(), "ordering".to_string()]),
+        Some(vec!["leaves".to_string()]),
         Some(false.into()),
     )
 }

@@ -27,9 +27,6 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_config::types::AuthCredentialsStoreMode;
-use codex_features::Feature;
-use codex_protocol::models::ContentItem;
-use codex_protocol::models::ResponseItem;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
@@ -123,39 +120,29 @@ async fn auto_compaction_remote_emits_started_and_completed_items() -> Result<()
         responses::ev_assistant_message("m2", "SECOND_REPLY"),
         responses::ev_completed_with_tokens("r2", /*total_tokens*/ 330_000),
     ]);
+    let compact_sse = responses::sse(vec![
+        serde_json::json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "compaction",
+                "id": "compact-1",
+                "encrypted_content": "ENCRYPTED_COMPACTION_SUMMARY"
+            }
+        }),
+        responses::ev_completed_with_tokens("compact-response", /*total_tokens*/ 200),
+    ]);
     let sse3 = responses::sse(vec![
         responses::ev_assistant_message("m3", "FINAL_REPLY"),
         responses::ev_completed_with_tokens("r3", /*total_tokens*/ 120),
     ]);
-    let responses_log = responses::mount_sse_sequence(&server, vec![sse1, sse2, sse3]).await;
-
-    let compacted_history = vec![
-        ResponseItem::Message {
-            id: None,
-            role: "assistant".to_string(),
-            content: vec![ContentItem::OutputText {
-                text: "REMOTE_COMPACT_SUMMARY".to_string(),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        },
-        ResponseItem::Compaction {
-            id: None,
-            encrypted_content: "ENCRYPTED_COMPACTION_SUMMARY".to_string(),
-            internal_chat_message_metadata_passthrough: None,
-        },
-    ];
-    let compact_mock = responses::mount_compact_json_once(
-        &server,
-        serde_json::json!({ "output": compacted_history }),
-    )
-    .await;
+    let responses_log =
+        responses::mount_sse_sequence(&server, vec![sse1, sse2, compact_sse, sse3]).await;
 
     let codex_home = TempDir::new()?;
     write_mock_responses_config_toml(
         codex_home.path(),
         &server.uri(),
-        &BTreeMap::from([(Feature::RemoteCompactionV2, false)]),
+        &BTreeMap::default(),
         REMOTE_AUTO_COMPACT_LIMIT,
         Some(true),
         "mock_provider",
@@ -193,13 +180,9 @@ async fn auto_compaction_remote_emits_started_and_completed_items() -> Result<()
     assert_eq!(completed.thread_id, thread_id);
     assert_eq!(started_id, completed_id);
 
-    let compact_requests = compact_mock.requests();
-    assert_eq!(compact_requests.len(), 1);
-    assert_eq!(compact_requests[0].path(), "/v1/responses/compact");
-
     let response_requests = responses_log.requests();
-    assert_eq!(response_requests.len(), 3);
-    let turn_metadata = response_requests
+    assert_eq!(response_requests.len(), 4);
+    let request_metadata = response_requests
         .iter()
         .map(|request| {
             request
@@ -209,7 +192,9 @@ async fn auto_compaction_remote_emits_started_and_completed_items() -> Result<()
                 .expect("turn request should include turn metadata")
         })
         .collect::<Vec<_>>();
-    for (request, metadata) in response_requests.iter().zip(&turn_metadata) {
+    for index in [0, 1, 3] {
+        let request = &response_requests[index];
+        let metadata = &request_metadata[index];
         assert_eq!(metadata["request_kind"].as_str(), Some("turn"));
         assert!(
             metadata["turn_id"]
@@ -224,11 +209,8 @@ async fn auto_compaction_remote_emits_started_and_completed_items() -> Result<()
         assert!(metadata.get("compaction").is_none());
     }
 
-    let compact_metadata = compact_requests[0]
-        .header("x-codex-turn-metadata")
-        .as_deref()
-        .map(parse_json_header)
-        .expect("compact request should include turn metadata");
+    let compact_request = &response_requests[2];
+    let compact_metadata = &request_metadata[2];
     assert_eq!(
         compact_metadata["request_kind"].as_str(),
         Some("compaction")
@@ -238,18 +220,18 @@ async fn auto_compaction_remote_emits_started_and_completed_items() -> Result<()
         serde_json::json!({
             "trigger": "auto",
             "reason": "context_limit",
-            "implementation": "responses_compact",
+            "implementation": "responses_compaction_v2",
             "phase": "pre_turn",
             "strategy": "memento",
         })
     );
     assert_eq!(
-        compact_metadata["turn_id"], turn_metadata[2]["turn_id"],
+        compact_metadata["turn_id"], request_metadata[3]["turn_id"],
         "pre-turn compaction should carry the current turn id"
     );
     assert_eq!(
         compact_metadata["window_id"].as_str(),
-        compact_requests[0].header("x-codex-window-id").as_deref()
+        compact_request.header("x-codex-window-id").as_deref()
     );
 
     Ok(())

@@ -1,0 +1,176 @@
+MDPWA PRODUCTION-READINESS IMPLEMENTATION REVIEW
+Review date: 2026-08-07
+Repository: C:\Users\kuh\Desktop\mdpwa-main
+
+RESULT
+
+No Critical release blocker was found in the inspected implementation. Two concrete
+release-risk problems remain. They are ranked below by actual release risk. Concerns
+that were only cosmetic, speculative, or refactoring opportunities were excluded.
+
+The review was read-only except for this requested findings ledger. Per AGENTS.md,
+tests and repository validation commands were not run because the user did not
+explicitly request checks. Test coverage statements below are based on inspection of
+the test source.
+
+
+1. HIGH - A data-encryption-key error can permanently deactivate every browser-push subscriber
+
+Exact files/functions
+
+- src/lib/pushSubscriptionRepository.ts
+  - readStoredPush() (lines 41-80)
+  - listActivePostgresPushSubscriptions() (lines 163-191)
+- src/lib/securityCrypto.ts
+  - decryptSensitiveText()
+- src/workflows/alertBroadcastDelivery.ts
+  - deliverPushBroadcast() / its call to listActivePostgresPushSubscriptions()
+
+Concrete failure scenario
+
+The active-subscription query decrypts each endpoint and key pair. readStoredPush()
+returns undefined for both corrupt row data and an operational decryption failure,
+including a missing, mistyped, or rotated MARTINDALE_DATA_ENCRYPTION_KEY. The list
+function collects every undefined row and executes:
+
+  UPDATE push_subscriptions SET status = 'inactive' ...
+
+for all of them. A single production deployment with the wrong encryption secret,
+followed by a scheduled or immediate broadcast, can therefore mark every active push
+subscription inactive. Restoring the correct key does not restore those statuses, so
+future broadcasts silently omit those residents until they subscribe again or an
+operator repairs the database. This converts a reversible configuration outage into
+durable notification-state loss.
+
+Existing test coverage
+
+- src/lib/tests/securityPrimitives.test.ts verifies encryption/decryption primitives,
+  including rejection with the wrong key.
+- src/workflows/alertBroadcastDelivery.test.ts mocks
+  listActivePostgresPushSubscriptions(); it does not exercise repository decryption.
+- No inspected test exercises listActivePostgresPushSubscriptions() with a wrong or
+  missing encryption key and asserts that active database state is preserved.
+
+Smallest reasonable fix
+
+Fail closed without mutating subscription state when any selected row cannot be
+decrypted. Distinguish decryption/configuration failure from a genuinely expired push
+endpoint; throw an operational error and leave every row unchanged. Keep the existing
+explicit expiration path (404/410 or expiration time), which correctly marks only that
+subscription expired. Add a repository-level test proving that wrong-key and missing-key
+reads perform no UPDATE, plus a test that a confirmed 404/410 still expires one row.
+
+
+2. MEDIUM - Resident PII and private message/location drafts persist in localStorage for seven days
+
+Exact files/functions
+
+- src/components/useResidentFormDraft.ts
+  - useResidentFormDraft(), removeDraft() (lines 5-7 and 22-119)
+- src/components/AlertSignupForm.tsx
+  - FormState and AlertSignupForm() draft registration (lines 27-91)
+- src/components/CommunityInputForm.tsx
+  - FormState, isCommunityInputDraft(), and CommunityInputForm() draft registration
+- src/components/MapFeedbackMap.tsx
+  - FormState, MapFeedbackDraft, isMapFeedbackDraft(), and MapFeedbackMap() draft
+    registration (notably lines 80-133 and 607-619)
+
+Concrete failure scenario
+
+useResidentFormDraft() writes the complete form value to origin-wide localStorage and
+keeps it for up to seven days. The alert form stores resident name and email. Community
+input stores name, email, phone, subject, and the full question/suggestion. Map feedback
+stores name, email, address, report text, and exact selected latitude/longitude. On a
+shared family phone, library computer, public kiosk, borrowed device, or shared browser
+profile, a later visitor can recover the prior resident's draft after the original user
+closed the tab or browser. The same values are also available to any script executing
+on the origin. This conflicts with the repository's privacy-first handling of resident
+submissions and is realistic for the project's older/rural resident audience.
+
+Existing test coverage
+
+- src/components/tests/useResidentFormDraft.test.tsx verifies localStorage recovery and
+  removal of drafts older than seven days.
+- ResidentDraftRecoveryNotice tests verify explicit recover/discard controls.
+- The inspected tests do not enforce data minimization, prevent PII from entering
+  persistent storage, or test isolation on shared-device/browser-restart scenarios.
+  Current tests therefore preserve the risky behavior rather than protect against it.
+
+Smallest reasonable fix
+
+Use sessionStorage for resident forms that contain PII, message content, addresses, or
+coordinates, while retaining the existing success/discard cleanup. If cross-session
+recovery must remain, persist only non-sensitive selections by default and require an
+explicit, disclosed resident opt-in before storing sensitive content locally. Update the
+draft hook tests to assert that sensitive drafts are absent from localStorage.
+
+
+AREAS IMPLEMENTED CORRECTLY IN THE INSPECTED CODE
+
+Resident write durability and idempotency
+
+- src/app/api/community-input/route.ts and src/lib/communityInputStore.ts use bounded
+  validation, durable idempotency, request-hash conflict detection, and an atomic
+  PostgreSQL statement for the submission and resident-notification outbox entry.
+- src/app/api/map-feedback/route.ts and src/lib/mapFeedbackStore.ts use the same durable
+  create/outbox pattern in transactional production mode.
+- The client preserves an idempotency key across uncertain failures and rotates it only
+  after success or a proven 409 conflict (src/components/useResidentFormSubmission.ts).
+
+Public map privacy
+
+- src/lib/mapFeedbackStore.ts toPublicMapFeedbackReport() removes resident contact and
+  internal moderation data and applies public coordinate precision before public output.
+- src/app/api/map-feedback/route.ts keeps public viewport reads separate from authorized
+  admin reads and bounds the PostgreSQL viewport result.
+
+Alert-signup management and scanner safety
+
+- src/app/api/alert-signups/link/route.ts uses GET only for an inert, no-store
+  confirmation page and requires POST for token exchange/mutation, preventing email link
+  scanners from changing subscription state.
+- Management tokens are opaque/hashed, and topic-update email failure is intentionally
+  best-effort after a successful durable update rather than producing a false failed-save
+  response (sendRenewedSubscriberLinks() in src/app/api/alert-signups/route.ts).
+
+Broadcast correctness and recovery
+
+- src/lib/alertBroadcastRepository.ts atomically creates broadcasts, recipient/outbox
+  state, and audit state; delivery attempts are claimed idempotently with leases.
+- src/workflows/alertBroadcastDelivery.ts snapshots eligible recipients, suppresses
+  recipients who become ineligible before delivery, and records per-recipient outcomes.
+- Expired push endpoints are explicitly transitioned to expired by
+  completeClaimedPushDeliveryAttempt(); cancellation and failed-delivery retry logic do
+  not resend completed recipients.
+- Email delivery is bounded in batches of five with retries
+  (src/lib/alertBroadcastNotifications.ts), rather than using unbounded concurrency.
+- vercel.json schedules /api/cron/outbox every five minutes, and
+  src/app/api/cron/outbox/route.ts provides authenticated recovery for stranded jobs.
+
+PWA update/offline behavior
+
+- scripts/templates/service-worker.js and public/sw.js cache only allowlisted same-origin
+  static GET assets, exclude API/query requests, use network-first navigation with an
+  offline fallback, and clean old versioned caches during activation.
+- src/app/pwa-register.tsx exposes an update prompt and reloads on controller change only
+  after the user requests the update.
+- public/manifest.json and public/site.webmanifest had identical SHA-256 hashes during
+  this review. Static service-worker and registration tests exist. The generator's
+  --check command was not run under the repository's opt-in validation policy.
+
+Admin/privacy and mobile fundamentals
+
+- src/lib/adminRoute.ts centralizes role/permission enforcement; admin session cookies
+  are HttpOnly, SameSite=Lax, and Secure in production, and login is rate-limited.
+- Resident form controls use a 16px base size and touch-action handling in
+  src/app/globals.css, avoiding common iOS input zoom behavior. The map uses responsive
+  heights in src/components/MapFeedbackMap.tsx. No concrete release-blocking mobile
+  usability failure was found in the inspected paths.
+
+
+RELEASE PRIORITY
+
+1. Fix push-subscription mutation on decryption failure before production secret
+   rotation or any deployment that changes encryption configuration.
+2. Remove sensitive resident drafts from persistent localStorage before public launch,
+   or obtain explicit opt-in with clear retention disclosure.

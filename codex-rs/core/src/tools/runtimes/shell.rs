@@ -326,7 +326,7 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             .shell
             .as_ref()
             .unwrap_or(session_shell.as_ref());
-        let shell_snapshot_location = req.turn_environment.shell_snapshot(&req.cwd);
+        let shell_snapshot_location = req.turn_environment.shell_snapshot(&req.cwd).await;
         let (file_system_sandbox_policy, _) = attempt.permissions.to_runtime_permissions();
         let sandbox_permissions = sandbox_permissions_preserving_denied_reads(
             req.sandbox_permissions,

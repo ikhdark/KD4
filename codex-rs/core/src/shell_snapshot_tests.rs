@@ -223,6 +223,10 @@ fn snapshot_file_name_parser_supports_legacy_and_suffixed_names() {
         Some(session_id)
     );
     assert_eq!(
+        snapshot_session_id_from_file_name(&format!("{session_id}.tmp-123.ps1")),
+        Some(session_id)
+    );
+    assert_eq!(
         snapshot_session_id_from_file_name("not-a-snapshot.txt"),
         None
     );
@@ -829,15 +833,54 @@ async fn linux_sh_snapshot_includes_sections() -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-#[ignore]
 #[tokio::test]
 async fn windows_powershell_snapshot_includes_sections() -> Result<()> {
     let shell = crate::shell::get_shell(ShellType::PowerShell, /*path*/ None)
         .context("PowerShell is required for snapshot test")?;
-    let snapshot = get_snapshot(&shell, &current_environment()).await?;
+    let dir = tempdir()?;
+    let cwd = dir.path().abs();
+    let marker_name = "CODEX_SNAPSHOT_WINDOWS_UNICODE_TEST";
+    let marker_value = "snowman-雪-'quoted'";
+    let mut capture_environment = current_environment();
+    capture_environment.insert(marker_name.to_string(), marker_value.to_string());
+    let snapshot_file = ShellSnapshot::try_create(
+        &cwd,
+        ThreadId::new(),
+        &cwd,
+        &shell,
+        &capture_environment,
+        /*state_db*/ None,
+    )
+    .await
+    .expect("PowerShell snapshot should be captured, validated, and finalized");
+    let snapshot_path = snapshot_file.path();
+    assert_eq!(
+        snapshot_path
+            .extension()
+            .and_then(|extension| extension.to_str()),
+        Some("ps1")
+    );
+    let snapshot = fs::read_to_string(&snapshot_path).await?;
     for section in ["# Snapshot file", "# Functions", "# aliases", "# exports"] {
         assert_snapshot_section(&snapshot, section);
     }
+    assert_snapshot_section(&snapshot, POWERSHELL_SNAPSHOT_FORMAT_HEADER);
+
+    let mut replay_environment = current_environment();
+    replay_environment.remove(marker_name);
+    let snapshot_path = powershell_single_quote(&snapshot_path.to_string_lossy());
+    let replay = run_script_with_timeout(
+        &shell,
+        &format!(
+            "try {{ [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 }} catch {{}}; . '{snapshot_path}'; Microsoft.PowerShell.Utility\\Write-Output $env:{marker_name}"
+        ),
+        SNAPSHOT_TIMEOUT,
+        /*use_login_shell*/ false,
+        &cwd,
+        &replay_environment,
+    )
+    .await?;
+    assert_eq!(replay.trim(), marker_value);
     Ok(())
 }
 

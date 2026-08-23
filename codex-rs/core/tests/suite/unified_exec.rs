@@ -42,6 +42,7 @@ use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
+use core_test_support::wait_for_event_match_with_timeout;
 use core_test_support::wait_for_event_with_timeout;
 use pretty_assertions::assert_eq;
 use regex_lite::Regex;
@@ -172,17 +173,21 @@ async fn wait_for_raw_unified_exec_output(
     test: &TestCodex,
     call_id: &str,
 ) -> Result<ParsedUnifiedExecOutput> {
-    let content = wait_for_event_match(&test.codex, |event| match event {
-        EventMsg::RawResponseItem(raw) => match &raw.item {
-            ResponseItem::FunctionCallOutput {
-                call_id: output_call_id,
-                output,
-                ..
-            } if output_call_id == call_id => output.text_content().map(str::to_string),
+    let content = wait_for_event_match_with_timeout(
+        &test.codex,
+        |event| match event {
+            EventMsg::RawResponseItem(raw) => match &raw.item {
+                ResponseItem::FunctionCallOutput {
+                    call_id: output_call_id,
+                    output,
+                    ..
+                } if output_call_id == call_id => output.text_content().map(str::to_string),
+                _ => None,
+            },
             _ => None,
         },
-        _ => None,
-    })
+        UNIFIED_EXEC_LAGGED_OUTPUT_TIMEOUT,
+    )
     .await;
 
     parse_unified_exec_output(&content)

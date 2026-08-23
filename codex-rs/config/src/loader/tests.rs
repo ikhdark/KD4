@@ -70,10 +70,27 @@ impl ExecutorFileSystem for TestFileSystem {
 
     fn get_metadata<'a>(
         &'a self,
-        _path: &'a PathUri,
+        path: &'a PathUri,
         _sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, FileMetadata> {
-        Box::pin(async move { unimplemented!("test filesystem only supports reads") })
+        Box::pin(async move {
+            let metadata = tokio::fs::symlink_metadata(path.to_abs_path()?.as_path()).await?;
+            let file_type = metadata.file_type();
+            let to_millis = |time: std::io::Result<std::time::SystemTime>| {
+                time.ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_millis() as i64)
+                    .unwrap_or_default()
+            };
+            Ok(FileMetadata {
+                is_directory: file_type.is_dir(),
+                is_file: file_type.is_file(),
+                is_symlink: file_type.is_symlink(),
+                size: metadata.len(),
+                created_at_ms: to_millis(metadata.created()),
+                modified_at_ms: to_millis(metadata.modified()),
+            })
+        })
     }
 
     fn read_directory<'a>(
@@ -253,4 +270,44 @@ model = "gpt-dev"
     )
     .await
     .expect("profile-v2 should allow unrelated legacy profiles in base user config");
+}
+
+#[tokio::test]
+async fn config_layer_stack_preserves_project_discovery_context() {
+    let codex_home = tempdir().expect("codex home");
+    let workspace = tempdir().expect("workspace");
+    let nested = workspace.path().join("src").join("nested");
+    std::fs::create_dir_all(&nested).expect("nested cwd");
+    std::fs::write(workspace.path().join(".codex-root"), "").expect("project marker");
+    std::fs::create_dir(workspace.path().join(".git")).expect("git marker");
+    let cwd = AbsolutePathBuf::from_absolute_path(&nested).expect("absolute cwd");
+    let project_root = AbsolutePathBuf::from_absolute_path(workspace.path()).expect("project root");
+    let fs = TestFileSystem;
+
+    let stack = load_config_layers_state(
+        &fs,
+        codex_home.path(),
+        Some(cwd.clone()),
+        &[(
+            "project_root_markers".to_string(),
+            toml::Value::Array(vec![toml::Value::String(".codex-root".to_string())]),
+        )],
+        LoaderOverrides::without_managed_config_for_tests(),
+        &crate::NoopThreadConfigLoader,
+    )
+    .await
+    .expect("load config with project discovery");
+
+    let discovery = stack.project_discovery().expect("project discovery");
+    assert!(discovery.matches(&cwd, &fs));
+    assert_eq!(discovery.cwd(), &cwd);
+    assert_eq!(discovery.project_root(), &project_root);
+    assert_eq!(discovery.project_root_markers(), &[".codex-root"]);
+    assert_eq!(discovery.git_checkout_root(), Some(&project_root));
+
+    let updated = stack.with_user_config(
+        &AbsolutePathBuf::resolve_path_against_base(CONFIG_TOML_FILE, codex_home.path()),
+        toml::Value::Table(Default::default()),
+    );
+    assert_eq!(updated.project_discovery(), Some(discovery));
 }

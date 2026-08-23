@@ -776,6 +776,15 @@ async fn selective_admission_keeps_overlapping_claims_as_metadata() {
     assert_eq!(second.integration_plan, IntegrationPlan::RootOwned);
     assert_eq!(second.overlaps.benign_read_overlap_count, 1);
 
+    let mut disjoint_draft = selective_worker_draft(root_session_id, "src/disjoint.rs", &[]);
+    disjoint_draft.contract_claims = vec!["independent-api".to_string()];
+    let disjoint = fixture
+        .store
+        .create_admitted_assignment(fixture.repo.path(), disjoint_draft, true)
+        .await
+        .expect("disjoint write and contract scopes remain single-writer work");
+    assert_eq!(disjoint.integration_plan, IntegrationPlan::SingleWriter);
+
     let mut overlapping_draft = selective_worker_draft(root_session_id, "src", &["AGENTS.md"]);
     overlapping_draft.contract_claims = vec!["shared-api".to_string()];
     let overlapping = fixture
@@ -790,7 +799,7 @@ async fn selective_admission_keeps_overlapping_claims_as_metadata() {
             .fetch_one(&pool)
             .await
             .expect("active write claim count reads"),
-        3
+        4
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
@@ -871,26 +880,28 @@ async fn repository_root_scope_allows_nested_writer_metadata() {
 async fn explorer_identity_rejects_only_the_same_primary_question() {
     let fixture = Fixture::new().await;
     let root_session_id = "explorer-identity-root";
-    let first = explorer_draft(
+    let first_draft = explorer_draft(
         root_session_id,
         "src/shared.rs",
         "trace the parser ownership",
     );
-    fixture
+    let first = fixture
         .store
-        .create_admitted_assignment(fixture.repo.path(), first.clone(), true)
+        .create_admitted_assignment(fixture.repo.path(), first_draft.clone(), true)
         .await
         .expect("first investigation is admitted");
     let duplicate = fixture
         .store
-        .create_admitted_assignment(fixture.repo.path(), first, true)
+        .create_admitted_assignment(fixture.repo.path(), first_draft, true)
         .await
         .expect_err("the same canonical investigation is rejected");
     assert!(matches!(
         duplicate,
         StoreError::AdmissionRejected {
-            reason: AdmissionRejectionReason::DuplicateExplorerInvestigation
+            reason: AdmissionRejectionReason::DuplicateExplorerInvestigation,
+            reusable_assignment_id: Some(assignment_id),
         }
+        if assignment_id == first.assignment.assignment_id
     ));
 
     let distinct = fixture
@@ -907,22 +918,39 @@ async fn explorer_identity_rejects_only_the_same_primary_question() {
         .await
         .expect("a distinct question may inspect the same surface");
     assert_eq!(distinct.overlaps.benign_read_overlap_count, 1);
+
+    fixture
+        .store
+        .submit_agent_receipt(first.attempt.attempt_id, completed_receipt(Vec::new()))
+        .await
+        .expect("the first investigation result seals");
+    let completed_duplicate = fixture
+        .store
+        .create_admitted_assignment(
+            fixture.repo.path(),
+            explorer_draft(
+                root_session_id,
+                "src/shared.rs",
+                "trace the parser ownership",
+            ),
+            true,
+        )
+        .await
+        .expect_err("the sealed result is reused instead of spawning duplicate work");
+    assert!(matches!(
+        completed_duplicate,
+        StoreError::AdmissionRejected {
+            reason: AdmissionRejectionReason::DuplicateExplorerInvestigation,
+            reusable_assignment_id: Some(assignment_id),
+        }
+        if assignment_id == first.assignment.assignment_id
+    ));
 }
 
 #[tokio::test]
 async fn selective_multi_writer_admission_records_the_required_integration_plan() {
     let fixture = Fixture::new().await;
     let root_session_id = "integration-plan-root";
-    fixture
-        .store
-        .create_admitted_assignment(
-            fixture.repo.path(),
-            selective_worker_draft(root_session_id, "src/first.rs", &[]),
-            true,
-        )
-        .await
-        .expect("first writer is admitted");
-
     let mut isolated = selective_worker_draft(root_session_id, "src/second.rs", &[]);
     isolated.workspace_strategy = WorkspaceStrategy::Isolated;
     let unavailable = fixture
@@ -933,7 +961,8 @@ async fn selective_multi_writer_admission_records_the_required_integration_plan(
     assert!(matches!(
         unavailable,
         StoreError::AdmissionRejected {
-            reason: AdmissionRejectionReason::IsolatedIntegratorUnavailable
+            reason: AdmissionRejectionReason::IsolatedIntegratorUnavailable,
+            reusable_assignment_id: None,
         }
     ));
     let admitted = fixture
@@ -943,6 +972,20 @@ async fn selective_multi_writer_admission_records_the_required_integration_plan(
         .expect("configured typed integrator makes the isolated handoff feasible");
     assert_eq!(
         admitted.integration_plan,
+        IntegrationPlan::TypedIntegratorRequired
+    );
+    assert_eq!(
+        admitted.assignment.integration_plan,
+        IntegrationPlan::TypedIntegratorRequired
+    );
+    assert_eq!(
+        fixture
+            .store
+            .get_agent_task(admitted.assignment.assignment_id, Some(0))
+            .await
+            .expect("persisted assignment reloads")
+            .assignment
+            .integration_plan,
         IntegrationPlan::TypedIntegratorRequired
     );
 }
@@ -3551,9 +3594,14 @@ fn assignments_without_additive_identity_or_capsule_fields_still_deserialize() {
         .as_object_mut()
         .expect("assignment object")
         .remove("task_capsule");
+    value
+        .as_object_mut()
+        .expect("assignment object")
+        .remove("integration_plan");
     let decoded: Assignment = serde_json::from_value(value).expect("legacy assignment decodes");
     assert!(decoded.repository_id.is_empty());
     assert_eq!(decoded.task_capsule, None);
+    assert_eq!(decoded.integration_plan, IntegrationPlan::SingleWriter);
 }
 
 #[tokio::test]
@@ -3581,6 +3629,7 @@ async fn task_capsule_attachment_is_canonical_and_one_time() {
         workspace_strategy: Some(assignment.workspace_strategy),
         relation: assignment.relation.clone(),
         architecture_contract_ref: assignment.architecture_contract_ref.clone(),
+        integration_plan: assignment.integration_plan,
         relevant_handles: vec![TaskCapsuleHandle::File {
             path: "src/new.rs".to_string(),
             existed: false,
@@ -3665,6 +3714,7 @@ async fn task_capsule_attachment_rejects_noncanonical_or_mismatched_payloads() {
         workspace_strategy: None,
         relation: None,
         architecture_contract_ref: None,
+        integration_plan: IntegrationPlan::SingleWriter,
         relevant_handles: Vec::new(),
         workspace_epoch: assignment.start_epoch,
         workspace_manifest_hash: "manifest-sha256".to_string(),
@@ -3691,11 +3741,37 @@ async fn task_capsule_attachment_rejects_noncanonical_or_mismatched_payloads() {
         serde_json::to_string(&legacy_decoded).expect("legacy capsule reserializes"),
         legacy_canonical
     );
+    let mut capsule_without_plan = legacy_value;
+    capsule_without_plan
+        .as_object_mut()
+        .expect("legacy capsule object")
+        .remove("integration_plan");
+    assert_eq!(
+        serde_json::from_value::<TaskCapsuleV1>(capsule_without_plan)
+            .expect("pre-integration-plan capsule decodes")
+            .integration_plan,
+        IntegrationPlan::SingleWriter
+    );
     let pretty = serde_json::to_string_pretty(&capsule).expect("capsule pretty serializes");
     assert!(matches!(
         fixture
             .store
             .attach_task_capsule(assignment.assignment_id, attempt.attempt_id, pretty)
+            .await,
+        Err(StoreError::InvalidTaskCapsule(_))
+    ));
+
+    let mut mismatched_plan = capsule.clone();
+    mismatched_plan.integration_plan = IntegrationPlan::RootOwned;
+    assert!(matches!(
+        fixture
+            .store
+            .attach_task_capsule(
+                assignment.assignment_id,
+                attempt.attempt_id,
+                serde_json::to_string(&mismatched_plan)
+                    .expect("mismatched integration plan serializes"),
+            )
             .await,
         Err(StoreError::InvalidTaskCapsule(_))
     ));
@@ -3823,7 +3899,7 @@ fn risk_gate_uses_canonical_concurrent_drift_reason() {
 }
 
 #[tokio::test]
-async fn relevant_and_dependency_drift_supersede_validation() {
+async fn focused_validation_dependency_receipt_freshness_is_scoped() {
     let relevant = Fixture::new().await;
     std::fs::create_dir_all(relevant.repo.path().join("src")).expect("src directory");
     std::fs::write(relevant.repo.path().join("src/a.rs"), "before\n").expect("a fixture");
@@ -3899,7 +3975,7 @@ async fn relevant_and_dependency_drift_supersede_validation() {
         .await,
     )
     .await;
-    assert_eq!(
+    assert_ne!(
         unrelated_call.evidence.dependency_manifest_hash,
         unrelated_call
             .evidence
@@ -3908,10 +3984,7 @@ async fn relevant_and_dependency_drift_supersede_validation() {
             .expect("execution snapshot")
             .manifest_hash
     );
-    assert_ne!(
-        unrelated_call.evidence.dependency_manifest_hash,
-        unrelated_call.evidence.covered_input_manifest_hash
-    );
+    assert!(!unrelated_call.evidence.dependency_manifest_hash.is_empty());
     std::fs::write(unrelated.repo.path().join("src/b.rs"), "external change\n")
         .expect("unrelated external change");
     unrelated
@@ -3919,15 +3992,24 @@ async fn relevant_and_dependency_drift_supersede_validation() {
         .capture_workspace_revision(unrelated.repo.path(), vec!["src/b.rs".to_string()])
         .await
         .expect("unrelated drift is detected");
-    let error = unrelated
+    unrelated
         .store
         .submit_agent_receipt(
             unrelated_attempt.attempt_id,
             completed_receipt(vec!["unrelated-validation".to_string()]),
         )
         .await
-        .expect_err("dependency drift supersedes narrow proof");
-    assert!(matches!(error, StoreError::EvidenceSuperseded { .. }));
+        .expect("unrelated source drift preserves a narrow proof");
+    assert_eq!(
+        unrelated
+            .store
+            .get_validation_call("unrelated-validation".to_string())
+            .await
+            .expect("validation reads")
+            .expect("validation exists")
+            .status,
+        ValidationCallStatus::Succeeded
+    );
 
     let sealed = Fixture::new().await;
     std::fs::create_dir_all(sealed.repo.path().join("src")).expect("src directory");
@@ -3977,7 +4059,7 @@ async fn relevant_and_dependency_drift_supersede_validation() {
 }
 
 #[tokio::test]
-async fn in_flight_validation_supersedes_repository_dependency_drift() {
+async fn focused_validation_dependency_in_flight_freshness_is_scoped() {
     let command = "cargo test -p owner narrow";
 
     let disjoint = Fixture::new().await;
@@ -4014,7 +4096,7 @@ async fn in_flight_validation_supersedes_repository_dependency_drift() {
         finish_focused_validation(&disjoint.store, disjoint_call)
             .await
             .status,
-        ValidationCallStatus::Superseded
+        ValidationCallStatus::Succeeded
     );
 
     let relevant = Fixture::new().await;
@@ -4045,7 +4127,60 @@ async fn in_flight_validation_supersedes_repository_dependency_drift() {
 }
 
 #[tokio::test]
-async fn directory_changes_and_new_build_configuration_supersede_validation() {
+async fn focused_validation_dependency_exact_snapshot_survives_unrelated_epochs() {
+    let fixture = Fixture::new().await;
+    std::fs::create_dir_all(fixture.repo.path().join("src")).expect("src directory");
+    std::fs::write(fixture.repo.path().join("src/lib.rs"), "before\n").expect("lib fixture");
+    std::fs::write(fixture.repo.path().join("src/unrelated.rs"), "before\n")
+        .expect("unrelated source fixture");
+    let command = "cargo test -p owner exact-snapshot";
+    let (_, attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            validation_worker_draft("exact-snapshot-root", "src/lib.rs", command),
+        )
+        .await
+        .expect("assignment");
+    let call = start_focused_validation(
+        &fixture.store,
+        attempt.attempt_id,
+        "exact-snapshot-validation",
+        command,
+    )
+    .await;
+    std::fs::write(fixture.repo.path().join("src/unrelated.rs"), "after\n")
+        .expect("unrelated source mutation");
+    fixture
+        .store
+        .capture_workspace_revision(fixture.repo.path(), vec!["src/unrelated.rs".to_string()])
+        .await
+        .expect("unrelated source epoch advances");
+    std::fs::write(
+        fixture.repo.path().join("README.md"),
+        "unrelated documentation\n",
+    )
+    .expect("documentation mutation");
+    fixture
+        .store
+        .capture_workspace_revision(fixture.repo.path(), vec!["README.md".to_string()])
+        .await
+        .expect("unrelated epoch advances");
+    let finished = finish_focused_validation(&fixture.store, call).await;
+    assert_eq!(finished.status, ValidationCallStatus::Succeeded);
+
+    fixture
+        .store
+        .submit_agent_receipt(
+            attempt.attempt_id,
+            completed_receipt(vec!["exact-snapshot-validation".to_string()]),
+        )
+        .await
+        .expect("exact dependency identity remains fresh across unrelated epoch");
+}
+
+#[tokio::test]
+async fn focused_validation_dependency_covered_and_build_configuration_changes_supersede() {
     let directory = Fixture::new().await;
     std::fs::create_dir_all(directory.repo.path().join("src")).expect("src directory");
     std::fs::write(directory.repo.path().join("src/lib.rs"), "before\n").expect("lib fixture");
@@ -4363,7 +4498,7 @@ async fn unrelated_work_in_the_same_repository_warns_without_blocking_quiescence
 }
 
 #[tokio::test]
-async fn focused_validation_rejects_out_of_scope_repository_mutation_during_execution() {
+async fn focused_validation_dependency_ignores_out_of_scope_mutation_during_execution() {
     let fixture = Fixture::new().await;
     std::fs::create_dir_all(fixture.repo.path().join("src")).expect("src directory");
     std::fs::write(fixture.repo.path().join("src/lib.rs"), "owned\n").expect("owned fixture");
@@ -4388,15 +4523,8 @@ async fn focused_validation_rejects_out_of_scope_repository_mutation_during_exec
     std::fs::write(fixture.repo.path().join("outside.txt"), "after\n")
         .expect("out-of-scope mutation");
     let call = finish_focused_validation(&fixture.store, call).await;
-    assert_eq!(call.status, ValidationCallStatus::Superseded);
-    assert!(
-        call.evidence
-            .stale_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("outside.txt")),
-        "the out-of-scope repository mutation is named in the stale reason: {:?}",
-        call.evidence.stale_reason
-    );
+    assert_eq!(call.status, ValidationCallStatus::Succeeded);
+    assert_eq!(call.evidence.stale_reason, None);
 }
 
 #[tokio::test]
@@ -4543,7 +4671,7 @@ async fn one_workspace_stale_epoch_does_not_double_count_multiple_proofs() {
 }
 
 #[tokio::test]
-async fn validation_singleflight_is_exact_and_epoch_bound() {
+async fn focused_validation_dependency_repository_wide_route_remains_conservative() {
     let fixture = Fixture::new().await;
     let command = "cargo test -p owner identical";
     let mut first_draft = validation_worker_draft("singleflight-root", "unused-a", command);
@@ -4583,13 +4711,14 @@ async fn validation_singleflight_is_exact_and_epoch_bound() {
 
     fixture
         .store
-        .capture_workspace_revision(fixture.repo.path(), vec!["epoch-marker".to_string()])
+        .capture_workspace_revision(fixture.repo.path(), vec!["README.md".to_string()])
         .await
-        .expect("marker baseline");
-    std::fs::write(fixture.repo.path().join("epoch-marker"), "changed\n").expect("epoch marker");
+        .expect("repository-wide documentation baseline");
+    std::fs::write(fixture.repo.path().join("README.md"), "changed\n")
+        .expect("repository-wide documentation change");
     fixture
         .store
-        .capture_workspace_revision(fixture.repo.path(), vec!["epoch-marker".to_string()])
+        .capture_workspace_revision(fixture.repo.path(), vec!["README.md".to_string()])
         .await
         .expect("epoch advances");
     let mut third_draft = validation_worker_draft("singleflight-root", "unused-c", command);
@@ -4610,7 +4739,7 @@ async fn validation_singleflight_is_exact_and_epoch_bound() {
 }
 
 #[tokio::test]
-async fn completed_validation_reuse_is_successful_exact_and_manifest_bound() {
+async fn focused_validation_dependency_completed_reuse_is_manifest_bound() {
     fn rust_evidence() -> ValidationEvidence {
         ValidationEvidence {
             cwd: Some("codex-rs".to_string()),
@@ -4696,6 +4825,41 @@ async fn completed_validation_reuse_is_successful_exact_and_manifest_bound() {
         )
         .await
         .expect("report validation receipt");
+
+    let unrelated_source = fixture.repo.path().join("codex-rs/protocol/src/lib.rs");
+    std::fs::create_dir_all(unrelated_source.parent().expect("unrelated source parent"))
+        .expect("unrelated source directory");
+    std::fs::write(&unrelated_source, "pub fn unrelated() {}\n").expect("unrelated source change");
+    fixture
+        .store
+        .capture_workspace_revision(
+            fixture.repo.path(),
+            vec!["codex-rs/protocol/src/lib.rs".to_string()],
+        )
+        .await
+        .expect("unrelated source revision");
+    let unrelated_attempt = attempt_for(&fixture, "reuse-root", "codex-rs/core", command).await;
+    let unrelated_follow_up = start_focused_validation_with_evidence(
+        &fixture.store,
+        unrelated_attempt.attempt_id,
+        "reuse-unrelated-source-call",
+        command,
+        rust_evidence(),
+    )
+    .await;
+    assert!(
+        unrelated_follow_up.evidence.shared_from_call_id.is_some(),
+        "an unrelated crate source change reuses the focused Cargo result"
+    );
+    finish_focused_validation(&fixture.store, unrelated_follow_up).await;
+    fixture
+        .store
+        .submit_agent_receipt(
+            unrelated_attempt.attempt_id,
+            completed_receipt(vec!["reuse-unrelated-source-call".to_string()]),
+        )
+        .await
+        .expect("unrelated source validation receipt");
 
     std::fs::write(&rust_source, "pub fn source_b() {}\n").expect("changed rust source fixture");
     let changed_attempt = attempt_for(&fixture, "reuse-root", "codex-rs/core", command).await;

@@ -5,7 +5,8 @@
       "enum": [
         "ready",
         "notConfigured",
-        "updateRequired"
+        "updateRequired",
+        "unsupported"
       ],
       "type": "string"
     }

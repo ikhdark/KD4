@@ -226,6 +226,7 @@ pub(super) fn shell_sampling_signal(
 pub(super) enum ValidationExecutionOutcome {
     ExecutedSuccess,
     ExecutedFailure,
+    ExecutedNotApplicable,
     NotExecuted,
 }
 
@@ -234,6 +235,7 @@ impl ValidationExecutionOutcome {
         match self {
             Self::ExecutedSuccess => "executed_success",
             Self::ExecutedFailure => "executed_failure",
+            Self::ExecutedNotApplicable => "executed_not_applicable",
             Self::NotExecuted => "not_executed",
         }
     }
@@ -242,7 +244,7 @@ impl ValidationExecutionOutcome {
         match self {
             Self::ExecutedSuccess => Some(true),
             Self::ExecutedFailure => Some(false),
-            Self::NotExecuted => None,
+            Self::ExecutedNotApplicable | Self::NotExecuted => None,
         }
     }
 
@@ -250,6 +252,7 @@ impl ValidationExecutionOutcome {
         match value.get("execution_outcome")?.as_str()? {
             "executed_success" => Some(Self::ExecutedSuccess),
             "executed_failure" => Some(Self::ExecutedFailure),
+            "executed_not_applicable" => Some(Self::ExecutedNotApplicable),
             "not_executed" => Some(Self::NotExecuted),
             _ => None,
         }
@@ -269,7 +272,9 @@ impl ValidationExecutionOutcome {
         match self {
             Self::ExecutedSuccess => codex_tools::ToolOutputOutcome::Success,
             Self::ExecutedFailure => codex_tools::ToolOutputOutcome::Failure,
-            Self::NotExecuted => codex_tools::ToolOutputOutcome::Skipped,
+            Self::ExecutedNotApplicable | Self::NotExecuted => {
+                codex_tools::ToolOutputOutcome::Skipped
+            }
         }
     }
 }
@@ -448,8 +453,8 @@ pub(super) async fn run_exec_like(
     let call_id = args.call_id.clone();
     let validation_output_owned = args.validation_launch.is_some();
     let result = run_exec_like_with_exit_code(args).await?;
-    let validation_failure =
-        validation_output_owned && result.exit_code.is_some_and(|code| code != 0);
+    let validation_failure = validation_output_owned
+        && result.validation_execution_outcome == ValidationExecutionOutcome::ExecutedFailure;
     Ok(LegacyShellToolOutput {
         inner: result.output,
         canonical_output: result.canonical_output,
@@ -821,7 +826,8 @@ pub(super) async fn run_exec_like_with_exit_code(
             let status = match execution_outcome {
                 ValidationExecutionOutcome::ExecutedSuccess => ValidationCallStatus::Succeeded,
                 ValidationExecutionOutcome::ExecutedFailure => ValidationCallStatus::Failed,
-                ValidationExecutionOutcome::NotExecuted => ValidationCallStatus::NotExecuted,
+                ValidationExecutionOutcome::ExecutedNotApplicable
+                | ValidationExecutionOutcome::NotExecuted => ValidationCallStatus::NotExecuted,
             };
             coordinator
                 .finish_focused_validation_with_result(
@@ -864,6 +870,7 @@ pub(super) async fn run_exec_like_with_exit_code(
             exit_code: match execution_outcome {
                 ValidationExecutionOutcome::ExecutedSuccess => Some(0),
                 ValidationExecutionOutcome::ExecutedFailure => Some(1),
+                ValidationExecutionOutcome::ExecutedNotApplicable => Some(0),
                 ValidationExecutionOutcome::NotExecuted => None,
             },
             validation_execution_outcome: execution_outcome,
@@ -952,7 +959,8 @@ pub(super) async fn run_exec_like_with_exit_code(
         (Ok(result), false) => match result.validation_execution_outcome() {
             ValidationExecutionOutcome::ExecutedSuccess => ValidationCallStatus::Succeeded,
             ValidationExecutionOutcome::ExecutedFailure => ValidationCallStatus::Failed,
-            ValidationExecutionOutcome::NotExecuted => ValidationCallStatus::NotExecuted,
+            ValidationExecutionOutcome::ExecutedNotApplicable
+            | ValidationExecutionOutcome::NotExecuted => ValidationCallStatus::NotExecuted,
         },
         (Err(FunctionCallError::RespondToModel(message)), false)
             if message.contains("rejected by user") =>
@@ -1275,12 +1283,9 @@ pub(crate) fn validate_structured_validation_leaf(
         false,
     )?;
     if program == "cargo"
-        && args.iter().any(|arg| {
-            matches!(
-                arg.as_str(),
-                "--workspace" | "--all" | "--all-targets" | "--all-features"
-            )
-        })
+        && cargo_command_args(args)
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "--workspace" | "--all" | "--all-targets"))
     {
         return Err("auto-validation cargo routes must remain focused".to_string());
     }
@@ -1365,12 +1370,20 @@ pub(crate) fn direct_validation_route(
 }
 
 fn cargo_args_have_package(args: &[String]) -> bool {
+    let args = cargo_command_args(args);
     args.windows(2)
         .any(|pair| matches!(pair[0].as_str(), "-p" | "--package") && !pair[1].starts_with('-'))
         || args.iter().any(|arg| {
             arg.strip_prefix("--package=")
                 .is_some_and(|value| !value.is_empty())
         })
+}
+
+fn cargo_command_args(args: &[String]) -> &[String] {
+    &args[..args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len())]
 }
 
 fn cargo_test_has_package_and_filter(args: &[String]) -> bool {
@@ -1607,7 +1620,6 @@ fn validate_nextest_forwarded_args(args: &[String]) -> Result<(), String> {
             | "--bins"
             | "--tests"
             | "--benches"
-            | "--all-targets"
             | "--no-fail-fast"
             | "--fail-fast"
             | "--no-capture"
@@ -1650,8 +1662,6 @@ fn validate_cargo_check_forwarded_args(args: &[String]) -> Result<(), String> {
             | "--tests"
             | "--benches"
             | "--examples"
-            | "--all-targets"
-            | "--workspace"
             | "--locked"
             | "--offline"
             | "--frozen"
@@ -1872,7 +1882,7 @@ fn validate_pytest_args(args: &[String], repo_root: &Path) -> Result<(), String>
                 return Err("pytest argument files are not admitted".to_string());
             }
             _ => {
-                require_safe_repo_relative_path(selector_path(arg), "pytest selector", repo_root)?;
+                require_focused_pytest_selector(arg, repo_root)?;
                 has_selector = true;
             }
         }
@@ -1958,6 +1968,29 @@ fn safe_just_identifier(value: &str) -> bool {
 
 fn selector_path(value: &str) -> &str {
     value.split("::").next().unwrap_or(value)
+}
+
+fn require_focused_pytest_selector(value: &str, repo_root: &Path) -> Result<(), String> {
+    let path = selector_path(value);
+    require_safe_repo_relative_path(path, "pytest selector", repo_root)?;
+    let candidate = repo_root.join(path);
+    match std::fs::symlink_metadata(&candidate) {
+        Ok(metadata) if metadata.is_dir() => Err(format!(
+            "pytest validation must name a test file or node, not a directory: {value}"
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (std::path::Path::new(path)
+            .extension()
+            .and_then(|value| value.to_str())
+            == Some("py"))
+        .then_some(())
+        .ok_or_else(|| {
+            format!("pytest validation must name a test file or node, not a directory: {value}")
+        }),
+        Err(error) => Err(format!(
+            "pytest selector could not be inspected safely ({value}): {error}"
+        )),
+    }
 }
 
 fn require_safe_unittest_selector(value: &str, repo_root: &Path) -> Result<(), String> {
@@ -2277,14 +2310,11 @@ async fn run_exec_like_with_exit_code_inner(
     let intercepted = match intercepted {
         Ok(intercepted) => intercepted,
         Err(err) => {
-            if let Some(attempt_key) = attempt_key.as_ref() {
-                session
-                    .services
-                    .command_execution
-                    .record_exit(attempt_key, -1)
+            if !known_delta_hit && let Some(attempt_key) = attempt_key.as_ref() {
+                err.record_attempt_failure(&session.services.command_execution, attempt_key)
                     .await;
             }
-            return Err(err);
+            return Err(err.into_error());
         }
     };
     if let Some(output) = intercepted {
@@ -2518,6 +2548,19 @@ async fn run_exec_like_with_exit_code_inner(
         } else {
             None
         };
+    let completed_validation_skip_disposition = req
+        .validation_launch
+        .as_ref()
+        .and_then(|launch| launch.structured_route.as_ref())
+        .and_then(|route| {
+            out.as_ref().ok().and_then(|output| {
+                crate::tools::command_execution::completed_validation_skip_disposition(
+                    route,
+                    output.aggregated_output.text.as_bytes(),
+                    output.exit_code,
+                )
+            })
+        });
     if let (Some(launch), Some(artifact), Some(exit_code)) = (
         req.validation_launch.as_ref(),
         raw_output_artifact.as_ref(),
@@ -2557,34 +2600,50 @@ async fn run_exec_like_with_exit_code_inner(
             content.push_str(&notice);
         }
     }
-    Ok(RunExecLikeResult {
-        output: FunctionToolOutput {
-            body: vec![
-                codex_protocol::models::FunctionCallOutputContentItem::InputText { text: content },
-            ],
-            success: Some(true),
-            outcome: Some(match exit_code {
+    let validation_execution_outcome = if completed_validation_skip_disposition.is_some() {
+        ValidationExecutionOutcome::ExecutedNotApplicable
+    } else {
+        match exit_code {
+            Some(0) => ValidationExecutionOutcome::ExecutedSuccess,
+            Some(_) | None => ValidationExecutionOutcome::ExecutedFailure,
+        }
+    };
+    let mut output = FunctionToolOutput {
+        body: vec![
+            codex_protocol::models::FunctionCallOutputContentItem::InputText { text: content },
+        ],
+        success: Some(true),
+        outcome: Some(if completed_validation_skip_disposition.is_some() {
+            codex_tools::ToolOutputOutcome::Skipped
+        } else {
+            match exit_code {
                 Some(0) => codex_tools::ToolOutputOutcome::Success,
                 Some(_) => codex_tools::ToolOutputOutcome::Failure,
                 None => codex_tools::ToolOutputOutcome::TimedOut,
-            }),
-            post_tool_use_response,
-            sampling_request_signal: shell_sampling_signal(
-                attempt_key.as_ref(),
-                req.hook_command.as_str(),
-                exit_code,
-                canonical_output.as_deref(),
-            ),
-            deterministic_continuation_receipts: Vec::new(),
-            deterministic_continuation_owner_key: None,
-            skip_disposition: None,
-        },
+            }
+        }),
+        post_tool_use_response,
+        sampling_request_signal: (completed_validation_skip_disposition.is_none())
+            .then(|| {
+                shell_sampling_signal(
+                    attempt_key.as_ref(),
+                    req.hook_command.as_str(),
+                    exit_code,
+                    canonical_output.as_deref(),
+                )
+            })
+            .flatten(),
+        deterministic_continuation_receipts: Vec::new(),
+        deterministic_continuation_owner_key: None,
+        skip_disposition: None,
+    };
+    if let Some(skip_disposition) = completed_validation_skip_disposition {
+        output = output.with_skip_disposition(skip_disposition);
+    }
+    Ok(RunExecLikeResult {
+        output,
         exit_code,
-        validation_execution_outcome: match exit_code {
-            Some(0) => ValidationExecutionOutcome::ExecutedSuccess,
-            Some(_) => ValidationExecutionOutcome::ExecutedFailure,
-            None => ValidationExecutionOutcome::ExecutedFailure,
-        },
+        validation_execution_outcome,
         canonical_output,
     })
 }

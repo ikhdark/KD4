@@ -14,7 +14,7 @@ pub fn create_list_mcp_resources_tool() -> ToolSpec {
         (
             "cursor".to_string(),
             JsonSchema::string(Some(
-                "Opaque cursor from a previous list_mcp_resources call; omit for the first page. Aggregate responses expose per-server values in `nextCursors`; pass one back with its matching `server`."
+                "Opaque cursor for an explicit single-server page. Omit to collect all bounded pages from the selected server or servers. A cursor requires `server`."
                     .to_string(),
             )),
         ),
@@ -42,7 +42,7 @@ pub fn create_list_mcp_resource_templates_tool() -> ToolSpec {
         (
             "cursor".to_string(),
             JsonSchema::string(Some(
-                "Opaque cursor from a previous list_mcp_resource_templates call; omit for the first page. Aggregate responses expose per-server values in `nextCursors`; pass one back with its matching `server`."
+                "Opaque cursor for an explicit single-server page. Omit to collect all bounded pages from the selected server or servers. A cursor requires `server`."
                     .to_string(),
             )),
         ),

@@ -1,0 +1,1824 @@
+KD4 CODEX-RS FULL STATIC BUG / REGRESSION / WORKFLOW AUDIT
+================================================================
+
+Repository: ikhdark/KD4
+Branch: main
+Audited commit: 63dde623c690207e5eef5dd7d9b6b36f47e32152
+Audit date: 2026-08-12 (America/Chicago)
+Scope: Every Git-tracked file and folder under codex-rs, including generated-source ownership/provenance and all post-baseline changes.
+
+RESULT
+------
+
+Current findings retained after a current-HEAD proof pass: 58
+  Critical: 1
+  High:     30
+  Medium:   24
+  Low:      3
+
+Confidence:
+  High:     52
+  Medium:   6
+
+No low-confidence hypotheses are included. “High confidence” means the current source contains a concrete control-flow, persistence, filesystem, or lifecycle failure path. It does not mean the failure was dynamically reproduced on this machine.
+
+AUDIT COMPLETION AND NO-SKIP LEDGER
+-----------------------------------
+
+1. Full baseline closure
+   The prior exhaustive codex-rs audit was pinned to KD4 commit
+   f84519c4d79be55b34eac3a32b90cd787ff5a8d0. It inventoried every non-target
+   path by relative path, size, and SHA-256 and assigned every path a semantic
+   disposition. For KD4 that baseline contained 5,012 files and 668 directories.
+   Across its complete comparison ledger it reconciled 5,765 file rows with:
+     - 0 duplicate paths
+     - 0 missing paths
+     - 0 extra paths
+     - 0 SHA-256 mismatches
+
+2. Current-revision delta closure
+   The recursive Git tree was pinned to the current commit above. Every file
+   changed after the full baseline was re-reviewed at current HEAD. The delta
+   contains 216 changed codex-rs files across the intervening 57 commits.
+   New, modified, deleted, generated, snapshot, schema, migration, fixture,
+   lockfile, and ownership relationships were reconciled rather than silently
+   omitted.
+
+3. Pre-repair and repair reconciliation
+   The repository’s exhaustive WORKTREE_REVIEW ledger was used only as a
+   provenance map for the pre-repair state; every surviving/deferred candidate
+   was checked against current HEAD. The final repair commit was independently
+   reviewed so already-fixed defects were removed from this report.
+
+4. Generated/binary policy
+   Generated schemas, snapshots, fixtures, and lockfiles were not treated as
+   independent handwritten implementations. They were reviewed through their
+   source owner, generation contract, checked-in provenance, hash/delta, and
+   consumer compatibility. This accounts for them without inventing defects in
+   generated output that must be fixed at the owner.
+
+5. Dynamic validation limitation
+   GitHub archive transport was unavailable to the execution container, so this
+   pass could not compile or run the repository. The findings below are static
+   source/control-flow findings at the pinned commit. Race- or OS-dependent
+   findings are marked Medium confidence where appropriate. No test result is
+   claimed.
+
+HIGHEST-IMPACT ORDER
+--------------------
+
+The first fixes should be:
+  1. MCP-07 arbitrary out-of-root file upload.
+  2. VAL-02 explicit “do not run tests” wrapper bypass.
+  3. EXEC-02/05/06/07/08 cancellation and process-finalization correctness.
+  4. TASK-05/06 agent capacity and orphan cleanup.
+  5. EXEC-09/10 artifact identity and evidence protection.
+  6. TUI-01/02/03 unbounded diff and filesystem race.
+  7. MCP-01/02/03/05 shutdown, pagination, and cancellation truthfulness.
+  8. TIME-03 partial multi-client request delivery.
+
+DETAILED FINDINGS
+-----------------
+
+[01] VAL-01 — Exact focused-validation reuse searches only the 64 most recent successful calls for the workspace. A matching, still-fresh proof older than that window is treated as absent.
+--------------------------------------------------------------------------------------------------------------
+Severity:   Medium
+Confidence: High
+Class:      Workflow / redundant validation
+File(s):
+  - codex-rs/agent-task-store/src/local.rs
+Owner/path: LocalAgentTaskStore::record_validation_call
+
+Issue
+~~~~~
+Exact focused-validation reuse searches only the 64 most recent successful calls for the workspace. A matching, still-fresh proof older than that window is treated as absent.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+The reuse identity is already computed, but the SQL query applies ORDER BY recorded_at DESC LIMIT 64 before matching the evidence key in Rust. Correctness of reuse therefore depends on unrelated validation volume rather than evidence freshness.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+A long-running KD4 workspace executes 80 different focused checks after `cargo test -p codex-core target_test`. The source and manifest for `target_test` are unchanged. Repeating the same requested proof scans the newest 64 records, misses the older exact match, and runs the test again.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Persist the exact reusable evidence key in indexed columns and query it directly. The query should filter by workspace, successful status, non-stale evidence, start epoch/manifest identity, command/provenance identity, and then select the newest exact match. If schema work is deferred, paginate until a match or an explicit age/row budget is reached; do not impose a correctness-affecting fixed 64-row prefix.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Insert more than 64 newer nonmatching successful calls, retain one older exact match, and assert that a new call shares from the older proof without executing.
+
+[02] VAL-02 — An explicit user prohibition such as “do not run tests” fails open for common wrappers. `make`, `just`, and `task` are classified as Opaque; Node script forms such as `npm run test` are not recognized as tests. Opaque/nonvalidation commands bypass the prohibition gate and execute.
+--------------------------------------------------------------------------------------------------------------
+Severity:   High
+Confidence: High
+Class:      User-instruction safety defect
+File(s):
+  - codex-rs/core/src/validation_admission.rs
+Owner/path: classify_argv_at_depth / prohibited_skip_for
+
+Issue
+~~~~~
+An explicit user prohibition such as “do not run tests” fails open for common wrappers. `make`, `just`, and `task` are classified as Opaque; Node script forms such as `npm run test` are not recognized as tests. Opaque/nonvalidation commands bypass the prohibition gate and execute.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+The code uses the same narrow classifier for cost prediction and hard user-denial enforcement. Uncertainty is acceptable for prediction, but it is not safe for a direct prohibition. The current `prohibited_skip_for` returns a skip only when classification is already `Validation`.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+The user says “Do not run tests while editing.” The model calls `just test` or `npm run test`. The validation classifier does not identify the wrapped test, so the shell handler proceeds despite the explicit instruction.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Separate hard-deny detection from the cost classifier. Under an active test/check/lint prohibition, recursively expand known wrappers using repository recipe metadata where possible; recognize `npm|pnpm|yarn run <script>` and common test script names; and fail closed with a model-visible “wrapped command may run prohibited validation” response when a wrapper is opaque. An explicit later user grant can override it through the existing authorization rules.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Add deny-contract tests for `just test`, `make test`, `task test`, `npm run test`, `pnpm run test`, nested shell wrappers, and an opaque wrapper whose body cannot be resolved.
+
+[03] VAL-03 — The in-flight validation key is constructed from the turn-local mutation revision before that revision is merged into the shared repository epoch. Two turns can therefore join the same validation flight even when one turn has already observed mutations that the other has not.
+--------------------------------------------------------------------------------------------------------------
+Severity:   High
+Confidence: High
+Class:      Concurrency / stale-proof regression
+File(s):
+  - codex-rs/core/src/tools/handlers/shell/shell_command.rs
+  - codex-rs/core/src/validation_admission.rs
+  - codex-rs/core/src/tools/command_execution.rs
+Owner/path: ShellCommandHandler validation registration
+
+Issue
+~~~~~
+The in-flight validation key is constructed from the turn-local mutation revision before that revision is merged into the shared repository epoch. Two turns can therefore join the same validation flight even when one turn has already observed mutations that the other has not.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+`validation_identity(... observed_mutation_revision)` is registered first; `observe_repository_revision(turn_id, observed_mutation_revision)` runs afterward. The deduplication boundary is consequently weaker than the repository-wide freshness boundary used for normal command attempts.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+Turn A starts `cargo test -p core foo` at local revision 0. Turn B edits a source file, advances its tracker to revision 1, and nearly simultaneously requests the same test. Depending on turn-local counters, B can attach to A’s pre-edit validation instead of executing against the changed repository.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Observe and obtain the globally monotonic repository epoch before registering validation singleflight, then include that epoch—or a frozen changed-input manifest hash—in `InFlightValidationKey`. The registration and epoch observation should be ordered under one repository coordination primitive so a mutation cannot slip between identity capture and admission.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Race two turn IDs around a mutation and assert that post-mutation validation never joins a pre-mutation flight, while identical requests at the same global epoch still coalesce.
+
+[04] VAL-04 — Completion removes the flight from the registry before storing the result and notifying waiters. A third caller entering in that gap sees no flight and starts a duplicate validation.
+--------------------------------------------------------------------------------------------------------------
+Severity:   Medium
+Confidence: High
+Class:      Singleflight race
+File(s):
+  - codex-rs/core/src/validation_admission.rs
+Owner/path: ValidationLeaderOwnership::complete
+
+Issue
+~~~~~
+Completion removes the flight from the registry before storing the result and notifying waiters. A third caller entering in that gap sees no flight and starts a duplicate validation.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+The registry removal, result publication, and notification are three separately awaited operations. Singleflight guarantees require the completed value to remain joinable until publication is visible.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+A 25-second package check completes. Existing followers are waiting. Immediately after the leader removes the map entry but before it stores the result, another model call requests the same check and becomes a new leader, launching a second process.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Publish the result first, mark the flight terminal, notify waiters, and only then remove it conditionally from the registry. Better, keep a short-lived terminal entry or perform state transition and registry removal under one lock so a new registration can reuse the completed value.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Pause completion between each boundary with barriers and assert that every concurrent registration either joins the original flight or reuses its terminal result; none becomes a second leader.
+
+[05] VAL-05 — One validation observation is written independently for repository-exact, repository-family, and global-family scopes. Each call performs its own UPSERT, cache invalidation, and pruning query.
+--------------------------------------------------------------------------------------------------------------
+Severity:   Medium
+Confidence: High
+Class:      Persistence integrity / SQLite overhead
+File(s):
+  - codex-rs/core/src/validation_admission.rs
+  - codex-rs/state/src/validation_history.rs
+Owner/path: ValidationObservationRecorder::record / ValidationHistoryStore::record
+
+Issue
+~~~~~
+One validation observation is written independently for repository-exact, repository-family, and global-family scopes. Each call performs its own UPSERT, cache invalidation, and pruning query.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+The three observations describe one event but are not atomic. A crash or timeout after one or two writes leaves internally inconsistent prediction tiers. The repeated prune also adds avoidable SQLite contention to every completed validation.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+A test finishes in 42 seconds. The exact and repository-family UPSERTs commit, but the global-family write times out. Future prediction behavior changes depending on which tier is queried, even though all three should represent the same run.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Add a batch-record API that derives all scope keys, executes the UPSERTs in one explicit SQLite transaction, invalidates the affected cache keys after commit, and runs pruning once. Preserve fail-open behavior if the whole batch cannot be stored.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Inject a failure between UPSERTs and assert all-or-none persistence; assert one prune per observation and equivalent aggregates to three successful scalar calls.
+
+[06] VAL-06 — Concurrent first-time key creation can make the losing process read the key immediately after `create_new` reports AlreadyExists, while the winner is still writing the 32 bytes. The loser then treats a short read as an invalid key and disables validation history for that runtime.
+--------------------------------------------------------------------------------------------------------------
+Severity:   Medium
+Confidence: High
+Class:      Startup race
+File(s):
+  - codex-rs/state/src/validation_history.rs
+Owner/path: load_or_create_key
+
+Issue
+~~~~~
+Concurrent first-time key creation can make the losing process read the key immediately after `create_new` reports AlreadyExists, while the winner is still writing the 32 bytes. The loser then treats a short read as an invalid key and disables validation history for that runtime.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+File creation publishes the directory entry before `write_all` and `sync_all` complete. `AlreadyExists` is not proof that the contents are complete.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+Desktop and VS Code start the same fork at once with a fresh CODEX_HOME. One creates `validation-history.key`; the other observes the file between open and write, reads zero or partial bytes, logs that history is unavailable, and loses prediction/reuse for the session.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Create a fully written, synced temporary key and atomically install it with a no-clobber operation. If another writer wins, retry reading the installed file until it has exactly 32 bytes or a bounded deadline expires. Sync the parent directory after installation.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Use barriers to hold the winning writer before `write_all`; start a second initializer and assert both return the same valid key rather than one failing with invalid length.
+
+[07] VAL-07 — `WRITE_WARNING_EMITTED` suppresses every validation-history write error after the first error anywhere in the process.
+--------------------------------------------------------------------------------------------------------------
+Severity:   Low
+Confidence: High
+Class:      Observability defect
+File(s):
+  - codex-rs/state/src/validation_history.rs
+Owner/path: ValidationHistoryStore::record
+
+Issue
+~~~~~
+`WRITE_WARNING_EMITTED` suppresses every validation-history write error after the first error anywhere in the process.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+A transient early timeout can consume the one warning; a later permanent database failure then remains silent indefinitely. This makes a disabled optimization look healthy and prevents diagnosis of repeated contention or corruption.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+Startup produces one harmless 100 ms timeout. Hours later the SQLite file becomes read-only. Every history write fails, but no further warning or counter identifies the permanent failure.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Replace the process-global one-shot flag with rate-limited structured telemetry keyed by failure class, plus success-after-failure recovery logging. Keep logs bounded, for example one warning per class per minute with a suppressed-count field.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Generate repeated errors, advance a test clock, and verify bounded recurring warnings and a recovery event after a successful write.
+
+[08] VAL-08 — The code reports 0.95 confidence while using a fixed normal critical value (1.645) with estimated variance and as few as eight completed samples. That lower predictive bound is too optimistic at small sample sizes and can skip a borderline validation prematurely.
+--------------------------------------------------------------------------------------------------------------
+Severity:   Medium
+Confidence: Medium
+Class:      Statistical gating defect
+File(s):
+  - codex-rs/core/src/validation_admission.rs
+Owner/path: prediction_from_aggregate
+
+Issue
+~~~~~
+The code reports 0.95 confidence while using a fixed normal critical value (1.645) with estimated variance and as few as eight completed samples. That lower predictive bound is too optimistic at small sample sizes and can skip a borderline validation prematurely.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+With unknown variance, the one-sided predictive bound requires a Student-t critical value or another calibrated method. At n=8, 1.645 materially understates uncertainty. Censored-above samples also count toward `effective` without contributing duration variance.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+Eight package checks cluster near 31–34 seconds with one variable run. The z-based lower bound can remain over the 30-second threshold and automatically skip the ninth check even though a correctly calibrated small-sample bound would not.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Use a one-sided Student-t predictive interval based on completed samples, conservatively incorporate censoring, and calibrate the minimum sample count with replay/backtesting. Do not label the output 0.95 unless empirical coverage meets that level.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Add deterministic datasets where z and t decisions differ, and a simulation/backtest asserting the configured false-skip rate.
+
+[09] TASK-01 — Restart recovery loads at most 256 persisted task bindings and has no pagination or completeness signal.
+--------------------------------------------------------------------------------------------------------------
+Severity:   High
+Confidence: High
+Class:      Restart recovery defect
+File(s):
+  - codex-rs/core/src/agent/task_coordinator.rs
+Owner/path: AgentTaskCoordinator::initialize
+
+Issue
+~~~~~
+Restart recovery loads at most 256 persisted task bindings and has no pagination or completeness signal.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+Bindings outside the first page remain durable in SQLite but absent from the in-memory `by_agent_path` and `by_assignment` indexes. Source-based lookups do not fall back to the store, so behavior depends on row ordering and workload size.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+A large CSV agent job or long session creates 300 active typed assignments. After Desktop restarts, 44 bindings are not loaded. Those resumed agents cannot resolve their assignment from `SessionSource`, so heartbeats, focused validation, metrics, or task completion silently bypass the typed-task layer.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Page through all active bindings during initialization, or load a bounded hot set and make every miss perform an indexed store lookup followed by cache insertion. Persist and expose a recovery-complete flag; never silently truncate.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Persist 300 active bindings, restart the coordinator, and verify source and assignment lookup succeeds for every one.
+
+[10] TASK-02 — Finishing focused validation discards the token’s immutable evidence and constructs a fresh `ValidationEvidence::default()` containing only output fields.
+--------------------------------------------------------------------------------------------------------------
+Severity:   High
+Confidence: Medium
+Class:      Validation persistence regression
+File(s):
+  - codex-rs/core/src/agent/task_coordinator.rs
+  - codex-rs/agent-task-store/src/local.rs
+Owner/path: AgentTaskCoordinator::finish_focused_validation_with_output
+
+Issue
+~~~~~
+Finishing focused validation discards the token’s immutable evidence and constructs a fresh `ValidationEvidence::default()` containing only output fields.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+The store explicitly requires terminal updates to preserve start epoch, covered manifest, manifest hash, shared-call identity, and other immutable provenance from the Running record. Any nondefault evidence therefore fails the immutable transition and can leave the validation call Running.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+A focused test begins with `start_epoch=12` and a real manifest hash. The process succeeds and retains output. Finish sends epoch 0/empty manifest via the default struct; the store returns `ValidationCallImmutable`, so the task never records a successful proof.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Move or clone `token.evidence`, update only `retained_output_ref`, `output_summary`, and terminal-only fields, then persist. Do not reconstruct evidence from defaults.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Begin with nondefault epoch, manifest, shared-call, and lease fields; finish successfully; assert every immutable field is preserved and only terminal fields change.
+
+[11] TASK-03 — Task location is run in `spawn_blocking` without a cooperative cancellation token. Dropping or aborting the async join does not stop the blocking traversal/parser/cache work.
+--------------------------------------------------------------------------------------------------------------
+Severity:   Medium
+Confidence: High
+Class:      Cancellation / wasted I/O
+File(s):
+  - codex-rs/file-search/src/task_locator.rs
+  - codex-rs/core/src/tools/handlers/source.rs
+Owner/path: spawn_blocking task-location path
+
+Issue
+~~~~~
+Task location is run in `spawn_blocking` without a cooperative cancellation token. Dropping or aborting the async join does not stop the blocking traversal/parser/cache work.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+Tokio cannot forcibly cancel work already executing on the blocking pool. A user cancellation can return control while the expensive repository scan continues consuming disk and CPU and may still publish cache state.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+The model calls task location on a monorepo containing large generated trees, then the user cancels after one second. The turn ends, but the blocking scan continues for minutes and competes with the next task.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Pass a cancellation token into the locator and check it at directory, file-read, parse, render, and cache-publication boundaries. On cancellation, stop traversal and do not publish a partial cache entry. Await bounded worker quiescence before reporting cancellation.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Cancel during each phase of a deliberately slow scan and assert bounded exit time, no subsequent cache write, and no continuing filesystem reads.
+
+[12] TASK-04 — The process-global repository-path-to-mutex map never evicts entries.
+--------------------------------------------------------------------------------------
+Severity:   Low
+Confidence: High
+Class:      Long-lived memory leak
+File(s):
+  - codex-rs/file-search/src/task_locator.rs
+Owner/path: per-repository task-locator gate registry
+
+Issue
+~~~~~
+The process-global repository-path-to-mutex map never evicts entries.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+Every distinct repository path opened by the long-lived Desktop/app-server process permanently retains a PathBuf and Arc<Mutex>, even after all scans and sessions end.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+A developer opens hundreds of temporary benchmark worktrees over weeks. Each unique path leaves an entry in the static registry; deleting the worktree does not reclaim it.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Store Weak mutex references and remove dead entries, scope the registry to session/runtime lifetime, or use a bounded cache with eviction only when no strong guard exists. Normalize repository identity before indexing to avoid duplicate spellings.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Scan many temporary repositories, drop all users, trigger cleanup, and assert the registry returns to a small baseline.
+
+[13] TASK-05 — V2 capacity eviction awaits rollout materialization and agent shutdown without a deadline or caller cancellation while a new capacity reservation is blocked.
+--------------------------------------------------------------------------------------------------------------
+Severity:   High
+Confidence: High
+Class:      Agent-capacity deadlock
+File(s):
+  - codex-rs/core/src/agent/control/residency.rs
+Owner/path: v2 capacity eviction path
+
+Issue
+~~~~~
+V2 capacity eviction awaits rollout materialization and agent shutdown without a deadline or caller cancellation while a new capacity reservation is blocked.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+A child with a stuck writer, subscription, or shutdown path can prevent the reservation from completing indefinitely. Since the eviction is on the capacity path, one bad resident can block all future agent spawns.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+A completed child has a rollout writer that never closes. A new `spawn_agent` tries to evict it, waits forever in materialization/shutdown, and every later agent request queues behind the same capacity operation.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Give materialization and graceful shutdown separate deadlines, then force-close subscriptions/processes and remove the registry entry under a reconciliation state. Propagate caller cancellation without leaving capacity reserved. Record forced-eviction evidence.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Inject a child whose materialization and shutdown futures never resolve; assert a new spawn either succeeds after forced cleanup or returns a bounded explicit error with capacity restored.
+
+[14] TASK-06 — Rollback of a partially committed agent spawn is delegated to a detached `tokio::spawn` from Drop. If no runtime is available, or the runtime is shutting down/aborts the task, the child and its typed-task binding can survive without being committed to the parent registry.
+--------------------------------------------------------------------------------------------------------------
+Severity:   High
+Confidence: High
+Class:      Orphaned-agent lifecycle defect
+File(s):
+  - codex-rs/core/src/agent/control/spawn.rs
+Owner/path: PendingSpawnCleanup::drop
+
+Issue
+~~~~~
+Rollback of a partially committed agent spawn is delegated to a detached `tokio::spawn` from Drop. If no runtime is available, or the runtime is shutting down/aborts the task, the child and its typed-task binding can survive without being committed to the parent registry.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+Drop-based cleanup is the last correctness boundary after the child exists. Best-effort detached work is not a durable ownership transfer and gives the caller no proof that cleanup completed.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+The spawn future creates a child thread, then is cancelled before registry commit while Desktop is closing. The cleanup task never runs, leaving a live or persisted child that the parent does not know how to manage.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Use an explicit awaited rollback on every error/cancellation branch. Back it with a runtime-owned cleanup supervisor or durable pending-spawn journal that survives task drop and startup-reconciles orphans. Drop should only enqueue into an always-owned supervisor and synchronously mark a tombstone if enqueueing fails.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Cancel at every post-child/pre-commit boundary, including runtime shutdown, and assert no live child, binding, subscription, or capacity slot remains.
+
+[15] TASK-07 — The documented no-op case with no user/instruction turns calls `replace` with the unchanged history instead of returning. `replace` increments `history_version`, invalidates prepared-history reuse, and clears the world-state baseline.
+--------------------------------------------------------------------------------------------------------------
+Severity:   Medium
+Confidence: High
+Class:      Context-cache regression
+File(s):
+  - codex-rs/core/src/context_manager/history.rs
+Owner/path: ContextManager::drop_last_n_user_turns
+
+Issue
+~~~~~
+The documented no-op case with no user/instruction turns calls `replace` with the unchanged history instead of returning. `replace` increments `history_version`, invalidates prepared-history reuse, and clears the world-state baseline.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+Observable state changes occur even though no history item is removed. The next turn can recompute/rehash history and reinject full world state unnecessarily.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+A newly created agent has only startup developer context. A rollback request arrives before any user turn. Nothing is removed, but the prepared prompt cache is invalidated and the next model call receives a larger full context reinjection.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+In the `user_positions.first()` None branch, return immediately without `replace`. Add an invariant that no-op history operations preserve version, prepared cache, reference context, and world-state baseline.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Populate startup-only history and prepared/world-state caches, call rollback, and assert byte-for-byte history plus every revision/baseline identity remains unchanged.
+
+[16] TASK-08 — The cancellation token is honored while asking permission, but after the user accepts it is not propagated through OAuth discovery/login, config persistence, or MCP runtime refresh.
+--------------------------------------------------------------------------------------------------------------
+Severity:   Medium
+Confidence: High
+Class:      Cancellation / unintended side effect
+File(s):
+  - codex-rs/core/src/mcp_skill_dependencies.rs
+Owner/path: apply_mcp_dependency_effect / install_planned_mcp_dependencies
+
+Issue
+~~~~~
+The cancellation token is honored while asking permission, but after the user accepts it is not propagated through OAuth discovery/login, config persistence, or MCP runtime refresh.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+Cancelling the turn no longer cancels the effect. Interactive browser work and global configuration mutation can continue after the UI reports the task stopped.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+A skill requests two MCP dependencies. The user accepts, then cancels the turn when OAuth opens. Login and `config.toml` modification continue, and servers may be enabled despite cancellation.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Thread the token through discovery, OAuth, serialized config merge, and runtime refresh. Check cancellation before every irreversible step; after a committed config write, finish reconciliation or roll back through a journal rather than simply dropping the future.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Cancel before OAuth, during OAuth, before config commit, and during refresh; assert each state has explicit, deterministic cleanup and no unreported config mutation.
+
+[17] TASK-09 — OAuth credentials are acquired for dependencies before the merged MCP configuration is persisted. Failure on a later dependency or config write can leave earlier credentials installed with no corresponding configured server.
+--------------------------------------------------------------------------------------------------------------
+Severity:   Medium
+Confidence: Medium
+Class:      Nontransactional external side effects
+File(s):
+  - codex-rs/core/src/mcp_skill_dependencies.rs
+Owner/path: install_planned_mcp_dependencies
+
+Issue
+~~~~~
+OAuth credentials are acquired for dependencies before the merged MCP configuration is persisted. Failure on a later dependency or config write can leave earlier credentials installed with no corresponding configured server.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+The operation spans credential storage, a config file, and runtime inventory but has no journal or rollback contract. Its all-or-nothing user meaning is not matched by its side effects.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+Dependency A completes OAuth; dependency B fails discovery. The function returns an error before merging either server, but A’s stored token remains in the credential store and the user has no cleanup path.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Stage a transaction journal listing intended servers and acquired credentials. Prefer persisting disabled/staged server entries first, complete OAuth, then atomically enable and refresh. On failure, remove newly acquired credentials/config entries or surface a resumable partial state with explicit cleanup.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Fail each dependency and each persistence step in turn; assert no invisible credential-only or config-only residue remains.
+
+[18] EXEC-01 — The per-repository mutation-gate map never evicts path keys or mutexes.
+----------------------------------------------------------------------------------------
+Severity:   Low
+Confidence: High
+Class:      Long-lived memory leak
+File(s):
+  - codex-rs/core/src/tools/command_execution.rs
+Owner/path: CommandExecutionLedger::workspace_mutation_gate
+
+Issue
+~~~~~
+The per-repository mutation-gate map never evicts path keys or mutexes.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+The app-server is long-lived and repository paths are unbounded. Completed worktrees remain retained forever even when no reservation references their mutex.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+Automation creates a new temporary worktree for each benchmark run. Months of runs leave thousands of dead PathBuf keys in every Desktop process.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Use Weak gate entries with removal after the final strong user drops, or a bounded cleanup pass that removes unlocked, unreferenced gates. Canonicalize repository identity before insertion.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Reserve/release gates for many temporary paths, delete them, run cleanup, and assert bounded registry size.
+
+[19] EXEC-02 — Turn cancellation waits indefinitely for every mutation’s `finalization_complete` token. That token is set only after durable lease finalization succeeds; there is no timeout or independent recovery completion.
+--------------------------------------------------------------------------------------------------------------
+Severity:   High
+Confidence: High
+Class:      Cancellation hang
+File(s):
+  - codex-rs/core/src/tools/command_execution.rs
+Owner/path: CommandExecutionLedger::cancel_mutations_for_turn
+
+Issue
+~~~~~
+Turn cancellation waits indefinitely for every mutation’s `finalization_complete` token. That token is set only after durable lease finalization succeeds; there is no timeout or independent recovery completion.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+A failed process teardown, stalled SQLite operation, or lost finalizer can make cancellation itself never return.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+A mutating Cargo process is cancelled while SQLite is locked and its finalization retry never succeeds. The user presses Stop, but the turn remains stuck because cancellation waits forever.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Use a bounded cancellation deadline. On expiry, force process-tree teardown, persist a durable “finalization pending/lease lost” reconciliation record, release UI cancellation, and let a supervised retry worker finish cleanup. Never silently declare the workspace clean.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Make finalization hang and fail repeatedly; assert Stop returns within the deadline, the mutation is fenced from new writers until reconciled, and cleanup later completes.
+
+[20] EXEC-03 — Dropping an unfinalized mutation guard outside a Tokio runtime only logs an error and returns, leaving the durable workspace mutation lease unfinished.
+--------------------------------------------------------------------------------------------------------------
+Severity:   High
+Confidence: High
+Class:      Lease-stranding lifecycle defect
+File(s):
+  - codex-rs/core/src/tools/command_execution.rs
+Owner/path: WorkspaceMutationGuard::drop
+
+Issue
+~~~~~
+Dropping an unfinalized mutation guard outside a Tokio runtime only logs an error and returns, leaving the durable workspace mutation lease unfinished.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+The guard is the ownership object for repository authority. A missing runtime should not convert mandatory release into a permanent leak.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+A synchronous shutdown/error path drops the guard after the runtime has torn down. The lease remains active in SQLite and the next KD4 session receives workspace-claim conflicts until expiry or manual cleanup.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Make ownership release independent of ambient runtime: enqueue to a process-lifetime cleanup supervisor before runtime teardown, write a synchronous durable tombstone/recovery record as a fallback, and startup-reconcile every unfinished lease. Prefer explicit awaited finish over relying on Drop.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Drop the guard with no current runtime and verify the lease is either finished immediately or deterministically reconciled on restart.
+
+[21] EXEC-04 — Only 128 turn baselines are retained. If a still-active old turn is evicted, its next cumulative mutation revision is subtracted from zero and previously counted mutations are added to the repository epoch again.
+--------------------------------------------------------------------------------------------------------------
+Severity:   Medium
+Confidence: High
+Class:      Freshness-accounting race
+File(s):
+  - codex-rs/core/src/tools/command_execution.rs
+Owner/path: CommandExecutionLedger::observe_repository_revision
+
+Issue
+~~~~~
+Only 128 turn baselines are retained. If a still-active old turn is evicted, its next cumulative mutation revision is subtracted from zero and previously counted mutations are added to the repository epoch again.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+The local tracker reports a cumulative turn revision, while the ledger assumes the prior baseline remains available. Eviction breaks that assumption and makes epoch values dependent on unrelated turn count.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+A long validation turn stays active while more than 128 short turns are created. Its baseline is evicted. When it later reports revision 4, the ledger adds all four again even though they were already observed, invalidating command/reuse identities unnecessarily.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Use globally assigned mutation event IDs, or retain baselines until the owning turn is terminal and then explicitly remove them. Do not share the command-attempt capacity constant with active-turn freshness state.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Keep one turn active, create enough other turns to force current eviction, report the old cumulative revision again, and assert the repository epoch advances only for genuinely new mutations.
+
+[22] EXEC-05 — The async watcher waits on `output_drained.notified()` without a deadline or an RAII guarantee that every streamer exit path notifies it.
+--------------------------------------------------------------------------------------------------------------
+Severity:   High
+Confidence: High
+Class:      Process finalization hang
+File(s):
+  - codex-rs/core/src/unified_exec/async_watcher.rs
+Owner/path: terminal output-drain wait
+
+Issue
+~~~~~
+The async watcher waits on `output_drained.notified()` without a deadline or an RAII guarantee that every streamer exit path notifies it.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+A panic, blocked output consumer, or missed notification prevents the terminal event and mutation-lease finalization forever even after the child has exited.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+A command emits large output; the streaming task panics while formatting a chunk. The process exits, but the watcher waits forever for output drain, so the UI never receives completion and cancellation cleanup also blocks.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Use an output-pump guard whose Drop always marks drain completion, await the pump JoinHandle directly, and add a bounded fallback that closes pipes, records truncated/incomplete output, and proceeds to durable process finalization.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Panic, abort, and backpressure the output pump; assert terminal completion and lease cleanup occur within a bound with an explicit incomplete-output flag.
+
+[23] EXEC-06 — Cleanup uses early-return error propagation inside a loop. Failure terminating or finalizing one process can skip all later processes and their mutation leases.
+--------------------------------------------------------------------------------------------------------------
+Severity:   High
+Confidence: High
+Class:      Incomplete process cleanup
+File(s):
+  - codex-rs/core/src/unified_exec/process_manager.rs
+Owner/path: multi-process termination/finalization loop
+
+Issue
+~~~~~
+Cleanup uses early-return error propagation inside a loop. Failure terminating or finalizing one process can skip all later processes and their mutation leases.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+Cleanup must be best-effort across the entire owned set; one bad child must not prevent attempts on independent children.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+Three long-running commands are active. Killing the first returns an OS error. The function returns immediately, leaving the second and third processes alive and their repository leases held.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Attempt termination, wait, artifact finalization, and lease release for every process. Collect errors with process IDs and return an aggregate only after all cleanup attempts. Put mandatory per-process finalization in scope guards/finally-style code.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Force the first child’s kill to fail and assert later children are still terminated and finalized; verify the aggregate contains every failure.
+
+[24] EXEC-07 — If a pending process registration is dropped without a current Tokio runtime, cleanup logs and returns instead of reliably terminating/reaping the already-created process tree.
+--------------------------------------------------------------------------------------------------------------
+Severity:   High
+Confidence: High
+Class:      Orphaned-process lifecycle defect
+File(s):
+  - codex-rs/core/src/unified_exec/process_manager.rs
+Owner/path: PendingProcessRegistration::drop
+
+Issue
+~~~~~
+If a pending process registration is dropped without a current Tokio runtime, cleanup logs and returns instead of reliably terminating/reaping the already-created process tree.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+The child exists before registration commit. Ambient runtime loss is exactly when cleanup must be strongest, not optional.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+Desktop shutdown races a command spawn after the OS process starts but before it is inserted in the manager. Drop runs after runtime teardown and leaves the compiler/server process alive in Windows Task Manager.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Place every spawned process in an OS job object/process group immediately, synchronously issue group termination in Drop, and hand reaping/finalization to a process-lifetime supervisor. Persist enough identity for startup reconciliation.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Drop at every spawn/registration boundary with and without a Tokio runtime; assert the entire descendant tree exits and no handle/lease remains.
+
+[25] EXEC-08 — Workspace-mutation finalization errors are converted into warnings and a truthy “finished” result, allowing callers to emit a normal terminal success even though durable repository authority was not released.
+--------------------------------------------------------------------------------------------------------------
+Severity:   High
+Confidence: High
+Class:      False-success / durability defect
+File(s):
+  - codex-rs/core/src/tools/command_execution.rs
+  - codex-rs/core/src/unified_exec/async_watcher.rs
+  - codex-rs/core/src/unified_exec/process_manager.rs
+Owner/path: finish_running_process and terminal event path
+
+Issue
+~~~~~
+Workspace-mutation finalization errors are converted into warnings and a truthy “finished” result, allowing callers to emit a normal terminal success even though durable repository authority was not released.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+Process exit and mutation finalization are separate claims. Treating failure of the second as success misleads the UI/model and can cause later claim conflicts.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+`cargo fmt` exits 0, but SQLite finalization fails. KD4 reports the command completed successfully; the next mutating command is blocked by the still-active lease with no visible connection to the prior “success.”
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Return a typed terminal outcome containing process result and cleanup result. Do not emit ordinary success until durable finalization succeeds; otherwise emit `completed_cleanup_pending`/degraded status, fence new mutations, and retry through the supervisor.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Force lease-finalization failure after exit 0 and assert the user/model sees an explicit cleanup failure and the command is not reusable as a clean success.
+
+[26] EXEC-09 — The writer retains an open handle to the original artifact, but later reads reopen the artifact by pathname. If the pathname is replaced, the same artifact ID can return bytes different from those written by the command.
+--------------------------------------------------------------------------------------------------------------
+Severity:   High
+Confidence: High
+Class:      Artifact integrity defect
+File(s):
+  - codex-rs/core/src/tools/command_output_artifact.rs
+Owner/path: retained raw-output writer / read_tool_output_artifact
+
+Issue
+~~~~~
+The writer retains an open handle to the original artifact, but later reads reopen the artifact by pathname. If the pathname is replaced, the same artifact ID can return bytes different from those written by the command.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+Open-handle identity and path identity are not revalidated. On filesystems that allow rename/replace while open, the original handle continues writing the old inode while readers open the attacker/replacement inode.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+A tool output is retained as artifact A. Another local process replaces A’s path with a different file before `read_tool_output` is called. The model receives replacement content under the trusted artifact ID.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Bind artifact IDs to immutable file identity and a content hash. Read through a retained read handle or reopen with no-follow and verify device/inode or Windows file ID plus expected size/hash. Expire the artifact on mismatch. Keep the directory private.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Replace/rename the artifact during and after writing on Unix and Windows and assert reads either return original bytes or reject identity mismatch.
+
+[27] EXEC-10 — Evidence deletion removes the protection marker before proving the retained log was deleted. If log deletion fails or the artifact is still active, the evidence loses protection and later retention can evict it.
+--------------------------------------------------------------------------------------------------------------
+Severity:   High
+Confidence: High
+Class:      Evidence-retention race
+File(s):
+  - codex-rs/core/src/tools/command_output_artifact.rs
+Owner/path: delete_evidence_artifact
+
+Issue
+~~~~~
+Evidence deletion removes the protection marker before proving the retained log was deleted. If log deletion fails or the artifact is still active, the evidence loses protection and later retention can evict it.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+The marker is the retention invariant. Removing it first creates a state that falsely says the evidence is disposable while the deletion operation has not committed.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+A validation receipt references a protected output log. Deletion removes the marker, but Windows denies deleting the open log. A subsequent retention sweep sees an unprotected old file and removes evidence still referenced by the receipt.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Under the retention permit, mark deletion-in-progress, close/verify no active writer, delete the log, sync the directory, and only then delete the marker. On any failure, restore/retain protection. A small transactional metadata index is safer than marker ordering alone.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Fail log deletion after marker handling and assert the artifact remains protected and readable.
+
+[28] EXEC-11 — A new evidence artifact can be rejected for exceeding the byte budget before the code reclaims eligible old unprotected logs.
+--------------------------------------------------------------------------------------------------------------
+Severity:   Medium
+Confidence: High
+Class:      Retention workflow defect
+File(s):
+  - codex-rs/core/src/tools/command_output_artifact.rs
+Owner/path: evidence artifact creation budget check
+
+Issue
+~~~~~
+A new evidence artifact can be rejected for exceeding the byte budget before the code reclaims eligible old unprotected logs.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+The apparent capacity is stale even though retention has safe victims. This makes evidence creation fail based on cleanup timing rather than the configured protected-evidence budget.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+The directory is at 500 MB, including 200 MB of expired unprotected command logs. A 2 MB validation artifact is rejected instead of first sweeping the expired logs.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Acquire the retention permit, reconcile actual directory state, evict eligible unprotected victims, recount, and only then enforce the hard budget. Protected evidence must never be chosen as a victim.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Fill the budget with reclaimable logs and assert evidence creation succeeds after one bounded sweep; repeat with only protected files and assert a clear rejection.
+
+[29] EXEC-12 — Normal sweeps treat any regular non-reparse marker file as protection, while reconciliation validates marker magic/content. A zero-byte or corrupt marker can therefore protect a log indefinitely between reconciliations.
+--------------------------------------------------------------------------------------------------------------
+Severity:   Medium
+Confidence: High
+Class:      Retention integrity defect
+File(s):
+  - codex-rs/core/src/tools/command_output_artifact.rs
+Owner/path: retention protection check
+
+Issue
+~~~~~
+Normal sweeps treat any regular non-reparse marker file as protection, while reconciliation validates marker magic/content. A zero-byte or corrupt marker can therefore protect a log indefinitely between reconciliations.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+Two code paths implement different definitions of “protected.” Disk usage and eviction behavior depend on whether reconciliation happened recently.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+A crash leaves an empty `.protect` marker. Runtime sweeps skip the corresponding multi-gigabyte log forever even though startup reconciliation would reject the marker.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Centralize one exact marker validator and use it for creation, sweep, read, deletion, and reconciliation. Invalid markers should be quarantined/removed under the retention lock with structured diagnostics.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Create truncated, wrong-magic, symlink, and reparse markers and assert every path makes the same protection decision.
+
+[30] EXEC-13 — Files and markers are synced, but the parent directory is not fsynced after create/delete/rename operations.
+--------------------------------------------------------------------------------------------------------------
+Severity:   Medium
+Confidence: High
+Class:      Crash-durability gap
+File(s):
+  - codex-rs/core/src/tools/command_output_artifact.rs
+Owner/path: artifact/marker create and delete operations
+
+Issue
+~~~~~
+Files and markers are synced, but the parent directory is not fsynced after create/delete/rename operations.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+On crash-prone Unix filesystems, synced file contents do not guarantee the directory entry survives. The API can report durable evidence that disappears or reappears after power loss.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+KD4 finishes a validation, syncs its log and protection marker, returns success, then the machine loses power. After reboot the marker directory entry is missing, allowing retention to delete referenced evidence.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+After every atomic install, replacement, and deletion, fsync the containing directory (and both directories for cross-directory moves). On Windows, use the platform durability primitive available for the directory/rename contract.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Use a crash-consistency harness or mocked filesystem operation log to assert file sync precedes directory sync before success publication.
+
+[31] EXEC-14 — The fallback replacement path removes the destination before renaming the temporary file. That creates a visibility gap and lets concurrent writers/readers observe a missing store or overwrite each other.
+--------------------------------------------------------------------------------------------------------------
+Severity:   High
+Confidence: High
+Class:      Atomic-write regression
+File(s):
+  - codex-rs/core/src/tools/known_delta_store.rs
+Owner/path: atomic cache/index replacement
+
+Issue
+~~~~~
+The fallback replacement path removes the destination before renaming the temporary file. That creates a visibility gap and lets concurrent writers/readers observe a missing store or overwrite each other.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+Pre-unlink defeats the point of an atomic replacement. It is especially relevant on Windows, where rename-over-existing often fails and this fallback is exercised.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+Two Codex sessions update the same known-delta index. Writer A deletes the destination; a reader sees no index and rebuilds; writer B installs its older snapshot; A then installs another snapshot, losing updates and doing redundant work.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Use a platform atomic replace primitive (`ReplaceFileW`/`MoveFileEx` with replace semantics on Windows; rename on Unix), protected by a cross-process lock or compare-and-swap generation. Never delete the live destination before a committed replacement is ready.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Run concurrent readers/writers with forced rename-over-existing failure and assert the path always resolves to either the old or complete new file, never missing/partial, with monotonic generation.
+
+[32] EXEC-15 — After a snapshot command times out, failed group/direct kill paths can still be followed by an unbounded `child.wait().await`.
+--------------------------------------------------------------------------------------------------------------
+Severity:   High
+Confidence: High
+Class:      Shell-startup hang
+File(s):
+  - codex-rs/core/src/shell_snapshot.rs
+Owner/path: snapshot timeout cleanup
+
+Issue
+~~~~~
+After a snapshot command times out, failed group/direct kill paths can still be followed by an unbounded `child.wait().await`.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+The timeout no longer bounds the operation if the OS process cannot be killed or reaped. Session startup can remain stuck indefinitely.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+The user’s shell startup launches a child that ignores termination or enters an uninterruptible state. Snapshot collection times out, kill fails, and Codex waits forever before the first prompt is usable.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Apply a second hard teardown deadline. Place the snapshot process in a job object/process group at spawn, force-kill the tree on timeout, and hand any unreaped PID to a supervisor while returning a bounded “snapshot unavailable” result.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Use a test child that ignores soft termination and a mocked wait that never resolves; assert startup returns within the hard deadline and the supervisor receives the process identity.
+
+[33] EXEC-16 — Shell snapshots can contain exported environment variables and functions, including credentials, but are written with ordinary filesystem defaults and retained for days. Permissions depend on ambient umask/Windows ACL inheritance rather than an explicit private contract.
+--------------------------------------------------------------------------------------------------------------
+Severity:   High
+Confidence: High
+Class:      Sensitive-data persistence defect
+File(s):
+  - codex-rs/core/src/shell_snapshot.rs
+Owner/path: snapshot file creation/retention
+
+Issue
+~~~~~
+Shell snapshots can contain exported environment variables and functions, including credentials, but are written with ordinary filesystem defaults and retained for days. Permissions depend on ambient umask/Windows ACL inheritance rather than an explicit private contract.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+A local snapshot is not ordinary cache data; it can include API keys, tokens, proxy credentials, and shell function bodies. Ambient directory policy may make it readable to other local users or backup/indexing tools.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+`GITHUB_TOKEN` and an internal registry token are exported by the login shell. KD4 stores them in a snapshot file whose inherited ACL permits another local account to read it until cleanup runs.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Create the snapshot directory owner-only and files with 0600 on Unix / an explicit owner-only DACL on Windows, use atomic secure creation, redact known secret patterns where semantics allow, minimize captured variables, and shorten/encrypt retention. Verify permissions before reuse.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Assert exact permissions/ACLs on every supported platform and verify representative secret variables are handled according to the documented policy.
+
+[34] EXEC-17 — Hook cancellation/timeout kills the direct child but does not establish and terminate an owned process group or Windows job object for descendants.
+--------------------------------------------------------------------------------------------------------------
+Severity:   High
+Confidence: High
+Class:      Descendant-process leak
+File(s):
+  - codex-rs/hooks/src/engine/command_runner.rs
+Owner/path: hook timeout/cancellation cleanup
+
+Issue
+~~~~~
+Hook cancellation/timeout kills the direct child but does not establish and terminate an owned process group or Windows job object for descendants.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+Hook commands commonly launch shells, Node, compilers, or servers. Killing only the immediate wrapper does not guarantee the work stops or pipes/handles close.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+A PostToolUse hook runs `npm` which launches Node grandchildren. The hook times out; the npm wrapper is killed, but Node keeps running and holding files, slowing or corrupting later commands.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Spawn every hook in a dedicated process group/job object, close inherited handles, terminate the full tree on cancellation/timeout, and wait with a hard deadline followed by supervised reaping.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Launch a child that launches a grandchild, cancel/timeout the hook, and assert the entire tree and all pipes/handles return to baseline.
+
+[35] TUI-01 — Local untracked files are read fully into memory and diffed without a per-file or aggregate byte cap; only the number of files is bounded.
+--------------------------------------------------------------------------------------------------------------
+Severity:   High
+Confidence: High
+Class:      Memory/latency defect
+File(s):
+  - codex-rs/tui/src/get_git_diff.rs
+Owner/path: untracked-file diff collection
+
+Issue
+~~~~~
+Local untracked files are read fully into memory and diffed without a per-file or aggregate byte cap; only the number of files is bounded.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+A single huge log, database, or generated binary can allocate gigabytes and block the TUI while producing a diff that is not useful to the model/user.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+The repository contains an untracked 4 GB trace log. Opening the diff view causes `fs::read` to attempt a 4 GB allocation and can OOM or freeze Codex.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Inspect metadata first, enforce per-file and aggregate byte budgets, stream only a bounded textual prefix/suffix, detect binary files, and emit an explicit “untracked file omitted: size/type” entry. Never materialize an oversized file solely for diff display.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Test sparse/real multi-gigabyte files, many medium files, and binary files under a small configured budget; assert bounded memory and deterministic omission metadata.
+
+[36] TUI-02 — Up to 50 fallback diff commands are run sequentially with a 30-second per-command timeout and no aggregate deadline, permitting roughly 25 minutes of blocking.
+--------------------------------------------------------------------------------------------------------------
+Severity:   High
+Confidence: High
+Class:      Aggregate-timeout defect
+File(s):
+  - codex-rs/tui/src/get_git_diff.rs
+Owner/path: untracked `git diff --no-index` fallback loop
+
+Issue
+~~~~~
+Up to 50 fallback diff commands are run sequentially with a 30-second per-command timeout and no aggregate deadline, permitting roughly 25 minutes of blocking.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+A bounded item count is not a bounded user operation when each item has an independent long timeout.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+Fifty untracked files trigger a slow or hung external diff driver. The user requests the current diff and the TUI can spend 50 × 30 seconds before returning.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Set one aggregate deadline/budget for the entire diff request, use bounded concurrency for independent files, disable external diff/textconv where appropriate, and stop with a partial-result marker when the budget expires.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Make every fallback sleep past its deadline; assert total wall time stays within the aggregate budget and already completed entries are returned.
+
+[37] TUI-03 — The code checks `symlink_metadata` and later reopens the path with `fs::read`. The path can be swapped between those operations for a symlink, reparse point, or different file.
+--------------------------------------------------------------------------------------------------------------
+Severity:   High
+Confidence: High
+Class:      Filesystem race / path escape
+File(s):
+  - codex-rs/tui/src/get_git_diff.rs
+Owner/path: untracked-file metadata then read path
+
+Issue
+~~~~~
+The code checks `symlink_metadata` and later reopens the path with `fs::read`. The path can be swapped between those operations for a symlink, reparse point, or different file.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+The safety decision and data read are not bound to the same filesystem object.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+A background process replaces `notes.txt` with a symlink to a large or sensitive file after metadata validation. The diff collector reads the replacement and may display data outside the intended untracked file.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Open with no-follow semantics relative to a trusted repository directory handle, fstat the opened handle, verify regular-file identity and repository confinement, then read through that same handle under byte caps.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Race replacement with symlink/reparse/different inode and assert the collector rejects the changed identity.
+
+[38] TUI-04 — NUL-delimited Git path output is converted into UTF-8 `String` values. Repositories can contain non-UTF-8 filenames on Unix, so those paths are corrupted or rejected before diffing.
+--------------------------------------------------------------------------------------------------------------
+Severity:   Medium
+Confidence: High
+Class:      Filename compatibility defect
+File(s):
+  - codex-rs/tui/src/get_git_diff.rs
+Owner/path: `git ls-files -z` output parsing
+
+Issue
+~~~~~
+NUL-delimited Git path output is converted into UTF-8 `String` values. Repositories can contain non-UTF-8 filenames on Unix, so those paths are corrupted or rejected before diffing.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+The `-z` form exists specifically to preserve arbitrary path bytes; decoding the whole output as UTF-8 discards that guarantee.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+A repository has an untracked filename containing byte 0xFF. Git reports it correctly, but the TUI cannot represent/open it and the diff inventory becomes incomplete.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Keep Git output as bytes, split on NUL, convert each path to `OsString` using platform-native APIs, and only use lossy display text at the UI boundary while retaining the raw path for filesystem operations.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Create non-UTF-8 filenames on Unix and assert they are discovered, safely opened, and displayed with an unambiguous escaped label.
+
+[39] MCP-01 — Graceful MCP shutdown has a deadline, but the subsequent forced-shutdown JoinSet is awaited without a second deadline.
+--------------------------------------------------------------------------------------------------------------
+Severity:   High
+Confidence: High
+Class:      Shutdown hang
+File(s):
+  - codex-rs/codex-mcp/src/connection_manager.rs
+Owner/path: shutdown_clients_with_deadline
+
+Issue
+~~~~~
+Graceful MCP shutdown has a deadline, but the subsequent forced-shutdown JoinSet is awaited without a second deadline.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+A client whose forced shutdown future never resolves can still block application shutdown forever, defeating the graceful timeout.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+One stdio MCP server ignores shutdown and its transport task is wedged. Desktop closes, graceful shutdown expires, but forced cleanup never completes and the backend process remains alive.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Give forced shutdown a strict hard deadline. After it expires, abort remaining tasks, terminate their OS process groups/job objects directly, close pipes, and record which clients required abandonment.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Use a client whose graceful and forced shutdown futures never resolve; assert manager shutdown returns within the combined bound and the process tree is killed.
+
+[40] MCP-02 — A graceful shutdown task panic is logged, but if the JoinSet otherwise drains before the timeout, the failed client is not necessarily placed into the forced-shutdown set.
+--------------------------------------------------------------------------------------------------------------
+Severity:   High
+Confidence: High
+Class:      Incomplete shutdown recovery
+File(s):
+  - codex-rs/codex-mcp/src/connection_manager.rs
+Owner/path: graceful client shutdown JoinSet handling
+
+Issue
+~~~~~
+A graceful shutdown task panic is logged, but if the JoinSet otherwise drains before the timeout, the failed client is not necessarily placed into the forced-shutdown set.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+Task completion is not equivalent to successful client shutdown. A panic can leave the underlying transport/process alive while the manager believes the graceful phase finished.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+One client panics while closing stdin. Other clients shut down normally, so the graceful set drains. No forced kill runs for the panicked client, leaving its server process alive.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Track shutdown outcome per client. Any panic, join error, timeout, or explicit failure must enqueue that exact client for forced cleanup. Forced cleanup should be idempotent and process-identity based.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Panic one graceful task and assert only that client is force-terminated and no process survives.
+
+[41] MCP-03 — Pagination detects only a cursor that repeats immediately. A server can cycle A→B→A, return ever-changing cursors, or endlessly repeat content, causing an infinite loop and unbounded allocation.
+--------------------------------------------------------------------------------------------------------------
+Severity:   High
+Confidence: High
+Class:      Unbounded pagination loop
+File(s):
+  - codex-rs/codex-mcp/src/connection_manager.rs
+Owner/path: resource/resource-template catalog pagination
+
+Issue
+~~~~~
+Pagination detects only a cursor that repeats immediately. A server can cycle A→B→A, return ever-changing cursors, or endlessly repeat content, causing an infinite loop and unbounded allocation.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+The loop has no seen-cursor set, page/item/byte ceiling, or overall deadline.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+A buggy MCP server alternates cursors `a` and `b`. Opening its resource catalog never returns and continually appends duplicate resources.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Track every seen cursor, reject any cycle, and enforce per-server maximum pages, items, bytes, and elapsed time. Deduplicate stable resource identities and return an explicit truncated/error status.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Test immediate repeat, multi-node cycle, unique infinite cursor stream, duplicate pages, and oversized catalogs.
+
+[42] MCP-04 — Server reconnect/list operations are performed sequentially, so unavailable or slow servers add their latency serially before tools become available.
+--------------------------------------------------------------------------------------------------------------
+Severity:   Medium
+Confidence: High
+Class:      Tool-discovery latency
+File(s):
+  - codex-rs/codex-mcp/src/connection_manager.rs
+Owner/path: list_all_tools
+
+Issue
+~~~~~
+Server reconnect/list operations are performed sequentially, so unavailable or slow servers add their latency serially before tools become available.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+Independent MCP servers do not require serial discovery. One bad optional server can delay every healthy server and the first useful model turn.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+Five configured servers each hit a 10-second connect timeout. Tool discovery takes roughly 50 seconds instead of around 10 seconds plus bounded overhead.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Run per-server connect/list work concurrently under a bounded semaphore and one aggregate deadline. Normalize the final result deterministically by configured server order/name and preserve per-server errors.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Configure multiple delayed servers and assert elapsed time is near the slowest bounded timeout, not their sum, with stable output ordering.
+
+[43] MCP-05 — On local cancellation the in-flight remote call future is dropped and KD4 reports the tool as cancelled without proving that the MCP server received/acknowledged cancellation or that the remote side effect stopped.
+--------------------------------------------------------------------------------------------------------------
+Severity:   High
+Confidence: High
+Class:      False cancellation semantics
+File(s):
+  - codex-rs/core/src/mcp_tool_call.rs
+Owner/path: remote MCP tool cancellation select
+
+Issue
+~~~~~
+On local cancellation the in-flight remote call future is dropped and KD4 reports the tool as cancelled without proving that the MCP server received/acknowledged cancellation or that the remote side effect stopped.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+Dropping a client future is not a reliable distributed cancellation protocol. For mutating tools, “cancelled” can falsely imply no action occurred.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+An MCP tool starts deleting cloud resources. The user presses Stop; KD4 immediately reports cancellation, but the server continues processing the already received request and deletes the resources.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Send the protocol cancellation notification when supported, wait for bounded acknowledgement/quiescence, and distinguish `cancelled_confirmed` from `cancellation_requested_remote_status_unknown`. Never represent unknown remote completion as definitive cancellation.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Use servers that acknowledge, ignore, delay, and race completion with cancellation; assert truthful terminal status for each case.
+
+[44] MCP-06 — Budget checks repeatedly serialize the entire growing response after each added error/server/content entry. With many small entries, work grows approximately O(n²).
+--------------------------------------------------------------------------------------------------------------
+Severity:   Medium
+Confidence: High
+Class:      Quadratic payload-building overhead
+File(s):
+  - codex-rs/core/src/tools/handlers/mcp_resource.rs
+Owner/path: bounded resource payload assembly
+
+Issue
+~~~~~
+Budget checks repeatedly serialize the entire growing response after each added error/server/content entry. With many small entries, work grows approximately O(n²).
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+The code pays for all prior entries again at every append. A response that is within the final byte cap can still consume excessive CPU and allocations.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+A catalog returns 10,000 tiny resources or errors. KD4 repeatedly serializes prefixes of length 1…10,000 before returning a bounded payload, causing seconds of avoidable CPU time.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Maintain incremental encoded-size accounting using a capped writer per new entry plus fixed JSON delimiter overhead, or stream directly into a bounded serializer. Serialize the final payload once for verification.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Benchmark increasing entry counts and assert near-linear CPU/allocation growth while preserving the exact byte cap.
+
+[45] MCP-07 — Declared MCP file arguments are resolved with `cwd.join(file_path)` and read with `sandbox: None`. An absolute path replaces the cwd, and relative traversal is not explicitly confined, allowing upload of any host file accessible to the process.
+--------------------------------------------------------------------------------------------------------------
+Severity:   Critical
+Confidence: High
+Class:      File-exfiltration security defect
+File(s):
+  - codex-rs/core/src/mcp_openai_file.rs
+Owner/path: build_uploaded_argument_value
+
+Issue
+~~~~~
+Declared MCP file arguments are resolved with `cwd.join(file_path)` and read with `sandbox: None`. An absolute path replaces the cwd, and relative traversal is not explicitly confined, allowing upload of any host file accessible to the process.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+This path does not apply the selected environment’s permission/sandbox context before transmitting bytes to remote OpenAI file storage. File read authority and network exfiltration authority are conflated.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+A model or compromised app tool supplies `C:\Users\user\.ssh\id_rsa` or `/home/user/.aws/credentials` as a declared file argument. KD4 reads and uploads it without a workspace-bound approval.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Resolve through the selected environment filesystem with its sandbox/permission context. Reject absolute paths and `..` escapes by default; confine canonicalized handles to approved roots; require explicit user approval for any out-of-root upload; log only safe metadata. Bind approval to file identity/hash so replacement cannot widen it.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Attempt absolute, traversal, symlink, junction/reparse, case-variant, and approved in-root paths in local and remote environments. Only approved, same-identity in-root files may upload.
+
+[46] MCP-08 — The upload limit is checked from metadata, then the file is reopened/read as a stream. The file can be replaced or grow between those operations, so the validated size/identity can differ from the bytes uploaded and the declared upload size.
+--------------------------------------------------------------------------------------------------------------
+Severity:   High
+Confidence: Medium
+Class:      File-size/identity race
+File(s):
+  - codex-rs/core/src/mcp_openai_file.rs
+Owner/path: build_uploaded_argument_value
+
+Issue
+~~~~~
+The upload limit is checked from metadata, then the file is reopened/read as a stream. The file can be replaced or grow between those operations, so the validated size/identity can differ from the bytes uploaded and the declared upload size.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+Metadata and content are not tied to one open handle. Even when the downstream upload rejects mismatch, the result is nondeterministic and can consume excess I/O/network.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+A 1 KB file passes the limit check, then another process replaces it with a much larger file before `read_file_stream`. KD4 begins uploading bytes that were never size-validated.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Open once with no-follow semantics, fstat that handle, enforce the limit with a bounded reader on the same handle, and verify EOF/size/hash. Reject identity or size changes before remote commit.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Race growth and replacement after metadata capture; assert no byte beyond the approved limit is read or uploaded.
+
+[47] MCP-09 — Array file arguments upload sequentially; if a later upload fails, earlier uploaded files are left in remote storage even though the tool call is rejected and no rewritten argument is returned.
+--------------------------------------------------------------------------------------------------------------
+Severity:   Medium
+Confidence: Medium
+Class:      Remote-file resource leak
+File(s):
+  - codex-rs/core/src/mcp_openai_file.rs
+Owner/path: rewrite_argument_value_for_openai_files array path
+
+Issue
+~~~~~
+Array file arguments upload sequentially; if a later upload fails, earlier uploaded files are left in remote storage even though the tool call is rejected and no rewritten argument is returned.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+The operation has partial external side effects without cleanup or a resumable result.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+Three files are requested. Files 1 and 2 upload successfully; file 3 fails validation. The call returns an error, but files 1 and 2 remain stored and potentially billable/retained.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Track newly created remote file IDs and delete them on pre-dispatch failure/cancellation, or expose a scoped upload transaction whose commit occurs only after all files succeed. If deletion is unavailable, return explicit partial-upload IDs and retention guidance instead of hiding them.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Fail each array index and cancel between uploads; assert earlier temporary uploads are removed or explicitly reported.
+
+[48] SRC-01 — Global Git ignore paths are derived from host `dirs::home_dir`/host config locations, then read through the selected executor filesystem. For remote/container environments, those host paths do not represent the selected environment’s home or Git configuration.
+--------------------------------------------------------------------------------------------------------------
+Severity:   High
+Confidence: High
+Class:      Remote-environment correctness defect
+File(s):
+  - codex-rs/core/src/tools/handlers/source.rs
+Owner/path: global ignore discovery
+
+Issue
+~~~~~
+Global Git ignore paths are derived from host `dirs::home_dir`/host config locations, then read through the selected executor filesystem. For remote/container environments, those host paths do not represent the selected environment’s home or Git configuration.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+Source visibility can differ from actual Git behavior, causing ignored generated/secret files to be searched or legitimate files to disappear.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+The selected container has `/home/dev/.config/git/ignore`, while the host is Windows. KD4 asks the container filesystem to read a Windows host path, silently misses the container ignore rules, and indexes files Git would ignore.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Resolve ignore configuration inside the selected environment—prefer executing `git config --path --get core.excludesFile` plus environment-native home/config resolution through the executor. Include the resolved ignore provenance in cache identity.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Use different host/remote homes and ignore files; assert results match `git check-ignore` inside the selected environment.
+
+[49] SRC-02 — The hand-written parser is not a complete Git config parser: it can match `excludesfile` outside the correct section and does not implement include/includeIf, quoting/escaping, relative-path, or environment-expansion semantics.
+--------------------------------------------------------------------------------------------------------------
+Severity:   Medium
+Confidence: High
+Class:      Git-config compatibility defect
+File(s):
+  - codex-rs/core/src/tools/handlers/source.rs
+Owner/path: parse_global_excludes_path
+
+Issue
+~~~~~
+The hand-written parser is not a complete Git config parser: it can match `excludesfile` outside the correct section and does not implement include/includeIf, quoting/escaping, relative-path, or environment-expansion semantics.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+KD4 can apply a different global ignore file than Git itself, which makes source search nonauthoritative.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+A user sets `[includeIf "gitdir:..."] path = work.inc`, and that included file sets `core.excludesFile = ~/.work-ignore`. Git honors it; KD4’s parser does not, so generated/private work files appear in search.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Do not reimplement Git config. Ask Git in the selected environment for the resolved path (`git config --path --get core.excludesFile`) with controlled environment and timeout, or use a proven parser that implements include semantics.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Cover includes, includeIf, quoted paths, escapes, relative paths, multiple sections, and platform-specific home expansion against real Git output.
+
+[50] SRC-03 — Permission and I/O failures while reading ignore/config/scan inputs are converted into absence or partial counters instead of a prominent incomplete-coverage result. A failed ignore read can make files visible that should have been excluded.
+--------------------------------------------------------------------------------------------------------------
+Severity:   High
+Confidence: High
+Class:      Silent incomplete/overbroad search
+File(s):
+  - codex-rs/core/src/tools/handlers/source.rs
+Owner/path: optional ignore reads / recover_scan_result
+
+Issue
+~~~~~
+Permission and I/O failures while reading ignore/config/scan inputs are converted into absence or partial counters instead of a prominent incomplete-coverage result. A failed ignore read can make files visible that should have been excluded.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+NotFound is an expected optional case; PermissionDenied, invalid data, and mid-scan I/O failures are materially different. Silently continuing makes the model believe search coverage is authoritative.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+`.gitignore` becomes unreadable. KD4 continues scanning and returns a credential fixture from an ignored directory without warning the model that ignore policy could not be loaded.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Only suppress NotFound for explicitly optional files. Surface all other failures as structured coverage warnings; for ignore-policy failure, fail closed or require an explicit `include_untrusted_visibility` override. Include skipped-path/error counts and affected roots in output.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Inject permission, transient deletion, invalid encoding, and directory read failures and assert truthful incomplete/fail-closed behavior.
+
+[51] PATCH-01 — Shell-text patch detection uses Bash-style parsing even when the actual command is PowerShell or Cmd. Text that is invalid for the selected shell can be intercepted and applied as a patch instead of failing as the shell would.
+--------------------------------------------------------------------------------------------------------------
+Severity:   High
+Confidence: High
+Class:      Shell-semantics regression
+File(s):
+  - codex-rs/apply-patch/src/invocation.rs
+Owner/path: shell invocation patch interception
+
+Issue
+~~~~~
+Shell-text patch detection uses Bash-style parsing even when the actual command is PowerShell or Cmd. Text that is invalid for the selected shell can be intercepted and applied as a patch instead of failing as the shell would.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+The pre-execution interceptor changes command semantics across platforms. A parser match should never turn an invalid native command into a successful filesystem mutation.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+On Windows, a PowerShell command contains a Bash heredoc-shaped `apply_patch <<'PATCH' ...`. PowerShell would reject it, but KD4 recognizes the Bash form and mutates files.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Restrict heredoc interception to shells whose grammar supports that syntax. For PowerShell/Cmd, require the structured apply-patch tool or implement exact shell-native invocation parsing. Verify the selected shell type before any mutation.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Run the same heredoc-shaped text under Bash, PowerShell, and Cmd; only Bash should be intercepted, and invalid native forms must leave the filesystem unchanged.
+
+[52] PATCH-02 — Conflicting patch endpoints are compared primarily as path strings rather than same-file identity under platform case and link rules. On case-insensitive filesystems, differently cased names can refer to the same file and bypass conflict checks.
+--------------------------------------------------------------------------------------------------------------
+Severity:   Medium
+Confidence: Medium
+Class:      Duplicate-target / filesystem identity defect
+File(s):
+  - codex-rs/apply-patch/src/invocation.rs
+Owner/path: duplicate source/destination validation
+
+Issue
+~~~~~
+Conflicting patch endpoints are compared primarily as path strings rather than same-file identity under platform case and link rules. On case-insensitive filesystems, differently cased names can refer to the same file and bypass conflict checks.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+A multi-operation patch can read/write/delete one physical file through aliases, producing order-dependent data loss.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+A Windows patch renames `Foo.rs` to `foo.rs` while another hunk updates `Foo.rs`. String comparison treats them as different endpoints even though the filesystem may resolve both to one file.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Normalize separators and case according to the target filesystem, open parents with no-follow semantics, and compare existing file IDs/canonical parent-plus-name identity. Define and test case-only rename behavior explicitly.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Cover case-only aliases, `.`/`..`, symlinks/junctions, hard links, and mixed separators on Windows and Unix.
+
+[53] AGENTS-01 — The byte budget is applied to loaded document bodies but does not fully include generated separators, labels, and truncation notices. The final rendered instruction string can exceed `project_doc_max_bytes`.
+--------------------------------------------------------------------------------------------------------------
+Severity:   Medium
+Confidence: High
+Class:      Context-budget defect
+File(s):
+  - codex-rs/core/src/agents_md.rs
+Owner/path: project instruction aggregation/rendering
+
+Issue
+~~~~~
+The byte budget is applied to loaded document bodies but does not fully include generated separators, labels, and truncation notices. The final rendered instruction string can exceed `project_doc_max_bytes`.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+The configured cap is expected to bound model-visible context, not only source bytes. Per-document overhead accumulates with many small instruction files.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+A repository has hundreds of tiny AGENTS files near the limit. Their bodies fit the budget, but repeated headings/separators push the actual injected prompt materially over it, wasting tokens and changing compaction behavior.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Budget the exact final encoded bytes. Reserve overhead before accepting each document, stop deterministically, and emit one bounded summary of omitted sources rather than unbudgeted per-file notices.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Generate many tiny files and multibyte UTF-8 content; assert the final byte length never exceeds the configured cap and truncation remains valid UTF-8.
+
+[54] AGENTS-02 — Environment loads are buffered such that each environment can consume work up to the full total document budget even when earlier environments already exhaust the aggregate budget.
+--------------------------------------------------------------------------------------------------------------
+Severity:   Medium
+Confidence: High
+Class:      Unnecessary remote I/O
+File(s):
+  - codex-rs/core/src/agents_md.rs
+Owner/path: multi-environment instruction loading
+
+Issue
+~~~~~
+Environment loads are buffered such that each environment can consume work up to the full total document budget even when earlier environments already exhaust the aggregate budget.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+The final output is bounded, but discovery/read cost is not. In remote environments this wastes RPCs, bytes, and latency for content guaranteed to be discarded.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+The primary environment supplies the full 32 KB instruction budget. Ten remote environments still traverse and read their own AGENTS files before their results are dropped.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Use a shared atomic remaining budget and staged scheduling: load priority environments first, then start additional environment work only while budget remains. Cancel outstanding reads when the aggregate cap is reached, while preserving deterministic priority/order.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Make the first environment fill the budget and assert later remote files are not read; test partial remaining budget and deterministic cutoff.
+
+[55] TIME-01 — External sleep always waits one full second before checking the requested deadline. Sub-second sleeps overshoot to roughly one second, and long sleeps issue one client RPC per second.
+--------------------------------------------------------------------------------------------------------------
+Severity:   Medium
+Confidence: High
+Class:      Time-provider semantics / RPC amplification
+File(s):
+  - codex-rs/app-server/src/current_time.rs
+Owner/path: AppServerTimeProvider::sleep
+
+Issue
+~~~~~
+External sleep always waits one full second before checking the requested deadline. Sub-second sleeps overshoot to roughly one second, and long sleeps issue one client RPC per second.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+The implementation does not honor the requested duration granularity and amplifies traffic linearly with elapsed seconds.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+A 100 ms retry backoff takes about 1 second. A one-hour scheduled wait sends roughly 3,600 current-time requests to the client.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+After obtaining the external start time, sleep locally for `min(remaining, coarse_drift_interval)` using a monotonic timer. For short durations, sleep exactly the remaining duration; for long durations, recheck the external clock sparsely near the deadline or after suspend/resume signals.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Use a fake external clock for 100 ms, 1.5 s, and one hour; assert bounded overshoot and a small logarithmic/constant number of RPCs.
+
+[56] TIME-02 — A pending callback is explicitly removed only on the function’s own timeout/thread cleanup. If the `request_current_time` future is externally dropped—such as turn/tool cancellation—the oneshot receiver disappears but the callback entry remains until a response, disconnect, or later cleanup.
+--------------------------------------------------------------------------------------------------------------
+Severity:   Medium
+Confidence: High
+Class:      Pending-request leak
+File(s):
+  - codex-rs/app-server/src/current_time.rs
+  - codex-rs/app-server/src/outgoing_message.rs
+Owner/path: request_current_time
+
+Issue
+~~~~~
+A pending callback is explicitly removed only on the function’s own timeout/thread cleanup. If the `request_current_time` future is externally dropped—such as turn/tool cancellation—the oneshot receiver disappears but the callback entry remains until a response, disconnect, or later cleanup.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+The outgoing sender retains the request payload, authorized connection set, and callback entry without an RAII cancellation guard.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+A current-time request is sent to a client that never responds; the owning turn is cancelled immediately. Repeating this can accumulate dead pending requests for the thread until it closes.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Introduce a `PendingRequestGuard` returned with the receiver. Its Drop asynchronously/supervisor-safely removes the exact request unless disarmed after response. Alternatively make the receiver wrapper own automatic cancellation.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Drop the future immediately after send and assert the pending callback count returns to zero without requiring thread or connection teardown.
+
+[57] TIME-03 — Request delivery is nontransactional across recipients. If an earlier send succeeds and a later queue send fails, the callback is removed entirely even though the earlier client received the request and is still authorized to respond.
+--------------------------------------------------------------------------------------------------------------
+Severity:   High
+Confidence: High
+Class:      Multi-client request delivery race
+File(s):
+  - codex-rs/app-server/src/outgoing_message.rs
+Owner/path: OutgoingMessageSender::send_request_to_connections
+
+Issue
+~~~~~
+Request delivery is nontransactional across recipients. If an earlier send succeeds and a later queue send fails, the callback is removed entirely even though the earlier client received the request and is still authorized to respond.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+The delivered request becomes orphaned: its response is logged as missing and the caller’s oneshot closes without a truthful per-recipient result.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+An approval request targets Desktop and VS Code. Desktop receives it; the channel fails while queueing to VS Code. KD4 removes the callback. The user approves in Desktop, but the response is ignored and the turn reports cancellation/failure.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Track successful recipients incrementally. On a per-recipient send failure, remove only that recipient from the authorization set. Keep the callback if at least one send succeeded; resolve an error only when none succeeded. Return/record partial delivery metadata.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Fail every recipient position in a multi-target send and assert successful recipients can still resolve the callback exactly once.
+
+[58] COMPACT-01 — When both primary and fallback compaction fail, the function returns the original primary error and discards the fallback error.
+--------------------------------------------------------------------------------------------------------------
+Severity:   Medium
+Confidence: High
+Class:      Error-masking defect
+File(s):
+  - codex-rs/core/src/compact_remote_v2.rs
+Owner/path: primary/fallback compaction attempt handling
+
+Issue
+~~~~~
+When both primary and fallback compaction fail, the function returns the original primary error and discards the fallback error.
+
+Why this is a real issue
+~~~~~~~~~~~~~~~~~~~~~~~~
+The fallback is usually a different model/path; its failure often contains the actionable cause. Masking it makes diagnosis and retry policy choose the wrong hypothesis.
+
+Real task example
+~~~~~~~~~~~~~~~~~
+Primary compaction fails with a transient model error; fallback then fails because its request exceeds a hard size limit. The user sees only the primary transient error and retries without addressing the real terminal failure.
+
+Highest-confidence fix
+~~~~~~~~~~~~~~~~~~~~~~
+Return a typed aggregate containing primary and fallback attempts, models, retryability, and causes. If one error must be primary, choose the terminal fallback error and attach the first as context/source.
+
+Required regression proof
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Make both attempts fail with distinguishable errors and assert both survive serialization/logging and the retryability decision uses the correct terminal cause.
+
+VERIFIED EXCLUSIONS — NOT REPORTED AS CURRENT DEFECTS
+-----------------------------------------------------
+
+The following earlier/suspected items were removed after checking current HEAD:
+
+- The validation-history stale lookup/cache publication race has a generation
+  guard and a dedicated concurrent-record regression test at current HEAD.
+- Shell snapshot stdout/stderr collection is bounded; the remaining report is
+  about teardown and sensitive persistence, not the already-fixed output cap.
+- MCP all-server resource aggregation now returns continuation metadata for
+  remaining servers/cursors; the old “silently loses later pages” allegation is
+  not current. Cursor-cycle and complexity limits remain real.
+- MCP tool-call approval uses current tool metadata and event serialization has
+  a capped writer; stale-tool-info and post-serialization byte-cap allegations
+  were not carried forward.
+- Source-search generated/vendor root handling and task-locator provenance work
+  listed as repaired in the repository ledger were not re-reported.
+- Publish/justfile issues outside codex-rs were excluded from this codex-rs-only
+  report.
+- Generated schemas/snapshots whose owners are correct were not counted merely
+  because they are large or machine-produced.
+
+IMPLEMENTATION ORDER
+--------------------
+
+Phase 1 — Security and truthful cancellation
+  MCP-07, VAL-02, MCP-05, TIME-03, TUI-03.
+
+Phase 2 — Process/agent lifecycle
+  EXEC-02, EXEC-03, EXEC-05 through EXEC-08, EXEC-15, EXEC-17,
+  TASK-05, TASK-06, MCP-01, MCP-02.
+
+Phase 3 — Validation correctness and reuse
+  VAL-01 through VAL-06, TASK-02, EXEC-04.
+
+Phase 4 — Artifact and filesystem integrity
+  EXEC-09 through EXEC-14, TUI-01 through TUI-04, MCP-08, PATCH-02.
+
+Phase 5 — Search/context/persistence efficiency
+  TASK-03/04, MCP-03/04/06/09, SRC-01 through SRC-03,
+  AGENTS-01/02, TIME-01/02, COMPACT-01, and the remaining observability items.
+
+For each phase, add the focused regression proof named in each finding before
+running broader validation. Do not combine unrelated persisted-format or
+process-lifecycle changes into one patch.
+
+END OF REPORT
+-------------
+
+This report is pinned to commit 63dde623c690207e5eef5dd7d9b6b36f47e32152.
+A later commit can invalidate individual findings and must be audited as a new
+revision rather than assumed equivalent.

@@ -28,8 +28,10 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
+use tokio::sync::Barrier;
 use uuid::Uuid;
 
 fn test_config(codex_home: &Path) -> RolloutConfig {
@@ -520,6 +522,84 @@ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<
     assert_eq!(text_after_second_persist, text);
 
     recorder.shutdown().await?;
+    assert!(recorder.flush().await.is_err());
+    assert!(recorder.record_canonical_items(&[]).await.is_err());
+    assert!(recorder.shutdown().await.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_shutdown_never_acknowledges_items_behind_shutdown() -> std::io::Result<()> {
+    const WRITERS: usize = 32;
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let recorder = RolloutRecorder::new(
+        &config,
+        RolloutRecorderParams::new(
+            ThreadId::new(),
+            None,
+            None,
+            SessionSource::Exec,
+            None,
+            "test_originator".to_string(),
+            BaseInstructions::default(),
+            Vec::new(),
+        ),
+    )
+    .await?;
+    let rollout_path = recorder.rollout_path().to_path_buf();
+    recorder
+        .record_canonical_items(&[RolloutItem::EventMsg(EventMsg::AgentMessage(
+            AgentMessageEvent {
+                message: "before-concurrent-shutdown".to_string(),
+                phase: None,
+                memory_citation: None,
+            },
+        ))])
+        .await?;
+    recorder.flush().await?;
+    let barrier = Arc::new(Barrier::new(WRITERS + 1));
+    let mut writers = Vec::new();
+    for index in 0..WRITERS {
+        let writer = recorder.clone();
+        let barrier = Arc::clone(&barrier);
+        writers.push(tokio::spawn(async move {
+            let message = format!("concurrent-item-{index:03}");
+            barrier.wait().await;
+            let result = writer
+                .record_canonical_items(&[RolloutItem::EventMsg(EventMsg::AgentMessage(
+                    AgentMessageEvent {
+                        message: message.clone(),
+                        phase: None,
+                        memory_citation: None,
+                    },
+                ))])
+                .await;
+            (message, result)
+        }));
+    }
+    let shutdown_recorder = recorder.clone();
+    let shutdown_barrier = Arc::clone(&barrier);
+    let shutdown = tokio::spawn(async move {
+        shutdown_barrier.wait().await;
+        shutdown_recorder.shutdown().await
+    });
+
+    let mut accepted = Vec::new();
+    for writer in writers {
+        let (message, result) = writer.await.expect("writer task");
+        if result.is_ok() {
+            accepted.push(message);
+        }
+    }
+    shutdown.await.expect("shutdown task")?;
+    let text = std::fs::read_to_string(rollout_path)?;
+    for message in accepted {
+        assert!(
+            text.contains(&message),
+            "successfully queued item must be persisted before shutdown: {message}"
+        );
+    }
     Ok(())
 }
 

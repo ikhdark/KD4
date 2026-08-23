@@ -127,6 +127,7 @@ use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::ContextFragmentDigest;
 use codex_protocol::protocol::ConversationAudioParams;
 use codex_protocol::protocol::CreditsSnapshot;
+use codex_protocol::protocol::ExecCommandSource;
 use codex_protocol::protocol::GranularApprovalConfig;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InterAgentCommunication;
@@ -234,6 +235,39 @@ fn accepted_context(mut item: TurnContextItem) -> TurnContextItem {
         }],
     });
     item
+}
+
+#[test]
+fn context_fragment_digests_ignore_opaque_skill_locator_rotation() {
+    fn skill_catalog(locator: &str, description: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: "developer".to_string(),
+            content: vec![ContentItem::InputText {
+                text: format!(
+                    "<skills_instructions>\n- openai-docs — {description} — skill:{locator}\n</skills_instructions>"
+                ),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    let first = digest_context_fragments(&[skill_catalog(
+        "0123456789abcdef01234567",
+        "Reference documentation",
+    )]);
+    let rotated = digest_context_fragments(&[skill_catalog(
+        "89abcdef0123456789abcdef",
+        "Reference documentation",
+    )]);
+    let changed = digest_context_fragments(&[skill_catalog(
+        "89abcdef0123456789abcdef",
+        "Changed documentation",
+    )]);
+
+    assert_eq!(first, rotated);
+    assert_ne!(first, changed);
 }
 
 async fn commit_test_context_baseline(session: &Session, suffix: &str) {
@@ -516,7 +550,7 @@ async fn regular_turn_bounds_unfinished_startup_prewarm_handoff() {
     assert_eq!(turn_started.trace_id, tc.trace_id);
     tokio::time::timeout(
         crate::session_startup_prewarm::FIRST_TURN_PREWARM_HANDOFF_TIMEOUT
-            + std::time::Duration::from_millis(500),
+            + std::time::Duration::from_secs(2),
         startup_prewarm_tx.closed(),
     )
     .await
@@ -2381,7 +2415,7 @@ async fn prepares_resumed_history_before_installing_it() {
 }
 
 #[test]
-fn resolve_multi_agent_version_handles_unset_and_legacy_history() {
+fn resolve_multi_agent_version_defaults_metadata_less_history_to_v2() {
     let thread_id = ThreadId::default();
 
     assert_eq!(
@@ -2400,7 +2434,7 @@ fn resolve_multi_agent_version_handles_unset_and_legacy_history() {
             }),
             /*inherited_multi_agent_version*/ None,
         ),
-        Some(MultiAgentVersion::V1)
+        Some(MultiAgentVersion::V2)
     );
     assert_eq!(
         resolve_multi_agent_version(
@@ -2412,6 +2446,31 @@ fn resolve_multi_agent_version_handles_unset_and_legacy_history() {
             Some(MultiAgentVersion::V2),
         ),
         Some(MultiAgentVersion::V2)
+    );
+    assert_eq!(
+        resolve_multi_agent_version(
+            &InitialHistory::Resumed(ResumedHistory {
+                conversation_id: thread_id,
+                history: Arc::new(Vec::new()),
+                rollout_path: None,
+            }),
+            Some(MultiAgentVersion::V1),
+        ),
+        Some(MultiAgentVersion::V1)
+    );
+    assert_eq!(
+        resolve_multi_agent_version(
+            &InitialHistory::Resumed(ResumedHistory {
+                conversation_id: thread_id,
+                history: Arc::new(vec![session_meta_item(
+                    thread_id,
+                    Some(MultiAgentVersion::V1)
+                )]),
+                rollout_path: None,
+            }),
+            Some(MultiAgentVersion::V2),
+        ),
+        Some(MultiAgentVersion::V1)
     );
     assert_eq!(
         resolve_multi_agent_version(
@@ -2442,7 +2501,7 @@ fn resolve_multi_agent_version_handles_unset_and_legacy_history() {
             &InitialHistory::Forked(Vec::new()),
             /*inherited_multi_agent_version*/ None
         ),
-        Some(MultiAgentVersion::V1)
+        Some(MultiAgentVersion::V2)
     );
 }
 
@@ -5935,6 +5994,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         tx_event,
         agent_status: agent_status_tx,
         state: Mutex::new(state),
+        durable_history_commit_gate: Semaphore::new(1),
+        durable_history_completed_commits: Mutex::new(HashSet::new()),
         tool_history_io_gate: Semaphore::new(/*permits*/ 1),
         managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
         features: config.features.clone(),
@@ -6450,7 +6511,7 @@ fn strict_auto_review_session_scope_grants_no_permissions() {
             scope: PermissionGrantScope::Session,
             strict_auto_review: true,
         },
-        std::path::Path::new("/tmp"),
+        Some(std::path::Path::new("/tmp")),
     );
 
     assert_eq!(
@@ -6550,6 +6611,103 @@ async fn request_permissions_emits_event_when_granular_policy_allows_requests() 
         .expect("request_permissions join error");
 
     assert_eq!(response, Some(expected_response));
+}
+
+#[tokio::test]
+async fn request_permissions_supports_network_grants_for_foreign_environments() {
+    let (session, mut turn_context, rx) = make_session_and_context_with_rx().await;
+    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    Arc::get_mut(&mut turn_context)
+        .expect("single thread settings ref")
+        .approval_policy
+        .set(AskForApproval::Granular(GranularApprovalConfig {
+            sandbox_approval: true,
+            rules: true,
+            skill_approval: true,
+            request_permissions: true,
+            mcp_elicitations: true,
+        }))
+        .expect("test setup should allow updating approval policy");
+
+    #[cfg(windows)]
+    let foreign_cwd = PathUri::parse("file:///home/remote/project").expect("foreign POSIX cwd");
+    #[cfg(not(windows))]
+    let foreign_cwd = PathUri::parse("file:///C:/remote/project").expect("foreign Windows cwd");
+    assert!(foreign_cwd.to_abs_path().is_err());
+    let requested_permissions = RequestPermissionProfile {
+        network: Some(codex_protocol::models::NetworkPermissions {
+            enabled: Some(true),
+        }),
+        ..RequestPermissionProfile::default()
+    };
+    let expected_response = codex_protocol::request_permissions::RequestPermissionsResponse {
+        permissions: requested_permissions.clone(),
+        scope: PermissionGrantScope::Session,
+        strict_auto_review: false,
+    };
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    let call_id = "remote-network-permission".to_string();
+
+    let handle = tokio::spawn({
+        let session = Arc::clone(&session);
+        let turn_context = Arc::clone(&turn_context);
+        let call_id = call_id.clone();
+        let requested_permissions = requested_permissions.clone();
+        let foreign_cwd = foreign_cwd.clone();
+        async move {
+            let mut environment = turn_context
+                .environments
+                .primary()
+                .expect("primary environment")
+                .selection();
+            environment.environment_id = "remote-environment".to_string();
+            environment.cwd = foreign_cwd;
+            session
+                .request_permissions_for_environment(
+                    &turn_context,
+                    call_id,
+                    RequestPermissionsArgs {
+                        environment_id: Some("remote-environment".to_string()),
+                        reason: Some("need remote network".to_string()),
+                        permissions: requested_permissions,
+                    },
+                    environment,
+                    CancellationToken::new(),
+                )
+                .await
+        }
+    });
+
+    let request_event = tokio::time::timeout(StdDuration::from_secs(1), rx.recv())
+        .await
+        .expect("request_permissions event timed out")
+        .expect("request_permissions event missing");
+    let EventMsg::RequestPermissions(request) = request_event.msg else {
+        panic!("expected request_permissions event");
+    };
+    assert_eq!(request.call_id, call_id);
+    assert_eq!(
+        request.environment_id.as_deref(),
+        Some("remote-environment")
+    );
+    assert_eq!(request.cwd, None);
+
+    session
+        .notify_request_permissions_response(&request.call_id, expected_response.clone())
+        .await;
+    let response = tokio::time::timeout(StdDuration::from_secs(1), handle)
+        .await
+        .expect("request_permissions future timed out")
+        .expect("request_permissions join error");
+
+    assert_eq!(response, Some(expected_response));
+    assert_eq!(
+        session
+            .granted_session_permissions("remote-environment")
+            .await,
+        Some(requested_permissions.into())
+    );
 }
 
 #[tokio::test]
@@ -8087,6 +8245,8 @@ where
         tx_event,
         agent_status: agent_status_tx,
         state: Mutex::new(state),
+        durable_history_commit_gate: Semaphore::new(1),
+        durable_history_completed_commits: Mutex::new(HashSet::new()),
         tool_history_io_gate: Semaphore::new(/*permits*/ 1),
         managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
         features: config.features.clone(),
@@ -8220,6 +8380,7 @@ async fn compacted_history_replacement_advances_planning_generation() {
             Vec::new(),
             None,
             None,
+            Vec::new(),
             CompactedItem {
                 message: "compacted".to_string(),
                 replacement_history: None,
@@ -9634,9 +9795,18 @@ async fn record_context_updates_and_set_reference_context_item_reinjects_full_co
 async fn record_context_updates_and_set_reference_context_item_persists_baseline_without_emitting_diffs()
  {
     let (mut session, turn_context) = make_session_and_context().await;
-    let previous_context_item = turn_context.to_turn_context_item();
     let previous_context = Arc::new(turn_context);
+    let mut previous_context_item = previous_context.to_turn_context_item();
     let world_state = build_world_state_from_turn_context(&session, &previous_context).await;
+    previous_context_item.context_provenance = Some(TurnContextProvenance {
+        accepted_attempt: AcceptedAttemptProvenance {
+            sampling_request_id: "previous-request".to_string(),
+            physical_attempt_id: "previous-attempt".to_string(),
+        },
+        fragment_digests: session
+            .build_context_fragment_digests(&previous_context, &world_state)
+            .await,
+    });
     let mut turn_context = Arc::try_unwrap(previous_context)
         .unwrap_or_else(|_| panic!("previous turn context should have no remaining references"));
     turn_context.sub_id = format!("{}-next", turn_context.sub_id);
@@ -9685,6 +9855,43 @@ async fn record_context_updates_and_set_reference_context_item_persists_baseline
     assert_context_matches_with_accepted_provenance(
         persisted_turn_context,
         turn_context.to_turn_context_item(),
+    );
+}
+
+#[tokio::test]
+async fn record_context_updates_reinjects_full_context_when_model_visible_fragments_change() {
+    let (session, turn_context) = make_session_and_context().await;
+    let previous_context = Arc::new(turn_context);
+    let previous_step = StepContext::for_test(Arc::clone(&previous_context));
+    session
+        .record_context_updates_and_set_reference_context_item(&previous_step)
+        .await;
+    commit_test_context_baseline(&session, "previous-fragments").await;
+    let previous_history_len = session.clone_history().await.raw_items().len();
+
+    drop(previous_step);
+    let mut current_context = Arc::try_unwrap(previous_context)
+        .unwrap_or_else(|_| panic!("previous turn context should have no remaining references"));
+    current_context.developer_instructions = Some("new model-visible instructions".to_string());
+    current_context.sub_id = format!("{}-next", current_context.sub_id);
+    let current_context = Arc::new(current_context);
+    let expected_reinjection = build_initial_context(&session, &current_context).await;
+
+    let current_step = StepContext::for_test(Arc::clone(&current_context));
+    assert_eq!(
+        session.estimate_context_update_items(&current_step).await,
+        expected_reinjection,
+        "pre-turn accounting should estimate the same full context reinjection"
+    );
+    session
+        .record_context_updates_and_set_reference_context_item(&current_step)
+        .await;
+
+    let history = session.clone_history().await;
+    assert_eq!(
+        &history.raw_items()[previous_history_len..],
+        expected_reinjection.as_slice(),
+        "changed model-visible context fragments should invalidate the accepted baseline"
     );
 }
 
@@ -9815,7 +10022,7 @@ async fn record_context_updates_and_set_reference_context_item_persists_full_rei
 }
 
 #[tokio::test]
-async fn run_user_shell_command_does_not_set_reference_context_item() {
+async fn run_user_shell_command_records_context_without_committing_reference_item() {
     let (session, _turn_context, rx) = make_session_and_context_with_rx().await;
     {
         let mut state = session.state.lock().await;
@@ -9842,6 +10049,80 @@ async fn run_user_shell_command_does_not_set_reference_context_item() {
         session.reference_context_item().await.is_none(),
         "standalone shell tasks should not mutate previous context"
     );
+    let history = session.clone_history().await;
+    assert!(
+        history.raw_items().iter().any(|item| matches!(
+            item,
+            ResponseItem::Message { role, .. } if role == "developer"
+        )),
+        "standalone shell tasks should persist their model-visible context baseline"
+    );
+}
+
+#[tokio::test]
+async fn user_shell_command_dispatches_foreign_primary_environment_to_exec_server() {
+    let (session, mut turn_context, rx) = make_session_and_context_with_rx().await;
+    let remote_environment = Arc::new(
+        codex_exec_server::Environment::create_for_tests(Some(
+            "ws://127.0.0.1:1/user-shell-routing".to_string(),
+        ))
+        .expect("remote test environment"),
+    );
+    assert!(remote_environment.is_remote());
+    let foreign_cwd = if cfg!(windows) {
+        PathUri::parse("file:///tmp/codex-user-shell-remote").expect("POSIX cwd URI")
+    } else {
+        PathUri::parse("file:///C:/codex-user-shell-remote").expect("Windows cwd URI")
+    };
+    assert!(
+        foreign_cwd.to_abs_path().is_err(),
+        "test cwd should be foreign to the Codex host"
+    );
+    let shell = turn_context.environments.turn_environments[0].shell.clone();
+    Arc::get_mut(&mut turn_context)
+        .expect("single turn context reference")
+        .environments
+        .turn_environments[0] = TurnEnvironment::new(
+        "remote-primary".to_string(),
+        remote_environment,
+        foreign_cwd.clone(),
+        shell,
+    );
+
+    tokio::time::timeout(
+        StdDuration::from_secs(5),
+        execute_user_shell_command(
+            Arc::clone(&session),
+            turn_context,
+            "echo remote".to_string(),
+            CancellationToken::new(),
+            UserShellCommandMode::StandaloneTurn,
+        ),
+    )
+    .await
+    .expect("remote dispatch should fail promptly against a closed endpoint");
+
+    let mut started = None;
+    let mut completed = None;
+    while started.is_none() || completed.is_none() {
+        let event = tokio::time::timeout(StdDuration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for user-shell event")
+            .expect("event channel open");
+        match event.msg {
+            EventMsg::ExecCommandBegin(begin) => started = Some(begin),
+            EventMsg::ExecCommandEnd(end) => completed = Some(end),
+            _ => {}
+        }
+    }
+
+    let started = started.expect("command start");
+    assert_eq!(started.cwd, foreign_cwd);
+    assert_eq!(started.source, ExecCommandSource::UserShell);
+    let completed = completed.expect("command completion");
+    assert_eq!(completed.cwd, foreign_cwd);
+    assert_eq!(completed.exit_code, -1);
+    assert!(completed.stderr.contains("execution error:"));
 }
 
 #[tokio::test]
@@ -10056,6 +10337,126 @@ impl SessionTask for NeverEndingTask {
 }
 
 #[derive(Clone)]
+struct DelayedToolOutputRelayTask {
+    call_id: String,
+    call_recorded: Arc<tokio::sync::Notify>,
+}
+
+impl SessionTask for DelayedToolOutputRelayTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.delayed_tool_output_relay"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        session: Arc<SessionTaskContext>,
+        ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        let session = session.clone_session();
+        session
+            .record_conversation_items(
+                &ctx,
+                &[ResponseItem::FunctionCall {
+                    id: None,
+                    name: "delayed_tool".to_string(),
+                    namespace: None,
+                    arguments: "{}".to_string(),
+                    call_id: self.call_id.clone(),
+                    internal_chat_message_metadata_passthrough: None,
+                }],
+            )
+            .await;
+        self.call_recorded.notify_one();
+
+        cancellation_token.cancelled().await;
+        sleep(Duration::from_millis(250)).await;
+
+        session
+            .record_conversation_items(
+                &ctx,
+                &[ResponseItem::FunctionCallOutput {
+                    id: None,
+                    call_id: self.call_id.clone(),
+                    output: FunctionCallOutputPayload::from_text(
+                        "delayed-runtime-output".to_string(),
+                    ),
+                    internal_chat_message_metadata_passthrough: None,
+                }],
+            )
+            .await;
+
+        Err(CodexErr::TurnAborted)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abort_waits_for_delayed_tool_output_relay_before_terminal_event() {
+    let (session, turn_context, rx_event) = make_session_and_context_with_rx().await;
+    let call_id = "delayed-call".to_string();
+    let call_recorded = Arc::new(tokio::sync::Notify::new());
+
+    session
+        .spawn_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            DelayedToolOutputRelayTask {
+                call_id: call_id.clone(),
+                call_recorded: Arc::clone(&call_recorded),
+            },
+        )
+        .await;
+
+    timeout(Duration::from_secs(1), call_recorded.notified())
+        .await
+        .expect("tool call should be recorded before cancellation");
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+
+    let history = session.clone_history().await;
+    let raw_items = history.raw_items();
+    let call_index = raw_items
+        .iter()
+        .position(|item| {
+            matches!(
+                item,
+                ResponseItem::FunctionCall {
+                    call_id: item_call_id,
+                    ..
+                } if item_call_id == &call_id
+            )
+        })
+        .expect("tool call should remain in conversation history");
+    let output_index = raw_items
+        .iter()
+        .position(|item| {
+            matches!(
+                item,
+                ResponseItem::FunctionCallOutput {
+                    call_id: item_call_id,
+                    output,
+                    ..
+                } if item_call_id == &call_id
+                    && output.text_content() == Some("delayed-runtime-output")
+            )
+        })
+        .expect("tool output should be relayed before terminal finalization");
+    assert!(call_index < output_index);
+
+    let terminal = recv_terminal_event(&rx_event, TerminalEventKind::TurnAborted).await;
+    match terminal.msg {
+        EventMsg::TurnAborted(event) => {
+            assert_eq!(event.reason, TurnAbortReason::Interrupted);
+        }
+        other => panic!("unexpected terminal event: {other:?}"),
+    }
+}
+
+#[derive(Clone)]
 struct BlockingAbortTask {
     abort_started: Arc<tokio::sync::Notify>,
     release_abort: CancellationToken,
@@ -10240,10 +10641,24 @@ async fn turn_complete_flushes_terminal_event_after_delivery() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn turn_aborted_flushes_terminal_event_after_delivery() {
+async fn turn_aborted_persists_missing_call_output_before_terminal_event() {
     let (mut sess, tc, rx) = make_session_and_context_with_rx().await;
     let store = attach_in_memory_thread_store(
         Arc::get_mut(&mut sess).expect("session should be uniquely owned"),
+    )
+    .await;
+
+    let unresolved_call_id = "call-interrupted-before-output";
+    sess.record_conversation_items(
+        &tc,
+        &[ResponseItem::FunctionCall {
+            id: None,
+            name: "interrupted_tool".to_string(),
+            namespace: None,
+            arguments: "{}".to_string(),
+            call_id: unresolved_call_id.to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        }],
     )
     .await;
 
@@ -10277,12 +10692,119 @@ async fn turn_aborted_flushes_terminal_event_after_delivery() {
         other => panic!("unexpected event: {other:?}"),
     }
     abort_task.await.expect("abort task should finish");
+    let history = sess.clone_history().await;
+    assert!(history.raw_items().iter().any(|item| {
+        matches!(
+            item,
+            ResponseItem::FunctionCallOutput {
+                call_id,
+                output,
+                ..
+            } if call_id == unresolved_call_id && output.text_content() == Some("aborted")
+        )
+    }));
     // Expected flushes:
     // 1. Task-runner flush after the task body observes cancellation.
-    // 2. Interrupted-marker flush before TurnAborted so abort observers can reread it.
-    // 3. Terminal-event flush after TurnAborted is appended.
-    let calls = wait_for_flush_count(&store, /*expected_flushes*/ 3).await;
-    assert_eq!(3, calls.flush_thread);
+    // 2. Missing-output flush before TurnAborted closes the persisted tool lifecycle.
+    // 3. Interrupted-marker flush before TurnAborted so abort observers can reread it.
+    // 4. Terminal-event flush after TurnAborted is appended.
+    let calls = wait_for_flush_count(&store, /*expected_flushes*/ 4).await;
+    assert_eq!(4, calls.flush_thread);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn durable_conversation_commit_survives_caller_cancellation_and_is_idempotent() {
+    let (mut sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let store = attach_in_memory_thread_store(
+        Arc::get_mut(&mut sess).expect("session should be uniquely owned"),
+    )
+    .await;
+    let initial_flushes = store.calls().await.flush_thread;
+    let call_id = "durable-before-history".to_string();
+    let output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: call_id.clone(),
+        output: FunctionCallOutputPayload::from_text("persisted-first".to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    let (state_locked_tx, state_locked_rx) = tokio::sync::oneshot::channel();
+    let (release_state_tx, release_state_rx) = std::sync::mpsc::channel();
+    let state_blocker = tokio::task::spawn_blocking({
+        let sess = Arc::clone(&sess);
+        move || {
+            let state_guard = sess.state.blocking_lock();
+            let _ = state_locked_tx.send(());
+            let _ = release_state_rx.recv();
+            drop(state_guard);
+        }
+    });
+    state_locked_rx.await.expect("state blocker acquires lock");
+    let (record_started_tx, record_started_rx) = tokio::sync::oneshot::channel();
+    let record_task = tokio::spawn({
+        let sess = Arc::clone(&sess);
+        let tc = Arc::clone(&tc);
+        let output = output.clone();
+        async move {
+            let outputs = [output];
+            let mut record = Box::pin(sess.record_conversation_items_durable(&tc, &outputs));
+            let mut record_started_tx = Some(record_started_tx);
+            std::future::poll_fn(move |cx| {
+                let result = record.as_mut().poll(cx);
+                if let Some(record_started_tx) = record_started_tx.take() {
+                    let _ = record_started_tx.send(());
+                }
+                result
+            })
+            .await
+        }
+    });
+    record_started_rx
+        .await
+        .expect("durable record future should reach its cancellation-shielded commit");
+    record_task.abort();
+    let _ = record_task.await;
+    release_state_tx
+        .send(())
+        .expect("release durable commit state blocker");
+    state_blocker.await.expect("state blocker joins");
+
+    let calls = wait_for_flush_count(&store, initial_flushes + 1).await;
+    assert_eq!(calls.flush_thread, initial_flushes + 1);
+
+    let history = sess.clone_history().await;
+    assert!(history.raw_items().iter().any(|item| {
+        matches!(
+            item,
+            ResponseItem::FunctionCallOutput {
+                call_id: item_call_id,
+                output,
+                ..
+            } if item_call_id == &call_id && output.text_content() == Some("persisted-first")
+        )
+    }));
+
+    sess.record_conversation_items_durable(&tc, &[output])
+        .await
+        .expect("retrying a completed durable commit should succeed");
+    let history = sess.clone_history().await;
+    assert_eq!(
+        history
+            .raw_items()
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item,
+                    ResponseItem::FunctionCallOutput {
+                        call_id: item_call_id,
+                        ..
+                    } if item_call_id == &call_id
+                )
+            })
+            .count(),
+        1
+    );
+    assert_eq!(store.calls().await.flush_thread, initial_flushes + 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

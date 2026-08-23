@@ -29,6 +29,7 @@ use std::time::Duration;
 use crate::AgentThreadId;
 use crate::CodexTurnId;
 use crate::ExecutionStatus;
+use crate::RawPayloadKind;
 use crate::RawTraceEventPayload;
 
 pub(crate) struct CodexTurnTraceEvent {
@@ -113,6 +114,17 @@ pub(crate) enum ToolRuntimePayload<'a> {
     CollabCloseBegin(&'a codex_protocol::protocol::CollabCloseBeginEvent),
     CollabCloseEnd(&'a codex_protocol::protocol::CollabCloseEndEvent),
     SubAgentActivity(&'a SubAgentActivityEvent),
+}
+
+impl ToolRuntimePayload<'_> {
+    pub(crate) fn raw_payload_kind(&self) -> RawPayloadKind {
+        match self {
+            Self::ExecCommandBegin(_) | Self::ExecCommandEnd(_) => {
+                RawPayloadKind::TerminalRuntimeEvent
+            }
+            _ => RawPayloadKind::ToolRuntimeEvent,
+        }
+    }
 }
 
 impl Serialize for ToolRuntimePayload<'_> {

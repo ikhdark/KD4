@@ -81,12 +81,13 @@ impl TurnEnvironment {
         }
     }
 
-    pub(crate) fn shell_snapshot(&self, cwd: &AbsolutePathBuf) -> Option<AbsolutePathBuf> {
+    pub(crate) async fn shell_snapshot(&self, cwd: &AbsolutePathBuf) -> Option<AbsolutePathBuf> {
         if self.cwd != PathUri::from_abs_path(cwd) {
             return None;
         }
         self.shell_snapshot
-            .peek()?
+            .clone()
+            .await
             .as_deref()
             .map(ShellSnapshotFile::path)
     }

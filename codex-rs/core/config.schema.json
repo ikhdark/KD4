@@ -380,24 +380,9 @@
             "type": "string"
           },
           "type": "array"
-        },
-        "waiting_policy": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/CodeModeWaitingPolicy"
-            }
-          ],
-          "description": "Deprecated compatibility field. Its value is ignored."
         }
       },
       "type": "object"
-    },
-    "CodeModeWaitingPolicy": {
-      "enum": [
-        "yield_after",
-        "run_to_completion"
-      ],
-      "type": "string"
     },
     "ConfigProfile": {
       "additionalProperties": false,
@@ -2707,7 +2692,7 @@
     },
     "ReasoningPhaseEfforts": {
       "additionalProperties": false,
-      "description": "Per-logical-request reasoning effort overrides. Presence of this table enables deterministic phase tracking; omitted fields inherit the resolved turn effort.",
+      "description": "Per-logical-request reasoning effort overrides. Deterministic phase tracking is enabled by default; omitted fields inherit the resolved turn effort.",
       "properties": {
         "deterministic_continuation": {
           "allOf": [
@@ -5389,7 +5374,7 @@
     },
     "project_doc_max_bytes": {
       "default": 32768,
-      "description": "Maximum number of bytes to include from an AGENTS.md project doc file.",
+      "description": "Maximum combined source bytes to retain from AGENTS.md project docs. Generated provenance and truncation notices do not consume this budget.",
       "format": "uint",
       "minimum": 0.0,
       "type": "integer"

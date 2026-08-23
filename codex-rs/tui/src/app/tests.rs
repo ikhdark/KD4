@@ -1206,6 +1206,8 @@ async fn collab_receiver_notification_does_not_cache_not_found_thread() {
                         status: codex_app_server_protocol::CollabAgentStatus::NotFound,
                         message: None,
                         surfaced_result: None,
+                        completion: None,
+                        last_agent_message: None,
                     },
                 )]),
             },

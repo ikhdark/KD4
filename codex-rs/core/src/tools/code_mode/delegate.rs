@@ -495,23 +495,24 @@ impl CoreTurnHost {
         .map_err(|error| error.to_string())
     }
 
-    async fn notify(&self, call_id: String, cell_id: CellId, text: String) -> Result<(), String> {
+    async fn notify(&self, call_id: String, _cell_id: CellId, text: String) -> Result<(), String> {
         if text.trim().is_empty() {
             return Ok(());
         }
         self.exec
             .session
-            .inject_if_running(vec![ResponseItem::CustomToolCallOutput {
-                id: None,
-                call_id,
-                name: Some(PUBLIC_TOOL_NAME.to_string()),
-                output: FunctionCallOutputPayload::from_text(text),
-                internal_chat_message_metadata_passthrough: None,
-            }])
-            .await
-            .map_err(|_| {
-                format!("failed to inject exec notify message for cell {cell_id}: no active turn")
-            })
+            .inject_no_new_turn(
+                vec![ResponseItem::CustomToolCallOutput {
+                    id: None,
+                    call_id,
+                    name: Some(PUBLIC_TOOL_NAME.to_string()),
+                    output: FunctionCallOutputPayload::from_text(text),
+                    internal_chat_message_metadata_passthrough: None,
+                }],
+                Some(self.exec.turn.as_ref()),
+            )
+            .await;
+        Ok(())
     }
 }
 

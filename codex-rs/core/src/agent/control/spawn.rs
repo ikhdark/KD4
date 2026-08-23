@@ -802,7 +802,9 @@ impl AgentControl {
         {
             Ok(reloaded_thread) => {
                 residency_slot.commit(reloaded_thread.thread_id);
-                state.notify_thread_created(reloaded_thread.thread_id);
+                state
+                    .notify_thread_created(reloaded_thread.thread_id, &reloaded_thread.thread)
+                    .await;
                 Ok(())
             }
             Err(err) => {
@@ -1103,7 +1105,9 @@ impl AgentControl {
         }
 
         // Notify only after the initial work is queued and the child becomes path-addressable.
-        state.notify_thread_created(new_thread.thread_id);
+        state
+            .notify_thread_created(new_thread.thread_id, &new_thread.thread)
+            .await;
         pending_cleanup.disarm();
 
         if let Some(SessionSource::SubAgent(
@@ -1445,12 +1449,20 @@ impl AgentControl {
         thread_id: ThreadId,
         session_source: SessionSource,
     ) -> CodexResult<ThreadId> {
+        let state = self.upgrade()?;
+        for metadata in self.state.live_agents() {
+            let Some(registered_thread_id) = metadata.agent_id else {
+                continue;
+            };
+            if state.get_thread(registered_thread_id).await.is_err() {
+                self.state.release_spawned_thread(registered_thread_id);
+            }
+        }
         let root_depth = thread_spawn_depth(&session_source).unwrap_or(0);
         let (resumed_thread_id, resumed_multi_agent_version) = Box::pin(
             self.resume_single_agent_from_rollout(config.clone(), thread_id, session_source),
         )
         .await?;
-        let state = self.upgrade()?;
         if config.multi_agent_version_from_features() == MultiAgentVersion::V2
             || resumed_multi_agent_version == MultiAgentVersion::V2
         {
@@ -1637,7 +1649,9 @@ impl AgentControl {
         }
         // Resumed threads are re-registered in-memory and need the same listener
         // attachment path as freshly spawned threads.
-        state.notify_thread_created(resumed_thread.thread_id);
+        state
+            .notify_thread_created(resumed_thread.thread_id, &resumed_thread.thread)
+            .await;
         if multi_agent_version != MultiAgentVersion::V2 {
             let child_reference = agent_metadata
                 .agent_path

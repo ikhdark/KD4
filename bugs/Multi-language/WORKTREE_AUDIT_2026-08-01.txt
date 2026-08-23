@@ -1,0 +1,210 @@
+KDS WORKING-TREE AUDIT LEDGER
+Date: 2026-08-01
+Scope: every tracked path plus every non-ignored untracked path reported by Git.
+Baseline inventory: 107 tracked paths, 0 non-ignored untracked paths; the requested ledger is the 108th in-scope path.
+
+READ-FIRST HOLD POINT
+- Source/config/test/documentation fixes are forbidden until the complete sweep is recorded here.
+- Existing deleted paths are reviewed from the tracked baseline plus their removal impact.
+- Ignored/generated paths (including .codex/verify-local) are outside the Git-tree scope.
+- RELEASED: all 108 paths were fully read (deleted paths from HEAD), both read-only agents finished, findings were reconciled, and a fresh hash/status check found no intervening source edit.
+
+STATUS KEY
+- PENDING: not yet read (none remain).
+- READ: full current file read; no confirmed defect.
+- CANDIDATE: concrete concern pending cross-file confirmation.
+- CONFIRMED: reproducible or contract-proven bug with a scoped fix plan.
+- REJECTED: investigated concern shown not to be a bug.
+- DELETED-REVIEWED: tracked baseline and deletion impact reviewed.
+- FIXED / VERIFIED: post-sweep implementation and validation outcomes.
+
+COVERAGE
+- Manifest assignment: RECORDED (108 disjoint paths)
+- Rust runtime, manifests, and native tests: COMPLETE (31/31)
+- Install/plugin/scripts/evaluator/workflows and Python tests: COMPLETE (46/46)
+- Documentation, repository infrastructure, fixtures, and deletion impact: COMPLETE (31/31)
+- Cross-contract synthesis: COMPLETE; 7 defects confirmed, plausible non-defects recorded below
+
+FILE MANIFEST
+owner | disposition | path
+DISTRIBUTION-AGENT | READ | .agents/plugins/marketplace.json
+DISTRIBUTION-AGENT | READ | .claude-plugin/marketplace.json
+ROOT | READ | .codex/.gitignore
+ROOT | READ | .codex/AGENTS.md
+ROOT | READ | .codex/README.md
+ROOT | READ | .codex/environments/README.md
+ROOT | READ | .codex/environments/environment.toml
+ROOT | READ | .codex/environments/setup.py
+ROOT | READ | .codex/skills/kds-harness/SKILL.md
+ROOT | READ | .codex/skills/kds-harness/agents/openai.yaml
+ROOT | READ | .codex/skills/kds-harness/references/agent-patterns.md
+ROOT | READ | .codex/skills/kds-harness/references/audit-rubric.md
+ROOT | READ | .codex/skills/kds-harness/references/context-management.md
+ROOT | READ | .codex/skills/kds-harness/references/evals.md
+ROOT | READ | .codex/skills/kds-harness/references/task-artifacts.md
+ROOT | READ | .gitattributes
+DISTRIBUTION-AGENT | READ | .github/workflows/ci.yml
+DISTRIBUTION-AGENT | READ | .github/workflows/release.yml
+ROOT | READ | .gitignore
+ROOT | READ | CHANGELOG.md
+RUNTIME-AGENT | READ | Cargo.lock
+RUNTIME-AGENT | READ | Cargo.toml
+ROOT | DELETED-REVIEWED | DEEP_PIPELINE_AUDIT_2026-07-31.txt
+ROOT | DELETED-REVIEWED | FULL_REPOSITORY_AUDIT_2026-07-31.txt
+ROOT | READ | LICENSE
+ROOT | READ | README.md
+ROOT | READ | SOURCE_MAP.md
+ROOT | DELETED-REVIEWED | WORKING_TREE_AUDIT.txt
+ROOT | READ | WORKTREE_AUDIT_2026-08-01.txt
+ROOT | DELETED-REVIEWED | docs/DECISIONS.md
+ROOT | READ | docs/INSTALL.md
+ROOT | DELETED-REVIEWED | docs/README.md
+ROOT | READ | docs/RELEASE.md
+ROOT | READ | docs/SAVINGS_LAB.md
+ROOT | DELETED-REVIEWED | docs/UNINSTALL.md
+ROOT | READ | docs/VALIDATION.md
+DISTRIBUTION-AGENT | READ | evals/codex_savings/corpus.json
+DISTRIBUTION-AGENT | READ | evals/codex_savings/preregistration.example.json
+DISTRIBUTION-AGENT | READ | evals/codex_savings/pricing/gpt-5.6-terra-standard-2026-07-30.json
+DISTRIBUTION-AGENT | READ | evals/codex_savings/provider-receipt.example.json
+DISTRIBUTION-AGENT | READ | evals/codex_savings/provider-request.example.json
+DISTRIBUTION-AGENT | READ | evals/codex_savings/provider-thread.example.json
+DISTRIBUTION-AGENT | READ | evals/codex_savings/tasks/diagnose-fix-retest/fixture/records.py
+DISTRIBUTION-AGENT | READ | evals/codex_savings/tasks/diagnose-fix-retest/fixture/test_records.py
+DISTRIBUTION-AGENT | READ | evals/codex_savings/tasks/diagnose-fix-retest/prompt.md
+DISTRIBUTION-AGENT | READ | evals/codex_savings/tasks/diagnose-fix-retest/verify.py
+DISTRIBUTION-AGENT | READ | evals/codex_savings/tasks/multi-file-report/fixture/inventory.py
+DISTRIBUTION-AGENT | READ | evals/codex_savings/tasks/multi-file-report/fixture/report.py
+DISTRIBUTION-AGENT | READ | evals/codex_savings/tasks/multi-file-report/fixture/test_report.py
+DISTRIBUTION-AGENT | READ | evals/codex_savings/tasks/multi-file-report/prompt.md
+DISTRIBUTION-AGENT | READ | evals/codex_savings/tasks/multi-file-report/verify.py
+DISTRIBUTION-AGENT | READ | evals/codex_savings/tasks/neutral-edit/fixture/status.txt
+DISTRIBUTION-AGENT | READ | evals/codex_savings/tasks/neutral-edit/prompt.md
+DISTRIBUTION-AGENT | READ | evals/codex_savings/tasks/neutral-edit/verify.py
+DISTRIBUTION-AGENT | READ | evals/codex_savings/tasks/noisy-failure/fixture/calculator.py
+DISTRIBUTION-AGENT | READ | evals/codex_savings/tasks/noisy-failure/fixture/test_calculator.py
+DISTRIBUTION-AGENT | READ | evals/codex_savings/tasks/noisy-failure/prompt.md
+DISTRIBUTION-AGENT | READ | evals/codex_savings/tasks/noisy-failure/verify.py
+DISTRIBUTION-AGENT | READ | install.sh
+DISTRIBUTION-AGENT | READ | plugins/kds/.claude-plugin/plugin.json
+DISTRIBUTION-AGENT | READ | plugins/kds/.codex-plugin/plugin.json
+DISTRIBUTION-AGENT | READ | plugins/kds/.mcp.json
+DISTRIBUTION-AGENT | READ | plugins/kds/hooks/codex-hooks.json
+DISTRIBUTION-AGENT | READ | plugins/kds/hooks/guard-protected-paths.ps1
+DISTRIBUTION-AGENT | READ | plugins/kds/hooks/guard-protected-paths.sh
+DISTRIBUTION-AGENT | READ | plugins/kds/hooks/hooks.json
+DISTRIBUTION-AGENT | READ | plugins/kds/runtime/kds.cmd
+DISTRIBUTION-AGENT | READ | plugins/kds/runtime/kds.sh
+DISTRIBUTION-AGENT | READ | plugins/kds/skills/kds/SKILL.md
+ROOT | DELETED-REVIEWED | repository_audit_findings.txt
+DISTRIBUTION-AGENT | DELETED-REVIEWED | scripts/README.md
+DISTRIBUTION-AGENT | READ | scripts/bench.ps1
+DISTRIBUTION-AGENT | FIXED | scripts/eval_codex_savings.py
+DISTRIBUTION-AGENT | FIXED | scripts/eval_codex_savings_verify.py
+DISTRIBUTION-AGENT | READ | scripts/plugin_lifecycle.py
+RUNTIME-AGENT | READ | src/cli.rs
+RUNTIME-AGENT | READ | src/diagnostics.rs
+RUNTIME-AGENT | READ | src/doctor.rs
+RUNTIME-AGENT | READ | src/evidence.rs
+RUNTIME-AGENT | FIXED | src/hook.rs
+RUNTIME-AGENT | FIXED | src/init.rs
+RUNTIME-AGENT | READ | src/main.rs
+RUNTIME-AGENT | READ | src/mcp.rs
+RUNTIME-AGENT | READ | src/measure.rs
+RUNTIME-AGENT | VERIFIED | src/output_file.rs
+RUNTIME-AGENT | READ | src/policy.rs
+RUNTIME-AGENT | READ | src/runner.rs
+RUNTIME-AGENT | READ | src/runner/capture.rs
+RUNTIME-AGENT | DELETED-REVIEWED | src/runner/import.rs
+RUNTIME-AGENT | READ | src/runner/passthrough.rs
+RUNTIME-AGENT | READ | src/runner/process.rs
+RUNTIME-AGENT | READ | src/runner/report.rs
+RUNTIME-AGENT | READ | src/runtime_config.rs
+RUNTIME-AGENT | READ | src/storage.rs
+RUNTIME-AGENT | READ | src/summarize.rs
+RUNTIME-AGENT | READ | src/summarize/adapters.rs
+RUNTIME-AGENT | READ | src/summarize/budget.rs
+RUNTIME-AGENT | READ | src/summarize/capture.rs
+RUNTIME-AGENT | READ | src/summarize/lifecycle.rs
+RUNTIME-AGENT | READ | src/summarize/redact.rs
+RUNTIME-AGENT | READ | src/summarize/render.rs
+RUNTIME-AGENT | READ | src/summarize/tests.rs
+RUNTIME-AGENT | READ | src/windows_process.rs
+DISTRIBUTION-AGENT | READ | tests/claude_plugin_e2e_smoke.py
+DISTRIBUTION-AGENT | READ | tests/codex_plugin_e2e_smoke.py
+DISTRIBUTION-AGENT | VERIFIED | tests/test_codex_savings_eval.py
+DISTRIBUTION-AGENT | READ | tests/test_plugin_lifecycle.py
+RUNTIME-AGENT | VERIFIED | tests/wrap.rs
+
+FINDINGS
+F-01 CONFIRMED - src/init.rs:225-230, 267, 304-320
+Evidence: is_managed_hook accepts every command ending in "hook pre-tool-use"; connect/uninstall then removes all matches.
+Consequence: an unrelated tool command such as "/tools/other-tool" hook pre-tool-use can be deleted from Claude settings.
+Fix plan: match only the exact command generated for this invocation or the exact legacy KDS executable/argument grammar, while preserving genuine stale KDS path migration.
+Validation: preserve suffix-colliding unrelated hooks during connect and uninstall; continue replacing a genuine stale KDS hook.
+
+F-02 CONFIRMED - src/init.rs:41-78 and 174-180
+Evidence: settings.json is read, then std::fs::copy writes settings.json.bak before AtomicOutput validates the settings target; copy follows a symlink and writes through a hard link.
+Consequence: init can overwrite an outside linked peer before the settings update is rejected or committed, and the backup can cease to match the settings snapshot.
+Fix plan: prepare/validate the settings destination first, publish the backup atomically from the already-read bytes, and reject if settings changed between read and commit.
+Validation: symlink/reparse and hard-link targets retain their sentinels; backup contains the exact prior settings; a change observed at the final snapshot check aborts without publishing new settings.
+
+F-03 CONFIRMED - src/init.rs:51
+Evidence: serde_json::from_str<Value> silently collapses duplicate object keys before pretty serialization.
+Consequence: init can discard duplicate top-level, hook, or unrelated Claude settings even though it owns only one hook entry.
+Fix plan: use storage::decode_json_no_duplicates and fail before backup or settings mutation.
+Validation: top-level and nested duplicate settings leave settings and backup state unchanged.
+
+F-04 CONFIRMED - src/hook.rs:65-88
+Evidence: the hook adapter also parses raw JSON directly into Value and can route using one retained duplicate tool_name, tool_input, or command member.
+Consequence: ambiguous hook input can emit an allow/rewrite instead of failing open.
+Fix plan: use the recursive duplicate-safe decoder and return no hook output on duplicates.
+Validation: duplicate top-level and nested command inputs produce no response.
+
+F-05 CONFIRMED - scripts/eval_codex_savings.py:4344-4354, 4596-4602, 4637-4647, 5606-5612, 6013-6020
+Evidence: a pair with tries=[] is appended before baseline/arms run; fatal state persists that partial pair, but replay structure validation rejects every pair lacking a retry receipt.
+Consequence: a real mid-pair fatal campaign can retain artifacts that its own deterministic replay refuses.
+Fix plan: persist only the fully completed pair/attempt prefix on pair-level fatal exit while retaining incomplete raw files through the artifact index.
+Validation: injected baseline-materialization and second-arm fatal campaigns both replay as incomplete without a structural error.
+
+F-06 CONFIRMED - scripts/eval_codex_savings.py:1934-1956, 2621-2625, 4259-4268
+Evidence: PATH sanitization drops an entire component whenever it contains kds/kds.exe/kds.cmd.
+Consequence: supported shared locations such as Cargo bin lose cargo, rustc, rg, and other co-located tools, changing confirmation-task behavior and invalidating evidence.
+Fix plan: remove only dedicated KDS-only PATH components and fail closed before paid work when KDS shares a component with another entry.
+Validation: a KDS-only directory is removed; a KDS-plus-sentinel directory aborts before launch and names the isolation remedy.
+
+F-07 CONFIRMED - scripts/eval_codex_savings.py:2474-2507 and scripts/eval_codex_savings_verify.py:62-84
+Evidence: both verifier layers inherit PYTHONPATH, PYTHONHOME, and other interpreter-startup controls while launching only with -B; retained environment provenance does not record them.
+Consequence: sitecustomize or equivalent startup injection can alter deterministic verifier results invisibly.
+Fix plan: strip Python startup-control variables at both process boundaries and use an isolated-safe driver/module load strategy.
+Validation: a hostile PYTHONPATH/sitecustomize marker is not loaded by either verifier layer.
+
+REJECTED CANDIDATES
+R-01 - Mutable GitHub Action tags are a supply-chain hardening opportunity, not a proven repository-contract defect; SOURCE_MAP's commit-pinned wording describes the released source commit.
+R-02 - install.sh lacks rollback if interrupted after replacement, but no atomic-upgrade/rollback contract exists.
+R-03 - deleted src/runner/import.rs is coherent: no current import/results/report-mode consumer remains.
+R-04 - ordinary AtomicOutput hard-link replacement uses rename and does not overwrite the peer inode; this differs from init's direct fs::copy backup.
+R-05 - measurement sidecar ordering, bounded capture incompleteness, and no-tool MCP behavior are intentional and fail/report as designed.
+R-06 - deleted scripts/README.md and the other deleted documentation/audit paths have no live source dependency.
+R-07 - lifecycle installPath, plugin guard launchers, Ubuntu Claude smoke spelling, artifact ordering, pricing strictness, and provider handoffs were traced and did not yield a runtime defect.
+R-08 - overwriting an ordinary prior .bak may need a future product decision, but no versioned/write-once backup contract exists.
+
+POST-SWEEP FIX LOG
+- F-01 FIXED / VERIFIED: hook ownership now accepts only the active command or the exact platform-generated KDS command grammar with a kds/kds.exe executable name. Connect and disconnect preserve suffix-colliding unrelated hooks while migrating a genuine stale KDS path.
+- F-02 FIXED / VERIFIED: init validates link/reparse boundaries, serializes KDS writers with a persistent sidecar lock, stages settings and backup bytes in the destination directory, rechecks snapshots immediately before atomic replacement, and guards backup rollback against later changes. Hard-link peers are not written through; symlink/reparse destinations are rejected. Supported filesystems have no portable pathname compare-and-replace against non-cooperating editors, so that final-check race is stated explicitly in docs/INSTALL.md rather than overclaimed.
+- F-03 FIXED / VERIFIED: init uses the recursive duplicate-safe JSON decoder. Duplicate top-level and nested settings abort before backup, lock, or settings mutation.
+- F-04 FIXED / VERIFIED: the PreToolUse adapter uses the same duplicate-safe decoder and produces no response for ambiguous top-level or nested hook events.
+- F-05 FIXED / VERIFIED: fatal Savings Lab handling truncates structured attempts and pairs to the last fully completed pair while retaining partial raw artifacts in the index. Baseline-fatal, second-arm-fatal, empty-prefix, and valid completed-r1/partial-r2 replay cases pass.
+- F-06 FIXED / VERIFIED: PATH sanitation removes only dedicated KDS-only components and fails closed before artifact creation or paid execution when KDS shares a directory with other entries.
+- F-07 FIXED / VERIFIED: both verifier process layers strip Python startup controls and launch with retained -E -s -S -B provenance. Replay validates the retained mode and flags at top level, including zero-attempt campaigns, and intentionally rejects legacy campaigns that predate this provenance.
+- Post-fix adversarial review also corrected backup-error rollback, top-level zero-attempt provenance validation, and the two-replication partial-prefix fixture before final verification.
+
+FINAL VALIDATION
+- Coverage: the ledger manifest has 108 unique paths and exactly matches the 108-path Git scope; all 9 deleted tracked paths are marked DELETED-REVIEWED. No PENDING manifest entry remains.
+- Rust: cargo fmt --check, cargo check --all-targets --locked, cargo clippy --all-targets --locked -- -D warnings, and cargo build --release --locked passed with Rust 1.95.0. cargo test --locked passed 206 unit tests and 51 binary/end-to-end tests.
+- Python: py_compile passed; tests/test_codex_savings_eval.py passed 80 tests; tests/test_plugin_lifecycle.py passed 101 tests with 4 platform skips.
+- Host integration: isolated Codex and Claude Code plugin smoke tests passed using temporary host homes and user CLI/PATH state; no real KDS_HOME, CODEX_HOME, CLAUDE_CONFIG_DIR, PATH, or shell profile was mutated.
+- Static checks: JSON, TOML, YAML, Python AST, shell/PowerShell syntax, local documentation links, stale deleted-path references, formatting, and git diff --check passed.
+
+FINAL DOUBLE CHECK
+COMPLETE. Root re-read every final fix surface and its tests after implementation. Both read-only agents performed post-fix adversarial reviews and reported no remaining concrete correctness or documentation defect. The eight rejected candidates remain rejected rather than being padded into findings. All 7 confirmed defects are fixed and verified; no concrete bug remains in the accepted Git-tree scope.

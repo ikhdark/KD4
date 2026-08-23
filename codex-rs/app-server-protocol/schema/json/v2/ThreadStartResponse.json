@@ -244,6 +244,22 @@
     },
     "CollabAgentState": {
       "properties": {
+        "completion": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TaskCompletionGate"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lastAgentMessage": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "message": {
           "type": [
             "string",
@@ -2986,6 +3002,18 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "projectionSourceDependenciesFallbackCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "projectionSourceDependenciesReuseCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
         "provenLoopActivationCount": {
           "default": 0,
           "format": "uint32",
@@ -3062,6 +3090,12 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "toolOutputArtifactReuseCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
         "toolOutputCanonicalByteCount": {
           "default": 0,
           "format": "uint64",
@@ -3123,6 +3157,18 @@
           "type": "integer"
         },
         "toolOutputTruncationCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "toolRouterRebuildCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "toolRouterReuseCount": {
           "default": 0,
           "format": "uint32",
           "minimum": 0.0,

@@ -247,7 +247,7 @@ pub enum ToolOutputOutcome {
     Skipped,
 }
 
-/// Why a tool intentionally did not execute.
+/// Why a tool result could not exercise the requested capability.
 ///
 /// A skipped result is non-success, but only `BlockingRequiredOperation`
 /// constitutes failure evidence for the sampling governor.

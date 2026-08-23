@@ -1,18 +1,26 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use codex_async_utils::CancelErr;
 use codex_async_utils::OrCancelExt;
+use codex_exec_server::ExecEnvPolicy;
+use codex_exec_server::ExecOutputStream as ServerExecOutputStream;
+use codex_exec_server::ExecParams;
+use codex_exec_server::ExecProcess;
 use codex_network_proxy::PROXY_ACTIVE_ENV_KEY;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::exec::ExecCapturePolicy;
 use crate::exec::StdoutStream;
 use crate::exec::execute_exec_request;
+use crate::exec_env::CODEX_PERMISSION_PROFILE_ENV_VAR;
+use crate::exec_env::CODEX_THREAD_ID_ENV_VAR;
 use crate::exec_env::create_env;
 use crate::sandboxing::ExecRequest;
 use crate::session::TurnInput;
@@ -33,7 +41,9 @@ use codex_protocol::items::CommandExecutionStatus;
 use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ExecCommandOutputDeltaEvent;
 use codex_protocol::protocol::ExecCommandSource;
+use codex_protocol::protocol::ExecOutputStream;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_sandboxing::SandboxType;
 use codex_shell_command::parse_command::parse_command;
@@ -111,10 +121,9 @@ pub(crate) async fn execute_user_shell_command(
         // Auxiliary mode runs within an existing active turn. That turn already
         // emitted TurnStarted, so emitting another TurnStarted here would create
         // duplicate turn lifecycle events and confuse clients.
-        // TODO(ccunningham): After TurnStarted, emit model-visible turn context diffs for
-        // standalone lifecycle tasks (for example /shell, and review once it emits TurnStarted).
-        // `/compact` is an intentional exception because compaction requests should not include
-        // freshly reinjected context before the summary/replacement history is applied.
+        // `/compact` is an intentional exception to this standalone context path because
+        // compaction requests should not include freshly reinjected context before the
+        // summary/replacement history is applied.
         let event = EventMsg::TurnStarted(TurnStartedEvent {
             turn_id: turn_context.sub_id.clone(),
             trace_id: turn_context.trace_id.clone(),
@@ -123,11 +132,21 @@ pub(crate) async fn execute_user_shell_command(
             collaboration_mode_kind: turn_context.collaboration_mode.mode,
         });
         session.send_event(turn_context.as_ref(), event).await;
+
+        // Standalone shell turns bypass model sampling, but their rollout still
+        // needs the same model-visible context baseline as a regular turn. Stage
+        // it after TurnStarted without committing a new reference item.
+        let step_context = session
+            .capture_step_context(Arc::clone(&turn_context))
+            .await;
+        session
+            .record_context_updates_and_set_reference_context_item(&step_context)
+            .await;
     }
 
     let Some((turn_environment, environment_shell)) = turn_context
         .environments
-        .local()
+        .primary()
         .and_then(|environment| environment.shell.as_ref().map(|shell| (environment, shell)))
     else {
         send_user_shell_error(
@@ -144,36 +163,7 @@ pub(crate) async fn execute_user_shell_command(
     // We do not source rc files or otherwise reformat the script.
     let use_login_shell = true;
     let display_command = environment_shell.derive_exec_args(&command, use_login_shell);
-    // TODO(anp): Migrate user-shell events and execution plumbing to PathUri so this local-only
-    // feature does not need to project the selected environment cwd onto the Codex host.
-    let Ok(cwd) = turn_environment.cwd().to_abs_path() else {
-        send_user_shell_error(
-            &session,
-            turn_context.as_ref(),
-            "shell working directory is not native to the Codex host",
-        )
-        .await;
-        return;
-    };
-    let shell_snapshot_location = turn_environment.shell_snapshot(&cwd);
-    let mut exec_env_map = create_env(
-        &turn_context.config.permissions.shell_environment_policy,
-        Some(session.thread_id),
-    );
-    if exec_env_map.contains_key(PROXY_ACTIVE_ENV_KEY) {
-        strip_managed_proxy_env(&mut exec_env_map);
-    }
-    let exec_command = prepare_user_shell_exec_command(
-        &display_command,
-        environment_shell,
-        shell_snapshot_location.as_ref(),
-        &turn_context
-            .config
-            .permissions
-            .shell_environment_policy
-            .r#set,
-        &mut exec_env_map,
-    );
+    let cwd = turn_environment.cwd().clone();
 
     let call_id = Uuid::new_v4().to_string();
     let raw_command = command;
@@ -186,7 +176,7 @@ pub(crate) async fn execute_user_shell_command(
                 id: call_id.clone(),
                 process_id: None,
                 command: display_command.clone(),
-                cwd: cwd.clone().into(),
+                cwd: cwd.clone(),
                 parsed_cmd: parsed_cmd.clone(),
                 source: ExecCommandSource::UserShell,
                 interaction_input: None,
@@ -201,53 +191,33 @@ pub(crate) async fn execute_user_shell_command(
         )
         .await;
 
-    let permission_profile = PermissionProfile::Disabled;
-    let exec_env = ExecRequest {
-        command: exec_command.clone(),
-        cwd: cwd.clone().into(),
-        env: exec_env_map,
-        exec_server_env_config: None,
-        // `/shell` is the explicit full-access escape hatch, so it must not
-        // inherit a managed proxy from the surrounding session or turn.
-        network: None,
-        network_environment_id: None,
-        // TODO(zhao-oai): Now that we have ExecExpiration::Cancellation, we
-        // should use that instead of an "arbitrarily large" timeout here.
-        expiration: USER_SHELL_TIMEOUT_MS.into(),
-        capture_policy: ExecCapturePolicy::ShellTool,
-        sandbox: SandboxType::None,
-        windows_sandbox_policy_cwd: cwd.clone().into(),
-        windows_sandbox_workspace_roots: turn_context.config.effective_workspace_roots(),
-        windows_sandbox_level: turn_context.windows_sandbox_level,
-        windows_sandbox_private_desktop: turn_context
-            .config
-            .permissions
-            .windows_sandbox_private_desktop,
-        permission_profile: permission_profile.clone(),
-        file_system_sandbox_policy: permission_profile.file_system_sandbox_policy(),
-        network_sandbox_policy: permission_profile.network_sandbox_policy(),
-        windows_sandbox_filesystem_overrides: None,
-        arg0: None,
-        exec_server_sandbox: None,
-        exec_server_enforce_managed_network: false,
-        exec_server_managed_network: None,
-    };
-
-    let stdout_stream = Some(StdoutStream {
-        sub_id: turn_context.sub_id.clone(),
-        call_id: call_id.clone(),
-        tx_event: session.get_tx_event(),
-        progress: None,
-    });
-
     let standalone_work_guard = turn_context.turn_timing_state.begin_standalone_work();
-    let exec_result = execute_exec_request(exec_env, stdout_stream, /*after_spawn*/ None)
-        .or_cancel(&cancellation_token)
-        .await;
+    let exec_result = if turn_environment.environment.is_remote() {
+        execute_remote_user_shell_command(
+            &session,
+            turn_context.as_ref(),
+            turn_environment,
+            display_command.clone(),
+            &call_id,
+            &cancellation_token,
+        )
+        .await
+    } else {
+        execute_local_user_shell_command(
+            &session,
+            turn_context.as_ref(),
+            turn_environment,
+            environment_shell,
+            &display_command,
+            &call_id,
+            &cancellation_token,
+        )
+        .await
+    };
     drop(standalone_work_guard);
 
     match exec_result {
-        Err(CancelErr::Cancelled) => {
+        Err(UserShellExecError::Cancelled) => {
             let aborted_message = "command aborted by user".to_string();
             persist_user_shell_output(
                 &session,
@@ -266,7 +236,7 @@ pub(crate) async fn execute_user_shell_command(
                         id: call_id,
                         process_id: None,
                         command: display_command.clone(),
-                        cwd: cwd.clone().into(),
+                        cwd: cwd.clone(),
                         parsed_cmd: parsed_cmd.clone(),
                         source: ExecCommandSource::UserShell,
                         interaction_input: None,
@@ -281,7 +251,7 @@ pub(crate) async fn execute_user_shell_command(
                 )
                 .await;
         }
-        Ok(Ok(output)) => {
+        Ok(output) => {
             let formatted_output =
                 format_exec_output_str(&output, turn_context.model_info.truncation_policy.into());
             session
@@ -291,7 +261,7 @@ pub(crate) async fn execute_user_shell_command(
                         id: call_id.clone(),
                         process_id: None,
                         command: display_command.clone(),
-                        cwd: cwd.clone().into(),
+                        cwd: cwd.clone(),
                         parsed_cmd: parsed_cmd.clone(),
                         source: ExecCommandSource::UserShell,
                         interaction_input: None,
@@ -321,9 +291,9 @@ pub(crate) async fn execute_user_shell_command(
             )
             .await;
         }
-        Ok(Err(err)) => {
-            error!("user shell command failed: {err:?}");
-            let message = format!("execution error: {err:?}");
+        Err(UserShellExecError::Failed(err)) => {
+            error!("user shell command failed: {err}");
+            let message = format!("execution error: {err}");
             let exec_output = ExecToolCallOutput {
                 exit_code: -1,
                 stdout: StreamOutput::new(String::new()),
@@ -343,7 +313,7 @@ pub(crate) async fn execute_user_shell_command(
                         id: call_id,
                         process_id: None,
                         command: display_command,
-                        cwd: cwd.into(),
+                        cwd,
                         parsed_cmd,
                         source: ExecCommandSource::UserShell,
                         interaction_input: None,
@@ -367,6 +337,255 @@ pub(crate) async fn execute_user_shell_command(
                 mode,
             )
             .await;
+        }
+    }
+}
+
+#[derive(Debug)]
+enum UserShellExecError {
+    Cancelled,
+    Failed(String),
+}
+
+async fn execute_local_user_shell_command(
+    session: &Session,
+    turn_context: &TurnContext,
+    turn_environment: &crate::session::turn_context::TurnEnvironment,
+    environment_shell: &Shell,
+    display_command: &[String],
+    call_id: &str,
+    cancellation_token: &CancellationToken,
+) -> Result<ExecToolCallOutput, UserShellExecError> {
+    let cwd = turn_environment.cwd().to_abs_path().map_err(|_| {
+        UserShellExecError::Failed(
+            "shell working directory is not native to the Codex host".to_string(),
+        )
+    })?;
+    let shell_snapshot_location = turn_environment.shell_snapshot(&cwd).await;
+    let mut exec_env_map = create_env(
+        &turn_context.config.permissions.shell_environment_policy,
+        Some(session.thread_id),
+    );
+    if exec_env_map.contains_key(PROXY_ACTIVE_ENV_KEY) {
+        strip_managed_proxy_env(&mut exec_env_map);
+    }
+    let exec_command = prepare_user_shell_exec_command(
+        display_command,
+        environment_shell,
+        shell_snapshot_location.as_ref(),
+        &turn_context
+            .config
+            .permissions
+            .shell_environment_policy
+            .r#set,
+        &mut exec_env_map,
+    );
+    let permission_profile = PermissionProfile::Disabled;
+    let exec_env = ExecRequest {
+        command: exec_command,
+        cwd: cwd.clone().into(),
+        env: exec_env_map,
+        exec_server_env_config: None,
+        // `/shell` is the explicit full-access escape hatch, so it must not
+        // inherit a managed proxy from the surrounding session or turn.
+        network: None,
+        network_environment_id: None,
+        expiration: USER_SHELL_TIMEOUT_MS.into(),
+        capture_policy: ExecCapturePolicy::ShellTool,
+        sandbox: SandboxType::None,
+        windows_sandbox_policy_cwd: cwd.clone().into(),
+        windows_sandbox_workspace_roots: turn_context.config.effective_workspace_roots(),
+        windows_sandbox_level: turn_context.windows_sandbox_level,
+        windows_sandbox_private_desktop: turn_context
+            .config
+            .permissions
+            .windows_sandbox_private_desktop,
+        permission_profile: permission_profile.clone(),
+        file_system_sandbox_policy: permission_profile.file_system_sandbox_policy(),
+        network_sandbox_policy: permission_profile.network_sandbox_policy(),
+        windows_sandbox_filesystem_overrides: None,
+        arg0: None,
+        exec_server_sandbox: None,
+        exec_server_enforce_managed_network: false,
+        exec_server_managed_network: None,
+    };
+    let stdout_stream = Some(StdoutStream {
+        sub_id: turn_context.sub_id.clone(),
+        call_id: call_id.to_string(),
+        tx_event: session.get_tx_event(),
+        progress: None,
+    });
+
+    match execute_exec_request(exec_env, stdout_stream, /*after_spawn*/ None)
+        .or_cancel(cancellation_token)
+        .await
+    {
+        Err(CancelErr::Cancelled) => Err(UserShellExecError::Cancelled),
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(err)) => Err(UserShellExecError::Failed(format!("{err:?}"))),
+    }
+}
+
+async fn execute_remote_user_shell_command(
+    session: &Session,
+    turn_context: &TurnContext,
+    turn_environment: &crate::session::turn_context::TurnEnvironment,
+    display_command: Vec<String>,
+    call_id: &str,
+    cancellation_token: &CancellationToken,
+) -> Result<ExecToolCallOutput, UserShellExecError> {
+    let policy = &turn_context.config.permissions.shell_environment_policy;
+    let mut exclude = policy
+        .exclude
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>();
+    exclude.push(CODEX_PERMISSION_PROFILE_ENV_VAR.to_string());
+    let mut r#set = policy.r#set.clone();
+    r#set.retain(|key, _| !key.eq_ignore_ascii_case(CODEX_PERMISSION_PROFILE_ENV_VAR));
+    let env_policy = ExecEnvPolicy {
+        inherit: policy.inherit.clone(),
+        ignore_default_excludes: policy.ignore_default_excludes,
+        exclude,
+        r#set,
+        include_only: policy
+            .include_only
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect(),
+    };
+    let env = HashMap::from([(
+        CODEX_THREAD_ID_ENV_VAR.to_string(),
+        session.thread_id.to_string(),
+    )]);
+    let process_id = call_id.into();
+    let exec_backend = turn_environment.environment.get_exec_backend();
+    let start = exec_backend.start(ExecParams {
+        process_id,
+        argv: display_command,
+        cwd: turn_environment.cwd().clone(),
+        env_policy: Some(env_policy),
+        env,
+        tty: false,
+        pipe_stdin: false,
+        arg0: None,
+        sandbox: None,
+        enforce_managed_network: false,
+        managed_network: None,
+    });
+    let started = match start.or_cancel(cancellation_token).await {
+        Err(CancelErr::Cancelled) => return Err(UserShellExecError::Cancelled),
+        Ok(Err(err)) => return Err(UserShellExecError::Failed(format!("{err:?}"))),
+        Ok(Ok(started)) => started,
+    };
+    let process = started.process;
+    let collect =
+        collect_remote_user_shell_output(session, turn_context, Arc::clone(&process), call_id);
+    let result = tokio::select! {
+        result = collect => result,
+        _ = cancellation_token.cancelled() => Err(UserShellExecError::Cancelled),
+        _ = tokio::time::sleep(Duration::from_millis(USER_SHELL_TIMEOUT_MS)) => {
+            Err(UserShellExecError::Failed("command timed out".to_string()))
+        }
+    };
+    terminate_remote_process_after_error(&session.terminal_tasks, process, result).await
+}
+
+async fn terminate_remote_process_after_error(
+    cleanup_tasks: &tokio_util::task::TaskTracker,
+    process: Arc<dyn ExecProcess>,
+    result: Result<ExecToolCallOutput, UserShellExecError>,
+) -> Result<ExecToolCallOutput, UserShellExecError> {
+    if result.is_ok() {
+        return result;
+    }
+
+    if let Err(err) = process.terminate().await {
+        warn!(
+            process_id = %process.process_id(),
+            error = %err,
+            "remote user shell termination was not confirmed; retaining cleanup ownership"
+        );
+        cleanup_tasks.spawn(retry_remote_user_shell_termination(process));
+    }
+    result
+}
+
+async fn retry_remote_user_shell_termination(process: Arc<dyn ExecProcess>) {
+    loop {
+        match process.terminate().await {
+            Ok(()) => return,
+            Err(err) => {
+                warn!(
+                    process_id = %process.process_id(),
+                    error = %err,
+                    "remote user shell cleanup termination retry failed"
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
+async fn collect_remote_user_shell_output(
+    session: &Session,
+    turn_context: &TurnContext,
+    process: Arc<dyn ExecProcess>,
+    call_id: &str,
+) -> Result<ExecToolCallOutput, UserShellExecError> {
+    let started_at = Instant::now();
+    let mut after_seq = None;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut aggregated = Vec::new();
+    let mut exit_code = None;
+
+    loop {
+        let response = process
+            .read(after_seq, /*max_bytes*/ None, Some(1_000))
+            .await
+            .map_err(|err| UserShellExecError::Failed(format!("{err:?}")))?;
+        if let Some(failure) = response.failure {
+            return Err(UserShellExecError::Failed(failure));
+        }
+        for chunk in response.chunks {
+            after_seq = Some(chunk.seq);
+            let bytes = chunk.chunk.into_inner();
+            let stream = match chunk.stream {
+                ServerExecOutputStream::Stdout | ServerExecOutputStream::Pty => {
+                    stdout.extend_from_slice(&bytes);
+                    ExecOutputStream::Stdout
+                }
+                ServerExecOutputStream::Stderr => {
+                    stderr.extend_from_slice(&bytes);
+                    ExecOutputStream::Stderr
+                }
+            };
+            aggregated.extend_from_slice(&bytes);
+            session
+                .send_event(
+                    turn_context,
+                    EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
+                        call_id: call_id.to_string(),
+                        stream,
+                        chunk: bytes,
+                    }),
+                )
+                .await;
+        }
+        after_seq = response.next_seq.checked_sub(1).or(after_seq);
+        exit_code = response.exit_code.or(exit_code);
+        if response.closed {
+            return Ok(ExecToolCallOutput {
+                exit_code: exit_code.unwrap_or(-1),
+                stdout: StreamOutput::new(String::from_utf8_lossy(&stdout).into_owned()),
+                stderr: StreamOutput::new(String::from_utf8_lossy(&stderr).into_owned()),
+                aggregated_output: StreamOutput::new(
+                    String::from_utf8_lossy(&aggregated).into_owned(),
+                ),
+                duration: started_at.elapsed(),
+                timed_out: false,
+            });
         }
     }
 }
@@ -477,6 +696,6 @@ async fn persist_user_shell_output(
         .await;
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 #[path = "user_shell_tests.rs"]
 mod tests;

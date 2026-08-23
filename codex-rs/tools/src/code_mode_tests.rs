@@ -41,7 +41,7 @@ fn augment_tool_spec_for_code_mode_augments_function_tools() {
 
 exec tool declaration:
 ```ts
-declare const tools: { lookup_order(args: { order_id: string; }): Promise<{ ok: boolean; }>; };
+declare const tools: { lookup_order(args: { order_id: string; }, options?: { timeout_ms?: number }): Promise<{ ok: boolean; }>; };
 ```"#
                 .to_string(),
             strict: false,
@@ -110,7 +110,7 @@ fn tool_spec_to_code_mode_tool_definition_returns_augmented_nested_tools() {
 
 exec tool declaration:
 ```ts
-declare const tools: { apply_patch(input: string): Promise<unknown>; };
+declare const tools: { apply_patch(input: string, options?: { timeout_ms?: number }): Promise<unknown>; };
 ```"#
                 .to_string(),
             kind: codex_code_mode::CodeModeToolKind::Freeform,

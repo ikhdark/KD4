@@ -228,6 +228,7 @@ impl TryFrom<RequestPermissionProfile> for CoreRequestPermissionProfile {
 }
 
 v2_enum_from_core!(
+    #[schemars(rename = "V2FileSystemAccessMode")]
     pub enum FileSystemAccessMode from CoreFileSystemAccessMode {
         Read,
         Write,
@@ -236,6 +237,7 @@ v2_enum_from_core!(
 );
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[schemars(rename = "V2FileSystemSpecialPath")]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[ts(tag = "kind")]
 #[ts(export_to = "v2/")]
@@ -281,6 +283,7 @@ impl From<FileSystemSpecialPath> for CoreFileSystemSpecialPath {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[schemars(rename = "V2FileSystemPath")]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[ts(tag = "type")]
 #[ts(export_to = "v2/")]
@@ -327,6 +330,7 @@ impl TryFrom<FileSystemPath> for CoreFileSystemPath<AbsolutePathBuf> {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[schemars(rename = "V2FileSystemSandboxEntry")]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct FileSystemSandboxEntry {

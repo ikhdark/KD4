@@ -11,6 +11,7 @@ use codex_config::McpServerIdentity;
 use codex_config::McpServerRequirement;
 use codex_config::McpServerValueMatcher;
 use codex_config::ProfileV2Name;
+use codex_config::ProjectDiscoveryContext;
 use codex_config::RequirementSource;
 use codex_config::Sourced;
 use codex_config::config_toml::AgentRoleToml;
@@ -442,33 +443,28 @@ async fn load_config_resolves_experimental_request_user_input_enabled() -> std::
 }
 
 #[tokio::test]
-async fn load_config_enables_reasoning_phase_efforts_by_default() -> std::io::Result<()> {
+async fn load_config_defaults_phase_tracking_to_empty_effort_overrides() -> std::io::Result<()> {
     let codex_home = tempdir()?;
     let config = Config::load_from_base_config_with_overrides(
-        ConfigToml::default(),
+        ConfigToml {
+            model_reasoning_effort: Some(ReasoningEffort::High),
+            ..ConfigToml::default()
+        },
         ConfigOverrides::default(),
         codex_home.abs(),
     )
     .await?;
 
+    assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::High));
     assert_eq!(
         config.reasoning_phase_efforts,
-        Some(ReasoningPhaseEfforts {
-            orient: Some(ReasoningEffort::High),
-            inspect: Some(ReasoningEffort::Low),
-            implement: Some(ReasoningEffort::High),
-            diagnose: Some(ReasoningEffort::High),
-            verify: Some(ReasoningEffort::Low),
-            finalize: Some(ReasoningEffort::Low),
-            deterministic_continuation: Some(ReasoningEffort::Low),
-        })
+        Some(ReasoningPhaseEfforts::default())
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn load_config_overlays_explicit_reasoning_phase_efforts_on_defaults() -> std::io::Result<()>
-{
+async fn load_config_preserves_explicit_reasoning_phase_effort_overrides() -> std::io::Result<()> {
     let codex_home = tempdir()?;
     let config = Config::load_from_base_config_with_overrides(
         ConfigToml {
@@ -487,13 +483,9 @@ async fn load_config_overlays_explicit_reasoning_phase_efforts_on_defaults() -> 
     assert_eq!(
         config.reasoning_phase_efforts,
         Some(ReasoningPhaseEfforts {
-            orient: Some(ReasoningEffort::High),
             inspect: Some(ReasoningEffort::Medium),
-            implement: Some(ReasoningEffort::High),
-            diagnose: Some(ReasoningEffort::High),
             verify: Some(ReasoningEffort::High),
-            finalize: Some(ReasoningEffort::Low),
-            deterministic_continuation: Some(ReasoningEffort::Low),
+            ..ReasoningPhaseEfforts::default()
         })
     );
     Ok(())
@@ -527,6 +519,32 @@ direct_only_tool_namespaces = ["mcp__history", "mcp__notes"]
         vec!["mcp__history".to_string(), "mcp__notes".to_string()]
     );
     assert!(config.features.enabled(Feature::CodeMode));
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_config_warns_when_code_mode_waiting_policy_is_ignored() -> std::io::Result<()> {
+    let codex_home = tempdir()?;
+    let config_toml: ConfigToml = toml::from_str(
+        r#"
+[features.code_mode]
+enabled = true
+waiting_policy = "yield_after"
+"#,
+    )
+    .expect("deprecated waiting policy should remain parseable");
+    let config = Config::load_from_base_config_with_overrides(
+        config_toml,
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+
+    assert_eq!(config.code_mode, CodeModeConfig::default());
+    assert!(config.startup_warnings.iter().any(|warning| {
+        warning
+            == "`features.code_mode.waiting_policy` is deprecated and ignored; remove this setting."
+    }));
     Ok(())
 }
 
@@ -9020,6 +9038,52 @@ async fn active_project_does_not_match_configured_alias_for_canonical_cwd() -> a
         None
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn config_reuses_project_trust_root() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    let project_root = tmp.path().join("project");
+    let cwd = project_root.join("nested");
+    let codex_home = tmp.path().join("codex-home");
+    std::fs::create_dir_all(project_root.join(".git"))?;
+    std::fs::create_dir_all(&cwd)?;
+    std::fs::create_dir_all(&codex_home)?;
+
+    let project_root = project_root.abs();
+    let cwd = cwd.abs();
+    let discovery = ProjectDiscoveryContext::new(
+        cwd.clone(),
+        project_root.clone(),
+        vec![".git".to_string()],
+        Some(project_root.clone()),
+        Some(project_root.clone()),
+        LOCAL_FS.as_ref(),
+    );
+    std::fs::remove_dir_all(project_root.join(".git"))?;
+
+    let config = Config::load_config_with_layer_stack(
+        LOCAL_FS.as_ref(),
+        ConfigToml {
+            projects: Some(HashMap::from([(
+                project_trust_key(project_root.as_path()),
+                ProjectConfig {
+                    trust_level: Some(TrustLevel::Trusted),
+                },
+            )])),
+            ..Default::default()
+        },
+        ConfigOverrides {
+            cwd: Some(cwd.to_path_buf()),
+            ..Default::default()
+        },
+        codex_home.abs(),
+        ConfigLayerStack::default().with_project_discovery(discovery),
+    )
+    .await?;
+
+    assert_eq!(config.active_project.trust_level, Some(TrustLevel::Trusted));
     Ok(())
 }
 

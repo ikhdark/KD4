@@ -117,6 +117,28 @@ fn remote_plugin_completion_rejects_catalog_refresh_failure_with_connectors_acce
     ));
 }
 
+#[test]
+fn implemented_below_ignored_above_local_plugin_completion_requires_requested_connectors() {
+    let requested_connectors = vec!["connector_calendar".to_string()];
+
+    assert!(!verified_local_plugin_install_completed(
+        true,
+        &requested_connectors,
+        None,
+    ));
+    assert!(!verified_local_plugin_install_completed(
+        true,
+        &requested_connectors,
+        Some(&[]),
+    ));
+}
+
+#[test]
+fn implemented_below_ignored_above_local_plugin_without_connectors_preserves_completion() {
+    assert!(verified_local_plugin_install_completed(true, &[], None));
+    assert!(!verified_local_plugin_install_completed(false, &[], None));
+}
+
 #[tokio::test]
 async fn verified_plugin_install_completed_requires_installed_plugin() {
     let codex_home = tempdir().expect("tempdir should succeed");

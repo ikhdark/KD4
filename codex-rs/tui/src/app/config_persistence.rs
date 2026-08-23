@@ -5,14 +5,6 @@
 //! loop.
 
 use super::*;
-#[cfg(target_os = "windows")]
-use codex_utils_approval_presets::ApprovalPreset;
-
-#[cfg(target_os = "windows")]
-pub(super) struct WindowsSetupPermissions {
-    pub(super) permission_profile: PermissionProfile,
-    pub(super) workspace_roots: Vec<AbsolutePathBuf>,
-}
 
 async fn build_config_on_runtime_worker(
     builder: ConfigBuilder,
@@ -63,29 +55,6 @@ impl App {
             format!("Failed to rebuild config for permission profile {profile_id}"),
         )
         .await
-    }
-
-    #[cfg(target_os = "windows")]
-    pub(super) async fn windows_setup_permissions(
-        &self,
-        preset: &ApprovalPreset,
-        profile_selection: Option<&PermissionProfileSelection>,
-    ) -> Result<WindowsSetupPermissions> {
-        match profile_selection {
-            Some(selection) => {
-                let selected_config = self
-                    .rebuild_config_for_permission_profile(selection.profile_id.as_str())
-                    .await?;
-                Ok(WindowsSetupPermissions {
-                    permission_profile: selected_config.permissions.permission_profile().clone(),
-                    workspace_roots: selected_config.effective_workspace_roots(),
-                })
-            }
-            None => Ok(WindowsSetupPermissions {
-                permission_profile: preset.permission_profile.clone(),
-                workspace_roots: self.config.effective_workspace_roots(),
-            }),
-        }
     }
 
     pub(super) async fn apply_permission_profile_selection(

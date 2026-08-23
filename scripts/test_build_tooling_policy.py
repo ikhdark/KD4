@@ -183,6 +183,23 @@ class BuildToolingPolicyTest(unittest.TestCase):
         self.assertNotIn(r"C:\Users\kuh\Desktop\kd4", text)
         self.assertNotIn(r"C:\Users\kuh\Desktop\codexKD`", text)
 
+    def test_agents_bootstraps_bounded_routing_before_broad_source_map(self) -> None:
+        text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        normalized = " ".join(text.split())
+        slice_command = (
+            'python scripts/source_owners.py slice --owner <owner-id> '
+            '--focus "<task description>" --max-relationships 32'
+        )
+
+        self.assertIn(slice_command, normalized)
+        self.assertLess(
+            normalized.index(slice_command),
+            normalized.index("[`SOURCEMAP.md`](SOURCEMAP.md)"),
+            "the bounded owner query must be available before the broad map route",
+        )
+        self.assertIn("Require an untruncated result", normalized)
+        self.assertIn("no omitted relationships or material unknowns", normalized)
+
     def test_agents_desktop_boundary_is_top_level_guidance(self) -> None:
         text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
 
@@ -1026,6 +1043,11 @@ class BuildToolingPolicyTest(unittest.TestCase):
         self.assertIn("cargo-workspace-analyzer.ps1", justfile)
         analyzer = (REPO_ROOT / "scripts/cargo-workspace-analyzer.ps1").read_text(
             encoding="utf-8"
+        )
+        self.assertIn(
+            "$ForwardedArgs | Where-Object "
+            "{ -not [string]::IsNullOrWhiteSpace($_) }",
+            analyzer,
         )
         self.assertIn('$lane = "rust-dead-code-matrix"', analyzer)
         self.assertIn('$env:RUSTFLAGS = "-Ddead_code"', analyzer)

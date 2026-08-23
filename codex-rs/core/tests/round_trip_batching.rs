@@ -279,29 +279,47 @@ async fn diagnosis_and_dynamic_validation_keep_model_boundaries() -> anyhow::Res
     Ok(())
 }
 
-#[test]
-fn orchestrator_prompt_preserves_only_substantive_model_boundaries() {
-    let prompt = include_str!("../templates/agents/orchestrator.md")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn root_production_request_contains_bounded_orchestration_guidance() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
 
-    for required_guidance in [
-        "request them together",
-        "default to available parallel tool",
-        "prefer one well-designed `functions.exec` packet",
-        "Run independent nested calls with",
-        "validation commands and read-only Git inspection",
-        "default Clippy and dead-code validation to the changed packages",
-        "covers exactly the same packages, targets, features, toolchain",
-        "Start independent non-Cargo checks alongside Rust validation",
-        "Publish remains the final validation barrier",
-        "only possible decision is to wait again",
-        "Keep a model boundary when the previous result determines",
-    ] {
-        assert!(
-            prompt.contains(required_guidance),
-            "missing orchestration guidance: {required_guidance}"
-        );
-    }
+    let server = start_mock_server().await;
+    let responses = mount_sse_sequence(
+        &server,
+        vec![sse(vec![
+            ev_assistant_message("done", "done"),
+            ev_completed("complete"),
+        ])],
+    )
+    .await;
+    let test = test_codex()
+        .with_model("test-gpt-5.1-codex")
+        .with_config(|config| {
+            let _ = config.features.disable(Feature::TaskCompletionReviewer);
+        })
+        .build(&server)
+        .await?;
+
+    test.submit_turn_and_capture_completion("inspect the workspace")
+        .await?;
+
+    let requests = responses.requests();
+    assert_eq!(requests.len(), 1);
+    let developer_text = requests[0].message_input_texts("developer").join("\n\n");
+    let open = "<root_orchestration_instructions>";
+    let close = "</root_orchestration_instructions>";
+    let guidance = developer_text
+        .split_once(open)
+        .and_then(|(_, suffix)| suffix.split_once(close).map(|(body, _)| body))
+        .expect("normal root request should contain registered orchestration guidance");
+    assert!(guidance.contains("request them together using available parallel tools"));
+    assert!(guidance.contains("one `functions.exec` packet"));
+    assert!(guidance.contains("split only for approvals, output bounds"));
+    assert!(guidance.contains("existing wait or session path"));
+    assert!(
+        codex_utils_output_truncation::approx_token_count(guidance) <= 256,
+        "registered orchestration guidance exceeded its per-request token budget"
+    );
+
+    Ok(())
 }

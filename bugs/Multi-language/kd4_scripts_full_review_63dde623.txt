@@ -1,0 +1,978 @@
+KD4 SCRIPTS FULL SOURCE REVIEW
+============================================================================================================
+
+Repository: ikhdark/KD4
+Reviewed branch: main
+Immutable reviewed commit: 63dde623c690207e5eef5dd7d9b6b36f47e32152
+Review date: 2026-08-12
+Scope: every file and folder under scripts/
+
+COMPLETION
+------------------------------------------------------------------------------------------------------------
+Files inventoried and fully read: 124 / 124
+  - scripts/ root files: 73
+  - scripts/codex_package/: 25
+  - scripts/install/: 7
+  - scripts/investigation_eval/: 19
+Evidence-backed findings: 43
+Severity: HIGH=29, MEDIUM=13, LOW=1
+Confidence: CONFIRMED means the failure follows directly from the reviewed control flow; HIGH means the
+platform/cache contract mismatch is direct, but the exact manifestation depends on the runtime environment.
+
+METHOD
+------------------------------------------------------------------------------------------------------------
+1. Pinned the audit to the immutable commit above.
+2. Inventoried the complete recursive scripts tree, including policies, documentation, lockfiles, generated
+   fixtures, prompts, patches, implementations, and every focused test.
+3. Read every file in full, then cross-checked implementations against callers, tests, and sibling platform
+   implementations.
+4. Removed candidates that were explicitly intentional or already covered by a stronger root-cause finding.
+5. Did not claim runtime execution of Windows, Docker, network, or release workflows. Findings marked
+   CONFIRMED are deterministic source/control-flow defects; portability findings are marked HIGH confidence.
+
+PRIORITY SUMMARY
+------------------------------------------------------------------------------------------------------------
+The highest-impact clusters are:
+- False-success validation and benchmarking (F01, F04, F05).
+- Cargo lane isolation failures (F06-F07).
+- Release/package atomicity and partial-commit behavior (F10, F12, F18, F26, F28, F30, F36).
+- Mutable-cache integrity bypasses (F19, F23-F25).
+- Stale or incompletely keyed source-build reuse (F21-F22).
+- Remote workflow cache destruction and stale-service reuse (F13-F16).
+- Installer acceptance/activation of broken releases (F29-F37).
+- Evaluation results that are not cryptographically or structurally bound to actual model runs (F38-F43).
+
+DETAILED FINDINGS
+============================================================================================================
+
+F01 - HIGH - CONFIRMED - Diagnostic false success
+------------------------------------------------------------------------------------------------------------
+File: scripts/git_doctor.py
+Relevant code: timed_status(), build_report(), main()
+Issue: A nonzero `git status --short --untracked-files=no` result is recorded exactly like a successful
+       status check. `timed_status()` returns `(elapsed, False)` for both return code 0 and every nonzero
+       return code, and `main()` fails only when the command times out.
+Why this is an issue: The doctor can certify Git health while Git is unable to inspect the repository at
+                      all. That is a false-success result on the diagnostic's primary probe.
+Real task example: A developer runs the doctor after an index corruption, unsafe-repository ownership error,
+                   or missing-object failure. `git status` exits 128, but the doctor prints a normal elapsed
+                   time and exits 0, so an automated setup check proceeds as though Git is healthy.
+Highest-confidence fix: Return a structured status result containing elapsed time, timeout state, return
+                        code, and a bounded stderr message. Add a `status_failed`/`status_error` field to
+                        `GitDoctorReport`; make `main()` return nonzero for timeout or command failure.
+                        Never display a failed command as a normal timing sample.
+Regression test to add: Mock `run_git()` to return code 128 with stderr and assert JSON reports the failure
+                        and the CLI exits nonzero; retain separate success and timeout tests.
+
+F02 - LOW - HIGH - Incorrect configuration diagnosis
+------------------------------------------------------------------------------------------------------------
+File: scripts/git_doctor.py
+Relevant code: git_config(), recommendations()
+Issue: `core.untrackedCache` is read as raw text but is considered enabled only when the text is exactly
+       `true`. Valid Git boolean spellings such as `yes`, `on`, or `1` are therefore reported as disabled.
+Why this is an issue: The same valid configuration can produce different doctor verdicts based only on
+                      spelling, causing unnecessary configuration churn and misleading automated reports.
+Real task example: A workstation has `git config core.untrackedCache yes`. Git treats the setting as
+                   enabled, but the doctor recommends enabling it again.
+Highest-confidence fix: Read boolean settings with `git config --type=bool --get <name>` and compare the
+                        canonical result, or route both FSMonitor and untracked-cache values through one
+                        Git-compatible boolean parser. Preserve non-boolean special values explicitly where
+                        a setting supports them.
+Regression test to add: Parameterize `true`, `yes`, `on`, `1`, `false`, `no`, `off`, and `0`; assert
+                        equivalent spellings receive equivalent recommendations.
+
+F03 - HIGH - CONFIRMED - Evidence/staging mismatch
+------------------------------------------------------------------------------------------------------------
+File: scripts/investigation_evidence_smoke.py
+Relevant code: provider source fingerprinting and _copy_tracked_tree()
+Issue: The provider fingerprint includes untracked provider files, but the staged provider copy is built
+       from `git ls-files` tracked paths only. The evidence identity can therefore describe bytes that are
+       not present in the provider actually exercised by the smoke run.
+Why this is an issue: A passing smoke result can be bound to the wrong source tree. This defeats the purpose
+                      of content-bound evidence and can hide missing new plugin modules or resources.
+Real task example: A developer adds an untracked `provider/runtime.py`, updates a tracked import to use it,
+                   and runs the smoke check before `git add`. The fingerprint changes because the new file
+                   exists, but staging omits it; the smoke run tests a stale/incomplete provider copy.
+Highest-confidence fix: Use one canonical file manifest for both fingerprinting and staging. Either include
+                        tracked plus untracked non-ignored files with `git ls-files --cached --others
+                        --exclude-standard -z`, or reject any untracked provider file before producing
+                        evidence. Copy and hash the exact same manifest, and record that manifest in the
+                        result.
+Regression test to add: Create an untracked provider module required by a tracked file. Assert the smoke
+                        tool either copies it and succeeds against matching evidence or fails before
+                        execution with an explicit untracked-source error.
+
+F04 - HIGH - CONFIRMED - Benchmark false success
+------------------------------------------------------------------------------------------------------------
+File: scripts/kd4_perf_snapshot.py
+Relevant code: ScenarioResult.passed, main()
+Issue: `ScenarioResult.passed` returns true for both `passed` and `skipped`. Consequently, a profile can
+       omit unavailable executables and still produce `ok: true`, an empty `failedScenarios`, and exit code
+       0.
+Why this is an issue: A baseline is only useful when its required measurements actually ran. Treating
+                      absence as success makes incomplete snapshots look comparable to complete snapshots.
+Real task example: A `phase0` run has no installed local Codex binary and no `cargo-nextest`. The
+                   installed-binary and test scenarios are skipped, but the command succeeds and the JSON
+                   can be archived as a valid phase-zero baseline.
+Highest-confidence fix: Give each profile an explicit required/optional scenario policy. A skipped required
+                        scenario must make the profile incomplete and return nonzero (or a distinct exit
+                        code). Add an explicit `--allow-skips`/`--allow-incomplete` escape hatch for
+                        exploratory runs, and report skipped scenario names separately from failed names.
+Regression test to add: Run a required scenario with a missing executable and assert `ok` is false and the
+                        CLI is nonzero by default; assert the opt-in incomplete mode is clearly labeled.
+
+F05 - HIGH - CONFIRMED - Validation fail-open
+------------------------------------------------------------------------------------------------------------
+File: scripts/root_maintenance.py
+Relevant code: git_changed_paths(), expand_changed_paths(), format-python/lint-python/test-python routing
+Issue: When either Git changed-path command cannot run or exits nonzero, `git_changed_paths()` prints an
+       error and returns an empty list. In `--changed` auto-detection mode, that empty list is then treated
+       as 'no matching changed files', and format/lint/test commands return success.
+Why this is an issue: Failure to discover the validation scope must not be indistinguishable from an empty
+                      scope. The current behavior silently bypasses validation precisely when repository
+                      state is broken.
+Real task example: A CI checkout lacks `HEAD`, or Git returns an index error. `python
+                   scripts/root_maintenance.py test-python --changed` prints a Git error followed by 'No
+                   matching changed Python files to test.' and exits 0.
+Highest-confidence fix: Make changed-path discovery return a success/error result or raise a dedicated
+                        exception. Auto-detected `--changed` commands must exit nonzero when discovery
+                        fails. Keep an empty list only for a successfully inspected repository with no
+                        changed paths.
+Regression test to add: Stub the first and second Git commands to fail independently; assert format, lint,
+                        and test subcommands all exit nonzero and never print a successful no-match verdict.
+
+F06 - HIGH - CONFIRMED - Cargo lane isolation bypass
+------------------------------------------------------------------------------------------------------------
+File: scripts/rust_build_status.py
+Relevant code: _cargo_command_with_target_dir(), run_in_cargo_lane()
+Issue: Cargo-watch commands supplied with `-s`/`--shell` are not rewritten. At the same time,
+       `run_in_cargo_lane()` removes `CARGO_TARGET_DIR`, so a watched shell command such as `cargo check`
+       falls back to the shared target directory instead of the reserved lane.
+Why this is an issue: The process holds a lane reservation that does not protect the directory actually
+                      receiving artifacts. Concurrent jobs can contend in the shared target while
+                      diagnostics falsely imply lane isolation.
+Real task example: One terminal runs `run-lane --lane core -- cargo watch -s "cargo check"` while another
+                   runs a shared build. The watch child compiles into `codex-rs/target`, causing lock
+                   contention and cross-job artifact churn despite the `core` lane lock.
+Highest-confidence fix: Set the child environment's `CARGO_TARGET_DIR` to the reserved lane as the universal
+                        fallback; an explicit Cargo `--target-dir` can still override it. Also recognize
+                        cargo-watch `-s`, `--shell`, and assignment forms and inject/propagate the lane into
+                        their nested command.
+Regression test to add: Cover `-s`, `--shell`, and `--shell=...`; execute a fake nested Cargo command and
+                        assert its effective target directory is the reserved lane.
+
+F07 - HIGH - CONFIRMED - Cargo lane parser bypass
+------------------------------------------------------------------------------------------------------------
+File: scripts/rust_build_status.py
+Relevant code: _cargo_command_with_target_dir()
+Issue: The Cargo argument scanner assumes the first non-dash token after `cargo` is the subcommand. It does
+       not understand `+toolchain` selectors or global options whose values are separate tokens. Commands
+       such as `cargo +nightly check` and `cargo -Z unstable-options check` are left unchanged.
+Why this is an issue: Because the wrapper also removes `CARGO_TARGET_DIR`, these valid Cargo forms compile
+                      into the shared target and escape the reserved lane.
+Real task example: A nightly-only validation is launched through `run-lane -- cargo +nightly test -p
+                   codex-core`. The lane directory remains mostly idle while the actual test writes to the
+                   shared target.
+Highest-confidence fix: Implement a small Cargo-prefix parser that consumes an optional `+toolchain` and all
+                        supported global options with their values before identifying the subcommand. Keep
+                        the reserved `CARGO_TARGET_DIR` environment fallback so unknown future Cargo
+                        prefixes remain isolated.
+Regression test to add: Parameterize `+nightly`, `-Z value`, `--config value`, and assignment forms; assert
+                        the effective target remains the reserved lane.
+
+F08 - MEDIUM - CONFIRMED - Misreported destructive maintenance
+------------------------------------------------------------------------------------------------------------
+File: scripts/rust_build_status.py
+Relevant code: prune_stale_lanes(), prune_stale_lanes_report()
+Issue: After a lane is renamed to a `.trash-*` path, a recursive-delete failure is described as 'deferred
+       cleanup', but the original lane is still appended to the `removed` list. The report then says it was
+       `pruned` even though its disk usage remains.
+Why this is an issue: Storage maintenance can claim success without reclaiming space. This makes disk-budget
+                      automation and operator decisions inaccurate.
+Real task example: Antivirus or a read-only artifact prevents `rmtree` after the rename. `target prune
+                   report` lists the lane as pruned, but a multi-gigabyte `.trash-*` directory is still
+                   present.
+Highest-confidence fix: Track `removed`, `deferred`, and `failed` outcomes separately. Append to `removed`
+                        only after successful deletion; include the actual trash path and remaining size for
+                        deferred cleanup. Add a bounded cleanup pass for old `.trash-*` directories.
+Regression test to add: Force `remove_tree_allow_readonly()` to raise after a successful rename and assert
+                        the report does not claim reclaimed/pruned status.
+
+F09 - MEDIUM - CONFIRMED - Artifact fallback selection bug
+------------------------------------------------------------------------------------------------------------
+File: scripts/stage_npm_archives.py
+Relevant code: artifact_dir_for_target(), install_single_codex_package_archive(), install_single_binary()
+Issue: Artifact selection returns the first existing directory among `<target>` and `<target>-unsigned`
+       without checking whether that directory contains the requested archive. An incomplete preferred
+       directory shadows a complete fallback directory.
+Why this is an issue: A valid workflow artifact set can be rejected because of an unrelated empty or partial
+                      directory left by another download/extraction step.
+Real task example: `artifacts/x86_64-pc-windows-msvc/` exists but lacks the package archive, while
+                   `artifacts/x86_64-pc-windows-msvc-unsigned/` contains it. Staging raises
+                   FileNotFoundError instead of using the valid unsigned artifact.
+Highest-confidence fix: Select by the exact required archive path, not directory existence. Search both
+                        candidates for the expected filename, reject ambiguous duplicate matches, and
+                        include all checked paths in the error.
+Regression test to add: Create an empty preferred directory and a complete fallback directory; assert the
+                        fallback archive is installed.
+
+F10 - MEDIUM - CONFIRMED - Post-commit failure reported as install failure
+------------------------------------------------------------------------------------------------------------
+File: scripts/stage_npm_archives.py
+Relevant code: install_single_codex_package_archive()
+Issue: After the new destination has been activated, failure to delete the old backup raises an exception.
+       The exception path restores the backup only when the new destination is absent, so the function
+       reports failure while leaving the new tree installed.
+Why this is an issue: Callers cannot tell whether failure means 'nothing changed' or 'new content committed
+                      but cleanup failed'. Retrying may overwrite a state that was already successfully
+                      installed.
+Real task example: Windows file scanning holds a handle in the backup directory. The swap succeeds, backup
+                   `rmtree` fails, staging exits with an error, but the vendor target now contains the new
+                   package.
+Highest-confidence fix: Make backup deletion a post-commit best-effort cleanup: warn and retain the uniquely
+                        named backup instead of throwing. If cleanup must be fatal, explicitly move the new
+                        destination aside and restore the backup before propagating the error.
+Regression test to add: Inject a backup-deletion error after activation and assert either a successful
+                        result with a cleanup warning or a fully restored old destination - never failure
+                        with silently committed state.
+
+F11 - HIGH - CONFIRMED - Native release component fail-open
+------------------------------------------------------------------------------------------------------------
+File: scripts/stage_npm_packages.py
+Relevant code: package_native_components(), install_from_workflow_artifacts()
+Issue: Native components declared by the build module but absent from the local `BINARY_COMPONENTS` registry
+       are silently dropped by a list comprehension guarded with `if name in BINARY_COMPONENTS`.
+Why this is an issue: Adding a new native component can produce a package without its required binary
+                      instead of failing at the registry boundary. The eventual failure may occur much later
+                      or only at runtime.
+Real task example: The build module adds `codex-new-helper` to a package's native-component set, but this
+                   script's registry is not updated. Staging downloads target artifacts and continues
+                   without installing the helper.
+Highest-confidence fix: Before artifact selection, compute unknown components after excluding the canonical
+                        codex-package component. Raise a clear error listing every unregistered component.
+                        Prefer one shared component registry consumed by both the build module and staging
+                        script.
+Regression test to add: Inject a package with an unknown native component and assert staging fails before
+                        downloads or package generation.
+
+F12 - HIGH - CONFIRMED - Batch release output is not transactional
+------------------------------------------------------------------------------------------------------------
+File: scripts/stage_npm_packages.py
+Relevant code: stage_package(), stage_packages(), main()
+Issue: Each package writes its tarball directly to the final output directory. If a later package in the
+       same invocation fails, tarballs from earlier packages remain and look like a complete release set.
+Why this is an issue: The CLI accepts multiple packages as one staging operation. Partial final outputs can
+                      be mistakenly uploaded or reused after the command reports failure.
+Real task example: A batch stages `codex` successfully and then fails while staging a platform package.
+                   `dist/npm/codex-npm-<version>.tgz` remains, and a later upload glob publishes it without
+                   the matching platform artifacts.
+Highest-confidence fix: Write every tarball into a per-run temporary output directory. After all package
+                        workers and the final source/native freshness check succeed, atomically replace
+                        final outputs as one commit with backups and rollback on commit failure. At minimum,
+                        track and remove outputs created by a failed invocation.
+Regression test to add: Make package A succeed and package B fail; assert no new final tarball remains and
+                        pre-existing outputs are unchanged.
+
+F13 - HIGH - CONFIRMED - Remote cache destruction
+------------------------------------------------------------------------------------------------------------
+File: scripts/start-codex-exec.sh
+Relevant code: rsync_opts
+Issue: `rsync` uses `--delete-excluded` while excluding `codex-rs/target/`, top-level `target/`,
+       `node_modules/`, and multiple cache directories. On the receiver, excluded content is therefore
+       deleted rather than merely left unsynchronized.
+Why this is an issue: The remote workflow is designed to reuse a remote build, yet every sync can erase the
+                      very Cargo and dependency caches needed for fast iteration.
+Real task example: A remote machine has a warm 80 GB `codex-rs/target`. Starting the exec-server helper
+                   syncs a small source edit and deletes the remote target tree, forcing a full rebuild.
+Highest-confidence fix: Remove `--delete-excluded`. Keep `--delete-delay` for in-scope source paths, or
+                        place persistent build caches outside the synchronized root and point Cargo to them
+                        explicitly. Add a deliberate separate cache-clean option if destructive cleanup is
+                        needed.
+Regression test to add: Run rsync against a fixture receiver containing an excluded target sentinel; assert
+                        source deletions propagate while the excluded sentinel survives.
+
+F14 - HIGH - CONFIRMED - Brittle remote readiness protocol
+------------------------------------------------------------------------------------------------------------
+File: scripts/start-codex-exec.sh
+Relevant code: remote exec-server process substitution and FIFO readiness read
+Issue: The first combined stdout/stderr line from `codex exec-server` is written to the readiness FIFO, and
+       that one line must start with `ws://`. Any warning or informational line emitted before the listen
+       URL makes startup fail even if the server reports a valid URL immediately afterward.
+Why this is an issue: Normal diagnostic output becomes a protocol-breaking event. This is especially fragile
+                      across new Codex versions that add startup warnings.
+Real task example: The remote binary prints a deprecation warning and then `ws://127.0.0.1:43123`. The
+                   script reads the warning, declares an invalid listen URL, kills the healthy server, and
+                   aborts.
+Highest-confidence fix: Read lines until a syntactically valid WebSocket listen URL appears or the
+                        timeout/process exit occurs; log all other lines. Prefer a dedicated ready-file/JSON
+                        readiness channel if the server supports one.
+Regression test to add: Use a fake server that prints a warning, blank line, then a valid URL; assert
+                        startup succeeds and preserves the warning in the log.
+
+F15 - HIGH - CONFIRMED - Stale/wrong service reuse
+------------------------------------------------------------------------------------------------------------
+File: scripts/test-remote-env.sh
+Relevant code: wait_for_remote_exec_server_port(), setup_remote_env()
+Issue: With server reuse enabled, readiness is only a successful TCP connection to the configured port. The
+       script does not perform a WebSocket handshake or verify that the listener is the expected Codex
+       exec-server.
+Why this is an issue: An unrelated process or stale incompatible server can be accepted as the test
+                      dependency, making failures occur later and obscuring their true cause.
+Real task example: A previous test left a dummy HTTP server on port 31987.
+                   `CODEX_TEST_REMOTE_ENV_REUSE_SERVER=1` accepts it and exports its URL; integration tests
+                   then fail with protocol errors.
+Highest-confidence fix: Probe the actual exec-server protocol: perform a WebSocket upgrade and a minimal
+                        supported initialize/health exchange, validating expected metadata. Reuse only after
+                        that probe succeeds.
+Regression test to add: Start a plain TCP listener and assert reuse is rejected; start a protocol-compatible
+                        fake exec-server and assert reuse succeeds.
+
+F16 - HIGH - CONFIRMED - Stale container/binary reuse
+------------------------------------------------------------------------------------------------------------
+File: scripts/test-remote-env.sh
+Relevant code: start_remote_env_container(), mounted_codex_path(), setup_remote_env()
+Issue: Container reuse checks only that a named container exists/runs. It does not validate the image,
+       binary mount source, mount destination, published port, privilege/security settings, or binary
+       identity. `mounted_codex_path()` then accepts any executable at the expected in-container basename.
+Why this is an issue: A new test request can silently run an older binary or incompatible container
+                      configuration while reporting the newly requested setup.
+Real task example: A reusable container was created with yesterday's `target/debug/codex` mount. Today the
+                   caller sets a different `CODEX_TEST_REMOTE_ENV_CODEX_BINARY`; the existing container is
+                   reused and the old mounted executable wins.
+Highest-confidence fix: Create the container with labels containing image ID, canonical host binary path and
+                        SHA-256, mount destination, port, and configuration version. On reuse, inspect and
+                        compare every label and Docker setting; recreate the container on any mismatch.
+Regression test to add: Reuse a container while changing the requested binary hash, image, and port in
+                        separate cases; assert each mismatch forces recreation.
+
+F17 - MEDIUM - HIGH - Incorrect Markdown anchors
+------------------------------------------------------------------------------------------------------------
+File: scripts/readme_toc.py
+Relevant code: generate_toc_lines(), slugify_heading()
+Issue: The ToC slugger operates on raw Markdown source rather than rendered heading text. Inline links,
+       emphasis/code markup, entities, and optional closing ATX hashes can therefore produce anchors
+       different from the IDs rendered by GitHub.
+Why this is an issue: The generated ToC can pass this repository's checker while its links navigate to
+                      nonexistent anchors in the rendered README.
+Real task example: For `## Use [Codex](https://example.test) ##`, the script incorporates link URL text
+                   and/or a trailing dash from the closing hashes, instead of producing the rendered-text
+                   anchor `use-codex`.
+Highest-confidence fix: Parse headings with a CommonMark/GFM parser, extract rendered plain text, strip
+                        closing ATX markers, and apply a tested GitHub-compatible slug algorithm with
+                        duplicate disambiguation. Do not derive IDs from raw inline-markup source.
+Regression test to add: Add link, emphasis, inline-code, entity, emoji/non-ASCII, and closing-hash headings;
+                        assert generated anchors match the renderer's expected IDs.
+
+F18 - HIGH - CONFIRMED - Ambiguous publish commit boundary
+------------------------------------------------------------------------------------------------------------
+File: scripts/publish-local-codex.ps1
+Relevant code: main publish try/catch, Restart-CodexDesktop, Remove-OldCodexBackups
+Issue: Binary rollback covers publish verification and doctor execution, but desktop restart and backup
+       pruning run after that rollback scope. If either throws, the overall command fails while the new
+       runtime bundle remains active; the outer catch restores desktop routing only.
+Why this is an issue: A failed command no longer implies rollback. Automation and users may retry or
+                      manually restore binaries even though the publish itself already committed.
+Real task example: All four binaries are atomically replaced and verified. Restarting Desktop fails, or an
+                   old backup cannot be deleted. The command exits with an error, but the install directory
+                   still contains the new bundle.
+Highest-confidence fix: Define and expose an explicit commit point. Keep critical operations inside one
+                        rollback scope; after commit, make backup pruning best-effort and report restart
+                        failure as a structured `publishCommitted=true, restartFailed=true` outcome rather
+                        than a generic rolled-back failure. Alternatively, extend the outer catch to restore
+                        every published binary before reporting failure.
+Regression test to add: Inject restart and backup-prune failures after successful binary verification.
+                        Assert the result unambiguously reports committed-versus-rolled-back state and
+                        matches the on-disk bundle.
+
+F19 - HIGH - CONFIRMED - Build cache integrity bypass
+------------------------------------------------------------------------------------------------------------
+File: scripts/codex_package/cargo.py
+Relevant code: source_output_matches_fingerprint()
+Issue: The fast reuse path accepts a binary when path, size, and `mtime_ns` match the stamp and merely
+       checks that the stored SHA-256 field is a string. It does not hash the current bytes.
+Why this is an issue: A same-size mutation with restored timestamp is treated as the stamped binary even
+                      though the stored digest no longer describes it. Package output can therefore contain
+                      corrupted or replaced code.
+Real task example: A tool patches `codex.exe` in place without changing length and preserves its timestamp.
+                   `--reuse-source-builds` skips Cargo and packages the modified binary as if its SHA-256
+                   still matched.
+Highest-confidence fix: For correctness, hash every candidate output before reuse and compare it to the
+                        stored digest. If performance requires a fast path, use an immutable
+                        content-addressed output or a trustworthy file-identity/change-journal mechanism -
+                        not mutable size/mtime metadata.
+Regression test to add: Change binary bytes while preserving size and `mtime_ns`; assert reuse is rejected
+                        and the binary is rebuilt.
+
+F20 - MEDIUM - CONFIRMED - Malformed cache crashes instead of missing
+------------------------------------------------------------------------------------------------------------
+File: scripts/codex_package/cargo.py
+Relevant code: read_source_build_stamp(), binaries_missing_for_reuse()
+Issue: `read_source_build_stamp()` returns any valid JSON value. The reuse path then calls `.get()` without
+       first requiring a dictionary, so a valid JSON list, string, number, or null can raise an attribute
+       error.
+Why this is an issue: Cache metadata is disposable state. Corruption or an old schema should cause a
+                      rebuild, not crash the packaging command.
+Real task example: An interrupted/manual edit leaves the stamp as `[]`. The next package build with reuse
+                   enabled terminates with `'list' object has no attribute 'get'` instead of rebuilding.
+Highest-confidence fix: Require the decoded stamp to be a dictionary with the expected schema/version;
+                        return `None` for every other shape. Add an explicit schema version and fail closed
+                        to a rebuild.
+Regression test to add: Parameterize `[]`, `null`, a string, a number, and wrong-schema objects; assert each
+                        becomes a cache miss without an exception.
+
+F21 - HIGH - HIGH - Incomplete build cache key
+------------------------------------------------------------------------------------------------------------
+File: scripts/codex_package/cargo.py
+Relevant code: write_source_build_stamp(), source_build_stamp_metadata_matches(), source_tree_fingerprint()
+Issue: The reuse key binds source state, target, profile, variant, and output fingerprints, but omits the
+       Cargo/rustc toolchain and important build-affecting configuration/environment such as RUSTFLAGS,
+       target linker, profile overrides, and V8 override artifact identities.
+Why this is an issue: The same source tree can legitimately produce different binaries under different
+                      toolchains or link/build settings. Reusing the old output violates the caller's
+                      current build request.
+Real task example: A release build is first produced with one `rustc` version or linker, then the toolchain
+                   or target RUSTFLAGS changes. `--reuse-source-builds` accepts the old binary because
+                   source and profile are unchanged.
+Highest-confidence fix: Add a normalized build-recipe fingerprint: cargo executable identity/version, `rustc
+                        -Vv`, target, profile configuration hash, relevant `CARGO_PROFILE_*`,
+                        RUSTFLAGS/encoded flags, target linker, and hashes of external V8 inputs. Compare it
+                        before any output reuse.
+Regression test to add: Change one build-affecting input at a time while preserving source and outputs;
+                        assert every change invalidates reuse.
+
+F22 - HIGH - CONFIRMED - Stale binary packaging mode
+------------------------------------------------------------------------------------------------------------
+File: scripts/codex_package/cli.py
+Relevant code: resolve_source_outputs(), source_outputs_from_existing()
+Issue: `--skip-build-if-present` checks only that the expected files exist. It does not require a matching
+       source-build stamp, source fingerprint, build recipe, or output digest.
+Why this is an issue: The option can package arbitrarily stale binaries from a previous checkout or build
+                      configuration while the package metadata version comes from the current workspace.
+Real task example: A developer changes core Rust code and bumps the workspace version, then runs package
+                   creation with `--skip-build-if-present`. Old package-lane binaries still exist, so the
+                   new-version archive contains old behavior.
+Highest-confidence fix: Replace existence-only acceptance with `source_build_stamp_matches()` using the
+                        complete recipe fingerprint. If no current stamp is available, fail with a rebuild
+                        instruction. If an unsafe escape hatch is retained, name it explicitly and print the
+                        unverified binary hashes.
+Regression test to add: Build once, alter a tracked source file, and invoke skip-if-present; assert
+                        packaging is rejected or rebuilds instead of reusing the old files.
+
+F23 - HIGH - CONFIRMED - Downloaded archive integrity bypass
+------------------------------------------------------------------------------------------------------------
+File: scripts/codex_package/dotslash.py
+Relevant code: verified_archive_stamp_matches(), archive_is_valid(), file_stamp()
+Issue: A cached DotSlash archive bypasses SHA-256 verification whenever its current size and `mtime_ns`
+       match the verification stamp. The stamp's expected digest is compared to metadata, not to current
+       bytes.
+Why this is an issue: A same-stat archive replacement is trusted and can feed corrupted or substituted
+                      executable content into package generation.
+Real task example: Cache corruption rewrites bytes inside an archive without changing length and restores
+                   its timestamp. The next package run accepts the verification stamp and extracts from the
+                   corrupted archive.
+Highest-confidence fix: Rehash the archive on every trust decision, or store it in an immutable
+                        content-addressed path whose name is the expected digest and enforce non-writable
+                        cache semantics. A mutable stat tuple is not an integrity proof.
+Regression test to add: Mutate a verified archive while preserving size/mtime and assert it is rejected and
+                        redownloaded.
+
+F24 - HIGH - CONFIRMED - Extracted executable integrity bypass
+------------------------------------------------------------------------------------------------------------
+File: scripts/codex_package/dotslash.py
+Relevant code: extracted_member_is_valid(), write_extracted_member_stamp(), file_stamp()
+Issue: An extracted DotSlash executable is considered valid from archive metadata plus the executable's size
+       and `mtime_ns`; its current bytes are never hashed.
+Why this is an issue: The package can reuse a modified cached executable even when the source archive
+                      remains valid.
+Real task example: A local process patches cached `rg` in place, preserves length, and restores its
+                   timestamp. Subsequent package builds copy the modified executable without re-extraction
+                   or detection.
+Highest-confidence fix: Record and verify a SHA-256 of the extracted member, ideally the digest computed
+                        while extracting. On every reuse, compare current bytes to that digest or
+                        rematerialize from the verified archive.
+Regression test to add: Modify an extracted executable with identical size/mtime and assert the tool
+                        re-extracts it.
+
+F25 - HIGH - CONFIRMED - V8 cache integrity bypass
+------------------------------------------------------------------------------------------------------------
+File: scripts/codex_package/v8.py
+Relevant code: has_checksum(), verified_checksum_stamp_matches(), file_stamp()
+Issue: Both the cached V8 static archive and generated Rust binding skip checksum calculation when their
+       size and `mtime_ns` match a verification stamp.
+Why this is an issue: These are build-critical native/code-generation inputs. A same-stat mutation can
+                      silently change the linked V8 library or Rust ABI declarations.
+Real task example: A damaged cache changes bytes in `librusty_v8...a.gz` or `src_binding...rs` while
+                   preserving size and timestamp. A musl package build trusts the stale stamp and compiles
+                   against the wrong input.
+Highest-confidence fix: Hash both artifacts against the release checksum at every trust boundary, or use
+                        immutable digest-addressed cache objects and atomically materialize read-only
+                        references.
+Regression test to add: For each artifact type, preserve size/mtime after mutation and assert
+                        `has_checksum()` returns false.
+
+F26 - HIGH - CONFIRMED - Destructive package replacement
+------------------------------------------------------------------------------------------------------------
+File: scripts/codex_package/layout.py
+Relevant code: prepare_package_dir(), build_package_dir(), validate_package_dir() call order
+Issue: With `--force`, the existing package directory is deleted before new inputs are copied and before the
+       new layout is validated. Reuse mode likewise removes managed paths in place before success.
+Why this is an issue: Any later copy, download, build, or validation failure destroys the last valid package
+                      and leaves a partial replacement.
+Real task example: A valid package directory exists. A forced rebuild deletes it, then copying the code-mode
+                   host fails because the source file disappears. The command exits with no usable old or
+                   new package.
+Highest-confidence fix: Build and validate into a sibling temporary directory. Atomically rename the
+                        existing directory to a backup, activate the new directory, and delete the backup
+                        only after commit; restore it on failure. For reuse mode, stage the managed subtree
+                        separately before replacing managed paths.
+Regression test to add: Inject a failure after one copied file and assert the prior package remains
+                        byte-for-byte intact.
+
+F27 - MEDIUM - CONFIRMED - Invalid role aliasing accepted
+------------------------------------------------------------------------------------------------------------
+File: scripts/codex_package/cargo.py; scripts/codex_package/cli.py; scripts/codex_package/layout.py
+Relevant code: validate_explicit_output_paths(), resolve_package_inputs(), build_package_dir()
+Issue: Explicit inputs are checked for existence but not for role distinctness. The same source file can be
+       supplied as the entrypoint, code-mode host, and/or Windows helper, and validation only confirms that
+       the destination filenames exist.
+Why this is an issue: A structurally valid package can contain the wrong executable under a required helper
+                      name and fail only when that runtime path is invoked.
+Real task example: A caller accidentally passes `codex.exe` for both `--entrypoint-bin` and
+                   `--code-mode-host-bin`. The package validates, but code mode launches the CLI binary as
+                   its host.
+Highest-confidence fix: Resolve canonical paths/file identities for all semantically distinct binary roles
+                        and reject aliases before any build or copy. Include both conflicting flag names in
+                        the error.
+Regression test to add: Pass the same inode/path for each pair of distinct roles and assert validation fails
+                        before modifying the package directory.
+
+F28 - MEDIUM - CONFIRMED - Multi-archive partial commit
+------------------------------------------------------------------------------------------------------------
+File: scripts/codex_package/cli.py
+Relevant code: main() archive_output loop
+Issue: Repeated `--archive-output` destinations are generated and committed one at a time. If a later
+       archive fails, earlier archive outputs from the same invocation remain committed.
+Why this is an issue: The CLI exposes multiple outputs as one operation, but failure can leave a partial
+                      format set that looks current.
+Real task example: A `.tar.gz` output succeeds and a following `.tar.zst` output fails because the
+                   compressor is missing. The command fails, but the new gzip archive remains beside an old
+                   zstd archive.
+Highest-confidence fix: Write every requested format to a temporary sibling, validate all, then commit all
+                        destinations with backups and rollback on any replacement failure. Do not expose a
+                        new output until every requested format is ready.
+Regression test to add: Force the second archive writer to fail and assert all final destinations retain
+                        their pre-run bytes.
+
+F29 - HIGH - CONFIRMED - Installer accepts failing binary
+------------------------------------------------------------------------------------------------------------
+File: scripts/install/install.ps1
+Relevant code: Get-VersionFromBinary()
+Issue: The PowerShell installer parses version output but never checks the native process exit code. A
+       binary that prints a plausible version and exits nonzero is treated as valid.
+Why this is an issue: Version text alone does not prove the downloaded executable can start successfully.
+                      The same helper is used for staged validation and installed-release completeness.
+Real task example: A damaged `codex.exe` prints `codex-cli 1.2.3` during startup and then exits 1. The
+                   installer accepts version 1.2.3 and activates the broken release.
+Highest-confidence fix: Capture `$LASTEXITCODE` immediately after invocation and require zero before parsing
+                        output. Preserve the Windows PowerShell stderr workaround, but return null/failure
+                        on every nonzero native exit.
+Regression test to add: Use a fake executable that prints the expected version then exits 7; assert staged
+                        validation and release-completeness checks reject it.
+
+F30 - HIGH - CONFIRMED - Installer activation lacks rollback
+------------------------------------------------------------------------------------------------------------
+File: scripts/install/install.ps1
+Relevant code: current junction update, visible command/PATH setup, final verification
+Issue: The installer can retarget the active `current` release before all visible-command, PATH, conflict,
+       and final verification work succeeds. The install lock prevents concurrency but there is no snapshot
+       and rollback of the prior active routing on a later failure.
+Why this is an issue: An installation command can report failure while leaving the user routed to a
+                      partially configured or unverified new release.
+Real task example: The release is staged and `current` is switched, then updating the visible command or
+                   user PATH fails because of permissions. The old release is not restored.
+Highest-confidence fix: Snapshot the old junction/visible command and any profile/environment edits. Prepare
+                        non-routing prerequisites first, switch `current` as the final commit, verify
+                        through the visible command, and restore the complete snapshot on any failure before
+                        commit completion.
+Regression test to add: Inject failures after each activation step and assert the previous version remains
+                        the active command with unchanged PATH state.
+
+F31 - MEDIUM - CONFIRMED - Unbounded installer wait
+------------------------------------------------------------------------------------------------------------
+File: scripts/install/install.ps1
+Relevant code: Invoke-WithInstallLock()
+Issue: The exclusive-file lock acquisition loop retries indefinitely. It has no deadline, cancellation
+       message, or owner diagnostics.
+Why this is an issue: A leaked handle or hung installer can block every later install forever, which is
+                      especially damaging in unattended setup and CI.
+Real task example: A crashed child process retains the lock file handle. A new installer remains in its
+                   retry loop for hours instead of failing with an actionable lock error.
+Highest-confidence fix: Add a configurable bounded deadline matching the shell installer's 600-second
+                        policy, emit lock path and available owner/process data, and return a nonzero
+                        timeout result.
+Regression test to add: Hold the lock from another process, use a short test timeout, and assert
+                        deterministic failure and diagnostics.
+
+F32 - HIGH - CONFIRMED - Installer masks binary failure
+------------------------------------------------------------------------------------------------------------
+File: scripts/install/install.sh
+Relevant code: version_from_binary()
+Issue: The POSIX-shell version probe is a pipeline. Without `pipefail`, its status is the status of `head`,
+       not the Codex executable, so a nonzero Codex exit can be masked when version-like output is present.
+Why this is an issue: The staged and installed binary checks can accept an executable that cannot complete
+                      even its version command successfully.
+Real task example: A binary writes `codex-cli 1.2.3` and exits 1. `sed | head` exits 0 and returns 1.2.3, so
+                   installation continues.
+Highest-confidence fix: Run the executable in a standalone conditional, capture output only when its exit
+                        status is zero, then parse that captured text in a separate pipeline. Do not rely on
+                        non-portable `pipefail` in `/bin/sh`.
+Regression test to add: Use a fake executable that prints a valid version and exits nonzero; assert
+                        `version_from_binary` fails.
+
+F33 - MEDIUM - HIGH - Supported-platform portability failure
+------------------------------------------------------------------------------------------------------------
+File: scripts/install/install.sh
+Relevant code: remove_matching_children()
+Issue: The `/bin/sh` installer claims macOS support but stale-artifact cleanup uses non-POSIX GNU-style
+       `find -mindepth` and `-maxdepth` options. That cleanup path is not portable to a baseline BSD/POSIX
+       `find` implementation.
+Why this is an issue: A prior interrupted install can force the next otherwise valid macOS install to abort
+                      during cleanup.
+Real task example: A `.staging.*` directory remains after interruption. On a system whose `find` lacks those
+                   options, cleanup exits nonzero under `set -e` before the release can be installed.
+Highest-confidence fix: Remove `find` from this top-level-only operation. Iterate the already bounded shell
+                        glob, validate each basename against the expected pattern, and `rm -rf --`/`rm -f
+                        --` each matched child.
+Regression test to add: Run cleanup with a stub `find` that rejects GNU depth flags, or under a BSD/POSIX
+                        environment, and assert stale children are safely removed.
+
+F34 - HIGH - CONFIRMED - Incomplete release can be activated
+------------------------------------------------------------------------------------------------------------
+File: scripts/install/install.sh
+Relevant code: install_package_release(), release_dir_is_complete(), activation sequence
+Issue: `install_package_release()` treats target resources such as Linux `bwrap` and Unix patched zsh as
+       optional if absent, then moves the staged directory into place. The installer does not rerun
+       `release_dir_is_complete()` before updating `current`, even though that function requires those
+       resources for the applicable targets.
+Why this is an issue: An archive that passes checksum and metadata validation but lacks a required runtime
+                      resource can become the active installation.
+Real task example: A Linux release archive accidentally omits `codex-resources/bwrap`. Staging succeeds,
+                   `current` is retargeted, and sandboxed commands fail. Only a later installer run notices
+                   the release is incomplete.
+Highest-confidence fix: Require every target-specific resource during staging and call
+                        `release_dir_is_complete()` on the fully staged release before activation. On
+                        failure, delete only staging and preserve the prior release.
+Regression test to add: Build package fixtures missing bwrap and zsh separately; assert neither can be moved
+                        into the release directory or selected by `current`.
+
+F35 - MEDIUM - CONFIRMED - Leaked parallel download work
+------------------------------------------------------------------------------------------------------------
+File: scripts/install/install.sh
+Relevant code: parallel checksum/archive downloads, wait_for_download(), cleanup trap
+Issue: Package checksum and archive downloads run in parallel, but early failure while waiting for or
+       verifying the checksum exits before the archive download is explicitly killed and reaped.
+Why this is an issue: The sibling downloader can continue writing into a temporary directory being removed
+                      by the exit trap, leak network/process work, or produce confusing secondary errors.
+Real task example: The checksum endpoint fails immediately while the large archive download is still
+                   running. The installer exits and removes its temp directory without first
+                   terminating/waiting for the archive PID.
+Highest-confidence fix: Register all background PIDs in cleanup, kill and wait for remaining children on any
+                        failure, and collect both download statuses before checksum processing can exit the
+                        function.
+Regression test to add: Make the checksum download fail while the archive downloader blocks; assert the
+                        archive process is terminated/reaped and no temp writer survives.
+
+F36 - HIGH - CONFIRMED - Shell installer activation lacks rollback
+------------------------------------------------------------------------------------------------------------
+File: scripts/install/install.sh
+Relevant code: update_current_link(), update_visible_command(), add_to_path(), verify_visible_command()
+Issue: Active release, visible command, and profile PATH state are changed sequentially with no transaction
+       or restoration path. A failure after one mutation leaves a partial install despite a nonzero result.
+Why this is an issue: The user's command routing can change even though the installer says installation
+                      failed.
+Real task example: `current` and `~/.local/bin/codex` are switched, then profile rewriting or
+                   visible-command verification fails. The old links/profile are not restored.
+Highest-confidence fix: Snapshot old links and profile contents, stage profile/shim changes first, switch
+                        `current` as the final commit, and restore all snapshots on failure. Verify both the
+                        direct release and visible command before deleting rollback state.
+Regression test to add: Inject a failure at each activation step and assert old links and profile bytes are
+                        restored.
+
+F37 - MEDIUM - CONFIRMED - Lock timeout policy bypass
+------------------------------------------------------------------------------------------------------------
+File: scripts/install/install.sh
+Relevant code: acquire_install_lock()
+Issue: The mkdir-lock fallback honors `LOCK_WAIT_SECS=600`, but the preferred `flock` branch calls blocking
+       `flock 9` with no timeout. On systems with flock, the declared wait policy is bypassed.
+Why this is an issue: A stuck holder can hang installation indefinitely on the most common Linux path.
+Real task example: Another process holds `install.lock` forever. The installer never reaches the 600-second
+                   timeout message because it blocks inside `flock`.
+Highest-confidence fix: Use `flock -w "$LOCK_WAIT_SECS" 9` (with a clear failure path), or implement a
+                        portable polling deadline around nonblocking flock.
+Regression test to add: Hold the flock, set a short wait, and assert the installer exits at the deadline
+                        with the lock path.
+
+F38 - HIGH - CONFIRMED - Evaluation fixture isolation bypass
+------------------------------------------------------------------------------------------------------------
+File: scripts/investigation_eval/validate_cases.py
+Relevant code: _scan_unified_diff(), _validate_patch()
+Issue: Patch validation constrains paths and hunk counts but never constrains the new Git file mode/type. A
+       new symlink (or another non-regular mode accepted by Git apply) under `investigation_cases/` can
+       pass.
+Why this is an issue: When materialized, a symlink fixture can point outside the isolated fixture tree and
+                      make the evaluation read or affect repository content not represented by the intended
+                      synthetic case.
+Real task example: A patch adds `investigation_cases/case/owner.rs` with mode 120000 and content
+                   `../../real/file.rs`. Its path header is in scope, but applying it creates an escaping
+                   symlink.
+Highest-confidence fix: Parse and require regular-file modes only (100644 or 100755), reject
+                        symlink/submodule/binary/rename/copy metadata, and preferably apply into a temporary
+                        worktree then `lstat` every created path and verify its resolved containment.
+Regression test to add: Add fixture patches for a symlink, gitlink, binary patch, and regular file; accept
+                        only the regular file.
+
+F39 - MEDIUM - CONFIRMED - Contradictory evaluation manifest accepted
+------------------------------------------------------------------------------------------------------------
+File: scripts/investigation_eval/validate_cases.py
+Relevant code: _validate_expected_findings(), validate_cases()
+Issue: The validator does not reject exact duplicate expected findings, duplicate forbidden kinds, or a
+       finding kind that appears in both expected and forbidden sets. Because forbidden matching is
+       kind-level, the last case is intrinsically contradictory to the scorer.
+Why this is an issue: Manifest mistakes can make one reported finding simultaneously increase recall and
+                      count as forbidden, or distort totals through duplicates.
+Real task example: A case accidentally lists `missing-handler` as both expected and forbidden. A correct
+                   model report is scored as a match and a forbidden finding.
+Highest-confidence fix: Reject duplicate expected finding objects and duplicate forbidden strings. Require
+                        expected kinds to be disjoint from forbidden kinds, or redesign forbidden findings
+                        to carry locator-scoped semantics.
+Regression test to add: Add duplicate and overlapping manifest fixtures and assert validation fails with the
+                        exact case/field.
+
+F40 - HIGH - CONFIRMED - Unproven benchmark provenance
+------------------------------------------------------------------------------------------------------------
+File: scripts/investigation_eval/score_results.py
+Relevant code: _load_result(), score()
+Issue: `raw_events` is validated only as a list. Its events are not schema-checked or used to prove the
+       case, model, execution settings, timestamps, or executable identity. Without `--binary-sha256`, the
+       scorer simply adopts the first hand-authored result's hash.
+Why this is an issue: A syntactically valid result file can claim a frozen model and binary without
+                      containing any evidence that such a run occurred.
+Real task example: A result sets the expected model strings, invents a 64-character binary hash, and
+                   supplies `raw_events: []`. The scorer accepts that hash as the run binary for the entire
+                   corpus.
+Highest-confidence fix: Have the harness produce an immutable raw event file and signed/content-hashed run
+                        manifest. Make the scorer parse a versioned event schema and derive case ID,
+                        model/settings, executable SHA, and completion metadata from that evidence. Require
+                        an externally measured binary hash rather than adopting one from the result.
+Regression test to add: Reject empty, malformed, wrong-case, wrong-model, and wrong-binary event streams;
+                        verify a valid stream derives the same envelope deterministically.
+
+F41 - HIGH - CONFIRMED - Self-reported efficiency metrics
+------------------------------------------------------------------------------------------------------------
+File: scripts/investigation_eval/score_results.py
+Relevant code: _load_result(), score()
+Issue: `tool_calls`, `repeated_equivalent_actions`, costs, and premature-completion status are accepted from
+       the result JSON and summed without comparison to `raw_events` or any independent trace.
+Why this is an issue: The benchmark's efficiency outputs are editable claims rather than measurements.
+Real task example: A run made 80 tool calls, but its result file states `tool_calls: 1` and zero repeated
+                   actions. The scorer reports the lower numbers.
+Highest-confidence fix: Compute tool-call counts, canonical repeated-action identities, token/model cost,
+                        and tool cost from validated events. Keep any manually judged field explicitly
+                        separate with assessor identity and evidence.
+Regression test to add: Provide events containing several calls and a contradictory metrics object; assert
+                        the scorer rejects the mismatch or ignores the supplied metrics in favor of derived
+                        values.
+
+F42 - HIGH - CONFIRMED - Findings can contradict model output
+------------------------------------------------------------------------------------------------------------
+File: scripts/investigation_eval/score_results.py
+Relevant code: _load_result(), score()
+Issue: `reported_findings` is scored independently of `final_output`. Nothing requires the structured
+       findings to have been emitted by, or even agree with, the model's actual final answer.
+Why this is an issue: Recall and precision can be changed by editing an auxiliary JSON array while leaving
+                      the captured model answer unchanged.
+Real task example: The final output says no bug was found, but the result JSON adds a confirmed expected
+                   finding. The scorer awards recall for the finding.
+Highest-confidence fix: Require the model to emit one canonical structured result and derive both
+                        human-readable output and scored findings from it. At minimum, hash/bind the final
+                        output and require an exact deterministic serialization match to
+                        `reported_findings`.
+Regression test to add: Supply a final answer and contradictory structured findings; assert result
+                        validation fails.
+
+F43 - MEDIUM - CONFIRMED - False-positive locator matching
+------------------------------------------------------------------------------------------------------------
+File: scripts/investigation_eval/score_results.py
+Relevant code: _finding_matches()
+Issue: Required locators are matched as case-insensitive substrings of all reported locators concatenated
+       with newlines. This ignores path/token boundaries and allows one required locator to span or occur
+       inside unrelated text.
+Why this is an issue: A finding can receive credit without identifying the required file/symbol precisely.
+Real task example: An expected locator `state.rs` matches a reported locator `not_state.rs`; short symbol
+                   names can also match prose or a different longer symbol.
+Highest-confidence fix: Normalize each locator into structured path/symbol components and compare per
+                        locator using exact canonical equality or explicit path-segment/symbol boundaries.
+                        Never search a concatenated haystack.
+Regression test to add: Assert `state.rs` does not match `not_state.rs`, locators cannot span list elements,
+                        and normalized separator/case equivalents still match where intended.
+
+REVIEWED-FILE LEDGER
+============================================================================================================
+Every path below was read in full. A finding ID means the file owns or materially participates in that
+finding. 'No separate finding' means the file was still reviewed and did not justify an additional
+standalone issue after caller/test cross-checking.
+
+scripts/AGENTS.md [reviewed - no separate finding]
+scripts/README.md [reviewed - no separate finding]
+scripts/app_server_schema_runtime_check.py [reviewed - no separate finding]
+scripts/asciicheck.py [reviewed - no separate finding]
+scripts/build_codex_package.py [reviewed - no separate finding]
+scripts/cargo-lane-trash-cleanup.ps1 [reviewed - no separate finding]
+scripts/cargo-lane.ps1 [reviewed - no separate finding]
+scripts/check_blob_size.py [reviewed - no separate finding]
+scripts/check_kd4_features.py [reviewed - no separate finding]
+scripts/common-rust-env.ps1 [reviewed - no separate finding]
+scripts/config_schema_check.py [reviewed - no separate finding]
+scripts/debug-codex.sh [reviewed - no separate finding]
+scripts/dev_env_doctor.py [reviewed - no separate finding]
+scripts/format.py [reviewed - no separate finding]
+scripts/generated_output_lock.py [reviewed - no separate finding]
+scripts/git_doctor.py [F01, F02]
+scripts/investigation_evidence_smoke.py [F03]
+scripts/invoke-rust-perf-env.ps1 [reviewed - no separate finding]
+scripts/just-shell.py [reviewed - no separate finding]
+scripts/kd4_model_attempt_analysis.py [reviewed - no separate finding]
+scripts/kd4_perf_snapshot.py [F04]
+scripts/kd4_sync_audit.py [reviewed - no separate finding]
+scripts/mock_responses_websocket_server.py [reviewed - no separate finding]
+scripts/publish-local-codex-wsl.sh [reviewed - no separate finding]
+scripts/publish-local-codex.ps1 [F18]
+scripts/publish_local_codex_test_support.py [reviewed - no separate finding]
+scripts/pyproject.toml [reviewed - no separate finding]
+scripts/readme_toc.py [F17]
+scripts/root_maintenance.py [F05]
+scripts/run-powershell-script.ps1 [reviewed - no separate finding]
+scripts/run_tui_with_exec_server.sh [reviewed - no separate finding]
+scripts/rust_build_status.py [F06, F07, F08]
+scripts/rust_build_status_support.py [reviewed - no separate finding]
+scripts/rust_packages.py [reviewed - no separate finding]
+scripts/sccache-perf.ps1 [reviewed - no separate finding]
+scripts/source_map_check.py [reviewed - no separate finding]
+scripts/source_owners.py [reviewed - no separate finding]
+scripts/stage_npm_archives.py [F09, F10]
+scripts/stage_npm_packages.py [F11, F12]
+scripts/start-codex-exec.sh [F13, F14]
+scripts/test-remote-env.sh [F15, F16]
+scripts/test_asciicheck.py [reviewed - no separate finding]
+scripts/test_build_tooling.py [reviewed - no separate finding]
+scripts/test_build_tooling_performance.py [reviewed - no separate finding]
+scripts/test_build_tooling_policy.py [reviewed - no separate finding]
+scripts/test_build_tooling_storage.py [reviewed - no separate finding]
+scripts/test_cargo_lane.py [reviewed - no separate finding]
+scripts/test_check_blob_size.py [reviewed - no separate finding]
+scripts/test_check_kd4_features.py [reviewed - no separate finding]
+scripts/test_dev_environment.py [reviewed - no separate finding]
+scripts/test_generate_config_proto.py [reviewed - no separate finding]
+scripts/test_kd4_perf_snapshot.py [reviewed - no separate finding]
+scripts/test_kd4_sync_audit.py [reviewed - no separate finding]
+scripts/test_mock_responses_websocket_server.py [reviewed - no separate finding]
+scripts/test_publish_local_codex.py [reviewed - no separate finding]
+scripts/test_publish_local_codex_apply.py [reviewed - no separate finding]
+scripts/test_publish_local_codex_build.py [reviewed - no separate finding]
+scripts/test_publish_local_codex_dry_run.py [reviewed - no separate finding]
+scripts/test_publish_local_codex_freshness.py [reviewed - no separate finding]
+scripts/test_publish_local_codex_wsl.py [reviewed - no separate finding]
+scripts/test_readme_toc.py [reviewed - no separate finding]
+scripts/test_run_powershell_script.py [reviewed - no separate finding]
+scripts/test_run_tui_with_exec_server.py [reviewed - no separate finding]
+scripts/test_shell_helpers.py [reviewed - no separate finding]
+scripts/test_source_map_check.py [reviewed - no separate finding]
+scripts/test_source_owners.py [reviewed - no separate finding]
+scripts/test_stage_npm_packages.py [reviewed - no separate finding]
+scripts/test_task_continuity_hook.py [reviewed - no separate finding]
+scripts/test_workflow_preflight.py [reviewed - no separate finding]
+scripts/tool_versions.py [reviewed - no separate finding]
+scripts/uv.lock [reviewed - no separate finding]
+scripts/vscode_runtime_proof.py [reviewed - no separate finding]
+scripts/workflow_preflight.py [reviewed - no separate finding]
+scripts/codex_package/AGENTS.md [reviewed - no separate finding]
+scripts/codex_package/README.md [reviewed - no separate finding]
+scripts/codex_package/__init__.py [reviewed - no separate finding]
+scripts/codex_package/archive.py [reviewed - no separate finding]
+scripts/codex_package/cargo.py [F19, F20, F21, F27]
+scripts/codex_package/cli.py [F22, F27, F28]
+scripts/codex_package/codex-zsh [reviewed - no separate finding]
+scripts/codex_package/dotslash.py [F23, F24]
+scripts/codex_package/layout.py [F26, F27]
+scripts/codex_package/rg [reviewed - no separate finding]
+scripts/codex_package/ripgrep.py [reviewed - no separate finding]
+scripts/codex_package/targets.py [reviewed - no separate finding]
+scripts/codex_package/test_archive.py [reviewed - no separate finding]
+scripts/codex_package/test_cargo.py [reviewed - no separate finding]
+scripts/codex_package/test_cli.py [reviewed - no separate finding]
+scripts/codex_package/test_dotslash.py [reviewed - no separate finding]
+scripts/codex_package/test_layout.py [reviewed - no separate finding]
+scripts/codex_package/test_ripgrep.py [reviewed - no separate finding]
+scripts/codex_package/test_targets.py [reviewed - no separate finding]
+scripts/codex_package/test_v8.py [reviewed - no separate finding]
+scripts/codex_package/test_version.py [reviewed - no separate finding]
+scripts/codex_package/test_zsh.py [reviewed - no separate finding]
+scripts/codex_package/v8.py [F25]
+scripts/codex_package/version.py [reviewed - no separate finding]
+scripts/codex_package/zsh.py [reviewed - no separate finding]
+scripts/install/AGENTS.md [reviewed - no separate finding]
+scripts/install/README.md [reviewed - no separate finding]
+scripts/install/build_install_sh.py [reviewed - no separate finding]
+scripts/install/install.ps1 [F29, F30, F31]
+scripts/install/install.sh [F32, F33, F34, F35, F36, F37]
+scripts/install/install_release.sh [reviewed - no separate finding]
+scripts/install/test_install_sh.py [reviewed - no separate finding]
+scripts/investigation_eval/README.md [reviewed - no separate finding]
+scripts/investigation_eval/cases.jsonl [reviewed - no separate finding]
+scripts/investigation_eval/patches/clean-control-batching.patch [reviewed - no separate finding]
+scripts/investigation_eval/patches/clean-control-dispatch.patch [reviewed - no separate finding]
+scripts/investigation_eval/patches/lifecycle-cancelled-child-leak.patch [reviewed - no separate finding]
+scripts/investigation_eval/patches/local-logic-last-batch-dropped.patch [reviewed - no separate finding]
+scripts/investigation_eval/patches/persistence-receipt-sequence-collision.patch [reviewed - no separate finding]
+scripts/investigation_eval/patches/protocol-sandbox-mode-swap.patch [reviewed - no separate finding]
+scripts/investigation_eval/patches/static-wiring-missing-handler.patch [reviewed - no separate finding]
+scripts/investigation_eval/prompts/clean-control-batching.md [reviewed - no separate finding]
+scripts/investigation_eval/prompts/clean-control-dispatch.md [reviewed - no separate finding]
+scripts/investigation_eval/prompts/lifecycle-cancelled-child-leak.md [reviewed - no separate finding]
+scripts/investigation_eval/prompts/local-logic-last-batch-dropped.md [reviewed - no separate finding]
+scripts/investigation_eval/prompts/persistence-receipt-sequence-collision.md [reviewed - no separate finding]
+scripts/investigation_eval/prompts/protocol-sandbox-mode-swap.md [reviewed - no separate finding]
+scripts/investigation_eval/prompts/static-wiring-missing-handler.md [reviewed - no separate finding]
+scripts/investigation_eval/score_results.py [F40, F41, F42, F43]
+scripts/investigation_eval/test_investigation_eval.py [reviewed - no separate finding]
+scripts/investigation_eval/validate_cases.py [F38, F39]
+
+INTENTIONAL BEHAVIORS / REJECTED CANDIDATES
+============================================================================================================
+- `asciicheck --fix` retaining a failing result after performing replacements is explicitly tested as the
+  current fix-then-rerun contract, so it was not reported as a bug.
+- Explicit user `--target-dir` overriding automatic lane injection is covered as intentional behavior; only
+  unintentional parser/shell escape paths are reported.
+- Repository policy intentionally disables incremental compilation in its normal Cargo configuration; this
+  was not misreported as an sccache defect.
+- Mock WebSocket wrong-path and aborted connections are intentionally excluded from the session limit and
+  are covered by tests.
+- The TUI exec-server launcher already scans output until it finds a URL and validates WebSocket readiness;
+  the first-line defect is confined to `start-codex-exec.sh`.
+- Task continuity, workflow preflight, source-map, source-owner, lockfile, and frozen investigation fixture
+  reviews did not yield an additional evidence-backed scripts-tree defect.
+- The seven frozen investigation patch/prompt pairs align with their expected and forbidden labels; the
+  reported evaluator issues are in corpus validation/scoring, not those fixture contents.
+
+IMPLEMENTATION ORDER
+============================================================================================================
+Phase 1 - Stop false success and integrity bypasses:
+  F01, F03-F07, F11, F13-F16, F19, F22-F25, F29, F32, F34, F38, F40-F42.
+
+Phase 2 - Make publication/installation transactional:
+  F10, F12, F18, F26, F28, F30, F35-F36.
+
+Phase 3 - Correct diagnostics, cache keys, portability, and scoring precision:
+  F02, F08-F09, F17, F20-F21, F27, F31, F33, F37, F39, F43.
+
+END OF REPORT

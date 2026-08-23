@@ -9,17 +9,21 @@ Scenario: After a prior manual /compact produced an older remote compaction item
 01:message/developer:<PERMISSIONS_INSTRUCTIONS>
 02:message/developer:<skills_usage_instructions>\n## How to use skills\n- Use the sma...
 03:message/developer:<NO_TEXT>
-04:compaction:encrypted=true
-05:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-06:message/user:USER_TWO
-07:function_call/test_tool
-08:function_call_output:unsupported call: test_tool
+04:message/developer:<root_orchestration_instructions>When several independent tool c...
+05:compaction:encrypted=true
+06:message/developer:<root_orchestration_instructions>When several independent tool c...
+07:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
+08:message/user:USER_TWO
+09:function_call/test_tool
+10:function_call_output:unsupported call: test_tool
 
 ## Second Turn Request (After Compaction)
 00:message/user:<task_model_guidance>Before acting, form and maintain a working ...
 01:message/developer:<PERMISSIONS_INSTRUCTIONS>
 02:message/developer:<skills_usage_instructions>\n## How to use skills\n- Use the sma...
 03:message/developer:<NO_TEXT>
-04:compaction:encrypted=true
-05:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-06:message/user:USER_TWO
+04:message/developer:<root_orchestration_instructions>When several independent tool c...
+05:compaction:encrypted=true
+06:message/developer:<root_orchestration_instructions>When several independent tool c...
+07:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
+08:message/user:USER_TWO

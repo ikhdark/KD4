@@ -439,6 +439,7 @@ async fn completed_tool_call_is_persisted_before_its_future_can_start() {
     turn_context
         .turn_timing_state
         .begin_model_generation(&mut pending, &SessionSource::Cli);
+    drop(turn_context.turn_timing_state.begin_model_request_wait());
     drop(sampling);
     let started = Arc::new(AtomicBool::new(false));
     let handler = Arc::new(PersistenceProbeHandler {

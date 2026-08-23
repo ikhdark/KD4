@@ -74,6 +74,9 @@ pub(super) fn server_notification_thread_target(
         ServerNotification::TurnReasoningPolicyUpdated(notification) => {
             Some(notification.thread_id.as_str())
         }
+        ServerNotification::TurnReasoningPolicySummary(notification) => {
+            Some(notification.thread_id.as_str())
+        }
         ServerNotification::HookStarted(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::TurnCompleted(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::TurnTerminalizationCompleted(notification) => {
@@ -209,6 +212,7 @@ mod tests {
     use codex_app_server_protocol::ServerNotification;
     use codex_app_server_protocol::ThreadSettings;
     use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
+    use codex_app_server_protocol::TurnReasoningPolicySummaryNotification;
     use codex_app_server_protocol::TurnTerminalizationCompletedNotification;
     use codex_app_server_protocol::WarningNotification;
     use codex_protocol::ThreadId;
@@ -216,6 +220,7 @@ mod tests {
     use codex_protocol::config_types::ModeKind;
     use codex_protocol::config_types::Settings;
     use codex_protocol::openai_models::ReasoningEffort;
+    use codex_protocol::protocol::ReasoningPolicyHistory;
     use codex_protocol::protocol::TerminalizationDeliveryState;
     use codex_protocol::protocol::TerminalizationRecoveryState;
     use codex_protocol::protocol::TurnTerminalizationReceipt;
@@ -348,6 +353,27 @@ mod tests {
                     terminal_interaction_released: true,
                     recovery_state: TerminalizationRecoveryState::None,
                     deadline_exhausted_phase: None,
+                },
+            },
+        );
+
+        let target = server_notification_thread_target(&notification);
+
+        assert_eq!(target, ServerNotificationThreadTarget::Thread(thread_id));
+    }
+
+    #[test]
+    fn reasoning_policy_summary_notifications_route_to_threads() {
+        let thread_id = ThreadId::new();
+        let notification = ServerNotification::TurnReasoningPolicySummary(
+            TurnReasoningPolicySummaryNotification {
+                thread_id: thread_id.to_string(),
+                turn_id: "turn".to_string(),
+                history: ReasoningPolicyHistory {
+                    turn_id: "turn".to_string(),
+                    entries: Vec::new(),
+                    total_entries: 0,
+                    truncated: false,
                 },
             },
         );

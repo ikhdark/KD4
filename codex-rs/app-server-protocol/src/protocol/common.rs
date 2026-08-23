@@ -307,7 +307,6 @@ macro_rules! client_request_definitions {
         #[allow(clippy::large_enum_variant)]
         pub enum ClientResponsePayload {
             $( $variant($response), )*
-            InterruptConversation(v1::InterruptConversationResponse),
         }
 
         impl ClientResponsePayload {
@@ -325,9 +324,6 @@ macro_rules! client_request_definitions {
                             Ok((request_id, result, Some(Self::$variant(response))))
                         }
                     )*
-                    Self::InterruptConversation(response) => {
-                        serde_json::to_value(response).map(|result| (request_id, result, None))
-                    }
                 }
             }
 
@@ -341,7 +337,6 @@ macro_rules! client_request_definitions {
                             })
                         }
                     )*
-                    Self::InterruptConversation(_) => None,
                 }
             }
 
@@ -362,16 +357,7 @@ macro_rules! client_request_definitions {
                             serde_json::to_value(response).map(|result| (request_id, result))
                         }
                     )*
-                    Self::InterruptConversation(response) => {
-                        serde_json::to_value(response).map(|result| (request_id, result))
-                    }
                 }
-            }
-        }
-
-        impl From<v1::InterruptConversationResponse> for ClientResponsePayload {
-            fn from(response: v1::InterruptConversationResponse) -> Self {
-                Self::InterruptConversation(response)
             }
         }
 
@@ -1021,6 +1007,11 @@ client_request_definitions! {
         serialization: global("config"),
         response: v2::WindowsSandboxReadinessResponse,
     },
+    WindowsSandboxGrantReadRoot => "windowsSandbox/grantReadRoot" {
+        params: v2::WindowsSandboxGrantReadRootParams,
+        serialization: global("windows-sandbox-setup"),
+        response: v2::WindowsSandboxGrantReadRootResponse,
+    },
 
     LoginAccount => "account/login/start" {
         params: v2::LoginAccountParams,
@@ -1653,6 +1644,8 @@ server_notification_definitions! {
     TurnStarted => "turn/started" (v2::TurnStartedNotification),
     #[experimental("reasoningPolicyVisibility")]
     TurnReasoningPolicyUpdated => "turn/reasoningPolicy/updated" (v2::TurnReasoningPolicyUpdatedNotification),
+    #[experimental("reasoningPolicyVisibility")]
+    TurnReasoningPolicySummary => "turn/reasoningPolicy/summary" (v2::TurnReasoningPolicySummaryNotification),
     HookStarted => "hook/started" (v2::HookStartedNotification),
     TurnCompleted => "turn/completed" (v2::TurnCompletedNotification),
     TurnTerminalizationCompleted => "turn/terminalizationCompleted" (v2::TurnTerminalizationCompletedNotification),
@@ -1752,6 +1745,7 @@ pub fn server_notification_requires_delivery(notification: &ServerNotification) 
             | ServerNotification::ServerRequestResolved(_)
             | ServerNotification::AccountLoginCompleted(_)
             | ServerNotification::ExternalAgentConfigImportCompleted(_)
+            | ServerNotification::TurnReasoningPolicySummary(_)
             | ServerNotification::AgentMessageDelta(_)
             | ServerNotification::PlanDelta(_)
             | ServerNotification::ReasoningSummaryTextDelta(_)
@@ -1854,6 +1848,18 @@ mod tests {
             ServerNotification::ThreadClosed(v2::ThreadClosedNotification {
                 thread_id: "thread".to_string(),
             }),
+            ServerNotification::TurnReasoningPolicySummary(
+                v2::TurnReasoningPolicySummaryNotification {
+                    thread_id: "thread".to_string(),
+                    turn_id: "turn".to_string(),
+                    history: codex_protocol::protocol::ReasoningPolicyHistory {
+                        turn_id: "turn".to_string(),
+                        entries: Vec::new(),
+                        total_entries: 0,
+                        truncated: false,
+                    },
+                },
+            ),
         ];
 
         for notification in notifications {

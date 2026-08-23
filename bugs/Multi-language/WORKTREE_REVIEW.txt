@@ -1,0 +1,185 @@
+MDPWA AUDIT REPAIR LEDGER
+Created: 2026-08-12
+Repository: ikhdark/mdpwa
+Validated checkout: 8efb80b87613a5537928292353d3d15679a8fb85
+Source audit: C:/Users/kuh/Downloads/MDPWA_current_full_audit_2026-08-12.txt
+Source audit coverage: read completely, lines 1-631
+
+PURPOSE
+-------
+This ledger retains every issue from the supplied audit that was independently
+validated against the current checkout. It is the implementation checklist and
+final disposition record for this repair pass.
+
+FROZEN INITIAL WORKTREE INVENTORY
+=================================
+The worktree was clean before this ledger was created: no staged, unstaged,
+deleted, renamed, type-changed, submodule, or untracked paths were present.
+The audit snapshot and the checkout HEAD are identical. This ledger is the first
+task-created path. Existing user work must remain untouched if it appears later.
+
+INSTRUCTIONS AND SOURCE-OF-TRUTH OWNERS
+=======================================
+- Root AGENTS.md is the only scoped instruction file in the checkout.
+- SOURCEMAP.md owns architecture, routes, persistence, workflows, generated
+  artifacts, and validation topology and must move with material changes.
+- src/i18n/routes.ts owns indexed route truth.
+- migrations/manifest.json owns the ordered migration/checksum inventory.
+- scripts/templates/service-worker.js owns generated public/sw.js behavior.
+- Paired messages/en and messages/es catalogs own durable resident/admin copy.
+- Repository checks and local servers are opt-in and were not authorized by the
+  request; implementation will add/update tests but not execute checks or start
+  the application during this task.
+
+VALIDATED FINDINGS AND INTENDED DISPOSITIONS
+============================================
+
+F-01 | CONFIRMED HIGH | Automatic push renewal resets Spanish locale
+Evidence: scripts/templates/service-worker.js readStoredPushTopics() returns only
+topics, saveReplacementPushSubscription() omits locale, and
+webPushSubscriptions.normalizeSubscription() defaults an omitted locale to en.
+Impact: endpoint rotation can change localized notification click routing without
+resident action.
+Disposition: rename/expand stored state lookup to return topics plus locale,
+require the stored locale, carry it through renewal, include it in the replacement
+POST, update API/storage state representations and regression tests, and regenerate
+public/sw.js.
+
+F-02 | CONFIRMED HIGH | Push renewal uses split save/delete writes
+Evidence: the service worker POSTs the replacement and then separately DELETEs the
+old endpoint, while the existing API and repository already accept
+previousEndpoint for one atomic replacement operation.
+Impact: worker termination or DELETE failure can leave duplicate/stale endpoints.
+Disposition: include previousEndpoint in the replacement POST, remove the DELETE,
+and update tests/generated worker to prove one mutation performs the migration.
+
+F-03 | CONFIRMED HIGH | Zero-target broadcasts finalize as sent
+Evidence: alertBroadcastRepository.finalizeBroadcastDelivery maps total = 0 to
+sent; sendAlertBroadcastEmails independently returns sent for an empty recipient
+list; the composer permits a zero audience after preview.
+Impact: an operator can reasonably read sent as successful direct delivery when no
+resident was targeted.
+Disposition: add the explicit durable no_targets outcome through a new migration,
+repository/model unions and finalization/recovery SQL, email delivery results,
+admin presentation, paired English/Spanish copy, tests, migration manifest, and
+SOURCEMAP. Publication remains separate and can still complete.
+
+F-04 | CONFIRMED MEDIUM | Restore Blob and pg_restore operations are unbounded
+Evidence: database-restore.mjs gives private Blob get/pipeline, pg_restore
+--version, pg_restore --list, and spawned pg_restore no deadline.
+Impact: an emergency restore can hang indefinitely, including after an in-place
+write fence is activated.
+Disposition: add conservative Blob download, preflight, and restore deadlines;
+terminate then force-kill a timed-out child; settle process listeners once; emit a
+clear bounded failure while preserving the existing rule that an ambiguous failed
+in-place restore leaves its write fence active for explicit operator review.
+
+F-05 | CONFIRMED MEDIUM | Retention deletion omits the configured Blob deadline
+Evidence: database-backup.mjs applies blobRequestTimeoutMs to publication and
+failed-publication cleanup but not scheduled-retention del().
+Impact: pruning can hang after a valid backup is verified, and ambiguous deletion
+can desynchronize object and manifest state.
+Disposition: add the deadline, reconcile artifact and sidecar existence after an
+ambiguous delete, mark only confirmed-absent manifests deleted, record a distinct
+privacy-safe prune-failure audit outcome, and report verified backup creation
+separately from non-fatal old-backup pruning failure.
+
+F-06 | CONFIRMED MEDIUM | Push receipt CacheStorage is unbounded
+Evidence: each broadcast writes a permanent martindale-push-receipts-v1 cache
+entry; activate cleanup handles only martindale-static-* release caches.
+Impact: long-lived installations accumulate uncontrolled state and eventually
+depend on browser quota eviction.
+Disposition: version the receipt cache, store receipt timestamps, prune by a replay
+window longer than normal delivery retry/expiry, enforce a maximum entry count,
+prune on activation and insertion, clean obsolete receipt cache versions, and add
+expiry/count tests.
+
+F-07 | CONFIRMED MEDIUM | SOURCEMAP migration topology stops at 0006
+Evidence: the canonical narrative lists 0001-0006 while the manifest and current
+owners include 0007, 0008, and 0009.
+Impact: maintainers can miss current idempotency, localization, permission, and
+metrics schema owners.
+Disposition: update the narrative and table ownership through the new latest
+migration created by F-03, advance map revision/date, and add a mechanical check
+that the map's declared latest migration matches migrations/manifest.json.
+
+F-08 | CONFIRMED LOW | SOURCEMAP indexed-route summary omits one real route
+Evidence: the short summary omits /codes-permits-planning while routes.ts and the
+same document's detailed route table include it.
+Impact: route/SEO impact sweeps can be incomplete.
+Disposition: add the route to the summary and extend the mechanical source-map
+check so its indexed route inventory must exactly match src/i18n/routes.ts.
+
+F-09 | CONFIRMED MEDIUM | Critical data workflows use mutable action tags
+Evidence: data-release-gate.yml and data-operations-tests.yml use mutable v6/v5
+action tags, while ci.yml and data-backup.yml use reviewed immutable SHAs and
+checkout persist-credentials:false.
+Impact: the same candidate can execute different third-party action code on rerun.
+Disposition: use the repository's reviewed checkout/setup-node/pnpm immutable pins,
+disable persisted checkout credentials, and add a workflow policy check rejecting
+external uses that are not pinned to a full commit SHA.
+
+F-10 | CONFIRMED MEDIUM | Data failure proof does not run on main pushes
+Evidence: data-operations-tests.yml has pull_request and workflow_dispatch only;
+the runbook requires its PostgreSQL proof for the exact production candidate.
+Impact: merge-created main SHAs can lack required evidence unless manually run.
+Disposition: add push main, retain manual dispatch, add concurrency/timeout bounds,
+and document the exact-candidate automatic proof.
+
+F-11 | CONFIRMED MEDIUM CONTROL GAP | Applied release enforcement lacks a gate
+Evidence: release-assurance-gaps.txt explicitly states the repository cannot prove
+the documented GitHub ruleset and production-promotion controls are applied.
+Impact: green workflows can exist without actually blocking an unsafe promotion.
+Disposition: make a short-lived, candidate-bound, HMAC-signed enforcement
+attestation mandatory in the production data release gate. Validate repository,
+branch, candidate SHA, exact required check names, ruleset URL, Vercel project and
+promotion-gate identifiers, verification/expiry times, and signature. Update the
+runbook and add unit coverage. This implements the runbook's accepted external
+immutable-control path when CI cannot reliably read administrative GitHub/Vercel
+configuration with its default token.
+
+F-12 | CONFIRMED MEDIUM VALIDATION GAP | No live named-admin HTTP/database proof
+Evidence: admin identity tests mock PostgreSQL and no release workflow provisions a
+fake named admin and exercises cookies, MFA, permissions, and revocation over HTTP.
+Impact: cross-layer deployment/runtime failures can pass unit verification.
+Disposition: add a disposable-PostgreSQL workflow job that migrates a synthetic
+database, bootstraps a fake metrics-only MFA administrator without logging secrets,
+starts the production app in CI, proves correct MFA login and cookie issuance,
+proves an allowed request, proves permission denial, revokes the session, proves
+post-revocation denial, and uploads privacy-safe candidate-bound evidence.
+
+F-13 | CONFIRMED MEDIUM VALIDATION GAP | No encrypted backup-to-restore rehearsal
+Evidence: repository docs acknowledge no lane creates an encrypted backup and runs
+database:restore --apply against an isolated disposable target.
+Impact: backup creation can remain green while the integrated encrypted archive,
+decrypt, pg_restore, schema, and verification path is broken.
+Disposition: add a guarded localhost-only local rehearsal mode to the production
+backup owner, then add a disposable-PostgreSQL workflow job that creates synthetic
+source data, produces/verifies an encrypted restore-point backup, restores it with
+the production restore script into a distinct empty database, verifies migration
+state and safe synthetic counts, uploads candidate/fingerprint evidence, and drops
+the disposable databases with the runner.
+
+CONTRADICTION, WIRING, AND RELEASE-RISK SUMMARY
+===============================================
+- F-01 and F-02 are one endpoint-migration contract and must be repaired together.
+- F-03 changes persistence truth and therefore requires migration, model, SQL,
+  API/UI result interpretation, bilingual copy, tests, manifest, and map updates.
+- F-04 and F-05 must preserve ambiguity safety: do not silently clear a restore
+  fence or guess that a remotely deleted object still exists.
+- F-06 must retain duplicate suppression across the legitimate replay horizon.
+- F-07/F-08 require mechanical ownership checks to prevent repeated drift.
+- F-09/F-10 are prerequisites for deterministic exact-candidate proofs.
+- F-11 cannot safely depend on a default CI token having repository-administration
+  or Vercel control-plane access; signed external evidence is fail-closed and
+  mandatory instead of pretending checked-in YAML proves applied policy.
+- F-12/F-13 use only fake data and disposable local PostgreSQL services. No
+  production credentials, resident data, dumps, sessions, or environment values
+  may enter logs or uploaded evidence.
+
+INITIAL VALIDATION STATE
+========================
+Static source validation: complete for F-01 through F-13.
+Repository commands/tests/build/server: not run; repository policy makes them
+opt-in and the user requested implementation rather than command execution.
+Final dispositions and any static limitations will be appended after repair.

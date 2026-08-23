@@ -75,12 +75,20 @@ enum ProtectedCreateRemoval {
     Other,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinuxSandboxBackend {
+    Bubblewrap,
+}
+
+fn linux_sandbox_backend(_use_legacy_landlock: bool) -> LinuxSandboxBackend {
+    LinuxSandboxBackend::Bubblewrap
+}
+
 #[derive(Debug, Parser)]
 /// CLI surface for the Linux sandbox helper.
 ///
-/// The type name remains `LandlockCommand` for compatibility with existing
-/// wiring, but bubblewrap is now the default filesystem sandbox and Landlock
-/// is the legacy fallback.
+/// The type name remains `LandlockCommand` for CLI compatibility, but
+/// bubblewrap is the Linux filesystem sandbox.
 pub struct LandlockCommand {
     /// It is possible that the cwd used in the context of the sandbox policy
     /// is different from the cwd of the process to spawn.
@@ -104,9 +112,7 @@ pub struct LandlockCommand {
     )]
     pub permission_profile: Option<PermissionProfile>,
 
-    /// Opt-in: use the legacy Landlock Linux sandbox fallback.
-    ///
-    /// When not set, the helper uses the default bubblewrap pipeline.
+    /// Removed compatibility flag retained as a no-op.
     #[arg(long = "use-legacy-landlock", hide = true, default_value_t = false)]
     pub use_legacy_landlock: bool,
 
@@ -164,18 +170,11 @@ pub fn run_main() -> ! {
     if command.is_empty() {
         panic!("No command specified to execute.");
     }
-    ensure_inner_stage_mode_is_valid(apply_seccomp_then_exec, use_legacy_landlock);
     let EffectivePermissions {
         permission_profile,
         file_system_sandbox_policy,
         network_sandbox_policy,
     } = resolve_permission_profile(permission_profile).unwrap_or_else(|err| panic!("{err}"));
-    ensure_legacy_landlock_mode_supports_policy(
-        use_legacy_landlock,
-        &file_system_sandbox_policy,
-        network_sandbox_policy,
-        &sandbox_policy_cwd,
-    );
 
     // Inner stage: apply seccomp/no_new_privs after bubblewrap has already
     // established the filesystem view.
@@ -214,48 +213,36 @@ pub fn run_main() -> ! {
         exec_or_panic(command);
     }
 
-    if !use_legacy_landlock {
-        // Outer stage: bubblewrap first, then re-enter this binary in the
-        // sandboxed environment to apply seccomp. This path never falls back
-        // to legacy Landlock on failure.
-        let proxy_route_spec =
-            if allow_network_for_proxy {
-                Some(prepare_host_proxy_route_spec().unwrap_or_else(|err| {
-                    panic!("failed to prepare host proxy routing bridge: {err}")
-                }))
-            } else {
-                None
-            };
-        let inner = build_inner_seccomp_command(InnerSeccompCommandArgs {
-            sandbox_policy_cwd: &sandbox_policy_cwd,
-            command_cwd: command_cwd.as_deref(),
-            permission_profile: &permission_profile,
-            allow_network_for_proxy,
-            proxy_route_spec,
-            command,
-        });
-        run_bwrap_with_proc_fallback(
-            &sandbox_policy_cwd,
-            command_cwd.as_deref(),
-            &file_system_sandbox_policy,
-            network_sandbox_policy,
-            inner,
-            !no_proc,
-            allow_network_for_proxy,
-        );
-    }
+    let LinuxSandboxBackend::Bubblewrap = linux_sandbox_backend(use_legacy_landlock);
 
-    // Legacy path: Landlock enforcement only, when bwrap sandboxing is not enabled.
-    if let Err(e) = apply_permission_profile_to_current_thread(
-        &permission_profile,
-        &sandbox_policy_cwd,
-        /*apply_landlock_fs*/ true,
+    // Outer stage: bubblewrap first, then re-enter this binary in the
+    // sandboxed environment to apply seccomp. There is no filesystem-sandbox
+    // fallback when bubblewrap setup fails.
+    let proxy_route_spec = if allow_network_for_proxy {
+        Some(
+            prepare_host_proxy_route_spec()
+                .unwrap_or_else(|err| panic!("failed to prepare host proxy routing bridge: {err}")),
+        )
+    } else {
+        None
+    };
+    let inner = build_inner_seccomp_command(InnerSeccompCommandArgs {
+        sandbox_policy_cwd: &sandbox_policy_cwd,
+        command_cwd: command_cwd.as_deref(),
+        permission_profile: &permission_profile,
         allow_network_for_proxy,
-        /*proxy_routed_network*/ false,
-    ) {
-        panic!("error applying legacy Linux sandbox restrictions: {e:?}");
-    }
-    exec_or_panic(command);
+        proxy_route_spec,
+        command,
+    });
+    run_bwrap_with_proc_fallback(
+        &sandbox_policy_cwd,
+        command_cwd.as_deref(),
+        &file_system_sandbox_policy,
+        network_sandbox_policy,
+        inner,
+        !no_proc,
+        allow_network_for_proxy,
+    );
 }
 
 #[derive(Debug, Clone)]
@@ -294,28 +281,6 @@ fn resolve_permission_profile(
         file_system_sandbox_policy,
         network_sandbox_policy,
     })
-}
-
-fn ensure_inner_stage_mode_is_valid(apply_seccomp_then_exec: bool, use_legacy_landlock: bool) {
-    if apply_seccomp_then_exec && use_legacy_landlock {
-        panic!("--apply-seccomp-then-exec is incompatible with --use-legacy-landlock");
-    }
-}
-
-fn ensure_legacy_landlock_mode_supports_policy(
-    use_legacy_landlock: bool,
-    file_system_sandbox_policy: &FileSystemSandboxPolicy,
-    network_sandbox_policy: NetworkSandboxPolicy,
-    sandbox_policy_cwd: &Path,
-) {
-    if use_legacy_landlock
-        && file_system_sandbox_policy
-            .needs_direct_runtime_enforcement(network_sandbox_policy, sandbox_policy_cwd)
-    {
-        panic!(
-            "permission profiles requiring direct runtime enforcement are incompatible with --use-legacy-landlock"
-        );
-    }
 }
 
 fn run_bwrap_with_proc_fallback(

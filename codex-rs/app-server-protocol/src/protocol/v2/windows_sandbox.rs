@@ -1,3 +1,4 @@
+use codex_protocol::models::PermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -28,6 +29,7 @@ pub enum WindowsSandboxReadiness {
     Ready,
     NotConfigured,
     UpdateRequired,
+    Unsupported,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -37,6 +39,14 @@ pub struct WindowsSandboxSetupStartParams {
     pub mode: WindowsSandboxSetupMode,
     #[ts(optional = nullable)]
     pub cwd: Option<AbsolutePathBuf>,
+    /// Named permission profile to resolve on the app-server before setup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub permission_profile_id: Option<String>,
+    /// Inline permission profile used when setup precedes persisting a preset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub permission_profile: Option<PermissionProfile>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -51,6 +61,22 @@ pub struct WindowsSandboxSetupStartResponse {
 #[ts(export_to = "v2/")]
 pub struct WindowsSandboxReadinessResponse {
     pub status: WindowsSandboxReadiness,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct WindowsSandboxGrantReadRootParams {
+    pub path: AbsolutePathBuf,
+    #[ts(optional = nullable)]
+    pub cwd: Option<AbsolutePathBuf>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct WindowsSandboxGrantReadRootResponse {
+    pub path: AbsolutePathBuf,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

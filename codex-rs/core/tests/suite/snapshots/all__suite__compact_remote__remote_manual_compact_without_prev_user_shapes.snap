@@ -9,5 +9,7 @@ Scenario: Remote manual /compact with no prior user turn skips the remote compac
 01:message/developer:<PERMISSIONS_INSTRUCTIONS>
 02:message/developer:<skills_usage_instructions>\n## How to use skills\n- Use the sma...
 03:message/developer:<NO_TEXT>
-04:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-05:message/user:USER_ONE
+04:message/developer:<root_orchestration_instructions>When several independent tool c...
+05:message/developer:<root_orchestration_instructions>When several independent tool c...
+06:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
+07:message/user:USER_ONE

@@ -17,6 +17,8 @@ use codex_apply_patch::AppliedPatchChange;
 use codex_apply_patch::AppliedPatchDelta;
 use codex_apply_patch::AppliedPatchFileChange;
 
+use crate::git_workspace::WorkspaceEvidenceIdentity;
+
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 const DEV_NULL: &str = "/dev/null";
 const REGULAR_FILE_MODE: &str = "100644";
@@ -210,6 +212,8 @@ pub struct TurnDiffTracker {
     unvalidated_unknown_mutation: bool,
     has_successful_validation: bool,
     last_successful_validation_revision: Option<u64>,
+    last_successful_validation_identity: Option<String>,
+    last_validated_workspace_identity: Option<WorkspaceEvidenceIdentity>,
     last_post_mutation_validation_status: ValidationFreshnessStatus,
     #[cfg(test)]
     post_edit_inspection_bundle: Option<PostEditInspectionBundle>,
@@ -233,6 +237,8 @@ impl Default for TurnDiffTracker {
             unvalidated_unknown_mutation: false,
             has_successful_validation: false,
             last_successful_validation_revision: None,
+            last_successful_validation_identity: None,
+            last_validated_workspace_identity: None,
             last_post_mutation_validation_status: ValidationFreshnessStatus::None,
             #[cfg(test)]
             post_edit_inspection_bundle: None,
@@ -407,6 +413,40 @@ impl TurnDiffTracker {
 
     pub(crate) fn last_successful_validation_revision(&self) -> Option<u64> {
         self.last_successful_validation_revision
+    }
+
+    pub(crate) fn record_workspace_freshness_observation(
+        &mut self,
+        successful_validation_identity: Option<String>,
+        workspace_identity: Option<WorkspaceEvidenceIdentity>,
+    ) {
+        if let Some(validation_identity) = successful_validation_identity {
+            if self.last_post_mutation_validation_status
+                != ValidationFreshnessStatus::PassedAfterLastMutation
+                || self.has_unvalidated_mutation()
+            {
+                return;
+            }
+            self.last_successful_validation_identity = Some(validation_identity);
+            self.last_validated_workspace_identity = workspace_identity;
+            return;
+        }
+        let Some(workspace_identity) = workspace_identity else {
+            return;
+        };
+        if self.last_validated_workspace_identity.as_ref() != Some(&workspace_identity) {
+            return;
+        }
+        self.unvalidated_paths.clear();
+        self.unvalidated_unknown_mutation = false;
+        self.last_successful_validation_revision = Some(self.mutation_revision);
+        self.last_post_mutation_validation_status =
+            ValidationFreshnessStatus::PassedAfterLastMutation;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_successful_validation_identity(&self) -> Option<&str> {
+        self.last_successful_validation_identity.as_deref()
     }
 
     #[cfg(test)]

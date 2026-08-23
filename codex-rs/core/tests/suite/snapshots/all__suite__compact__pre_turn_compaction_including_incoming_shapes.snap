@@ -1,13 +1,15 @@
 ---
 source: core/tests/suite/compact.rs
+assertion_line: 4834
 expression: "format_labeled_requests_snapshot(\"Pre-turn auto-compaction with a context override emits the context diff in the compact request while the incoming user message is still excluded.\",\n&[(\"Local Compaction Request\", &requests[2]),\n(\"Local Post-Compaction History Layout\", &requests[3]),])"
 ---
 Scenario: Pre-turn auto-compaction with a context override emits the context diff in the compact request while the incoming user message is still excluded.
 
 ## Local Compaction Request
-00:message/developer[2]:
+00:message/developer[3]:
     [01] <PERMISSIONS_INSTRUCTIONS>
-    [02] <skills_usage_instructions>\n## How to use skills\n- Use the sma...
+    [02] <root_orchestration_instructions>When several independent tool c...
+    [03] <skills_usage_instructions>\n## How to use skills\n- Use the sma...
 01:message/user:USER_ONE
 02:message/assistant:FIRST_REPLY
 03:message/user:USER_TWO
@@ -19,8 +21,10 @@ Scenario: Pre-turn auto-compaction with a context override emits the context dif
 01:message/developer:<PERMISSIONS_INSTRUCTIONS>
 02:message/developer:<skills_usage_instructions>\n## How to use skills\n- Use the sma...
 03:message/developer:<NO_TEXT>
-04:message/user:<ENVIRONMENT_CONTEXT:cwd=PRETURN_CONTEXT_DIFF_CWD>
-05:message/user:<COMPACTION_SUMMARY>\nPRE_TURN_SUMMARY
-06:message/user[2]:
+04:message/developer:<root_orchestration_instructions>When several independent tool c...
+05:message/user:<ENVIRONMENT_CONTEXT:cwd=PRETURN_CONTEXT_DIFF_CWD>
+06:message/user:<COMPACTION_SUMMARY>\nPRE_TURN_SUMMARY
+07:message/developer:<root_orchestration_instructions>When several independent tool c...
+08:message/user[2]:
     [01] <input_image:detail,image_url>
     [02] USER_THREE

@@ -39,11 +39,7 @@ use codex_api::AuthProvider;
 use codex_api::CompactClient as ApiCompactClient;
 use codex_api::CompactionInput as ApiCompactionInput;
 use codex_api::Compression;
-use codex_api::MemoriesClient as ApiMemoriesClient;
-use codex_api::MemorySummarizeInput as ApiMemorySummarizeInput;
-use codex_api::MemorySummarizeOutput as ApiMemorySummarizeOutput;
 use codex_api::Provider as ApiProvider;
-use codex_api::RawMemory as ApiRawMemory;
 use codex_api::RealtimeCallClient as ApiRealtimeCallClient;
 use codex_api::RealtimeSessionConfig as ApiRealtimeSessionConfig;
 use codex_api::Reasoning;
@@ -192,7 +188,6 @@ const RESPONSES_COMPACT_ENDPOINT: &str = "/responses/compact";
 // `/responses/compact` is unary, so the timeout covers the full response rather than one idle
 // period between stream events.
 const COMPACT_REQUEST_TIMEOUT_IDLE_MULTIPLIER: u32 = 4;
-const MEMORIES_SUMMARIZE_ENDPOINT: &str = "/memories/trace_summarize";
 /// Independent component serialization adds small JSON wrappers that are represented as envelope
 /// overhead in the final request. This is a diagnostic bound, not a request-building requirement.
 const MODEL_ATTEMPT_RECONCILIATION_TOLERANCE_BYTES: i64 = 256;
@@ -1159,19 +1154,6 @@ pub(crate) fn request_effort_for_model(
         .request_effort
 }
 
-fn memory_summary_reasoning(
-    model_info: &ModelInfo,
-    effort: Option<ReasoningEffortConfig>,
-) -> Option<Reasoning> {
-    effort
-        .and_then(|effort| request_effort_for_model(model_info, Some(effort)))
-        .map(|effort| Reasoning {
-            effort: Some(effort),
-            summary: None,
-            context: None,
-        })
-}
-
 fn session_telemetry_for_request(
     session_telemetry: &SessionTelemetry,
     request: &ResponsesApiRequest,
@@ -1249,7 +1231,9 @@ struct RequestSchemaCacheValue {
 #[derive(Debug, Default)]
 struct RequestSchemaSerializationCache {
     entries: VecDeque<(RequestSchemaCacheKey, RequestSchemaCacheValue)>,
+    #[cfg(test)]
     hits: u64,
+    #[cfg(test)]
     misses: u64,
 }
 
@@ -1262,12 +1246,21 @@ impl RequestSchemaSerializationCache {
         let entry = self.entries.remove(index)?;
         let value = entry.1.clone();
         self.entries.push_back(entry);
-        self.hits = self.hits.saturating_add(1);
+        #[cfg(test)]
+        {
+            self.hits = self.hits.saturating_add(1);
+        }
         Some(value)
     }
 
+    #[cfg(test)]
     fn record_miss(&mut self) {
         self.misses = self.misses.saturating_add(1);
+    }
+
+    #[cfg(test)]
+    fn diagnostics(&self) -> (u64, u64, usize) {
+        (self.hits, self.misses, self.entries.len())
     }
 
     fn insert(&mut self, key: RequestSchemaCacheKey, value: RequestSchemaCacheValue) {
@@ -1320,6 +1313,13 @@ impl RequestRouteTelemetry {
 /// Turn-scoped settings (model selection, reasoning controls, telemetry context, and turn
 /// metadata) are passed explicitly to the relevant methods to keep turn lifetime visible at the
 /// call site.
+///
+/// Direct memory summarization is owned by the `codex-api` endpoint client rather than this
+/// session-scoped Responses client.
+///
+/// ```compile_fail
+/// let _legacy_endpoint = codex_core::ModelClient::summarize_memories;
+/// ```
 #[derive(Debug, Clone)]
 pub struct ModelClient {
     state: Arc<ModelClientState>,
@@ -1997,53 +1997,6 @@ impl ModelClient {
         })
     }
 
-    /// Builds memory summaries for each provided normalized raw memory.
-    ///
-    /// This is a unary call (no streaming) to `/v1/memories/trace_summarize`.
-    ///
-    /// The model selection, reasoning effort, and telemetry context are passed explicitly to keep
-    /// `ModelClient` session-scoped.
-    pub async fn summarize_memories(
-        &self,
-        raw_memories: Vec<ApiRawMemory>,
-        model_info: &ModelInfo,
-        effort: Option<ReasoningEffortConfig>,
-        session_telemetry: &SessionTelemetry,
-    ) -> Result<Vec<ApiMemorySummarizeOutput>> {
-        if raw_memories.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let client_setup = self.current_client_setup().await?;
-        let transport =
-            self.build_api_transport(&client_setup.api_provider, MEMORIES_SUMMARIZE_ENDPOINT)?;
-        let request_telemetry = Self::build_request_telemetry(
-            session_telemetry,
-            AuthRequestTelemetryContext::new(
-                client_setup.auth.as_ref().map(CodexAuth::auth_mode),
-                client_setup.api_auth.as_ref(),
-                client_setup.agent_identity_telemetry.clone(),
-                PendingUnauthorizedRetry::default(),
-            ),
-            RequestRouteTelemetry::for_endpoint(MEMORIES_SUMMARIZE_ENDPOINT),
-            self.state.auth_env_telemetry.clone(),
-        );
-        let client =
-            ApiMemoriesClient::new(transport, client_setup.api_provider, client_setup.api_auth)
-                .with_telemetry(Some(request_telemetry));
-
-        let payload = ApiMemorySummarizeInput {
-            model: model_info.slug.clone(),
-            raw_memories,
-            reasoning: memory_summary_reasoning(model_info, effort),
-        };
-
-        client
-            .summarize_input(&payload, self.build_subagent_headers())
-            .await
-            .map_err(|error| self.state.provider.map_api_error(error))
-    }
-
     fn build_subagent_headers(&self) -> ApiHeaderMap {
         let mut extra_headers = ApiHeaderMap::new();
         add_originator_header(&mut extra_headers, self.state.originator.as_str());
@@ -2158,20 +2111,16 @@ impl ModelClient {
     fn request_schema_cache_key(
         prompt: &Prompt,
         verbosity: Option<VerbosityConfig>,
-        use_responses_lite: bool,
     ) -> serde_json::Result<RequestSchemaCacheKey> {
-        let uses_precomputed_tool_digest = prompt.digests.tools.is_some();
         let tool_identity = match prompt.digests.tools {
-            Some(digest) => digest.to_vec(),
-            None => serde_json::to_vec(prompt.tools.as_slice())?,
+            Some(digest) => digest,
+            None => Sha256::digest(serde_json::to_vec(prompt.tools.as_slice())?).into(),
         };
         let serialized = serde_json::to_vec(&(
-            uses_precomputed_tool_digest,
             tool_identity,
             &prompt.output_schema,
             prompt.output_schema_strict,
             format!("{verbosity:?}"),
-            use_responses_lite,
         ))?;
         let mut hasher = Sha256::new();
         hasher.update(b"codex.request-schema-cache.v1");
@@ -2184,7 +2133,7 @@ impl ModelClient {
         &self,
         prompt: &Prompt,
         verbosity: Option<VerbosityConfig>,
-        use_responses_lite: bool,
+        _use_responses_lite: bool,
     ) -> Result<RequestSchemaCacheValue> {
         if !crate::latency_switches::stage3_persistence_history_enabled() {
             return Ok(RequestSchemaCacheValue {
@@ -2196,7 +2145,7 @@ impl ModelClient {
                 ),
             });
         }
-        let key = Self::request_schema_cache_key(prompt, verbosity, use_responses_lite)?;
+        let key = Self::request_schema_cache_key(prompt, verbosity)?;
         {
             let mut cache = self
                 .state
@@ -2207,6 +2156,7 @@ impl ModelClient {
                 trace!("request schema serialization cache hit");
                 return Ok(value);
             }
+            #[cfg(test)]
             cache.record_miss();
         }
 

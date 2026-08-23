@@ -271,13 +271,54 @@ async fn remote_write_closed_stdin_marks_process_exited() {
 async fn fail_and_terminate_preserves_failure_message() {
     let process = remote_process(WriteStatus::Accepted, /*terminate_error*/ None).await;
 
-    process.fail_and_terminate("network denied".to_string());
-    process.fail_and_terminate("second failure".to_string());
+    process
+        .fail_and_terminate("network denied".to_string())
+        .await
+        .expect("first termination succeeds");
+    process
+        .fail_and_terminate("second failure".to_string())
+        .await
+        .expect("repeated termination remains successful");
 
     assert!(process.has_exited());
     assert_eq!(
         process.failure_message(),
         Some("network denied".to_string())
+    );
+}
+
+#[tokio::test]
+async fn unified_exec_termination_failure_retains_process_owner() {
+    let manager = UnifiedExecProcessManager::default();
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let process = remote_process(
+        WriteStatus::Accepted,
+        Some("terminate unavailable".to_string()),
+    )
+    .await;
+    let process_id = 1_001;
+    store_process_for_test(&manager, &session, &turn, process_id, Arc::clone(&process)).await;
+
+    let error = manager
+        .fail_process_with_message(process_id, &process, "network denied".to_string())
+        .await;
+
+    assert!(matches!(error, UnifiedExecError::ProcessFailed { .. }));
+    assert!(!process.has_exited());
+    assert_eq!(
+        process.failure_message(),
+        Some("network denied".to_string())
+    );
+    assert!(
+        manager
+            .process_store
+            .lock()
+            .await
+            .processes
+            .get(&process_id)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.process, &process)),
+        "the manager must retain the process owner when termination is unconfirmed"
     );
 }
 
@@ -492,30 +533,34 @@ async fn terminate_all_processes_confirms_remote_termination_for_failed_process(
     .await;
     store_process_for_test(&manager, &session, &turn, 1000, Arc::clone(&process)).await;
 
-    process.fail_and_terminate("test failure".to_string());
+    let process_for_failure = Arc::clone(&process);
+    let failure_task = tokio::spawn(async move {
+        process_for_failure
+            .fail_and_terminate("test failure".to_string())
+            .await
+    });
     tokio::time::timeout(
         Duration::from_secs(2),
         termination_control.started.notified(),
     )
     .await
     .expect("detached remote termination should start");
-    assert!(process.has_exited());
+    assert!(!process.has_exited());
 
     let manager_for_shutdown = Arc::clone(&manager);
     let shutdown_task = tokio::spawn(async move {
         manager_for_shutdown.terminate_all_processes().await;
     });
 
-    tokio::time::timeout(
-        Duration::from_secs(2),
-        termination_control.started.notified(),
-    )
-    .await
-    .expect("confirmed remote termination should start");
+    tokio::task::yield_now().await;
     assert!(!shutdown_task.is_finished());
     assert!(!termination_control.completed.load(Ordering::Acquire));
 
     termination_control.allowed.send_replace(true);
+    failure_task
+        .await
+        .expect("failure task joins")
+        .expect("failure termination succeeds");
     tokio::time::timeout(Duration::from_secs(2), shutdown_task)
         .await
         .expect("shutdown should finish after remote termination")

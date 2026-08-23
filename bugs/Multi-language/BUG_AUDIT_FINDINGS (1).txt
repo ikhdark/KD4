@@ -1,0 +1,551 @@
+MARTINDALE APP - COMPREHENSIVE STATIC BUG AUDIT
+Audit date: 2026-07-28
+Audit target: current working tree before this report was created
+
+SUMMARY
+
+Confirmed findings: 12
+  Medium: 5
+  Low: 7
+
+Unconfirmed risks retained separately: 2
+
+No project-owned baseline path was skipped. The audit was static and read-only:
+the only task-authored repository change is this report.
+
+
+SCOPE AND COVERAGE
+
+The baseline was built with:
+
+  git ls-files --cached --others --exclude-standard
+
+That produced 484 unique project-owned paths:
+
+  - 477 files present in the working tree
+  - 7 tracked files currently deleted
+
+The mutually exclusive coverage ledger is:
+
+  Backend, persistence, APIs, and workflows: 156/156
+    - src/lib implementation/declaration files: 75
+    - src/lib tests: 48
+    - src/workflows: 3
+    - src/app/api routes: 18
+    - src/app/calendar.ics/route.ts: 1
+    - migrations: 6
+    - data/examples fixtures: 5
+
+  Frontend, localized routes, i18n, and tests: 143/143
+    - localized app files: 23
+    - app tests: 25
+    - app-root PWA/SEO files: 6
+    - component files, including nearby tests: 64
+    - i18n files: 12
+    - shared test-support files: 9
+    - src-root runtime/declaration files: 4
+
+  Repository root, configuration, operations, catalogs, and public assets:
+  185/185
+    - .codex: 13 (6 present plus 7 tracked deletions)
+    - .github: 7
+    - repository-root files and configuration: 26
+    - docs: 2
+    - e2e: 2
+    - messages: 91
+    - public: 17
+    - scripts: 27
+
+The 7 tracked deletions were reviewed as current working-tree state:
+
+  - .codex/skills/mdpwa-harness/SKILL.md
+  - .codex/skills/mdpwa-harness/agents/openai.yaml
+  - .codex/skills/mdpwa-harness/references/agent-patterns.md
+  - .codex/skills/mdpwa-harness/references/audit-rubric.md
+  - .codex/skills/mdpwa-harness/references/context-management.md
+  - .codex/skills/mdpwa-harness/references/evals.md
+  - .codex/skills/mdpwa-harness/references/task-artifacts.md
+
+All 12 binary public assets were decoded for file type, byte size, and
+dimensions. The PWA screenshots and representative full-size icon variants
+were also visually inspected.
+All English and Spanish catalog files were parsed and compared by namespace,
+key, empty value, identical-value candidates, and ICU arguments during the
+static review.
+
+Repository-policy exclusions were not treated as project-owned source:
+
+  - .git/**
+  - .next/**
+  - node_modules/**
+  - .serena/**
+  - .vercel/**
+  - coverage/**
+  - playwright-report/**
+  - test-results/**
+  - ignored live data/*.json
+  - data/.backups/**
+  - generated .codex harness/verification run state
+
+Those paths are generated, vendored, private, ignored runtime state, or tool
+state. No environment values, resident records, live stores, logs, or secrets
+were read or copied into this report.
+
+
+METHOD AND LIMITATIONS
+
+This was a file-by-file static audit of the current working tree. Findings were
+retained only when the review established:
+
+  1. a violated repository, API, persistence, UI, test, or content invariant;
+  2. a reachable causal path;
+  3. a practical consequence; and
+  4. precise source evidence.
+
+Every retained finding received a separate adversarial re-check for guards,
+alternate call paths, storage differences, native browser behavior, tests, and
+documented intent. Duplicate causes were consolidated.
+
+Per repository policy, the audit did not run lint, typecheck, unit tests,
+format checks, builds, package/dependency audits, generated-output checks,
+development servers, local browser automation, database commands, or
+application/provider remote-service calls. Runtime-only,
+production-configuration-only, concurrency-only,
+and current dependency-vulnerability defects can therefore exist beyond what
+static source proves. Official City of Martindale web material was consulted
+only to verify the civic fact in finding 9.
+
+Severity meanings:
+
+  Medium - a concrete operational, data-integrity, or admin-workflow failure
+           under a bounded but plausible path.
+  Low    - a concrete defect with limited reach, mitigation, or impact confined
+           to local/admin UX, tests, documentation, stale metadata, or a past
+           civic record.
+
+
+CONFIRMED FINDINGS
+
+1. [MEDIUM] Requeueing an exhausted stale-running outbox job does not make a
+   replacement dispatch claimable
+
+Invariant:
+  A successful operator "requeue" action must return the selected outbox job to
+  a state that a dispatcher can claim.
+
+Causal path:
+  A final allowed claim increments attempt_count from max_attempts - 1 to
+  max_attempts before workflow launch. If the dispatcher then crashes before
+  recording workflow_run_id, the row becomes an eligible stale-running claim.
+  The operator script changes that row to retry, clears the lock and workflow
+  ID, and reports success, but only resets attempt_count when source=dead.
+  Both resident and broadcast dispatchers require attempt_count < max_attempts.
+  Their exhausted-row cleanup only examines state=running, so the newly retry
+  row is neither claimable nor converted to dead.
+
+Consequence:
+  A resident-notification job remains stuck until direct repair. A broadcast
+  replacement claim is likewise stuck if no already-started orphan workflow
+  survives. The script nevertheless prints that it requeued the claim.
+
+Evidence:
+  - scripts/outbox-dead-letter.mjs:93-112, 168-175
+  - src/lib/residentNotificationRepository.ts:26-61, 77-116
+  - src/lib/alertBroadcastRepository.ts:1093-1150, 1170-1212
+  - src/lib/residentNotificationDispatcher.ts:45-68
+  - src/lib/alertBroadcastDispatcher.ts:63-80
+
+Qualification:
+  An already-started alert workflow can still resume on its own, so this
+  finding does not claim that every affected broadcast is impossible to
+  deliver. The confirmed failure is that the operator action does not create a
+  dispatchable replacement claim.
+
+
+2. [MEDIUM] Changing an item out of a filtered community-input queue leaves a
+   stale row and can skip the next eligible submission
+
+Invariant:
+  A filtered moderation queue must continue to contain only matching records,
+  and pagination must not skip records after a local mutation changes the
+  filtered server result set.
+
+Causal path:
+  The panel requests a page using statusFilter. After PATCH changes a matching
+  item to a different status, updateStatus replaces that item in place rather
+  than removing it when it no longer matches the active filter. It also keeps
+  the old nextOffset. If a 20-item filtered page loses one record on the
+  server, the record formerly at index 20 shifts to index 19; "Load more" still
+  requests offset 20 and skips it.
+
+Consequence:
+  An administrator can see reviewed/closed work in a "new" queue and can miss
+  one still-eligible resident submission until the queue is reloaded or
+  refiltered.
+
+Evidence:
+  - src/components/CommunityInputAdminPanel.tsx:134-152, 160-183,
+    215-245, 333-339
+  - src/app/api/community-input/route.ts:108-150
+
+
+3. [MEDIUM] Map moderation accepts text beyond the durable schema limits and
+   behaves differently across storage backends
+
+Invariant:
+  Authenticated API input must be bounded before persistence and must have
+  consistent meaning across supported stores.
+
+Causal path:
+  readOptionalText trims nonblank strings but has no length argument. Review
+  PATCH passes reviewNote and publicAddress directly to updateReview. The
+  PostgreSQL implementation writes them against CHECK constraints of 1000 and
+  240 characters. The route rethrows that database error. The JSON
+  implementation instead converts an overlength supplied value to undefined
+  while continuing the review update.
+
+Consequence:
+  A direct/custom authenticated admin client can send 1001/241-character
+  values. PostgreSQL returns an unhandled 500 with no update, while Blob/local
+  JSON can report success after clearing the moderation reason or public
+  address and applying the other review fields.
+
+Evidence:
+  - src/app/api/map-feedback/route.ts:102-105, 476-553, 603-617
+  - src/lib/mapFeedbackStore.ts:502-531, 548-620, 1212-1235
+  - migrations/0001_security_reliability_foundation.up.sql:161-170
+
+Qualification:
+  The shipped admin panel has matching maxLength attributes, so ordinary UI
+  entry is bounded. The confirmed path is the public admin API contract used by
+  a direct or custom authenticated client.
+
+
+4. [MEDIUM] A failed backup-manifest transaction leaves scheduled backup blobs
+   outside repository-managed retention
+
+Invariant:
+  A scheduled backup is not successful until its verified database manifest is
+  recorded, and scheduled encrypted objects must be eligible for the configured
+  7-365 day retention window.
+
+Causal path:
+  database-backup uploads the encrypted artifact and its sidecar before the
+  backup_manifests/audit transaction. Its compensating Blob deletion is scoped
+  only to failures inside the upload block. If the later database transaction
+  or connection fails, both private objects remain while the command fails.
+  Future pruning selects paths only from backup_manifests, so the unrecorded
+  pair is never selected or marked deleted. No repository Blob-listing or
+  reconciliation job discovers it.
+
+Consequence:
+  Repeated failed scheduled runs can create an unbounded set of encrypted
+  artifact/sidecar pairs that are absent from the recovery audit inventory and
+  retained beyond the repository's scheduled-backup policy. The data remains
+  encrypted, but repository-managed retention and observability cannot see it.
+
+Evidence:
+  - scripts/database-backup.mjs:122-160, 163-241, 244-250
+  - docs/security-data-operations.md:39-45
+  - .github/workflows/data-backup.yml:36-42
+  - src/app/api/health/operational/route.ts:53-58
+
+Qualification:
+  An external Blob lifecycle or manual dashboard cleanup could mitigate this,
+  but no such policy or reconciliation path is established in the repository.
+
+
+5. [MEDIUM] The example-data verification gate omits two tracked store fixtures
+
+Invariant:
+  Every tracked data/examples fixture must contain fake values and match its
+  owning store schema envelope.
+
+Causal path:
+  data-report defines and iterates only alert-signups, community-input, and
+  map-feedback stores. The data:examples command and both verify suites rely on
+  that array. check-local-data-files only rejects tracked top-level live JSON;
+  it does not validate example schemas or privacy-safe values. The broadcast and
+  Web Push example filenames have no other validator or fixture-loading test.
+
+Consequence:
+  A malformed schema envelope or non-fake/sensitive value in either omitted
+  fixture can pass verify:fast and verify:full.
+
+Omitted fixtures:
+  - data/examples/alert-broadcasts.example.json
+  - data/examples/web-push-subscriptions.example.json
+
+Evidence:
+  - AGENTS.md:97-98
+  - PROJECT_NOTES.md:79-82
+  - scripts/data-report.mjs:33-90, 275-315, 418-477
+  - scripts/check-local-data-files.mjs:45-81
+  - package.json:43, 62-63
+
+Qualification:
+  The current contents of both files were inspected and are not proven invalid.
+  The confirmed bug is the verification blind spot, not bad current fixture
+  data.
+
+
+6. [LOW] Map-abuse PATCH omits the database-unavailable response used by GET
+   and POST
+
+Invariant:
+  Every database-only abuse-queue operation must fail closed with a controlled
+  503 when transactional storage is unavailable.
+
+Causal path:
+  GET and POST explicitly check isTransactionalStoreConfigured. PATCH
+  authenticates, validates its body, and calls getPostgres without the same
+  guard or a matching catch. In nonproduction, configured legacy admin
+  credentials can authenticate without DATABASE_URL, after which a valid UUID,
+  action, and resolution reach getPostgres and
+  TransactionalStoreUnavailableError.
+
+Consequence:
+  A valid direct local admin request receives an internal 500 instead of the
+  documented no-store 503. No data mutation occurs.
+
+Evidence:
+  - src/app/api/map-feedback/abuse/route.ts:100-111, 176-182, 298-327
+  - src/lib/adminIdentity.ts:124-132, 359-383
+  - src/lib/postgres.ts:25-31
+
+Qualification:
+  The normal admin UI cannot first load an abuse queue without the database, so
+  this is primarily a direct-API/misconfiguration path.
+
+
+7. [LOW] Subscriber search can leave an enabled action button paired with a
+   blank invalid selection
+
+Invariant:
+  Action enablement must reflect the visible, currently selectable subscriber.
+
+Causal path:
+  A replacement search load replaces items but preserves every nonempty
+  selectedId. When the old subscriber is absent from the new results, the
+  required controlled select has no matching option and displays its empty
+  placeholder. The Apply button still tests the stale state string, so it
+  remains enabled.
+
+Consequence:
+  An operator can fill the reason and click Apply only to be stopped by native
+  required-field validation, then must explicitly select a current result.
+
+Evidence:
+  - src/components/AdminSubscriberPanel.tsx:97-103, 175-182, 251-270,
+    302-305
+
+Qualification:
+  Native required-select validation blocks the ordinary submit before the
+  PATCH path. This is not a silent destructive action against the hidden old
+  subscriber.
+
+
+8. [LOW] PWA install screenshots materially depict an obsolete home experience
+
+Invariant:
+  Manifest screenshots labeled as the Martindale home page must represent the
+  application residents install.
+
+Causal path:
+  All three manifests label desktop.png and mobile.png as home-page screenshots.
+  The images show a sidebar/calendar-centric legacy interface and an old
+  "Latest City Meeting" card. The current home source instead renders a
+  photo-based hero, four resident action cards, report map, weather, projects,
+  public safety, and calendar sections.
+
+Consequence:
+  Browser/PWA install surfaces advertise an interface users do not receive and
+  omit the current report-map, weather, project, and safety workflows.
+
+Evidence:
+  - public/manifest.json:42-55
+  - public/site.webmanifest:42-55
+  - public/manifest.es.json:42-55
+  - public/screenshots/desktop.png
+  - public/screenshots/mobile.png
+  - src/app/[locale]/page.tsx:122-241
+
+
+9. [LOW] The directly downloadable July 16 council event still contains the
+   wrong official location
+
+Invariant:
+  Meeting locations must follow the latest controlling official notice.
+
+Causal path:
+  The event record stores 409 Main Street and an inherited June 16 verification
+  date. The later official City News notice, posted July 9, states that the
+  July 16, 2026 regular council meeting was at 407 Main Street. The event is now
+  expired from upcoming UI, but findEventByCalendarId searches all events and
+  the calendar route emits the stored LOCATION for a direct matching query.
+
+Consequence:
+  /calendar.ics?event=city-council-2026-07-16 currently downloads an ICS file
+  with the wrong address.
+
+Evidence:
+  - src/lib/events.ts:35-37, 161-173, 745-757, 801-810, 827-875
+  - src/app/calendar.ics/route.ts:10-38
+  - Official notice (accessed 2026-07-28):
+    https://martindale.texas.gov/m/newsflash/Home/Detail/542
+
+Qualification:
+  The meeting is past, so current impact is limited to the still-reachable
+  direct calendar download and any consumer of the stored historical event.
+  This finding does not infer that the separate August 20 location is wrong.
+
+
+10. [LOW] The repository-local Codex workflow index contains dead authoritative
+    links after an incomplete harness removal
+
+Invariant:
+  The .codex "Start Here" table and canonical source map must route contributors
+  to files that exist in the current working tree.
+
+Causal path:
+  .codex/README links to harness/README.md, harness/workflow.md, and
+  skills/mdpwa-harness/SKILL.md. The current tree has no .codex/harness source,
+  and all seven tracked mdpwa-harness skill files are deleted. SOURCEMAP still
+  advertises the skill.
+
+Consequence:
+  Contributors following the documented durable-task workflow reach missing
+  files, and the canonical topology advertises a removed owner.
+
+Evidence:
+  - .codex/README.md:9-20
+  - SOURCEMAP.md:107-112
+  - the 7 tracked deletions listed in the coverage section
+
+Qualification:
+  .codex/AGENTS.md describes several paths as durable "when present"; those
+  conditional policy lines are not themselves broken links.
+
+
+11. [LOW] The global i18n navigation mock enshrines unprefixed Spanish URLs
+
+Invariant:
+  Tests of Spanish navigation and locale switching must model the explicit /es
+  prefix contract.
+
+Causal path:
+  Vitest globally aliases @/i18n/navigation to i18nNavigationMock. Production
+  LocaleSwitcher passes locale={nextLocale}, but the mock ignores locale
+  semantics and emits href unchanged. SiteHeader and Spanish navigation tests
+  consequently assert unprefixed English paths for Spanish links.
+
+Consequence:
+  Removing or breaking the locale prop/prefix behavior can still pass these
+  integration tests. This is a test-infrastructure defect; the current
+  production next-intl Link is not shown broken.
+
+Evidence:
+  - vitest.config.ts:15-20
+  - src/components/LocaleSwitcher.tsx:39-74
+  - src/test/i18nNavigationMock.tsx:12-26
+  - src/components/tests/SiteHeader.dom.test.tsx:168-186
+  - src/components/tests/SiteNavigation.test.tsx:58-73
+  - src/i18n/routing.ts:78-95
+  - src/app/tests/proxy.test.ts:75-80
+
+
+12. [LOW] The route-metadata catalog unit test is a no-op for every current page
+
+Invariant:
+  A test named "keeps route metadata keys present" must inspect the metadata
+  declarations used by current pages.
+
+Causal path:
+  metadataKeyUsages skips a page unless its source contains
+  createPageMetadata. Current pages declare metadata through makeMetadata, so
+  the usage list is empty and the named test passes without checking a page.
+
+Consequence:
+  The unit test supplies no independent metadata-usage coverage and gives a
+  misleading green result.
+
+Evidence:
+  - src/i18n/messages.test.ts:86-108, 282-295
+  - src/app/[locale]/alerts/page.tsx:13-18
+  - src/i18n/metadata.ts:14-15, 65-88
+
+Qualification:
+  This is not a proven current product failure. TypeScript restricts
+  makeMetadata keys to CatalogMessages["Metadata"], the Spanish catalog must
+  satisfy the English shape, and check-i18n-catalogs independently compares all
+  flattened locale keys:
+  - src/i18n/messages.ts:140-142, 188-195
+  - scripts/check-i18n-catalogs.mjs:620-655
+
+
+UNCONFIRMED RISKS - NOT COUNTED AS BUGS
+
+U1. The default public map panel selects the oldest fetched report, but intended
+    product behavior is undocumented
+
+Observed behavior:
+  Both public stores return reports newest-first. With no focused URL or marker
+  selection, MapFeedbackMap uses reports.at(-1), so the summary and abuse form
+  display the oldest of up to 200 fetched reports.
+
+Evidence:
+  - src/app/api/map-feedback/route.ts:161-180, 248-260
+  - src/lib/mapFeedbackStore.ts:972-990
+  - src/components/MapFeedbackMap.tsx:587-590, 627-635, 766-806,
+    1322-1335
+
+Missing fact:
+  No repository contract or resident copy states whether the default panel
+  should show the newest, oldest, or another prioritized report. The ordering
+  is therefore a plausible UX defect, not a safely confirmed bug.
+
+
+U2. Alternate database aliases can evade restore URL identity, but the remaining
+    guard blocks a normal populated primary
+
+Observed behavior:
+  database-restore compares lowercased hostname, port, and database name, with
+  one "-pooler." normalization. A different DNS/routing alias for the same
+  database compares unequal and enters the rehearsal branch, omitting the
+  in-place confirmation and recent restore-point checks. That branch separately
+  refuses any target with public tables.
+
+Evidence:
+  - scripts/database-restore.mjs:66-77, 142-184
+  - docs/security-data-operations.md:49-59
+
+Missing facts:
+  The repository does not establish a usable alternate production endpoint,
+  and a full bypass also requires the protected primary to have zero public
+  tables. A normal populated primary is stopped by the non-empty rehearsal
+  guard. DNS equivalence and production state cannot be proven from static
+  source, so this is not a confirmed current bug.
+
+
+IMPORTANT REJECTED OR CONSOLIDATED CANDIDATES
+
+  - The stale subscriber selection cannot silently PATCH the hidden prior
+    subscriber through ordinary UI interaction; native required-select
+    validation blocks it. Only the residual UI-state bug is finding 7.
+  - Service-worker push renewal saves a replacement before deleting the old
+    endpoint. A failed save preserves the old record; a failed delete leaves a
+    stale duplicate that later delivery handling can expire. No data-loss bug
+    was confirmed.
+  - The two omitted example fixtures are one verification-gate bug, not two.
+  - The missing .codex harness pages, deleted skill, and stale source-map claim
+    are one incomplete-removal bug, not separate counts.
+  - No claim was made about the August 20 council location from evidence that
+    only controls the July 16 event.
+
+
+FINAL STATE
+
+No source, configuration, catalog, test, migration, workflow, script, or public
+asset was changed by the audit. Pre-existing modified, deleted, and untracked
+working-tree changes were preserved. BUG_AUDIT_FINDINGS.txt is the sole
+task-authored file.

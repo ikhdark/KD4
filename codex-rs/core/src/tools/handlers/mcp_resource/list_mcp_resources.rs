@@ -8,10 +8,13 @@ use codex_protocol::protocol::McpInvocation;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 
+use rmcp::model::ListResourcesResult;
 use rmcp::model::PaginatedRequestParams;
+use rmcp::model::Resource;
 
 use super::ListResourcesArgs;
 use super::ListResourcesPayload;
+use super::McpServerCollection;
 use super::canonical_all_list_resources;
 use super::canonical_single_list_resources;
 use super::ensure_model_can_access_mcp_server;
@@ -22,6 +25,42 @@ use super::parse_arguments;
 use super::serialize_function_output;
 
 pub struct ListMcpResourcesHandler;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ListResourcesStrategy {
+    Exhaustive,
+    ExplicitPage,
+}
+
+fn list_resources_strategy(cursor: Option<&str>) -> ListResourcesStrategy {
+    if cursor.is_some() {
+        ListResourcesStrategy::ExplicitPage
+    } else {
+        ListResourcesStrategy::Exhaustive
+    }
+}
+
+fn exhaustive_resource_pages(
+    collection: McpServerCollection<Vec<Resource>>,
+) -> McpServerCollection<ListResourcesResult> {
+    McpServerCollection {
+        results: collection
+            .results
+            .into_iter()
+            .map(|(server, resources)| {
+                (
+                    server,
+                    ListResourcesResult {
+                        meta: None,
+                        next_cursor: None,
+                        resources,
+                    },
+                )
+            })
+            .collect(),
+        errors: collection.errors,
+    }
+}
 
 impl ToolExecutor<ToolInvocation> for ListMcpResourcesHandler {
     fn tool_name(&self) -> ToolName {
@@ -87,18 +126,43 @@ impl ListMcpResourcesHandler {
             async {
                 let (payload, canonical) = if let Some(server_name) = server.clone() {
                     ensure_model_can_access_mcp_server(turn.as_ref(), &server_name)?;
-                    let params = cursor
-                        .clone()
-                        .map(|value| PaginatedRequestParams::default().with_cursor(Some(value)));
-                    let result =
-                        manager
+                    let result = match list_resources_strategy(cursor.as_deref()) {
+                        ListResourcesStrategy::Exhaustive => {
+                            let collection = manager
+                                .list_all_resources(|candidate| candidate == server_name)
+                                .await;
+                            let mut pages = exhaustive_resource_pages(collection);
+                            pages.results.remove(&server_name).ok_or_else(|| {
+                                pages
+                                    .errors
+                                    .into_iter()
+                                    .find(|error| error.server == server_name)
+                                    .map_or_else(
+                                        || {
+                                            FunctionCallError::RespondToModel(format!(
+                                                "resources/list failed: unknown MCP server '{server_name}'"
+                                            ))
+                                        },
+                                        |error| {
+                                            FunctionCallError::RespondToModel(error.message)
+                                        },
+                                    )
+                            })?
+                        }
+                        ListResourcesStrategy::ExplicitPage => {
+                            let params = cursor.clone().map(|value| {
+                                PaginatedRequestParams::default().with_cursor(Some(value))
+                            });
+                            manager
                             .list_resources(&server_name, params)
                             .await
                             .map_err(|err| {
                                 FunctionCallError::RespondToModel(format!(
                                     "resources/list failed: {err:#}"
                                 ))
-                            })?;
+                            })?
+                        }
+                    };
                     let canonical = canonical_single_list_resources(&server_name, &result)?;
                     let payload = ListResourcesPayload::from_single_server(
                         server_name,
@@ -113,11 +177,12 @@ impl ListMcpResourcesHandler {
                         ));
                     }
 
-                    let pages = manager
-                        .list_resource_pages(|server_name| {
+                    let collection = manager
+                        .list_all_resources(|server_name| {
                             model_can_access_mcp_server(turn.as_ref(), server_name)
                         })
                         .await;
+                    let pages = exhaustive_resource_pages(collection);
                     let canonical = canonical_all_list_resources(&pages)?;
                     let payload = ListResourcesPayload::from_all_servers(pages, truncation_policy)?;
                     (payload, canonical)
@@ -132,5 +197,22 @@ impl ListMcpResourcesHandler {
 impl CoreToolRuntime for ListMcpResourcesHandler {
     fn waits_for_runtime_cancellation(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn omitted_cursor_uses_exhaustive_owner_collection() {
+        assert_eq!(
+            list_resources_strategy(None),
+            ListResourcesStrategy::Exhaustive
+        );
+        assert_eq!(
+            list_resources_strategy(Some("opaque-cursor")),
+            ListResourcesStrategy::ExplicitPage
+        );
     }
 }

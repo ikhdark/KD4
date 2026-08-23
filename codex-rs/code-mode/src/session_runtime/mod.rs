@@ -121,14 +121,6 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         })
     }
 
-    pub(crate) async fn observe(
-        &self,
-        cell_id: &CellId,
-        mode: ObserveMode,
-    ) -> Result<CellEvent, Error> {
-        self.begin_observe(cell_id, mode).await?.event().await
-    }
-
     pub(crate) async fn begin_observe(
         &self,
         cell_id: &CellId,

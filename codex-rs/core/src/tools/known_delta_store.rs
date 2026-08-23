@@ -226,10 +226,11 @@ enum EvidenceOutcome {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+/// Local cache costs only. A Known Delta hit still returns the complete cached
+/// output to the model, so these metrics must not claim provider-token savings.
 struct EvidenceMetrics {
     lookup_micros: u64,
     fingerprint_micros: u64,
-    projected_tokens_avoided: u64,
     executor_micros_avoided: u64,
 }
 
@@ -410,11 +411,9 @@ pub(crate) async fn record_success(
         record.metrics = EvidenceMetrics {
             lookup_micros: micros(lookup_cost),
             fingerprint_micros: micros(fingerprint_cost),
-            projected_tokens_avoided: u64::try_from(output.len().div_ceil(4)).unwrap_or(u64::MAX),
             executor_micros_avoided: micros(executor_cost),
         };
         record.reusable = record.shadow_validations > 0
-            && record.metrics.projected_tokens_avoided > 0
             && record.metrics.executor_micros_avoided
                 > record
                     .metrics
@@ -1006,6 +1005,61 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn empty_output_evidence_promotes_when_execution_is_profitable() {
+        let home = TempDir::new().unwrap();
+        let id = identity("project", "empty-lineage", "empty-fingerprint");
+        assert_eq!(
+            record_success(home.path(), &id, None, b"", Duration::from_secs(1)).await,
+            Observation::Published
+        );
+        let candidate = lookup(home.path(), &id).await.unwrap();
+        let observation = test_observation::with_profitability_costs(
+            record_success(home.path(), &id, Some(&candidate), b"", Duration::ZERO),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+        )
+        .await;
+        assert_eq!(
+            observation,
+            Observation::Unchanged {
+                reuse_enabled: true
+            }
+        );
+
+        let candidate = lookup(home.path(), &id).await.unwrap();
+        assert!(candidate.reusable());
+        let artifact = remint_task_handle(home.path(), "empty-task", &candidate).await;
+        let (_, bytes, error) = artifact.model_projection();
+        assert_eq!(bytes, Some(0));
+        assert!(error.is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_projected_token_metric_is_readable_but_not_written() {
+        let home = TempDir::new().unwrap();
+        let id = identity("project", "legacy-lineage", "legacy-fingerprint");
+        record_success(home.path(), &id, None, b"output", Duration::from_secs(1)).await;
+        let candidate = lookup(home.path(), &id).await.unwrap();
+        let mut serialized = serde_json::to_value(&candidate.record).unwrap();
+        assert!(
+            serialized["metrics"]
+                .get("projected_tokens_avoided")
+                .is_none()
+        );
+
+        serialized["metrics"]["projected_tokens_avoided"] = serde_json::json!(42);
+        tokio::fs::write(
+            evidence_path(home.path(), &id),
+            serde_json::to_vec(&serialized).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert!(lookup(home.path(), &id).await.is_some());
     }
 
     #[tokio::test]

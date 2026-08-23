@@ -209,8 +209,10 @@ impl std::fmt::Display for AdmissionRejectionReason {
 }
 
 #[doc(hidden)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum IntegrationPlan {
+    #[default]
     SingleWriter,
     RootOwned,
     TypedIntegratorRequired,
@@ -331,6 +333,7 @@ impl AssignmentDraft {
             start_epoch: 0,
             relation: self.relation,
             architecture_contract_ref: self.architecture_contract_ref,
+            integration_plan: IntegrationPlan::SingleWriter,
             task_capsule: None,
             created_at: Utc::now(),
         })
@@ -370,6 +373,9 @@ pub struct Assignment {
     pub relation: Option<AssignmentRelation>,
     #[serde(default)]
     pub architecture_contract_ref: Option<ArchitectureContractRef>,
+    /// Durable integration ownership selected by admission and enforced by the spawn bootstrap.
+    #[serde(default)]
+    pub integration_plan: IntegrationPlan,
     /// Immutable canonical `TaskCapsuleV1` JSON attached before the child is launched.
     #[serde(default)]
     pub task_capsule: Option<String>,
@@ -512,6 +518,8 @@ pub struct TaskCapsuleV1 {
     pub relation: Option<AssignmentRelation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub architecture_contract_ref: Option<ArchitectureContractRef>,
+    #[serde(default)]
+    pub integration_plan: IntegrationPlan,
     pub relevant_handles: Vec<TaskCapsuleHandle>,
     pub workspace_epoch: u64,
     pub workspace_manifest_hash: String,

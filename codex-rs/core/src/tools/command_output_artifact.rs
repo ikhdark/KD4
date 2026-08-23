@@ -224,6 +224,8 @@ struct LogicalArtifactMetadata {
     artifact_id: String,
     canonical_kind: CanonicalToolResultKind,
     canonical_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retained_sha256: Option<String>,
     canonical_bytes: u64,
     retained_bytes: u64,
     complete: bool,
@@ -2002,6 +2004,7 @@ async fn create_canonical_output_artifact_with_id(
         artifact_id: id.to_string(),
         canonical_kind: canonical.kind,
         canonical_sha256: canonical.sha256.clone(),
+        retained_sha256: Some(format!("{:x}", Sha256::digest(retained))),
         canonical_bytes: canonical.exact_bytes,
         retained_bytes,
         complete,
@@ -2184,6 +2187,10 @@ pub(crate) async fn attach_canonical_output_artifact(
         artifact_id: id.to_string(),
         canonical_kind: canonical.kind,
         canonical_sha256: canonical.sha256.clone(),
+        retained_sha256: Some(format!(
+            "{:x}",
+            Sha256::digest(&canonical.bytes[..retained_bytes as usize])
+        )),
         canonical_bytes: canonical.exact_bytes,
         retained_bytes,
         complete,
@@ -3252,6 +3259,7 @@ fn load_logical_metadata(
                 artifact_id: id.to_string(),
                 canonical_kind: CanonicalToolResultKind::Bytes,
                 canonical_sha256: format!("{:x}", Sha256::digest(&contents)),
+                retained_sha256: Some(format!("{:x}", Sha256::digest(&contents))),
                 canonical_bytes: bytes,
                 retained_bytes: bytes,
                 complete: true,
@@ -3313,13 +3321,15 @@ fn load_validated_logical_snapshot(
     path: &Path,
     metadata: &LogicalArtifactMetadata,
 ) -> Result<Vec<u8>, ReadToolOutputError> {
-    if !metadata.complete
-        || metadata.retained_bytes != metadata.canonical_bytes
-        || !metadata.unavailable_ranges.is_empty()
+    if metadata.retained_bytes > metadata.canonical_bytes
+        || metadata.unavailable_ranges.iter().any(|range| {
+            range.start > range.end
+                || range.end > metadata.canonical_bytes
+                || range.start < metadata.retained_bytes
+        })
     {
         return Err(ReadToolOutputError::Io(
-            "artifact snapshot is incomplete; exact recovery identity cannot be verified"
-                .to_string(),
+            "artifact retained and unavailable ranges do not match metadata".to_string(),
         ));
     }
     for segment in &metadata.segments {
@@ -3336,7 +3346,16 @@ fn load_validated_logical_snapshot(
         metadata,
         CanonicalByteRange::new(0, metadata.retained_bytes),
     )?;
-    if format!("{:x}", Sha256::digest(&snapshot)) != metadata.canonical_sha256 {
+    let expected_sha256 = metadata.retained_sha256.as_deref().or_else(|| {
+        (metadata.complete && metadata.retained_bytes == metadata.canonical_bytes)
+            .then_some(metadata.canonical_sha256.as_str())
+    });
+    let Some(expected_sha256) = expected_sha256 else {
+        return Err(ReadToolOutputError::Io(
+            "incomplete artifact metadata has no retained SHA identity".to_string(),
+        ));
+    };
+    if format!("{:x}", Sha256::digest(&snapshot)) != expected_sha256 {
         return Err(ReadToolOutputError::Io(
             "artifact SHA identity does not match metadata".to_string(),
         ));
@@ -3346,15 +3365,13 @@ fn load_validated_logical_snapshot(
             "artifact line index does not match its validated snapshot".to_string(),
         ));
     }
-    let ranges_are_valid = metadata
-        .json_pointers
-        .values()
-        .all(|entry| entry.range.end <= metadata.retained_bytes)
-        && metadata.sections.iter().all(|section| {
-            section
-                .canonical_range
-                .is_none_or(|range| range.end <= metadata.retained_bytes)
-        });
+    let ranges_are_valid = metadata.json_pointers.values().all(|entry| {
+        entry.range.start <= entry.range.end && entry.range.end <= metadata.canonical_bytes
+    }) && metadata.sections.iter().all(|section| {
+        section
+            .canonical_range
+            .is_none_or(|range| range.start <= range.end && range.end <= metadata.canonical_bytes)
+    });
     if !ranges_are_valid {
         return Err(ReadToolOutputError::Io(
             "artifact selector index is outside the validated snapshot".to_string(),
@@ -4159,7 +4176,12 @@ pub(crate) async fn read_tool_output_selectors_with_ceiling_and_reuse(
     let metadata = tokio::task::spawn_blocking(move || load_logical_metadata(&metadata_path, id))
         .await
         .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))??;
-    let artifact_identity = metadata.canonical_sha256.clone();
+    let artifact_identity = format!(
+        "{}:{}:{}",
+        metadata.canonical_sha256,
+        metadata.retained_bytes,
+        metadata.retained_sha256.as_deref().unwrap_or_default()
+    );
     let request_cache_key = deterministic_recovery_cache_key(
         codex_home,
         thread_id,
@@ -4187,7 +4209,7 @@ pub(crate) async fn read_tool_output_selectors_with_ceiling_and_reuse(
             canonical_bytes: metadata.canonical_bytes,
             retained_bytes: metadata.retained_bytes,
             complete: false,
-            unavailable_ranges: Vec::new(),
+            unavailable_ranges: metadata.unavailable_ranges.clone(),
             results: Vec::with_capacity(selectors.len()),
         };
         for selector in &selectors {

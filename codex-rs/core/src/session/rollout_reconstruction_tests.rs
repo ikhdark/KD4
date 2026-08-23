@@ -354,8 +354,18 @@ async fn record_initial_history_restores_world_state_baseline() {
     let (session, turn_context) = make_session_and_context().await;
     let turn_context = Arc::new(turn_context);
     let world_state = build_world_state_from_turn_context(&session, &turn_context).await;
+    let mut accepted_turn_context = turn_context.to_turn_context_item();
+    accepted_turn_context.context_provenance = Some(TurnContextProvenance {
+        accepted_attempt: AcceptedAttemptProvenance {
+            sampling_request_id: "test-request".to_string(),
+            physical_attempt_id: "test-attempt".to_string(),
+        },
+        fragment_digests: session
+            .build_context_fragment_digests(&turn_context, &world_state)
+            .await,
+    });
     let rollout_items = completed_user_turn_rollout(
-        accepted_context(turn_context.to_turn_context_item()),
+        accepted_turn_context,
         vec![RolloutItem::WorldState(WorldStateItem::full(
             world_state.snapshot().into_value(),
         ))],

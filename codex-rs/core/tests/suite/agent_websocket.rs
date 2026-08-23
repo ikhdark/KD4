@@ -1,4 +1,5 @@
 use anyhow::Result;
+use codex_core::ForkSnapshot;
 use codex_features::Feature;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::protocol::EventMsg;
@@ -17,6 +18,7 @@ use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
+use std::sync::Arc;
 use std::time::Duration;
 
 const WS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
@@ -256,6 +258,119 @@ async fn websocket_first_turn_handles_handshake_delay_with_startup_prewarm() -> 
         "expected request tools to be populated"
     );
     assert_eq!(turn["type"].as_str(), Some("response.create"));
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_cold_resume_and_fork_each_start_with_prewarm() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_websocket_server(vec![
+        vec![
+            vec![ev_response_created("warm-new"), ev_completed("warm-new")],
+            vec![ev_response_created("resp-new"), ev_completed("resp-new")],
+        ],
+        vec![
+            vec![
+                ev_response_created("warm-resume"),
+                ev_completed("warm-resume"),
+            ],
+            vec![
+                ev_response_created("resp-resume"),
+                ev_completed("resp-resume"),
+            ],
+        ],
+        vec![
+            vec![ev_response_created("warm-fork"), ev_completed("warm-fork")],
+            vec![ev_response_created("resp-fork"), ev_completed("resp-fork")],
+        ],
+    ])
+    .await;
+
+    let initial = test_codex().build_with_websocket_server(&server).await?;
+    initial.submit_turn("seed history").await?;
+    let rollout_path = initial
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+    initial.codex.submit(Op::Shutdown).await?;
+    wait_for_event(&initial.codex, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
+
+    let resumed = test_codex()
+        .resume_with_websocket_server(&server, Arc::clone(&initial.home), rollout_path.clone())
+        .await?;
+    let resume_prewarm = server
+        .wait_for_request(/*connection_index*/ 1, /*request_index*/ 0)
+        .await
+        .body_json();
+    assert_eq!(resume_prewarm["generate"].as_bool(), Some(false));
+    let resume_metadata: Value = serde_json::from_str(
+        resume_prewarm["client_metadata"]["x-codex-turn-metadata"]
+            .as_str()
+            .expect("resume prewarm turn metadata"),
+    )?;
+    assert_eq!(resume_metadata["request_kind"].as_str(), Some("prewarm"));
+    resumed.submit_turn("continue after resume").await?;
+    resumed.codex.submit(Op::Shutdown).await?;
+    wait_for_event(&resumed.codex, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
+
+    let forked = resumed
+        .thread_manager
+        .fork_thread(
+            ForkSnapshot::Interrupted,
+            resumed.config.clone(),
+            rollout_path,
+            /*thread_source*/ None,
+            /*parent_trace*/ None,
+        )
+        .await?;
+    let fork_prewarm = server
+        .wait_for_request(/*connection_index*/ 2, /*request_index*/ 0)
+        .await
+        .body_json();
+    assert_eq!(fork_prewarm["generate"].as_bool(), Some(false));
+    let fork_metadata: Value = serde_json::from_str(
+        fork_prewarm["client_metadata"]["x-codex-turn-metadata"]
+            .as_str()
+            .expect("fork prewarm turn metadata"),
+    )?;
+    assert_eq!(fork_metadata["request_kind"].as_str(), Some("prewarm"));
+    forked
+        .thread
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "continue after fork".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    wait_for_event(&forked.thread, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    assert_eq!(server.handshakes().len(), 3);
+    assert_eq!(
+        server
+            .connections()
+            .iter()
+            .map(Vec::len)
+            .collect::<Vec<_>>(),
+        vec![2, 2, 2]
+    );
 
     server.shutdown().await;
     Ok(())

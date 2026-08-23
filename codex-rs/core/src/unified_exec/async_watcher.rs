@@ -275,6 +275,7 @@ pub(crate) fn spawn_exit_watcher(
     validation_observation: Option<crate::validation_admission::ValidationObservationToken>,
     validation_leader: Option<crate::validation_admission::ValidationLeaderOwnership>,
     validation_waiter: Option<crate::validation_admission::ValidationLeader>,
+    completed_validation_route: Option<codex_protocol::plan_tool::ValidationRoute>,
     known_delta: Option<PreparedKnownDelta>,
     known_delta_executor_started_at: Option<Instant>,
     tool_dispatch_timing: Option<Arc<ToolDispatchTiming>>,
@@ -484,11 +485,31 @@ pub(crate) fn spawn_exit_watcher(
         }
         if let Some(leader) = validation_leader {
             let text = transcript.lock().await.to_bytes();
+            let completed_validation_skip_disposition =
+                completed_validation_route.as_ref().and_then(|route| {
+                    crate::tools::command_execution::completed_validation_skip_disposition(
+                        route, &text, exit_code,
+                    )
+                });
             leader
                 .complete(crate::validation_admission::ReusableValidationResult {
                     value: serde_json::json!({
                         "text": String::from_utf8_lossy(&text),
-                        "success": failure_message.is_none() && exit_code == 0,
+                        "success": if completed_validation_skip_disposition.is_some() {
+                            None
+                        } else {
+                            Some(failure_message.is_none() && exit_code == 0)
+                        },
+                        "execution_outcome": if completed_validation_skip_disposition.is_some() {
+                            "executed_not_applicable"
+                        } else if failure_message.is_none() && exit_code == 0 {
+                            "executed_success"
+                        } else {
+                            "executed_failure"
+                        },
+                        "command_was_executed": true,
+                        "exit_code": exit_code,
+                        "skip_disposition": completed_validation_skip_disposition,
                     }),
                 })
                 .await;

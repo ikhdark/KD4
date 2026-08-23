@@ -1,6 +1,7 @@
 use chrono::DateTime;
 use chrono::Duration as ChronoDuration;
 use chrono::Utc;
+use codex_agent_task_store::WorkspaceManifestEntry;
 use codex_git_utils::collect_git_info;
 use codex_git_utils::get_git_repo_root;
 use codex_protocol::ThreadId;
@@ -271,6 +272,7 @@ impl PlanUpdateEffect {
 pub(crate) struct PlanUpdateOutcome {
     pub(crate) public_update: UpdatePlanArgs,
     pub(crate) effect: PlanUpdateEffect,
+    pub(crate) durably_recorded: bool,
     /// Authoritative durable-plan proof for pre-edit final-validation admission.
     /// `None` means the task-evidence mode cannot prove either state.
     pub(crate) unfinished_mutation_obligation: Option<bool>,
@@ -471,14 +473,11 @@ fn completion_recovery_identity(
             &serde_json::json!({
                 "source": basis.source_identity,
                 "requirements": basis.requirement_identity,
-                "task_evidence_epoch": basis.task_evidence_epoch,
-                "host_mutation_revision": basis.host_mutation_revision,
             }),
         ),
         workspace_identity: canonical_hash(
             "KD4_COMPLETION_RECOVERY_WORKSPACE_V1",
             &serde_json::json!({
-                "epoch": basis.workspace_epoch,
                 "manifest": basis.workspace_manifest_identity,
             }),
         ),
@@ -585,8 +584,27 @@ pub(crate) struct FinalProofSealInputV1 {
     pub(crate) configuration_identity: String,
     pub(crate) child_gate_state: Vec<String>,
     pub(crate) reviewer_configuration_identity: String,
+    pub(crate) typed_validation_proofs: Vec<TypedValidationProofInputV1>,
     pub(crate) diff_snapshot: CandidateDiffSnapshotV1,
     pub(crate) checkpoint_token_budget: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TypedValidationProofInputV1 {
+    pub(crate) assignment_id: String,
+    pub(crate) attempt_id: String,
+    pub(crate) call_id: String,
+    pub(crate) receipt_evidence_epoch: u64,
+    pub(crate) workspace_epoch: u64,
+    pub(crate) validation_end_epoch: u64,
+    pub(crate) implementation_identity: String,
+    pub(crate) coverage_identity: String,
+    pub(crate) recorded_cwd: String,
+    pub(crate) retained_output_digest: String,
+    pub(crate) retained_output_ref: String,
+    pub(crate) covered_manifest: Vec<WorkspaceManifestEntry>,
+    pub(crate) current_workspace_manifest_identity: Option<String>,
+    pub(crate) validation_result: ValidationResult,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -649,6 +667,33 @@ pub(crate) struct TaskEvidenceLedger {
     desktop_activation_runtime: Arc<std::sync::Mutex<DesktopActivationRuntimeState>>,
     #[cfg(test)]
     persistence_test_control: Arc<std::sync::Mutex<Option<PersistenceTestControl>>>,
+}
+
+const SOURCE_OWNER_MANIFEST_SCHEMA_VERSION: u32 = 2;
+
+#[derive(Debug, Deserialize)]
+struct SourceOwnerManifest {
+    schema_version: u32,
+    #[serde(default)]
+    owners: Vec<SourceOwnerDeclaration>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SourceOwnerDeclaration {
+    id: String,
+    #[serde(default)]
+    roots: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SourceOwnerIndex {
+    roots: Vec<SourceOwnerRoot>,
+}
+
+#[derive(Debug, Clone)]
+struct SourceOwnerRoot {
+    owner_id: String,
+    root: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1675,6 +1720,8 @@ struct CompletionReviewReceiptV2 {
     repair_baseline: Option<RepairBaseline>,
     #[serde(default)]
     baseline_hash: Option<String>,
+    #[serde(default)]
+    invalid_repair_lineage: bool,
     #[serde(default)]
     input_mode: Option<RereviewInputMode>,
     #[serde(default)]
@@ -2820,21 +2867,46 @@ fn render_compaction_task_state(document: &TaskEvidenceDocument) -> String {
                 StepStatus::Passed | StepStatus::Completed | StepStatus::Skipped
             )
         })
-        .map(|step| {
+        .flat_map(|step| {
             let active = if document.active_step_id.as_deref() == Some(step.id.as_str()) {
                 " active"
             } else {
                 ""
             };
-            format!(
+            let mut lines = vec![format!(
                 "- {} [{}{}]: {}",
                 step.id,
                 step_status_name(&step.status),
                 active,
                 step.step
-            )
+            )];
+            append_compaction_source_context(
+                &mut lines,
+                &step.id,
+                step.source_owner.as_deref(),
+                &step.implementation_surfaces,
+            );
+            lines
         })
         .collect::<Vec<_>>();
+    let unresolved_work_unit = document
+        .planning
+        .work_unit
+        .as_ref()
+        .filter(|_| document.plan.is_empty() && document.completion.is_none());
+    let focused_work_unit_lines = unresolved_work_unit
+        .map(|work_unit| {
+            let subject = format!("focused work unit {}", work_unit.id);
+            let mut lines = vec![format!("- {subject} [unresolved]")];
+            append_compaction_source_context(
+                &mut lines,
+                &subject,
+                work_unit.source_owner.as_deref(),
+                &work_unit.implementation_surfaces,
+            );
+            lines
+        })
+        .unwrap_or_default();
 
     let mut goal = document
         .plan
@@ -2856,6 +2928,7 @@ fn render_compaction_task_state(document: &TaskEvidenceDocument) -> String {
     }
 
     let mut current_state = unresolved_steps.clone();
+    current_state.extend(focused_work_unit_lines.clone());
     current_state.extend(
         document
             .latest_file_hashes
@@ -2884,6 +2957,7 @@ fn render_compaction_task_state(document: &TaskEvidenceDocument) -> String {
         .collect::<Vec<_>>();
 
     let mut unresolved_work = unresolved_steps;
+    unresolved_work.extend(focused_work_unit_lines);
     for step in document.plan.iter().filter(|step| {
         !matches!(
             step.status,
@@ -3010,6 +3084,10 @@ fn render_compaction_task_state(document: &TaskEvidenceDocument) -> String {
             })
         })
         .map(|step| vec![format!("- {}: {}", step.id, step.step)])
+        .or_else(|| {
+            unresolved_work_unit
+                .map(|work_unit| vec![format!("- Continue focused work unit {}.", work_unit.id)])
+        })
         .unwrap_or_else(|| vec!["- No unresolved durable plan action.".to_string()]);
 
     let sections = [
@@ -3029,6 +3107,23 @@ fn render_compaction_task_state(document: &TaskEvidenceDocument) -> String {
     )
 }
 
+fn append_compaction_source_context(
+    lines: &mut Vec<String>,
+    subject: &str,
+    source_owner: Option<&str>,
+    implementation_surfaces: &[String],
+) {
+    if let Some(source_owner) = source_owner {
+        lines.push(format!("- {subject} source owner: {source_owner}"));
+    }
+    if !implementation_surfaces.is_empty() {
+        lines.push(format!(
+            "- {subject} implementation surfaces: {}",
+            implementation_surfaces.join(", ")
+        ));
+    }
+}
+
 fn empty_compaction_task_state() -> String {
     [
         "## Goal\n- Continue the current user request.",
@@ -3043,6 +3138,7 @@ fn empty_compaction_task_state() -> String {
 
 fn task_is_tracked_for_compaction(document: &TaskEvidenceDocument) -> bool {
     !document.plan.is_empty()
+        || (document.completion.is_none() && document.planning.work_unit.is_some())
         || !document.locked_user_decisions.is_empty()
         || !document.edit_receipts.is_empty()
         || document
@@ -3100,6 +3196,157 @@ fn step_status_name(status: &StepStatus) -> &'static str {
     }
 }
 
+async fn load_source_owner_index(repo_root: &Path) -> Option<SourceOwnerIndex> {
+    let path = repo_root.join("source_owners.toml");
+    let contents = match tokio::fs::read_to_string(&path).await {
+        Ok(contents) => contents,
+        Err(err) => {
+            warn!(
+                "source-owner derivation is unavailable because {} could not be read: {err}",
+                path.display()
+            );
+            return None;
+        }
+    };
+    let manifest = match toml::from_str::<SourceOwnerManifest>(&contents) {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            warn!(
+                "source-owner derivation is unavailable because {} is invalid: {err}",
+                path.display()
+            );
+            return None;
+        }
+    };
+    if manifest.schema_version != SOURCE_OWNER_MANIFEST_SCHEMA_VERSION {
+        warn!(
+            "source-owner derivation is unavailable because {} uses unsupported schema version {}",
+            path.display(),
+            manifest.schema_version
+        );
+        return None;
+    }
+
+    let mut owner_ids = BTreeSet::new();
+    let mut roots = Vec::new();
+    for owner in manifest.owners {
+        if owner.id.trim().is_empty() || !owner_ids.insert(owner.id.clone()) {
+            warn!(
+                "source-owner derivation is unavailable because {} contains an empty or duplicate owner id",
+                path.display()
+            );
+            return None;
+        }
+        for root in owner.roots {
+            let Ok(root) = canonical_repair_path(&root, false) else {
+                warn!(
+                    "source-owner derivation is unavailable because {} contains an unsafe owner root",
+                    path.display()
+                );
+                return None;
+            };
+            roots.push(SourceOwnerRoot {
+                owner_id: owner.id.clone(),
+                root,
+            });
+        }
+    }
+    Some(SourceOwnerIndex { roots })
+}
+
+impl SourceOwnerIndex {
+    fn derive(&self, implementation_surfaces: &[String]) -> Option<String> {
+        if implementation_surfaces.is_empty() {
+            return None;
+        }
+        let mut derived_owner = None;
+        for surface in implementation_surfaces {
+            let surface = canonical_repair_path(surface, false).ok()?;
+            let mut best_specificity = None;
+            let mut best_owners = BTreeSet::new();
+            for candidate in &self.roots {
+                if surface == candidate.root
+                    || surface
+                        .strip_prefix(&candidate.root)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+                {
+                    let specificity = candidate.root.len();
+                    match best_specificity {
+                        None => {
+                            best_specificity = Some(specificity);
+                            best_owners.insert(candidate.owner_id.as_str());
+                        }
+                        Some(best) if specificity > best => {
+                            best_specificity = Some(specificity);
+                            best_owners.clear();
+                            best_owners.insert(candidate.owner_id.as_str());
+                        }
+                        Some(best) if specificity == best => {
+                            best_owners.insert(candidate.owner_id.as_str());
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
+            if best_owners.len() != 1 {
+                return None;
+            }
+            let owner = (*best_owners.first()?).to_string();
+            if derived_owner
+                .as_ref()
+                .is_some_and(|derived: &String| derived != &owner)
+            {
+                return None;
+            }
+            derived_owner = Some(owner);
+        }
+        derived_owner
+    }
+}
+
+fn normalize_implementation_surfaces(repo_root: &Path, surfaces: &[String]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    surfaces
+        .iter()
+        .filter_map(|surface| {
+            let normalized = normalize_input_path(repo_root, None, Path::new(surface));
+            let canonical = canonical_repair_path(&normalized, false).ok()?;
+            seen.insert(canonical.clone()).then_some(canonical)
+        })
+        .collect()
+}
+
+fn rederive_document_source_owners(
+    document: &mut TaskEvidenceDocument,
+    repo_root: &Path,
+    index: Option<&SourceOwnerIndex>,
+) -> bool {
+    let mut changed = false;
+    for step in &mut document.plan {
+        let surfaces = normalize_implementation_surfaces(repo_root, &step.implementation_surfaces);
+        let source_owner = index.and_then(|index| index.derive(&surfaces));
+        if step.implementation_surfaces != surfaces || step.source_owner != source_owner {
+            step.implementation_surfaces = surfaces;
+            step.source_owner = source_owner;
+            step.revision = step.revision.saturating_add(1);
+            step.validation_receipt_id = None;
+            changed = true;
+        }
+    }
+    if let Some(work_unit) = document.planning.work_unit.as_mut() {
+        let surfaces =
+            normalize_implementation_surfaces(repo_root, &work_unit.implementation_surfaces);
+        let source_owner = index.and_then(|index| index.derive(&surfaces));
+        if work_unit.implementation_surfaces != surfaces || work_unit.source_owner != source_owner {
+            work_unit.implementation_surfaces = surfaces;
+            work_unit.source_owner = source_owner;
+            work_unit.validation_receipt_id = None;
+            changed = true;
+        }
+    }
+    changed
+}
+
 impl TaskEvidenceLedger {
     pub(crate) async fn load_or_new(codex_home: PathBuf, thread_id: ThreadId, cwd: &Path) -> Self {
         let (mode, repo_root) = if let Some(repo_root) = find_kd4_repo_root(cwd) {
@@ -3110,6 +3357,11 @@ impl TaskEvidenceLedger {
             return Self::disabled();
         };
         let repo_root = canonical_repository_root(&repo_root);
+        let source_owner_index = if mode == TaskEvidenceMode::Kd4Completion {
+            load_source_owner_index(&repo_root).await
+        } else {
+            None
+        };
         let evidence_path = codex_home
             .join("task-evidence")
             .join(format!("{thread_id}.json"));
@@ -3159,6 +3411,20 @@ impl TaskEvidenceLedger {
         };
         let document = if let Some((mut document, legacy_completion_model)) = existing {
             migrate_document_with_completion_model(&mut document, legacy_completion_model);
+            if rederive_document_source_owners(
+                &mut document,
+                &repo_root,
+                source_owner_index.as_ref(),
+            ) {
+                invalidate_for_plan_change(&mut document);
+                document.planning.material_revision =
+                    document.planning.material_revision.saturating_add(1);
+                document.planning.counters.structural_revisions = document
+                    .planning
+                    .counters
+                    .structural_revisions
+                    .saturating_add(1);
+            }
             for receipt in &mut document.terminalization_receipts {
                 if receipt.delivery_state.is_authoritative_claim()
                     && (!receipt.app_server_acknowledged
@@ -4379,9 +4645,15 @@ impl TaskEvidenceLedger {
             return PlanUpdateOutcome {
                 public_update: requested_public,
                 effect: PlanUpdateEffect::NoOp,
+                durably_recorded: true,
                 unfinished_mutation_obligation: None,
             };
         }
+        let source_owner_index = match self.repo_root.as_deref() {
+            Some(repo_root) => load_source_owner_index(repo_root).await,
+            None => None,
+        };
+        let repo_root = self.repo_root.clone();
         for fact in &mut update.facts {
             let normalized = fact
                 .depends_on_paths
@@ -4442,7 +4714,7 @@ impl TaskEvidenceLedger {
             } else {
                 None
             };
-        let Some((response, snapshot)) = self
+        let Some((mut response, snapshot)) = self
             .update_document(|document| {
                 let was_unplanned = document.plan.is_empty()
                     && document.planning.work_unit.is_none()
@@ -4521,6 +4793,27 @@ impl TaskEvidenceLedger {
                             .map(MutationObligationState::from)
                             .collect::<Vec<_>>()
                     });
+                    let implementation_surfaces = evidence
+                        .map(|evidence| evidence.implementation_surfaces.clone())
+                        .or_else(|| {
+                            old.as_ref()
+                                .map(|step| step.implementation_surfaces.clone())
+                        })
+                        .unwrap_or_default();
+                    let implementation_surfaces = repo_root.as_deref().map_or_else(
+                        || {
+                            implementation_surfaces
+                                .iter()
+                                .map(|surface| normalize_slashes(surface))
+                                .collect()
+                        },
+                        |repo_root| {
+                            normalize_implementation_surfaces(repo_root, &implementation_surfaces)
+                        },
+                    );
+                    let source_owner = source_owner_index
+                        .as_ref()
+                        .and_then(|index| index.derive(&implementation_surfaces));
                     let mut candidate = EvidencePlanStep {
                         id: id.clone(),
                         revision: old.as_ref().map_or(1, |step| step.revision),
@@ -4532,46 +4825,18 @@ impl TaskEvidenceLedger {
                         generated_artifacts: item.generated_artifacts.clone(),
                         risks: item.risks.clone(),
                         requires_desktop_activation: item.requires_desktop_activation,
-                        validation_route: if evidence.is_some_and(|evidence| {
-                            evidence.validation_disposition
-                                == Some(ValidationDisposition::NotRequired)
-                        }) {
-                            None
-                        } else {
-                            item.validation_route.clone().or_else(|| {
-                                old.as_ref().and_then(|step| step.validation_route.clone())
-                            })
-                        },
+                        validation_route: item.validation_route.clone().or_else(|| {
+                            old.as_ref().and_then(|step| step.validation_route.clone())
+                        }),
                         external_validation_route: evidence
                             .and_then(|evidence| evidence.external_validation_route.clone())
                             .or_else(|| {
                                 old.as_ref()
                                     .and_then(|step| step.external_validation_route.clone())
                             }),
-                        validation_disposition: evidence
-                            .and_then(|evidence| evidence.validation_disposition)
-                            .unwrap_or_else(|| {
-                                old.as_ref().map_or_else(
-                                    || {
-                                        if item.validation_route.is_some() {
-                                            ValidationDisposition::Executable
-                                        } else {
-                                            ValidationDisposition::NotRequired
-                                        }
-                                    },
-                                    |step| step.validation_disposition,
-                                )
-                            }),
-                        source_owner: evidence
-                            .and_then(|evidence| evidence.source_owner.clone())
-                            .or_else(|| old.as_ref().and_then(|step| step.source_owner.clone())),
-                        implementation_surfaces: evidence
-                            .map(|evidence| evidence.implementation_surfaces.clone())
-                            .or_else(|| {
-                                old.as_ref()
-                                    .map(|step| step.implementation_surfaces.clone())
-                            })
-                            .unwrap_or_default(),
+                        validation_disposition: ValidationDisposition::UnresolvedDiscoverable,
+                        source_owner,
+                        implementation_surfaces,
                         mutation_obligations: requested_obligations
                             .or_else(|| old.as_ref().map(|step| step.mutation_obligations.clone()))
                             .unwrap_or_default(),
@@ -4582,6 +4847,14 @@ impl TaskEvidenceLedger {
                             .as_ref()
                             .map_or_else(BTreeSet::new, |step| step.edit_paths.clone()),
                     };
+                    candidate.validation_disposition = derive_validation_disposition(
+                        evidence.and_then(|evidence| evidence.validation_disposition),
+                        old.as_ref().map(|step| step.validation_disposition),
+                        step_requires_validation(&candidate),
+                        candidate.validation_route.is_some()
+                            || candidate.external_validation_route.is_some(),
+                        candidate.status == StepStatus::Skipped,
+                    );
                     let material_step_change = old.as_ref().is_none_or(|step| {
                         !step_materially_matches_item(step, item)
                             || !step_internal_structure_matches(step, &candidate)
@@ -4614,18 +4887,33 @@ impl TaskEvidenceLedger {
                 }
 
                 if document.planning.tier == PlanningTier::Focused && document.plan.is_empty() {
+                    let previous_disposition = document
+                        .planning
+                        .work_unit
+                        .as_ref()
+                        .map(|work_unit| work_unit.validation_disposition);
                     let work_unit = ensure_focused_work_unit(document);
                     let before = work_unit.clone();
-                    if update.source_owner.is_some() {
-                        work_unit.source_owner.clone_from(&update.source_owner);
-                    }
                     if !update.implementation_surfaces.is_empty() {
-                        work_unit.implementation_surfaces = update
-                            .implementation_surfaces
-                            .iter()
-                            .map(|path| normalize_slashes(path))
-                            .collect();
+                        work_unit.implementation_surfaces = repo_root.as_deref().map_or_else(
+                            || {
+                                update
+                                    .implementation_surfaces
+                                    .iter()
+                                    .map(|path| normalize_slashes(path))
+                                    .collect()
+                            },
+                            |repo_root| {
+                                normalize_implementation_surfaces(
+                                    repo_root,
+                                    &update.implementation_surfaces,
+                                )
+                            },
+                        );
                     }
+                    work_unit.source_owner = source_owner_index
+                        .as_ref()
+                        .and_then(|index| index.derive(&work_unit.implementation_surfaces));
                     if !update.acceptance_criteria.is_empty() {
                         work_unit.acceptance_criteria = update.acceptance_criteria.clone();
                     }
@@ -4637,9 +4925,6 @@ impl TaskEvidenceLedger {
                             .map(MutationObligationState::from)
                             .collect();
                     }
-                    if let Some(disposition) = update.validation_disposition {
-                        work_unit.validation_disposition = disposition;
-                    }
                     if update.validation_route.is_some() {
                         work_unit
                             .validation_route
@@ -4650,6 +4935,14 @@ impl TaskEvidenceLedger {
                             .external_validation_route
                             .clone_from(&update.external_validation_route);
                     }
+                    work_unit.validation_disposition = derive_validation_disposition(
+                        update.validation_disposition,
+                        previous_disposition,
+                        focused_work_unit_requires_validation(work_unit),
+                        work_unit.validation_route.is_some()
+                            || work_unit.external_validation_route.is_some(),
+                        false,
+                    );
                     material_plan_change |= before != *work_unit;
                 }
                 if material_plan_change {
@@ -4710,6 +5003,7 @@ impl TaskEvidenceLedger {
                         plan: document.plan.iter().map(plan_item_from_evidence).collect(),
                     },
                     effect,
+                    durably_recorded: false,
                     unfinished_mutation_obligation: Some(has_unfinished_mutation_obligation(
                         document,
                     )),
@@ -4720,10 +5014,14 @@ impl TaskEvidenceLedger {
             return PlanUpdateOutcome {
                 public_update: requested_public,
                 effect: PlanUpdateEffect::NoOp,
+                durably_recorded: true,
                 unfinished_mutation_obligation: None,
             };
         };
-        self.persist_document(&snapshot).await;
+        response.durably_recorded = matches!(
+            self.persist_document(&snapshot).await,
+            PersistOutcome::Persisted | PersistOutcome::Superseded
+        );
         response
     }
 
@@ -4750,8 +5048,8 @@ impl TaskEvidenceLedger {
             {
                 return None;
             }
-            let route = step.validation_route.clone()?;
-            let covered_paths = validation_route_covered_paths(&route);
+            let full_route = step.validation_route.clone()?;
+            let covered_paths = validation_route_covered_paths(&full_route);
             let repository_wide = covered_paths.is_empty();
             let has_relevant_pending_intent = document.edit_intents.iter().any(|intent| {
                 intent.completed_at.is_none()
@@ -4765,7 +5063,7 @@ impl TaskEvidenceLedger {
             if has_relevant_pending_intent {
                 return None;
             }
-            let leaf_implementation_identities = route
+            let all_leaf_implementation_identities = full_route
                 .leaves
                 .iter()
                 .map(|leaf| {
@@ -4775,7 +5073,25 @@ impl TaskEvidenceLedger {
                         &acknowledgement.covered_manifest,
                     )
                 })
-                .collect();
+                .collect::<Vec<_>>();
+            let (leaves, leaf_implementation_identities): (Vec<_>, Vec<_>) = full_route
+                .leaves
+                .iter()
+                .cloned()
+                .zip(all_leaf_implementation_identities)
+                .filter(|(leaf, implementation_identity)| {
+                    !validation_leaf_has_reusable_command_proof(
+                        document,
+                        step,
+                        leaf,
+                        implementation_identity,
+                    )
+                })
+                .unzip();
+            let route = ValidationRoute {
+                leaves,
+                ordering: full_route.ordering,
+            };
             (
                 AutoValidationCandidate {
                     step_id: step.id.clone(),
@@ -4839,6 +5155,39 @@ impl TaskEvidenceLedger {
             false,
             &covered_manifest,
         ))
+    }
+
+    pub(crate) async fn direct_validation_implementation_identity_for_leaf(
+        &self,
+        executed_leaf: &codex_protocol::plan_tool::ValidationRouteLeaf,
+    ) -> Result<String, String> {
+        if let Some(candidate) = self.auto_validation_candidate().await
+            && let Some((_, identity)) = candidate
+                .route
+                .leaves
+                .iter()
+                .zip(candidate.leaf_implementation_identities.iter())
+                .find(|(planned_leaf, _)| {
+                    crate::validation_admission::validation_argv_semantically_covers(
+                        &executed_leaf.argv,
+                        &planned_leaf.argv,
+                    ) && executed_leaf.uncertainty == planned_leaf.uncertainty
+                        && executed_leaf.covered_paths.iter().collect::<BTreeSet<_>>()
+                            == planned_leaf.covered_paths.iter().collect::<BTreeSet<_>>()
+                        && executed_leaf
+                            .covered_contracts
+                            .iter()
+                            .collect::<BTreeSet<_>>()
+                            == planned_leaf
+                                .covered_contracts
+                                .iter()
+                                .collect::<BTreeSet<_>>()
+                })
+        {
+            return Ok(identity.clone());
+        }
+        self.direct_validation_implementation_identity(&executed_leaf.covered_paths)
+            .await
     }
 
     #[cfg(test)]
@@ -5281,7 +5630,13 @@ impl TaskEvidenceLedger {
                         )
                     })
                     .unwrap_or_else(|| {
-                        current_action_attribution(document, "command", &action_id)
+                        if document.plan.is_empty()
+                            && matches!(&mutation, CommandMutation::ReadOnly)
+                        {
+                            (None, None, None, ActionAttributionKind::OutsidePlan)
+                        } else {
+                            current_action_attribution(document, "command", &action_id)
+                        }
                     });
                 if observed_mutation {
                     let normalized_paths = mutation_paths.map(|paths| {
@@ -5527,6 +5882,7 @@ impl TaskEvidenceLedger {
             accepted_review_id,
             initial_review_id,
             initial_repair_instruction_hash,
+            invalid_repair_lineage,
             original_findings,
             manifest_gap_reconstructed,
             current_repair_snapshot,
@@ -5832,6 +6188,8 @@ impl TaskEvidenceLedger {
                         && receipt.terminal_outcome.is_none()
                 })
             });
+            let invalid_repair_lineage =
+                initial_receipt.is_some_and(|receipt| receipt.invalid_repair_lineage);
             (
                 document.revision,
                 ledger.root_task_id.clone(),
@@ -5862,6 +6220,7 @@ impl TaskEvidenceLedger {
                 cycle.and_then(|cycle| cycle.accepted_review_id.clone()),
                 initial_receipt.map(|receipt| receipt.review_id.clone()),
                 initial_receipt.and_then(|receipt| receipt.repair_instruction_hash.clone()),
+                invalid_repair_lineage,
                 initial_receipt
                     .map(|receipt| receipt.findings.clone())
                     .unwrap_or_default(),
@@ -5875,6 +6234,7 @@ impl TaskEvidenceLedger {
             initial_repair_baseline.as_ref(),
             initial_repair_baseline_hash.as_deref(),
             initial_repair_instruction_hash.as_deref(),
+            invalid_repair_lineage,
             &original_findings,
             &current_repair_snapshot,
             &implementation_identity_hash,
@@ -6228,7 +6588,7 @@ impl TaskEvidenceLedger {
                 ))
             },
         );
-        let repair_baseline_metadata = if input.attempt_kind
+        let repair_baseline_binding = if input.attempt_kind
             == CompletionReviewAttemptKind::InitialReview
             && input.repair_instruction.is_some()
         {
@@ -6251,8 +6611,10 @@ impl TaskEvidenceLedger {
                 input.repair_instruction.as_deref(),
             )
         } else {
-            None
+            InitialRepairBaselineBinding::default()
         };
+        let invalid_repair_lineage = repair_baseline_binding.invalid_lineage;
+        let repair_baseline_metadata = repair_baseline_binding.metadata;
         let rereview_metadata = if input.attempt_kind == CompletionReviewAttemptKind::Rereview {
             let Some(rereview_input) = dossier.rereview_input.as_ref() else {
                 return AtomicReviewTransition::Failed;
@@ -6347,7 +6709,7 @@ impl TaskEvidenceLedger {
                 mappings,
             )
         });
-        self.atomic_review_update(dossier.document_revision, None, None, move |document| {
+        let update = move |document: &mut TaskEvidenceDocument| {
             let current_validation_receipt_ids = reconstruct_manifest.then(|| {
                 document
                     .command_receipts
@@ -6423,6 +6785,7 @@ impl TaskEvidenceLedger {
                 repair_instruction_hash,
                 repair_baseline: persisted_repair_baseline,
                 baseline_hash: persisted_baseline_hash,
+                invalid_repair_lineage,
                 input_mode: persisted_input_mode,
                 delta_hash: persisted_delta_hash,
                 rereview_delta: persisted_rereview_delta,
@@ -6462,6 +6825,7 @@ impl TaskEvidenceLedger {
                     repair_instruction_hash: None,
                     repair_baseline: None,
                     baseline_hash: None,
+                    invalid_repair_lineage: false,
                     input_mode: None,
                     delta_hash: None,
                     rereview_delta: None,
@@ -6628,8 +6992,11 @@ impl TaskEvidenceLedger {
                 review_id,
                 findings,
             }
-        })
-        .await
+        };
+        let transition = self
+            .atomic_review_update(dossier.document_revision, None, None, update)
+            .await;
+        transition
     }
 
     pub(crate) async fn finalize_completion_review(
@@ -6735,6 +7102,7 @@ impl TaskEvidenceLedger {
                         repair_instruction_hash: None,
                         repair_baseline: None,
                         baseline_hash: None,
+                        invalid_repair_lineage: false,
                         input_mode: None,
                         delta_hash: None,
                         rereview_delta: None,
@@ -6837,6 +7205,33 @@ impl TaskEvidenceLedger {
         dossier: &CompletionReviewDossier,
     ) -> AtomicReviewTransition<()> {
         self.atomic_review_update(dossier.document_revision, None, None, |document| {
+            let Some(ledger) = document.completion_review_v2.as_mut() else {
+                return;
+            };
+            if let Some(cycle) = ledger.active_review_cycle.as_mut()
+                && cycle.phase == CompletionReviewCyclePhase::ProvisionalClean
+            {
+                cycle.phase = CompletionReviewCyclePhase::InitialReviewPending;
+                cycle.accepted_review_id = None;
+                cycle.accepted_dossier_snapshot_id = None;
+                ledger.review_risk.unresolved = true;
+                ledger.review_risk.cycle_id = Some(cycle.cycle_id.clone());
+                ledger.review_risk.opened_at = Some(timestamp());
+                ledger.review_risk.resolved_at = None;
+            }
+            document.completion = None;
+            document.updated_at = timestamp();
+        })
+        .await
+    }
+
+    pub(crate) async fn supersede_current_provisional_completion_review(
+        &self,
+    ) -> AtomicReviewTransition<()> {
+        let Some(expected_revision) = self.document_revision().await else {
+            return AtomicReviewTransition::Failed;
+        };
+        self.atomic_review_update(expected_revision, None, None, |document| {
             let Some(ledger) = document.completion_review_v2.as_mut() else {
                 return;
             };
@@ -6984,6 +7379,7 @@ impl TaskEvidenceLedger {
                 repair_instruction_hash: None,
                 repair_baseline: None,
                 baseline_hash: None,
+                invalid_repair_lineage: false,
                 input_mode: None,
                 delta_hash: None,
                 rereview_delta: None,
@@ -7483,8 +7879,6 @@ impl TaskEvidenceLedger {
                 canonical_hash(
                     "KD4_FINAL_PROOF_IMPLEMENTATION_IDENTITY_V1",
                     &serde_json::json!({
-                        "evidence_epoch": document.evidence_epoch,
-                        "host_mutation_revision": document.host_mutation_revision,
                         "plan": document.plan,
                         "work_unit": document.planning.work_unit,
                         "latest_file_hashes": document.latest_file_hashes,
@@ -7518,11 +7912,17 @@ impl TaskEvidenceLedger {
     /// remain unfrozen; later workspace observations invalidate or refresh this basis.
     pub(crate) async fn seal_final_proof_candidate(
         &self,
-        input: FinalProofSealInputV1,
+        mut input: FinalProofSealInputV1,
     ) -> Option<FinalProofSealResultV1> {
         if !self.allows_kd4_completion() {
             return None;
         }
+        input.typed_validation_proofs = current_typed_validation_proofs(
+            self.repo_root.as_deref(),
+            &input.workspace_manifest_identity,
+            input.typed_validation_proofs,
+        )
+        .await;
         let evidence_path = self
             .evidence_path
             .as_ref()
@@ -7549,6 +7949,7 @@ impl TaskEvidenceLedger {
                         &basis,
                         &candidate,
                         &validation_plan,
+                        &input.typed_validation_proofs,
                     );
                 let telemetry = FinalProofSealTelemetryV1 {
                     validation_launch_count,
@@ -7831,8 +8232,11 @@ impl TaskEvidenceLedger {
         terminal_hooks_completed: bool,
         mutation_quiescent: bool,
     ) -> bool {
-        let Some((recorded, snapshot)) = self
-            .update_document(|document| {
+        let Some(expected_revision) = self.document_revision().await else {
+            return false;
+        };
+        matches!(
+            self.atomic_review_update(expected_revision, None, None, move |document| {
                 let (Some(basis), Some(candidate), Some(checkpoint)) = (
                     document.final_proof.basis.as_ref(),
                     document.final_proof.candidate.as_ref(),
@@ -7871,11 +8275,9 @@ impl TaskEvidenceLedger {
                 document.updated_at = timestamp();
                 true
             })
-            .await
-        else {
-            return false;
-        };
-        recorded && self.persist_document(&snapshot).await == PersistOutcome::Persisted
+            .await,
+            AtomicReviewTransition::Persisted(true)
+        )
     }
 
     pub(crate) async fn completion_gate(&self) -> Option<TaskCompletionGate> {
@@ -9211,6 +9613,20 @@ impl TaskEvidenceLedger {
         #[cfg(not(test))]
         None
     }
+
+    #[cfg(test)]
+    pub(crate) fn set_persistence_failure_for_test(&self, fail_writes: bool) {
+        let mut guard = self
+            .persistence_test_control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let control = guard.get_or_insert_with(|| PersistenceTestControl {
+            before_next_write: Arc::new(std::sync::Mutex::new(None)),
+            fail_writes: Arc::new(AtomicBool::new(false)),
+            supersede_writes: Arc::new(AtomicU64::new(0)),
+        });
+        control.fail_writes.store(fail_writes, Ordering::Release);
+    }
 }
 
 fn completion_candidate_basis(
@@ -9226,9 +9642,6 @@ fn completion_candidate_basis(
             "implementation_identity": input.implementation_identity,
             "source_identity": input.source_identity,
             "requirement_identity": input.requirement_identity,
-            "task_evidence_epoch": document.evidence_epoch,
-            "host_mutation_revision": document.host_mutation_revision,
-            "workspace_epoch": input.workspace_epoch,
             "workspace_manifest_identity": input.workspace_manifest_identity,
             "environment_identity": input.environment_identity,
             "toolchain_identity": input.toolchain_identity,
@@ -9282,9 +9695,9 @@ fn validation_plan_for_basis(
     let mut steps = Vec::new();
     let mut ambiguous_or_unmappable = false;
     for evidence_step in &document.plan {
-        let needs_validation = evidence_step.validation_disposition
-            != ValidationDisposition::NotRequired
-            || evidence_step.validation_route.is_some();
+        let needs_validation = evidence_step.status != StepStatus::Skipped
+            && (evidence_step.validation_disposition != ValidationDisposition::NotRequired
+                || step_requires_validation(evidence_step));
         let Some(route) = evidence_step.validation_route.as_ref() else {
             ambiguous_or_unmappable |= needs_validation;
             continue;
@@ -9318,7 +9731,7 @@ fn validation_plan_for_basis(
     {
         let needs_validation = work_unit.validation_disposition
             != ValidationDisposition::NotRequired
-            || work_unit.validation_route.is_some();
+            || focused_work_unit_requires_validation(work_unit);
         if let Some(route) = work_unit.validation_route.as_ref() {
             for (leaf_index, leaf) in route.leaves.iter().enumerate() {
                 let mut covered_paths = leaf.covered_paths.clone();
@@ -9397,20 +9810,27 @@ fn completion_candidate_for(
 
 fn current_final_proof_observations(
     document: &TaskEvidenceDocument,
-    _basis: &CompletionCandidateBasisV1,
+    basis: &CompletionCandidateBasisV1,
     candidate: &CompletionCandidateV1,
     plan: &ValidationPlanV1,
+    typed_validation_proofs: &[TypedValidationProofInputV1],
 ) -> (Vec<FinalProofObservationV1>, u32, u64) {
+    let retained_candidate_is_current = document.final_proof.candidate.as_ref() == Some(candidate);
     let mut by_step = document
         .final_proof
         .proof_observations
         .iter()
         .filter(|observation| {
             observation.candidate_id == candidate.candidate_id
-                && observation.evidence_revision == document.evidence_epoch
+                && (observation.evidence_revision == document.evidence_epoch
+                    || retained_candidate_is_current)
                 && observation.complete_identity
         })
-        .map(|observation| (observation.plan_step_id.clone(), observation.clone()))
+        .map(|observation| {
+            let mut observation = observation.clone();
+            observation.evidence_revision = document.evidence_epoch;
+            (observation.plan_step_id.clone(), observation)
+        })
         .collect::<BTreeMap<_, _>>();
     let mut validation_receipt_ids = BTreeSet::new();
     let mut validation_process_ns = 0_u64;
@@ -9461,11 +9881,171 @@ fn current_final_proof_observations(
             },
         );
     }
+    for step in &plan.steps {
+        if by_step.contains_key(&step.step_id) {
+            continue;
+        }
+        let Some((proof, executed_leaf)) = typed_validation_proofs.iter().find_map(|proof| {
+            typed_validation_proof_leaf(document, basis, proof, step).map(|leaf| (proof, leaf))
+        }) else {
+            continue;
+        };
+        let invocation_identity = canonical_hash(
+            "KD4_VALIDATION_INVOCATION_V1",
+            &serde_json::json!({
+                "argv": executed_leaf.argv,
+                "cwd": proof.validation_result.proof_key.cwd,
+            }),
+        );
+        let coverage_identity = canonical_hash(
+            "KD4_VALIDATION_COVERAGE_V1",
+            &serde_json::json!({
+                "paths": step.covered_paths,
+                "contracts": step.covered_contracts,
+            }),
+        );
+        by_step.insert(
+            step.step_id.clone(),
+            FinalProofObservationV1 {
+                candidate_id: candidate.candidate_id.clone(),
+                plan_step_id: step.step_id.clone(),
+                obligation_id: step.obligation_id.clone(),
+                successful: true,
+                complete_identity: true,
+                invocation_identity,
+                coverage_identity,
+                retained_output_digest: proof.retained_output_digest.clone(),
+                retained_output_ref: Some(proof.retained_output_ref.clone()),
+                evidence_revision: document.evidence_epoch,
+            },
+        );
+    }
     (
         by_step.into_values().collect(),
         u32::try_from(validation_receipt_ids.len()).unwrap_or(u32::MAX),
         validation_process_ns,
     )
+}
+
+fn typed_validation_proof_leaf<'a>(
+    document: &TaskEvidenceDocument,
+    basis: &CompletionCandidateBasisV1,
+    proof: &'a TypedValidationProofInputV1,
+    step: &ValidationPlanStepV1,
+) -> Option<&'a codex_protocol::plan_tool::ValidationRouteLeaf> {
+    let result = &proof.validation_result;
+    (proof.receipt_evidence_epoch == proof.validation_end_epoch
+        && proof.validation_end_epoch <= proof.workspace_epoch
+        && !proof.assignment_id.is_empty()
+        && !proof.attempt_id.is_empty()
+        && !proof.call_id.is_empty()
+        && !proof.covered_manifest.is_empty()
+        && proof.current_workspace_manifest_identity.as_deref()
+            == Some(basis.workspace_manifest_identity.as_str())
+        && result.call_id == proof.call_id
+        && result.status.is_success()
+        && result.freshness != codex_protocol::validation::ValidationFreshness::Superseded
+        && result.proof_key.validation_contract_version
+            == codex_protocol::validation::VALIDATION_CONTRACT_VERSION
+        && result.proof_key.implementation_identity == proof.implementation_identity
+        && result.proof_key.coverage_identity == proof.coverage_identity
+        && !result.proof_key.environment_identity.is_empty()
+        && !result.proof_key.toolchain_identity.is_empty()
+        && !result.proof_key.configuration_identity.is_empty()
+        && repository_roots_match(
+            Path::new(&result.proof_key.repository),
+            Path::new(&document.start.repository_root),
+        )
+        && recorded_or_native_path_matches(&proof.recorded_cwd, Path::new(&result.proof_key.cwd))
+        && recorded_or_native_path_within_repository(
+            &proof.recorded_cwd,
+            Path::new(&document.start.repository_root),
+        )
+        && !proof.retained_output_digest.is_empty()
+        && !proof.retained_output_ref.is_empty()
+        && result
+            .raw_artifact_ref
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        && result
+            .raw_artifact_sha256
+            .as_deref()
+            .is_some_and(|value| !value.is_empty()))
+    .then_some(())?;
+    result.route.leaves.iter().find(|leaf| {
+        crate::validation_admission::validation_argv_semantically_covers(&leaf.argv, &step.argv)
+            && (!step.semantic_timeout
+                || (leaf.semantic_timeout && leaf.timeout_ms == step.timeout_ms))
+            && step
+                .covered_paths
+                .iter()
+                .all(|path| leaf.covered_paths.contains(path))
+            && step
+                .covered_contracts
+                .iter()
+                .all(|contract| leaf.covered_contracts.contains(contract))
+    })
+}
+
+async fn current_typed_validation_proofs(
+    repo_root: Option<&Path>,
+    workspace_manifest_identity: &str,
+    proofs: Vec<TypedValidationProofInputV1>,
+) -> Vec<TypedValidationProofInputV1> {
+    let Some(repo_root) = repo_root else {
+        return Vec::new();
+    };
+    let mut current = Vec::new();
+    for mut proof in proofs {
+        if proof.covered_manifest.is_empty() {
+            continue;
+        }
+        let mut manifest_is_current = true;
+        for expected in &proof.covered_manifest {
+            if expected.path == codex_agent_task_store::REPOSITORY_WIDE_PATH {
+                let head = crate::git_workspace::capture_candidate_diff(repo_root)
+                    .await
+                    .and_then(|capture| capture.head_identity);
+                if expected.content_hash != head
+                    || expected.existed != expected.content_hash.is_some()
+                {
+                    manifest_is_current = false;
+                    break;
+                }
+                continue;
+            }
+            let Ok(absolute) = validated_generated_artifact_path(repo_root, &expected.path) else {
+                manifest_is_current = false;
+                break;
+            };
+            let observed = match sha256_file(&absolute).await {
+                Ok(hash) => WorkspaceManifestEntry {
+                    path: expected.path.clone(),
+                    content_hash: Some(hash),
+                    existed: true,
+                },
+                Err(error) if error.kind() == io::ErrorKind::NotFound => WorkspaceManifestEntry {
+                    path: expected.path.clone(),
+                    content_hash: None,
+                    existed: false,
+                },
+                Err(_) => {
+                    manifest_is_current = false;
+                    break;
+                }
+            };
+            if observed != *expected {
+                manifest_is_current = false;
+                break;
+            }
+        }
+        if manifest_is_current {
+            proof.current_workspace_manifest_identity =
+                Some(workspace_manifest_identity.to_string());
+            current.push(proof);
+        }
+    }
+    current
 }
 
 fn missing_or_failed_obligations(
@@ -11214,6 +11794,7 @@ fn build_rereview_input(
     baseline: Option<&RepairBaseline>,
     persisted_baseline_hash: Option<&str>,
     repair_instruction_hash: Option<&str>,
+    invalid_repair_lineage: bool,
     original_findings: &[CompletionReviewFindingReceipt],
     current: &CurrentRepairSnapshot,
     candidate_implementation_identity: &str,
@@ -11226,8 +11807,13 @@ fn build_rereview_input(
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
+    if invalid_repair_lineage {
+        reasons.insert(RereviewFallbackReason::InvalidRepairLineage);
+    }
     let Some(baseline) = baseline else {
-        reasons.insert(RereviewFallbackReason::MissingBaseline);
+        if !invalid_repair_lineage {
+            reasons.insert(RereviewFallbackReason::MissingBaseline);
+        }
         return Some(RereviewInput {
             input_mode: RereviewInputMode::FullFallback,
             baseline_hash: persisted_baseline_hash.map(str::to_string),
@@ -11444,17 +12030,35 @@ pub(crate) fn repair_baseline_hash(baseline: &RepairBaseline) -> String {
     )
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct InitialRepairBaselineBinding {
+    metadata: Option<(RepairBaseline, String)>,
+    invalid_lineage: bool,
+}
+
 fn bind_initial_repair_baseline_metadata(
     baseline: Result<RepairBaseline, RereviewFallbackReason>,
     instruction: Option<&str>,
-) -> Option<(RepairBaseline, String)> {
-    let baseline = baseline.ok()?;
+) -> InitialRepairBaselineBinding {
+    let Ok(baseline) = baseline else {
+        return InitialRepairBaselineBinding::default();
+    };
     let baseline_hash = repair_baseline_hash(&baseline);
-    instruction
-        .is_some_and(|instruction| {
-            repair_instruction_matches_baseline(instruction, &baseline, &baseline_hash)
-        })
-        .then_some((baseline, baseline_hash))
+    match instruction {
+        Some(instruction)
+            if repair_instruction_matches_baseline(instruction, &baseline, &baseline_hash) =>
+        {
+            InitialRepairBaselineBinding {
+                metadata: Some((baseline, baseline_hash)),
+                invalid_lineage: false,
+            }
+        }
+        Some(_) => InitialRepairBaselineBinding {
+            metadata: None,
+            invalid_lineage: true,
+        },
+        None => InitialRepairBaselineBinding::default(),
+    }
 }
 
 pub(crate) fn repair_delta_hash(delta: &RepairDelta) -> String {
@@ -12507,6 +13111,7 @@ fn validate_rereview_audit_metadata(
 ) -> Result<(), String> {
     let has_audit_metadata = receipt.repair_baseline.is_some()
         || receipt.baseline_hash.is_some()
+        || receipt.invalid_repair_lineage
         || receipt.input_mode.is_some()
         || receipt.delta_hash.is_some()
         || receipt.rereview_delta.is_some()
@@ -12524,6 +13129,13 @@ fn validate_rereview_audit_metadata(
                 || receipt.rereview_audit_hash.is_some()
             {
                 return Err("initial review contains rereview audit metadata".to_string());
+            }
+            if receipt.invalid_repair_lineage
+                && (receipt.repair_instruction_hash.is_none()
+                    || receipt.repair_baseline.is_some()
+                    || receipt.baseline_hash.is_some())
+            {
+                return Err("invalid repair lineage marker is inconsistent".to_string());
             }
             match (
                 receipt.repair_instruction_hash.as_ref(),
@@ -13106,6 +13718,42 @@ fn recorded_path_uri_matches(recorded: &str, expected: &Path) -> bool {
         .is_some_and(|path| repository_roots_match(path.as_path(), expected))
 }
 
+fn recorded_or_native_path_matches(recorded: &str, expected: &Path) -> bool {
+    recorded_path_uri_matches(recorded, expected)
+        || (Path::new(recorded).is_absolute()
+            && expected.is_absolute()
+            && repository_roots_match(Path::new(recorded), expected))
+}
+
+fn recorded_or_native_locations_match(left: &str, right: &str) -> bool {
+    let resolve = |value: &str| {
+        PathUri::parse(value)
+            .ok()
+            .and_then(|uri| uri.to_abs_path().ok())
+            .map(codex_utils_absolute_path::AbsolutePathBuf::into_path_buf)
+            .or_else(|| Path::new(value).is_absolute().then(|| PathBuf::from(value)))
+    };
+    resolve(left)
+        .zip(resolve(right))
+        .is_some_and(|(left, right)| repository_roots_match(&left, &right))
+}
+
+fn recorded_or_native_path_within_repository(recorded: &str, repository_root: &Path) -> bool {
+    let recorded = PathUri::parse(recorded)
+        .ok()
+        .and_then(|uri| uri.to_abs_path().ok())
+        .map(codex_utils_absolute_path::AbsolutePathBuf::into_path_buf)
+        .unwrap_or_else(|| PathBuf::from(recorded));
+    if !recorded.is_absolute() || !repository_root.is_absolute() {
+        return false;
+    }
+    let recorded = canonical_repository_root(&recorded);
+    let repository_root = canonical_repository_root(repository_root);
+    recorded
+        .ancestors()
+        .any(|ancestor| repository_root_paths_equal(ancestor, &repository_root))
+}
+
 #[cfg(not(windows))]
 fn repository_root_paths_equal(left: &Path, right: &Path) -> bool {
     left == right
@@ -13368,6 +14016,7 @@ fn seed_migrated_v4_terminal_lineage(document: &mut TaskEvidenceDocument) {
         repair_instruction_hash: None,
         repair_baseline: None,
         baseline_hash: None,
+        invalid_repair_lineage: false,
         input_mode: None,
         delta_hash: None,
         rereview_delta: None,
@@ -13600,9 +14249,13 @@ fn record_obligation_progress(
 fn admissible_requested_status(step: &EvidencePlanStep) -> StepStatus {
     match step.status {
         StepStatus::Passed => match step.validation_disposition {
-            ValidationDisposition::NotRequired => StepStatus::Passed,
+            ValidationDisposition::NotRequired if !step_requires_validation(step) => {
+                StepStatus::Passed
+            }
             ValidationDisposition::UnavailableBlocked => StepStatus::Blocked,
-            ValidationDisposition::Executable | ValidationDisposition::UnresolvedDiscoverable => {
+            ValidationDisposition::Executable
+            | ValidationDisposition::UnresolvedDiscoverable
+            | ValidationDisposition::NotRequired => {
                 if step.validation_receipt_id.is_some() {
                     StepStatus::Passed
                 } else if implementation_obligations_satisfied(&step.mutation_obligations) {
@@ -13622,6 +14275,57 @@ fn admissible_requested_status(step: &EvidencePlanStep) -> StepStatus {
     }
 }
 
+fn derive_validation_disposition(
+    requested: Option<ValidationDisposition>,
+    previous: Option<ValidationDisposition>,
+    structurally_required: bool,
+    has_route: bool,
+    skipped: bool,
+) -> ValidationDisposition {
+    if skipped {
+        return ValidationDisposition::NotRequired;
+    }
+    if requested == Some(ValidationDisposition::NotRequired) && structurally_required {
+        if has_route {
+            return ValidationDisposition::Executable;
+        }
+        return previous
+            .filter(|disposition| *disposition != ValidationDisposition::NotRequired)
+            .unwrap_or(ValidationDisposition::UnresolvedDiscoverable);
+    }
+    if requested.is_none() && has_route {
+        return ValidationDisposition::Executable;
+    }
+    if requested.is_none()
+        && previous == Some(ValidationDisposition::NotRequired)
+        && structurally_required
+    {
+        return ValidationDisposition::UnresolvedDiscoverable;
+    }
+    requested.or(previous).unwrap_or(if structurally_required {
+        ValidationDisposition::UnresolvedDiscoverable
+    } else {
+        ValidationDisposition::NotRequired
+    })
+}
+
+fn step_requires_validation(step: &EvidencePlanStep) -> bool {
+    step.validation_route.is_some()
+        || step.external_validation_route.is_some()
+        || !step.runtime_paths.is_empty()
+        || !step.generated_artifacts.is_empty()
+        || step.requires_desktop_activation
+        || !step.implementation_surfaces.is_empty()
+        || !step.mutation_obligations.is_empty()
+}
+
+fn focused_work_unit_requires_validation(work_unit: &FocusedWorkUnit) -> bool {
+    work_unit.validation_route.is_some()
+        || work_unit.external_validation_route.is_some()
+        || !work_unit.implementation_surfaces.is_empty()
+        || !work_unit.mutation_obligations.is_empty()
+}
+
 fn ensure_focused_work_unit(document: &mut TaskEvidenceDocument) -> &mut FocusedWorkUnit {
     let mut hasher = Sha256::new();
     hasher.update(b"KD4_FOCUSED_WORK_UNIT_V1\0");
@@ -13633,7 +14337,7 @@ fn ensure_focused_work_unit(document: &mut TaskEvidenceDocument) -> &mut Focused
         implementation_surfaces: Vec::new(),
         acceptance_criteria: Vec::new(),
         mutation_obligations: Vec::new(),
-        validation_disposition: ValidationDisposition::NotRequired,
+        validation_disposition: ValidationDisposition::UnresolvedDiscoverable,
         validation_route: None,
         external_validation_route: None,
         validation_receipt_id: None,
@@ -13721,7 +14425,7 @@ fn command_receipt_has_current_proof_identity(
             Path::new(&validation.proof_key.repository),
             Path::new(&document.start.repository_root),
         )
-        && recorded_path_uri_matches(&receipt.cwd, Path::new(&validation.proof_key.cwd))
+        && recorded_or_native_locations_match(&receipt.cwd, &validation.proof_key.cwd)
         && recorded_path_uri_matches(&receipt.cwd, Path::new(&document.start.repository_root))
 }
 
@@ -13735,15 +14439,31 @@ fn command_receipt_is_retained_by_path_scoped_proof(
         .zip(receipt.step_revision)
         .is_some_and(|(step_id, revision)| {
             document.plan.iter().any(|step| {
-                step.id == step_id
-                    && step.revision == revision
-                    && step.status == StepStatus::Passed
+                if step.id != step_id || step.revision != revision {
+                    return false;
+                }
+                let Some(route) = step.validation_route.as_ref() else {
+                    return false;
+                };
+                let retained_passed_step = step.status == StepStatus::Passed
                     && step.validation_receipt_id.is_some()
-                    && step.validation_route.as_ref().is_some_and(|route| {
-                        route.leaves.iter().any(|leaf| {
-                            crate::validation_admission::validation_argv_semantically_covers(
-                                &receipt.command,
-                                &leaf.argv,
+                    && route.leaves.iter().any(|leaf| {
+                        crate::validation_admission::validation_argv_semantically_covers(
+                            &receipt.command,
+                            &leaf.argv,
+                        )
+                    });
+                retained_passed_step
+                    || route.leaves.iter().any(|leaf| {
+                        let implementation_identity =
+                            current_validation_leaf_identity(document, step, leaf);
+                        implementation_identity.is_some_and(|implementation_identity| {
+                            validation_receipt_matches_leaf_proof(
+                                document,
+                                receipt,
+                                step,
+                                leaf,
+                                &implementation_identity,
                             )
                         })
                     })
@@ -13767,6 +14487,86 @@ fn command_receipt_is_retained_by_path_scoped_proof(
                             })
                         })
                 })
+        })
+}
+
+fn current_validation_leaf_identity(
+    document: &TaskEvidenceDocument,
+    step: &EvidencePlanStep,
+    leaf: &codex_protocol::plan_tool::ValidationRouteLeaf,
+) -> Option<String> {
+    let acknowledgement = document.batch_acknowledgement.as_ref()?;
+    (acknowledgement.step_id == step.id
+        && acknowledgement.implementation_revision == document.host_mutation_revision)
+        .then(|| {
+            validation_leaf_implementation_identity(
+                acknowledgement.implementation_revision,
+                leaf,
+                &acknowledgement.covered_manifest,
+            )
+        })
+}
+
+fn validation_leaf_has_reusable_command_proof(
+    document: &TaskEvidenceDocument,
+    step: &EvidencePlanStep,
+    leaf: &codex_protocol::plan_tool::ValidationRouteLeaf,
+    implementation_identity: &str,
+) -> bool {
+    document.command_receipts.iter().any(|receipt| {
+        validation_receipt_matches_leaf_proof(
+            document,
+            receipt,
+            step,
+            leaf,
+            implementation_identity,
+        )
+    })
+}
+
+fn validation_receipt_matches_leaf_proof(
+    document: &TaskEvidenceDocument,
+    receipt: &CommandReceipt,
+    step: &EvidencePlanStep,
+    leaf: &codex_protocol::plan_tool::ValidationRouteLeaf,
+    implementation_identity: &str,
+) -> bool {
+    let Some(validation) = receipt.validation_result.as_ref() else {
+        return false;
+    };
+    receipt.step_id.as_deref() == Some(step.id.as_str())
+        && receipt.step_revision == Some(step.revision)
+        && receipt.exit_code == 0
+        && !receipt.timed_out
+        && !receipt.possible_mutation
+        && receipt.implementation_identity_hash.as_deref() == Some(implementation_identity)
+        && validation.status.is_success()
+        && validation.proof_key.validation_contract_version
+            == codex_protocol::validation::VALIDATION_CONTRACT_VERSION
+        && validation.proof_key.implementation_identity == implementation_identity
+        && repository_roots_match(
+            Path::new(&validation.proof_key.repository),
+            Path::new(&document.start.repository_root),
+        )
+        && recorded_or_native_locations_match(&receipt.cwd, &validation.proof_key.cwd)
+        && recorded_path_uri_matches(&receipt.cwd, Path::new(&document.start.repository_root))
+        && crate::validation_admission::validation_argv_semantically_covers(
+            &receipt.command,
+            &leaf.argv,
+        )
+        && validation.route.leaves.iter().any(|executed_leaf| {
+            crate::validation_admission::validation_argv_semantically_covers(
+                &executed_leaf.argv,
+                &leaf.argv,
+            ) && executed_leaf.uncertainty == leaf.uncertainty
+                && executed_leaf.covered_paths.iter().collect::<BTreeSet<_>>()
+                    == leaf.covered_paths.iter().collect::<BTreeSet<_>>()
+                && executed_leaf
+                    .covered_contracts
+                    .iter()
+                    .collect::<BTreeSet<_>>()
+                    == leaf.covered_contracts.iter().collect::<BTreeSet<_>>()
+                && validation.duration_ms <= leaf.timeout_ms
         })
 }
 
@@ -14419,6 +15219,29 @@ fn derive_completion_gate(
             unacknowledged_steps.join(", ")
         ));
     }
+    if document.plan.is_empty()
+        && let Some(work_unit) = document.planning.work_unit.as_ref()
+    {
+        match work_unit.validation_disposition {
+            ValidationDisposition::UnavailableBlocked => blocked.push(format!(
+                "focused work unit `{}` has no available validation route",
+                work_unit.id
+            )),
+            ValidationDisposition::NotRequired
+                if !focused_work_unit_requires_validation(work_unit) => {}
+            ValidationDisposition::Executable
+            | ValidationDisposition::UnresolvedDiscoverable
+            | ValidationDisposition::NotRequired
+                if work_unit.validation_receipt_id.is_none() =>
+            {
+                partial.push(format!(
+                    "focused work unit `{}` lacks current validation proof",
+                    work_unit.id
+                ));
+            }
+            _ => {}
+        }
+    }
     let steps_by_id = document
         .plan
         .iter()
@@ -14631,9 +15454,14 @@ fn invalidate_for_mutation(
             fact.dependencies_current = false;
         }
     }
-    let repair_count_by_lineage = std::mem::take(&mut document.final_proof.repair_count_by_lineage);
+    let prior = std::mem::take(&mut document.final_proof);
     document.final_proof = FinalProofStateV1 {
-        repair_count_by_lineage,
+        basis: prior.basis,
+        validation_plan: prior.validation_plan,
+        candidate: prior.candidate,
+        diff_snapshot: prior.diff_snapshot,
+        proof_observations: prior.proof_observations,
+        repair_count_by_lineage: prior.repair_count_by_lineage,
         ..FinalProofStateV1::default()
     };
     let acknowledgement_invalidated =
@@ -15368,9 +16196,9 @@ mod tests {
     #[tokio::test]
     async fn legacy_completed_is_canonicalized_to_passed() {
         let (_temp, ledger) = ledger_fixture().await;
-        let normalized = ledger
-            .record_plan_update(&plan(StepStatus::Completed))
-            .await;
+        let mut update = plan(StepStatus::Completed);
+        update.plan[0].runtime_paths.clear();
+        let normalized = ledger.record_plan_update(&update).await;
         assert_eq!(normalized.plan[0].status, StepStatus::Passed);
         let gate = ledger.completion_gate().await.expect("gate");
         assert_eq!(gate.status, TaskCompletionStatus::Passed);
@@ -15460,9 +16288,9 @@ mod tests {
     #[tokio::test]
     async fn compaction_task_state_retains_completed_step_details() {
         let (_temp, ledger) = ledger_fixture().await;
-        ledger
-            .record_plan_update(&plan(StepStatus::Completed))
-            .await;
+        let mut update = plan(StepStatus::Completed);
+        update.plan[0].runtime_paths.clear();
+        ledger.record_plan_update(&update).await;
 
         let state = ledger
             .compaction_task_state()
@@ -15477,9 +16305,9 @@ mod tests {
     #[tokio::test]
     async fn non_blocking_runtime_risk_is_a_warning_and_keeps_completion_partial() {
         let (_temp, ledger) = ledger_fixture().await;
-        ledger
-            .record_plan_update(&plan(StepStatus::Completed))
-            .await;
+        let mut update = plan(StepStatus::Completed);
+        update.plan[0].runtime_paths.clear();
+        ledger.record_plan_update(&update).await;
         {
             let mut guard = ledger.document.lock().await;
             let document = guard.as_mut().expect("document");
@@ -15703,16 +16531,44 @@ mod tests {
                 Err(RereviewFallbackReason::RequirementManifestChanged),
                 Some("{}"),
             ),
-            None
+            InitialRepairBaselineBinding::default()
         );
     }
 
     #[test]
-    fn repair_instruction_mismatch_omits_delta_metadata() {
+    fn invalid_repair_lineage_mismatch_forces_full_fallback() {
         let baseline = repair_baseline_fixture();
+        let binding = bind_initial_repair_baseline_metadata(Ok(baseline.clone()), Some("{}"));
+        assert!(binding.metadata.is_none());
+        assert!(binding.invalid_lineage);
+
+        let input = build_rereview_input(
+            None,
+            None,
+            Some("repair-hash"),
+            binding.invalid_lineage,
+            &[],
+            &CurrentRepairSnapshot {
+                repository_root: String::new(),
+                path_states: Vec::new(),
+                command_receipts: Vec::new(),
+                plan_structure_hash: String::new(),
+                declared_path_scopes: Vec::new(),
+                implementation_surfaces: Vec::new(),
+                default_child_mutation_identities: Vec::new(),
+                typed_mutation_identities: Vec::new(),
+                external_evidence_ids: Vec::new(),
+                containment_errors: Vec::new(),
+            },
+            "candidate",
+            "source",
+            "manifest",
+        )
+        .expect("full fallback input");
+        assert_eq!(input.input_mode, RereviewInputMode::FullFallback);
         assert_eq!(
-            bind_initial_repair_baseline_metadata(Ok(baseline.clone()), Some("{}")),
-            None
+            input.fallback_reasons,
+            vec![RereviewFallbackReason::InvalidRepairLineage]
         );
 
         let baseline_hash = repair_baseline_hash(&baseline);
@@ -15721,7 +16577,9 @@ mod tests {
             "declared_repair_scope": &baseline.repair_scope,
         })
         .to_string();
-        assert!(bind_initial_repair_baseline_metadata(Ok(baseline), Some(&instruction)).is_some());
+        let binding = bind_initial_repair_baseline_metadata(Ok(baseline), Some(&instruction));
+        assert!(binding.metadata.is_some());
+        assert!(!binding.invalid_lineage);
     }
 
     #[test]
@@ -15913,6 +16771,7 @@ mod tests {
             Some(&baseline),
             Some(&baseline_hash),
             Some("repair-hash"),
+            false,
             &original_findings,
             &current,
             "candidate",
@@ -15980,6 +16839,7 @@ mod tests {
             Some(&baseline),
             Some("wrong-baseline-hash"),
             Some("repair-hash"),
+            false,
             &[repair_finding("F1", &["R1"])],
             &current,
             "candidate",

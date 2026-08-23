@@ -85,6 +85,107 @@ async fn initialized_coordinator() -> (AgentTaskCoordinator, TempDir, TempDir) {
     (coordinator, codex_home, repository)
 }
 
+#[tokio::test]
+async fn validation_waiter_is_removed_on_cancellation() {
+    let (coordinator, _codex_home, _repository) = initialized_coordinator().await;
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+
+    let current = coordinator
+        .wait_for_validation_call_terminal(
+            "cancelled-validation",
+            &cancellation,
+            Utc::now() + chrono::Duration::minutes(1),
+        )
+        .await
+        .expect("cancelled validation wait succeeds");
+
+    assert!(current.is_none());
+    assert!(
+        coordinator
+            .validation_waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty(),
+        "cancellation must release the validation waiter registration"
+    );
+}
+
+#[tokio::test]
+async fn cancelling_one_validation_waiter_keeps_other_waiter_registered() {
+    let (coordinator, _codex_home, _repository) = initialized_coordinator().await;
+    let first_cancellation = CancellationToken::new();
+    let second_cancellation = CancellationToken::new();
+    let first_coordinator = coordinator.clone();
+    let first_token = first_cancellation.clone();
+    let first = tokio::spawn(async move {
+        first_coordinator
+            .wait_for_validation_call_terminal(
+                "shared-validation",
+                &first_token,
+                Utc::now() + chrono::Duration::minutes(1),
+            )
+            .await
+    });
+    let second_coordinator = coordinator.clone();
+    let second_token = second_cancellation.clone();
+    let second = tokio::spawn(async move {
+        second_coordinator
+            .wait_for_validation_call_terminal(
+                "shared-validation",
+                &second_token,
+                Utc::now() + chrono::Duration::minutes(1),
+            )
+            .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let registrations = coordinator
+                .validation_waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get("shared-validation")
+                .map(|entry| entry.registrations);
+            if registrations == Some(2) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both validation waiters register");
+
+    first_cancellation.cancel();
+    first
+        .await
+        .expect("first validation wait task joins")
+        .expect("first validation wait succeeds");
+    assert_eq!(
+        coordinator
+            .validation_waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get("shared-validation")
+            .map(|entry| entry.registrations),
+        Some(1),
+        "one cancelled owner must not unregister the remaining waiter"
+    );
+
+    second_cancellation.cancel();
+    second
+        .await
+        .expect("second validation wait task joins")
+        .expect("second validation wait succeeds");
+    assert!(
+        coordinator
+            .validation_waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    );
+}
+
 #[test]
 fn bounded_diagnostics_deduplicate_progress_and_root_evidence_hydration() {
     let coordinator = AgentTaskCoordinator::default();

@@ -1558,8 +1558,8 @@ async fn conversation_text_before_start_emits_error() -> Result<()> {
 async fn conversation_second_start_replaces_runtime() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
-    let server = start_websocket_server(vec![
-        vec![],
+    let api_server = start_mock_server().await;
+    let realtime_server = start_websocket_server(vec![
         vec![vec![json!({
             "type": "session.updated",
             "session": { "id": "sess_old", "instructions": "old" }
@@ -1578,13 +1578,12 @@ async fn conversation_second_start_replaces_runtime() -> Result<()> {
         ],
     ])
     .await;
-    let mut builder = test_codex();
-    let test = builder.build_with_websocket_server(&server).await?;
-    assert!(
-        server
-            .wait_for_handshakes(/*expected*/ 1, Duration::from_secs(2))
-            .await
-    );
+    let realtime_base_url = realtime_server.uri().to_string();
+    let mut builder = test_codex().with_config(move |config| {
+        config.experimental_realtime_ws_base_url = Some(realtime_base_url);
+        config.realtime.version = RealtimeWsVersion::V1;
+    });
+    let test = builder.build(&api_server).await?;
 
     test.codex
         .submit(Op::RealtimeConversationStart(ConversationStartParams {
@@ -1667,30 +1666,34 @@ async fn conversation_second_start_replaces_runtime() -> Result<()> {
     })
     .await;
 
-    let connections = server.connections();
-    assert_eq!(connections.len(), 3);
-    assert_eq!(connections[1].len(), 1);
+    let connections = realtime_server.connections();
+    assert_eq!(connections.len(), 2);
+    assert_eq!(connections[0].len(), 1);
     let old_instructions =
-        websocket_request_instructions(&connections[1][0]).expect("old session instructions");
+        websocket_request_instructions(&connections[0][0]).expect("old session instructions");
     assert!(old_instructions.starts_with("old"));
     assert_eq!(
-        server.handshakes()[1].header("x-session-id").as_deref(),
+        realtime_server.handshakes()[0]
+            .header("x-session-id")
+            .as_deref(),
         Some("conv_old")
     );
-    assert_eq!(connections[2].len(), 2);
+    assert_eq!(connections[1].len(), 2);
     let new_instructions =
-        websocket_request_instructions(&connections[2][0]).expect("new session instructions");
+        websocket_request_instructions(&connections[1][0]).expect("new session instructions");
     assert!(new_instructions.starts_with("new"));
     assert_eq!(
-        server.handshakes()[2].header("x-session-id").as_deref(),
+        realtime_server.handshakes()[1]
+            .header("x-session-id")
+            .as_deref(),
         Some("conv_new")
     );
     assert_eq!(
-        connections[2][1].body_json()["type"].as_str(),
+        connections[1][1].body_json()["type"].as_str(),
         Some("input_audio_buffer.append")
     );
 
-    server.shutdown().await;
+    realtime_server.shutdown().await;
     Ok(())
 }
 

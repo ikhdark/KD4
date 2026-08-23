@@ -323,17 +323,6 @@ impl ChatWidget {
                     == WindowsSandboxLevel::Disabled
                 {
                     let preset = preset.clone();
-                    if crate::windows_sandbox::sandbox_setup_is_complete(
-                        self.config.codex_home.as_path(),
-                    ) {
-                        return vec![Box::new(move |tx| {
-                            tx.send(AppEvent::EnableWindowsSandboxForAgentMode {
-                                preset: preset.clone(),
-                                mode: WindowsSandboxEnableMode::Elevated,
-                                profile_selection: profile_selection.clone(),
-                            });
-                        })];
-                    }
                     return vec![Box::new(move |tx| {
                         tx.send(AppEvent::OpenWindowsSandboxEnablePrompt {
                             preset: preset.clone(),

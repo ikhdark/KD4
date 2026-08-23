@@ -176,9 +176,14 @@ impl ChatWidget {
             };
         if let Some(cell) = finalized_streamed_cell {
             self.add_boxed_history(cell);
-            // TODO: Replace streamed output with the final plan item text if plan streaming is
-            // removed or if we need to reconcile mismatches between streamed and final content.
             if let Some(source) = consolidated_plan_source {
+                // The completed item is authoritative. Stream deltas can be lossy or revised by
+                // the final event, so use the streamed source only for legacy empty completions.
+                let source = if plan_text.trim().is_empty() {
+                    source
+                } else {
+                    plan_text.clone()
+                };
                 self.note_stream_consolidation_queued();
                 self.app_event_tx
                     .send(AppEvent::ConsolidateProposedPlan(source));

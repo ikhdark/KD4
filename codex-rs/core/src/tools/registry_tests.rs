@@ -135,7 +135,12 @@ fn complete_projection_envelope_respects_applied_limit() {
 }
 
 #[test]
-fn projection_limit_retains_a_native_minimal_fallback() {
+fn projection_fallback_preserves_essential_inline() {
+    let essential = serde_json::json!({
+        "chunk_id": "chunk-1",
+        "exit_code": null,
+        "session_id": 41,
+    });
     let envelope = ToolProjectionV1 {
         version: 1,
         tool: "test".to_string(),
@@ -149,20 +154,117 @@ fn projection_limit_retains_a_native_minimal_fallback() {
         artifact_id: Some("artifact-123".to_string()),
         sections: Vec::new(),
         omitted_sections: Vec::new(),
-        result: serde_json::json!({ "large_metadata": "x".repeat(8_000) }),
+        result: serde_json::json!({
+            "essential": essential,
+            "large_metadata": "x".repeat(8_000),
+            "selected_text": "",
+        }),
     };
 
     let projected =
         serialize_projection_with_limit(envelope, "selected output", 1).expect("fallback");
-    let BoundedModelProjection::Fallback { value, rendered } = projected else {
-        panic!("expected a bounded fallback");
+    let BoundedModelProjection::Envelope { envelope, rendered } = projected else {
+        panic!("expected a typed minimal carrier");
     };
 
-    assert!(approx_token_count(&rendered) <= 1);
+    assert!(approx_token_count(&rendered) > 1);
+    assert_eq!(envelope.artifact_id.as_deref(), Some("artifact-123"));
+    assert_eq!(envelope.result["essential"], essential);
+    assert_eq!(envelope.result["selected_text"], "");
+    assert!(envelope.result.get("large_metadata").is_none());
     assert_eq!(
         serde_json::from_str::<Value>(&rendered).expect("valid JSON fallback"),
-        value
+        serde_json::to_value(envelope).expect("serialize typed carrier"),
     );
+}
+
+#[tokio::test]
+async fn projection_source_dependency_decision_records_reuse_and_fallback() {
+    let timing = TurnTimingState::default();
+    let expected =
+        std::collections::BTreeSet::from([crate::tool_history::SourceDependencyV1::new(
+            std::path::Path::new("src"),
+            true,
+        )]);
+    let carried = with_precomputed_projection_source_dependencies(Some(expected.clone()), async {
+        resolve_projection_source_dependencies(
+            &timing,
+            precomputed_projection_source_dependencies(),
+            || panic!("precomputed dependencies must skip fallback analysis"),
+        )
+    })
+    .await;
+    assert_eq!(carried, expected);
+    let fallback_expected =
+        std::collections::BTreeSet::from([crate::tool_history::SourceDependencyV1::new(
+            std::path::Path::new("fallback"),
+            false,
+        )]);
+    let fallback =
+        resolve_projection_source_dependencies(&timing, None, || fallback_expected.clone());
+    assert_eq!(fallback, fallback_expected);
+    let counters = timing.complete_snapshot().protocol_timing().counters;
+    assert_eq!(counters.projection_source_dependencies_reuse_count, 1);
+    assert_eq!(counters.projection_source_dependencies_fallback_count, 1);
+
+    let output = "bounded output".to_string();
+    let canonical = CanonicalToolResult::text(output.clone());
+    let projection = project_model_output(ModelProjectionInput {
+        spillable_text: output.clone(),
+        outcome: ToolOutputOutcome::Success,
+        essential_inline: serde_json::json!({}),
+        origin_call_id: "source-dependencies-call".to_string(),
+        selection_facts: ProjectionSelectionFacts {
+            mode: "test",
+            available_fragments: 0,
+            selected_fragments: 0,
+            exact_duplicates_removed: 0,
+            selected_ids: Vec::new(),
+            omitted_inline_ids: Vec::new(),
+            partial_ids: Vec::new(),
+        },
+        applied_token_limit: 512,
+        projected_text: output.clone(),
+        preserved_content: Vec::new(),
+        codex_home: std::path::PathBuf::new(),
+        thread_id: "thread".to_string(),
+        tool_name: "cargo_test".to_string(),
+        original_output_sha256: canonical.sha256.clone(),
+        original_output_tokens: canonical.approximate_tokens,
+        original_output_text: output.clone(),
+        invocation_sha256: None,
+        canonical,
+        semantic_class: "tool_output".to_string(),
+        source_dependencies: carried,
+        projection_eligible: true,
+        projection_truncated: false,
+        predetermined_ranges: Vec::new(),
+        predetermined_json_pointers: Vec::new(),
+        original_response: ResponseInputItem::FunctionCallOutput {
+            call_id: "source-dependencies-call".to_string(),
+            output: FunctionCallOutputPayload::from_text(output),
+        },
+        materialization: ProjectionMaterialization::InlineCarrier,
+    })
+    .await
+    .expect("projected result");
+    let mut result = AnyToolResult {
+        call_id: "source-dependencies-call".to_string(),
+        payload: ToolPayload::Function {
+            arguments: "{}".to_string(),
+        },
+        result: Box::new(FunctionToolOutput::from_text(
+            "native output".to_string(),
+            Some(true),
+        )),
+        post_tool_use_payload: None,
+        model_projection: None,
+        source_dependencies: None,
+        code_mode_feedback: Vec::new(),
+    };
+    result.install_model_projection(Some(projection));
+
+    assert_eq!(result.projected_source_dependencies(), Some(&expected));
 }
 
 #[test]
@@ -383,6 +485,8 @@ async fn structured_projection_artifact_recovers_original_bytes() {
     })
     .await
     .expect("structured projection");
+    assert!(projection.artifact_created);
+    assert!(!projection.artifact_reused);
     let artifact_id = projection
         .candidate
         .as_ref()
@@ -404,6 +508,69 @@ async fn structured_projection_artifact_recovers_original_bytes() {
         .expect("artifact metadata line and payload");
 
     assert_eq!(recovered_payload.as_bytes(), full_output.as_bytes());
+}
+
+#[tokio::test]
+async fn canonical_projection_reuses_existing_artifact_id() {
+    let temp = tempfile::tempdir().expect("temporary Codex home");
+    let thread_id = "canonical-reuse-thread";
+    let full_output = format!("header\n{}\nfooter\n", "exact retained output ".repeat(128));
+    let canonical = CanonicalToolResult::text(full_output.clone());
+    let artifact = create_canonical_output_artifact(temp.path(), thread_id, &canonical).await;
+    let artifact_id = artifact.artifact_id().expect("existing artifact ID");
+
+    let projection = project_model_output(ModelProjectionInput {
+        spillable_text: full_output.clone(),
+        outcome: ToolOutputOutcome::Success,
+        essential_inline: serde_json::json!({
+            "raw_output_artifact_id": artifact_id,
+        }),
+        origin_call_id: "canonical-reuse-call".to_string(),
+        selection_facts: ProjectionSelectionFacts {
+            mode: "test",
+            available_fragments: 0,
+            selected_fragments: 0,
+            exact_duplicates_removed: 0,
+            selected_ids: Vec::new(),
+            omitted_inline_ids: Vec::new(),
+            partial_ids: Vec::new(),
+        },
+        applied_token_limit: 128,
+        projected_text: "header\nfooter".to_string(),
+        preserved_content: Vec::new(),
+        codex_home: temp.path().to_path_buf(),
+        thread_id: thread_id.to_string(),
+        tool_name: "exec_command".to_string(),
+        original_output_sha256: canonical.sha256.clone(),
+        original_output_tokens: canonical.approximate_tokens,
+        original_output_text: full_output.clone(),
+        invocation_sha256: None,
+        canonical,
+        semantic_class: "tool_output".to_string(),
+        source_dependencies: std::collections::BTreeSet::new(),
+        projection_eligible: true,
+        projection_truncated: true,
+        predetermined_ranges: Vec::new(),
+        predetermined_json_pointers: Vec::new(),
+        original_response: ResponseInputItem::FunctionCallOutput {
+            call_id: "canonical-reuse-call".to_string(),
+            output: FunctionCallOutputPayload::from_text(full_output),
+        },
+        materialization: ProjectionMaterialization::CanonicalArtifact,
+    })
+    .await
+    .expect("canonical projection should attach the existing artifact");
+
+    assert!(!projection.artifact_created);
+    assert!(projection.artifact_reused);
+    assert_eq!(
+        projection
+            .candidate
+            .as_ref()
+            .expect("canonical artifact candidate")
+            .artifact_id,
+        artifact_id
+    );
 }
 
 #[test]
@@ -1060,6 +1227,8 @@ async fn projection_owner_recovery_mixed_selectors_survive_code_mode_continuatio
         )),
         post_tool_use_payload: None,
         model_projection: Some(inner_projection),
+        source_dependencies: None,
+        code_mode_feedback: Vec::new(),
     };
     let continuation = nested
         .owner_drained_continuation()
@@ -1147,6 +1316,8 @@ async fn projection_owner_recovery_mixed_selectors_survive_code_mode_continuatio
         )),
         post_tool_use_payload: None,
         model_projection: Some(outer_projection),
+        source_dependencies: None,
+        code_mode_feedback: Vec::new(),
     };
 
     assert!(
@@ -1378,6 +1549,8 @@ fn metadata_free_new_tool_result_has_no_owner_drained_continuation() {
         )),
         post_tool_use_payload: None,
         model_projection: None,
+        source_dependencies: None,
+        code_mode_feedback: Vec::new(),
     };
 
     assert!(result.owner_drained_continuation().is_none());
@@ -1972,7 +2145,11 @@ async fn write_stdin_does_not_expose_default_pre_tool_use_payload() {
 }
 
 #[test]
-fn post_tool_use_feedback_output_keeps_code_mode_result_typed() {
+fn post_tool_feedback_survives_code_mode_projection() {
+    let model_visible = crate::tools::context::FunctionToolOutput::from_text(
+        "hook feedback".to_string(),
+        /*success*/ None,
+    );
     let result = AnyToolResult {
         call_id: "call-1".to_string(),
         payload: ToolPayload::Function {
@@ -1982,13 +2159,14 @@ fn post_tool_use_feedback_output_keeps_code_mode_result_typed() {
             original: Box::new(codex_tools::JsonToolOutput::new(
                 serde_json::json!({ "typed": true }),
             )),
-            model_visible: crate::tools::context::FunctionToolOutput::from_text(
-                "hook feedback".to_string(),
-                /*success*/ None,
-            ),
+            model_visible,
         }),
         post_tool_use_payload: None,
         model_projection: None,
+        source_dependencies: None,
+        code_mode_feedback: vec![FunctionCallOutputContentItem::InputText {
+            text: "hook feedback".to_string(),
+        }],
     };
 
     assert_eq!(
@@ -2001,35 +2179,41 @@ fn post_tool_use_feedback_output_keeps_code_mode_result_typed() {
         }
     );
 
-    let result = AnyToolResult {
-        call_id: "call-1".to_string(),
-        payload: ToolPayload::Function {
-            arguments: "{}".to_string(),
-        },
-        result: Box::new(PostToolUseFeedbackOutput {
-            original: Box::new(codex_tools::JsonToolOutput::new(
-                serde_json::json!({ "typed": true }),
-            )),
-            model_visible: crate::tools::context::FunctionToolOutput::from_text(
-                "hook feedback".to_string(),
-                /*success*/ None,
-            ),
-        }),
-        post_tool_use_payload: None,
-        model_projection: None,
-    };
+    for original in [
+        serde_json::json!({ "typed": true }),
+        serde_json::json!(["typed", true]),
+        serde_json::json!("typed"),
+        serde_json::Value::Null,
+    ] {
+        let model_visible = crate::tools::context::FunctionToolOutput::from_text(
+            "hook feedback".to_string(),
+            /*success*/ None,
+        );
+        let mut result = AnyToolResult {
+            call_id: "call-1".to_string(),
+            payload: ToolPayload::Function {
+                arguments: "{}".to_string(),
+            },
+            result: Box::new(PostToolUseFeedbackOutput {
+                original: Box::new(codex_tools::JsonToolOutput::new(original.clone())),
+                model_visible,
+            }),
+            post_tool_use_payload: None,
+            model_projection: None,
+            source_dependencies: None,
+            code_mode_feedback: vec![FunctionCallOutputContentItem::InputText {
+                text: "hook feedback".to_string(),
+            }],
+        };
 
-    assert_eq!(
-        result
-            .result
-            .canonical_result(&result.payload)
-            .and_then(|canonical| canonical.value),
-        Some(serde_json::json!({ "typed": true }))
-    );
-    assert_eq!(
-        result.code_mode_result(),
-        serde_json::json!({ "typed": true })
-    );
+        assert_eq!(
+            result.take_code_mode_feedback(),
+            vec![FunctionCallOutputContentItem::InputText {
+                text: "hook feedback".to_string(),
+            }]
+        );
+        assert_eq!(result.code_mode_result(), original);
+    }
 }
 
 #[tokio::test]

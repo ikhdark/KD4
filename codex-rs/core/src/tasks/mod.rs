@@ -100,7 +100,10 @@ pub(crate) use user_shell::UserShellCommandMode;
 pub(crate) use user_shell::UserShellCommandTask;
 pub(crate) use user_shell::execute_user_shell_command;
 
-const GRACEFULL_INTERRUPTION_TIMEOUT_MS: u64 = 100;
+const GRACEFUL_INTERRUPTION_MARGIN: Duration = Duration::from_millis(250);
+const GRACEFUL_INTERRUPTION_TIMEOUT: Duration =
+    crate::tools::parallel::TOOL_RUNTIME_CANCELLATION_GRACE
+        .saturating_add(GRACEFUL_INTERRUPTION_MARGIN);
 const TERMINAL_MUTATION_FINALIZATION_TIMEOUT: Duration = Duration::from_secs(1);
 // Sealing is the only terminal phase that may need to collect and persist the
 // complete proof bundle. Give it a little more room without lengthening every
@@ -172,6 +175,21 @@ impl TerminalDeadline {
             exhausted_phase: Arc::new(std::sync::Mutex::new(None)),
             phase_timings_ns: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
         }
+    }
+
+    fn start_with_initial_phase(phase: &'static str, phase_started: tokio::time::Instant) -> Self {
+        let deadline_started = tokio::time::Instant::now();
+        let deadline = Self {
+            started: phase_started,
+            deadline: deadline_started + TERMINALIZATION_DEADLINE,
+            exhausted_phase: Arc::new(std::sync::Mutex::new(None)),
+            phase_timings_ns: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+        };
+        deadline.record_elapsed(
+            phase,
+            deadline_started.saturating_duration_since(phase_started),
+        );
+        deadline
     }
 
     fn remaining(&self, per_operation_limit: Duration) -> Option<Duration> {
@@ -616,6 +634,71 @@ struct TerminalInteractionMilestone {
     cleared_active_turn: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DurableSideEffectStep {
+    RunSideEffect,
+    PersistReceipt,
+    Complete,
+}
+
+fn durable_side_effect_step(
+    side_effect_completed: bool,
+    receipt_persisted: bool,
+) -> DurableSideEffectStep {
+    if receipt_persisted {
+        DurableSideEffectStep::Complete
+    } else if side_effect_completed {
+        DurableSideEffectStep::PersistReceipt
+    } else {
+        DurableSideEffectStep::RunSideEffect
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalPublicationDecision {
+    Publish,
+    DeferForRolloutRepair,
+}
+
+fn terminal_publication_decision(rollout_structure_ready: bool) -> TerminalPublicationDecision {
+    if rollout_structure_ready {
+        TerminalPublicationDecision::Publish
+    } else {
+        TerminalPublicationDecision::DeferForRolloutRepair
+    }
+}
+
+fn terminal_rollout_structure_ready(
+    missing_call_output_repair_succeeded: bool,
+    required_rollout_repairs_complete: bool,
+) -> bool {
+    missing_call_output_repair_succeeded && required_rollout_repairs_complete
+}
+
+fn downgrade_for_required_finalization_memo(
+    gate: &mut TaskCompletionGate,
+    memo_persisted: bool,
+    failure_reason: &str,
+) -> bool {
+    if gate.status != TaskCompletionStatus::Passed || memo_persisted {
+        return false;
+    }
+    gate.status = TaskCompletionStatus::Partial;
+    gate.reasons.push(failure_reason.to_string());
+    gate.reasons.sort();
+    gate.reasons.dedup();
+    true
+}
+
+fn atomic_review_transition_persisted<T>(
+    transition: &Result<crate::task_evidence::AtomicReviewTransition<T>, TerminalWaitError>,
+) -> bool {
+    matches!(
+        transition,
+        Ok(crate::task_evidence::AtomicReviewTransition::Persisted(_))
+    )
+}
+
 fn select_terminal_authority<T>(durable: Option<T>, candidate: T) -> (T, bool) {
     match durable {
         Some(authority) => (authority, true),
@@ -700,14 +783,12 @@ async fn seal_terminal_final_proof(
             "worktree": &worktree_identity,
             "changed_paths": &changed_paths,
             "raw_artifact_digest": &raw_artifact_digest,
-            "workspace_epoch": workspace_epoch,
             "workspace_path_snapshots": &workspace_path_snapshot_identity,
         }),
     );
     let workspace_manifest_identity = final_proof_hash(
         "KD4_FINAL_PROOF_WORKSPACE_MANIFEST_V1",
         &serde_json::json!({
-            "workspace_epoch": workspace_epoch,
             "head": &head_identity,
             "index": &index_identity,
             "worktree": &worktree_identity,
@@ -770,6 +851,7 @@ async fn seal_terminal_final_proof(
             child_gate_state,
             reviewer_configuration_identity:
                 completion_review::completion_review_configuration_identity(turn_context),
+            typed_validation_proofs: authoritative.typed_validation_proofs,
             diff_snapshot: CandidateDiffSnapshotV1 {
                 candidate_id: String::new(),
                 diff_identity,
@@ -1173,6 +1255,7 @@ impl Session {
         outcome: TurnTerminalOutcome,
     ) -> BoxFuture<'a, TerminalSchedule> {
         Box::pin(async move {
+            let terminal_fence_started = tokio::time::Instant::now();
             let (task, turn_state, reasoning_policy_recorder, permit, coordinator) = {
                 let mut active = self.active_turn.lock().await;
                 let Some(active_turn) = active.as_mut() else {
@@ -1213,10 +1296,11 @@ impl Session {
             let session = Arc::clone(self);
             let terminal_turn_id = coordinator.turn_id().to_string();
             let finalizer_coordinator = Arc::clone(&coordinator);
-            // The supervisor has accepted the final task result at this point. Start the
-            // single terminalization clock before scheduling the session-owned finalizer so
-            // executor delay cannot extend the five-second correctness window.
-            let terminal_deadline = TerminalDeadline::start();
+            // The supervisor has accepted the final task result at this point. Preserve the
+            // admission-fence timing origin, but start the correctness deadline here so lock
+            // contention cannot shorten the finalizer's five-second window.
+            let terminal_deadline =
+                TerminalDeadline::start_with_initial_phase("fence", terminal_fence_started);
             self.terminal_tasks.spawn(
             async move {
                 let mut finalization = TerminalFinalization {
@@ -1348,6 +1432,8 @@ impl Session {
         event: &mut EventMsg,
         durable_outcome: String,
         durable_success_established: bool,
+        rollout_structure_ready: bool,
+        rollout_repair_items: Vec<ResponseItem>,
     ) -> TerminalInteractionMilestone {
         let terminal_identity = format!("{}:{}", self.thread_id, turn_context.sub_id);
         apply_terminal_phase_timings(event, &finalization.deadline.phase_timings_ns());
@@ -1360,6 +1446,23 @@ impl Session {
                 cleared_active_turn,
             };
         };
+        if terminal_publication_decision(rollout_structure_ready)
+            == TerminalPublicationDecision::DeferForRolloutRepair
+        {
+            self.schedule_terminal_after_rollout_repair(
+                Arc::clone(&finalization.task.turn_context),
+                event.clone(),
+                durable_outcome.clone(),
+                finalization.mutation_quiescent,
+                rollout_repair_items,
+            );
+            let cleared_active_turn = self.detach_terminal_turn(finalization).await;
+            return TerminalInteractionMilestone {
+                live_attempted: false,
+                live_delivered: false,
+                cleared_active_turn,
+            };
+        }
         let final_proof_identity = self
             .services
             .task_evidence
@@ -1545,9 +1648,8 @@ impl Session {
             permit.mark_delivery_attempted(live_delivered);
         }
         let requires_app_server_ack = turn_context.app_server_client_name.is_some();
-        if requires_app_server_ack || !live_delivered {
-            self.schedule_terminal_redelivery(authority.clone(), requires_app_server_ack);
-        }
+        let redelivery = (requires_app_server_ack || !live_delivered)
+            .then(|| (authority.clone(), requires_app_server_ack));
 
         let delivery_state = if live_delivered {
             DurableDeliveryState::Delivered
@@ -1572,15 +1674,26 @@ impl Session {
             TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
             self.services
                 .task_evidence
-                .update_terminal_interaction(update),
+                .update_terminal_interaction(update.clone()),
         )
         .await
         {
-            Ok(true) => {}
-            Ok(false) | Err(_) => warn!(
-                turn_id = %turn_context.sub_id,
-                "terminal interaction receipt remains pending; recovery will replay the exact authoritative event"
-            ),
+            Ok(true) => {
+                if let Some((authority, require_app_server_ack)) = redelivery {
+                    self.schedule_terminal_redelivery(authority, require_app_server_ack);
+                }
+            }
+            Ok(false) | Err(_) => {
+                warn!(
+                    turn_id = %turn_context.sub_id,
+                    "terminal interaction receipt remains pending; retrying persistence before any redelivery"
+                );
+                self.schedule_terminal_interaction_persistence_retry(
+                    Arc::clone(&finalization.task.turn_context),
+                    update,
+                    redelivery,
+                );
+            }
         }
 
         TerminalInteractionMilestone {
@@ -1653,6 +1766,142 @@ impl Session {
         }
     }
 
+    fn schedule_terminal_interaction_persistence_retry(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        update: TerminalInteractionUpdate,
+        redelivery: Option<(AuthoritativeTerminalEventV1, bool)>,
+    ) {
+        let session = Arc::clone(self);
+        self.terminal_tasks.spawn(async move {
+            let retry_interval = Duration::from_millis(500);
+            loop {
+                if session.shutting_down.load(Ordering::Acquire) {
+                    warn!(turn_id = %turn_context.sub_id, "terminal receipt persistence stopped at shutdown");
+                    return;
+                }
+                if session
+                    .services
+                    .task_evidence
+                    .update_terminal_interaction(update.clone())
+                    .await
+                {
+                    session
+                        .emit_terminalization_receipt(
+                            turn_context.as_ref(),
+                            &update.terminal_identity,
+                        )
+                        .await;
+                    if let Some((authority, require_app_server_ack)) = redelivery {
+                        session.schedule_terminal_redelivery(authority, require_app_server_ack);
+                    }
+                    return;
+                }
+                tokio::time::sleep(retry_interval).await;
+            }
+        });
+    }
+
+    fn schedule_completion_invalidation_retry(self: &Arc<Self>, reason: String) {
+        let session = Arc::clone(self);
+        self.terminal_tasks.spawn(async move {
+            let retry_interval = Duration::from_millis(500);
+            loop {
+                if session.shutting_down.load(Ordering::Acquire) {
+                    warn!(%reason, "completion invalidation persistence stopped at shutdown");
+                    return;
+                }
+                if matches!(
+                    session
+                        .services
+                        .task_evidence
+                        .invalidate_completion_after_terminal_emission_failure(&reason)
+                        .await,
+                    crate::task_evidence::AtomicReviewTransition::Persisted(())
+                ) {
+                    return;
+                }
+                tokio::time::sleep(retry_interval).await;
+            }
+        });
+    }
+
+    fn schedule_provisional_review_supersession_retry(self: &Arc<Self>) {
+        let session = Arc::clone(self);
+        self.terminal_tasks.spawn(async move {
+            let retry_interval = Duration::from_millis(500);
+            loop {
+                if session.shutting_down.load(Ordering::Acquire) {
+                    warn!("provisional completion-review supersession stopped at shutdown");
+                    return;
+                }
+                if matches!(
+                    session
+                        .services
+                        .task_evidence
+                        .supersede_current_provisional_completion_review()
+                        .await,
+                    crate::task_evidence::AtomicReviewTransition::Persisted(())
+                ) {
+                    return;
+                }
+                tokio::time::sleep(retry_interval).await;
+            }
+        });
+    }
+
+    fn schedule_terminal_after_rollout_repair(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        event: EventMsg,
+        semantic_outcome: String,
+        mutation_quiescent: bool,
+        mut rollout_repair_items: Vec<ResponseItem>,
+    ) {
+        let session = Arc::clone(self);
+        self.terminal_tasks.spawn(async move {
+            let retry_interval = Duration::from_millis(500);
+            loop {
+                if session.shutting_down.load(Ordering::Acquire) {
+                    warn!(turn_id = %turn_context.sub_id, "missing tool-output repair stopped at shutdown before terminal publication");
+                    return;
+                }
+                if !rollout_repair_items.is_empty() {
+                    match session
+                        .record_conversation_items_durable(
+                            &turn_context,
+                            &rollout_repair_items,
+                        )
+                        .await
+                    {
+                        Ok(()) => rollout_repair_items.clear(),
+                        Err(err) => {
+                            warn!(turn_id = %turn_context.sub_id, "retrying required rollout-item repair before terminal publication: {err}");
+                            tokio::time::sleep(retry_interval).await;
+                            continue;
+                        }
+                    }
+                }
+                match session
+                    .persist_missing_call_outputs_durable(&turn_context)
+                    .await
+                {
+                    Ok(_) => break,
+                    Err(err) => warn!(turn_id = %turn_context.sub_id, "retrying missing tool-output repair before terminal publication: {err}"),
+                }
+                tokio::time::sleep(retry_interval).await;
+            }
+            session
+                .establish_recovered_terminal_event(
+                    &turn_context,
+                    event,
+                    semantic_outcome,
+                    mutation_quiescent,
+                )
+                .await;
+        });
+    }
+
     pub(crate) fn schedule_terminal_redelivery(
         self: &Arc<Self>,
         authority: AuthoritativeTerminalEventV1,
@@ -1671,46 +1920,62 @@ impl Session {
                 entry.redelivery_scheduled = true;
             }
             let retry_interval = Duration::from_millis(500);
+            let mut live_side_effect_completed = false;
+            let mut receipt_persisted = false;
+            let mut pending_update = None;
             loop {
                 tokio::time::sleep(retry_interval).await;
-                if session.shutting_down.load(Ordering::Acquire)
-                    || (require_app_server_ack
-                        && session
-                            .terminal_delivery_acknowledged(
-                                &authority.terminal_identity,
-                                &authority.fingerprint,
-                            )
-                            .await)
-                {
+                if session.shutting_down.load(Ordering::Acquire) {
                     break;
                 }
-                let accepted = session.try_send_live_event_accepted(Event {
-                    id: authority.turn_id.clone(),
-                    msg: authority.event.clone(),
-                });
-                if accepted {
-                    let released = session
-                        .release_terminal_turn_after_live_handoff(&authority.turn_id)
-                        .await;
-                    let updated = session
-                        .services
-                        .task_evidence
-                        .update_terminal_interaction(TerminalInteractionUpdate {
-                            terminal_identity: authority.terminal_identity.clone(),
-                            delivery_state: DurableDeliveryState::Delivered,
-                            app_server_acknowledged: false,
-                            runtime_status_converged: true,
-                            rollout_mirrored: false,
-                            parent_notification_completed: false,
-                            post_terminal_cleanup_completed: false,
-                            active_turn_detached: released,
-                            terminal_interaction_released: released,
-                            recovery_state: TerminalRecoveryState::Recovered,
-                            phase_timings_ns: BTreeMap::new(),
-                            terminalization: None,
-                        })
-                        .await;
-                    if updated {
+                match durable_side_effect_step(live_side_effect_completed, receipt_persisted) {
+                    DurableSideEffectStep::RunSideEffect => {
+                        if require_app_server_ack
+                            && session
+                                .terminal_delivery_acknowledged(
+                                    &authority.terminal_identity,
+                                    &authority.fingerprint,
+                                )
+                                .await
+                        {
+                            break;
+                        }
+                        if session.try_send_live_event_accepted(Event {
+                            id: authority.turn_id.clone(),
+                            msg: authority.event.clone(),
+                        }) {
+                            let released = session
+                                .release_terminal_turn_after_live_handoff(&authority.turn_id)
+                                .await;
+                            pending_update = Some(TerminalInteractionUpdate {
+                                terminal_identity: authority.terminal_identity.clone(),
+                                delivery_state: DurableDeliveryState::Delivered,
+                                app_server_acknowledged: false,
+                                runtime_status_converged: true,
+                                rollout_mirrored: false,
+                                parent_notification_completed: false,
+                                post_terminal_cleanup_completed: false,
+                                active_turn_detached: released,
+                                terminal_interaction_released: released,
+                                recovery_state: TerminalRecoveryState::Recovered,
+                                phase_timings_ns: BTreeMap::new(),
+                                terminalization: None,
+                            });
+                            live_side_effect_completed = true;
+                        }
+                    }
+                    DurableSideEffectStep::PersistReceipt => {
+                        let Some(update) = pending_update.as_ref() else {
+                            live_side_effect_completed = false;
+                            continue;
+                        };
+                        receipt_persisted = session
+                            .services
+                            .task_evidence
+                            .update_terminal_interaction(update.clone())
+                            .await;
+                    }
+                    DurableSideEffectStep::Complete => {
                         let turn_context = session
                             .new_default_turn_with_sub_id(authority.turn_id.clone())
                             .await;
@@ -1720,9 +1985,12 @@ impl Session {
                                 &authority.terminal_identity,
                             )
                             .await;
-                    }
-                    if !require_app_server_ack {
-                        break;
+                        if !require_app_server_ack {
+                            break;
+                        }
+                        live_side_effect_completed = false;
+                        receipt_persisted = false;
+                        pending_update = None;
                     }
                 }
             }
@@ -1792,43 +2060,54 @@ impl Session {
         let session = Arc::clone(self);
         self.terminal_tasks.spawn(async move {
             let retry_interval = Duration::from_secs(1);
+            let mut notification_completed = false;
+            let mut receipt_persisted = false;
             loop {
                 tokio::time::sleep(retry_interval).await;
                 if session.shutting_down.load(Ordering::Acquire) {
                     return;
                 }
-                if !session
-                    .register_authoritative_terminal_delivery(
-                        terminal_identity.clone(),
-                        fingerprint.clone(),
-                    )
-                    .await
-                {
-                    return;
-                }
-                if session
-                    .maybe_notify_parent_of_terminal_turn(turn_context.as_ref(), &event)
-                    .await
-                {
-                    let _ = session
-                        .services
-                        .task_evidence
-                        .update_terminal_interaction(TerminalInteractionUpdate {
-                            terminal_identity,
-                            delivery_state: DurableDeliveryState::Claimed,
-                            app_server_acknowledged: false,
-                            runtime_status_converged: true,
-                            rollout_mirrored: false,
-                            parent_notification_completed: true,
-                            post_terminal_cleanup_completed: false,
-                            active_turn_detached: false,
-                            terminal_interaction_released: false,
-                            recovery_state: TerminalRecoveryState::None,
-                            phase_timings_ns: BTreeMap::new(),
-                            terminalization: None,
-                        })
-                        .await;
-                    return;
+                match durable_side_effect_step(notification_completed, receipt_persisted) {
+                    DurableSideEffectStep::RunSideEffect => {
+                        if !session
+                            .register_authoritative_terminal_delivery(
+                                terminal_identity.clone(),
+                                fingerprint.clone(),
+                            )
+                            .await
+                        {
+                            return;
+                        }
+                        notification_completed = session
+                            .maybe_notify_parent_of_terminal_turn(turn_context.as_ref(), &event)
+                            .await;
+                    }
+                    DurableSideEffectStep::PersistReceipt => {
+                        receipt_persisted = session
+                            .services
+                            .task_evidence
+                            .update_terminal_interaction(TerminalInteractionUpdate {
+                                terminal_identity: terminal_identity.clone(),
+                                delivery_state: DurableDeliveryState::Claimed,
+                                app_server_acknowledged: false,
+                                runtime_status_converged: true,
+                                rollout_mirrored: false,
+                                parent_notification_completed: true,
+                                post_terminal_cleanup_completed: false,
+                                active_turn_detached: false,
+                                terminal_interaction_released: false,
+                                recovery_state: TerminalRecoveryState::None,
+                                phase_timings_ns: BTreeMap::new(),
+                                terminalization: None,
+                            })
+                            .await;
+                    }
+                    DurableSideEffectStep::Complete => {
+                        session
+                            .emit_terminalization_receipt(turn_context.as_ref(), &terminal_identity)
+                            .await;
+                        return;
+                    }
                 }
             }
         });
@@ -1863,76 +2142,97 @@ impl Session {
             .pending_authoritative_terminal_events()
             .await
         {
-            let rollout_mirrored = self
-                .ensure_terminal_authority_mirrored_in_rollout(&authority)
+            self.recover_authoritative_terminal_delivery(
+                authority, /*require_app_server_ack*/ true,
+            )
+            .await;
+        }
+    }
+
+    async fn recover_authoritative_terminal_delivery(
+        self: &Arc<Self>,
+        authority: AuthoritativeTerminalEventV1,
+        require_app_server_ack: bool,
+    ) {
+        let rollout_mirrored = self
+            .ensure_terminal_authority_mirrored_in_rollout(&authority)
+            .await;
+        if !self
+            .register_authoritative_terminal_delivery(
+                authority.terminal_identity.clone(),
+                authority.fingerprint.clone(),
+            )
+            .await
+        {
+            warn!(
+                turn_id = %authority.turn_id,
+                "skipping conflicting recovered terminal delivery"
+            );
+            return;
+        }
+        let live_delivered = self.try_send_live_event_accepted(Event {
+            id: authority.turn_id.clone(),
+            msg: authority.event.clone(),
+        });
+        let turn_context = self
+            .new_default_turn_with_sub_id(authority.turn_id.clone())
+            .await;
+        let parent_notification_completed = self
+            .maybe_notify_parent_of_terminal_turn(turn_context.as_ref(), &authority.event)
+            .await;
+        self.services
+            .guardian_rejection_circuit_breaker
+            .lock()
+            .await
+            .clear_turn(&authority.turn_id);
+        let released = self
+            .release_terminal_turn_after_live_handoff(&authority.turn_id)
+            .await;
+        let update = TerminalInteractionUpdate {
+            terminal_identity: authority.terminal_identity.clone(),
+            delivery_state: if live_delivered {
+                DurableDeliveryState::Delivered
+            } else {
+                DurableDeliveryState::DeliveryFailed
+            },
+            // A non-app-server client accepts the live channel handoff directly; there is no
+            // later protocol acknowledgement to wait for before restart recovery is complete.
+            app_server_acknowledged: !require_app_server_ack,
+            runtime_status_converged: true,
+            rollout_mirrored,
+            parent_notification_completed,
+            post_terminal_cleanup_completed: true,
+            active_turn_detached: released,
+            terminal_interaction_released: released,
+            recovery_state: TerminalRecoveryState::Recovered,
+            phase_timings_ns: BTreeMap::new(),
+            terminalization: None,
+        };
+        let redelivery = (require_app_server_ack || !live_delivered)
+            .then(|| (authority.clone(), require_app_server_ack));
+        let updated = self
+            .services
+            .task_evidence
+            .update_terminal_interaction(update.clone())
+            .await;
+        if updated {
+            self.emit_terminalization_receipt(turn_context.as_ref(), &authority.terminal_identity)
                 .await;
-            if !self
-                .register_authoritative_terminal_delivery(
-                    authority.terminal_identity.clone(),
-                    authority.fingerprint.clone(),
-                )
-                .await
-            {
-                warn!(
-                    turn_id = %authority.turn_id,
-                    "skipping conflicting recovered terminal delivery"
-                );
-                continue;
+            if let Some((authority, require_app_server_ack)) = redelivery {
+                self.schedule_terminal_redelivery(authority, require_app_server_ack);
             }
-            let live_delivered = self.try_send_live_event_accepted(Event {
-                id: authority.turn_id.clone(),
-                msg: authority.event.clone(),
-            });
-            let turn_context = self
-                .new_default_turn_with_sub_id(authority.turn_id.clone())
-                .await;
-            let parent_notification_completed = self
-                .maybe_notify_parent_of_terminal_turn(turn_context.as_ref(), &authority.event)
-                .await;
-            self.services
-                .guardian_rejection_circuit_breaker
-                .lock()
-                .await
-                .clear_turn(&authority.turn_id);
-            let released = self
-                .release_terminal_turn_after_live_handoff(&authority.turn_id)
-                .await;
-            let updated = self
-                .services
-                .task_evidence
-                .update_terminal_interaction(TerminalInteractionUpdate {
-                    terminal_identity: authority.terminal_identity.clone(),
-                    delivery_state: if live_delivered {
-                        DurableDeliveryState::Delivered
-                    } else {
-                        DurableDeliveryState::DeliveryFailed
-                    },
-                    app_server_acknowledged: false,
-                    runtime_status_converged: true,
-                    rollout_mirrored,
-                    parent_notification_completed,
-                    post_terminal_cleanup_completed: true,
-                    active_turn_detached: released,
-                    terminal_interaction_released: released,
-                    recovery_state: TerminalRecoveryState::Recovered,
-                    phase_timings_ns: BTreeMap::new(),
-                    terminalization: None,
-                })
-                .await;
-            if updated {
-                self.emit_terminalization_receipt(
-                    turn_context.as_ref(),
-                    &authority.terminal_identity,
-                )
-                .await;
-            }
-            if !parent_notification_completed {
-                self.schedule_parent_terminal_notification_retry(
-                    Arc::clone(&turn_context),
-                    authority.event.clone(),
-                );
-            }
-            self.schedule_terminal_redelivery(authority, /*require_app_server_ack*/ true);
+        } else {
+            self.schedule_terminal_interaction_persistence_retry(
+                Arc::clone(&turn_context),
+                update,
+                redelivery,
+            );
+        }
+        if !parent_notification_completed {
+            self.schedule_parent_terminal_notification_retry(
+                Arc::clone(&turn_context),
+                authority.event.clone(),
+            );
         }
     }
 
@@ -1970,13 +2270,16 @@ impl Session {
     }
 
     pub(crate) async fn recover_bound_terminal_intent(self: &Arc<Self>, turn_id: String) {
-        if self
+        if let Some(authority) = self
             .services
             .task_evidence
             .authoritative_terminal_event(&format!("{}:{turn_id}", self.thread_id))
             .await
-            .is_some()
         {
+            self.recover_authoritative_terminal_delivery(
+                authority, /*require_app_server_ack*/ false,
+            )
+            .await;
             return;
         }
         let Some(intent) = self
@@ -2214,9 +2517,8 @@ impl Session {
             msg: authority.event.clone(),
         });
         let requires_app_server_ack = turn_context.app_server_client_name.is_some();
-        if requires_app_server_ack || !live_delivered {
-            self.schedule_terminal_redelivery(authority.clone(), requires_app_server_ack);
-        }
+        let redelivery = (requires_app_server_ack || !live_delivered)
+            .then(|| (authority.clone(), requires_app_server_ack));
         let parent_notification_completed = self
             .finish_terminal_event_dispatch(turn_context, &authority.event)
             .await;
@@ -2226,31 +2528,41 @@ impl Session {
                 authority.event.clone(),
             );
         }
+        let update = TerminalInteractionUpdate {
+            terminal_identity,
+            delivery_state: if live_delivered {
+                DurableDeliveryState::Delivered
+            } else {
+                DurableDeliveryState::DeliveryFailed
+            },
+            app_server_acknowledged: false,
+            runtime_status_converged: true,
+            rollout_mirrored,
+            parent_notification_completed,
+            post_terminal_cleanup_completed: true,
+            active_turn_detached: true,
+            terminal_interaction_released: true,
+            recovery_state: TerminalRecoveryState::Recovered,
+            phase_timings_ns: BTreeMap::new(),
+            terminalization: None,
+        };
         let updated = self
             .services
             .task_evidence
-            .update_terminal_interaction(TerminalInteractionUpdate {
-                terminal_identity,
-                delivery_state: if live_delivered {
-                    DurableDeliveryState::Delivered
-                } else {
-                    DurableDeliveryState::DeliveryFailed
-                },
-                app_server_acknowledged: false,
-                runtime_status_converged: true,
-                rollout_mirrored,
-                parent_notification_completed,
-                post_terminal_cleanup_completed: true,
-                active_turn_detached: true,
-                terminal_interaction_released: true,
-                recovery_state: TerminalRecoveryState::Recovered,
-                phase_timings_ns: BTreeMap::new(),
-                terminalization: None,
-            })
+            .update_terminal_interaction(update.clone())
             .await;
         if updated {
             self.emit_terminalization_receipt(turn_context.as_ref(), &authority.terminal_identity)
                 .await;
+            if let Some((authority, require_app_server_ack)) = redelivery {
+                self.schedule_terminal_redelivery(authority, require_app_server_ack);
+            }
+        } else {
+            self.schedule_terminal_interaction_persistence_retry(
+                Arc::clone(turn_context),
+                update,
+                redelivery,
+            );
         }
     }
 
@@ -2423,11 +2735,11 @@ impl Session {
         if requires_abort_cleanup {
             tokio::select! {
                 _ = finalization.task.done.notified() => {},
-                _ = tokio::time::sleep(Duration::from_millis(GRACEFULL_INTERRUPTION_TIMEOUT_MS)) => {
+                _ = tokio::time::sleep(GRACEFUL_INTERRUPTION_TIMEOUT) => {
                     warn!(
                         "task {} didn't complete gracefully after {}ms",
                         turn_context.sub_id,
-                        GRACEFULL_INTERRUPTION_TIMEOUT_MS
+                        GRACEFUL_INTERRUPTION_TIMEOUT.as_millis()
                     );
                 }
             }
@@ -2452,12 +2764,45 @@ impl Session {
             }
         }
 
+        let missing_call_output_repair_failure = match finalization
+            .deadline
+            .run(
+                "preparation",
+                TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
+                self.persist_missing_call_outputs_durable(&turn_context),
+            )
+            .await
+        {
+            Ok(Ok(0)) => None,
+            Ok(Ok(output_count)) => {
+                warn!(
+                    turn_id = %turn_context.sub_id,
+                    output_count,
+                    "persisted missing tool outputs before terminal event"
+                );
+                None
+            }
+            Ok(Err(err)) => {
+                let reason =
+                    format!("missing tool-output repair failed before terminal publication: {err}");
+                warn!(turn_id = %turn_context.sub_id, %reason);
+                Some(reason)
+            }
+            Err(_) => {
+                let reason =
+                    "missing tool-output repair timed out before terminal publication".to_string();
+                warn!(turn_id = %turn_context.sub_id, %reason);
+                Some(reason)
+            }
+        };
+
         turn_context.turn_timing_state.begin_finalization();
 
         let explicit_abort_reason = match &finalization.outcome {
             TurnTerminalOutcome::Aborted(reason) => Some(reason.clone()),
             _ => None,
         };
+        let mut interrupted_marker_repair = Vec::new();
         if explicit_abort_reason == Some(TurnAbortReason::Interrupted)
             && let Some(marker) = interrupted_turn_history_marker(
                 InterruptedTurnHistoryMarker::from_config_and_version(
@@ -2466,29 +2811,26 @@ impl Session {
                 ),
             )
         {
-            let marker_persistence = async {
-                self.record_conversation_items(
-                    turn_context.as_ref(),
-                    std::slice::from_ref(&marker),
-                )
-                .await;
-                self.flush_rollout().await
-            };
             match finalization
                 .deadline
                 .run(
                     "preparation",
                     TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                    marker_persistence,
+                    self.record_conversation_items_durable(
+                        &turn_context,
+                        std::slice::from_ref(&marker),
+                    ),
                 )
                 .await
             {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
-                    warn!("failed to flush interrupted-turn marker before terminal event: {err}")
+                    warn!("failed to persist interrupted-turn marker before terminal event: {err}");
+                    interrupted_marker_repair.push(marker);
                 }
                 Err(_) => {
-                    warn!(turn_id = %turn_context.sub_id, "timed out persisting interrupted-turn marker before terminal event")
+                    warn!(turn_id = %turn_context.sub_id, "timed out persisting interrupted-turn marker before terminal event");
+                    interrupted_marker_repair.push(marker);
                 }
             }
         }
@@ -2625,6 +2967,9 @@ impl Session {
             completion_review_partial_reasons
                 .push("terminal hooks did not finish before completion review".to_string());
         }
+        if let Some(reason) = missing_call_output_repair_failure.as_ref() {
+            completion_review_partial_reasons.push(reason.clone());
+        }
         let mut atomically_persisted_completion = None;
         let mut terminal_authoritative_inputs = None;
         if abort_reason.is_none()
@@ -2709,11 +3054,17 @@ impl Session {
                                 ) =>
                         {
                             if !completion_review::user_sources_still_current(&dossier).await {
-                                let _ = self
+                                let superseded = self
                                     .services
                                     .task_evidence
                                     .supersede_provisional_completion_review(&dossier)
                                     .await;
+                                if !matches!(
+                                    superseded,
+                                    crate::task_evidence::AtomicReviewTransition::Persisted(())
+                                ) {
+                                    self.schedule_provisional_review_supersession_retry();
+                                }
                                 completion_review_partial_reasons.push(
                                     "a file-backed user source changed before terminal closure"
                                         .to_string(),
@@ -2795,13 +3146,19 @@ impl Session {
                                             crate::task_evidence::AtomicReviewTransition::Superseded
                                             | crate::task_evidence::AtomicReviewTransition::Failed => {
                                                 if let Some(retry_dossier) = retry_dossier.as_ref() {
-                                                    let _ = self
+                                                    let superseded = self
                                                         .services
                                                         .task_evidence
                                                         .supersede_provisional_completion_review(
                                                             retry_dossier,
                                                         )
                                                         .await;
+                                                    if !matches!(
+                                                        superseded,
+                                                        crate::task_evidence::AtomicReviewTransition::Persisted(())
+                                                    ) {
+                                                        self.schedule_provisional_review_supersession_retry();
+                                                    }
                                                 }
                                                 completion_review_partial_reasons.push(
                                                     "the reviewed candidate changed during terminal finalization"
@@ -2820,11 +3177,17 @@ impl Session {
                             }
                         }
                         Some(dossier) => {
-                            let _ = self
+                            let superseded = self
                                 .services
                                 .task_evidence
                                 .supersede_provisional_completion_review(&dossier)
                                 .await;
+                            if !matches!(
+                                superseded,
+                                crate::task_evidence::AtomicReviewTransition::Persisted(())
+                            ) {
+                                self.schedule_provisional_review_supersession_retry();
+                            }
                             completion_review_partial_reasons.push(
                                 "the reviewed candidate was invalidated before terminal closure"
                                     .to_string(),
@@ -2848,6 +3211,7 @@ impl Session {
                     gate.reasons.push(reason.to_string());
                     gate.reasons.sort();
                     gate.reasons.dedup();
+                    self.schedule_completion_invalidation_retry(reason.to_string());
                 }
             }
         }
@@ -3006,7 +3370,7 @@ impl Session {
                     let conservative_rerun_count =
                         u32::try_from(freshness_diagnostics.conservative_reruns)
                             .unwrap_or(u32::MAX);
-                    let gate = match result {
+                    let mut gate = match result {
                         FinalProofSealResultV1::Sealed {
                             checkpoint,
                             telemetry,
@@ -3055,62 +3419,105 @@ impl Session {
                                     .memoized_finalization_result(&turn_context.sub_id),
                             )
                             .await;
-                        if let Ok(Some(memoized)) = memoized
-                            && surfaced_result.is_none()
-                        {
-                            finalization
-                                .deadline
-                                .record_elapsed("terminal_memo_hit", Duration::ZERO);
-                            last_agent_message = Some(memoized);
-                        } else if let Some(message) = last_agent_message.clone() {
-                            let _ = finalization
-                                .deadline
-                                .run(
-                                    "completion_finalization",
-                                    TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                                    async {
-                                        let Some((_checkpoint_id, payload)) = self
-                                            .services
-                                            .task_evidence
-                                            .completion_checkpoint_payload()
-                                            .await
-                                        else {
-                                            return false;
-                                        };
-                                        let Ok(checkpoint) =
-                                            serde_json::from_str::<CompletionCheckpointV1>(
-                                                &payload,
-                                            )
-                                        else {
-                                            return false;
-                                        };
-                                        let requested_artifacts = checkpoint
-                                            .evidence_artifact_references
-                                            .into_iter()
-                                            .collect::<BTreeSet<_>>();
-                                        let history = self.clone_history().await;
-                                        let projected = history.prepare_for_finalization(
-                                            &turn_context.model_info.input_modalities,
-                                            crate::context::CompletionCheckpointContext::new(
-                                                payload,
+                        let (memo_persisted, memo_failure_reason) = match memoized {
+                            Ok(Some(memoized)) => {
+                                finalization
+                                    .deadline
+                                    .record_elapsed("terminal_memo_hit", Duration::ZERO);
+                                if surfaced_result.is_none() {
+                                    last_agent_message = Some(memoized);
+                                }
+                                (true, None)
+                            }
+                            Ok(None) => {
+                                if let Some(message) = last_agent_message.clone() {
+                                    match finalization
+                                        .deadline
+                                        .run(
+                                            "completion_finalization",
+                                            TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
+                                            async {
+                                                let Some((_checkpoint_id, payload)) = self
+                                                    .services
+                                                    .task_evidence
+                                                    .completion_checkpoint_payload()
+                                                    .await
+                                                else {
+                                                    return false;
+                                                };
+                                                let Ok(checkpoint) = serde_json::from_str::<
+                                                    CompletionCheckpointV1,
+                                                >(&payload)
+                                                else {
+                                                    return false;
+                                                };
+                                                let requested_artifacts = checkpoint
+                                                    .evidence_artifact_references
+                                                    .into_iter()
+                                                    .collect::<BTreeSet<_>>();
+                                                let history = self.clone_history().await;
+                                                let projected = history.prepare_for_finalization(
+                                                    &turn_context.model_info.input_modalities,
+                                                    crate::context::CompletionCheckpointContext::new(
+                                                        payload,
+                                                    ),
+                                                    &requested_artifacts,
+                                                );
+                                                if projected.items().is_empty() {
+                                                    return false;
+                                                }
+                                                self.services
+                                                    .task_evidence
+                                                    .record_finalization_result(
+                                                        turn_context.sub_id.clone(),
+                                                        message,
+                                                        finalization.mutation_quiescent,
+                                                        finalization.mutation_quiescent,
+                                                    )
+                                                    .await
+                                            },
+                                        )
+                                        .await
+                                    {
+                                        Ok(true) => (true, None),
+                                        Ok(false) => (
+                                            false,
+                                            Some(
+                                                "the exact finalization memo was not durably recorded"
+                                                    .to_string(),
                                             ),
-                                            &requested_artifacts,
-                                        );
-                                        if projected.items().is_empty() {
-                                            return false;
-                                        }
-                                        self.services
-                                            .task_evidence
-                                            .record_finalization_result(
-                                                turn_context.sub_id.clone(),
-                                                message,
-                                                finalization.mutation_quiescent,
-                                                finalization.mutation_quiescent,
-                                            )
-                                            .await
-                                    },
-                                )
-                                .await;
+                                        ),
+                                        Err(_) => (
+                                            false,
+                                            Some(
+                                                "finalization memo persistence timed out"
+                                                    .to_string(),
+                                            ),
+                                        ),
+                                    }
+                                } else {
+                                    (
+                                        false,
+                                        Some(
+                                            "passed final proof had no final message to memoize"
+                                                .to_string(),
+                                        ),
+                                    )
+                                }
+                            }
+                            Err(_) => (
+                                false,
+                                Some("finalization memo lookup timed out".to_string()),
+                            ),
+                        };
+                        if let Some(reason) = memo_failure_reason
+                            && downgrade_for_required_finalization_memo(
+                                &mut gate,
+                                memo_persisted,
+                                &reason,
+                            )
+                        {
+                            self.schedule_completion_invalidation_retry(reason);
                         }
                     }
                     completion = Some(gate);
@@ -3222,7 +3629,7 @@ impl Session {
                     gate.reasons.sort();
                     gate.reasons.dedup();
                 }
-                let _ = finalization
+                let invalidation = finalization
                     .deadline
                     .run(
                         "freshness",
@@ -3232,6 +3639,10 @@ impl Session {
                             .invalidate_completion_after_terminal_emission_failure(reason),
                     )
                     .await;
+                if !atomic_review_transition_persisted(&invalidation) {
+                    warn!(turn_id = %turn_context.sub_id, %reason, "completion invalidation was not durably persisted before terminal emission");
+                    self.schedule_completion_invalidation_retry(reason.to_string());
+                }
             }
         }
         let completed_at = timing_snapshot.completed_at_unix_secs;
@@ -3299,6 +3710,10 @@ impl Session {
             .reasoning_policy_recorder
             .take_summary(turn_context.sub_id.clone());
         let durable_outcome = semantic_terminal_outcome(&event);
+        let rollout_structure_ready = terminal_rollout_structure_ready(
+            missing_call_output_repair_failure.is_none(),
+            interrupted_marker_repair.is_empty(),
+        );
         let terminal_milestone = self
             .publish_terminal_interaction_milestone(
                 finalization,
@@ -3306,6 +3721,8 @@ impl Session {
                 &mut event,
                 durable_outcome,
                 passed_root_completion,
+                rollout_structure_ready,
+                interrupted_marker_repair,
             )
             .await;
         if !finalization.coordinator.durable_terminal_committed() {
@@ -3447,26 +3864,29 @@ impl Session {
             };
             let phase_timings_ns = finalization.deadline.phase_timings_ns();
             let terminal_identity = format!("{}:{}", self.thread_id, turn_context.sub_id);
-            let task_evidence = self.services.task_evidence.clone();
             let session = Arc::clone(self);
             let turn_context = Arc::clone(&turn_context);
             self.spawn_terminal_receipt_task(async move {
+                let update = TerminalInteractionUpdate {
+                    terminal_identity: terminal_identity.clone(),
+                    delivery_state,
+                    app_server_acknowledged: false,
+                    runtime_status_converged: true,
+                    rollout_mirrored: false,
+                    parent_notification_completed,
+                    post_terminal_cleanup_completed: true,
+                    active_turn_detached: cleared_active_turn,
+                    terminal_interaction_released: cleared_active_turn,
+                    recovery_state: pending_terminal_recovery_state(delivery_state),
+                    phase_timings_ns,
+                    terminalization: final_terminalization.clone(),
+                };
                 let persistence = tokio::time::timeout(
                     TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                    task_evidence.update_terminal_interaction(TerminalInteractionUpdate {
-                        terminal_identity: terminal_identity.clone(),
-                        delivery_state,
-                        app_server_acknowledged: false,
-                        runtime_status_converged: true,
-                        rollout_mirrored: false,
-                        parent_notification_completed,
-                        post_terminal_cleanup_completed: true,
-                        active_turn_detached: cleared_active_turn,
-                        terminal_interaction_released: cleared_active_turn,
-                        recovery_state: pending_terminal_recovery_state(delivery_state),
-                        phase_timings_ns,
-                        terminalization: final_terminalization.clone(),
-                    }),
+                    session
+                        .services
+                        .task_evidence
+                        .update_terminal_interaction(update.clone()),
                 )
                 .await;
                 match persistence {
@@ -3478,11 +3898,13 @@ impl Session {
                             )
                             .await;
                     }
-                    Ok(false) => {
-                        warn!(turn_id = %turn_context.sub_id, "failed to persist late terminalization receipt; completed turn remains authoritative");
-                    }
-                    Err(_) => {
-                        warn!(turn_id = %turn_context.sub_id, "timed out persisting late terminalization receipt; completed turn remains authoritative");
+                    Ok(false) | Err(_) => {
+                        warn!(turn_id = %turn_context.sub_id, "late terminalization receipt remains pending; retrying persistence only");
+                        session.schedule_terminal_interaction_persistence_retry(
+                            Arc::clone(&turn_context),
+                            update,
+                            None,
+                        );
                     }
                 }
             });
@@ -3535,6 +3957,54 @@ impl Session {
             .turn_metadata_state
             .cancel_git_enrichment_task();
         turn_context.turn_timing_state.begin_finalization();
+        let missing_call_output_repair_succeeded = matches!(
+            finalization
+                .deadline
+                .run(
+                    "preparation",
+                    TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
+                    self.persist_missing_call_outputs_durable(&turn_context),
+                )
+                .await,
+            Ok(Ok(_))
+        );
+
+        let abort_reason = match &finalization.outcome {
+            TurnTerminalOutcome::Aborted(reason) => Some(reason.clone()),
+            TurnTerminalOutcome::ReturnedError(CodexErr::TurnAborted) => {
+                Some(TurnAbortReason::Interrupted)
+            }
+            _ => None,
+        };
+        let mut interrupted_marker_repair = Vec::new();
+        if abort_reason == Some(TurnAbortReason::Interrupted)
+            && let Some(marker) = interrupted_turn_history_marker(
+                InterruptedTurnHistoryMarker::from_config_and_version(
+                    turn_context.config.as_ref(),
+                    turn_context.multi_agent_version,
+                ),
+            )
+            && !matches!(
+                finalization
+                    .deadline
+                    .run(
+                        "preparation",
+                        TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
+                        self.record_conversation_items_durable(
+                            &turn_context,
+                            std::slice::from_ref(&marker),
+                        ),
+                    )
+                    .await,
+                Ok(Ok(()))
+            )
+        {
+            interrupted_marker_repair.push(marker);
+        }
+        let rollout_structure_ready = terminal_rollout_structure_ready(
+            missing_call_output_repair_succeeded,
+            interrupted_marker_repair.is_empty(),
+        );
 
         let prior_delivery_state = finalization.coordinator.delivery_state();
         let had_authoritative_claim =
@@ -3557,14 +4027,7 @@ impl Session {
                     &[],
                 );
             }
-            let abort_reason = match &finalization.outcome {
-                TurnTerminalOutcome::Aborted(reason) => Some(reason.clone()),
-                TurnTerminalOutcome::ReturnedError(CodexErr::TurnAborted) => {
-                    Some(TurnAbortReason::Interrupted)
-                }
-                _ => None,
-            };
-            let mut event = if let Some(reason) = abort_reason {
+            let mut event = if let Some(reason) = abort_reason.clone() {
                 EventMsg::TurnAborted(TurnAbortedEvent {
                     turn_id: Some(turn_context.sub_id.clone()),
                     reason,
@@ -3600,6 +4063,8 @@ impl Session {
                     &mut event,
                     "fail_safe".to_string(),
                     false,
+                    rollout_structure_ready,
+                    interrupted_marker_repair,
                 )
                 .await;
             if milestone.live_attempted {
@@ -3626,17 +4091,19 @@ impl Session {
         )
         .await;
         if !finalization.coordinator.durable_terminal_committed() {
+            let reason = "terminal emission failed after completion-review closure";
             let invalidation = self
                 .services
                 .task_evidence
-                .invalidate_completion_after_terminal_emission_failure(
-                    "terminal emission failed after completion-review closure",
-                );
-            if tokio::time::timeout(TERMINAL_MUTATION_FINALIZATION_TIMEOUT, invalidation)
-                .await
-                .is_err()
-            {
-                warn!(turn_id = %turn_context.sub_id, "timed out invalidating completion during fail-safe cleanup");
+                .invalidate_completion_after_terminal_emission_failure(reason);
+            let transition =
+                tokio::time::timeout(TERMINAL_MUTATION_FINALIZATION_TIMEOUT, invalidation).await;
+            if !matches!(
+                transition,
+                Ok(crate::task_evidence::AtomicReviewTransition::Persisted(()))
+            ) {
+                warn!(turn_id = %turn_context.sub_id, "completion invalidation did not persist during fail-safe cleanup");
+                self.schedule_completion_invalidation_retry(reason.to_string());
             }
         }
         let mut fail_safe_parent_notification_completed = false;
@@ -3710,26 +4177,35 @@ impl Session {
                 CoordinatorDeliveryState::Delivered => DurableDeliveryState::Delivered,
                 CoordinatorDeliveryState::DeliveryFailed => DurableDeliveryState::DeliveryFailed,
             };
-            let _ = tokio::time::timeout(
+            let update = TerminalInteractionUpdate {
+                terminal_identity: format!("{}:{}", self.thread_id, turn_context.sub_id),
+                delivery_state,
+                app_server_acknowledged: false,
+                runtime_status_converged: true,
+                rollout_mirrored: false,
+                parent_notification_completed: fail_safe_parent_notification_completed,
+                post_terminal_cleanup_completed: true,
+                active_turn_detached: true,
+                terminal_interaction_released: true,
+                recovery_state: TerminalRecoveryState::Recovered,
+                phase_timings_ns: finalization.deadline.phase_timings_ns(),
+                terminalization: None,
+            };
+            let persisted = tokio::time::timeout(
                 TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                self.services.task_evidence.update_terminal_interaction(
-                    TerminalInteractionUpdate {
-                        terminal_identity: format!("{}:{}", self.thread_id, turn_context.sub_id),
-                        delivery_state,
-                        app_server_acknowledged: false,
-                        runtime_status_converged: true,
-                        rollout_mirrored: false,
-                        parent_notification_completed: fail_safe_parent_notification_completed,
-                        post_terminal_cleanup_completed: true,
-                        active_turn_detached: true,
-                        terminal_interaction_released: true,
-                        recovery_state: TerminalRecoveryState::Recovered,
-                        phase_timings_ns: finalization.deadline.phase_timings_ns(),
-                        terminalization: None,
-                    },
-                ),
+                self.services
+                    .task_evidence
+                    .update_terminal_interaction(update.clone()),
             )
             .await;
+            if !matches!(persisted, Ok(true)) {
+                warn!(turn_id = %turn_context.sub_id, "fail-safe terminal interaction receipt remains pending; retrying persistence only");
+                self.schedule_terminal_interaction_persistence_retry(
+                    Arc::clone(&turn_context),
+                    update,
+                    None,
+                );
+            }
         }
     }
 }

@@ -317,11 +317,27 @@ impl PendingProcessRegistration {
         process: Arc<UnifiedExecProcess>,
         network_approval: Option<DeferredNetworkApproval>,
     ) {
+        assert!(
+            !self.committed,
+            "cannot attach a process after registration is committed"
+        );
+        assert!(
+            self.primary_process.is_none(),
+            "cannot attach more than one primary process to a registration"
+        );
         self.primary_process = Some(process);
         self.network_approval = network_approval;
     }
 
     pub(super) fn set_initial_exec_command_active(&mut self, active: Arc<AtomicBool>) {
+        assert!(
+            !self.committed,
+            "cannot attach command activity after registration is committed"
+        );
+        assert!(
+            self.initial_exec_command_active.is_none(),
+            "cannot attach command activity more than once"
+        );
         self.initial_exec_command_active = Some(active);
     }
 
@@ -353,6 +369,7 @@ impl PendingProcessRegistration {
     }
 
     async fn cleanup(&mut self) -> Result<(), String> {
+        assert!(!self.committed, "cannot clean up a committed registration");
         if let Some(active) = self.initial_exec_command_active.as_ref() {
             active.store(false, Ordering::Release);
         }
@@ -363,6 +380,14 @@ impl PendingProcessRegistration {
     }
 
     fn commit(&mut self) {
+        assert!(
+            !self.committed,
+            "cannot commit a registration more than once"
+        );
+        assert!(
+            self.primary_process.is_some(),
+            "cannot commit before the primary process is attached"
+        );
         self.committed = true;
         self.pending_spawns.clear();
     }
@@ -602,16 +627,6 @@ async fn finish_deferred_network_approval_after_process_exit_for_session(
     finish_deferred_network_approval_for_session(session, deferred).await
 }
 
-fn fail_process_with_message(process: &UnifiedExecProcess, message: String) -> UnifiedExecError {
-    if let Some(message) = process.failure_message() {
-        process.terminate();
-        return UnifiedExecError::process_failed(message);
-    }
-
-    process.fail_and_terminate(message.clone());
-    UnifiedExecError::process_failed(process.failure_message().unwrap_or(message))
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn emit_failed_initial_exec_end_if_unstored(
     process_started_alive: bool,
@@ -663,11 +678,51 @@ fn terminate_process_on_network_denial(
         }
         let session = session.upgrade();
         let message = network_denial_message_for_session(session.as_ref(), Some(deferred)).await;
-        process.fail_and_terminate(message);
+        if let Err(error) = process.fail_and_terminate(message).await {
+            tracing::warn!(
+                %error,
+                "failed to confirm unified exec termination after network denial"
+            );
+        }
     });
 }
 
 impl UnifiedExecProcessManager {
+    pub(super) async fn fail_process_with_message(
+        &self,
+        process_id: u32,
+        process: &Arc<UnifiedExecProcess>,
+        message: String,
+    ) -> UnifiedExecError {
+        let message = process.failure_message().unwrap_or(message);
+        match process.fail_and_terminate(message.clone()).await {
+            Ok(()) => {
+                let removed = {
+                    let mut store = self.process_store.lock().await;
+                    let is_same_process = store
+                        .processes
+                        .get(&process_id)
+                        .is_some_and(|entry| Arc::ptr_eq(&entry.process, process));
+                    is_same_process.then(|| store.remove(process_id)).flatten()
+                };
+                if let Some(entry) = removed {
+                    unregister_network_approval_for_entry(&entry).await;
+                }
+                UnifiedExecError::process_failed(message)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    process_id,
+                    %error,
+                    "retaining unified exec process because termination was not confirmed"
+                );
+                UnifiedExecError::process_failed(format!(
+                    "{message}; process termination was not confirmed: {error}"
+                ))
+            }
+        }
+    }
+
     pub(crate) fn effective_environment(
         &self,
         context: &UnifiedExecContext,
@@ -1008,8 +1063,9 @@ impl UnifiedExecProcessManager {
                 wall_time,
             )
             .await;
-            self.release_process_id(request.process_id).await;
-            return Err(fail_process_with_message(process.as_ref(), message));
+            return Err(self
+                .fail_process_with_message(request.process_id, &process, message)
+                .await);
         }
         if let Some(message) = process.failure_message() {
             let finish_result = finish_deferred_network_approval_for_session(
@@ -1028,11 +1084,14 @@ impl UnifiedExecProcessManager {
                 wall_time,
             )
             .await;
-            self.release_process_id(request.process_id).await;
             if let Err(message) = finish_result {
-                return Err(fail_process_with_message(process.as_ref(), message));
+                return Err(self
+                    .fail_process_with_message(request.process_id, &process, message)
+                    .await);
             }
-            return Err(UnifiedExecError::process_failed(message));
+            return Err(self
+                .fail_process_with_message(request.process_id, &process, message)
+                .await);
         }
         let process_id = request.process_id;
         let (response_process_id, exit_code) = if process_started_alive {
@@ -1050,7 +1109,9 @@ impl UnifiedExecProcessManager {
                         )
                         .await
                     {
-                        return Err(fail_process_with_message(entry.process.as_ref(), message));
+                        return Err(self
+                            .fail_process_with_message(process_id, &entry.process, message)
+                            .await);
                     }
                     process.check_for_sandbox_denial_with_text(&text).await?;
                     (None, exit_code)
@@ -1079,8 +1140,9 @@ impl UnifiedExecProcessManager {
                     wall_time,
                 )
                 .await;
-                self.release_process_id(request.process_id).await;
-                return Err(fail_process_with_message(process.as_ref(), message));
+                return Err(self
+                    .fail_process_with_message(request.process_id, &process, message)
+                    .await);
             }
             let exit_code = process.exit_code();
             let exit = exit_code.unwrap_or(-1);
@@ -1133,6 +1195,19 @@ impl UnifiedExecProcessManager {
         }
 
         if response.process_id.is_none() {
+            let completed_validation_skip_disposition = request
+                .validation_launch
+                .as_ref()
+                .and_then(|launch| launch.structured_route.as_ref())
+                .and_then(|route| {
+                    response.exit_code.and_then(|exit_code| {
+                        crate::tools::command_execution::completed_validation_skip_disposition(
+                            route,
+                            &response.raw_output,
+                            exit_code,
+                        )
+                    })
+                });
             if let Some(known_delta) = request.known_delta.as_ref() {
                 record_known_delta_from_transcript(
                     context.turn.config.codex_home.as_path(),
@@ -1166,7 +1241,21 @@ impl UnifiedExecProcessManager {
                     .complete(crate::validation_admission::ReusableValidationResult {
                         value: serde_json::json!({
                             "text": String::from_utf8_lossy(&response.raw_output),
-                            "success": response.exit_code == Some(0),
+                            "success": if completed_validation_skip_disposition.is_some() {
+                                None
+                            } else {
+                                Some(response.exit_code == Some(0))
+                            },
+                            "execution_outcome": if completed_validation_skip_disposition.is_some() {
+                                "executed_not_applicable"
+                            } else if response.exit_code == Some(0) {
+                                "executed_success"
+                            } else {
+                                "executed_failure"
+                            },
+                            "command_was_executed": true,
+                            "exit_code": response.exit_code,
+                            "skip_disposition": completed_validation_skip_disposition,
                         }),
                     })
                     .await;
@@ -1259,10 +1348,10 @@ impl UnifiedExecProcessManager {
                         let status = self.refresh_process_state(process_id).await;
                         if matches!(status, ProcessStatus::Exited { .. }) {
                             status_after_write = Some(status);
-                        } else if matches!(err, UnifiedExecError::ProcessFailed { .. }) {
-                            process.terminate();
-                            self.release_process_id(process_id).await;
-                            return Err(err);
+                        } else if let UnifiedExecError::ProcessFailed { message } = err {
+                            return Err(self
+                                .fail_process_with_message(process_id, &process, message)
+                                .await);
                         } else {
                             return Err(err);
                         }
@@ -1319,8 +1408,9 @@ impl UnifiedExecProcessManager {
             let message =
                 network_denial_message_for_session(session.as_ref(), network_approval.clone())
                     .await;
-            self.release_process_id(process_id).await;
-            return Err(fail_process_with_message(process.as_ref(), message));
+            return Err(self
+                .fail_process_with_message(process_id, &process, message)
+                .await);
         }
         if let Some(message) = process.failure_message() {
             let finish_result = finish_deferred_network_approval_for_session(
@@ -1328,11 +1418,14 @@ impl UnifiedExecProcessManager {
                 network_approval.clone(),
             )
             .await;
-            self.release_process_id(process_id).await;
             if let Err(message) = finish_result {
-                return Err(fail_process_with_message(process.as_ref(), message));
+                return Err(self
+                    .fail_process_with_message(process_id, &process, message)
+                    .await);
             }
-            return Err(UnifiedExecError::process_failed(message));
+            return Err(self
+                .fail_process_with_message(process_id, &process, message)
+                .await);
         }
 
         // After polling, refresh_process_state tells us whether the PTY is
@@ -1355,7 +1448,9 @@ impl UnifiedExecProcessManager {
                 if let Err(message) =
                     finish_network_approval_after_process_exit_for_entry(&entry).await
                 {
-                    return Err(fail_process_with_message(entry.process.as_ref(), message));
+                    return Err(self
+                        .fail_process_with_message(request.process_id, &entry.process, message)
+                        .await);
                 }
                 (None, exit_code, call_id)
             }
@@ -1546,6 +1641,9 @@ impl UnifiedExecProcessManager {
             )));
         }
 
+        let completed_validation_route = validation_launch
+            .as_ref()
+            .and_then(|launch| launch.structured_route.clone());
         context
             .session
             .services
@@ -1578,6 +1676,7 @@ impl UnifiedExecProcessManager {
             validation_observation,
             validation_leader,
             validation_waiter,
+            completed_validation_route,
             known_delta,
             known_delta_executor_started_at,
             tool_dispatch_timing,
@@ -2325,26 +2424,37 @@ impl UnifiedExecProcessManager {
     }
 
     pub(crate) async fn terminate_all_processes(&self) {
-        let entries: Vec<ProcessEntry> = {
+        let processes: Vec<(u32, Arc<UnifiedExecProcess>)> = {
             let mut processes = self.process_store.lock().await;
-            let entries: Vec<ProcessEntry> = processes
+            let entries = processes
                 .processes
-                .drain()
-                .map(|(_, entry)| entry)
+                .iter()
+                .map(|(process_id, entry)| (*process_id, Arc::clone(&entry.process)))
                 .collect();
             processes.reserved_process_ids.clear();
             entries
         };
 
-        for entry in entries {
-            if let Err(err) = entry.process.terminate_confirmed().await {
+        for (process_id, process) in processes {
+            if let Err(err) = process.terminate_confirmed().await {
                 tracing::warn!(
-                    process_id = entry.process_id,
+                    process_id,
                     %err,
-                    "failed to terminate unified exec process during shutdown"
+                    "retaining unified exec process after unconfirmed shutdown termination"
                 );
+                continue;
             }
-            unregister_network_approval_for_entry(&entry).await;
+            let entry = {
+                let mut store = self.process_store.lock().await;
+                let is_same_process = store
+                    .processes
+                    .get(&process_id)
+                    .is_some_and(|entry| Arc::ptr_eq(&entry.process, &process));
+                is_same_process.then(|| store.remove(process_id)).flatten()
+            };
+            if let Some(entry) = entry {
+                unregister_network_approval_for_entry(&entry).await;
+            }
         }
     }
 

@@ -326,7 +326,7 @@ pub const CONFIG_OPTION_DOCS: &[ConfigOptionDoc] = &[
     doc(
         "project_doc_max_bytes",
         "Project and profile",
-        "Maximum bytes read from an `AGENTS.md` project doc.",
+        "Maximum combined source bytes retained from `AGENTS.md` project docs; generated provenance and truncation notices do not consume this budget.",
     ),
     doc(
         "project_doc_fallback_filenames",

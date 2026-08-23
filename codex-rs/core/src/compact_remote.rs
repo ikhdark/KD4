@@ -290,7 +290,7 @@ async fn run_remote_compact_task_inner_impl(
         trace_input_history,
     } = attempt;
     let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
-    let (new_history, world_state_baseline) = process_compacted_history(
+    let (new_history, world_state_baseline, fragment_digests) = process_compacted_history(
         sess.as_ref(),
         compaction_turn_context.as_ref(),
         new_history,
@@ -328,6 +328,7 @@ async fn run_remote_compact_task_inner_impl(
         new_history,
         reference_context_item,
         world_state_baseline,
+        fragment_digests,
         compacted_item,
     )
     .await;
@@ -343,10 +344,14 @@ pub(crate) async fn process_compacted_history(
     turn_context: &TurnContext,
     mut compacted_history: Vec<ResponseItem>,
     initial_context_injection: &InitialContextInjection,
-) -> (Vec<ResponseItem>, Option<WorldStateSnapshot>) {
+) -> (
+    Vec<ResponseItem>,
+    Option<WorldStateSnapshot>,
+    Vec<codex_protocol::protocol::ContextFragmentDigest>,
+) {
     // Preserve the caller-selected replacement ordering. The default `AtStart` path retains the
     // cacheable prompt prefix while still leaving the summary or compaction item last.
-    let (initial_context, world_state_baseline) =
+    let (initial_context, world_state_baseline, fragment_digests) =
         build_compaction_initial_context(sess, turn_context, initial_context_injection).await;
 
     compacted_history = bounded_remote_compacted_history(compacted_history);
@@ -357,6 +362,7 @@ pub(crate) async fn process_compacted_history(
             initial_context_injection,
         ),
         world_state_baseline,
+        fragment_digests,
     )
 }
 

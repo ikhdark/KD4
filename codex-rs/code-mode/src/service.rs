@@ -11,7 +11,6 @@ use codex_code_mode_protocol::CodeModeSessionResultFuture;
 use codex_code_mode_protocol::CodeModeToolKind;
 use codex_code_mode_protocol::DEFAULT_EXEC_YIELD_TIME_MS;
 use codex_code_mode_protocol::ExecuteRequest;
-use codex_code_mode_protocol::ExecuteToPendingOutcome;
 use codex_code_mode_protocol::FunctionCallOutputContentItem;
 use codex_code_mode_protocol::ImageDetail;
 use codex_code_mode_protocol::NotificationFuture;
@@ -20,8 +19,6 @@ use codex_code_mode_protocol::StartedCell;
 use codex_code_mode_protocol::ToolInvocationFuture;
 use codex_code_mode_protocol::WaitOutcome;
 use codex_code_mode_protocol::WaitRequest;
-use codex_code_mode_protocol::WaitToPendingOutcome;
-use codex_code_mode_protocol::WaitToPendingRequest;
 use serde_json::Value as JsonValue;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -123,26 +120,6 @@ impl InProcessCodeModeSession {
         Ok(StartedCell::from_result_receiver(cell_id, response_rx))
     }
 
-    pub async fn execute_to_pending(
-        &self,
-        request: ExecuteRequest,
-    ) -> Result<ExecuteToPendingOutcome, String> {
-        let started = self
-            .runtime
-            .execute(
-                runtime_request(request),
-                runtime::ObserveMode::PendingFrontier,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        let cell_id = protocol_cell_id(&started.cell_id);
-        let event = started
-            .initial_event()
-            .await
-            .map_err(|error| error.to_string())?;
-        pending_outcome(&cell_id, event)
-    }
-
     pub async fn wait(&self, request: WaitRequest) -> Result<WaitOutcome, String> {
         self.begin_wait(request).await.await
     }
@@ -183,29 +160,6 @@ impl InProcessCodeModeSession {
             Err(runtime::Error::MissingCell(_) | runtime::Error::ClosedCell(_)) => {
                 Ok(WaitOutcome::MissingCell(missing_cell_response(cell_id)))
             }
-            Err(error) => Err(error.to_string()),
-        }
-    }
-
-    pub async fn wait_to_pending(
-        &self,
-        request: WaitToPendingRequest,
-    ) -> Result<WaitToPendingOutcome, String> {
-        let cell_id = request.cell_id;
-        match self
-            .runtime
-            .observe(
-                &runtime_cell_id(&cell_id),
-                runtime::ObserveMode::PendingFrontier,
-            )
-            .await
-        {
-            Ok(event) => Ok(WaitToPendingOutcome::LiveCell(pending_outcome(
-                &cell_id, event,
-            )?)),
-            Err(runtime::Error::MissingCell(_) | runtime::Error::ClosedCell(_)) => Ok(
-                WaitToPendingOutcome::MissingCell(missing_cell_response(cell_id)),
-            ),
             Err(error) => Err(error.to_string()),
         }
     }
@@ -306,6 +260,7 @@ impl runtime::SessionRuntimeDelegate for ProtocolDelegate {
 }
 
 fn runtime_request(request: ExecuteRequest) -> runtime::CreateCellRequest {
+    const DEFAULT_TOOL_TIMEOUT_MS: u64 = 60_000;
     runtime::CreateCellRequest {
         tool_call_id: request.tool_call_id,
         enabled_tools: request
@@ -325,6 +280,7 @@ fn runtime_request(request: ExecuteRequest) -> runtime::CreateCellRequest {
             })
             .collect(),
         source: request.source,
+        default_tool_timeout_ms: DEFAULT_TOOL_TIMEOUT_MS,
     }
 }
 
@@ -334,25 +290,6 @@ fn runtime_cell_id(cell_id: &CellId) -> runtime::CellId {
 
 fn protocol_cell_id(cell_id: &runtime::CellId) -> CellId {
     CellId::new(cell_id.as_str().to_string())
-}
-
-fn pending_outcome(
-    cell_id: &CellId,
-    event: runtime::CellEvent,
-) -> Result<ExecuteToPendingOutcome, String> {
-    match event {
-        runtime::CellEvent::Pending {
-            content_items,
-            pending_tool_call_ids,
-        } => Ok(ExecuteToPendingOutcome::Pending {
-            cell_id: cell_id.clone(),
-            content_items: content_items.into_iter().map(output_item).collect(),
-            pending_tool_call_ids,
-        }),
-        event => Ok(ExecuteToPendingOutcome::Completed(runtime_response(
-            cell_id, event,
-        )?)),
-    }
 }
 
 fn runtime_response(
@@ -376,9 +313,6 @@ fn runtime_response(
             cell_id: cell_id.clone(),
             content_items: content_items.into_iter().map(output_item).collect(),
         }),
-        runtime::CellEvent::Pending { .. } => {
-            Err("cell returned a pending frontier unexpectedly".to_string())
-        }
     }
 }
 

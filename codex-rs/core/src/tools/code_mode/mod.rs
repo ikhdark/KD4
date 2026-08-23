@@ -87,17 +87,19 @@ struct CodeModePacketMetrics {
     nested_call_count: usize,
     batchable_observation_count: usize,
     result_bytes: usize,
+    post_tool_use_feedback: Vec<FunctionCallOutputContentItem>,
 }
 
 struct CodeModePacketReceipt {
     nested_call_count: usize,
     batchable_observation_count: usize,
     result_bytes: usize,
+    post_tool_use_feedback: Vec<FunctionCallOutputContentItem>,
     advisory: Option<&'static str>,
 }
 
 const TINY_PACKET_RESULT_BYTES: usize = 1_024;
-const TINY_PACKET_ADVISORY: &str = "This exec packet contained one small read-only observation. Before another tool boundary, batch all remaining independent evidence with Promise.all; if this result is sufficient or unchanged from prior evidence, synthesize and stop.";
+const TINY_PACKET_ADVISORY: &str = "This exec packet contained one small read-only observation. Limit only one observation or poll on a documented resumable wait or session path to 60 seconds, never the operation's lifetime. On expiry, resume the same valid operation through that path; do not abandon or duplicate it. Otherwise follow the tool's timeout or runtime contract. Attach success and failure handlers to each independent promise and await notify(...) inside each handler, so every settled result is delivered immediately. Use Promise.allSettled only as a lifetime barrier that keeps the cell alive; never put readers in a bare Promise.all, because one stalled call or interruption must not suppress completed results. If this result is sufficient or unchanged from prior evidence, synthesize and stop.";
 
 impl CodeModeService {
     pub(crate) fn new(session_provider: Arc<dyn CodeModeSessionProvider>) -> Self {
@@ -181,6 +183,7 @@ impl CodeModeService {
         cell_id: &CellId,
         batchable_observation: bool,
         result_bytes: usize,
+        post_tool_use_feedback: Vec<FunctionCallOutputContentItem>,
     ) {
         let mut admission = self
             .packet_admission
@@ -192,6 +195,9 @@ impl CodeModeService {
             .batchable_observation_count
             .saturating_add(usize::from(batchable_observation));
         metrics.result_bytes = metrics.result_bytes.saturating_add(result_bytes);
+        metrics
+            .post_tool_use_feedback
+            .extend(post_tool_use_feedback);
     }
 
     fn finish_packet(&self, cell_id: &str, turn_id: &str) -> CodeModePacketReceipt {
@@ -217,6 +223,7 @@ impl CodeModeService {
             nested_call_count: metrics.nested_call_count,
             batchable_observation_count: metrics.batchable_observation_count,
             result_bytes: metrics.result_bytes,
+            post_tool_use_feedback: metrics.post_tool_use_feedback,
             advisory,
         }
     }
@@ -319,6 +326,7 @@ pub(super) fn handle_runtime_response(
         nested_call_count = packet.nested_call_count,
         batchable_observation_count = packet.batchable_observation_count,
         result_bytes = packet.result_bytes,
+        post_tool_use_feedback_count = packet.post_tool_use_feedback.len(),
         low_density_advisory = packet.advisory.is_some(),
         "code-mode packet admission receipt"
     );
@@ -328,6 +336,7 @@ pub(super) fn handle_runtime_response(
         hard_limit,
         original_image_detail_supported,
         started_at,
+        packet.post_tool_use_feedback,
     );
     if let Some(advisory) = packet.advisory {
         output.body.push(FunctionCallOutputContentItem::InputText {
@@ -351,6 +360,7 @@ fn format_runtime_response(
     hard_limit: usize,
     original_image_detail_supported: bool,
     started_at: std::time::Instant,
+    post_tool_use_feedback: Vec<FunctionCallOutputContentItem>,
 ) -> FunctionToolOutput {
     let continuation_owner_key = match &response {
         RuntimeResponse::Yielded { cell_id, .. }
@@ -388,6 +398,7 @@ fn format_runtime_response(
         }
     };
 
+    content_items.extend(post_tool_use_feedback);
     sanitize_image_detail_items(original_image_detail_supported, &mut content_items);
     let mut content_items =
         truncate_code_mode_result(content_items, max_output_tokens, outcome, hard_limit);
@@ -526,7 +537,7 @@ async fn call_nested_tool(
             cancellation_token,
         )
         .await;
-    let result = match result {
+    let mut result = match result {
         Ok(result) => result,
         Err(error) => {
             tool_runtime.record_code_mode_failure(
@@ -542,6 +553,7 @@ async fn call_nested_tool(
     let signal = result.sampling_request_signal();
     let canonical_artifact_required = result.requires_canonical_artifact();
     let receipts = result.intrinsic_deterministic_continuation_receipts();
+    let source_dependencies = result.projected_source_dependencies().cloned();
     if let Some(continuation) = result.owner_drained_continuation() {
         exec.turn
             .turn_timing_state
@@ -551,19 +563,21 @@ async fn call_nested_tool(
             .code_mode_service
             .record_owner_drained_continuation(&cell_id, continuation);
     }
+    let post_tool_use_feedback = result.take_code_mode_feedback();
     let result_value = result.code_mode_result();
     exec.session.services.code_mode_service.record_packet_call(
         &cell_id,
         is_batchable_observation(&tool_name, &payload)
             && !result_has_live_exec_session(&result_value),
         serde_json::to_vec(&result_value).map_or(0, |bytes| bytes.len()),
+        post_tool_use_feedback,
     );
     tool_runtime.record_code_mode_result(
         CodeModeToolResult {
             cell_id: cell_id.as_str(),
             tool_name: &tool_name,
             payload: &payload,
-            source_dependencies: None,
+            source_dependencies,
             outcome_context,
             signal: signal.as_ref(),
             result: result_value.clone(),
@@ -626,9 +640,13 @@ fn is_batchable_observation(tool_name: &ToolName, payload: &ToolPayload) -> bool
 }
 
 fn result_has_live_exec_session(result: &JsonValue) -> bool {
-    result
-        .get("session_id")
-        .is_some_and(|session_id| !session_id.is_null())
+    [
+        result.get("session_id"),
+        result.pointer("/result/essential/session_id"),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|session_id| !session_id.is_null())
 }
 
 fn nested_failure_fingerprint(tool_name: &ToolName, error: &str) -> String {
@@ -756,19 +774,60 @@ mod tests {
         let service = test_service();
         let cell = CellId::new("cell".to_string());
 
-        service.record_packet_call(&cell, true, 128);
-        assert!(service.finish_packet("cell", "turn").advisory.is_some());
-        service.record_packet_call(&cell, true, 128);
+        service.record_packet_call(&cell, true, 128, Vec::new());
+        let advisory = service
+            .finish_packet("cell", "turn")
+            .advisory
+            .expect("first tiny packet should include an advisory");
+        assert!(advisory.contains("one observation or poll"));
+        assert!(advisory.contains("never the operation's lifetime"));
+        assert!(advisory.contains("resume the same valid operation"));
+        assert!(advisory.contains("do not abandon or duplicate it"));
+        assert!(advisory.contains("follow the tool's timeout or runtime contract"));
+        assert!(advisory.contains("success and failure handlers to each independent promise"));
+        assert!(advisory.contains("await notify(...) inside each handler"));
+        assert!(advisory.contains("Promise.allSettled"));
+        assert!(advisory.contains("only as a lifetime barrier"));
+        assert!(advisory.contains("every settled result is delivered immediately"));
+        assert!(advisory.contains("never put readers in a bare Promise.all"));
+        assert!(
+            advisory
+                .contains("one stalled call or interruption must not suppress completed results")
+        );
+        service.record_packet_call(&cell, true, 128, Vec::new());
         assert!(service.finish_packet("cell", "turn").advisory.is_none());
-        service.record_packet_call(&cell, true, 128);
+        service.record_packet_call(&cell, true, 128, Vec::new());
         assert!(service.finish_packet("cell", "turn").advisory.is_none());
 
         for _ in 0..6 {
-            service.record_packet_call(&cell, true, 128);
+            service.record_packet_call(&cell, true, 128, Vec::new());
         }
         let batched = service.finish_packet("cell", "turn");
         assert_eq!(batched.nested_call_count, 6);
         assert!(batched.advisory.is_none());
+    }
+
+    #[test]
+    fn post_tool_feedback_is_drained_once_with_code_mode_packet() {
+        let service = test_service();
+        let cell = CellId::new("feedback-cell".to_string());
+        let feedback = vec![FunctionCallOutputContentItem::InputText {
+            text: "hook feedback".to_string(),
+        }];
+
+        service.record_packet_call(&cell, false, 32, feedback.clone());
+        assert_eq!(
+            service
+                .finish_packet("feedback-cell", "turn")
+                .post_tool_use_feedback,
+            feedback
+        );
+        assert!(
+            service
+                .finish_packet("feedback-cell", "turn")
+                .post_tool_use_feedback
+                .is_empty()
+        );
     }
 
     #[test]
@@ -810,7 +869,27 @@ mod tests {
             &ToolName::plain("shell_command"),
             &mutating_shell_script
         ));
+    }
+
+    #[test]
+    fn projected_live_exec_session_is_detected() {
         assert!(result_has_live_exec_session(&json!({"session_id": 7})));
+        assert!(result_has_live_exec_session(&json!({
+            "version": 1,
+            "result": {
+                "essential": {
+                    "session_id": 7,
+                },
+                "selected_text": "",
+            },
+        })));
+        assert!(!result_has_live_exec_session(&json!({
+            "result": {
+                "essential": {
+                    "session_id": null,
+                },
+            },
+        })));
         assert!(!result_has_live_exec_session(&json!({"exit_code": 0})));
     }
 

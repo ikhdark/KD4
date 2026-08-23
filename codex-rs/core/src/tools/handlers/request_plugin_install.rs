@@ -431,12 +431,12 @@ async fn verify_request_plugin_install_completed(
 
             session.reload_user_config_layer().await;
             let config = session.get_config().await;
-            let completed = verified_plugin_install_completed(
+            let plugin_installed = verified_plugin_install_completed(
                 plugin.id.as_str(),
                 config.as_ref(),
                 session.services.plugins_manager.as_ref(),
             );
-            let _ = refresh_missing_requested_connectors(
+            let accessible_connectors = refresh_missing_requested_connectors(
                 turn,
                 manager,
                 auth,
@@ -444,7 +444,11 @@ async fn verify_request_plugin_install_completed(
                 plugin.id.as_str(),
             )
             .await;
-            completed
+            verified_local_plugin_install_completed(
+                plugin_installed,
+                &plugin.app_connector_ids,
+                accessible_connectors.as_deref(),
+            )
         }
     }
 }
@@ -495,6 +499,18 @@ fn verified_remote_plugin_install_completed(
                             }))
                 })
         })
+}
+
+fn verified_local_plugin_install_completed(
+    plugin_installed: bool,
+    expected_connector_ids: &[String],
+    accessible_connectors: Option<&[AppInfo]>,
+) -> bool {
+    plugin_installed
+        && (expected_connector_ids.is_empty()
+            || accessible_connectors.is_some_and(|accessible_connectors| {
+                all_requested_connectors_picked_up(expected_connector_ids, accessible_connectors)
+            }))
 }
 
 fn is_remote_plugin_install_suggestion(plugin_id: &str) -> bool {

@@ -6,6 +6,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+use codex_agent_task_store::AgentTask;
+use codex_agent_task_store::AttemptState;
+use codex_agent_task_store::ValidationCallStatus;
+use codex_agent_task_store::ValidationProofKind;
 use codex_features::Feature;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::error::CodexErr;
@@ -71,6 +75,7 @@ use crate::task_evidence::SourceMapping;
 use crate::task_evidence::SourceMaterialization;
 use crate::task_evidence::SourceSpan;
 use crate::task_evidence::TaskEvidenceLedger;
+use crate::task_evidence::TypedValidationProofInputV1;
 use crate::task_evidence::UserSourceAvailability;
 use crate::task_evidence::UserSourceKind;
 use crate::task_evidence::UserSourceRecord;
@@ -3855,6 +3860,7 @@ pub(crate) async fn implementation_identity_for_evidence(
 pub(crate) struct AuthoritativeReviewInputs {
     pub(crate) typed_mutation_identities: Vec<String>,
     pub(crate) typed_evidence: Vec<String>,
+    pub(crate) typed_validation_proofs: Vec<TypedValidationProofInputV1>,
     pub(crate) partial_reasons: Vec<String>,
     pub(crate) review_lens_selection_facts: ReviewLensSelectionFacts,
     pub(crate) typed_quiescent: bool,
@@ -4027,6 +4033,9 @@ async fn collect_authoritative_review_inputs(
                             }))
                             .unwrap_or_default(),
                         );
+                        result
+                            .typed_validation_proofs
+                            .extend(authoritative_typed_validation_proofs(&task));
                         result.typed_evidence.push(
                             serde_json::to_string(&json!({
                                 "binding": binding,
@@ -4061,6 +4070,14 @@ async fn collect_authoritative_review_inputs(
     result.typed_mutation_identities.dedup();
     result.typed_evidence.sort();
     result.typed_evidence.dedup();
+    result.typed_validation_proofs.sort_by(|left, right| {
+        (&left.assignment_id, &left.attempt_id, &left.call_id).cmp(&(
+            &right.assignment_id,
+            &right.attempt_id,
+            &right.call_id,
+        ))
+    });
+    result.typed_validation_proofs.dedup();
     result.partial_reasons.sort();
     result.partial_reasons.dedup();
     result
@@ -4074,6 +4091,94 @@ async fn collect_authoritative_review_inputs(
     result.review_lens_selection_facts.risk_hints.sort();
     result.review_lens_selection_facts.risk_hints.dedup();
     result
+}
+
+fn authoritative_typed_validation_proofs(task: &AgentTask) -> Vec<TypedValidationProofInputV1> {
+    let Some(receipt) = task.receipt.as_ref() else {
+        return Vec::new();
+    };
+    let attempt = &task.current_attempt;
+    let workspace_epoch = task.workspace_status.epoch;
+    if attempt.state != AttemptState::Completed
+        || !receipt.status.is_success()
+        || receipt.assignment_id != task.assignment.assignment_id
+        || receipt.assignment_id != attempt.assignment_id
+        || receipt.attempt_id != attempt.attempt_id
+        || receipt.evidence_epoch > workspace_epoch
+    {
+        return Vec::new();
+    }
+
+    receipt
+        .validation_call_ids
+        .iter()
+        .filter_map(|call_id| {
+            let call = task
+                .validation_calls
+                .iter()
+                .find(|call| call.call_id == *call_id && call.attempt_id == attempt.attempt_id)?;
+            let evidence = &call.evidence;
+            if call.status != ValidationCallStatus::Succeeded
+                || call.proof_kind != ValidationProofKind::Focused
+                || call
+                    .resolved_executable
+                    .as_deref()
+                    .is_none_or(|path| !Path::new(path).is_absolute())
+                || !evidence.is_reusable_success()
+                || evidence.end_epoch != Some(receipt.evidence_epoch)
+                || evidence
+                    .source_evidence_epoch
+                    .is_none_or(|epoch| epoch > receipt.evidence_epoch)
+                || evidence.covered_manifest.is_empty()
+            {
+                return None;
+            }
+            let validation_result: codex_protocol::validation::ValidationResult = evidence
+                .validation_result
+                .clone()
+                .and_then(|value| serde_json::from_value(value).ok())?;
+            if validation_result.call_id != call.call_id
+                || !validation_result.status.is_success()
+                || validation_result.freshness
+                    == codex_protocol::validation::ValidationFreshness::Superseded
+                || validation_result.proof_key.validation_contract_version
+                    != codex_protocol::validation::VALIDATION_CONTRACT_VERSION
+                || validation_result.proof_key.implementation_identity
+                    != evidence.implementation_identity
+                || validation_result.proof_key.coverage_identity != evidence.coverage_identity
+                || validation_result.proof_key.repository.is_empty()
+                || validation_result.proof_key.cwd.is_empty()
+                || evidence.cwd.as_deref() != Some(validation_result.proof_key.cwd.as_str())
+                || validation_result.route.leaves.is_empty()
+                || validation_result
+                    .raw_artifact_ref
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+                || validation_result
+                    .raw_artifact_sha256
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+            {
+                return None;
+            }
+            Some(TypedValidationProofInputV1 {
+                assignment_id: receipt.assignment_id.to_string(),
+                attempt_id: receipt.attempt_id.to_string(),
+                call_id: call.call_id.clone(),
+                receipt_evidence_epoch: receipt.evidence_epoch,
+                workspace_epoch,
+                validation_end_epoch: evidence.end_epoch?,
+                implementation_identity: evidence.implementation_identity.clone(),
+                coverage_identity: evidence.coverage_identity.clone(),
+                recorded_cwd: evidence.cwd.clone()?,
+                retained_output_digest: evidence.retained_output_digest.clone(),
+                retained_output_ref: evidence.retained_output_ref.clone()?,
+                covered_manifest: evidence.covered_manifest.clone(),
+                current_workspace_manifest_identity: None,
+                validation_result,
+            })
+        })
+        .collect()
 }
 
 fn authoritative_mutation_page_saturation_reason(
@@ -5245,10 +5350,214 @@ mod tests {
     use super::*;
     use crate::config::ConfigBuilder;
     use crate::task_evidence::CurrentRepairSnapshot;
+    use chrono::Utc;
+    use codex_agent_task_store::AcceptanceCriterion;
+    use codex_agent_task_store::AgentReceipt;
+    use codex_agent_task_store::AgentRole;
+    use codex_agent_task_store::AgentStatusClaim;
+    use codex_agent_task_store::Assignment;
+    use codex_agent_task_store::AssignmentId;
+    use codex_agent_task_store::Attempt;
+    use codex_agent_task_store::AttemptId;
+    use codex_agent_task_store::CapabilityProfile;
+    use codex_agent_task_store::CriterionResult;
+    use codex_agent_task_store::CriterionStatus;
+    use codex_agent_task_store::ValidationCall;
+    use codex_agent_task_store::ValidationEvidence;
+    use codex_agent_task_store::WorkspaceManifestEntry;
+    use codex_agent_task_store::WorkspaceStrategy;
+    use codex_agent_task_store::WorkspaceTaskStatus;
+    use codex_protocol::plan_tool::ValidationRoute;
+    use codex_protocol::plan_tool::ValidationRouteLeaf;
+    use codex_protocol::plan_tool::ValidationRouteOrdering;
     use codex_protocol::protocol::TaskCompletionGate;
+    use codex_protocol::validation::ValidationFreshness;
+    use codex_protocol::validation::ValidationProofKey;
+    use codex_protocol::validation::ValidationResult;
+    use codex_protocol::validation::ValidationTerminalStatus;
     use sha2::Digest;
     use sha2::Sha256;
     use tempfile::tempdir;
+
+    fn completed_typed_task_with_structured_validation() -> AgentTask {
+        let assignment_id = AssignmentId::new();
+        let attempt_id = AttemptId::new();
+        let now = Utc::now();
+        let workspace_epoch = 7;
+        let call_id = "typed-validation".to_string();
+        let implementation_identity = "typed-implementation".to_string();
+        let coverage_identity = "typed-coverage".to_string();
+        let repository = "C:/repo".to_string();
+        let validation_result = ValidationResult {
+            proof_key: ValidationProofKey {
+                repository: repository.clone(),
+                cwd: repository.clone(),
+                canonical_route_hash: "typed-route".to_string(),
+                implementation_identity: implementation_identity.clone(),
+                coverage_identity: coverage_identity.clone(),
+                environment_identity: "typed-environment".to_string(),
+                toolchain_identity: "typed-toolchain".to_string(),
+                configuration_identity: "typed-configuration".to_string(),
+                validation_contract_version:
+                    codex_protocol::validation::VALIDATION_CONTRACT_VERSION,
+            },
+            route: ValidationRoute {
+                leaves: vec![ValidationRouteLeaf {
+                    argv: vec!["cargo".to_string(), "test".to_string(), "typed".to_string()],
+                    uncertainty: "typed validation".to_string(),
+                    covered_paths: vec!["codex-rs/core/src/task_evidence.rs".to_string()],
+                    covered_contracts: vec!["typed-child-final-proof".to_string()],
+                    timeout_ms: 120_000,
+                    semantic_timeout: false,
+                }],
+                ordering: ValidationRouteOrdering::RunAll,
+            },
+            call_id: call_id.clone(),
+            process_id: None,
+            status: ValidationTerminalStatus::Succeeded,
+            duration_ms: 17,
+            summary: Some("typed validation passed".to_string()),
+            failure_excerpt: None,
+            raw_artifact_ref: Some("artifact://typed-raw".to_string()),
+            raw_artifact_sha256: Some("typed-raw-sha256".to_string()),
+            freshness: ValidationFreshness::Executed,
+        };
+        AgentTask {
+            assignment: Assignment {
+                assignment_id,
+                root_session_id: "root-session".to_string(),
+                admission_origin: codex_agent_task_store::AssignmentAdmissionOrigin::Typed,
+                repository_id: "repository".to_string(),
+                workspace_id: "workspace".to_string(),
+                role: AgentRole::Worker,
+                capability_profile: CapabilityProfile::ScopedSourceWrite,
+                objective: "complete typed validation".to_string(),
+                acceptance_criteria: vec![AcceptanceCriterion {
+                    id: "criterion".to_string(),
+                    text: "typed validation passes".to_string(),
+                }],
+                read_scope: Vec::new(),
+                write_scope: Vec::new(),
+                stop_condition: "task complete".to_string(),
+                dependencies: Vec::new(),
+                risk_hints: Vec::new(),
+                required_evidence: Vec::new(),
+                prohibited_changes: Vec::new(),
+                contract_claims: Vec::new(),
+                workspace_strategy: WorkspaceStrategy::Shared,
+                start_epoch: workspace_epoch,
+                relation: None,
+                task_capsule: None,
+                architecture_contract_ref: None,
+                integration_plan: codex_agent_task_store::IntegrationPlan::SingleWriter,
+                created_at: now,
+            },
+            current_attempt: Attempt {
+                attempt_id,
+                assignment_id,
+                ordinal: 0,
+                amendment: None,
+                state: AttemptState::Completed,
+                created_at: now,
+                sealed_at: Some(now),
+            },
+            gates: Vec::new(),
+            receipt: Some(AgentReceipt {
+                assignment_id,
+                attempt_id,
+                status: AgentStatusClaim::Completed,
+                summary: "completed".to_string(),
+                criterion_results: vec![CriterionResult {
+                    criterion_id: "criterion".to_string(),
+                    status: CriterionStatus::Passed,
+                    evidence: None,
+                }],
+                declared_changes: Vec::new(),
+                validation_call_ids: vec![call_id.clone()],
+                blockers: Vec::new(),
+                risks: Vec::new(),
+                next_action: None,
+                architecture_contract: None,
+                evidence_epoch: workspace_epoch,
+                evidence_manifest_hash: "typed-manifest".to_string(),
+                sealed_at: now,
+            }),
+            validation_calls: vec![ValidationCall {
+                call_id,
+                attempt_id,
+                command_summary: "focused validation".to_string(),
+                resolved_executable: Some(
+                    std::fs::canonicalize(
+                        std::env::current_exe().expect("current test executable"),
+                    )
+                    .expect("current test executable canonicalizes")
+                    .to_string_lossy()
+                    .into_owned(),
+                ),
+                proof_kind: ValidationProofKind::Focused,
+                evidence: ValidationEvidence {
+                    candidate_id: "typed-candidate".to_string(),
+                    implementation_identity,
+                    source_evidence_epoch: Some(workspace_epoch),
+                    normalized_invocation: "cargo test typed".to_string(),
+                    coverage_identity,
+                    start_epoch: workspace_epoch,
+                    end_epoch: Some(workspace_epoch),
+                    covered_scopes: Vec::new(),
+                    covered_manifest: vec![WorkspaceManifestEntry {
+                        path: "codex-rs/core/src/task_evidence.rs".to_string(),
+                        content_hash: Some("typed-content".to_string()),
+                        existed: true,
+                    }],
+                    execution_snapshot: None,
+                    covered_contracts: vec!["typed-child-final-proof".to_string()],
+                    manifest_hash: "typed-manifest".to_string(),
+                    repository_wide: false,
+                    cwd: Some(repository),
+                    environment_hash: Some("typed-environment".to_string()),
+                    toolchain: Some("typed-toolchain".to_string()),
+                    features_configuration_identity: "typed-configuration".to_string(),
+                    covered_input_manifest_hash: "typed-inputs".to_string(),
+                    dependency_manifest_hash: "typed-dependencies".to_string(),
+                    successful_result: Some(true),
+                    retained_output_digest: "typed-output-digest".to_string(),
+                    retained_output_ref: Some("artifact://typed-output".to_string()),
+                    output_summary: Some("typed validation passed".to_string()),
+                    validation_result: Some(
+                        serde_json::to_value(validation_result)
+                            .expect("validation result serializes"),
+                    ),
+                    lease_expires_at: None,
+                    shared_from_call_id: None,
+                    stale_reason: None,
+                },
+                status: ValidationCallStatus::Succeeded,
+                recorded_at: now,
+            }],
+            workspace_status: WorkspaceTaskStatus {
+                epoch: workspace_epoch,
+                ..WorkspaceTaskStatus::default()
+            },
+            isolation_handoff: None,
+            integration_handoffs: Vec::new(),
+            observations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn typed_child_validation_receipt_collector_reuses_scoped_proof_after_unrelated_epoch() {
+        let mut task = completed_typed_task_with_structured_validation();
+        let proofs = authoritative_typed_validation_proofs(&task);
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(proofs[0].call_id, "typed-validation");
+        assert_eq!(proofs[0].retained_output_ref, "artifact://typed-output");
+
+        task.workspace_status.epoch = task.workspace_status.epoch.saturating_add(1);
+        assert_eq!(authoritative_typed_validation_proofs(&task).len(), 1);
+        task.validation_calls[0].evidence.end_epoch =
+            Some(task.workspace_status.epoch.saturating_add(1));
+        assert!(authoritative_typed_validation_proofs(&task).is_empty());
+    }
 
     #[tokio::test]
     async fn reviewer_config_disables_recursive_completion_review() {

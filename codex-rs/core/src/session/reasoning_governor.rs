@@ -472,7 +472,6 @@ struct WaitConvergenceHandle {
     fingerprint: String,
     observations: u32,
     enforcement_reported: bool,
-    retained_result: AuthoritativeWaitOwnerResult,
 }
 
 struct DeterministicDispatchLedger {
@@ -1172,10 +1171,26 @@ impl SamplingRequestSignalCollector {
             DeterministicCycleKind::StructuredToolPass
         };
         let broad_source_evidence_by_action = if all_broad_source {
-            ordered
-                .iter()
-                .map(|(_, action, evidence)| (action.identity.clone(), (*evidence).clone()))
-                .collect()
+            let mut evidence_by_action = BTreeMap::new();
+            let mut ambiguous_actions = BTreeSet::new();
+            for (_, action, evidence) in &ordered {
+                if action.class == StructuredActionClass::Other {
+                    continue;
+                }
+                match evidence_by_action.get(&action.identity) {
+                    Some(existing) if existing != *evidence => {
+                        ambiguous_actions.insert(action.identity.clone());
+                    }
+                    Some(_) => {}
+                    None => {
+                        evidence_by_action.insert(action.identity.clone(), (*evidence).clone());
+                    }
+                }
+            }
+            for action in ambiguous_actions {
+                evidence_by_action.remove(&action);
+            }
+            evidence_by_action
         } else {
             BTreeMap::new()
         };
@@ -1791,6 +1806,7 @@ pub(crate) struct SamplingReasoningGovernor {
     consecutive_no_progress: u32,
     consecutive_obligation_no_progress: u32,
     last_cycle: Option<String>,
+    last_broad_source_evidence_by_action: BTreeMap<String, String>,
     last_state_revision: Option<String>,
     directive_issued: bool,
     proven_loop_active: bool,
@@ -1829,6 +1845,7 @@ impl SamplingReasoningGovernor {
             consecutive_no_progress: 0,
             consecutive_obligation_no_progress: 0,
             last_cycle: None,
+            last_broad_source_evidence_by_action: BTreeMap::new(),
             last_state_revision: None,
             directive_issued: false,
             proven_loop_active: false,
@@ -2133,6 +2150,22 @@ impl SamplingReasoningGovernor {
                     ledger.blocked_wait_gate = None;
                 }
             }
+            if observation.disposition == AuthoritativeWaitDisposition::Terminal
+                && observation.result.surfaceable_message.is_some()
+            {
+                // The owner has already supplied the exact assistant text for
+                // this terminal state. Surface it directly instead of making
+                // the model restate an authoritative completion.
+                self.wait_convergence = None;
+                return SamplingConvergenceDecision {
+                    continuation: ContinuationDisposition::SurfaceExistingResult,
+                    proven_loop_activated: false,
+                    authoritative_wait: Some(AuthoritativeWaitResolution::Terminal(
+                        observation.result,
+                    )),
+                    ..Default::default()
+                };
+            }
             if self
                 .wait_convergence
                 .as_ref()
@@ -2146,7 +2179,6 @@ impl SamplingReasoningGovernor {
                     fingerprint,
                     observations: 1,
                     enforcement_reported: false,
-                    retained_result: observation.result.clone(),
                 });
             }
             let Some(handle) = self.wait_convergence.as_mut() else {
@@ -2156,14 +2188,12 @@ impl SamplingReasoningGovernor {
                 let activated = !handle.enforcement_reported;
                 handle.enforcement_reported = true;
                 return match observation.disposition {
-                    AuthoritativeWaitDisposition::Terminal => SamplingConvergenceDecision {
-                        continuation: ContinuationDisposition::SurfaceExistingResult,
-                        proven_loop_activated: activated,
-                        authoritative_wait: Some(AuthoritativeWaitResolution::Terminal(
-                            handle.retained_result.clone(),
-                        )),
-                        ..Default::default()
-                    },
+                    AuthoritativeWaitDisposition::Terminal => {
+                        // A terminal owner result without designated assistant
+                        // text still needs the model to produce the semantic
+                        // final response.
+                        SamplingConvergenceDecision::default()
+                    }
                     AuthoritativeWaitDisposition::Blocked => {
                         self.dispatch_ledger
                             .lock()
@@ -2220,6 +2250,23 @@ impl SamplingReasoningGovernor {
 
         let repeated_cycle = self.last_cycle.as_deref() == Some(cycle.key.as_str())
             && self.last_state_revision.as_deref() == Some(settled_revision.as_str());
+        let mut fixed_point_broad_source_evidence = cycle.broad_source_evidence_by_action.clone();
+        if repeated_cycle {
+            for (action, evidence) in &self.last_broad_source_evidence_by_action {
+                match fixed_point_broad_source_evidence.get(action) {
+                    Some(current) if current != evidence => {
+                        // The semantic cycle is equivalent, but this action's
+                        // evidence binding is ambiguous across observations.
+                        // Do not suppress that action prospectively.
+                        fixed_point_broad_source_evidence.remove(action);
+                    }
+                    Some(_) => {}
+                    None => {
+                        fixed_point_broad_source_evidence.insert(action.clone(), evidence.clone());
+                    }
+                }
+            }
+        }
         if repeated_cycle || cycle.kind == DeterministicCycleKind::Empty {
             self.consecutive_no_progress = self.consecutive_no_progress.saturating_add(1);
             self.consecutive_obligation_no_progress =
@@ -2252,6 +2299,7 @@ impl SamplingReasoningGovernor {
             });
         }
         self.last_cycle = Some(cycle.key.clone());
+        self.last_broad_source_evidence_by_action = cycle.broad_source_evidence_by_action.clone();
         self.last_state_revision = Some(settled_revision.clone());
 
         let repeated_failure = repeated_cycle
@@ -2287,7 +2335,7 @@ impl SamplingReasoningGovernor {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .broad_source_pass_gate = Some(BroadSourcePassGate {
                 state_revision: settled_revision,
-                evidence_by_action: cycle.broad_source_evidence_by_action,
+                evidence_by_action: fixed_point_broad_source_evidence,
             });
         }
         self.directive_issued = true;
@@ -2320,6 +2368,7 @@ impl SamplingReasoningGovernor {
         self.consecutive_no_progress = 0;
         self.consecutive_obligation_no_progress = 0;
         self.last_cycle = None;
+        self.last_broad_source_evidence_by_action.clear();
         self.last_state_revision = None;
         self.directive_issued = false;
         self.proven_loop_active = false;
@@ -2488,7 +2537,10 @@ pub(crate) fn resolve_request_policy_for_generation(
     if sampling.is_residual_deterministic() {
         let configured_override =
             config.and_then(|config| config.deterministic_continuation.clone());
-        let configured_effort = configured_override.clone().unwrap_or(ReasoningEffort::Low);
+        let configured_effort = configured_override
+            .clone()
+            .or(turn_fallback)
+            .unwrap_or(ReasoningEffort::Low);
         let effective_effort = lowest_supported_equivalent(configured_effort.clone(), model_info);
         return SamplingRequestPolicy {
             phase,
@@ -2814,7 +2866,7 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_protocol_fallback_alone_uses_the_lowest_supported_override() {
+    fn deterministic_changed_continuation_uses_the_lowest_supported_override() {
         let model = model(
             &[ReasoningEffort::Medium, ReasoningEffort::High],
             ReasoningEffort::High,
@@ -2823,7 +2875,7 @@ mod tests {
         let residual = SamplingGenerationDisposition::ResidualDeterministic(
             ResidualDeterministicSamplingProof {
                 relevant_state_fingerprint: "state".to_string(),
-                exact_action: ResidualDeterministicAction::CompleteProtocolTurn,
+                exact_action: ResidualDeterministicAction::RequireChangedContinuation,
             },
         );
 
@@ -2867,7 +2919,7 @@ mod tests {
     }
 
     #[test]
-    fn residual_deterministic_sampling_defaults_to_low_without_an_override() {
+    fn residual_deterministic_sampling_inherits_turn_fallback_without_an_override() {
         let model = model(
             &[ReasoningEffort::Low, ReasoningEffort::High],
             ReasoningEffort::High,
@@ -2875,7 +2927,7 @@ mod tests {
         let residual = SamplingGenerationDisposition::ResidualDeterministic(
             ResidualDeterministicSamplingProof {
                 relevant_state_fingerprint: "state".to_string(),
-                exact_action: ResidualDeterministicAction::CompleteProtocolTurn,
+                exact_action: ResidualDeterministicAction::RequireChangedContinuation,
             },
         );
 
@@ -2887,8 +2939,8 @@ mod tests {
             &residual,
         );
 
-        assert_eq!(policy.configured_effort, Some(ReasoningEffort::Low));
-        assert_eq!(policy.effective_effort, Some(ReasoningEffort::Low));
+        assert_eq!(policy.configured_effort, Some(ReasoningEffort::High));
+        assert_eq!(policy.effective_effort, Some(ReasoningEffort::High));
         assert_eq!(policy.source, SamplingRequestPolicySource::TurnFallback);
     }
 
@@ -4004,6 +4056,7 @@ mod tests {
         baselines: &SamplingRequestBaselines,
         identity: &str,
         mixed: bool,
+        surfaceable_message: Option<&str>,
     ) -> SamplingRequestSignalCollector {
         let collector = governor.collector(baselines);
         {
@@ -4022,7 +4075,7 @@ mod tests {
                 result: AuthoritativeWaitOwnerResult {
                     adapter: "multi_agent_v2".to_string(),
                     value: json!({"message": "terminal owner result"}),
-                    surfaceable_message: Some("terminal owner result".to_string()),
+                    surfaceable_message: surfaceable_message.map(ToOwned::to_owned),
                 },
                 assignment_ids: Vec::new(),
             }];
@@ -4031,22 +4084,22 @@ mod tests {
     }
 
     #[test]
-    fn second_exact_authoritative_wait_surfaces_existing_result() {
+    fn first_exact_authoritative_wait_with_designated_surface_surfaces_existing_result() {
         let mut governor = SamplingReasoningGovernor::new(None);
         let (baselines, settled) = unchanged_state(&governor);
 
-        let first = authoritative_wait_collector(&governor, &baselines, "same", false);
+        let first = authoritative_wait_collector(
+            &governor,
+            &baselines,
+            "same",
+            false,
+            Some("terminal owner result"),
+        );
         assert_eq!(
             governor.evaluate_convergence(&baselines, &first, &settled),
-            SamplingConvergenceDecision::default()
-        );
-
-        let second = authoritative_wait_collector(&governor, &baselines, "same", false);
-        assert_eq!(
-            governor.evaluate_convergence(&baselines, &second, &settled),
             SamplingConvergenceDecision {
                 continuation: ContinuationDisposition::SurfaceExistingResult,
-                proven_loop_activated: true,
+                proven_loop_activated: false,
                 authoritative_wait: Some(AuthoritativeWaitResolution::Terminal(
                     AuthoritativeWaitOwnerResult {
                         adapter: "multi_agent_v2".to_string(),
@@ -4057,6 +4110,21 @@ mod tests {
                 ..Default::default()
             }
         );
+    }
+
+    #[test]
+    fn terminal_authoritative_wait_without_designated_surface_remains_model_required() {
+        let mut governor = SamplingReasoningGovernor::new(None);
+        let (baselines, settled) = unchanged_state(&governor);
+
+        for _ in 0..2 {
+            let collector =
+                authoritative_wait_collector(&governor, &baselines, "same", false, None);
+            assert_eq!(
+                governor.evaluate_convergence(&baselines, &collector, &settled),
+                SamplingConvergenceDecision::default()
+            );
+        }
     }
 
     #[test]
@@ -4146,17 +4214,17 @@ mod tests {
     fn authoritative_wait_enforcement_resets_on_identity_state_or_mixed_calls() {
         let mut governor = SamplingReasoningGovernor::new(None);
         let (baselines, settled) = unchanged_state(&governor);
-        let first = authoritative_wait_collector(&governor, &baselines, "first", false);
+        let first = authoritative_wait_collector(&governor, &baselines, "first", false, None);
         governor.evaluate_convergence(&baselines, &first, &settled);
 
         let changed_identity =
-            authoritative_wait_collector(&governor, &baselines, "changed", false);
+            authoritative_wait_collector(&governor, &baselines, "changed", false, None);
         assert_eq!(
             governor.evaluate_convergence(&baselines, &changed_identity, &settled),
             SamplingConvergenceDecision::default()
         );
 
-        let mixed = authoritative_wait_collector(&governor, &baselines, "changed", true);
+        let mixed = authoritative_wait_collector(&governor, &baselines, "changed", true, None);
         assert_eq!(
             governor.evaluate_convergence(&baselines, &mixed, &settled),
             SamplingConvergenceDecision::default()
@@ -4168,7 +4236,7 @@ mod tests {
             ..settled
         };
         let changed_state =
-            authoritative_wait_collector(&governor, &changed_baselines, "changed", false);
+            authoritative_wait_collector(&governor, &changed_baselines, "changed", false, None);
         assert_eq!(
             governor.evaluate_convergence(&changed_baselines, &changed_state, &changed_settled),
             SamplingConvergenceDecision::default()
@@ -4523,6 +4591,45 @@ mod tests {
         let (_, registration) =
             read_only_pass_collector(&governor, &changed_baselines, arguments, "new-state");
         assert!(registration.suppressed_source_pass.is_none());
+    }
+
+    #[test]
+    fn broad_source_fixed_point_suppresses_every_proven_equivalent_action() {
+        let mut governor = SamplingReasoningGovernor::new(None);
+        let (baselines, settled) = unchanged_state(&governor);
+        let first_action = r#"{"artifact_id":"artifact-1"}"#;
+        let second_action = r#"{"artifact_id":"artifact-2"}"#;
+
+        for arguments in [first_action, second_action] {
+            let (collector, registration) =
+                read_only_pass_collector(&governor, &baselines, arguments, "same-evidence");
+            assert!(registration.suppressed_source_pass.is_none());
+            governor.evaluate_convergence(&baselines, &collector, &settled);
+        }
+
+        let (_, second_registration) =
+            read_only_pass_collector(&governor, &baselines, second_action, "unreachable");
+        assert!(second_registration.suppressed_source_pass.is_some());
+
+        let (suppressed_first, first_registration) =
+            read_only_pass_collector(&governor, &baselines, first_action, "unreachable");
+        assert!(first_registration.suppressed_source_pass.is_some());
+        let decision = governor.evaluate_convergence(&baselines, &suppressed_first, &settled);
+        assert_eq!(
+            decision.continuation,
+            ContinuationDisposition::TerminalCompletionRequired
+        );
+        assert!(decision.proven_loop_activated);
+
+        let new_action = r#"{"artifact_id":"artifact-3"}"#;
+        let (_, new_registration) =
+            read_only_pass_collector(&governor, &baselines, new_action, "new-evidence");
+        assert!(new_registration.suppressed_source_pass.is_none());
+
+        let changed_baselines = governor.baselines(8, ValidationFreshnessStatus::None, None);
+        let (_, changed_state_registration) =
+            read_only_pass_collector(&governor, &changed_baselines, first_action, "new-state");
+        assert!(changed_state_registration.suppressed_source_pass.is_none());
     }
 
     #[test]

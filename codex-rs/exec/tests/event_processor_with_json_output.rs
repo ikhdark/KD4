@@ -15,6 +15,8 @@ use codex_app_server_protocol::McpToolCallStatus as ApiMcpToolCallStatus;
 use codex_app_server_protocol::PatchApplyStatus as ApiPatchApplyStatus;
 use codex_app_server_protocol::PatchChangeKind as ApiPatchChangeKind;
 use codex_app_server_protocol::ServerNotification;
+use codex_app_server_protocol::TaskCompletionGate;
+use codex_app_server_protocol::TaskCompletionStatus;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadTokenUsage;
 use codex_app_server_protocol::TokenUsageBreakdown;
@@ -760,6 +762,12 @@ fn collab_spawn_begin_and_end_emit_item_events() {
                         status: ApiCollabAgentStatus::Running,
                         message: None,
                         surfaced_result: None,
+                        completion: Some(TaskCompletionGate {
+                            status: TaskCompletionStatus::Partial,
+                            reasons: vec!["validation pending".to_string()],
+                            evidence_path: Some("artifacts/completion.json".to_string()),
+                        }),
+                        last_agent_message: Some("implementation complete".to_string()),
                     },
                 )]),
             },
@@ -805,6 +813,12 @@ fn collab_spawn_begin_and_end_emit_item_events() {
                                 status: CollabAgentStatus::Running,
                                 message: None,
                                 surfaced_result: None,
+                                completion: Some(TaskCompletionGate {
+                                    status: TaskCompletionStatus::Partial,
+                                    reasons: vec!["validation pending".to_string()],
+                                    evidence_path: Some("artifacts/completion.json".to_string(),),
+                                }),
+                                last_agent_message: Some("implementation complete".to_string(),),
                             },
                         )]),
                         status: CollabToolCallStatus::Completed,

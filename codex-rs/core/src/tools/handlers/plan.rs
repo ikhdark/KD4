@@ -233,6 +233,12 @@ impl PlanHandler {
             .task_evidence
             .record_planning_update(requested_input.clone())
             .await;
+        if !outcome.durably_recorded {
+            return Err(FunctionCallError::RespondToModel(
+                "update_plan could not be durably persisted; no plan update was acknowledged"
+                    .to_string(),
+            ));
+        }
         match outcome.effect {
             PlanUpdateEffect::Initial => turn.turn_timing_state.record_initial_plan_generation(),
             PlanUpdateEffect::StructuralRevision => {

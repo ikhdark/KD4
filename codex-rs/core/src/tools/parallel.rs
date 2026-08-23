@@ -41,7 +41,7 @@ use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TurnTimingToolCallSource;
 
-const TOOL_RUNTIME_CANCELLATION_GRACE: Duration = Duration::from_secs(2);
+pub(crate) const TOOL_RUNTIME_CANCELLATION_GRACE: Duration = Duration::from_secs(2);
 
 fn reused_failure_diagnosis(
     _tool_name: &codex_tools::ToolName,
@@ -396,17 +396,19 @@ impl ToolCallRuntime {
         let Some(collector) = &self.sampling_request_signals else {
             return;
         };
-        result.source_dependencies = crate::tool_history::tool_call_observes_workspace(
-            result.tool_name.name.as_str(),
-            result.payload,
-        )
-        .then(|| {
-            crate::tool_history::source_dependencies_for_tool_call(
+        if result.source_dependencies.is_none() {
+            result.source_dependencies = crate::tool_history::tool_call_observes_workspace(
                 result.tool_name.name.as_str(),
                 result.payload,
-                self.step_context.turn.config.cwd.as_path(),
             )
-        });
+            .then(|| {
+                crate::tool_history::source_dependencies_for_tool_call(
+                    result.tool_name.name.as_str(),
+                    result.payload,
+                    self.step_context.turn.config.cwd.as_path(),
+                )
+            });
+        }
         collector.record_code_mode_result(result);
         collector.record_accepted_deterministic_continuation_receipts(receipts);
     }
@@ -742,6 +744,9 @@ impl ToolCallRuntime {
                 ToolCallSource::Direct,
                 cancellation_token,
                 timing,
+                workspace_revision_before
+                    .as_ref()
+                    .map(|baseline| baseline.source_dependencies.clone()),
             );
             let result = future.await;
             evidence_timing.record_outcome(tool_dispatch_outcome_label(&result));
@@ -792,7 +797,8 @@ impl ToolCallRuntime {
                         signal_collector.as_ref().and_then(|collector| {
                             collector.code_mode_source_dependencies(owner_key)
                         })
-                    });
+                    })
+                    .or_else(|| response.projected_source_dependencies().cloned());
                     let response = response.into_response();
                     let evidence_capture_started = Instant::now();
                     self.register_workspace_evidence_for_response(
@@ -912,6 +918,7 @@ impl ToolCallRuntime {
                     source,
                     cancellation_token,
                     Arc::clone(&timing),
+                    None,
                 )
                 .await;
             timing.record_outcome(tool_dispatch_outcome_label(&result));
@@ -934,6 +941,9 @@ impl ToolCallRuntime {
         source: ToolCallSource,
         cancellation_token: CancellationToken,
         timing: Arc<ToolDispatchTiming>,
+        projection_source_dependencies: Option<
+            std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
+        >,
     ) -> impl std::future::Future<Output = Result<AnyToolResult, FunctionCallError>> {
         let Some(router) = self.step_context.tool_router() else {
             return Either::Left(std::future::ready(Err(FunctionCallError::Fatal(
@@ -1051,19 +1061,29 @@ impl ToolCallRuntime {
                     None
                 };
 
+                let projection_source_dependencies = projection_source_dependencies.or_else(|| {
+                    evidence_revision_before
+                        .as_ref()
+                        .map(|baseline| baseline.source_dependencies.clone())
+                });
+
+                let dispatch = router
+                    .dispatch_tool_call_with_terminal_outcome(
+                        Arc::clone(&session),
+                        Arc::clone(&step_context),
+                        invocation_cancellation_token,
+                        tracker,
+                        dispatch_call,
+                        source,
+                        dispatch_terminal_outcome_reached,
+                    )
+                    .instrument(dispatch_span.clone());
                 let result = scope_tool_dispatch_timing(
                     Arc::clone(&timing),
-                    router
-                        .dispatch_tool_call_with_terminal_outcome(
-                            Arc::clone(&session),
-                            Arc::clone(&step_context),
-                            invocation_cancellation_token,
-                            tracker,
-                            dispatch_call,
-                            source,
-                            dispatch_terminal_outcome_reached,
-                        )
-                        .instrument(dispatch_span.clone()),
+                    crate::tools::registry::with_precomputed_projection_source_dependencies(
+                        projection_source_dependencies,
+                        dispatch,
+                    ),
                 )
                 .await;
                 timing.mark_output_collected();
@@ -1225,6 +1245,8 @@ impl ToolCallRuntime {
             }),
             post_tool_use_payload: None,
             model_projection: None,
+            source_dependencies: None,
+            code_mode_feedback: Vec::new(),
         }
     }
 

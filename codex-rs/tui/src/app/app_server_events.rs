@@ -137,6 +137,44 @@ impl App {
                 }
                 return;
             }
+            ServerNotification::WindowsSandboxSetupCompleted(notification) => {
+                let Some(pending) = self.windows_sandbox.pending_setup.take() else {
+                    tracing::warn!(
+                        ?notification.mode,
+                        "ignoring Windows sandbox setup completion without a pending TUI setup"
+                    );
+                    return;
+                };
+                if notification.success {
+                    self.app_event_tx
+                        .send(AppEvent::EnableWindowsSandboxForAgentMode {
+                            preset: pending.preset,
+                            mode: pending.mode,
+                            profile_selection: pending.profile_selection,
+                        });
+                } else {
+                    let error = notification
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "Windows sandbox setup failed".to_string());
+                    match pending.mode {
+                        crate::app_event::WindowsSandboxEnableMode::Elevated => self
+                            .app_event_tx
+                            .send(AppEvent::OpenWindowsSandboxFallbackPrompt {
+                                preset: pending.preset,
+                                profile_selection: pending.profile_selection,
+                            }),
+                        crate::app_event::WindowsSandboxEnableMode::Legacy => self
+                            .app_event_tx
+                            .send(AppEvent::WindowsSandboxLegacySetupFailed {
+                                preset: pending.preset,
+                                profile_selection: pending.profile_selection,
+                                error,
+                            }),
+                    }
+                }
+                return;
+            }
             ServerNotification::AppListUpdated(notification) => {
                 self.chat_widget.on_connectors_loaded(
                     Ok(ConnectorsSnapshot {

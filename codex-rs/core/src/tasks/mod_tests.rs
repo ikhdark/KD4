@@ -1,9 +1,20 @@
+use super::DurableSideEffectStep;
 use super::FINAL_PROOF_CANDIDATE_SEAL_TIMEOUT;
+use super::SessionTask;
+use super::SessionTaskContext;
+use super::SessionTaskResult;
 use super::TASK_COMPACT_METRIC;
 use super::TERMINAL_MUTATION_FINALIZATION_TIMEOUT;
+use super::TERMINALIZATION_DEADLINE;
 use super::TerminalDeadline;
+use super::TerminalPublicationDecision;
+use super::TerminalSchedule;
 use super::TerminalWaitError;
+use super::TurnTerminalOutcome;
 use super::apply_terminal_phase_timings_to_timing;
+use super::atomic_review_transition_persisted;
+use super::downgrade_for_required_finalization_memo;
+use super::durable_side_effect_step;
 use super::emit_compact_metric;
 use super::emit_turn_memory_metric;
 use super::emit_turn_network_proxy_metric;
@@ -11,12 +22,23 @@ use super::merge_completion_review_partial;
 use super::pending_terminal_recovery_state;
 use super::protocol_terminalization_receipt;
 use super::select_terminal_authority;
+use super::terminal_publication_decision;
+use super::terminal_rollout_structure_ready;
+use crate::session::TurnInput;
 use crate::session::tests::make_session_and_context_with_rx;
+use crate::session::turn_context::TurnContext;
 use crate::state::ActiveTurn;
 use crate::state::SamplingAdmission;
+use crate::state::TaskKind;
 use crate::state::TerminalDeliveryState;
 use crate::state::TerminalWakeResult;
 use crate::state::TurnTerminalCoordinator;
+use crate::task_evidence::AtomicReviewTransition;
+use crate::task_evidence::AuthoritativeTerminalEventV1;
+use crate::task_evidence::TaskEvidenceLedger;
+use crate::task_evidence::TaskEvidenceMode;
+use crate::task_evidence::TerminalClaimResult;
+use crate::task_evidence::TerminalDecisionClaim;
 use crate::task_evidence::TerminalDeliveryState as DurableDeliveryState;
 use crate::task_evidence::TerminalRecoveryState;
 use crate::task_evidence::TerminalizationReceiptSnapshot;
@@ -26,11 +48,13 @@ use codex_otel::SessionTelemetry;
 use codex_otel::TURN_MEMORY_METRIC;
 use codex_otel::TURN_NETWORK_PROXY_METRIC;
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TaskCompletionGate;
 use codex_protocol::protocol::TaskCompletionStatus;
 use codex_protocol::protocol::TerminalizationRecoveryState;
 use codex_protocol::protocol::TurnAbortReason;
+use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnTiming;
 use codex_protocol::protocol::TurnTimingTerminalization;
 use opentelemetry::KeyValue;
@@ -41,10 +65,110 @@ use opentelemetry_sdk::metrics::data::MetricData;
 use opentelemetry_sdk::metrics::data::ResourceMetrics;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+
+#[derive(Clone, Copy)]
+struct FenceBlockingTask;
+
+impl SessionTask for FenceBlockingTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.terminal_fence"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        _session: Arc<SessionTaskContext>,
+        _ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        cancellation_token.cancelled().await;
+        Ok(super::TurnTaskResult::default())
+    }
+}
+
+#[test]
+fn implemented_below_ignored_above_successful_side_effect_retries_only_receipt() {
+    assert_eq!(
+        durable_side_effect_step(false, false),
+        DurableSideEffectStep::RunSideEffect
+    );
+    assert_eq!(
+        durable_side_effect_step(true, false),
+        DurableSideEffectStep::PersistReceipt
+    );
+    assert_eq!(
+        durable_side_effect_step(true, true),
+        DurableSideEffectStep::Complete
+    );
+}
+
+#[test]
+fn implemented_below_ignored_above_missing_output_repair_defers_terminal_publication() {
+    assert_eq!(
+        terminal_publication_decision(false),
+        TerminalPublicationDecision::DeferForRolloutRepair
+    );
+    assert_eq!(
+        terminal_publication_decision(true),
+        TerminalPublicationDecision::Publish
+    );
+}
+
+#[test]
+fn implemented_below_ignored_above_required_marker_repair_defers_terminal_publication() {
+    assert!(!terminal_rollout_structure_ready(true, false));
+    assert!(!terminal_rollout_structure_ready(false, true));
+    assert!(terminal_rollout_structure_ready(true, true));
+}
+
+#[test]
+fn implemented_below_ignored_above_failed_finalization_memo_downgrades_passed_gate() {
+    let mut gate = TaskCompletionGate {
+        status: TaskCompletionStatus::Passed,
+        reasons: Vec::new(),
+        evidence_path: None,
+    };
+    assert!(downgrade_for_required_finalization_memo(
+        &mut gate,
+        false,
+        "memo write failed",
+    ));
+    assert_eq!(gate.status, TaskCompletionStatus::Partial);
+    assert_eq!(gate.reasons, vec!["memo write failed"]);
+
+    assert!(!downgrade_for_required_finalization_memo(
+        &mut gate, true, "unused",
+    ));
+}
+
+#[test]
+fn implemented_below_ignored_above_review_transition_requires_durable_persistence() {
+    assert!(atomic_review_transition_persisted(&Ok(
+        AtomicReviewTransition::Persisted(())
+    )));
+    assert!(!atomic_review_transition_persisted(&Ok(
+        AtomicReviewTransition::<()>::Superseded
+    )));
+    assert!(!atomic_review_transition_persisted(&Ok(
+        AtomicReviewTransition::<()>::Failed
+    )));
+    assert!(!atomic_review_transition_persisted(&Err::<
+        AtomicReviewTransition<()>,
+        _,
+    >(
+        TerminalWaitError::OperationTimedOut
+    )));
+}
 
 fn test_session_telemetry() -> SessionTelemetry {
     let exporter = InMemoryMetricExporter::default();
@@ -240,6 +364,100 @@ async fn terminalization_recovery_notification_claim_is_one_shot() {
 }
 
 #[tokio::test]
+async fn authoritative_terminal_claim_is_replayed_on_cli_restart() {
+    let (mut session, turn_context, events) = make_session_and_context_with_rx().await;
+    let evidence_home = tempfile::tempdir().expect("create evidence home");
+    let task_evidence = TaskEvidenceLedger::load_or_new(
+        evidence_home.path().to_path_buf(),
+        session.thread_id,
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+    )
+    .await;
+    assert_eq!(task_evidence.mode(), TaskEvidenceMode::Kd4Completion);
+    Arc::get_mut(&mut session)
+        .expect("test session is uniquely owned")
+        .services
+        .task_evidence = task_evidence;
+
+    let turn_id = turn_context.sub_id.clone();
+    let terminal_identity = format!("{}:{turn_id}", session.thread_id);
+    let terminal_event = EventMsg::TurnComplete(TurnCompleteEvent {
+        turn_id: turn_id.clone(),
+        last_agent_message: Some("durably completed before restart".to_string()),
+        surfaced_result: None,
+        error: None,
+        completion: None,
+        completed_at: None,
+        duration_ms: None,
+        time_to_first_token_ms: None,
+        timing: None,
+    });
+    let authority = AuthoritativeTerminalEventV1 {
+        version: 1,
+        terminal_identity: terminal_identity.clone(),
+        turn_id: turn_id.clone(),
+        fingerprint: crate::terminal_event_fingerprint(&terminal_event)
+            .expect("terminal event fingerprint"),
+        event: terminal_event.clone(),
+        semantic_outcome: "passed".to_string(),
+        final_proof_identity: None,
+    };
+    assert!(matches!(
+        session
+            .services
+            .task_evidence
+            .commit_terminal_decision_and_claim(TerminalDecisionClaim {
+                authoritative_event: authority,
+                deadline_exhausted_phase: None,
+                mutation_quiescent: true,
+                durable_success_established: true,
+                retained_ownership: Vec::new(),
+                phase_timings_ns: BTreeMap::new(),
+            })
+            .await,
+        TerminalClaimResult::Claimed(_)
+    ));
+    assert_eq!(
+        session
+            .services
+            .task_evidence
+            .pending_authoritative_terminal_events()
+            .await
+            .len(),
+        1
+    );
+
+    session.recover_bound_terminal_intent(turn_id.clone()).await;
+
+    let recovered = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let event = events
+                .recv()
+                .await
+                .expect("terminal recovery event channel remains open");
+            if event.id == turn_id {
+                break event.msg;
+            }
+        }
+    })
+    .await
+    .expect("authoritative terminal event is replayed");
+    assert_eq!(
+        serde_json::to_value(recovered).expect("serialize recovered terminal event"),
+        serde_json::to_value(terminal_event).expect("serialize expected terminal event")
+    );
+    assert!(
+        session
+            .services
+            .task_evidence
+            .pending_authoritative_terminal_events()
+            .await
+            .is_empty(),
+        "CLI recovery must complete rollout, delivery, notification, and cleanup obligations"
+    );
+}
+
+#[tokio::test]
 async fn taskless_placeholder_cleanup_is_pointer_identity_guarded() {
     let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
     let first = ActiveTurn::default();
@@ -308,6 +526,90 @@ async fn terminal_deadline_is_shared_and_starts_no_work_after_exhaustion() {
     let timings = deadline.phase_timings_ns();
     assert_eq!(timings["first_wait"], 3_000_000_000);
     assert_eq!(timings["second_wait"], 2_000_000_000);
+}
+
+#[tokio::test(start_paused = true)]
+async fn terminal_schedule_records_admission_fence_in_terminal_timing() {
+    const FENCE_WAIT: Duration = Duration::from_millis(25);
+
+    let phase_started = tokio::time::Instant::now();
+    tokio::time::advance(FENCE_WAIT).await;
+    let deadline = TerminalDeadline::start_with_initial_phase("fence", phase_started);
+    assert_eq!(
+        deadline.remaining(TERMINALIZATION_DEADLINE),
+        Some(TERMINALIZATION_DEADLINE)
+    );
+    assert_eq!(deadline.phase_timings_ns()["fence"], 25_000_000);
+
+    let (session, turn_context, events) = make_session_and_context_with_rx().await;
+    session
+        .start_task(Arc::clone(&turn_context), Vec::new(), FenceBlockingTask)
+        .await;
+
+    let (active_turn_locked_tx, active_turn_locked_rx) = tokio::sync::oneshot::channel();
+    let (release_active_turn_tx, release_active_turn_rx) = std::sync::mpsc::channel();
+    let active_turn_blocker = tokio::task::spawn_blocking({
+        let session = Arc::clone(&session);
+        move || {
+            let active_turn = session.active_turn.blocking_lock();
+            assert!(
+                active_turn
+                    .as_ref()
+                    .is_some_and(|active_turn| active_turn.task.is_some())
+            );
+            let _ = active_turn_locked_tx.send(());
+            let _ = release_active_turn_rx.recv();
+            drop(active_turn);
+        }
+    });
+    active_turn_locked_rx
+        .await
+        .expect("active-turn blocker acquires lock");
+    let schedule = tokio::spawn({
+        let session = Arc::clone(&session);
+        let turn_id = turn_context.sub_id.clone();
+        async move {
+            session
+                .schedule_turn_terminal(
+                    Some(turn_id.as_str()),
+                    TurnTerminalOutcome::Aborted(TurnAbortReason::Interrupted),
+                )
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    assert!(!schedule.is_finished());
+    tokio::time::advance(FENCE_WAIT).await;
+    release_active_turn_tx
+        .send(())
+        .expect("release active-turn blocker");
+    active_turn_blocker
+        .await
+        .expect("active-turn blocker joins");
+
+    assert!(matches!(
+        schedule.await.expect("terminal schedule task joins"),
+        TerminalSchedule::Started(_)
+    ));
+    let timing = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let event = events
+                .recv()
+                .await
+                .expect("terminal event channel remains open");
+            if let EventMsg::TurnAborted(event) = event.msg
+                && event.turn_id.as_deref() == Some(turn_context.sub_id.as_str())
+            {
+                break event.timing.expect("terminal event includes timing");
+            }
+        }
+    })
+    .await
+    .expect("terminal event is emitted");
+
+    assert!(
+        timing.terminalization.fence_ns >= u64::try_from(FENCE_WAIT.as_nanos()).unwrap_or(u64::MAX)
+    );
 }
 
 #[tokio::test]

@@ -7,10 +7,32 @@ use super::resize_reflow::trailing_run_start;
 use super::*;
 use crate::config_update::format_config_error;
 use crate::external_agent_config_migration_flow::ExternalAgentConfigMigrationFlowOutcome;
+use codex_app_server_protocol::WindowsSandboxGrantReadRootParams;
+use codex_app_server_protocol::WindowsSandboxReadiness;
+use codex_app_server_protocol::WindowsSandboxSetupMode;
+use codex_app_server_protocol::WindowsSandboxSetupStartParams;
 #[cfg(target_os = "windows")]
 use codex_config::types::WindowsSandboxModeToml;
+use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_approval_presets::ApprovalPreset;
 
 const SHUTDOWN_FIRST_EXIT_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 2);
+
+fn windows_sandbox_setup_params(
+    mode: WindowsSandboxSetupMode,
+    cwd: AbsolutePathBuf,
+    preset: &ApprovalPreset,
+    profile_selection: Option<&PermissionProfileSelection>,
+) -> WindowsSandboxSetupStartParams {
+    WindowsSandboxSetupStartParams {
+        mode,
+        cwd: Some(cwd),
+        permission_profile_id: profile_selection.map(|selection| selection.profile_id.clone()),
+        permission_profile: profile_selection
+            .is_none()
+            .then(|| preset.permission_profile.clone()),
+    }
+}
 
 impl App {
     pub(super) async fn handle_event(
@@ -1150,106 +1172,53 @@ impl App {
                     );
                     return Ok(AppRunControl::Continue);
                 }
-                #[cfg(target_os = "windows")]
-                {
-                    let setup_permissions = match self
-                        .windows_setup_permissions(&preset, profile_selection.as_ref())
-                        .await
-                    {
-                        Ok(setup_permissions) => setup_permissions,
-                        Err(err) => {
-                            tracing::warn!(
-                                error = %err,
-                                "failed to resolve permission profile for elevated Windows sandbox setup"
-                            );
-                            self.chat_widget.add_error_message(format!(
-                                "Failed to prepare Windows sandbox for the selected permission profile: {err}"
-                            ));
-                            return Ok(AppRunControl::Continue);
-                        }
-                    };
-                    let permission_profile = setup_permissions.permission_profile;
-                    let workspace_roots = setup_permissions.workspace_roots;
-                    let command_cwd = self.config.cwd.clone();
-                    let env_map: std::collections::HashMap<String, String> =
-                        std::env::vars().collect();
-                    let codex_home = self.config.codex_home.clone();
-                    let tx = self.app_event_tx.clone();
-
-                    // If the elevated setup already ran on this machine, don't prompt for
-                    // elevation again - just flip the config to use the elevated path.
-                    if crate::windows_sandbox::sandbox_setup_is_complete(codex_home.as_path()) {
-                        tx.send(AppEvent::EnableWindowsSandboxForAgentMode {
-                            preset,
-                            mode: WindowsSandboxEnableMode::Elevated,
-                            profile_selection,
-                        });
+                match app_server.windows_sandbox_readiness().await {
+                    Ok(response) if response.status == WindowsSandboxReadiness::Ready => {
+                        self.app_event_tx
+                            .send(AppEvent::EnableWindowsSandboxForAgentMode {
+                                preset,
+                                mode: WindowsSandboxEnableMode::Elevated,
+                                profile_selection,
+                            });
                         return Ok(AppRunControl::Continue);
                     }
-
-                    self.chat_widget.show_windows_sandbox_setup_status();
-                    self.windows_sandbox.setup_started_at = Some(Instant::now());
-                    let session_telemetry = self.session_telemetry.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let result = crate::windows_sandbox::run_elevated_setup(
-                            &permission_profile,
-                            workspace_roots.as_slice(),
-                            command_cwd.as_path(),
-                            &env_map,
-                            codex_home.as_path(),
+                    Ok(response) if response.status == WindowsSandboxReadiness::Unsupported => {
+                        self.chat_widget.add_error_message(
+                            "Windows sandbox setup is not supported by the connected app-server."
+                                .to_string(),
                         );
-                        let event = match result {
-                            Ok(()) => {
-                                session_telemetry.counter(
-                                    "codex.windows_sandbox.elevated_setup_success",
-                                    /*inc*/ 1,
-                                    &[],
-                                );
-                                AppEvent::EnableWindowsSandboxForAgentMode {
-                                    preset: preset.clone(),
-                                    mode: WindowsSandboxEnableMode::Elevated,
-                                    profile_selection: profile_selection.clone(),
-                                }
-                            }
-                            Err(err) => {
-                                let mut code_tag: Option<String> = None;
-                                let mut message_tag: Option<String> = None;
-                                if let Some((code, message)) =
-                                    crate::windows_sandbox::elevated_setup_failure_details(&err)
-                                {
-                                    code_tag = Some(code);
-                                    message_tag = Some(message);
-                                }
-                                let mut tags: Vec<(&str, &str)> = Vec::new();
-                                if let Some(code) = code_tag.as_deref() {
-                                    tags.push(("code", code));
-                                }
-                                if let Some(message) = message_tag.as_deref() {
-                                    tags.push(("message", message));
-                                }
-                                session_telemetry.counter(
-                                    crate::windows_sandbox::elevated_setup_failure_metric_name(
-                                        &err,
-                                    ),
-                                    /*inc*/ 1,
-                                    &tags,
-                                );
-                                tracing::error!(
-                                    error = %err,
-                                    "failed to run elevated Windows sandbox setup"
-                                );
-                                AppEvent::OpenWindowsSandboxFallbackPrompt {
-                                    preset,
-                                    profile_selection,
-                                }
-                            }
-                        };
-                        tx.send(event);
-                    });
+                        return Ok(AppRunControl::Continue);
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        self.chat_widget.add_error_message(format!(
+                            "Failed to check Windows sandbox readiness: {err}"
+                        ));
+                        return Ok(AppRunControl::Continue);
+                    }
                 }
-                #[cfg(not(target_os = "windows"))]
-                {
-                    let _ = (preset, profile_selection);
+
+                let params = windows_sandbox_setup_params(
+                    WindowsSandboxSetupMode::Elevated,
+                    self.config.cwd.clone(),
+                    &preset,
+                    profile_selection.as_ref(),
+                );
+                self.chat_widget.show_windows_sandbox_setup_status();
+                self.windows_sandbox.setup_started_at = Some(Instant::now());
+                self.windows_sandbox.pending_setup = Some(PendingWindowsSandboxSetup {
+                    preset: preset.clone(),
+                    profile_selection: profile_selection.clone(),
+                    mode: WindowsSandboxEnableMode::Elevated,
+                });
+                if let Err(err) = app_server.windows_sandbox_setup_start(params).await {
+                    tracing::error!(error = %err, "failed to start elevated Windows sandbox setup");
+                    self.windows_sandbox.pending_setup = None;
+                    self.app_event_tx
+                        .send(AppEvent::OpenWindowsSandboxFallbackPrompt {
+                            preset,
+                            profile_selection,
+                        });
                 }
             }
             AppEvent::BeginWindowsSandboxLegacySetup {
@@ -1269,71 +1238,27 @@ impl App {
                     );
                     return Ok(AppRunControl::Continue);
                 }
-                #[cfg(target_os = "windows")]
-                {
-                    let setup_permissions = match self
-                        .windows_setup_permissions(&preset, profile_selection.as_ref())
-                        .await
-                    {
-                        Ok(setup_permissions) => setup_permissions,
-                        Err(err) => {
-                            tracing::warn!(
-                                error = %err,
-                                "failed to resolve permission profile for legacy Windows sandbox setup"
-                            );
-                            self.chat_widget.add_error_message(format!(
-                                "Failed to prepare Windows sandbox for the selected permission profile: {err}"
-                            ));
-                            return Ok(AppRunControl::Continue);
-                        }
-                    };
-                    let permission_profile = setup_permissions.permission_profile;
-                    let workspace_roots = setup_permissions.workspace_roots;
-                    let command_cwd = self.config.cwd.clone();
-                    let env_map: std::collections::HashMap<String, String> =
-                        std::env::vars().collect();
-                    let codex_home = self.config.codex_home.clone();
-                    let tx = self.app_event_tx.clone();
-                    let session_telemetry = self.session_telemetry.clone();
-
-                    self.chat_widget.show_windows_sandbox_setup_status();
-                    tokio::task::spawn_blocking(move || {
-                        let event =
-                            match codex_windows_sandbox::run_windows_sandbox_legacy_preflight(
-                                &permission_profile,
-                                workspace_roots.as_slice(),
-                                codex_home.as_path(),
-                                command_cwd.as_path(),
-                                &env_map,
-                            ) {
-                                Ok(()) => AppEvent::EnableWindowsSandboxForAgentMode {
-                                    preset,
-                                    mode: WindowsSandboxEnableMode::Legacy,
-                                    profile_selection,
-                                },
-                                Err(err) => {
-                                    session_telemetry.counter(
-                                        "codex.windows_sandbox.legacy_setup_preflight_failed",
-                                        /*inc*/ 1,
-                                        &[],
-                                    );
-                                    tracing::warn!(
-                                        error = %err,
-                                        "failed to preflight non-admin Windows sandbox setup"
-                                    );
-                                    AppEvent::WindowsSandboxLegacySetupFailed {
-                                        preset,
-                                        profile_selection,
-                                        error: err.to_string(),
-                                    }
-                                }
-                            };
-                        tx.send(event);
-                    });
-                }
-                #[cfg(not(target_os = "windows"))]
-                {
-                    let _ = (preset, profile_selection);
+                let params = windows_sandbox_setup_params(
+                    WindowsSandboxSetupMode::Unelevated,
+                    self.config.cwd.clone(),
+                    &preset,
+                    profile_selection.as_ref(),
+                );
+                self.chat_widget.show_windows_sandbox_setup_status();
+                self.windows_sandbox.pending_setup = Some(PendingWindowsSandboxSetup {
+                    preset: preset.clone(),
+                    profile_selection: profile_selection.clone(),
+                    mode: WindowsSandboxEnableMode::Legacy,
+                });
+                if let Err(err) = app_server.windows_sandbox_setup_start(params).await {
+                    tracing::warn!(error = %err, "failed to start non-admin Windows sandbox setup");
+                    self.windows_sandbox.pending_setup = None;
+                    self.app_event_tx
+                        .send(AppEvent::WindowsSandboxLegacySetupFailed {
+                            preset,
+                            profile_selection,
+                            error: err.to_string(),
+                        });
                 }
             }
             AppEvent::WindowsSandboxLegacySetupFailed {
@@ -1354,62 +1279,43 @@ impl App {
                     .open_windows_sandbox_legacy_unavailable_prompt(preset, profile_selection);
             }
             AppEvent::BeginWindowsSandboxGrantReadRoot { path } => {
-                #[cfg(target_os = "windows")]
+                self.chat_widget
+                    .add_to_history(history_cell::new_info_event(
+                        format!("Granting sandbox read access to {path} ..."),
+                        /*hint*/ None,
+                    ));
+                let requested_path = PathBuf::from(&path);
+                let absolute_path = match AbsolutePathBuf::try_from(requested_path.clone()) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        self.chat_widget
+                            .add_to_history(history_cell::new_error_event(format!(
+                                "Error: invalid read root: {err}"
+                            )));
+                        return Ok(AppRunControl::Continue);
+                    }
+                };
+                match app_server
+                    .windows_sandbox_grant_read_root(WindowsSandboxGrantReadRootParams {
+                        path: absolute_path,
+                        cwd: Some(self.config.cwd.clone()),
+                    })
+                    .await
                 {
-                    self.chat_widget
+                    Ok(response) => self
+                        .chat_widget
                         .add_to_history(history_cell::new_info_event(
-                            format!("Granting sandbox read access to {path} ..."),
+                            format!(
+                                "Sandbox read access granted for {}",
+                                response.path.as_path().display()
+                            ),
                             /*hint*/ None,
-                        ));
-
-                    let permission_profile = self.config.permissions.effective_permission_profile();
-                    let workspace_roots = self.config.effective_workspace_roots();
-                    let command_cwd = self.config.cwd.clone();
-                    let env_map: std::collections::HashMap<String, String> =
-                        std::env::vars().collect();
-                    let codex_home = self.config.codex_home.clone();
-                    let tx = self.app_event_tx.clone();
-
-                    tokio::task::spawn_blocking(move || {
-                        let requested_path = PathBuf::from(path);
-                        let event = match crate::windows_sandbox::grant_read_root_non_elevated(
-                            &permission_profile,
-                            workspace_roots.as_slice(),
-                            command_cwd.as_path(),
-                            &env_map,
-                            codex_home.as_path(),
-                            requested_path.as_path(),
-                        ) {
-                            Ok(canonical_path) => AppEvent::WindowsSandboxGrantReadRootCompleted {
-                                path: canonical_path,
-                                error: None,
-                            },
-                            Err(err) => AppEvent::WindowsSandboxGrantReadRootCompleted {
-                                path: requested_path,
-                                error: Some(err.to_string()),
-                            },
-                        };
-                        tx.send(event);
-                    });
-                }
-                #[cfg(not(target_os = "windows"))]
-                {
-                    let _ = path;
+                        )),
+                    Err(err) => self
+                        .chat_widget
+                        .add_to_history(history_cell::new_error_event(format!("Error: {err}"))),
                 }
             }
-            AppEvent::WindowsSandboxGrantReadRootCompleted { path, error } => match error {
-                Some(err) => {
-                    self.chat_widget
-                        .add_to_history(history_cell::new_error_event(format!("Error: {err}")));
-                }
-                None => {
-                    self.chat_widget
-                        .add_to_history(history_cell::new_info_event(
-                            format!("Sandbox read access granted for {}", path.display()),
-                            /*hint*/ None,
-                        ));
-                }
-            },
             AppEvent::EnableWindowsSandboxForAgentMode {
                 preset,
                 mode,
@@ -2489,5 +2395,54 @@ impl App {
                 AppRunControl::Continue
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_config::types::ApprovalsReviewer;
+    use codex_utils_approval_presets::builtin_approval_presets;
+
+    #[test]
+    fn windows_sandbox_setup_params_preserve_pending_permission_selection() {
+        let preset = builtin_approval_presets()
+            .into_iter()
+            .find(|preset| preset.id == "auto")
+            .expect("auto preset");
+        let cwd = AbsolutePathBuf::try_from(
+            std::env::current_dir().expect("current directory should be available"),
+        )
+        .expect("current directory should be absolute");
+
+        let inline = windows_sandbox_setup_params(
+            WindowsSandboxSetupMode::Elevated,
+            cwd.clone(),
+            &preset,
+            None,
+        );
+        assert_eq!(inline.permission_profile_id, None);
+        assert_eq!(
+            inline.permission_profile,
+            Some(preset.permission_profile.clone())
+        );
+
+        let selection = PermissionProfileSelection {
+            profile_id: "managed-default".to_string(),
+            approval_policy: Some(AskForApproval::OnRequest),
+            approvals_reviewer: Some(ApprovalsReviewer::User),
+            display_label: "Managed default".to_string(),
+        };
+        let named = windows_sandbox_setup_params(
+            WindowsSandboxSetupMode::Unelevated,
+            cwd,
+            &preset,
+            Some(&selection),
+        );
+        assert_eq!(
+            named.permission_profile_id.as_deref(),
+            Some("managed-default")
+        );
+        assert_eq!(named.permission_profile, None);
     }
 }
