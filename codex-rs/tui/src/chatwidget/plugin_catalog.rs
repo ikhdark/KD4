@@ -1004,7 +1004,7 @@ impl ChatWidget {
         .label()
         .map(str::to_string)
         .unwrap_or_else(|| plugin.marketplace_name.clone());
-        let display_name = plugin_display_name(&plugin.summary);
+        let display_name = plugin.summary.display_name();
         let detail_status_label = plugin_detail_status_label(&plugin.summary);
         let mut header = ColumnRenderable::new();
         header.push(Line::from("Plugins".bold()));
@@ -1574,7 +1574,7 @@ fn plugin_entries_for_marketplaces<'a>(
             marketplace
                 .plugins
                 .iter()
-                .map(move |plugin| (marketplace, plugin, plugin_display_name(plugin)))
+                .map(move |plugin| (marketplace, plugin, plugin.display_name()))
         })
         .collect::<Vec<_>>();
     dedupe_plugin_entries(entries)
@@ -1841,17 +1841,6 @@ pub(super) fn marketplace_is_user_configured_git(config: &Config, marketplace_na
         .and_then(|marketplace| marketplace.get("source_type"))
         .and_then(toml::Value::as_str)
         .is_some_and(|source_type| source_type == "git")
-}
-
-fn plugin_display_name(plugin: &PluginSummary) -> String {
-    plugin
-        .interface
-        .as_ref()
-        .and_then(|interface| interface.display_name.as_deref())
-        .map(str::trim)
-        .filter(|display_name| !display_name.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| plugin.name.clone())
 }
 
 fn plugin_brief_description(

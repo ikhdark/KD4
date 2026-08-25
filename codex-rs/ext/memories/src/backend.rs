@@ -1,39 +1,19 @@
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
-use std::future::Future;
-
-/// Storage interface behind the memories tools.
-///
-/// Implementations should return paths relative to the memory store and enforce
-/// their own storage-specific access rules. The local implementation uses the
-/// filesystem today; a later implementation can satisfy the same contract from a
-/// remote backend.
-pub trait MemoriesBackend: Clone + Send + Sync + 'static {
-    fn add_ad_hoc_note(
-        &self,
-        request: AddAdHocMemoryNoteRequest,
-    ) -> impl Future<Output = Result<AddAdHocMemoryNoteResponse, MemoriesBackendError>> + Send;
-
-    fn list(
-        &self,
-        request: ListMemoriesRequest,
-    ) -> impl Future<Output = Result<ListMemoriesResponse, MemoriesBackendError>> + Send;
-
-    fn read(
-        &self,
-        request: ReadMemoryRequest,
-    ) -> impl Future<Output = Result<ReadMemoryResponse, MemoriesBackendError>> + Send;
-
-    fn search(
-        &self,
-        request: SearchMemoriesRequest,
-    ) -> impl Future<Output = Result<SearchMemoriesResponse, MemoriesBackendError>> + Send;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AddAdHocMemoryNoteRequest {
+    /// Name of the note file to create, in
+    /// YYYY-MM-DDTHH-MM-SS-<slug>.md format. The slug must use only lowercase
+    /// ASCII letters, digits, and hyphens.
+    #[schemars(
+        length(min = 24, max = 128),
+        regex(pattern = r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-[a-z0-9][a-z0-9-]{0,79}\.md$")
+    )]
     pub filename: String,
+    /// Verbatim Markdown note to append to the ad-hoc memory notes.
+    #[schemars(length(min = 1))]
     pub note: String,
 }
 

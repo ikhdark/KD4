@@ -15,10 +15,12 @@ use sqlx::sqlite::SqliteSynchronous;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::future::Future;
 use std::io::Read;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
@@ -82,7 +84,6 @@ use crate::StoreError;
 use crate::StoreResult;
 use crate::TaskActor;
 use crate::TaskCapsuleV1;
-use crate::TaskStoreFuture;
 use crate::ValidationCall;
 use crate::ValidationCallStatus;
 use crate::ValidationEvidence;
@@ -227,6 +228,8 @@ pub struct LocalAgentTaskStore {
     wake_revision: Arc<watch::Sender<u64>>,
     durable_wake_poller: Arc<DurableWakePoller>,
 }
+
+pub type TaskStoreFuture<'a, T> = Pin<Box<dyn Future<Output = StoreResult<T>> + Send + 'a>>;
 
 struct DurableWakePoller {
     waiter_count: AtomicUsize,
@@ -3713,8 +3716,8 @@ impl LocalAgentTaskStore {
     }
 }
 
-impl crate::AgentTaskStore for LocalAgentTaskStore {
-    fn create_assignment<'a>(
+impl LocalAgentTaskStore {
+    pub fn create_assignment<'a>(
         &'a self,
         repo_root: &'a Path,
         draft: AssignmentDraft,
@@ -3728,7 +3731,7 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         })
     }
 
-    fn create_admitted_assignment<'a>(
+    pub fn create_admitted_assignment<'a>(
         &'a self,
         repo_root: &'a Path,
         draft: AssignmentDraft,
@@ -3750,7 +3753,7 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         })
     }
 
-    fn attach_task_capsule(
+    pub fn attach_task_capsule(
         &self,
         assignment_id: AssignmentId,
         attempt_id: AttemptId,
@@ -3767,7 +3770,7 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         })
     }
 
-    fn get_agent_task(
+    pub fn get_agent_task(
         &self,
         assignment_id: AssignmentId,
         observation_limit: Option<usize>,
@@ -3778,7 +3781,7 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         })
     }
 
-    fn bind_agent_task(
+    pub fn bind_agent_task(
         &self,
         binding: AgentTaskBindingDraft,
     ) -> TaskStoreFuture<'_, AgentTaskBinding> {
@@ -3791,7 +3794,7 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         })
     }
 
-    fn remove_agent_task_binding(
+    pub fn remove_agent_task_binding(
         &self,
         actor: TaskActor,
         assignment_id: AssignmentId,
@@ -3807,14 +3810,14 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         })
     }
 
-    fn get_agent_task_binding(
+    pub fn get_agent_task_binding(
         &self,
         assignment_id: AssignmentId,
     ) -> TaskStoreFuture<'_, Option<AgentTaskBinding>> {
         Box::pin(async move { self.get_agent_task_binding_impl(assignment_id).await })
     }
 
-    fn list_agent_task_bindings(
+    pub fn list_agent_task_bindings(
         &self,
         root_session_id: String,
         limit: Option<usize>,
@@ -3825,14 +3828,14 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         })
     }
 
-    fn heartbeat_typed_workspace_actor(
+    pub fn heartbeat_typed_workspace_actor(
         &self,
         binding: AgentTaskBinding,
     ) -> TaskStoreFuture<'_, bool> {
         Box::pin(async move { self.heartbeat_typed_workspace_actor_impl(binding).await })
     }
 
-    fn append_observation(
+    pub fn append_observation(
         &self,
         attempt_id: AttemptId,
         kind: ObservationKind,
@@ -3850,7 +3853,7 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         })
     }
 
-    fn record_validation_call(&self, call: ValidationCall) -> TaskStoreFuture<'_, ()> {
+    pub fn record_validation_call(&self, call: ValidationCall) -> TaskStoreFuture<'_, ()> {
         Box::pin(async move {
             let result = self.record_validation_call_impl(call).await;
             if result.is_ok() {
@@ -3860,11 +3863,14 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         })
     }
 
-    fn get_validation_call(&self, call_id: String) -> TaskStoreFuture<'_, Option<ValidationCall>> {
+    pub fn get_validation_call(
+        &self,
+        call_id: String,
+    ) -> TaskStoreFuture<'_, Option<ValidationCall>> {
         Box::pin(async move { self.get_validation_call_impl(call_id).await })
     }
 
-    fn heartbeat_validation_call(
+    pub fn heartbeat_validation_call(
         &self,
         call_id: String,
         lease_expires_at: chrono::DateTime<Utc>,
@@ -3875,7 +3881,7 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         })
     }
 
-    fn replay_required_evidence_missing<'a>(
+    pub fn replay_required_evidence_missing<'a>(
         &'a self,
         attempt_id: AttemptId,
         receipt: &'a ReceiptDraft,
@@ -3886,7 +3892,7 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         })
     }
 
-    fn submit_agent_receipt(
+    pub fn submit_agent_receipt(
         &self,
         attempt_id: AttemptId,
         receipt: ReceiptDraft,
@@ -3902,7 +3908,7 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         })
     }
 
-    fn submit_agent_receipt_with_review(
+    pub fn submit_agent_receipt_with_review(
         &self,
         attempt_id: AttemptId,
         receipt: ReceiptDraft,
@@ -3919,7 +3925,7 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         })
     }
 
-    fn amend_agent_task(
+    pub fn amend_agent_task(
         &self,
         actor: TaskActor,
         assignment_id: AssignmentId,
@@ -3936,7 +3942,7 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         })
     }
 
-    fn abandon_agent_task(
+    pub fn abandon_agent_task(
         &self,
         actor: TaskActor,
         assignment_id: AssignmentId,
@@ -3953,7 +3959,7 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         })
     }
 
-    fn set_agent_gate(
+    pub fn set_agent_gate(
         &self,
         actor: TaskActor,
         assignment_id: AssignmentId,
@@ -3972,7 +3978,7 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         })
     }
 
-    fn waive_agent_gate(
+    pub fn waive_agent_gate(
         &self,
         actor: TaskActor,
         assignment_id: AssignmentId,
@@ -3990,7 +3996,7 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         })
     }
 
-    fn read_wake_events(
+    pub fn read_wake_events(
         &self,
         root_session_id: String,
         after_event_id: Option<WakeEventId>,
@@ -4001,7 +4007,7 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         })
     }
 
-    fn wait_for_wake_events(
+    pub fn wait_for_wake_events(
         &self,
         root_session_id: String,
         after_event_id: Option<WakeEventId>,
@@ -4012,7 +4018,7 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         })
     }
 
-    fn automatic_wake_cursor(
+    pub fn automatic_wake_cursor(
         &self,
         root_session_id: String,
         consuming_agent_path: String,
@@ -4023,7 +4029,7 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         })
     }
 
-    fn compare_and_swap_automatic_wake_cursor(
+    pub fn compare_and_swap_automatic_wake_cursor(
         &self,
         root_session_id: String,
         consuming_agent_path: String,
@@ -4041,7 +4047,7 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         })
     }
 
-    fn reserve_stalled_nudge(
+    pub fn reserve_stalled_nudge(
         &self,
         assignment_id: AssignmentId,
         no_progress_before: chrono::DateTime<Utc>,
@@ -4052,7 +4058,7 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         })
     }
 
-    fn recover_nonproductive_assignment(
+    pub fn recover_nonproductive_assignment(
         &self,
         assignment_id: AssignmentId,
         no_progress_before: chrono::DateTime<Utc>,
@@ -4068,11 +4074,11 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         })
     }
 
-    fn release_stalled_nudge(&self, assignment_id: AssignmentId) -> TaskStoreFuture<'_, bool> {
+    pub fn release_stalled_nudge(&self, assignment_id: AssignmentId) -> TaskStoreFuture<'_, bool> {
         Box::pin(async move { self.release_stalled_nudge_impl(assignment_id).await })
     }
 
-    fn capture_workspace_revision<'a>(
+    pub fn capture_workspace_revision<'a>(
         &'a self,
         repo_root: &'a Path,
         paths: Vec<String>,
@@ -4082,7 +4088,7 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         )
     }
 
-    fn read_workspace_events<'a>(
+    pub fn read_workspace_events<'a>(
         &'a self,
         repo_root: &'a Path,
         after_epoch: u64,
@@ -4092,7 +4098,7 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         )
     }
 
-    fn register_workspace_actor<'a>(
+    pub fn register_workspace_actor<'a>(
         &'a self,
         repo_root: &'a Path,
         registration: WorkspaceActorRegistration,
@@ -4107,7 +4113,7 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         })
     }
 
-    fn check_quiescence(
+    pub fn check_quiescence(
         &self,
         root_session_id: String,
     ) -> TaskStoreFuture<'_, crate::QuiescenceStatus> {
@@ -4118,7 +4124,7 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         })
     }
 
-    fn inspect_quiescence(
+    pub fn inspect_quiescence(
         &self,
         root_session_id: String,
     ) -> TaskStoreFuture<'_, crate::QuiescenceStatus> {
@@ -4127,7 +4133,7 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         )
     }
 
-    fn begin_mutation<'a>(
+    pub fn begin_mutation<'a>(
         &'a self,
         attempt_id: AttemptId,
         repo_root: &'a Path,
@@ -4145,7 +4151,7 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         })
     }
 
-    fn finalize_mutation<'a>(
+    pub fn finalize_mutation<'a>(
         &'a self,
         attempt_id: AttemptId,
         repo_root: &'a Path,
@@ -4162,7 +4168,7 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         })
     }
 
-    fn finalize_pending_mutations(
+    pub fn finalize_pending_mutations(
         &self,
         attempt_id: AttemptId,
     ) -> TaskStoreFuture<'_, Vec<MutationEvidence>> {
@@ -4175,7 +4181,7 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         })
     }
 
-    fn list_mutation_evidence(
+    pub fn list_mutation_evidence(
         &self,
         attempt_id: AttemptId,
         limit: Option<usize>,
@@ -4183,7 +4189,7 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         Box::pin(async move { self.list_mutation_evidence_impl(attempt_id, limit).await })
     }
 
-    fn read_mutation_snapshot(
+    pub fn read_mutation_snapshot(
         &self,
         attempt_id: AttemptId,
         path: String,
@@ -5024,11 +5030,7 @@ fn validation_event_is_repository_global(path: &str) -> bool {
     if is_repository_global_validation_file(Path::new(path)) {
         return true;
     }
-    let path = if cfg!(windows) {
-        path.to_lowercase()
-    } else {
-        path.to_string()
-    };
+    let path = path.to_lowercase();
     [
         "codex-rs/app-server-protocol/schema",
         "codex-rs/hooks/schema/generated",
@@ -5040,11 +5042,7 @@ fn validation_event_is_repository_global(path: &str) -> bool {
 fn merge_validation_scopes(scopes: Vec<RepoScope>) -> Vec<RepoScope> {
     let mut merged = HashMap::<String, RepoScope>::new();
     for scope in scopes {
-        let key = if cfg!(windows) {
-            scope.path.to_lowercase()
-        } else {
-            scope.path.clone()
-        };
+        let key = scope.path.to_lowercase();
         merged
             .entry(key)
             .and_modify(|existing| existing.recursive |= scope.recursive)
@@ -6897,11 +6895,7 @@ async fn require_repository_identity_tx(
     let bound_id = row.get::<String, _>("repository_id");
     let bound_workspace_id = row.get::<String, _>("workspace_id");
     let bound_root = row.get::<String, _>("canonical_root");
-    let root_matches = if cfg!(windows) {
-        bound_root.to_lowercase() == repository.canonical_path.to_lowercase()
-    } else {
-        bound_root == repository.canonical_path
-    };
+    let root_matches = bound_root.to_lowercase() == repository.canonical_path.to_lowercase();
     if assignment.repository_id.is_empty()
         || assignment.repository_id != bound_id
         || repository.id != bound_id
@@ -7131,7 +7125,7 @@ async fn capture_snapshot_atomic(
     logical_path: String,
 ) -> StoreResult<SnapshotCapture> {
     #[cfg(test)]
-    if let Ok(pause) = TEST_SNAPSHOT_CAPTURE_PAUSE.try_with(|pause| Arc::clone(pause)) {
+    if let Ok(pause) = TEST_SNAPSHOT_CAPTURE_PAUSE.try_with(Arc::clone) {
         pause.started.add_permits(1);
         if let Ok(permit) = pause.release.acquire().await {
             permit.forget();
@@ -7201,8 +7195,7 @@ async fn capture_snapshot_atomic(
             destination.flush()?;
             destination.sync_all()?;
             std::fs::rename(&temporary_path, &snapshot_path)?;
-            #[cfg(unix)]
-            std::fs::File::open(parent)?.sync_all()?;
+
             Ok(capture)
         })();
         if result.is_err() {

@@ -1,7 +1,6 @@
 use super::DurableSideEffectStep;
 use super::FINAL_PROOF_CANDIDATE_SEAL_TIMEOUT;
 use super::SessionTask;
-use super::SessionTaskContext;
 use super::SessionTaskResult;
 use super::TASK_COMPACT_METRIC;
 use super::TERMINAL_MUTATION_FINALIZATION_TIMEOUT;
@@ -90,16 +89,25 @@ impl SessionTask for FenceBlockingTask {
         "session_task.terminal_fence"
     }
 
-    async fn run(
+    fn run(
         self: Arc<Self>,
-        _session: Arc<SessionTaskContext>,
+        _session: Arc<crate::session::session::Session>,
         _ctx: Arc<TurnContext>,
         _input: Vec<TurnInput>,
         cancellation_token: CancellationToken,
-    ) -> SessionTaskResult {
-        cancellation_token.cancelled().await;
-        Ok(super::TurnTaskResult::default())
+    ) -> futures::future::BoxFuture<'static, SessionTaskResult> {
+        Box::pin(async move {
+            cancellation_token.cancelled().await;
+            Ok(super::TurnTaskResult::default())
+        })
     }
+}
+
+#[test]
+fn session_task_is_the_object_safe_runtime_boundary() {
+    let task: Arc<dyn SessionTask> = Arc::new(FenceBlockingTask);
+    assert_eq!(task.kind(), TaskKind::Regular);
+    assert_eq!(task.span_name(), "session_task.terminal_fence");
 }
 
 #[test]

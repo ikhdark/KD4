@@ -1,4 +1,4 @@
-use crate::function_tool::FunctionCallError;
+use crate::FunctionCallError;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;

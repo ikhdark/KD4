@@ -12,7 +12,6 @@ modify the code
 - `InlineHiddenTagParser<T>`: generic parser that hides inline tags and extracts their contents
 - `CitationStreamParser`: convenience wrapper for `<oai-mem-citation>...</oai-mem-citation>`
 - `strip_citations(...)`: one-shot helper for non-streamed strings
-- `Utf8StreamParser<P>`: adapter for raw `&[u8]` streams that may split UTF-8 code points
 
 ## Why this exists
 
@@ -42,28 +41,6 @@ assert_eq!(second.extracted, vec!["doc A".to_string()]);
 let tail = parser.finish();
 assert!(tail.visible_text.is_empty());
 assert!(tail.extracted.is_empty());
-```
-
-## Example: raw byte streaming with split UTF-8 code points
-
-```rust
-use codex_utils_stream_parser::CitationStreamParser;
-use codex_utils_stream_parser::Utf8StreamParser;
-
-# fn demo() -> Result<(), codex_utils_stream_parser::Utf8StreamParserError> {
-let mut parser = Utf8StreamParser::new(CitationStreamParser::new());
-
-// "é" split across chunks: 0xC3 + 0xA9
-let first = parser.push_bytes(&[b'H', 0xC3])?;
-assert_eq!(first.visible_text, "H");
-
-let second = parser.push_bytes(&[0xA9, b'!'])?;
-assert_eq!(second.visible_text, "é!");
-
-let tail = parser.finish()?;
-assert!(tail.visible_text.is_empty());
-# Ok(())
-# }
 ```
 
 ## Example: custom hidden tags

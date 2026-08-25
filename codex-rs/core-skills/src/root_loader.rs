@@ -3,8 +3,10 @@ use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
-use codex_utils_plugins::PluginSkillRoot;
+use codex_plugin::PluginSkillRoot;
 
 use crate::SkillLoadOutcome;
 use crate::loader::SkillRoot;
@@ -12,12 +14,15 @@ use crate::loader::SkillRootSnapshot;
 use crate::loader::load_skill_root;
 use crate::model::SkillFileSystemsByPath;
 
+static NEXT_PLUGIN_SKILL_SNAPSHOT_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
 /// Parsed plugin skill-root snapshots produced by one plugin load.
 ///
 /// Clones share the same snapshots. The plugins manager stores them with the corresponding loaded
 /// plugins and passes a clone to skill loading as an optional preload.
 #[derive(Clone)]
 pub struct PluginSkillSnapshots {
+    cache_identity: u64,
     snapshots_by_root: Arc<Mutex<HashMap<PluginSkillRoot, SkillRootSnapshot>>>,
 }
 
@@ -25,8 +30,13 @@ impl PluginSkillSnapshots {
     /// Creates an empty snapshot collection for a plugin load to populate.
     pub fn for_plugin_load() -> Self {
         Self {
+            cache_identity: NEXT_PLUGIN_SKILL_SNAPSHOT_IDENTITY.fetch_add(1, Ordering::Relaxed),
             snapshots_by_root: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub(crate) fn cache_identity(&self) -> u64 {
+        self.cache_identity
     }
 }
 

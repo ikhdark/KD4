@@ -34,12 +34,6 @@ impl SessionLogger {
             std::fs::create_dir_all(parent)?;
         }
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-
         let file = opts.open(path)?;
         self.file.get_or_init(|| Mutex::new(file));
         Ok(())

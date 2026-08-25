@@ -10,6 +10,7 @@ use codex_protocol::protocol::HookRunSummary;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
 use super::common;
+use super::common::ContextInjectingHookOutcome;
 use crate::engine::CommandShell;
 use crate::engine::ConfiguredHandler;
 use crate::engine::command_runner::CommandRunResult;
@@ -29,14 +30,6 @@ pub struct UserPromptSubmitRequest {
     pub model: String,
     pub permission_mode: String,
     pub prompt: String,
-}
-
-#[derive(Debug)]
-pub struct UserPromptSubmitOutcome {
-    pub hook_events: Vec<HookCompletedEvent>,
-    pub should_stop: bool,
-    pub stop_reason: Option<String>,
-    pub additional_contexts: Vec<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -64,19 +57,14 @@ pub(crate) async fn run(
     handlers: &[ConfiguredHandler],
     shell: &CommandShell,
     request: UserPromptSubmitRequest,
-) -> UserPromptSubmitOutcome {
+) -> ContextInjectingHookOutcome {
     let matched = dispatcher::select_handlers(
         handlers,
         HookEventName::UserPromptSubmit,
         /*matcher_input*/ None,
     );
     if matched.is_empty() {
-        return UserPromptSubmitOutcome {
-            hook_events: Vec::new(),
-            should_stop: false,
-            stop_reason: None,
-            additional_contexts: Vec::new(),
-        };
+        return ContextInjectingHookOutcome::default();
     }
 
     let subagent = SubagentCommandInputFields::from(request.subagent.as_ref());
@@ -94,11 +82,13 @@ pub(crate) async fn run(
     }) {
         Ok(input_json) => input_json,
         Err(error) => {
-            return serialization_failure_outcome(common::serialization_failure_hook_events(
-                matched,
-                Some(request.turn_id),
-                format!("failed to serialize user prompt submit hook input: {error}"),
-            ));
+            return ContextInjectingHookOutcome::from_serialization_failure(
+                common::serialization_failure_hook_events(
+                    matched,
+                    Some(request.turn_id),
+                    format!("failed to serialize user prompt submit hook input: {error}"),
+                ),
+            );
         }
     };
 
@@ -122,7 +112,7 @@ pub(crate) async fn run(
             .map(|result| result.data.additional_contexts_for_model.as_slice()),
     );
 
-    UserPromptSubmitOutcome {
+    ContextInjectingHookOutcome {
         hook_events: results.into_iter().map(|result| result.completed).collect(),
         should_stop,
         stop_reason,
@@ -261,15 +251,6 @@ fn parse_completed(
             additional_contexts_for_model,
         },
         completion_order: 0,
-    }
-}
-
-fn serialization_failure_outcome(hook_events: Vec<HookCompletedEvent>) -> UserPromptSubmitOutcome {
-    UserPromptSubmitOutcome {
-        hook_events,
-        should_stop: false,
-        stop_reason: None,
-        additional_contexts: Vec::new(),
     }
 }
 

@@ -979,11 +979,8 @@ mod tests {
     #[tokio::test]
     async fn multiplexed_environment_sends_keepalive() -> anyhow::Result<()> {
         let (client_websocket, mut server_websocket) = websocket_pair().await?;
-        let runtime_paths = crate::ExecServerRuntimePaths::new(
-            std::env::current_exe()?,
-            /*codex_linux_sandbox_exe*/ None,
-        )
-        .map_err(anyhow::Error::from)?;
+        let runtime_paths = crate::ExecServerRuntimePaths::new(std::env::current_exe()?)
+            .map_err(anyhow::Error::from)?;
         let environment_task = tokio::spawn(run_multiplexed_environment(
             client_websocket,
             ConnectionProcessor::new(runtime_paths),

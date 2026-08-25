@@ -108,6 +108,7 @@ async fn resume_includes_initial_messages_from_rollout_events() -> Result<()> {
             matches!(
                 initial_messages,
                 [
+                    EventMsg::ThreadSettingsApplied(_),
                     EventMsg::TurnStarted(_),
                     EventMsg::UserMessage(_),
                     EventMsg::AgentMessage(_),
@@ -125,6 +126,7 @@ async fn resume_includes_initial_messages_from_rollout_events() -> Result<()> {
         .expect("expected initial messages to be present for resumed session");
     match initial_messages.as_slice() {
         [
+            EventMsg::ThreadSettingsApplied(_),
             EventMsg::TurnStarted(started),
             EventMsg::UserMessage(first_user),
             EventMsg::AgentMessage(assistant_message),
@@ -196,6 +198,7 @@ async fn resume_includes_initial_messages_from_reasoning_events() -> Result<()> 
             matches!(
                 initial_messages,
                 [
+                    EventMsg::ThreadSettingsApplied(_),
                     EventMsg::TurnStarted(_),
                     EventMsg::UserMessage(_),
                     EventMsg::AgentReasoning(_),
@@ -216,6 +219,7 @@ async fn resume_includes_initial_messages_from_reasoning_events() -> Result<()> 
         .expect("expected initial messages to be present for resumed session");
     match initial_messages.as_slice() {
         [
+            EventMsg::ThreadSettingsApplied(_),
             EventMsg::TurnStarted(started),
             EventMsg::UserMessage(first_user),
             EventMsg::AgentReasoning(reasoning),

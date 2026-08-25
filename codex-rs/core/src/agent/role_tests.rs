@@ -102,7 +102,7 @@ async fn apply_explorer_role_sets_read_only_permissions() {
         config.permissions.permission_profile(),
         &PermissionProfile::read_only()
     );
-    #[cfg(target_os = "windows")]
+
     if !codex_windows_sandbox::legacy_restricted_token_enforces_delete_child() {
         assert_eq!(
             config.permissions.windows_sandbox_mode,
@@ -313,8 +313,6 @@ async fn apply_role_preserves_unspecified_keys() {
         TomlValue::String("base-model".to_string()),
     )])
     .await;
-    config.codex_linux_sandbox_exe = Some(PathBuf::from("/tmp/codex-linux-sandbox"));
-    config.main_execve_wrapper_exe = Some(PathBuf::from("/tmp/codex-execve-wrapper"));
     let role_path = write_role_config(
         &home,
         "effort-only.toml",
@@ -336,14 +334,6 @@ async fn apply_role_preserves_unspecified_keys() {
 
     assert_eq!(config.model.as_deref(), Some("base-model"));
     assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::High));
-    assert_eq!(
-        config.codex_linux_sandbox_exe,
-        Some(PathBuf::from("/tmp/codex-linux-sandbox"))
-    );
-    assert_eq!(
-        config.main_execve_wrapper_exe,
-        Some(PathBuf::from("/tmp/codex-execve-wrapper"))
-    );
 }
 
 #[tokio::test]
@@ -407,79 +397,6 @@ async fn apply_role_preserves_existing_service_tier_without_override() {
 }
 
 #[tokio::test]
-#[cfg(not(windows))]
-async fn apply_role_does_not_materialize_default_sandbox_workspace_write_fields() {
-    use codex_protocol::protocol::SandboxPolicy;
-    let (home, mut config) = test_config_with_cli_overrides(vec![
-        (
-            "sandbox_mode".to_string(),
-            TomlValue::String("workspace-write".to_string()),
-        ),
-        (
-            "sandbox_workspace_write.network_access".to_string(),
-            TomlValue::Boolean(true),
-        ),
-    ])
-    .await;
-    let role_path = write_role_config(
-        &home,
-        "sandbox-role.toml",
-        r#"developer_instructions = "Stay focused"
-
-[sandbox_workspace_write]
-writable_roots = ["./sandbox-root"]
-"#,
-    )
-    .await;
-    config.agent_roles.insert(
-        "custom".to_string(),
-        AgentRoleConfig {
-            description: None,
-            config_file: Some(role_path),
-            nickname_candidates: None,
-        },
-    );
-
-    apply_role_to_config(&mut config, Some("custom"))
-        .await
-        .expect("custom role should apply");
-
-    let role_layer = config
-        .config_layer_stack
-        .get_layers(
-            ConfigLayerStackOrdering::LowestPrecedenceFirst,
-            /*include_disabled*/ true,
-        )
-        .into_iter()
-        .rfind(|layer| layer.name == ConfigLayerSource::SessionFlags)
-        .expect("expected a session flags layer");
-    let sandbox_workspace_write = role_layer
-        .config
-        .get("sandbox_workspace_write")
-        .and_then(TomlValue::as_table)
-        .expect("role layer should include sandbox_workspace_write");
-    assert_eq!(
-        sandbox_workspace_write.contains_key("network_access"),
-        false
-    );
-    assert_eq!(
-        sandbox_workspace_write.contains_key("exclude_tmpdir_env_var"),
-        false
-    );
-    assert_eq!(
-        sandbox_workspace_write.contains_key("exclude_slash_tmp"),
-        false
-    );
-
-    match &config.legacy_sandbox_policy() {
-        SandboxPolicy::WorkspaceWrite { network_access, .. } => {
-            assert_eq!(*network_access, true);
-        }
-        other => panic!("expected workspace-write sandbox policy, got {other:?}"),
-    }
-}
-
-#[tokio::test]
 async fn apply_role_takes_precedence_over_existing_session_flags_for_same_key() {
     let (home, mut config) = test_config_with_cli_overrides(vec![(
         "model".to_string(),
@@ -510,7 +427,7 @@ async fn apply_role_takes_precedence_over_existing_session_flags_for_same_key() 
     assert_eq!(session_flags_layer_count(&config), before_layers + 1);
 }
 
-#[cfg_attr(windows, ignore)]
+#[ignore]
 #[tokio::test]
 async fn apply_role_skills_config_disables_skill_for_spawned_agent() {
     let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;

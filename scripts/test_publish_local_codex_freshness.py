@@ -692,7 +692,7 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
             self.assertIn("--profile dev", result.stdout)
             self.assertNotIn("preflightCheckCommand:", result.stdout)
 
-    def test_dry_run_release_reports_preflight_unless_skipped(self) -> None:
+    def test_dry_run_release_reports_only_artifact_producing_build(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             install_dir = temp_path / "install"
@@ -714,29 +714,11 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
                 0,
                 f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
-            self.assertIn("preflightCheckCommand: cargo --config", result.stdout)
-            self.assertIn(" check --target-dir ", result.stdout)
+            self.assertNotIn("preflightCheckCommand:", result.stdout)
+            self.assertNotIn(" check --target-dir ", result.stdout)
             self.assertIn("buildCommand: cargo --config", result.stdout)
             self.assertIn(" build --target-dir ", result.stdout)
             self.assertIn("(not run)", result.stdout)
-
-            skipped = self.run_script(
-                "-DryRun",
-                "-SkipPreflightCheck",
-                "-SourceExe",
-                str(fake_codex),
-                "-InstallDir",
-                str(install_dir),
-            )
-
-            self.assertEqual(
-                skipped.returncode,
-                0,
-                f"stdout:\n{skipped.stdout}\nstderr:\n{skipped.stderr}",
-            )
-            self.assertNotIn("preflightCheckCommand:", skipped.stdout)
-            self.assertIn("buildCommand: cargo --config", skipped.stdout)
-            self.assertIn(" build --target-dir ", skipped.stdout)
 
     def test_fast_proof_omits_desktop_appx_probe_for_noop(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

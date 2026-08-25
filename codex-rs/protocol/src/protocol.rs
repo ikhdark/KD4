@@ -121,8 +121,6 @@ pub const COLLABORATION_MODE_OPEN_TAG: &str = "<collaboration_mode>";
 pub const COLLABORATION_MODE_CLOSE_TAG: &str = "</collaboration_mode>";
 pub const MULTI_AGENT_MODE_OPEN_TAG: &str = "<multi_agent_mode>";
 pub const MULTI_AGENT_MODE_CLOSE_TAG: &str = "</multi_agent_mode>";
-pub const REALTIME_CONVERSATION_OPEN_TAG: &str = "<realtime_conversation>";
-pub const REALTIME_CONVERSATION_CLOSE_TAG: &str = "</realtime_conversation>";
 pub const USER_MESSAGE_BEGIN: &str = "## My request for Codex:";
 
 /// Removes the model-context prefix from a user message before displaying it.
@@ -201,254 +199,6 @@ pub struct McpServerRefreshConfig {
     /// OAuth credential store mode to use with this server snapshot.
     pub mcp_oauth_credentials_store_mode: Value,
     pub auth_keyring_backend_kind: Value,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ConversationStartParams {
-    /// Whether Codex response handoffs are managed through explicit client append calls.
-    pub client_managed_handoffs: bool,
-    /// Whether to route any remaining transcript tail through Codex when the session ends.
-    /// TODO: Remove this rollout knob once transcript-tail flushing is always enabled.
-    pub flush_transcript_tail_on_session_end: bool,
-    /// Sends automatic Codex responses as realtime conversation items instead of handoff appends.
-    pub codex_responses_as_items: bool,
-    /// Optional prefix added to automatic Codex response items when `codex_responses_as_items` is set.
-    pub codex_response_item_prefix: Option<String>,
-    /// Optional prefix added to automatic V1 Codex commentary sent with
-    /// `conversation.handoff.append` when `codex_responses_as_items` is not set. Final answers are
-    /// sent without the prefix.
-    pub codex_response_handoff_prefix: Option<String>,
-    /// Overrides the configured realtime model for this session only.
-    pub model: Option<String>,
-    /// Selects whether the realtime session should produce text or audio output.
-    pub output_modality: RealtimeOutputModality,
-    /// Whether to append Codex's startup context to the realtime backend prompt.
-    pub include_startup_context: bool,
-    pub prompt: Option<Option<String>>,
-    pub realtime_session_id: Option<String>,
-    pub transport: Option<ConversationStartTransport>,
-    /// Overrides the configured realtime protocol version for this session only.
-    pub version: Option<RealtimeConversationVersion>,
-    pub voice: Option<RealtimeVoice>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ConversationStartTransport {
-    Websocket,
-    Webrtc { sdp: String },
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "snake_case")]
-pub enum RealtimeOutputModality {
-    Text,
-    Audio,
-}
-
-#[derive(
-    Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash, JsonSchema, TS, Ord, PartialOrd,
-)]
-#[serde(rename_all = "snake_case")]
-#[ts(rename_all = "snake_case")]
-pub enum RealtimeVoice {
-    Alloy,
-    Arbor,
-    Ash,
-    Ballad,
-    Breeze,
-    Cedar,
-    Coral,
-    Cove,
-    Echo,
-    Ember,
-    Juniper,
-    Maple,
-    Marin,
-    Sage,
-    Shimmer,
-    Sol,
-    Spruce,
-    Vale,
-    Verse,
-}
-
-impl RealtimeVoice {
-    pub fn wire_name(self) -> &'static str {
-        match self {
-            Self::Alloy => "alloy",
-            Self::Arbor => "arbor",
-            Self::Ash => "ash",
-            Self::Ballad => "ballad",
-            Self::Breeze => "breeze",
-            Self::Cedar => "cedar",
-            Self::Coral => "coral",
-            Self::Cove => "cove",
-            Self::Echo => "echo",
-            Self::Ember => "ember",
-            Self::Juniper => "juniper",
-            Self::Maple => "maple",
-            Self::Marin => "marin",
-            Self::Sage => "sage",
-            Self::Shimmer => "shimmer",
-            Self::Sol => "sol",
-            Self::Spruce => "spruce",
-            Self::Vale => "vale",
-            Self::Verse => "verse",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(rename_all = "camelCase")]
-pub struct RealtimeVoicesList {
-    pub v1: Vec<RealtimeVoice>,
-    pub v2: Vec<RealtimeVoice>,
-    pub default_v1: RealtimeVoice,
-    pub default_v2: RealtimeVoice,
-}
-
-impl RealtimeVoicesList {
-    pub fn builtin() -> Self {
-        Self {
-            v1: vec![
-                RealtimeVoice::Juniper,
-                RealtimeVoice::Maple,
-                RealtimeVoice::Spruce,
-                RealtimeVoice::Ember,
-                RealtimeVoice::Vale,
-                RealtimeVoice::Breeze,
-                RealtimeVoice::Arbor,
-                RealtimeVoice::Sol,
-                RealtimeVoice::Cove,
-            ],
-            v2: vec![
-                RealtimeVoice::Alloy,
-                RealtimeVoice::Ash,
-                RealtimeVoice::Ballad,
-                RealtimeVoice::Coral,
-                RealtimeVoice::Echo,
-                RealtimeVoice::Sage,
-                RealtimeVoice::Shimmer,
-                RealtimeVoice::Verse,
-                RealtimeVoice::Marin,
-                RealtimeVoice::Cedar,
-            ],
-            default_v1: RealtimeVoice::Cove,
-            default_v2: RealtimeVoice::Marin,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-pub struct RealtimeAudioFrame {
-    pub data: String,
-    pub sample_rate: u32,
-    pub num_channels: u16,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub samples_per_channel: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub item_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-pub struct RealtimeTranscriptDelta {
-    pub delta: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-pub struct RealtimeTranscriptDone {
-    pub text: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-pub struct RealtimeTranscriptEntry {
-    pub role: String,
-    pub text: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-pub struct RealtimeHandoffRequested {
-    pub handoff_id: String,
-    pub item_id: String,
-    pub input_transcript: String,
-    pub active_transcript: Vec<RealtimeTranscriptEntry>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-pub struct RealtimeNoopRequested {
-    pub call_id: String,
-    pub item_id: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-pub struct RealtimeInputAudioSpeechStarted {
-    pub item_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-pub struct RealtimeResponseCancelled {
-    pub response_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-pub struct RealtimeResponseCreated {
-    pub response_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-pub struct RealtimeResponseDone {
-    pub response_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-pub enum RealtimeEvent {
-    SessionUpdated {
-        realtime_session_id: String,
-        instructions: Option<String>,
-    },
-    InputAudioSpeechStarted(RealtimeInputAudioSpeechStarted),
-    InputTranscriptDelta(RealtimeTranscriptDelta),
-    InputTranscriptDone(RealtimeTranscriptDone),
-    OutputTranscriptDelta(RealtimeTranscriptDelta),
-    OutputTranscriptDone(RealtimeTranscriptDone),
-    AudioOut(RealtimeAudioFrame),
-    ResponseCreated(RealtimeResponseCreated),
-    ResponseCancelled(RealtimeResponseCancelled),
-    ResponseDone(RealtimeResponseDone),
-    ConversationItemAdded(Value),
-    ConversationItemDone {
-        item_id: String,
-    },
-    HandoffRequested(RealtimeHandoffRequested),
-    NoopRequested(RealtimeNoopRequested),
-    Error(String),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ConversationAudioParams {
-    pub frame: RealtimeAudioFrame,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ConversationTextParams {
-    pub text: String,
-    pub role: ConversationTextRole,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema, TS)]
-#[serde(rename_all = "snake_case")]
-#[ts(rename_all = "snake_case")]
-pub enum ConversationTextRole {
-    #[default]
-    User,
-    Developer,
-    Assistant,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ConversationSpeechParams {
-    pub text: String,
 }
 
 /// Persistent thread-settings overrides that can be applied before user input or
@@ -537,24 +287,6 @@ pub enum Op {
     /// Terminate all running background terminal processes for this thread.
     /// Use this when callers intentionally want to stop long-lived background shells.
     CleanBackgroundTerminals,
-
-    /// Start a realtime conversation stream.
-    RealtimeConversationStart(ConversationStartParams),
-
-    /// Send audio input to the running realtime conversation stream.
-    RealtimeConversationAudio(ConversationAudioParams),
-
-    /// Send text input to the running realtime conversation stream.
-    RealtimeConversationText(ConversationTextParams),
-
-    /// Append speakable text to the running realtime conversation stream.
-    RealtimeConversationSpeech(ConversationSpeechParams),
-
-    /// Close the running realtime conversation stream.
-    RealtimeConversationClose,
-
-    /// Request the list of voices supported by realtime conversation streams.
-    RealtimeConversationListVoices,
 
     /// User input, optionally with thread-settings overrides applied first.
     UserInput {
@@ -688,16 +420,26 @@ pub enum Op {
     },
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "lowercase")]
+#[ts(rename_all = "lowercase")]
 pub enum ThreadMemoryMode {
     Enabled,
     Disabled,
 }
 
+impl ThreadMemoryMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "lowercase")]
-#[ts(rename_all = "lowercase")]
+#[ts(rename_all = "lowercase", export_to = "v2/")]
 pub enum ThreadHistoryMode {
     #[default]
     Legacy,
@@ -723,6 +465,30 @@ impl FromStr for ThreadHistoryMode {
             _ => Err(format!("unknown thread history mode `{value}`")),
         }
     }
+}
+
+/// The timestamp used to order thread listings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ThreadSortKey {
+    #[default]
+    CreatedAt,
+    UpdatedAt,
+    RecencyAt,
+}
+
+/// The direction used to order thread listings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SortDirection {
+    Asc,
+    #[default]
+    Desc,
+}
+
+/// Spawn-graph relationship used to filter thread listings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ThreadRelationFilter {
+    DirectChildrenOf(ThreadId),
+    DescendantsOf(ThreadId),
 }
 
 impl From<Vec<UserInput>> for Op {
@@ -869,12 +635,6 @@ impl Op {
         match self {
             Self::Interrupt => "interrupt",
             Self::CleanBackgroundTerminals => "clean_background_terminals",
-            Self::RealtimeConversationStart(_) => "realtime_conversation_start",
-            Self::RealtimeConversationAudio(_) => "realtime_conversation_audio",
-            Self::RealtimeConversationText(_) => "realtime_conversation_text",
-            Self::RealtimeConversationSpeech(_) => "realtime_conversation_speech",
-            Self::RealtimeConversationClose => "realtime_conversation_close",
-            Self::RealtimeConversationListVoices => "realtime_conversation_list_voices",
             Self::UserInput { .. } => "user_input",
             Self::ThreadSettings { .. } => "thread_settings",
             Self::InterAgentCommunication { .. } => "inter_agent_communication",
@@ -1205,24 +965,9 @@ impl SandboxPolicy {
                     }
                 }
 
-                // Include /tmp on Unix unless explicitly excluded.
-                if cfg!(unix) && !exclude_slash_tmp {
-                    match AbsolutePathBuf::from_absolute_path("/tmp") {
-                        Ok(slash_tmp) => {
-                            if slash_tmp.as_path().is_dir() {
-                                roots.push(slash_tmp);
-                            }
-                        }
-                        Err(e) => {
-                            error!("Ignoring invalid /tmp for sandbox writable root: {e}");
-                        }
-                    }
-                }
+                let _ = exclude_slash_tmp;
 
-                // Include $TMPDIR unless explicitly excluded. On macOS, TMPDIR
-                // is per-user, so writes to TMPDIR should not be readable by
-                // other users on the system.
-                //
+                // Include the configured temporary directory unless explicitly excluded.
                 // By comparison, TMPDIR is not guaranteed to be defined on
                 // Linux or Windows, but supporting it here gives users a way to
                 // provide the model with their own temporary directory without
@@ -1363,18 +1108,6 @@ pub enum EventMsg {
     /// Warning issued by the guardian automatic approval reviewer.
     GuardianWarning(WarningEvent),
 
-    /// Realtime conversation lifecycle start event.
-    RealtimeConversationStarted(RealtimeConversationStartedEvent),
-
-    /// Realtime conversation streaming payload event.
-    RealtimeConversationRealtime(RealtimeConversationRealtimeEvent),
-
-    /// Realtime conversation lifecycle close event.
-    RealtimeConversationClosed(RealtimeConversationClosedEvent),
-
-    /// Realtime session description protocol payload.
-    RealtimeConversationSdp(RealtimeConversationSdpEvent),
-
     /// Model routing changed from the requested model to a different model.
     ModelReroute(ModelRerouteEvent),
 
@@ -1449,6 +1182,8 @@ pub enum EventMsg {
 
     McpToolCallEnd(McpToolCallEndEvent),
 
+    McpToolCallProgress(McpToolCallProgressEvent),
+
     WebSearchBegin(WebSearchBeginEvent),
 
     WebSearchEnd(WebSearchEndEvent),
@@ -1507,9 +1242,6 @@ pub enum EventMsg {
     PatchApplyEnd(PatchApplyEndEvent),
 
     TurnDiff(TurnDiffEvent),
-
-    /// List of voices supported by realtime conversation streams.
-    RealtimeConversationListVoicesResponse(RealtimeConversationListVoicesResponseEvent),
 
     PlanUpdate(UpdatePlanArgs),
 
@@ -1576,6 +1308,24 @@ pub enum HookEventName {
     Stop,
 }
 
+impl HookEventName {
+    /// Stable display and telemetry label for this hook event.
+    pub const fn as_pascal_case_label(self) -> &'static str {
+        match self {
+            Self::PreToolUse => "PreToolUse",
+            Self::PermissionRequest => "PermissionRequest",
+            Self::PostToolUse => "PostToolUse",
+            Self::PreCompact => "PreCompact",
+            Self::PostCompact => "PostCompact",
+            Self::SessionStart => "SessionStart",
+            Self::UserPromptSubmit => "UserPromptSubmit",
+            Self::SubagentStart => "SubagentStart",
+            Self::SubagentStop => "SubagentStop",
+            Self::Stop => "Stop",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum HookHandlerType {
@@ -1613,6 +1363,91 @@ pub enum HookSource {
     LegacyManagedConfigMdm,
     #[default]
     Unknown,
+}
+
+impl HookSource {
+    /// Stable configuration and telemetry label for this hook source.
+    pub const fn as_snake_case_label(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::User => "user",
+            Self::Project => "project",
+            Self::Mdm => "mdm",
+            Self::SessionFlags => "session_flags",
+            Self::Plugin => "plugin",
+            Self::CloudRequirements => "cloud_requirements",
+            Self::CloudManagedConfig => "cloud_managed_config",
+            Self::LegacyManagedConfigFile => "legacy_managed_config_file",
+            Self::LegacyManagedConfigMdm => "legacy_managed_config_mdm",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[cfg(test)]
+mod hook_label_tests {
+    use super::HookEventName;
+    use super::HookSource;
+
+    #[test]
+    fn hook_labels_are_complete_and_stable() {
+        assert_eq!(
+            [
+                HookEventName::PreToolUse,
+                HookEventName::PermissionRequest,
+                HookEventName::PostToolUse,
+                HookEventName::PreCompact,
+                HookEventName::PostCompact,
+                HookEventName::SessionStart,
+                HookEventName::UserPromptSubmit,
+                HookEventName::SubagentStart,
+                HookEventName::SubagentStop,
+                HookEventName::Stop,
+            ]
+            .map(HookEventName::as_pascal_case_label),
+            [
+                "PreToolUse",
+                "PermissionRequest",
+                "PostToolUse",
+                "PreCompact",
+                "PostCompact",
+                "SessionStart",
+                "UserPromptSubmit",
+                "SubagentStart",
+                "SubagentStop",
+                "Stop",
+            ]
+        );
+        assert_eq!(
+            [
+                HookSource::System,
+                HookSource::User,
+                HookSource::Project,
+                HookSource::Mdm,
+                HookSource::SessionFlags,
+                HookSource::Plugin,
+                HookSource::CloudRequirements,
+                HookSource::CloudManagedConfig,
+                HookSource::LegacyManagedConfigFile,
+                HookSource::LegacyManagedConfigMdm,
+                HookSource::Unknown,
+            ]
+            .map(HookSource::as_snake_case_label),
+            [
+                "system",
+                "user",
+                "project",
+                "mdm",
+                "session_flags",
+                "plugin",
+                "cloud_requirements",
+                "cloud_managed_config",
+                "legacy_managed_config_file",
+                "legacy_managed_config_mdm",
+                "unknown",
+            ]
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -1686,36 +1521,6 @@ pub struct HookStartedEvent {
 pub struct HookCompletedEvent {
     pub turn_id: Option<String>,
     pub run: HookRunSummary,
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "snake_case")]
-pub enum RealtimeConversationVersion {
-    V1,
-    #[default]
-    V2,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
-pub struct RealtimeConversationStartedEvent {
-    pub realtime_session_id: Option<String>,
-    pub version: RealtimeConversationVersion,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
-pub struct RealtimeConversationRealtimeEvent {
-    pub payload: RealtimeEvent,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
-pub struct RealtimeConversationClosedEvent {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
-pub struct RealtimeConversationSdpEvent {
-    pub sdp: String,
 }
 
 impl From<CollabAgentSpawnBeginEvent> for EventMsg {
@@ -3426,6 +3231,15 @@ pub struct ThreadSettingsSnapshot {
     )]
     #[ts(optional)]
     pub service_tier: Option<Option<String>>,
+    /// Outer `None` means an older snapshot did not supply this field; an
+    /// inner `None` records an explicit effective clear.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional)]
+    pub developer_instructions: Option<Option<String>>,
     pub approval_policy: AskForApproval,
     pub approvals_reviewer: ApprovalsReviewer,
     pub permission_profile: PermissionProfile,
@@ -3848,6 +3662,13 @@ pub struct McpToolCallBeginEvent {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS, PartialEq)]
+pub struct McpToolCallProgressEvent {
+    /// Identifier of the in-progress MCP tool-call item.
+    pub call_id: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS, PartialEq)]
 pub struct McpToolCallEndEvent {
     /// Identifier for the corresponding McpToolCallBegin that finished.
     pub call_id: String,
@@ -3942,15 +3763,6 @@ pub struct ImageGenerationEndEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub saved_path: Option<AbsolutePathBuf>,
-}
-
-// Conversation kept for backward compatibility.
-/// Response payload for `Op::GetHistory` containing the current session's
-/// in-memory transcript.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
-pub struct ConversationPathResponseEvent {
-    pub conversation_id: ThreadId,
-    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
@@ -4198,6 +4010,7 @@ pub enum SessionSource {
 #[serde(try_from = "String", into = "String")]
 #[schemars(with = "String")]
 #[ts(type = "string")]
+#[ts(export_to = "v2/")]
 pub enum ThreadSource {
     User,
     Subagent,
@@ -4506,7 +4319,7 @@ pub struct SessionMeta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_nickname: Option<String>,
     /// Optional role (agent_role) assigned to an AgentControl-spawned sub-agent.
-    #[serde(default, alias = "agent_type", skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_role: Option<String>,
     /// Optional canonical agent path assigned to an AgentControl-spawned sub-agent.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4565,41 +4378,12 @@ impl Default for SessionMeta {
     }
 }
 
-#[derive(Serialize, Debug, Clone, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Debug, Clone, JsonSchema, TS)]
 pub struct SessionMetaLine {
     #[serde(flatten)]
     pub meta: SessionMeta,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git: Option<GitInfo>,
-}
-
-impl<'de> Deserialize<'de> for SessionMetaLine {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct SessionMetaLineFields {
-            #[serde(flatten)]
-            meta: SessionMeta,
-            git: Option<GitInfo>,
-        }
-
-        let mut value = Value::deserialize(deserializer)?;
-        let fields = value
-            .as_object_mut()
-            .ok_or_else(|| D::Error::custom("session metadata must be an object"))?;
-        if !fields.contains_key("session_id") {
-            let thread_id = fields
-                .get("id")
-                .cloned()
-                .ok_or_else(|| D::Error::missing_field("id"))?;
-            fields.insert("session_id".to_string(), thread_id);
-        }
-        let SessionMetaLineFields { meta, git } =
-            serde_json::from_value(value).map_err(D::Error::custom)?;
-        Ok(Self { meta, git })
-    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, JsonSchema, TS)]
@@ -4830,19 +4614,12 @@ pub struct TurnContextItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multi_agent_mode: Option<MultiAgentMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub realtime_active: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<ReasoningEffortConfig>,
     /// Durable proof that this baseline was transmitted and accepted by the
     /// exact physical request named here. Legacy items omit this field and are
     /// reconstructed as an unknown baseline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_provenance: Option<TurnContextProvenance>,
-    // Compatibility-only field written with a default value so older Codex
-    // versions can deserialize turn-context rollout items. It is no longer
-    // read by context reconstruction and should be removed in a future schema
-    // cleanup.
-    pub summary: ReasoningSummaryConfig,
 }
 
 impl TurnContextItem {
@@ -4881,6 +4658,17 @@ impl From<crate::openai_models::TruncationPolicyConfig> for TruncationPolicy {
 }
 
 impl TruncationPolicy {
+    pub fn truncate_text(&self, content: &str) -> String {
+        match self {
+            TruncationPolicy::Bytes(bytes) => {
+                codex_utils_string::truncate_middle_chars(content, *bytes)
+            }
+            TruncationPolicy::Tokens(tokens) => {
+                codex_utils_string::truncate_middle_with_token_budget(content, *tokens).0
+            }
+        }
+    }
+
     pub fn token_budget(&self) -> usize {
         match self {
             TruncationPolicy::Bytes(bytes) => {
@@ -4916,11 +4704,131 @@ impl Mul<f64> for TruncationPolicy {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, JsonSchema)]
+pub const CURRENT_ROLLOUT_FORMAT_VERSION: u32 = 1;
+
+#[derive(Clone)]
 pub struct RolloutLine {
     pub timestamp: String,
-    #[serde(flatten)]
     pub item: RolloutItem,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct RolloutLineSchema<'a> {
+    pub timestamp: &'a str,
+    pub format_version: u32,
+    #[serde(flatten)]
+    pub item: &'a RolloutItem,
+}
+
+impl JsonSchema for RolloutLine {
+    fn schema_name() -> String {
+        "RolloutLine".to_string()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::schema::Schema {
+        RolloutLineSchema::json_schema(generator)
+    }
+}
+
+impl Serialize for RolloutLine {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        RolloutLineSchema {
+            timestamp: &self.timestamp,
+            format_version: CURRENT_ROLLOUT_FORMAT_VERSION,
+            item: &self.item,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RolloutLine {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let mut value = Value::deserialize(deserializer)?;
+        let fields = value
+            .as_object_mut()
+            .ok_or_else(|| D::Error::custom("rollout line must be an object"))?;
+        let timestamp = fields
+            .remove("timestamp")
+            .ok_or_else(|| D::Error::missing_field("timestamp"))?;
+        let timestamp = serde_json::from_value(timestamp).map_err(D::Error::custom)?;
+        let version = fields
+            .remove("format_version")
+            .map(serde_json::from_value::<u32>)
+            .transpose()
+            .map_err(D::Error::custom)?
+            .unwrap_or(0);
+
+        match version {
+            0 => migrate_rollout_v0(fields).map_err(D::Error::custom)?,
+            CURRENT_ROLLOUT_FORMAT_VERSION => {
+                reject_v0_fields_in_current_rollout(fields).map_err(D::Error::custom)?
+            }
+            _ => {
+                return Err(D::Error::custom(format!(
+                    "unsupported rollout format version {version}; this build supports version {CURRENT_ROLLOUT_FORMAT_VERSION}"
+                )));
+            }
+        }
+
+        let item = serde_json::from_value(Value::Object(std::mem::take(fields)))
+            .map_err(D::Error::custom)?;
+        Ok(Self { timestamp, item })
+    }
+}
+
+fn migrate_rollout_v0(fields: &mut serde_json::Map<String, Value>) -> Result<(), String> {
+    let item_type = fields
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let Some(payload) = fields.get_mut("payload").and_then(Value::as_object_mut) else {
+        return Ok(());
+    };
+    match item_type.as_deref() {
+        Some("session_meta") => {
+            if !payload.contains_key("session_id") {
+                let thread_id = payload
+                    .get("id")
+                    .cloned()
+                    .ok_or_else(|| "v0 session metadata is missing id".to_string())?;
+                payload.insert("session_id".to_string(), thread_id);
+            }
+            if let Some(agent_type) = payload.remove("agent_type") {
+                payload
+                    .entry("agent_role".to_string())
+                    .or_insert(agent_type);
+            }
+        }
+        Some("turn_context") => {
+            payload.remove("summary");
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn reject_v0_fields_in_current_rollout(
+    fields: &serde_json::Map<String, Value>,
+) -> Result<(), String> {
+    let item_type = fields.get("type").and_then(Value::as_str);
+    let payload = fields.get("payload").and_then(Value::as_object);
+    if item_type == Some("turn_context")
+        && payload.is_some_and(|value| value.contains_key("summary"))
+    {
+        return Err("rollout format version 1 does not accept turn_context.summary".to_string());
+    }
+    if item_type == Some("session_meta")
+        && payload.is_some_and(|value| value.contains_key("agent_type"))
+    {
+        return Err("rollout format version 1 does not accept session_meta.agent_type".to_string());
+    }
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, TS)]
@@ -5183,11 +5091,6 @@ pub struct StreamErrorEvent {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
-pub struct StreamInfoEvent {
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct PatchApplyBeginEvent {
     /// Identifier so this can be paired with the PatchApplyEnd event.
     pub call_id: String,
@@ -5306,11 +5209,6 @@ impl fmt::Display for McpAuthStatus {
         };
         f.write_str(text)
     }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-pub struct RealtimeConversationListVoicesResponseEvent {
-    pub voices: RealtimeVoicesList,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, TS)]
@@ -5570,6 +5468,43 @@ pub enum ThreadGoalStatus {
     UsageLimited,
     BudgetLimited,
     Complete,
+}
+
+impl ThreadGoalStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Paused => "paused",
+            Self::Blocked => "blocked",
+            Self::UsageLimited => "usage_limited",
+            Self::BudgetLimited => "budget_limited",
+            Self::Complete => "complete",
+        }
+    }
+
+    pub const fn is_active(self) -> bool {
+        matches!(self, Self::Active)
+    }
+
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::BudgetLimited | Self::Complete)
+    }
+}
+
+impl TryFrom<&str> for ThreadGoalStatus {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "active" => Ok(Self::Active),
+            "paused" => Ok(Self::Paused),
+            "blocked" => Ok(Self::Blocked),
+            "usage_limited" => Ok(Self::UsageLimited),
+            "budget_limited" => Ok(Self::BudgetLimited),
+            "complete" => Ok(Self::Complete),
+            other => Err(format!("unknown thread goal status `{other}`")),
+        }
+    }
 }
 
 pub const MAX_THREAD_GOAL_OBJECTIVE_CHARS: usize = 4_000;
@@ -6174,6 +6109,22 @@ mod tests {
         }))?;
         assert!(legacy.completion.is_none());
         assert!(legacy.error.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn consolidated_thread_value_types_preserve_their_contracts() -> Result<()> {
+        assert_eq!(ThreadSortKey::default(), ThreadSortKey::CreatedAt);
+        assert_eq!(SortDirection::default(), SortDirection::Desc);
+        assert_eq!(ThreadGoalStatus::UsageLimited.as_str(), "usage_limited");
+        assert_eq!(
+            ThreadGoalStatus::try_from("budget_limited"),
+            Ok(ThreadGoalStatus::BudgetLimited)
+        );
+        assert_eq!(
+            serde_json::to_value(ThreadGoalStatus::UsageLimited)?,
+            json!("usageLimited")
+        );
         Ok(())
     }
 
@@ -6819,16 +6770,9 @@ mod tests {
 
     #[test]
     fn file_system_policy_rejects_legacy_bridge_for_non_workspace_writes() {
-        let cwd = if cfg!(windows) {
-            Path::new(r"C:\workspace")
-        } else {
-            Path::new("/tmp/workspace")
-        };
-        let external_write_path = if cfg!(windows) {
-            AbsolutePathBuf::from_absolute_path(r"C:\temp").expect("absolute windows temp path")
-        } else {
-            AbsolutePathBuf::from_absolute_path("/tmp").expect("absolute tmp path")
-        };
+        let cwd = Path::new(r"C:\workspace");
+        let external_write_path =
+            AbsolutePathBuf::from_absolute_path(r"C:\temp").expect("absolute windows temp path");
         let policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
             path: FileSystemPath::Path {
                 path: external_write_path,
@@ -7426,56 +7370,6 @@ mod tests {
     }
 
     #[test]
-    fn realtime_conversation_started_event_uses_realtime_session_id() {
-        let event = RealtimeConversationStartedEvent {
-            realtime_session_id: Some("conv_1".to_string()),
-            version: RealtimeConversationVersion::V2,
-        };
-
-        assert_eq!(
-            serde_json::to_value(&event).unwrap(),
-            json!({
-                "realtime_session_id": "conv_1",
-                "version": "v2"
-            })
-        );
-    }
-
-    #[test]
-    fn realtime_voice_list_is_stable() {
-        assert_eq!(
-            RealtimeVoicesList::builtin(),
-            RealtimeVoicesList {
-                v1: vec![
-                    RealtimeVoice::Juniper,
-                    RealtimeVoice::Maple,
-                    RealtimeVoice::Spruce,
-                    RealtimeVoice::Ember,
-                    RealtimeVoice::Vale,
-                    RealtimeVoice::Breeze,
-                    RealtimeVoice::Arbor,
-                    RealtimeVoice::Sol,
-                    RealtimeVoice::Cove,
-                ],
-                v2: vec![
-                    RealtimeVoice::Alloy,
-                    RealtimeVoice::Ash,
-                    RealtimeVoice::Ballad,
-                    RealtimeVoice::Coral,
-                    RealtimeVoice::Echo,
-                    RealtimeVoice::Sage,
-                    RealtimeVoice::Shimmer,
-                    RealtimeVoice::Verse,
-                    RealtimeVoice::Marin,
-                    RealtimeVoice::Cedar,
-                ],
-                default_v1: RealtimeVoice::Cove,
-                default_v2: RealtimeVoice::Marin,
-            }
-        );
-    }
-
-    #[test]
     fn user_input_text_serializes_empty_text_elements() -> Result<()> {
         let input = UserInput::Text {
             text: "hello".to_string(),
@@ -7617,6 +7511,74 @@ mod tests {
         unknown["history_mode"] = json!("future");
         assert!(serde_json::from_value::<SessionMeta>(unknown).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn rollout_line_writes_current_format_version() -> Result<()> {
+        let thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000001")?;
+        let line = RolloutLine {
+            timestamp: "2026-08-24T00:00:00Z".to_string(),
+            item: RolloutItem::SessionMeta(SessionMetaLine {
+                meta: SessionMeta {
+                    session_id: thread_id.into(),
+                    id: thread_id,
+                    ..Default::default()
+                },
+                git: None,
+            }),
+        };
+
+        let value = serde_json::to_value(line)?;
+        assert_eq!(
+            value["format_version"],
+            json!(CURRENT_ROLLOUT_FORMAT_VERSION)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rollout_line_migrates_unversioned_session_metadata() -> Result<()> {
+        let thread_id = "00000000-0000-0000-0000-000000000001";
+        let line: RolloutLine = serde_json::from_value(json!({
+            "timestamp": "2026-08-24T00:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": thread_id,
+                "timestamp": "2026-08-24T00:00:00Z",
+                "cwd": "/tmp",
+                "originator": "codex",
+                "cli_version": "0.0.0",
+                "model_provider": null,
+                "base_instructions": null,
+                "agent_type": "worker"
+            }
+        }))?;
+
+        let RolloutItem::SessionMeta(meta) = line.item else {
+            panic!("expected session metadata");
+        };
+        assert_eq!(meta.meta.session_id.to_string(), thread_id);
+        assert_eq!(meta.meta.agent_role.as_deref(), Some("worker"));
+        Ok(())
+    }
+
+    #[test]
+    fn rollout_line_rejects_legacy_fields_and_future_versions() {
+        let current_with_legacy_field = json!({
+            "timestamp": "2026-08-24T00:00:00Z",
+            "format_version": CURRENT_ROLLOUT_FORMAT_VERSION,
+            "type": "turn_context",
+            "payload": { "summary": "auto" }
+        });
+        assert!(serde_json::from_value::<RolloutLine>(current_with_legacy_field).is_err());
+
+        let future = json!({
+            "timestamp": "2026-08-24T00:00:00Z",
+            "format_version": CURRENT_ROLLOUT_FORMAT_VERSION + 1,
+            "type": "event_msg",
+            "payload": { "type": "shutdown_complete" }
+        });
+        assert!(serde_json::from_value::<RolloutLine>(future).is_err());
     }
 
     #[test]
@@ -7801,10 +7763,8 @@ mod tests {
             collaboration_mode: None,
             multi_agent_version: None,
             multi_agent_mode: None,
-            realtime_active: None,
             effort: None,
             context_provenance: None,
-            summary: ReasoningSummaryConfig::Auto,
         };
 
         let value = serde_json::to_value(item)?;
@@ -7828,7 +7788,7 @@ mod tests {
                 }]
             })
         );
-        assert_eq!(value["summary"], json!("auto"));
+        assert!(value.get("summary").is_none());
         Ok(())
     }
 

@@ -7,6 +7,9 @@
     "codex": "bin/codex.js"
   },
   "type": "module",
+  "os": [
+    "win32"
+  ],
   "engines": {
     "node": ">=16"
   },

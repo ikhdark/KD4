@@ -6,11 +6,15 @@ use super::record_known_delta_from_transcript;
 use super::resolve_aggregated_output;
 use super::split_valid_utf8_prefix_with_max;
 use super::wait_for_process_output_drain;
+use super::wait_for_process_output_finalization;
 
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::tools::command_execution::CommandAttemptKey;
@@ -76,6 +80,38 @@ async fn exit_before_watcher_registration_is_observed_once() {
         CompletionApplyResult::AlreadyApplied
     );
     assert!(ledger.running_process(73).await.is_none());
+}
+
+#[tokio::test]
+async fn transcript_drain_does_not_overtake_raw_output_finalization() {
+    let output_drained = CancellationToken::new();
+    let output_closed = Arc::new(AtomicBool::new(false));
+    let output_closed_notify = Arc::new(Notify::new());
+    let waiter_drained = output_drained.clone();
+    let waiter_closed = Arc::clone(&output_closed);
+    let waiter_notify = Arc::clone(&output_closed_notify);
+    let waiter = tokio::spawn(async move {
+        wait_for_process_output_finalization(
+            &waiter_drained,
+            waiter_closed.as_ref(),
+            waiter_notify.as_ref(),
+        )
+        .await;
+    });
+
+    output_drained.cancel();
+    tokio::task::yield_now().await;
+    assert!(
+        !waiter.is_finished(),
+        "transcript drain must not publish completion while the artifact is pending"
+    );
+
+    output_closed.store(true, Ordering::Release);
+    output_closed_notify.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .expect("artifact finalization should release the completion waiter")
+        .expect("completion waiter should not panic");
 }
 
 fn run_git(cwd: &std::path::Path, args: &[&str]) -> String {

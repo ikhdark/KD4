@@ -186,7 +186,7 @@ async fn send_client_management_request_once(
     request: &ClientManagementRequest<'_>,
     action: &str,
 ) -> io::Result<ClientManagementResponse> {
-    let client = create_client_without_request_logging();
+    let client = create_client_without_request_logging()?;
     let auth_headers = auth.request_headers()?;
     let request = match request {
         ClientManagementRequest::List { url, params } => {

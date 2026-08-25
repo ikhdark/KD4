@@ -917,7 +917,7 @@ fn normalized_source_path(path: &Path) -> String {
         }
     }
     let normalized = lexical.to_string_lossy().replace('\\', "/");
-    #[cfg(windows)]
+
     let normalized = normalized.to_ascii_lowercase();
     let trimmed = normalized.trim_end_matches('/');
     if trimmed.is_empty() {
@@ -1074,10 +1074,7 @@ pub(crate) async fn persist_tool_history_state(
         installed
             .sync_all()
             .map_err(|err| format!("failed to sync installed tool-history ledger: {err}"))?;
-        #[cfg(unix)]
-        std::fs::File::open(directory)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|err| format!("failed to sync tool-history ledger directory: {err}"))?;
+
         Ok(())
     })
     .await
@@ -1271,17 +1268,60 @@ pub(crate) fn tool_observes_workspace(tool_identity: &str) -> bool {
     )
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WorkspaceCallClassification {
+    pub(crate) observes_workspace: bool,
+    pub(crate) workspace_cwd: PathBuf,
+    pub(crate) source_dependencies: BTreeSet<SourceDependencyV1>,
+}
+
+pub(crate) fn classify_workspace_tool_call(
+    tool_identity: &str,
+    payload: &ToolPayload,
+    default_cwd: &Path,
+) -> WorkspaceCallClassification {
+    if !tool_observes_workspace(tool_identity) {
+        return WorkspaceCallClassification {
+            observes_workspace: false,
+            workspace_cwd: default_cwd.to_path_buf(),
+            source_dependencies: BTreeSet::new(),
+        };
+    }
+    let arguments = workspace_call_arguments(payload);
+    let observes_workspace = workspace_call_observes_from_arguments(arguments.as_ref());
+    let workspace_cwd = arguments.as_ref().map_or_else(
+        || default_cwd.to_path_buf(),
+        |arguments| workspace_cwd_from_arguments(arguments, default_cwd),
+    );
+    let source_dependencies = arguments.as_ref().map_or_else(BTreeSet::new, |arguments| {
+        source_dependencies_from_arguments(tool_identity, arguments, &workspace_cwd)
+    });
+    WorkspaceCallClassification {
+        observes_workspace,
+        workspace_cwd,
+        source_dependencies,
+    }
+}
+
 pub(crate) fn tool_call_observes_workspace(tool_identity: &str, payload: &ToolPayload) -> bool {
     if !tool_observes_workspace(tool_identity) {
         return false;
     }
+    workspace_call_observes_from_arguments(workspace_call_arguments(payload).as_ref())
+}
+
+fn workspace_call_arguments(payload: &ToolPayload) -> Option<serde_json::Value> {
     let ToolPayload::Function { arguments } = payload else {
+        return None;
+    };
+    serde_json::from_str(arguments).ok()
+}
+
+fn workspace_call_observes_from_arguments(arguments: Option<&serde_json::Value>) -> bool {
+    let Some(arguments) = arguments else {
         return true;
     };
-    let Ok(arguments) = serde_json::from_str::<serde_json::Value>(arguments) else {
-        return true;
-    };
-    let Some(command) = dependency_command(&arguments) else {
+    let Some(command) = dependency_command(arguments) else {
         return true;
     };
     !crate::turn_diff_tracker::command_may_mutate(&command)
@@ -1294,8 +1334,7 @@ pub(crate) fn tool_call_is_proven_read_only(_tool_identity: &str, _payload: &Too
     // A command-name mutation heuristic cannot prove that launching a process
     // is side-effect-free: validation commands can run build scripts and an
     // otherwise read-oriented executable can be replaced or configured to
-    // write. Keep workspace-capable process calls behind the exclusive gate
-    // until admission is backed by an independently enforced read-only sandbox.
+    // write. Keep workspace-capable process calls behind the exclusive gate.
     false
 }
 
@@ -1304,23 +1343,53 @@ pub(crate) fn source_dependencies_for_tool_call(
     payload: &ToolPayload,
     default_cwd: &Path,
 ) -> BTreeSet<SourceDependencyV1> {
+    source_dependencies_for_tool_call_with_parsed_arguments(
+        tool_identity,
+        payload,
+        None,
+        default_cwd,
+    )
+}
+
+pub(crate) fn source_dependencies_for_tool_call_with_parsed_arguments(
+    tool_identity: &str,
+    payload: &ToolPayload,
+    parsed_arguments: Option<&serde_json::Value>,
+    default_cwd: &Path,
+) -> BTreeSet<SourceDependencyV1> {
     if !tool_observes_workspace(tool_identity) {
         return BTreeSet::new();
     }
-    let ToolPayload::Function { arguments } = payload else {
-        return BTreeSet::new();
-    };
-    let Ok(arguments) = serde_json::from_str::<serde_json::Value>(arguments) else {
+    let arguments = parsed_arguments
+        .cloned()
+        .or_else(|| workspace_call_arguments(payload));
+    let Some(arguments) = arguments else {
         return BTreeSet::new();
     };
     let cwd = workspace_cwd_from_arguments(&arguments, default_cwd);
+    source_dependencies_from_arguments(tool_identity, &arguments, &cwd)
+}
+
+fn source_dependencies_from_arguments(
+    tool_identity: &str,
+    arguments: &serde_json::Value,
+    cwd: &Path,
+) -> BTreeSet<SourceDependencyV1> {
     if tool_identity == "cargo_test" {
-        return cargo_test_dependencies(&arguments, &cwd);
+        return cargo_test_dependencies(arguments, cwd);
     }
-    let Some(command) = dependency_command(&arguments) else {
+    if let Some((command, shell_type)) = dependency_search_command(arguments) {
+        match crate::tools::handlers::command_search::rg_search_path_operands(&command, shell_type)
+        {
+            Ok(Some(scopes)) => return dependencies_for_search_scopes(scopes, cwd),
+            Err(_) => return BTreeSet::from([SourceDependencyV1::new(cwd, true)]),
+            Ok(None) => {}
+        }
+    }
+    let Some(command) = dependency_command(arguments) else {
         return BTreeSet::new();
     };
-    dependencies_for_command(&command, &cwd)
+    dependencies_for_command(&command, cwd)
 }
 
 fn cargo_test_dependencies(
@@ -1335,19 +1404,25 @@ fn cargo_test_dependencies(
     let Some(package) = package else {
         return BTreeSet::from([SourceDependencyV1::new(cwd, true)]);
     };
-    let workspace_root = cargo_workspace_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
-    let package_index = cargo_package_index(&workspace_root);
-    let Some(package_root) = package_index.get(&package) else {
+    let workspace = cargo_workspace_root(cwd).unwrap_or_else(|| CargoWorkspaceRoot {
+        path: cwd.to_path_buf(),
+        manifest: std::fs::read_to_string(cwd.join("Cargo.toml"))
+            .ok()
+            .map(CargoManifestRecord::new),
+    });
+    let workspace_graph =
+        cargo_workspace_graph_with_root_manifest(&workspace.path, workspace.manifest);
+    let Some(package_root) = workspace_graph.packages.get(&package) else {
         return BTreeSet::from([SourceDependencyV1::new(cwd, true)]);
     };
     let mut dependencies = BTreeSet::from([
-        SourceDependencyV1::new(&workspace_root.join("Cargo.toml"), false),
-        SourceDependencyV1::new(&workspace_root.join("Cargo.lock"), false),
+        SourceDependencyV1::new(&workspace.path.join("Cargo.toml"), false),
+        SourceDependencyV1::new(&workspace.path.join("Cargo.lock"), false),
     ]);
     let mut visited = BTreeSet::new();
     collect_cargo_package_dependencies(
         package_root,
-        &package_index,
+        &workspace_graph,
         &mut visited,
         &mut dependencies,
     );
@@ -1369,24 +1444,119 @@ fn cargo_test_package_from_args(arguments: &serde_json::Value) -> Option<String>
         })
 }
 
-fn cargo_workspace_root(cwd: &Path) -> Option<PathBuf> {
+struct CargoWorkspaceRoot {
+    path: PathBuf,
+    manifest: Option<CargoManifestRecord>,
+}
+
+fn cargo_workspace_root(cwd: &Path) -> Option<CargoWorkspaceRoot> {
     cwd.ancestors().find_map(|root| {
         let manifest = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
-        let parsed = manifest.parse::<toml::Value>().ok()?;
-        parsed
+        let manifest = CargoManifestRecord::new(manifest);
+        manifest
+            .parsed
+            .as_ref()?
             .get("workspace")
             .is_some()
-            .then(|| root.to_path_buf())
+            .then(|| CargoWorkspaceRoot {
+                path: root.to_path_buf(),
+                manifest: Some(manifest),
+            })
     })
 }
 
-fn cargo_package_index(workspace_root: &Path) -> BTreeMap<String, PathBuf> {
-    let mut packages = BTreeMap::new();
+#[derive(Clone, Debug)]
+struct CargoManifestRecord {
+    source: String,
+    parsed: Option<toml::Value>,
+}
+
+impl CargoManifestRecord {
+    fn new(source: String) -> Self {
+        let parsed = toml::from_str::<toml::Value>(&source).ok();
+        Self { source, parsed }
+    }
+}
+
+#[derive(Debug, Default)]
+struct CargoWorkspaceGraph {
+    packages: BTreeMap<String, PathBuf>,
+    manifests: BTreeMap<PathBuf, CargoManifestRecord>,
+}
+
+#[cfg(test)]
+fn cargo_package_index(workspace_root: &Path) -> CargoWorkspaceGraph {
+    let root_manifest = std::fs::read_to_string(workspace_root.join("Cargo.toml")).ok();
+    cargo_package_index_with_root_manifest(workspace_root, root_manifest)
+}
+
+#[cfg(test)]
+fn cargo_package_index_with_root_manifest(
+    workspace_root: &Path,
+    root_manifest: Option<String>,
+) -> CargoWorkspaceGraph {
+    cargo_workspace_graph_with_root_manifest(
+        workspace_root,
+        root_manifest.map(CargoManifestRecord::new),
+    )
+}
+
+fn cargo_workspace_graph_with_root_manifest(
+    workspace_root: &Path,
+    root_manifest: Option<CargoManifestRecord>,
+) -> CargoWorkspaceGraph {
+    cargo_workspace_graph_with_manifest_reader(workspace_root, root_manifest, |path| {
+        std::fs::read_to_string(path).ok()
+    })
+}
+
+#[cfg(test)]
+fn cargo_package_index_with_manifest_reader(
+    workspace_root: &Path,
+    root_manifest: Option<String>,
+    read_manifest: impl FnMut(&Path) -> Option<String>,
+) -> CargoWorkspaceGraph {
+    cargo_workspace_graph_with_manifest_reader(
+        workspace_root,
+        root_manifest.map(CargoManifestRecord::new),
+        read_manifest,
+    )
+}
+
+fn cargo_workspace_graph_with_manifest_reader(
+    workspace_root: &Path,
+    root_manifest: Option<CargoManifestRecord>,
+    mut read_manifest: impl FnMut(&Path) -> Option<String>,
+) -> CargoWorkspaceGraph {
+    let workspace_root =
+        dunce::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+    let mut manifest_cache = BTreeMap::new();
+    manifest_cache.insert(workspace_root.join("Cargo.toml"), root_manifest);
+    cargo_workspace_graph_with_manifest_cache(
+        &workspace_root,
+        &mut manifest_cache,
+        &mut read_manifest,
+    )
+}
+
+fn cargo_workspace_graph_with_manifest_cache(
+    workspace_root: &Path,
+    manifest_cache: &mut BTreeMap<PathBuf, Option<CargoManifestRecord>>,
+    read_manifest: &mut impl FnMut(&Path) -> Option<String>,
+) -> CargoWorkspaceGraph {
+    let workspace_root =
+        dunce::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+    let mut graph = CargoWorkspaceGraph::default();
     let mut pending = vec![workspace_root.to_path_buf()];
-    if let Some(members) = std::fs::read_to_string(workspace_root.join("Cargo.toml"))
-        .ok()
-        .and_then(|manifest| manifest.parse::<toml::Value>().ok())
-        .and_then(|parsed| parsed.get("workspace")?.get("members")?.as_array().cloned())
+    let root_manifest = cached_cargo_manifest(
+        &workspace_root.join("Cargo.toml"),
+        manifest_cache,
+        read_manifest,
+    );
+    if let Some(members) = root_manifest
+        .as_ref()
+        .and_then(|manifest| manifest.parsed.as_ref())
+        .and_then(|parsed| parsed.get("workspace")?.get("members")?.as_array())
     {
         pending.extend(
             members
@@ -1399,13 +1569,20 @@ fn cargo_package_index(workspace_root: &Path) -> BTreeMap<String, PathBuf> {
                 .map(|member| workspace_root.join(member)),
         );
     }
+    let mut visited = BTreeSet::new();
     while let Some(directory) = pending.pop() {
+        let directory = dunce::canonicalize(&directory).unwrap_or_else(|_| directory.to_path_buf());
+        if !visited.insert(directory.clone()) {
+            continue;
+        }
         let manifest_path = directory.join("Cargo.toml");
-        if let Some(name) = std::fs::read_to_string(&manifest_path)
-            .ok()
-            .and_then(|manifest| cargo_manifest_package_name(&manifest))
-        {
-            packages.insert(name, directory.clone());
+        let manifest = cached_cargo_manifest(&manifest_path, manifest_cache, read_manifest);
+        if let Some(manifest) = manifest {
+            pending.extend(cargo_manifest_path_dependencies(&manifest, &directory));
+            if let Some(name) = cargo_manifest_package_name(&manifest) {
+                graph.packages.insert(name, directory.clone());
+            }
+            graph.manifests.insert(directory.clone(), manifest);
         }
 
         let Ok(entries) = std::fs::read_dir(&directory) else {
@@ -1415,17 +1592,118 @@ fn cargo_package_index(workspace_root: &Path) -> BTreeMap<String, PathBuf> {
             let path = entry.path();
             if path.is_dir() {
                 let name = entry.file_name();
-                if !matches!(name.to_str(), Some("target" | ".git" | "node_modules")) {
+                if !matches!(
+                    name.to_str(),
+                    Some("target" | ".git" | "vendor" | "third_party" | "node_modules")
+                ) {
                     pending.push(path);
                 }
             }
         }
     }
-    packages
+    graph
 }
 
-fn cargo_manifest_package_name(manifest: &str) -> Option<String> {
-    if let Some(name) = manifest.parse::<toml::Value>().ok().and_then(|parsed| {
+fn cached_cargo_manifest(
+    path: &Path,
+    cache: &mut BTreeMap<PathBuf, Option<CargoManifestRecord>>,
+    read_manifest: &mut impl FnMut(&Path) -> Option<String>,
+) -> Option<CargoManifestRecord> {
+    if let Some(manifest) = cache.get(path) {
+        return manifest.clone();
+    }
+    let manifest = read_manifest(path).map(CargoManifestRecord::new);
+    cache.insert(path.to_path_buf(), manifest.clone());
+    manifest
+}
+
+fn cargo_manifest_path_dependencies(
+    manifest: &CargoManifestRecord,
+    package_root: &Path,
+) -> BTreeSet<PathBuf> {
+    let Some(parsed) = manifest.parsed.as_ref() else {
+        return cargo_manifest_dependency_fallback(
+            &manifest.source,
+            package_root,
+            &BTreeMap::new(),
+        );
+    };
+    let tables = ["dependencies", "dev-dependencies", "build-dependencies"]
+        .into_iter()
+        .filter_map(|key| parsed.get(key).and_then(toml::Value::as_table));
+    let target_tables = parsed
+        .get("target")
+        .and_then(toml::Value::as_table)
+        .into_iter()
+        .flat_map(|targets| targets.values())
+        .filter_map(toml::Value::as_table)
+        .flat_map(|target| {
+            ["dependencies", "dev-dependencies", "build-dependencies"]
+                .into_iter()
+                .filter_map(move |key| target.get(key).and_then(toml::Value::as_table))
+        });
+    tables
+        .chain(target_tables)
+        .flat_map(|table| table.values())
+        .filter_map(toml::Value::as_table)
+        .filter_map(|specification| specification.get("path"))
+        .filter_map(toml::Value::as_str)
+        .map(|path| package_root.join(path))
+        .collect()
+}
+
+pub(crate) fn find_cargo_package_directory(package: &str, cwd: &Path) -> Option<PathBuf> {
+    find_cargo_package_directory_with_manifest_reader(package, cwd, |path| {
+        std::fs::read_to_string(path).ok()
+    })
+}
+
+pub(crate) fn find_cargo_package_directory_with_manifest_reader(
+    package: &str,
+    cwd: &Path,
+    mut read_manifest: impl FnMut(&Path) -> Option<String>,
+) -> Option<PathBuf> {
+    let mut candidates = BTreeSet::new();
+    for ancestor in cwd.ancestors() {
+        for candidate in [ancestor.to_path_buf(), ancestor.join("codex-rs")] {
+            candidates.insert(
+                dunce::canonicalize(&candidate).unwrap_or_else(|_| candidate.to_path_buf()),
+            );
+        }
+    }
+
+    let mut manifest_cache = BTreeMap::new();
+    let mut roots = Vec::new();
+    for candidate in candidates {
+        let manifest = cached_cargo_manifest(
+            &candidate.join("Cargo.toml"),
+            &mut manifest_cache,
+            &mut read_manifest,
+        );
+        if manifest
+            .as_ref()
+            .and_then(|manifest| manifest.parsed.as_ref())
+            .is_some_and(|parsed| parsed.get("workspace").is_some())
+        {
+            roots.push(candidate);
+        }
+    }
+
+    for root in roots {
+        let graph = cargo_workspace_graph_with_manifest_cache(
+            &root,
+            &mut manifest_cache,
+            &mut read_manifest,
+        );
+        if let Some(directory) = graph.packages.get(package) {
+            return Some(directory.clone());
+        }
+    }
+    None
+}
+
+fn cargo_manifest_package_name(manifest: &CargoManifestRecord) -> Option<String> {
+    if let Some(name) = manifest.parsed.as_ref().and_then(|parsed| {
         parsed
             .get("package")?
             .get("name")?
@@ -1439,7 +1717,7 @@ fn cargo_manifest_package_name(manifest: &str) -> Option<String> {
     // than the bundled TOML parser. Package names are simple quoted scalars,
     // so this narrow fallback can still identify local workspace members.
     let mut in_package = false;
-    for raw_line in manifest.lines() {
+    for raw_line in manifest.source.lines() {
         let line = raw_line.trim();
         if line.starts_with('[') {
             in_package = line == "[package]";
@@ -1469,7 +1747,7 @@ fn cargo_manifest_package_name(manifest: &str) -> Option<String> {
 
 fn collect_cargo_package_dependencies(
     package_root: &Path,
-    package_index: &BTreeMap<String, PathBuf>,
+    workspace_graph: &CargoWorkspaceGraph,
     visited: &mut BTreeSet<PathBuf>,
     dependencies: &mut BTreeSet<SourceDependencyV1>,
 ) {
@@ -1479,15 +1757,17 @@ fn collect_cargo_package_dependencies(
         return;
     }
     dependencies.insert(SourceDependencyV1::new(&package_root, true));
-    let manifest_path = package_root.join("Cargo.toml");
-    let Ok(manifest) = std::fs::read_to_string(&manifest_path) else {
+    let manifest = workspace_graph.manifests.get(&package_root);
+    let Some(manifest) = manifest else {
         return;
     };
-    let Ok(parsed) = manifest.parse::<toml::Value>() else {
-        for local_root in
-            cargo_manifest_dependency_fallback(&manifest, &package_root, package_index)
-        {
-            collect_cargo_package_dependencies(&local_root, package_index, visited, dependencies);
+    let Some(parsed) = manifest.parsed.as_ref() else {
+        for local_root in cargo_manifest_dependency_fallback(
+            &manifest.source,
+            &package_root,
+            &workspace_graph.packages,
+        ) {
+            collect_cargo_package_dependencies(&local_root, workspace_graph, visited, dependencies);
         }
         return;
     };
@@ -1518,14 +1798,14 @@ fn collect_cargo_package_dependencies(
                                 .get("package")
                                 .and_then(toml::Value::as_str)
                                 .unwrap_or(dependency_name);
-                            package_index.get(package_name).cloned()
+                            workspace_graph.packages.get(package_name).cloned()
                         })
                 })
-                .or_else(|| package_index.get(dependency_name).cloned());
+                .or_else(|| workspace_graph.packages.get(dependency_name).cloned());
             if let Some(local_root) = local_root {
                 collect_cargo_package_dependencies(
                     &local_root,
-                    package_index,
+                    workspace_graph,
                     visited,
                     dependencies,
                 );
@@ -1585,6 +1865,7 @@ fn inline_dependency_string<'a>(specification: &'a str, key: &str) -> Option<&'a
         })
 }
 
+#[cfg(test)]
 pub(crate) fn workspace_evidence_cwd_for_tool_call(
     tool_identity: &str,
     payload: &ToolPayload,
@@ -1593,10 +1874,7 @@ pub(crate) fn workspace_evidence_cwd_for_tool_call(
     if !tool_observes_workspace(tool_identity) {
         return default_cwd.to_path_buf();
     }
-    let ToolPayload::Function { arguments } = payload else {
-        return default_cwd.to_path_buf();
-    };
-    let Ok(arguments) = serde_json::from_str::<serde_json::Value>(arguments) else {
+    let Some(arguments) = workspace_call_arguments(payload) else {
         return default_cwd.to_path_buf();
     };
     workspace_cwd_from_arguments(&arguments, default_cwd)
@@ -1650,6 +1928,55 @@ fn dependency_command(arguments: &serde_json::Value) -> Option<Vec<String>> {
         }
     }
     None
+}
+
+fn dependency_search_command(
+    arguments: &serde_json::Value,
+) -> Option<(Vec<String>, Option<crate::shell::ShellType>)> {
+    if let Some(command) = dependency_command(arguments) {
+        return Some((command, None));
+    }
+    let script = arguments
+        .get("command")
+        .or_else(|| arguments.get("cmd"))?
+        .as_str()?;
+    let shell_type = arguments
+        .get("shell")
+        .and_then(serde_json::Value::as_str)
+        .and_then(shell_type_from_name)
+        .unwrap_or_else(|| crate::shell::default_user_shell().shell_type);
+    let command = match shell_type {
+        crate::shell::ShellType::PowerShell => vec![
+            "powershell".to_string(),
+            "-Command".to_string(),
+            script.to_string(),
+        ],
+        crate::shell::ShellType::Cmd => {
+            vec!["cmd".to_string(), "/c".to_string(), script.to_string()]
+        }
+        crate::shell::ShellType::Bash => {
+            vec!["bash".to_string(), "-c".to_string(), script.to_string()]
+        }
+        crate::shell::ShellType::Zsh => {
+            vec!["zsh".to_string(), "-c".to_string(), script.to_string()]
+        }
+        crate::shell::ShellType::Sh => {
+            vec!["sh".to_string(), "-c".to_string(), script.to_string()]
+        }
+    };
+    Some((command, Some(shell_type)))
+}
+
+fn shell_type_from_name(value: &str) -> Option<crate::shell::ShellType> {
+    let name = command_basename(value);
+    match name.as_str() {
+        "pwsh" | "powershell" => Some(crate::shell::ShellType::PowerShell),
+        "cmd" | "cmd.exe" => Some(crate::shell::ShellType::Cmd),
+        "bash" => Some(crate::shell::ShellType::Bash),
+        "zsh" => Some(crate::shell::ShellType::Zsh),
+        "sh" => Some(crate::shell::ShellType::Sh),
+        _ => None,
+    }
 }
 
 fn dependencies_for_command(command: &[String], cwd: &Path) -> BTreeSet<SourceDependencyV1> {
@@ -1730,6 +2057,27 @@ fn dependencies_for_command(command: &[String], cwd: &Path) -> BTreeSet<SourceDe
         return BTreeSet::from([SourceDependencyV1::new(cwd, true)]);
     }
     if scopes.len() > 8 {
+        return BTreeSet::from([SourceDependencyV1::new(cwd, true)]);
+    }
+    scopes
+        .into_iter()
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            }
+        })
+        .map(|path| {
+            let recursive = path.is_dir() || path.extension().is_none();
+            SourceDependencyV1::new(&path, recursive)
+        })
+        .collect()
+}
+
+fn dependencies_for_search_scopes(scopes: Vec<String>, cwd: &Path) -> BTreeSet<SourceDependencyV1> {
+    if scopes.is_empty() || scopes.len() > 8 {
         return BTreeSet::from([SourceDependencyV1::new(cwd, true)]);
     }
     scopes

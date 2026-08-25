@@ -15,11 +15,9 @@ use tracing::Span;
 
 use super::CommandShell;
 use super::ConfiguredHandler;
-use super::dispatcher::hook_event_name_label;
 use super::dispatcher::hook_execution_mode_label;
 use super::dispatcher::hook_handler_type_label;
 use super::dispatcher::hook_scope_label;
-use super::dispatcher::hook_source_label;
 use super::dispatcher::scope_for_event;
 use codex_protocol::protocol::HookExecutionMode;
 use codex_protocol::protocol::HookHandlerType;
@@ -43,11 +41,11 @@ pub(crate) struct CommandRunResult {
     level = "trace",
     skip_all,
     fields(
-        hook.event_name = hook_event_name_label(handler.event_name),
+        hook.event_name = handler.event_name.as_pascal_case_label(),
         hook.handler_type = hook_handler_type_label(HookHandlerType::Command),
         hook.execution_mode = hook_execution_mode_label(HookExecutionMode::Sync),
         hook.scope = hook_scope_label(scope_for_event(handler.event_name)),
-        hook.source = hook_source_label(handler.source),
+        hook.source = handler.source.as_snake_case_label(),
         hook.display_order = handler.display_order,
         hook.configured_order = configured_order,
         hook.timeout_sec = handler.timeout_sec,
@@ -90,13 +88,6 @@ async fn run_command_with_reservation(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    #[cfg(unix)]
-    unsafe {
-        command.pre_exec(|| {
-            codex_utils_pty::process_group::detach_from_tty()?;
-            Ok(())
-        });
-    }
 
     let managed = match timeout_at(timeout_deadline, reservation).await {
         Ok(Ok(managed)) => managed,
@@ -136,7 +127,7 @@ async fn run_command_with_reservation(
             );
         }
     };
-    #[cfg(windows)]
+
     {
         let Some(process_id) = child.id() else {
             terminate_command_tree(&mut child, &managed).await;
@@ -281,12 +272,10 @@ async fn terminate_command_tree(
     child: &mut tokio::process::Child,
     managed: &codex_utils_pty::ManagedRootProcess,
 ) {
-    #[cfg(windows)]
     if let Err(err) = managed.terminate() {
         tracing::warn!("failed to terminate hook process Job Object: {err:?}");
     }
-    #[cfg(not(windows))]
-    let _ = managed;
+
     if let Some(process_group_id) = child.id()
         && let Err(err) = codex_utils_pty::process_group::kill_process_group(process_group_id)
     {
@@ -419,42 +408,25 @@ fn build_command(shell: &CommandShell, handler: &ConfiguredHandler) -> Command {
         Command::new(&shell.program)
     };
     if shell.program.is_empty() {
-        #[cfg(windows)]
         command.raw_arg(format!(r#""{}""#, handler.command));
-
-        #[cfg(not(windows))]
-        command.arg(&handler.command);
     } else {
         command.args(&shell.args);
 
-        #[cfg(windows)]
         if shell.args.iter().any(|arg| arg.eq_ignore_ascii_case("/c")) {
             command.raw_arg(format!(r#""{}""#, handler.command));
         } else {
             command.arg(&handler.command);
         }
-
-        #[cfg(not(windows))]
-        command.arg(&handler.command);
     }
     command.envs(&handler.env);
     command
 }
 
 fn default_shell_command() -> Command {
-    #[cfg(windows)]
     {
         let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
         let mut command = Command::new(comspec);
         command.arg("/C");
-        command
-    }
-
-    #[cfg(not(windows))]
-    {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let mut command = Command::new(shell);
-        command.arg("-lc");
         command
     }
 }
@@ -484,7 +456,6 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
     fn explicit_test_shell() -> CommandShell {
         CommandShell {
             program: "powershell.exe".to_string(),
@@ -492,21 +463,12 @@ mod tests {
         }
     }
 
-    #[cfg(not(windows))]
-    fn explicit_test_shell() -> CommandShell {
-        CommandShell {
-            program: "/bin/sh".to_string(),
-            args: vec!["-lc".to_string()],
-        }
-    }
-
     #[tokio::test]
     async fn timeout_covers_a_blocked_stdin_write() {
         let cwd = AbsolutePathBuf::current_dir().expect("current directory");
-        #[cfg(windows)]
+
         let command = "Start-Sleep -Seconds 60".to_string();
-        #[cfg(not(windows))]
-        let command = "sleep 60".to_string();
+
         let handler = test_handler(command, 1, &cwd);
         let input_json = "x".repeat(4 * 1024 * 1024);
 
@@ -534,16 +496,12 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let marker = temp_dir.path().join("spawned-after-admission-timeout.txt");
         let cwd = AbsolutePathBuf::try_from(temp_dir.path().to_path_buf()).expect("absolute cwd");
-        #[cfg(windows)]
+
         let command = {
             let marker = marker.to_string_lossy().replace('\'', "''");
             format!("Set-Content -LiteralPath '{marker}' -Value spawned")
         };
-        #[cfg(not(windows))]
-        let command = {
-            let marker = marker.to_string_lossy().replace('\'', "'\\''");
-            format!("printf spawned > '{marker}'")
-        };
+
         let handler = test_handler(command, 1, &cwd);
         let blocked_admission =
             std::future::pending::<io::Result<codex_utils_pty::ManagedRootProcess>>();
@@ -570,18 +528,14 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let marker = temp_dir.path().join("escaped-descendant.txt");
         let cwd = AbsolutePathBuf::try_from(temp_dir.path().to_path_buf()).expect("absolute cwd");
-        #[cfg(windows)]
+
         let command = {
             let marker = marker.to_string_lossy().replace('\'', "''");
             format!(
                 "Start-Job -ScriptBlock {{ Start-Sleep -Seconds 3; Set-Content -LiteralPath '{marker}' -Value done }} | Out-Null; Start-Sleep -Seconds 60"
             )
         };
-        #[cfg(not(windows))]
-        let command = {
-            let marker = marker.to_string_lossy().replace('\'', "'\\''");
-            format!("(sleep 3; printf done > '{marker}') & sleep 60")
-        };
+
         let handler = test_handler(command, 1, &cwd);
 
         let result = tokio::time::timeout(
@@ -603,7 +557,7 @@ mod tests {
     #[tokio::test]
     async fn drains_output_while_writing_stdin() {
         let cwd = AbsolutePathBuf::current_dir().expect("current directory");
-        #[cfg(windows)]
+
         let command = concat!(
             "$stdout = [Console]::OpenStandardOutput(); ",
             "$bytes = New-Object byte[] (2 * 1024 * 1024); ",
@@ -612,8 +566,7 @@ mod tests {
             "[Console]::In.ReadToEnd() | Out-Null"
         )
         .to_string();
-        #[cfg(not(windows))]
-        let command = "dd if=/dev/zero bs=65536 count=32 2>/dev/null; cat >/dev/null".to_string();
+
         let handler = test_handler(command, 5, &cwd);
         let input_json = "x".repeat(4 * 1024 * 1024);
 

@@ -2,7 +2,6 @@
 // from the eventual unsafe cleanup.
 #![allow(unsafe_op_in_unsafe_fn)]
 
-#[cfg(any(target_os = "windows", test))]
 mod ssh_config_dependencies;
 
 use std::fmt;
@@ -86,7 +85,6 @@ pub const LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR: &str = concat!(
     "on this Windows build; select the elevated Windows sandbox backend"
 );
 
-#[cfg(target_os = "windows")]
 mod legacy_delete_child_probe_cache {
     pub(super) static LEGACY_DELETE_CHILD_RESTRICTION: std::sync::OnceLock<bool> =
         std::sync::OnceLock::new();
@@ -97,13 +95,11 @@ mod legacy_delete_child_probe_cache {
 ///
 /// A false result means the same-user legacy backend cannot safely contain
 /// deletions and must fail closed rather than launch the requested process.
-#[cfg(target_os = "windows")]
 pub fn legacy_restricted_token_enforces_delete_child() -> bool {
     let cache = &legacy_delete_child_probe_cache::LEGACY_DELETE_CHILD_RESTRICTION;
     *cache.get_or_init(|| token::probe_legacy_delete_child_restriction().unwrap_or(false))
 }
 
-#[cfg(target_os = "windows")]
 pub(crate) fn ensure_legacy_delete_child_safety(enforces_delete_child: bool) -> anyhow::Result<()> {
     if !enforces_delete_child {
         anyhow::bail!(LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR);
@@ -111,326 +107,315 @@ pub(crate) fn ensure_legacy_delete_child_safety(enforces_delete_child: bool) -> 
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
 mod acl;
-#[cfg(target_os = "windows")]
+
 mod allow;
-#[cfg(target_os = "windows")]
+
 mod audit;
-#[cfg(target_os = "windows")]
+
 mod cap;
-#[cfg(target_os = "windows")]
+
 mod deny_read_acl;
-#[cfg(target_os = "windows")]
+
 mod deny_read_state;
-#[cfg(target_os = "windows")]
+
 mod desktop;
-#[cfg(target_os = "windows")]
+
 mod dpapi;
-#[cfg(target_os = "windows")]
+
 mod env;
-#[cfg(target_os = "windows")]
+
 mod helper_materialization;
-#[cfg(target_os = "windows")]
+
 mod hide_users;
-#[cfg(target_os = "windows")]
+
 mod identity;
-#[cfg(target_os = "windows")]
+
 mod logging;
-#[cfg(target_os = "windows")]
+
 mod path_normalization;
-#[cfg(target_os = "windows")]
+
 mod process;
-#[cfg(target_os = "windows")]
+
 mod resolved_permissions;
-#[cfg(target_os = "windows")]
+
 mod token;
-#[cfg(target_os = "windows")]
+
 mod wfp;
-#[cfg(target_os = "windows")]
+
 mod wfp_setup;
-#[cfg(target_os = "windows")]
+
 mod winutil;
-#[cfg(target_os = "windows")]
+
 mod workspace_acl;
 
 mod deny_read_resolver;
 
-#[cfg(target_os = "windows")]
 mod conpty;
 
-#[cfg(target_os = "windows")]
 mod elevated;
 
-#[cfg(target_os = "windows")]
 mod elevated_impl;
 
-#[cfg(target_os = "windows")]
 mod proc_thread_attr;
 
-#[cfg(target_os = "windows")]
 mod sandbox_utils;
 
-#[cfg(target_os = "windows")]
 mod setup;
 
-#[cfg(target_os = "windows")]
+#[doc(hidden)]
+pub mod setup_protocol;
+
 mod setup_error;
 
-#[cfg(target_os = "windows")]
 mod spawn_prep;
 
-#[cfg(target_os = "windows")]
 mod stdio_bridge;
 
-#[cfg(target_os = "windows")]
 mod unified_exec;
-#[cfg(target_os = "windows")]
+
 mod wrapper;
 
-#[cfg(target_os = "windows")]
 pub(crate) use elevated::ipc_framed;
 
-#[cfg(target_os = "windows")]
 pub(crate) use elevated::runner_client;
 
-#[cfg(target_os = "windows")]
 pub(crate) use elevated::runner_pipe;
 
-#[cfg(target_os = "windows")]
 pub use acl::add_deny_read_ace;
-#[cfg(target_os = "windows")]
+
 pub use acl::add_deny_write_ace;
 
-#[cfg(target_os = "windows")]
 pub use acl::allow_null_device;
-#[cfg(target_os = "windows")]
+
 pub use acl::ensure_allow_mask_aces;
-#[cfg(target_os = "windows")]
+
 pub use acl::ensure_allow_mask_aces_with_inheritance;
-#[cfg(target_os = "windows")]
+
 pub use acl::ensure_allow_write_aces;
-#[cfg(target_os = "windows")]
+
 pub use acl::fetch_dacl_handle;
-#[cfg(target_os = "windows")]
+
 pub use acl::path_mask_allows;
-#[cfg(target_os = "windows")]
+
 pub use acl::path_mask_has_explicit_allow_ace;
-#[cfg(target_os = "windows")]
+
 pub use audit::apply_world_writable_scan_and_denies_for_permissions;
-#[cfg(target_os = "windows")]
+
+pub use audit::world_writable_warning_details;
+
 pub use cap::load_or_create_cap_sids;
-#[cfg(target_os = "windows")]
+
 pub use cap::workspace_cap_sid_for_cwd;
-#[cfg(target_os = "windows")]
+
 pub use cap::workspace_write_cap_sid_for_root;
-#[cfg(target_os = "windows")]
+
 pub use cap::workspace_write_root_contains_path;
-#[cfg(target_os = "windows")]
+
 pub use cap::workspace_write_root_overlaps_path;
-#[cfg(target_os = "windows")]
+
 pub use conpty::ConptyInstance;
-#[cfg(target_os = "windows")]
+
 pub use conpty::spawn_conpty_process_as_user;
-#[cfg(target_os = "windows")]
+
 pub use deny_read_acl::apply_deny_read_acls;
-#[cfg(target_os = "windows")]
+
 pub use deny_read_acl::plan_deny_read_acl_paths;
 pub use deny_read_resolver::resolve_windows_deny_read_paths;
-#[cfg(target_os = "windows")]
+
 pub use deny_read_state::sync_persistent_deny_read_acls;
-#[cfg(target_os = "windows")]
+
 pub use desktop::LaunchDesktop;
-#[cfg(target_os = "windows")]
+
 pub use dpapi::protect as dpapi_protect;
-#[cfg(target_os = "windows")]
+
 pub use dpapi::unprotect as dpapi_unprotect;
-#[cfg(target_os = "windows")]
+
 pub use elevated_impl::ElevatedSandboxProfileCaptureRequest;
-#[cfg(target_os = "windows")]
+
 pub use elevated_impl::run_windows_sandbox_capture_for_permission_profile as run_windows_sandbox_capture_for_permission_profile_elevated;
-#[cfg(target_os = "windows")]
+
 pub use helper_materialization::HelperMaterializationStatus;
-#[cfg(target_os = "windows")]
+
 pub use helper_materialization::resolve_current_exe_for_launch;
-#[cfg(target_os = "windows")]
+
 pub use helper_materialization::resolve_current_exe_for_launch_with_status;
-#[cfg(target_os = "windows")]
+
 pub use helper_materialization::resolve_exe_for_launch;
-#[cfg(target_os = "windows")]
+
 pub use helper_materialization::resolve_exe_for_launch_with_status;
-#[cfg(target_os = "windows")]
+
 pub use hide_users::hide_current_user_profile_dir;
-#[cfg(target_os = "windows")]
+
 pub use hide_users::hide_newly_created_users;
-#[cfg(target_os = "windows")]
+
 pub use identity::require_logon_sandbox_creds;
-#[cfg(target_os = "windows")]
+
 pub use identity::sandbox_setup_is_complete;
-#[cfg(target_os = "windows")]
+
 pub use ipc_framed::ErrorPayload;
-#[cfg(target_os = "windows")]
+
 pub use ipc_framed::ErrorStage;
-#[cfg(target_os = "windows")]
+
 pub use ipc_framed::ExitPayload;
-#[cfg(target_os = "windows")]
+
 pub use ipc_framed::FramedMessage;
-#[cfg(target_os = "windows")]
+
 pub use ipc_framed::IPC_PROTOCOL_VERSION;
-#[cfg(target_os = "windows")]
+
 pub use ipc_framed::Message;
-#[cfg(target_os = "windows")]
+
 pub use ipc_framed::OutputPayload;
-#[cfg(target_os = "windows")]
+
 pub use ipc_framed::OutputStream;
-#[cfg(target_os = "windows")]
+
 pub use ipc_framed::ResizePayload;
-#[cfg(target_os = "windows")]
+
 pub use ipc_framed::SpawnReady;
-#[cfg(target_os = "windows")]
+
 pub use ipc_framed::SpawnRequest;
-#[cfg(target_os = "windows")]
+
 pub use ipc_framed::StdinPayload;
-#[cfg(target_os = "windows")]
+
 pub use ipc_framed::decode_bytes;
-#[cfg(target_os = "windows")]
+
 pub use ipc_framed::encode_bytes;
-#[cfg(target_os = "windows")]
+
 pub use ipc_framed::read_frame;
-#[cfg(target_os = "windows")]
+
 pub use ipc_framed::write_frame;
-#[cfg(target_os = "windows")]
+
 pub use logging::current_log_file_path;
-#[cfg(target_os = "windows")]
+
 pub use logging::current_log_file_path_for_codex_home;
-#[cfg(target_os = "windows")]
+
 pub use logging::log_file_path_for_utc_date;
-#[cfg(target_os = "windows")]
+
 pub use logging::log_note;
-#[cfg(target_os = "windows")]
+
 pub use logging::log_writer;
-#[cfg(target_os = "windows")]
+
 pub use path_normalization::canonicalize_path;
-#[cfg(target_os = "windows")]
+
 pub use process::ConsoleMode;
-#[cfg(target_os = "windows")]
+
 pub use process::PipeSpawnHandles;
-#[cfg(target_os = "windows")]
+
 pub use process::StderrMode;
-#[cfg(target_os = "windows")]
+
 pub use process::StdinMode;
-#[cfg(target_os = "windows")]
+
 pub use process::create_process_as_user;
-#[cfg(target_os = "windows")]
+
 pub use process::read_handle_loop;
-#[cfg(target_os = "windows")]
+
 pub use process::spawn_process_with_pipes;
-#[cfg(target_os = "windows")]
+
 pub use resolved_permissions::ResolvedWindowsSandboxPermissions;
-#[cfg(target_os = "windows")]
+
 pub use resolved_permissions::WindowsSandboxTokenMode;
-#[cfg(target_os = "windows")]
+
 pub use resolved_permissions::token_mode_for_permission_profile;
-#[cfg(target_os = "windows")]
+
 pub use setup::SETUP_VERSION;
-#[cfg(target_os = "windows")]
+
 pub use setup::SandboxSetupRequest;
-#[cfg(target_os = "windows")]
+
+pub use setup::SandboxUserRecord;
+
+pub use setup::SandboxUsersFile;
+
 pub use setup::SetupRootOverrides;
-#[cfg(target_os = "windows")]
+
 pub use setup::run_elevated_provisioning_setup;
-#[cfg(target_os = "windows")]
+
 pub use setup::run_elevated_setup;
-#[cfg(target_os = "windows")]
+
 pub use setup::run_setup_refresh;
-#[cfg(target_os = "windows")]
+
 pub use setup::run_setup_refresh_with_extra_read_roots;
-#[cfg(target_os = "windows")]
+
 pub use setup::run_strict_read_root_grant;
-#[cfg(target_os = "windows")]
+
 pub use setup::sandbox_bin_dir;
-#[cfg(target_os = "windows")]
+
 pub use setup::sandbox_dir;
-#[cfg(target_os = "windows")]
+
 pub use setup::sandbox_secrets_dir;
-#[cfg(target_os = "windows")]
+
 pub use setup_error::SetupErrorCode;
-#[cfg(target_os = "windows")]
+
 pub use setup_error::SetupErrorReport;
-#[cfg(target_os = "windows")]
+
 pub use setup_error::SetupFailure;
-#[cfg(target_os = "windows")]
+
 pub use setup_error::extract_failure as extract_setup_failure;
-#[cfg(target_os = "windows")]
+
 pub use setup_error::sanitize_setup_metric_tag_value;
-#[cfg(target_os = "windows")]
+
 pub use setup_error::setup_error_path;
-#[cfg(target_os = "windows")]
+
 pub use setup_error::write_setup_error_report;
-#[cfg(target_os = "windows")]
+
 pub use stdio_bridge::forward_sandbox_session_stdio;
-#[cfg(target_os = "windows")]
+
 #[doc(hidden)]
 pub use token::LocalSid;
-#[cfg(target_os = "windows")]
+
 pub use token::convert_string_sid_to_sid;
-#[cfg(target_os = "windows")]
+
 pub use token::create_readonly_token_with_cap_from;
-#[cfg(target_os = "windows")]
+
 pub use token::create_readonly_token_with_caps_and_user_from;
-#[cfg(target_os = "windows")]
+
 pub use token::create_readonly_token_with_caps_from;
-#[cfg(target_os = "windows")]
+
 pub use token::create_workspace_write_token_with_caps_and_user_from;
-#[cfg(target_os = "windows")]
+
 pub use token::create_workspace_write_token_with_caps_from;
-#[cfg(target_os = "windows")]
+
 pub use token::get_current_token_for_restriction;
-#[cfg(target_os = "windows")]
+
 pub use unified_exec::WindowsSandboxSessionRequest;
-#[cfg(target_os = "windows")]
+
 pub use unified_exec::spawn_windows_sandbox_session_elevated_for_permission_profile;
-#[cfg(target_os = "windows")]
+
 pub use unified_exec::spawn_windows_sandbox_session_for_level;
-#[cfg(target_os = "windows")]
+
 pub use unified_exec::spawn_windows_sandbox_session_legacy;
-#[cfg(target_os = "windows")]
+
 pub use wfp::install_wfp_filters_for_account;
-#[cfg(target_os = "windows")]
+
 pub use wfp_setup::install_wfp_filters;
-#[cfg(target_os = "windows")]
+
 pub use windows_impl::CaptureResult;
-#[cfg(target_os = "windows")]
+
 pub use windows_impl::run_windows_sandbox_capture;
-#[cfg(target_os = "windows")]
+
 pub use windows_impl::run_windows_sandbox_capture_with_filesystem_overrides;
-#[cfg(target_os = "windows")]
+
 pub use windows_impl::run_windows_sandbox_capture_with_filesystem_overrides_and_output_sink;
-#[cfg(target_os = "windows")]
+
 pub use windows_impl::run_windows_sandbox_legacy_preflight;
-#[cfg(target_os = "windows")]
+
+pub use winutil::WELL_KNOWN_USERS_SID;
+
 pub use winutil::quote_windows_arg;
-#[cfg(target_os = "windows")]
+
+pub use winutil::resolve_sid;
+
 pub use winutil::string_from_sid_bytes;
-#[cfg(target_os = "windows")]
+
 pub use winutil::to_wide;
-#[cfg(target_os = "windows")]
+
 pub use workspace_acl::is_command_cwd_root;
-#[cfg(target_os = "windows")]
+
 pub use wrapper::CODEX_WINDOWS_SANDBOX_ARG1;
-#[cfg(target_os = "windows")]
+
 pub use wrapper::create_windows_sandbox_command_args_for_permission_profile;
-#[cfg(target_os = "windows")]
+
 pub use wrapper::run_windows_sandbox_wrapper_main;
 
-#[cfg(not(target_os = "windows"))]
-pub use stub::CaptureResult;
-#[cfg(not(target_os = "windows"))]
-pub use stub::run_windows_sandbox_capture;
-#[cfg(not(target_os = "windows"))]
-pub use stub::run_windows_sandbox_legacy_preflight;
-
-#[cfg(target_os = "windows")]
 mod windows_impl {
     use super::CaptureOutputSink;
     use super::CaptureOutputStream;
@@ -538,7 +523,7 @@ mod windows_impl {
 
     unsafe fn close_pipe_handles(handles: &[HANDLE]) {
         for &handle in handles {
-            if handle != 0 && handle != INVALID_HANDLE_VALUE {
+            if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
                 CloseHandle(handle);
             }
         }
@@ -551,12 +536,12 @@ mod windows_impl {
     }
 
     unsafe fn setup_stdio_pipes() -> io::Result<PipeHandles> {
-        let mut in_r: HANDLE = 0;
-        let mut in_w: HANDLE = 0;
-        let mut out_r: HANDLE = 0;
-        let mut out_w: HANDLE = 0;
-        let mut err_r: HANDLE = 0;
-        let mut err_w: HANDLE = 0;
+        let mut in_r: HANDLE = ptr::null_mut();
+        let mut in_w: HANDLE = ptr::null_mut();
+        let mut out_r: HANDLE = ptr::null_mut();
+        let mut out_w: HANDLE = ptr::null_mut();
+        let mut err_r: HANDLE = ptr::null_mut();
+        let mut err_w: HANDLE = ptr::null_mut();
         if CreatePipe(&mut in_r, &mut in_w, ptr::null_mut(), 0) == 0 {
             return Err(io::Error::from_raw_os_error(GetLastError() as i32));
         }
@@ -597,7 +582,7 @@ mod windows_impl {
 
     impl Drop for OwnedCapturePipeHandle {
         fn drop(&mut self) {
-            if self.0 != 0 && self.0 != INVALID_HANDLE_VALUE {
+            if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
                 unsafe {
                     CloseHandle(self.0);
                 }
@@ -695,8 +680,13 @@ mod windows_impl {
             stream: CaptureOutputStream,
         ) -> Self {
             let (stop_tx, stop_rx) = mpsc::sync_channel(1);
-            let join =
-                std::thread::spawn(move || read_capture_pipe(handle, stop_rx, output_sink, stream));
+            // windows-sys models HANDLE as an opaque pointer. Move its address
+            // across the thread boundary, then restore the handle in the owner
+            // thread that performs the reads.
+            let handle_addr = handle as usize;
+            let join = std::thread::spawn(move || {
+                read_capture_pipe(handle_addr as HANDLE, stop_rx, output_sink, stream)
+            });
             Self {
                 stop_tx,
                 join: Some(join),
@@ -974,10 +964,10 @@ mod windows_impl {
         }
 
         unsafe {
-            if pi.hThread != 0 {
+            if !pi.hThread.is_null() {
                 CloseHandle(pi.hThread);
             }
-            if pi.hProcess != 0 {
+            if !pi.hProcess.is_null() {
                 CloseHandle(pi.hProcess);
             }
             CloseHandle(security.h_token);
@@ -1185,7 +1175,9 @@ mod windows_impl {
         #[test]
         fn stopped_capture_reader_bounds_continuous_writer_drain() {
             let (reader, out_w) = capture_pipe_with_open_writer();
+            let out_w_addr = out_w as usize;
             let writer = std::thread::spawn(move || {
+                let out_w = out_w_addr as HANDLE;
                 let chunk = [b'x'; 64];
                 while write_pipe(out_w, &chunk).is_ok() {
                     std::thread::sleep(Duration::from_millis(2));
@@ -1221,7 +1213,7 @@ mod windows_impl {
         #[test]
         fn process_wait_failure_is_not_treated_as_exit() {
             match super::wait_for_process(
-                /*invalid process handle*/ 0,
+                /*invalid process handle*/ ptr::null_mut(),
                 Some(0),
                 /*cancellation*/ None,
             ) {
@@ -1262,49 +1254,5 @@ mod windows_impl {
                 crate::LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR
             );
         }
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-mod stub {
-    use super::WindowsSandboxCancellationToken;
-    use anyhow::Result;
-    use anyhow::bail;
-    use codex_protocol::models::PermissionProfile;
-    use codex_utils_absolute_path::AbsolutePathBuf;
-    use std::collections::HashMap;
-    use std::path::Path;
-
-    #[derive(Debug, Default)]
-    pub struct CaptureResult {
-        pub exit_code: i32,
-        pub stdout: Vec<u8>,
-        pub stderr: Vec<u8>,
-        pub timed_out: bool,
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn run_windows_sandbox_capture(
-        _permission_profile: &PermissionProfile,
-        _workspace_roots: &[AbsolutePathBuf],
-        _codex_home: &Path,
-        _command: Vec<String>,
-        _cwd: &Path,
-        _env_map: HashMap<String, String>,
-        _timeout_ms: Option<u64>,
-        _cancellation: Option<WindowsSandboxCancellationToken>,
-        _use_private_desktop: bool,
-    ) -> Result<CaptureResult> {
-        bail!("Windows sandbox is only available on Windows")
-    }
-
-    pub fn run_windows_sandbox_legacy_preflight(
-        _permission_profile: &PermissionProfile,
-        _workspace_roots: &[AbsolutePathBuf],
-        _codex_home: &Path,
-        _cwd: &Path,
-        _env_map: &HashMap<String, String>,
-    ) -> Result<()> {
-        bail!("Windows sandbox is only available on Windows")
     }
 }

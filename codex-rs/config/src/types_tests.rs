@@ -2,6 +2,15 @@ use super::*;
 use pretty_assertions::assert_eq;
 
 #[test]
+fn otel_value_types_are_protocol_owned() {
+    let protocol: codex_protocol::config_types::OtelHttpProtocol = OtelHttpProtocol::Binary;
+    let tls: codex_protocol::config_types::OtelTlsConfig = OtelTlsConfig::default();
+
+    assert_eq!(protocol, OtelHttpProtocol::Binary);
+    assert_eq!(tls, OtelTlsConfig::default());
+}
+
+#[test]
 fn deserialize_skill_config_with_name_selector() {
     let cfg: SkillConfig = toml::from_str(
         r#"

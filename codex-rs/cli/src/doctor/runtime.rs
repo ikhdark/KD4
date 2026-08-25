@@ -15,7 +15,8 @@ use std::time::Duration;
 
 use codex_install_context::InstallContext;
 use codex_install_context::InstallMethod;
-#[cfg(windows)]
+use codex_utils_build_info::BuildInfo;
+
 use serde::Deserialize;
 use sha2::Digest;
 use sha2::Sha256;
@@ -27,7 +28,6 @@ use super::DoctorIssue;
 use super::describe_install_context;
 use super::doctor_install_context;
 use super::push_path_detail;
-use crate::build_info;
 
 /// Builds the process provenance row for the current Codex executable.
 ///
@@ -40,7 +40,7 @@ pub(super) fn runtime_check() -> DoctorCheck {
     let arch = env::consts::ARCH;
     let platform = format!("{os}-{arch}");
     let install_method = install_method_name(&install_context);
-    let build_info = build_info::build_info();
+    let build_info = BuildInfo::current();
     let mut details = vec![
         format!("version: {}", build_info.version),
         format!("platform: {platform}"),
@@ -48,7 +48,7 @@ pub(super) fn runtime_check() -> DoctorCheck {
             "install method: {}",
             describe_install_context(&install_context)
         ),
-        format!("commit: {}", build_commit()),
+        format!("commit: {}", build_info.commit),
         format!("dirty: {}", build_info.dirty),
         format!("profile: {}", build_info.profile),
         format!("built: {}", build_info.built),
@@ -78,12 +78,7 @@ pub(super) fn local_publish_target_path() -> Option<PathBuf> {
         .or_else(|| env::var_os("HOME").filter(|value| !value.is_empty()))
         .map(PathBuf::from);
 
-    local_publish_target_path_from_inputs(
-        local_cli_path,
-        local_publish_dir,
-        default_home,
-        cfg!(windows),
-    )
+    local_publish_target_path_from_inputs(local_cli_path, local_publish_dir, default_home, true)
 }
 
 fn local_publish_target_path_from_inputs(
@@ -112,7 +107,7 @@ pub(super) async fn local_publish_check(target_path: PathBuf) -> DoctorCheck {
     let current_is_target = current_exe
         .as_deref()
         .is_some_and(|current| same_path(current, &target_path));
-    let build_info = build_info::build_info();
+    let build_info = BuildInfo::current();
     let mut details = vec![
         format!(
             "publish dir: {}",
@@ -257,7 +252,6 @@ pub(super) async fn local_publish_check(target_path: PathBuf) -> DoctorCheck {
 
 /// Verifies that Codex Desktop has a non-current app-server process running
 /// from the selected local target, without starting or stopping Desktop.
-#[cfg(windows)]
 pub(super) async fn desktop_runtime_chain_check(
     target_path: PathBuf,
     show_details: bool,
@@ -389,7 +383,6 @@ fn install_method_name(context: &InstallContext) -> &'static str {
         InstallMethod::Npm => "npm",
         InstallMethod::Bun => "bun",
         InstallMethod::Pnpm => "pnpm",
-        InstallMethod::Brew => "brew",
         InstallMethod::Other => "local build",
     }
 }
@@ -416,19 +409,11 @@ fn search_provider(context: &InstallContext) -> &'static str {
     }
 }
 
-fn build_commit() -> &'static str {
-    build_info::build_info().commit
-}
-
 fn same_path(left: &Path, right: &Path) -> bool {
     let left = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
     let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
-    if cfg!(windows) {
-        left.to_string_lossy()
-            .eq_ignore_ascii_case(&right.to_string_lossy())
-    } else {
-        left == right
-    }
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
 }
 
 fn file_sha256(path: &Path) -> Result<String, String> {
@@ -541,7 +526,6 @@ fn git_status_count(repo_root: &Path) -> Option<usize> {
     })
 }
 
-#[cfg(windows)]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct DesktopProcessEvidence {
@@ -550,7 +534,6 @@ struct DesktopProcessEvidence {
     is_app_server: bool,
 }
 
-#[cfg(windows)]
 async fn desktop_process_probe() -> Result<Vec<self::DesktopProcessEvidence>, String> {
     let mut command = tokio::process::Command::new("powershell");
     command
@@ -584,7 +567,6 @@ Get-CimInstance Win32_Process -Filter "Name='codex.exe'" -OperationTimeoutSec 2 
         .collect()
 }
 
-#[cfg(windows)]
 fn matching_desktop_app_servers<'a>(
     processes: &'a [self::DesktopProcessEvidence],
     target_path: &Path,
@@ -603,7 +585,6 @@ fn matching_desktop_app_servers<'a>(
         .collect()
 }
 
-#[cfg(windows)]
 fn push_desktop_process_details(
     details: &mut Vec<String>,
     processes: &[self::DesktopProcessEvidence],
@@ -635,6 +616,23 @@ fn push_desktop_process_details(
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn runtime_check_reports_shared_build_info() {
+        let build_info = BuildInfo::current();
+        let check = runtime_check();
+
+        assert!(
+            check
+                .details
+                .contains(&format!("commit: {}", build_info.commit))
+        );
+        assert!(
+            check
+                .details
+                .contains(&format!("profile: {}", build_info.profile))
+        );
+    }
 
     #[test]
     fn local_publish_target_resolution_is_explicit_off_windows() {
@@ -682,16 +680,9 @@ mod tests {
 
     #[tokio::test]
     async fn command_probe_timeout_is_bounded() {
-        #[cfg(windows)]
         let mut command = {
             let mut command = tokio::process::Command::new("powershell");
             command.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 2"]);
-            command
-        };
-        #[cfg(not(windows))]
-        let mut command = {
-            let mut command = tokio::process::Command::new("sh");
-            command.args(["-c", "sleep 2"]);
             command
         };
 
@@ -703,7 +694,6 @@ mod tests {
         assert!(err.contains("timed out"), "unexpected error: {err}");
     }
 
-    #[cfg(windows)]
     #[test]
     fn desktop_matching_requires_noncurrent_app_server_at_target_path() {
         let temp = tempfile::tempdir().expect("tempdir");

@@ -16,9 +16,14 @@ use crate::status::plan_type_display_name;
 use crate::terminal_visualization_instructions::with_terminal_visualization_instructions;
 use codex_app_server_client::AppServerClient;
 use codex_app_server_client::AppServerEvent;
+use codex_app_server_client::AppServerInitializeResponse;
 use codex_app_server_client::AppServerPath;
 use codex_app_server_client::AppServerRequestHandle;
+use codex_app_server_client::ThreadLifecycleOverrides;
 use codex_app_server_client::TypedRequestError;
+use codex_app_server_client::thread_fork_params_from_config as build_thread_fork_params;
+use codex_app_server_client::thread_resume_params_from_config as build_thread_resume_params;
+use codex_app_server_client::thread_start_params_from_config as build_thread_start_params;
 use codex_app_server_protocol::Account;
 use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::AuthMode;
@@ -91,7 +96,6 @@ use codex_app_server_protocol::ThreadSettingsUpdateParams;
 use codex_app_server_protocol::ThreadSettingsUpdateResponse;
 use codex_app_server_protocol::ThreadShellCommandParams;
 use codex_app_server_protocol::ThreadShellCommandResponse;
-use codex_app_server_protocol::ThreadSource;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStartSource;
@@ -129,7 +133,7 @@ use codex_utils_path_uri::PathUri;
 use color_eyre::eyre::ContextCompat;
 use color_eyre::eyre::Result;
 use color_eyre::eyre::WrapErr;
-use std::collections::HashMap;
+use serde::de::DeserializeOwned;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -144,7 +148,18 @@ pub(crate) const EXTERNAL_AGENT_CONFIG_IMPORT_IN_PROGRESS_MESSAGE: &str =
 const THREAD_SETTINGS_UPDATE_METHOD: &str = "thread/settings/update";
 
 fn bootstrap_request_error(context: &'static str, err: TypedRequestError) -> color_eyre::Report {
-    color_eyre::eyre::eyre!("{context}: {err}")
+    color_eyre::Report::new(err).wrap_err(context)
+}
+
+pub(crate) fn server_error_data_from_report<T: DeserializeOwned>(
+    error: &color_eyre::Report,
+) -> Option<T> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<TypedRequestError>())
+        .and_then(TypedRequestError::server_error)
+        .and_then(|error| error.data.clone())
+        .and_then(|data| serde_json::from_value(data).ok())
 }
 
 fn is_thread_settings_update_unsupported(source: &JSONRPCErrorError) -> bool {
@@ -262,6 +277,10 @@ impl AppServerSession {
             return None;
         };
         client.server_version()
+    }
+
+    pub(crate) fn initialize_response(&self) -> &AppServerInitializeResponse {
+        self.client.initialize_response()
     }
 
     pub(crate) async fn bootstrap(&mut self, config: &Config) -> Result<AppServerBootstrap> {
@@ -792,7 +811,7 @@ impl AppServerSession {
             .into_iter()
             .map(serde_json::to_value)
             .collect::<std::result::Result<Vec<_>, _>>()
-            .wrap_err("failed to encode thread/inject_items payload")?;
+            .wrap_err("failed to encode thread/injectItems payload")?;
         let request_id = self.next_request_id();
         self.client
             .request_typed(ClientRequest::ThreadInjectItems {
@@ -803,7 +822,7 @@ impl AppServerSession {
                 },
             })
             .await
-            .wrap_err("thread/inject_items failed during TUI side conversation setup")
+            .wrap_err("thread/injectItems failed during TUI side conversation setup")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -851,7 +870,6 @@ impl AppServerSession {
                     personality,
                     output_schema,
                     collaboration_mode,
-                    multi_agent_mode: None,
                 },
             })
             .await
@@ -1304,88 +1322,6 @@ fn model_preset_from_api_model(model: ApiModel) -> ModelPreset {
     }
 }
 
-fn approvals_reviewer_override_from_config(
-    config: &Config,
-) -> Option<codex_app_server_protocol::ApprovalsReviewer> {
-    Some(config.approvals_reviewer.into())
-}
-
-fn config_request_overrides_from_config(
-    config: &Config,
-) -> Option<HashMap<String, serde_json::Value>> {
-    let mut overrides = HashMap::new();
-    let mut insert = |key: &str, value: Option<String>| {
-        if let Some(value) = value {
-            overrides.insert(key.to_string(), serde_json::Value::String(value));
-        }
-    };
-    insert(
-        "model_reasoning_effort",
-        config
-            .model_reasoning_effort
-            .as_ref()
-            .map(std::string::ToString::to_string),
-    );
-    insert(
-        "model_reasoning_summary",
-        config
-            .model_reasoning_summary
-            .map(|summary| summary.to_string()),
-    );
-    insert(
-        "model_verbosity",
-        config
-            .model_verbosity
-            .map(|verbosity| verbosity.to_string()),
-    );
-    insert(
-        "personality",
-        config
-            .personality
-            .map(|personality| personality.to_string()),
-    );
-    insert(
-        "web_search",
-        Some(config.web_search_mode.value().to_string()),
-    );
-    if config.bypass_hook_trust {
-        overrides.insert("bypass_hook_trust".to_string(), true.into());
-    }
-    Some(overrides)
-}
-
-fn service_tier_override_from_config(config: &Config) -> Option<Option<String>> {
-    config.service_tier.clone().map(Some).or_else(|| {
-        (config.notices.fast_default_opt_out == Some(true))
-            .then(|| Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string()))
-    })
-}
-
-fn sandbox_mode_from_permission_profile(
-    permission_profile: &PermissionProfile,
-    cwd: &std::path::Path,
-) -> Option<codex_app_server_protocol::SandboxMode> {
-    match permission_profile {
-        PermissionProfile::Disabled => {
-            Some(codex_app_server_protocol::SandboxMode::DangerFullAccess)
-        }
-        PermissionProfile::External { .. } => None,
-        PermissionProfile::Managed { .. } => {
-            let file_system_policy = permission_profile.file_system_sandbox_policy();
-            if file_system_policy.has_full_disk_write_access() {
-                permission_profile
-                    .network_sandbox_policy()
-                    .is_enabled()
-                    .then_some(codex_app_server_protocol::SandboxMode::DangerFullAccess)
-            } else if file_system_policy.can_write_path_with_cwd(cwd, cwd) {
-                Some(codex_app_server_protocol::SandboxMode::WorkspaceWrite)
-            } else {
-                Some(codex_app_server_protocol::SandboxMode::ReadOnly)
-            }
-        }
-    }
-}
-
 fn permission_profile_id_from_active_profile(active: ActivePermissionProfile) -> String {
     active.id
 }
@@ -1439,35 +1375,16 @@ fn thread_start_params_from_config(
     remote_cwd_override: Option<&std::path::Path>,
     session_start_source: Option<ThreadStartSource>,
 ) -> ThreadStartParams {
-    let permissions = permissions_selection_from_config(config, thread_params_mode);
-    let sandbox = permissions
-        .is_none()
-        .then(|| {
-            sandbox_mode_from_permission_profile(
-                &config.permissions.effective_permission_profile(),
-                config.cwd.as_path(),
-            )
-        })
-        .flatten();
-    ThreadStartParams {
-        model: config.model.clone(),
-        model_provider: thread_params_mode.model_provider_from_config(config),
-        service_tier: service_tier_override_from_config(config),
-        cwd: thread_cwd_from_config(config, thread_params_mode, remote_cwd_override),
-        runtime_workspace_roots: Some(config.workspace_roots.clone()),
-        approval_policy: Some(config.permissions.approval_policy.value().into()),
-        approvals_reviewer: approvals_reviewer_override_from_config(config),
-        sandbox,
-        permissions,
-        config: config_request_overrides_from_config(config),
-        ephemeral: Some(config.ephemeral),
-        session_start_source,
-        thread_source: Some(ThreadSource::User),
-        developer_instructions: with_terminal_visualization_instructions(
-            config, /*control_instructions*/ None,
+    build_thread_start_params(
+        config,
+        thread_lifecycle_overrides_from_config(
+            config,
+            thread_params_mode,
+            remote_cwd_override,
+            with_terminal_visualization_instructions(config, /*control_instructions*/ None),
         ),
-        ..ThreadStartParams::default()
-    }
+        session_start_source,
+    )
 }
 
 fn thread_resume_params_from_config(
@@ -1476,33 +1393,18 @@ fn thread_resume_params_from_config(
     thread_params_mode: ThreadParamsMode,
     remote_cwd_override: Option<&std::path::Path>,
 ) -> ThreadResumeParams {
-    let permissions = permissions_selection_from_config(&config, thread_params_mode);
-    let sandbox = permissions
-        .is_none()
-        .then(|| {
-            sandbox_mode_from_permission_profile(
-                &config.permissions.effective_permission_profile(),
-                config.cwd.as_path(),
-            )
-        })
-        .flatten();
-    ThreadResumeParams {
-        thread_id: thread_id.to_string(),
-        model: config.model.clone(),
-        model_provider: thread_params_mode.model_provider_from_config(&config),
-        service_tier: service_tier_override_from_config(&config),
-        cwd: thread_cwd_from_config(&config, thread_params_mode, remote_cwd_override),
-        runtime_workspace_roots: Some(config.workspace_roots.clone()),
-        approval_policy: Some(config.permissions.approval_policy.value().into()),
-        approvals_reviewer: approvals_reviewer_override_from_config(&config),
-        sandbox,
-        permissions,
-        config: config_request_overrides_from_config(&config),
-        developer_instructions: with_terminal_visualization_instructions(
-            &config, /*control_instructions*/ None,
-        ),
-        ..ThreadResumeParams::default()
-    }
+    let overrides = thread_lifecycle_overrides_from_config(
+        &config,
+        thread_params_mode,
+        remote_cwd_override,
+        with_terminal_visualization_instructions(&config, /*control_instructions*/ None),
+    );
+    build_thread_resume_params(
+        &config,
+        thread_id.to_string(),
+        overrides,
+        /*approvals_reviewer_override*/ None,
+    )
 }
 
 fn thread_fork_params_from_config(
@@ -1511,36 +1413,29 @@ fn thread_fork_params_from_config(
     thread_params_mode: ThreadParamsMode,
     remote_cwd_override: Option<&std::path::Path>,
 ) -> ThreadForkParams {
-    let permissions = permissions_selection_from_config(&config, thread_params_mode);
-    let sandbox = permissions
-        .is_none()
-        .then(|| {
-            sandbox_mode_from_permission_profile(
-                &config.permissions.effective_permission_profile(),
-                config.cwd.as_path(),
-            )
-        })
-        .flatten();
-    ThreadForkParams {
-        thread_id: thread_id.to_string(),
-        model: config.model.clone(),
-        model_provider: thread_params_mode.model_provider_from_config(&config),
-        service_tier: service_tier_override_from_config(&config),
-        cwd: thread_cwd_from_config(&config, thread_params_mode, remote_cwd_override),
-        runtime_workspace_roots: Some(config.workspace_roots.clone()),
-        approval_policy: Some(config.permissions.approval_policy.value().into()),
-        approvals_reviewer: approvals_reviewer_override_from_config(&config),
-        sandbox,
-        permissions,
-        config: config_request_overrides_from_config(&config),
-        base_instructions: config.base_instructions.clone(),
-        developer_instructions: with_terminal_visualization_instructions(
-            &config,
-            config.developer_instructions.clone(),
-        ),
-        ephemeral: config.ephemeral,
-        thread_source: Some(ThreadSource::User),
-        ..ThreadForkParams::default()
+    let developer_instructions =
+        with_terminal_visualization_instructions(&config, config.developer_instructions.clone());
+    let overrides = thread_lifecycle_overrides_from_config(
+        &config,
+        thread_params_mode,
+        remote_cwd_override,
+        developer_instructions,
+    );
+    build_thread_fork_params(&config, thread_id.to_string(), overrides)
+}
+
+fn thread_lifecycle_overrides_from_config(
+    config: &Config,
+    thread_params_mode: ThreadParamsMode,
+    remote_cwd_override: Option<&std::path::Path>,
+    developer_instructions: Option<String>,
+) -> ThreadLifecycleOverrides {
+    ThreadLifecycleOverrides {
+        model_provider: thread_params_mode.model_provider_from_config(config),
+        cwd: thread_cwd_from_config(config, thread_params_mode, remote_cwd_override),
+        permissions: permissions_selection_from_config(config, thread_params_mode),
+        developer_instructions,
+        exclude_turns: false,
     }
 }
 
@@ -1805,6 +1700,7 @@ mod tests {
     use super::*;
     use crate::legacy_core::config::ConfigBuilder;
     use crate::legacy_core::config::ConfigOverrides;
+    use codex_app_server_protocol::ThreadSource;
     use codex_app_server_protocol::ThreadStatus;
     use codex_app_server_protocol::Turn;
     use codex_app_server_protocol::TurnStatus;
@@ -1816,17 +1712,12 @@ mod tests {
     use codex_protocol::config_types::WebSearchMode;
     use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY;
     use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
-    use codex_protocol::models::ManagedFileSystemPermissions;
     use codex_protocol::openai_models::ReasoningEffort;
-    use codex_protocol::permissions::FileSystemAccessMode;
-    use codex_protocol::permissions::FileSystemPath;
-    use codex_protocol::permissions::FileSystemSandboxEntry;
-    use codex_protocol::permissions::FileSystemSpecialPath;
-    use codex_protocol::permissions::NetworkSandboxPolicy;
     use codex_utils_absolute_path::test_support::PathBufExt;
     use codex_utils_absolute_path::test_support::test_path_buf;
     use codex_utils_path_uri::LegacyAppPathString;
     use pretty_assertions::assert_eq;
+    use std::collections::HashMap;
     use tempfile::TempDir;
 
     async fn build_config(temp_dir: &TempDir) -> Config {
@@ -2045,7 +1936,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let config = build_config(&temp_dir).await;
         let thread_id = ThreadId::new();
-        let expected_sandbox = sandbox_mode_from_permission_profile(
+        let expected_sandbox = codex_app_server_protocol::SandboxMode::from_permission_profile(
             &config.permissions.effective_permission_profile(),
             config.cwd.as_path(),
         );
@@ -2098,72 +1989,13 @@ mod tests {
         assert_eq!(fork.thread_source, Some(ThreadSource::User));
     }
 
-    #[test]
-    fn sandbox_mode_does_not_project_non_cwd_write_roots_for_remote_sessions() {
-        let cwd = test_path_buf("/workspace/project").abs();
-        let extra_root = test_path_buf("/workspace/cache").abs();
-        let permission_profile: PermissionProfile = PermissionProfile::Managed {
-            network: NetworkSandboxPolicy::Restricted,
-            file_system: ManagedFileSystemPermissions::Restricted {
-                entries: vec![
-                    FileSystemSandboxEntry {
-                        path: FileSystemPath::Special {
-                            value: FileSystemSpecialPath::Root,
-                        },
-                        access: FileSystemAccessMode::Read,
-                    },
-                    FileSystemSandboxEntry {
-                        path: FileSystemPath::Path { path: extra_root },
-                        access: FileSystemAccessMode::Write,
-                    },
-                ],
-                glob_scan_max_depth: None,
-            },
-        };
-
-        assert_eq!(
-            sandbox_mode_from_permission_profile(&permission_profile, cwd.as_path()),
-            Some(codex_app_server_protocol::SandboxMode::ReadOnly)
-        );
-    }
-
-    #[test]
-    fn sandbox_mode_projects_cwd_write_for_remote_sessions() {
-        let cwd = test_path_buf("/workspace/project").abs();
-        let permission_profile: PermissionProfile = PermissionProfile::Managed {
-            network: NetworkSandboxPolicy::Restricted,
-            file_system: ManagedFileSystemPermissions::Restricted {
-                entries: vec![
-                    FileSystemSandboxEntry {
-                        path: FileSystemPath::Special {
-                            value: FileSystemSpecialPath::Root,
-                        },
-                        access: FileSystemAccessMode::Read,
-                    },
-                    FileSystemSandboxEntry {
-                        path: FileSystemPath::Special {
-                            value: FileSystemSpecialPath::ProjectRoots { subpath: None },
-                        },
-                        access: FileSystemAccessMode::Write,
-                    },
-                ],
-                glob_scan_max_depth: None,
-            },
-        };
-
-        assert_eq!(
-            sandbox_mode_from_permission_profile(&permission_profile, cwd.as_path()),
-            Some(codex_app_server_protocol::SandboxMode::WorkspaceWrite)
-        );
-    }
-
     #[tokio::test]
     async fn thread_lifecycle_params_forward_explicit_remote_cwd_override_for_remote_sessions() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let config = build_config(&temp_dir).await;
         let thread_id = ThreadId::new();
         let remote_cwd = PathBuf::from("repo/on/server");
-        let expected_sandbox = sandbox_mode_from_permission_profile(
+        let expected_sandbox = codex_app_server_protocol::SandboxMode::from_permission_profile(
             &config.permissions.effective_permission_profile(),
             config.cwd.as_path(),
         );
@@ -2218,6 +2050,7 @@ mod tests {
         config.bypass_hook_trust = true;
         config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
         let thread_id = ThreadId::new();
+        let expected_reviewer = Some(config.approvals_reviewer.into());
 
         let start = thread_start_params_from_config(
             &config,
@@ -2242,6 +2075,9 @@ mod tests {
         assert_eq!(start.service_tier, expected_service_tier);
         assert_eq!(resume.service_tier, expected_service_tier);
         assert_eq!(fork.service_tier, expected_service_tier);
+        assert_eq!(start.approvals_reviewer, expected_reviewer);
+        assert_eq!(resume.approvals_reviewer, None);
+        assert_eq!(fork.approvals_reviewer, expected_reviewer);
         let string = |value: &str| serde_json::Value::String(value.to_string());
         let expected_config = HashMap::from([
             ("model_reasoning_effort".to_string(), string("high")),
@@ -2263,13 +2099,15 @@ mod tests {
         config.personality = None;
 
         let implicit_overrides =
-            config_request_overrides_from_config(&config).expect("config overrides");
+            codex_app_server_client::thread_config_overrides_from_config(&config)
+                .expect("config overrides");
 
         assert!(!implicit_overrides.contains_key("personality"));
 
         config.personality = Some(Personality::None);
         let explicit_overrides =
-            config_request_overrides_from_config(&config).expect("config overrides");
+            codex_app_server_client::thread_config_overrides_from_config(&config)
+                .expect("config overrides");
 
         assert_eq!(
             explicit_overrides.get("personality"),
@@ -2452,7 +2290,6 @@ mod tests {
                 .into(),
             active_permission_profile: None,
             reasoning_effort: None,
-            multi_agent_mode: Default::default(),
             initial_turns_page: None,
         };
 

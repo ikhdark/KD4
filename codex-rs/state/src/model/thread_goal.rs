@@ -1,61 +1,12 @@
 use anyhow::Result;
-use anyhow::anyhow;
 use chrono::DateTime;
 use chrono::Utc;
 use codex_protocol::ThreadId;
-use serde::Serialize;
+pub use codex_protocol::protocol::ThreadGoalStatus;
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 
 use super::epoch_millis_to_datetime;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ThreadGoalStatus {
-    Active,
-    Paused,
-    Blocked,
-    UsageLimited,
-    BudgetLimited,
-    Complete,
-}
-
-impl ThreadGoalStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::Paused => "paused",
-            Self::Blocked => "blocked",
-            Self::UsageLimited => "usage_limited",
-            Self::BudgetLimited => "budget_limited",
-            Self::Complete => "complete",
-        }
-    }
-
-    pub fn is_active(self) -> bool {
-        self == Self::Active
-    }
-
-    pub fn is_terminal(self) -> bool {
-        matches!(self, Self::BudgetLimited | Self::Complete)
-    }
-}
-
-impl TryFrom<&str> for ThreadGoalStatus {
-    type Error = anyhow::Error;
-
-    fn try_from(value: &str) -> Result<Self> {
-        match value {
-            "active" => Ok(Self::Active),
-            "paused" => Ok(Self::Paused),
-            "blocked" => Ok(Self::Blocked),
-            "usage_limited" => Ok(Self::UsageLimited),
-            "budget_limited" => Ok(Self::BudgetLimited),
-            "complete" => Ok(Self::Complete),
-            other => Err(anyhow!("unknown thread goal status `{other}`")),
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreadGoal {
@@ -106,12 +57,28 @@ impl TryFrom<ThreadGoalRow> for ThreadGoal {
             thread_id: ThreadId::try_from(row.thread_id)?,
             goal_id: row.goal_id,
             objective: row.objective,
-            status: ThreadGoalStatus::try_from(row.status.as_str())?,
+            status: ThreadGoalStatus::try_from(row.status.as_str()).map_err(anyhow::Error::msg)?,
             token_budget: row.token_budget,
             tokens_used: row.tokens_used,
             time_used_seconds: row.time_used_seconds,
             created_at: epoch_millis_to_datetime(row.created_at_ms)?,
             updated_at: epoch_millis_to_datetime(row.updated_at_ms)?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ThreadGoalStatus;
+
+    #[test]
+    fn goal_status_is_protocol_owned_with_stable_storage_labels() {
+        let status: codex_protocol::protocol::ThreadGoalStatus = ThreadGoalStatus::UsageLimited;
+
+        assert_eq!(status.as_str(), "usage_limited");
+        assert_eq!(
+            ThreadGoalStatus::try_from("complete"),
+            Ok(ThreadGoalStatus::Complete)
+        );
     }
 }

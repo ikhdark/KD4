@@ -8,36 +8,29 @@ use std::sync::LazyLock;
 use tracing::warn;
 
 static CONSOLIDATION_PROMPT_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
-    parse_embedded_template(
+    Template::parse_embedded(
         include_str!("../templates/memories/consolidation.compact.md"),
         "memories/consolidation.compact.md",
     )
 });
 static STAGE_ONE_INPUT_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
-    parse_embedded_template(
+    Template::parse_embedded(
         include_str!("../templates/memories/stage_one_input.md"),
         "memories/stage_one_input.md",
     )
 });
 static MEMORY_EXTENSIONS_FOLDER_STRUCTURE_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
-    parse_embedded_template(
+    Template::parse_embedded(
         crate::prompt_blocks::EXTENSIONS_FOLDER_STRUCTURE,
         "memories/extensions_folder_structure.md",
     )
 });
 static MEMORY_EXTENSIONS_PRIMARY_INPUTS_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
-    parse_embedded_template(
+    Template::parse_embedded(
         crate::prompt_blocks::EXTENSIONS_PRIMARY_INPUTS,
         "memories/extensions_primary_inputs.md",
     )
 });
-
-fn parse_embedded_template(source: &'static str, template_name: &str) -> Template {
-    match Template::parse(source) {
-        Ok(template) => template,
-        Err(err) => panic!("embedded template {template_name} is invalid: {err}"),
-    }
-}
 
 /// Builds the consolidation subagent prompt for a specific memory root.
 pub fn build_consolidation_prompt(memory_root: &Path) -> String {

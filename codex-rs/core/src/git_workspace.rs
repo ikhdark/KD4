@@ -20,6 +20,7 @@ use codex_file_watcher::FileWatcher;
 use codex_file_watcher::FileWatcherSubscriber;
 use codex_file_watcher::WatchPath;
 use codex_file_watcher::WatchRegistration;
+use codex_git_utils::DISABLED_HOOKS_PATH;
 use codex_git_utils::get_git_remote_urls_assume_git_repo;
 use codex_git_utils::get_git_repo_root;
 use codex_git_utils::get_git_repo_root_with_fs;
@@ -40,7 +41,6 @@ use tracing::warn;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 
 const GIT_DEPENDENCY_TIMEOUT: Duration = Duration::from_secs(5);
-const DISABLED_HOOKS_PATH: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 const SOURCE_CHANGE_JOURNAL_CAPACITY: usize = 4_096;
 const GENERATED_CODEX_EVAL_PATHSPEC: &str = ":(exclude).codex/evals/**";
 const PROJECT_DISCOVERY_REUSE_METRIC: &str = "codex.project_discovery_reuse";
@@ -137,22 +137,45 @@ impl std::fmt::Debug for GitWorkspaceMetadataSource {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub(crate) struct GitWorkspaceMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) associated_remote_urls: Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) latest_git_commit_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) has_changes: Option<bool>,
+}
+
+impl GitWorkspaceMetadata {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.associated_remote_urls.is_none()
+            && self.latest_git_commit_hash.is_none()
+            && self.has_changes.is_none()
+    }
 }
 
 /// One immutable, read-only Git observation used by the completion candidate.
 /// The caller owns artifact retention and checkpoint preview bounds.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct CandidateDiffCapture {
+    repository_root: Option<String>,
     pub(crate) head_identity: Option<String>,
     pub(crate) index_identity: Option<String>,
     pub(crate) worktree_identity: Option<String>,
     pub(crate) changed_paths: Vec<String>,
     pub(crate) raw_diff: Vec<u8>,
+}
+
+impl CandidateDiffCapture {
+    pub(crate) fn workspace_evidence_identity(&self) -> WorkspaceEvidenceIdentity {
+        WorkspaceEvidenceIdentity {
+            repository_root: self.repository_root.clone(),
+            head_identity: self.head_identity.clone(),
+            index_identity: self.index_identity.clone(),
+            worktree_identity: self.worktree_identity.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -209,12 +232,7 @@ pub(crate) async fn capture_workspace_evidence_identity(
     let index_diff = index_diff?;
     let worktree_diff = worktree_diff?;
     let untracked = untracked?;
-    let head_identity = head.and_then(|head| {
-        String::from_utf8(head)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-    });
+    let head_identity = candidate_head_identity(head);
     let untracked_paths = untracked
         .split(|byte| *byte == 0)
         .filter(|entry| !entry.is_empty())
@@ -244,13 +262,16 @@ pub(crate) async fn capture_workspace_evidence_identity(
 
 pub(crate) async fn capture_candidate_diff(cwd: &Path) -> Option<CandidateDiffCapture> {
     let repo_root = get_git_repo_root(cwd)?;
-    let (head, index_diff, worktree_diff, index_paths, worktree_paths, untracked) = tokio::join!(
+    let (head, index_capture, worktree_capture, untracked) = tokio::join!(
         candidate_git_output(&repo_root, &["rev-parse", "--verify", "HEAD"]),
         candidate_git_output(
             &repo_root,
             &[
                 "diff",
                 "--cached",
+                "--raw",
+                "-z",
+                "--patch",
                 "--binary",
                 "--no-ext-diff",
                 "--",
@@ -262,37 +283,15 @@ pub(crate) async fn capture_candidate_diff(cwd: &Path) -> Option<CandidateDiffCa
             &repo_root,
             &[
                 "diff",
+                "--raw",
+                "-z",
+                "--patch",
                 "--binary",
                 "--no-ext-diff",
                 "--",
                 ".",
                 GENERATED_CODEX_EVAL_PATHSPEC,
             ]
-        ),
-        candidate_git_output(
-            &repo_root,
-            &[
-                "diff",
-                "--cached",
-                "--name-only",
-                "-z",
-                "--no-ext-diff",
-                "--",
-                ".",
-                GENERATED_CODEX_EVAL_PATHSPEC,
-            ],
-        ),
-        candidate_git_output(
-            &repo_root,
-            &[
-                "diff",
-                "--name-only",
-                "-z",
-                "--no-ext-diff",
-                "--",
-                ".",
-                GENERATED_CODEX_EVAL_PATHSPEC,
-            ],
         ),
         candidate_git_output(
             &repo_root,
@@ -307,17 +306,10 @@ pub(crate) async fn capture_candidate_diff(cwd: &Path) -> Option<CandidateDiffCa
             ],
         ),
     );
-    let index_diff = index_diff?;
-    let worktree_diff = worktree_diff?;
-    let index_paths = index_paths?;
-    let worktree_paths = worktree_paths?;
+    let (index_paths, index_diff) = candidate_diff_and_paths(&index_capture?)?;
+    let (worktree_paths, worktree_diff) = candidate_diff_and_paths(&worktree_capture?)?;
     let untracked = untracked?;
-    let head_identity = head.and_then(|head| {
-        String::from_utf8(head)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-    });
+    let head_identity = candidate_head_identity(head);
     let index_identity = Some(format!("{:x}", Sha256::digest(&index_diff)));
     let untracked_paths = untracked
         .split(|byte| *byte == 0)
@@ -334,8 +326,8 @@ pub(crate) async fn capture_candidate_diff(cwd: &Path) -> Option<CandidateDiffCa
     worktree_hasher.update(&worktree_diff);
     worktree_hasher.update(&untracked_manifest);
     let worktree_identity = Some(format!("{:x}", worktree_hasher.finalize()));
-    let mut changed_paths = candidate_changed_paths(&index_paths)?;
-    changed_paths.extend(candidate_changed_paths(&worktree_paths)?);
+    let mut changed_paths = index_paths;
+    changed_paths.extend(worktree_paths);
     changed_paths.extend(untracked_paths);
     changed_paths.sort();
     changed_paths.dedup();
@@ -347,11 +339,61 @@ pub(crate) async fn capture_candidate_diff(cwd: &Path) -> Option<CandidateDiffCa
     raw_diff.extend_from_slice(b"\nKD4_CANDIDATE_UNTRACKED_MANIFEST_V1\n");
     raw_diff.extend_from_slice(&untracked_manifest);
     Some(CandidateDiffCapture {
+        repository_root: Some(
+            dunce::canonicalize(&repo_root)
+                .unwrap_or(repo_root)
+                .to_string_lossy()
+                .into_owned(),
+        ),
         head_identity,
         index_identity,
         worktree_identity,
         changed_paths,
         raw_diff,
+    })
+}
+
+fn candidate_diff_and_paths(output: &[u8]) -> Option<(Vec<String>, Vec<u8>)> {
+    if output.is_empty() {
+        return Some((Vec::new(), Vec::new()));
+    }
+    let mut offset = 0;
+    let mut paths = Vec::new();
+    while output.get(offset) == Some(&b':') {
+        let header_end = output[offset..].iter().position(|byte| *byte == 0)? + offset;
+        let header = std::str::from_utf8(&output[offset..header_end]).ok()?;
+        let status = header.split_ascii_whitespace().next_back()?;
+        let path_start = header_end.saturating_add(1);
+        let path_end = output[path_start..].iter().position(|byte| *byte == 0)? + path_start;
+        let first_path = std::str::from_utf8(&output[path_start..path_end]).ok()?;
+        offset = path_end.saturating_add(1);
+        if matches!(status.as_bytes().first(), Some(b'R' | b'C')) {
+            let second_path_end = output[offset..].iter().position(|byte| *byte == 0)? + offset;
+            paths.push(
+                std::str::from_utf8(&output[offset..second_path_end])
+                    .ok()?
+                    .to_string(),
+            );
+            offset = second_path_end.saturating_add(1);
+        } else {
+            paths.push(first_path.to_string());
+        }
+    }
+    if output.get(offset) == Some(&0) {
+        offset = offset.saturating_add(1);
+    }
+    if offset < output.len() && !output[offset..].starts_with(b"diff --git ") {
+        return None;
+    }
+    Some((paths, output[offset..].to_vec()))
+}
+
+fn candidate_head_identity(head: Option<Vec<u8>>) -> Option<String> {
+    head.and_then(|head| {
+        String::from_utf8(head)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
     })
 }
 
@@ -405,16 +447,6 @@ async fn candidate_untracked_manifest(
     })
     .await
     .ok()?
-}
-
-fn candidate_changed_paths(output: &[u8]) -> Option<Vec<String>> {
-    output
-        .split(|byte| *byte == 0)
-        .filter(|entry| !entry.is_empty())
-        .map(std::str::from_utf8)
-        .map(|path| path.map(str::to_string))
-        .collect::<Result<Vec<_>, _>>()
-        .ok()
 }
 
 async fn candidate_git_output(repo_root: &Path, args: &[&str]) -> Option<Vec<u8>> {
@@ -723,18 +755,26 @@ impl GitWorkspaceCache {
         project_discovery: Option<&ProjectDiscoveryContext>,
         metrics: Option<&MetricsClient>,
     ) -> GitWorkspaceSnapshot {
-        let key = RootCacheKey {
-            environment_generation: environments.generation,
-            environments: environments
-                .turn_environments
-                .iter()
-                .filter_map(|environment| {
-                    Some(EnvironmentWorkspaceKey {
+        let environment_candidates = environments
+            .turn_environments
+            .iter()
+            .enumerate()
+            .filter_map(|(index, environment)| {
+                Some((
+                    index,
+                    EnvironmentWorkspaceKey {
                         environment_id: environment.environment_id.clone(),
                         cwd: environment.cwd().to_abs_path().ok()?,
                         remote: environment.environment.is_remote(),
-                    })
-                })
+                    },
+                ))
+            })
+            .collect::<Vec<_>>();
+        let key = RootCacheKey {
+            environment_generation: environments.generation,
+            environments: environment_candidates
+                .iter()
+                .map(|(_, environment)| environment.clone())
                 .collect(),
         };
         let cacheable = environments.starting.is_empty()
@@ -766,12 +806,8 @@ impl GitWorkspaceCache {
         }
 
         let mut entries = Vec::with_capacity(key.environments.len());
-        for (environment, key_environment) in environments
-            .turn_environments
-            .iter()
-            .filter(|environment| environment.cwd().to_abs_path().is_ok())
-            .zip(&key.environments)
-        {
+        for (environment_index, key_environment) in &environment_candidates {
+            let environment = &environments.turn_environments[*environment_index];
             let fs = environment.environment.get_filesystem();
             let repo_root = if let Some(repo_root) =
                 matching_checkout_root(project_discovery, key_environment, fs.as_ref(), metrics)
@@ -942,6 +978,10 @@ impl GitWorkspaceCache {
                 .filter(|path| !is_generated_codex_eval_path(path))
                 .collect::<Vec<_>>()
         });
+        self.record_filtered_source_change_event(changed_paths)
+    }
+
+    fn record_filtered_source_change_event(&self, changed_paths: Option<Vec<PathBuf>>) -> u64 {
         if changed_paths.as_ref().is_some_and(Vec::is_empty) {
             return self.watcher_generation.load(Ordering::Acquire);
         }
@@ -1115,7 +1155,7 @@ impl GitWorkspaceCache {
             return;
         }
         self.host_mutation_generation.fetch_add(1, Ordering::AcqRel);
-        self.record_source_change_event((!paths.is_empty()).then_some(paths));
+        self.record_filtered_source_change_event((!paths.is_empty()).then_some(paths));
     }
 }
 
@@ -1179,11 +1219,7 @@ fn record_project_discovery_reuse(
 
 fn is_generated_codex_eval_path(path: &Path) -> bool {
     let normalized = path.to_string_lossy().replace('\\', "/");
-    let normalized = if cfg!(windows) {
-        normalized.to_ascii_lowercase()
-    } else {
-        normalized
-    };
+    let normalized = normalized.to_ascii_lowercase();
     normalized == ".codex/evals"
         || normalized.starts_with(".codex/evals/")
         || normalized.ends_with("/.codex/evals")
@@ -1197,11 +1233,7 @@ fn canonical_workspace_evidence_root(repo_root: &Path) -> PathBuf {
 fn path_is_same_or_descendant(path: &Path, ancestor: &Path) -> bool {
     let normalize = |path: &Path| {
         let value = path.to_string_lossy().replace('\\', "/");
-        if cfg!(windows) {
-            value.to_lowercase()
-        } else {
-            value
-        }
+        value.to_lowercase()
     };
     let path = normalize(path);
     let ancestor = normalize(ancestor);
@@ -1402,10 +1434,7 @@ struct DependencyFingerprint {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum StableFileIdentity {
-    #[cfg(windows)]
     Windows { volume: u64, index: [u8; 16] },
-    #[cfg(unix)]
-    Unix { device: u64, inode: u64 },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1434,21 +1463,8 @@ fn dependency_fingerprint(path: PathBuf, hash_contents: bool) -> Option<Dependen
             },
         }),
         Ok(metadata) if metadata.is_file() => {
-            let file = File::open(&path).ok()?;
-            let digest = hash_contents.then(|| std::fs::read(&path).ok()).flatten();
-            if hash_contents && digest.is_none() {
-                return None;
-            }
-            Some(DependencyFingerprint {
-                path,
-                state: DependencyState::File {
-                    len: metadata.len(),
-                    modified: metadata.modified().ok(),
-                    created: metadata.created().ok(),
-                    stable_id: stable_file_identity(&file),
-                    digest: digest.map(|contents| Sha256::digest(contents).into()),
-                },
-            })
+            let state = file_dependency_state(File::open(&path).ok()?, hash_contents)?;
+            Some(DependencyFingerprint { path, state })
         }
         Ok(_) => None,
         Err(err) if err.kind() == ErrorKind::NotFound => Some(DependencyFingerprint {
@@ -1459,7 +1475,25 @@ fn dependency_fingerprint(path: PathBuf, hash_contents: bool) -> Option<Dependen
     }
 }
 
-#[cfg(windows)]
+fn file_dependency_state(mut file: File, hash_contents: bool) -> Option<DependencyState> {
+    let metadata = file.metadata().ok()?;
+    let stable_id = stable_file_identity(&file);
+    let digest = if hash_contents {
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents).ok()?;
+        Some(Sha256::digest(contents).into())
+    } else {
+        None
+    };
+    Some(DependencyState::File {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        created: metadata.created().ok(),
+        stable_id,
+        digest,
+    })
+}
+
 fn stable_file_identity(file: &File) -> Option<StableFileIdentity> {
     use std::mem::MaybeUninit;
     use std::os::windows::io::AsRawHandle;
@@ -1470,7 +1504,7 @@ fn stable_file_identity(file: &File) -> Option<StableFileIdentity> {
     let mut info = MaybeUninit::<FILE_ID_INFO>::zeroed();
     let success = unsafe {
         GetFileInformationByHandleEx(
-            file.as_raw_handle() as isize,
+            file.as_raw_handle(),
             FileIdInfo,
             info.as_mut_ptr().cast(),
             std::mem::size_of::<FILE_ID_INFO>() as u32,
@@ -1487,22 +1521,6 @@ fn stable_file_identity(file: &File) -> Option<StableFileIdentity> {
             index,
         },
     )
-}
-
-#[cfg(unix)]
-fn stable_file_identity(file: &File) -> Option<StableFileIdentity> {
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = file.metadata().ok()?;
-    Some(StableFileIdentity::Unix {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
-}
-
-#[cfg(not(any(windows, unix)))]
-fn stable_file_identity(_file: &File) -> Option<StableFileIdentity> {
-    None
 }
 
 #[cfg(test)]

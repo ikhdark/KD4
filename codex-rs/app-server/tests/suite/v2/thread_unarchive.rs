@@ -281,6 +281,7 @@ async fn thread_unarchive_preserves_pathless_store_metadata() -> Result<()> {
     .await?;
 
     let result = client
+        .sender()
         .request(ClientRequest::ThreadUnarchive {
             request_id: RequestId::Integer(1),
             params: ThreadUnarchiveParams {

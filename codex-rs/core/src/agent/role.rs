@@ -228,8 +228,6 @@ mod reload {
             cwd: Some(config.cwd.to_path_buf()),
             model_provider: preserve_current_provider.then(|| config.model_provider_id.clone()),
             service_tier: preserve_current_service_tier.then(|| config.service_tier.clone()),
-            codex_linux_sandbox_exe: config.codex_linux_sandbox_exe.clone(),
-            main_execve_wrapper_exe: config.main_execve_wrapper_exe.clone(),
             ..Default::default()
         }
     }
@@ -346,11 +344,8 @@ mod built_in {
     }
 
     fn read_only_config_file_contents() -> &'static str {
-        #[cfg(target_os = "windows")]
         let legacy_windows_sandbox_compatible =
             codex_windows_sandbox::legacy_restricted_token_enforces_delete_child();
-        #[cfg(not(target_os = "windows"))]
-        let legacy_windows_sandbox_compatible = true;
 
         read_only_config_file_contents_for_legacy_compatibility(legacy_windows_sandbox_compatible)
     }

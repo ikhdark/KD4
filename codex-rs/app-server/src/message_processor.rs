@@ -9,7 +9,6 @@ use crate::config_manager::ConfigManager;
 use crate::connection_rpc_gate::ConnectionRpcGate;
 use crate::current_time::app_server_time_provider;
 use crate::desktop_activation::DesktopActivationBootstrap;
-use crate::error_code::OVERLOADED_ERROR_CODE;
 use crate::error_code::invalid_request;
 use crate::extensions::ThreadExtensionDependencies;
 use crate::extensions::app_server_extension_event_sink;
@@ -30,7 +29,6 @@ use crate::request_processors::ExternalAgentConfigRequestProcessor;
 use crate::request_processors::ExternalAgentConfigRequestProcessorArgs;
 use crate::request_processors::FeedbackRequestProcessor;
 use crate::request_processors::FsRequestProcessor;
-use crate::request_processors::GitRequestProcessor;
 use crate::request_processors::InitializeRequestProcessor;
 use crate::request_processors::MarketplaceRequestProcessor;
 use crate::request_processors::McpRequestProcessor;
@@ -43,6 +41,7 @@ use crate::request_processors::ThreadGoalRequestProcessor;
 use crate::request_processors::ThreadRequestProcessor;
 use crate::request_processors::TurnRequestProcessor;
 use crate::request_processors::WindowsSandboxRequestProcessor;
+use crate::request_processors::git_diff_to_remote_response;
 use crate::request_serialization::QueuedInitializedRequest;
 use crate::request_serialization::RequestAdmission;
 use crate::request_serialization::RequestSerializationQueueKey;
@@ -56,6 +55,7 @@ use codex_analytics::AnalyticsEventsClient;
 use codex_analytics::AppServerRpcTransport;
 use codex_app_server_protocol::ClientNotification;
 use codex_app_server_protocol::ClientRequest;
+use codex_app_server_protocol::ClientRequestRequiredCapability;
 use codex_app_server_protocol::ClientResponsePayload;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::ExperimentalApi;
@@ -64,7 +64,9 @@ use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::JSONRPCResponse;
+use codex_app_server_protocol::OverloadReason;
 use codex_app_server_protocol::experimental_required_message;
+use codex_app_server_protocol::overloaded_error;
 use codex_arg0::Arg0DispatchPaths;
 use codex_chatgpt::workspace_settings;
 use codex_core::ThreadManager;
@@ -74,14 +76,11 @@ use codex_feedback::CodexFeedback;
 use codex_goal_extension::GoalService;
 use codex_home::CodexHomeUserInstructionsProvider;
 use codex_login::AuthManager;
-use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_rollout::StateDbHandle;
 use codex_state::log_db::LogDbLayer;
 use tokio::sync::Semaphore;
-use tokio::sync::broadcast;
-use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
@@ -89,22 +88,23 @@ use crate::models_refresh_worker::ModelsRefreshWorker;
 
 const SERIALIZED_REQUEST_QUEUE_FULL_MESSAGE: &str = "Serialized request queue is full";
 
-fn deserialize_client_request(
-    request: &JSONRPCRequest,
-) -> Result<ClientRequest, JSONRPCErrorError> {
-    serde_json::to_value(request)
+struct InitializedClientMetadata {
+    app_server_client_name: Option<String>,
+    client_version: Option<String>,
+    supports_openai_form_elicitation: bool,
+    rpc_gate: Arc<ConnectionRpcGate>,
+}
+
+fn deserialize_client_request(request: JSONRPCRequest) -> Result<ClientRequest, JSONRPCErrorError> {
+    ClientRequest::try_from(request)
         .map_err(|err| invalid_request(format!("Invalid request: {err}")))
-        .and_then(|request_json| {
-            serde_json::from_value(request_json)
-                .map_err(|err| invalid_request(format!("Invalid request: {err}")))
-        })
 }
 
 pub(crate) struct MessageProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     models_refresh_worker: ModelsRefreshWorker,
     skills_watcher: Arc<SkillsWatcher>,
-    account_processor: AccountRequestProcessor,
+    pub(crate) account_processor: AccountRequestProcessor,
     apps_processor: AppsRequestProcessor,
     catalog_processor: CatalogRequestProcessor,
     command_exec_processor: CommandExecRequestProcessor,
@@ -114,15 +114,15 @@ pub(crate) struct MessageProcessor {
     external_agent_config_processor: ExternalAgentConfigRequestProcessor,
     feedback_processor: FeedbackRequestProcessor,
     fs_processor: FsRequestProcessor,
-    git_processor: GitRequestProcessor,
-    initialize_processor: InitializeRequestProcessor,
+    pub(crate) initialize_processor: InitializeRequestProcessor,
     marketplace_processor: MarketplaceRequestProcessor,
     mcp_processor: McpRequestProcessor,
     plugin_processor: PluginRequestProcessor,
     remote_control_processor: RemoteControlRequestProcessor,
     search_processor: SearchRequestProcessor,
     thread_goal_processor: ThreadGoalRequestProcessor,
-    thread_processor: ThreadRequestProcessor,
+    pub(crate) thread_processor: ThreadRequestProcessor,
+    pub(crate) thread_manager: Arc<ThreadManager>,
     turn_processor: TurnRequestProcessor,
     bug_worker_shutdown: CancellationToken,
     windows_sandbox_processor: WindowsSandboxRequestProcessor,
@@ -386,7 +386,6 @@ impl MessageProcessor {
             log_db.clone(),
             state_db.clone(),
         );
-        let git_processor = GitRequestProcessor::new();
         let initialize_processor = InitializeRequestProcessor::new(
             outgoing.clone(),
             analytics_events_client.clone(),
@@ -433,7 +432,7 @@ impl MessageProcessor {
             Arc::clone(&thread_store),
             Arc::clone(&pending_thread_unloads),
             thread_state_manager.clone(),
-            thread_watch_manager.clone(),
+            thread_watch_manager,
             Arc::clone(&thread_list_state_permit),
             thread_goal_processor.clone(),
             state_db.clone(),
@@ -450,11 +449,7 @@ impl MessageProcessor {
             arg0_paths.clone(),
             Arc::clone(&config),
             config_manager.clone(),
-            pending_thread_unloads,
             thread_state_manager,
-            thread_watch_manager,
-            thread_list_state_permit,
-            Arc::clone(&skills_watcher),
             bug_worker_shutdown.clone(),
         );
         if matches!(plugin_startup_tasks, crate::PluginStartupTasks::Start) {
@@ -513,7 +508,6 @@ impl MessageProcessor {
             external_agent_config_processor,
             feedback_processor,
             fs_processor,
-            git_processor,
             initialize_processor,
             marketplace_processor,
             mcp_processor,
@@ -522,6 +516,7 @@ impl MessageProcessor {
             search_processor,
             thread_goal_processor,
             thread_processor,
+            thread_manager,
             turn_processor,
             bug_worker_shutdown,
             windows_sandbox_processor,
@@ -565,7 +560,7 @@ impl MessageProcessor {
             Arc::clone(&self.outgoing),
             request_context.clone(),
             async {
-                let codex_request = deserialize_client_request(&request);
+                let codex_request = deserialize_client_request(request);
                 let result = match codex_request {
                     Ok(codex_request) => {
                         // Websocket callers finalize outbound readiness in lib.rs after mirroring
@@ -665,92 +660,11 @@ impl MessageProcessor {
         request_fut.instrument(request_context.span()).await;
     }
 
-    pub(crate) fn thread_created_receiver(&self) -> broadcast::Receiver<ThreadId> {
-        self.thread_processor.thread_created_receiver()
-    }
-
-    pub(crate) async fn send_initialize_notifications_to_connection(
-        &self,
-        connection_id: ConnectionId,
-    ) {
-        self.initialize_processor
-            .send_initialize_notifications_to_connection(connection_id)
-            .await;
-    }
-
-    pub(crate) async fn connection_initialized(
-        &self,
-        connection_id: ConnectionId,
-        request_attestation: bool,
-        experimental_api: bool,
-    ) {
-        self.thread_processor
-            .connection_initialized(
-                connection_id,
-                ConnectionCapabilities {
-                    request_attestation,
-                    experimental_api,
-                },
-            )
-            .await;
-    }
-
-    pub(crate) async fn send_initialize_notifications(&self) {
-        self.initialize_processor
-            .send_initialize_notifications()
-            .await;
-    }
-
-    pub(crate) async fn try_attach_thread_listener(
-        &self,
-        thread_id: ThreadId,
-        connection_ids: Vec<ConnectionId>,
-    ) {
-        self.thread_processor
-            .try_attach_thread_listener(thread_id, connection_ids)
-            .await;
-    }
-
-    pub(crate) async fn resync_thread_listeners(&self, connection_ids: Vec<ConnectionId>) {
-        self.thread_processor
-            .resync_thread_listeners(connection_ids)
-            .await;
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn subscribed_connection_ids_for_test(
-        &self,
-        thread_id: ThreadId,
-    ) -> Vec<ConnectionId> {
-        self.thread_processor
-            .subscribed_connection_ids_for_test(thread_id)
-            .await
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn set_thread_created_resync_override_for_test(&self, thread_id: ThreadId) {
-        self.thread_processor
-            .set_thread_created_resync_override_for_test(thread_id)
-            .await;
-    }
-
     pub(crate) async fn drain_background_tasks(&self) {
         self.bug_worker_shutdown.cancel();
         self.models_refresh_worker.shutdown();
         self.thread_processor.drain_background_tasks().await;
         self.outgoing.shutdown_delivery_tasks().await;
-    }
-
-    pub(crate) async fn cancel_active_login(&self) {
-        self.account_processor.cancel_active_login().await;
-    }
-
-    pub(crate) async fn clear_all_thread_listeners(&self) {
-        self.thread_processor.clear_all_thread_listeners().await;
-    }
-
-    pub(crate) async fn shutdown_threads(&self) {
-        self.thread_processor.shutdown_threads().await;
     }
 
     pub(crate) async fn connection_closed(
@@ -779,11 +693,6 @@ impl MessageProcessor {
             .connection_closed(connection_id)
             .await;
         self.thread_processor.connection_closed(connection_id).await;
-    }
-
-    pub(crate) fn subscribe_running_assistant_turn_count(&self) -> watch::Receiver<usize> {
-        self.thread_processor
-            .subscribe_running_assistant_turn_count()
     }
 
     /// Handle a standalone JSON-RPC response originating from the peer.
@@ -837,6 +746,7 @@ impl MessageProcessor {
                 .await?;
             if connection_initialized {
                 self.thread_processor
+                    .thread_state_manager
                     .connection_initialized(
                         connection_id,
                         ConnectionCapabilities {
@@ -874,12 +784,9 @@ impl MessageProcessor {
         {
             return Err(invalid_request(experimental_required_message(reason)));
         }
-        if matches!(
-            &codex_request,
-            ClientRequest::ThreadDesktopActivationObligation { .. }
-                | ClientRequest::ThreadDesktopActivationChallenge { .. }
-                | ClientRequest::ThreadDesktopActivationRecord { .. }
-        ) && !session.desktop_activation_receipts()
+        if codex_request.required_capability()
+            == Some(ClientRequestRequiredCapability::DesktopActivationReceipts)
+            && !session.desktop_activation_receipts()
         {
             return Err(invalid_request(
                 "Desktop activation receipts capability was not enabled during initialize",
@@ -893,9 +800,13 @@ impl MessageProcessor {
         );
 
         let serialization_scope = codex_request.serialization_scope();
-        let app_server_client_name = session.app_server_client_name().map(str::to_string);
-        let client_version = session.client_version().map(str::to_string);
-        let supports_openai_form_elicitation = session.supports_openai_form_elicitation();
+        let client_metadata = InitializedClientMetadata {
+            app_server_client_name: session.app_server_client_name().map(str::to_string),
+            client_version: session.client_version().map(str::to_string),
+            supports_openai_form_elicitation: session.supports_openai_form_elicitation(),
+            rpc_gate: Arc::clone(&session.rpc_gate),
+        };
+        let admission_error_request_id = connection_request_id.request_id.clone();
         let error_request_id = connection_request_id.clone();
         let rpc_gate = Arc::clone(&session.rpc_gate);
         let rpc_cancellation = rpc_gate.cancellation_token();
@@ -917,10 +828,10 @@ impl MessageProcessor {
                         connection_request_id,
                         codex_request,
                         request_context,
-                        app_server_client_name,
-                        client_version,
-                        supports_openai_form_elicitation,
-                        handler_rpc_gate,
+                        InitializedClientMetadata {
+                            rpc_gate: handler_rpc_gate,
+                            ..client_metadata
+                        },
                     ) => {
                         if let Err(error) = result {
                             processor.outgoing.send_error(error_request_id, error).await;
@@ -939,11 +850,12 @@ impl MessageProcessor {
                     .await,
                 RequestAdmission::Rejected(_)
             ) {
-                return Err(JSONRPCErrorError {
-                    code: OVERLOADED_ERROR_CODE,
-                    message: SERIALIZED_REQUEST_QUEUE_FULL_MESSAGE.to_string(),
-                    data: None,
-                });
+                self.initialize_processor
+                    .track_initialized_request_error(connection_id, admission_error_request_id);
+                return Err(overloaded_error(
+                    OverloadReason::SerializedRequestQueue,
+                    SERIALIZED_REQUEST_QUEUE_FULL_MESSAGE,
+                ));
             }
         } else {
             tokio::spawn(async move {
@@ -958,11 +870,14 @@ impl MessageProcessor {
         connection_request_id: ConnectionRequestId,
         codex_request: ClientRequest,
         request_context: RequestContext,
-        app_server_client_name: Option<String>,
-        client_version: Option<String>,
-        supports_openai_form_elicitation: bool,
-        rpc_gate: Arc<ConnectionRpcGate>,
+        client_metadata: InitializedClientMetadata,
     ) -> Result<(), JSONRPCErrorError> {
+        let InitializedClientMetadata {
+            app_server_client_name,
+            client_version,
+            supports_openai_form_elicitation,
+            rpc_gate,
+        } = client_metadata;
         let connection_id = connection_request_id.connection_id;
         let request_id = ConnectionRequestId {
             connection_id,
@@ -1110,23 +1025,23 @@ impl MessageProcessor {
                 .model_provider_capabilities_read()
                 .await
                 .map(|response| Some(response.into())),
-            ClientRequest::ThreadStart { params, .. } => {
-                self.thread_processor
-                    .thread_start(
-                        request_id.clone(),
-                        params,
-                        app_server_client_name.clone(),
-                        client_version.clone(),
-                        supports_openai_form_elicitation,
-                        request_context,
-                    )
-                    .await
-            }
-            ClientRequest::ThreadUnsubscribe { params, .. } => {
-                self.thread_processor
-                    .thread_unsubscribe(&request_id, params)
-                    .await
-            }
+            ClientRequest::ThreadStart { params, .. } => self
+                .thread_processor
+                .thread_start(
+                    request_id.clone(),
+                    params,
+                    app_server_client_name.clone(),
+                    client_version.clone(),
+                    supports_openai_form_elicitation,
+                    request_context,
+                )
+                .await
+                .map(|()| None),
+            ClientRequest::ThreadUnsubscribe { params, .. } => self
+                .thread_processor
+                .thread_unsubscribe(params, request_id.connection_id)
+                .await
+                .map(|response| Some(response.into())),
             ClientRequest::ThreadResume { params, .. } => {
                 self.thread_processor
                     .thread_resume(
@@ -1138,6 +1053,7 @@ impl MessageProcessor {
                         supports_openai_form_elicitation,
                     )
                     .await
+                    .map(|()| None)
             }
             ClientRequest::ThreadDesktopActivationObligation { params, .. } => {
                 self.thread_processor
@@ -1165,6 +1081,7 @@ impl MessageProcessor {
                         supports_openai_form_elicitation,
                     )
                     .await
+                    .map(|()| None)
             }
             ClientRequest::ThreadArchive { params, .. } => {
                 self.thread_processor
@@ -1176,16 +1093,16 @@ impl MessageProcessor {
                     .thread_delete(request_id.clone(), params)
                     .await
             }
-            ClientRequest::ThreadIncrementElicitation { params, .. } => {
-                self.thread_processor
-                    .thread_increment_elicitation(&request_id, params)
-                    .await
-            }
-            ClientRequest::ThreadDecrementElicitation { params, .. } => {
-                self.thread_processor
-                    .thread_decrement_elicitation(&request_id, params)
-                    .await
-            }
+            ClientRequest::ThreadIncrementElicitation { params, .. } => self
+                .thread_processor
+                .thread_increment_elicitation(&request_id, params)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadDecrementElicitation { params, .. } => self
+                .thread_processor
+                .thread_decrement_elicitation(&request_id, params)
+                .await
+                .map(|response| Some(response.into())),
             ClientRequest::ThreadSetName { params, .. } => {
                 self.thread_processor
                     .thread_set_name(request_id.clone(), params)
@@ -1204,79 +1121,101 @@ impl MessageProcessor {
                     .thread_goal_clear(request_id.clone(), params)
                     .await
             }
-            ClientRequest::ThreadMetadataUpdate { params, .. } => {
-                self.thread_processor.thread_metadata_update(params).await
-            }
-            ClientRequest::ThreadSettingsUpdate { params, .. } => {
-                self.turn_processor
-                    .thread_settings_update(&request_id, params)
-                    .await
-            }
-            ClientRequest::ThreadMemoryModeSet { params, .. } => {
-                self.thread_processor.thread_memory_mode_set(params).await
-            }
-            ClientRequest::MemoryReset { .. } => self.thread_processor.memory_reset().await,
+            ClientRequest::ThreadMetadataUpdate { params, .. } => self
+                .thread_processor
+                .thread_metadata_update(params)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadSettingsUpdate { params, .. } => self
+                .turn_processor
+                .thread_settings_update(&request_id, params)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadMemoryModeSet { params, .. } => self
+                .thread_processor
+                .thread_memory_mode_set(params)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::MemoryReset { .. } => self
+                .thread_processor
+                .memory_reset()
+                .await
+                .map(|response| Some(response.into())),
             ClientRequest::ThreadUnarchive { params, .. } => {
                 self.thread_processor
                     .thread_unarchive(request_id.clone(), params)
                     .await
             }
-            ClientRequest::ThreadCompactStart { params, .. } => {
-                self.thread_processor
-                    .thread_compact_start(&request_id, params)
-                    .await
-            }
-            ClientRequest::ThreadBackgroundTerminalsClean { params, .. } => {
-                self.thread_processor
-                    .thread_background_terminals_clean(&request_id, params)
-                    .await
-            }
-            ClientRequest::ThreadBackgroundTerminalsList { params, .. } => {
-                self.thread_processor
-                    .thread_background_terminals_list(params)
-                    .await
-            }
-            ClientRequest::ThreadBackgroundTerminalsTerminate { params, .. } => {
-                self.thread_processor
-                    .thread_background_terminals_terminate(params)
-                    .await
-            }
+            ClientRequest::ThreadCompactStart { params, .. } => self
+                .thread_processor
+                .thread_compact_start(&request_id, params)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadBackgroundTerminalsClean { params, .. } => self
+                .thread_processor
+                .thread_background_terminals_clean(&request_id, params)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadBackgroundTerminalsList { params, .. } => self
+                .thread_processor
+                .thread_background_terminals_list(params)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadBackgroundTerminalsTerminate { params, .. } => self
+                .thread_processor
+                .thread_background_terminals_terminate(params)
+                .await
+                .map(|response| Some(response.into())),
             ClientRequest::ThreadRollback { params, .. } => {
                 self.thread_processor
                     .thread_rollback(&request_id, params, app_server_client_name.as_deref())
                     .await
             }
-            ClientRequest::ThreadList { params, .. } => {
-                self.thread_processor.thread_list(params).await
-            }
-            ClientRequest::ThreadSearch { params, .. } => {
-                self.thread_processor.thread_search(params).await
-            }
-            ClientRequest::ThreadLoadedList { params, .. } => {
-                self.thread_processor.thread_loaded_list(params).await
-            }
-            ClientRequest::ThreadRead { params, .. } => {
-                self.thread_processor.thread_read(params).await
-            }
-            ClientRequest::ThreadTurnsList { params, .. } => {
-                self.thread_processor.thread_turns_list(params).await
-            }
-            ClientRequest::ThreadItemsList { params, .. } => {
-                self.thread_processor.thread_items_list(params).await
-            }
-            ClientRequest::ThreadShellCommand { params, .. } => {
-                self.thread_processor
-                    .thread_shell_command(&request_id, params)
-                    .await
-            }
-            ClientRequest::ThreadApproveGuardianDeniedAction { params, .. } => {
-                self.thread_processor
-                    .thread_approve_guardian_denied_action(&request_id, params)
-                    .await
-            }
-            ClientRequest::GetConversationSummary { params, .. } => {
-                self.thread_processor.conversation_summary(params).await
-            }
+            ClientRequest::ThreadList { params, .. } => self
+                .thread_processor
+                .thread_list(params)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadSearch { params, .. } => self
+                .thread_processor
+                .thread_search(params)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadLoadedList { params, .. } => self
+                .thread_processor
+                .thread_loaded_list(params)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadRead { params, .. } => self
+                .thread_processor
+                .thread_read(params)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadTurnsList { params, .. } => self
+                .thread_processor
+                .thread_turns_list(params)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadItemsList { params, .. } => self
+                .thread_processor
+                .thread_items_list(params)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadShellCommand { params, .. } => self
+                .thread_processor
+                .thread_shell_command(&request_id, params)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadApproveGuardianDeniedAction { params, .. } => self
+                .thread_processor
+                .thread_approve_guardian_denied_action(&request_id, params)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::GetConversationSummary { params, .. } => self
+                .thread_processor
+                .conversation_summary(params)
+                .await
+                .map(|response| Some(response.into())),
             ClientRequest::SkillsList { params, .. } => {
                 self.catalog_processor.skills_list(params).await
             }
@@ -1373,45 +1312,19 @@ impl MessageProcessor {
                     )
                     .await
             }
-            ClientRequest::ThreadInjectItems { params, .. } => {
-                self.turn_processor.thread_inject_items(params).await
-            }
+            ClientRequest::ThreadInjectItems { params, .. } => self
+                .turn_processor
+                .thread_inject_items(params)
+                .await
+                .map(|response| Some(response.into())),
             ClientRequest::TurnSteer { params, .. } => {
                 self.turn_processor.turn_steer(&request_id, params).await
             }
-            ClientRequest::TurnInterrupt { params, .. } => {
-                self.turn_processor
-                    .turn_interrupt(&request_id, params)
-                    .await
-            }
-            ClientRequest::ThreadRealtimeStart { params, .. } => {
-                self.turn_processor
-                    .thread_realtime_start(&request_id, params)
-                    .await
-            }
-            ClientRequest::ThreadRealtimeAppendAudio { params, .. } => {
-                self.turn_processor
-                    .thread_realtime_append_audio(&request_id, params)
-                    .await
-            }
-            ClientRequest::ThreadRealtimeAppendText { params, .. } => {
-                self.turn_processor
-                    .thread_realtime_append_text(&request_id, params)
-                    .await
-            }
-            ClientRequest::ThreadRealtimeAppendSpeech { params, .. } => {
-                self.turn_processor
-                    .thread_realtime_append_speech(&request_id, params)
-                    .await
-            }
-            ClientRequest::ThreadRealtimeStop { params, .. } => {
-                self.turn_processor
-                    .thread_realtime_stop(&request_id, params)
-                    .await
-            }
-            ClientRequest::ThreadRealtimeListVoices { params: _, .. } => {
-                self.turn_processor.thread_realtime_list_voices().await
-            }
+            ClientRequest::TurnInterrupt { params, .. } => self
+                .turn_processor
+                .turn_interrupt(&request_id, params)
+                .await
+                .map(|response| response.map(Into::into)),
             ClientRequest::BugCreate { params, .. } => self.turn_processor.bug_create(params).await,
             ClientRequest::McpServerOauthLogin { params, .. } => {
                 self.mcp_processor.mcp_server_oauth_login(params).await
@@ -1430,9 +1343,7 @@ impl MessageProcessor {
                     .await
             }
             ClientRequest::McpServerToolCall { params, .. } => {
-                self.mcp_processor
-                    .mcp_server_tool_call(&request_id, params)
-                    .await
+                self.mcp_processor.mcp_server_tool_call(params).await
             }
             ClientRequest::WindowsSandboxSetupStart { params, .. } => {
                 self.windows_sandbox_processor
@@ -1483,7 +1394,7 @@ impl MessageProcessor {
                     .await
             }
             ClientRequest::GitDiffToRemote { params, .. } => {
-                self.git_processor.git_diff_to_remote(params).await
+                git_diff_to_remote_response(params).await
             }
             ClientRequest::FuzzyFileSearch { params, .. } => self
                 .search_processor

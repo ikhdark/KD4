@@ -81,30 +81,6 @@ its source, provenance kind, freshness or revision, and exact covered contract.
 Name skipped checks and their reasons. Do not turn a passing narrow check into a
 broader completion claim.
 
-For a performance-sensitive implementation, quality is the first gate; latency
-and token use are secondary optimization dimensions. Record the quality checks,
-benchmark workload, latency metric and threshold, token metric or budget, build
-identity, sample count, and statistic before claiming an improvement. Reject a
-candidate immediately if it weakens correctness, safety, output fidelity,
-compatibility, or another required quality property. Only candidates passing the
-same quality contract may be compared for latency and token use.
-
-Run focused quality checks before the real task-scoped latency and token
-measurements. If either performance dimension misses its contract, keep the
-quality result, mark performance as failed, and use the measurements to narrow
-owner-level work on the exercised hot path. Patch that path, rerun affected
-quality checks, then rerun the same measurements. Do not tune the quality,
-latency, or token contract to the candidate implementation. Each post-change
-measurement is evidence for the new workspace revision, not a retry of
-unchanged state.
-
-Retain the baseline and each candidate result under that unchanged contract. A
-regressing candidate must not replace a better correct implementation. After a
-bounded alternative and its quality-plus-performance sequence, select the best
-measured quality-preserving version using the stated latency and token
-contracts. If that version still misses either contract, keep the performance
-status failed rather than treating relative improvement as completion.
-
 Validation is check-only and bound to the revision and covered path/contract
 manifest. A relevant mutation supersedes the result. Generated-output
 regeneration is a separate, explicitly owner-attributed command serialized by

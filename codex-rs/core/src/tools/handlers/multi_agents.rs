@@ -5,9 +5,9 @@
 //! config, inherit runtime-only state such as provider, approval policy, sandbox, and cwd, and
 //! then optionally layer role-specific config on top.
 
+use crate::FunctionCallError;
 use crate::agent::AgentStatus;
 use crate::agent::exceeds_thread_spawn_depth_limit;
-use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;

@@ -10,6 +10,7 @@ mod live_thread;
 mod local;
 mod store;
 mod thread_metadata_sync;
+mod thread_name;
 mod types;
 
 pub use error::ThreadStoreError;
@@ -22,6 +23,7 @@ pub use local::LocalThreadStore;
 pub use local::LocalThreadStoreConfig;
 pub use store::ThreadStore;
 pub use store::ThreadStoreFuture;
+pub use thread_name::normalize_thread_name;
 pub use types::AppendThreadItemsParams;
 pub use types::ArchiveThreadParams;
 pub use types::ClearableField;

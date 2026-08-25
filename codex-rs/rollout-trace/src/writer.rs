@@ -105,9 +105,31 @@ impl TraceWriter {
         })
     }
 
+    /// Best-effort payload write used by hot-path trace producers.
+    pub(crate) fn write_json_payload_best_effort(
+        &self,
+        kind: RawPayloadKind,
+        value: &impl Serialize,
+    ) -> Option<RawPayloadRef> {
+        match self.write_json_payload(kind, value) {
+            Ok(payload_ref) => Some(payload_ref),
+            Err(err) => {
+                tracing::warn!("failed to write rollout trace payload: {err:#}");
+                None
+            }
+        }
+    }
+
     /// Appends one raw event with no extra envelope context.
     pub fn append(&self, payload: RawTraceEventPayload) -> Result<RawTraceEvent> {
         self.append_with_context(RawTraceEventContext::default(), payload)
+    }
+
+    /// Best-effort event append used by hot-path trace producers.
+    pub(crate) fn append_best_effort(&self, payload: RawTraceEventPayload) {
+        if let Err(err) = self.append(payload) {
+            tracing::warn!("failed to append rollout trace event: {err:#}");
+        }
     }
 
     /// Appends one raw event with explicit thread/turn context.
@@ -131,6 +153,17 @@ impl TraceWriter {
         inner.event_log.write_all(b"\n")?;
         inner.event_log.flush()?;
         Ok(event)
+    }
+
+    /// Best-effort contextual event append used by hot-path trace producers.
+    pub(crate) fn append_with_context_best_effort(
+        &self,
+        context: RawTraceEventContext,
+        payload: RawTraceEventPayload,
+    ) {
+        if let Err(err) = self.append_with_context(context, payload) {
+            tracing::warn!("failed to append rollout trace event: {err:#}");
+        }
     }
 
     fn lock_inner(&self) -> MutexGuard<'_, TraceWriterInner> {
@@ -258,6 +291,29 @@ mod tests {
         assert_eq!(
             rollout.raw_payloads[&metadata_payload.raw_payload_id].path,
             "payloads/1.json"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn best_effort_payload_write_warns_and_returns_none() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let writer = TraceWriter::create(
+            temp.path(),
+            "trace-1".to_string(),
+            "rollout-1".to_string(),
+            "thread-root".to_string(),
+        )?;
+        std::fs::remove_dir_all(temp.path().join(crate::bundle::PAYLOADS_DIR_NAME))?;
+
+        assert!(
+            writer
+                .write_json_payload_best_effort(
+                    RawPayloadKind::ProtocolEvent,
+                    &json!({ "event": "missing-directory" }),
+                )
+                .is_none()
         );
 
         Ok(())

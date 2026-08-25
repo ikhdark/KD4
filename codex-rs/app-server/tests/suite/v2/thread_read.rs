@@ -55,6 +55,7 @@ use codex_feedback::CodexFeedback;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ReasoningPolicyHistory;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource as ProtocolSessionSource;
 use codex_protocol::protocol::TaskCompletionGate as CoreTaskCompletionGate;
@@ -84,10 +85,7 @@ use tempfile::TempDir;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-#[cfg(windows)]
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
-#[cfg(not(windows))]
-const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[tokio::test]
 async fn thread_read_returns_summary_without_turns() -> Result<()> {
@@ -210,6 +208,103 @@ async fn thread_read_can_include_turns() -> Result<()> {
         other => panic!("expected user message item, got {other:?}"),
     }
     assert_eq!(thread.status, ThreadStatus::NotLoaded);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_read_reasoning_policy_history_follows_initialize_capability() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+
+    for experimental_api in [false, true] {
+        let codex_home = TempDir::new()?;
+        create_config_toml(codex_home.path(), &server.uri())?;
+        let conversation_id = create_fake_rollout_with_text_elements(
+            codex_home.path(),
+            "2025-01-05T12-00-00",
+            "2025-01-05T12:00:00Z",
+            "Saved user message",
+            Vec::new(),
+            Some("mock_provider"),
+            /*git_info*/ None,
+        )?;
+        let path = rollout_path(codex_home.path(), "2025-01-05T12-00-00", &conversation_id);
+        let turn_id = "reasoning-policy-turn";
+        let history = ReasoningPolicyHistory {
+            turn_id: turn_id.to_string(),
+            entries: Vec::new(),
+            total_entries: 0,
+            truncated: false,
+        };
+        for item in [
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: turn_id.to_string(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::ReasoningPolicySummary(history.clone())),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: turn_id.to_string(),
+                last_agent_message: None,
+                surfaced_result: None,
+                error: None,
+                completion: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+                timing: None,
+            })),
+        ] {
+            append_rollout_item_to_path(&path, &item).await?;
+        }
+
+        let mut mcp = TestAppServer::builder()
+            .with_codex_home(codex_home.path())
+            .without_auto_env()
+            .build()
+            .await?;
+        let initialize = mcp
+            .initialize_with_capabilities(
+                ClientInfo {
+                    name: "reasoning-policy-capability-test".to_string(),
+                    title: None,
+                    version: "0.1.0".to_string(),
+                },
+                Some(InitializeCapabilities {
+                    experimental_api,
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        assert!(matches!(
+            initialize,
+            codex_app_server_protocol::JSONRPCMessage::Response(_)
+        ));
+
+        let read_id = mcp
+            .send_thread_read_request(ThreadReadParams {
+                thread_id: conversation_id,
+                include_turns: true,
+            })
+            .await?;
+        let read_response: JSONRPCResponse = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+        )
+        .await??;
+        let ThreadReadResponse { thread, .. } = to_response(read_response)?;
+        let turn = thread
+            .turns
+            .iter()
+            .find(|turn| turn.id == turn_id)
+            .expect("reasoning-policy turn should be returned");
+        assert_eq!(
+            turn.reasoning_policy_history.as_ref(),
+            experimental_api.then_some(&history)
+        );
+    }
 
     Ok(())
 }
@@ -754,6 +849,7 @@ async fn thread_turns_list_reads_store_history_without_rollout_path() -> Result<
     .await?;
 
     let result = client
+        .sender()
         .request(ClientRequest::ThreadTurnsList {
             request_id: RequestId::Integer(1),
             params: ThreadTurnsListParams {
@@ -820,6 +916,7 @@ async fn thread_read_loaded_include_turns_reads_store_history_without_rollout_pa
     .await?;
 
     let result = client
+        .sender()
         .request(ClientRequest::ThreadStart {
             request_id: RequestId::Integer(1),
             params: ThreadStartParams {
@@ -841,6 +938,7 @@ async fn thread_read_loaded_include_turns_reads_store_history_without_rollout_pa
         .await?;
 
     let result = client
+        .sender()
         .request(ClientRequest::ThreadRead {
             request_id: RequestId::Integer(2),
             params: ThreadReadParams {
@@ -906,6 +1004,7 @@ async fn thread_list_includes_store_thread_without_rollout_path() -> Result<()> 
     .await?;
 
     let result = client
+        .sender()
         .request(ClientRequest::ThreadList {
             request_id: RequestId::Integer(1),
             params: ThreadListParams {
@@ -1458,6 +1557,14 @@ async fn thread_read_include_turns_rejects_unmaterialized_loaded_thread() -> Res
             .contains("includeTurns is unavailable before first user message"),
         "unexpected error: {}",
         read_err.error.message
+    );
+    assert_eq!(
+        serde_json::from_value::<codex_app_server_protocol::ThreadErrorData>(
+            read_err.error.data.expect("thread error data")
+        )?,
+        codex_app_server_protocol::ThreadErrorData {
+            reason: codex_app_server_protocol::ThreadErrorReason::NotMaterialized,
+        }
     );
 
     Ok(())

@@ -26,10 +26,10 @@ use tokio::time::sleep_until;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+use crate::retry::backoff;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::turn_timing::now_unix_timestamp_ms;
-use crate::util::backoff;
 
 use super::AUTO_REVIEW_DENIAL_WINDOW_SIZE;
 use super::GUARDIAN_REVIEW_TIMEOUT;
@@ -702,7 +702,7 @@ pub(super) async fn guardian_review_session_config(
     let available_models = session
         .services
         .models_manager
-        .list_models(
+        .list_models_shared(
             codex_models_manager::manager::RefreshStrategy::Offline,
             turn.config.http_client_factory(),
         )
@@ -786,7 +786,7 @@ pub(super) async fn guardian_review_session_config(
 async fn run_guardian_review_session_before_deadline(
     session: Arc<Session>,
     turn: Arc<TurnContext>,
-    request: GuardianApprovalRequest,
+    request: Arc<GuardianApprovalRequest>,
     retry_reason: Option<String>,
     schema: serde_json::Value,
     external_cancel: Option<CancellationToken>,
@@ -888,6 +888,7 @@ pub(super) async fn run_guardian_review_session_with_retry(
 ) -> (GuardianReviewOutcome, GuardianReviewAnalyticsResult) {
     assert!(max_attempts > 0, "guardian review must run at least once");
     let deadline = Instant::now() + GUARDIAN_REVIEW_TIMEOUT;
+    let request = Arc::new(request);
     let mut attempt_count = 1;
     loop {
         let (outcome, mut analytics_result) = run_guardian_review_session_before_deadline(

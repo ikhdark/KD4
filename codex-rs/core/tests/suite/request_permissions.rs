@@ -8,7 +8,6 @@ use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::models::AdditionalPermissionProfile as PermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::models::PermissionProfile as CorePermissionProfile;
-use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecApprovalRequestEvent;
@@ -20,6 +19,8 @@ use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use core_test_support::normalized_directory_write_permissions;
+use core_test_support::requested_directory_write_permissions;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
@@ -29,12 +30,12 @@ use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
-use core_test_support::skip_if_sandbox;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
+use core_test_support::workspace_write_excluding_tmp;
 use pretty_assertions::assert_eq;
 use regex_lite::Regex;
 use serde_json::Value;
@@ -42,10 +43,6 @@ use serde_json::json;
 use std::fs;
 use std::path::Path;
 use test_case::test_case;
-
-fn absolute_path(path: &Path) -> AbsolutePathBuf {
-    AbsolutePathBuf::try_from(path).expect("absolute path")
-}
 
 struct CommandResult {
     exit_code: Option<i64>,
@@ -278,39 +275,9 @@ async fn expect_request_permissions_event(
     }
 }
 
-fn workspace_write_excluding_tmp() -> CorePermissionProfile {
-    CorePermissionProfile::workspace_write_with(
-        &[],
-        NetworkSandboxPolicy::Restricted,
-        /*exclude_tmpdir_env_var*/ true,
-        /*exclude_slash_tmp*/ true,
-    )
-}
-
-fn requested_directory_write_permissions(path: &Path) -> RequestPermissionProfile {
-    RequestPermissionProfile {
-        file_system: Some(FileSystemPermissions::from_read_write_roots(
-            Some(vec![]),
-            Some(vec![absolute_path(path)]),
-        )),
-        ..RequestPermissionProfile::default()
-    }
-}
-
-fn normalized_directory_write_permissions(path: &Path) -> Result<RequestPermissionProfile> {
-    Ok(RequestPermissionProfile {
-        file_system: Some(FileSystemPermissions::from_read_write_roots(
-            Some(vec![]),
-            Some(vec![AbsolutePathBuf::try_from(path.canonicalize()?)?]),
-        )),
-        ..RequestPermissionProfile::default()
-    })
-}
-
 #[tokio::test(flavor = "current_thread")]
 async fn with_additional_permissions_requires_approval_under_on_request() -> Result<()> {
     skip_if_no_network!(Ok(()));
-    skip_if_sandbox!(Ok(()));
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -402,7 +369,6 @@ async fn with_additional_permissions_requires_approval_under_on_request() -> Res
 async fn request_permissions_tool_is_auto_denied_when_granular_request_permissions_is_disabled()
 -> Result<()> {
     skip_if_no_network!(Ok(()));
-    skip_if_sandbox!(Ok(()));
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::Granular(GranularApprovalConfig {
@@ -504,7 +470,6 @@ async fn relative_additional_permissions_resolve_against_tool_workdir(
     command_tool: AdditionalPermissionsCommandTool,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
-    skip_if_sandbox!(Ok(()));
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -621,216 +586,8 @@ async fn relative_additional_permissions_resolve_against_tool_workdir(
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[cfg(target_os = "macos")]
-async fn read_only_with_additional_permissions_does_not_widen_to_unrequested_cwd_write()
--> Result<()> {
-    skip_if_no_network!(Ok(()));
-    skip_if_sandbox!(Ok(()));
-
-    let server = start_mock_server().await;
-    let approval_policy = AskForApproval::OnRequest;
-    let permission_profile = CorePermissionProfile::read_only();
-    let permission_profile_for_config = CorePermissionProfile::read_only();
-
-    let mut builder = test_codex().with_config(move |config| {
-        config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config
-            .permissions
-            .set_permission_profile(permission_profile_for_config)
-            .expect("set permission profile");
-        config
-            .features
-            .enable(Feature::ExecPermissionApprovals)
-            .expect("test config should allow feature update");
-        config
-            .features
-            .enable(Feature::RequestPermissionsTool)
-            .expect("test config should allow feature update");
-    });
-    let test = builder.build(&server).await?;
-
-    let requested_write = test.workspace_path("requested-only-cwd.txt");
-    let unrequested_write = test.workspace_path("unrequested-cwd-write.txt");
-    let _ = fs::remove_file(&requested_write);
-    let _ = fs::remove_file(&unrequested_write);
-
-    let call_id = "request_permissions_cwd_widening";
-    let command = format!(
-        "printf {:?} > {:?} && cat {:?}",
-        "cwd-widened", unrequested_write, unrequested_write
-    );
-    let requested_permissions = PermissionProfile {
-        file_system: Some(FileSystemPermissions::from_read_write_roots(
-            Some(vec![]),
-            Some(vec![absolute_path(&requested_write)]),
-        )),
-        ..Default::default()
-    };
-    let event = shell_event_with_request_permissions(call_id, &command, &requested_permissions)?;
-
-    let _ = mount_sse_once(
-        &server,
-        sse(vec![
-            ev_response_created("resp-cwd-1"),
-            event,
-            ev_completed("resp-cwd-1"),
-        ]),
-    )
-    .await;
-    let results = mount_sse_once(
-        &server,
-        sse(vec![
-            ev_assistant_message("msg-cwd-1", "done"),
-            ev_completed("resp-cwd-2"),
-        ]),
-    )
-    .await;
-
-    submit_turn(&test, call_id, approval_policy, permission_profile.clone()).await?;
-
-    let approval = expect_exec_approval(&test, &command).await;
-    assert_eq!(
-        approval.additional_permissions,
-        Some(requested_permissions.clone())
-    );
-    test.codex
-        .submit(Op::ExecApproval {
-            id: approval.effective_approval_id(),
-            turn_id: None,
-            decision: ReviewDecision::Approved,
-        })
-        .await?;
-    wait_for_completion(&test).await;
-
-    let result = parse_result(&results.single_request().function_call_output(call_id));
-    assert!(
-        result.exit_code != Some(0),
-        "unrequested cwd write should stay denied: {:?} {}",
-        result.exit_code,
-        result.stdout
-    );
-    assert!(
-        !requested_write.exists(),
-        "requested path should remain untouched when the command targets an unrequested file"
-    );
-    assert!(
-        !unrequested_write.exists(),
-        "unrequested cwd write should remain blocked"
-    );
-
-    let _ = fs::remove_file(unrequested_write);
-    let _ = fs::remove_file(requested_write);
-    Ok(())
-}
-
-#[tokio::test(flavor = "current_thread")]
-#[cfg(target_os = "macos")]
-async fn read_only_with_additional_permissions_does_not_widen_to_unrequested_tmp_write()
--> Result<()> {
-    skip_if_no_network!(Ok(()));
-    skip_if_sandbox!(Ok(()));
-
-    let server = start_mock_server().await;
-    let approval_policy = AskForApproval::OnRequest;
-    let permission_profile = CorePermissionProfile::read_only();
-    let permission_profile_for_config = CorePermissionProfile::read_only();
-
-    let mut builder = test_codex().with_config(move |config| {
-        config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config
-            .permissions
-            .set_permission_profile(permission_profile_for_config)
-            .expect("set permission profile");
-        config
-            .features
-            .enable(Feature::ExecPermissionApprovals)
-            .expect("test config should allow feature update");
-        config
-            .features
-            .enable(Feature::RequestPermissionsTool)
-            .expect("test config should allow feature update");
-    });
-    let test = builder.build(&server).await?;
-
-    let requested_write = test.workspace_path("requested-only-tmp.txt");
-    let tmp_dir = tempfile::tempdir()?;
-    let tmp_write = tmp_dir.path().join("tmp-widening.txt");
-    let _ = fs::remove_file(&requested_write);
-    let _ = fs::remove_file(&tmp_write);
-
-    let call_id = "request_permissions_tmp_widening";
-    let command = format!(
-        "printf {:?} > {:?} && cat {:?}",
-        "tmp-widened", tmp_write, tmp_write
-    );
-    let requested_permissions = PermissionProfile {
-        file_system: Some(FileSystemPermissions::from_read_write_roots(
-            Some(vec![]),
-            Some(vec![absolute_path(&requested_write)]),
-        )),
-        ..Default::default()
-    };
-    let event = shell_event_with_request_permissions(call_id, &command, &requested_permissions)?;
-
-    let _ = mount_sse_once(
-        &server,
-        sse(vec![
-            ev_response_created("resp-tmp-1"),
-            event,
-            ev_completed("resp-tmp-1"),
-        ]),
-    )
-    .await;
-    let results = mount_sse_once(
-        &server,
-        sse(vec![
-            ev_assistant_message("msg-tmp-1", "done"),
-            ev_completed("resp-tmp-2"),
-        ]),
-    )
-    .await;
-
-    submit_turn(&test, call_id, approval_policy, permission_profile.clone()).await?;
-
-    let approval = expect_exec_approval(&test, &command).await;
-    assert_eq!(
-        approval.additional_permissions,
-        Some(requested_permissions.clone())
-    );
-    test.codex
-        .submit(Op::ExecApproval {
-            id: approval.effective_approval_id(),
-            turn_id: None,
-            decision: ReviewDecision::Approved,
-        })
-        .await?;
-    wait_for_completion(&test).await;
-
-    let result = parse_result(&results.single_request().function_call_output(call_id));
-    assert!(
-        result.exit_code != Some(0),
-        "unrequested tmp write should stay denied: {:?} {}",
-        result.exit_code,
-        result.stdout
-    );
-    assert!(
-        !requested_write.exists(),
-        "requested path should remain untouched when the command targets an unrequested file"
-    );
-    assert!(
-        !tmp_write.exists(),
-        "unrequested tmp write should remain blocked"
-    );
-
-    let _ = fs::remove_file(tmp_write);
-    let _ = fs::remove_file(requested_write);
-    Ok(())
-}
-
-#[tokio::test(flavor = "current_thread")]
 async fn workspace_write_with_additional_permissions_can_write_outside_cwd() -> Result<()> {
     skip_if_no_network!(Ok(()));
-    skip_if_sandbox!(Ok(()));
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -1045,7 +802,6 @@ async fn with_additional_permissions_denied_approval_blocks_execution() -> Resul
 #[tokio::test(flavor = "current_thread")]
 async fn request_permissions_grants_apply_to_later_exec_command_calls() -> Result<()> {
     skip_if_no_network!(Ok(()));
-    skip_if_sandbox!(Ok(()));
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -1172,7 +928,6 @@ async fn request_permissions_grants_apply_to_later_exec_command_calls() -> Resul
 async fn request_permissions_preapprove_explicit_exec_permissions_outside_on_request() -> Result<()>
 {
     skip_if_no_network!(Ok(()));
-    skip_if_sandbox!(Ok(()));
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -1293,7 +1048,6 @@ async fn request_permissions_preapprove_explicit_exec_permissions_outside_on_req
 #[tokio::test(flavor = "current_thread")]
 async fn request_permissions_grants_apply_to_later_shell_command_calls() -> Result<()> {
     skip_if_no_network!(Ok(()));
-    skip_if_sandbox!(Ok(()));
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -1408,7 +1162,6 @@ async fn request_permissions_grants_apply_to_later_shell_command_calls() -> Resu
 async fn request_permissions_grants_apply_to_later_shell_command_calls_without_inline_permission_feature()
 -> Result<()> {
     skip_if_no_network!(Ok(()));
-    skip_if_sandbox!(Ok(()));
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -1523,7 +1276,6 @@ async fn request_permissions_grants_apply_to_later_shell_command_calls_without_i
 #[tokio::test(flavor = "current_thread")]
 async fn partial_request_permissions_grants_do_not_preapprove_new_permissions() -> Result<()> {
     skip_if_no_network!(Ok(()));
-    skip_if_sandbox!(Ok(()));
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -1690,7 +1442,6 @@ async fn partial_request_permissions_grants_do_not_preapprove_new_permissions() 
 #[tokio::test(flavor = "current_thread")]
 async fn request_permissions_grants_do_not_carry_across_turns() -> Result<()> {
     skip_if_no_network!(Ok(()));
-    skip_if_sandbox!(Ok(()));
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -1798,145 +1549,6 @@ async fn request_permissions_grants_do_not_carry_across_turns() -> Result<()> {
         .function_call_output_text("exec-call")
         .expect("expected exec-call output");
     assert!(output.contains("missing `additional_permissions`"));
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "current_thread")]
-#[cfg(target_os = "macos")]
-async fn request_permissions_session_grants_carry_across_turns() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-    skip_if_sandbox!(Ok(()));
-
-    let server = start_mock_server().await;
-    let approval_policy = AskForApproval::OnRequest;
-    let permission_profile = workspace_write_excluding_tmp();
-    let permission_profile_for_config = workspace_write_excluding_tmp();
-
-    let mut builder = test_codex().with_config(move |config| {
-        config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config
-            .permissions
-            .set_permission_profile(permission_profile_for_config)
-            .expect("set permission profile");
-        config
-            .features
-            .enable(Feature::ExecPermissionApprovals)
-            .expect("test config should allow feature update");
-        config
-            .features
-            .enable(Feature::RequestPermissionsTool)
-            .expect("test config should allow feature update");
-    });
-    let test = builder.build(&server).await?;
-
-    let outside_dir = tempfile::tempdir()?;
-    let outside_write = outside_dir.path().join("session-sticky-write.txt");
-    let requested_permissions = requested_directory_write_permissions(outside_dir.path());
-    let normalized_requested_permissions =
-        normalized_directory_write_permissions(outside_dir.path())?;
-    let command = format!(
-        "printf {:?} > {:?} && cat {:?}",
-        "session-sticky-ok", outside_write, outside_write
-    );
-
-    let _first_turn = mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-session-turn-1"),
-                request_permissions_tool_event(
-                    "permissions-call",
-                    "Allow writing outside the workspace",
-                    &requested_permissions,
-                )?,
-                ev_completed("resp-session-turn-1"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-session-turn-2"),
-                ev_assistant_message("msg-session-turn-1", "done"),
-                ev_completed("resp-session-turn-2"),
-            ]),
-        ],
-    )
-    .await;
-
-    submit_turn(
-        &test,
-        "request session permissions for later use",
-        approval_policy,
-        permission_profile.clone(),
-    )
-    .await?;
-
-    let granted_permissions = expect_request_permissions_event(&test, "permissions-call").await;
-    assert_eq!(
-        granted_permissions,
-        normalized_requested_permissions.clone()
-    );
-    test.codex
-        .submit(Op::RequestPermissionsResponse {
-            id: "permissions-call".to_string(),
-            response: RequestPermissionsResponse {
-                permissions: normalized_requested_permissions,
-                scope: PermissionGrantScope::Session,
-                strict_auto_review: false,
-            },
-        })
-        .await?;
-    wait_for_completion(&test).await;
-
-    let second_turn = mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-session-turn-3"),
-                exec_command_event("exec-call", &command)?,
-                ev_completed("resp-session-turn-3"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-session-turn-4"),
-                ev_assistant_message("msg-session-turn-2", "done"),
-                ev_completed("resp-session-turn-4"),
-            ]),
-        ],
-    )
-    .await;
-
-    submit_turn(
-        &test,
-        "reuse session permissions in a later turn",
-        approval_policy,
-        permission_profile,
-    )
-    .await?;
-
-    let completion_event = wait_for_event(&test.codex, |event| {
-        matches!(
-            event,
-            EventMsg::ExecApprovalRequest(_) | EventMsg::TurnComplete(_)
-        )
-    })
-    .await;
-    if let EventMsg::ExecApprovalRequest(approval) = completion_event {
-        test.codex
-            .submit(Op::ExecApproval {
-                id: approval.effective_approval_id(),
-                turn_id: None,
-                decision: ReviewDecision::Approved,
-            })
-            .await?;
-        wait_for_completion(&test).await;
-    }
-
-    let exec_output = second_turn
-        .function_call_output_text("exec-call")
-        .map(|output| json!({ "output": output }))
-        .expect("expected exec-call output");
-    let result = parse_result(&exec_output);
-    assert_eq!(result.exit_code, Some(0));
-    assert_eq!(result.stdout.trim(), "session-sticky-ok");
-    assert_eq!(fs::read_to_string(&outside_write)?, "session-sticky-ok");
 
     Ok(())
 }

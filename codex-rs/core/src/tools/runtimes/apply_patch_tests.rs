@@ -7,7 +7,6 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::GranularApprovalConfig;
-use codex_sandboxing::SandboxManager;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::policy_transforms::effective_file_system_sandbox_policy;
 use codex_sandboxing::policy_transforms::effective_network_sandbox_policy;
@@ -55,7 +54,7 @@ async fn guardian_review_request_includes_patch_context() {
         .abs();
     let action =
         ApplyPatchAction::new_add_for_test(&PathUri::from_abs_path(&path), "hello".to_string());
-    let expected_cwd = action.cwd.to_abs_path().expect("native patch cwd");
+    let expected_cwd = action.cwd.clone();
     let expected_patch = action.patch.clone();
     let request = ApplyPatchRequest {
         turn_environment: test_turn_environment(codex_exec_server::LOCAL_ENVIRONMENT_ID),
@@ -83,10 +82,55 @@ async fn guardian_review_request_includes_patch_context() {
         ApprovalAction::ApplyPatch {
             id: "call-1".to_string(),
             cwd: expected_cwd,
+            files: vec![PathUri::from_abs_path(&path)],
+            patch: expected_patch,
+        }
+    );
+}
+
+#[tokio::test]
+async fn guardian_review_request_preserves_foreign_paths() {
+    let path = PathUri::parse("file:///tmp/guardian-remote.txt").expect("POSIX path URI");
+    let action = ApplyPatchAction::new_add_for_test(&path, "hello".to_string());
+    let expected_cwd = action.cwd.clone();
+    let expected_patch = action.patch.clone();
+    let request = ApplyPatchRequest {
+        turn_environment: test_turn_environment("remote"),
+        action,
+        file_paths: vec![path.clone()],
+        changes: HashMap::new(),
+        exec_approval_requirement: ExecApprovalRequirement::NeedsApproval {
+            reason: None,
+            proposed_execpolicy_amendment: None,
+        },
+        additional_permissions: None,
+        permissions_preapproved: false,
+    };
+
+    let guardian_request =
+        ApplyPatchRuntime::build_guardian_review_request(&request, "call-remote")
+            .expect("foreign guardian paths should not require host conversion");
+
+    assert_eq!(
+        guardian_request,
+        ApprovalAction::ApplyPatch {
+            id: "call-remote".to_string(),
+            cwd: expected_cwd,
             files: vec![path],
             patch: expected_patch,
         }
     );
+}
+
+#[test]
+fn mutation_evidence_rejects_foreign_paths() {
+    let repo_root = std::env::temp_dir().abs();
+    let foreign_path = PathUri::parse("file:///tmp/typed-remote.txt").expect("POSIX path URI");
+
+    let error = native_mutation_repo_paths(repo_root.as_path(), &[foreign_path])
+        .expect_err("foreign paths cannot be captured by the host mutation store");
+
+    assert!(format!("{error:?}").contains("mutation evidence cannot represent"));
 }
 
 #[tokio::test]
@@ -216,19 +260,15 @@ async fn file_system_sandbox_context_uses_active_attempt() {
         &file_system_policy,
         NetworkSandboxPolicy::Restricted,
     );
-    let manager = SandboxManager::new();
     let sandbox_policy_cwd = PathUri::from_abs_path(&path);
     let attempt = SandboxAttempt {
-        sandbox: SandboxType::MacosSeatbelt,
+        sandbox: SandboxType::WindowsRestrictedToken,
         sandbox_requested: true,
         permissions: &permissions,
         exec_server_permissions: &permissions,
         enforce_managed_network: false,
-        manager: &manager,
         sandbox_cwd: &sandbox_policy_cwd,
         workspace_roots: std::slice::from_ref(&path),
-        codex_linux_sandbox_exe: None,
-        use_legacy_landlock: true,
         windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
         windows_sandbox_private_desktop: true,
         network_denial_cancellation_token: None,
@@ -261,7 +301,6 @@ async fn file_system_sandbox_context_uses_active_attempt() {
         WindowsSandboxLevel::RestrictedToken
     );
     assert_eq!(sandbox.windows_sandbox_private_desktop, true);
-    assert_eq!(sandbox.use_legacy_landlock, true);
 }
 
 #[tokio::test]
@@ -285,7 +324,6 @@ async fn no_sandbox_attempt_has_no_file_system_context() {
         permissions_preapproved: false,
     };
     let permissions = PermissionProfile::Disabled;
-    let manager = SandboxManager::new();
     let sandbox_policy_cwd = PathUri::from_abs_path(&path);
     let attempt = SandboxAttempt {
         sandbox: SandboxType::None,
@@ -293,11 +331,8 @@ async fn no_sandbox_attempt_has_no_file_system_context() {
         permissions: &permissions,
         exec_server_permissions: &permissions,
         enforce_managed_network: false,
-        manager: &manager,
         sandbox_cwd: &sandbox_policy_cwd,
         workspace_roots: std::slice::from_ref(&path),
-        codex_linux_sandbox_exe: None,
-        use_legacy_landlock: false,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
         windows_sandbox_private_desktop: false,
         network_denial_cancellation_token: None,

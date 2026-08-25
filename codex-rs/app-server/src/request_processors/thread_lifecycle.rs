@@ -1,6 +1,6 @@
 use super::*;
 use crate::thread_state::TerminalEventDisposition;
-use codex_protocol::config_types::MultiAgentMode;
+use crate::thread_status::ThreadStatusSubscription;
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
 
@@ -157,7 +157,7 @@ struct UnloadingState {
     delay: Duration,
     has_subscribers_rx: watch::Receiver<bool>,
     has_subscribers: (bool, Instant),
-    thread_status_rx: watch::Receiver<ThreadStatus>,
+    thread_status_rx: ThreadStatusSubscription,
     is_active: (bool, Instant),
     evict_tx: mpsc::UnboundedSender<EvictionRequest>,
     evict_rx: mpsc::UnboundedReceiver<EvictionRequest>,
@@ -1038,11 +1038,11 @@ pub(super) async fn handle_pending_thread_resume_request(
         active_turn_status = ?active_turn.as_ref().map(|turn| &turn.status),
         "composing running thread resume response"
     );
+    // The active-turn snapshot is reconstructed from retained history above and may describe a
+    // turn that was interrupted by process shutdown. The live agent status is the authority for
+    // whether that persisted in-progress turn is still running.
     let has_live_in_progress_turn =
-        matches!(conversation.agent_status().await, AgentStatus::Running)
-            || active_turn
-                .as_ref()
-                .is_some_and(|turn| matches!(turn.status, TurnStatus::InProgress));
+        matches!(conversation.agent_status().await, AgentStatus::Running);
 
     let request_id = pending.request_id;
     let connection_id = request_id.connection_id;
@@ -1150,7 +1150,6 @@ pub(super) async fn handle_pending_thread_resume_request(
         sandbox,
         active_permission_profile,
         reasoning_effort,
-        multi_agent_mode: MultiAgentMode::ExplicitRequestOnly,
         initial_turns_page,
     };
     outgoing
@@ -1294,6 +1293,14 @@ pub(super) fn set_thread_status_and_interrupt_stale_turns(
     loaded_status: ThreadStatus,
     has_live_in_progress_turn: bool,
 ) {
+    let loaded_status = match loaded_status {
+        ThreadStatus::Active { active_flags }
+            if !has_live_in_progress_turn && active_flags.is_empty() =>
+        {
+            ThreadStatus::Idle
+        }
+        status => status,
+    };
     let status = resolve_thread_status(loaded_status, has_live_in_progress_turn);
     if !matches!(status, ThreadStatus::Active { .. }) {
         for turn in &mut thread.turns {

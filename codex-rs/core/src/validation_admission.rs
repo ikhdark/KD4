@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -71,6 +72,7 @@ pub(crate) struct ValidationAuthorizationRule {
 
 #[derive(Debug, Default)]
 pub(crate) struct ValidationAuthorization {
+    enabled: bool,
     pub(crate) revision: u64,
     next_sequence: u64,
     pub(crate) rules: Vec<ValidationAuthorizationRule>,
@@ -86,7 +88,17 @@ pub(crate) enum ValidationAuthorizationMatch {
 }
 
 impl ValidationAuthorization {
+    pub(crate) fn enabled() -> Self {
+        Self {
+            enabled: true,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn update_from_user_input(&mut self, text: &str) -> bool {
+        if !self.enabled {
+            return false;
+        }
         let mut parsed = parse_directives(text);
         if parsed.is_empty() {
             return false;
@@ -620,15 +632,19 @@ impl ValidationLeaderOwnership {
 pub(crate) type SharedValidationSingleflight =
     Arc<tokio::sync::Mutex<HashMap<InFlightValidationKey, Arc<ValidationFlight>>>>;
 
-/// Process-wide validation admission, partitioned by the complete proof key.
-///
-/// Keeping the registry process-scoped lets concurrent sessions in the same
-/// workspace share an in-flight Cargo validation. Repository, source,
-/// toolchain, environment, configuration, and contract changes remain isolated
-/// by [`InFlightValidationKey`]. Completed results are still never cached.
-pub(crate) fn process_validation_singleflight() -> SharedValidationSingleflight {
-    static REGISTRY: std::sync::OnceLock<SharedValidationSingleflight> = std::sync::OnceLock::new();
-    Arc::clone(REGISTRY.get_or_init(|| Arc::new(tokio::sync::Mutex::new(HashMap::new()))))
+static DISABLED_VALIDATION_SINGLEFLIGHT: LazyLock<SharedValidationSingleflight> =
+    LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(HashMap::new())));
+
+/// Creates the in-flight validation registry owned by one turn context.
+/// Completed results are never cached, and unrelated sessions never share a
+/// command-execution decision. Disabled turns share one inert registry because
+/// validation admission never registers work for them.
+pub(crate) fn new_validation_singleflight(enabled: bool) -> SharedValidationSingleflight {
+    if enabled {
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()))
+    } else {
+        Arc::clone(&DISABLED_VALIDATION_SINGLEFLIGHT)
+    }
 }
 
 #[derive(Debug)]
@@ -714,6 +730,10 @@ pub(crate) struct ValidationLaunchPlan {
     pub(crate) proof_key: Option<codex_protocol::validation::ValidationProofKey>,
     /// The exact predeclared leaf route, when this is an automatic launch.
     pub(crate) structured_route: Option<codex_protocol::plan_tool::ValidationRoute>,
+    /// The plan step whose implementation identity was bound when the validation
+    /// launch was admitted. Command completion must not rediscover this binding
+    /// after the process has run because task evidence may have advanced by then.
+    pub(crate) bound_plan_step: Option<(String, u64)>,
     pub(crate) validation_call_id: Option<String>,
     pub(crate) turn_timing_state: Option<Arc<crate::turn_timing::TurnTimingState>>,
     pub(crate) force_fresh: bool,
@@ -725,6 +745,16 @@ pub(crate) async fn admit_validation(
     repository: &[u8],
     invocation: &CommandInvocation,
 ) -> ValidationAdmission {
+    let (enabled, authorization_revision) = {
+        let guard = authorization.read().await;
+        (guard.enabled, guard.revision)
+    };
+    if !enabled {
+        return ValidationAdmission::Execute {
+            authorization_revision,
+            observation: None,
+        };
+    }
     let classification = classify_validation(invocation);
     let ValidationClassification::Validation {
         leaves,
@@ -1683,9 +1713,35 @@ fn descriptor(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn disabled_validation_policy_does_not_parse_or_classify_commands() {
+        let authorization = Arc::new(RwLock::new(ValidationAuthorization::default()));
+        assert!(
+            !authorization
+                .write()
+                .await
+                .update_from_user_input("Do not run tests.")
+        );
+
+        let admission = admit_validation(
+            &authorization,
+            None,
+            b"ordinary-repository",
+            &CommandInvocation::Script("cargo test --workspace".into()),
+        )
+        .await;
+        assert!(matches!(
+            admission,
+            ValidationAdmission::Execute {
+                observation: None,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn prohibited_validation_wrappers_fail_closed() {
-        let mut authorization = ValidationAuthorization::default();
+        let mut authorization = ValidationAuthorization::enabled();
         assert!(authorization.update_from_user_input("Do not run tests."));
 
         for invocation in [
@@ -1709,7 +1765,7 @@ mod tests {
 
     #[test]
     fn validation_wrapper_guard_does_not_block_unprohibited_recipes() {
-        let mut authorization = ValidationAuthorization::default();
+        let mut authorization = ValidationAuthorization::enabled();
         assert!(authorization.update_from_user_input("Do not run tests."));
 
         for invocation in [
@@ -1728,7 +1784,7 @@ mod tests {
 
     #[test]
     fn focused_grant_and_workspace_denial_coexist() {
-        let mut authorization = ValidationAuthorization::default();
+        let mut authorization = ValidationAuthorization::enabled();
         assert!(
             authorization
                 .update_from_user_input("Run focused tests; do not run the workspace suite.")
@@ -1755,7 +1811,7 @@ mod tests {
 
     #[test]
     fn validation_authorization_ignores_foreign_policy_versions() {
-        let mut authorization = ValidationAuthorization::default();
+        let mut authorization = ValidationAuthorization::enabled();
         assert!(authorization.update_from_user_input("Run focused tests."));
         assert_eq!(
             authorization.decision_for(
@@ -1781,7 +1837,7 @@ mod tests {
 
     #[test]
     fn quoted_and_interrogative_text_do_not_authorize() {
-        let mut authorization = ValidationAuthorization::default();
+        let mut authorization = ValidationAuthorization::enabled();
         assert!(!authorization.update_from_user_input(
             "Write documentation saying 'run tests'. Why did it run tests?"
         ));
@@ -1789,7 +1845,7 @@ mod tests {
 
     #[test]
     fn broad_prohibition_matches_unknown_but_narrow_grant_does_not() {
-        let mut prohibited = ValidationAuthorization::default();
+        let mut prohibited = ValidationAuthorization::enabled();
         prohibited.update_from_user_input("Do not run tests.");
         assert_eq!(
             prohibited.decision_for(
@@ -1800,7 +1856,7 @@ mod tests {
             ),
             ValidationAuthorizationMatch::Prohibited
         );
-        let mut granted = ValidationAuthorization::default();
+        let mut granted = ValidationAuthorization::enabled();
         granted.update_from_user_input("Run focused tests.");
         assert_eq!(
             granted.decision_for(
@@ -1884,7 +1940,7 @@ mod tests {
 
     #[test]
     fn directive_defaults_are_operation_isolated() {
-        let mut authorization = ValidationAuthorization::default();
+        let mut authorization = ValidationAuthorization::enabled();
         assert!(authorization.update_from_user_input("Run checks; run lint; do not run tests."));
         assert_eq!(
             authorization.decision_for(
@@ -1914,7 +1970,7 @@ mod tests {
             ValidationAuthorizationMatch::Unspecified
         );
 
-        let mut revoked = ValidationAuthorization::default();
+        let mut revoked = ValidationAuthorization::enabled();
         revoked.update_from_user_input("Run focused tests.");
         revoked.update_from_user_input("Do not run tests.");
         assert_eq!(
@@ -2032,7 +2088,7 @@ mod tests {
 
     #[tokio::test]
     async fn command_runner_classification_routes_are_consistent() {
-        let authorization = Arc::new(RwLock::new(ValidationAuthorization::default()));
+        let authorization = Arc::new(RwLock::new(ValidationAuthorization::enabled()));
         let cases = [
             (
                 CommandInvocation::Argv {
@@ -2146,7 +2202,7 @@ mod tests {
             ));
         }
 
-        let mut prohibited = ValidationAuthorization::default();
+        let mut prohibited = ValidationAuthorization::enabled();
         assert!(prohibited.update_from_user_input("Do not run tests."));
         let prohibited = Arc::new(RwLock::new(prohibited));
         for (invocation, _, _) in cases
@@ -2252,14 +2308,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_singleflight_registry_is_shared_across_turns() {
-        let first_turn = process_validation_singleflight();
-        let second_turn = process_validation_singleflight();
-        assert!(Arc::ptr_eq(&first_turn, &second_turn));
+    async fn validation_singleflight_registry_is_local_to_its_turn() {
+        let first_turn = new_validation_singleflight(true);
+        let second_turn = new_validation_singleflight(true);
+        assert!(!Arc::ptr_eq(&first_turn, &second_turn));
 
         let task_cancellation = CancellationToken::new();
         let invocation = CommandInvocation::Script(
-            "cargo test -p codex-core process_singleflight_registry_is_shared_across_turns".into(),
+            "cargo test -p codex-core validation_singleflight_registry_is_local_to_its_turn".into(),
         );
         let key = validation_identity(
             b"process-registry-test-repo",
@@ -2280,15 +2336,27 @@ mod tests {
             ValidationRegistration::Leader { execution, .. } => execution,
             ValidationRegistration::Follower(_) => panic!("first turn must lead"),
         };
-        match register_if_absent(&second_turn, key, "second-turn-call", &task_cancellation).await {
-            ValidationRegistration::Follower(follower) => {
-                assert_eq!(follower.shared_from_call_id(), "first-turn-call");
-            }
-            ValidationRegistration::Leader { .. } => {
-                panic!("second turn must join the process-scoped flight")
-            }
-        }
+        let second_execution =
+            match register_if_absent(&second_turn, key, "second-turn-call", &task_cancellation)
+                .await
+            {
+                ValidationRegistration::Leader { execution, .. } => execution,
+                ValidationRegistration::Follower(_) => {
+                    panic!("a distinct turn must own a distinct validation flight")
+                }
+            };
         execution.abandon().await;
+        second_execution.abandon().await;
+    }
+
+    #[test]
+    fn disabled_validation_singleflight_does_not_allocate_per_turn() {
+        let first_turn = new_validation_singleflight(false);
+        let second_turn = new_validation_singleflight(false);
+        let enabled_turn = new_validation_singleflight(true);
+
+        assert!(Arc::ptr_eq(&first_turn, &second_turn));
+        assert!(!Arc::ptr_eq(&first_turn, &enabled_turn));
     }
 
     #[tokio::test]

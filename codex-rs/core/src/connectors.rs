@@ -1,9 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::LazyLock;
-use std::sync::Mutex as StdMutex;
 use std::time::Duration;
-use std::time::Instant;
 
 use async_channel::unbounded;
 pub use codex_connectors::AppBranding;
@@ -32,6 +29,8 @@ use codex_features::Feature;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
+use codex_mcp::CodexAppsToolsCache;
+use codex_mcp::CodexAppsToolsSnapshot;
 use codex_mcp::MCP_TOOL_CODEX_APPS_META_KEY;
 use codex_mcp::McpConnectionManager;
 use codex_mcp::McpRuntimeContext;
@@ -41,27 +40,9 @@ use codex_mcp::codex_apps_tools_cache_key;
 use codex_mcp::compute_auth_statuses;
 use codex_mcp::effective_mcp_servers;
 use codex_mcp::tool_plugin_provenance;
+use codex_protocol::protocol::Product;
 
 const CONNECTORS_READY_TIMEOUT_ON_EMPTY_TOOLS: Duration = Duration::from_secs(30);
-
-#[derive(Clone, PartialEq, Eq)]
-struct AccessibleConnectorsCacheKey {
-    chatgpt_base_url: String,
-    account_id: Option<String>,
-    chatgpt_user_id: Option<String>,
-    is_workspace_account: bool,
-}
-
-#[derive(Clone)]
-struct CachedAccessibleConnectors {
-    key: AccessibleConnectorsCacheKey,
-    expires_at: Instant,
-    connectors: Vec<AppInfo>,
-    codex_apps_ready: bool,
-}
-
-static ACCESSIBLE_CONNECTORS_CACHE: LazyLock<StdMutex<Option<CachedAccessibleConnectors>>> =
-    LazyLock::new(|| StdMutex::new(None));
 
 #[derive(Debug, Clone)]
 pub struct AccessibleConnectorsStatus {
@@ -119,6 +100,22 @@ pub(crate) async fn list_tool_suggest_discoverable_tools_with_auth(
 pub async fn list_cached_accessible_connectors_from_mcp_tools(
     config: &Config,
 ) -> Option<Vec<AppInfo>> {
+    let tools_cache = CodexAppsToolsCache::shared();
+    list_cached_accessible_connectors_from_tools_cache(config, &tools_cache).await
+}
+
+pub async fn list_cached_accessible_connectors_from_mcp_tools_with_mcp_manager(
+    config: &Config,
+    mcp_manager: &McpManager,
+) -> Option<Vec<AppInfo>> {
+    let tools_cache = mcp_manager.codex_apps_tools_cache();
+    list_cached_accessible_connectors_from_tools_cache(config, &tools_cache).await
+}
+
+async fn list_cached_accessible_connectors_from_tools_cache(
+    config: &Config,
+    tools_cache: &CodexAppsToolsCache,
+) -> Option<Vec<AppInfo>> {
     let auth_manager =
         AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
     let auth = auth_manager.auth().await;
@@ -128,26 +125,16 @@ pub async fn list_cached_accessible_connectors_from_mcp_tools(
     {
         return Some(Vec::new());
     }
-    let cache_key = accessible_connectors_cache_key(config, auth.as_ref());
-    read_cached_accessible_connectors(&cache_key).map(|status| status.connectors)
-}
-
-pub(crate) fn refresh_accessible_connectors_cache_from_mcp_tools(
-    config: &Config,
-    auth: Option<&CodexAuth>,
-    mcp_tools: &[ToolInfo],
-) {
-    if !config.features.enabled(Feature::Apps) {
-        return;
-    }
-
-    let cache_key = accessible_connectors_cache_key(config, auth);
-    let accessible_connectors = accessible_connectors_for_app_list_from_mcp_tools(mcp_tools);
-    write_cached_accessible_connectors(
-        cache_key,
-        &accessible_connectors,
-        /*codex_apps_ready*/ true,
-    );
+    tools_cache
+        .current_snapshot(
+            config.codex_home.to_path_buf(),
+            codex_apps_tools_cache_key(
+                auth.as_ref(),
+                &config.chatgpt_base_url,
+                config.apps_mcp_product_sku.as_deref(),
+            ),
+        )
+        .map(|snapshot| accessible_connectors_status_from_tools_snapshot(&snapshot).connectors)
 }
 
 pub async fn list_accessible_connectors_from_mcp_tools_with_options(
@@ -168,10 +155,8 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_options_and_status(
     // TODO: Wire callers that already own an EnvironmentManager into
     // list_accessible_connectors_from_mcp_tools_with_environment_manager instead
     // of constructing a temporary manager here.
-    let local_runtime_paths = ExecServerRuntimePaths::from_optional_paths(
-        config.codex_self_exe.clone(),
-        config.codex_linux_sandbox_exe.clone(),
-    )?;
+    let local_runtime_paths =
+        ExecServerRuntimePaths::from_optional_path(config.codex_self_exe.clone())?;
     let environment_manager =
         EnvironmentManager::from_codex_home(config.codex_home.clone(), Some(local_runtime_paths))
             .await?;
@@ -188,7 +173,9 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_environment_manager(
     force_refetch: bool,
     environment_manager: Arc<EnvironmentManager>,
 ) -> anyhow::Result<AccessibleConnectorsStatus> {
-    let plugins_manager = Arc::new(PluginsManager::new(config.codex_home.to_path_buf()));
+    let auth_manager =
+        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
+    let plugins_manager = connector_discovery_plugins_manager(config, auth_manager.as_ref());
     let mcp_manager = Arc::new(McpManager::new(plugins_manager));
     list_accessible_connectors_from_mcp_tools_with_mcp_manager(
         config,
@@ -197,6 +184,17 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_environment_manager(
         mcp_manager,
     )
     .await
+}
+
+fn connector_discovery_plugins_manager(
+    config: &Config,
+    auth_manager: &AuthManager,
+) -> Arc<PluginsManager> {
+    Arc::new(PluginsManager::new_with_options(
+        config.codex_home.to_path_buf(),
+        Some(Product::Codex),
+        auth_manager.get_api_auth_mode(),
+    ))
 }
 
 pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
@@ -217,11 +215,20 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
             codex_apps_ready: true,
         });
     }
-    let cache_key = accessible_connectors_cache_key(config, auth.as_ref());
+    let tools_cache = mcp_manager.codex_apps_tools_cache();
     let mcp_config = mcp_manager.runtime_config(config).await;
+    let tools_cache_key = codex_apps_tools_cache_key(
+        auth.as_ref(),
+        &mcp_config.chatgpt_base_url,
+        mcp_config.apps_mcp_product_sku.as_deref(),
+    );
     let tool_plugin_provenance = tool_plugin_provenance(&mcp_config);
-    if !force_refetch && let Some(mut cached_status) = read_cached_accessible_connectors(&cache_key)
+    if !force_refetch
+        && let Some(snapshot) =
+            tools_cache.current_snapshot(config.codex_home.to_path_buf(), tools_cache_key.clone())
+        && snapshot.is_fresh_for(codex_connectors::CONNECTORS_CACHE_TTL)
     {
+        let mut cached_status = accessible_connectors_status_from_tools_snapshot(&snapshot);
         cached_status.connectors =
             with_app_plugin_sources(cached_status.connectors, &tool_plugin_provenance);
         return Ok(cached_status);
@@ -268,8 +275,8 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
         // one exists, but do not reintroduce the old hidden-local fallback.
         runtime_context,
         config.codex_home.to_path_buf(),
-        mcp_manager.codex_apps_tools_cache(),
-        codex_apps_tools_cache_key(auth.as_ref()),
+        tools_cache.clone(),
+        tools_cache_key.clone(),
         mcp_config.prefix_mcp_tool_names,
         mcp_config.client_elicitation_capability,
         /*supports_openai_form_elicitation*/ false,
@@ -306,7 +313,7 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
         mcp_connection_manager.list_all_tools().await
     };
     let mut should_reload_tools = false;
-    let codex_apps_ready = if refreshed_tools_succeeded {
+    let mut codex_apps_ready = if refreshed_tools_succeeded {
         true
     } else if let Some(cfg) = mcp_servers.get(CODEX_APPS_MCP_SERVER_NAME) {
         let immediate_ready = mcp_connection_manager
@@ -337,71 +344,38 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
         cancel_token.cancel();
     }
 
-    let accessible_connectors = accessible_connectors_for_app_list_from_mcp_tools(&tools);
-    if codex_apps_ready || !accessible_connectors.is_empty() {
-        write_cached_accessible_connectors(cache_key, &accessible_connectors, codex_apps_ready);
-    }
-    let accessible_connectors =
-        with_app_plugin_sources(accessible_connectors, &tool_plugin_provenance);
     mcp_connection_manager.shutdown().await;
+    if let Some(snapshot) =
+        tools_cache.current_snapshot(config.codex_home.to_path_buf(), tools_cache_key)
+        && snapshot.codex_apps_ready()
+    {
+        tools = snapshot.tools().to_vec();
+        codex_apps_ready = true;
+    }
+    let accessible_connectors = with_app_plugin_sources(
+        accessible_connectors_for_app_list_from_mcp_tools(&tools),
+        &tool_plugin_provenance,
+    );
     Ok(AccessibleConnectorsStatus {
         connectors: accessible_connectors,
         codex_apps_ready,
     })
 }
 
-fn accessible_connectors_cache_key(
-    config: &Config,
-    auth: Option<&CodexAuth>,
-) -> AccessibleConnectorsCacheKey {
-    let account_id = auth.and_then(CodexAuth::get_account_id);
-    let chatgpt_user_id = auth.and_then(CodexAuth::get_chatgpt_user_id);
-    let is_workspace_account = auth.is_some_and(CodexAuth::is_workspace_account);
-    AccessibleConnectorsCacheKey {
-        chatgpt_base_url: config.chatgpt_base_url.clone(),
-        account_id,
-        chatgpt_user_id,
-        is_workspace_account,
-    }
+fn accessible_connectors_status_from_tools_snapshot(
+    snapshot: &CodexAppsToolsSnapshot,
+) -> AccessibleConnectorsStatus {
+    accessible_connectors_status_from_tools(snapshot.tools(), snapshot.codex_apps_ready())
 }
 
-fn read_cached_accessible_connectors(
-    cache_key: &AccessibleConnectorsCacheKey,
-) -> Option<AccessibleConnectorsStatus> {
-    let mut cache_guard = ACCESSIBLE_CONNECTORS_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let now = Instant::now();
-
-    if let Some(cached) = cache_guard.as_ref() {
-        if now < cached.expires_at && cached.key == *cache_key {
-            return Some(AccessibleConnectorsStatus {
-                connectors: cached.connectors.clone(),
-                codex_apps_ready: cached.codex_apps_ready,
-            });
-        }
-        if now >= cached.expires_at {
-            *cache_guard = None;
-        }
-    }
-
-    None
-}
-
-fn write_cached_accessible_connectors(
-    cache_key: AccessibleConnectorsCacheKey,
-    connectors: &[AppInfo],
+fn accessible_connectors_status_from_tools(
+    tools: &[ToolInfo],
     codex_apps_ready: bool,
-) {
-    let mut cache_guard = ACCESSIBLE_CONNECTORS_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *cache_guard = Some(CachedAccessibleConnectors {
-        key: cache_key,
-        expires_at: Instant::now() + codex_connectors::CONNECTORS_CACHE_TTL,
-        connectors: connectors.to_vec(),
+) -> AccessibleConnectorsStatus {
+    AccessibleConnectorsStatus {
+        connectors: accessible_connectors_for_app_list_from_mcp_tools(tools),
         codex_apps_ready,
-    });
+    }
 }
 
 fn tool_suggest_connector_ids(

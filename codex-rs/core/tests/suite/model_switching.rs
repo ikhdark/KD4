@@ -695,8 +695,8 @@ async fn generated_image_is_replayed_for_image_capable_models() -> Result<()> {
     );
     assert_eq!(
         image_generation_calls[0]["id"].as_str(),
-        None,
-        "expected the image generation call id to be omitted"
+        Some("ig_123"),
+        "expected the image generation call id to be preserved"
     );
     assert_eq!(
         image_generation_calls[0]["result"].as_str(),
@@ -800,8 +800,8 @@ async fn model_change_from_generated_image_to_text_preserves_prior_generated_ima
     );
     assert_eq!(
         image_generation_calls[0]["id"].as_str(),
-        None,
-        "second request should omit the generated image call id"
+        Some("ig_123"),
+        "second request should preserve the generated image call id"
     );
     assert_eq!(
         image_generation_calls[0]["result"].as_str(),

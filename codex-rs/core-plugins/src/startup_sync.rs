@@ -94,12 +94,6 @@ fn curated_plugins_sha_path(codex_home: &Path) -> PathBuf {
 }
 
 pub fn sync_openai_plugins_repo(codex_home: &Path) -> Result<String, String> {
-    #[cfg(target_os = "macos")]
-    let git_binary = match which::which("git") {
-        Ok(git_path) => macos_git_binary_from_path(git_path, apple_developer_tools_available()),
-        Err(_) => None,
-    };
-    #[cfg(not(target_os = "macos"))]
     let git_binary = Some(PathBuf::from("git"));
 
     sync_openai_plugins_repo_with_transport_overrides(
@@ -672,29 +666,6 @@ fn git_command(git_binary: &Path) -> Command {
     command
 }
 
-#[cfg(any(target_os = "macos", test))]
-fn macos_git_binary_from_path(
-    git_path: PathBuf,
-    apple_developer_tools_available: bool,
-) -> Option<PathBuf> {
-    if git_path == Path::new("/usr/bin/git") && !apple_developer_tools_available {
-        None
-    } else {
-        Some(git_path)
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn apple_developer_tools_available() -> bool {
-    Command::new("/usr/bin/xcode-select")
-        .arg("-p")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
 fn run_git_command_with_timeout(
     command: &mut Command,
     context: &str,
@@ -767,7 +738,8 @@ fn ensure_git_success(output: &Output, context: &str) -> Result<(), String> {
 async fn fetch_curated_repo_remote_sha(api_base_url: &str) -> Result<String, String> {
     let api_base_url = api_base_url.trim_end_matches('/');
     let repo_url = format!("{api_base_url}/repos/{OPENAI_PLUGINS_OWNER}/{OPENAI_PLUGINS_REPO}");
-    let client = create_client_without_request_logging();
+    let client = create_client_without_request_logging()
+        .map_err(|err| format!("failed to build HTTP client: {err}"))?;
     let repo_body = fetch_github_text(&client, &repo_url, "get curated plugins repository").await?;
     let repo_summary: GitHubRepositorySummary =
         serde_json::from_str(&repo_body).map_err(|err| {
@@ -801,14 +773,16 @@ async fn fetch_curated_repo_zipball(
     let api_base_url = api_base_url.trim_end_matches('/');
     let repo_url = format!("{api_base_url}/repos/{OPENAI_PLUGINS_OWNER}/{OPENAI_PLUGINS_REPO}");
     let zipball_url = format!("{repo_url}/zipball/{remote_sha}");
-    let client = create_client_without_request_logging();
+    let client = create_client_without_request_logging()
+        .map_err(|err| format!("failed to build HTTP client: {err}"))?;
     fetch_github_bytes(&client, &zipball_url, "download curated plugins archive").await
 }
 
 async fn fetch_curated_repo_backup_archive_zip(
     backup_archive_api_url: &str,
 ) -> Result<Vec<u8>, String> {
-    let client = create_client_without_request_logging();
+    let client = create_client_without_request_logging()
+        .map_err(|err| format!("failed to build HTTP client: {err}"))?;
     let export_body = fetch_public_text(
         &client,
         backup_archive_api_url,
@@ -1103,22 +1077,6 @@ fn extract_zipball_to_dir(bytes: &[u8], destination: &Path) -> Result<(), String
     Ok(())
 }
 
-#[cfg(unix)]
-fn apply_zip_permissions(entry: &zip::read::ZipFile<'_>, output_path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let Some(mode) = entry.unix_mode() else {
-        return Ok(());
-    };
-    std::fs::set_permissions(output_path, std::fs::Permissions::from_mode(mode)).map_err(|err| {
-        format!(
-            "failed to set permissions on curated plugins file {}: {err}",
-            output_path.display()
-        )
-    })
-}
-
-#[cfg(not(unix))]
 fn apply_zip_permissions(
     _entry: &zip::read::ZipFile<'_>,
     _output_path: &Path,

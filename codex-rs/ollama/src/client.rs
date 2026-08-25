@@ -7,8 +7,8 @@ use std::io;
 
 use crate::line_buffer::LineBuffer;
 use crate::parser::pull_events_from_value;
+use crate::pull::CliProgressReporter;
 use crate::pull::PullEvent;
-use crate::pull::PullProgressReporter;
 use crate::url::base_url_to_host_root;
 use crate::url::is_openai_compatible_base_url;
 use codex_core::config::Config;
@@ -210,12 +210,9 @@ impl OllamaClient {
         Ok(Box::pin(s))
     }
 
-    /// High-level helper to pull a model and drive a progress reporter.
-    pub async fn pull_with_reporter(
-        &self,
-        model: &str,
-        reporter: &mut dyn PullProgressReporter,
-    ) -> io::Result<()> {
+    /// Pull a model while reporting progress to the CLI.
+    pub(crate) async fn pull_with_cli_progress(&self, model: &str) -> io::Result<()> {
+        let mut reporter = CliProgressReporter::new();
         reporter.on_event(&PullEvent::Status(format!("Pulling model {model}...")))?;
         let mut stream = self.pull_model_stream(model).await?;
         while let Some(event) = stream.next().await {

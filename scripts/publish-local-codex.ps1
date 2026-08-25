@@ -403,110 +403,15 @@ function Invoke-GitNulDelimitedList {
     }
 }
 
-function Get-TrackedSourceNewestWriteUtc {
-    param(
-        [string]$RepoRoot,
-        [switch]$RequireStatusScan
-    )
-
-    $git = Get-Command git -ErrorAction SilentlyContinue
-    if (-not $git) {
-        return $null
-    }
-
-    $newest = $null
-
-    try {
-        $trackedResult = Invoke-GitNulDelimitedList `
-            -GitPath $git.Source `
-            -RepoRoot $RepoRoot `
-            -Arguments @("-c", "core.quotepath=false", "ls-files", "-z", "--", "codex-rs", "scripts/publish-local-codex.ps1", "scripts/common-rust-env.ps1", "justfile")
-    }
-    catch {
-        return $null
-    }
-    if ($trackedResult.ExitCode -eq 0) {
-        foreach ($file in $trackedResult.Records) {
-            if (-not (Test-LocalPublishBuildRelevantPath -Path $file)) {
-                continue
-            }
-            $path = Join-Path $RepoRoot (($file -replace "/", [System.IO.Path]::DirectorySeparatorChar))
-            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-                continue
-            }
-
-            $lastWrite = [System.IO.File]::GetLastWriteTimeUtc($path)
-            if ($null -eq $newest -or $lastWrite -gt $newest) {
-                $newest = $lastWrite
-            }
-        }
-    }
-
-    try {
-        $changedResult = Invoke-GitNulDelimitedList `
-            -GitPath $git.Source `
-            -RepoRoot $RepoRoot `
-            -Arguments @("-c", "core.quotepath=false", "status", "--porcelain=v1", "-z", "-uall", "--")
-    }
-    catch {
-        if ($RequireStatusScan) {
-            return $null
-        }
-        return $newest
-    }
-    if ($changedResult.ExitCode -ne 0) {
-        if ($RequireStatusScan) {
-            return $null
-        }
-        return $newest
-    }
-
-    $changedFiles = @($changedResult.Records)
-    for ($changedIndex = 0; $changedIndex -lt $changedFiles.Count; $changedIndex++) {
-        $entry = $changedFiles[$changedIndex]
-        if ([string]::IsNullOrWhiteSpace($entry) -or $entry.Length -lt 4) {
-            continue
-        }
-        $statusCode = $entry.Substring(0, 2)
-        $file = $entry.Substring(3)
-        if (($statusCode.Contains("R") -or $statusCode.Contains("C")) -and ($changedIndex + 1) -lt $changedFiles.Count) {
-            # In porcelain v1 -z output the destination is in the status
-            # record and the source path follows as a second NUL record.
-            $changedIndex++
-        }
-        if (-not (Test-LocalPublishBuildRelevantPath -Path $file)) {
-            continue
-        }
-
-        $path = Join-Path $RepoRoot (($file -replace "/", [System.IO.Path]::DirectorySeparatorChar))
-        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-            if ($statusCode.Contains("D")) {
-                $deletedWrite = [DateTime]::UtcNow
-                if ($null -eq $newest -or $deletedWrite -gt $newest) {
-                    $newest = $deletedWrite
-                }
-            }
-            continue
-        }
-
-        $lastWrite = [System.IO.File]::GetLastWriteTimeUtc($path)
-        if ($null -eq $newest -or $lastWrite -gt $newest) {
-            $newest = $lastWrite
-        }
-    }
-
-    return $newest
-}
-
 function Get-SourceNewestWriteUtcForProof {
     param(
-        [string]$RepoRoot,
+        [AllowNull()]
+        [object]$SourceSnapshot,
         [string]$StampPath
     )
 
-    $liveNewestUtc = Get-TrackedSourceNewestWriteUtc -RepoRoot $RepoRoot -RequireStatusScan
-    if ($null -ne $liveNewestUtc) {
-        return $liveNewestUtc
+    if ($null -ne $SourceSnapshot -and $null -ne $SourceSnapshot.NewestWriteUtc) {
+        return $SourceSnapshot.NewestWriteUtc
     }
 
     return Get-BuildStampNewestWriteUtc -StampPath $StampPath
@@ -557,7 +462,7 @@ function Get-CachedLocalPublishFileSha256 {
     }
 }
 
-function Get-LocalPublishBuildInputFingerprint {
+function Get-LocalPublishBuildInputSnapshot {
     param(
         [string]$RepoRoot
     )
@@ -605,6 +510,7 @@ function Get-LocalPublishBuildInputFingerprint {
     $sha256 = [Security.Cryptography.SHA256]::Create()
     $utf8 = [Text.UTF8Encoding]::new($false)
     $empty = [byte[]]::new(0)
+    $newestWriteUtc = $null
     try {
         $prefixBytes = $utf8.GetBytes("codex-local-publish-inputs-v3`nhead=$(([string]$headCommit[0]).Trim())`n")
         [void]$sha256.TransformBlock($prefixBytes, 0, $prefixBytes.Length, $prefixBytes, 0)
@@ -619,10 +525,17 @@ function Get-LocalPublishBuildInputFingerprint {
             if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
                 $missingBytes = $utf8.GetBytes("missing:$($pathBytes.Length):$normalized`n")
                 [void]$sha256.TransformBlock($missingBytes, 0, $missingBytes.Length, $missingBytes, 0)
+                $deletedWriteUtc = [DateTime]::UtcNow
+                if ($null -eq $newestWriteUtc -or $deletedWriteUtc -gt $newestWriteUtc) {
+                    $newestWriteUtc = $deletedWriteUtc
+                }
                 continue
             }
 
             $fileInfo = [System.IO.FileInfo]::new($path)
+            if ($null -eq $newestWriteUtc -or $fileInfo.LastWriteTimeUtc -gt $newestWriteUtc) {
+                $newestWriteUtc = $fileInfo.LastWriteTimeUtc
+            }
             $fileSha256 = Get-CachedLocalPublishFileSha256 -Path $path -ForceRefresh
             if (-not (Test-Sha256Text -Value $fileSha256)) {
                 return $null
@@ -634,7 +547,10 @@ function Get-LocalPublishBuildInputFingerprint {
         }
 
         [void]$sha256.TransformFinalBlock($empty, 0, 0)
-        return [BitConverter]::ToString($sha256.Hash).Replace("-", "").ToLowerInvariant()
+        return [pscustomobject]@{
+            Fingerprint = [BitConverter]::ToString($sha256.Hash).Replace("-", "").ToLowerInvariant()
+            NewestWriteUtc = $newestWriteUtc
+        }
     }
     catch {
         return $null
@@ -724,7 +640,9 @@ function Get-AutoSkipBuildDecision {
         [string]$SourceExe,
         [string]$SourceCodeModeHostExe,
         [string]$SourceWindowsSandboxSetupExe,
-        [string]$SourceCommandRunnerExe
+        [string]$SourceCommandRunnerExe,
+        [AllowNull()]
+        [object]$SourceSnapshot
     )
 
     if (
@@ -750,7 +668,15 @@ function Get-AutoSkipBuildDecision {
         return [pscustomobject]@{ CanSkip = $false; Reason = "build stamp profile mismatch" }
     }
 
-    $sourceFingerprint = Get-LocalPublishBuildInputFingerprint -RepoRoot $RepoRoot
+    if ($null -eq $SourceSnapshot) {
+        $SourceSnapshot = Get-LocalPublishBuildInputSnapshot -RepoRoot $RepoRoot
+    }
+    $sourceFingerprint = if ($null -eq $SourceSnapshot) {
+        $null
+    }
+    else {
+        $SourceSnapshot.Fingerprint
+    }
     if (-not (Test-Sha256Text -Value $sourceFingerprint)) {
         return [pscustomobject]@{ CanSkip = $false; Reason = "publish input fingerprint unavailable" }
     }
@@ -1464,6 +1390,18 @@ function Set-PathEnvironmentVariableForTarget {
     }
 }
 
+function Get-LocalPublishBuildInputFingerprint {
+    param(
+        [string]$RepoRoot
+    )
+
+    $snapshot = Get-LocalPublishBuildInputSnapshot -RepoRoot $RepoRoot
+    if ($null -eq $snapshot) {
+        return $null
+    }
+    return $snapshot.Fingerprint
+}
+
 function Get-BuiltWindowsSandboxSetupPath {
     param(
         [string]$RepoRoot,
@@ -2013,7 +1951,7 @@ function Get-GitBuildCommit {
         return "unknown"
     }
 
-    # See Get-TrackedSourceNewestWriteUtc: keep 5.1-safe around redirected git stderr.
+    # Keep Windows PowerShell 5.1 safe around redirected native Git stderr.
     $oldErrorActionPreference = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
@@ -2039,7 +1977,7 @@ function Get-GitBuildDirty {
         return "unknown"
     }
 
-    # See Get-TrackedSourceNewestWriteUtc: keep 5.1-safe around redirected git stderr.
+    # Keep Windows PowerShell 5.1 safe around redirected native Git stderr.
     $oldErrorActionPreference = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
@@ -2443,15 +2381,10 @@ function Invoke-CodexBuild {
     }
     $publishPackages = @("-p", "codex-cli", "-p", "codex-code-mode-host", "-p", "codex-windows-sandbox")
     $buildArgs = $cargoConfigArgs + @("build") + $publishPackages + @("--profile", $cargoProfile)
-    $checkArgs = $cargoConfigArgs + @("check") + $publishPackages + @("--profile", $cargoProfile)
-    $preflightCheckEnabled = -not $SkipPreflightCheck -and $Profile -ne "debug"
-    $runPreflightCheck = -not $DryRun -and $preflightCheckEnabled
 
     $codexRs = Join-Path $RepoRoot "codex-rs"
     $publishTargetDir = Join-Path $codexRs "target\publish-$Profile"
-    $checkCommandArgs = @(Add-CargoTargetDirArgument -CommandArgs (@("cargo") + $checkArgs) -TargetDir $publishTargetDir)
     $buildCommandArgs = @(Add-CargoTargetDirArgument -CommandArgs (@("cargo") + $buildArgs) -TargetDir $publishTargetDir)
-    $checkCommand = Format-CargoCommandForProof -CommandArgs $checkCommandArgs
     $buildCommand = Format-CargoCommandForProof -CommandArgs $buildCommandArgs
     Assert-RustyV8ArchiveReadyForPublish `
         -RepoRoot $RepoRoot `
@@ -2460,9 +2393,6 @@ function Invoke-CodexBuild {
         -AllowDownload:$AllowRustyV8Download `
         -ArchivePath $RustyV8Archive
     if ($DryRun) {
-        if ($preflightCheckEnabled) {
-            Write-ProofLine "preflightCheckCommand" "$checkCommand (not run)"
-        }
         Write-ProofLine "buildCommand" "$buildCommand (not run)"
         return
     }
@@ -2483,9 +2413,6 @@ function Invoke-CodexBuild {
     Write-ProofLine "cargoTargetDir" $publishTargetDir
     Push-Location $codexRs
     try {
-        if ($runPreflightCheck) {
-            Invoke-CargoForPublish -CommandArgs $checkCommandArgs -FailureDescription "cargo check"
-        }
         Invoke-CargoForPublish -CommandArgs $buildCommandArgs -FailureDescription "cargo build"
     }
     finally {
@@ -2798,7 +2725,7 @@ if ($TestRun -and $SkipBuild) {
 }
 
 $sourceBuildStampMustRemainValid = $false
-if ($AutoSkipBuild -and -not $SkipBuild -and -not $BuildOnly) {
+if ($AutoSkipBuild -and -not $SkipBuild) {
     $autoSkipBuildDecision = Get-AutoSkipBuildDecision `
         -RepoRoot $repoRoot `
         -StampPath $buildStampPath `
@@ -2831,14 +2758,20 @@ if (-not $SkipBuild) {
     }
     Invoke-CodexBuild -RepoRoot $repoRoot -Profile $Profile -DryRun:$DryRun
     if (-not $DryRun -and $null -ne $buildInputFingerprintBefore) {
-        $buildInputFingerprintAfter = Get-LocalPublishBuildInputFingerprint -RepoRoot $repoRoot
+        $buildInputSnapshotAfter = Get-LocalPublishBuildInputSnapshot -RepoRoot $repoRoot
+        $buildInputFingerprintAfter = if ($null -eq $buildInputSnapshotAfter) {
+            $null
+        }
+        else {
+            $buildInputSnapshotAfter.Fingerprint
+        }
         if (-not (Test-Sha256Text -Value $buildInputFingerprintAfter)) {
             throw "Could not fingerprint local publish inputs after build; refusing to publish an unbound build."
         }
         if ($buildInputFingerprintBefore -cne $buildInputFingerprintAfter) {
             throw "Local publish inputs changed during the build; rerun publish so the artifacts match one source snapshot."
         }
-        $builtSourceNewestUtc = Get-TrackedSourceNewestWriteUtc -RepoRoot $repoRoot
+        $builtSourceNewestUtc = $buildInputSnapshotAfter.NewestWriteUtc
         Write-BuildStamp `
             -StampPath (Get-BuildStampPath -RepoRoot $repoRoot -Profile $Profile) `
             -Profile $Profile `
@@ -2975,9 +2908,15 @@ Write-ProofLine "sourceSha256" $sourceSha256
 Write-ProofLine "sourceCodeModeHostSha256" $sourceCodeModeHostSha256
 Write-ProofLine "sourceWindowsSandboxSetupSha256" $sourceWindowsSandboxSetupSha256
 Write-ProofLine "sourceCommandRunnerSha256" $sourceCommandRunnerSha256
+$finalBuildInputSnapshot = if ($SkipBuild -or $sourceBuildStampMustRemainValid) {
+    Get-LocalPublishBuildInputSnapshot -RepoRoot $repoRoot
+}
+else {
+    $null
+}
 $sourceTreeNewestUtc = if ($SkipBuild) {
     Get-SourceNewestWriteUtcForProof `
-        -RepoRoot $repoRoot `
+        -SourceSnapshot $finalBuildInputSnapshot `
         -StampPath $buildStampPath
 }
 else {
@@ -3010,7 +2949,8 @@ if ($SkipBuild -or $sourceBuildStampMustRemainValid) {
         -SourceExe $SourceExe `
         -SourceCodeModeHostExe $SourceCodeModeHostExe `
         -SourceWindowsSandboxSetupExe $SourceWindowsSandboxSetupExe `
-        -SourceCommandRunnerExe $SourceCommandRunnerExe
+        -SourceCommandRunnerExe $SourceCommandRunnerExe `
+        -SourceSnapshot $finalBuildInputSnapshot
     Write-ProofLine "sourceBuildStampValidation" $finalBuildStampDecision.Reason
     if ($finalBuildStampDecision.CanSkip) {
         $sourceBuildFreshnessProvenByStamp = $true

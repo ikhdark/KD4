@@ -208,7 +208,6 @@ fn drop_lockfile_inputs(lock_config: &mut ConfigToml) {
     lock_config.sandbox_workspace_write = None;
     lock_config.default_permissions = None;
     lock_config.permissions = None;
-    lock_config.experimental_use_unified_exec_tool = None;
 }
 
 fn resolved_config_to_toml<Toml>(
@@ -267,6 +266,10 @@ mod tests {
             .expect("lock should materialize feature states");
         let feature_entries = features.entries();
         for spec in codex_features::FEATURES {
+            if matches!(spec.stage, codex_features::Stage::Internal) {
+                assert_eq!(feature_entries.get(spec.key), None, "{}", spec.key);
+                continue;
+            }
             assert_eq!(
                 feature_entries.get(spec.key),
                 Some(&sc.original_config_do_not_use.features.enabled(spec.id)),

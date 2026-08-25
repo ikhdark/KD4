@@ -101,7 +101,7 @@ pub(crate) fn normalize_hook_context(
     if !capsule_shape_is_complete(&value) {
         return ContinuityContextNormalization::Invalid;
     }
-    let Ok(capsule) = serde_json::from_str::<ContinuityCapsule>(json) else {
+    let Ok(capsule) = continuity_capsule_from_value(value) else {
         return ContinuityContextNormalization::Invalid;
     };
     if !capsule_is_complete(&capsule) {
@@ -120,6 +120,10 @@ pub(crate) fn normalize_hook_context(
         return ContinuityContextNormalization::Invalid;
     };
     ContinuityContextNormalization::Valid(format!("{CAPSULE_OPEN}{json}{CAPSULE_CLOSE}"))
+}
+
+fn continuity_capsule_from_value(value: Value) -> serde_json::Result<ContinuityCapsule> {
+    serde_json::from_value(value)
 }
 
 pub(crate) fn deduplicate_prepared_capsules(items: &mut Vec<ResponseItem>) {
@@ -319,6 +323,17 @@ mod tests {
         assert_eq!(first, second);
         assert!(!first.contains("untrusted"));
         assert!(!first.contains("timestamp"));
+    }
+
+    #[test]
+    fn validated_json_value_is_the_typed_capsule_source() {
+        let capsule = capsule(9);
+        let json = marker_body(&capsule).expect("capsule body");
+        let value = serde_json::from_str::<Value>(json).expect("validated JSON value");
+        let typed = continuity_capsule_from_value(value).expect("typed capsule");
+
+        assert_eq!(typed.continuity_epoch, 9);
+        assert_eq!(typed.session_id, "session");
     }
 
     #[test]

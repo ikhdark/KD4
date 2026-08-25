@@ -15,6 +15,7 @@ workspace = true
 [dependencies]
 codex-utils-absolute-path = { workspace = true }
 codex-utils-home-dir = { workspace = true }
+shlex = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

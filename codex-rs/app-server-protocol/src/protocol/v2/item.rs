@@ -555,62 +555,6 @@ impl From<GuardianCommandSource> for CoreGuardianCommandSource {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-pub struct GuardianCommandReviewAction {
-    pub source: GuardianCommandSource,
-    pub command: String,
-    pub cwd: AbsolutePathBuf,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-pub struct GuardianExecveReviewAction {
-    pub source: GuardianCommandSource,
-    pub program: String,
-    pub argv: Vec<String>,
-    pub cwd: AbsolutePathBuf,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-pub struct GuardianApplyPatchReviewAction {
-    pub cwd: AbsolutePathBuf,
-    pub files: Vec<AbsolutePathBuf>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-pub struct GuardianNetworkAccessReviewAction {
-    pub target: String,
-    pub host: String,
-    pub protocol: NetworkApprovalProtocol,
-    pub port: u16,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-pub struct GuardianMcpToolCallReviewAction {
-    pub server: String,
-    pub tool_name: String,
-    pub connector_id: Option<String>,
-    pub connector_name: Option<String>,
-    pub tool_title: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-pub struct GuardianRequestPermissionsReviewAction {
-    pub reason: Option<String>,
-    pub permissions: RequestPermissionProfile,
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "camelCase")]
 #[ts(tag = "type", rename_all = "camelCase")]
@@ -634,8 +578,8 @@ pub enum GuardianApprovalReviewAction {
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
     ApplyPatch {
-        cwd: AbsolutePathBuf,
-        files: Vec<AbsolutePathBuf>,
+        cwd: LegacyAppPathString,
+        files: Vec<LegacyAppPathString>,
     },
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
@@ -1334,7 +1278,7 @@ pub struct ItemGuardianApprovalReviewStartedNotification {
     ///
     /// In most cases, one review maps to one target item. The exceptions are
     /// - execve reviews, where a single command may contain multiple execve
-    ///   calls to review (only possible when using the shell_zsh_fork feature)
+    ///   calls to review
     /// - network policy reviews, where there is no target item
     ///
     /// A network call is triggered by a CommandExecution item, so having a
@@ -1366,7 +1310,7 @@ pub struct ItemGuardianApprovalReviewCompletedNotification {
     ///
     /// In most cases, one review maps to one target item. The exceptions are
     /// - execve reviews, where a single command may contain multiple execve
-    ///   calls to review (only possible when using the shell_zsh_fork feature)
+    ///   calls to review
     /// - network policy reviews, where there is no target item
     ///
     /// A network call is triggered by a CommandExecution item, so having a
@@ -1485,19 +1429,6 @@ pub struct CommandExecutionOutputDeltaNotification {
     pub item_id: String,
     pub delta: String,
 }
-/// Deprecated legacy notification for `apply_patch` textual output.
-///
-/// The server no longer emits this notification.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-pub struct FileChangeOutputDeltaNotification {
-    pub thread_id: String,
-    pub turn_id: String,
-    pub item_id: String,
-    pub delta: String,
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]

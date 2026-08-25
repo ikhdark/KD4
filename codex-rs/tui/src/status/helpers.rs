@@ -267,20 +267,11 @@ mod tests {
         let cwd = TempDir::new().expect("temp cwd");
         let config = test_config(&codex_home, &cwd).await;
         let native_source = PathUri::from_abs_path(&config.cwd.join("AGENTS.md"));
-        let foreign_source = if cfg!(windows) {
-            PathUri::parse("file:///remote%20workspace/AGENTS.md")
-                .expect("POSIX instruction source")
-        } else {
-            PathUri::parse("file:///C:/remote%20workspace/AGENTS.md")
-                .expect("Windows instruction source")
-        };
+        let foreign_source = PathUri::parse("file:///remote%20workspace/AGENTS.md")
+            .expect("POSIX instruction source");
 
         let summary = compose_agents_summary(&config, &[native_source, foreign_source]);
-        if cfg!(windows) {
-            insta::assert_snapshot!(summary, @r"AGENTS.md, /remote workspace/AGENTS.md");
-        } else {
-            insta::assert_snapshot!(summary, @r"AGENTS.md, C:\remote workspace\AGENTS.md");
-        }
+        insta::assert_snapshot!(summary, @r"AGENTS.md, /remote workspace/AGENTS.md");
     }
 
     #[tokio::test]

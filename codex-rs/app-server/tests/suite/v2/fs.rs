@@ -23,17 +23,11 @@ use tempfile::TempDir;
 use tokio::time::Duration;
 use tokio::time::timeout;
 
-#[cfg(unix)]
-use std::os::unix::fs::symlink;
-#[cfg(unix)]
-use std::process::Command;
-
 // macOS and Windows CI can spend tens of seconds starting app-server
 // subprocesses or processing test RPCs under load.
-#[cfg(any(target_os = "macos", windows))]
+
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
-#[cfg(not(any(target_os = "macos", windows)))]
-const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
 const OPTIONAL_FS_CHANGE_TIMEOUT: Duration = Duration::from_secs(2);
 const READ_FILE_LIMIT_BYTES: usize = 10 * 1024 * 1024;
 
@@ -185,35 +179,6 @@ async fn fs_read_file_enforces_exact_size_limit() -> Result<()> {
         "fs/readFile file exceeds maximum size of 10485760 bytes",
     )
     .await?;
-
-    Ok(())
-}
-
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fs_get_metadata_reports_symlink() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    let file_path = codex_home.path().join("note.txt");
-    let symlink_path = codex_home.path().join("note-link.txt");
-    std::fs::write(&file_path, "hello")?;
-    symlink(&file_path, &symlink_path)?;
-
-    let mut mcp = initialized_mcp(&codex_home).await?;
-    let request_id = mcp
-        .send_fs_get_metadata_request(codex_app_server_protocol::FsGetMetadataParams {
-            path: absolute_path(symlink_path),
-        })
-        .await?;
-    let response = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-
-    let stat: FsGetMetadataResponse = to_response(response)?;
-    assert_eq!(stat.is_directory, false);
-    assert_eq!(stat.is_file, true);
-    assert_eq!(stat.is_symlink, true);
 
     Ok(())
 }
@@ -618,111 +583,6 @@ async fn fs_copy_rejects_copying_directory_into_descendant() -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fs_copy_preserves_symlinks_in_recursive_copy() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    let source_dir = codex_home.path().join("source");
-    let nested_dir = source_dir.join("nested");
-    let copied_dir = codex_home.path().join("copied");
-    std::fs::create_dir_all(&nested_dir)?;
-    symlink("nested", source_dir.join("nested-link"))?;
-
-    let mut mcp = initialized_mcp(&codex_home).await?;
-    let request_id = mcp
-        .send_fs_copy_request(FsCopyParams {
-            source_path: absolute_path(source_dir),
-            destination_path: absolute_path(copied_dir.clone()),
-            recursive: true,
-        })
-        .await?;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-
-    let copied_link = copied_dir.join("nested-link");
-    let metadata = std::fs::symlink_metadata(&copied_link)?;
-    assert!(metadata.file_type().is_symlink());
-    assert_eq!(std::fs::read_link(copied_link)?, PathBuf::from("nested"));
-
-    Ok(())
-}
-
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fs_copy_ignores_unknown_special_files_in_recursive_copy() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    let source_dir = codex_home.path().join("source");
-    let copied_dir = codex_home.path().join("copied");
-    std::fs::create_dir_all(&source_dir)?;
-    std::fs::write(source_dir.join("note.txt"), "hello")?;
-    let fifo_path = source_dir.join("named-pipe");
-    let output = Command::new("mkfifo").arg(&fifo_path).output()?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "mkfifo failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout).trim(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-
-    let mut mcp = initialized_mcp(&codex_home).await?;
-    let request_id = mcp
-        .send_fs_copy_request(FsCopyParams {
-            source_path: absolute_path(source_dir),
-            destination_path: absolute_path(copied_dir.clone()),
-            recursive: true,
-        })
-        .await?;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-
-    assert_eq!(
-        std::fs::read_to_string(copied_dir.join("note.txt"))?,
-        "hello"
-    );
-    assert!(!copied_dir.join("named-pipe").exists());
-
-    Ok(())
-}
-
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fs_copy_rejects_standalone_fifo_source() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    let fifo_path = codex_home.path().join("named-pipe");
-    let output = Command::new("mkfifo").arg(&fifo_path).output()?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "mkfifo failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout).trim(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-
-    let mut mcp = initialized_mcp(&codex_home).await?;
-    let request_id = mcp
-        .send_fs_copy_request(FsCopyParams {
-            source_path: absolute_path(fifo_path),
-            destination_path: absolute_path(codex_home.path().join("copied")),
-            recursive: false,
-        })
-        .await?;
-    expect_error_message(
-        &mut mcp,
-        request_id,
-        "fs/copy only supports regular files, directories, and symlinks",
-    )
-    .await?;
-
-    Ok(())
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fs_watch_directory_reports_changed_child_paths_and_unwatch_stops_notifications()
 -> Result<()> {
@@ -917,7 +777,6 @@ fn replace_file_atomically(path: &PathBuf, contents: &str) -> Result<()> {
     let temp_path = path.with_extension("lock");
     std::fs::write(&temp_path, contents)?;
 
-    #[cfg(windows)]
     match std::fs::remove_file(path) {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}

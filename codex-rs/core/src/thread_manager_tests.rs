@@ -136,6 +136,15 @@ fn developer_interrupted_marker() -> ResponseItem {
         .expect("developer interrupted marker should be enabled")
 }
 
+fn response_item_matches_ignoring_id(item: &RolloutItem, expected: &ResponseItem) -> bool {
+    let RolloutItem::ResponseItem(item) = item else {
+        return false;
+    };
+    let mut item = item.clone();
+    item.set_id(None);
+    item == *expected
+}
+
 #[test]
 fn effective_originator_prefers_thread_scoped_sources_before_env_originator() {
     for (metrics_service_name, persisted_originator, inherited_originator, expected_originator) in [
@@ -862,6 +871,8 @@ async fn resume_and_fork_restore_thread_environments_from_rollout_impl() {
     }];
     let mut source_config = config.clone();
     source_config.cwd = selected_cwd.clone();
+    let developer_instructions = "persisted thread developer instructions".to_string();
+    source_config.developer_instructions = Some(developer_instructions.clone());
     let source = manager
         .start_thread_with_options(StartThreadOptions {
             config: source_config,
@@ -925,6 +936,10 @@ async fn resume_and_fork_restore_thread_environments_from_rollout_impl() {
         resumed_turn.environments.turn_environments[0].cwd(),
         &PathUri::from_abs_path(&selected_cwd)
     );
+    assert_eq!(
+        resumed_turn.developer_instructions.as_deref(),
+        Some(developer_instructions.as_str())
+    );
 
     let forked = manager
         .fork_thread(
@@ -947,6 +962,10 @@ async fn resume_and_fork_restore_thread_environments_from_rollout_impl() {
     assert_eq!(
         forked_turn.environments.turn_environments[0].cwd(),
         &PathUri::from_abs_path(&selected_cwd)
+    );
+    assert_eq!(
+        forked_turn.developer_instructions.as_deref(),
+        Some(developer_instructions.as_str())
     );
 }
 
@@ -971,7 +990,7 @@ async fn explicit_installation_id_skips_codex_home_file() {
         empty_extension_registry(),
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
-        thread_store,
+        thread_store.clone(),
         local_agent_graph_store_from_state_db(state_db.as_ref()),
         installation_id.clone(),
         /*attestation_provider*/ None,
@@ -1139,7 +1158,7 @@ async fn resume_stopped_thread_from_rollout_preserves_thread_source() {
         empty_extension_registry(),
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
-        thread_store,
+        thread_store.clone(),
         local_agent_graph_store_from_state_db(state_db.as_ref()),
         TEST_INSTALLATION_ID.to_string(),
         /*attestation_provider*/ None,
@@ -1250,67 +1269,6 @@ async fn subtree_listing_uses_injected_graph_store_without_state_db() {
 }
 
 #[tokio::test]
-async fn failed_new_thread_initialization_deletes_created_persistence() {
-    let temp_dir = tempdir().expect("tempdir");
-    let mut config = test_config().await;
-    config.codex_home = temp_dir.path().join("codex-home").abs();
-    config.cwd = config.codex_home.abs();
-    config.experimental_thread_store = ThreadStoreConfig::InMemory {
-        id: format!("thread-manager-init-failure-{}", uuid::Uuid::new_v4()),
-    };
-    // `None` is checked directly after thread persistence is created, before
-    // shell detection can consult the host environment.
-    config
-        .features
-        .enable(Feature::ShellZshFork)
-        .expect("test config should allow shell_zsh_fork");
-    config.zsh_path = None;
-    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
-
-    let auth_manager =
-        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
-    let thread_store = thread_store_from_config(&config, /*state_db*/ None);
-    let in_memory_store = thread_store
-        .as_any()
-        .downcast_ref::<InMemoryThreadStore>()
-        .expect("configured in-memory store");
-    let manager = ThreadManager::new(
-        &config,
-        auth_manager,
-        SessionSource::Exec,
-        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
-        empty_extension_registry(),
-        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
-        /*analytics_events_client*/ None,
-        thread_store.clone(),
-        /*agent_graph_store*/ None,
-        TEST_INSTALLATION_ID.to_string(),
-        /*attestation_provider*/ None,
-        /*external_time_provider*/ None,
-    );
-
-    let error = match manager.start_thread(config).await {
-        Ok(_) => panic!("the injected post-persistence initialization failure should be returned"),
-        Err(error) => error,
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("zsh fork feature enabled, but no packaged zsh fork is available"),
-        "unexpected initialization failure: {error}"
-    );
-    assert!(manager.list_thread_ids().await.is_empty());
-
-    let calls = in_memory_store.calls().await;
-    assert_eq!(
-        calls.create_thread, 1,
-        "the fixture must reach persistence creation before the injected failure"
-    );
-    assert_eq!(calls.discard_thread, 1);
-    assert_eq!(calls.delete_thread, 1);
-}
-
-#[tokio::test]
 async fn rollback_thread_spawn_removes_exact_thread_and_persistence() {
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;
@@ -1347,6 +1305,7 @@ async fn rollback_thread_spawn_removes_exact_thread_and_persistence() {
         .start_thread(config)
         .await
         .expect("start thread to roll back");
+    assert!(!started.was_already_running);
     assert!(
         manager
             .rollback_thread_spawn(started.thread_id, &started.thread)
@@ -1362,6 +1321,90 @@ async fn rollback_thread_spawn_removes_exact_thread_and_persistence() {
 
     let calls = in_memory_store.calls().await;
     assert_eq!(calls.delete_thread, 1);
+}
+
+#[tokio::test]
+async fn missing_error_path_rollback_resumed_thread_preserves_persistence_and_ownership() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    config.experimental_thread_store = ThreadStoreConfig::InMemory {
+        id: format!("thread-manager-resume-rollback-{}", uuid::Uuid::new_v4()),
+    };
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let thread_store = thread_store_from_config(&config, /*state_db*/ None);
+    let in_memory_store = thread_store
+        .as_any()
+        .downcast_ref::<InMemoryThreadStore>()
+        .expect("configured in-memory store");
+    let manager = ThreadManager::new(
+        &config,
+        auth_manager.clone(),
+        SessionSource::Exec,
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        empty_extension_registry(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        thread_store.clone(),
+        /*agent_graph_store*/ None,
+        TEST_INSTALLATION_ID.to_string(),
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    );
+
+    let source = manager
+        .start_thread(config.clone())
+        .await
+        .expect("start source thread");
+    let rollout_path = source.thread.rollout_path();
+    source
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown source thread");
+    let _ = manager.remove_thread(&source.thread_id).await;
+
+    let resumed_history = InitialHistory::Resumed(ResumedHistory {
+        conversation_id: source.thread_id,
+        history: Arc::new(vec![RolloutItem::ResponseItem(user_msg("hello"))]),
+        rollout_path,
+    });
+    let resumed = manager
+        .resume_thread_with_history(
+            config.clone(),
+            resumed_history.clone(),
+            auth_manager.clone(),
+            /*parent_trace*/ None,
+            /*supports_openai_form_elicitation*/ false,
+        )
+        .await
+        .expect("cold resume thread");
+    assert!(!resumed.was_already_running);
+
+    let reused = manager
+        .resume_thread_with_history(
+            config,
+            resumed_history,
+            auth_manager,
+            /*parent_trace*/ None,
+            /*supports_openai_form_elicitation*/ false,
+        )
+        .await
+        .expect("reuse running thread");
+    assert!(reused.was_already_running);
+    assert!(Arc::ptr_eq(&resumed.thread, &reused.thread));
+
+    assert!(
+        manager
+            .rollback_resumed_thread_spawn(resumed.thread_id, &resumed.thread)
+            .await
+    );
+    assert!(manager.get_thread(resumed.thread_id).await.is_err());
+    assert_eq!(in_memory_store.calls().await.delete_thread, 0);
 }
 
 #[test]
@@ -1511,6 +1554,7 @@ async fn new_uses_active_provider_for_model_refresh() {
     );
 
     let _ = manager
+        .get_models_manager()
         .list_models(
             RefreshStrategy::Online,
             crate::test_support::default_http_client_factory(),
@@ -1949,9 +1993,7 @@ async fn interrupted_fork_snapshot_does_not_synthesize_turn_id_for_legacy_histor
         .iter()
         .filter(|item| !matches!(item, RolloutItem::SessionMeta(_)))
         .collect();
-    let interrupted_marker_json =
-        serde_json::to_value(RolloutItem::ResponseItem(developer_interrupted_marker()))
-            .expect("serialize interrupted marker");
+    let interrupted_marker = developer_interrupted_marker();
     let interrupted_abort_json = serde_json::to_value(RolloutItem::EventMsg(
         EventMsg::TurnAborted(TurnAbortedEvent {
             turn_id: expected_turn_id,
@@ -1965,10 +2007,7 @@ async fn interrupted_fork_snapshot_does_not_synthesize_turn_id_for_legacy_histor
     assert_eq!(
         rollout_items
             .iter()
-            .filter(|item| {
-                serde_json::to_value(item).expect("serialize rollout item")
-                    == interrupted_marker_json
-            })
+            .filter(|item| response_item_matches_ignoring_id(item, &interrupted_marker))
             .count(),
         1,
     );
@@ -2157,16 +2196,11 @@ async fn interrupted_fork_snapshot_uses_persisted_mid_turn_history_without_live_
         .iter()
         .filter(|item| !matches!(item, RolloutItem::SessionMeta(_)))
         .collect();
-    let interrupted_marker_json =
-        serde_json::to_value(RolloutItem::ResponseItem(developer_interrupted_marker()))
-            .expect("serialize interrupted marker");
+    let interrupted_marker = developer_interrupted_marker();
     assert_eq!(
         forked_rollout_items
             .iter()
-            .filter(|item| {
-                serde_json::to_value(item).expect("serialize forked rollout item")
-                    == interrupted_marker_json
-            })
+            .filter(|item| response_item_matches_ignoring_id(item, &interrupted_marker))
             .count(),
         1,
     );
@@ -2198,10 +2232,7 @@ async fn interrupted_fork_snapshot_uses_persisted_mid_turn_history_without_live_
     assert_eq!(
         reforked_rollout_items
             .iter()
-            .filter(|item| {
-                serde_json::to_value(item).expect("serialize re-forked rollout item")
-                    == interrupted_marker_json
-            })
+            .filter(|item| response_item_matches_ignoring_id(item, &interrupted_marker))
             .count(),
         1,
     );
@@ -2220,4 +2251,36 @@ async fn interrupted_fork_snapshot_uses_persisted_mid_turn_history_without_live_
             .count(),
         1,
     );
+}
+
+#[test]
+fn thread_manager_does_not_forward_model_catalog_operations() {
+    let source = include_str!("thread_manager.rs");
+    for method_name in ["list_models", "list_collaboration_modes"] {
+        let obsolete_forwarder = ["pub fn ", method_name, "("].concat();
+        let obsolete_async_forwarder = ["pub async fn ", method_name, "("].concat();
+        assert!(
+            !source.contains(&obsolete_forwarder) && !source.contains(&obsolete_async_forwarder),
+            "ThreadManager must not forward model catalog method `{method_name}`"
+        );
+    }
+}
+
+#[test]
+fn stored_thread_errors_are_classified_by_variant_not_message() {
+    let thread_id =
+        ThreadId::from_string("00000000-0000-0000-0000-000000000402").expect("valid thread id");
+    let old_missing_message = format!("no rollout found for thread id {thread_id}");
+
+    let invalid = stored_thread_read_error(
+        thread_id,
+        ThreadStoreError::InvalidRequest {
+            message: old_missing_message,
+        },
+    );
+    assert!(matches!(invalid, CodexErr::Fatal(_)));
+
+    let missing =
+        stored_thread_read_error(thread_id, ThreadStoreError::ThreadNotFound { thread_id });
+    assert!(matches!(missing, CodexErr::ThreadNotFound(id) if id == thread_id));
 }

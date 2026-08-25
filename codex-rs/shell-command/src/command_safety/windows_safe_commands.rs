@@ -1,8 +1,10 @@
 use crate::command_safety::is_safe_command::is_exact_version_probe;
 use crate::command_safety::is_safe_command::is_safe_git_command;
 use crate::command_safety::is_trusted_powershell_host;
+use crate::command_safety::powershell_parser::PowershellInvocation;
 use crate::command_safety::powershell_parser::PowershellParseAnalysis;
 use crate::command_safety::powershell_parser::PowershellParseOutcome;
+use crate::command_safety::powershell_parser::parse_powershell_invocation;
 use crate::command_safety::powershell_parser::parse_with_powershell_ast;
 
 /// On Windows, we conservatively allow only clearly read-only PowerShell invocations
@@ -24,82 +26,17 @@ pub fn is_safe_command_windows(command: &[String]) -> bool {
 fn try_parse_powershell_command_sequence(command: &[String]) -> Option<Vec<Vec<String>>> {
     let (exe, rest) = command.split_first()?;
     if is_trusted_powershell_host(exe) {
-        parse_powershell_invocation(exe, rest)
+        let PowershellInvocation::InlineCommand {
+            script,
+            no_profile: true,
+        } = parse_powershell_invocation(rest)
+        else {
+            return None;
+        };
+        parse_powershell_script(exe, script)
     } else {
         None
     }
-}
-
-/// Parses a PowerShell invocation into discrete command vectors, rejecting unsafe patterns.
-fn parse_powershell_invocation(executable: &str, args: &[String]) -> Option<Vec<Vec<String>>> {
-    if args.is_empty() {
-        // Examples rejected here: "pwsh" and "powershell.exe" with no additional arguments.
-        return None;
-    }
-
-    let mut idx = 0;
-    let mut no_profile = false;
-    while idx < args.len() {
-        let arg = &args[idx];
-        let lower = arg.to_ascii_lowercase();
-        match lower.as_str() {
-            "-command" | "/command" | "-c" => {
-                if !no_profile {
-                    return None;
-                }
-                let script = args.get(idx + 1)?;
-                if idx + 2 != args.len() {
-                    // Reject if there is more than one token representing the actual command.
-                    // Examples rejected here: "pwsh -Command foo bar" and "powershell -c ls extra".
-                    return None;
-                }
-                return parse_powershell_script(executable, script);
-            }
-            _ if lower.starts_with("-command:") || lower.starts_with("/command:") => {
-                if !no_profile {
-                    return None;
-                }
-                if idx + 1 != args.len() {
-                    // Reject if there are more tokens after the command itself.
-                    // Examples rejected here: "pwsh -Command:dir C:\\" and "powershell /Command:dir C:\\" with trailing args.
-                    return None;
-                }
-                let script = arg.split_once(':')?.1;
-                return parse_powershell_script(executable, script);
-            }
-
-            // Benign, no-arg flags we tolerate.
-            "-noprofile" => {
-                no_profile = true;
-                idx += 1;
-                continue;
-            }
-            "-nologo" | "-noninteractive" | "-mta" | "-sta" => {
-                idx += 1;
-                continue;
-            }
-
-            // Explicitly forbidden/opaque or unnecessary for read-only operations.
-            "-encodedcommand" | "-ec" | "-file" | "/file" | "-windowstyle" | "-executionpolicy"
-            | "-workingdirectory" => {
-                // Examples rejected here: "pwsh -EncodedCommand ..." and "powershell -File script.ps1".
-                return None;
-            }
-
-            // Unknown switch → bail conservatively.
-            _ if lower.starts_with('-') => {
-                // Examples rejected here: "pwsh -UnknownFlag" and "powershell -foo bar".
-                return None;
-            }
-
-            // PowerShell treats bare values as `-File`, not as `-Command` source. Do not
-            // reinterpret that invocation into a different execution mode for safelisting.
-            _ => return None,
-        }
-    }
-
-    // Examples rejected here: "pwsh" and "powershell.exe -NoLogo" without a script.
-    None
 }
 
 /// Tokenizes an inline PowerShell script and delegates to the command splitter.
@@ -201,7 +138,7 @@ fn is_safe_ripgrep(words: &[String]) -> bool {
     })
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::powershell::try_find_pwsh_executable_blocking;
@@ -674,9 +611,7 @@ mod tests {
 
     #[test]
     fn uses_invoked_powershell_variant_for_parsing() {
-        if !cfg!(windows) {
-            return;
-        }
+        {}
 
         let chain = "pwd && ls";
         assert!(

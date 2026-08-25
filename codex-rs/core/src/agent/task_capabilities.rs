@@ -203,9 +203,9 @@ pub(crate) fn build_cold_review_context(
 
 /// Classifies a tool name without trusting an arbitrary namespace to impersonate a core tool.
 ///
-/// MultiAgentV2's collaboration namespace is configurable, so callers must pass the namespace
-/// selected for the active turn. Any other namespace is external. When collaboration tools are
-/// unnamespaced, pass `None` for both namespace arguments.
+/// Callers must pass the collaboration namespace selected for the active agent-tool version and
+/// turn. Any other namespace is external. When collaboration tools are unnamespaced, pass `None`
+/// for both namespace arguments.
 pub(crate) fn classify_typed_tool(
     namespace: Option<&str>,
     name: &str,
@@ -356,6 +356,8 @@ fn classify_collaboration_tool(name: &str) -> TypedToolClass {
         &[
             "spawn_agent",
             "send_input",
+            "resume_agent",
+            "close_agent",
             "followup_task",
             "interrupt_agent",
             "amend_agent_task",
@@ -407,7 +409,7 @@ pub(crate) fn normalize_absolute_repo_path(
         ));
     }
 
-    let relative = if cfg!(windows) {
+    let relative = {
         let root_components = repo_root.components().collect::<Vec<_>>();
         let path_components = path.components().collect::<Vec<_>>();
         if path_components.len() < root_components.len()
@@ -430,15 +432,6 @@ pub(crate) fn normalize_absolute_repo_path(
             .iter()
             .map(|component| component.as_os_str())
             .collect::<PathBuf>()
-    } else {
-        path.strip_prefix(repo_root)
-            .map(Path::to_path_buf)
-            .map_err(|_| {
-                invalid_path(
-                    &path.to_string_lossy(),
-                    "absolute path is outside the assignment repository",
-                )
-            })?
     };
     normalize_repo_relative_path(repo_root, &relative.to_string_lossy())
 }
@@ -562,19 +555,15 @@ fn ensure_canonical_containment(
 }
 
 fn path_starts_with(path: &Path, root: &Path) -> bool {
-    if cfg!(windows) {
-        let path_components = path
-            .components()
-            .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
-            .collect::<Vec<_>>();
-        let root_components = root
-            .components()
-            .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
-            .collect::<Vec<_>>();
-        path_components.starts_with(&root_components)
-    } else {
-        path.starts_with(root)
-    }
+    let path_components = path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
+        .collect::<Vec<_>>();
+    let root_components = root
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
+        .collect::<Vec<_>>();
+    path_components.starts_with(&root_components)
 }
 
 fn scope_covers_path(scope: &str, recursive: bool, path: &str) -> bool {
@@ -596,11 +585,7 @@ fn repo_paths_equal(left: &str, right: &str) -> bool {
 }
 
 fn normalized_comparison_path(path: &str) -> String {
-    if cfg!(windows) {
-        path.to_lowercase()
-    } else {
-        path.to_string()
-    }
+    path.to_lowercase()
 }
 
 fn normalize_contract_id(contract: &str) -> Option<String> {

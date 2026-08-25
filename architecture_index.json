@@ -1,5 +1,5 @@
 {
-  "manifest_sha256": "cfe5b481db6c34c607bef05d83b53c6e7cd196302857b20fc0fdb848add67ab9",
+  "manifest_sha256": "0261a42e2585112e5ea6091da977aa85a2a2befcce4254fa7cc1c352f0c30e98",
   "omitted": {
     "relationships": 0
   },
@@ -11,6 +11,7 @@
       "facet_exclusions": {
         "configuration_and_gates": "Experimental schema selection is an explicit generator argument, not an ambient repository feature gate."
       },
+      "feature_ids": [],
       "generated_artifacts": [
         "codex-rs/app-server-protocol/schema"
       ],
@@ -65,6 +66,7 @@
         "control_and_data_flow": "This owner is a runtime boundary; request-to-core control flow is declared by its caller and consumer relationships.",
         "generated_artifacts": "Protocol generation is owned separately by app-server-protocol-contracts."
       },
+      "feature_ids": [],
       "generated_artifacts": [],
       "id": "app-server-runtime",
       "invariants": [
@@ -72,7 +74,7 @@
           "evidence": [
             {
               "path": "codex-rs/app-server/src/lib.rs",
-              "symbol": "run_main_with_transport_options"
+              "symbol": "run_main"
             }
           ],
           "id": "transport-dispatch-contract",
@@ -116,6 +118,7 @@
         "configuration_and_gates": "Top-level subcommand dispatch is selected by parsed CLI input rather than a repository feature gate.",
         "generated_artifacts": "The CLI dispatch owner does not generate a checked-in contract."
       },
+      "feature_ids": [],
       "generated_artifacts": [],
       "id": "cli-entrypoints",
       "invariants": [
@@ -162,11 +165,66 @@
       ]
     },
     {
+      "configuration": [
+        "codex-rs/code-mode-protocol/src/description.rs"
+      ],
+      "facet_exclusions": {
+        "configuration_and_gates": "Code-mode protocol behavior is selected by its callers rather than repository configuration owned by this crate.",
+        "generated_artifacts": "Tool declarations are rendered at runtime and have no checked-in generated mirror."
+      },
+      "feature_ids": [],
+      "generated_artifacts": [],
+      "id": "code-mode-protocol-contracts",
+      "invariants": [
+        {
+          "evidence": [
+            {
+              "path": "codex-rs/code-mode-protocol/src/description.rs",
+              "symbol": "build_exec_tool_description"
+            }
+          ],
+          "id": "code-mode-description-contract",
+          "kind": "compatibility",
+          "statement": "Rendered code-mode tool descriptions preserve callable names, schemas, runtime metadata, and bounded lazy-discovery guidance consumed by the host and core runtime.",
+          "tests": [
+            "codex-rs/code-mode-protocol/src/description.rs"
+          ]
+        }
+      ],
+      "primary_entries": [
+        {
+          "path": "codex-rs/code-mode-protocol/src/lib.rs",
+          "symbol": "build_exec_tool_description"
+        }
+      ],
+      "roots": [
+        "codex-rs/code-mode-protocol"
+      ],
+      "tests": [
+        "codex-rs/code-mode-protocol/src/description.rs",
+        "codex-rs/code-mode-protocol/src/host/host_tests.rs"
+      ],
+      "validation": [
+        {
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "codex-code-mode-protocol"
+          ],
+          "cwd": "codex-rs",
+          "id": "code-mode-protocol-focused",
+          "role": "focused_tests"
+        }
+      ]
+    },
+    {
       "configuration": [],
       "facet_exclusions": {
         "control_and_data_flow": "Core contains many task-specific flows; select a narrower owner such as planning-architecture-runtime or tool-output-recovery before mutation.",
         "generated_artifacts": "Generated contracts consumed by core are owned by their protocol or configuration generators."
       },
+      "feature_ids": [],
       "generated_artifacts": [],
       "id": "core-agent-runtime",
       "invariants": [
@@ -197,7 +255,9 @@
         }
       ],
       "roots": [
-        "codex-rs/core/src"
+        "codex-rs/core/src",
+        "codex-rs/core/tests",
+        "codex-rs/core/benches"
       ],
       "tests": [
         "codex-rs/core/tests"
@@ -217,13 +277,12 @@
       ]
     },
     {
-      "configuration": [
-        "kd4_features.toml"
-      ],
+      "configuration": [],
       "facet_exclusions": {
         "control_and_data_flow": "This owner defines feature identity and defaults; runtime behavior is controlled by consuming owners.",
         "generated_artifacts": "The feature registry is source-backed and has no checked-in generated mirror."
       },
+      "feature_ids": [],
       "generated_artifacts": [],
       "id": "feature-registry",
       "invariants": [
@@ -270,12 +329,131 @@
     },
     {
       "configuration": [
-        "codex-rs/core/src/task_evidence.rs"
+        "kd4_features.toml"
+      ],
+      "facet_exclusions": {
+        "control_and_data_flow": "The checker validates a declarative inventory; individual capability runtime flows remain with their implementation owners.",
+        "generated_artifacts": "The capability inventory is authored source and has no checked-in generated mirror."
+      },
+      "feature_ids": [],
+      "generated_artifacts": [],
+      "id": "kd4-capability-manifest",
+      "invariants": [
+        {
+          "evidence": [
+            {
+              "path": "scripts/check_kd4_features.py",
+              "symbol": "validate_manifest"
+            }
+          ],
+          "id": "capability-evidence-reachability",
+          "kind": "semantic",
+          "statement": "Every declared KD4 capability has valid lifecycle metadata and repository-contained evidence, while optional runtime feature links resolve against the canonical Rust feature registry.",
+          "tests": [
+            "scripts/test_check_kd4_features.py"
+          ]
+        }
+      ],
+      "primary_entries": [
+        {
+          "path": "scripts/check_kd4_features.py",
+          "symbol": "validate_manifest"
+        }
+      ],
+      "roots": [
+        "kd4_features.toml",
+        "scripts/check_kd4_features.py"
+      ],
+      "tests": [
+        "scripts/test_check_kd4_features.py"
+      ],
+      "validation": [
+        {
+          "argv": [
+            "python",
+            "-m",
+            "unittest",
+            "scripts.test_check_kd4_features"
+          ],
+          "cwd": ".",
+          "id": "kd4-capability-manifest-focused",
+          "role": "focused_tests"
+        }
+      ]
+    },
+    {
+      "configuration": [
+        "codex-rs/models-manager/src/prompt_resolver.rs",
+        "codex-rs/models-manager/src/model_info.rs"
+      ],
+      "facet_exclusions": {
+        "configuration_and_gates": "Model metadata and local prompt overrides are resolved by the manager; remote model availability configuration is outside this owner.",
+        "generated_artifacts": "Local prompt overrides are authored Rust inputs rather than generated artifacts."
+      },
+      "feature_ids": [],
+      "generated_artifacts": [],
+      "id": "model-catalog-runtime",
+      "invariants": [
+        {
+          "evidence": [
+            {
+              "path": "codex-rs/models-manager/src/model_info.rs",
+              "symbol": "model_info_from_slug"
+            },
+            {
+              "path": "codex-rs/models-manager/src/prompt_resolver.rs"
+            }
+          ],
+          "id": "model-instruction-resolution",
+          "kind": "semantic",
+          "statement": "Each resolved model receives the intended base instructions and metadata without duplicating or dropping prompt contracts across local and remote catalog paths.",
+          "tests": [
+            "codex-rs/models-manager/src/prompt_contract_tests.rs",
+            "codex-rs/models-manager/src/prompt_resolver.rs",
+            "codex-rs/models-manager/src/model_info_tests.rs",
+            "codex-rs/models-manager/src/manager_tests.rs"
+          ]
+        }
+      ],
+      "primary_entries": [
+        {
+          "path": "codex-rs/models-manager/src/manager.rs",
+          "symbol": "ModelsManager"
+        }
+      ],
+      "roots": [
+        "codex-rs/models-manager"
+      ],
+      "tests": [
+        "codex-rs/models-manager/src/prompt_contract_tests.rs",
+        "codex-rs/models-manager/src/prompt_resolver.rs",
+        "codex-rs/models-manager/src/model_info_tests.rs",
+        "codex-rs/models-manager/src/manager_tests.rs"
+      ],
+      "validation": [
+        {
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "codex-models-manager"
+          ],
+          "cwd": "codex-rs",
+          "id": "models-manager-focused",
+          "role": "focused_tests"
+        }
+      ]
+    },
+    {
+      "configuration": [
+        "codex-rs/core/src/plan_store.rs",
+        "codex-rs/core/src/tools/handlers/plan.rs"
       ],
       "facet_exclusions": {
         "configuration_and_gates": "Planning tier and validation behavior are runtime state, not a repository or feature configuration gate.",
         "generated_artifacts": "The update_plan schema is constructed at runtime and has no checked-in generated mirror."
       },
+      "feature_ids": [],
       "generated_artifacts": [],
       "id": "planning-architecture-runtime",
       "invariants": [
@@ -298,12 +476,18 @@
         {
           "path": "codex-rs/core/src/tools/handlers/plan.rs",
           "symbol": "PlanHandler"
+        },
+        {
+          "path": "codex-rs/core/src/plan_store.rs",
+          "symbol": "PlanStore"
         }
       ],
       "roots": [
-        "codex-rs/core/src/tools/handlers",
-        "codex-rs/core/src/session",
-        "codex-rs/core/src/task_evidence.rs"
+        "codex-rs/core/src/plan_store.rs",
+        "codex-rs/core/src/tools/handlers/plan.rs",
+        "codex-rs/core/src/tools/handlers/plan_tests.rs",
+        "codex-rs/core/src/tools/spec_plan.rs",
+        "codex-rs/core/src/session/reasoning_governor.rs"
       ],
       "tests": [
         "codex-rs/core/src/tools/handlers/plan_tests.rs"
@@ -331,6 +515,7 @@
         "configuration_and_gates": "Discovery is driven by the active cwd and filesystem snapshot rather than a feature gate.",
         "generated_artifacts": "Repository metadata and instruction results are runtime cache entries, not checked-in generated artifacts."
       },
+      "feature_ids": [],
       "generated_artifacts": [],
       "id": "repository-context-discovery",
       "invariants": [
@@ -389,50 +574,183 @@
     },
     {
       "configuration": [
-        "codex-rs/kda.toml"
+        "codex-rs/core/benches/turn_latency.rs"
       ],
       "facet_exclusions": {
-        "callers_and_consumers": "The configuration is consumed by the external cargo-kda entrypoint, which is not source-owned in this repository.",
-        "control_and_data_flow": "This owner is declarative admission policy evaluated by the external cargo-kda analyzer rather than a KD4 runtime flow.",
-        "generated_artifacts": "The quality-gate configuration is authored source and has no generated mirror.",
-        "registration_and_entrypoints": "Cargo discovers the external cargo-kda subcommand; KD4 has no in-repository runtime registration point."
+        "configuration_and_gates": "The benchmark command selects a workflow directly; no repository feature or configuration file owns that selection.",
+        "generated_artifacts": "Serialized reports are local runtime outputs rather than checked-in generated mirrors."
       },
+      "feature_ids": [],
       "generated_artifacts": [],
-      "id": "semantic-quality-gate",
+      "id": "rust-turn-latency-benchmark",
       "invariants": [
         {
           "evidence": [
             {
-              "path": "codex-rs/kda.toml",
-              "symbol": "architecture-gate"
+              "path": "codex-rs/core/benches/turn_latency.rs",
+              "symbol": "BenchmarkCommand"
             }
           ],
-          "id": "source-bound-agent-admission",
+          "id": "separate-capture-and-comparison-verdicts",
           "kind": "semantic",
-          "statement": "Autonomous changes cannot pass on unowned impact, incomplete consequence closure, or validation evidence from a different source, profile, architecture, dependency, command, target, or test selection.",
-          "tests": []
+          "statement": "Code-mode capture emits one-build raw samples and a nested-dispatch quality verdict, while synthetic reports alone emit local baseline/candidate non-inferiority verdicts.",
+          "tests": [
+            "codex-rs/core/tests/turn_latency_bench.rs"
+          ]
         }
       ],
       "primary_entries": [
         {
-          "path": "codex-rs/kda.toml",
-          "symbol": "version"
+          "ambiguous": true,
+          "path": "codex-rs/core/benches/turn_latency.rs",
+          "symbol": "main"
         }
       ],
       "roots": [
-        "codex-rs/kda.toml"
+        "codex-rs/core/benches/turn_latency.rs",
+        "codex-rs/core/tests/turn_latency_bench.rs"
       ],
-      "tests": [],
+      "tests": [
+        "codex-rs/core/tests/turn_latency_bench.rs"
+      ],
       "validation": [
         {
           "argv": [
-            "python",
-            "-c",
-            "import pathlib,tomllib; tomllib.loads(pathlib.Path('codex-rs/kda.toml').read_text())"
+            "cargo",
+            "test",
+            "-p",
+            "codex-core",
+            "--test",
+            "turn_latency_bench",
+            "code_mode_capture_report_has_no_local_ab_gate"
           ],
-          "cwd": ".",
-          "id": "kda-config-syntax",
-          "role": "configuration_check"
+          "cwd": "codex-rs",
+          "id": "rust-turn-latency-focused",
+          "role": "focused_tests"
+        }
+      ]
+    },
+    {
+      "configuration": [
+        "codex-rs/protocol/src/protocol.rs",
+        "codex-rs/protocol/src/models.rs"
+      ],
+      "facet_exclusions": {
+        "configuration_and_gates": "Shared protocol shape is a compatibility boundary and is not selected by a repository feature gate owned here.",
+        "generated_artifacts": "App-server schema mirrors are owned separately by app-server-protocol-contracts."
+      },
+      "feature_ids": [],
+      "generated_artifacts": [],
+      "id": "shared-protocol-contracts",
+      "invariants": [
+        {
+          "evidence": [
+            {
+              "path": "codex-rs/protocol/src/protocol.rs"
+            },
+            {
+              "path": "codex-rs/protocol/src/models.rs",
+              "symbol": "BASE_INSTRUCTIONS_DEFAULT"
+            }
+          ],
+          "id": "shared-protocol-compatibility",
+          "kind": "compatibility",
+          "statement": "Shared wire types, base instructions, rollouts, and stored-session representations remain compatible across core, CLI, app-server, and protocol consumers.",
+          "tests": [
+            "codex-rs/protocol/src"
+          ]
+        }
+      ],
+      "primary_entries": [
+        {
+          "path": "codex-rs/protocol/src/lib.rs",
+          "symbol": "protocol"
+        }
+      ],
+      "roots": [
+        "codex-rs/protocol"
+      ],
+      "tests": [
+        "codex-rs/protocol/src"
+      ],
+      "validation": [
+        {
+          "argv": [
+            "cargo",
+            "nextest",
+            "run",
+            "-p",
+            "codex-protocol"
+          ],
+          "cwd": "codex-rs",
+          "id": "protocol-focused",
+          "role": "focused_tests"
+        }
+      ]
+    },
+    {
+      "configuration": [
+        "codex-rs/utils/build-info/src/lib.rs",
+        "codex-rs/utils/der/src/lib.rs"
+      ],
+      "facet_exclusions": {
+        "configuration_and_gates": "Utility behavior is selected through typed crate dependencies rather than repository feature gates.",
+        "generated_artifacts": "These utility crates are authored source and do not own generated mirrors."
+      },
+      "feature_ids": [],
+      "generated_artifacts": [],
+      "id": "shared-utility-crates",
+      "invariants": [
+        {
+          "evidence": [
+            {
+              "path": "codex-rs/utils/build-info/src/lib.rs",
+              "symbol": "BuildInfo"
+            },
+            {
+              "path": "codex-rs/utils/der/src/lib.rs",
+              "symbol": "first_der_item"
+            }
+          ],
+          "id": "shared-utility-single-source",
+          "kind": "semantic",
+          "statement": "Cross-domain build metadata and DER boundary parsing each have one typed implementation and one directly owned unit-test contract.",
+          "tests": [
+            "codex-rs/utils/build-info/src/lib.rs",
+            "codex-rs/utils/der/src/lib.rs"
+          ]
+        }
+      ],
+      "primary_entries": [
+        {
+          "path": "codex-rs/utils/build-info/src/lib.rs",
+          "symbol": "BuildInfo"
+        },
+        {
+          "path": "codex-rs/utils/der/src/lib.rs",
+          "symbol": "first_der_item"
+        }
+      ],
+      "roots": [
+        "codex-rs/utils"
+      ],
+      "tests": [
+        "codex-rs/utils/build-info/src/lib.rs",
+        "codex-rs/utils/der/src/lib.rs"
+      ],
+      "validation": [
+        {
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "codex-utils-build-info",
+            "-p",
+            "codex-utils-der"
+          ],
+          "cwd": "codex-rs",
+          "id": "shared-utilities-focused",
+          "role": "focused_tests"
         }
       ]
     },
@@ -441,6 +759,7 @@
         "source_owners.toml"
       ],
       "facet_exclusions": {},
+      "feature_ids": [],
       "generated_artifacts": [
         "SOURCEMAP.md",
         "architecture_index.json"
@@ -474,8 +793,7 @@
         "source_owners.toml"
       ],
       "tests": [
-        "scripts/test_source_owners.py",
-        "scripts/test_architecture_comprehension_eval.py"
+        "scripts/test_source_owners.py"
       ],
       "validation": [
         {
@@ -483,11 +801,69 @@
             "python",
             "-m",
             "unittest",
-            "scripts.test_source_owners",
-            "scripts.test_architecture_comprehension_eval"
+            "scripts.test_source_owners"
           ],
           "cwd": ".",
           "id": "source-owner-focused",
+          "role": "focused_tests"
+        }
+      ]
+    },
+    {
+      "configuration": [
+        "codex-rs/core/src/task_evidence/desktop_activation.rs",
+        "codex-rs/core/src/task_evidence/external_evidence.rs",
+        "codex-rs/core/src/task_evidence/source_owner_index.rs"
+      ],
+      "facet_exclusions": {
+        "configuration_and_gates": "KD4 completion evidence is activated by repository identity rather than a user-selectable feature gate.",
+        "generated_artifacts": "Evidence documents and oversized payload artifacts are runtime state under CODEX_HOME, not checked-in generated mirrors."
+      },
+      "feature_ids": [
+        "task-evidence-completion-gate"
+      ],
+      "generated_artifacts": [],
+      "id": "task-evidence-runtime",
+      "invariants": [
+        {
+          "evidence": [
+            {
+              "path": "codex-rs/core/src/task_evidence.rs",
+              "symbol": "TaskEvidenceLedger::completion_gate"
+            }
+          ],
+          "id": "current-evidence-completion",
+          "kind": "semantic",
+          "statement": "Completion admission uses current, repository-contained evidence and reopens after relevant mutations or stale validation.",
+          "tests": [
+            "codex-rs/core/src/task_evidence_tests.rs"
+          ]
+        }
+      ],
+      "primary_entries": [
+        {
+          "path": "codex-rs/core/src/task_evidence.rs",
+          "symbol": "TaskEvidenceLedger"
+        }
+      ],
+      "roots": [
+        "codex-rs/core/src/task_evidence.rs",
+        "codex-rs/core/src/task_evidence"
+      ],
+      "tests": [
+        "codex-rs/core/src/task_evidence_tests.rs"
+      ],
+      "validation": [
+        {
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "codex-core",
+            "task_evidence_tests"
+          ],
+          "cwd": "codex-rs",
+          "id": "task-evidence-focused",
           "role": "focused_tests"
         }
       ]
@@ -500,6 +876,7 @@
         "configuration_and_gates": "Recovery limits are tool-schema and call arguments, not repository configuration or a feature gate.",
         "generated_artifacts": "Output artifacts are immutable runtime state and are not checked-in generated files."
       },
+      "feature_ids": [],
       "generated_artifacts": [],
       "id": "tool-output-recovery",
       "invariants": [
@@ -538,7 +915,7 @@
             "test",
             "-p",
             "codex-core",
-            "command_output_artifact_tests"
+            "tools::command_output_artifact::hardening_tests"
           ],
           "cwd": "codex-rs",
           "id": "tool-output-focused",
@@ -619,7 +996,7 @@
       "evidence": [
         {
           "path": "codex-rs/app-server/src/lib.rs",
-          "symbol": "run_main_with_transport_options"
+          "symbol": "run_main"
         }
       ],
       "kind": "calls",
@@ -683,6 +1060,58 @@
       "confidence": "compiler_resolved",
       "evidence": [
         {
+          "path": "codex-rs/code-mode-host/src/lib.rs",
+          "symbol": "codex_code_mode_protocol"
+        }
+      ],
+      "kind": "consumed_by",
+      "source": "owner:code-mode-protocol-contracts",
+      "target": "path:codex-rs/code-mode-host"
+    },
+    {
+      "category": "control_flow",
+      "confidence": "compiler_resolved",
+      "evidence": [
+        {
+          "path": "codex-rs/code-mode-protocol/src/lib.rs",
+          "symbol": "build_exec_tool_description"
+        }
+      ],
+      "kind": "calls",
+      "source": "owner:code-mode-protocol-contracts",
+      "target": "path:codex-rs/code-mode-protocol/src/description.rs"
+    },
+    {
+      "category": "runtime_registration",
+      "confidence": "compiler_resolved",
+      "evidence": [
+        {
+          "path": "codex-rs/code-mode-protocol/src/lib.rs",
+          "symbol": "build_exec_tool_description"
+        }
+      ],
+      "kind": "registers",
+      "source": "owner:code-mode-protocol-contracts",
+      "target": "path:codex-rs/code-mode-protocol/src/lib.rs"
+    },
+    {
+      "category": "tests_contracts",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "codex-rs/code-mode-protocol/src/description.rs",
+          "symbol": "tests"
+        }
+      ],
+      "kind": "validated_by",
+      "source": "owner:code-mode-protocol-contracts",
+      "target": "path:codex-rs/code-mode-protocol/src/description.rs"
+    },
+    {
+      "category": "callers_consumers",
+      "confidence": "compiler_resolved",
+      "evidence": [
+        {
           "path": "codex-rs/core/src/session/mod.rs",
           "symbol": "Codex"
         }
@@ -731,17 +1160,108 @@
       "target": "owner:core-agent-runtime"
     },
     {
-      "category": "configuration",
-      "confidence": "manifest_derived",
+      "category": "callers_consumers",
+      "confidence": "compiler_resolved",
       "evidence": [
         {
-          "path": "codex-rs/features/src/lib.rs",
-          "symbol": "Feature"
+          "path": "scripts/kd4_perf_snapshot.py",
+          "symbol": "check_kd4_features.py"
+        }
+      ],
+      "kind": "consumed_by",
+      "source": "owner:kd4-capability-manifest",
+      "target": "path:scripts/kd4_perf_snapshot.py"
+    },
+    {
+      "category": "configuration",
+      "confidence": "compiler_resolved",
+      "evidence": [
+        {
+          "path": "scripts/check_kd4_features.py",
+          "symbol": "DEFAULT_MANIFEST"
         }
       ],
       "kind": "reads_config",
-      "source": "owner:feature-registry",
+      "source": "owner:kd4-capability-manifest",
       "target": "config:kd4_features.toml"
+    },
+    {
+      "category": "runtime_registration",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "justfile",
+          "symbol": "check-kd4-features"
+        }
+      ],
+      "kind": "registers",
+      "source": "owner:kd4-capability-manifest",
+      "target": "path:justfile"
+    },
+    {
+      "category": "tests_contracts",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "scripts/test_check_kd4_features.py",
+          "symbol": "FeatureManifestTest"
+        }
+      ],
+      "kind": "validated_by",
+      "source": "owner:kd4-capability-manifest",
+      "target": "path:scripts/test_check_kd4_features.py"
+    },
+    {
+      "category": "callers_consumers",
+      "confidence": "compiler_resolved",
+      "evidence": [
+        {
+          "path": "codex-rs/core/src/config/mod.rs",
+          "symbol": "ModelsManagerConfig"
+        }
+      ],
+      "kind": "consumed_by",
+      "source": "owner:model-catalog-runtime",
+      "target": "owner:core-agent-runtime"
+    },
+    {
+      "category": "control_flow",
+      "confidence": "compiler_resolved",
+      "evidence": [
+        {
+          "path": "codex-rs/models-manager/src/manager.rs",
+          "symbol": "ModelsManager"
+        }
+      ],
+      "kind": "calls",
+      "source": "owner:model-catalog-runtime",
+      "target": "path:codex-rs/models-manager/src/model_info.rs"
+    },
+    {
+      "category": "runtime_registration",
+      "confidence": "compiler_resolved",
+      "evidence": [
+        {
+          "path": "codex-rs/core/src/session/mod.rs",
+          "symbol": "SharedModelsManager"
+        }
+      ],
+      "kind": "constructs",
+      "source": "owner:model-catalog-runtime",
+      "target": "path:codex-rs/models-manager/src/manager.rs"
+    },
+    {
+      "category": "tests_contracts",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "codex-rs/models-manager/src/prompt_contract_tests.rs",
+          "symbol": "resolved_prompts_satisfy_named_contract_registry"
+        }
+      ],
+      "kind": "validated_by",
+      "source": "owner:model-catalog-runtime",
+      "target": "path:codex-rs/models-manager/src/prompt_contract_tests.rs"
     },
     {
       "category": "callers_consumers",
@@ -848,30 +1368,163 @@
       "target": "path:codex-rs/core/src/git_workspace_tests.rs"
     },
     {
-      "category": "configuration",
-      "confidence": "manifest_derived",
+      "category": "callers_consumers",
+      "confidence": "declared",
       "evidence": [
         {
-          "path": "codex-rs/kda.toml",
-          "symbol": "architecture-gate"
+          "path": "codex-rs/core/Cargo.toml",
+          "symbol": "[[bench]] turn_latency"
         }
       ],
-      "kind": "gated_by",
-      "source": "owner:semantic-quality-gate",
-      "target": "config:codex-rs/kda.toml"
+      "kind": "consumed_by",
+      "source": "owner:rust-turn-latency-benchmark",
+      "target": "path:codex-rs/core/Cargo.toml"
+    },
+    {
+      "category": "control_flow",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "codex-rs/core/benches/turn_latency.rs",
+          "symbol": "run_code_mode_capture"
+        }
+      ],
+      "kind": "calls",
+      "source": "owner:rust-turn-latency-benchmark",
+      "target": "owner:core-agent-runtime"
+    },
+    {
+      "category": "runtime_registration",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "codex-rs/core/Cargo.toml",
+          "symbol": "[[bench]] turn_latency"
+        }
+      ],
+      "kind": "registers",
+      "source": "owner:rust-turn-latency-benchmark",
+      "target": "path:codex-rs/core/Cargo.toml"
     },
     {
       "category": "tests_contracts",
       "confidence": "declared",
       "evidence": [
         {
-          "path": "codex-rs/kda.toml",
-          "symbol": "version"
+          "path": "codex-rs/core/tests/turn_latency_bench.rs",
+          "symbol": "include"
         }
       ],
       "kind": "validated_by",
-      "source": "owner:semantic-quality-gate",
-      "target": "path:codex-rs/kda.toml"
+      "source": "owner:rust-turn-latency-benchmark",
+      "target": "path:codex-rs/core/benches/turn_latency.rs"
+    },
+    {
+      "category": "callers_consumers",
+      "confidence": "compiler_resolved",
+      "evidence": [
+        {
+          "path": "codex-rs/core/src/lib.rs",
+          "symbol": "codex_protocol"
+        }
+      ],
+      "kind": "consumed_by",
+      "source": "owner:shared-protocol-contracts",
+      "target": "owner:core-agent-runtime"
+    },
+    {
+      "category": "control_flow",
+      "confidence": "compiler_resolved",
+      "evidence": [
+        {
+          "path": "codex-rs/app-server/src",
+          "symbol": "codex_protocol"
+        }
+      ],
+      "kind": "consumed_by",
+      "source": "owner:shared-protocol-contracts",
+      "target": "owner:app-server-runtime"
+    },
+    {
+      "category": "runtime_registration",
+      "confidence": "compiler_resolved",
+      "evidence": [
+        {
+          "path": "codex-rs/protocol/src/lib.rs"
+        }
+      ],
+      "kind": "registers",
+      "source": "owner:shared-protocol-contracts",
+      "target": "path:codex-rs/protocol/src/lib.rs"
+    },
+    {
+      "category": "tests_contracts",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "codex-rs/protocol/src",
+          "symbol": "crate tests"
+        }
+      ],
+      "kind": "validated_by",
+      "source": "owner:shared-protocol-contracts",
+      "target": "path:codex-rs/protocol/src"
+    },
+    {
+      "category": "callers_consumers",
+      "confidence": "compiler_resolved",
+      "evidence": [
+        {
+          "path": "codex-rs/app-server/src/build_info.rs",
+          "symbol": "BuildInfo"
+        }
+      ],
+      "kind": "consumed_by",
+      "source": "owner:shared-utility-crates",
+      "target": "owner:app-server-runtime"
+    },
+    {
+      "category": "control_flow",
+      "confidence": "compiler_resolved",
+      "evidence": [
+        {
+          "path": "codex-rs/cli/src/doctor/runtime.rs",
+          "symbol": "BuildInfo"
+        }
+      ],
+      "kind": "consumed_by",
+      "source": "owner:shared-utility-crates",
+      "target": "owner:cli-entrypoints"
+    },
+    {
+      "category": "runtime_registration",
+      "confidence": "manifest_derived",
+      "evidence": [
+        {
+          "path": "codex-rs/Cargo.toml",
+          "symbol": "workspace.dependencies"
+        }
+      ],
+      "kind": "registers",
+      "source": "owner:shared-utility-crates",
+      "target": "path:codex-rs/Cargo.toml"
+    },
+    {
+      "category": "tests_contracts",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "codex-rs/utils/build-info/src/lib.rs",
+          "symbol": "tests"
+        },
+        {
+          "path": "codex-rs/utils/der/src/lib.rs",
+          "symbol": "tests"
+        }
+      ],
+      "kind": "validated_by",
+      "source": "owner:shared-utility-crates",
+      "target": "path:codex-rs/utils"
     },
     {
       "category": "callers_consumers",
@@ -956,6 +1609,58 @@
       "confidence": "compiler_resolved",
       "evidence": [
         {
+          "path": "codex-rs/core/src/tools/handlers/mcp.rs",
+          "symbol": "McpHandler::handle_call"
+        }
+      ],
+      "kind": "consumed_by",
+      "source": "owner:task-evidence-runtime",
+      "target": "path:codex-rs/core/src/tools/handlers/mcp.rs"
+    },
+    {
+      "category": "control_flow",
+      "confidence": "compiler_resolved",
+      "evidence": [
+        {
+          "path": "codex-rs/core/src/task_evidence.rs",
+          "symbol": "TaskEvidenceLedger::record_planning_update"
+        }
+      ],
+      "kind": "calls",
+      "source": "owner:task-evidence-runtime",
+      "target": "owner:planning-architecture-runtime"
+    },
+    {
+      "category": "runtime_registration",
+      "confidence": "compiler_resolved",
+      "evidence": [
+        {
+          "path": "codex-rs/core/src/session/session.rs",
+          "symbol": "TaskEvidenceLedger::load_or_new"
+        }
+      ],
+      "kind": "constructs",
+      "source": "owner:task-evidence-runtime",
+      "target": "path:codex-rs/core/src/session/session.rs"
+    },
+    {
+      "category": "tests_contracts",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "codex-rs/core/src/task_evidence_tests.rs",
+          "symbol": "source_owner_is_derived_from_implementation_surfaces"
+        }
+      ],
+      "kind": "validated_by",
+      "source": "owner:task-evidence-runtime",
+      "target": "path:codex-rs/core/src/task_evidence_tests.rs"
+    },
+    {
+      "category": "callers_consumers",
+      "confidence": "compiler_resolved",
+      "evidence": [
+        {
           "path": "codex-rs/core/src/context_manager/history.rs",
           "symbol": "read_tool_output"
         }
@@ -1004,7 +1709,7 @@
       "target": "path:codex-rs/core/src/tools/command_output_artifact_tests.rs"
     }
   ],
-  "repository_revision": "manifest:cfe5b481db6c34c607bef05d83b53c6e7cd196302857b20fc0fdb848add67ab9",
+  "repository_revision": "manifest:0261a42e2585112e5ea6091da977aa85a2a2befcce4254fa7cc1c352f0c30e98",
   "schema_version": 2,
   "status": "complete",
   "unresolved": []

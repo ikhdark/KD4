@@ -16,7 +16,6 @@ use crate::catalog::SkillPackageId;
 use crate::catalog::SkillProviderResult;
 use crate::catalog::SkillReadResult;
 use crate::catalog::SkillResourceId;
-use crate::catalog::SkillSearchResult;
 
 pub use executor::ExecutorSkillProvider;
 pub use host::HostSkillProvider;
@@ -42,25 +41,16 @@ pub struct SkillReadRequest {
     pub mcp_resources: Option<Arc<McpResourceClient>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SkillSearchRequest {
-    pub authority: SkillAuthority,
-    pub package: SkillPackageId,
-    pub query: String,
-}
-
 pub type SkillProviderFuture<'a, T> =
     Pin<Box<dyn Future<Output = SkillProviderResult<T>> + Send + 'a>>;
 
 /// Source-specific skill catalog and resource access.
 ///
 /// Implementations must preserve authority boundaries: a resource listed by a
-/// provider must be read or searched through the same provider/authority rather
+/// provider must be read through the same provider/authority rather
 /// than converted into an ambient local path.
 pub trait SkillProvider: Send + Sync {
     fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog>;
 
     fn read(&self, request: SkillReadRequest) -> SkillProviderFuture<'_, SkillReadResult>;
-
-    fn search(&self, request: SkillSearchRequest) -> SkillProviderFuture<'_, SkillSearchResult>;
 }

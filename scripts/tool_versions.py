@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tomllib
 from functools import cache
 from pathlib import Path
@@ -22,17 +23,33 @@ def scripts_ruff_requirement() -> str:
     raise RuntimeError("scripts/pyproject.toml must declare a ruff dependency")
 
 
-LANE_NAME_PATTERN = r"[A-Za-z0-9_.-]+"
-LANE_PATH_PATTERN = rf"target[\\/]+lanes[\\/]+({LANE_NAME_PATTERN})"
-SCRIPT_LANE_PATTERN = rf"(?:^|\s)-Lane\s+({LANE_NAME_PATTERN})(?:\s|$)"
-JUST_LANE_PATTERN = (
-    rf"\b(?:test-lane(?:-fast)?|cargo-lane(?:-(?:home|isolated-home))?|"
-    rf"test-lane-package|check-lane|clippy-lane|watch-lane|coverage-lane|"
-    rf"fix-lane)\s+({LANE_NAME_PATTERN})\b"
-)
-JUST_FIXED_LANE_PATTERN = r"\b(test-lane-main|cargo-lane-main|release-lane)\b"
-JUST_FIXED_LANE_NAMES = {
-    "test-lane-main": "main",
-    "cargo-lane-main": "main",
-    "release-lane": "release",
-}
+@cache
+def cargo_lane_patterns() -> dict[str, object]:
+    pattern_path = Path(__file__).with_name("cargo_lane_patterns.json")
+    data = json.loads(pattern_path.read_text(encoding="utf-8"))
+    required_patterns = (
+        "lane_path_pattern",
+        "script_lane_pattern",
+        "just_lane_pattern",
+        "just_fixed_lane_pattern",
+    )
+    for name in required_patterns:
+        if not isinstance(data.get(name), str) or not data[name]:
+            raise RuntimeError(f"{pattern_path} must define a non-empty {name}")
+    fixed_lane_names = data.get("just_fixed_lane_names")
+    if not isinstance(fixed_lane_names, dict) or not all(
+        isinstance(name, str) and isinstance(lane, str)
+        for name, lane in fixed_lane_names.items()
+    ):
+        raise RuntimeError(
+            f"{pattern_path} must define a string-to-string just_fixed_lane_names map"
+        )
+    return data
+
+
+_CARGO_LANE_PATTERNS = cargo_lane_patterns()
+LANE_PATH_PATTERN = str(_CARGO_LANE_PATTERNS["lane_path_pattern"])
+SCRIPT_LANE_PATTERN = str(_CARGO_LANE_PATTERNS["script_lane_pattern"])
+JUST_LANE_PATTERN = str(_CARGO_LANE_PATTERNS["just_lane_pattern"])
+JUST_FIXED_LANE_PATTERN = str(_CARGO_LANE_PATTERNS["just_fixed_lane_pattern"])
+JUST_FIXED_LANE_NAMES = dict(_CARGO_LANE_PATTERNS["just_fixed_lane_names"])

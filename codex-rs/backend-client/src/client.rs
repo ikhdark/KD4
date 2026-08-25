@@ -1,4 +1,3 @@
-use crate::types::AccountsCheckResponse;
 use crate::types::CodeTaskDetailsResponse;
 use crate::types::CodexUserSettingsResponse;
 use crate::types::CodexWorkspaceMessagesResponse;
@@ -107,7 +106,7 @@ struct SendAddCreditsNudgeEmailRequest {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PathStyle {
+enum PathStyle {
     /// /api/codex/…
     CodexApi,
     /// /wham/…
@@ -131,7 +130,6 @@ pub struct Client {
     auth_provider: SharedAuthProvider,
     user_agent: Option<HeaderValue>,
     chatgpt_account_id: Option<String>,
-    chatgpt_account_is_fedramp: bool,
     path_style: PathStyle,
 }
 
@@ -142,10 +140,6 @@ impl fmt::Debug for Client {
             .field("auth_provider", &"<provider>")
             .field("user_agent", &self.user_agent)
             .field("chatgpt_account_id", &self.chatgpt_account_id)
-            .field(
-                "chatgpt_account_is_fedramp",
-                &self.chatgpt_account_is_fedramp,
-            )
             .field("path_style", &self.path_style)
             .finish_non_exhaustive()
     }
@@ -176,7 +170,6 @@ impl Client {
             auth_provider: codex_model_provider::unauthenticated_auth_provider(),
             user_agent: None,
             chatgpt_account_id: None,
-            chatgpt_account_is_fedramp: false,
             path_style,
         }
     }
@@ -208,16 +201,6 @@ impl Client {
         self
     }
 
-    pub fn with_fedramp_routing_header(mut self) -> Self {
-        self.chatgpt_account_is_fedramp = true;
-        self
-    }
-
-    pub fn with_path_style(mut self, style: PathStyle) -> Self {
-        self.path_style = style;
-        self
-    }
-
     fn headers(&self) -> HeaderMap {
         let mut h = HeaderMap::new();
         if let Some(ua) = &self.user_agent {
@@ -231,11 +214,6 @@ impl Client {
             && let Ok(hv) = HeaderValue::from_str(acc)
         {
             h.insert(name, hv);
-        }
-        if self.chatgpt_account_is_fedramp
-            && let Ok(name) = HeaderName::from_bytes(b"X-OpenAI-Fedramp")
-        {
-            h.insert(name, HeaderValue::from_static("true"));
         }
         h
     }
@@ -301,27 +279,8 @@ impl Client {
         }
     }
 
-    pub async fn get_rate_limits(&self) -> Result<RateLimitSnapshot> {
-        let snapshots = self.get_rate_limits_many().await?;
-        let preferred = snapshots
-            .iter()
-            .find(|snapshot| snapshot.limit_id.as_deref() == Some("codex"))
-            .cloned();
-        Ok(preferred.unwrap_or_else(|| snapshots[0].clone()))
-    }
-
     pub async fn get_rate_limits_many(&self) -> Result<Vec<RateLimitSnapshot>> {
         Ok(self.get_rate_limits_with_reset_credits().await?.rate_limits)
-    }
-
-    pub async fn get_accounts_check(&self) -> Result<AccountsCheckResponse> {
-        let url = match self.path_style {
-            PathStyle::CodexApi => format!("{}/api/codex/accounts/check", self.base_url),
-            PathStyle::ChatGptApi => format!("{}/wham/accounts/check", self.base_url),
-        };
-        let req = self.request(Method::GET, &url).headers(self.headers());
-        let (body, ct) = self.exec_request(req, "GET", &url).await?;
-        self.decode_json(&url, &ct, &body)
     }
 
     pub async fn get_token_usage_profile(&self) -> Result<TokenUsageProfile> {
@@ -922,49 +881,6 @@ mod tests {
     }
 
     #[test]
-    fn preferred_snapshot_selection_matches_get_rate_limits_behavior() {
-        let snapshots = [
-            RateLimitSnapshot {
-                limit_id: Some("codex_other".to_string()),
-                limit_name: Some("codex_other".to_string()),
-                primary: Some(RateLimitWindow {
-                    used_percent: 90.0,
-                    window_minutes: Some(60),
-                    resets_at: Some(1),
-                }),
-                secondary: None,
-                credits: None,
-                individual_limit: None,
-                spend_control_reached: None,
-                plan_type: Some(AccountPlanType::Pro),
-                rate_limit_reached_type: None,
-            },
-            RateLimitSnapshot {
-                limit_id: Some("codex".to_string()),
-                limit_name: Some("codex".to_string()),
-                primary: Some(RateLimitWindow {
-                    used_percent: 10.0,
-                    window_minutes: Some(60),
-                    resets_at: Some(2),
-                }),
-                secondary: None,
-                credits: None,
-                individual_limit: None,
-                spend_control_reached: None,
-                plan_type: Some(AccountPlanType::Pro),
-                rate_limit_reached_type: None,
-            },
-        ];
-
-        let preferred = snapshots
-            .iter()
-            .find(|snapshot| snapshot.limit_id.as_deref() == Some("codex"))
-            .cloned()
-            .unwrap_or_else(|| snapshots[0].clone());
-        assert_eq!(preferred.limit_id.as_deref(), Some("codex"));
-    }
-
-    #[test]
     fn usage_payload_maps_every_rate_limit_reached_type() {
         let cases = [
             (
@@ -1174,7 +1090,6 @@ mod tests {
             auth_provider: codex_model_provider::unauthenticated_auth_provider(),
             user_agent: None,
             chatgpt_account_id: None,
-            chatgpt_account_is_fedramp: false,
             path_style,
         }
     }

@@ -22,7 +22,7 @@ use codex_core::ARCHIVED_SESSIONS_SUBDIR;
 use codex_git_utils::GitSha;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::GitInfo as RolloutGitInfo;
-use codex_rollout::state_db::reconcile_rollout;
+use codex_rollout::state_integration::reconcile_rollout;
 use codex_state::StateRuntime;
 use pretty_assertions::assert_eq;
 use serde_json::Value;

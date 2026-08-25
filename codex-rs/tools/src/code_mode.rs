@@ -106,19 +106,6 @@ pub fn collect_code_mode_tool_definitions<'a>(
     tool_definitions
 }
 
-pub fn collect_code_mode_exec_prompt_tool_definitions<'a>(
-    specs: impl IntoIterator<Item = &'a ToolSpec>,
-) -> Vec<CodeModeToolDefinition> {
-    let mut tool_definitions = specs
-        .into_iter()
-        .flat_map(code_mode_tool_definitions_for_spec)
-        .filter(|definition| codex_code_mode::is_code_mode_nested_tool(&definition.name))
-        .collect::<Vec<_>>();
-    tool_definitions.sort_by(|left, right| left.name.cmp(&right.name));
-    tool_definitions.dedup_by(|left, right| left.name == right.name);
-    tool_definitions
-}
-
 fn augmented_description_for_spec(spec: &ToolSpec) -> Option<String> {
     code_mode_tool_definition_for_spec(spec)
         .map(codex_code_mode::augment_tool_definition)
@@ -132,9 +119,10 @@ fn code_mode_tool_definition_for_spec(spec: &ToolSpec) -> Option<CodeModeToolDef
 fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefinition> {
     match spec {
         ToolSpec::Function(tool) => {
-            let name = tool.name.clone();
+            let tool_name = ToolName::plain(tool.name.clone());
+            let name = tool_name.name.clone();
             vec![CodeModeToolDefinition {
-                tool_name: ToolName::plain(name.clone()),
+                tool_name,
                 name,
                 description: tool.description.clone(),
                 kind: CodeModeToolKind::Function,
@@ -143,9 +131,10 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
             }]
         }
         ToolSpec::Freeform(tool) => {
-            let name = tool.name.clone();
+            let tool_name = ToolName::plain(tool.name.clone());
+            let name = tool_name.name.clone();
             vec![CodeModeToolDefinition {
-                tool_name: ToolName::plain(name.clone()),
+                tool_name,
                 name,
                 description: tool.description.clone(),
                 kind: CodeModeToolKind::Freeform,
@@ -156,18 +145,16 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
         ToolSpec::Namespace(namespace) => namespace
             .tools
             .iter()
-            .map(|tool| match tool {
-                ResponsesApiNamespaceTool::Function(tool) => {
-                    let tool_name = ToolName::namespaced(namespace.name.clone(), tool.name.clone());
-                    CodeModeToolDefinition {
-                        name: code_mode_name_for_tool_name(&tool_name),
-                        tool_name,
-                        description: tool.description.clone(),
-                        kind: CodeModeToolKind::Function,
-                        input_schema: serde_json::to_value(&tool.parameters).ok(),
-                        output_schema: tool.output_schema.clone(),
-                    }
-                }
+            .zip(spec.callable_tool_names())
+            .map(|(tool, tool_name)| match tool {
+                ResponsesApiNamespaceTool::Function(tool) => CodeModeToolDefinition {
+                    name: code_mode_name_for_tool_name(&tool_name),
+                    tool_name,
+                    description: tool.description.clone(),
+                    kind: CodeModeToolKind::Function,
+                    input_schema: serde_json::to_value(&tool.parameters).ok(),
+                    output_schema: tool.output_schema.clone(),
+                },
             })
             .collect(),
         ToolSpec::ToolSearch {

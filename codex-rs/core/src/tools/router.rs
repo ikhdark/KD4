@@ -1,9 +1,10 @@
+use crate::FunctionCallError;
 use crate::agent::task_capabilities::ExternalMutationIntent;
 use crate::agent::task_capabilities::TypedToolClass;
 use crate::agent::task_capabilities::authorize_typed_tool;
 use crate::agent::task_capabilities::classify_typed_tool;
 use crate::agent::task_capabilities::is_independent_review_source;
-use crate::function_tool::FunctionCallError;
+use crate::client_common::ToolSchemaArtifact;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::tools::context::SharedTurnDiffTracker;
@@ -14,10 +15,12 @@ use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::registry::AnyToolResult;
 use crate::tools::registry::ToolArgumentDiffConsumer;
 use crate::tools::registry::ToolRegistry;
+use crate::tools::spec_plan::active_collaboration_namespace;
 use crate::tools::spec_plan::build_tool_router;
 use crate::tools::tool_dispatch_trace::record_authorization_state_coordination;
 use codex_agent_task_store::AssignmentAdmissionOrigin;
 use codex_agent_task_store::AttemptState;
+use codex_config::schema::canonicalize as canonicalize_json;
 use codex_mcp::ToolInfo;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::ResponseItem;
@@ -57,10 +60,10 @@ pub(crate) enum ToolCallBuildError {
 
 pub struct ToolRouter {
     registry: ToolRegistry,
-    model_visible_specs: Vec<ToolSpec>,
     planning_warnings: Vec<String>,
     proven_read_only_external_tools: HashSet<ToolName>,
     exposure_identity: ToolExposureIdentity,
+    schema_cache: Mutex<Option<(String, u64, Arc<ToolSchemaArtifact>)>>,
     manifest_cache: Mutex<Option<(String, u64, ToolManifestItem)>>,
 }
 
@@ -120,17 +123,18 @@ impl ToolRouter {
     }
 
     pub(crate) fn from_parts_with_warnings_and_identity(
-        registry: ToolRegistry,
+        mut registry: ToolRegistry,
         model_visible_specs: Vec<ToolSpec>,
         planning_warnings: Vec<String>,
         exposure_identity: ToolExposureIdentity,
     ) -> Self {
+        registry.set_model_visible_specs(model_visible_specs);
         Self {
             registry,
-            model_visible_specs,
             planning_warnings,
             proven_read_only_external_tools: HashSet::new(),
             exposure_identity,
+            schema_cache: Mutex::new(None),
             manifest_cache: Mutex::new(None),
         }
     }
@@ -139,17 +143,47 @@ impl ToolRouter {
         &self.exposure_identity
     }
 
-    pub fn model_visible_specs(&self) -> Vec<ToolSpec> {
-        self.model_visible_specs.clone()
-    }
-
-    pub(crate) fn model_visible_specs_for_turn(
+    pub(crate) fn classify_tool_name(
         &self,
         turn: &crate::session::turn_context::TurnContext,
-    ) -> Vec<ToolSpec> {
+        tool_name: &ToolName,
+    ) -> TypedToolClass {
+        classify_typed_tool(
+            tool_name.namespace.as_deref(),
+            &tool_name.name,
+            active_collaboration_namespace(turn, self.exposure_identity.agent_surface_stage),
+        )
+    }
+
+    pub fn model_visible_specs(&self) -> Vec<ToolSpec> {
+        self.registry.model_visible_specs()
+    }
+
+    pub(crate) fn model_visible_schemas(&self) -> Arc<ToolSchemaArtifact> {
+        self.registry.model_visible_schemas()
+    }
+
+    pub(crate) fn model_visible_schemas_for_turn(
+        &self,
+        turn: &crate::session::turn_context::TurnContext,
+    ) -> Arc<ToolSchemaArtifact> {
         let activated = turn.activated_deferred_tools();
         if activated.is_empty() {
-            return self.model_visible_specs();
+            return self.model_visible_schemas();
+        }
+
+        let activation_revision = turn.deferred_tool_activation_revision();
+        let turn_id = turn.sub_id.clone();
+        if let Some((_, _, schemas)) = self
+            .schema_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .filter(|(cached_turn, cached_revision, _)| {
+                cached_turn == &turn_id && *cached_revision == activation_revision
+            })
+        {
+            return Arc::clone(schemas);
         }
 
         let mut visible = self.model_visible_specs();
@@ -162,7 +196,13 @@ impl ToolRouter {
             };
             merge_visible_tool_spec(&mut visible, spec);
         }
-        visible
+        let schemas = Arc::new(ToolSchemaArtifact::new(visible));
+        *self
+            .schema_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((turn_id, activation_revision, Arc::clone(&schemas)));
+        schemas
     }
 
     pub(crate) fn deferred_tool_capability_revisions(&self) -> HashMap<ToolName, String> {
@@ -206,7 +246,7 @@ impl ToolRouter {
             .into_iter()
             .map(|(name, exposure, spec)| {
                 let canonical_spec =
-                    canonicalize_json(serde_json::to_value(spec).unwrap_or_default());
+                    canonicalize_json(&serde_json::to_value(spec).unwrap_or_default());
                 let spec_sha256 = format!(
                     "{:x}",
                     Sha256::digest(serde_json::to_vec(&canonical_spec).unwrap_or_default())
@@ -229,8 +269,8 @@ impl ToolRouter {
                 })
             })
             .collect::<Vec<_>>();
-        let manifest = canonicalize_json(serde_json::json!({
-            "model_visible": self.model_visible_specs,
+        let manifest = canonicalize_json(&serde_json::json!({
+            "model_visible": self.registry.model_visible_schemas().specs(),
             "registered": registered,
         }));
         let fingerprint_input = serde_json::json!({
@@ -380,23 +420,10 @@ impl ToolRouter {
         } else {
             ExternalMutationIntent::MayMutate
         };
-        let collaboration_namespace = step_context
-            .turn
-            .provider
-            .capabilities()
-            .namespace_tools
-            .then_some(
-                step_context
-                    .turn
-                    .config
-                    .multi_agent_v2
-                    .tool_namespace
-                    .as_deref(),
-            )
-            .flatten();
+        let tool_class = self.classify_tool_name(step_context.turn.as_ref(), &call.tool_name);
         authorize_independent_review_tool_call(
             &step_context.turn.session_source,
-            collaboration_namespace,
+            tool_class,
             &call,
             external_mutation_intent,
         )?;
@@ -404,6 +431,7 @@ impl ToolRouter {
         let authorization_result = authorize_bound_typed_tool_call(
             session.as_ref(),
             step_context.as_ref(),
+            tool_class,
             &call,
             external_mutation_intent,
         )
@@ -416,11 +444,8 @@ impl ToolRouter {
             payload,
         } = call;
 
-        // Keep the legacy ToolInvocation.turn field tied to the same request state until handlers migrate.
-        let turn = Arc::clone(&step_context.turn);
         let invocation = ToolInvocation {
             session,
-            turn,
             step_context,
             cancellation_token,
             tracker,
@@ -493,25 +518,6 @@ fn merge_visible_tool_spec(visible: &mut Vec<ToolSpec>, spec: ToolSpec) {
         }
     } else {
         visible.push(ToolSpec::Namespace(namespace));
-    }
-}
-
-fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Array(values) => {
-            serde_json::Value::Array(values.into_iter().map(canonicalize_json).collect())
-        }
-        serde_json::Value::Object(values) => {
-            let mut entries = values.into_iter().collect::<Vec<_>>();
-            entries.sort_by(|left, right| left.0.cmp(&right.0));
-            serde_json::Value::Object(
-                entries
-                    .into_iter()
-                    .map(|(key, value)| (key, canonicalize_json(value)))
-                    .collect(),
-            )
-        }
-        value => value,
     }
 }
 
@@ -590,18 +596,13 @@ fn is_allowlisted_read_only_external_tool(name: &ToolName) -> bool {
 
 fn authorize_independent_review_tool_call(
     session_source: &SessionSource,
-    collaboration_namespace: Option<&str>,
+    class: TypedToolClass,
     call: &ToolCall,
     external_mutation_intent: ExternalMutationIntent,
 ) -> Result<(), FunctionCallError> {
     if !is_independent_review_source(session_source) {
         return Ok(());
     }
-    let class = classify_typed_tool(
-        call.tool_name.namespace.as_deref(),
-        &call.tool_name.name,
-        collaboration_namespace,
-    );
     let allowed = matches!(
         class,
         TypedToolClass::AgentCommunication
@@ -625,6 +626,7 @@ fn authorize_independent_review_tool_call(
 async fn authorize_bound_typed_tool_call(
     session: &Session,
     step_context: &StepContext,
+    class: TypedToolClass,
     call: &ToolCall,
     _external_mutation_intent: ExternalMutationIntent,
 ) -> Result<(), FunctionCallError> {
@@ -632,25 +634,6 @@ async fn authorize_bound_typed_tool_call(
     let Some(binding) = coordinator.binding_for_source(&step_context.turn.session_source) else {
         return Ok(());
     };
-    let collaboration_namespace = step_context
-        .turn
-        .provider
-        .capabilities()
-        .namespace_tools
-        .then_some(
-            step_context
-                .turn
-                .config
-                .multi_agent_v2
-                .tool_namespace
-                .as_deref(),
-        )
-        .flatten();
-    let class = classify_typed_tool(
-        call.tool_name.namespace.as_deref(),
-        &call.tool_name.name,
-        collaboration_namespace,
-    );
     let task = coordinator
         .get_agent_task(binding.assignment_id, Some(0))
         .await
@@ -717,6 +700,22 @@ pub(crate) fn extension_tool_executors(
             )
         })
         .collect()
+}
+
+pub(crate) fn extension_tool_surface_revision(session: &Session) -> u64 {
+    session
+        .services
+        .extensions
+        .tool_contributors()
+        .iter()
+        .fold(0_u64, |revision, contributor| {
+            revision
+                .rotate_left(7)
+                .wrapping_add(contributor.surface_revision(
+                    &session.services.session_extension_data,
+                    &session.services.thread_extension_data,
+                ))
+        })
 }
 
 #[cfg(test)]

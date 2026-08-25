@@ -2,6 +2,7 @@ use super::*;
 use crate::agent::control::render_input_preview;
 use crate::tools::handlers::multi_agents_spec::create_send_input_tool_v1;
 use codex_tools::ToolSpec;
+use std::sync::Arc;
 
 pub(crate) struct Handler;
 
@@ -33,11 +34,12 @@ impl Handler {
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let ToolInvocation {
             session,
-            turn,
+            step_context,
             payload,
             call_id,
             ..
         } = invocation;
+        let turn = Arc::clone(&step_context.turn);
         let arguments = function_arguments(payload)?;
         let args: SendInputArgs = parse_arguments(&arguments)?;
         let receiver_thread_id = parse_agent_id_target(&args.target)?;

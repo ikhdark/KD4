@@ -452,20 +452,6 @@ pub fn public_key_ssh_from_private_key_pkcs8_base64(
     Ok(encode_ssh_ed25519_public_key(&signing_key.verifying_key()))
 }
 
-pub fn verifying_key_from_private_key_pkcs8_base64(
-    private_key_pkcs8_base64: &str,
-) -> Result<VerifyingKey> {
-    let signing_key = signing_key_from_private_key_pkcs8_base64(private_key_pkcs8_base64)?;
-    Ok(signing_key.verifying_key())
-}
-
-pub fn curve25519_secret_key_from_private_key_pkcs8_base64(
-    private_key_pkcs8_base64: &str,
-) -> Result<Curve25519SecretKey> {
-    let signing_key = signing_key_from_private_key_pkcs8_base64(private_key_pkcs8_base64)?;
-    Ok(curve25519_secret_key_from_signing_key(&signing_key))
-}
-
 pub fn agent_registration_url(agent_identity_authapi_base_url: &str) -> String {
     agent_identity_authapi_url(agent_identity_authapi_base_url, "/v1/agent/register")
 }

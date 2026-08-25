@@ -668,23 +668,16 @@ mod tests {
     use tokio::time::timeout;
 
     fn test_runtime_paths() -> ExecServerRuntimePaths {
-        ExecServerRuntimePaths::new(
-            std::env::current_exe().expect("current exe"),
-            /*codex_linux_sandbox_exe*/ None,
-        )
-        .expect("runtime paths")
+        ExecServerRuntimePaths::new(std::env::current_exe().expect("current exe"))
+            .expect("runtime paths")
     }
 
     fn successful_process_argv() -> Vec<String> {
-        if cfg!(windows) {
-            vec![
-                std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string()),
-                "/C".to_string(),
-                "exit /B 0".to_string(),
-            ]
-        } else {
-            vec!["true".to_string()]
-        }
+        vec![
+            std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string()),
+            "/C".to_string(),
+            "exit /B 0".to_string(),
+        ]
     }
 
     fn assert_local_environment_unavailable(manager: &EnvironmentManager) {
@@ -1288,9 +1281,7 @@ mod tests {
     #[tokio::test]
     async fn local_environment_passes_runtime_paths_to_exec_backend() {
         let environment = Environment::local(test_runtime_paths());
-        #[cfg(unix)]
-        let uri = "file://server/share/checkout";
-        #[cfg(windows)]
+
         let uri = "file:///usr/local/checkout";
         let sandbox_cwd = PathUri::parse(uri).expect("non-native sandbox cwd URI");
         let source = sandbox_cwd

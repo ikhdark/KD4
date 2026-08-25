@@ -38,14 +38,12 @@ use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::NetworkPolicyRuleAction;
 use codex_protocol::protocol::ReviewDecision;
-use codex_sandboxing::SandboxManager;
 use codex_sandboxing::SandboxType;
-use codex_utils_path_uri::PathUri;
+use codex_sandboxing::select_initial;
+use codex_sandboxing::should_sandbox;
 use std::time::Instant;
 
-pub(crate) struct ToolOrchestrator {
-    sandbox: SandboxManager,
-}
+pub(crate) struct ToolOrchestrator;
 
 pub(crate) struct OrchestratorRunResult<Out> {
     pub output: Out,
@@ -54,9 +52,7 @@ pub(crate) struct OrchestratorRunResult<Out> {
 
 impl ToolOrchestrator {
     pub fn new() -> Self {
-        Self {
-            sandbox: SandboxManager::new(),
-        }
+        Self
     }
 
     async fn run_attempt<Rq, Out, T>(
@@ -73,7 +69,6 @@ impl ToolOrchestrator {
             &tool_ctx.session,
             &tool_ctx.turn.sub_id,
             managed_network_active,
-            attempt.sandbox,
             tool.network_approval_spec(req, tool_ctx),
         )
         .await
@@ -94,11 +89,8 @@ impl ToolOrchestrator {
             permissions: attempt.permissions,
             exec_server_permissions: attempt.exec_server_permissions,
             enforce_managed_network: attempt.enforce_managed_network,
-            manager: attempt.manager,
             sandbox_cwd: attempt.sandbox_cwd,
             workspace_roots: attempt.workspace_roots,
-            codex_linux_sandbox_exe: attempt.codex_linux_sandbox_exe,
-            use_legacy_landlock: attempt.use_legacy_landlock,
             windows_sandbox_level: attempt.windows_sandbox_level,
             windows_sandbox_private_desktop: attempt.windows_sandbox_private_desktop,
             network_denial_cancellation_token: network_approval
@@ -241,7 +233,7 @@ impl ToolOrchestrator {
         let sandbox_preference = tool.sandbox_preference();
         let sandbox_requested = match sandbox_override {
             SandboxOverride::BypassSandboxFirstAttempt => false,
-            SandboxOverride::NoOverride => self.sandbox.should_sandbox(
+            SandboxOverride::NoOverride => should_sandbox(
                 &file_system_sandbox_policy,
                 network_sandbox_policy,
                 sandbox_preference,
@@ -249,7 +241,7 @@ impl ToolOrchestrator {
             ),
         };
         let initial_sandbox = if sandbox_requested {
-            self.sandbox.select_initial(
+            select_initial(
                 &file_system_sandbox_policy,
                 network_sandbox_policy,
                 sandbox_preference,
@@ -260,13 +252,10 @@ impl ToolOrchestrator {
             SandboxType::None
         };
 
-        // Platform-specific flag gating is handled by SandboxManager::select_initial.
-        let use_legacy_landlock = turn_ctx.config.features.use_legacy_landlock();
-        #[allow(deprecated)]
         let sandbox_policy_cwd = tool
             .sandbox_cwd(req)
             .cloned()
-            .unwrap_or_else(|| PathUri::from_abs_path(&turn_ctx.cwd));
+            .unwrap_or_else(|| turn_ctx.cwd_uri());
         let workspace_roots = turn_ctx.config.effective_workspace_roots();
         let initial_attempt = SandboxAttempt {
             sandbox: initial_sandbox,
@@ -274,11 +263,8 @@ impl ToolOrchestrator {
             permissions: &turn_ctx.permission_profile,
             exec_server_permissions: turn_ctx.config.permissions.permission_profile(),
             enforce_managed_network: managed_network_active,
-            manager: &self.sandbox,
             sandbox_cwd: &sandbox_policy_cwd,
             workspace_roots: workspace_roots.as_slice(),
-            codex_linux_sandbox_exe: turn_ctx.config.codex_linux_sandbox_exe.as_ref(),
-            use_legacy_landlock,
             windows_sandbox_level: turn_ctx.windows_sandbox_level,
             windows_sandbox_private_desktop: turn_ctx
                 .config
@@ -429,14 +415,14 @@ impl ToolOrchestrator {
                 }
 
                 let retry_sandbox_requested = !unsandboxed_allowed
-                    && self.sandbox.should_sandbox(
+                    && should_sandbox(
                         &file_system_sandbox_policy,
                         network_sandbox_policy,
                         sandbox_preference,
                         managed_network_active,
                     );
                 let retry_sandbox = if retry_sandbox_requested {
-                    self.sandbox.select_initial(
+                    select_initial(
                         &file_system_sandbox_policy,
                         network_sandbox_policy,
                         sandbox_preference,
@@ -446,22 +432,14 @@ impl ToolOrchestrator {
                 } else {
                     SandboxType::None
                 };
-                let retry_codex_linux_sandbox_exe = if unsandboxed_allowed {
-                    None
-                } else {
-                    turn_ctx.config.codex_linux_sandbox_exe.as_ref()
-                };
                 let retry_attempt = SandboxAttempt {
                     sandbox: retry_sandbox,
                     sandbox_requested: retry_sandbox_requested,
                     permissions: &turn_ctx.permission_profile,
                     exec_server_permissions: turn_ctx.config.permissions.permission_profile(),
                     enforce_managed_network: managed_network_active,
-                    manager: &self.sandbox,
                     sandbox_cwd: &sandbox_policy_cwd,
                     workspace_roots: workspace_roots.as_slice(),
-                    codex_linux_sandbox_exe: retry_codex_linux_sandbox_exe,
-                    use_legacy_landlock,
                     windows_sandbox_level: turn_ctx.windows_sandbox_level,
                     windows_sandbox_private_desktop: turn_ctx
                         .config

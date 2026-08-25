@@ -56,13 +56,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::watch;
 
-use codex_rollout::state_db::StateDbHandle;
+use codex_rollout::state_integration::StateDbHandle;
 
 #[derive(Clone, Debug)]
 pub struct ThreadConfigSnapshot {
     pub model: String,
     pub model_provider_id: String,
     pub service_tier: Option<String>,
+    pub developer_instructions: Option<String>,
     pub approval_policy: AskForApproval,
     pub approvals_reviewer: ApprovalsReviewer,
     pub permission_profile: PermissionProfile,
@@ -781,11 +782,22 @@ impl CodexThread {
         self.codex.session.multi_agent_version()
     }
 
-    /// Refresh the thread's layer-backed user config state from a caller-supplied
-    /// config snapshot. Thread-scoped layers and session-static settings remain
-    /// unchanged.
+    /// Refresh the thread's layer-backed user config from a caller-supplied snapshot.
+    /// Thread-scoped layers and session-static settings remain unchanged.
     pub async fn refresh_runtime_config(&self, next_config: crate::config::Config) {
         self.codex.session.refresh_runtime_config(next_config).await;
+    }
+
+    /// Refreshes runtime config while also publishing the listed materialized feature gates.
+    pub async fn refresh_runtime_config_features(
+        &self,
+        next_config: crate::config::Config,
+        refreshed_features: &[Feature],
+    ) {
+        self.codex
+            .session
+            .refresh_runtime_config_features(next_config, refreshed_features)
+            .await;
     }
 
     pub async fn environment_selections(&self) -> Vec<TurnEnvironmentSelection> {

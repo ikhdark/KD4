@@ -30,8 +30,6 @@ use similar::TextDiff;
 pub use streaming_parser::StreamingPatchParser;
 use thiserror::Error;
 
-pub use invocation::MaybeApplyPatch;
-pub use invocation::maybe_parse_apply_patch;
 pub use invocation::maybe_parse_apply_patch_verified;
 pub use invocation::maybe_parse_apply_patch_verified_for_environment;
 pub use invocation::verify_apply_patch_args;
@@ -1041,24 +1039,13 @@ fn bounded_patch_mismatch_excerpt(
             rendered.push('\n');
         }
         rendered.push_str(&prefix);
-        rendered.push_str(truncate_utf8(line, remaining));
+        rendered.push_str(&line[..line.floor_char_boundary(remaining)]);
         rendered_end = excerpt_start + index + 1;
         if line.len() > remaining {
             break;
         }
     }
     (!rendered.is_empty()).then(|| (excerpt_start + 1, rendered_end, rendered))
-}
-
-fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
-    if value.len() <= max_bytes {
-        return value;
-    }
-    let mut end = max_bytes;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    &value[..end]
 }
 
 /// Apply the `(start_index, old_len, new_lines)` replacements to `original_lines`,
@@ -1518,61 +1505,6 @@ mod tests {
             assert_eq!(fs::read(&dest).unwrap(), contents.as_bytes());
             assert!(stderr.is_empty());
         }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_failed_move_returns_committed_destination_delta() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempdir().unwrap();
-        let source_dir = dir.path().join("locked");
-        let dest_dir = dir.path().join("out");
-        fs::create_dir(&source_dir).unwrap();
-        fs::create_dir(&dest_dir).unwrap();
-        let src = source_dir.join("src.txt");
-        let dest = dest_dir.join("dst.txt");
-        fs::write(&src, "line\n").unwrap();
-        fs::set_permissions(&source_dir, fs::Permissions::from_mode(0o555)).unwrap();
-
-        let patch = wrap_patch(
-            "*** Update File: locked/src.txt\n*** Move to: out/dst.txt\n@@\n-line\n+line2",
-        );
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let failure = apply_patch(
-            &patch,
-            &PathUri::from_host_native_path(dir.path()).expect("absolute test path"),
-            &mut stdout,
-            &mut stderr,
-            LOCAL_FS.as_ref(),
-            /*sandbox*/ None,
-        )
-        .await
-        .expect_err("source removal should fail after destination write");
-
-        fs::set_permissions(&source_dir, fs::Permissions::from_mode(0o755)).unwrap();
-
-        assert!(
-            String::from_utf8(stderr)
-                .unwrap()
-                .contains(&format!("Failed to remove original {}", src.display()))
-        );
-        assert_eq!(
-            failure.delta(),
-            &AppliedPatchDelta::new(
-                vec![AppliedPatchChange {
-                    path: dest.clone(),
-                    change: AppliedPatchFileChange::Add {
-                        content: "line2\n".to_string(),
-                        overwritten_content: None,
-                    },
-                }],
-                /*exact*/ true,
-            )
-        );
-        assert_eq!(fs::read_to_string(src).unwrap(), "line\n");
-        assert_eq!(fs::read_to_string(dest).unwrap(), "line2\n");
     }
 
     /// Verify that a single `Update File` hunk with multiple change chunks can update different
@@ -2038,36 +1970,6 @@ g
         );
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_apply_patch_fails_on_write_error() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempdir().unwrap();
-        let locked_dir = dir.path().join("locked");
-        fs::create_dir(&locked_dir).unwrap();
-        fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o555)).unwrap();
-
-        let patch = wrap_patch("*** Add File: locked/new.txt\n+after");
-
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let result = apply_patch(
-            &patch,
-            &PathUri::from_host_native_path(dir.path()).expect("absolute test path"),
-            &mut stdout,
-            &mut stderr,
-            LOCAL_FS.as_ref(),
-            /*sandbox*/ None,
-        )
-        .await;
-        let failure = result.expect_err("write should fail");
-
-        fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o755)).unwrap();
-
-        assert!(!failure.delta().is_exact());
-    }
-
     #[tokio::test]
     async fn test_unreadable_destinations_return_inexact_delta() {
         let dir = tempdir().unwrap();
@@ -2095,31 +1997,5 @@ g
 
             assert!(!delta.is_exact());
         }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_delete_symlink_returns_inexact_delta() {
-        use std::os::unix::fs::symlink;
-
-        let dir = tempdir().unwrap();
-        fs::write(dir.path().join("target.txt"), "target\n").unwrap();
-        symlink(dir.path().join("target.txt"), dir.path().join("link.txt")).unwrap();
-        let patch = wrap_patch("*** Delete File: link.txt");
-
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let delta = apply_patch(
-            &patch,
-            &PathUri::from_host_native_path(dir.path()).expect("absolute test path"),
-            &mut stdout,
-            &mut stderr,
-            LOCAL_FS.as_ref(),
-            /*sandbox*/ None,
-        )
-        .await
-        .unwrap();
-
-        assert!(!delta.is_exact());
     }
 }

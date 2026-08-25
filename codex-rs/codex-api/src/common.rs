@@ -14,6 +14,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 use tokio::sync::mpsc;
@@ -29,7 +30,7 @@ pub struct CompactionInput<'a> {
     #[serde(skip_serializing_if = "str::is_empty")]
     pub instructions: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<Value>>,
+    pub tools: Option<Arc<[Value]>>,
     pub parallel_tool_calls: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<Reasoning>,
@@ -217,9 +218,9 @@ pub struct ResponsesApiRequest {
     pub model: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub instructions: String,
-    pub input: std::sync::Arc<[ResponseItem]>,
+    pub input: Arc<[ResponseItem]>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<serde_json::Value>>,
+    pub tools: Option<Arc<[Value]>>,
     pub tool_choice: String,
     pub parallel_tool_calls: bool,
     pub reasoning: Option<Reasoning>,
@@ -269,9 +270,9 @@ pub struct ResponseCreateWsRequest {
     pub instructions: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_response_id: Option<String>,
-    pub input: std::sync::Arc<[ResponseItem]>,
+    pub input: Arc<[ResponseItem]>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<Value>>,
+    pub tools: Option<Arc<[Value]>>,
     pub tool_choice: String,
     pub parallel_tool_calls: bool,
     pub reasoning: Option<Reasoning>,

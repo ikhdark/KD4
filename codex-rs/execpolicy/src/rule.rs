@@ -19,6 +19,32 @@ pub enum PatternToken {
 }
 
 impl PatternToken {
+    pub fn single(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(Error::InvalidPattern("token cannot be empty".to_string()));
+        }
+        Ok(Self::Single(value))
+    }
+
+    pub fn from_alternatives(alternatives: Vec<String>) -> Result<Self> {
+        match alternatives.as_slice() {
+            [] => Err(Error::InvalidPattern(
+                "pattern alternatives cannot be empty".to_string(),
+            )),
+            [single] => Self::single(single.clone()),
+            _ if alternatives
+                .iter()
+                .any(|alternative| alternative.trim().is_empty()) =>
+            {
+                Err(Error::InvalidPattern(
+                    "pattern alternatives cannot include empty tokens".to_string(),
+                ))
+            }
+            _ => Ok(Self::Alts(alternatives)),
+        }
+    }
+
     fn matches(&self, token: &str) -> bool {
         match self {
             Self::Single(expected) => expected == token,
@@ -303,4 +329,17 @@ pub(crate) fn validate_not_match_examples(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PatternToken;
+
+    #[test]
+    fn constructs_and_reads_pattern_alternatives() {
+        let token = PatternToken::from_alternatives(vec!["git".into(), "jj".into()])
+            .expect("non-empty alternatives should be valid");
+
+        assert_eq!(token.alternatives(), &["git", "jj"]);
+    }
 }

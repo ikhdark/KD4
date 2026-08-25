@@ -5937,3 +5937,15 @@ async fn plugin_hooks_for_layer_stack_loads_configured_plugin_hooks() {
     );
     assert_eq!(outcome.hook_load_warnings, Vec::<String>::new());
 }
+
+#[test]
+fn retired_remote_sync_plugin_paths_are_absent() {
+    let manager_source = include_str!("manager.rs");
+    let remote_legacy_source = include_str!("remote_legacy.rs");
+
+    assert!(!manager_source.contains("install_plugin_with_remote_sync"));
+    assert!(!manager_source.contains("uninstall_plugin_with_remote_sync"));
+    assert!(!remote_legacy_source.contains("pub async fn enable_remote_plugin"));
+    assert!(!remote_legacy_source.contains("pub async fn uninstall_remote_plugin"));
+    assert!(!remote_legacy_source.contains("RemotePluginMutationError"));
+}

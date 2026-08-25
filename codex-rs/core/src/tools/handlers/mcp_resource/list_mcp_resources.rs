@@ -1,4 +1,4 @@
-use crate::function_tool::FunctionCallError;
+use crate::FunctionCallError;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::handlers::mcp_resource_spec::create_list_mcp_resources_tool;
@@ -9,7 +9,6 @@ use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 
 use rmcp::model::ListResourcesResult;
-use rmcp::model::PaginatedRequestParams;
 use rmcp::model::Resource;
 
 use super::ListResourcesArgs;
@@ -17,28 +16,17 @@ use super::ListResourcesPayload;
 use super::McpServerCollection;
 use super::canonical_all_list_resources;
 use super::canonical_single_list_resources;
+use super::ensure_cursor_has_server;
 use super::ensure_model_can_access_mcp_server;
 use super::execute_resource_call;
+use super::list_mcp_server_page;
 use super::model_can_access_mcp_server;
 use super::parse_args_with_default;
 use super::parse_arguments;
 use super::serialize_function_output;
+use super::take_server_result;
 
 pub struct ListMcpResourcesHandler;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ListResourcesStrategy {
-    Exhaustive,
-    ExplicitPage,
-}
-
-fn list_resources_strategy(cursor: Option<&str>) -> ListResourcesStrategy {
-    if cursor.is_some() {
-        ListResourcesStrategy::ExplicitPage
-    } else {
-        ListResourcesStrategy::Exhaustive
-    }
-}
 
 fn exhaustive_resource_pages(
     collection: McpServerCollection<Vec<Resource>>,
@@ -109,6 +97,7 @@ impl ListMcpResourcesHandler {
         let args: ListResourcesArgs = parse_args_with_default(arguments.clone())?;
         let args = args.normalize()?;
         let ListResourcesArgs { server, cursor } = args;
+        ensure_cursor_has_server(server.as_deref(), cursor.as_deref())?;
 
         let invocation = McpInvocation {
             server: server.clone().unwrap_or_else(|| "codex".to_string()),
@@ -126,43 +115,30 @@ impl ListMcpResourcesHandler {
             async {
                 let (payload, canonical) = if let Some(server_name) = server.clone() {
                     ensure_model_can_access_mcp_server(turn.as_ref(), &server_name)?;
-                    let result = match list_resources_strategy(cursor.as_deref()) {
-                        ListResourcesStrategy::Exhaustive => {
+                    let result = list_mcp_server_page(
+                        cursor.clone(),
+                        || async {
                             let collection = manager
                                 .list_all_resources(|candidate| candidate == server_name)
                                 .await;
-                            let mut pages = exhaustive_resource_pages(collection);
-                            pages.results.remove(&server_name).ok_or_else(|| {
-                                pages
-                                    .errors
-                                    .into_iter()
-                                    .find(|error| error.server == server_name)
-                                    .map_or_else(
-                                        || {
-                                            FunctionCallError::RespondToModel(format!(
-                                                "resources/list failed: unknown MCP server '{server_name}'"
-                                            ))
-                                        },
-                                        |error| {
-                                            FunctionCallError::RespondToModel(error.message)
-                                        },
-                                    )
-                            })?
-                        }
-                        ListResourcesStrategy::ExplicitPage => {
-                            let params = cursor.clone().map(|value| {
-                                PaginatedRequestParams::default().with_cursor(Some(value))
-                            });
+                            take_server_result(
+                                exhaustive_resource_pages(collection),
+                                &server_name,
+                                "resources/list",
+                            )
+                        },
+                        |params| async {
                             manager
-                            .list_resources(&server_name, params)
-                            .await
-                            .map_err(|err| {
-                                FunctionCallError::RespondToModel(format!(
-                                    "resources/list failed: {err:#}"
-                                ))
-                            })?
-                        }
-                    };
+                                .list_resources(&server_name, params)
+                                .await
+                                .map_err(|err| {
+                                    FunctionCallError::RespondToModel(format!(
+                                        "resources/list failed: {err:#}"
+                                    ))
+                                })
+                        },
+                    )
+                    .await?;
                     let canonical = canonical_single_list_resources(&server_name, &result)?;
                     let payload = ListResourcesPayload::from_single_server(
                         server_name,
@@ -171,12 +147,6 @@ impl ListMcpResourcesHandler {
                     )?;
                     (payload, canonical)
                 } else {
-                    if cursor.is_some() {
-                        return Err(FunctionCallError::RespondToModel(
-                            "cursor can only be used when a server is specified".to_string(),
-                        ));
-                    }
-
                     let collection = manager
                         .list_all_resources(|server_name| {
                             model_can_access_mcp_server(turn.as_ref(), server_name)
@@ -202,17 +172,22 @@ impl CoreToolRuntime for ListMcpResourcesHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[test]
     fn omitted_cursor_uses_exhaustive_owner_collection() {
         assert_eq!(
-            list_resources_strategy(None),
-            ListResourcesStrategy::Exhaustive
+            super::super::mcp_list_strategy(None),
+            super::super::McpListStrategy::Exhaustive
         );
         assert_eq!(
-            list_resources_strategy(Some("opaque-cursor")),
-            ListResourcesStrategy::ExplicitPage
+            super::super::mcp_list_strategy(Some("opaque-cursor")),
+            super::super::McpListStrategy::ExplicitPage
         );
+    }
+
+    #[test]
+    fn cursor_requires_an_explicit_server() {
+        assert!(super::super::ensure_cursor_has_server(None, Some("cursor")).is_err());
+        assert!(super::super::ensure_cursor_has_server(Some("server"), Some("cursor")).is_ok());
     }
 }

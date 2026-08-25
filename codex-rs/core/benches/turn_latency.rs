@@ -1,5 +1,29 @@
+// Two intentionally separate latency workflows share this executable:
+//
+// - `code-mode-turn` captures one fixed warm workload for one identified build. It
+//   emits raw samples and a nested-dispatch quality verdict; cross-build comparison
+//   belongs to the external benchmark runner.
+// - Synthetic scenarios run local baseline/candidate pairs and own the statistical
+//   non-inferiority verdict.
+//
+// `BenchmarkCommand` is the ownership boundary. Keep capture-only fields out of
+// `Report` and paired-comparison fields out of `CodeModeCaptureReport`.
+
 use anyhow::Context;
 use anyhow::Result;
+use codex_features::Feature;
+use codex_protocol::protocol::TurnTiming;
+use core_test_support::responses::ResponseMock;
+use core_test_support::responses::ResponsesRequest;
+use core_test_support::responses::ev_assistant_message;
+use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_custom_tool_call;
+use core_test_support::responses::ev_response_created;
+use core_test_support::responses::mount_sse_sequence;
+use core_test_support::responses::sse;
+use core_test_support::responses::start_mock_server;
+use core_test_support::test_codex::TestCodex;
+use core_test_support::test_codex::test_codex;
 use futures::SinkExt;
 use futures::StreamExt;
 use rand::Rng;
@@ -10,10 +34,11 @@ use std::env;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::path::PathBuf;
-#[cfg(windows)]
+
 use std::process::Command;
-#[cfg(windows)]
+
 use std::process::Stdio;
 use std::time::Duration;
 use std::time::Instant;
@@ -31,12 +56,31 @@ const DEFAULT_WARMUPS: usize = 10;
 const DEFAULT_ITERATIONS: usize = 100;
 const DEFAULT_CLUSTERS: usize = 3;
 const RELIABILITY_ITERATIONS: usize = 600;
+const CODE_MODE_WARMUPS: usize = 5;
+const CODE_MODE_ITERATIONS: usize = 30;
+const CODE_MODE_CLUSTERS: usize = 3;
+const CODE_MODE_NESTED_DISPATCH_SOURCE: &str = r#"
+const dispatched = await tools.update_plan({
+  plan: [{ step: "benchmark nested dispatch", status: "in_progress" }],
+});
+text(JSON.stringify({
+  dispatched: typeof dispatched?.message === "string",
+}));
+"#;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Scenario {
     Deterministic,
     LoopbackWebsocket,
+    Persistence,
+    WindowsExecutor,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ScenarioWorkload {
+    Deterministic,
+    LoopbackWebsocket(SocketAddr),
     Persistence,
     WindowsExecutor,
 }
@@ -65,6 +109,12 @@ struct Args {
     relative_margin: f64,
 }
 
+#[derive(Debug)]
+enum BenchmarkCommand {
+    CodeModeCapture { host: PathBuf },
+    Synthetic(Args),
+}
+
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 struct Sample {
     duration_ns: u64,
@@ -72,6 +122,9 @@ struct Sample {
     failed: bool,
     serialized_bytes: u64,
     cache_hits: u32,
+    exec_description_tokens: u64,
+    prompt_input_tokens: u64,
+    tool_calls: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -82,6 +135,9 @@ struct VariantSummary {
     failure_rate: f64,
     serialized_bytes_median: f64,
     cache_hits_median: f64,
+    exec_description_tokens_median: f64,
+    prompt_input_tokens_median: f64,
+    tool_call_median: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -101,6 +157,8 @@ struct ClusterReport {
     baseline: VariantSummary,
     candidate: VariantSummary,
     non_inferiority: NonInferiority,
+    baseline_samples: Vec<Sample>,
+    candidate_samples: Vec<Sample>,
 }
 
 #[derive(Debug, Serialize)]
@@ -111,6 +169,25 @@ struct Report {
     warmups: usize,
     measured_iterations_per_cluster: usize,
     clusters: Vec<ClusterReport>,
+    passed: bool,
+    limitation: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct CodeModeClusterReport {
+    cluster: usize,
+    capture: VariantSummary,
+    samples: Vec<Sample>,
+}
+
+#[derive(Debug, Serialize)]
+struct CodeModeCaptureReport {
+    schema_version: u16,
+    scenario: &'static str,
+    mode: &'static str,
+    warmups: usize,
+    measured_iterations_per_cluster: usize,
+    clusters: Vec<CodeModeClusterReport>,
     passed: bool,
     limitation: &'static str,
 }
@@ -152,35 +229,201 @@ impl Drop for LoopbackServer {
 type ClientWebsocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 struct ScenarioState {
-    websocket_addr: Option<SocketAddr>,
     websocket: Option<ClientWebsocket>,
-    schema_cached: bool,
+    serialized_schema: Option<Vec<u8>>,
     persistence_dir: TempDir,
 }
 
 impl ScenarioState {
-    fn new(websocket_addr: Option<SocketAddr>) -> Result<Self> {
+    fn new() -> Result<Self> {
         Ok(Self {
-            websocket_addr,
             websocket: None,
-            schema_cached: false,
+            serialized_schema: None,
             persistence_dir: tempfile::tempdir()?,
         })
     }
 
-    async fn preconnect(&mut self) -> Result<()> {
+    async fn preconnect(&mut self, addr: SocketAddr) -> Result<&mut ClientWebsocket> {
         if self.websocket.is_none() {
-            let addr = self.websocket_addr.context("loopback address missing")?;
             let (websocket, _) = connect_async(format!("ws://{addr}")).await?;
             self.websocket = Some(websocket);
         }
-        Ok(())
+        self.websocket
+            .as_mut()
+            .context("preconnected websocket should be initialized")
     }
+}
+
+struct CodeModeFixture {
+    _server: wiremock::MockServer,
+    test: TestCodex,
+    response_mock: ResponseMock,
+}
+
+impl CodeModeFixture {
+    async fn start(code_mode_host: &Path, turns: usize, fixture_id: &str) -> Result<Self> {
+        let server = start_mock_server().await;
+        let mut sequence = Vec::with_capacity(turns * 2);
+        for turn in 0..turns {
+            let response_id = format!("{fixture_id}-exec-{turn}");
+            let call_id = format!("{fixture_id}-call-{turn}");
+            sequence.push(sse(vec![
+                ev_response_created(&response_id),
+                ev_custom_tool_call(&call_id, "exec", CODE_MODE_NESTED_DISPATCH_SOURCE),
+                ev_completed(&response_id),
+            ]));
+            let completion_id = format!("{fixture_id}-completion-{turn}");
+            sequence.push(sse(vec![
+                ev_assistant_message(&completion_id, "done"),
+                ev_completed(&completion_id),
+            ]));
+        }
+        let response_mock = mount_sse_sequence(&server, sequence).await;
+        let test = test_codex()
+            .with_model("test-gpt-5.1-codex")
+            .with_code_mode_host_program(code_mode_host.to_path_buf())
+            .with_config(|config| {
+                let _ = config.features.enable(Feature::CodeModeOnly);
+                let _ = config.features.disable(Feature::TaskCompletionReviewer);
+            })
+            .build(&server)
+            .await?;
+        Ok(Self {
+            _server: server,
+            test,
+            response_mock,
+        })
+    }
+
+    async fn sample(&self) -> Sample {
+        let requests_before = self.response_mock.requests().len();
+        let started = Instant::now();
+        let completion = self
+            .test
+            .submit_turn_and_capture_completion(
+                "Run the fixed CodeModeOnly nested-dispatch benchmark and finish.",
+            )
+            .await;
+        let duration_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        let requests = self.response_mock.requests();
+        let turn_requests = &requests[requests_before..];
+        match completion {
+            Ok(completion) => {
+                let timing = completion.timing.as_ref();
+                let first_request = turn_requests.first();
+                let sampling_requests = timing
+                    .map(|timing| timing.counters.model_request_count)
+                    .unwrap_or_default();
+                let tool_calls = timing
+                    .map(|timing| timing.counters.tool_call_count)
+                    .unwrap_or_default();
+                let semantic_output_ok =
+                    turn_requests.get(1).is_some_and(nested_output_is_expected);
+                let failed = completion.last_agent_message.as_deref() != Some("done")
+                    || completion.error.is_some()
+                    || turn_requests.len() != 2
+                    || sampling_requests != 2
+                    || tool_calls != 2
+                    || !timing.is_some_and(timing_reconciles)
+                    || !semantic_output_ok;
+                Sample {
+                    duration_ns,
+                    sampling_requests,
+                    failed,
+                    serialized_bytes: first_request
+                        .map(|request| request.body_bytes().len() as u64)
+                        .unwrap_or_default(),
+                    cache_hits: 0,
+                    exec_description_tokens: first_request
+                        .map(exec_description_tokens)
+                        .unwrap_or_default(),
+                    prompt_input_tokens: first_request.map(prompt_input_tokens).unwrap_or_default(),
+                    tool_calls,
+                }
+            }
+            Err(_) => Sample {
+                duration_ns,
+                failed: true,
+                ..Sample::default()
+            },
+        }
+    }
+}
+
+fn nested_output_is_expected(request: &ResponsesRequest) -> bool {
+    request
+        .body_json()
+        .get("input")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("type").and_then(serde_json::Value::as_str)
+                    == Some("custom_tool_call_output")
+                    && item
+                        .get("output")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|output| output.contains("\"dispatched\":true"))
+            })
+        })
+}
+
+fn timing_reconciles(timing: &TurnTiming) -> bool {
+    timing.model_requests.len() == timing.counters.model_request_count as usize
+        && timing.counters.model_request_count
+            == timing.counters.attempts_by_kind.primary
+                + timing.counters.attempts_by_kind.retry
+                + timing.counters.attempts_by_kind.fallback
+        && timing
+            .model_requests
+            .iter()
+            .map(|request| request.tool_call_count)
+            .sum::<u32>()
+            == timing.counters.tool_call_count
+}
+
+fn exec_description_tokens(request: &ResponsesRequest) -> u64 {
+    request
+        .body_json()
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|tools| {
+            tools.iter().find_map(|tool| {
+                (tool.get("name").and_then(serde_json::Value::as_str) == Some("exec"))
+                    .then(|| tool.get("description").and_then(serde_json::Value::as_str))
+                    .flatten()
+            })
+        })
+        .map(codex_utils_output_truncation::approx_token_count)
+        .unwrap_or_default() as u64
+}
+
+fn prompt_input_tokens(request: &ResponsesRequest) -> u64 {
+    let body = request.body_json();
+    let logical_prompt = serde_json::json!({
+        "instructions": body.get("instructions"),
+        "input": body.get("input"),
+        "tools": body.get("tools"),
+    });
+    codex_utils_output_truncation::approx_token_count(&logical_prompt.to_string()) as u64
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = parse_args()?;
+    match parse_command()? {
+        BenchmarkCommand::CodeModeCapture { host } => {
+            let report = run_code_mode_capture(&host).await?;
+            let passed = report.passed;
+            println!("{}", serde_json::to_string(&report)?);
+            if !passed {
+                anyhow::bail!("code-mode capture failed its nested-dispatch quality gate");
+            }
+            Ok(())
+        }
+        BenchmarkCommand::Synthetic(args) => run_synthetic_reports(args).await,
+    }
+}
+
+async fn run_synthetic_reports(args: Args) -> Result<()> {
     let scenarios = args.scenario.map_or_else(
         || {
             vec![
@@ -213,21 +456,27 @@ async fn main() -> Result<()> {
 }
 
 async fn run_report(scenario: Scenario, mode: Mode, args: &Args) -> Result<Report> {
-    let loopback = if scenario == Scenario::LoopbackWebsocket {
-        Some(LoopbackServer::start().await?)
-    } else {
-        None
+    let (workload, _loopback) = match scenario {
+        Scenario::Deterministic => (ScenarioWorkload::Deterministic, None),
+        Scenario::LoopbackWebsocket => {
+            let server = LoopbackServer::start().await?;
+            (
+                ScenarioWorkload::LoopbackWebsocket(server.addr),
+                Some(server),
+            )
+        }
+        Scenario::Persistence => (ScenarioWorkload::Persistence, None),
+        Scenario::WindowsExecutor => (ScenarioWorkload::WindowsExecutor, None),
     };
-    let addr = loopback.as_ref().map(|server| server.addr);
     let mut clusters = Vec::with_capacity(args.clusters);
     for cluster in 0..args.clusters {
         let mut rng = StdRng::seed_from_u64(0x4b4434_u64 + cluster as u64);
-        let mut baseline_state = ScenarioState::new(addr)?;
-        let mut candidate_state = ScenarioState::new(addr)?;
+        let mut baseline_state = ScenarioState::new()?;
+        let mut candidate_state = ScenarioState::new()?;
         if mode == Mode::Warm {
             for _ in 0..args.warmups {
-                let _ = run_sample(scenario, Variant::Baseline, &mut baseline_state).await;
-                let _ = run_sample(scenario, Variant::Candidate, &mut candidate_state).await;
+                let _ = run_sample(workload, Variant::Baseline, &mut baseline_state).await;
+                let _ = run_sample(workload, Variant::Candidate, &mut candidate_state).await;
             }
         }
         let mut baseline = Vec::with_capacity(args.iterations);
@@ -235,23 +484,23 @@ async fn run_report(scenario: Scenario, mode: Mode, args: &Args) -> Result<Repor
         for _ in 0..args.iterations {
             let candidate_first = rng.random_bool(0.5);
             if mode == Mode::Cold {
-                baseline_state = ScenarioState::new(addr)?;
-                candidate_state = ScenarioState::new(addr)?;
+                baseline_state = ScenarioState::new()?;
+                candidate_state = ScenarioState::new()?;
             }
-            if scenario == Scenario::LoopbackWebsocket && candidate_first {
-                candidate_state.preconnect().await?;
+            if candidate_first && let ScenarioWorkload::LoopbackWebsocket(addr) = workload {
+                candidate_state.preconnect(addr).await?;
             }
             if candidate_first {
                 candidate
-                    .push(run_sample(scenario, Variant::Candidate, &mut candidate_state).await);
-                baseline.push(run_sample(scenario, Variant::Baseline, &mut baseline_state).await);
+                    .push(run_sample(workload, Variant::Candidate, &mut candidate_state).await);
+                baseline.push(run_sample(workload, Variant::Baseline, &mut baseline_state).await);
             } else {
-                baseline.push(run_sample(scenario, Variant::Baseline, &mut baseline_state).await);
-                if scenario == Scenario::LoopbackWebsocket {
-                    candidate_state.preconnect().await?;
+                baseline.push(run_sample(workload, Variant::Baseline, &mut baseline_state).await);
+                if let ScenarioWorkload::LoopbackWebsocket(addr) = workload {
+                    candidate_state.preconnect(addr).await?;
                 }
                 candidate
-                    .push(run_sample(scenario, Variant::Candidate, &mut candidate_state).await);
+                    .push(run_sample(workload, Variant::Candidate, &mut candidate_state).await);
             }
         }
         let gate = non_inferiority(
@@ -265,13 +514,15 @@ async fn run_report(scenario: Scenario, mode: Mode, args: &Args) -> Result<Repor
             baseline: summarize(&baseline),
             candidate: summarize(&candidate),
             non_inferiority: gate,
+            baseline_samples: baseline,
+            candidate_samples: candidate,
         });
     }
     let passed = clusters
         .iter()
         .all(|cluster| cluster.non_inferiority.passed);
     Ok(Report {
-        schema_version: 1,
+        schema_version: 2,
         scenario,
         mode,
         warmups: if mode == Mode::Warm { args.warmups } else { 0 },
@@ -282,13 +533,66 @@ async fn run_report(scenario: Scenario, mode: Mode, args: &Args) -> Result<Repor
     })
 }
 
-async fn run_sample(scenario: Scenario, variant: Variant, state: &mut ScenarioState) -> Sample {
+async fn run_code_mode_capture(code_mode_host: &Path) -> Result<CodeModeCaptureReport> {
+    anyhow::ensure!(
+        code_mode_host.is_file(),
+        "code-mode host does not exist: {}",
+        code_mode_host.display()
+    );
+    let turns = CODE_MODE_WARMUPS + CODE_MODE_ITERATIONS;
+    let mut clusters = Vec::with_capacity(CODE_MODE_CLUSTERS);
+    for cluster in 0..CODE_MODE_CLUSTERS {
+        let fixture =
+            CodeModeFixture::start(code_mode_host, turns, &format!("capture-{}", cluster + 1))
+                .await?;
+        for _ in 0..CODE_MODE_WARMUPS {
+            let sample = fixture.sample().await;
+            anyhow::ensure!(
+                !sample.failed,
+                "CodeModeOnly warmup failed its nested-dispatch quality gate"
+            );
+        }
+        let mut samples = Vec::with_capacity(CODE_MODE_ITERATIONS);
+        for _ in 0..CODE_MODE_ITERATIONS {
+            samples.push(fixture.sample().await);
+        }
+        clusters.push(CodeModeClusterReport {
+            cluster: cluster + 1,
+            capture: summarize(&samples),
+            samples,
+        });
+    }
+    Ok(code_mode_capture_report(clusters))
+}
+
+fn code_mode_capture_report(clusters: Vec<CodeModeClusterReport>) -> CodeModeCaptureReport {
+    let passed = clusters
+        .iter()
+        .flat_map(|cluster| &cluster.samples)
+        .all(|sample| !sample.failed);
+    CodeModeCaptureReport {
+        schema_version: 3,
+        scenario: "code_mode_turn",
+        mode: "warm",
+        warmups: CODE_MODE_WARMUPS,
+        measured_iterations_per_cluster: CODE_MODE_ITERATIONS,
+        clusters,
+        passed,
+        limitation: "single-build capture only: an external runner must attach build identity and compare this raw report with a separately captured build; this local mock benchmark does not establish Desktop-visible or real-model latency",
+    }
+}
+
+async fn run_sample(
+    workload: ScenarioWorkload,
+    variant: Variant,
+    state: &mut ScenarioState,
+) -> Sample {
     let started = Instant::now();
-    let result = match scenario {
-        Scenario::Deterministic => deterministic_sample(variant, state).await,
-        Scenario::LoopbackWebsocket => websocket_sample(variant, state).await,
-        Scenario::Persistence => persistence_sample(variant, state),
-        Scenario::WindowsExecutor => windows_executor_sample(),
+    let result = match workload {
+        ScenarioWorkload::Deterministic => deterministic_sample(variant, state).await,
+        ScenarioWorkload::LoopbackWebsocket(addr) => websocket_sample(variant, state, addr).await,
+        ScenarioWorkload::Persistence => persistence_sample(variant, state),
+        ScenarioWorkload::WindowsExecutor => windows_executor_sample(),
     };
     match result {
         Ok((sampling_requests, serialized_bytes, cache_hits)) => Sample {
@@ -297,6 +601,7 @@ async fn run_sample(scenario: Scenario, variant: Variant, state: &mut ScenarioSt
             failed: false,
             serialized_bytes,
             cache_hits,
+            ..Sample::default()
         },
         Err(_) => Sample {
             duration_ns: started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
@@ -322,19 +627,40 @@ async fn deterministic_sample(
             );
         }
     }
-    let payload = serde_json::json!({"tools": ["shell", "mcp"], "schema": {"type": "object"}});
-    let serialized = serde_json::to_vec(&payload)?;
-    let cache_hits = u32::from(variant == Variant::Candidate && state.schema_cached);
-    state.schema_cached = variant == Variant::Candidate;
-    Ok((2, serialized.len() as u64, cache_hits))
+    let (serialized_bytes, cache_hits) = match variant {
+        Variant::Baseline => {
+            let payload =
+                serde_json::json!({"tools": ["shell", "mcp"], "schema": {"type": "object"}});
+            (serde_json::to_vec(&payload)?.len() as u64, 0)
+        }
+        Variant::Candidate => {
+            let cache_hit = state.serialized_schema.is_some();
+            if state.serialized_schema.is_none() {
+                let payload = serde_json::json!({
+                    "tools": ["shell", "mcp"],
+                    "schema": {"type": "object"}
+                });
+                state.serialized_schema = Some(serde_json::to_vec(&payload)?);
+            }
+            let serialized_bytes = state
+                .serialized_schema
+                .as_ref()
+                .map_or(0, |serialized| serialized.len() as u64);
+            (serialized_bytes, u32::from(cache_hit))
+        }
+    };
+    Ok((2, serialized_bytes, cache_hits))
 }
 
-async fn websocket_sample(variant: Variant, state: &mut ScenarioState) -> Result<(u32, u64, u32)> {
+async fn websocket_sample(
+    variant: Variant,
+    state: &mut ScenarioState,
+    addr: SocketAddr,
+) -> Result<(u32, u64, u32)> {
     if variant == Variant::Baseline {
         state.websocket = None;
     }
-    state.preconnect().await?;
-    let websocket = state.websocket.as_mut().context("websocket unavailable")?;
+    let websocket = state.preconnect(addr).await?;
     websocket
         .send(Message::Binary(vec![1, 2, 3, 4].into()))
         .await?;
@@ -367,7 +693,6 @@ fn append_and_flush(path: &PathBuf, bytes: &[u8]) -> Result<()> {
 }
 
 fn windows_executor_sample() -> Result<(u32, u64, u32)> {
-    #[cfg(windows)]
     {
         let status = Command::new("cmd")
             .args(["/d", "/c", "ver"])
@@ -377,8 +702,6 @@ fn windows_executor_sample() -> Result<(u32, u64, u32)> {
         anyhow::ensure!(status.success(), "executor probe failed");
         Ok((0, 0, 0))
     }
-    #[cfg(not(windows))]
-    anyhow::bail!("Windows-only scenario")
 }
 
 fn summarize(samples: &[Sample]) -> VariantSummary {
@@ -397,7 +720,7 @@ fn summarize(samples: &[Sample]) -> VariantSummary {
             0.5,
         ),
         failure_rate: samples.iter().filter(|sample| sample.failed).count() as f64
-            / samples.len().max(1) as f64,
+            / samples.len() as f64,
         serialized_bytes_median: percentile(
             &samples
                 .iter()
@@ -409,6 +732,27 @@ fn summarize(samples: &[Sample]) -> VariantSummary {
             &samples
                 .iter()
                 .map(|sample| sample.cache_hits as f64)
+                .collect::<Vec<_>>(),
+            0.5,
+        ),
+        exec_description_tokens_median: percentile(
+            &samples
+                .iter()
+                .map(|sample| sample.exec_description_tokens as f64)
+                .collect::<Vec<_>>(),
+            0.5,
+        ),
+        prompt_input_tokens_median: percentile(
+            &samples
+                .iter()
+                .map(|sample| sample.prompt_input_tokens as f64)
+                .collect::<Vec<_>>(),
+            0.5,
+        ),
+        tool_call_median: percentile(
+            &samples
+                .iter()
+                .map(|sample| sample.tool_calls as f64)
                 .collect::<Vec<_>>(),
             0.5,
         ),
@@ -449,9 +793,8 @@ fn non_inferiority(
             .collect::<Vec<_>>(),
     );
     let failure_rate_delta = candidate.iter().filter(|sample| sample.failed).count() as f64
-        / candidate.len().max(1) as f64
-        - baseline.iter().filter(|sample| sample.failed).count() as f64
-            / baseline.len().max(1) as f64;
+        / candidate.len() as f64
+        - baseline.iter().filter(|sample| sample.failed).count() as f64 / baseline.len() as f64;
     NonInferiority {
         absolute_regression_ucb_ms,
         relative_regression_ucb,
@@ -467,9 +810,6 @@ fn non_inferiority(
 }
 
 fn one_sided_95_ucb(values: &[f64]) -> f64 {
-    if values.is_empty() {
-        return f64::INFINITY;
-    }
     let mean = values.iter().sum::<f64>() / values.len() as f64;
     if values.len() == 1 {
         return mean;
@@ -483,20 +823,53 @@ fn one_sided_95_ucb(values: &[f64]) -> f64 {
 }
 
 fn mean(values: &[f64]) -> f64 {
-    values.iter().sum::<f64>() / values.len().max(1) as f64
+    values.iter().sum::<f64>() / values.len() as f64
 }
 
 fn percentile(values: &[f64], quantile: f64) -> f64 {
-    if values.is_empty() {
-        return f64::NAN;
-    }
     let mut values = values.to_vec();
     values.sort_by(f64::total_cmp);
     let index = ((values.len() - 1) as f64 * quantile).ceil() as usize;
     values[index]
 }
 
-fn parse_args() -> Result<Args> {
+fn parse_command() -> Result<BenchmarkCommand> {
+    parse_command_from(env::args().skip(1))
+}
+
+fn parse_command_from(values: impl IntoIterator<Item = String>) -> Result<BenchmarkCommand> {
+    let mut values = values.into_iter();
+    let Some(first) = values.next() else {
+        return parse_synthetic_args_from(std::iter::empty()).map(BenchmarkCommand::Synthetic);
+    };
+    if first == "code-mode-turn" {
+        return parse_code_mode_args_from(values);
+    }
+    parse_synthetic_args_from(std::iter::once(first).chain(values)).map(BenchmarkCommand::Synthetic)
+}
+
+fn parse_code_mode_args_from(values: impl IntoIterator<Item = String>) -> Result<BenchmarkCommand> {
+    let mut host = None;
+    let mut values = values.into_iter();
+    while let Some(flag) = values.next() {
+        match flag.as_str() {
+            "--code-mode-host" => {
+                anyhow::ensure!(host.is_none(), "--code-mode-host supplied more than once");
+                host = Some(PathBuf::from(
+                    values.next().context("missing code-mode host path")?,
+                ));
+            }
+            other => anyhow::bail!(
+                "unknown code-mode-turn argument `{other}`; the workload is fixed and accepts only --code-mode-host <existing executable>"
+            ),
+        }
+    }
+    Ok(BenchmarkCommand::CodeModeCapture {
+        host: host.context("code-mode-turn requires --code-mode-host <existing executable>")?,
+    })
+}
+
+fn parse_synthetic_args_from(values: impl IntoIterator<Item = String>) -> Result<Args> {
     let mut args = Args {
         scenario: None,
         mode: None,
@@ -506,7 +879,7 @@ fn parse_args() -> Result<Args> {
         absolute_margin_ms: 3.0,
         relative_margin: 0.03,
     };
-    let mut values = env::args().skip(1);
+    let mut values = values.into_iter();
     while let Some(flag) = values.next() {
         match flag.as_str() {
             "--scenario" => {
@@ -544,4 +917,129 @@ fn parse_args() -> Result<Args> {
     anyhow::ensure!(args.iterations > 0, "iterations must be positive");
     anyhow::ensure!(args.clusters > 0, "clusters must be positive");
     Ok(args)
+}
+
+#[cfg(test)]
+#[allow(dead_code, unused_imports)]
+mod tests {
+    use super::*;
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn code_mode_command_has_one_fixed_configuration() {
+        let command = parse_command_from(strings(&[
+            "code-mode-turn",
+            "--code-mode-host",
+            "code-mode-host",
+        ]))
+        .expect("fixed code-mode command should parse");
+
+        let BenchmarkCommand::CodeModeCapture { host } = command else {
+            panic!("expected code-mode capture command");
+        };
+        assert_eq!(host, PathBuf::from("code-mode-host"));
+
+        let error = parse_command_from(strings(&[
+            "code-mode-turn",
+            "--code-mode-host",
+            "code-mode-host",
+            "--mode",
+            "warm",
+        ]))
+        .expect_err("generic mode must not be part of code-mode capture");
+        assert!(error.to_string().contains("workload is fixed"));
+    }
+
+    #[test]
+    fn synthetic_scenarios_do_not_include_code_mode_capture() {
+        let command = parse_command_from(strings(&["--scenario", "deterministic"]))
+            .expect("synthetic command should parse");
+        let BenchmarkCommand::Synthetic(args) = command else {
+            panic!("expected synthetic command");
+        };
+        assert_eq!(args.scenario, Some(Scenario::Deterministic));
+
+        let error = parse_command_from(strings(&["--scenario", "code-mode-turn"]))
+            .expect_err("code mode must use its dedicated command");
+        assert!(error.to_string().contains("unknown scenario"));
+    }
+
+    #[test]
+    fn code_mode_capture_report_has_no_local_ab_gate() {
+        let samples = vec![Sample {
+            duration_ns: 1_000_000,
+            ..Sample::default()
+        }];
+        let report = code_mode_capture_report(vec![CodeModeClusterReport {
+            cluster: 1,
+            capture: summarize(&samples),
+            samples,
+        }]);
+        let value = serde_json::to_value(report).expect("capture report should serialize");
+
+        assert_eq!(value["schema_version"], 3);
+        assert_eq!(value["scenario"], "code_mode_turn");
+        assert!(value["clusters"][0].get("capture").is_some());
+        for paired_field in [
+            "baseline",
+            "candidate",
+            "non_inferiority",
+            "baseline_samples",
+            "candidate_samples",
+        ] {
+            assert!(value["clusters"][0].get(paired_field).is_none());
+        }
+    }
+
+    #[test]
+    fn code_mode_workload_dispatches_exactly_one_nested_tool() {
+        assert_eq!(
+            CODE_MODE_NESTED_DISPATCH_SOURCE
+                .matches("tools.update_plan")
+                .count(),
+            1
+        );
+        assert!(CODE_MODE_NESTED_DISPATCH_SOURCE.contains("dispatched"));
+        assert!(!CODE_MODE_NESTED_DISPATCH_SOURCE.contains("completed"));
+    }
+
+    #[tokio::test]
+    async fn deterministic_cache_hit_reuses_the_cached_serialization() {
+        let mut state = ScenarioState::new().expect("scenario state should initialize");
+        let (_, _, first_cache_hits) = deterministic_sample(Variant::Candidate, &mut state)
+            .await
+            .expect("cold candidate sample should succeed");
+        assert_eq!(first_cache_hits, 0);
+
+        state.serialized_schema = Some(vec![0; 7]);
+        let (_, serialized_bytes, second_cache_hits) =
+            deterministic_sample(Variant::Candidate, &mut state)
+                .await
+                .expect("warm candidate sample should succeed");
+
+        assert_eq!(serialized_bytes, 7);
+        assert_eq!(second_cache_hits, 1);
+    }
+
+    #[test]
+    fn non_empty_samples_drive_summary_and_non_inferiority_statistics() {
+        let baseline = [Sample {
+            duration_ns: 1_000_000,
+            sampling_requests: 2,
+            ..Sample::default()
+        }];
+        let candidate = baseline;
+
+        let summary = summarize(&baseline);
+        let gate = non_inferiority(&baseline, &candidate, 0.0, 0.0);
+
+        assert_eq!(summary.median_ms, 1.0);
+        assert_eq!(summary.failure_rate, 0.0);
+        assert_eq!(gate.absolute_regression_ucb_ms, 0.0);
+        assert_eq!(gate.relative_regression_ucb, 0.0);
+        assert!(gate.passed);
+    }
 }

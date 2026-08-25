@@ -473,6 +473,42 @@ fn command_dependencies_cover_search_test_and_ownership_inputs() {
 }
 
 #[test]
+fn rg_dependencies_reuse_search_scope_parsing_for_options_and_compound_commands() {
+    let cwd = Path::new("/repo");
+    let explicit_pattern = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "program": "rg",
+            "args": ["--max-depth", "3", "-e", "needle", "codex-rs/core"],
+            "workdir": "/repo"
+        })
+        .to_string(),
+    };
+    assert_eq!(
+        source_dependencies_for_tool_call("exec_command", &explicit_pattern, cwd),
+        BTreeSet::from([SourceDependencyV1::new(
+            Path::new("/repo/codex-rs/core"),
+            true,
+        )])
+    );
+
+    let compound = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "cmd": "Write-Output ready; rg -e needle codex-rs/tui",
+            "shell": "powershell",
+            "workdir": "/repo"
+        })
+        .to_string(),
+    };
+    assert_eq!(
+        source_dependencies_for_tool_call("exec_command", &compound, cwd),
+        BTreeSet::from([SourceDependencyV1::new(
+            Path::new("/repo/codex-rs/tui"),
+            true,
+        )])
+    );
+}
+
+#[test]
 fn cargo_test_dependencies_follow_selected_local_package_graph() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(
@@ -506,6 +542,57 @@ fn cargo_test_dependencies_follow_selected_local_package_graph() {
 }
 
 #[test]
+fn duplicate_repository_reads_cargo_index_reuses_each_manifest() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root_manifest = "[workspace]\nmembers = [\"app\", \"support\"]\nresolver = \"2\"\n";
+    std::fs::write(temp.path().join("Cargo.toml"), root_manifest).expect("workspace manifest");
+    std::fs::create_dir_all(temp.path().join("app/src")).expect("app source");
+    std::fs::create_dir_all(temp.path().join("support/src")).expect("support source");
+    std::fs::write(
+        temp.path().join("app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[dependencies]\nsupport = { path = \"../support\" }\n",
+    )
+    .expect("app manifest");
+    std::fs::write(
+        temp.path().join("support/Cargo.toml"),
+        "[package]\nname = \"support\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("support manifest");
+    let mut reads = BTreeMap::<PathBuf, usize>::new();
+
+    let mut index = cargo_package_index_with_manifest_reader(
+        temp.path(),
+        Some(root_manifest.to_string()),
+        |path| {
+            *reads.entry(path.to_path_buf()).or_default() += 1;
+            std::fs::read_to_string(path).ok()
+        },
+    );
+
+    assert_eq!(reads.get(&temp.path().join("Cargo.toml")), None);
+    assert_eq!(reads.get(&temp.path().join("app/Cargo.toml")), Some(&1));
+    assert_eq!(reads.get(&temp.path().join("support/Cargo.toml")), Some(&1));
+
+    let app_root = index.packages.get("app").expect("app package").clone();
+    index
+        .manifests
+        .get_mut(&app_root)
+        .expect("canonical app manifest")
+        .source = "this source is no longer parseable TOML".to_string();
+    std::fs::remove_file(app_root.join("Cargo.toml")).expect("remove indexed manifest");
+    let mut visited = BTreeSet::new();
+    let mut dependencies = BTreeSet::new();
+    collect_cargo_package_dependencies(&app_root, &index, &mut visited, &mut dependencies);
+    assert!(
+        dependencies.contains(&SourceDependencyV1::new(
+            index.packages.get("support").expect("support package"),
+            true,
+        )),
+        "cached dependency graph: {dependencies:#?}; index: {index:#?}"
+    );
+}
+
+#[test]
 fn workspace_evidence_cwd_uses_explicit_workdir() {
     let payload = ToolPayload::Function {
         arguments: serde_json::json!({
@@ -518,6 +605,31 @@ fn workspace_evidence_cwd_uses_explicit_workdir() {
     assert_eq!(
         workspace_evidence_cwd_for_tool_call("exec_command", &payload, Path::new("/workspace"),),
         PathBuf::from("/workspace/nested/repository")
+    );
+}
+
+#[test]
+fn workspace_call_classification_derives_all_evidence_inputs_once() {
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "program": "rg",
+            "args": ["needle", "src/foo.rs"],
+            "workdir": "/repo"
+        })
+        .to_string(),
+    };
+
+    let classification =
+        classify_workspace_tool_call("exec_command", &payload, Path::new("/fallback"));
+
+    assert!(classification.observes_workspace);
+    assert_eq!(classification.workspace_cwd, PathBuf::from("/repo"));
+    assert_eq!(
+        classification.source_dependencies,
+        BTreeSet::from([SourceDependencyV1::new(
+            Path::new("/repo/src/foo.rs"),
+            false,
+        )])
     );
 }
 

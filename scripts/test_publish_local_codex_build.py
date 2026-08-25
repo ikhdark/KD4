@@ -2,12 +2,13 @@
 
 from pathlib import Path
 import os
-import shutil
 import subprocess
 import tempfile
 import unittest
 
 from scripts.publish_local_codex_test_support import PublishLocalCodexTestBase
+from scripts.publish_local_codex_test_support import clean_env
+from scripts.publish_local_codex_test_support import ps_single_quote
 
 
 SCRIPT = Path(__file__).resolve().parent / "publish-local-codex.ps1"
@@ -15,39 +16,6 @@ CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 RUN_TIMEOUT_SECONDS = 120
 FIXTURE_TIME = 946684900
 FRESH_SOURCE_TIME = FIXTURE_TIME + 10_000
-
-
-def powershell() -> str | None:
-    # Prefer Windows PowerShell 5.1: production invokes publish-local-codex.ps1
-    # via `powershell -NoProfile -File ...` from the justfile, and 5.1 has
-    # stricter native-stderr and StrictMode semantics than pwsh 7 — bugs in
-    # that class are invisible when the tests run under pwsh.
-    return shutil.which("powershell") or shutil.which("pwsh")
-
-
-def ps_single_quote(value: str | Path) -> str:
-    return "'" + str(value).replace("'", "''") + "'"
-
-
-PUBLISH_ENV_VARS = (
-    "CODEX_LOCAL_PUBLISH_DIR",
-    "CODEX_LOCAL_CODEX_HOME",
-    "CODEX_LOCAL_CODEX_SQLITE_HOME",
-    "CODEX_HOME",
-    "CODEX_SQLITE_HOME",
-    "CODEX_CLI_PATH",
-)
-
-
-def clean_env() -> dict[str, str]:
-    # A prior -ConfigureDesktopLocalCli publish persists these at User scope,
-    # so the inherited environment can carry them; the script prefers
-    # CODEX_LOCAL_PUBLISH_DIR over the test's temp USERPROFILE, which makes
-    # assertions machine-state-dependent unless they are stripped.
-    env = os.environ.copy()
-    for name in PUBLISH_ENV_VARS:
-        env.pop(name, None)
-    return env
 
 
 class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
@@ -91,7 +59,7 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
             self.assertEqual(result.stdout.strip(), "x86_64-pc-windows-msvc")
             self.assertNotIn("OSArchitecture", SCRIPT.read_text(encoding="utf-8"))
 
-    def test_actual_release_build_runs_preflight_and_uses_target_dir_argument(
+    def test_actual_release_build_runs_one_artifact_producing_cargo_command(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -138,26 +106,11 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
             self.assertIn("fake cargo --config ", result.stdout)
             self.assertIn(" build --target-dir ", result.stdout)
             self.assertIn("target\\publish-release", result.stdout)
-            self.assertRegex(result.stdout, r"fake cargo .* check ")
+            self.assertNotRegex(result.stdout, r"fake cargo .* check ")
+            self.assertEqual(result.stdout.count("fake cargo "), 1)
             self.assertIn("cargoTargetDirEnv=", result.stdout)
             self.assertNotIn("inherited-target", result.stdout)
             self.assert_no_publish_temps(install_dir)
-
-            skipped = self.run_script(
-                "-SkipPreflightCheck",
-                "-SourceExe",
-                str(fake_codex),
-                "-InstallDir",
-                str(install_dir),
-                env=env,
-            )
-            self.assertEqual(
-                skipped.returncode,
-                0,
-                f"stdout:\n{skipped.stdout}\nstderr:\n{skipped.stderr}",
-            )
-            self.assertNotRegex(skipped.stdout, r"fake cargo .* check ")
-            self.assertRegex(skipped.stdout, r"fake cargo .* build ")
 
     def test_new_content_stamp_overrides_old_sidecar_mtime(self) -> None:
         self.init_repo_fixture()
@@ -291,6 +244,146 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
             self.assertNotIn("desktopLocalCliRouting:", result.stdout)
             self.assertNotIn("doctorCommand:", result.stdout)
             self.assertFalse((install_dir / "codex.exe").exists())
+
+    def test_build_only_auto_skip_reuses_and_invalidates_content_stamp(self) -> None:
+        self.init_repo_fixture()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            install_dir = temp_path / "install"
+            fake_bin = temp_path / "bin"
+            fake_bin.mkdir()
+            build_count = temp_path / "cargo-build-count.txt"
+            built_dir = (
+                self.repo_root / "codex-rs" / "target" / "publish-release" / "release"
+            )
+            fake_cargo = fake_bin / "cargo.cmd"
+            fake_cargo.write_text(
+                "\r\n".join(
+                    [
+                        "@echo off",
+                        "echo fake cargo %*",
+                        f'echo build>>"{build_count}"',
+                        f'if not exist "{built_dir}" mkdir "{built_dir}"',
+                        f'copy /y "%ComSpec%" "{built_dir / "codex.exe"}" >nul',
+                        "exit /b 0",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            env = clean_env()
+            env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+            auto_skip_args = (
+                "-BuildOnly",
+                "-AutoSkipBuild",
+                "-SkipPreflightCheck",
+                "-InstallDir",
+                str(install_dir),
+            )
+
+            initial = self.run_script(*auto_skip_args, env=env)
+            self.assertEqual(
+                initial.returncode,
+                0,
+                f"stdout:\n{initial.stdout}\nstderr:\n{initial.stderr}",
+            )
+            self.assertIn("autoSkipBuild: false", initial.stdout)
+            self.assertIn(
+                "autoSkipBuildReason: source artifact missing", initial.stdout
+            )
+            self.assertIn("fake cargo --config ", initial.stdout)
+            self.assertEqual(
+                len(build_count.read_text(encoding="utf-8").splitlines()), 1
+            )
+
+            cached = self.run_script(*auto_skip_args, env=env)
+            self.assertEqual(
+                cached.returncode,
+                0,
+                f"stdout:\n{cached.stdout}\nstderr:\n{cached.stderr}",
+            )
+            self.assertIn("autoSkipBuild: true", cached.stdout)
+            self.assertIn(
+                "autoSkipBuildReason: source artifacts and tracked publish inputs match build stamp",
+                cached.stdout,
+            )
+            self.assertIn("buildCommand: <skipped>", cached.stdout)
+            self.assertNotIn("fake cargo --config ", cached.stdout)
+            self.assertEqual(
+                len(build_count.read_text(encoding="utf-8").splitlines()), 1
+            )
+
+            (built_dir / "codex.exe").write_bytes(b"mutated release artifact")
+            artifact_invalidated = self.run_script(*auto_skip_args, env=env)
+            self.assertEqual(
+                artifact_invalidated.returncode,
+                0,
+                f"stdout:\n{artifact_invalidated.stdout}\nstderr:\n{artifact_invalidated.stderr}",
+            )
+            self.assertIn("autoSkipBuild: false", artifact_invalidated.stdout)
+            self.assertIn(
+                "autoSkipBuildReason: source artifact differs from stamped build",
+                artifact_invalidated.stdout,
+            )
+            self.assertIn("fake cargo --config ", artifact_invalidated.stdout)
+            self.assertEqual(
+                len(build_count.read_text(encoding="utf-8").splitlines()), 2
+            )
+
+            forced = self.run_script(
+                "-BuildOnly",
+                "-SkipPreflightCheck",
+                "-InstallDir",
+                str(install_dir),
+                env=env,
+            )
+            self.assertEqual(
+                forced.returncode,
+                0,
+                f"stdout:\n{forced.stdout}\nstderr:\n{forced.stderr}",
+            )
+            self.assertNotIn("autoSkipBuild:", forced.stdout)
+            self.assertIn("fake cargo --config ", forced.stdout)
+            self.assertEqual(
+                len(build_count.read_text(encoding="utf-8").splitlines()), 3
+            )
+
+            self.touch_tracked_source(FRESH_SOURCE_TIME)
+            invalidated = self.run_script(*auto_skip_args, env=env)
+            self.assertEqual(
+                invalidated.returncode,
+                0,
+                f"stdout:\n{invalidated.stdout}\nstderr:\n{invalidated.stderr}",
+            )
+            self.assertIn("autoSkipBuild: false", invalidated.stdout)
+            self.assertIn(
+                "autoSkipBuildReason: tracked publish inputs changed",
+                invalidated.stdout,
+            )
+            self.assertIn("fake cargo --config ", invalidated.stdout)
+            self.assertEqual(
+                len(build_count.read_text(encoding="utf-8").splitlines()), 4
+            )
+
+            for result in (initial, cached, artifact_invalidated, forced, invalidated):
+                self.assertIn("buildOnly: true", result.stdout)
+                self.assertNotIn("targetPath:", result.stdout)
+            self.assertFalse((install_dir / "codex.exe").exists())
+
+    def test_build_only_rejects_explicit_skip_build(self) -> None:
+        self.init_repo_fixture()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = self.run_script(
+                "-BuildOnly",
+                "-SkipBuild",
+                "-InstallDir",
+                str(Path(temp_dir) / "install"),
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "-BuildOnly cannot be combined with -SkipBuild.",
+                result.stdout + result.stderr,
+            )
 
     def test_test_run_executes_build_and_doctor_without_publishing(self) -> None:
         self.init_repo_fixture()

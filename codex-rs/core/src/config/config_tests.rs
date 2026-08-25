@@ -20,11 +20,6 @@ use codex_config::config_toml::AutoReviewToml;
 use codex_config::config_toml::ConfigToml;
 use codex_config::config_toml::ExperimentalRequestUserInput;
 use codex_config::config_toml::ProjectConfig;
-use codex_config::config_toml::RealtimeConfig;
-use codex_config::config_toml::RealtimeToml;
-use codex_config::config_toml::RealtimeTransport;
-use codex_config::config_toml::RealtimeWsMode;
-use codex_config::config_toml::RealtimeWsVersion;
 use codex_config::config_toml::ToolsToml;
 use codex_config::loader::project_trust_key;
 use codex_config::permissions_toml::FilesystemPermissionToml;
@@ -93,7 +88,6 @@ use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::NetworkAccess;
-use codex_protocol::protocol::RealtimeVoice;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_utils_path_uri::LegacyAppPathString;
 use serde::Deserialize;
@@ -215,6 +209,23 @@ async fn load_config_normalizes_relative_cwd_override() -> std::io::Result<()> {
     .await?;
 
     assert_eq!(config.cwd, expected_cwd);
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_config_canonicalizes_chatgpt_base_url_once_at_the_boundary() -> std::io::Result<()> {
+    let codex_home = tempdir()?;
+    let config = Config::load_from_base_config_with_overrides(
+        ConfigToml {
+            chatgpt_base_url: Some("HTTPS://CHATGPT.COM/codex/".to_string()),
+            ..Default::default()
+        },
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+
+    assert_eq!(config.chatgpt_base_url, "https://chatgpt.com/backend-api");
     Ok(())
 }
 
@@ -346,41 +357,26 @@ enabled = false
 }
 
 #[test]
-fn tools_web_search_true_deserializes_to_none() {
-    let cfg: ConfigToml = toml::from_str(
-        r#"
+fn tools_web_search_bool_is_rejected_with_migration_guidance() {
+    for enabled in [true, false] {
+        let err = toml::from_str::<ConfigToml>(&format!(
+            r#"
 [tools]
-web_search = true
-"#,
-    )
-    .expect("TOML deserialization should succeed");
+web_search = {enabled}
+"#
+        ))
+        .expect_err("boolean tools.web_search should be rejected");
 
-    assert_eq!(
-        cfg.tools,
-        Some(ToolsToml {
-            web_search: None,
-            experimental_request_user_input: None,
-        })
-    );
-}
-
-#[test]
-fn tools_web_search_false_deserializes_to_none() {
-    let cfg: ConfigToml = toml::from_str(
-        r#"
-[tools]
-web_search = false
-"#,
-    )
-    .expect("TOML deserialization should succeed");
-
-    assert_eq!(
-        cfg.tools,
-        Some(ToolsToml {
-            web_search: None,
-            experimental_request_user_input: None,
-        })
-    );
+        let message = err.to_string();
+        assert!(
+            message.contains("`tools.web_search` no longer accepts a boolean"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("top-level `web_search = \"live\"`"),
+            "unexpected error: {message}"
+        );
+    }
 }
 
 #[test]
@@ -531,32 +527,6 @@ direct_only_tool_namespaces = ["mcp__history", "mcp__notes"]
         vec!["mcp__history".to_string(), "mcp__notes".to_string()]
     );
     assert!(config.features.enabled(Feature::CodeMode));
-    Ok(())
-}
-
-#[tokio::test]
-async fn load_config_warns_when_code_mode_waiting_policy_is_ignored() -> std::io::Result<()> {
-    let codex_home = tempdir()?;
-    let config_toml: ConfigToml = toml::from_str(
-        r#"
-[features.code_mode]
-enabled = true
-waiting_policy = "yield_after"
-"#,
-    )
-    .expect("deprecated waiting policy should remain parseable");
-    let config = Config::load_from_base_config_with_overrides(
-        config_toml,
-        ConfigOverrides::default(),
-        codex_home.abs(),
-    )
-    .await?;
-
-    assert_eq!(config.code_mode, CodeModeConfig::default());
-    assert!(config.startup_warnings.iter().any(|warning| {
-        warning
-            == "`features.code_mode.waiting_policy` is deprecated and ignored; remove this setting."
-    }));
     Ok(())
 }
 
@@ -2743,27 +2713,12 @@ async fn empty_config_defaults_to_builtin_profile_for_trusted_project() -> std::
             .active_permission_profile()
             .as_ref()
             .map(|active| active.id.as_str()),
-        Some(if cfg!(target_os = "windows") {
-            BUILT_IN_PERMISSION_PROFILE_READ_ONLY
-        } else {
-            BUILT_IN_PERMISSION_PROFILE_WORKSPACE
-        })
+        Some(BUILT_IN_PERMISSION_PROFILE_READ_ONLY)
     );
-    if cfg!(target_os = "windows") {
-        assert!(
-            !policy.can_write_path_with_cwd(cwd.path(), cwd.path()),
-            "expected trusted project fallback to stay read-only without Windows sandbox support, policy: {policy:?}"
-        );
-    } else {
-        assert!(
-            policy.can_write_path_with_cwd(cwd.path(), cwd.path()),
-            "expected trusted project fallback to use :workspace, policy: {policy:?}"
-        );
-        assert!(
-            !policy.can_write_path_with_cwd(&cwd.path().join(".codex"), cwd.path()),
-            "expected :workspace metadata carveouts, policy: {policy:?}"
-        );
-    }
+    assert!(
+        !policy.can_write_path_with_cwd(cwd.path(), cwd.path()),
+        "expected trusted project fallback to stay read-only without Windows sandbox support, policy: {policy:?}"
+    );
     Ok(())
 }
 
@@ -2798,31 +2753,16 @@ async fn empty_config_defaults_to_builtin_profile_for_untrusted_project() -> std
             .active_permission_profile()
             .as_ref()
             .map(|active| active.id.as_str()),
-        Some(if cfg!(target_os = "windows") {
-            BUILT_IN_PERMISSION_PROFILE_READ_ONLY
-        } else {
-            BUILT_IN_PERMISSION_PROFILE_WORKSPACE
-        })
+        Some(BUILT_IN_PERMISSION_PROFILE_READ_ONLY)
     );
     assert!(
         policy.can_read_path_with_cwd(cwd.path(), cwd.path()),
         "expected untrusted project fallback to allow reads, policy: {policy:?}"
     );
-    if cfg!(target_os = "windows") {
-        assert!(
-            !policy.can_write_path_with_cwd(cwd.path(), cwd.path()),
-            "expected untrusted project fallback to stay read-only without Windows sandbox support, policy: {policy:?}"
-        );
-    } else {
-        assert!(
-            policy.can_write_path_with_cwd(cwd.path(), cwd.path()),
-            "expected untrusted project fallback to use :workspace, policy: {policy:?}"
-        );
-        assert!(
-            !policy.can_write_path_with_cwd(&cwd.path().join(".codex"), cwd.path()),
-            "expected :workspace metadata carveouts, policy: {policy:?}"
-        );
-    }
+    assert!(
+        !policy.can_write_path_with_cwd(cwd.path(), cwd.path()),
+        "expected untrusted project fallback to stay read-only without Windows sandbox support, policy: {policy:?}"
+    );
     Ok(())
 }
 
@@ -3862,19 +3802,7 @@ trust_level = "trusted"
         /*permission_profile_constraint*/ None,
     )
     .await;
-    if cfg!(target_os = "windows") {
-        assert_eq!(resolution, SandboxPolicy::new_read_only_policy());
-    } else {
-        assert_eq!(
-            resolution,
-            SandboxPolicy::WorkspaceWrite {
-                writable_roots: vec![writable_root.clone()],
-                network_access: false,
-                exclude_tmpdir_env_var: true,
-                exclude_slash_tmp: true,
-            }
-        );
-    }
+    assert_eq!(resolution, SandboxPolicy::new_read_only_policy());
 
     let sandbox_workspace_write = format!(
         r#"
@@ -3901,19 +3829,7 @@ exclude_slash_tmp = true
         /*permission_profile_constraint*/ None,
     )
     .await;
-    if cfg!(target_os = "windows") {
-        assert_eq!(resolution, SandboxPolicy::new_read_only_policy());
-    } else {
-        assert_eq!(
-            resolution,
-            SandboxPolicy::WorkspaceWrite {
-                writable_roots: vec![writable_root],
-                network_access: false,
-                exclude_tmpdir_env_var: true,
-                exclude_slash_tmp: true,
-            }
-        );
-    }
+    assert_eq!(resolution, SandboxPolicy::new_read_only_policy());
 }
 
 #[tokio::test]
@@ -3991,7 +3907,8 @@ exclude_slash_tmp = true
                 );
             }
             "workspace-write" => {
-                if cfg!(target_os = "windows") {
+                #[cfg(windows)]
+                {
                     assert_eq!(
                         sandbox_policy,
                         SandboxPolicy::new_read_only_policy(),
@@ -4006,30 +3923,33 @@ exclude_slash_tmp = true
                         ),
                         "downgraded workspace-write should match the legacy read-only projection"
                     );
-                    continue;
                 }
-                assert_eq!(
-                    config.permissions.workspace_roots(),
-                    &[cwd.abs(), extra_root.clone()]
-                );
-                assert!(
-                    file_system_policy
-                        .entries
-                        .contains(&FileSystemSandboxEntry {
-                            path: FileSystemPath::Path { path: cwd.abs() },
-                            access: FileSystemAccessMode::Write,
-                        })
-                );
-                assert!(
-                    file_system_policy
-                        .entries
-                        .contains(&FileSystemSandboxEntry {
-                            path: FileSystemPath::Path {
-                                path: extra_root.clone(),
-                            },
-                            access: FileSystemAccessMode::Write,
-                        })
-                );
+                #[cfg(not(windows))]
+                {
+                    assert_eq!(
+                        config.permissions.workspace_roots(),
+                        &[cwd.abs(), extra_root.clone()]
+                    );
+                    assert!(
+                        file_system_policy
+                            .entries
+                            .contains(&FileSystemSandboxEntry {
+                                path: FileSystemPath::Path { path: cwd.abs() },
+                                access: FileSystemAccessMode::Write,
+                            })
+                    );
+                    assert!(
+                        file_system_policy
+                            .entries
+                            .contains(&FileSystemSandboxEntry {
+                                path: FileSystemPath::Path {
+                                    path: extra_root.clone(),
+                                },
+                                access: FileSystemAccessMode::Write,
+                            })
+                    );
+                }
+                #[cfg(not(windows))]
                 for subpath in [".git", ".agents", ".codex"] {
                     assert!(
                         file_system_policy
@@ -5033,47 +4953,10 @@ async fn add_dir_override_extends_workspace_writable_roots() -> std::io::Result<
     )
     .await?;
 
-    let expected_backend = backend.abs();
-    if cfg!(target_os = "windows") {
-        match &config.legacy_sandbox_policy() {
-            SandboxPolicy::ReadOnly { .. } => {}
-            other => panic!("expected read-only policy on Windows, got {other:?}"),
-        }
-    } else {
-        match &config.legacy_sandbox_policy() {
-            SandboxPolicy::WorkspaceWrite { writable_roots, .. } => {
-                assert_eq!(
-                    writable_roots
-                        .iter()
-                        .filter(|root| **root == expected_backend)
-                        .count(),
-                    1,
-                    "expected single writable root entry for {}",
-                    expected_backend.display()
-                );
-            }
-            other => panic!("expected workspace-write policy, got {other:?}"),
-        }
+    match &config.legacy_sandbox_policy() {
+        SandboxPolicy::ReadOnly { .. } => {}
+        other => panic!("expected read-only policy on Windows, got {other:?}"),
     }
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn default_zsh_path_sets_runtime_zsh_path() -> std::io::Result<()> {
-    let codex_home = TempDir::new()?;
-    let default_zsh_path = codex_home.path().join("packaged-zsh");
-
-    let config = Config::load_from_base_config_with_overrides(
-        ConfigToml::default(),
-        ConfigOverrides {
-            default_zsh_path: Some(default_zsh_path.abs()),
-            ..Default::default()
-        },
-        codex_home.abs(),
-    )
-    .await?;
-    assert_eq!(config.zsh_path, Some(default_zsh_path));
 
     Ok(())
 }
@@ -5102,7 +4985,6 @@ async fn sqlite_home_defaults_to_codex_home_for_workspace_write() -> std::io::Re
 async fn workspace_write_includes_configured_writable_root_once_without_memories_root()
 -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
-    let memories_root = codex_home.path().join("memories");
     let writable_root = codex_home.path().join("writable").abs();
     let config = Config::load_from_base_config_with_overrides(
         ConfigToml {
@@ -5120,33 +5002,9 @@ async fn workspace_write_includes_configured_writable_root_once_without_memories
     )
     .await?;
 
-    if cfg!(target_os = "windows") {
-        match &config.legacy_sandbox_policy() {
-            SandboxPolicy::ReadOnly { .. } => {}
-            other => panic!("expected read-only policy on Windows, got {other:?}"),
-        }
-    } else {
-        assert!(
-            !memories_root.exists(),
-            "expected config load not to create memories root at {}",
-            memories_root.display()
-        );
-        let expected_memories_root = memories_root.abs();
-        match &config.legacy_sandbox_policy() {
-            SandboxPolicy::WorkspaceWrite { writable_roots, .. } => {
-                assert!(!writable_roots.contains(&expected_memories_root));
-                assert_eq!(
-                    writable_roots
-                        .iter()
-                        .filter(|root| **root == writable_root)
-                        .count(),
-                    1,
-                    "expected single writable root entry for {}",
-                    writable_root.display()
-                );
-            }
-            other => panic!("expected workspace-write policy, got {other:?}"),
-        }
+    match &config.legacy_sandbox_policy() {
+        SandboxPolicy::ReadOnly { .. } => {}
+        other => panic!("expected read-only policy on Windows, got {other:?}"),
     }
 
     Ok(())
@@ -5191,18 +5049,9 @@ async fn memory_tool_makes_memories_root_readable_without_creating_or_widening_w
     assert!(file_system_policy.can_read_path_with_cwd(memories_root_abs.as_path(), cwd.path()));
     assert!(!file_system_policy.can_write_path_with_cwd(memories_root_abs.as_path(), cwd.path()));
 
-    if cfg!(target_os = "windows") {
-        match &config.legacy_sandbox_policy() {
-            SandboxPolicy::ReadOnly { .. } => {}
-            other => panic!("expected read-only policy on Windows, got {other:?}"),
-        }
-    } else {
-        match &config.legacy_sandbox_policy() {
-            SandboxPolicy::WorkspaceWrite { writable_roots, .. } => {
-                assert!(!writable_roots.contains(&memories_root_abs));
-            }
-            other => panic!("expected workspace-write policy, got {other:?}"),
-        }
+    match &config.legacy_sandbox_policy() {
+        SandboxPolicy::ReadOnly { .. } => {}
+        other => panic!("expected read-only policy on Windows, got {other:?}"),
     }
 
     Ok(())
@@ -5517,32 +5366,12 @@ model = "gpt-project-local"
 }
 
 #[tokio::test]
-async fn feature_table_overrides_legacy_flags() -> std::io::Result<()> {
+async fn canonical_feature_toggle_loads() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     let mut entries = BTreeMap::new();
-    entries.insert("apply_patch_freeform".to_string(), false);
+    entries.insert("unified_exec".to_string(), true);
     let cfg = ConfigToml {
         features: Some(FeaturesToml::from(entries)),
-        ..Default::default()
-    };
-
-    let config = Config::load_from_base_config_with_overrides(
-        cfg,
-        ConfigOverrides::default(),
-        codex_home.abs(),
-    )
-    .await?;
-
-    assert!(!config.features.enabled(Feature::ApplyPatchFreeform));
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn legacy_toggles_map_to_features() -> std::io::Result<()> {
-    let codex_home = TempDir::new()?;
-    let cfg = ConfigToml {
-        experimental_use_unified_exec_tool: Some(true),
         ..Default::default()
     };
 
@@ -6002,7 +5831,8 @@ async fn to_mcp_config_preserves_auth_elicitation_feature_from_config() -> std::
 }
 
 #[tokio::test]
-async fn load_global_mcp_servers_rejects_inline_bearer_token() -> anyhow::Result<()> {
+async fn load_global_mcp_servers_rejects_inline_bearer_token_via_config_parser()
+-> anyhow::Result<()> {
     let codex_home = TempDir::new()?;
     let config_path = codex_home.path().join(CONFIG_TOML_FILE);
 
@@ -6020,10 +5850,26 @@ bearer_token = "secret"
         .expect_err("bearer_token entries should be rejected");
 
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-    assert!(err.to_string().contains("bearer_token"));
-    assert!(err.to_string().contains("bearer_token_env_var"));
+    assert!(err.to_string().contains("bearer_token is not supported"));
 
     Ok(())
+}
+
+#[test]
+fn retired_raw_config_loader_wrappers_are_removed() {
+    let source = include_str!("mod.rs");
+    let retired_names = [
+        ["load_config_as_toml_", "with_cli_overrides"].concat(),
+        ["load_config_as_toml_", "with_cli_and_loader_overrides"].concat(),
+        ["load_config_as_toml_", "with_cli_and_load_options"].concat(),
+    ];
+
+    for name in retired_names {
+        assert!(
+            !source.contains(&format!("pub async fn {name}")),
+            "retired raw ConfigToml loader wrapper still exists: {name}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -7909,66 +7755,6 @@ developer_instructions = "Write carefully"
     Ok(())
 }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn agent_role_discovery_terminates_on_directory_symlink_cycle() -> std::io::Result<()> {
-    let codex_home = TempDir::new()?;
-    let repo_root = TempDir::new()?;
-    let nested_cwd = repo_root.path().join("packages").join("app");
-    std::fs::create_dir_all(repo_root.path().join(".git"))?;
-    std::fs::create_dir_all(&nested_cwd)?;
-
-    let workspace_key = repo_root.path().to_string_lossy().replace('\\', "\\\\");
-    std::fs::write(
-        codex_home.path().join(CONFIG_TOML_FILE),
-        format!(
-            r#"[projects."{workspace_key}"]
-trust_level = "trusted"
-"#
-        ),
-    )?;
-
-    let agents_dir = repo_root.path().join(".codex").join("agents");
-    std::fs::create_dir_all(&agents_dir)?;
-    std::fs::write(
-        agents_dir.join("researcher.toml"),
-        r#"
-name = "researcher"
-description = "from cycle"
-developer_instructions = "Research carefully"
-"#,
-    )?;
-    std::os::unix::fs::symlink(&agents_dir, agents_dir.join("loop"))?;
-
-    let config = ConfigBuilder::without_managed_config_for_tests()
-        .codex_home(codex_home.path().to_path_buf())
-        .harness_overrides(ConfigOverrides {
-            cwd: Some(nested_cwd),
-            ..Default::default()
-        })
-        .build()
-        .await?;
-
-    assert_eq!(config.agent_roles.len(), 1);
-    assert_eq!(
-        config
-            .agent_roles
-            .get("researcher")
-            .and_then(|role| role.description.as_deref()),
-        Some("from cycle")
-    );
-    assert!(
-        !config
-            .startup_warnings
-            .iter()
-            .any(|warning| warning.contains("duplicate agent role name `researcher`")),
-        "{:?}",
-        config.startup_warnings
-    );
-
-    Ok(())
-}
-
 #[tokio::test]
 async fn mixed_legacy_and_standalone_agent_role_sources_merge_with_precedence()
 -> std::io::Result<()> {
@@ -8446,33 +8232,6 @@ request_max_retries = 4            # retry failed HTTP requests
 stream_max_retries = 10            # retry dropped SSE streams
 stream_idle_timeout_ms = 300000    # 5m idle timeout
 websocket_connect_timeout_ms = 15000
-
-[profiles.o3]
-model = "o3"
-model_provider = "openai"
-approval_policy = "never"
-model_reasoning_effort = "high"
-model_reasoning_summary = "detailed"
-
-[profiles.gpt3]
-model = "gpt-3.5-turbo"
-model_provider = "openai-custom"
-
-[profiles.zdr]
-model = "o3"
-model_provider = "openai"
-approval_policy = "on-request"
-
-[profiles.zdr.analytics]
-enabled = false
-
-[profiles.gpt5]
-model = "gpt-5.4"
-model_provider = "openai"
-approval_policy = "on-request"
-model_reasoning_effort = "high"
-model_reasoning_summary = "detailed"
-model_verbosity = "high"
 "#;
 
     let cfg: ConfigToml = toml::from_str(toml).expect("TOML deserialization should succeed");
@@ -8514,6 +8273,37 @@ async fn legacy_profile_selection_is_rejected() -> std::io::Result<()> {
     assert!(
         err.to_string()
             .contains("legacy `profile = \"gpt3\"` config is no longer supported"),
+        "unexpected error: {err}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_profile_tables_are_rejected() -> std::io::Result<()> {
+    let mut fixture = create_test_fixture()?;
+    fixture.cfg = toml::from_str(
+        r#"
+[profiles.work]
+model = "gpt-work"
+"#,
+    )
+    .expect("TOML deserialization should succeed");
+
+    let err = Config::load_from_base_config_with_overrides(
+        fixture.cfg.clone(),
+        ConfigOverrides {
+            cwd: Some(fixture.cwd_path()),
+            ..Default::default()
+        },
+        fixture.codex_home(),
+    )
+    .await
+    .expect_err("legacy profile tables should be rejected");
+
+    assert_eq!(err.kind(), ErrorKind::InvalidData);
+    assert!(
+        err.to_string()
+            .contains("legacy `profiles` config tables are no longer supported"),
         "unexpected error: {err}"
     );
     Ok(())
@@ -9026,33 +8816,6 @@ trust_level = "trusted"
     Ok(())
 }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn active_project_does_not_match_configured_alias_for_canonical_cwd() -> anyhow::Result<()> {
-    let tmp = tempdir()?;
-    let project_root = tmp.path().join("project");
-    let alias_root = tmp.path().join("project_alias");
-    std::fs::create_dir_all(&project_root)?;
-    std::os::unix::fs::symlink(&project_root, &alias_root)?;
-
-    let config = ConfigToml {
-        projects: Some(HashMap::from([(
-            alias_root.to_string_lossy().to_string(),
-            ProjectConfig {
-                trust_level: Some(TrustLevel::Trusted),
-            },
-        )])),
-        ..Default::default()
-    };
-
-    assert_eq!(
-        config.get_active_project(&project_root, /*repo_root*/ None),
-        None
-    );
-
-    Ok(())
-}
-
 #[tokio::test]
 async fn config_reuses_project_trust_root() -> anyhow::Result<()> {
     let tmp = tempdir()?;
@@ -9202,17 +8965,10 @@ trust_level = "untrusted"
     .await;
 
     // Verify that untrusted projects get WorkspaceWrite (or ReadOnly on Windows due to downgrade)
-    if cfg!(target_os = "windows") {
-        assert!(
-            matches!(resolution, SandboxPolicy::ReadOnly { .. }),
-            "Expected ReadOnly on Windows, got {resolution:?}"
-        );
-    } else {
-        assert!(
-            matches!(resolution, SandboxPolicy::WorkspaceWrite { .. }),
-            "Expected WorkspaceWrite for untrusted project, got {resolution:?}"
-        );
-    }
+    assert!(
+        matches!(resolution, SandboxPolicy::ReadOnly { .. }),
+        "Expected ReadOnly on Windows, got {resolution:?}"
+    );
 
     Ok(())
 }
@@ -9309,11 +9065,7 @@ async fn derive_sandbox_policy_preserves_windows_downgrade_for_unsupported_fallb
     )
     .await;
 
-    if cfg!(target_os = "windows") {
-        assert_eq!(resolution, SandboxPolicy::new_read_only_policy());
-    } else {
-        assert_eq!(resolution, SandboxPolicy::new_workspace_write_policy());
-    }
+    assert_eq!(resolution, SandboxPolicy::new_read_only_policy());
     Ok(())
 }
 
@@ -9525,23 +9277,13 @@ async fn test_untrusted_project_gets_unless_trusted_approval_policy() -> anyhow:
     );
 
     // Verify that untrusted projects still get WorkspaceWrite sandbox (or ReadOnly on Windows)
-    if cfg!(target_os = "windows") {
-        assert!(
-            matches!(
-                &config.legacy_sandbox_policy(),
-                SandboxPolicy::ReadOnly { .. }
-            ),
-            "Expected ReadOnly on Windows"
-        );
-    } else {
-        assert!(
-            matches!(
-                &config.legacy_sandbox_policy(),
-                SandboxPolicy::WorkspaceWrite { .. }
-            ),
-            "Expected WorkspaceWrite sandbox for untrusted project"
-        );
-    }
+    assert!(
+        matches!(
+            &config.legacy_sandbox_policy(),
+            SandboxPolicy::ReadOnly { .. }
+        ),
+        "Expected ReadOnly on Windows"
+    );
 
     Ok(())
 }
@@ -10204,6 +9946,48 @@ async fn approvals_reviewer_can_be_set_in_config_without_guardian_approval() -> 
 }
 
 #[tokio::test]
+async fn headless_approval_policy_is_conditioned_on_resolved_reviewer() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    let configured_policy = ConfigToml {
+        approval_policy: Some(AskForApproval::OnRequest),
+        ..Default::default()
+    };
+
+    let auto_reviewed = Config::load_from_base_config_with_overrides(
+        ConfigToml {
+            approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
+            ..configured_policy.clone()
+        },
+        ConfigOverrides {
+            headless_approval_policy: Some(AskForApproval::Never),
+            ..Default::default()
+        },
+        codex_home.path().abs(),
+    )
+    .await?;
+    let user_reviewed = Config::load_from_base_config_with_overrides(
+        configured_policy,
+        ConfigOverrides {
+            headless_approval_policy: Some(AskForApproval::Never),
+            approvals_reviewer: Some(ApprovalsReviewer::User),
+            ..Default::default()
+        },
+        codex_home.path().abs(),
+    )
+    .await?;
+
+    assert_eq!(
+        auto_reviewed.permissions.approval_policy.value(),
+        AskForApproval::OnRequest
+    );
+    assert_eq!(
+        user_reviewed.permissions.approval_policy.value(),
+        AskForApproval::Never
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn requirements_disallowing_default_approvals_reviewer_falls_back_to_required_default()
 -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
@@ -10437,6 +10221,22 @@ enabled = true
     );
 
     Ok(())
+}
+
+#[test]
+fn multi_agent_v2_runtime_defaults_follow_feature_policy() {
+    let config = MultiAgentV2Config::default();
+
+    assert_eq!(
+        config.max_concurrent_threads_per_session,
+        MULTI_AGENT_V2_DEFAULT_MAX_CONCURRENT_THREADS_PER_SESSION
+    );
+    assert_eq!(config.min_wait_timeout_ms, MULTI_AGENT_MIN_WAIT_TIMEOUT_MS);
+    assert_eq!(config.max_wait_timeout_ms, MULTI_AGENT_MAX_WAIT_TIMEOUT_MS);
+    assert_eq!(
+        config.default_wait_timeout_ms,
+        MULTI_AGENT_DEFAULT_WAIT_TIMEOUT_MS
+    );
 }
 
 #[test]
@@ -10867,7 +10667,7 @@ shell_tool = false
 }
 
 #[tokio::test]
-async fn feature_requirements_warn_on_collab_legacy_alias() -> std::io::Result<()> {
+async fn feature_requirements_treat_legacy_alias_as_unknown() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
 
     let config = ConfigBuilder::without_managed_config_for_tests()
@@ -10883,12 +10683,11 @@ collab = true
         .build()
         .await?;
 
-    assert!(config.features.enabled(Feature::Collab));
     assert!(
-        config.startup_warnings.iter().any(|warning| {
-            warning.contains("Using legacy `features` requirement `collab`")
-                && warning.contains("prefer canonical feature key `multi_agent`")
-        }),
+        config
+            .startup_warnings
+            .iter()
+            .any(|warning| warning.contains("Ignoring unknown `features` requirement `collab`")),
         "{:?}",
         config.startup_warnings
     );
@@ -10919,6 +10718,33 @@ made_up_feature = true
             .iter()
             .any(|warning| warning
                 .contains("Ignoring unknown `features` requirement `made_up_feature`")),
+        "{:?}",
+        config.startup_warnings
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn feature_requirements_treat_retired_feature_as_unknown() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+
+    let config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .cloud_config_bundle(
+            CloudConfigBundleFixture::loader_with_enterprise_requirement(
+                r#"
+[features]
+apply_patch_freeform = true
+"#,
+            ),
+        )
+        .build()
+        .await?;
+
+    assert!(
+        config.startup_warnings.iter().any(|warning| warning
+            .contains("Ignoring unknown `features` requirement `apply_patch_freeform`")),
         "{:?}",
         config.startup_warnings
     );
@@ -11095,35 +10921,6 @@ disabled_tools = [
 }
 
 #[tokio::test]
-async fn experimental_realtime_start_instructions_load_from_config_toml() -> std::io::Result<()> {
-    let cfg: ConfigToml = toml::from_str(
-        r#"
-experimental_realtime_start_instructions = "start instructions from config"
-"#,
-    )
-    .expect("TOML deserialization should succeed");
-
-    assert_eq!(
-        cfg.experimental_realtime_start_instructions.as_deref(),
-        Some("start instructions from config")
-    );
-
-    let codex_home = TempDir::new()?;
-    let config = Config::load_from_base_config_with_overrides(
-        cfg,
-        ConfigOverrides::default(),
-        codex_home.abs(),
-    )
-    .await?;
-
-    assert_eq!(
-        config.experimental_realtime_start_instructions.as_deref(),
-        Some("start instructions from config")
-    );
-    Ok(())
-}
-
-#[tokio::test]
 async fn experimental_thread_config_endpoint_loads_from_config_toml() -> std::io::Result<()> {
     let cfg: ConfigToml = toml::from_str(
         r#"
@@ -11148,234 +10945,6 @@ experimental_thread_config_endpoint = "http://127.0.0.1:8061"
     assert_eq!(
         config.experimental_thread_config_endpoint.as_deref(),
         Some("http://127.0.0.1:8061")
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn experimental_realtime_ws_base_url_loads_from_config_toml() -> std::io::Result<()> {
-    let cfg: ConfigToml = toml::from_str(
-        r#"experimental_realtime_ws_base_url = "http://127.0.0.1:8011"
-experimental_realtime_webrtc_call_base_url = "http://127.0.0.1:8082/v1"
-"#,
-    )
-    .expect("TOML deserialization should succeed");
-
-    assert_eq!(
-        cfg.experimental_realtime_ws_base_url.as_deref(),
-        Some("http://127.0.0.1:8011")
-    );
-    assert_eq!(
-        cfg.experimental_realtime_webrtc_call_base_url.as_deref(),
-        Some("http://127.0.0.1:8082/v1")
-    );
-    let codex_home = TempDir::new()?;
-    let config = Config::load_from_base_config_with_overrides(
-        cfg,
-        ConfigOverrides::default(),
-        codex_home.abs(),
-    )
-    .await?;
-
-    assert_eq!(
-        config.experimental_realtime_ws_base_url.as_deref(),
-        Some("http://127.0.0.1:8011")
-    );
-    assert_eq!(
-        config.experimental_realtime_webrtc_call_base_url.as_deref(),
-        Some("http://127.0.0.1:8082/v1")
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn experimental_realtime_ws_backend_prompt_loads_from_config_toml() -> std::io::Result<()> {
-    let cfg: ConfigToml = toml::from_str(
-        r#"
-experimental_realtime_ws_backend_prompt = "prompt from config"
-"#,
-    )
-    .expect("TOML deserialization should succeed");
-
-    assert_eq!(
-        cfg.experimental_realtime_ws_backend_prompt.as_deref(),
-        Some("prompt from config")
-    );
-
-    let codex_home = TempDir::new()?;
-    let config = Config::load_from_base_config_with_overrides(
-        cfg,
-        ConfigOverrides::default(),
-        codex_home.abs(),
-    )
-    .await?;
-
-    assert_eq!(
-        config.experimental_realtime_ws_backend_prompt.as_deref(),
-        Some("prompt from config")
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn experimental_realtime_ws_startup_context_loads_from_config_toml() -> std::io::Result<()> {
-    let cfg: ConfigToml = toml::from_str(
-        r#"
-experimental_realtime_ws_startup_context = "startup context from config"
-"#,
-    )
-    .expect("TOML deserialization should succeed");
-
-    assert_eq!(
-        cfg.experimental_realtime_ws_startup_context.as_deref(),
-        Some("startup context from config")
-    );
-
-    let codex_home = TempDir::new()?;
-    let config = Config::load_from_base_config_with_overrides(
-        cfg,
-        ConfigOverrides::default(),
-        codex_home.abs(),
-    )
-    .await?;
-
-    assert_eq!(
-        config.experimental_realtime_ws_startup_context.as_deref(),
-        Some("startup context from config")
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn experimental_realtime_ws_model_loads_from_config_toml() -> std::io::Result<()> {
-    let cfg: ConfigToml = toml::from_str(
-        r#"
-experimental_realtime_ws_model = "realtime-test-model"
-"#,
-    )
-    .expect("TOML deserialization should succeed");
-
-    assert_eq!(
-        cfg.experimental_realtime_ws_model.as_deref(),
-        Some("realtime-test-model")
-    );
-
-    let codex_home = TempDir::new()?;
-    let config = Config::load_from_base_config_with_overrides(
-        cfg,
-        ConfigOverrides::default(),
-        codex_home.abs(),
-    )
-    .await?;
-
-    assert_eq!(
-        config.experimental_realtime_ws_model.as_deref(),
-        Some("realtime-test-model")
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn realtime_config_partial_table_uses_realtime_defaults() -> std::io::Result<()> {
-    let cfg: ConfigToml = toml::from_str(
-        r#"
-[realtime]
-voice = "marin"
-"#,
-    )
-    .expect("TOML deserialization should succeed");
-
-    let codex_home = TempDir::new()?;
-    let config = Config::load_from_base_config_with_overrides(
-        cfg,
-        ConfigOverrides::default(),
-        codex_home.abs(),
-    )
-    .await?;
-
-    assert_eq!(
-        config.realtime,
-        RealtimeConfig {
-            voice: Some(RealtimeVoice::Marin),
-            ..RealtimeConfig::default()
-        }
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn realtime_loads_from_config_toml() -> std::io::Result<()> {
-    let cfg: ConfigToml = toml::from_str(
-        r#"
-[realtime]
-version = "v2"
-type = "transcription"
-transport = "webrtc"
-voice = "cedar"
-"#,
-    )
-    .expect("TOML deserialization should succeed");
-
-    assert_eq!(
-        cfg.realtime,
-        Some(RealtimeToml {
-            version: Some(RealtimeWsVersion::V2),
-            session_type: Some(RealtimeWsMode::Transcription),
-            transport: Some(RealtimeTransport::WebRtc),
-            voice: Some(RealtimeVoice::Cedar),
-        })
-    );
-
-    let codex_home = TempDir::new()?;
-    let config = Config::load_from_base_config_with_overrides(
-        cfg,
-        ConfigOverrides::default(),
-        codex_home.abs(),
-    )
-    .await?;
-
-    assert_eq!(
-        config.realtime,
-        RealtimeConfig {
-            version: RealtimeWsVersion::V2,
-            session_type: RealtimeWsMode::Transcription,
-            transport: RealtimeTransport::WebRtc,
-            voice: Some(RealtimeVoice::Cedar),
-        }
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn realtime_audio_loads_from_config_toml() -> std::io::Result<()> {
-    let cfg: ConfigToml = toml::from_str(
-        r#"
-[audio]
-microphone = "USB Mic"
-speaker = "Desk Speakers"
-"#,
-    )
-    .expect("TOML deserialization should succeed");
-
-    let realtime_audio = cfg
-        .audio
-        .as_ref()
-        .expect("realtime audio config should be present");
-    assert_eq!(realtime_audio.microphone.as_deref(), Some("USB Mic"));
-    assert_eq!(realtime_audio.speaker.as_deref(), Some("Desk Speakers"));
-
-    let codex_home = TempDir::new()?;
-    let config = Config::load_from_base_config_with_overrides(
-        cfg,
-        ConfigOverrides::default(),
-        codex_home.abs(),
-    )
-    .await?;
-
-    assert_eq!(config.realtime_audio.microphone.as_deref(), Some("USB Mic"));
-    assert_eq!(
-        config.realtime_audio.speaker.as_deref(),
-        Some("Desk Speakers")
     );
     Ok(())
 }

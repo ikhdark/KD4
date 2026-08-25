@@ -22,6 +22,10 @@ use crate::ConstraintError;
 use crate::ManagedHooksRequirementsToml;
 use crate::mcp_requirements::McpServerRequirement;
 use crate::mcp_types::AppToolApproval;
+pub use crate::permissions_toml::NetworkDomainPermissionToml;
+pub use crate::permissions_toml::NetworkDomainPermissionsToml;
+pub use crate::permissions_toml::NetworkUnixSocketPermissionToml;
+pub use crate::permissions_toml::NetworkUnixSocketPermissionsToml;
 use crate::permissions_toml::PermissionProfileToml;
 use crate::types::WindowsSandboxModeToml;
 
@@ -262,92 +266,6 @@ pub enum MarketplaceAllowedSourceKind {
 impl PluginRequirementsToml {
     pub fn is_empty(&self) -> bool {
         self.mcp_servers.as_ref().is_none_or(BTreeMap::is_empty)
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
-pub struct NetworkDomainPermissionsToml {
-    #[serde(flatten)]
-    pub entries: BTreeMap<String, NetworkDomainPermissionToml>,
-}
-
-impl NetworkDomainPermissionsToml {
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    pub fn allowed_domains(&self) -> Option<Vec<String>> {
-        let allowed_domains: Vec<String> = self
-            .entries
-            .iter()
-            .filter(|(_, permission)| matches!(permission, NetworkDomainPermissionToml::Allow))
-            .map(|(pattern, _)| pattern.clone())
-            .collect();
-        (!allowed_domains.is_empty()).then_some(allowed_domains)
-    }
-
-    pub fn denied_domains(&self) -> Option<Vec<String>> {
-        let denied_domains: Vec<String> = self
-            .entries
-            .iter()
-            .filter(|(_, permission)| matches!(permission, NetworkDomainPermissionToml::Deny))
-            .map(|(pattern, _)| pattern.clone())
-            .collect();
-        (!denied_domains.is_empty()).then_some(denied_domains)
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "lowercase")]
-pub enum NetworkDomainPermissionToml {
-    Allow,
-    Deny,
-}
-
-impl std::fmt::Display for NetworkDomainPermissionToml {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let permission = match self {
-            Self::Allow => "allow",
-            Self::Deny => "deny",
-        };
-        f.write_str(permission)
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
-pub struct NetworkUnixSocketPermissionsToml {
-    #[serde(flatten)]
-    pub entries: BTreeMap<String, NetworkUnixSocketPermissionToml>,
-}
-
-impl NetworkUnixSocketPermissionsToml {
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    pub fn allow_unix_sockets(&self) -> Vec<String> {
-        self.entries
-            .iter()
-            .filter(|(_, permission)| matches!(permission, NetworkUnixSocketPermissionToml::Allow))
-            .map(|(path, _)| path.clone())
-            .collect()
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "lowercase")]
-pub enum NetworkUnixSocketPermissionToml {
-    Allow,
-    Deny,
-}
-
-impl std::fmt::Display for NetworkUnixSocketPermissionToml {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let permission = match self {
-            Self::Allow => "allow",
-            Self::Deny => "deny",
-        };
-        f.write_str(permission)
     }
 }
 
@@ -668,8 +586,7 @@ fn split_glob_pattern(input: &str) -> (&str, &str) {
     match separator_index {
         Some(0) => ("/", &input[1..]),
         Some(index)
-            if cfg!(windows)
-                && index == 2
+            if index == 2
                 && input.as_bytes().get(1) == Some(&b':')
                 && input.as_bytes().get(2).is_some() =>
         {
@@ -681,11 +598,7 @@ fn split_glob_pattern(input: &str) -> (&str, &str) {
 }
 
 fn is_path_separator(ch: char) -> bool {
-    if cfg!(windows) {
-        ch == '/' || ch == '\\'
-    } else {
-        ch == '/'
-    }
+    ch == '/' || ch == '\\'
 }
 
 fn is_glob_metacharacter(ch: char) -> bool {
@@ -2186,16 +2099,8 @@ allowed_approvals_reviewers = ["user"]
 
     #[test]
     fn deserialize_filesystem_deny_read_requirements() -> Result<()> {
-        let deny_read_0 = if cfg!(windows) {
-            r"C:\Users\alice\.gitconfig"
-        } else {
-            "/home/alice/.gitconfig"
-        };
-        let deny_read_1 = if cfg!(windows) {
-            r"C:\Users\alice\.ssh"
-        } else {
-            "/home/alice/.ssh"
-        };
+        let deny_read_0 = r"C:\Users\alice\.gitconfig";
+        let deny_read_1 = r"C:\Users\alice\.ssh";
         let toml_str = format!(
             r#"
             [permissions.filesystem]
@@ -2838,7 +2743,7 @@ allowed_approvals_reviewers = ["user"]
         let config: ConfigRequirementsToml = from_str(toml_str)?;
         let requirements: ConfigRequirements = with_unknown_source(config).try_into()?;
 
-        let root = if cfg!(windows) { "C:\\repo" } else { "/repo" };
+        let root = "C:\\repo";
         assert!(
             requirements
                 .permission_profile
@@ -2953,7 +2858,7 @@ allowed_approvals_reviewers = ["user"]
         );
 
         let requirements = ConfigRequirements::try_from(requirements_with_sources)?;
-        let root = if cfg!(windows) { "C:\\repo" } else { "/repo" };
+        let root = "C:\\repo";
         let workspace_write_profile = PermissionProfile::workspace_write_with(
             &[AbsolutePathBuf::from_absolute_path(root)?],
             NetworkSandboxPolicy::Restricted,
@@ -3497,64 +3402,6 @@ command = "python3 /enterprise/hooks/pre.py"
             err.to_string()
                 .contains("`experimental_network.unix_sockets` cannot be combined"),
             "unexpected error: {err:#}"
-        );
-    }
-
-    #[test]
-    fn network_permission_containers_project_allowed_and_denied_entries() {
-        let domains = NetworkDomainPermissionsToml {
-            entries: BTreeMap::from([
-                (
-                    "*.openai.com".to_string(),
-                    NetworkDomainPermissionToml::Allow,
-                ),
-                (
-                    "api.example.com".to_string(),
-                    NetworkDomainPermissionToml::Allow,
-                ),
-                (
-                    "blocked.example.com".to_string(),
-                    NetworkDomainPermissionToml::Deny,
-                ),
-            ]),
-        };
-        let unix_sockets = NetworkUnixSocketPermissionsToml {
-            entries: BTreeMap::from([
-                (
-                    "/tmp/example.sock".to_string(),
-                    NetworkUnixSocketPermissionToml::Allow,
-                ),
-                (
-                    "/tmp/ignored.sock".to_string(),
-                    NetworkUnixSocketPermissionToml::Deny,
-                ),
-            ]),
-        };
-
-        assert_eq!(
-            domains.allowed_domains(),
-            Some(vec![
-                "*.openai.com".to_string(),
-                "api.example.com".to_string()
-            ])
-        );
-        assert_eq!(
-            domains.denied_domains(),
-            Some(vec!["blocked.example.com".to_string()])
-        );
-        assert_eq!(
-            NetworkDomainPermissionsToml {
-                entries: BTreeMap::from([(
-                    "api.example.com".to_string(),
-                    NetworkDomainPermissionToml::Allow,
-                )]),
-            }
-            .denied_domains(),
-            None
-        );
-        assert_eq!(
-            unix_sockets.allow_unix_sockets(),
-            vec!["/tmp/example.sock".to_string()]
         );
     }
 

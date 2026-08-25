@@ -61,6 +61,7 @@ use codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::Personality;
 use codex_protocol::mcp::CallToolResult;
+use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentMessageEvent;
@@ -114,10 +115,8 @@ use super::analytics::wait_for_analytics_payload;
 use super::analytics::wait_for_goal_event;
 use super::analytics::wait_for_matching_analytics_event;
 
-#[cfg(windows)]
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
-#[cfg(not(windows))]
-const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 const CODEX_5_2_INSTRUCTIONS_TEMPLATE_DEFAULT: &str = "You are Codex, a coding agent based on GPT-5. You and the user share the same workspace and collaborate to achieve the user's goals.";
 
 fn normalized_existing_path(path: impl AsRef<Path>) -> Result<PathBuf> {
@@ -199,6 +198,14 @@ async fn thread_resume_rejects_unmaterialized_thread() -> Result<()> {
             .contains("no rollout found for thread id"),
         "unexpected resume error: {}",
         resume_err.error.message
+    );
+    assert_eq!(
+        serde_json::from_value::<codex_app_server_protocol::ThreadErrorData>(
+            resume_err.error.data.expect("thread error data")
+        )?,
+        codex_app_server_protocol::ThreadErrorData {
+            reason: codex_app_server_protocol::ThreadErrorReason::NotMaterialized,
+        }
     );
 
     Ok(())
@@ -626,10 +633,14 @@ async fn thread_resume_preserves_acknowledged_approvals_reviewer_update() -> Res
 }
 
 #[tokio::test]
-async fn settings_only_model_update_survives_cold_resume_and_explicit_override_wins() -> Result<()>
-{
+async fn settings_only_non_model_update_survives_cold_resume_and_explicit_override_wins()
+-> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
+    let updated_cwd_dir = TempDir::new()?;
+    let updated_cwd = normalized_existing_path(updated_cwd_dir.path())?;
+    let override_cwd_dir = TempDir::new()?;
+    let override_cwd = normalized_existing_path(override_cwd_dir.path())?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
     let thread_id = {
@@ -661,7 +672,7 @@ async fn settings_only_model_update_survives_cold_resume_and_explicit_override_w
         let update_id = mcp
             .send_thread_settings_update_request(ThreadSettingsUpdateParams {
                 thread_id: thread.id.clone(),
-                model: Some("mock-model-2".to_string()),
+                cwd: Some(updated_cwd.clone()),
                 ..Default::default()
             })
             .await?;
@@ -678,7 +689,7 @@ async fn settings_only_model_update_survives_cold_resume_and_explicit_override_w
         .await??;
         assert!(
             rollout_path.exists(),
-            "model-only settings update should materialize resumable state"
+            "non-model settings update should materialize resumable state"
         );
 
         thread.id
@@ -702,8 +713,8 @@ async fn settings_only_model_update_survives_cold_resume_and_explicit_override_w
             mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
         )
         .await??;
-        let ThreadResumeResponse { model, .. } = to_response::<ThreadResumeResponse>(resume_resp)?;
-        assert_eq!(model, "mock-model-2");
+        let ThreadResumeResponse { cwd, .. } = to_response::<ThreadResumeResponse>(resume_resp)?;
+        assert_eq!(cwd, AbsolutePathBuf::from_absolute_path(&updated_cwd)?);
     }
 
     let mut mcp = TestAppServer::builder()
@@ -715,7 +726,7 @@ async fn settings_only_model_update_survives_cold_resume_and_explicit_override_w
     let resume_id = mcp
         .send_thread_resume_request(ThreadResumeParams {
             thread_id,
-            model: Some("mock-model-3".to_string()),
+            cwd: Some(override_cwd.to_string_lossy().into_owned()),
             ..Default::default()
         })
         .await?;
@@ -724,8 +735,95 @@ async fn settings_only_model_update_survives_cold_resume_and_explicit_override_w
         mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
     )
     .await??;
-    let ThreadResumeResponse { model, .. } = to_response::<ThreadResumeResponse>(resume_resp)?;
-    assert_eq!(model, "mock-model-3");
+    let ThreadResumeResponse { cwd, .. } = to_response::<ThreadResumeResponse>(resume_resp)?;
+    assert_eq!(cwd, AbsolutePathBuf::from_absolute_path(&override_cwd)?);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn first_turn_persists_complete_initial_thread_settings_for_cold_resume() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let (thread_id, expected_active_permission_profile) = {
+        let mut mcp = TestAppServer::builder()
+            .with_codex_home(codex_home.path())
+            .build()
+            .await?;
+        timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+        let start_id = mcp
+            .send_thread_start_request_with_auto_env(ThreadStartParams {
+                permissions: Some(BUILT_IN_PERMISSION_PROFILE_READ_ONLY.to_string()),
+                ..Default::default()
+            })
+            .await?;
+        let start_resp: JSONRPCResponse = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+        )
+        .await??;
+        let ThreadStartResponse {
+            thread,
+            active_permission_profile,
+            ..
+        } = to_response::<ThreadStartResponse>(start_resp)?;
+        assert!(
+            active_permission_profile.is_some(),
+            "named permission profile should retain its provenance"
+        );
+
+        let turn_id = mcp
+            .send_turn_start_request(TurnStartParams {
+                thread_id: thread.id.clone(),
+                client_user_message_id: None,
+                input: vec![UserInput::Text {
+                    text: "materialize complete initial settings".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            })
+            .await?;
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(turn_id)),
+        )
+        .await??;
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("turn/completed"),
+        )
+        .await??;
+
+        (thread.id, active_permission_profile)
+    };
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id,
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let ThreadResumeResponse {
+        active_permission_profile,
+        ..
+    } = to_response::<ThreadResumeResponse>(resume_resp)?;
+    assert_eq!(
+        active_permission_profile,
+        expected_active_permission_profile
+    );
 
     Ok(())
 }
@@ -1893,15 +1991,20 @@ async fn thread_goal_lifecycle_emits_analytics_and_clear_deletes_goal() -> Resul
         ]),
     ])
     .await;
+    let analytics_server = MockServer::start().await;
     let codex_home = TempDir::new()?;
-    create_config_toml_with_chatgpt_base_url(codex_home.path(), &server.uri(), &server.uri())?;
+    create_config_toml_with_chatgpt_base_url(
+        codex_home.path(),
+        &server.uri(),
+        &analytics_server.uri(),
+    )?;
     let config_path = codex_home.path().join("config.toml");
     let config = std::fs::read_to_string(&config_path)?;
     std::fs::write(
         &config_path,
         config.replace("personality = true\n", "personality = true\ngoals = true\n"),
     )?;
-    mount_analytics_capture(&server, codex_home.path()).await?;
+    mount_analytics_capture(&analytics_server, codex_home.path()).await?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -1967,7 +2070,8 @@ async fn thread_goal_lifecycle_emits_analytics_and_clear_deletes_goal() -> Resul
     )
     .await??;
 
-    let created = wait_for_goal_event(&server, DEFAULT_READ_TIMEOUT, "created", "active").await?;
+    let created =
+        wait_for_goal_event(&analytics_server, DEFAULT_READ_TIMEOUT, "created", "active").await?;
     let persisted_goal_id = created["event_params"]["goal_id"]
         .as_str()
         .expect("created goal id");
@@ -1981,10 +2085,10 @@ async fn thread_goal_lifecycle_emits_analytics_and_clear_deletes_goal() -> Resul
     assert!(created["event_params"].get("token_budget").is_none());
 
     let usage = wait_for_goal_event(
-        &server,
+        &analytics_server,
         DEFAULT_READ_TIMEOUT,
         "usage_accounted",
-        "budget_limited",
+        "budgetLimited",
     )
     .await?;
     let causal_turn_id = usage["event_params"]["turn_id"]
@@ -1999,10 +2103,10 @@ async fn thread_goal_lifecycle_emits_analytics_and_clear_deletes_goal() -> Resul
     );
 
     let status = wait_for_goal_event(
-        &server,
+        &analytics_server,
         DEFAULT_READ_TIMEOUT,
         "status_changed",
-        "budget_limited",
+        "budgetLimited",
     )
     .await?;
     assert_eq!(status["event_params"]["goal_id"], persisted_goal_id);
@@ -2038,8 +2142,13 @@ async fn thread_goal_lifecycle_emits_analytics_and_clear_deletes_goal() -> Resul
     )
     .await??;
 
-    let cleared =
-        wait_for_goal_event(&server, DEFAULT_READ_TIMEOUT, "cleared", "budget_limited").await?;
+    let cleared = wait_for_goal_event(
+        &analytics_server,
+        DEFAULT_READ_TIMEOUT,
+        "cleared",
+        "budgetLimited",
+    )
+    .await?;
     assert_eq!(cleared["event_params"]["goal_id"], persisted_goal_id);
     assert_eq!(cleared["event_params"]["turn_id"], serde_json::Value::Null);
 
@@ -3187,7 +3296,6 @@ async fn thread_resume_rejects_mismatched_path_for_running_thread_id() -> Result
     )
     .await??;
 
-    #[cfg(windows)]
     {
         let active_path = thread.path.as_ref().expect("thread should have path");
         let active_path_display = active_path.as_os_str().to_string_lossy();
@@ -3274,7 +3382,7 @@ async fn thread_resume_rejects_mismatched_path_for_running_thread_id() -> Result
 }
 
 #[tokio::test]
-async fn thread_resume_rejoins_running_thread_even_with_override_mismatch() -> Result<()> {
+async fn thread_resume_rejects_overrides_that_cannot_apply_to_a_running_thread() -> Result<()> {
     let server = responses::start_mock_server().await;
     let first_response = responses::sse_response(responses::sse(vec![
         responses::ev_response_created("resp-1"),
@@ -3371,42 +3479,30 @@ async fn thread_resume_rejoins_running_thread_even_with_override_mismatch() -> R
             ..Default::default()
         })
         .await?;
-    let resume_resp: JSONRPCResponse = timeout(
+    let resume_err: JSONRPCError = timeout(
         DEFAULT_READ_TIMEOUT,
-        primary.read_stream_until_response_message(RequestId::Integer(resume_id)),
+        primary.read_stream_until_error_message(RequestId::Integer(resume_id)),
     )
     .await??;
-    let ThreadResumeResponse {
-        thread,
-        model,
-        initial_turns_page,
-        ..
-    } = to_response::<ThreadResumeResponse>(resume_resp)?;
-    assert_eq!(model, "gpt-5.4");
-    let initial_turns_page = initial_turns_page.expect("resume should include initial turns page");
-    let resumed_running_turn = initial_turns_page
-        .data
-        .first()
-        .expect("resume page should include the running turn");
-    assert_eq!(resumed_running_turn.id, running_turn.id);
-    assert_eq!(resumed_running_turn.items_view, TurnItemsView::Summary);
-    assert_eq!(resumed_running_turn.status, TurnStatus::InProgress);
-    assert!(initial_turns_page.backwards_cursor.is_some());
-    assert_eq!(initial_turns_page.next_cursor, None);
-    // The running-thread resume response is queued onto the thread listener task.
-    // If the in-flight turn completes before that queued command runs, the response
-    // can legitimately observe the thread as idle.
-    match &thread.status {
-        ThreadStatus::Active { active_flags } => assert!(active_flags.is_empty()),
-        ThreadStatus::Idle => {}
-        status => panic!("unexpected thread status after running resume: {status:?}"),
-    }
+    assert_eq!(resume_err.error.code, -32600);
+    assert!(
+        resume_err
+            .error
+            .message
+            .contains("cannot apply thread/resume overrides to loaded thread"),
+        "unexpected resume error: {}",
+        resume_err.error.message
+    );
+    assert!(resume_err.error.message.contains("model requested="));
+    assert!(resume_err.error.message.contains("cwd requested="));
 
     timeout(
         DEFAULT_READ_TIMEOUT,
         primary.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
+
+    assert_eq!(running_turn.status, TurnStatus::InProgress);
 
     Ok(())
 }

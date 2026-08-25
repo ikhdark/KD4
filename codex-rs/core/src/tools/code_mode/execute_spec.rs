@@ -1,14 +1,10 @@
-use codex_code_mode::ToolDefinition as CodeModeToolDefinition;
 use codex_tools::FreeformTool;
 use codex_tools::FreeformToolFormat;
 use codex_tools::ToolSpec;
-use std::collections::BTreeMap;
 
 pub(crate) fn create_code_mode_tool(
-    enabled_tools: &[CodeModeToolDefinition],
-    deferred_tools: &[CodeModeToolDefinition],
-    namespace_descriptions: &BTreeMap<String, codex_code_mode::ToolNamespaceDescription>,
     code_mode_only: bool,
+    has_deferred_tools: bool,
     direct_only_tool_names: &[String],
 ) -> ToolSpec {
     const CODE_MODE_FREEFORM_GRAMMAR: &str = r#"
@@ -23,11 +19,9 @@ SOURCE: /[\s\S]+/
 
     ToolSpec::Freeform(FreeformTool {
         name: codex_code_mode::PUBLIC_TOOL_NAME.to_string(),
-        description: codex_code_mode::build_exec_tool_description_with_direct_only_tools(
-            enabled_tools,
-            deferred_tools,
-            namespace_descriptions,
+        description: codex_code_mode::build_exec_tool_description(
             code_mode_only,
+            has_deferred_tools,
             direct_only_tool_names,
         ),
         format: FreeformToolFormat {
@@ -41,35 +35,21 @@ SOURCE: /[\s\S]+/
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_tools::ToolName;
     use pretty_assertions::assert_eq;
 
     #[test]
     fn create_code_mode_tool_matches_expected_spec() {
-        let enabled_tools = vec![codex_code_mode::ToolDefinition {
-            name: "update_plan".to_string(),
-            tool_name: ToolName::plain("update_plan"),
-            description: "Update the plan".to_string(),
-            kind: codex_code_mode::CodeModeToolKind::Function,
-            input_schema: None,
-            output_schema: None,
-        }];
-
         assert_eq!(
             create_code_mode_tool(
-                &enabled_tools,
-                &[],
-                &BTreeMap::new(),
                 /*code_mode_only*/ true,
+                /*has_deferred_tools*/ false,
                 &["direct_helper".to_string()],
             ),
             ToolSpec::Freeform(FreeformTool {
                 name: codex_code_mode::PUBLIC_TOOL_NAME.to_string(),
-                description: codex_code_mode::build_exec_tool_description_with_direct_only_tools(
-                    &enabled_tools,
-                    &[],
-                    &BTreeMap::new(),
+                description: codex_code_mode::build_exec_tool_description(
                     /*code_mode_only*/ true,
+                    /*has_deferred_tools*/ false,
                     &["direct_helper".to_string()],
                 ),
                 format: FreeformToolFormat {
@@ -92,8 +72,7 @@ SOURCE: /[\s\S]+/
 
     #[test]
     fn optimization_priority_code_mode_builds_coherent_packets_at_the_code_mode_limit() {
-        let exec_description =
-            codex_code_mode::build_exec_tool_description(&[], &[], &BTreeMap::new(), true);
+        let exec_description = codex_code_mode::build_exec_tool_description(true, false, &[]);
 
         assert!(exec_description.contains("defaults to 10000"));
         assert!(

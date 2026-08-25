@@ -131,6 +131,27 @@ pub async fn codex_plugins_enabled_for_workspace(
     Ok(codex_plugins_enabled)
 }
 
+/// Reads the workspace setting while preserving the product's fail-open behavior.
+pub async fn codex_plugins_enabled_for_workspace_or_default(
+    config: &Config,
+    auth: Option<&CodexAuth>,
+    cache: Option<&WorkspaceSettingsCache>,
+) -> bool {
+    workspace_setting_or_default(codex_plugins_enabled_for_workspace(config, auth, cache).await)
+}
+
+fn workspace_setting_or_default(result: anyhow::Result<bool>) -> bool {
+    match result {
+        Ok(enabled) => enabled,
+        Err(err) => {
+            tracing::warn!(
+                "failed to fetch workspace Codex plugins setting; allowing Codex plugins: {err:#}"
+            );
+            true
+        }
+    }
+}
+
 fn encode_path_segment(value: &str) -> String {
     let mut encoded = String::new();
     for byte in value.bytes() {

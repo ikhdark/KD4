@@ -8,7 +8,6 @@ use crate::backend::AddAdHocMemoryNoteRequest;
 use crate::backend::AddAdHocMemoryNoteResponse;
 use crate::backend::ListMemoriesRequest;
 use crate::backend::ListMemoriesResponse;
-use crate::backend::MemoriesBackend;
 use crate::backend::MemoriesBackendError;
 use crate::backend::ReadMemoryRequest;
 use crate::backend::ReadMemoryResponse;
@@ -98,29 +97,29 @@ impl LocalMemoriesBackend {
     }
 }
 
-impl MemoriesBackend for LocalMemoriesBackend {
-    async fn add_ad_hoc_note(
+impl LocalMemoriesBackend {
+    pub(crate) async fn add_ad_hoc_note(
         &self,
         request: AddAdHocMemoryNoteRequest,
     ) -> Result<AddAdHocMemoryNoteResponse, MemoriesBackendError> {
         ad_hoc_note::add_ad_hoc_note(self, request).await
     }
 
-    async fn list(
+    pub(crate) async fn list(
         &self,
         request: ListMemoriesRequest,
     ) -> Result<ListMemoriesResponse, MemoriesBackendError> {
         list::list(self, request).await
     }
 
-    async fn read(
+    pub(crate) async fn read(
         &self,
         request: ReadMemoryRequest,
     ) -> Result<ReadMemoryResponse, MemoriesBackendError> {
         read::read(self, request).await
     }
 
-    async fn search(
+    pub(crate) async fn search(
         &self,
         request: SearchMemoriesRequest,
     ) -> Result<SearchMemoriesResponse, MemoriesBackendError> {

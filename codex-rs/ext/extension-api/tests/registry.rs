@@ -70,6 +70,14 @@ impl TurnInputContributor for AllContributors {
 }
 
 impl ToolContributor for AllContributors {
+    fn surface_revision(
+        &self,
+        _session_store: &ExtensionData,
+        _thread_store: &ExtensionData,
+    ) -> u64 {
+        41
+    }
+
     fn tools(
         &self,
         _session_store: &ExtensionData,
@@ -132,6 +140,13 @@ async fn build_round_trips_every_contributor_category() {
     assert_eq!(registry.context_contributors().len(), 1);
     assert_eq!(registry.turn_input_contributors().len(), 1);
     assert_eq!(registry.tool_contributors().len(), 1);
+    assert_eq!(
+        registry.tool_contributors()[0].surface_revision(
+            &ExtensionData::new("session"),
+            &ExtensionData::new("thread")
+        ),
+        41
+    );
     assert_eq!(registry.tool_lifecycle_contributors().len(), 1);
     assert_eq!(registry.turn_item_contributors().len(), 1);
     assert_eq!(

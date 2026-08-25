@@ -1,3 +1,4 @@
+use super::REMOTE_CONTROL_INSTALLATION_ID_HEADER;
 use super::auth::RemoteControlConnectionAuth;
 use super::enroll::RemoteControlEnrollment;
 use super::enroll::RemoteControlServerTokenRefreshRequirement;
@@ -24,8 +25,6 @@ use tracing::warn;
 const REMOTE_CONTROL_ENROLL_TIMEOUT: Duration = Duration::from_secs(30);
 const REMOTE_CONTROL_SERVER_TOKEN_REFRESH_BACKOFF_MIN_SECS: u64 = 24;
 const REMOTE_CONTROL_SERVER_TOKEN_REFRESH_BACKOFF_MAX_SECS: u64 = 36;
-
-pub(super) const REMOTE_CONTROL_INSTALLATION_ID_HEADER: &str = "x-codex-installation-id";
 
 #[derive(Debug)]
 struct RemoteControlServerRequestError {
@@ -223,7 +222,7 @@ where
     Request: Serialize,
     Response: DeserializeOwned,
 {
-    let client = create_client_without_request_logging();
+    let client = create_client_without_request_logging()?;
     let auth_headers = auth.request_headers()?;
     let response = client
         .post(url)

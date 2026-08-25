@@ -18,6 +18,7 @@ use crate::ThreadMetadataBuilder;
 use crate::ThreadsPage;
 use crate::migrations::ensure_kd4_compatibility_indexes;
 use crate::migrations::repair_legacy_recency_migration_version;
+use crate::migrations::repair_legacy_validation_index_migration_order;
 use crate::migrations::runtime_goals_migrator;
 use crate::migrations::runtime_logs_migrator;
 use crate::migrations::runtime_memories_migrator;
@@ -29,7 +30,6 @@ use crate::model::anchor_from_item;
 use crate::model::datetime_to_epoch_millis;
 use crate::model::datetime_to_epoch_seconds;
 use crate::model::epoch_millis_to_datetime;
-use crate::paths::file_modified_time_utc;
 use crate::telemetry::DbKind;
 use crate::telemetry::DbTelemetry;
 use crate::telemetry::DbTelemetryHandle;
@@ -53,10 +53,7 @@ use sqlx::sqlite::SqliteJournalMode;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::sqlite::SqliteSynchronous;
 use std::collections::BTreeSet;
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -77,6 +74,12 @@ mod remote_control;
 #[cfg(test)]
 mod test_support;
 mod threads;
+
+async fn file_modified_time_utc(path: &Path) -> Option<DateTime<Utc>> {
+    let modified = tokio::fs::metadata(path).await.ok()?.modified().ok()?;
+    let updated_at: DateTime<Utc> = modified.into();
+    Some(updated_at)
+}
 
 pub use external_agent_config_imports::ExternalAgentConfigImportDetailsRecord;
 pub use external_agent_config_imports::ExternalAgentConfigImportFailureRecord;
@@ -207,8 +210,7 @@ impl StateRuntime {
         telemetry_override: Option<DbTelemetryHandle>,
     ) -> anyhow::Result<Arc<Self>> {
         tokio::fs::create_dir_all(&codex_home).await?;
-        #[cfg(unix)]
-        tokio::fs::set_permissions(&codex_home, std::fs::Permissions::from_mode(0o700)).await?;
+
         let state_migrator = runtime_state_migrator();
         let logs_migrator = runtime_logs_migrator();
         let goals_migrator = runtime_goals_migrator();
@@ -434,19 +436,6 @@ async fn open_sqlite(
     spec: RuntimeDbSpec,
     telemetry_override: Option<&dyn DbTelemetry>,
 ) -> anyhow::Result<SqlitePool> {
-    #[cfg(unix)]
-    {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
-        }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .mode(0o600)
-            .open(path)?;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
     let options = base_sqlite_options(path).auto_vacuum(SqliteAutoVacuum::Incremental);
     let started = Instant::now();
     let pool_result = SqlitePoolOptions::new()
@@ -465,6 +454,9 @@ async fn open_sqlite(
         .map_err(|source| recovery::RuntimeDbInitError::new(spec.label, "open", path, source))?;
     let started = Instant::now();
     let migrate_result = async {
+        if matches!(spec.kind, DbKind::State) {
+            repair_legacy_validation_index_migration_order(&pool, migrator).await?;
+        }
         let migrator = runtime_migrator_for_pool(&pool, migrator).await?;
         if matches!(spec.kind, DbKind::State) {
             repair_legacy_recency_migration_version(&pool, &migrator).await?;

@@ -100,12 +100,6 @@ fn read_block_at(file: &File, offset: u64, len: usize) -> io::Result<FileReadBlo
     })
 }
 
-#[cfg(unix)]
-fn read_file_at(file: &File, bytes: &mut [u8], offset: u64) -> io::Result<usize> {
-    std::os::unix::fs::FileExt::read_at(file, bytes, offset)
-}
-
-#[cfg(windows)]
 fn read_file_at(file: &File, bytes: &mut [u8], offset: u64) -> io::Result<usize> {
     std::os::windows::fs::FileExt::seek_read(file, bytes, offset)
 }

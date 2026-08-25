@@ -1,13 +1,11 @@
 use crate::context::ApprovalPromptContext;
 use crate::context::CollaborationModeInstructions;
 use crate::context::ContextualUserFragment;
+use crate::context::EffectiveMultiAgentMode;
 use crate::context::ModelSwitchInstructions;
 use crate::context::MultiAgentModeInstructions;
 use crate::context::PermissionsInstructions;
 use crate::context::PersonalitySpecInstructions;
-use crate::context::RealtimeEndInstructions;
-use crate::context::RealtimeStartInstructions;
-use crate::context::RealtimeStartWithInstructions;
 use crate::session::PreviousTurnSettings;
 use crate::session::turn_context::TurnContext;
 use codex_execpolicy::Policy;
@@ -48,8 +46,7 @@ fn build_permissions_update_item(
                     .and_then(|messages| messages.approvals.as_ref()),
             ),
             exec_policy,
-            #[allow(deprecated)]
-            &next.cwd,
+            next.cwd(),
             next.config
                 .features
                 .enabled(Feature::ExecPermissionApprovals),
@@ -92,59 +89,20 @@ fn build_multi_agent_mode_update_item(
 ) -> Option<String> {
     let effective_multi_agent_mode = crate::session::multi_agents::effective_multi_agent_mode(next);
     let previous = previous?;
-    if previous.multi_agent_mode == effective_multi_agent_mode {
+    if previous.multi_agent_mode
+        == effective_multi_agent_mode
+            .as_ref()
+            .map(EffectiveMultiAgentMode::to_persisted_mode)
+    {
         return None;
     }
 
     match effective_multi_agent_mode {
         Some(multi_agent_mode) => Some(MultiAgentModeInstructions::new(multi_agent_mode).render()),
-        None if previous.multi_agent_mode == Some(MultiAgentMode::Proactive) => {
-            Some(MultiAgentModeInstructions::new(MultiAgentMode::ExplicitRequestOnly).render())
-        }
+        None if previous.multi_agent_mode == Some(MultiAgentMode::Proactive) => Some(
+            MultiAgentModeInstructions::new(EffectiveMultiAgentMode::ExplicitRequestOnly).render(),
+        ),
         None => None,
-    }
-}
-
-fn build_realtime_start_item(next: &TurnContext) -> String {
-    if let Some(instructions) = next
-        .config
-        .experimental_realtime_start_instructions
-        .as_deref()
-    {
-        RealtimeStartWithInstructions::new(instructions).render()
-    } else {
-        RealtimeStartInstructions.render()
-    }
-}
-
-pub(crate) fn build_realtime_update_item(
-    previous: Option<&TurnContextItem>,
-    previous_turn_settings: Option<&PreviousTurnSettings>,
-    next: &TurnContext,
-) -> Option<String> {
-    match (
-        previous.and_then(|item| item.realtime_active),
-        next.realtime_active,
-    ) {
-        (Some(true), false) => Some(RealtimeEndInstructions::new("inactive").render()),
-        (Some(false), true) | (None, true) => Some(build_realtime_start_item(next)),
-        (Some(true), true) | (Some(false), false) => None,
-        (None, false) => previous_turn_settings
-            .and_then(|settings| settings.realtime_active)
-            .filter(|realtime_active| *realtime_active)
-            .map(|_| RealtimeEndInstructions::new("inactive").render()),
-    }
-}
-
-pub(crate) fn build_initial_realtime_item(
-    previous: Option<&TurnContextItem>,
-    previous_turn_settings: Option<&PreviousTurnSettings>,
-    next: &TurnContext,
-) -> Option<String> {
-    if next.realtime_active {
-        Some(build_realtime_start_item(next))
-    } else {
-        build_realtime_update_item(previous, previous_turn_settings, next)
     }
 }
 
@@ -263,7 +221,6 @@ pub(crate) fn build_settings_update_items(
         build_permissions_update_item(previous, next, exec_policy),
         build_collaboration_mode_update_item(previous, next),
         build_multi_agent_mode_update_item(previous, next),
-        build_realtime_update_item(previous, previous_turn_settings, next),
         build_personality_update_item(previous, next, personality_feature_enabled),
     ]
     .into_iter()

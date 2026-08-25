@@ -19,6 +19,7 @@ use std::time::Duration;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
+use codex_http_client::build_blocking_reqwest_client_with_custom_ca;
 use url::Url;
 use uuid::Uuid;
 
@@ -94,10 +95,11 @@ fn pack_dir(codex_home: &Path) -> PathBuf {
 
 fn download_bytes_with_limit(url: &str, max_bytes: u64) -> Result<Vec<u8>> {
     validate_download_url(url)?;
-    let response = reqwest::blocking::Client::builder()
-        .timeout(PET_DOWNLOAD_TIMEOUT)
-        .build()
-        .context("build pet asset download client")?
+    let client = build_blocking_reqwest_client_with_custom_ca(
+        reqwest::blocking::Client::builder().timeout(PET_DOWNLOAD_TIMEOUT),
+    )
+    .context("build pet asset download client")?;
+    let response = client
         .get(url)
         .send()
         .with_context(|| format!("download pet asset from {url}"))?

@@ -19,19 +19,34 @@ use tracing::warn;
 
 use crate::rmcp_client::Elicitation;
 use crate::rmcp_client::SendElicitation;
+use crate::rmcp_client::SendProgress;
 
 #[derive(Clone)]
 pub(crate) struct LoggingClientHandler {
     client_info: ClientInfo,
     send_elicitation: Arc<SendElicitation>,
+    send_progress: Arc<SendProgress>,
 }
 
 impl LoggingClientHandler {
-    pub(crate) fn new(client_info: ClientInfo, send_elicitation: SendElicitation) -> Self {
+    pub(crate) fn new(
+        client_info: ClientInfo,
+        send_elicitation: SendElicitation,
+        send_progress: SendProgress,
+    ) -> Self {
         Self {
             client_info,
             send_elicitation: Arc::new(send_elicitation),
+            send_progress: Arc::new(send_progress),
         }
+    }
+
+    async fn handle_progress_notification(&self, params: ProgressNotificationParam) {
+        info!(
+            "MCP server progress notification (token: {:?}, progress: {}, total: {:?}, message: {:?})",
+            params.progress_token, params.progress, params.total, params.message
+        );
+        (self.send_progress)(params).await;
     }
 }
 
@@ -63,10 +78,7 @@ impl ClientHandler for LoggingClientHandler {
         params: ProgressNotificationParam,
         _context: NotificationContext<RoleClient>,
     ) {
-        info!(
-            "MCP server progress notification (token: {:?}, progress: {}, total: {:?}, message: {:?})",
-            params.progress_token, params.progress, params.total, params.message
-        );
+        self.handle_progress_notification(params).await;
     }
 
     async fn on_resource_updated(
@@ -133,5 +145,42 @@ impl ClientHandler for LoggingClientHandler {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmcp::model::NumberOrString;
+    use rmcp::model::ProgressToken;
+    use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn progress_notifications_are_forwarded_to_runtime_callback() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_by_callback = Arc::clone(&seen);
+        let handler = LoggingClientHandler::new(
+            ClientInfo::default(),
+            Box::new(|_, _| Box::pin(async move { unreachable!() })),
+            Box::new(move |params| {
+                let seen = Arc::clone(&seen_by_callback);
+                Box::pin(async move {
+                    seen.lock().expect("progress callback lock").push(params);
+                })
+            }),
+        );
+        let params = ProgressNotificationParam {
+            progress_token: ProgressToken(NumberOrString::String("item-1".into())),
+            progress: 3.0,
+            total: Some(10.0),
+            message: Some("working".to_string()),
+        };
+
+        handler.handle_progress_notification(params.clone()).await;
+
+        assert_eq!(
+            seen.lock().expect("progress callback lock").as_slice(),
+            &[params]
+        );
     }
 }

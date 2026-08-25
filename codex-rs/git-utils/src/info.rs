@@ -12,15 +12,15 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use futures::StreamExt;
 use futures::stream;
-use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::process::Command;
 use tokio::time::Duration as TokioDuration;
 use tokio::time::timeout;
-use ts_rs::TS;
 
+use crate::DISABLED_HOOKS_PATH;
 use crate::GitSha;
+pub use codex_protocol::protocol::GitInfo;
 
 /// Return `true` if the project folder specified by the `Config` is inside a
 /// Git repository.
@@ -69,22 +69,8 @@ pub async fn get_git_repo_root_with_fs(
 
 /// Timeout for git commands to prevent freezing on large repositories
 const GIT_COMMAND_TIMEOUT: TokioDuration = TokioDuration::from_secs(5);
-const DISABLED_HOOKS_PATH: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 const UNTRACKED_DIFF_CONCURRENCY: usize = 8;
 const MAX_DIFF_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
-
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, TS)]
-pub struct GitInfo {
-    /// Current commit hash (SHA)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub commit_hash: Option<GitSha>,
-    /// Current branch name
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-    /// Repository URL (if available from remote)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub repository_url: Option<String>,
-}
 
 /// Confirmed, runtime-only repository identity plus stable Git metadata.
 /// Mutable worktree, index, and untracked-file observations stay external.
@@ -590,7 +576,7 @@ fn git_inspection_args_os(
     command_args
 }
 
-fn is_dubious_ownership_stderr(status_success: bool, stderr: &[u8]) -> bool {
+pub(crate) fn is_dubious_ownership_stderr(status_success: bool, stderr: &[u8]) -> bool {
     if status_success {
         return false;
     }
@@ -893,7 +879,7 @@ async fn diff_against_sha(cwd: &Path, sha: &GitSha) -> Option<String> {
 
     if !untracked.is_empty() {
         // Use platform-appropriate null device and guard paths with `--`.
-        let null_device = OsString::from(if cfg!(windows) { "NUL" } else { "/dev/null" });
+        let null_device = OsString::from("NUL");
         let futures = untracked.into_iter().map(|file| {
             let args = vec![
                 OsString::from("diff"),
@@ -938,16 +924,7 @@ fn parse_nul_terminated_paths(output: Vec<u8>) -> Option<Vec<OsString>> {
 }
 
 fn os_string_from_git_bytes(bytes: &[u8]) -> Option<OsString> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStringExt;
-
-        Some(OsString::from_vec(bytes.to_vec()))
-    }
-    #[cfg(not(unix))]
-    {
-        String::from_utf8(bytes.to_vec()).ok().map(OsString::from)
-    }
+    String::from_utf8(bytes.to_vec()).ok().map(OsString::from)
 }
 
 /// Resolve the path that should be used for trust checks. Similar to
@@ -1055,11 +1032,20 @@ pub async fn current_branch_name(cwd: &Path) -> Option<String> {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
-    #[cfg(unix)]
-    use std::os::unix::ffi::OsStrExt;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
+
     use std::process::Command as StdCommand;
+
+    #[test]
+    fn git_info_is_protocol_owned() {
+        let info = GitInfo {
+            commit_hash: None,
+            branch: Some("main".to_string()),
+            repository_url: None,
+        };
+        let protocol_info: codex_protocol::protocol::GitInfo = info;
+
+        assert_eq!(protocol_info.branch.as_deref(), Some("main"));
+    }
 
     fn run_git(cwd: &Path, args: &[&str]) -> String {
         let output = StdCommand::new("git")
@@ -1196,14 +1182,6 @@ mod tests {
                 OsString::from("line\nname.txt")
             ]
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn nul_terminated_paths_preserve_non_utf8_bytes() {
-        let paths =
-            parse_nul_terminated_paths(b"non-utf8-\xff.txt\0".to_vec()).expect("parse paths");
-        assert_eq!(paths[0].as_os_str().as_bytes(), b"non-utf8-\xff.txt");
     }
 
     #[tokio::test]
@@ -1458,150 +1436,6 @@ mod tests {
         assert_eq!(
             local_git_branches(repo).await,
             vec!["main".to_string(), "feature/local".to_string()]
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn fsmonitor_override_rejects_configured_helper() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let git = temp_dir.path().join("git");
-        let log = temp_dir.path().join("git.log");
-        std::fs::write(
-            &git,
-            "#!/bin/sh\n\
-             printf '%s\\n' \"$*\" >>\"$0.log\"\n\
-             case \"$1\" in\n\
-             config) printf '/tmp/fsmonitor-helper\\000' ;;\n\
-             *) printf 'worktree output\\n' ;;\n\
-             esac\n",
-        )
-        .expect("write fake Git");
-        let mut permissions = std::fs::metadata(&git)
-            .expect("read fake Git metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&git, permissions).expect("mark fake Git executable");
-
-        // The config response mirrors:
-        // git -c core.fsmonitor=/tmp/fsmonitor-helper \
-        //   config --null --get core.fsmonitor
-        let fsmonitor = detect_local_fsmonitor_override(&git, temp_dir.path()).await;
-        let output = run_git_command_with_timeout_from(
-            &git,
-            &["status", "--porcelain"],
-            temp_dir.path(),
-            fsmonitor,
-        )
-        .await
-        .expect("run fake Git");
-
-        assert_eq!(
-            (output.status.code(), output.stdout),
-            (Some(0), b"worktree output\n".to_vec())
-        );
-        let disabled_hooks = format!("core.hooksPath={DISABLED_HOOKS_PATH}");
-        assert_eq!(
-            std::fs::read_to_string(log)
-                .expect("read fake Git log")
-                .lines()
-                .map(str::to_string)
-                .collect::<Vec<_>>(),
-            vec![
-                "config --null --get core.fsmonitor".to_string(),
-                "config --null --type=bool --fixed-value --get core.fsmonitor /tmp/fsmonitor-helper"
-                    .to_string(),
-                format!(
-                    "-c {disabled_hooks} -c core.fsmonitor=false -c core.quotePath=true status --porcelain"
-                ),
-            ]
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn fsmonitor_override_uses_effective_layered_config_value() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let repo = temp_dir.path().join("repo");
-        std::fs::create_dir(&repo).expect("create repository directory");
-        let init_status = std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&repo)
-            .status()
-            .expect("initialize test repository");
-        assert_eq!(init_status.code(), Some(0), "initialize test repository");
-
-        let git = temp_dir.path().join("git");
-        let global_config = temp_dir.path().join("git.global");
-        let log = temp_dir.path().join("git.log");
-        std::fs::write(
-            &git,
-            "#!/bin/sh\n\
-             printf '%s\\n' \"$*\" >>\"$0.log\"\n\
-             case \"$1\" in\n\
-             config)\n\
-               GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=\"$0.global\" exec git \"$@\"\n\
-               ;;\n\
-             version) printf 'feature: fsmonitor--daemon\\n' ;;\n\
-             *) printf 'worktree output\\n' ;;\n\
-             esac\n",
-        )
-        .expect("write layered-config Git");
-        let mut permissions = std::fs::metadata(&git)
-            .expect("read layered-config Git metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&git, permissions).expect("mark layered-config Git executable");
-
-        let global_status = std::process::Command::new("git")
-            .args([
-                "config",
-                "--file",
-                global_config.to_str().expect("global config path"),
-                "core.fsmonitor",
-                "/tmp/fsmonitor-helper",
-            ])
-            .status()
-            .expect("write global fsmonitor helper");
-        assert_eq!(
-            global_status.code(),
-            Some(0),
-            "write global fsmonitor helper"
-        );
-        let local_status = std::process::Command::new("git")
-            .args(["config", "core.fsmonitor", "true"])
-            .current_dir(&repo)
-            .status()
-            .expect("write local built-in fsmonitor config");
-        assert_eq!(
-            local_status.code(),
-            Some(0),
-            "write local built-in fsmonitor config"
-        );
-
-        let fsmonitor = detect_local_fsmonitor_override(&git, repo.as_path()).await;
-        let output = run_git_command_with_timeout_from(
-            &git,
-            &["status", "--porcelain"],
-            repo.as_path(),
-            fsmonitor,
-        )
-        .await
-        .expect("run Git with layered config");
-        assert_eq!(
-            (output.status.code(), output.stdout),
-            (Some(0), b"worktree output\n".to_vec())
-        );
-
-        let actual = std::fs::read_to_string(log).expect("read layered-config Git log");
-        let disabled_hooks = format!("core.hooksPath={DISABLED_HOOKS_PATH}");
-        assert_eq!(
-            actual.lines().map(str::to_string).collect::<Vec<_>>(),
-            vec![
-                "config --null --get core.fsmonitor".to_string(),
-                "version --build-options".to_string(),
-                format!("-c {disabled_hooks} -c core.fsmonitor=true status --porcelain"),
-            ]
         );
     }
 }

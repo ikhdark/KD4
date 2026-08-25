@@ -1,9 +1,9 @@
+use codex_file_system::write_atomically;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::io;
-use std::io::Write;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -103,20 +103,6 @@ fn write_plugin_share_local_paths(
     })
     .map_err(io::Error::other)?;
     write_atomically(&path, &format!("{contents}\n"))
-}
-
-fn write_atomically(write_path: &Path, contents: &str) -> io::Result<()> {
-    let parent = write_path.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("path {} has no parent directory", write_path.display()),
-        )
-    })?;
-    std::fs::create_dir_all(parent)?;
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-    tmp.write_all(contents.as_bytes())?;
-    tmp.persist(write_path).map_err(|err| err.error)?;
-    Ok(())
 }
 
 fn plugin_share_local_paths_path(codex_home: &Path) -> std::path::PathBuf {

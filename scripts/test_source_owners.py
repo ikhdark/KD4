@@ -13,6 +13,17 @@ from scripts import source_owners  # noqa: E402
 
 
 class SourceOwnersTest(unittest.TestCase):
+    def test_source_owners_slice_recipe_allows_relationship_limit_override(self) -> None:
+        justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
+        recipe = justfile.split("source-owners-slice owner *args:", 1)[1].split(
+            "\n\n", 1
+        )[0]
+
+        self.assertIn(
+            'slice --owner "{{ owner }}" --max-relationships 32 @forwarded_args',
+            recipe,
+        )
+
     def test_manifest_validation_and_managed_block_are_deterministic(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -25,6 +36,7 @@ class SourceOwnersTest(unittest.TestCase):
 
 [[owners]]
 id = "alpha"
+feature_ids = ["alpha-feature"]
 concern_ids = ["alpha-routing"]
 aliases = ["alpha"]
 phrases = ["alpha locator"]
@@ -152,6 +164,105 @@ roots = ["src"]
             self.assertEqual(target.read_text(encoding="utf-8"), "old\n")
             self.assertEqual(list(Path(directory).glob("*.tmp")), [])
 
+    def test_manifest_validation_reuses_equivalent_path_probes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            source = root / "src" / "lib.rs"
+            source.write_text("fn locate() {}\n", encoding="utf-8")
+            manifest_path = root / "source_owners.toml"
+            manifest_path.write_text(
+                """schema_version = 2
+[[owners]]
+id = "alpha"
+roots = ["src/lib.rs"]
+contracts = ["src/lib.rs"]
+tests = ["src/lib.rs"]
+primary_entries = [{ path = "src/lib.rs", symbol = "locate" }]
+relationships = [{ category = "control_flow", kind = "calls", target = "path:src/lib.rs", confidence = "compiler_resolved", evidence = [{ path = "src/lib.rs", symbol = "locate" }] }]
+invariants = [{ id = "stable", kind = "semantic", statement = "Stable.", evidence = [{ path = "src/lib.rs", symbol = "locate" }], tests = ["src/lib.rs"] }]
+""",
+                encoding="utf-8",
+            )
+            original_exists = Path.exists
+            source_exists_calls = 0
+
+            def tracked_exists(path: Path) -> bool:
+                nonlocal source_exists_calls
+                if path == source:
+                    source_exists_calls += 1
+                return original_exists(path)
+
+            with (
+                mock.patch.object(
+                    source_owners,
+                    "confined_path",
+                    wraps=source_owners.confined_path,
+                ) as resolve_path,
+                mock.patch.object(Path, "exists", tracked_exists),
+            ):
+                source_owners.load_and_validate(manifest_path, root)
+
+            matching_resolutions = [
+                call
+                for call in resolve_path.call_args_list
+                if call.args[1] == "src/lib.rs"
+            ]
+            self.assertEqual(len(matching_resolutions), 1)
+            self.assertEqual(source_exists_calls, 1)
+
+    def test_generate_reads_source_map_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            (root / "src" / "lib.rs").write_text(
+                "fn locate() {}\n", encoding="utf-8"
+            )
+            manifest_path = root / "source_owners.toml"
+            manifest_path.write_text(
+                """schema_version = 2
+[[owners]]
+id = "alpha"
+roots = ["src/lib.rs"]
+""",
+                encoding="utf-8",
+            )
+            source_map = root / "SOURCEMAP.md"
+            source_map.write_text("manual prose\n", encoding="utf-8")
+            architecture_index = root / "architecture_index.json"
+            original_read_text = Path.read_text
+            source_map_reads = 0
+
+            def tracked_read_text(path: Path, *args: object, **kwargs: object) -> str:
+                nonlocal source_map_reads
+                if path == source_map:
+                    source_map_reads += 1
+                return original_read_text(path, *args, **kwargs)
+
+            argv = [
+                "source_owners.py",
+                "generate",
+                "--manifest",
+                str(manifest_path),
+                "--source-map",
+                str(source_map),
+                "--architecture-index",
+                str(architecture_index),
+                "--repo-root",
+                str(root),
+            ]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(Path, "read_text", tracked_read_text),
+            ):
+                self.assertEqual(source_owners.main(), 0)
+
+            self.assertEqual(source_map_reads, 1)
+            self.assertIn(
+                source_owners.BEGIN_PREFIX,
+                source_map.read_text(encoding="utf-8"),
+            )
+
     def test_query_is_bounded_revision_keyed_and_includes_incoming_edges(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -162,6 +273,7 @@ roots = ["src"]
                 """schema_version = 2
 [[owners]]
 id = "alpha"
+feature_ids = ["alpha-feature"]
 roots = ["src"]
 [[owners.relationships]]
 category = "tests_contracts"
@@ -206,6 +318,7 @@ evidence = [{ path = "src/lib.rs", symbol = "locate" }]
             self.assertTrue(
                 any(item["source"] == "owner:beta" for item in result["relationships"])
             )
+            self.assertEqual(result["owners"][0]["feature_ids"], ["alpha-feature"])
             self.assertEqual(result["owners"][0]["invariants"][0]["id"], "stable")
 
     def test_architecture_slice_distinguishes_unknowns_from_bounded_noise(self) -> None:
@@ -344,6 +457,101 @@ evidence = [{ path = "src/lib.rs", symbol = "item" }]
         index = json.loads(first)
         self.assertEqual(index["repository_revision"], f"manifest:{digest}")
         self.assertTrue(all("facet_exclusions" in owner for owner in index["owners"]))
+
+    def test_repository_slices_retain_representative_relationships(self) -> None:
+        manifest, digest = source_owners.load_and_validate(
+            source_owners.DEFAULT_MANIFEST, source_owners.REPO_ROOT
+        )
+        cases = [
+            (
+                ["repository-context-discovery"],
+                "nested repository identity and failed instruction reads",
+                [
+                    ("registration_and_entrypoints", "git_workspace.rs"),
+                    ("callers_and_consumers", "session/mod.rs"),
+                    ("control_and_data_flow", "agents_md.rs"),
+                    ("tests_and_contracts", "agents_md_tests.rs"),
+                    ("invariants", "snapshot-scoped-discovery"),
+                ],
+            ),
+            (
+                ["feature-registry", "core-agent-runtime"],
+                "feature registry runtime wiring and compatibility",
+                [
+                    ("callers_and_consumers", "core-agent-runtime"),
+                    ("registration_and_entrypoints", "features/src/lib.rs"),
+                    ("invariants", "feature-key-compatibility"),
+                ],
+            ),
+            (
+                ["kd4-capability-manifest"],
+                "KD4 capability lifecycle and static reachability evidence",
+                [
+                    ("configuration_and_gates", "kd4_features.toml"),
+                    ("callers_and_consumers", "kd4_perf_snapshot.py"),
+                    ("registration_and_entrypoints", "check-kd4-features"),
+                    ("tests_and_contracts", "test_check_kd4_features.py"),
+                    ("invariants", "capability-evidence-reachability"),
+                ],
+            ),
+            (
+                ["app-server-protocol-contracts", "app-server-runtime"],
+                "generated protocol source consumer and parity",
+                [
+                    ("generated_artifacts", "app-server-protocol/schema"),
+                    ("callers_and_consumers", "app-server-runtime"),
+                    ("registration_and_entrypoints", "app-server-schema-check"),
+                    ("invariants", "schema-source-parity"),
+                ],
+            ),
+        ]
+
+        for owners, focus, expectations in cases:
+            with self.subTest(owners=owners):
+                slice_ = source_owners.architecture_slice(
+                    manifest,
+                    digest,
+                    source_owners.REPO_ROOT,
+                    owners,
+                    max_relationships=32,
+                    focus=focus,
+                )
+                self.assertFalse(slice_["truncated"])
+                self.assertEqual(slice_["omitted_relationships"], 0)
+                self.assertEqual(slice_["material_unknowns"], [])
+                for facet, needle in expectations:
+                    relationships = slice_[facet]["relationships"]
+                    self.assertTrue(
+                        any(
+                            needle in relationship.get("target", "")
+                            or needle in relationship.get("evidence", "")
+                            for relationship in relationships
+                        ),
+                        f"{facet} did not contain {needle!r}",
+                    )
+
+    def test_runtime_features_and_kd4_capabilities_have_distinct_owners(self) -> None:
+        manifest, _ = source_owners.load_and_validate(
+            source_owners.DEFAULT_MANIFEST, source_owners.REPO_ROOT
+        )
+        owners = {owner["id"]: owner for owner in manifest["owners"]}
+
+        runtime_owner = owners["feature-registry"]
+        capability_owner = owners["kd4-capability-manifest"]
+        self.assertNotIn("kd4_features.toml", runtime_owner["contracts"])
+        self.assertIn("kd4_features.toml", capability_owner["contracts"])
+        self.assertFalse(
+            any(
+                relationship["target"] == "config:kd4_features.toml"
+                for relationship in runtime_owner.get("relationships", [])
+            )
+        )
+        self.assertTrue(
+            any(
+                relationship["target"] == "config:kd4_features.toml"
+                for relationship in capability_owner.get("relationships", [])
+            )
+        )
 
     def test_unknown_relationship_category_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

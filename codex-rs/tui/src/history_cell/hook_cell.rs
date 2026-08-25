@@ -443,7 +443,7 @@ impl HookRunCell {
         width: u16,
         render_full_context: bool,
     ) {
-        let label = hook_event_label(self.event_name);
+        let label = self.event_name.to_core().as_pascal_case_label();
         match &self.state {
             HookRunState::VisibleRunning { start_time, .. }
             | HookRunState::QuietLinger { start_time, .. } => {
@@ -710,7 +710,7 @@ fn push_running_hook_group(
     animations_enabled: bool,
 ) {
     push_hook_line_separator(lines);
-    let label = hook_event_label(group.key.event_name);
+    let label = group.key.event_name.to_core().as_pascal_case_label();
     let hook_text = if group.count == 1 {
         format!("Running {label} hook")
     } else {
@@ -808,21 +808,6 @@ fn hook_output_prefix(kind: HookOutputEntryKind) -> &'static str {
         HookOutputEntryKind::Feedback => "feedback: ",
         HookOutputEntryKind::Context => "hook context: ",
         HookOutputEntryKind::Error => "error: ",
-    }
-}
-
-fn hook_event_label(event_name: HookEventName) -> &'static str {
-    match event_name {
-        HookEventName::PreToolUse => "PreToolUse",
-        HookEventName::PermissionRequest => "PermissionRequest",
-        HookEventName::PostToolUse => "PostToolUse",
-        HookEventName::PreCompact => "PreCompact",
-        HookEventName::PostCompact => "PostCompact",
-        HookEventName::SessionStart => "SessionStart",
-        HookEventName::UserPromptSubmit => "UserPromptSubmit",
-        HookEventName::SubagentStart => "SubagentStart",
-        HookEventName::SubagentStop => "SubagentStop",
-        HookEventName::Stop => "Stop",
     }
 }
 

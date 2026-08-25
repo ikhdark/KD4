@@ -2,24 +2,26 @@
 
 use std::collections::HashSet;
 
-pub use codex_utils_plugins::mention_syntax;
-pub use codex_utils_plugins::plugin_namespace_for_skill_path;
-
 mod load_outcome;
 pub mod manifest;
+pub mod mention_syntax;
+mod namespace;
 mod plugin_id;
 mod provider;
 
 use codex_config::HookEventsToml;
 use codex_utils_absolute_path::AbsolutePathBuf;
-pub use load_outcome::EffectiveSkillRoots;
 pub use load_outcome::LoadedPlugin;
 pub use load_outcome::PluginLoadOutcome;
 pub use load_outcome::prompt_safe_plugin_description;
+pub use namespace::DISCOVERABLE_PLUGIN_MANIFEST_PATHS;
+pub use namespace::find_plugin_manifest_path;
+pub use namespace::plugin_namespace_for_root_uri;
+pub use namespace::plugin_namespace_for_skill_path;
+pub use namespace::plugin_namespace_for_skill_uri;
 pub use plugin_id::PluginId;
 pub use plugin_id::PluginIdError;
 pub use plugin_id::validate_plugin_segment;
-pub use provider::PluginProvider;
 pub use provider::PluginResourceLocator;
 pub use provider::ResolvedPlugin;
 pub use provider::ResolvedPluginError;
@@ -76,4 +78,12 @@ pub struct PluginTelemetryMetadata {
     /// Optional backend identifier for remote plugins.
     pub remote_plugin_id: Option<String>,
     pub capability_summary: Option<PluginCapabilitySummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PluginSkillRoot {
+    pub path: AbsolutePathBuf,
+    pub plugin_id: String,
+    pub plugin_namespace: String,
+    pub plugin_root: AbsolutePathBuf,
 }

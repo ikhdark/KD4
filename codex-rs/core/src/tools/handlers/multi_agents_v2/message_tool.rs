@@ -7,7 +7,11 @@ use super::*;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::tools::context::FunctionToolOutput;
+use crate::tools::handlers::multi_agents_spec::create_followup_task_tool;
+use crate::tools::handlers::multi_agents_spec::create_send_message_tool;
 use codex_protocol::protocol::InterAgentCommunication;
+use codex_tools::ToolSpec;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MessageDeliveryMode {
@@ -47,6 +51,86 @@ pub(crate) struct FollowupTaskArgs {
     pub(crate) message: String,
 }
 
+pub(crate) struct SendMessageHandler;
+
+impl ToolExecutor<ToolInvocation> for SendMessageHandler {
+    fn tool_name(&self) -> ToolName {
+        ToolName::plain("send_message")
+    }
+
+    fn spec(&self) -> ToolSpec {
+        create_send_message_tool()
+    }
+
+    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+        Box::pin(self.handle_call(invocation))
+    }
+}
+
+impl SendMessageHandler {
+    async fn handle_call(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
+        let arguments = function_arguments(invocation.payload.clone())?;
+        let args: SendMessageArgs = parse_arguments(&arguments)?;
+        handle_message_string_tool(
+            invocation,
+            MessageDeliveryMode::QueueOnly,
+            args.target,
+            args.message,
+        )
+        .await
+        .map(boxed_tool_output)
+    }
+}
+
+impl CoreToolRuntime for SendMessageHandler {
+    fn matches_kind(&self, payload: &ToolPayload) -> bool {
+        matches!(payload, ToolPayload::Function { .. })
+    }
+}
+
+pub(crate) struct FollowupTaskHandler;
+
+impl ToolExecutor<ToolInvocation> for FollowupTaskHandler {
+    fn tool_name(&self) -> ToolName {
+        ToolName::plain("followup_task")
+    }
+
+    fn spec(&self) -> ToolSpec {
+        create_followup_task_tool()
+    }
+
+    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+        Box::pin(self.handle_call(invocation))
+    }
+}
+
+impl FollowupTaskHandler {
+    async fn handle_call(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
+        let arguments = function_arguments(invocation.payload.clone())?;
+        let args: FollowupTaskArgs = parse_arguments(&arguments)?;
+        handle_message_string_tool(
+            invocation,
+            MessageDeliveryMode::TriggerTurn,
+            args.target,
+            args.message,
+        )
+        .await
+        .map(boxed_tool_output)
+    }
+}
+
+impl CoreToolRuntime for FollowupTaskHandler {
+    fn matches_kind(&self, payload: &ToolPayload) -> bool {
+        matches!(payload, ToolPayload::Function { .. })
+    }
+}
+
 pub(super) fn message_content(message: String) -> Result<String, FunctionCallError> {
     if message.trim().is_empty() {
         return Err(FunctionCallError::RespondToModel(
@@ -66,10 +150,11 @@ pub(crate) async fn handle_message_string_tool(
     let message = message_content(message)?;
     let ToolInvocation {
         session,
-        turn,
+        step_context,
         call_id,
         ..
     } = invocation;
+    let turn = Arc::clone(&step_context.turn);
     let receiver_thread_id = resolve_agent_target(&session, &turn, &target).await?;
     let receiver_agent = session
         .services
@@ -127,4 +212,20 @@ pub(crate) async fn handle_message_string_tool(
     .await;
 
     Ok(FunctionToolOutput::from_text(String::new(), Some(true)))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn message_handlers_are_owned_by_shared_dispatch_module() {
+        let source = include_str!("message_tool.rs");
+        let parent_source = include_str!("../multi_agents_v2.rs");
+
+        for handler in ["SendMessageHandler", "FollowupTaskHandler"] {
+            assert!(source.contains(&format!("pub(crate) struct {handler};")));
+        }
+        for module in ["send_message", "followup_task"] {
+            assert!(!parent_source.contains(&format!("mod {module};")));
+        }
+    }
 }

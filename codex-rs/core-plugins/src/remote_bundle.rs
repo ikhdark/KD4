@@ -9,8 +9,8 @@ use crate::store::validate_plugin_version_segment;
 use codex_login::default_client::create_client_without_request_logging;
 use codex_plugin::PluginId;
 use codex_plugin::PluginIdError;
+use codex_plugin::find_plugin_manifest_path;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use codex_utils_plugins::find_plugin_manifest_path;
 use reqwest::Response;
 use reqwest::StatusCode;
 use serde_json::Value as JsonValue;
@@ -42,6 +42,9 @@ pub struct ValidatedRemotePluginBundle {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemotePluginBundleInstallError {
+    #[error("failed to build remote plugin bundle HTTP client: {0}")]
+    HttpClient(#[from] codex_login::BuildLoginHttpClientError),
+
     #[error("backend did not return a release version for remote plugin `{remote_plugin_id}`")]
     MissingReleaseVersion { remote_plugin_id: String },
 
@@ -138,7 +141,8 @@ impl RemotePluginBundleInstallError {
         match self {
             Self::Io { context, .. } => Some(error_context_sub_error_type(context)),
             Self::Store(err) => err.sub_error_type(),
-            Self::MissingReleaseVersion { .. }
+            Self::HttpClient(_)
+            | Self::MissingReleaseVersion { .. }
             | Self::InvalidReleaseVersion { .. }
             | Self::MissingBundleDownloadUrl { .. }
             | Self::InvalidBundleDownloadUrl { .. }
@@ -290,7 +294,7 @@ async fn download_remote_plugin_bundle_with_limit(
     bundle_download_url: &str,
     max_bytes: u64,
 ) -> Result<Vec<u8>, RemotePluginBundleInstallError> {
-    let client = create_client_without_request_logging();
+    let client = create_client_without_request_logging()?;
     let response = client
         .get(bundle_download_url)
         .timeout(REMOTE_PLUGIN_BUNDLE_DOWNLOAD_TIMEOUT)
@@ -633,6 +637,19 @@ mod tests {
     const REMOTE_PLUGIN_ID: &str = "plugins~Plugin_00000000000000000000000000000000";
 
     #[test]
+    fn http_client_build_error_has_no_store_sub_error_type() {
+        let error = RemotePluginBundleInstallError::HttpClient(
+            codex_login::BuildLoginHttpClientError::ReadCaFile {
+                source_env: "TEST_CA_BUNDLE",
+                path: std::path::PathBuf::from("missing.pem"),
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "missing test CA"),
+            },
+        );
+
+        assert_eq!(error.sub_error_type(), None);
+    }
+
+    #[test]
     fn validate_remote_plugin_bundle_uses_detail_name_for_local_plugin_id() {
         let bundle = validate_remote_plugin_bundle(
             REMOTE_PLUGIN_ID,
@@ -963,33 +980,6 @@ mod tests {
             std::fs::read(destination.path().join(long_path)).expect("read extracted file"),
             b"long"
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn extraction_preserves_executable_permissions() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let destination = tempdir().expect("tempdir");
-        extract_plugin_bundle_tar_gz(
-            &tar_gz_bytes(&[
-                (
-                    ".codex-plugin/plugin.json",
-                    b"{\"name\":\"linear\"}",
-                    /*mode*/ 0o644,
-                ),
-                ("bin/helper", b"#!/bin/sh\n", /*mode*/ 0o755),
-            ]),
-            destination.path(),
-        )
-        .expect("extract bundle");
-
-        let mode = std::fs::metadata(destination.path().join("bin/helper"))
-            .expect("helper metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o755);
     }
 
     fn valid_remote_plugin_bundle() -> ValidatedRemotePluginBundle {

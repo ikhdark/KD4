@@ -106,7 +106,7 @@ impl App {
             self.config.cwd.to_path_buf(),
             version,
         )
-        .with_yolo_mode(history_cell::is_yolo_mode(&self.config))
+        .with_full_access_mode(history_cell::is_full_access_mode(&self.config))
         .display_lines(width)
     }
 
@@ -183,21 +183,6 @@ fn desktop_thread_open_error_message(err: &str) -> String {
     )
 }
 
-#[cfg(target_os = "macos")]
-fn open_desktop_thread_url(url: &str) -> Result<(), String> {
-    let status = std::process::Command::new("open")
-        .arg(url)
-        .status()
-        .map_err(|err| format!("failed to invoke `open`: {err}"))?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("`open {url}` exited with {status}"))
-    }
-}
-
-#[cfg(target_os = "windows")]
 fn open_desktop_thread_url(url: &str) -> Result<(), String> {
     let script = windows_desktop_app_launch_script(url);
     let output = std::process::Command::new("powershell.exe")
@@ -222,7 +207,6 @@ fn open_desktop_thread_url(url: &str) -> Result<(), String> {
     }
 }
 
-#[cfg(target_os = "windows")]
 fn windows_desktop_app_launch_script(url: &str) -> String {
     let url = powershell_single_quoted_string(url);
     format!(
@@ -253,14 +237,8 @@ Start-Process -FilePath $exe -WorkingDirectory $appDir -ArgumentList @('resource
     )
 }
 
-#[cfg(target_os = "windows")]
 fn powershell_single_quoted_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn open_desktop_thread_url(_url: &str) -> Result<(), String> {
-    Err("Codex Desktop is only available on macOS and Windows".to_string())
 }
 
 #[cfg(test)]

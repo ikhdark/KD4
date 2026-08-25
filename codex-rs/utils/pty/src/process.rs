@@ -1,7 +1,6 @@
 use core::fmt;
 use std::io;
-#[cfg(unix)]
-use std::os::fd::RawFd;
+
 use std::process::ExitStatus;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -37,14 +36,6 @@ pub(crate) fn exit_code_from_status(status: ExitStatus) -> i32 {
         return code;
     }
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if let Some(signal) = status.signal() {
-            return 128 + signal;
-        }
-    }
-
     -1
 }
 
@@ -77,19 +68,8 @@ impl From<TerminalSize> for PtySize {
     }
 }
 
-#[cfg(unix)]
-pub(crate) trait PtyHandleKeepAlive: Send {}
-
-#[cfg(unix)]
-impl<T: Send + ?Sized> PtyHandleKeepAlive for T {}
-
 pub(crate) enum PtyMasterHandle {
     Resizable(Box<dyn MasterPty + Send>),
-    #[cfg(unix)]
-    Opaque {
-        raw_fd: RawFd,
-        _handle: Box<dyn PtyHandleKeepAlive>,
-    },
 }
 
 pub struct PtyHandles {
@@ -192,8 +172,6 @@ impl ProcessHandle {
             if let Some(handles) = handles.as_ref() {
                 return match &handles._master {
                     PtyMasterHandle::Resizable(master) => master.resize(size.into()),
-                    #[cfg(unix)]
-                    PtyMasterHandle::Opaque { raw_fd, .. } => resize_raw_pty(*raw_fd, size),
                 };
             }
         }
@@ -348,6 +326,12 @@ mod tests {
         assert!(!killed.load(Ordering::SeqCst));
         assert!(handle.writer_sender().is_closed());
     }
+
+    #[test]
+    fn opaque_pty_handle_uses_send_directly() {
+        let removed_trait = ["trait PtyHandle", "KeepAlive"].concat();
+        assert!(!include_str!("process.rs").contains(&removed_trait));
+    }
 }
 
 /// Adapts a closure into a `ChildTerminator` implementation.
@@ -366,21 +350,6 @@ impl ChildTerminator for ClosureTerminator {
         }
         Ok(())
     }
-}
-
-#[cfg(unix)]
-fn resize_raw_pty(raw_fd: RawFd, size: TerminalSize) -> anyhow::Result<()> {
-    let mut winsize = libc::winsize {
-        ws_row: size.rows,
-        ws_col: size.cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    let result = unsafe { libc::ioctl(raw_fd, libc::TIOCSWINSZ, &mut winsize) };
-    if result == -1 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(())
 }
 
 /// Combine split stdout/stderr receivers into a single broadcast receiver.

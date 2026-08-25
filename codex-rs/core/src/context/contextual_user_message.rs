@@ -8,11 +8,8 @@ use super::CompletionReviewRepair;
 use super::FragmentRegistration;
 use super::FragmentRegistrationProxy;
 use super::InternalModelContextFragment;
-use super::LegacyApplyPatchExecCommandWarning;
-use super::LegacyModelMismatchWarning;
-use super::LegacyUnifiedExecProcessLimitWarning;
 use super::RecommendedPluginsInstructions;
-use super::SkillInstructions;
+use super::SkillInjection;
 use super::SubagentNotification;
 use super::TaskCapsuleFragment;
 use super::TaskModelGuidance;
@@ -21,6 +18,89 @@ use super::UserInstructions;
 use super::UserShellCommand;
 use super::world_state::EnvironmentsState;
 use super::world_state::TaskEvidenceContext;
+
+// These warnings are no longer produced. The fragment definitions remain here so compaction can
+// recognize messages restored from old sessions.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LegacyApplyPatchExecCommandWarning;
+
+impl super::ContextualUserFragment for LegacyApplyPatchExecCommandWarning {
+    fn role(&self) -> &'static str {
+        "user"
+    }
+
+    fn markers(&self) -> (&'static str, &'static str) {
+        Self::type_markers()
+    }
+
+    fn type_markers() -> (&'static str, &'static str) {
+        ("", "")
+    }
+
+    fn matches_text(text: &str) -> bool {
+        let trimmed = text.trim();
+        trimmed.starts_with("Warning: apply_patch was requested via ")
+            && trimmed.ends_with("Use the apply_patch tool instead of exec_command.")
+    }
+
+    fn body(&self) -> String {
+        String::new()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LegacyModelMismatchWarning;
+
+impl super::ContextualUserFragment for LegacyModelMismatchWarning {
+    fn role(&self) -> &'static str {
+        "user"
+    }
+
+    fn markers(&self) -> (&'static str, &'static str) {
+        Self::type_markers()
+    }
+
+    fn type_markers() -> (&'static str, &'static str) {
+        ("", "")
+    }
+
+    fn matches_text(text: &str) -> bool {
+        text.trim().starts_with(
+            "Warning: Your account was flagged for potentially high-risk cyber activity",
+        )
+    }
+
+    fn body(&self) -> String {
+        String::new()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LegacyUnifiedExecProcessLimitWarning;
+
+impl super::ContextualUserFragment for LegacyUnifiedExecProcessLimitWarning {
+    fn role(&self) -> &'static str {
+        "user"
+    }
+
+    fn markers(&self) -> (&'static str, &'static str) {
+        Self::type_markers()
+    }
+
+    fn type_markers() -> (&'static str, &'static str) {
+        ("", "")
+    }
+
+    fn matches_text(text: &str) -> bool {
+        text.trim().starts_with(
+            "Warning: The maximum number of unified exec processes you can keep open is",
+        )
+    }
+
+    fn body(&self) -> String {
+        String::new()
+    }
+}
 
 static USER_INSTRUCTIONS_REGISTRATION: FragmentRegistrationProxy<UserInstructions> =
     FragmentRegistrationProxy::new();
@@ -32,7 +112,7 @@ static COMPLETION_REVIEW_REPAIR_REGISTRATION: FragmentRegistrationProxy<Completi
     FragmentRegistrationProxy::new();
 static COMPLETION_CHECKPOINT_REGISTRATION: FragmentRegistrationProxy<CompletionCheckpointContext> =
     FragmentRegistrationProxy::new();
-static SKILL_INSTRUCTIONS_REGISTRATION: FragmentRegistrationProxy<SkillInstructions> =
+static SKILL_INSTRUCTIONS_REGISTRATION: FragmentRegistrationProxy<SkillInjection> =
     FragmentRegistrationProxy::new();
 static USER_SHELL_COMMAND_REGISTRATION: FragmentRegistrationProxy<UserShellCommand> =
     FragmentRegistrationProxy::new();

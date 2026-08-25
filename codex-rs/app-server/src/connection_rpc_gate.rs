@@ -41,7 +41,7 @@ impl Drop for TaskRegistration {
         };
         state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .abort_handles
             .remove(&self.task_id);
     }
@@ -77,7 +77,7 @@ impl ConnectionRpcGate {
             let mut state = self
                 .state
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !state.accepting {
                 return;
             }
@@ -116,7 +116,7 @@ impl ConnectionRpcGate {
         let state = self
             .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.accepting.then(commit)
     }
 
@@ -124,7 +124,7 @@ impl ConnectionRpcGate {
         let mut state = self
             .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !state.accepting {
             return;
         }
@@ -147,7 +147,7 @@ impl ConnectionRpcGate {
         let abort_handles = self
             .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .abort_handles
             .values()
             .cloned()
@@ -164,7 +164,7 @@ impl ConnectionRpcGate {
     fn is_accepting(&self) -> bool {
         self.state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .accepting
     }
 

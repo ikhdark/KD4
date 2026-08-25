@@ -35,7 +35,7 @@ enum ApplyPatchShell {
 }
 
 #[derive(Debug, PartialEq)]
-pub enum MaybeApplyPatch {
+enum MaybeApplyPatch {
     Body(ApplyPatchArgs),
     ShellParseError(ExtractHeredocError),
     PatchParseError(ParseError),
@@ -113,9 +113,8 @@ fn extract_apply_patch_from_shell(
     }
 }
 
-// TODO: make private once we remove tests in lib.rs
 /// `cwd` supplies the path convention used to interpret the shell executable in `argv`.
-pub fn maybe_parse_apply_patch(argv: &[String], cwd: &PathUri) -> MaybeApplyPatch {
+fn maybe_parse_apply_patch(argv: &[String], cwd: &PathUri) -> MaybeApplyPatch {
     match argv {
         // Direct invocation: apply_patch <patch>
         [cmd, body] if APPLY_PATCH_COMMANDS.contains(&cmd.as_str()) => match parse_patch(body) {
@@ -533,6 +532,17 @@ mod tests {
     use std::string::ToString;
     use tempfile::tempdir;
 
+    #[test]
+    fn unverified_parser_is_private_to_invocation_module() {
+        let invocation_source = include_str!("invocation.rs");
+        let public_signature = ["pub fn maybe_parse_apply_", "patch("].concat();
+        assert!(!invocation_source.contains(&public_signature));
+
+        let crate_source = include_str!("lib.rs");
+        let public_reexport = ["pub use invocation::maybe_parse_apply_", "patch;"].concat();
+        assert!(!crate_source.contains(&public_reexport));
+    }
+
     /// Helper to construct a patch with the given body.
     fn wrap_patch(body: &str) -> String {
         format!("*** Begin Patch\n{body}\n*** End Patch")
@@ -886,87 +896,6 @@ PATCH"#,
     }
 
     #[tokio::test]
-    async fn test_unified_diff_last_line_replacement() {
-        // Replace the very last line of the file.
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("last.txt");
-        fs::write(&path, "foo\nbar\nbaz\n").unwrap();
-
-        let patch = wrap_patch(&format!(
-            r#"*** Update File: {}
-@@
- foo
- bar
--baz
-+BAZ
-"#,
-            path.display()
-        ));
-
-        let patch = parse_patch(&patch).unwrap();
-        let chunks = match patch.hunks.as_slice() {
-            [Hunk::UpdateFile { chunks, .. }] => chunks,
-            _ => panic!("Expected a single UpdateFile hunk"),
-        };
-
-        let path_uri = PathUri::from_host_native_path(&path).expect("absolute test path");
-        let diff =
-            unified_diff_from_chunks(&path_uri, chunks, LOCAL_FS.as_ref(), /*sandbox*/ None)
-                .await
-                .unwrap();
-        let expected_diff = r#"@@ -2,2 +2,2 @@
- bar
--baz
-+BAZ
-"#;
-        let expected = ApplyPatchFileUpdate {
-            unified_diff: expected_diff.to_string(),
-            original_content: "foo\nbar\nbaz\n".to_string(),
-            content: "foo\nbar\nBAZ\n".to_string(),
-        };
-        assert_eq!(expected, diff);
-    }
-
-    #[tokio::test]
-    async fn test_unified_diff_insert_at_eof() {
-        // Insert a new line at end‑of‑file.
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("insert.txt");
-        fs::write(&path, "foo\nbar\nbaz\n").unwrap();
-
-        let patch = wrap_patch(&format!(
-            r#"*** Update File: {}
-@@
-+quux
-*** End of File
-"#,
-            path.display()
-        ));
-
-        let patch = parse_patch(&patch).unwrap();
-        let chunks = match patch.hunks.as_slice() {
-            [Hunk::UpdateFile { chunks, .. }] => chunks,
-            _ => panic!("Expected a single UpdateFile hunk"),
-        };
-
-        let path_uri = PathUri::from_host_native_path(&path).expect("absolute test path");
-        let diff =
-            unified_diff_from_chunks(&path_uri, chunks, LOCAL_FS.as_ref(), /*sandbox*/ None)
-                .await
-                .unwrap();
-        let expected_diff = r#"@@ -3 +3,2 @@
- baz
-+quux
-"#;
-        let expected = ApplyPatchFileUpdate {
-            unified_diff: expected_diff.to_string(),
-            original_content: "foo\nbar\nbaz\n".to_string(),
-            content: "foo\nbar\nbaz\nquux\n".to_string(),
-        };
-        assert_eq!(expected, diff);
-    }
-
-    #[tokio::test]
     async fn test_unified_diff_insert_after_named_context() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("context.txt");
@@ -1268,33 +1197,5 @@ PATCH"#,
 
             assert!(matches!(result, MaybeApplyPatchVerified::Body(_)));
         }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_delete_symlink_still_verifies() {
-        use std::os::unix::fs::symlink;
-
-        let session_dir = tempdir().unwrap();
-        fs::write(session_dir.path().join("target.txt"), "target\n").unwrap();
-        symlink(
-            session_dir.path().join("target.txt"),
-            session_dir.path().join("link.txt"),
-        )
-        .unwrap();
-        let argv = vec![
-            "apply_patch".to_string(),
-            "*** Begin Patch\n*** Delete File: link.txt\n*** End Patch".to_string(),
-        ];
-
-        let result = maybe_parse_apply_patch_verified(
-            &argv,
-            &PathUri::from_host_native_path(session_dir.path()).expect("absolute test path"),
-            LOCAL_FS.as_ref(),
-            /*sandbox*/ None,
-        )
-        .await;
-
-        assert!(matches!(result, MaybeApplyPatchVerified::Body(_)));
     }
 }

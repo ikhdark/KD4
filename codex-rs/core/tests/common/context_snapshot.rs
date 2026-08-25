@@ -644,7 +644,7 @@ mod tests {
             "role": "developer",
             "content": [{
                 "type": "input_text",
-                "text": "<realtime_conversation>\r\nRealtime conversation started.\r\n\r\nYou are..."
+                "text": "<runtime_context>\r\nRuntime context started.\r\n\r\nYou are..."
             }]
         })];
 
@@ -656,7 +656,7 @@ mod tests {
 
         assert_eq!(
             rendered,
-            r"00:message/developer:<realtime_conversation>\nRealtime conversation started.\n\nYou a..."
+            r"00:message/developer:<runtime_context>\nRuntime context started.\n\nYou are..."
         );
     }
 

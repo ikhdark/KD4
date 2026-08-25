@@ -9,7 +9,7 @@ use codex_protocol::openai_models::TruncationPolicyConfig;
 use codex_protocol::openai_models::WebSearchToolType;
 use codex_protocol::openai_models::default_input_modalities;
 
-use crate::config::ModelsManagerConfig;
+use crate::ModelsManagerConfig;
 use codex_utils_output_truncation::approx_bytes_for_tokens;
 use tracing::warn;
 
@@ -21,11 +21,6 @@ const LOCAL_PRAGMATIC_TEMPLATE: &str = "You are a deeply pragmatic, effective so
 const PERSONALITY_PLACEHOLDER: &str = "{{ personality }}";
 
 pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig) -> ModelInfo {
-    if let Some(supports_reasoning_summaries) = config.model_supports_reasoning_summaries
-        && supports_reasoning_summaries
-    {
-        model.supports_reasoning_summaries = true;
-    }
     if let Some(context_window) = config.model_context_window {
         model.context_window = Some(
             model
@@ -62,7 +57,7 @@ pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig)
     model
 }
 
-fn clear_instruction_messages(model: &mut ModelInfo) {
+pub(crate) fn clear_instruction_messages(model: &mut ModelInfo) {
     if let Some(model_messages) = &mut model.model_messages {
         model_messages.instructions_template = None;
         model_messages.instructions_variables = None;
@@ -90,7 +85,9 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
         default_service_tier: None,
         availability_nux: None,
         upgrade: None,
-        base_instructions: BASE_INSTRUCTIONS.to_string(),
+        base_instructions: crate::prompt_resolver::resolve_prompt(slug, None)
+            .content
+            .to_string(),
         model_messages: local_personality_messages_for_slug(slug),
         include_skills_usage_instructions: false,
         supports_reasoning_summaries: false,

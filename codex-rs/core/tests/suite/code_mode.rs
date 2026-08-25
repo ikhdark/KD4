@@ -524,7 +524,7 @@ async fn run_code_mode_turn_with_rmcp_config(
     Ok((test, second_mock))
 }
 
-#[cfg_attr(windows, ignore = "no exec_command on Windows")]
+#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_can_return_exec_command_output() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -887,12 +887,13 @@ if (!tool) {
             })
         })
         .expect("exec description should be present");
-    assert!(exec_description.contains("filter `ALL_TOOLS` by `name` and `description`"));
-    assert!(exec_description.contains("### `tool_search`"));
-    assert!(exec_description.contains("status: \"completed\" | \"incomplete\" | \"aborted\";"));
-    assert!(exec_description.contains("execution: \"client\";"));
-    assert!(exec_description.contains("tools: unknown[];"));
-    assert!(exec_description.contains("omitted_result_count: number | null;"));
+    assert!(exec_description.contains("Nested tool schemas are discovered lazily at runtime"));
+    assert!(exec_description.contains("Find a tool in `ALL_TOOLS`"));
+    assert!(!exec_description.contains("### `tool_search`"));
+    assert!(!exec_description.contains("status: \"completed\" | \"incomplete\" | \"aborted\";"));
+    assert!(!exec_description.contains("execution: \"client\";"));
+    assert!(!exec_description.contains("tools: unknown[];"));
+    assert!(!exec_description.contains("omitted_result_count: number | null;"));
     assert!(!exec_description.contains("calendar_timezone_option_99"));
 
     let request = follow_up_mock.single_request();
@@ -1005,7 +1006,7 @@ text(JSON.stringify({{
     Ok(())
 }
 
-#[cfg_attr(windows, ignore = "no exec_command on Windows")]
+#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_only_can_call_nested_tools() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -1136,7 +1137,7 @@ text(JSON.stringify(result));
     Ok(())
 }
 
-#[cfg_attr(windows, ignore = "flaky on windows")]
+#[ignore = "flaky on windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_nested_tool_calls_can_run_in_parallel() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -1234,7 +1235,7 @@ const TOKEN_POLICY_TEST_MODEL: &str = "gpt-5.4";
 
 // A nested `exec_command` limit applies to `result.output` inside JavaScript.
 // The outer code-mode and history budgets apply after the script calls `text`.
-#[cfg_attr(windows, ignore = "no exec_command on Windows")]
+#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exec_nested_limit_formats_truncated_result_with_warning() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -1264,7 +1265,7 @@ text(result.output);
     Ok(())
 }
 
-#[cfg_attr(windows, ignore = "no exec_command on Windows")]
+#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exec_nested_limit_preserves_result_variable_before_default_history_truncation()
 -> Result<()> {
@@ -1302,7 +1303,7 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
     Ok(())
 }
 
-#[cfg_attr(windows, ignore = "no exec_command on Windows")]
+#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exec_nested_limit_truncates_result_variable_when_exceeded() -> Result<()> {
     // TODO(anp): Remove after Wine exec returns complete nested-tool output to code mode.
@@ -1348,7 +1349,7 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
     Ok(())
 }
 
-#[cfg_attr(windows, ignore = "no exec_command on Windows")]
+#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exec_nested_limit_preserves_result_variable_before_configured_history_truncation()
 -> Result<()> {
@@ -1395,7 +1396,7 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
     Ok(())
 }
 
-#[cfg_attr(windows, ignore = "no exec_command on Windows")]
+#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exec_without_nested_limit_preserves_result_variable_before_default_history_truncation()
 -> Result<()> {
@@ -1432,7 +1433,7 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
     Ok(())
 }
 
-#[cfg_attr(windows, ignore = "no exec_command on Windows")]
+#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exec_without_nested_limit_preserves_result_variable_before_configured_history_truncation()
 -> Result<()> {
@@ -1480,7 +1481,7 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
 
 // The outer directive limits output after JavaScript emits it; it does not
 // limit `result.output` returned by the nested command.
-#[cfg_attr(windows, ignore = "no exec_command on Windows")]
+#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exec_outer_limit_truncates_emitted_output() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -1551,7 +1552,7 @@ Error:\ boom\n
     Ok(())
 }
 
-#[cfg_attr(windows, ignore = "no exec_command on Windows")]
+#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exec_surfaces_handler_errors_as_exceptions() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -1590,7 +1591,7 @@ try {
     Ok(())
 }
 
-#[cfg_attr(windows, ignore = "no exec_command on Windows")]
+#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_can_yield_and_resume_with_wait() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -1736,7 +1737,7 @@ text("phase 3");
     Ok(())
 }
 
-#[cfg_attr(windows, ignore = "no exec_command on Windows")]
+#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_yield_and_termination_are_not_starved_by_runtime_output() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -1833,7 +1834,7 @@ while (true) {}
     Ok(())
 }
 
-#[cfg_attr(windows, ignore = "no exec_command on Windows")]
+#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_can_run_multiple_yielded_sessions() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -2001,7 +2002,7 @@ text("session b done");
     Ok(())
 }
 
-#[cfg_attr(windows, ignore = "no exec_command on Windows")]
+#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_concurrent_cells_merge_only_the_stored_values_they_write() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -2154,7 +2155,7 @@ yield_control();
     Ok(())
 }
 
-#[cfg_attr(windows, ignore = "no exec_command on Windows")]
+#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_wait_can_terminate_and_continue() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -2354,7 +2355,7 @@ await new Promise(() => {});"#,
     Ok(())
 }
 
-#[cfg_attr(windows, ignore = "no exec_command on Windows")]
+#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_wait_terminate_returns_completed_session_if_it_finished_after_yield_control()
 -> Result<()> {
@@ -2550,7 +2551,7 @@ text("session b done");
     Ok(())
 }
 
-#[cfg_attr(windows, ignore = "no exec_command on Windows")]
+#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_background_keeps_running_on_later_turn_without_wait() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -2643,7 +2644,7 @@ text("after yield");
     Ok(())
 }
 
-#[cfg_attr(windows, ignore = "no exec_command on Windows")]
+#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_wait_uses_its_own_max_tokens_budget() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -3679,30 +3680,31 @@ async fn code_mode_can_call_hidden_dynamic_tools() -> Result<()> {
         let _ = config.features.enable(Feature::CodeMode);
     });
     let base_test = builder.build(&server).await?;
+    let options = base_test
+        .thread_manager
+        .start_thread_options(base_test.config.clone())
+        .with_dynamic_tools(vec![DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+            name: "codex_app".to_string(),
+            description: "Codex app tools.".to_string(),
+            tools: vec![DynamicToolNamespaceTool::Function(
+                DynamicToolFunctionSpec {
+                    name: "hidden_dynamic_tool".to_string(),
+                    description: "A hidden dynamic tool.".to_string(),
+                    input_schema: serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "city": { "type": "string" }
+                            },
+                        "required": ["city"],
+                        "additionalProperties": false,
+                    }),
+                    defer_loading: true,
+                },
+            )],
+        })]);
     let new_thread = base_test
         .thread_manager
-        .start_thread_with_tools(
-            base_test.config.clone(),
-            vec![DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
-                name: "codex_app".to_string(),
-                description: "Codex app tools.".to_string(),
-                tools: vec![DynamicToolNamespaceTool::Function(
-                    DynamicToolFunctionSpec {
-                        name: "hidden_dynamic_tool".to_string(),
-                        description: "A hidden dynamic tool.".to_string(),
-                        input_schema: serde_json::json!({
-                                "type": "object",
-                                "properties": {
-                                    "city": { "type": "string" }
-                                },
-                            "required": ["city"],
-                            "additionalProperties": false,
-                        }),
-                        defer_loading: true,
-                    },
-                )],
-            })],
-        )
+        .start_thread_with_options(options)
         .await?;
     let mut test = base_test;
     test.codex.replace_thread(new_thread.thread);
@@ -3848,27 +3850,28 @@ async fn code_mode_excludes_configured_nested_tool_namespaces() -> Result<()> {
         config.code_mode.excluded_tool_namespaces = vec!["excluded".to_string()];
     });
     let base_test = builder.build(&server).await?;
+    let options = base_test
+        .thread_manager
+        .start_thread_options(base_test.config.clone())
+        .with_dynamic_tools(vec![DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+            name: "excluded".to_string(),
+            description: "Excluded tools.".to_string(),
+            tools: vec![DynamicToolNamespaceTool::Function(
+                DynamicToolFunctionSpec {
+                    name: "lookup".to_string(),
+                    description: "An excluded dynamic tool.".to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false,
+                    }),
+                    defer_loading: false,
+                },
+            )],
+        })]);
     let new_thread = base_test
         .thread_manager
-        .start_thread_with_tools(
-            base_test.config.clone(),
-            vec![DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
-                name: "excluded".to_string(),
-                description: "Excluded tools.".to_string(),
-                tools: vec![DynamicToolNamespaceTool::Function(
-                    DynamicToolFunctionSpec {
-                        name: "lookup".to_string(),
-                        description: "An excluded dynamic tool.".to_string(),
-                        input_schema: serde_json::json!({
-                            "type": "object",
-                            "properties": {},
-                            "additionalProperties": false,
-                        }),
-                        defer_loading: false,
-                    },
-                )],
-            })],
-        )
+        .start_thread_with_options(options)
         .await?;
     let mut test = base_test;
     test.codex.replace_thread(new_thread.thread);

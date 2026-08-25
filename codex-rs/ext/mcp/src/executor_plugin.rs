@@ -1,4 +1,4 @@
-use codex_connectors_extension::ExecutorPluginConnectorProvider;
+use codex_connectors_extension::load_executor_plugin_connectors;
 use codex_core::config::Config;
 use codex_core_plugins::ExecutorPluginProvider;
 use codex_exec_server::EnvironmentManager;
@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use self::provider::ExecutorPluginMcpProvider;
+use self::provider::load_executor_plugin_mcp_servers;
 
 mod provider;
 
@@ -40,16 +40,12 @@ struct CachedSelectedRoot {
 
 pub(crate) struct SelectedExecutorPluginMcpContributor {
     plugin_provider: ExecutorPluginProvider,
-    mcp_provider: ExecutorPluginMcpProvider,
-    connector_provider: ExecutorPluginConnectorProvider,
 }
 
 impl SelectedExecutorPluginMcpContributor {
     pub(crate) fn new(environment_manager: Arc<EnvironmentManager>) -> Self {
         Self {
             plugin_provider: ExecutorPluginProvider::new(Arc::clone(&environment_manager)),
-            mcp_provider: ExecutorPluginMcpProvider,
-            connector_provider: ExecutorPluginConnectorProvider,
         }
     }
 
@@ -86,17 +82,17 @@ impl SelectedExecutorPluginMcpContributor {
         };
         let metadata = match plugin {
             Some(plugin) => {
-                let servers = self.mcp_provider.load(&plugin).await.unwrap_or_else(|err| {
-                    tracing::warn!(
-                        selected_root = selected_root.id,
-                        error = %err,
-                        "failed to load selected executor plugin MCP servers"
-                    );
-                    Vec::new()
-                });
-                let connector_ids = self
-                    .connector_provider
-                    .load(&plugin)
+                let servers = load_executor_plugin_mcp_servers(&plugin)
+                    .await
+                    .unwrap_or_else(|err| {
+                        tracing::warn!(
+                            selected_root = selected_root.id,
+                            error = %err,
+                            "failed to load selected executor plugin MCP servers"
+                        );
+                        Vec::new()
+                    });
+                let connector_ids = load_executor_plugin_connectors(&plugin)
                     .await
                     .unwrap_or_else(|err| {
                         tracing::warn!(

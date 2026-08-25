@@ -3,7 +3,7 @@ use codex_shell_command::bash::parse_shell_script_into_commands;
 use codex_shell_command::is_safe_command::is_known_safe_command;
 use codex_shell_command::parse_command::parse_shell_script;
 
-pub use crate::metrics::MEMORIES_USAGE_METRIC;
+pub const MEMORIES_USAGE_METRIC: &str = "codex.memories.usage";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MemoriesUsageKind {

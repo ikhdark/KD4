@@ -135,9 +135,7 @@ fn git_check_from_inputs(inputs: GitCheckInputs) -> DoctorCheck {
             .remedy("Install Git or fix PATH so Codex can inspect repository metadata.")
             .field("selected git"),
         );
-    } else if let Some(cause) =
-        old_windows_git_warning(inputs.git_version.as_deref(), cfg!(windows))
-    {
+    } else if let Some(cause) = old_windows_git_warning(inputs.git_version.as_deref(), true) {
         check.status = CheckStatus::Warning;
         check.summary = cause.clone();
         check = check.issue(

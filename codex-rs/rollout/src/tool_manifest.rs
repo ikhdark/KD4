@@ -88,6 +88,21 @@ impl ToolManifestDictionary {
     }
 
     pub fn encode_item(&mut self, item: &ToolManifestItem) -> Result<ToolManifestItem, String> {
+        if let Some(manifest) = item.manifest.as_ref() {
+            if let Some(existing) = self.manifests.get(&item.hash) {
+                if existing != manifest {
+                    return Err(format!(
+                        "tool manifest hash {} resolves to conflicting definitions",
+                        item.hash
+                    ));
+                }
+                self.current_hash = Some(item.hash.clone());
+                return Ok(ToolManifestItem::reference(item.hash.clone()));
+            }
+
+            return Ok(self.encode(item.hash.clone(), manifest.clone()));
+        }
+
         let mut decoded = self.clone();
         decoded.apply(item)?;
         let manifest = decoded
@@ -349,5 +364,28 @@ mod tests {
         assert_eq!(added.len(), 2);
         assert!(removed.is_empty());
         assert_eq!(apply_delta(&base, &added, &removed), Ok(target));
+    }
+
+    #[test]
+    fn known_full_snapshot_uses_reference_fast_path_and_rejects_conflicts() {
+        let original = manifest(&["shell", "read"]);
+        let conflicting = manifest(&["shell", "write"]);
+        let mut writer = ToolManifestDictionary::default();
+        writer.encode("known".to_string(), original.clone());
+
+        let reference = writer
+            .encode_item(&ToolManifestItem::full(
+                "known".to_string(),
+                original.clone(),
+            ))
+            .expect("an identical known snapshot should encode as a reference");
+        assert!(reference.is_reference());
+        assert_eq!(writer.manifest("known"), Some(&original));
+
+        let error = writer
+            .encode_item(&ToolManifestItem::full("known".to_string(), conflicting))
+            .expect_err("a reused hash must still reject a conflicting definition");
+        assert!(error.contains("conflicting definitions"));
+        assert_eq!(writer.manifest("known"), Some(&original));
     }
 }

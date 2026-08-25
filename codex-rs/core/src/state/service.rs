@@ -20,6 +20,7 @@ use crate::git_workspace::GitWorkspaceCache;
 use crate::guardian::GuardianRejection;
 use crate::guardian::GuardianRejectionCircuitBreaker;
 use crate::mcp::McpManager;
+use crate::plan_store::PlanStore;
 use crate::session::McpRuntimeSnapshot;
 use crate::task_evidence::TaskEvidenceLedger;
 use crate::tools::code_mode::CodeModeService;
@@ -44,13 +45,13 @@ use codex_mcp::McpRuntimeContext;
 use codex_models_manager::manager::SharedModelsManager;
 use codex_otel::SessionTelemetry;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
-use codex_rollout::state_db::StateDbHandle;
+use codex_rollout::state_integration::StateDbHandle;
 use codex_rollout_trace::ThreadTraceContext;
 use codex_thread_store::LiveThread;
 use codex_thread_store::ThreadStore;
-use std::path::PathBuf;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) struct SessionServices {
@@ -60,16 +61,13 @@ pub(crate) struct SessionServices {
     /// publication must advance this value before a pending turn may replan.
     pub(crate) planning_generation: AtomicU64,
     /// Serializes environment-driven runtime rebuilds.
-    pub(crate) mcp_projection_lock: Mutex<()>,
+    pub(crate) mcp_projection_lock: Semaphore,
     pub(crate) mcp_startup_cancellation_token: Mutex<CancellationToken>,
     pub(crate) unified_exec_manager: UnifiedExecProcessManager,
     pub(crate) command_execution: CommandExecutionLedger,
+    pub(crate) plan_store: PlanStore,
     pub(crate) task_evidence: TaskEvidenceLedger,
     pub(crate) elicitations: ElicitationService,
-    #[cfg_attr(not(unix), allow(dead_code))]
-    pub(crate) shell_zsh_path: Option<PathBuf>,
-    #[cfg_attr(not(unix), allow(dead_code))]
-    pub(crate) main_execve_wrapper_exe: Option<PathBuf>,
     pub(crate) analytics_events_client: AnalyticsEventsClient,
     pub(crate) hooks: ArcSwap<Hooks>,
     pub(crate) rollout_thread_trace: ThreadTraceContext,

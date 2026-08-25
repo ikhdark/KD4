@@ -1,4 +1,4 @@
-use crate::function_tool::FunctionCallError;
+use crate::FunctionCallError;
 use crate::tools::command_output_artifact::RECOVERY_AGGREGATE_TOKEN_CEILING;
 use crate::tools::command_output_artifact::ReadToolOutputError;
 use crate::tools::command_output_artifact::ReadToolOutputResult;
@@ -119,18 +119,7 @@ impl RecoveryContinuationState {
                 selector: selector.clone(),
             };
         }
-        if self.output.results.iter().all(|result| {
-            matches!(
-                result.status,
-                ToolOutputSelectorStatus::Ok
-                    | ToolOutputSelectorStatus::SelectorTooLarge
-                    | ToolOutputSelectorStatus::AggregateOmitted
-            ) && result.continuation.is_none()
-        }) {
-            ContinuationStep::Complete
-        } else {
-            ContinuationStep::Stop(ContinuationStopReason::IncompleteOwnerResult)
-        }
+        ContinuationStep::Complete
     }
 
     fn accept_page(
@@ -333,11 +322,7 @@ async fn handle_read_tool_output(
             "read_tool_output received unsupported payload".to_string(),
         ));
     };
-    let args: ReadToolOutputArgs = serde_json::from_str(arguments).map_err(|err| {
-        FunctionCallError::RespondToModel(format!(
-            "failed to parse read_tool_output arguments: {err}"
-        ))
-    })?;
+    let args = parse_read_tool_output_args(arguments)?;
     // Keep validating the legacy knob for compatibility, but never use it to
     // clip a selected value. The selector engine owns its exact response fit.
     let _legacy_max_bytes = resolved_max_bytes(args.max_bytes)?;
@@ -349,7 +334,7 @@ async fn handle_read_tool_output(
             .as_bytes(),
     );
     let transaction = execute_recovery_transaction_with_continuations(
-        invocation.turn.config.codex_home.as_path(),
+        invocation.step_context.turn.config.codex_home.as_path(),
         &invocation.session.thread_id.to_string(),
         &args.artifact_id,
         selectors,
@@ -365,11 +350,13 @@ async fn handle_read_tool_output(
     } = transaction;
     if !reused {
         invocation
+            .step_context
             .turn
             .turn_timing_state
             .record_tool_output_artifact_reread();
     }
     invocation
+        .step_context
         .turn
         .turn_timing_state
         .record_tool_output_recovery(recovery_retruncation_count(&output));
@@ -390,6 +377,14 @@ async fn handle_read_tool_output(
         exact_recovery,
         semantic_evidence,
     }))
+}
+
+fn parse_read_tool_output_args(arguments: &str) -> Result<ReadToolOutputArgs, FunctionCallError> {
+    serde_json::from_str(arguments).map_err(|err| {
+        FunctionCallError::RespondToModel(format!(
+            "failed to parse read_tool_output arguments: {err}. Consult the advertised read_tool_output schema."
+        ))
+    })
 }
 
 fn read_tool_output_semantic_evidence(output: &ReadToolOutputResult) -> Vec<String> {
@@ -496,14 +491,11 @@ async fn execute_recovery_transaction_with_continuations(
         RECOVERY_AGGREGATE_TOKEN_CEILING
     };
     let mut state = RecoveryContinuationState::new(output, reused, token_ceiling);
-    loop {
-        let ContinuationStep::Follow {
-            result_index,
-            selector,
-        } = state.next_step()
-        else {
-            break;
-        };
+    while let ContinuationStep::Follow {
+        result_index,
+        selector,
+    } = state.next_step()
+    {
         if cancellation_token.is_cancelled() {
             break;
         }
@@ -606,7 +598,7 @@ fn resolved_selectors(
                 "ranges may contain at most {MAX_LEGACY_RANGES} entries"
             )));
         }
-        let mut ranges = args
+        let ranges = args
             .ranges
             .iter()
             .map(|range| {
@@ -615,36 +607,12 @@ fn resolved_selectors(
                         "each range requires 1-based start_line <= end_line".to_string(),
                     ))
                 } else {
-                    Ok(ToolOutputSelector::Lines {
-                        start: range.start_line,
-                        end: range.end_line,
-                    })
+                    Ok((range.start_line, range.end_line))
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        ranges.sort_unstable_by_key(|selector| match selector {
-            ToolOutputSelector::Lines { start, end } => (*start, *end),
-            _ => unreachable!("legacy ranges always normalize to line selectors"),
-        });
-        let mut normalized: Vec<ToolOutputSelector> = Vec::with_capacity(ranges.len());
-        for selector in ranges {
-            let ToolOutputSelector::Lines { start, end } = selector else {
-                unreachable!("legacy ranges always normalize to line selectors");
-            };
-            match normalized.last_mut() {
-                Some(ToolOutputSelector::Lines {
-                    start: _,
-                    end: previous_end,
-                }) if start <= previous_end.saturating_add(1) => {
-                    *previous_end = (*previous_end).max(end);
-                }
-                _ => normalized.push(ToolOutputSelector::Lines { start, end }),
-            }
-        }
-        let aggregate_lines = normalized.iter().try_fold(0_usize, |total, selector| {
-            let ToolOutputSelector::Lines { start, end } = selector else {
-                unreachable!("legacy ranges always normalize to line selectors");
-            };
+        let normalized = crate::tools::command_output_artifact::normalize_line_ranges(ranges);
+        let aggregate_lines = normalized.iter().try_fold(0_usize, |total, (start, end)| {
             total.checked_add(end - start + 1)
         });
         if aggregate_lines.is_none_or(|lines| lines > MAX_AGGREGATE_LINES) {
@@ -652,7 +620,10 @@ fn resolved_selectors(
                 "ranges may request at most {MAX_AGGREGATE_LINES} aggregate lines"
             )));
         }
-        return Ok(normalized);
+        return Ok(normalized
+            .into_iter()
+            .map(|(start, end)| ToolOutputSelector::Lines { start, end })
+            .collect());
     }
     let (start, end) = resolved_line_range(args)?;
     Ok(vec![ToolOutputSelector::Lines { start, end }])
@@ -748,6 +719,23 @@ mod tests {
             unavailable_ranges: Vec::new(),
             results,
         }
+    }
+
+    #[test]
+    fn terminal_recovery_results_complete_after_the_validation_pass() {
+        let mut ok = continuation_result(search_selector(0), None, "ok");
+        ok.status = ToolOutputSelectorStatus::Ok;
+        let mut oversized = continuation_result(search_selector(10), None, "oversized");
+        oversized.status = ToolOutputSelectorStatus::SelectorTooLarge;
+        let mut omitted = continuation_result(search_selector(20), None, "omitted");
+        omitted.status = ToolOutputSelectorStatus::AggregateOmitted;
+        let state = RecoveryContinuationState::new(
+            recovery_output(vec![ok, oversized, omitted]),
+            false,
+            usize::MAX,
+        );
+
+        assert_eq!(state.next_step(), ContinuationStep::Complete);
     }
 
     #[test]
@@ -1128,6 +1116,21 @@ mod tests {
         for invalid in [0, 16_385, usize::MAX] {
             assert!(resolved_max_bytes(Some(invalid)).is_err());
         }
+    }
+
+    #[test]
+    fn invalid_recovery_selectors_defer_shape_to_advertised_schema() {
+        let error = parse_read_tool_output_args(
+            r#"{"artifact_id":"artifact","selector":{"kind":"line","start":1,"end":2}}"#,
+        )
+        .expect_err("singular selector and line kind must be rejected");
+        let FunctionCallError::RespondToModel(message) = error else {
+            panic!("parse failures must be returned to the model");
+        };
+
+        assert!(message.contains("advertised read_tool_output schema"));
+        assert!(!message.contains(r#""selectors""#));
+        assert!(!message.contains(r#"{"artifact_id""#));
     }
 
     #[test]

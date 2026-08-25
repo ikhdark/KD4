@@ -5,7 +5,6 @@
 //! not depend on the memory write pipeline.
 
 pub mod citations;
-mod metrics;
 pub mod usage;
 
 use codex_utils_absolute_path::AbsolutePathBuf;

@@ -290,20 +290,30 @@ impl ThreadHistoryBuilder {
             .or_else(|| self.turns.last().cloned())
     }
 
+    /// Returns the current turn only while it is still in progress.
+    ///
+    /// Interrupted turns intentionally remain open briefly so late items can still be grouped
+    /// into the correct turn. Consumers making lifecycle decisions must not treat that retained
+    /// presentation snapshot as live state.
+    pub fn in_progress_turn_snapshot(&self) -> Option<Turn> {
+        self.active_turn_snapshot()
+            .filter(|turn| turn.status == TurnStatus::InProgress)
+    }
+
+    /// Returns the current turn id only while the turn is still in progress.
+    pub fn in_progress_turn_id(&self) -> Option<&str> {
+        self.current_turn
+            .as_ref()
+            .filter(|turn| turn.status == TurnStatus::InProgress)
+            .map(|turn| turn.id.as_str())
+    }
+
     /// Returns the active turn id without materializing a turn snapshot.
     pub fn active_turn_id(&self) -> Option<&str> {
         self.current_turn
             .as_ref()
             .map(|turn| turn.id.as_str())
             .or_else(|| self.turns.last().map(|turn| turn.id.as_str()))
-    }
-
-    pub fn turn_snapshot(&self, turn_id: &str) -> Option<Turn> {
-        self.current_turn
-            .as_ref()
-            .filter(|turn| turn.id == turn_id)
-            .map(Turn::from)
-            .or_else(|| self.turns.iter().find(|turn| turn.id == turn_id).cloned())
     }
 
     /// Returns the index of the active turn snapshot within the finished turn list.
@@ -426,12 +436,6 @@ impl ThreadHistoryBuilder {
             | RolloutItem::WorldState(_)
             | RolloutItem::SessionMeta(_) => {}
         }
-    }
-
-    /// Handles one event and returns the materialized items or turn metadata
-    /// changed by that event.
-    pub fn handle_event_with_changes(&mut self, event: &EventMsg) -> ThreadHistoryChangeSet {
-        self.collect_changes(|builder| builder.handle_event(event))
     }
 
     /// Handles a rollout item and returns the materialized items or turn metadata
@@ -1746,9 +1750,40 @@ mod tests {
     use codex_utils_absolute_path::test_support::PathBufExt;
     use codex_utils_absolute_path::test_support::test_path_buf;
     use pretty_assertions::assert_eq;
+
     use std::path::PathBuf;
     use std::time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn interrupted_snapshot_is_not_an_in_progress_turn() {
+        let mut builder = ThreadHistoryBuilder::new();
+        builder.handle_event(&EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-1".into(),
+            trace_id: None,
+            started_at: None,
+            model_context_window: None,
+            collaboration_mode_kind: Default::default(),
+        }));
+
+        assert_eq!(builder.in_progress_turn_id(), Some("turn-1"));
+        assert!(builder.in_progress_turn_snapshot().is_some());
+
+        builder.handle_event(&EventMsg::TurnAborted(TurnAbortedEvent {
+            turn_id: Some("turn-1".into()),
+            reason: TurnAbortReason::Interrupted,
+            completed_at: None,
+            duration_ms: None,
+            timing: None,
+        }));
+
+        assert_eq!(
+            builder.active_turn_snapshot().map(|turn| turn.status),
+            Some(TurnStatus::Interrupted)
+        );
+        assert_eq!(builder.in_progress_turn_id(), None);
+        assert_eq!(builder.in_progress_turn_snapshot(), None);
+    }
 
     fn reasoning_policy_history(turn_id: &str) -> ReasoningPolicyHistory {
         ReasoningPolicyHistory {

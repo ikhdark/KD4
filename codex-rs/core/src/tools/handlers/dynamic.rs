@@ -1,4 +1,4 @@
-use crate::function_tool::FunctionCallError;
+use crate::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::FunctionToolOutput;
@@ -25,6 +25,7 @@ use codex_tools::ToolSpec;
 use codex_tools::default_namespace_description;
 use codex_tools::dynamic_tool_to_responses_api_tool;
 use serde_json::Value;
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::oneshot;
 use tracing::warn;
@@ -117,11 +118,12 @@ impl DynamicToolHandler {
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let ToolInvocation {
             session,
-            turn,
+            step_context,
             call_id,
             payload,
             ..
         } = invocation;
+        let turn = Arc::clone(&step_context.turn);
 
         let arguments = match payload {
             ToolPayload::Function { arguments } => arguments,

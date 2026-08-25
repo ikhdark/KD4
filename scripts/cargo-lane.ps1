@@ -5,6 +5,7 @@ $CargoLanesRootMarkerName = ".codex-cargo-lanes-root"
 $CargoLanesRootMarkerContent = "codex-kd cargo lanes root v1"
 
 . (Join-Path $PSScriptRoot "common-rust-env.ps1")
+. (Join-Path $PSScriptRoot "cargo-lane-patterns.ps1")
 
 function Test-CargoLaneCommandToken {
     param(
@@ -361,31 +362,8 @@ function Get-ActiveCargoLaneNames {
         return @()
     }
 
-    # Keep these lane forms in sync with scripts/rust_build_status.py; that
-    # Python tool is the canonical build-health/prune implementation.
-    $lanePathPattern = "target[\\/]+lanes[\\/]+([A-Za-z0-9_.-]+)"
-    $justLanePattern = "\b(?:test-lane(?:-fast)?|cargo-lane(?:-(?:home|isolated-home))?|test-lane-package|check-lane|clippy-lane|watch-lane|coverage-lane|fix-lane)\s+([A-Za-z0-9_.-]+)\b"
-    $justFixedLanePattern = "\b(test-lane-main|cargo-lane-main|release-lane)\b"
-    $justFixedLaneNames = @{
-        "test-lane-main" = "main"
-        "cargo-lane-main" = "main"
-        "release-lane" = "release"
-    }
-    $scriptLanePattern = "(?:^|\s)-Lane\s+([A-Za-z0-9_.-]+)(?:\s|$)"
-
-    foreach ($line in $lines) {
-        foreach ($match in [regex]::Matches($line, $lanePathPattern)) {
-            [void]$names.Add((ConvertTo-SafeLaneName $match.Groups[1].Value))
-        }
-        foreach ($match in [regex]::Matches($line, $justLanePattern)) {
-            [void]$names.Add((ConvertTo-SafeLaneName $match.Groups[1].Value))
-        }
-        foreach ($match in [regex]::Matches($line, $justFixedLanePattern)) {
-            [void]$names.Add((ConvertTo-SafeLaneName $justFixedLaneNames[$match.Groups[1].Value]))
-        }
-        foreach ($match in [regex]::Matches($line, $scriptLanePattern)) {
-            [void]$names.Add((ConvertTo-SafeLaneName $match.Groups[1].Value))
-        }
+    foreach ($name in @(Get-CargoLaneNamesFromCommandLines -CommandLines $lines)) {
+        [void]$names.Add((ConvertTo-SafeLaneName $name))
     }
 
     return @($names)

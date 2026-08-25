@@ -1,7 +1,8 @@
 use codex_protocol::request_permissions::RequestPermissionsArgs;
 use codex_sandboxing::policy_transforms::normalize_additional_permissions;
+use std::sync::Arc;
 
-use crate::function_tool::FunctionCallError;
+use crate::FunctionCallError;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
@@ -48,13 +49,13 @@ impl RequestPermissionsHandler {
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let ToolInvocation {
             session,
-            turn,
             step_context,
             cancellation_token,
             call_id,
             payload,
             ..
         } = invocation;
+        let turn = Arc::clone(&step_context.turn);
 
         let arguments = match payload {
             ToolPayload::Function { arguments } => arguments,
@@ -144,10 +145,8 @@ mod tests {
 
     #[test]
     fn foreign_environment_accepts_network_only_permission_request() {
-        #[cfg(windows)]
         let cwd = PathUri::parse("file:///home/remote/project").expect("foreign POSIX cwd");
-        #[cfg(not(windows))]
-        let cwd = PathUri::parse("file:///C:/remote/project").expect("foreign Windows cwd");
+
         assert!(cwd.to_abs_path().is_err());
 
         let args =

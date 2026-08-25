@@ -1,4 +1,4 @@
-use crate::function_tool::FunctionCallError;
+use crate::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use codex_protocol::ThreadId;

@@ -360,72 +360,6 @@ async fn command_exec_permission_profile_does_not_reuse_default_network_proxy() 
     Ok(())
 }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn command_exec_permission_profile_project_roots_use_command_cwd() -> Result<()> {
-    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
-    let codex_home = TempDir::new()?;
-    let command_dir = codex_home.path().join("command-cwd");
-    std::fs::create_dir(&command_dir)?;
-    create_config_toml(codex_home.path(), &server.uri(), "never")?;
-    insert_command_exec_config(
-        codex_home.path(),
-        r#"
-[permissions.command-cwd.filesystem]
-":root" = "read"
-":workspace_roots" = "write"
-"#,
-    )?;
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let command_request_id = mcp
-        .send_command_exec_request(CommandExecParams {
-            command: vec![
-                "sh".to_string(),
-                "-lc".to_string(),
-                "printf child > child.txt && ! printf parent > ../parent.txt".to_string(),
-            ],
-            process_id: None,
-            tty: false,
-            stream_stdin: false,
-            stream_stdout_stderr: false,
-            output_bytes_cap: None,
-            disable_output_cap: false,
-            disable_timeout: false,
-            timeout_ms: None,
-            cwd: Some("command-cwd".into()),
-            env: None,
-            size: None,
-            sandbox_policy: None,
-            permission_profile: Some("command-cwd".to_string()),
-        })
-        .await?;
-
-    let response = mcp
-        .read_stream_until_response_message(RequestId::Integer(command_request_id))
-        .await?;
-    let response: CommandExecResponse = to_response(response)?;
-    assert_eq!(
-        response.exit_code, 0,
-        "parent cwd write should fail under command project-root profile: {response:?}"
-    );
-    assert_eq!(
-        std::fs::read_to_string(command_dir.join("child.txt"))?,
-        "child"
-    );
-    assert!(
-        !codex_home.path().join("parent.txt").exists(),
-        "permissionProfile :workspace_roots write should not grant the server cwd when command cwd differs"
-    );
-
-    Ok(())
-}
-
 #[tokio::test]
 async fn command_exec_returns_error_when_local_environment_is_disabled() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
@@ -980,10 +914,7 @@ async fn command_exec_tty_supports_initial_size_and_resize() -> Result<()> {
             timeout_ms: None,
             cwd: None,
             env: None,
-            size: Some(CommandExecTerminalSize {
-                rows: 31,
-                cols: 101,
-            }),
+            size: Some(CommandExecTerminalSize::new(31, 101)),
             sandbox_policy: None,
             permission_profile: None,
         })
@@ -1000,10 +931,7 @@ async fn command_exec_tty_supports_initial_size_and_resize() -> Result<()> {
     let resize_request_id = mcp
         .send_command_exec_resize_request(CommandExecResizeParams {
             process_id: process_id.clone(),
-            size: CommandExecTerminalSize {
-                rows: 45,
-                cols: 132,
-            },
+            size: CommandExecTerminalSize::new(45, 132),
         })
         .await?;
     let resize_response = mcp

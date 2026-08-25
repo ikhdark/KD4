@@ -1,4 +1,6 @@
 use crate::model::ThreadMetadata;
+use chrono::DateTime;
+use chrono::Utc;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::persisted_thread_settings::PersistedThreadSettingsReducer;
@@ -54,6 +56,26 @@ pub fn apply_rollout_items(
     }
 }
 
+/// Return the latest persisted turn-start timestamp in a rollout item batch.
+///
+/// `TurnStartedEvent::started_at` is the authoritative product-recency fact.
+/// Older events may omit it, so callers can retain their existing fallback in
+/// that case.
+pub fn latest_rollout_recency_at(items: &[RolloutItem]) -> Option<DateTime<Utc>> {
+    items.iter().filter_map(rollout_item_recency_at).next_back()
+}
+
+fn rollout_item_recency_at(item: &RolloutItem) -> Option<DateTime<Utc>> {
+    let RolloutItem::EventMsg(EventMsg::TurnStarted(event)) = item else {
+        return None;
+    };
+    turn_started_recency_at(event.started_at)
+}
+
+fn turn_started_recency_at(started_at: Option<i64>) -> Option<DateTime<Utc>> {
+    started_at.and_then(|started_at| DateTime::from_timestamp(started_at, 0))
+}
+
 fn apply_non_setting_rollout_item(metadata: &mut ThreadMetadata, item: &RolloutItem) {
     match item {
         RolloutItem::SessionMeta(meta_line) => apply_session_meta_from_item(metadata, meta_line),
@@ -77,7 +99,8 @@ pub fn rollout_item_affects_thread_metadata(item: &RolloutItem) -> bool {
             EventMsg::TokenCount(_)
             | EventMsg::UserMessage(_)
             | EventMsg::ThreadGoalUpdated(_)
-            | EventMsg::ThreadSettingsApplied(_),
+            | EventMsg::ThreadSettingsApplied(_)
+            | EventMsg::TurnStarted(_),
         ) => true,
         RolloutItem::EventMsg(EventMsg::ItemCompleted(event))
             if matches!(event.item, TurnItem::UserMessage(_)) =>
@@ -174,6 +197,11 @@ fn apply_event_msg(metadata: &mut ThreadMetadata, event: &EventMsg) {
                 set_preview_if_empty(metadata, Some(objective.to_string()));
             }
         }
+        EventMsg::TurnStarted(event) => {
+            if let Some(recency_at) = turn_started_recency_at(event.started_at) {
+                metadata.recency_at = recency_at;
+            }
+        }
         _ => {}
     }
 }
@@ -237,6 +265,7 @@ mod tests {
     use codex_protocol::protocol::ThreadSettingsSnapshot;
     use codex_protocol::protocol::TurnContextItem;
     use codex_protocol::protocol::TurnEnvironmentSelections;
+    use codex_protocol::protocol::TurnStartedEvent;
     use codex_protocol::protocol::USER_MESSAGE_BEGIN;
     use codex_protocol::protocol::UserMessageEvent;
     use codex_protocol::user_input::UserInput;
@@ -244,6 +273,27 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
     use uuid::Uuid;
+
+    #[test]
+    fn turn_started_timestamp_is_the_authoritative_recency_fact() {
+        let mut metadata = metadata_for_test();
+        let started_at = 1_735_905_845;
+        let item = RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-1".to_string(),
+            trace_id: None,
+            started_at: Some(started_at),
+            model_context_window: None,
+            collaboration_mode_kind: Default::default(),
+        }));
+
+        apply_rollout_item(&mut metadata, &item, "test-provider");
+
+        assert_eq!(
+            metadata.recency_at,
+            DateTime::<Utc>::from_timestamp(started_at, 0).expect("valid timestamp")
+        );
+        assert!(super::rollout_item_affects_thread_metadata(&item));
+    }
 
     #[test]
     fn response_item_user_messages_do_not_set_title_or_first_user_message() {
@@ -454,10 +504,8 @@ mod tests {
                 collaboration_mode: None,
                 multi_agent_version: None,
                 multi_agent_mode: None,
-                realtime_active: None,
                 effort: None,
                 context_provenance: None,
-                summary: codex_protocol::config_types::ReasoningSummary::Auto,
             }),
             "test-provider",
         );
@@ -501,10 +549,8 @@ mod tests {
                 collaboration_mode: None,
                 multi_agent_version: None,
                 multi_agent_mode: None,
-                realtime_active: None,
                 effort: None,
                 context_provenance: None,
-                summary: codex_protocol::config_types::ReasoningSummary::Auto,
             }),
             "test-provider",
         );
@@ -533,6 +579,7 @@ mod tests {
                     model: "persisted-model".to_string(),
                     model_provider_id: "persisted-provider".to_string(),
                     service_tier: Some(Some("flex".to_string())),
+                    developer_instructions: Some(None),
                     approval_policy: AskForApproval::Never,
                     approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::AutoReview,
                     permission_profile: permission_profile.clone(),
@@ -602,10 +649,8 @@ mod tests {
                 collaboration_mode: None,
                 multi_agent_version: None,
                 multi_agent_mode: None,
-                realtime_active: None,
                 effort: Some(ReasoningEffort::High),
                 context_provenance: None,
-                summary: codex_protocol::config_types::ReasoningSummary::Auto,
             }),
             "test-provider",
         );
@@ -642,10 +687,8 @@ mod tests {
                 collaboration_mode: None,
                 multi_agent_version: None,
                 multi_agent_mode: None,
-                realtime_active: None,
                 effort: Some(ReasoningEffort::High),
                 context_provenance: None,
-                summary: codex_protocol::config_types::ReasoningSummary::Auto,
             }),
             "test-provider",
         );

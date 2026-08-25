@@ -4,14 +4,14 @@ use std::collections::HashSet;
 use codex_connectors::metadata::connector_mention_slug;
 use codex_protocol::user_input::UserInput;
 
+use crate::PLUGIN_TEXT_MENTION_SIGIL;
+use crate::TOOL_MENTION_SIGIL;
 use crate::connectors;
 use crate::injection::ToolMentionKind;
 use crate::injection::app_id_from_path;
 use crate::injection::extract_tool_mentions_with_sigil;
 use crate::injection::plugin_config_name_from_path;
 use crate::injection::tool_kind_for_path;
-use crate::mention_syntax::PLUGIN_TEXT_MENTION_SIGIL;
-use crate::mention_syntax::TOOL_MENTION_SIGIL;
 
 use super::PluginCapabilitySummary;
 

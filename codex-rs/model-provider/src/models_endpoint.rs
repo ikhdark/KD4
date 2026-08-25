@@ -358,7 +358,9 @@ mod tests {
                     .lock()
                     .expect("observed request lock should not be poisoned") =
                     Some((http_client_factory.outbound_proxy_policy(), request_url));
-                Ok(ReqwestTransport::from_http_client(create_client()))
+                Ok(ReqwestTransport::from_http_client(
+                    create_client().expect("test HTTP client should build"),
+                ))
             })
         }
     }

@@ -1,9 +1,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::function_tool::FunctionCallError;
+use crate::FunctionCallError;
 use crate::mcp_tool_call::handle_mcp_tool_call;
-use crate::original_image_detail::can_request_original_image_detail;
 use crate::task_evidence::ExternalEvidenceCapture;
 use crate::tools::context::McpToolOutput;
 use crate::tools::context::ToolInvocation;
@@ -26,6 +25,7 @@ use codex_tools::ToolName;
 use codex_tools::ToolSearchInfo;
 use codex_tools::ToolSearchSourceInfo;
 use codex_tools::ToolSpec;
+use codex_tools::can_request_original_image_detail;
 use codex_tools::mcp_tool_to_responses_api_tool;
 use serde_json::Map;
 use serde_json::Value;
@@ -329,7 +329,12 @@ fn mcp_hook_tool_input(raw_arguments: &str) -> Value {
         return Value::Object(Map::new());
     }
 
-    serde_json::from_str(raw_arguments).unwrap_or_else(|_| Value::String(raw_arguments.to_string()))
+    match crate::tools::handlers::parsed_function_argument_value(raw_arguments) {
+        Some(Ok(value)) => value,
+        Some(Err(_)) => Value::String(raw_arguments.to_string()),
+        None => serde_json::from_str(raw_arguments)
+            .unwrap_or_else(|_| Value::String(raw_arguments.to_string())),
+    }
 }
 
 fn build_mcp_search_text(info: &ToolInfo) -> String {
@@ -418,7 +423,6 @@ mod tests {
             handler.pre_tool_use_payload(&ToolInvocation {
                 session: session.into(),
                 step_context: StepContext::for_test(Arc::clone(&turn)),
-                turn,
                 cancellation_token: tokio_util::sync::CancellationToken::new(),
                 tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
                 call_id: "call-mcp-pre".to_string(),
@@ -452,7 +456,6 @@ mod tests {
             handler.pre_tool_use_payload(&ToolInvocation {
                 session: session.into(),
                 step_context: StepContext::for_test(Arc::clone(&turn)),
-                turn,
                 cancellation_token: tokio_util::sync::CancellationToken::new(),
                 tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
                 call_id: "call-mcp-pre-builtin-like".to_string(),
@@ -482,7 +485,6 @@ mod tests {
                 ToolInvocation {
                     session: session.into(),
                     step_context: StepContext::for_test(Arc::clone(&turn)),
-                    turn,
                     cancellation_token: tokio_util::sync::CancellationToken::new(),
                     tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
                     call_id: "call-mcp-rewrite-builtin-like".to_string(),
@@ -531,7 +533,6 @@ mod tests {
         let invocation = ToolInvocation {
             session: session.into(),
             step_context: StepContext::for_test(Arc::clone(&turn)),
-            turn,
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
             call_id: "call-mcp-post".to_string(),

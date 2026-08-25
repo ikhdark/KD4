@@ -9,7 +9,6 @@ from functools import cache
 import hashlib
 import json
 import os
-import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -19,11 +18,22 @@ from typing import Callable, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_ROOT = REPO_ROOT / "scripts"
+SCRIPT_AUDIT_ROOTS = (
+    REPO_ROOT / ".codex" / "environments",
+    REPO_ROOT / ".codex" / "hooks",
+    SCRIPTS_ROOT,
+    REPO_ROOT / "codex-cli" / "scripts",
+    REPO_ROOT / "codex-rs" / "app-server-test-client" / "scripts",
+    REPO_ROOT / "codex-rs" / "config" / "scripts",
+    REPO_ROOT / "codex-rs" / "scripts",
+    REPO_ROOT / "codex-rs" / "skills" / "src" / "assets" / "samples",
+    REPO_ROOT / "sdk" / "python" / "scripts",
+    REPO_ROOT / "tools" / "argument-comment-lint",
+)
 
 SCRIPT_KIND_BY_SUFFIX = {
     ".py": "python",
     ".ps1": "powershell",
-    ".sh": "shell",
     ".js": "javascript",
     ".mjs": "javascript",
 }
@@ -49,14 +59,6 @@ POWERSHELL_PARSE_ALL_SCRIPT = (
     "}; "
     "if ($failed) { exit 1 }"
 )
-
-PRETTIER_TARGETS = [
-    "package.json",
-    "pnpm-workspace.yaml",
-    "codex-cli/**/*.js",
-    "sdk/typescript/**/*.js",
-    "sdk/typescript/**/*.ts",
-]
 
 
 def script_kind_for_path(path: Path) -> str | None:
@@ -86,22 +88,33 @@ def script_inventory() -> tuple[
     python_sources: list[str] = []
     unittest_targets: list[str] = []
     script_kinds: list[tuple[str, str]] = []
-    for path in SCRIPTS_ROOT.rglob("*"):
-        if not path.is_file() or "__pycache__" in path.parts or ".venv" in path.parts:
-            continue
-        target = path.relative_to(REPO_ROOT).as_posix()
-        if path.suffix.lower() == ".py":
-            python_sources.append(target)
-            if path.name.lower().startswith("test_"):
-                unittest_targets.append(
-                    path.relative_to(REPO_ROOT)
-                    .with_suffix("")
-                    .as_posix()
-                    .replace("/", ".")
-                )
-        kind = script_kind_for_path(path)
-        if kind is not None:
-            script_kinds.append((target, kind))
+    for root in SCRIPT_AUDIT_ROOTS:
+        for path in root.rglob("*"):
+            if (
+                not path.is_file()
+                or "__pycache__" in path.parts
+                or ".venv" in path.parts
+            ):
+                continue
+            target = path.relative_to(REPO_ROOT).as_posix()
+            if path.suffix.lower() == ".py":
+                python_sources.append(target)
+                if path.name.lower().startswith("test_"):
+                    if SCRIPTS_ROOT in path.parents:
+                        unittest_targets.append(
+                            path.relative_to(REPO_ROOT)
+                            .with_suffix("")
+                            .as_posix()
+                            .replace("/", ".")
+                        )
+                    else:
+                        # unittest accepts repository-relative file paths. Keep
+                        # tests below non-package script roots discoverable even
+                        # when a path segment cannot be a Python identifier.
+                        unittest_targets.append(target)
+            kind = script_kind_for_path(path)
+            if kind is not None:
+                script_kinds.append((target, kind))
     return (
         tuple(sorted(python_sources)),
         tuple(sorted(unittest_targets)),
@@ -128,7 +141,7 @@ def script_kind_map() -> dict[str, str]:
 UV_RUN_SCRIPTS = ["uv", "run", "--frozen", "--project", "scripts"]
 
 # Several script owners intentionally use aggregate test modules instead of a
-# same-stem test file. Keep that routing explicit so changed PowerShell/shell
+# same-stem test file. Keep that routing explicit so changed PowerShell
 # helpers and shared Python utilities do not receive syntax-only validation.
 SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
     "scripts/app_server_schema_runtime_check.py": ("scripts.test_dev_environment",),
@@ -136,37 +149,25 @@ SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
     "scripts/cargo-lane-trash-cleanup.ps1": ("scripts.test_cargo_lane",),
     "scripts/cargo-lane.ps1": ("scripts.test_cargo_lane",),
     "scripts/common-rust-env.ps1": ("scripts.test_build_tooling_performance",),
-    "scripts/codex_package/codex-zsh": (
-        "scripts.codex_package.test_dotslash",
-        "scripts.codex_package.test_zsh",
-    ),
     "scripts/codex_package/rg": (
         "scripts.codex_package.test_dotslash",
         "scripts.codex_package.test_ripgrep",
     ),
     "scripts/config_schema_check.py": ("scripts.test_dev_environment",),
     "scripts/generated_output_lock.py": ("scripts.test_dev_environment",),
-    "scripts/debug-codex.sh": ("scripts.test_shell_helpers",),
     "scripts/dev_env_doctor.py": ("scripts.test_dev_environment",),
     "scripts/format.py": ("scripts.test_build_tooling",),
     "scripts/git_doctor.py": ("scripts.test_dev_environment",),
     "scripts/invoke-rust-perf-env.ps1": ("scripts.test_build_tooling_performance",),
     "scripts/install/install.ps1": ("scripts.test_build_tooling_policy",),
-    "scripts/install/build_install_sh.py": ("scripts.install.test_install_sh",),
-    "scripts/install/install.sh": (
-        "scripts.install.test_install_sh",
-        "scripts.test_build_tooling_policy",
+    "scripts/investigation_eval/score_results.py": (
+        "scripts.investigation_eval.test_investigation_eval",
     ),
-    "scripts/install/install_release.sh": ("scripts.install.test_install_sh",),
+    "scripts/investigation_eval/validate_cases.py": (
+        "scripts.investigation_eval.test_investigation_eval",
+    ),
     "scripts/just-shell.py": ("scripts.test_build_tooling",),
-    "scripts/publish-local-codex-wsl.sh": (
-        "scripts.test_dev_environment",
-        "scripts.test_publish_local_codex",
-        "scripts.test_publish_local_codex_apply",
-        "scripts.test_publish_local_codex_build",
-        "scripts.test_publish_local_codex_dry_run",
-        "scripts.test_publish_local_codex_freshness",
-    ),
+    "scripts/kd4_model_attempt_analysis.py": ("scripts.test_kd4_perf_snapshot",),
     "scripts/publish-local-codex.ps1": (
         "scripts.test_publish_local_codex",
         "scripts.test_publish_local_codex_apply",
@@ -181,16 +182,12 @@ SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
         "scripts.test_publish_local_codex_freshness",
     ),
     "scripts/root_maintenance.py": ("scripts.test_build_tooling_policy",),
-    "scripts/run-powershell-script.ps1": ("scripts.test_run_powershell_script",),
-    "scripts/run_tui_with_exec_server.sh": ("scripts.test_run_tui_with_exec_server",),
     "scripts/rust_build_status.py": ("scripts.test_build_tooling_storage",),
     "scripts/rust_build_status_support.py": ("scripts.test_build_tooling_storage",),
     "scripts/rust_packages.py": ("scripts.test_build_tooling_policy",),
     "scripts/sccache-perf.ps1": ("scripts.test_build_tooling_performance",),
     "scripts/stage_npm_packages.py": ("scripts.test_stage_npm_packages",),
     "scripts/stage_npm_archives.py": ("scripts.test_stage_npm_packages",),
-    "scripts/start-codex-exec.sh": ("scripts.test_run_tui_with_exec_server",),
-    "scripts/test-remote-env.sh": ("scripts.test_build_tooling_policy",),
     "scripts/tool_versions.py": ("scripts.test_build_tooling_storage",),
     "scripts/vscode_runtime_proof.py": ("scripts.test_dev_environment",),
 }
@@ -203,8 +200,7 @@ def repository_relative_path(path_text: str) -> Path | None:
             path = path.relative_to(REPO_ROOT)
         except ValueError:
             return None
-    if os.name == "nt":
-        path = Path(*(part.lower() for part in path.parts))
+    path = Path(*(part.lower() for part in path.parts))
     return path
 
 
@@ -342,24 +338,8 @@ def python_test_targets(modules: Sequence[str], changed: Sequence[str]) -> list[
     return sorted(dict.fromkeys(selected))
 
 
-def script_audit_test_targets(
-    *,
-    platform: str | None = None,
-    native_sh_available: bool | None = None,
-) -> tuple[list[str], list[str]]:
-    platform = os.name if platform is None else platform
-    native_sh_available = (
-        Path("/bin/sh").is_file()
-        if native_sh_available is None
-        else native_sh_available
-    )
-    targets = python_unittest_targets()
-    skipped: list[str] = []
-    install_test = "scripts.install.test_install_sh"
-    if platform == "nt" and not native_sh_available and install_test in targets:
-        targets.remove(install_test)
-        skipped.append(f"{install_test}: native /bin/sh is unavailable on Windows")
-    return targets, skipped
+def script_audit_test_targets() -> list[str]:
+    return python_unittest_targets()
 
 
 def script_audit_context_issues() -> list[str]:
@@ -391,7 +371,6 @@ def script_audit_context_issues() -> list[str]:
                     "package.json audit:scripts must route to "
                     f"`{SCRIPT_AUDIT_PACKAGE_COMMAND}`"
                 )
-
     justfile_path = REPO_ROOT / "justfile"
     if justfile_path.is_file():
         try:
@@ -507,8 +486,6 @@ def script_audit_findings(
                 errors.append(
                     f"Python syntax error in {target}:{exc.lineno}: {exc.msg}"
                 )
-        elif kind == "shell" and not text.startswith("#!"):
-            errors.append(f"shell script is missing a shebang: {target}")
         elif kind == "dotslash":
             _, separator, manifest_text = text.partition("\n")
             if not separator:
@@ -619,29 +596,6 @@ def script_audit_commands(
                 )
             )
 
-    shell_targets = [
-        target for target, kind in kind_by_target.items() if kind == "shell"
-    ]
-    if shell_targets:
-        bash = resolve_tool("bash")
-        if bash is None:
-            missing_tools.append("bash")
-        else:
-            parse_script = "set -o pipefail; " + " && ".join(
-                f"sed $'s/\\r$//' {shlex.quote(target)} | bash -n"
-                for target in shell_targets
-            )
-            commands.append(
-                (
-                    "shell syntax",
-                    (
-                        bash,
-                        "-c",
-                        parse_script,
-                    ),
-                )
-            )
-
     javascript_targets = [
         target for target, kind in kind_by_target.items() if kind == "javascript"
     ]
@@ -681,9 +635,7 @@ def git_context_label() -> str:
     return f"{branch}; {max(0, len(lines) - 1)} changed path(s)"
 
 
-def run_script_audit(
-    *, include_tests: bool, strict: bool, allow_platform_skips: bool = False
-) -> int:
+def run_script_audit(*, include_tests: bool, strict: bool) -> int:
     audit_targets = script_source_targets()
     kind_by_target = script_kind_map()
     inventory: dict[str, int] = {}
@@ -703,9 +655,7 @@ def run_script_audit(
     errors = script_audit_context_issues()
     hygiene_errors, advisories = script_audit_findings(kind_by_target=kind_by_target)
     errors.extend(hygiene_errors)
-    test_targets, skipped_tests = (
-        script_audit_test_targets() if include_tests else ([], [])
-    )
+    test_targets = script_audit_test_targets() if include_tests else []
     commands, missing_tools = script_audit_commands(
         include_tests=include_tests,
         test_targets=test_targets,
@@ -717,9 +667,6 @@ def run_script_audit(
         print(f"[FAIL] {issue}", flush=True)
     for advisory in advisories:
         print(f"[ADVISORY] {advisory}", flush=True)
-    for skipped_test in skipped_tests:
-        print(f"[SKIP] {skipped_test}", flush=True)
-
     failed_commands: list[str] = []
     passed_commands = 0
     for label, command in commands:
@@ -742,20 +689,12 @@ def run_script_audit(
         print(
             "[FAIL] --strict promoted optimization advisories to failures", flush=True
         )
-    skipped_test_failure = bool(skipped_tests) and not allow_platform_skips
-    if skipped_test_failure:
-        print(
-            "[FAIL] platform-specific test coverage was skipped; "
-            "rerun on a capable host or pass --allow-platform-skips",
-            flush=True,
-        )
-    if errors or failed_commands or strict_failure or skipped_test_failure:
+    if errors or failed_commands or strict_failure:
         print(
             "SCRIPT AUDIT FAILED: "
             f"{len(errors)} internal/context failure(s), "
             f"{len(failed_commands)} command failure(s), "
-            f"{len(advisories)} advisory item(s), "
-            f"{len(skipped_tests)} platform test skip(s).",
+            f"{len(advisories)} advisory item(s).",
             flush=True,
         )
         return 1
@@ -764,8 +703,7 @@ def run_script_audit(
         "SCRIPT AUDIT PASSED: "
         f"{len(audit_targets)} script artifact(s), "
         f"{passed_commands} command group(s), "
-        f"{len(advisories)} advisory item(s), "
-        f"{len(skipped_tests)} platform test skip(s).",
+        f"{len(advisories)} advisory item(s).",
         flush=True,
     )
     return 0
@@ -785,20 +723,6 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run root package maintenance commands.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-
-    prettier = subparsers.add_parser("format-prettier")
-    prettier.add_argument("--write", action="store_true")
-
-    python_format = subparsers.add_parser("format-python")
-    python_format.add_argument("--write", action="store_true")
-    python_format.add_argument(
-        "--changed",
-        action="append",
-        nargs="?",
-        const=None,
-        default=[],
-        help="Format changed scripts/*.py paths. With no path, detect changed paths from git.",
-    )
 
     python_lint = subparsers.add_parser("lint-python")
     python_lint.add_argument("--fix", action="store_true")
@@ -841,38 +765,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Treat optimization advisories such as large or syntax-only scripts as failures.",
     )
-    script_audit.add_argument(
-        "--allow-platform-skips",
-        action="store_true",
-        help="Allow a full audit to pass when platform-specific tests cannot run on this host.",
-    )
-
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-
-    if args.command == "format-prettier":
-        mode = "--write" if args.write else "--check"
-        return run(["pnpm", "exec", "prettier", mode, *PRETTIER_TARGETS])
-
-    if args.command == "format-python":
-        command = [*UV_RUN_SCRIPTS, "ruff", "format"]
-        if not args.write:
-            command.append("--check")
-        changed_paths = resolved_changed_paths(args.changed)
-        if changed_paths is None:
-            return 2
-        targets = (
-            python_lint_targets(changed_paths)
-            if changed_paths or not args.changed
-            else []
-        )
-        if not targets:
-            print("No matching changed Python files to format.")
-            return 0
-        return run([*command, *targets])
 
     if args.command == "lint-python":
         command = [*UV_RUN_SCRIPTS, "ruff", "check"]
@@ -918,7 +815,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_script_audit(
             include_tests=not args.quick,
             strict=args.strict,
-            allow_platform_skips=args.allow_platform_skips,
         )
 
     raise AssertionError(f"unhandled command: {args.command}")

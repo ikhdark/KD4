@@ -2,6 +2,7 @@ use super::*;
 use codex_apply_patch::MaybeApplyPatchVerified;
 use codex_exec_server::LOCAL_FS;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::FileChange;
 use core_test_support::PathBufExt;
 use core_test_support::PathExt;
@@ -34,7 +35,6 @@ async fn invocation_for_payload(payload: ToolPayload) -> ToolInvocation {
     ToolInvocation {
         session: session.into(),
         step_context: StepContext::for_test(Arc::clone(&turn)),
-        turn,
         cancellation_token: tokio_util::sync::CancellationToken::new(),
         tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
         call_id: "call-apply-patch".to_string(),
@@ -60,6 +60,25 @@ async fn pre_tool_use_payload_uses_freeform_patch_input() {
             tool_input: json!({ "command": patch }),
         })
     );
+}
+
+#[tokio::test]
+async fn foreign_patch_uses_only_an_external_sandbox_profile() {
+    let (_session, mut turn) = make_session_and_context().await;
+    let file_paths = vec![PathUri::parse("file:///tmp/remote.txt").expect("POSIX path URI")];
+
+    assert!(external_patch_permissions(&turn, file_paths.clone()).is_none());
+
+    turn.permission_profile = PermissionProfile::External {
+        network: NetworkSandboxPolicy::Restricted,
+    };
+    let (returned_paths, permissions, policy) =
+        external_patch_permissions(&turn, file_paths.clone()).expect("external sandbox profile");
+
+    assert_eq!(returned_paths, file_paths);
+    assert_eq!(permissions.additional_permissions, None);
+    assert!(!permissions.permissions_preapproved);
+    assert_eq!(policy, FileSystemSandboxPolicy::external_sandbox());
 }
 
 #[tokio::test]
@@ -300,12 +319,8 @@ async fn input_state_determined_environment_mismatch_blocks_exact_retry_without_
     );
     let command = vec!["apply_patch".to_string(), patch];
     let fs = turn_environment.environment.get_filesystem();
-    let attempt_key = CommandAttemptKey::new(
-        "shell",
-        &selected_environment_id,
-        &cwd.to_string(),
-        &command,
-    );
+    let attempt_key =
+        CommandAttemptKey::new("shell", &selected_environment_id, cwd.to_string(), &command);
     session
         .services
         .command_execution
@@ -384,7 +399,7 @@ async fn input_state_determined_implicit_patch_blocks_exact_retry_without_mutati
     let attempt_key = CommandAttemptKey::new(
         "shell",
         &turn_environment.environment_id,
-        &cwd.to_string(),
+        cwd.to_string(),
         &command,
     );
     session

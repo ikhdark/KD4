@@ -1,4 +1,32 @@
 use super::*;
+
+#[test]
+fn status_notification_is_the_canonical_response_payload() {
+    let status = RemoteControlStatusChangedNotification {
+        status: RemoteControlConnectionStatus::Connected,
+        server_name: "remote.example.test".to_string(),
+        installation_id: "installation-1".to_string(),
+        environment_id: Some("environment-1".to_string()),
+    };
+
+    let enable = RemoteControlEnableResponse(status.clone());
+    let disable = RemoteControlDisableResponse(status.clone());
+    let read = RemoteControlStatusReadResponse(status.clone());
+
+    let expected = serde_json::to_value(status).expect("serialize canonical status");
+    assert_eq!(
+        serde_json::to_value(enable).expect("serialize enable"),
+        expected
+    );
+    assert_eq!(
+        serde_json::to_value(disable).expect("serialize disable"),
+        expected
+    );
+    assert_eq!(
+        serde_json::to_value(read).expect("serialize read"),
+        expected
+    );
+}
 use pretty_assertions::assert_eq;
 use serde_json::json;
 

@@ -1,6 +1,9 @@
 mod json;
 mod truncate;
 
+use sha1::Digest;
+use sha1::Sha1;
+
 pub use json::to_ascii_json_string;
 pub use truncate::approx_bytes_for_tokens;
 pub use truncate::approx_token_count;
@@ -8,21 +11,9 @@ pub use truncate::approx_tokens_from_byte_count;
 pub use truncate::truncate_middle_chars;
 pub use truncate::truncate_middle_with_token_budget;
 
-// Truncate a &str to a byte budget at a char boundary (prefix)
-#[inline]
-pub fn take_bytes_at_char_boundary(s: &str, maxb: usize) -> &str {
-    if s.len() <= maxb {
-        return s;
-    }
-    let mut last_ok = 0;
-    for (i, ch) in s.char_indices() {
-        let nb = i + ch.len_utf8();
-        if nb > maxb {
-            break;
-        }
-        last_ok = nb;
-    }
-    &s[..last_ok]
+/// Return the lowercase SHA-1 digest for `bytes`.
+pub fn sha1_hex(bytes: impl AsRef<[u8]>) -> String {
+    format!("{:x}", Sha1::digest(bytes.as_ref()))
 }
 
 /// Sanitize a tag value to comply with metric tag validation rules:
@@ -48,20 +39,6 @@ pub fn sanitize_metric_tag_value(value: &str) -> String {
     } else {
         trimmed[..MAX_LEN].to_string()
     }
-}
-
-/// Find all UUIDs in a string.
-#[allow(clippy::unwrap_used)]
-pub fn find_uuids(s: &str) -> Vec<String> {
-    static RE: std::sync::OnceLock<regex_lite::Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| {
-        regex_lite::Regex::new(
-            r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}",
-        )
-        .unwrap() // Unwrap is safe thanks to the tests.
-    });
-
-    re.find_iter(s).map(|m| m.as_str().to_string()).collect()
 }
 
 /// Convert a markdown-style `#L..` location suffix into a terminal-friendly
@@ -102,38 +79,10 @@ fn parse_markdown_hash_location_point(point: &str) -> Option<(&str, Option<&str>
 #[cfg(test)]
 #[allow(warnings, clippy::all)]
 mod tests {
-    use super::find_uuids;
     use super::normalize_markdown_hash_location_suffix;
     use super::sanitize_metric_tag_value;
+    use super::sha1_hex;
     use pretty_assertions::assert_eq;
-
-    #[test]
-    fn find_uuids_finds_multiple() {
-        let input =
-            "x 00112233-4455-6677-8899-aabbccddeeff-k y 12345678-90ab-cdef-0123-456789abcdef";
-        assert_eq!(
-            find_uuids(input),
-            vec![
-                "00112233-4455-6677-8899-aabbccddeeff".to_string(),
-                "12345678-90ab-cdef-0123-456789abcdef".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn find_uuids_ignores_invalid() {
-        let input = "not-a-uuid-1234-5678-9abc-def0-123456789abc";
-        assert_eq!(find_uuids(input), Vec::<String>::new());
-    }
-
-    #[test]
-    fn find_uuids_handles_non_ascii_without_overlap() {
-        let input = "🙂 55e5d6f7-8a7f-4d2a-8d88-123456789012abc";
-        assert_eq!(
-            find_uuids(input),
-            vec!["55e5d6f7-8a7f-4d2a-8d88-123456789012".to_string()]
-        );
-    }
 
     #[test]
     fn sanitize_metric_tag_value_trims_and_fills_unspecified() {
@@ -145,6 +94,11 @@ mod tests {
     fn sanitize_metric_tag_value_replaces_invalid_chars() {
         let msg = "bad value!";
         assert_eq!(sanitize_metric_tag_value(msg), "bad_value");
+    }
+
+    #[test]
+    fn sha1_hex_uses_lowercase_full_width_encoding() {
+        assert_eq!(sha1_hex(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
     }
 
     #[test]

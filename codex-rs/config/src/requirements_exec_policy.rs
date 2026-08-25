@@ -195,33 +195,10 @@ fn parse_pattern_token(
     token_index: usize,
 ) -> Result<PatternToken, RequirementsExecPolicyParseError> {
     match (&token.token, &token.any_of) {
-        (Some(single), None) => {
-            if single.trim().is_empty() {
-                return Err(RequirementsExecPolicyParseError::InvalidPatternToken {
-                    rule_index,
-                    token_index,
-                    reason: "token cannot be empty".to_string(),
-                });
-            }
-            Ok(PatternToken::Single(single.clone()))
-        }
-        (None, Some(alternatives)) => {
-            if alternatives.is_empty() {
-                return Err(RequirementsExecPolicyParseError::InvalidPatternToken {
-                    rule_index,
-                    token_index,
-                    reason: "any_of cannot be empty".to_string(),
-                });
-            }
-            if alternatives.iter().any(|alt| alt.trim().is_empty()) {
-                return Err(RequirementsExecPolicyParseError::InvalidPatternToken {
-                    rule_index,
-                    token_index,
-                    reason: "any_of cannot include empty tokens".to_string(),
-                });
-            }
-            Ok(PatternToken::Alts(alternatives.clone()))
-        }
+        (Some(single), None) => PatternToken::single(single.clone())
+            .map_err(|err| invalid_pattern_token_from_execpolicy(err, rule_index, token_index)),
+        (None, Some(alternatives)) => PatternToken::from_alternatives(alternatives.clone())
+            .map_err(|err| invalid_pattern_token_from_execpolicy(err, rule_index, token_index)),
         (Some(_), Some(_)) => Err(RequirementsExecPolicyParseError::InvalidPatternToken {
             rule_index,
             token_index,
@@ -232,5 +209,52 @@ fn parse_pattern_token(
             token_index,
             reason: "set either token or any_of".to_string(),
         }),
+    }
+}
+
+fn invalid_pattern_token_from_execpolicy(
+    err: codex_execpolicy::Error,
+    rule_index: usize,
+    token_index: usize,
+) -> RequirementsExecPolicyParseError {
+    let reason = match err {
+        codex_execpolicy::Error::InvalidPattern(reason) => reason,
+        other => other.to_string(),
+    };
+    RequirementsExecPolicyParseError::InvalidPatternToken {
+        rule_index,
+        token_index,
+        reason,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn requirements_policy_uses_shared_pattern_token_validation() {
+        let config = RequirementsExecPolicyToml {
+            prefix_rules: vec![RequirementsExecPolicyPrefixRuleToml {
+                pattern: vec![RequirementsExecPolicyPatternTokenToml {
+                    token: None,
+                    any_of: Some(vec!["git".to_string(), " ".to_string()]),
+                }],
+                decision: Some(RequirementsExecPolicyDecisionToml::Forbidden),
+                justification: None,
+            }],
+        };
+
+        let err = config
+            .to_policy()
+            .expect_err("empty alternatives must fail");
+        assert!(matches!(
+            err,
+            RequirementsExecPolicyParseError::InvalidPatternToken {
+                rule_index: 0,
+                token_index: 0,
+                ref reason,
+            } if reason == "pattern alternatives cannot include empty tokens"
+        ));
     }
 }

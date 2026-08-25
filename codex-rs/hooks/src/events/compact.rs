@@ -10,6 +10,7 @@ use codex_protocol::protocol::HookRunSummary;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
 use super::common;
+use super::common::StatelessHookOutcome;
 use crate::engine::CommandShell;
 use crate::engine::ConfiguredHandler;
 use crate::engine::command_runner::CommandRunResult;
@@ -42,20 +43,6 @@ pub struct PostCompactRequest {
     pub compaction_summary: Option<String>,
 }
 
-#[derive(Debug)]
-pub struct StatelessHookOutcome {
-    pub hook_events: Vec<HookCompletedEvent>,
-    pub should_stop: bool,
-    pub stop_reason: Option<String>,
-}
-
-#[derive(Debug)]
-pub struct PreCompactOutcome {
-    pub hook_events: Vec<HookCompletedEvent>,
-    pub should_stop: bool,
-    pub stop_reason: Option<String>,
-}
-
 pub(crate) fn preview_pre(
     handlers: &[ConfiguredHandler],
     request: &PreCompactRequest,
@@ -74,14 +61,14 @@ pub(crate) async fn run_pre(
     handlers: &[ConfiguredHandler],
     shell: &CommandShell,
     request: PreCompactRequest,
-) -> PreCompactOutcome {
+) -> StatelessHookOutcome {
     let matched = dispatcher::select_handlers(
         handlers,
         HookEventName::PreCompact,
         Some(request.trigger.as_str()),
     );
     if matched.is_empty() {
-        return PreCompactOutcome {
+        return StatelessHookOutcome {
             hook_events: Vec::new(),
             should_stop: false,
             stop_reason: None,
@@ -91,7 +78,7 @@ pub(crate) async fn run_pre(
     let input_json = match pre_command_input_json(&request) {
         Ok(input_json) => input_json,
         Err(error) => {
-            return PreCompactOutcome {
+            return StatelessHookOutcome {
                 hook_events: common::serialization_failure_hook_events(
                     matched,
                     Some(request.turn_id),
@@ -116,7 +103,7 @@ pub(crate) async fn run_pre(
     let stop_reason = results
         .iter()
         .find_map(|result| result.data.stop_reason.clone());
-    PreCompactOutcome {
+    StatelessHookOutcome {
         hook_events: results.into_iter().map(|result| result.completed).collect(),
         should_stop,
         stop_reason,

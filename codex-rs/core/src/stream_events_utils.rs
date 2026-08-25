@@ -24,7 +24,7 @@ use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::ToolExecutionId;
-use codex_rollout::state_db;
+use codex_rollout::state_integration;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_stream_parser::strip_proposed_plan_blocks;
 use futures::Future;
@@ -180,7 +180,7 @@ pub(crate) async fn mark_thread_memory_mode_polluted_if_external_context(
     {
         return;
     }
-    state_db::mark_thread_memory_mode_polluted(
+    state_integration::mark_thread_memory_mode_polluted(
         sess.services.state_db.as_deref(),
         sess.thread_id,
         "record_completed_response_item",
@@ -189,7 +189,7 @@ pub(crate) async fn mark_thread_memory_mode_polluted_if_external_context(
 }
 
 async fn record_stage1_output_usage_and_detect_memory_citation(
-    state_db_ctx: Option<&state_db::StateDbHandle>,
+    state_db_ctx: Option<&state_integration::StateDbHandle>,
     item: &ResponseItem,
 ) -> bool {
     let Some(raw_text) = raw_assistant_output_text_from_item(item) else {
@@ -204,7 +204,7 @@ async fn record_stage1_output_usage_and_detect_memory_citation(
 }
 
 async fn record_stage1_output_usage_for_memory_citation(
-    state_db_ctx: Option<&state_db::StateDbHandle>,
+    state_db_ctx: Option<&state_integration::StateDbHandle>,
     memory_citation: &MemoryCitation,
 ) -> bool {
     let thread_ids = thread_ids_from_memory_citation(memory_citation);

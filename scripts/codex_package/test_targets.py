@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from codex_package import targets
 from codex_package.targets import BINARY_TARGETS
+from codex_package.targets import NPM_TARGETS
 from codex_package.targets import PACKAGE_VARIANTS
 from codex_package.targets import RELEASE_TARGETS
 from codex_package.targets import SUPPORTED_TARGETS
@@ -27,28 +28,46 @@ class TargetMetadataTest(unittest.TestCase):
         spec = TARGET_SPECS["x86_64-pc-windows-msvc"]
 
         self.assertFalse(hasattr(spec, "__dict__"))
-        self.assertEqual(spec.exe_suffix, ".exe")
+        self.assertFalse(hasattr(spec, "exe_suffix"))
         self.assertEqual(spec.rg_name, "rg.exe")
+        self.assertEqual(spec.code_mode_host_name, "codex-code-mode-host.exe")
 
     def test_supported_choices_are_sorted_tuples(self) -> None:
         self.assertEqual(SUPPORTED_TARGETS, tuple(sorted(TARGET_SPECS)))
         self.assertEqual(SUPPORTED_VARIANTS, tuple(sorted(PACKAGE_VARIANTS)))
         self.assertEqual(set(BINARY_TARGETS), set(RELEASE_TARGETS))
 
-    def test_release_targets_match_standalone_installers(self) -> None:
-        install_sh = (
-            targets.REPO_ROOT / "scripts" / "install" / "install.sh"
-        ).read_text(encoding="utf-8")
+    def test_release_targets_match_windows_installer(self) -> None:
         install_ps1 = (
             targets.REPO_ROOT / "scripts" / "install" / "install.ps1"
         ).read_text(encoding="utf-8")
 
         for release in RELEASE_TARGETS.values():
-            installer = install_ps1 if release.host_system == "windows" else install_sh
             with self.subTest(target=release.target):
-                self.assertIn(release.target, installer)
-                self.assertIn(release.npm_tag, installer)
-                self.assertIn(release.platform_label, installer)
+                self.assertEqual(release.host_system, "windows")
+                self.assertIn(release.target, install_ps1)
+                self.assertIn("codex-package-", install_ps1)
+                self.assertIn(release.platform_label, install_ps1)
+
+    def test_release_targets_do_not_expose_retired_npm_assets(self) -> None:
+        for release in RELEASE_TARGETS.values():
+            with self.subTest(target=release.target):
+                self.assertFalse(hasattr(release, "npm_tag"))
+                self.assertFalse(hasattr(release, "legacy_npm_asset"))
+
+    def test_npm_targets_are_canonical_binary_target_metadata(self) -> None:
+        self.assertEqual(set(NPM_TARGETS), set(BINARY_TARGETS))
+        self.assertEqual(
+            {target.node_platform_key for target in NPM_TARGETS.values()},
+            {"win32-x64", "win32-arm64"},
+        )
+        self.assertEqual(
+            {target.package for target in NPM_TARGETS.values()},
+            {"codex-win32-x64", "codex-win32-arm64"},
+        )
+        self.assertTrue(
+            all(target.executable_name == "codex.exe" for target in NPM_TARGETS.values())
+        )
 
     def test_entrypoint_name_uses_precomputed_variant_target_names(self) -> None:
         variant = PACKAGE_VARIANTS["codex"]
@@ -58,16 +77,12 @@ class TargetMetadataTest(unittest.TestCase):
             "codex.exe",
         )
         self.assertEqual(
-            variant.entrypoint_name(TARGET_SPECS["aarch64-apple-darwin"]),
-            "codex",
+            variant.entrypoint_name(TARGET_SPECS["aarch64-pc-windows-msvc"]),
+            "codex.exe",
         )
 
     def test_default_target_is_cached_for_process_lifetime(self) -> None:
-        calls = {"system": 0, "machine": 0}
-
-        def fake_system() -> str:
-            calls["system"] += 1
-            return "Windows"
+        calls = {"machine": 0}
 
         def fake_machine() -> str:
             calls["machine"] += 1
@@ -75,13 +90,12 @@ class TargetMetadataTest(unittest.TestCase):
 
         default_target.cache_clear()
         with (
-            patch.object(targets.platform, "system", fake_system),
             patch.object(targets.platform, "machine", fake_machine),
         ):
             self.assertEqual(default_target(), "x86_64-pc-windows-msvc")
             self.assertEqual(default_target(), "x86_64-pc-windows-msvc")
 
-        self.assertEqual(calls, {"system": 1, "machine": 1})
+        self.assertEqual(calls, {"machine": 1})
         default_target.cache_clear()
 
     def test_normalize_machine_uses_alias_table(self) -> None:
@@ -89,16 +103,14 @@ class TargetMetadataTest(unittest.TestCase):
         self.assertEqual(normalize_machine("arm64"), "aarch64")
         self.assertEqual(normalize_machine("mips64"), "mips64")
 
-    def test_unsupported_host_is_sampled_once_for_consistent_error(self) -> None:
+    def test_unsupported_architecture_is_sampled_once_for_consistent_error(self) -> None:
         default_target.cache_clear()
         with (
-            patch.object(targets.platform, "system", return_value="Plan9") as system,
             patch.object(targets.platform, "machine", return_value="mips64") as machine,
-            self.assertRaisesRegex(RuntimeError, "Plan9/mips64"),
+            self.assertRaisesRegex(RuntimeError, "Windows architecture mips64"),
         ):
             default_target()
 
-        system.assert_called_once_with()
         machine.assert_called_once_with()
         default_target.cache_clear()
 
@@ -152,19 +164,6 @@ class ResolveInputPathTest(unittest.TestCase):
 
         with patch.object(targets.platform, "system", lambda: "Windows"):
             self.assertTrue(is_executable(fake_path))
-
-    def test_windows_host_accepts_extensionless_cross_target_binary(self) -> None:
-        # A prebuilt Linux/mac binary staged from a Windows host has no
-        # extension and no meaningful execute bits; existence must suffice.
-        fake_path = SimpleNamespace(
-            suffix="",
-            is_file=lambda: True,
-            stat=lambda: SimpleNamespace(st_mode=stat.S_IFREG),
-        )
-
-        with patch.object(targets.platform, "system", lambda: "Windows"):
-            self.assertTrue(is_executable(fake_path))
-
 
 if __name__ == "__main__":
     unittest.main()

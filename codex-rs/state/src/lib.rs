@@ -1,8 +1,9 @@
 //! SQLite-backed state for rollout metadata.
 //!
-//! This crate is intentionally small and focused: it extracts rollout metadata
-//! from JSONL rollouts and mirrors it into a local SQLite database. Backfill
-//! orchestration and rollout scanning live in `codex-core`.
+//! This crate owns the SQLite schema, migrations, and runtime APIs. The
+//! rollout-specific initialization, backfill orchestration, reconciliation,
+//! and filesystem fallback bridge lives in `codex-rollout::state_integration`
+//! so this crate does not depend on the rollout representation.
 
 const _: () = assert!(
     libsqlite3_sys::SQLITE_VERSION_NUMBER >= 3_051_003,
@@ -15,7 +16,6 @@ mod extract;
 pub mod log_db;
 mod migrations;
 mod model;
-mod paths;
 mod runtime;
 mod telemetry;
 mod validation_history;
@@ -45,6 +45,7 @@ pub use bugs::BugStore;
 /// Most consumers should prefer [`StateRuntime`].
 pub use extract::apply_rollout_item;
 pub use extract::apply_rollout_items;
+pub use extract::latest_rollout_recency_at;
 pub use extract::rollout_item_affects_thread_metadata;
 pub use model::AgentJob;
 pub use model::AgentJobCreateParams;
@@ -131,3 +132,16 @@ pub const DB_LOG_PHASE_DURATION_METRIC: &str = "codex.sqlite.logs.phase.duration
 pub const DB_LOG_RETENTION_METRIC: &str = "codex.sqlite.logs.retention.count";
 /// Rollout fallback attempts. Tags: [caller, reason]
 pub const DB_FALLBACK_METRIC: &str = "codex.sqlite.fallback.count";
+
+#[cfg(test)]
+mod module_consolidation_tests {
+    #[test]
+    fn runtime_owns_its_file_timestamp_helper() {
+        let state_lib = include_str!("lib.rs");
+        let runtime = include_str!("runtime.rs");
+        let obsolete_paths_module = ["mod pa", "ths;"].concat();
+
+        assert!(!state_lib.contains(&obsolete_paths_module));
+        assert!(runtime.contains("async fn file_modified_time_utc"));
+    }
+}

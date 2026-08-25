@@ -10,6 +10,8 @@ use codex_protocol::models::ResponseItem;
 use codex_tools::ToolSpec;
 use futures::Stream;
 use serde_json::Value;
+use sha2::Digest;
+use sha2::Sha256;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Context;
@@ -25,6 +27,59 @@ pub(crate) struct PromptDigests {
     pub(crate) instructions: Option<[u8; 32]>,
     pub(crate) tools: Option<[u8; 32]>,
     pub(crate) history: Option<[u8; 32]>,
+}
+
+/// Immutable, model-visible tool schema data shared by prompt construction,
+/// request serialization, accounting, and retries.
+#[derive(Debug)]
+pub(crate) struct ToolSchemaArtifact {
+    specs: Arc<[ToolSpec]>,
+    serialized: Arc<[u8]>,
+    digest: [u8; 32],
+    has_request_user_input: bool,
+    has_wait: bool,
+}
+
+impl ToolSchemaArtifact {
+    pub(crate) fn new(specs: Vec<ToolSpec>) -> Self {
+        let specs: Arc<[ToolSpec]> = specs.into();
+        let serialized: Arc<[u8]> = serde_json::to_vec(specs.as_ref())
+            .unwrap_or_default()
+            .into();
+        Self {
+            has_request_user_input: specs.iter().any(|spec| spec.name() == "request_user_input"),
+            has_wait: specs.iter().any(|spec| spec.name() == "wait"),
+            digest: Sha256::digest(serialized.as_ref()).into(),
+            specs,
+            serialized,
+        }
+    }
+
+    pub(crate) fn specs(&self) -> &[ToolSpec] {
+        &self.specs
+    }
+
+    pub(crate) fn serialized(&self) -> &[u8] {
+        &self.serialized
+    }
+
+    pub(crate) fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+
+    pub(crate) fn has_request_user_input(&self) -> bool {
+        self.has_request_user_input
+    }
+
+    pub(crate) fn has_wait(&self) -> bool {
+        self.has_wait
+    }
+}
+
+impl Default for ToolSchemaArtifact {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
 }
 
 /// API request payload for a single model turn
@@ -65,7 +120,7 @@ pub struct Prompt {
 
     /// Tools available to the model, including additional tools sourced from
     /// external MCP servers.
-    pub(crate) tools: Vec<ToolSpec>,
+    pub(crate) tools: Arc<ToolSchemaArtifact>,
 
     /// Whether parallel tool calls are permitted for this prompt.
     pub(crate) parallel_tool_calls: bool,
@@ -91,7 +146,7 @@ impl Default for Prompt {
             stable_context_manifest: StableContextManifest::default(),
             prompt_provenance: PromptProvenanceSidecar::default(),
             digests: PromptDigests::default(),
-            tools: Vec::new(),
+            tools: Arc::new(ToolSchemaArtifact::default()),
             parallel_tool_calls: false,
             base_instructions: BaseInstructions::default(),
             output_schema: None,

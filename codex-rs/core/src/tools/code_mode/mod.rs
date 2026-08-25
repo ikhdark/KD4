@@ -25,9 +25,7 @@ use sha2::Sha256;
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 
-use crate::function_tool::FunctionCallError;
-use crate::original_image_detail::can_request_original_image_detail;
-use crate::original_image_detail::sanitize_original_image_detail as sanitize_image_detail_items;
+use crate::FunctionCallError;
 use crate::session::reasoning_governor::CodeModeToolResult;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
@@ -41,6 +39,8 @@ use crate::tools::router::ToolCall;
 use crate::tools::router::ToolCallSource;
 use codex_protocol::openai_models::ToolMode;
 use codex_tools::ToolName;
+use codex_tools::can_request_original_image_detail;
+use codex_tools::sanitize_original_image_detail as sanitize_image_detail_items;
 use codex_utils_output_truncation::OutputOutcome;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::formatted_truncate_text_content_items_with_policy;
@@ -55,7 +55,6 @@ pub(crate) use wait_handler::CodeModeWaitHandler;
 
 pub(crate) const PUBLIC_TOOL_NAME: &str = codex_code_mode::PUBLIC_TOOL_NAME;
 pub(crate) const WAIT_TOOL_NAME: &str = codex_code_mode::WAIT_TOOL_NAME;
-pub(crate) const DEFAULT_WAIT_YIELD_TIME_MS: u64 = codex_code_mode::DEFAULT_WAIT_YIELD_TIME_MS;
 
 /// Returns true for the un-namespaced code-mode `exec` tool.
 pub(crate) fn is_exec_tool_name(tool_name: &ToolName) -> bool {

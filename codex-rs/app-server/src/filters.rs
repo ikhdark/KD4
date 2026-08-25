@@ -46,7 +46,7 @@ pub(crate) fn compute_source_filters(
                 | ThreadSourceKind::Unknown => None,
             })
             .collect::<Vec<_>>();
-        (interactive_sources, Some(source_kinds))
+        (interactive_sources, None)
     }
 }
 
@@ -107,13 +107,13 @@ mod tests {
     #[test]
     fn compute_source_filters_interactive_only_skips_post_filtering() {
         let source_kinds = vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode];
-        let (allowed_sources, filter) = compute_source_filters(Some(source_kinds.clone()));
+        let (allowed_sources, filter) = compute_source_filters(Some(source_kinds));
 
         assert_eq!(
             allowed_sources,
             vec![CoreSessionSource::Cli, CoreSessionSource::VSCode]
         );
-        assert_eq!(filter, Some(source_kinds));
+        assert_eq!(filter, None);
     }
 
     #[test]

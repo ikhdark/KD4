@@ -139,6 +139,7 @@ async fn renews_cache_ttl_on_matching_models_etag() -> Result<()> {
     // Cached models remain usable offline.
     let offline_models = test
         .thread_manager
+        .get_models_manager()
         .list_models(
             RefreshStrategy::Offline,
             codex_core::test_support::default_http_client_factory(),

@@ -600,10 +600,6 @@ async fn build_test_codex_with_memories_config(
     test_codex()
         .with_home(home)
         .with_config(move |config| {
-            config
-                .features
-                .enable(Feature::Sqlite)
-                .expect("test config should allow feature update");
             config.memories = memories;
         })
         .build(server)

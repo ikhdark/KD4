@@ -1,9 +1,9 @@
 use chrono::DateTime;
 use chrono::Utc;
+use codex_file_system::AtomicWriteLock;
+use codex_file_system::acquire_atomic_write_lock;
+use codex_file_system::write_bytes_atomically;
 use codex_protocol::openai_models::ModelInfo;
-use codex_utils_path::AtomicWriteLock;
-use codex_utils_path::acquire_atomic_write_lock;
-use codex_utils_path::write_bytes_atomically;
 use serde::Deserialize;
 use serde::Serialize;
 use std::fmt;

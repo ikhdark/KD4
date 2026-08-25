@@ -62,6 +62,8 @@ use tracing::error;
 use tracing::info;
 use tracing::warn;
 
+pub(super) const REMOTE_CONTROL_INSTALLATION_ID_HEADER: &str = "x-codex-installation-id";
+
 pub struct RemoteControlStartConfig {
     pub remote_control_url: String,
     pub installation_id: String,

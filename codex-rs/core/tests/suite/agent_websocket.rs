@@ -1,6 +1,6 @@
 use anyhow::Result;
+use codex_api::RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE;
 use codex_core::ForkSnapshot;
-use codex_features::Feature;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
@@ -20,8 +20,6 @@ use pretty_assertions::assert_eq;
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
-
-const WS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_model_switch_to_responses_lite_omits_top_level_tools() -> Result<()> {
@@ -382,6 +380,7 @@ async fn websocket_v2_test_codex_shell_chain() -> Result<()> {
 
     let call_id = "shell-command-call";
     let mut shell_command_call = ev_shell_command_call(call_id, "echo websocket");
+    shell_command_call["item"]["id"] = serde_json::json!("fc_shell-command-call");
     shell_command_call["item"]["internal_chat_message_metadata_passthrough"] =
         serde_json::json!({"turn_id": "turn-123"});
     let server = start_websocket_server(vec![vec![
@@ -399,12 +398,7 @@ async fn websocket_v2_test_codex_shell_chain() -> Result<()> {
     ]])
     .await;
 
-    let mut builder = test_codex().with_windows_cmd_shell().with_config(|config| {
-        config
-            .features
-            .enable(Feature::ResponsesWebsocketsV2)
-            .expect("test config should allow feature update");
-    });
+    let mut builder = test_codex().with_windows_cmd_shell();
 
     let test = builder.build_with_websocket_server(&server).await?;
     test.submit_turn_with_policy("run the echo command", test.config.legacy_sandbox_policy())
@@ -457,7 +451,7 @@ async fn websocket_v2_test_codex_shell_chain() -> Result<()> {
     let handshake = server.single_handshake();
     assert_eq!(
         handshake.header("openai-beta"),
-        Some(WS_V2_BETA_HEADER_VALUE.to_string())
+        Some(RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE.to_string())
     );
 
     server.shutdown().await;
@@ -478,12 +472,7 @@ async fn websocket_v2_first_turn_uses_updated_fast_tier_after_startup_prewarm() 
     ]])
     .await;
 
-    let mut builder = test_codex().with_config(|config| {
-        config
-            .features
-            .enable(Feature::ResponsesWebsocketsV2)
-            .expect("test config should allow feature update");
-    });
+    let mut builder = test_codex();
     let test = builder.build_with_websocket_server(&server).await?;
 
     let warmup = server
@@ -534,10 +523,6 @@ async fn websocket_v2_first_turn_drops_fast_tier_after_startup_prewarm() -> Resu
     .await;
 
     let mut builder = test_codex().with_config(|config| {
-        config
-            .features
-            .enable(Feature::ResponsesWebsocketsV2)
-            .expect("test config should allow feature update");
         config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
     });
     let test = builder.build_with_websocket_server(&server).await?;
@@ -594,12 +579,7 @@ async fn websocket_v2_next_turn_uses_updated_service_tier() -> Result<()> {
     ]])
     .await;
 
-    let mut builder = test_codex().with_config(|config| {
-        config
-            .features
-            .enable(Feature::ResponsesWebsocketsV2)
-            .expect("test config should allow feature update");
-    });
+    let mut builder = test_codex();
     let test = builder.build_with_websocket_server(&server).await?;
 
     let warmup = server

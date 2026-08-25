@@ -33,11 +33,11 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::warn;
 
+use crate::FunctionCallError;
 use crate::config::edit::ConfigEdit;
 use crate::config::edit::ConfigEditsBuilder;
 use crate::connectors;
 use crate::connectors::AppInfo;
-use crate::function_tool::FunctionCallError;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
@@ -389,7 +389,6 @@ async fn verify_request_plugin_install_completed(
         DiscoverableTool::Connector(connector) => refresh_missing_requested_connectors(
             turn,
             manager,
-            auth,
             std::slice::from_ref(&connector.id),
             connector.id.as_str(),
         )
@@ -409,7 +408,6 @@ async fn verify_request_plugin_install_completed(
                     refresh_missing_requested_connectors(
                         turn,
                         manager,
-                        auth,
                         &plugin.app_connector_ids,
                         plugin.id.as_str(),
                     )
@@ -439,7 +437,6 @@ async fn verify_request_plugin_install_completed(
             let accessible_connectors = refresh_missing_requested_connectors(
                 turn,
                 manager,
-                auth,
                 &plugin.app_connector_ids,
                 plugin.id.as_str(),
             )
@@ -522,7 +519,6 @@ fn is_remote_plugin_install_suggestion(plugin_id: &str) -> bool {
 async fn refresh_missing_requested_connectors(
     turn: &crate::session::turn_context::TurnContext,
     manager: &codex_mcp::McpConnectionManager,
-    auth: Option<&codex_login::CodexAuth>,
     expected_connector_ids: &[String],
     tool_id: &str,
 ) -> Option<Vec<AppInfo>> {
@@ -544,11 +540,6 @@ async fn refresh_missing_requested_connectors(
             let accessible_connectors = connectors::with_app_enabled_state(
                 connectors::accessible_connectors_from_mcp_tools(&mcp_tools),
                 &turn.config,
-            );
-            connectors::refresh_accessible_connectors_cache_from_mcp_tools(
-                &turn.config,
-                auth,
-                &mcp_tools,
             );
             Some(accessible_connectors)
         }

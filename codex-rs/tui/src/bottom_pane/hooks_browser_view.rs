@@ -314,7 +314,11 @@ impl HooksBrowserView {
         event_name: HookEventName,
         review_needed_count: usize,
     ) -> Vec<Line<'static>> {
-        let mut lines = vec![format!("{} hooks", event_label(event_name)).bold().into()];
+        let mut lines = vec![
+            format!("{} hooks", event_name.to_core().as_pascal_case_label())
+                .bold()
+                .into(),
+        ];
         match review_needed_message(review_needed_count) {
             None => lines.push(
                 "Turn hooks on or off. Your changes are saved automatically."
@@ -353,7 +357,7 @@ impl HooksBrowserView {
             let mut row_line = vec![
                 Span::from(format!(
                     "{:<EVENT_COLUMN_WIDTH$}",
-                    event_label(row.event_name)
+                    row.event_name.to_core().as_pascal_case_label()
                 )),
                 Span::from(format!("{:<COUNT_COLUMN_WIDTH$}", row.installed)),
                 Span::from(format!("{:<COUNT_COLUMN_WIDTH$}", row.active)),
@@ -473,7 +477,10 @@ impl HooksBrowserView {
             return vec!["No hooks installed for this event.".dim().into()];
         };
 
-        let mut lines = vec![detail_line("Event", event_label(event_name))];
+        let mut lines = vec![detail_line(
+            "Event",
+            event_name.to_core().as_pascal_case_label(),
+        )];
         if let Some(matcher) = hook.matcher.as_deref() {
             lines.extend(detail_wrapped_lines(
                 "Matcher", matcher, width, /*max_lines*/ None,
@@ -724,21 +731,6 @@ fn hook_trust_label(status: HookTrustStatus) -> &'static str {
         HookTrustStatus::Trusted => "Trusted",
         HookTrustStatus::Untrusted => "New hook - review required",
         HookTrustStatus::Modified => "Modified since last trusted - review required",
-    }
-}
-
-fn event_label(event_name: HookEventName) -> &'static str {
-    match event_name {
-        HookEventName::PreToolUse => "PreToolUse",
-        HookEventName::PermissionRequest => "PermissionRequest",
-        HookEventName::PostToolUse => "PostToolUse",
-        HookEventName::PreCompact => "PreCompact",
-        HookEventName::PostCompact => "PostCompact",
-        HookEventName::SessionStart => "SessionStart",
-        HookEventName::UserPromptSubmit => "UserPromptSubmit",
-        HookEventName::SubagentStart => "SubagentStart",
-        HookEventName::SubagentStop => "SubagentStop",
-        HookEventName::Stop => "Stop",
     }
 }
 

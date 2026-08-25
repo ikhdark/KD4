@@ -1,38 +1,21 @@
 #!/usr/bin/env python3
 
 import os
-from pathlib import Path
-import shutil
 import subprocess
 import tempfile
 import unittest
+from pathlib import Path
+
+from scripts.build_tooling_test_support import REPO_ROOT
+from scripts.build_tooling_test_support import powershell
+from scripts.build_tooling_test_support import ps_single_quote
+from scripts.build_tooling_test_support import pwsh_only
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
-def powershell() -> str | None:
-    # Prefer Windows PowerShell 5.1: the justfile invokes these scripts via
-    # `powershell -NoProfile -File ...`, so tests should exercise the same
-    # host (5.1 has stricter native-stderr and StrictMode semantics).
-    return shutil.which("powershell") or shutil.which("pwsh")
-
-
-def pwsh_only() -> str | None:
-    # invoke-rust-perf-env.ps1 runs under pwsh 7.4+ in production (recipes
-    # invoke it inline in the just-shell pwsh session), and its -NoSccache
-    # proof depends on pwsh's empty-env-var semantics, so its tests must not
-    # fall back to Windows PowerShell 5.1.
-    return shutil.which("pwsh")
-
-
-def ps_single_quote(value: str | Path) -> str:
-    return "'" + str(value).replace("'", "''") + "'"
-
-
 class BuildToolingPerformanceTest(unittest.TestCase):
-    @unittest.skipUnless(os.name == "nt", "invoke-rust-perf-env is Windows-only")
     def test_perf_env_no_sccache_leaves_incremental_and_uses_lane(self) -> None:
         shell = pwsh_only()
         if shell is None:
@@ -82,7 +65,6 @@ class BuildToolingPerformanceTest(unittest.TestCase):
         self.assertIn("cargoTargetDir=", result.stdout)
         self.assertIn("perf-nextest-nosccache", result.stdout)
 
-    @unittest.skipUnless(os.name == "nt", "invoke-rust-perf-env is Windows-only")
     def test_perf_env_rejects_explicit_target_outside_reserved_lane(self) -> None:
         shell = pwsh_only()
         if shell is None:
@@ -142,7 +124,6 @@ class BuildToolingPerformanceTest(unittest.TestCase):
         self.assertNotIn("targetenv=", result.stdout)
         self.assertNotIn("stale-target-env", result.stdout)
 
-    @unittest.skipUnless(os.name == "nt", "invoke-rust-perf-env is Windows-only")
     def test_perf_env_rejects_dot_path_lane_names(self) -> None:
         shell = pwsh_only()
         if shell is None:
@@ -178,7 +159,6 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("Cargo target lane", result.stderr)
 
-    @unittest.skipUnless(os.name == "nt", "invoke-rust-perf-env is Windows-only")
     def test_perf_env_keeps_same_length_cargo_watch_rewrite(self) -> None:
         shell = pwsh_only()
         if shell is None:
@@ -240,7 +220,6 @@ class BuildToolingPerformanceTest(unittest.TestCase):
         self.assertIn("--target-dir", result.stdout)
         self.assertIn(" -- --nocapture", result.stdout)
 
-    @unittest.skipUnless(os.name == "nt", "invoke-rust-perf-env is Windows-only")
     def test_perf_env_non_native_success_does_not_use_stale_last_exit_code(
         self,
     ) -> None:
@@ -276,7 +255,6 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
 
-    @unittest.skipUnless(os.name == "nt", "invoke-rust-perf-env is Windows-only")
     def test_perf_env_non_native_failure_returns_nonzero(self) -> None:
         shell = pwsh_only()
         if shell is None:
@@ -310,7 +288,6 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
 
-    @unittest.skipUnless(os.name == "nt", "invoke-rust-perf-env is Windows-only")
     def test_perf_env_restore_helper_preserves_empty_environment_variable(
         self,
     ) -> None:
@@ -354,9 +331,6 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
 
-    @unittest.skipUnless(
-        os.name == "nt", "common-rust-env sccache restart is Windows-only"
-    )
     def test_common_rust_env_restarts_stale_sccache_server_cache_size(self) -> None:
         shell = powershell()
         if shell is None:
@@ -439,7 +413,6 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             self.assertIn("--start-server", call_text)
             self.assertIn("80 GiB", stats.read_text(encoding="utf-8"))
 
-    @unittest.skipUnless(os.name == "nt", "common-rust-env is Windows-only")
     def test_common_rust_env_cache_size_honors_override(self) -> None:
         shell = powershell()
         if shell is None:
@@ -484,7 +457,6 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                 )
                 self.assertIn(expected, result.stdout)
 
-    @unittest.skipUnless(os.name == "nt", "common-rust-env is Windows-only")
     def test_common_rust_env_compares_cache_sizes_by_bytes(self) -> None:
         shell = powershell()
         if shell is None:
@@ -538,7 +510,6 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             ["True"] * 7,
         )
 
-    @unittest.skipUnless(os.name == "nt", "sccache-perf is Windows-only")
     def test_sccache_perf_restart_ignores_stop_failure_and_checks_start(self) -> None:
         shell = powershell()
         if shell is None:
@@ -604,7 +575,6 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             ["--stop-server", "--start-server", "--show-stats"],
         )
 
-    @unittest.skipUnless(os.name == "nt", "sccache-perf is Windows-only")
     def test_sccache_perf_reset_fails_when_zero_stats_fails(self) -> None:
         shell = powershell()
         if shell is None:
@@ -665,7 +635,6 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             ["--show-stats", "--zero-stats"],
         )
 
-    @unittest.skipUnless(os.name == "nt", "sccache-perf is Windows-only")
     def test_sccache_perf_reports_command_removed_after_lookup(self) -> None:
         shell = powershell()
         if shell is None:
@@ -732,7 +701,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
         self.assertIn("app-server-thread-status-check:", justfile)
         self.assertIn("app-server-schema-protocol-check:", justfile)
         self.assertIn("app-server-schema-check:", justfile)
-        self.assertIn("app-server-schema-check-force owner:", justfile)
+        self.assertIn('app-server-schema-regenerate owner experimental="":', justfile)
         self.assertIn("cargo nextest run -p codex-app-server-protocol -E", justfile)
 
     def test_agents_current_nested_instruction_layout_and_budget_are_explicit(
@@ -784,13 +753,19 @@ class BuildToolingPerformanceTest(unittest.TestCase):
         expected_eol_attributes = [f"{path}: eol: lf" for path in expected_agent_files]
         root_text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
         normalized_root = " ".join(root_text.split())
+        workspace_text = (REPO_ROOT / ".codex" / "AGENTS.md").read_text(
+            encoding="utf-8"
+        )
 
         self.assertEqual(actual_agent_files, sorted(expected_agent_files))
         self.assertEqual(actual_eol_attributes, expected_eol_attributes)
-        self.assertIn("further nested files apply only where present", normalized_root)
         self.assertIn(
-            "Never rely on an instruction file that is absent", normalized_root
+            "Read every applicable `AGENTS.md` from the repository root through "
+            "each path touched",
+            normalized_root,
         )
+        self.assertIn("`.codex/AGENTS.md` covers workspace routing", normalized_root)
+        self.assertIn("The root `AGENTS.md` still applies", workspace_text)
         rust_parent = REPO_ROOT / "codex-rs" / "AGENTS.md"
         core_policy = REPO_ROOT / "codex-rs" / "core" / "AGENTS.md"
         source_map = REPO_ROOT / "SOURCEMAP.md"

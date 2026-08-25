@@ -177,6 +177,91 @@ pub(crate) async fn runtime_migrator_for_pool(
     Ok(compatible)
 }
 
+/// Repair the short-lived KD4 migration ordering where the thread/agent-job
+/// indexes were recorded as version 41 and validation history as version 42.
+///
+/// The repair is deliberately checksum-gated. It recognizes only the exact LF
+/// or CRLF forms of the SQL that is now embedded as versions 42 and 41,
+/// respectively, and changes only the SQLx ledger. The schema objects already
+/// created by those migrations are unchanged.
+pub(crate) async fn repair_legacy_validation_index_migration_order(
+    pool: &SqlitePool,
+    migrator: &Migrator,
+) -> anyhow::Result<()> {
+    let Some(validation_migration) = migrator
+        .migrations
+        .iter()
+        .find(|migration| migration.version == 41)
+    else {
+        return Ok(());
+    };
+    let Some(index_migration) = migrator
+        .migrations
+        .iter()
+        .find(|migration| migration.version == 42)
+    else {
+        return Ok(());
+    };
+    let migrations_table_exists = sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+    )
+    .fetch_optional(pool)
+    .await?
+    .is_some();
+    if !migrations_table_exists {
+        return Ok(());
+    }
+
+    let rows = sqlx::query_as::<_, (i64, Vec<u8>)>(
+        "SELECT version, checksum FROM _sqlx_migrations WHERE version IN (41, 42) ORDER BY version",
+    )
+    .fetch_all(pool)
+    .await?;
+    let checksum_41 = rows
+        .iter()
+        .find_map(|(version, checksum)| (*version == 41).then_some(checksum.as_slice()));
+    let checksum_42 = rows
+        .iter()
+        .find_map(|(version, checksum)| (*version == 42).then_some(checksum.as_slice()));
+    let version_41_is_legacy_indexes = checksum_41
+        .is_some_and(|checksum| !matching_line_endings(index_migration, checksum).is_empty());
+    if !version_41_is_legacy_indexes {
+        return Ok(());
+    }
+
+    let version_42_is_legacy_validation = checksum_42
+        .is_some_and(|checksum| !matching_line_endings(validation_migration, checksum).is_empty());
+    if checksum_42.is_some() && !version_42_is_legacy_validation {
+        anyhow::bail!(
+            "legacy migration 41 checksum matched thread/agent-job indexes, but migration 42 was not the recognized validation-history migration"
+        );
+    }
+
+    let mut transaction = pool.begin().await?;
+    if version_42_is_legacy_validation {
+        sqlx::query("UPDATE _sqlx_migrations SET version = -41 WHERE version = 41")
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("UPDATE _sqlx_migrations SET version = 41, description = ? WHERE version = 42")
+            .bind(validation_migration.description.as_ref())
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query(
+            "UPDATE _sqlx_migrations SET version = 42, description = ? WHERE version = -41",
+        )
+        .bind(index_migration.description.as_ref())
+        .execute(&mut *transaction)
+        .await?;
+    } else {
+        sqlx::query("UPDATE _sqlx_migrations SET version = 42, description = ? WHERE version = 41")
+            .bind(index_migration.description.as_ref())
+            .execute(&mut *transaction)
+            .await?;
+    }
+    transaction.commit().await?;
+    Ok(())
+}
+
 pub(crate) async fn ensure_kd4_compatibility_indexes(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query(
         r#"

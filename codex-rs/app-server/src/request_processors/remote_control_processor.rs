@@ -43,7 +43,7 @@ impl RemoteControlRequestProcessor {
                 .await
                 .map_err(map_update_error)?
         };
-        Ok(RemoteControlEnableResponse::from(status))
+        Ok(RemoteControlEnableResponse(status))
     }
 
     pub(crate) async fn disable(
@@ -60,17 +60,11 @@ impl RemoteControlRequestProcessor {
                 .await
                 .map_err(map_update_error)?
         };
-        Ok(RemoteControlDisableResponse::from(status))
+        Ok(RemoteControlDisableResponse(status))
     }
 
     pub(crate) fn status_read(&self) -> Result<RemoteControlStatusReadResponse, JSONRPCErrorError> {
-        let status = self.handle()?.status();
-        Ok(RemoteControlStatusReadResponse {
-            status: status.status,
-            server_name: status.server_name,
-            installation_id: status.installation_id,
-            environment_id: status.environment_id,
-        })
+        Ok(RemoteControlStatusReadResponse(self.handle()?.status()))
     }
 
     pub(crate) async fn pairing_start(

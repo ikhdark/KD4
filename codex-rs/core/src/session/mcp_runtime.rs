@@ -82,8 +82,6 @@ impl McpRuntimeSnapshot {
                 .features
                 .enabled(Feature::SkillMcpDependencyInstall),
             approval_policy: config.permissions.approval_policy.clone(),
-            codex_linux_sandbox_exe: config.codex_linux_sandbox_exe.clone(),
-            use_legacy_landlock: config.features.use_legacy_landlock(),
             apps_enabled: config.features.enabled(Feature::Apps),
             prefix_mcp_tool_names: config.prefix_mcp_tool_names(),
             client_elicitation_capability: ElicitationCapability::default(),

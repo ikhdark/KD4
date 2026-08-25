@@ -36,7 +36,7 @@ use crate::tools::runtimes::unified_exec::UnifiedExecRuntime;
 use crate::tools::sandboxing::SandboxAttempt;
 use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
-#[cfg(windows)]
+
 use crate::tools::sandboxing::same_exec_authorization_envelope;
 use crate::tools::tool_dispatch_trace::active_tool_dispatch_timing;
 use crate::tools::tool_dispatch_trace::mark_exec_process_exited;
@@ -79,7 +79,7 @@ use codex_protocol::protocol::NextSampleBlockReason;
 use codex_protocol::protocol::ToolLifecycleTimerWait;
 use codex_protocol::protocol::ToolLifecycleWakeReason;
 use codex_sandboxing::SandboxCommand;
-#[cfg(windows)]
+
 use codex_shell_command::powershell::prove_noprofile_powershell_command_as_direct_argv;
 use codex_tools::ToolName;
 use codex_utils_output_truncation::approx_token_count;
@@ -1742,7 +1742,6 @@ impl UnifiedExecProcessManager {
     ) -> Result<Arc<UnifiedExecProcess>, UnifiedExecError> {
         let inherited_fds = spawn_lifecycle.inherited_fds();
 
-        #[cfg(target_os = "windows")]
         if request.sandbox == codex_sandboxing::SandboxType::WindowsRestrictedToken {
             // TODO(anp): Keep PathUri through the Windows sandbox launch boundary.
             let native_cwd =
@@ -1918,12 +1917,8 @@ impl UnifiedExecProcessManager {
             local_policy_env,
         };
         let mut orchestrator = ToolOrchestrator::new();
-        let mut runtime = UnifiedExecRuntime::new_with_pending_spawns(
-            self,
-            request.shell_mode.clone(),
-            pending_spawns,
-        );
-        #[cfg(windows)]
+        let mut runtime = UnifiedExecRuntime::new_with_pending_spawns(self, pending_spawns);
+
         let proven_direct_argv = (request.shell_type == crate::shell::ShellType::PowerShell
             && request.command == request.command_for_safety)
             .then(|| {
@@ -1932,7 +1927,7 @@ impl UnifiedExecProcessManager {
                 })
             })
             .flatten();
-        #[cfg(windows)]
+
         let canonical_exec_approval_requirement = if let Some(proof) = proven_direct_argv.as_ref() {
             Some(
                 context
@@ -1975,7 +1970,7 @@ impl UnifiedExecProcessManager {
                 prefix_rule: request.prefix_rule.clone(),
             })
             .await;
-        #[cfg(windows)]
+
         let approved_powershell_direct_argv = if let (Some(proof), Some(canonical_requirement)) =
             (proven_direct_argv, canonical_exec_approval_requirement)
             && same_exec_authorization_envelope(&exec_approval_requirement, &canonical_requirement)
@@ -1989,9 +1984,9 @@ impl UnifiedExecProcessManager {
         let req = UnifiedExecToolRequest {
             command: request.command.clone(),
             command_for_approval: request.command_for_safety.clone(),
-            #[cfg(windows)]
+
             normalization_cwd: request.normalization_cwd.clone(),
-            #[cfg(windows)]
+
             approved_powershell_direct_argv,
             raw_output_artifact: request.raw_output_artifact.clone(),
             shell_type: request.shell_type,
@@ -2013,8 +2008,6 @@ impl UnifiedExecProcessManager {
             tty: request.tty,
             sandbox_permissions: request.sandbox_permissions,
             additional_permissions: request.additional_permissions.clone(),
-            #[cfg(unix)]
-            additional_permissions_preapproved: request.additional_permissions_preapproved,
             justification: request.justification.clone(),
             exec_approval_requirement,
             validation_launch: request.validation_launch.clone(),

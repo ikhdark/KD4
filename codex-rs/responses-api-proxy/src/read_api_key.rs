@@ -8,16 +8,6 @@ use zeroize::Zeroize;
 const BUFFER_SIZE: usize = 1024;
 const AUTH_HEADER_PREFIX: &[u8] = b"Bearer ";
 
-/// Reads the auth token from stdin and returns a static `Authorization` header
-/// value with the auth token used with `Bearer`. The header value is returned
-/// as a `&'static str` whose bytes are locked in memory to avoid accidental
-/// exposure.
-#[cfg(unix)]
-pub(crate) fn read_auth_header_from_stdin() -> Result<&'static str> {
-    read_auth_header_with(read_from_unix_stdin)
-}
-
-#[cfg(windows)]
 pub(crate) fn read_auth_header_from_stdin() -> Result<&'static str> {
     use std::io::Read;
 
@@ -27,46 +17,6 @@ pub(crate) fn read_auth_header_from_stdin() -> Result<&'static str> {
     // equivalent of mlock() on Windows right now, it is not pressing until we
     // address that issue.
     read_auth_header_with(|buffer| std::io::stdin().read(buffer))
-}
-
-/// We perform a low-level read with `read(2)` because `stdio::io::stdin()` has
-/// an internal BufReader:
-///
-/// https://github.com/rust-lang/rust/blob/bcbbdcb8522fd3cb4a8dde62313b251ab107694d/library/std/src/io/stdio.rs#L250-L252
-///
-/// that can end up retaining a copy of stdin data in memory with no way to zero
-/// it out, whereas we aim to guarantee there is exactly one copy of the API key
-/// in memory, protected by mlock(2).
-#[cfg(unix)]
-fn read_from_unix_stdin(buffer: &mut [u8]) -> std::io::Result<usize> {
-    use libc::c_void;
-    use libc::read;
-
-    // Perform a single read(2) call into the provided buffer slice.
-    // Looping and newline/EOF handling are managed by the caller.
-    loop {
-        let result = unsafe {
-            read(
-                libc::STDIN_FILENO,
-                buffer.as_mut_ptr().cast::<c_void>(),
-                buffer.len(),
-            )
-        };
-
-        if result == 0 {
-            return Ok(0);
-        }
-
-        if result < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(err);
-        }
-
-        return Ok(result as usize);
-    }
 }
 
 fn read_auth_header_with<F>(mut read_fn: F) -> Result<&'static str>
@@ -161,46 +111,6 @@ where
     Ok(leaked)
 }
 
-#[cfg(unix)]
-fn mlock_str(value: &str) {
-    use libc::_SC_PAGESIZE;
-    use libc::c_void;
-    use libc::mlock;
-    use libc::sysconf;
-
-    if value.is_empty() {
-        return;
-    }
-
-    let page_size = unsafe { sysconf(_SC_PAGESIZE) };
-    if page_size <= 0 {
-        return;
-    }
-    let page_size = page_size as usize;
-    if page_size == 0 {
-        return;
-    }
-
-    let addr = value.as_ptr() as usize;
-    let len = value.len();
-    let start = addr & !(page_size - 1);
-    let addr_end = match addr.checked_add(len) {
-        Some(v) => match v.checked_add(page_size - 1) {
-            Some(total) => total,
-            None => return,
-        },
-        None => return,
-    };
-    let end = addr_end & !(page_size - 1);
-    let size = end.saturating_sub(start);
-    if size == 0 {
-        return;
-    }
-
-    let _ = unsafe { mlock(start as *const c_void, size) };
-}
-
-#[cfg(not(unix))]
 fn mlock_str(_value: &str) {}
 
 /// The key should match /^[A-Za-z0-9\-_]+$/. Ensure there is no funny business

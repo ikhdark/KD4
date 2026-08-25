@@ -7,6 +7,7 @@ use codex_protocol::approvals::NetworkApprovalProtocol;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -32,19 +33,10 @@ pub(crate) enum GuardianApprovalRequest {
         justification: Option<String>,
         tty: bool,
     },
-    #[cfg(unix)]
-    Execve {
-        id: String,
-        source: GuardianCommandSource,
-        program: String,
-        argv: Vec<String>,
-        cwd: AbsolutePathBuf,
-        additional_permissions: Option<AdditionalPermissionProfile>,
-    },
     ApplyPatch {
         id: String,
-        cwd: AbsolutePathBuf,
-        files: Vec<AbsolutePathBuf>,
+        cwd: PathUri,
+        files: Vec<PathUri>,
         patch: String,
     },
     NetworkAccess {
@@ -115,17 +107,6 @@ struct CommandApprovalAction<'a> {
     justification: Option<&'a String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tty: Option<bool>,
-}
-
-#[cfg(unix)]
-#[derive(Serialize)]
-struct ExecveApprovalAction<'a> {
-    tool: &'a str,
-    program: &'a str,
-    argv: &'a [String],
-    cwd: &'a Path,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    additional_permissions: Option<&'a AdditionalPermissionProfile>,
 }
 
 #[derive(Serialize)]
@@ -208,14 +189,6 @@ fn command_assessment_action(
     }
 }
 
-#[cfg(unix)]
-fn guardian_command_source_tool_name(source: GuardianCommandSource) -> &'static str {
-    match source {
-        GuardianCommandSource::Shell => "shell",
-        GuardianCommandSource::UnifiedExec => "exec_command",
-    }
-}
-
 fn truncate_guardian_action_value(value: Value) -> (Value, bool) {
     match value {
         Value::String(text) => {
@@ -237,7 +210,7 @@ fn truncate_guardian_action_value(value: Value) -> (Value, bool) {
         }
         Value::Object(values) => {
             let mut entries = values.into_iter().collect::<Vec<_>>();
-            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            entries.sort_by_key(|(left, _)| left.clone());
             let mut truncated = false;
             let values = entries
                 .into_iter()
@@ -250,6 +223,42 @@ fn truncate_guardian_action_value(value: Value) -> (Value, bool) {
             (Value::Object(values), truncated)
         }
         other => (other, false),
+    }
+}
+
+fn truncate_guardian_action_value_ref(value: &Value) -> (Value, bool) {
+    match value {
+        Value::String(text) => {
+            let (text, truncated) = guardian_truncate_text(text, GUARDIAN_MAX_ACTION_STRING_TOKENS);
+            (Value::String(text), truncated)
+        }
+        Value::Array(values) => {
+            let mut truncated = false;
+            let values = values
+                .iter()
+                .map(|value| {
+                    let (value, value_truncated) = truncate_guardian_action_value_ref(value);
+                    truncated |= value_truncated;
+                    value
+                })
+                .collect::<Vec<_>>();
+            (Value::Array(values), truncated)
+        }
+        Value::Object(values) => {
+            let mut entries = values.iter().collect::<Vec<_>>();
+            entries.sort_by_key(|(left, _)| *left);
+            let mut truncated = false;
+            let values = entries
+                .into_iter()
+                .map(|(key, value)| {
+                    let (value, value_truncated) = truncate_guardian_action_value_ref(value);
+                    truncated |= value_truncated;
+                    (key.clone(), value)
+                })
+                .collect();
+            (Value::Object(values), truncated)
+        }
+        other => (other.clone(), false),
     }
 }
 
@@ -296,21 +305,7 @@ pub(crate) fn guardian_approval_request_to_json(
             justification.as_ref(),
             Some(*tty),
         ),
-        #[cfg(unix)]
-        GuardianApprovalRequest::Execve {
-            id: _,
-            source,
-            program,
-            argv,
-            cwd,
-            additional_permissions,
-        } => serialize_guardian_action(ExecveApprovalAction {
-            tool: guardian_command_source_tool_name(*source),
-            program,
-            argv,
-            cwd,
-            additional_permissions: additional_permissions.as_ref(),
-        }),
+
         GuardianApprovalRequest::ApplyPatch {
             id: _,
             cwd,
@@ -387,23 +382,11 @@ pub(crate) fn guardian_assessment_action(
         GuardianApprovalRequest::ExecCommand { command, cwd, .. } => {
             command_assessment_action(GuardianCommandSource::UnifiedExec, command, cwd)
         }
-        #[cfg(unix)]
-        GuardianApprovalRequest::Execve {
-            source,
-            program,
-            argv,
-            cwd,
-            ..
-        } => GuardianAssessmentAction::Execve {
-            source: *source,
-            program: program.clone(),
-            argv: argv.clone(),
-            cwd: cwd.clone(),
-        },
+
         GuardianApprovalRequest::ApplyPatch { cwd, files, .. } => {
             GuardianAssessmentAction::ApplyPatch {
-                cwd: cwd.clone(),
-                files: files.clone(),
+                cwd: cwd.clone().into(),
+                files: files.iter().cloned().map(Into::into).collect(),
             }
         }
         GuardianApprovalRequest::NetworkAccess {
@@ -467,17 +450,7 @@ pub(crate) fn guardian_reviewed_action(
             additional_permissions: additional_permissions.clone(),
             tty: *tty,
         },
-        #[cfg(unix)]
-        GuardianApprovalRequest::Execve {
-            source,
-            program,
-            additional_permissions,
-            ..
-        } => GuardianReviewedAction::Execve {
-            source: *source,
-            program: program.clone(),
-            additional_permissions: additional_permissions.clone(),
-        },
+
         GuardianApprovalRequest::ApplyPatch { .. } => GuardianReviewedAction::ApplyPatch {},
         GuardianApprovalRequest::NetworkAccess { protocol, port, .. } => {
             GuardianReviewedAction::NetworkAccess {
@@ -513,8 +486,6 @@ pub(crate) fn guardian_request_target_item_id(request: &GuardianApprovalRequest)
         | GuardianApprovalRequest::McpToolCall { id, .. }
         | GuardianApprovalRequest::RequestPermissions { id, .. } => Some(id),
         GuardianApprovalRequest::NetworkAccess { .. } => None,
-        #[cfg(unix)]
-        GuardianApprovalRequest::Execve { id, .. } => Some(id),
     }
 }
 
@@ -529,18 +500,70 @@ pub(crate) fn guardian_request_turn_id<'a>(
         | GuardianApprovalRequest::ExecCommand { .. }
         | GuardianApprovalRequest::ApplyPatch { .. }
         | GuardianApprovalRequest::McpToolCall { .. } => default_turn_id,
-        #[cfg(unix)]
-        GuardianApprovalRequest::Execve { .. } => default_turn_id,
     }
 }
 
 pub(crate) fn format_guardian_action_pretty(
     action: &GuardianApprovalRequest,
 ) -> serde_json::Result<FormattedGuardianAction> {
-    let value = guardian_approval_request_to_json(action)?;
-    let (value, truncated) = truncate_guardian_action_value(value);
+    let (value, pre_truncated) = match action {
+        GuardianApprovalRequest::ApplyPatch {
+            cwd, files, patch, ..
+        } => {
+            let (patch, truncated) =
+                guardian_truncate_text(patch, GUARDIAN_MAX_ACTION_STRING_TOKENS);
+            (
+                serde_json::json!({
+                    "tool": "apply_patch",
+                    "cwd": cwd,
+                    "files": files,
+                    "patch": patch,
+                }),
+                truncated,
+            )
+        }
+        GuardianApprovalRequest::McpToolCall {
+            server,
+            tool_name,
+            arguments,
+            connector_id,
+            connector_name,
+            connector_description,
+            connected_account_email,
+            tool_title,
+            tool_description,
+            annotations,
+            ..
+        } => {
+            let (arguments, truncated) = arguments.as_ref().map_or_else(
+                || (None, false),
+                |arguments| {
+                    let (arguments, truncated) = truncate_guardian_action_value_ref(arguments);
+                    (Some(arguments), truncated)
+                },
+            );
+            (
+                serialize_guardian_action(McpToolCallApprovalAction {
+                    tool: "mcp_tool_call",
+                    server,
+                    tool_name,
+                    arguments: arguments.as_ref(),
+                    connector_id: connector_id.as_ref(),
+                    connector_name: connector_name.as_ref(),
+                    connector_description: connector_description.as_ref(),
+                    connected_account_email: connected_account_email.as_ref(),
+                    tool_title: tool_title.as_ref(),
+                    tool_description: tool_description.as_ref(),
+                    annotations: annotations.as_ref(),
+                })?,
+                truncated,
+            )
+        }
+        _ => (guardian_approval_request_to_json(action)?, false),
+    };
+    let (value, post_truncated) = truncate_guardian_action_value(value);
     Ok(FormattedGuardianAction {
         text: serde_json::to_string_pretty(&value)?,
-        truncated,
+        truncated: pre_truncated || post_truncated,
     })
 }

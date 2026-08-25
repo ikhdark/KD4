@@ -34,7 +34,6 @@ use crate::reducer::AnalyticsReducer;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ClientResponsePayload;
 use codex_app_server_protocol::InitializeParams;
-use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
@@ -497,13 +496,11 @@ impl AnalyticsEventsClient {
         &self,
         connection_id: u64,
         request_id: RequestId,
-        error: JSONRPCErrorError,
         error_type: Option<AnalyticsJsonRpcError>,
     ) {
         self.record_fact(AnalyticsFact::ErrorResponse {
             connection_id,
             request_id,
-            error,
             error_type,
         });
     }
@@ -624,7 +621,14 @@ async fn send_track_events_request(
         #[cfg(debug_assertions)]
         AnalyticsEventsDestination::CaptureFile { .. } => return,
     };
-    let response = create_client()
+    let client = match create_client() {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::warn!("failed to build events HTTP client: {err}");
+            return;
+        }
+    };
+    let response = client
         .post(url)
         .timeout(ANALYTICS_EVENTS_TIMEOUT)
         .headers(codex_model_provider::auth_provider_from_auth(auth).to_auth_headers())

@@ -127,7 +127,7 @@ async fn test_create_client_sets_default_headers() {
     use wiremock::matchers::method;
     use wiremock::matchers::path;
 
-    let client = create_client();
+    let client = create_client().expect("default client should build");
 
     // Spin up a local mock server and capture a request.
     let server = MockServer::start().await;
@@ -170,6 +170,56 @@ async fn test_create_client_sets_default_headers() {
     assert_eq!(residency_header.to_str().unwrap(), "us");
 
     set_default_client_residency_requirement(/*enforce_residency*/ None);
+}
+
+#[test]
+fn default_client_constructors_reject_invalid_custom_ca() {
+    const CHILD_ENV: &str = "CODEX_LOGIN_INVALID_CA_TEST_CHILD";
+
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory should be created");
+        let invalid_ca_path = temp_dir.path().join("invalid-ca.pem");
+        std::fs::write(&invalid_ca_path, "not a PEM certificate")
+            .expect("invalid CA fixture should be written");
+        for sandboxed in [false, true] {
+            let mut command = std::process::Command::new(
+                std::env::current_exe().expect("test executable should be available"),
+            );
+            command
+                .arg("default_client_constructors_reject_invalid_custom_ca")
+                .arg("--nocapture")
+                .env_remove("CODEX_CA_CERTIFICATE")
+                .env_remove("SSL_CERT_FILE")
+                .env_remove("CODEX_SANDBOX")
+                .env("CODEX_CA_CERTIFICATE", &invalid_ca_path)
+                .env(CHILD_ENV, "1");
+            if sandboxed {
+                command.env("CODEX_SANDBOX", "seatbelt");
+            }
+            let output = command.output().expect("isolated CA subprocess should run");
+
+            assert!(
+                output.status.success(),
+                "default client constructors accepted an invalid custom CA (sandboxed: {sandboxed})\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        return;
+    }
+
+    let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
+    assert!(create_client().is_err());
+    assert!(create_client_without_request_logging().is_err());
+    assert!(create_client_with_chatgpt_cookies(&factory).is_err());
+    assert!(
+        create_client_for_route(
+            &factory,
+            "https://example.test/invalid-ca",
+            ClientRouteClass::Auth,
+        )
+        .is_err()
+    );
 }
 
 #[tokio::test]
@@ -280,17 +330,4 @@ fn test_invalid_suffix_is_sanitized2() {
         sanitize_user_agent(format!("{prefix} ({suffix})"), prefix),
         "codex_cli_rs/0.0.0 (bad_suffix)"
     );
-}
-
-#[test]
-#[cfg(target_os = "macos")]
-fn test_macos() {
-    use regex_lite::Regex;
-    let user_agent = get_codex_user_agent();
-    let originator = regex_lite::escape(originator().value.as_str());
-    let re = Regex::new(&format!(
-        r"^{originator}/\d+\.\d+\.\d+ \(Mac OS \d+\.\d+\.\d+; (x86_64|arm64)\) (\S+)$"
-    ))
-    .unwrap();
-    assert!(re.is_match(&user_agent));
 }

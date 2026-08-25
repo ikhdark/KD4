@@ -1,6 +1,14 @@
 use codex_cloud_tasks_client::CloudBackend;
 use codex_cloud_tasks_mock_client::MockClient;
 
+#[test]
+fn mock_client_implementation_lives_at_its_crate_root() {
+    let source = include_str!("../../cloud-tasks-mock-client/src/lib.rs");
+    let obsolete_module = ["mod mo", "ck;"].concat();
+
+    assert!(!source.contains(&obsolete_module));
+}
+
 #[tokio::test]
 async fn mock_backend_varies_by_env() {
     let client = MockClient;

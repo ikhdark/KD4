@@ -14,7 +14,6 @@ use codex_protocol::models::SearchToolCallParams;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use serde_json::json;
-use tracing::warn;
 
 use crate::model::AgentThreadId;
 use crate::model::CodeModeRuntimeToolId;
@@ -365,13 +364,7 @@ fn write_json_payload_best_effort(
     kind: RawPayloadKind,
     payload: &impl Serialize,
 ) -> Option<RawPayloadRef> {
-    match writer.write_json_payload(kind, payload) {
-        Ok(payload_ref) => Some(payload_ref),
-        Err(err) => {
-            warn!("failed to write rollout trace payload: {err:#}");
-            None
-        }
-    }
+    writer.write_json_payload_best_effort(kind, payload)
 }
 
 fn append_with_context_best_effort(
@@ -382,9 +375,9 @@ fn append_with_context_best_effort(
         thread_id: Some(context.thread_id.clone()),
         codex_turn_id: Some(context.codex_turn_id.clone()),
     };
-    if let Err(err) = context.writer.append_with_context(event_context, payload) {
-        warn!("failed to append rollout trace event: {err:#}");
-    }
+    context
+        .writer
+        .append_with_context_best_effort(event_context, payload);
 }
 
 #[cfg(test)]

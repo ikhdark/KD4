@@ -19,7 +19,6 @@
 //! # }
 //! ```
 
-use std::future::Future;
 use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::SystemTime;
@@ -91,18 +90,6 @@ impl LogSinkQueueConfig {
             },
         }
     }
-}
-
-/// A tracing log writer that can flush entries accepted by its queue.
-///
-/// Implementations should keep `Layer::on_event` non-blocking for ordinary log
-/// events. `flush` should wait for entries accepted before the flush command to
-/// be processed by the writer.
-pub trait LogWriter<S>: Layer<S>
-where
-    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
-{
-    fn flush(&self) -> impl Future<Output = ()> + Send + '_;
 }
 
 pub struct LogDbLayer {
@@ -247,15 +234,6 @@ where
         };
 
         self.try_send(entry);
-    }
-}
-
-impl<S> LogWriter<S> for LogDbLayer
-where
-    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
-{
-    fn flush(&self) -> impl Future<Output = ()> + Send + '_ {
-        LogDbLayer::flush(self)
     }
 }
 
@@ -1072,5 +1050,11 @@ mod tests {
             .await
             .expect("flush task completes")
             .expect("flush task succeeds");
+    }
+
+    #[test]
+    fn log_flushing_stays_on_the_concrete_layer() {
+        let removed_trait = ["trait Log", "Writer"].concat();
+        assert!(!include_str!("log_db.rs").contains(&removed_trait));
     }
 }

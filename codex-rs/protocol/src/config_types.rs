@@ -21,6 +21,24 @@ use wildmatch::WildMatchPattern;
 
 use crate::openai_models::ReasoningEffort;
 
+/// HTTP payload encoding used by OTLP/HTTP exporters.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum OtelHttpProtocol {
+    Binary,
+    Json,
+}
+
+/// TLS material used by OTLP exporters.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+#[serde(rename_all = "kebab-case")]
+pub struct OtelTlsConfig {
+    pub ca_certificate: Option<AbsolutePathBuf>,
+    pub client_certificate: Option<AbsolutePathBuf>,
+    pub client_private_key: Option<AbsolutePathBuf>,
+}
+
 /// Selects which part of the active context is charged against
 /// `model_auto_compact_token_limit`.
 #[derive(
@@ -271,6 +289,13 @@ pub enum WindowsSandboxLevel {
     Disabled,
     RestrictedToken,
     Elevated,
+}
+
+/// Windows sandbox implementation selected for an explicit setup request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsSandboxSetupMode {
+    Elevated,
+    Unelevated,
 }
 
 #[derive(

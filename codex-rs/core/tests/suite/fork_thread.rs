@@ -3,6 +3,8 @@ use std::sync::Arc;
 use codex_core::ForkSnapshot;
 use codex_core::NewThread;
 use codex_core::parse_turn_item;
+use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
+use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
@@ -146,6 +148,76 @@ async fn fork_thread_twice_drops_to_first_message() {
     let expected_after_second: Vec<RolloutItem> = fork1_items[..cut_last_on_fork1].to_vec();
     let fork2_items = read_rollout_items(&fork2_path);
     assert_fork_rollout(&fork2_items, &expected_after_second);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fork_thread_from_history_rejects_invalid_dynamic_tools() {
+    skip_if_no_network!();
+
+    let server = MockServer::start().await;
+    let source_sse = sse(vec![
+        ev_response_created("resp-source"),
+        ev_completed("resp-source"),
+    ]);
+    mount_sse_sequence(&server, vec![source_sse]).await;
+
+    let mut builder = test_codex();
+    let test = builder.build(&server).await.expect("create conversation");
+    test.submit_turn("persist source history")
+        .await
+        .expect("complete source turn");
+    test.codex.ensure_rollout_materialized().await;
+    test.codex
+        .flush_rollout()
+        .await
+        .expect("flush source rollout");
+
+    let source_path = test.codex.rollout_path().expect("source rollout path");
+    let mut source_items = read_rollout_items_with_session_meta(&source_path);
+    let session_meta = source_items
+        .iter_mut()
+        .find_map(|item| match item {
+            RolloutItem::SessionMeta(session_meta) => Some(session_meta),
+            _ => None,
+        })
+        .expect("session metadata");
+    session_meta.meta.dynamic_tools =
+        Some(vec![DynamicToolSpec::Function(DynamicToolFunctionSpec {
+            name: "invalid tool name".to_string(),
+            description: "Invalid restored tool fixture.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            defer_loading: false,
+        })]);
+
+    let error = match test
+        .thread_manager
+        .fork_thread_from_history(
+            ForkSnapshot::Interrupted,
+            test.config.clone(),
+            InitialHistory::Resumed(ResumedHistory {
+                conversation_id: test.session_configured.thread_id,
+                history: Arc::new(source_items),
+                rollout_path: None,
+            }),
+            /*thread_source*/ None,
+            /*parent_trace*/ None,
+            /*supports_openai_form_elicitation*/ false,
+        )
+        .await
+    {
+        Ok(_) => panic!("invalid restored dynamic tools should reject fork"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains(
+            "dynamic tool name must match ^[a-zA-Z0-9_-]+$ to match Responses API: invalid tool name"
+        ),
+        "unexpected fork error: {error}"
+    );
 }
 
 #[test]
@@ -293,6 +365,13 @@ fn assert_fork_rollout(actual: &[RolloutItem], expected_copied_prefix: &[Rollout
 }
 
 fn read_rollout_items(path: &std::path::Path) -> Vec<RolloutItem> {
+    read_rollout_items_with_session_meta(path)
+        .into_iter()
+        .filter(|item| !matches!(item, RolloutItem::SessionMeta(_)))
+        .collect()
+}
+
+fn read_rollout_items_with_session_meta(path: &std::path::Path) -> Vec<RolloutItem> {
     let read_message = format!("failed to read rollout file {}", path.display());
     let text = std::fs::read_to_string(path).expect(&read_message);
     let mut items: Vec<RolloutItem> = Vec::new();
@@ -304,10 +383,7 @@ fn read_rollout_items(path: &std::path::Path) -> Vec<RolloutItem> {
         let v: serde_json::Value = serde_json::from_str(line).expect(&parse_json_message);
         let parse_line_message = format!("failed to parse rollout line `{line}`");
         let rl: RolloutLine = serde_json::from_value(v).expect(&parse_line_message);
-        match rl.item {
-            RolloutItem::SessionMeta(_) => {}
-            other => items.push(other),
-        }
+        items.push(rl.item);
     }
     items
 }

@@ -16,8 +16,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::MEMORY_TOOLS_NAMESPACE;
-use crate::backend::MemoriesBackend;
 use crate::backend::MemoriesBackendError;
+use crate::local::LocalMemoriesBackend;
 use crate::schema;
 
 mod ad_hoc_note;
@@ -25,13 +25,10 @@ mod list;
 mod read;
 mod search;
 
-pub(crate) fn memory_tools<B>(
-    backend: B,
+pub(crate) fn memory_tools(
+    backend: LocalMemoriesBackend,
     metrics_client: Option<MetricsClient>,
-) -> Vec<Arc<dyn ToolExecutor<ToolCall>>>
-where
-    B: MemoriesBackend,
-{
+) -> Vec<Arc<dyn ToolExecutor<ToolCall>>> {
     vec![
         Arc::new(ad_hoc_note::AddAdHocNoteTool {
             backend: backend.clone(),

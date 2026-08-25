@@ -1,3 +1,4 @@
+mod atomic_write;
 mod confined_file;
 mod find_up;
 
@@ -146,8 +147,6 @@ pub struct FileSystemSandboxContext {
     pub windows_sandbox_level: WindowsSandboxLevel,
     #[serde(default)]
     pub windows_sandbox_private_desktop: bool,
-    #[serde(default)]
-    pub use_legacy_landlock: bool,
 }
 
 impl FileSystemSandboxContext {
@@ -193,7 +192,6 @@ impl FileSystemSandboxContext {
             workspace_roots: Vec::new(),
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
             windows_sandbox_private_desktop: false,
-            use_legacy_landlock: false,
         }
     }
 
@@ -633,3 +631,10 @@ fn reserve_walk_response_bytes(
     *response_bytes = total_bytes;
     true
 }
+pub use atomic_write::AtomicWriteLock;
+pub use atomic_write::SymlinkWritePaths;
+pub use atomic_write::acquire_atomic_write_lock;
+pub use atomic_write::atomic_write_lock_path;
+pub use atomic_write::resolve_symlink_write_paths;
+pub use atomic_write::write_atomically;
+pub use atomic_write::write_bytes_atomically;

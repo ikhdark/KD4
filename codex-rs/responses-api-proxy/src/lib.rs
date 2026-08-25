@@ -13,6 +13,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use clap::Parser;
+use codex_http_client::build_blocking_reqwest_client_with_custom_ca;
 use reqwest::Url;
 use reqwest::blocking::Client;
 use reqwest::header::AUTHORIZATION;
@@ -100,11 +101,12 @@ pub fn run_main(args: Args) -> Result<()> {
     let server = Server::from_listener(listener, None)
         .map_err(|err| anyhow!("creating HTTP server: {err}"))?;
     let client = Arc::new(
-        Client::builder()
-            // Disable reqwest's 30s default so long-lived response streams keep flowing.
-            .timeout(None::<Duration>)
-            .build()
-            .context("building reqwest client")?,
+        build_blocking_reqwest_client_with_custom_ca(
+            Client::builder()
+                // Disable reqwest's 30s default so long-lived response streams keep flowing.
+                .timeout(None::<Duration>),
+        )
+        .context("building reqwest client")?,
     );
 
     eprintln!("responses-api-proxy listening on {bound_addr}");

@@ -32,8 +32,7 @@ async fn command_approval_holds_an_elicitation_until_response() {
     let (session, turn_context, events) = make_session_and_context_with_rx().await;
     *session.active_turn.lock().await = Some(ActiveTurn::default());
     let mut pause_state = session.subscribe_elicitation_pause_state();
-    #[allow(deprecated)]
-    let cwd = turn_context.cwd.clone();
+    let cwd = turn_context.cwd().clone();
 
     let request = tokio::spawn({
         let session = session.clone();

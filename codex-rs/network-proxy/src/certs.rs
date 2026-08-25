@@ -2,6 +2,7 @@ use anyhow::Context as _;
 use anyhow::Result;
 use anyhow::anyhow;
 use base64::Engine as _;
+use codex_utils_der::first_der_item;
 use codex_utils_home_dir::find_codex_home;
 use rama_net::tls::ApplicationProtocol;
 use rama_tls_rustls::dep::pki_types::CertificateDer;
@@ -372,33 +373,6 @@ fn load_ca_directory_certificates(path: &Path) -> Vec<CertificateDer<'static>> {
     certs
 }
 
-fn first_der_item(der: &[u8]) -> Option<&[u8]> {
-    der_item_length(der).map(|length| &der[..length])
-}
-
-fn der_item_length(der: &[u8]) -> Option<usize> {
-    let &length_octet = der.get(1)?;
-    if length_octet & 0x80 == 0 {
-        return Some(2 + usize::from(length_octet)).filter(|length| *length <= der.len());
-    }
-
-    let length_octets = usize::from(length_octet & 0x7f);
-    if length_octets == 0 {
-        return None;
-    }
-
-    let length_end = 2usize.checked_add(length_octets)?;
-    let mut content_length = 0usize;
-    for &byte in der.get(2..length_end)? {
-        content_length = content_length
-            .checked_mul(256)?
-            .checked_add(usize::from(byte))?;
-    }
-    length_end
-        .checked_add(content_length)
-        .filter(|length| *length <= der.len())
-}
-
 fn is_current_generated_trust_bundle_path(path: &Path, managed_ca_cert_path: &Path) -> bool {
     let Some(proxy_dir) = managed_ca_cert_path.parent() else {
         return false;
@@ -558,13 +532,9 @@ fn open_managed_ca_lock(path: &Path) -> Result<File> {
         ));
     }
 
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    options.mode(0o600);
+
     options
         .open(path)
         .with_context(|| format!("failed to open {}", path.display()))
@@ -745,15 +715,6 @@ fn write_atomic_create_new(path: &Path, contents: &[u8], mode: u32) -> Result<()
     Ok(())
 }
 
-#[cfg(not(windows))]
-fn sync_parent_dir(parent: &Path) -> Result<()> {
-    // Best-effort durability: ensure the directory entry is persisted too.
-    let dir = File::open(parent).with_context(|| format!("failed to open {}", parent.display()))?;
-    dir.sync_all()
-        .with_context(|| format!("failed to fsync {}", parent.display()))
-}
-
-#[cfg(windows)]
 fn sync_parent_dir(_parent: &Path) -> Result<()> {
     Ok(())
 }
@@ -781,19 +742,6 @@ fn write_atomic_create_new_or_reuse(path: &Path, contents: &[u8], mode: u32) -> 
     }
 }
 
-#[cfg(unix)]
-fn open_create_new_with_mode(path: &Path, mode: u32) -> Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(path)
-        .with_context(|| format!("failed to create {}", path.display()))
-}
-
-#[cfg(not(unix))]
 fn open_create_new_with_mode(path: &Path, _mode: u32) -> Result<File> {
     OpenOptions::new()
         .write(true)
@@ -990,24 +938,5 @@ mod tests {
         let baseline_bundle = fs::read_to_string(&trust_bundle.path).unwrap();
 
         assert_eq!(baseline_bundle.matches(&managed_ca_cert).count(), 1);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn write_atomic_create_new_or_reuse_rejects_matching_symlink_target() {
-        use std::os::unix::fs::symlink;
-
-        let dir = tempdir().unwrap();
-        let target = dir.path().join("real-bundle.pem");
-        let link = dir.path().join("ca-bundle.pem");
-        fs::write(&target, "bundle").unwrap();
-        symlink(&target, &link).unwrap();
-
-        let err = write_atomic_create_new_or_reuse(&link, b"bundle", /*mode*/ 0o644).unwrap_err();
-
-        assert_eq!(
-            err.to_string(),
-            format!("refusing to reuse symlink {}", link.display())
-        );
     }
 }

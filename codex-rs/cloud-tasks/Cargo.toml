@@ -18,18 +18,18 @@ chrono = { workspace = true, features = ["serde"] }
 clap = { workspace = true, features = ["derive"] }
 codex-http-client = { workspace = true }
 codex-cloud-tasks-client = { workspace = true }
-# TODO: codex-cloud-tasks-mock-client should be in dev-dependencies.
+# Used by CODEX_CLOUD_TASKS_MODE=mock in debug builds as well as by tests.
 codex-cloud-tasks-mock-client = { workspace = true }
 codex-core = { workspace = true }
 codex-git-utils = { workspace = true }
-codex-login = { path = "../login" }
+codex-login = { workspace = true }
 codex-model-provider = { workspace = true }
 codex-tui = { workspace = true }
 codex-utils-cli = { workspace = true }
 crossterm = { workspace = true, features = ["event-stream"] }
 owo-colors = { workspace = true, features = ["supports-colors"] }
 ratatui = { workspace = true }
-reqwest = { workspace = true, features = ["json"] }
+reqwest = { workspace = true, features = ["json", "rustls"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 supports-color = { workspace = true }

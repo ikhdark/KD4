@@ -37,7 +37,7 @@ class GitDoctorTest(unittest.TestCase):
 
         with (
             mock.patch.object(git_doctor, "run_git", side_effect=run_git),
-            mock.patch.object(git_doctor, "path_kind", return_value="linux"),
+            mock.patch.object(git_doctor, "path_kind", return_value="windows"),
             mock.patch.object(
                 git_doctor, "unreadable_pytest_cache_dirs", return_value=()
             ),
@@ -74,7 +74,7 @@ class GitDoctorTest(unittest.TestCase):
                 self.assertFalse(
                     any(
                         "untracked cache" in item
-                        for item in git_doctor.recommendations("linux", "true", value)
+                        for item in git_doctor.recommendations("windows", "true", value)
                     )
                 )
         for value in ("false", "no", "off", "0", None, "invalid"):
@@ -83,7 +83,7 @@ class GitDoctorTest(unittest.TestCase):
                 self.assertTrue(
                     any(
                         "untracked cache" in item
-                        for item in git_doctor.recommendations("linux", "true", value)
+                        for item in git_doctor.recommendations("windows", "true", value)
                     )
                 )
 

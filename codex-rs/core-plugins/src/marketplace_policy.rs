@@ -21,7 +21,7 @@ use codex_config::types::MarketplaceSourceType;
 use codex_config::types::PluginConfig;
 use codex_plugin::PluginId;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use codex_utils_path::paths_match_after_normalization;
+use codex_utils_absolute_path::paths_match_after_normalization;
 use regex::Regex;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -78,7 +78,7 @@ impl MarketplacePolicy {
         self.restricted.is_some()
     }
 
-    fn validate_source(&self, source: &MarketplaceSource) -> Result<(), String> {
+    pub(crate) fn validate_source(&self, source: &MarketplaceSource) -> Result<(), String> {
         let Some(RestrictedMarketplacePolicy {
             allowed_sources,
             source: requirement_source,
@@ -147,22 +147,6 @@ impl MarketplacePolicy {
             ));
         }
         Ok(())
-    }
-
-    pub(crate) fn validate_git_source(
-        &self,
-        source: &str,
-        ref_name: Option<String>,
-    ) -> Result<Option<MarketplaceSource>, String> {
-        if !self.is_restricted() {
-            return Ok(None);
-        }
-        let source = parse_marketplace_source(source, ref_name).map_err(|err| err.to_string())?;
-        if !matches!(source, MarketplaceSource::Git { .. }) {
-            return Err("configured Git marketplace source is not a Git URL".to_string());
-        }
-        self.validate_source(&source)?;
-        Ok(Some(source))
     }
 
     fn validate_configured_marketplace(

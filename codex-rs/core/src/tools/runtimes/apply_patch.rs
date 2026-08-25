@@ -112,18 +112,18 @@ impl ApplyPatchRuntime {
 
         let cwd = match req.turn_environment.cwd().to_abs_path() {
             Ok(cwd) => cwd.to_path_buf(),
-            Err(_) => {
+            Err(error) => {
+                if binding.is_some() {
+                    return Err(ToolError::Rejected(format!(
+                        "apply_patch: typed mutation evidence requires a host-native workspace: {error}"
+                    )));
+                }
                 self.typed_mutations_started = true;
                 return Ok(());
             }
         };
         let repo_root = get_git_repo_root(&cwd).unwrap_or(cwd);
-        let repo_paths = req
-            .file_paths
-            .iter()
-            .filter_map(|path| path.to_abs_path().ok())
-            .filter_map(|path| normalize_absolute_repo_path(&repo_root, path.as_path()).ok())
-            .collect::<Vec<_>>();
+        let repo_paths = native_mutation_repo_paths(&repo_root, &req.file_paths)?;
 
         if repo_paths.is_empty() {
             ctx.session
@@ -137,9 +137,14 @@ impl ApplyPatchRuntime {
                 .note_host_workspace_mutation_paths(&repo_root, &repo_paths);
         }
 
-        if let (Some(binding), Some(store)) = (binding.as_ref(), coordinator.store()) {
+        if let Some(binding) = binding.as_ref() {
+            let store = coordinator.store().ok_or_else(|| {
+                ToolError::Rejected(
+                    "apply_patch: typed mutation evidence store is unavailable".to_string(),
+                )
+            })?;
             for path in &repo_paths {
-                if let Err(error) = store
+                store
                     .begin_mutation(
                         binding.attempt_id,
                         &repo_root,
@@ -147,13 +152,11 @@ impl ApplyPatchRuntime {
                         AttributionConfidence::Definitive,
                     )
                     .await
-                {
-                    tracing::warn!(
-                        %error,
-                        path,
-                        "apply_patch mutation evidence was unavailable; continuing with the write"
-                    );
-                }
+                    .map_err(|error| {
+                        ToolError::Rejected(format!(
+                            "apply_patch: mutation evidence could not be recorded for `{path}`: {error}"
+                        ))
+                    })?;
             }
         }
 
@@ -205,17 +208,10 @@ impl ApplyPatchRuntime {
         req: &ApplyPatchRequest,
         call_id: &str,
     ) -> std::io::Result<ApprovalAction> {
-        // TODO(anp): Remove this conversion once the guardian API supports PathUri.
-        let cwd = req.action.cwd.to_abs_path()?;
-        let files = req
-            .file_paths
-            .iter()
-            .map(PathUri::to_abs_path)
-            .collect::<std::io::Result<Vec<_>>>()?;
         Ok(ApprovalAction::ApplyPatch {
             id: call_id.to_string(),
-            cwd,
-            files,
+            cwd: req.action.cwd.clone(),
+            files: req.file_paths.clone(),
             patch: req.action.patch.clone(),
         })
     }
@@ -240,9 +236,29 @@ impl ApplyPatchRuntime {
                 .collect(),
             windows_sandbox_level: attempt.windows_sandbox_level,
             windows_sandbox_private_desktop: attempt.windows_sandbox_private_desktop,
-            use_legacy_landlock: attempt.use_legacy_landlock,
         })
     }
+}
+
+fn native_mutation_repo_paths(
+    repo_root: &std::path::Path,
+    file_paths: &[PathUri],
+) -> Result<Vec<String>, ToolError> {
+    file_paths
+        .iter()
+        .map(|path| {
+            let native_path = path.to_abs_path().map_err(|error| {
+                ToolError::Rejected(format!(
+                    "apply_patch: mutation evidence cannot represent `{path}` on this host: {error}"
+                ))
+            })?;
+            normalize_absolute_repo_path(repo_root, native_path.as_path()).map_err(|error| {
+                ToolError::Rejected(format!(
+                    "apply_patch: mutation path `{path}` is outside the evidence workspace: {error}"
+                ))
+            })
+        })
+        .collect()
 }
 
 impl Sandboxable for ApplyPatchRuntime {

@@ -9,9 +9,7 @@ use crate::tools::context::ToolPayload;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::registry::PostToolUsePayload;
-use codex_exec_server::Environment;
 use codex_protocol::models::AdditionalPermissionProfile;
-use codex_tools::UnifiedExecShellMode;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -128,6 +126,7 @@ pub(crate) struct ResolvedCommand {
     pub(crate) command: Vec<String>,
     pub(crate) safety_command: Vec<String>,
     pub(crate) shell_type: ShellType,
+    pub(crate) use_login_shell: bool,
     pub(crate) preflight_shell_type: Option<ShellType>,
 }
 
@@ -154,7 +153,6 @@ fn post_unified_exec_tool_use_payload(
 pub(crate) fn get_command(
     args: &ExecCommandArgs,
     session_shell: Arc<Shell>,
-    shell_mode: &UnifiedExecShellMode,
     allow_login_shell: bool,
     environment_is_remote: bool,
 ) -> Result<ResolvedCommand, String> {
@@ -171,7 +169,8 @@ pub(crate) fn get_command(
 
     if invocation.is_powershell_script() {
         let powershell = match args.shell.as_ref() {
-            Some(shell) => get_shell_by_model_provided_path(&PathBuf::from(shell)),
+            Some(shell) => get_shell_by_model_provided_path(&PathBuf::from(shell))
+                .map_err(|err| err.to_string())?,
             None if session_shell.shell_type == ShellType::PowerShell => {
                 session_shell.as_ref().clone()
             }
@@ -196,6 +195,7 @@ pub(crate) fn get_command(
             command: invocation.to_exec_args(&powershell, use_login_shell),
             safety_command: invocation.to_safety_args(&powershell, use_login_shell),
             shell_type: ShellType::PowerShell,
+            use_login_shell,
             preflight_shell_type: Some(ShellType::PowerShell),
         });
     }
@@ -212,56 +212,26 @@ pub(crate) fn get_command(
             safety_command: command.clone(),
             command,
             shell_type: session_shell.shell_type,
+            use_login_shell,
             preflight_shell_type: None,
         });
     }
 
-    match shell_mode {
-        UnifiedExecShellMode::Direct => {
-            let model_shell = args
-                .shell
-                .as_ref()
-                .map(|shell_str| get_shell_by_model_provided_path(&PathBuf::from(shell_str)));
-            let shell = model_shell.as_ref().unwrap_or(session_shell.as_ref());
-            let command = invocation.to_exec_args(shell, use_login_shell);
-            Ok(ResolvedCommand {
-                safety_command: command.clone(),
-                command,
-                shell_type: shell.shell_type,
-                preflight_shell_type: Some(shell.shell_type),
-            })
-        }
-        UnifiedExecShellMode::ZshFork(zsh_fork_config) => {
-            if args.shell.is_some() {
-                return Err(
-                    "`shell` is not supported for local zsh-fork exec; omit `shell` to use zsh-fork, or target a remote environment where `shell` is supported.".to_string(),
-                );
-            }
-
-            let command = vec![
-                zsh_fork_config.shell_zsh_path.to_string_lossy().to_string(),
-                if use_login_shell { "-lc" } else { "-c" }.to_string(),
-                invocation.display_command(),
-            ];
-            Ok(ResolvedCommand {
-                safety_command: command.clone(),
-                command,
-                shell_type: ShellType::Zsh,
-                preflight_shell_type: Some(ShellType::Zsh),
-            })
-        }
-    }
-}
-
-pub(crate) fn shell_mode_for_environment(
-    turn_shell_mode: &UnifiedExecShellMode,
-    environment: &Environment,
-) -> UnifiedExecShellMode {
-    if environment.is_remote() {
-        UnifiedExecShellMode::Direct
-    } else {
-        turn_shell_mode.clone()
-    }
+    let model_shell = args
+        .shell
+        .as_ref()
+        .map(|shell_str| get_shell_by_model_provided_path(&PathBuf::from(shell_str)))
+        .transpose()
+        .map_err(|err| err.to_string())?;
+    let shell = model_shell.as_ref().unwrap_or(session_shell.as_ref());
+    let command = invocation.to_exec_args(shell, use_login_shell);
+    Ok(ResolvedCommand {
+        safety_command: command.clone(),
+        command,
+        shell_type: shell.shell_type,
+        use_login_shell,
+        preflight_shell_type: Some(shell.shell_type),
+    })
 }
 
 #[cfg(test)]

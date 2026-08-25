@@ -740,7 +740,6 @@ async fn queued_restore_with_remote_images_keeps_local_placeholder_mapping() {
 async fn interrupted_turn_restore_keeps_active_mode_for_resubmission() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
     chat.thread_id = Some(ThreadId::new());
-    chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
 
     let plan_mask = collaboration_modes::plan_mask(chat.model_catalog.as_ref())
         .expect("expected plan collaboration mode");
@@ -1063,7 +1062,6 @@ async fn restore_thread_input_state_syncs_sleep_inhibitor_state() {
         user_turn_pending_start: false,
         current_collaboration_mode: chat.current_collaboration_mode.clone(),
         active_collaboration_mask: chat.active_collaboration_mask.clone(),
-        task_running: true,
         agent_turn_running: true,
     }));
 

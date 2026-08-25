@@ -126,22 +126,6 @@ pub(crate) fn apply_default_headers(
     }
 }
 
-#[cfg(unix)]
-pub(crate) const DEFAULT_ENV_VARS: &[&str] = &[
-    "HOME",
-    "LOGNAME",
-    "PATH",
-    "SHELL",
-    "USER",
-    "__CF_USER_TEXT_ENCODING",
-    "LANG",
-    "LC_ALL",
-    "TERM",
-    "TMPDIR",
-    "TZ",
-];
-
-#[cfg(windows)]
 pub(crate) const DEFAULT_ENV_VARS: &[&str] =
     codex_protocol::shell_environment::WINDOWS_CORE_ENV_VARS;
 
@@ -288,21 +272,5 @@ mod tests {
             err.to_string().contains("requires remote MCP stdio"),
             "unexpected error: {err}"
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[serial(extra_rmcp_env)]
-    fn create_env_preserves_path_when_it_is_not_utf8() {
-        use std::os::unix::ffi::OsStrExt;
-
-        let raw_path = std::ffi::OsStr::from_bytes(b"/tmp/codex-\xFF/bin");
-        let expected = raw_path.to_os_string();
-        let _guard = EnvVarGuard::set("PATH", raw_path);
-
-        let env =
-            create_env_for_mcp_server(/*extra_env*/ None, &[]).expect("local MCP env should build");
-
-        assert_eq!(env.get(OsStr::new("PATH")), Some(&expected));
     }
 }

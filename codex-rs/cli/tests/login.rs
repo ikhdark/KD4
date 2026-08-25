@@ -60,6 +60,19 @@ fn login_with_api_key_reads_stdin_and_writes_auth_json() -> Result<()> {
 }
 
 #[test]
+fn login_rejects_removed_api_key_argument() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let mut cmd = codex_command(codex_home.path())?;
+
+    cmd.args(["login", "--api-key", "sk-should-not-be-accepted"])
+        .assert()
+        .failure()
+        .stderr(contains("unexpected argument '--api-key'"));
+
+    Ok(())
+}
+
+#[test]
 fn login_with_access_token_rejects_invalid_jwt() -> Result<()> {
     let codex_home = TempDir::new()?;
     write_file_auth_config(codex_home.path())?;

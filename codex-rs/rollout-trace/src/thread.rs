@@ -432,12 +432,10 @@ fn start_root_in_root(
     )?;
     let writer = Arc::new(writer);
 
-    if let Err(err) = writer.append(RawTraceEventPayload::RolloutStarted {
+    writer.append_best_effort(RawTraceEventPayload::RolloutStarted {
         trace_id,
         root_thread_id: thread_id.clone(),
-    }) {
-        warn!("failed to append rollout trace event: {err:#}");
-    }
+    });
 
     debug!("recording rollout trace at {}", bundle_dir.display());
     Ok(ThreadTraceContext::start(writer, thread_id, metadata))
@@ -462,13 +460,7 @@ impl EnabledThreadTraceContext {
         kind: RawPayloadKind,
         payload: &impl Serialize,
     ) -> Option<RawPayloadRef> {
-        match self.writer.write_json_payload(kind, payload) {
-            Ok(payload_ref) => Some(payload_ref),
-            Err(err) => {
-                warn!("failed to write rollout trace payload: {err:#}");
-                None
-            }
-        }
+        self.writer.write_json_payload_best_effort(kind, payload)
     }
 
     fn raw_tool_runtime_payload(
@@ -504,9 +496,7 @@ impl EnabledThreadTraceContext {
     }
 
     fn append_best_effort(&self, payload: RawTraceEventPayload) {
-        if let Err(err) = self.writer.append(payload) {
-            warn!("failed to append rollout trace event: {err:#}");
-        }
+        self.writer.append_best_effort(payload);
     }
 
     fn append_with_context_best_effort(
@@ -518,9 +508,8 @@ impl EnabledThreadTraceContext {
             thread_id: Some(self.thread_id.clone()),
             codex_turn_id: Some(codex_turn_id),
         };
-        if let Err(err) = self.writer.append_with_context(event_context, payload) {
-            warn!("failed to append rollout trace event: {err:#}");
-        }
+        self.writer
+            .append_with_context_best_effort(event_context, payload);
     }
 }
 

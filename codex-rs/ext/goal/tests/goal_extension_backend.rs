@@ -200,6 +200,7 @@ async fn goal_tool_surface_tracks_inactive_and_active_state() -> anyhow::Result<
         .await;
 
     let inactive = harness.tools();
+    assert_eq!(harness.tool_surface_revision(), 1);
     assert_eq!(tool_names(&inactive), ["create_goal"]);
     assert_eq!(
         tool_by_name(&inactive, "create_goal").exposure(),
@@ -215,6 +216,7 @@ async fn goal_tool_surface_tracks_inactive_and_active_state() -> anyhow::Result<
         .await?;
 
     let active = harness.tools();
+    assert_eq!(harness.tool_surface_revision(), 2);
     assert_eq!(
         tool_names(&active),
         ["get_goal", "create_goal", "update_goal"]
@@ -240,6 +242,7 @@ async fn goal_tool_surface_tracks_inactive_and_active_state() -> anyhow::Result<
         ))
         .await?;
     let inactive_again = harness.tools();
+    assert_eq!(harness.tool_surface_revision(), 1);
     assert_eq!(tool_names(&inactive_again), ["create_goal"]);
     Ok(())
 }
@@ -1268,6 +1271,17 @@ impl GoalExtensionHarness {
             .iter()
             .flat_map(|contributor| contributor.tools(&self.session_store, &self.thread_store))
             .collect()
+    }
+
+    fn tool_surface_revision(&self) -> u64 {
+        self.registry
+            .tool_contributors()
+            .iter()
+            .fold(0_u64, |revision, contributor| {
+                revision.rotate_left(7).wrapping_add(
+                    contributor.surface_revision(&self.session_store, &self.thread_store),
+                )
+            })
     }
 
     async fn start_turn(&self, turn_id: &str, usage: &TokenUsage) {

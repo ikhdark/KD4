@@ -54,10 +54,20 @@ pub(crate) fn new_plan_update(update: UpdatePlanArgs) -> PlanUpdateCell {
 /// The plan body is stored as raw markdown so terminal resize reflow can render it again at the
 /// current width. Callers should use `new_proposed_plan_stream` only for transient live streaming
 /// cells, then consolidate to this source-backed cell when the plan is complete.
+#[cfg(test)]
 pub(crate) fn new_proposed_plan(plan_markdown: String, cwd: &Path) -> ProposedPlanCell {
+    new_proposed_plan_with_file_opener(plan_markdown, cwd, UriBasedFileOpener::None)
+}
+
+pub(crate) fn new_proposed_plan_with_file_opener(
+    plan_markdown: String,
+    cwd: &Path,
+    file_opener: UriBasedFileOpener,
+) -> ProposedPlanCell {
     ProposedPlanCell {
         plan_markdown,
         cwd: cwd.to_path_buf(),
+        file_opener,
     }
 }
 
@@ -84,6 +94,7 @@ pub(crate) struct ProposedPlanCell {
     plan_markdown: String,
     /// Session cwd used to keep local file-link display aligned with live streamed plan rendering.
     cwd: PathBuf,
+    file_opener: UriBasedFileOpener,
 }
 
 /// Transient proposed-plan history emitted while a plan is still streaming.
@@ -115,6 +126,7 @@ impl HistoryCell for ProposedPlanCell {
             &self.plan_markdown,
             Some(wrap_width),
             Some(self.cwd.as_path()),
+            self.file_opener,
         );
         if body.is_empty() {
             body.push(HyperlinkLine::new(Line::from("(empty)".dim().italic())));

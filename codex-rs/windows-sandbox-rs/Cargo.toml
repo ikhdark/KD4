@@ -22,9 +22,9 @@ path = "src/bin/command_runner/main.rs"
 workspace = true
 
 [dependencies]
-anyhow = "1.0"
+anyhow = { workspace = true }
 base64 = { workspace = true }
-chrono = { version = "0.4.42", default-features = false, features = [
+chrono = { workspace = true, features = [
     "clock",
     "std",
 ] }
@@ -32,13 +32,17 @@ codex-utils-pty = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 codex-utils-string = { workspace = true }
 codex-otel = { workspace = true }
-dunce = "1.0"
+codex-protocol = { workspace = true }
+codex-shell-command = { workspace = true }
+dirs = { workspace = true }
+dunce = { workspace = true }
 glob = { workspace = true }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tempfile = "3"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt", "macros", "signal", "time"] }
 tracing-appender = { workspace = true }
+rand = { workspace = true, features = ["small_rng"] }
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_WindowsFirewall",
@@ -46,19 +50,8 @@ windows = { version = "0.58", features = [
     "Win32_System_Variant",
 ] }
 
-[dependencies.codex-protocol]
-package = "codex-protocol"
-path = "../protocol"
-
-[dependencies.rand]
-default-features = false
-features = ["std", "small_rng"]
-version = "0.8"
-
-[dependencies.dirs-next]
-version = "2.0"
-
-[target.'cfg(windows)'.dependencies.windows-sys]
+[dependencies.windows-sys]
+workspace = true
 features = [
     "Win32_Foundation",
     "Win32_System_Diagnostics_Debug",
@@ -90,7 +83,6 @@ features = [
     "Win32_UI_Shell",
     "Win32_System_Registry",
 ]
-version = "0.52"
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

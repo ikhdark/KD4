@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 
 PACKAGE_NAME = "openai-codex-cli-bin"
@@ -16,8 +15,7 @@ def bundled_package_dir() -> Path:
 
 
 def bundled_codex_path() -> Path:
-    exe = "codex.exe" if os.name == "nt" else "codex"
-    path = bundled_package_dir() / "bin" / exe
+    path = bundled_package_dir() / "bin" / "codex.exe"
     if not path.is_file():
         raise FileNotFoundError(
             f"{PACKAGE_NAME} is installed but missing its packaged codex binary at {path}"

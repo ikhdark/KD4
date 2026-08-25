@@ -15,9 +15,6 @@ async fn direct_file_system_rejects_non_native_uri_as_invalid_input() {
 }
 
 fn non_native_uri() -> PathUri {
-    #[cfg(unix)]
-    let uri = "file://server/share/file.txt";
-    #[cfg(windows)]
     let uri = "file:///usr/local/file.txt";
 
     match PathUri::parse(uri) {

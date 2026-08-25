@@ -153,10 +153,11 @@ fn installed_marketplace_metadata(
     marketplace: &ConfiguredGitMarketplace,
     revision: &str,
 ) -> InstalledMarketplaceMetadata {
+    let (source, ref_name) = marketplace.git_source();
     InstalledMarketplaceMetadata {
         source_type: MarketplaceSourceType::Git,
-        source: marketplace.source.clone(),
-        ref_name: marketplace.ref_name.clone(),
+        source: source.to_string(),
+        ref_name: ref_name.map(str::to_string),
         sparse_paths: marketplace.sparse_paths.clone(),
         revision: revision.to_string(),
     }

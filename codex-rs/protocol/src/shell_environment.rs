@@ -24,7 +24,7 @@ where
 {
     let mut env_map = populate_env(vars, policy, thread_id);
 
-    if cfg!(target_os = "windows") {
+    {
         // Filtered Windows environments still need PATHEXT so command lookup can
         // resolve executable and script extensions consistently.
         if !env_map.keys().any(|k| k.eq_ignore_ascii_case("PATHEXT")) {
@@ -48,9 +48,6 @@ where
         ShellEnvironmentPolicyInherit::All => vars.into_iter().collect(),
         ShellEnvironmentPolicyInherit::None => HashMap::new(),
         ShellEnvironmentPolicyInherit::Core => {
-            #[cfg(not(target_os = "windows"))]
-            let core_env_vars = UNIX_CORE_ENV_VARS;
-            #[cfg(target_os = "windows")]
             let core_env_vars = WINDOWS_CORE_ENV_VARS;
 
             vars.into_iter()
@@ -100,13 +97,6 @@ where
     env_map
 }
 
-#[cfg(not(target_os = "windows"))]
-const UNIX_CORE_ENV_VARS: &[&str] = &[
-    "PATH", "SHELL", "TMPDIR", "TEMP", "TMP", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME",
-    "USER",
-];
-
-#[cfg(target_os = "windows")]
 pub const WINDOWS_CORE_ENV_VARS: &[&str] = &[
     // Core path resolution
     "PATH",
@@ -139,7 +129,7 @@ pub const WINDOWS_CORE_ENV_VARS: &[&str] = &[
     "PWSH",
 ];
 
-#[cfg(all(test, target_os = "windows"))]
+#[cfg(test)]
 mod windows_tests {
     use super::*;
     use pretty_assertions::assert_eq;
@@ -152,7 +142,7 @@ mod windows_tests {
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
+
     fn core_inherit_preserves_windows_startup_vars_case_insensitively() {
         let vars = make_vars(&[
             ("Shell", "C:\\Program Files\\Git\\bin\\bash.exe"),
@@ -187,7 +177,7 @@ mod windows_tests {
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
+
     fn create_env_inserts_pathext_on_windows_when_missing() {
         let policy = ShellEnvironmentPolicy {
             inherit: ShellEnvironmentPolicyInherit::None,
@@ -197,44 +187,6 @@ mod windows_tests {
 
         let result = create_env_from_vars(Vec::new(), &policy, /*thread_id*/ None);
         let expected = HashMap::from([("PATHEXT".to_string(), ".COM;.EXE;.BAT;.CMD".to_string())]);
-
-        assert_eq!(result, expected);
-    }
-}
-
-#[cfg(all(test, not(target_os = "windows")))]
-mod non_windows_tests {
-    use super::*;
-    use pretty_assertions::assert_eq;
-
-    fn make_vars(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs
-            .iter()
-            .map(|(key, value)| (key.to_string(), value.to_string()))
-            .collect()
-    }
-
-    #[test]
-    fn core_inherit_preserves_non_windows_core_vars_case_insensitively() {
-        let vars = make_vars(&[
-            ("path", "/usr/bin"),
-            ("home", "/home/codex"),
-            ("TmpDir", "/tmp/custom"),
-            ("OPENAI_API_KEY", "secret"),
-        ]);
-
-        let policy = ShellEnvironmentPolicy {
-            inherit: ShellEnvironmentPolicyInherit::Core,
-            ignore_default_excludes: true,
-            ..Default::default()
-        };
-
-        let result = populate_env(vars, &policy, /*thread_id*/ None);
-        let expected = HashMap::from([
-            ("path".to_string(), "/usr/bin".to_string()),
-            ("home".to_string(), "/home/codex".to_string()),
-            ("TmpDir".to_string(), "/tmp/custom".to_string()),
-        ]);
 
         assert_eq!(result, expected);
     }

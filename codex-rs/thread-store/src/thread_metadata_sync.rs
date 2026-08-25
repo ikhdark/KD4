@@ -60,11 +60,7 @@ impl ThreadMetadataSync {
     }
 
     pub(crate) fn git_info_from_repository_context(context: &RepositoryContext) -> GitInfo {
-        GitInfo {
-            commit_hash: context.git_info.commit_hash.clone(),
-            branch: context.git_info.branch.clone(),
-            repository_url: context.git_info.repository_url.clone(),
-        }
+        context.git_info.clone()
     }
 
     pub(crate) fn for_create_with_git_info(
@@ -181,7 +177,8 @@ impl ThreadMetadataSync {
             thread_updated_at_touch()
         };
         if advances_recency {
-            update.advance_recency_at = Some(Utc::now());
+            update.advance_recency_at =
+                Some(codex_state::latest_rollout_recency_at(items).unwrap_or_else(Utc::now));
         }
         self.merge_pending_update(Some(update));
         if !affects_metadata
@@ -521,6 +518,7 @@ mod tests {
             model: "persisted-model".to_string(),
             model_provider_id: "persisted-provider".to_string(),
             service_tier: Some(Some("flex".to_string())),
+            developer_instructions: Some(None),
             approval_policy: AskForApproval::Never,
             approvals_reviewer: ApprovalsReviewer::User,
             permission_profile: permission_profile.clone(),
@@ -680,12 +678,13 @@ mod tests {
         let thread_id = ThreadId::new();
         let mut sync = ThreadMetadataSync::for_resume(&resume_params(thread_id, Vec::new()));
 
+        let started_at = 1_735_905_845;
         let update = sync
             .observe_appended_items(&[RolloutItem::EventMsg(EventMsg::TurnStarted(
                 TurnStartedEvent {
                     turn_id: "turn-1".to_string(),
                     trace_id: None,
-                    started_at: None,
+                    started_at: Some(started_at),
                     model_context_window: None,
                     collaboration_mode_kind: Default::default(),
                 },
@@ -693,7 +692,10 @@ mod tests {
             .expect("turn start metadata update");
 
         assert!(update.patch.updated_at.is_some());
-        assert!(update.patch.advance_recency_at.is_some());
+        assert_eq!(
+            update.patch.advance_recency_at,
+            DateTime::<Utc>::from_timestamp(started_at, 0)
+        );
     }
 
     #[test]

@@ -11,16 +11,11 @@ if (scriptArgs.length === 0) {
 const configuredPython = process.env.PYTHON;
 const candidates = configuredPython
   ? [[configuredPython, []]]
-  : process.platform === "win32"
-    ? [
-        ["py", ["-3"]],
-        ["python3", []],
-        ["python", []],
-      ]
-    : [
-        ["python3", []],
-        ["python", []],
-      ];
+  : [
+      ["py", ["-3"]],
+      ["python3", []],
+      ["python", []],
+    ];
 
 for (const [command, prefixArgs] of candidates) {
   const probe = spawnSync(command, [...prefixArgs, "--version"], {

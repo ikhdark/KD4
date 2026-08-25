@@ -53,15 +53,7 @@ impl HistoryEntry {
             text_elements: Vec::new(),
             local_image_paths: Vec::new(),
             remote_image_urls: Vec::new(),
-            mention_bindings: decoded
-                .mentions
-                .into_iter()
-                .map(|mention| MentionBinding {
-                    sigil: mention.sigil,
-                    mention: mention.mention,
-                    path: mention.path,
-                })
-                .collect(),
+            mention_bindings: decoded.mentions,
             pending_pastes: Vec::new(),
         }
     }

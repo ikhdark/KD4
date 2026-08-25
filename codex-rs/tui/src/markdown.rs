@@ -26,6 +26,7 @@ use std::path::Path;
 
 use crate::table_detect;
 use crate::terminal_hyperlinks::HyperlinkLine;
+use codex_config::types::UriBasedFileOpener;
 
 /// Render markdown source to styled ratatui lines and append them to `lines`.
 ///
@@ -70,9 +71,15 @@ pub(crate) fn render_markdown_agent_with_links_and_cwd(
     markdown_source: &str,
     width: Option<usize>,
     cwd: Option<&Path>,
+    file_opener: UriBasedFileOpener,
 ) -> Vec<HyperlinkLine> {
     let normalized = unwrap_markdown_fences(markdown_source);
-    crate::markdown_render::render_markdown_lines_with_width_and_cwd(&normalized, width, cwd)
+    crate::markdown_render::render_markdown_lines_with_width_cwd_and_file_opener(
+        &normalized,
+        width,
+        cwd,
+        file_opener,
+    )
 }
 
 /// Strip `` ```md ``/`` ```markdown `` fences that contain tables, emitting their content as bare

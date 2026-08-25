@@ -122,7 +122,11 @@ async fn step_context_with_blocked_mcp_server(
         runtime_context.clone(),
         turn.config.codex_home.to_path_buf(),
         CodexAppsToolsCache::default(),
-        codex_mcp::codex_apps_tools_cache_key(None),
+        codex_mcp::codex_apps_tools_cache_key(
+            None,
+            &turn.config.chatgpt_base_url,
+            turn.config.apps_mcp_product_sku.as_deref(),
+        ),
         turn.config.prefix_mcp_tool_names(),
         ElicitationCapability::default(),
         /*supports_openai_form_elicitation*/ false,
@@ -771,14 +775,12 @@ async fn cancelled_read_resource_handler_emits_one_failed_terminal_item() {
     let cancellation_token = CancellationToken::new();
     let handler_task = tokio::spawn({
         let session = Arc::clone(&session);
-        let turn = Arc::clone(&turn);
         let cancellation_token = cancellation_token.clone();
         async move {
             ReadMcpResourceHandler
                 .handle(ToolInvocation {
                     session,
                     step_context,
-                    turn,
                     cancellation_token,
                     tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
                     call_id: CALL_ID.to_string(),

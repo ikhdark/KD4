@@ -77,17 +77,8 @@ def git_config(name: str) -> str | None:
 
 
 def path_kind(path: Path) -> str:
-    text = path.as_posix()
-    if os.name == "nt":
-        return "windows"
-    is_wsl = "microsoft" in platform.uname().release.lower() or bool(
-        os.environ.get("WSL_INTEROP")
-    )
-    if is_wsl:
-        if text.startswith("/mnt/") or text.startswith("/run/desktop/mnt/host/"):
-            return "wsl-windows-mount"
-        return "wsl-native"
-    return platform.system().lower() or "unknown"
+    del path
+    return "windows"
 
 
 def fsmonitor_enabled(value: str | None) -> bool:
@@ -164,10 +155,6 @@ def recommendations(
     if not git_boolean_enabled(untracked_cache):
         items.append(
             "Enable the untracked cache: `git config core.untrackedCache true`."
-        )
-    if kind == "wsl-windows-mount":
-        items.append(
-            "This checkout is on a Windows-mounted WSL path; move heavy Rust work to a WSL-native path such as `~/src/KD4` if status/builds remain slow."
         )
     if unreadable_pytest_caches:
         paths = ", ".join(f"`{path}`" for path in unreadable_pytest_caches)

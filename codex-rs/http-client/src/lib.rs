@@ -18,6 +18,7 @@ pub use crate::client::HttpResponse;
 pub use crate::client::RequestBuilder;
 pub use crate::client_builder::HttpClientBuilder;
 pub use crate::custom_ca::BuildCustomCaTransportError;
+pub use crate::custom_ca::build_blocking_reqwest_client_with_custom_ca;
 /// Test-only subprocess hook for custom CA coverage.
 ///
 /// This stays public only so the `custom_ca_probe` binary target can reuse the shared helper. It

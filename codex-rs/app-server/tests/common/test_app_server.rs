@@ -17,6 +17,7 @@ use anyhow::Context;
 use anyhow::ensure;
 use codex_app_server_protocol::AppsInstalledParams;
 use codex_app_server_protocol::AppsListParams;
+use codex_app_server_protocol::AppsReadParams;
 use codex_app_server_protocol::CancelLoginAccountParams;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientNotification;
@@ -93,12 +94,6 @@ use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadMemoryModeSetParams;
 use codex_app_server_protocol::ThreadMetadataUpdateParams;
 use codex_app_server_protocol::ThreadReadParams;
-use codex_app_server_protocol::ThreadRealtimeAppendAudioParams;
-use codex_app_server_protocol::ThreadRealtimeAppendSpeechParams;
-use codex_app_server_protocol::ThreadRealtimeAppendTextParams;
-use codex_app_server_protocol::ThreadRealtimeListVoicesParams;
-use codex_app_server_protocol::ThreadRealtimeStartParams;
-use codex_app_server_protocol::ThreadRealtimeStopParams;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadRollbackParams;
 use codex_app_server_protocol::ThreadSearchParams;
@@ -172,6 +167,10 @@ impl TestAppServer {
 
     pub async fn wait_for_exit(&mut self) -> std::io::Result<ExitStatus> {
         self.process.wait().await
+    }
+
+    pub fn close_stdin(&mut self) {
+        drop(self.stdin.take());
     }
 
     /// Returns the automatically selected test environment retained by this server.
@@ -783,6 +782,12 @@ impl TestAppServer {
         self.send_request("app/installed", params).await
     }
 
+    /// Send an `app/read` JSON-RPC request.
+    pub async fn send_apps_read_request(&mut self, params: AppsReadParams) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("app/read", params).await
+    }
+
     /// Send an `mcpServer/resource/read` JSON-RPC request.
     pub async fn send_mcp_resource_read_request(
         &mut self,
@@ -995,13 +1000,13 @@ impl TestAppServer {
         Ok(completed)
     }
 
-    /// Send a `thread/inject_items` JSON-RPC request (v2).
+    /// Send a `thread/injectItems` JSON-RPC request (v2).
     pub async fn send_thread_inject_items_request(
         &mut self,
         params: ThreadInjectItemsParams,
     ) -> anyhow::Result<i64> {
         let params = Some(serde_json::to_value(params)?);
-        self.send_request("thread/inject_items", params).await
+        self.send_request("thread/injectItems", params).await
     }
 
     /// Send a `command/exec` JSON-RPC request (v2).
@@ -1083,63 +1088,6 @@ impl TestAppServer {
     ) -> anyhow::Result<i64> {
         let params = Some(serde_json::to_value(params)?);
         self.send_request("turn/interrupt", params).await
-    }
-
-    /// Send a `thread/realtime/start` JSON-RPC request (v2).
-    pub async fn send_thread_realtime_start_request(
-        &mut self,
-        params: ThreadRealtimeStartParams,
-    ) -> anyhow::Result<i64> {
-        let params = Some(serde_json::to_value(params)?);
-        self.send_request("thread/realtime/start", params).await
-    }
-
-    /// Send a `thread/realtime/appendAudio` JSON-RPC request (v2).
-    pub async fn send_thread_realtime_append_audio_request(
-        &mut self,
-        params: ThreadRealtimeAppendAudioParams,
-    ) -> anyhow::Result<i64> {
-        let params = Some(serde_json::to_value(params)?);
-        self.send_request("thread/realtime/appendAudio", params)
-            .await
-    }
-
-    /// Send a `thread/realtime/appendText` JSON-RPC request (v2).
-    pub async fn send_thread_realtime_append_text_request(
-        &mut self,
-        params: ThreadRealtimeAppendTextParams,
-    ) -> anyhow::Result<i64> {
-        let params = Some(serde_json::to_value(params)?);
-        self.send_request("thread/realtime/appendText", params)
-            .await
-    }
-
-    /// Send a `thread/realtime/appendSpeech` JSON-RPC request (v2).
-    pub async fn send_thread_realtime_append_speech_request(
-        &mut self,
-        params: ThreadRealtimeAppendSpeechParams,
-    ) -> anyhow::Result<i64> {
-        let params = Some(serde_json::to_value(params)?);
-        self.send_request("thread/realtime/appendSpeech", params)
-            .await
-    }
-
-    /// Send a `thread/realtime/stop` JSON-RPC request (v2).
-    pub async fn send_thread_realtime_stop_request(
-        &mut self,
-        params: ThreadRealtimeStopParams,
-    ) -> anyhow::Result<i64> {
-        let params = Some(serde_json::to_value(params)?);
-        self.send_request("thread/realtime/stop", params).await
-    }
-
-    pub async fn send_thread_realtime_list_voices_request(
-        &mut self,
-        params: ThreadRealtimeListVoicesParams,
-    ) -> anyhow::Result<i64> {
-        let params = Some(serde_json::to_value(params)?);
-        self.send_request("thread/realtime/listVoices", params)
-            .await
     }
 
     /// Deterministically clean up an intentionally in-flight turn.

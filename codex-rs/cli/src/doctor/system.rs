@@ -123,9 +123,9 @@ mod tests {
             ("PAGER".to_string(), "less -R".to_string()),
         ]);
         let check = system_check_from_inputs(SystemCheckInputs {
-            os: "macOS 15.0".to_string(),
-            os_type: "macos".to_string(),
-            os_version: "15.0".to_string(),
+            os: "Windows 11".to_string(),
+            os_type: "windows".to_string(),
+            os_version: "11".to_string(),
             os_language: Some("en-US".to_string()),
             locale_env,
             editor_env,
@@ -136,9 +136,9 @@ mod tests {
         assert_eq!(
             check.details,
             vec![
-                "os: macOS 15.0",
-                "os type: macos",
-                "os version: 15.0",
+                "os: Windows 11",
+                "os type: windows",
+                "os version: 11",
                 "os language: en-US",
                 "LANG: en_US.UTF-8",
                 "VISUAL: code --wait",
@@ -154,8 +154,8 @@ mod tests {
     #[test]
     fn system_check_handles_missing_os_language() {
         let check = system_check_from_inputs(SystemCheckInputs {
-            os: "Linux".to_string(),
-            os_type: "linux".to_string(),
+            os: "Windows".to_string(),
+            os_type: "windows".to_string(),
             os_version: "unknown".to_string(),
             os_language: None,
             locale_env: BTreeMap::new(),
@@ -170,8 +170,8 @@ mod tests {
         assert_eq!(
             check.details,
             vec![
-                "os: Linux",
-                "os type: linux",
+                "os: Windows",
+                "os type: windows",
                 "os version: unknown",
                 "os language: unavailable",
                 "VISUAL: not set",

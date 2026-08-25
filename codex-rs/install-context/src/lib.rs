@@ -11,14 +11,7 @@ const PATH_DIRNAME: &str = "codex-path";
 const RELEASES_DIRNAME: &str = "releases";
 const RESOURCES_DIRNAME: &str = "codex-resources";
 const STANDALONE_PACKAGES_DIRNAME: &str = "standalone";
-const ZSH_DIRNAME: &str = "zsh";
 static INSTALL_CONTEXT: OnceLock<InstallContext> = OnceLock::new();
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StandalonePlatform {
-    Unix,
-    Windows,
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CodexPackageLayout {
@@ -42,15 +35,12 @@ pub struct InstallContext {
 pub enum InstallMethod {
     Standalone {
         /// The managed standalone release directory. Legacy installs use paths
-        /// such as
-        /// `~/.codex/packages/standalone/releases/0.111.0-x86_64-unknown-linux-musl`.
+        /// such as `%CODEX_HOME%\packages\standalone\releases\0.111.0-x86_64-pc-windows-msvc`.
         /// Package-layout installs use the package root that contains `bin/`,
         /// `codex-resources/`, and `codex-path/`.
         release_dir: AbsolutePathBuf,
         /// The bundled resource directory for managed dependencies.
         resources_dir: Option<AbsolutePathBuf>,
-        /// The platform of the standalone release, either `Unix` or `Windows`.
-        platform: StandalonePlatform,
     },
     /// A Codex binary launched through the npm-managed `codex.js` shim.
     Npm,
@@ -58,8 +48,6 @@ pub enum InstallMethod {
     Bun,
     /// A Codex binary launched through the pnpm-managed `codex.js` shim.
     Pnpm,
-    /// A Codex binary that appears to come from a Homebrew install prefix.
-    Brew,
     /// Any other execution environment.
     ///
     /// This commonly covers `cargo run`, app-bundled Codex binaries, custom
@@ -67,23 +55,90 @@ pub enum InstallMethod {
     Other,
 }
 
+/// Update action appropriate for a detected Codex installation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateAction {
+    /// Update a global npm installation.
+    NpmGlobalLatest,
+    /// Update a global Bun installation.
+    BunGlobalLatest,
+    /// Update a global pnpm installation.
+    PnpmGlobalLatest,
+    /// Rerun the standalone Windows installer.
+    StandaloneWindows,
+}
+
+impl UpdateAction {
+    pub fn from_install_context(context: &InstallContext) -> Option<Self> {
+        match &context.method {
+            InstallMethod::Npm => Some(Self::NpmGlobalLatest),
+            InstallMethod::Bun => Some(Self::BunGlobalLatest),
+            InstallMethod::Pnpm => Some(Self::PnpmGlobalLatest),
+            InstallMethod::Standalone { .. } => Some(Self::StandaloneWindows),
+            InstallMethod::Other => None,
+        }
+    }
+
+    pub fn command_args(self) -> (&'static str, &'static [&'static str]) {
+        match self {
+            Self::NpmGlobalLatest => ("npm", &["install", "-g", "@openai/codex"]),
+            Self::BunGlobalLatest => ("bun", &["install", "-g", "@openai/codex"]),
+            Self::PnpmGlobalLatest => ("pnpm", &["add", "-g", "@openai/codex"]),
+            Self::StandaloneWindows => (
+                "powershell",
+                &[
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-c",
+                    "$env:CODEX_NON_INTERACTIVE=1; irm https://chatgpt.com/codex/install.ps1 | iex",
+                ],
+            ),
+        }
+    }
+
+    pub fn command_str(self) -> String {
+        let (command, args) = self.command_args();
+        shlex::try_join(std::iter::once(command).chain(args.iter().copied()))
+            .unwrap_or_else(|_| format!("{command} {}", args.join(" ")))
+    }
+}
+
+/// Compare two stable, three-component release versions.
+pub fn is_newer_version(latest: &str, current: &str) -> Option<bool> {
+    match (
+        parse_release_version(latest),
+        parse_release_version(current),
+    ) {
+        (Some(latest), Some(current)) => Some(latest > current),
+        _ => None,
+    }
+}
+
+/// Extract the version component from a Codex Rust release tag.
+pub fn version_from_release_tag(tag: &str) -> Option<&str> {
+    tag.strip_prefix("rust-v")
+}
+
+/// Return whether a version identifies an unversioned source build.
+pub fn is_source_build_version(version: &str) -> bool {
+    parse_release_version(version) == Some((0, 0, 0))
+}
+
+fn parse_release_version(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.trim().split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next()?.parse::<u64>().ok()?;
+    let patch = parts.next()?.parse::<u64>().ok()?;
+    Some((major, minor, patch))
+}
+
 impl InstallContext {
-    pub fn from_exe(
-        is_macos: bool,
-        current_exe: Option<&Path>,
-        method_override: Option<InstallMethod>,
-    ) -> Self {
+    pub fn from_exe(current_exe: Option<&Path>, method_override: Option<InstallMethod>) -> Self {
         let codex_home = codex_utils_home_dir::find_codex_home().ok();
-        Self::from_exe_with_codex_home(
-            is_macos,
-            current_exe,
-            method_override,
-            codex_home.as_deref(),
-        )
+        Self::from_exe_with_codex_home(current_exe, method_override, codex_home.as_deref())
     }
 
     fn from_exe_with_codex_home(
-        is_macos: bool,
         current_exe: Option<&Path>,
         method_override: Option<InstallMethod>,
         codex_home: Option<&Path>,
@@ -92,7 +147,7 @@ impl InstallContext {
         let method = if let Some(method) = method_override {
             method
         } else if let Some(exe_path) = current_exe {
-            install_method_from_exe(exe_path, codex_home, package_layout.as_ref(), is_macos)
+            install_method_from_exe(exe_path, codex_home, package_layout.as_ref())
         } else {
             InstallMethod::Other
         };
@@ -115,11 +170,7 @@ impl InstallContext {
             } else {
                 None
             };
-            Self::from_exe(
-                cfg!(target_os = "macos"),
-                current_exe.as_deref(),
-                method_override,
-            )
+            Self::from_exe(current_exe.as_deref(), method_override)
         })
     }
 
@@ -170,18 +221,6 @@ impl InstallContext {
 
         None
     }
-
-    pub fn bundled_zsh_path(&self) -> Option<AbsolutePathBuf> {
-        if cfg!(windows) {
-            None
-        } else {
-            self.bundled_resource(zsh_resource_path())
-        }
-    }
-
-    pub fn bundled_zsh_bin_dir(&self) -> Option<AbsolutePathBuf> {
-        self.bundled_zsh_path()?.parent()
-    }
 }
 
 impl CodexPackageLayout {
@@ -213,18 +252,13 @@ fn install_method_from_exe(
     exe_path: &Path,
     codex_home: Option<&Path>,
     package_layout: Option<&CodexPackageLayout>,
-    is_macos: bool,
 ) -> InstallMethod {
     if let Some(standalone_method) = standalone_install_method(exe_path, codex_home, package_layout)
     {
         return standalone_method;
     }
 
-    if is_macos && (exe_path.starts_with("/opt/homebrew") || exe_path.starts_with("/usr/local")) {
-        InstallMethod::Brew
-    } else {
-        InstallMethod::Other
-    }
+    InstallMethod::Other
 }
 
 fn standalone_install_method(
@@ -250,7 +284,6 @@ fn standalone_install_method(
     Some(InstallMethod::Standalone {
         release_dir,
         resources_dir: resources_dir.is_dir().then_some(resources_dir),
-        platform: standalone_platform(),
     })
 }
 
@@ -259,28 +292,12 @@ fn canonical_absolute_path(path: &Path) -> Option<AbsolutePathBuf> {
     AbsolutePathBuf::from_absolute_path(canonical_path).ok()
 }
 
-fn standalone_platform() -> StandalonePlatform {
-    if cfg!(windows) {
-        StandalonePlatform::Windows
-    } else {
-        StandalonePlatform::Unix
-    }
-}
-
 fn existing_dir(path: AbsolutePathBuf) -> Option<AbsolutePathBuf> {
     path.is_dir().then_some(path)
 }
 
 fn default_rg_command() -> PathBuf {
-    if cfg!(windows) {
-        PathBuf::from("rg.exe")
-    } else {
-        PathBuf::from("rg")
-    }
-}
-
-fn zsh_resource_path() -> PathBuf {
-    PathBuf::from(ZSH_DIRNAME).join(BIN_DIRNAME).join("zsh")
+    PathBuf::from("rg.exe")
 }
 
 #[cfg(test)]
@@ -292,14 +309,70 @@ mod tests {
     const TEST_RESOURCE_NAME: &str = "codex-test-helper";
 
     #[test]
+    fn release_version_policy_is_shared() {
+        assert_eq!(version_from_release_tag("rust-v1.5.0"), Some("1.5.0"));
+        assert_eq!(version_from_release_tag("v1.5.0"), None);
+        assert_eq!(is_newer_version("1.2.4", "1.2.3"), Some(true));
+        assert_eq!(is_newer_version("1.2.3", "1.2.4"), Some(false));
+        assert_eq!(is_newer_version("1.2.3-beta.1", "1.2.2"), None);
+        assert_eq!(is_newer_version(" 1.2.3 ", "1.2.2"), Some(true));
+        assert!(is_source_build_version("0.0.0"));
+        assert!(!is_source_build_version("0.1.0"));
+    }
+
+    #[test]
+    fn update_actions_come_from_install_context() {
+        let standalone_release_dir =
+            AbsolutePathBuf::from_absolute_path(std::env::temp_dir().join("standalone-release"))
+                .expect("temp dir path should be absolute");
+        for (method, expected) in [
+            (InstallMethod::Npm, Some(UpdateAction::NpmGlobalLatest)),
+            (InstallMethod::Bun, Some(UpdateAction::BunGlobalLatest)),
+            (InstallMethod::Pnpm, Some(UpdateAction::PnpmGlobalLatest)),
+            (
+                InstallMethod::Standalone {
+                    release_dir: standalone_release_dir,
+                    resources_dir: None,
+                },
+                Some(UpdateAction::StandaloneWindows),
+            ),
+            (InstallMethod::Other, None),
+        ] {
+            assert_eq!(
+                UpdateAction::from_install_context(&InstallContext {
+                    method,
+                    package_layout: None,
+                }),
+                expected
+            );
+        }
+        assert_eq!(
+            UpdateAction::NpmGlobalLatest.command_args(),
+            ("npm", &["install", "-g", "@openai/codex"][..])
+        );
+        assert_eq!(
+            UpdateAction::StandaloneWindows.command_args(),
+            (
+                "powershell",
+                &[
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-c",
+                    "$env:CODEX_NON_INTERACTIVE=1; irm https://chatgpt.com/codex/install.ps1 | iex"
+                ][..],
+            )
+        );
+    }
+
+    #[test]
     fn detects_standalone_install_from_release_layout() -> std::io::Result<()> {
         let codex_home = tempfile::tempdir()?;
         let release_dir = codex_home
             .path()
-            .join("packages/standalone/releases/1.2.3-x86_64-unknown-linux-musl");
+            .join("packages/standalone/releases/1.2.3-x86_64-pc-windows-msvc");
         let resources_dir = release_dir.join(RESOURCES_DIRNAME);
         fs::create_dir_all(&resources_dir)?;
-        let exe_path = release_dir.join(if cfg!(windows) { "codex.exe" } else { "codex" });
+        let exe_path = release_dir.join("codex.exe");
         fs::write(&exe_path, "")?;
         fs::write(resources_dir.join(default_rg_command()), "")?;
         fs::write(resources_dir.join(TEST_RESOURCE_NAME), "")?;
@@ -309,7 +382,6 @@ mod tests {
             AbsolutePathBuf::from_absolute_path(resources_dir.canonicalize()?)?;
 
         let context = InstallContext::from_exe_with_codex_home(
-            /*is_macos*/ false,
             /*current_exe*/ Some(&exe_path),
             /*method_override*/ None,
             /*codex_home*/ Some(codex_home.path()),
@@ -320,7 +392,6 @@ mod tests {
                 method: InstallMethod::Standalone {
                     release_dir: canonical_release_dir,
                     resources_dir: Some(canonical_resources_dir.clone()),
-                    platform: standalone_platform(),
                 },
                 package_layout: None,
             }
@@ -337,13 +408,12 @@ mod tests {
         let codex_home = tempfile::tempdir()?;
         let release_dir = codex_home
             .path()
-            .join("packages/standalone/releases/1.2.3-x86_64-unknown-linux-musl");
+            .join("packages/standalone/releases/1.2.3-x86_64-pc-windows-msvc");
         fs::create_dir_all(&release_dir)?;
-        let exe_path = release_dir.join(if cfg!(windows) { "codex.exe" } else { "codex" });
+        let exe_path = release_dir.join("codex.exe");
         fs::write(&exe_path, "")?;
 
         let context = InstallContext::from_exe_with_codex_home(
-            /*is_macos*/ false,
             /*current_exe*/ Some(&exe_path),
             /*method_override*/ None,
             /*codex_home*/ Some(codex_home.path()),
@@ -362,15 +432,10 @@ mod tests {
         fs::create_dir_all(&resources_dir)?;
         fs::create_dir_all(&path_dir)?;
         fs::write(package_dir.path().join(PACKAGE_METADATA_FILENAME), "{}")?;
-        let exe_path = bin_dir.join(if cfg!(windows) { "codex.exe" } else { "codex" });
+        let exe_path = bin_dir.join("codex.exe");
         fs::write(&exe_path, "")?;
         fs::write(resources_dir.join(TEST_RESOURCE_NAME), "")?;
         fs::write(path_dir.join(default_rg_command()), "")?;
-        if !cfg!(windows) {
-            let zsh_path = resources_dir.join(zsh_resource_path());
-            fs::create_dir_all(zsh_path.parent().expect("zsh path should have parent"))?;
-            fs::write(&zsh_path, "")?;
-        }
         let canonical_package_dir =
             AbsolutePathBuf::from_absolute_path(package_dir.path().canonicalize()?)?;
         let canonical_bin_dir = AbsolutePathBuf::from_absolute_path(bin_dir.canonicalize()?)?;
@@ -385,7 +450,6 @@ mod tests {
         };
 
         let context = InstallContext::from_exe_with_codex_home(
-            /*is_macos*/ false,
             /*current_exe*/ Some(&exe_path),
             /*method_override*/ None,
             /*codex_home*/ None,
@@ -407,19 +471,6 @@ mod tests {
             context.bundled_resource(TEST_RESOURCE_NAME),
             Some(canonical_resources_dir.join(TEST_RESOURCE_NAME))
         );
-        if cfg!(windows) {
-            assert_eq!(context.bundled_zsh_path(), None);
-            assert_eq!(context.bundled_zsh_bin_dir(), None);
-        } else {
-            assert_eq!(
-                context.bundled_zsh_path(),
-                Some(canonical_resources_dir.join(zsh_resource_path()))
-            );
-            assert_eq!(
-                context.bundled_zsh_bin_dir(),
-                Some(canonical_resources_dir.join(ZSH_DIRNAME).join(BIN_DIRNAME))
-            );
-        }
         Ok(())
     }
 
@@ -428,7 +479,7 @@ mod tests {
         let codex_home = tempfile::tempdir()?;
         let package_dir = codex_home
             .path()
-            .join("packages/standalone/releases/1.2.3-x86_64-unknown-linux-musl");
+            .join("packages/standalone/releases/1.2.3-x86_64-pc-windows-msvc");
         let bin_dir = package_dir.join(BIN_DIRNAME);
         let resources_dir = package_dir.join(RESOURCES_DIRNAME);
         let path_dir = package_dir.join(PATH_DIRNAME);
@@ -436,7 +487,7 @@ mod tests {
         fs::create_dir_all(&resources_dir)?;
         fs::create_dir_all(&path_dir)?;
         fs::write(package_dir.join(PACKAGE_METADATA_FILENAME), "{}")?;
-        let exe_path = bin_dir.join(if cfg!(windows) { "codex.exe" } else { "codex" });
+        let exe_path = bin_dir.join("codex.exe");
         fs::write(&exe_path, "")?;
         fs::write(resources_dir.join(TEST_RESOURCE_NAME), "")?;
         fs::write(path_dir.join(default_rg_command()), "")?;
@@ -448,7 +499,6 @@ mod tests {
         let canonical_path_dir = AbsolutePathBuf::from_absolute_path(path_dir.canonicalize()?)?;
 
         let context = InstallContext::from_exe_with_codex_home(
-            /*is_macos*/ false,
             /*current_exe*/ Some(&exe_path),
             /*method_override*/ None,
             /*codex_home*/ Some(codex_home.path()),
@@ -459,7 +509,6 @@ mod tests {
                 method: InstallMethod::Standalone {
                     release_dir: canonical_package_dir.clone(),
                     resources_dir: Some(canonical_resources_dir.clone()),
-                    platform: standalone_platform(),
                 },
                 package_layout: Some(CodexPackageLayout {
                     package_dir: canonical_package_dir,
@@ -490,13 +539,12 @@ mod tests {
         fs::create_dir_all(&bin_dir)?;
         fs::create_dir_all(&path_dir)?;
         fs::write(package_dir.path().join(PACKAGE_METADATA_FILENAME), "{}")?;
-        let exe_path = bin_dir.join(if cfg!(windows) { "codex.exe" } else { "codex" });
+        let exe_path = bin_dir.join("codex.exe");
         fs::write(&exe_path, "")?;
         fs::write(path_dir.join(default_rg_command()), "")?;
         let canonical_path_dir = AbsolutePathBuf::from_absolute_path(path_dir.canonicalize()?)?;
 
         let context = InstallContext::from_exe(
-            /*is_macos*/ false,
             /*current_exe*/ Some(&exe_path),
             /*method_override*/ Some(InstallMethod::Npm),
         );
@@ -517,11 +565,10 @@ mod tests {
         let bin_dir = package_dir.path().join(BIN_DIRNAME);
         fs::create_dir_all(&bin_dir)?;
         fs::write(package_dir.path().join(PACKAGE_METADATA_FILENAME), "{}")?;
-        let exe_path = bin_dir.join(if cfg!(windows) { "codex.exe" } else { "codex" });
+        let exe_path = bin_dir.join("codex.exe");
         fs::write(&exe_path, "")?;
 
         let context = InstallContext::from_exe_with_codex_home(
-            /*is_macos*/ false,
             /*current_exe*/ Some(&exe_path),
             /*method_override*/ None,
             /*codex_home*/ None,
@@ -540,11 +587,10 @@ mod tests {
         fs::create_dir_all(resources_dir.join(TEST_RESOURCE_NAME))?;
         fs::create_dir_all(path_dir.join(default_rg_command()))?;
         fs::write(package_dir.path().join(PACKAGE_METADATA_FILENAME), "{}")?;
-        let exe_path = bin_dir.join(if cfg!(windows) { "codex.exe" } else { "codex" });
+        let exe_path = bin_dir.join("codex.exe");
         fs::write(&exe_path, "")?;
 
         let context = InstallContext::from_exe_with_codex_home(
-            /*is_macos*/ false,
             /*current_exe*/ Some(&exe_path),
             /*method_override*/ None,
             /*codex_home*/ None,
@@ -557,8 +603,7 @@ mod tests {
     #[test]
     fn package_manager_method_overrides_take_precedence() {
         let pnpm_context = InstallContext::from_exe(
-            /*is_macos*/ false,
-            /*current_exe*/ Some(Path::new("/tmp/codex")),
+            /*current_exe*/ Some(Path::new(r"C:\Codex\codex.exe")),
             /*method_override*/ Some(InstallMethod::Pnpm),
         );
         assert_eq!(
@@ -570,8 +615,7 @@ mod tests {
         );
 
         let npm_context = InstallContext::from_exe(
-            /*is_macos*/ false,
-            /*current_exe*/ Some(Path::new("/tmp/codex")),
+            /*current_exe*/ Some(Path::new(r"C:\Codex\codex.exe")),
             /*method_override*/ Some(InstallMethod::Npm),
         );
         assert_eq!(
@@ -583,31 +627,13 @@ mod tests {
         );
 
         let bun_context = InstallContext::from_exe(
-            /*is_macos*/ false,
-            /*current_exe*/ Some(Path::new("/tmp/codex")),
+            /*current_exe*/ Some(Path::new(r"C:\Codex\codex.exe")),
             /*method_override*/ Some(InstallMethod::Bun),
         );
         assert_eq!(
             bun_context,
             InstallContext {
                 method: InstallMethod::Bun,
-                package_layout: None,
-            }
-        );
-    }
-
-    #[test]
-    fn brew_is_detected_on_macos_prefixes() {
-        let context = InstallContext::from_exe_with_codex_home(
-            /*is_macos*/ true,
-            /*current_exe*/ Some(Path::new("/opt/homebrew/bin/codex")),
-            /*method_override*/ None,
-            /*codex_home*/ None,
-        );
-        assert_eq!(
-            context,
-            InstallContext {
-                method: InstallMethod::Brew,
                 package_layout: None,
             }
         );

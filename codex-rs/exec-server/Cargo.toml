@@ -30,7 +30,7 @@ codex-utils-pty = { workspace = true }
 codex-utils-rustls-provider = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
-reqwest = { workspace = true, features = ["json", "rustls-tls", "stream"] }
+reqwest = { workspace = true, features = ["json", "rustls", "stream"] }
 prost = "0.14.3"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -52,13 +52,9 @@ tokio-tungstenite = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 
-[target.'cfg(unix)'.dependencies]
-libc = { workspace = true }
-
-[target.'cfg(windows)'.dependencies]
 codex-utils-home-dir = { workspace = true }
 codex-windows-sandbox = { workspace = true }
-windows-sys = { version = "0.52", features = [
+windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
 ] }
@@ -71,8 +67,8 @@ http = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 pretty_assertions = { workspace = true }
-rcgen = { workspace = true }
-rustls = { workspace = true }
+prost-build = "=0.14.3"
+protoc-bin-vendored = "=3.2.0"
 serial_test = { workspace = true }
 tempfile = { workspace = true }
 test-case = "3.3.1"

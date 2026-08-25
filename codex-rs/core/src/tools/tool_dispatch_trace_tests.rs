@@ -14,7 +14,7 @@ use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
-use crate::function_tool::FunctionCallError;
+use crate::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
@@ -188,6 +188,32 @@ async fn dispatch_timing_measures_exec_spawn_from_request_acceptance() {
     assert!(exited_snapshot.exec_cleanup_state_observed);
     assert!(!exited_snapshot.exec_background_process_expected);
     assert!(exited_snapshot.exec_running_process_after_cleanup);
+}
+
+#[test]
+fn relay_delivery_requires_enqueue_and_is_recorded_exactly_once() {
+    let turn_timing = Arc::new(TurnTimingState::default());
+    turn_timing.mark_turn_started();
+    let timing =
+        ToolDispatchTiming::new_with_turn_clock(turn_timing, tokio::time::Instant::now(), true);
+    let execution_id = timing.execution_id().clone();
+    let stale_execution_id = codex_protocol::protocol::ToolExecutionId("stale".to_string());
+
+    assert!(!timing.mark_relay_delivery(&execution_id));
+    assert!(timing.mark_relay_enqueue());
+    assert!(!timing.mark_relay_delivery(&stale_execution_id));
+    assert!(timing.mark_relay_delivery(&execution_id));
+    assert!(!timing.mark_relay_delivery(&execution_id));
+
+    assert_eq!(
+        timing
+            .snapshot(tokio::time::Instant::now())
+            .lifecycle_events
+            .iter()
+            .filter(|event| event.boundary == ToolLifecycleBoundary::RelayDelivery)
+            .count(),
+        1
+    );
 }
 
 struct TestHandler {
@@ -456,7 +482,6 @@ fn test_invocation_with_payload(
     ToolInvocation {
         session,
         step_context,
-        turn,
         cancellation_token: CancellationToken::new(),
         tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
         call_id: call_id.to_string(),

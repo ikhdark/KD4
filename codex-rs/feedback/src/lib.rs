@@ -728,6 +728,23 @@ mod tests {
     }
 
     #[test]
+    fn configured_sentry_transport_can_be_constructed() {
+        use sentry::TransportFactory;
+        use sentry::transports::DefaultTransportFactory;
+
+        let options = sentry::ClientOptions {
+            dsn: Some(
+                "https://public@example.invalid/1"
+                    .parse()
+                    .expect("test DSN should parse"),
+            ),
+            ..Default::default()
+        };
+
+        let _transport = DefaultTransportFactory.create_transport(&options);
+    }
+
+    #[test]
     fn metadata_layer_records_tags_from_feedback_target() {
         let fb = CodexFeedback::new();
         let _guard = tracing_subscriber::registry()

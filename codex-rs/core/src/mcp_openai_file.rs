@@ -107,7 +107,7 @@ pub(crate) async fn rewrite_mcp_tool_arguments_for_openai_files(
     let upload_auth = codex_model_provider::auth_provider_from_auth(auth);
     let turn_context = step_context.turn.as_ref();
     let http_client_factory = turn_context.config.http_client_factory();
-    let base_url = turn_context.config.chatgpt_base_url.trim_end_matches('/');
+    let base_url = &turn_context.config.chatgpt_base_url;
     let mut uploaded_file_ids = Vec::new();
     let mut rewritten_arguments = arguments.clone();
 
@@ -387,7 +387,7 @@ async fn build_uploaded_argument_value(
     let upload_auth = codex_model_provider::auth_provider_from_auth(auth);
     let turn_context = step_context.turn.as_ref();
     upload_staged_openai_file(
-        turn_context.config.chatgpt_base_url.trim_end_matches('/'),
+        &turn_context.config.chatgpt_base_url,
         upload_auth.as_ref(),
         &turn_context.config.http_client_factory(),
         staged,

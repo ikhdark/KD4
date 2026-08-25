@@ -163,33 +163,6 @@ async fn app_server_startup_lock_serializes_waiters() {
         .expect("second startup lock should succeed");
 }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn control_socket_file_is_private_after_bind() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let temp_dir = tempfile::TempDir::new().expect("temp dir");
-    let socket_path = test_socket_path(temp_dir.path());
-    let (transport_event_tx, _transport_event_rx) =
-        mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
-    let shutdown_token = CancellationToken::new();
-    let accept_handle = start_control_socket_acceptor(
-        socket_path.clone(),
-        transport_event_tx,
-        shutdown_token.clone(),
-    )
-    .await
-    .expect("control socket acceptor should start");
-
-    let metadata = tokio::fs::metadata(socket_path.as_path())
-        .await
-        .expect("socket metadata should exist");
-    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-
-    shutdown_token.cancel();
-    accept_handle.await.expect("acceptor should join");
-}
-
 fn absolute_path(path: &str) -> AbsolutePathBuf {
     AbsolutePathBuf::from_absolute_path(path).expect("absolute path")
 }
@@ -221,12 +194,6 @@ async fn connect_to_socket(socket_path: &Path) -> IoResult<UnixStream> {
     UnixStream::connect(socket_path).await
 }
 
-#[cfg(unix)]
-fn assert_socket_path_removed(socket_path: &Path) {
-    assert!(!socket_path.exists());
-}
-
-#[cfg(windows)]
 fn assert_socket_path_removed(_socket_path: &Path) {
     // uds_windows uses a regular filesystem path as its rendezvous point,
     // but there is no Unix socket filesystem node to assert on.

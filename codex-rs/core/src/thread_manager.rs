@@ -43,14 +43,11 @@ use codex_login::default_client::originator;
 use codex_model_provider::create_model_provider;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::OPENAI_PROVIDER_ID;
-use codex_models_manager::manager::RefreshStrategy;
 use codex_models_manager::manager::SharedModelsManager;
 use codex_protocol::ThreadId;
-use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
-use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::persisted_thread_settings::PersistedThreadSettings;
 use codex_protocol::persisted_thread_settings::PersistedThreadSettingsOverrideMask;
 use codex_protocol::persisted_thread_settings::reduce_persisted_thread_settings;
@@ -71,7 +68,7 @@ use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::W3cTraceContext;
-use codex_rollout::state_db::StateDbHandle;
+use codex_rollout::state_integration::StateDbHandle;
 use codex_thread_store::DeleteThreadParams;
 use codex_thread_store::InMemoryThreadStore;
 use codex_thread_store::LocalThreadStore;
@@ -134,6 +131,9 @@ pub struct NewThread {
     pub thread_id: ThreadId,
     pub thread: Arc<CodexThread>,
     pub session_configured: SessionConfiguredEvent,
+    /// True when a resume found this exact thread already loaded and running.
+    /// Callers must not roll back an instance they did not create.
+    pub was_already_running: bool,
 }
 
 /// Inputs outside rollout history used while reconstructing persistent settings.
@@ -234,6 +234,16 @@ pub struct StartThreadOptions {
     pub environments: Vec<TurnEnvironmentSelection>,
     pub thread_extension_init: ExtensionDataInit,
     pub supports_openai_form_elicitation: bool,
+}
+
+impl StartThreadOptions {
+    pub fn with_dynamic_tools(
+        mut self,
+        dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
+    ) -> Self {
+        self.dynamic_tools = dynamic_tools;
+        self
+    }
 }
 
 fn originator_from_service_name(service_name: Option<&str>) -> Option<String> {
@@ -387,6 +397,9 @@ fn apply_reconstructed_settings_to_config(
     }
     if let Some(service_tier) = settings.service_tier.as_ref() {
         config.service_tier = service_tier.clone();
+    }
+    if let Some(developer_instructions) = settings.developer_instructions.as_ref() {
+        config.developer_instructions = developer_instructions.clone();
     }
     if let Some(reasoning_effort) = settings.reasoning_effort.as_ref() {
         config.model_reasoning_effort = reasoning_effort.clone();
@@ -786,21 +799,6 @@ impl ThreadManager {
         self.state.models_manager.clone()
     }
 
-    pub async fn list_models(
-        &self,
-        refresh_strategy: RefreshStrategy,
-        http_client_factory: codex_http_client::HttpClientFactory,
-    ) -> Vec<ModelPreset> {
-        self.state
-            .models_manager
-            .list_models(refresh_strategy, http_client_factory)
-            .await
-    }
-
-    pub fn list_collaboration_modes(&self) -> Vec<CollaborationModeMask> {
-        self.state.models_manager.list_collaboration_modes()
-    }
-
     pub async fn list_thread_ids(&self) -> Vec<ThreadId> {
         self.state.list_thread_ids().await
     }
@@ -824,6 +822,40 @@ impl ThreadManager {
 
     pub async fn get_thread(&self, thread_id: ThreadId) -> CodexResult<Arc<CodexThread>> {
         self.state.get_thread(thread_id).await
+    }
+
+    /// Resolve a materialized rollout path through the configured thread store.
+    pub async fn resolve_existing_rollout_path(
+        &self,
+        thread_id: ThreadId,
+        include_archived: bool,
+    ) -> CodexResult<Option<PathBuf>> {
+        if let Some(local_store) = self
+            .state
+            .thread_store
+            .as_any()
+            .downcast_ref::<LocalThreadStore>()
+        {
+            return local_store
+                .resolve_existing_rollout_path(thread_id, include_archived)
+                .await
+                .map_err(|err| stored_thread_read_error(thread_id, err));
+        }
+
+        match self
+            .state
+            .thread_store
+            .read_thread(ReadThreadParams {
+                thread_id,
+                include_archived,
+                include_history: false,
+            })
+            .await
+        {
+            Ok(thread) => Ok(thread.rollout_path),
+            Err(ThreadStoreError::ThreadNotFound { .. }) => Ok(None),
+            Err(err) => Err(stored_thread_read_error(thread_id, err)),
+        }
     }
 
     /// Atomically replaces the pending MCP refresh config for a set of threads.
@@ -949,36 +981,35 @@ impl ThreadManager {
         Ok(subtree_thread_ids)
     }
 
-    pub async fn start_thread(&self, config: Config) -> CodexResult<NewThread> {
-        // Box delegated thread-spawn futures so these convenience wrappers do
-        // not inline the full spawn path into every caller's async state.
-        Box::pin(self.start_thread_with_tools(config, Vec::new())).await
-    }
-
-    pub async fn start_thread_with_tools(
-        &self,
-        config: Config,
-        dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
-    ) -> CodexResult<NewThread> {
+    /// Builds the default option set used by [`Self::start_thread`].
+    ///
+    /// Callers that need specialized startup behavior can modify the returned
+    /// options before passing them to [`Self::start_thread_with_options`].
+    pub fn start_thread_options(&self, config: Config) -> StartThreadOptions {
         let environments = default_thread_environment_selections(
             self.state.environment_manager.as_ref(),
             &config.cwd,
         );
-        Box::pin(self.start_thread_with_options(StartThreadOptions {
+        StartThreadOptions {
             config,
             allow_provider_model_fallback: false,
             initial_history: InitialHistory::New,
             history_mode: None,
             session_source: None,
             thread_source: None,
-            dynamic_tools,
+            dynamic_tools: Vec::new(),
             metrics_service_name: None,
             parent_trace: None,
             environments,
             thread_extension_init: ExtensionDataInit::default(),
             supports_openai_form_elicitation: false,
-        }))
-        .await
+        }
+    }
+
+    pub async fn start_thread(&self, config: Config) -> CodexResult<NewThread> {
+        // Box the delegated thread-spawn future so this convenience wrapper does
+        // not inline the full spawn path into every caller's async state.
+        Box::pin(self.start_thread_with_options(self.start_thread_options(config))).await
     }
 
     pub async fn start_thread_with_options(
@@ -1337,6 +1368,27 @@ impl ThreadManager {
         true
     }
 
+    /// Roll back a resumed thread that failed before its creator could publish
+    /// a successful response, preserving the pre-existing persisted thread.
+    #[doc(hidden)]
+    pub async fn rollback_resumed_thread_spawn(
+        &self,
+        thread_id: ThreadId,
+        expected_thread: &Arc<CodexThread>,
+    ) -> bool {
+        if !self
+            .state
+            .remove_thread_if_same(&thread_id, expected_thread)
+            .await
+        {
+            return false;
+        }
+        if let Err(err) = expected_thread.shutdown_and_wait().await {
+            warn!("failed to shut down rolled-back resumed thread {thread_id}: {err}");
+        }
+        true
+    }
+
     /// Tries to shut down all tracked threads concurrently within the provided timeout.
     /// Threads that complete shutdown are removed from the manager; incomplete shutdowns
     /// remain tracked so callers can retry or inspect them later.
@@ -1642,21 +1694,7 @@ impl ThreadManagerState {
         self.thread_store
             .read_thread(params)
             .await
-            .map_err(|err| match err {
-                ThreadStoreError::ThreadNotFound { thread_id } => {
-                    CodexErr::ThreadNotFound(thread_id)
-                }
-                ThreadStoreError::InvalidRequest { message } => {
-                    if message.starts_with("no rollout found for thread id ") {
-                        CodexErr::ThreadNotFound(thread_id)
-                    } else {
-                        CodexErr::Fatal(format!(
-                            "failed to read stored thread {thread_id}: invalid thread-store request: {message}"
-                        ))
-                    }
-                }
-                err => CodexErr::Fatal(format!("failed to read stored thread {thread_id}: {err}")),
-            })
+            .map_err(|err| stored_thread_read_error(thread_id, err))
     }
 
     /// Send an operation to a thread by ID.
@@ -2153,6 +2191,7 @@ impl ThreadManagerState {
                         thread_id: resumed.conversation_id,
                         session_configured: thread.session_configured(),
                         thread,
+                        was_already_running: true,
                     });
                 }
                 threads.remove(&resumed.conversation_id);
@@ -2285,6 +2324,7 @@ impl ThreadManagerState {
                     thread_id,
                     thread,
                     session_configured,
+                    was_already_running: false,
                 });
             }
         }
@@ -2367,8 +2407,21 @@ fn stored_thread_to_initial_history(
 fn thread_store_rollout_read_error(err: ThreadStoreError) -> CodexErr {
     match err {
         ThreadStoreError::ThreadNotFound { thread_id } => CodexErr::ThreadNotFound(thread_id),
+        err @ ThreadStoreError::RolloutNotMaterialized { .. } => {
+            CodexErr::InvalidRequest(err.to_string())
+        }
         ThreadStoreError::InvalidRequest { message } => CodexErr::InvalidRequest(message),
         err => CodexErr::Fatal(format!("failed to read thread by rollout path: {err}")),
+    }
+}
+
+fn stored_thread_read_error(thread_id: ThreadId, err: ThreadStoreError) -> CodexErr {
+    match err {
+        ThreadStoreError::ThreadNotFound { thread_id } => CodexErr::ThreadNotFound(thread_id),
+        ThreadStoreError::InvalidRequest { message } => CodexErr::Fatal(format!(
+            "failed to read stored thread {thread_id}: invalid thread-store request: {message}"
+        )),
+        err => CodexErr::Fatal(format!("failed to read stored thread {thread_id}: {err}")),
     }
 }
 

@@ -11,13 +11,11 @@ pub fn is_likely_sandbox_denied(
         return false;
     }
 
-    const SANDBOX_DENIED_KEYWORDS: [&str; 7] = [
-        "operation not permitted",
+    const SANDBOX_DENIED_KEYWORDS: [&str; 5] = [
         "permission denied",
+        "operation not permitted",
         "read-only file system",
-        "seccomp",
         "sandbox",
-        "landlock",
         "failed to write file",
     ];
 
@@ -41,16 +39,6 @@ pub fn is_likely_sandbox_denied(
     const QUICK_REJECT_EXIT_CODES: [i32; 3] = [2, 126, 127];
     if QUICK_REJECT_EXIT_CODES.contains(&exec_output.exit_code) {
         return false;
-    }
-
-    #[cfg(unix)]
-    {
-        const EXIT_CODE_SIGNAL_BASE: i32 = 128;
-        if sandbox_type == SandboxType::LinuxSeccomp
-            && exec_output.exit_code == EXIT_CODE_SIGNAL_BASE + libc::SIGSYS
-        {
-            return true;
-        }
     }
 
     false

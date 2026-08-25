@@ -1,11 +1,6 @@
 use crate::context_manager::truncate_function_output_payload;
-use crate::original_image_detail::sanitize_original_image_detail;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
-use crate::session::turn_context::TurnContext;
-use crate::tools::TELEMETRY_PREVIEW_MAX_BYTES;
-use crate::tools::TELEMETRY_PREVIEW_MAX_LINES;
-use crate::tools::TELEMETRY_PREVIEW_TRUNCATION_NOTICE;
 use crate::tools::command_output_artifact::RawOutputArtifact;
 #[cfg(test)]
 use crate::tools::command_output_artifact::ToolOutputArtifactId;
@@ -32,6 +27,8 @@ use codex_tools::ToolOutputProjectionMetadata;
 use codex_tools::ToolOutputProjectionRange;
 use codex_tools::ToolOutputSkipDisposition;
 use codex_tools::code_mode_tool_search_result;
+use codex_tools::sanitize_original_image_detail;
+use codex_tools::telemetry_preview;
 use codex_utils_output_truncation::OutputLimitResolution;
 use codex_utils_output_truncation::OutputOutcome;
 use codex_utils_output_truncation::TruncationPolicy;
@@ -40,7 +37,6 @@ use codex_utils_output_truncation::formatted_truncate_text;
 use codex_utils_output_truncation::formatted_truncate_text_with_output_limit;
 use codex_utils_output_truncation::resolve_projected_output_limits;
 use codex_utils_output_truncation::truncate_text_to_token_ceiling;
-use codex_utils_string::take_bytes_at_char_boundary;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
@@ -76,8 +72,6 @@ pub enum ToolCallSource {
 #[derive(Clone)]
 pub struct ToolInvocation {
     pub session: Arc<Session>,
-    // TODO(sayan): Remove this compatibility field once handlers use `step_context.turn`.
-    pub turn: Arc<TurnContext>,
     pub(crate) step_context: Arc<StepContext>,
     pub cancellation_token: CancellationToken,
     pub tracker: SharedTurnDiffTracker,
@@ -1297,46 +1291,6 @@ fn function_tool_response(
         call_id: call_id.to_string(),
         output: FunctionCallOutputPayload { body, success },
     }
-}
-
-fn telemetry_preview(content: &str) -> String {
-    let truncated_slice = take_bytes_at_char_boundary(content, TELEMETRY_PREVIEW_MAX_BYTES);
-    let truncated_by_bytes = truncated_slice.len() < content.len();
-
-    let mut preview = String::new();
-    let mut lines_iter = truncated_slice.lines();
-    for idx in 0..TELEMETRY_PREVIEW_MAX_LINES {
-        match lines_iter.next() {
-            Some(line) => {
-                if idx > 0 {
-                    preview.push('\n');
-                }
-                preview.push_str(line);
-            }
-            None => break,
-        }
-    }
-    let truncated_by_lines = lines_iter.next().is_some();
-
-    if !truncated_by_bytes && !truncated_by_lines {
-        return content.to_string();
-    }
-
-    if preview.len() < truncated_slice.len()
-        && truncated_slice
-            .as_bytes()
-            .get(preview.len())
-            .is_some_and(|byte| *byte == b'\n')
-    {
-        preview.push('\n');
-    }
-
-    if !preview.is_empty() && !preview.ends_with('\n') {
-        preview.push('\n');
-    }
-    preview.push_str(TELEMETRY_PREVIEW_TRUNCATION_NOTICE);
-
-    preview
 }
 
 #[cfg(test)]

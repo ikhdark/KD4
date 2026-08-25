@@ -603,11 +603,7 @@ fn build_authorize_url(
     if let Some(workspace_ids) = forced_chatgpt_workspace_ids {
         query.push(("allowed_workspace_id".to_string(), workspace_ids.join(",")));
     }
-    let qs = query
-        .into_iter()
-        .map(|(k, v)| format!("{k}={}", urlencoding::encode(&v)))
-        .collect::<Vec<_>>()
-        .join("&");
+    let qs = crate::form_urlencode(query);
     format!("{issuer}/oauth/authorize?{qs}")
 }
 
@@ -764,16 +760,7 @@ fn redact_sensitive_url_parts(url: &mut url::Url) {
         return;
     }
 
-    let redacted_query = query_pairs
-        .into_iter()
-        .fold(
-            url::form_urlencoded::Serializer::new(String::new()),
-            |mut serializer, (key, value)| {
-                serializer.append_pair(&key, &value);
-                serializer
-            },
-        )
-        .finish();
+    let redacted_query = crate::form_urlencode(query_pairs);
     url.set_query(Some(&redacted_query));
 }
 
@@ -834,13 +821,13 @@ pub(crate) async fn exchange_code_for_tokens(
     let resp = client
         .post(token_endpoint)
         .header("Content-Type", "application/x-www-form-urlencoded")
-        .body(format!(
-            "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&code_verifier={}",
-            urlencoding::encode(code),
-            urlencoding::encode(redirect_uri),
-            urlencoding::encode(client_id),
-            urlencoding::encode(&pkce.code_verifier)
-        ))
+        .body(crate::form_urlencode([
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", redirect_uri),
+            ("client_id", client_id),
+            ("code_verifier", pkce.code_verifier.as_str()),
+        ]))
         .send()
         .await;
     let resp = match resp {
@@ -1149,14 +1136,19 @@ pub(crate) async fn obtain_api_key(
     let resp = client
         .post(token_endpoint)
         .header("Content-Type", "application/x-www-form-urlencoded")
-        .body(format!(
-            "grant_type={}&client_id={}&requested_token={}&subject_token={}&subject_token_type={}",
-            urlencoding::encode("urn:ietf:params:oauth:grant-type:token-exchange"),
-            urlencoding::encode(client_id),
-            urlencoding::encode("openai-api-key"),
-            urlencoding::encode(id_token),
-            urlencoding::encode("urn:ietf:params:oauth:token-type:id_token")
-        ))
+        .body(crate::form_urlencode([
+            (
+                "grant_type",
+                "urn:ietf:params:oauth:grant-type:token-exchange",
+            ),
+            ("client_id", client_id),
+            ("requested_token", "openai-api-key"),
+            ("subject_token", id_token),
+            (
+                "subject_token_type",
+                "urn:ietf:params:oauth:token-type:id_token",
+            ),
+        ]))
         .send()
         .await
         .map_err(io::Error::other)?;

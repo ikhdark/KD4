@@ -3,7 +3,6 @@
 import json
 import inspect
 import os
-import platform
 import shutil
 import stat
 from pathlib import Path
@@ -12,7 +11,6 @@ from pathlib import PureWindowsPath
 from .targets import PackageInputs
 from .targets import PackageVariant
 from .targets import TargetSpec
-from .zsh import ZSH_RESOURCE_PATH
 
 
 LAYOUT_VERSION = 1
@@ -94,8 +92,6 @@ def validate_package_input_roles(inputs: PackageInputs) -> None:
         ("entrypoint", inputs.entrypoint_bin),
         ("code-mode host", inputs.code_mode_host_bin),
         ("ripgrep", inputs.rg_bin),
-        ("zsh", inputs.zsh_bin),
-        ("bwrap", inputs.bwrap_bin),
         ("Windows command runner", inputs.codex_command_runner_bin),
         ("Windows sandbox setup", inputs.codex_windows_sandbox_setup_bin),
     )
@@ -132,48 +128,32 @@ def build_package_dir(
     copy_executable(
         inputs.entrypoint_bin,
         bin_dir / entrypoint_name,
-        is_windows=spec.is_windows,
     )
     copy_executable(
         inputs.code_mode_host_bin,
         bin_dir / spec.code_mode_host_name,
-        is_windows=spec.is_windows,
     )
     copy_executable(
         inputs.rg_bin,
         path_dir / spec.rg_name,
-        is_windows=spec.is_windows,
         prefer_hardlink=True,
     )
-    if spec.is_windows:
-        for alias in APPLY_PATCH_ALIASES:
-            write_windows_apply_patch_alias(
-                path_dir / f"{alias}.bat",
-                PureWindowsPath("..") / "bin" / entrypoint_name,
-            )
-
-    if inputs.zsh_bin is not None:
-        copy_executable(
-            inputs.zsh_bin,
-            resources_dir / ZSH_RESOURCE_PATH,
-            is_windows=False,
+    for alias in APPLY_PATCH_ALIASES:
+        write_windows_apply_patch_alias(
+            path_dir / f"{alias}.bat",
+            PureWindowsPath("..") / "bin" / entrypoint_name,
         )
-
-    if inputs.bwrap_bin is not None:
-        copy_executable(inputs.bwrap_bin, resources_dir / "bwrap", is_windows=False)
 
     if inputs.codex_command_runner_bin is not None:
         copy_executable(
             inputs.codex_command_runner_bin,
             resources_dir / "codex-command-runner.exe",
-            is_windows=True,
         )
 
     if inputs.codex_windows_sandbox_setup_bin is not None:
         copy_executable(
             inputs.codex_windows_sandbox_setup_bin,
             resources_dir / "codex-windows-sandbox-setup.exe",
-            is_windows=True,
         )
 
     metadata = {
@@ -194,7 +174,6 @@ def validate_package_dir(
     spec: TargetSpec,
     *,
     expected_version: str | None = None,
-    include_zsh: bool,
     fast: bool = False,
 ) -> None:
     required_dirs = [
@@ -244,62 +223,41 @@ def validate_package_dir(
     ]
     executable_files = list(required_files)
 
-    if include_zsh:
-        zsh_path = Path("codex-resources") / ZSH_RESOURCE_PATH
-        required_files.append(zsh_path)
-        executable_files.append(zsh_path)
-
-    if spec.is_linux:
-        required_files.append(Path("codex-resources") / "bwrap")
-        executable_files.append(Path("codex-resources") / "bwrap")
-
-    if spec.is_windows:
-        required_files.extend(
-            [
-                Path("codex-resources") / "codex-command-runner.exe",
-                Path("codex-resources") / "codex-windows-sandbox-setup.exe",
-                *[Path("codex-path") / f"{alias}.bat" for alias in APPLY_PATCH_ALIASES],
-            ]
-        )
+    required_files.extend(
+        [
+            Path("codex-resources") / "codex-command-runner.exe",
+            Path("codex-resources") / "codex-windows-sandbox-setup.exe",
+            *[Path("codex-path") / f"{alias}.bat" for alias in APPLY_PATCH_ALIASES],
+        ]
+    )
 
     for relative_file in required_files:
         path = package_dir / relative_file
         if not path.is_file():
             raise RuntimeError(f"Missing package file: {relative_file}")
 
-    if spec.is_windows:
-        expected_alias_text = windows_apply_patch_alias_text(
-            PureWindowsPath("..") / "bin" / variant.entrypoint_name(spec)
-        )
-        for alias in APPLY_PATCH_ALIASES:
-            relative_file = Path("codex-path") / f"{alias}.bat"
-            actual = (package_dir / relative_file).read_text(encoding="utf-8")
-            if actual != expected_alias_text:
-                raise RuntimeError(f"Invalid package file contents: {relative_file}")
-
-    if not spec.is_windows and not fast:
-        for relative_file in executable_files:
-            path = package_dir / relative_file
-            if not is_executable(path):
-                raise RuntimeError(f"Package file is not executable: {relative_file}")
+    expected_alias_text = windows_apply_patch_alias_text(
+        PureWindowsPath("..") / "bin" / variant.entrypoint_name(spec)
+    )
+    for alias in APPLY_PATCH_ALIASES:
+        relative_file = Path("codex-path") / f"{alias}.bat"
+        actual = (package_dir / relative_file).read_text(encoding="utf-8")
+        if actual != expected_alias_text:
+            raise RuntimeError(f"Invalid package file contents: {relative_file}")
 
 
 def copy_executable(
     src: Path,
     dest: Path,
     *,
-    is_windows: bool,
     prefer_hardlink: bool | None = None,
 ) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     copy_file_for_staging(
         src,
         dest,
-        prefer_hardlink=is_windows if prefer_hardlink is None else prefer_hardlink,
+        prefer_hardlink=True if prefer_hardlink is None else prefer_hardlink,
     )
-    if not is_windows:
-        mode = dest.stat().st_mode
-        dest.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
 def write_windows_apply_patch_alias(
@@ -339,7 +297,4 @@ def write_json(path: Path, value: object) -> None:
 
 
 def is_executable(path: Path) -> bool:
-    if platform.system().lower() == "windows":
-        return path.is_file()
-
-    return bool(path.stat().st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
+    return path.is_file()

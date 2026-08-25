@@ -6,6 +6,7 @@ use super::super::RemotePluginServiceConfig;
 use super::local_paths;
 use codex_app_server_protocol::PluginAuthPolicy;
 use codex_app_server_protocol::PluginInstallPolicy;
+use codex_file_system::write_atomically;
 use codex_login::CodexAuth;
 use codex_plugin::PluginId;
 use codex_plugin::validate_plugin_segment;
@@ -15,7 +16,6 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
-use std::io::Write;
 use std::path::Component;
 use std::path::Path;
 
@@ -328,7 +328,7 @@ fn update_personal_marketplace(
 
     let contents = serde_json::to_string_pretty(&marketplace)
         .map_err(|err| RemotePluginCatalogError::UnexpectedResponse(err.to_string()))?;
-    write_json_atomically(marketplace_path.as_path(), &format!("{contents}\n")).map_err(|err| {
+    write_atomically(marketplace_path.as_path(), &format!("{contents}\n")).map_err(|err| {
         RemotePluginCatalogError::UnexpectedResponse(format!(
             "failed to update personal plugin marketplace: {err}"
         ))
@@ -453,18 +453,4 @@ fn invalid_marketplace_file(path: &Path, message: &str) -> RemotePluginCatalogEr
         path: path.to_path_buf(),
         reason: message.to_string(),
     }
-}
-
-fn write_json_atomically(write_path: &Path, contents: &str) -> io::Result<()> {
-    let parent = write_path.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("path {} has no parent directory", write_path.display()),
-        )
-    })?;
-    std::fs::create_dir_all(parent)?;
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-    tmp.write_all(contents.as_bytes())?;
-    tmp.persist(write_path).map_err(|err| err.error)?;
-    Ok(())
 }

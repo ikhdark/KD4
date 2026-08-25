@@ -14,7 +14,6 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use codex_extension_api::ExtensionData;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use sha2::Digest;
@@ -61,8 +60,6 @@ use crate::task_evidence::TerminalizationReceiptSnapshot;
 use crate::terminal_event_fingerprint;
 use codex_analytics::TurnProfileFact;
 use codex_analytics::TurnTokenUsageFact;
-use codex_login::AuthManager;
-use codex_models_manager::manager::SharedModelsManager;
 use codex_otel::SessionTelemetry;
 use codex_otel::TURN_E2E_DURATION_METRIC;
 use codex_otel::TURN_MEMORY_METRIC;
@@ -215,6 +212,7 @@ struct TerminalDeadline {
 }
 
 impl TerminalDeadline {
+    #[cfg(test)]
     fn start() -> Self {
         let started = tokio::time::Instant::now();
         Self {
@@ -492,38 +490,6 @@ fn bool_tag(value: bool) -> &'static str {
     if value { "true" } else { "false" }
 }
 
-/// Thin wrapper that exposes the parts of [`Session`] task runners need.
-#[derive(Clone)]
-pub(crate) struct SessionTaskContext {
-    session: Arc<Session>,
-    turn_extension_data: Arc<ExtensionData>,
-}
-
-impl SessionTaskContext {
-    pub(crate) fn new(session: Arc<Session>, turn_extension_data: Arc<ExtensionData>) -> Self {
-        Self {
-            session,
-            turn_extension_data,
-        }
-    }
-
-    pub(crate) fn clone_session(&self) -> Arc<Session> {
-        Arc::clone(&self.session)
-    }
-
-    pub(crate) fn turn_extension_data(&self) -> Arc<ExtensionData> {
-        Arc::clone(&self.turn_extension_data)
-    }
-
-    pub(crate) fn auth_manager(&self) -> Arc<AuthManager> {
-        Arc::clone(&self.session.services.auth_manager)
-    }
-
-    pub(crate) fn models_manager(&self) -> SharedModelsManager {
-        Arc::clone(&self.session.services.models_manager)
-    }
-}
-
 /// Async task that drives a [`Session`] turn.
 ///
 /// Implementations encapsulate a specific Codex workflow (regular chat,
@@ -552,82 +518,21 @@ pub(crate) trait SessionTask: Send + Sync + 'static {
     /// lifecycle instead.
     fn run(
         self: Arc<Self>,
-        session: Arc<SessionTaskContext>,
+        session: Arc<Session>,
         ctx: Arc<TurnContext>,
         input: Vec<TurnInput>,
         cancellation_token: CancellationToken,
-    ) -> impl std::future::Future<Output = SessionTaskResult> + Send;
+    ) -> BoxFuture<'static, SessionTaskResult>;
 
     /// Gives the task a chance to perform cleanup after an abort.
     ///
     /// The default implementation is a no-op; override this if additional
     /// teardown or notifications are required once
     /// [`Session::abort_all_tasks`] cancels the task.
-    fn abort(
-        &self,
-        session: Arc<SessionTaskContext>,
-        ctx: Arc<TurnContext>,
-    ) -> impl std::future::Future<Output = ()> + Send {
-        async move {
+    fn abort<'a>(&'a self, session: Arc<Session>, ctx: Arc<TurnContext>) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
             let _ = (session, ctx);
-        }
-    }
-}
-
-pub(crate) trait AnySessionTask: Send + Sync + 'static {
-    fn kind(&self) -> TaskKind;
-
-    fn span_name(&self) -> &'static str;
-
-    fn run(
-        self: Arc<Self>,
-        session: Arc<SessionTaskContext>,
-        ctx: Arc<TurnContext>,
-        input: Vec<TurnInput>,
-        cancellation_token: CancellationToken,
-    ) -> BoxFuture<'static, SessionTaskResult>;
-
-    fn abort<'a>(
-        &'a self,
-        session: Arc<SessionTaskContext>,
-        ctx: Arc<TurnContext>,
-    ) -> BoxFuture<'a, ()>;
-}
-
-impl<T> AnySessionTask for T
-where
-    T: SessionTask,
-{
-    fn kind(&self) -> TaskKind {
-        SessionTask::kind(self)
-    }
-
-    fn span_name(&self) -> &'static str {
-        SessionTask::span_name(self)
-    }
-
-    fn run(
-        self: Arc<Self>,
-        session: Arc<SessionTaskContext>,
-        ctx: Arc<TurnContext>,
-        input: Vec<TurnInput>,
-        cancellation_token: CancellationToken,
-    ) -> BoxFuture<'static, SessionTaskResult> {
-        Box::pin(SessionTask::run(
-            self,
-            session,
-            ctx,
-            input,
-            cancellation_token,
-        ))
-    }
-
-    fn abort<'a>(
-        &'a self,
-        session: Arc<SessionTaskContext>,
-        ctx: Arc<TurnContext>,
-    ) -> BoxFuture<'a, ()> {
-        Box::pin(SessionTask::abort(self, session, ctx))
+        })
     }
 }
 
@@ -680,6 +585,13 @@ struct TerminalInteractionMilestone {
     live_attempted: bool,
     live_delivered: bool,
     cleared_active_turn: bool,
+}
+
+struct TerminalInteractionOutcome {
+    durable_outcome: String,
+    durable_success_established: bool,
+    rollout_structure_ready: bool,
+    rollout_repair_items: Vec<ResponseItem>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -784,16 +696,20 @@ async fn seal_terminal_final_proof(
         .await?;
     let workspace_path_snapshot_identity =
         identity_snapshot.workspace_path_snapshot_identity.clone();
+    let capture =
+        crate::git_workspace::capture_candidate_diff(turn_context.config.cwd.as_path()).await;
+    let observed_workspace_identity = capture
+        .as_ref()
+        .map(crate::git_workspace::CandidateDiffCapture::workspace_evidence_identity);
     let workspace_epoch = session
         .services
         .command_execution
-        .observe_repository_revision(
+        .observe_repository_revision_with_identity(
             &turn_context.sub_id,
             identity_snapshot.host_mutation_revision,
+            observed_workspace_identity,
         )
         .await;
-    let capture =
-        crate::git_workspace::capture_candidate_diff(turn_context.config.cwd.as_path()).await;
     let (head_identity, index_identity, worktree_identity, changed_paths, raw_diff) =
         if let Some(capture) = capture {
             (
@@ -1026,7 +942,7 @@ impl Session {
                 return;
             }
         };
-        let task: Arc<dyn AnySessionTask> = Arc::new(task);
+        let task: Arc<dyn SessionTask> = Arc::new(task);
         let task_kind = task.kind();
         let span_name = task.span_name();
         let turn_started_at_unix_ms = turn_context.turn_timing_state.mark_turn_started();
@@ -1065,15 +981,11 @@ impl Session {
         self.emit_turn_start_lifecycle(turn_context.as_ref(), &token_usage_at_turn_start)
             .await;
 
-        let turn_extension_data = Arc::clone(&turn_context.extension_data);
         let mut active = self.active_turn.lock().await;
         let turn = active.get_or_insert_with(ActiveTurn::default);
         debug_assert!(turn.task.is_none());
         let done_clone = Arc::clone(&done);
-        let session_ctx = Arc::new(SessionTaskContext::new(
-            Arc::clone(self),
-            Arc::clone(&turn_extension_data),
-        ));
+        let session = Arc::clone(self);
         let ctx = Arc::clone(&turn_context);
         let task_for_run = Arc::clone(&task);
         let task_input = input;
@@ -1104,7 +1016,7 @@ impl Session {
                 let _ = start_rx.await;
                 task_for_run
                     .run(
-                        session_ctx,
+                        session,
                         ctx,
                         task_input,
                         task_cancellation_token.child_token(),
@@ -1134,7 +1046,6 @@ impl Session {
             _supervisor_handle: supervisor_handle,
             task_span,
             turn_context: Arc::clone(&turn_context),
-            turn_extension_data,
             _agent_execution_guard: agent_execution_guard,
         };
         turn.task = Some(running_task);
@@ -1478,11 +1389,14 @@ impl Session {
         finalization: &mut TerminalFinalization,
         turn_context: &TurnContext,
         event: &mut EventMsg,
-        durable_outcome: String,
-        durable_success_established: bool,
-        rollout_structure_ready: bool,
-        rollout_repair_items: Vec<ResponseItem>,
+        outcome: TerminalInteractionOutcome,
     ) -> TerminalInteractionMilestone {
+        let TerminalInteractionOutcome {
+            durable_outcome,
+            durable_success_established,
+            rollout_structure_ready,
+            rollout_repair_items,
+        } = outcome;
         let terminal_identity = format!("{}:{}", self.thread_id, turn_context.sub_id);
         apply_terminal_phase_timings(event, &finalization.deadline.phase_timings_ns());
         let Some(candidate_fingerprint) = terminal_event_fingerprint(event) else {
@@ -3029,16 +2943,12 @@ impl Session {
             finalization.task.worker_abort_handle.abort();
 
             let session_task = Arc::clone(&finalization.task.task);
-            let session_ctx = Arc::new(SessionTaskContext::new(
-                Arc::clone(self),
-                Arc::clone(&finalization.task.turn_extension_data),
-            ));
             if finalization
                 .deadline
                 .run(
                     "hooks_quiescence",
                     TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                    session_task.abort(session_ctx, Arc::clone(&turn_context)),
+                    session_task.abort(Arc::clone(self), Arc::clone(&turn_context)),
                 )
                 .await
                 .is_err()
@@ -4002,10 +3912,12 @@ impl Session {
                 finalization,
                 turn_context.as_ref(),
                 &mut event,
-                durable_outcome,
-                passed_root_completion,
-                rollout_structure_ready,
-                interrupted_marker_repair,
+                TerminalInteractionOutcome {
+                    durable_outcome,
+                    durable_success_established: passed_root_completion,
+                    rollout_structure_ready,
+                    rollout_repair_items: interrupted_marker_repair,
+                },
             )
             .await;
         if !finalization.coordinator.durable_terminal_committed() {
@@ -4344,10 +4256,12 @@ impl Session {
                     finalization,
                     turn_context.as_ref(),
                     &mut event,
-                    "fail_safe".to_string(),
-                    false,
-                    rollout_structure_ready,
-                    interrupted_marker_repair,
+                    TerminalInteractionOutcome {
+                        durable_outcome: "fail_safe".to_string(),
+                        durable_success_established: false,
+                        rollout_structure_ready,
+                        rollout_repair_items: interrupted_marker_repair,
+                    },
                 )
                 .await;
             if milestone.live_attempted {
@@ -4452,7 +4366,7 @@ impl Session {
             tokio::time::Instant::now().saturating_duration_since(post_cleanup_started),
         );
         finalization.deadline.finish_unclassified();
-        let _ = self.emit_pending_turn_profile(finalization);
+        let final_terminalization = self.emit_pending_turn_profile(finalization);
         if had_authoritative_claim || finalization.coordinator.durable_terminal_committed() {
             let delivery_state = match finalization.coordinator.delivery_state() {
                 CoordinatorDeliveryState::NotAttempted => DurableDeliveryState::NotAttempted,
@@ -4472,7 +4386,7 @@ impl Session {
                 terminal_interaction_released: true,
                 recovery_state: TerminalRecoveryState::Recovered,
                 phase_timings_ns: finalization.deadline.phase_timings_ns(),
-                terminalization: None,
+                terminalization: final_terminalization,
             };
             let persisted = tokio::time::timeout(
                 TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
@@ -4481,13 +4395,28 @@ impl Session {
                     .update_terminal_interaction(update.clone()),
             )
             .await;
-            if !matches!(persisted, Ok(true)) {
-                warn!(turn_id = %turn_context.sub_id, "fail-safe terminal interaction receipt remains pending; retrying persistence only");
-                self.schedule_terminal_interaction_persistence_retry(
-                    Arc::clone(&turn_context),
-                    update,
-                    None,
-                );
+            match persisted {
+                Ok(true) => {
+                    let session = Arc::clone(self);
+                    let receipt_turn_context = Arc::clone(&turn_context);
+                    let terminal_identity = update.terminal_identity.clone();
+                    self.spawn_terminal_receipt_task(async move {
+                        session
+                            .emit_terminalization_receipt(
+                                receipt_turn_context.as_ref(),
+                                &terminal_identity,
+                            )
+                            .await;
+                    });
+                }
+                Ok(false) | Err(_) => {
+                    warn!(turn_id = %turn_context.sub_id, "fail-safe terminal interaction receipt remains pending; retrying persistence only");
+                    self.schedule_terminal_interaction_persistence_retry(
+                        Arc::clone(&turn_context),
+                        update,
+                        None,
+                    );
+                }
             }
         }
     }

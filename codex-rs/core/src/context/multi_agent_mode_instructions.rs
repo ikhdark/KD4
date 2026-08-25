@@ -4,7 +4,6 @@ use codex_protocol::protocol::MULTI_AGENT_MODE_CLOSE_TAG;
 use codex_protocol::protocol::MULTI_AGENT_MODE_OPEN_TAG;
 
 const EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT: &str = "Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.";
-const PROACTIVE_MULTI_AGENT_MODE_TEXT: &str = "Proactive multi-agent delegation is active. Any earlier instruction requiring an explicit user request before spawning sub-agents no longer applies. Use sub-agents when parallel work would materially improve speed or quality. This mode remains active until a later multi-agent mode developer message changes it.";
 const ORCHESTRATOR_TEMPLATE: &str = include_str!("../../templates/agents/orchestrator.md");
 const ROOT_ORCHESTRATION_OPEN: &str = "<!-- runtime-root-orchestration:start -->";
 const ROOT_ORCHESTRATION_CLOSE: &str = "<!-- runtime-root-orchestration:end -->";
@@ -36,10 +35,15 @@ fn root_orchestration_text() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use super::EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT;
+    use super::EffectiveMultiAgentMode;
+    use super::MultiAgentModeInstructions;
     use super::ROOT_ORCHESTRATION_CLOSE;
     use super::ROOT_ORCHESTRATION_OPEN;
     use super::extract_root_orchestration_text;
     use super::root_orchestration_text;
+    use crate::context::ContextualUserFragment;
+    use codex_protocol::config_types::MultiAgentMode;
 
     #[test]
     fn extracts_exactly_one_ordered_root_orchestration_section() {
@@ -78,6 +82,42 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn effective_modes_only_persist_and_render_current_policies() {
+        let cases = [
+            (
+                EffectiveMultiAgentMode::Custom("custom policy".to_string()),
+                MultiAgentMode::Custom("custom policy".to_string()),
+                "custom policy",
+            ),
+            (
+                EffectiveMultiAgentMode::ExplicitRequestOnly,
+                MultiAgentMode::ExplicitRequestOnly,
+                EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT,
+            ),
+        ];
+
+        for (mode, persisted, rendered) in cases {
+            assert_eq!(mode.to_persisted_mode(), persisted);
+            assert_eq!(MultiAgentModeInstructions::new(mode).body(), rendered);
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EffectiveMultiAgentMode {
+    Custom(String),
+    ExplicitRequestOnly,
+}
+
+impl EffectiveMultiAgentMode {
+    pub(crate) fn to_persisted_mode(&self) -> MultiAgentMode {
+        match self {
+            Self::Custom(hint_text) => MultiAgentMode::Custom(hint_text.clone()),
+            Self::ExplicitRequestOnly => MultiAgentMode::ExplicitRequestOnly,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,11 +146,11 @@ impl ContextualUserFragment for RootOrchestrationInstructions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MultiAgentModeInstructions {
-    multi_agent_mode: MultiAgentMode,
+    multi_agent_mode: EffectiveMultiAgentMode,
 }
 
 impl MultiAgentModeInstructions {
-    pub(crate) fn new(multi_agent_mode: MultiAgentMode) -> Self {
+    pub(crate) fn new(multi_agent_mode: EffectiveMultiAgentMode) -> Self {
         Self { multi_agent_mode }
     }
 }
@@ -130,11 +170,10 @@ impl ContextualUserFragment for MultiAgentModeInstructions {
 
     fn body(&self) -> String {
         match &self.multi_agent_mode {
-            MultiAgentMode::Custom(hint_text) => hint_text.clone(),
-            MultiAgentMode::ExplicitRequestOnly => {
+            EffectiveMultiAgentMode::Custom(hint_text) => hint_text.clone(),
+            EffectiveMultiAgentMode::ExplicitRequestOnly => {
                 EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT.to_string()
             }
-            MultiAgentMode::Proactive => PROACTIVE_MULTI_AGENT_MODE_TEXT.to_string(),
         }
     }
 }

@@ -43,7 +43,6 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::RealtimeConversationVersion as RealtimeWsVersion;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionSource;
@@ -422,11 +421,10 @@ impl TestCodexBuilder {
     }
 
     pub fn with_windows_cmd_shell(self) -> Self {
-        if cfg!(windows) {
-            self.with_user_shell(get_shell_by_model_provided_path(&PathBuf::from("cmd.exe")))
-        } else {
-            self
-        }
+        self.with_user_shell(
+            get_shell_by_model_provided_path(&PathBuf::from("cmd.exe"))
+                .expect("cmd.exe should be available to the Windows-only test runtime"),
+        )
     }
 
     pub async fn build(&mut self, server: &wiremock::MockServer) -> anyhow::Result<TestCodex> {
@@ -519,8 +517,6 @@ impl TestCodexBuilder {
         self.config_mutators.push(Box::new(move |config| {
             config.model_provider.base_url = Some(base_url_clone);
             config.model_provider.supports_websockets = true;
-            config.experimental_realtime_ws_model = Some("realtime-test-model".to_string());
-            config.realtime.version = RealtimeWsVersion::V1;
         }));
         let test_env = TestEnv::local().await?;
         Box::pin(self.build_with_home_and_base_url(
@@ -559,8 +555,6 @@ impl TestCodexBuilder {
         self.config_mutators.push(Box::new(move |config| {
             config.model_provider.base_url = Some(base_url_clone);
             config.model_provider.supports_websockets = true;
-            config.experimental_realtime_ws_model = Some("realtime-test-model".to_string());
-            config.realtime.version = RealtimeWsVersion::V1;
         }));
         let test_env = TestEnv::local().await?;
         Box::pin(self.build_with_home_and_base_url(
@@ -588,17 +582,8 @@ impl TestCodexBuilder {
             .exec_server_url
             .clone()
             .or_else(|| test_env.exec_server_url.clone());
-        #[cfg(target_os = "linux")]
-        let codex_linux_sandbox_exe = Some(
-            crate::find_codex_linux_sandbox_exe()
-                .context("should find binary for codex-linux-sandbox")?,
-        );
-        #[cfg(not(target_os = "linux"))]
-        let codex_linux_sandbox_exe = None;
-        let local_runtime_paths = codex_exec_server::ExecServerRuntimePaths::new(
-            std::env::current_exe()?,
-            codex_linux_sandbox_exe,
-        )?;
+        let local_runtime_paths =
+            codex_exec_server::ExecServerRuntimePaths::new(std::env::current_exe()?)?;
         let environment_manager = Arc::new(if include_local_environment {
             codex_exec_server::EnvironmentManager::create_for_tests_with_local(
                 exec_server_url,

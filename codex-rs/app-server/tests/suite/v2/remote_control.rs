@@ -16,7 +16,7 @@ use codex_app_server::AppServerTransport;
 use codex_app_server::AppServerWebsocketAuthSettings;
 use codex_app_server::PluginStartupTasks;
 use codex_app_server::RemoteControlStartupMode;
-use codex_app_server::run_main_with_transport_options;
+use codex_app_server::run_main;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RemoteControlClient;
@@ -205,7 +205,7 @@ async fn managed_requirements_allow_remote_control_true_does_not_enable_or_block
     )
     .await??;
     let received: RemoteControlStatusReadResponse = to_response(response)?;
-    assert_eq!(received.status, RemoteControlConnectionStatus::Disabled);
+    assert_eq!(received.0.status, RemoteControlConnectionStatus::Disabled);
     Ok(())
 }
 
@@ -225,11 +225,9 @@ async fn explicit_remote_control_startup_fails_when_disabled_by_requirements() -
 
     let result = timeout(
         STARTUP_TIMEOUT,
-        run_main_with_transport_options(
+        run_main(
             Arg0DispatchPaths {
                 codex_self_exe: Some(std::env::current_exe()?),
-                codex_linux_sandbox_exe: None,
-                main_execve_wrapper_exe: None,
             },
             CliConfigOverrides::default(),
             LoaderOverrides::with_managed_config_path_for_tests(managed_config_path),
@@ -405,10 +403,10 @@ async fn remote_control_disable_returns_disabled_status() -> Result<()> {
     .await??;
     let received: RemoteControlDisableResponse = to_response(response)?;
 
-    assert_eq!(received.status, RemoteControlConnectionStatus::Disabled);
-    assert!(!received.server_name.is_empty());
-    assert_eq!(received.environment_id, None);
-    assert!(!received.installation_id.is_empty());
+    assert_eq!(received.0.status, RemoteControlConnectionStatus::Disabled);
+    assert!(!received.0.server_name.is_empty());
+    assert_eq!(received.0.environment_id, None);
+    assert!(!received.0.installation_id.is_empty());
     Ok(())
 }
 
@@ -430,10 +428,10 @@ async fn remote_control_status_read_returns_disabled_status() -> Result<()> {
     .await??;
     let received: RemoteControlStatusReadResponse = to_response(response)?;
 
-    assert_eq!(received.status, RemoteControlConnectionStatus::Disabled);
-    assert!(!received.server_name.is_empty());
-    assert_eq!(received.environment_id, None);
-    assert!(!received.installation_id.is_empty());
+    assert_eq!(received.0.status, RemoteControlConnectionStatus::Disabled);
+    assert!(!received.0.server_name.is_empty());
+    assert_eq!(received.0.environment_id, None);
+    assert!(!received.0.installation_id.is_empty());
     Ok(())
 }
 
@@ -467,10 +465,10 @@ async fn remote_control_enable_returns_connecting_status() -> Result<()> {
     .await??;
     let received: RemoteControlEnableResponse = to_response(response)?;
 
-    assert_eq!(received.status, RemoteControlConnectionStatus::Connecting);
-    assert!(!received.server_name.is_empty());
-    assert_eq!(received.environment_id.as_deref(), Some("environment-id"));
-    assert!(!received.installation_id.is_empty());
+    assert_eq!(received.0.status, RemoteControlConnectionStatus::Connecting);
+    assert!(!received.0.server_name.is_empty());
+    assert_eq!(received.0.environment_id.as_deref(), Some("environment-id"));
+    assert!(!received.0.installation_id.is_empty());
     Ok(())
 }
 
@@ -501,7 +499,7 @@ async fn disable_waits_for_in_flight_durable_enable() -> Result<()> {
     backend.complete_enrollment()?;
     let response = wait_for_response(&mut mcp, disable_request_id).await?;
     let received: RemoteControlDisableResponse = to_response(response)?;
-    assert_eq!(received.status, RemoteControlConnectionStatus::Disabled);
+    assert_eq!(received.0.status, RemoteControlConnectionStatus::Disabled);
     assert_eq!(
         remote_control_preference(&state_db, &websocket_url).await?,
         Some(false)
@@ -606,10 +604,10 @@ async fn remote_control_status_read_returns_connecting_status_after_enable() -> 
     .await??;
     let received: RemoteControlStatusReadResponse = to_response(response)?;
 
-    assert_eq!(received.status, RemoteControlConnectionStatus::Connecting);
-    assert!(!received.server_name.is_empty());
-    assert_eq!(received.environment_id.as_deref(), Some("environment-id"));
-    assert!(!received.installation_id.is_empty());
+    assert_eq!(received.0.status, RemoteControlConnectionStatus::Connecting);
+    assert!(!received.0.server_name.is_empty());
+    assert_eq!(received.0.environment_id.as_deref(), Some("environment-id"));
+    assert!(!received.0.installation_id.is_empty());
     Ok(())
 }
 

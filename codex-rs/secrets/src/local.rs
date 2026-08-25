@@ -19,6 +19,7 @@ use anyhow::Context;
 use anyhow::Result;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use codex_keyring_store::DefaultKeyringStore;
 use codex_keyring_store::KeyringStore;
 use rand::TryRngCore;
 use rand::rngs::OsRng;
@@ -29,7 +30,6 @@ use tracing::warn;
 use super::SecretListEntry;
 use super::SecretName;
 use super::SecretScope;
-use super::SecretsBackend;
 use super::compute_keyring_account;
 use super::keyring_service;
 
@@ -73,6 +73,11 @@ pub struct LocalSecretsBackend {
 }
 
 impl LocalSecretsBackend {
+    pub fn new_default(codex_home: PathBuf) -> Self {
+        let keyring_store: Arc<dyn KeyringStore> = Arc::new(DefaultKeyringStore);
+        Self::new(codex_home, keyring_store)
+    }
+
     pub fn new(codex_home: PathBuf, keyring_store: Arc<dyn KeyringStore>) -> Self {
         Self::new_with_namespace(
             codex_home,
@@ -210,24 +215,6 @@ impl LocalSecretsBackend {
                 Ok(generated)
             }
         }
-    }
-}
-
-impl SecretsBackend for LocalSecretsBackend {
-    fn set(&self, scope: &SecretScope, name: &SecretName, value: &str) -> Result<()> {
-        LocalSecretsBackend::set(self, scope, name, value)
-    }
-
-    fn get(&self, scope: &SecretScope, name: &SecretName) -> Result<Option<String>> {
-        LocalSecretsBackend::get(self, scope, name)
-    }
-
-    fn delete(&self, scope: &SecretScope, name: &SecretName) -> Result<bool> {
-        LocalSecretsBackend::delete(self, scope, name)
-    }
-
-    fn list(&self, scope_filter: Option<&SecretScope>) -> Result<Vec<SecretListEntry>> {
-        LocalSecretsBackend::list(self, scope_filter)
     }
 }
 

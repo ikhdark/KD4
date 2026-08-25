@@ -86,11 +86,16 @@ async fn thread_inject_items_adds_raw_response_items_to_thread_history() -> Resu
         panic!("expected resumed rollout history");
     };
     assert!(
-        resumed_history
-            .history
-            .iter()
-            .any(|item| matches!(item, RolloutItem::ResponseItem(response_item) if responses::strip_metadata(response_item.clone()) == injected_item)),
-        "injected item should be persisted in rollout history"
+        resumed_history.history.iter().any(|item| {
+            let RolloutItem::ResponseItem(response_item) = item else {
+                return false;
+            };
+            response_item
+                .id()
+                .is_some_and(|item_id| item_id.starts_with("msg_"))
+                && response_item_without_id(response_item.clone()) == injected_item
+        }),
+        "injected item should be persisted in rollout history with a stable id"
     );
 
     let turn_req = mcp
@@ -115,11 +120,13 @@ async fn thread_inject_items_adds_raw_response_items_to_thread_history() -> Resu
     )
     .await??;
 
-    let injected_value = serde_json::to_value(&injected_item)?;
     let model_input = response_mock.single_request().input();
     let injected_index = model_input
         .iter()
-        .position(|item| item == &injected_value)
+        .position(|item| {
+            response_item_json_without_id(item.clone())
+                == serde_json::to_value(&injected_item).expect("serialize injected item")
+        })
         .expect("injected item should be sent in the next model request");
     let user_prompt_index = response_item_text_position(&model_input, "Hello")
         .expect("user prompt should be sent in the next model request");
@@ -240,15 +247,33 @@ async fn thread_inject_items_adds_raw_response_items_after_a_turn() -> Result<()
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 2);
     assert!(
-        !requests[0].input().contains(&injected_value),
+        !requests[0]
+            .input()
+            .into_iter()
+            .any(|item| response_item_json_without_id(item) == injected_value),
         "injected item should not be sent before it is injected"
     );
     assert!(
-        requests[1].input().contains(&injected_value),
+        requests[1]
+            .input()
+            .into_iter()
+            .any(|item| response_item_json_without_id(item) == injected_value),
         "injected item should be sent after being injected into existing history"
     );
 
     Ok(())
+}
+
+fn response_item_without_id(mut item: ResponseItem) -> ResponseItem {
+    item.set_id(None);
+    responses::strip_metadata(item)
+}
+
+fn response_item_json_without_id(mut item: Value) -> Value {
+    if let Some(object) = item.as_object_mut() {
+        object.remove("id");
+    }
+    responses::strip_metadata_from_json(item)
 }
 
 fn create_config_toml(codex_home: &Path, server_uri: &str) -> std::io::Result<()> {

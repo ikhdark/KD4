@@ -29,17 +29,15 @@ The layout version remains `1`:
 .
 ├── codex-package.json
 ├── bin
-│   ├── <entrypoint>[.exe]
-│   └── codex-code-mode-host[.exe]
+│   ├── <entrypoint>.exe
+│   └── codex-code-mode-host.exe
 ├── codex-resources
-│   ├── bwrap                              # Linux only
-│   ├── zsh/bin/zsh                        # supported Unix targets
-│   ├── codex-command-runner.exe           # Windows only
-│   └── codex-windows-sandbox-setup.exe    # Windows only
+│   ├── codex-command-runner.exe
+│   └── codex-windows-sandbox-setup.exe
 └── codex-path
-    ├── rg[.exe]
-    ├── apply_patch.bat                    # Windows only
-    └── applypatch.bat                     # Windows only
+    ├── rg.exe
+    ├── apply_patch.bat
+    └── applypatch.bat
 ```
 
 `codex` and `codex-app-server` are supported entrypoint variants. The
@@ -59,7 +57,7 @@ bypasses that reuse. `--skip-build-if-present` is a separate mode that requires
 all expected package-lane outputs and cannot be combined with source overrides
 or source-build reuse flags.
 
-The CLI validates platform-specific flags, package/archive destinations,
+The CLI validates package/archive destinations,
 duplicate outputs, and compression compatibility before starting Cargo builds
 or downloads. `--reuse-package-dir` removes only package-managed paths and
 preserves unrelated local contents; those unmanaged paths are excluded from
@@ -67,10 +65,7 @@ canonical archives.
 
 ## DotSlash Resources
 
-Ripgrep comes from `rg` unless `--rg-bin` is supplied. Supported Unix targets
-also include the patched zsh runtime from `codex-zsh`; `--zsh-bin` supplies a
-local executable, while `--zsh-manifest` selects a standalone DotSlash manifest.
-Those two zsh overrides are mutually exclusive.
+Ripgrep comes from `rg` unless `--rg-bin` is supplied.
 
 Downloaded archives and extracted executables are cached under the system temp
 directory in `codex-package/`. Cache entries are verified against manifest size
@@ -90,4 +85,4 @@ python -m unittest discover -s scripts/codex_package -p 'test_*.py'
 ```
 
 The suite covers target metadata, source-build reuse, CLI preflight, layout,
-archive behavior, DotSlash resources, V8 artifacts, and version discovery.
+archive behavior, DotSlash resources, and version discovery.

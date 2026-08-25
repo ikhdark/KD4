@@ -222,10 +222,6 @@ async fn report_agent_job_result_rejects_wrong_thread() -> Result<()> {
             .features
             .enable(Feature::SpawnCsv)
             .expect("test config should allow feature update");
-        config
-            .features
-            .enable(Feature::Sqlite)
-            .expect("test config should allow feature update");
     });
     let test = builder.build(&server).await?;
 
@@ -288,10 +284,6 @@ async fn spawn_agents_on_csv_runs_and_exports() -> Result<()> {
             .features
             .enable(Feature::SpawnCsv)
             .expect("test config should allow feature update");
-        config
-            .features
-            .enable(Feature::Sqlite)
-            .expect("test config should allow feature update");
     });
     let test = builder.build(&server).await?;
 
@@ -344,10 +336,6 @@ async fn spawn_agents_on_csv_dedupes_item_ids() -> Result<()> {
         config
             .features
             .enable(Feature::SpawnCsv)
-            .expect("test config should allow feature update");
-        config
-            .features
-            .enable(Feature::Sqlite)
             .expect("test config should allow feature update");
     });
     let test = builder.build(&server).await?;
@@ -402,10 +390,6 @@ async fn spawn_agents_on_csv_stop_halts_future_items() -> Result<()> {
         config
             .features
             .enable(Feature::SpawnCsv)
-            .expect("test config should allow feature update");
-        config
-            .features
-            .enable(Feature::Sqlite)
             .expect("test config should allow feature update");
     });
     let test = builder.build(&server).await?;

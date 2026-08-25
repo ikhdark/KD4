@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
-#[cfg(windows)]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -33,7 +33,6 @@ use std::sync::atomic::AtomicBool;
 
 use codex_network_proxy::NetworkProxy;
 use codex_protocol::models::AdditionalPermissionProfile;
-use codex_tools::UnifiedExecShellMode;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_path_uri::PathUri;
 use rand::Rng;
@@ -75,9 +74,7 @@ pub(crate) const WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS: u64 = 2_000;
 pub(crate) const MIN_EMPTY_YIELD_TIME_MS: u64 = 5_000;
 pub(crate) const MAX_YIELD_TIME_MS: u64 = 30_000;
 pub(crate) const DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS: u64 = 60_000;
-#[cfg(all(test, unix))]
-pub(crate) const DEFAULT_MAX_OUTPUT_TOKENS: usize =
-    codex_utils_output_truncation::DEFAULT_SUCCESS_OUTPUT_TOKENS;
+
 pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_BYTES: usize = 1024 * 1024; // 1 MiB
 pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_TOKENS: usize = UNIFIED_EXEC_OUTPUT_MAX_BYTES / 4;
 pub(crate) const MAX_UNIFIED_EXEC_PROCESSES: usize = 64;
@@ -127,11 +124,10 @@ pub(crate) struct ExecCommandRequest {
     pub yield_time_ms: u64,
     pub max_output_tokens: Option<usize>,
     pub cwd: PathUri,
-    #[cfg(windows)]
+
     pub normalization_cwd: Option<PathBuf>,
     pub sandbox_cwd: PathUri,
     pub turn_environment: TurnEnvironment,
-    pub shell_mode: UnifiedExecShellMode,
     pub network: Option<NetworkProxy>,
     pub tty: bool,
     pub sandbox_permissions: SandboxPermissions,
@@ -284,7 +280,7 @@ pub(crate) fn clamp_yield_time(yield_time_ms: u64) -> u64 {
 
 pub(crate) fn clamp_yield_time_for_readiness(yield_time_ms: u64, executor_ready: bool) -> u64 {
     let executor_ready = executor_ready && crate::latency_switches::stage5_executor_enabled();
-    let yield_time_ms = if cfg!(windows) && !executor_ready {
+    let yield_time_ms = if !executor_ready {
         yield_time_ms.max(WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS)
     } else {
         yield_time_ms
@@ -302,7 +298,6 @@ pub(crate) fn generate_chunk_id() -> String {
 #[cfg(test)]
 #[path = "process_tests.rs"]
 mod process_tests;
-#[cfg(test)]
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 #[path = "mod_tests.rs"]
 mod tests;

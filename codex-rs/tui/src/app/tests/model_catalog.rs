@@ -280,7 +280,7 @@ async fn accepted_model_migration_persists_target_default_reasoning_effort() {
 }
 
 #[tokio::test]
-async fn model_migration_prompt_respects_hide_flag_and_self_target() {
+async fn model_migration_prompt_respects_seen_mapping_and_self_target() {
     let mut seen = BTreeMap::new();
     seen.insert("gpt-5.2".to_string(), "gpt-5.4".to_string());
     assert!(!should_show_model_migration_prompt(
@@ -307,7 +307,7 @@ async fn model_migration_prompt_skips_when_target_missing_or_hidden() {
         .expect("preset present");
     current.upgrade = Some(ModelUpgrade {
         id: "missing-target".to_string(),
-        migration_config_key: HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG.to_string(),
+        migration_config_key: "unused-test-key".to_string(),
         model_link: None,
         upgrade_copy: None,
         migration_markdown: None,

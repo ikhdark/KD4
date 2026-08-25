@@ -1,11 +1,14 @@
 use super::SandboxCommand;
-#[cfg(target_os = "windows")]
+
 use super::SandboxDirectSpawnTransformRequest;
-use super::SandboxManager;
 use super::SandboxTransformRequest;
 use super::SandboxType;
 use super::SandboxablePreference;
 use super::get_platform_sandbox;
+use super::select_initial;
+use super::transform;
+
+use super::transform_for_direct_spawn_with_codex_home;
 use super::with_managed_mitm_ca_readable_root;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::AdditionalPermissionProfile;
@@ -27,8 +30,7 @@ use tempfile::TempDir;
 
 #[test]
 fn danger_full_access_defaults_to_no_sandbox_without_network_requirements() {
-    let manager = SandboxManager::new();
-    let sandbox = manager.select_initial(
+    let sandbox = select_initial(
         &FileSystemSandboxPolicy::unrestricted(),
         NetworkSandboxPolicy::Enabled,
         SandboxablePreference::Auto,
@@ -40,10 +42,9 @@ fn danger_full_access_defaults_to_no_sandbox_without_network_requirements() {
 
 #[test]
 fn danger_full_access_uses_platform_sandbox_with_network_requirements() {
-    let manager = SandboxManager::new();
     let expected =
         get_platform_sandbox(/*windows_sandbox_enabled*/ false).unwrap_or(SandboxType::None);
-    let sandbox = manager.select_initial(
+    let sandbox = select_initial(
         &FileSystemSandboxPolicy::unrestricted(),
         NetworkSandboxPolicy::Enabled,
         SandboxablePreference::Auto,
@@ -55,10 +56,9 @@ fn danger_full_access_uses_platform_sandbox_with_network_requirements() {
 
 #[test]
 fn restricted_file_system_uses_platform_sandbox_without_managed_network() {
-    let manager = SandboxManager::new();
     let expected =
         get_platform_sandbox(/*windows_sandbox_enabled*/ false).unwrap_or(SandboxType::None);
-    let sandbox = manager.select_initial(
+    let sandbox = select_initial(
         &FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
             path: FileSystemPath::Special {
                 value: FileSystemSpecialPath::Root,
@@ -75,38 +75,30 @@ fn restricted_file_system_uses_platform_sandbox_without_managed_network() {
 
 #[test]
 fn unsandboxed_transform_preserves_foreign_cwd_and_unrestricted_file_system_policy() {
-    let manager = SandboxManager::new();
-    let cwd_uri = if cfg!(windows) {
-        PathUri::parse("file:///workspace/remote").expect("POSIX path URI")
-    } else {
-        PathUri::parse("file:///C:/workspace/remote").expect("Windows path URI")
-    };
+    let cwd_uri = PathUri::parse("file:///workspace/remote").expect("POSIX path URI");
     let permissions = PermissionProfile::from_runtime_permissions(
         &FileSystemSandboxPolicy::unrestricted(),
         NetworkSandboxPolicy::Restricted,
     );
-    let exec_request = manager
-        .transform(SandboxTransformRequest {
-            command: SandboxCommand {
-                program: "true".into(),
-                args: Vec::new(),
-                cwd: cwd_uri.clone(),
-                env: HashMap::new(),
-                managed_network: None,
-                additional_permissions: None,
-            },
-            permissions: &permissions,
-            sandbox: SandboxType::None,
-            enforce_managed_network: false,
-            environment_id: None,
-            network: None,
-            sandbox_policy_cwd: &cwd_uri,
-            codex_linux_sandbox_exe: None,
-            use_legacy_landlock: false,
-            windows_sandbox_level: WindowsSandboxLevel::Disabled,
-            windows_sandbox_private_desktop: false,
-        })
-        .expect("transform");
+    let exec_request = transform(SandboxTransformRequest {
+        command: SandboxCommand {
+            program: "true".into(),
+            args: Vec::new(),
+            cwd: cwd_uri.clone(),
+            env: HashMap::new(),
+            managed_network: None,
+            additional_permissions: None,
+        },
+        permissions: &permissions,
+        sandbox: SandboxType::None,
+        enforce_managed_network: false,
+        environment_id: None,
+        network: None,
+        sandbox_policy_cwd: &cwd_uri,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+        windows_sandbox_private_desktop: false,
+    })
+    .expect("transform");
 
     assert_eq!(exec_request.cwd, cwd_uri);
     assert_eq!(exec_request.sandbox_policy_cwd, cwd_uri);
@@ -122,7 +114,6 @@ fn unsandboxed_transform_preserves_foreign_cwd_and_unrestricted_file_system_poli
 
 #[test]
 fn transform_additional_permissions_enable_network_for_external_sandbox() {
-    let manager = SandboxManager::new();
     let cwd = AbsolutePathBuf::current_dir().expect("current dir");
     let cwd_uri = PathUri::from_abs_path(&cwd);
     let permissions = PermissionProfile::External {
@@ -133,36 +124,33 @@ fn transform_additional_permissions_enable_network_for_external_sandbox() {
         canonicalize(temp_dir.path()).expect("canonicalize temp dir"),
     )
     .expect("absolute temp dir");
-    let exec_request = manager
-        .transform(SandboxTransformRequest {
-            command: SandboxCommand {
-                program: "true".into(),
-                args: Vec::new(),
-                cwd: cwd_uri.clone(),
-                env: HashMap::new(),
-                managed_network: None,
-                additional_permissions: Some(AdditionalPermissionProfile {
-                    network: Some(NetworkPermissions {
-                        enabled: Some(true),
-                    }),
-                    file_system: Some(FileSystemPermissions::from_read_write_roots(
-                        Some(vec![path]),
-                        Some(Vec::new()),
-                    )),
+    let exec_request = transform(SandboxTransformRequest {
+        command: SandboxCommand {
+            program: "true".into(),
+            args: Vec::new(),
+            cwd: cwd_uri.clone(),
+            env: HashMap::new(),
+            managed_network: None,
+            additional_permissions: Some(AdditionalPermissionProfile {
+                network: Some(NetworkPermissions {
+                    enabled: Some(true),
                 }),
-            },
-            permissions: &permissions,
-            sandbox: SandboxType::None,
-            enforce_managed_network: false,
-            environment_id: None,
-            network: None,
-            sandbox_policy_cwd: &cwd_uri,
-            codex_linux_sandbox_exe: None,
-            use_legacy_landlock: false,
-            windows_sandbox_level: WindowsSandboxLevel::Disabled,
-            windows_sandbox_private_desktop: false,
-        })
-        .expect("transform");
+                file_system: Some(FileSystemPermissions::from_read_write_roots(
+                    Some(vec![path]),
+                    Some(Vec::new()),
+                )),
+            }),
+        },
+        permissions: &permissions,
+        sandbox: SandboxType::None,
+        enforce_managed_network: false,
+        environment_id: None,
+        network: None,
+        sandbox_policy_cwd: &cwd_uri,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+        windows_sandbox_private_desktop: false,
+    })
+    .expect("transform");
 
     assert_eq!(
         exec_request.permission_profile,
@@ -178,7 +166,6 @@ fn transform_additional_permissions_enable_network_for_external_sandbox() {
 
 #[test]
 fn transform_additional_permissions_preserves_denied_entries() {
-    let manager = SandboxManager::new();
     let cwd = AbsolutePathBuf::current_dir().expect("current dir");
     let cwd_uri = PathUri::from_abs_path(&cwd);
     let temp_dir = TempDir::new().expect("create temp dir");
@@ -206,34 +193,31 @@ fn transform_additional_permissions_preserves_denied_entries() {
         &file_system_policy,
         NetworkSandboxPolicy::Restricted,
     );
-    let exec_request = manager
-        .transform(SandboxTransformRequest {
-            command: SandboxCommand {
-                program: "true".into(),
-                args: Vec::new(),
-                cwd: cwd_uri.clone(),
-                env: HashMap::new(),
-                managed_network: None,
-                additional_permissions: Some(AdditionalPermissionProfile {
-                    file_system: Some(FileSystemPermissions::from_read_write_roots(
-                        /*read*/ None,
-                        Some(vec![allowed_path.clone()]),
-                    )),
-                    ..Default::default()
-                }),
-            },
-            permissions: &permissions,
-            sandbox: SandboxType::None,
-            enforce_managed_network: false,
-            environment_id: None,
-            network: None,
-            sandbox_policy_cwd: &cwd_uri,
-            codex_linux_sandbox_exe: None,
-            use_legacy_landlock: false,
-            windows_sandbox_level: WindowsSandboxLevel::Disabled,
-            windows_sandbox_private_desktop: false,
-        })
-        .expect("transform");
+    let exec_request = transform(SandboxTransformRequest {
+        command: SandboxCommand {
+            program: "true".into(),
+            args: Vec::new(),
+            cwd: cwd_uri.clone(),
+            env: HashMap::new(),
+            managed_network: None,
+            additional_permissions: Some(AdditionalPermissionProfile {
+                file_system: Some(FileSystemPermissions::from_read_write_roots(
+                    /*read*/ None,
+                    Some(vec![allowed_path.clone()]),
+                )),
+                ..Default::default()
+            }),
+        },
+        permissions: &permissions,
+        sandbox: SandboxType::None,
+        enforce_managed_network: false,
+        environment_id: None,
+        network: None,
+        sandbox_policy_cwd: &cwd_uri,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+        windows_sandbox_private_desktop: false,
+    })
+    .expect("transform");
 
     assert_eq!(
         exec_request.file_system_sandbox_policy,
@@ -302,129 +286,6 @@ fn managed_mitm_ca_bundle_becomes_readable_for_restricted_sandbox() {
     );
 }
 
-#[cfg(target_os = "linux")]
-fn transform_linux_seccomp_request(
-    codex_linux_sandbox_exe: &std::path::Path,
-) -> super::SandboxExecRequest {
-    let manager = SandboxManager::new();
-    let cwd = AbsolutePathBuf::current_dir().expect("current dir");
-    let cwd_uri = PathUri::from_abs_path(&cwd);
-    let permissions = PermissionProfile::Disabled;
-    manager
-        .transform(SandboxTransformRequest {
-            command: SandboxCommand {
-                program: "true".into(),
-                args: Vec::new(),
-                cwd: cwd_uri.clone(),
-                env: HashMap::new(),
-                managed_network: None,
-                additional_permissions: None,
-            },
-            permissions: &permissions,
-            sandbox: SandboxType::LinuxSeccomp,
-            enforce_managed_network: false,
-            environment_id: None,
-            network: None,
-            sandbox_policy_cwd: &cwd_uri,
-            codex_linux_sandbox_exe: Some(codex_linux_sandbox_exe),
-            use_legacy_landlock: false,
-            windows_sandbox_level: WindowsSandboxLevel::Disabled,
-            windows_sandbox_private_desktop: false,
-        })
-        .expect("transform")
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn wsl1_rejects_linux_bubblewrap_path() {
-    let restricted_policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
-        path: FileSystemPath::Special {
-            value: FileSystemSpecialPath::Root,
-        },
-        access: FileSystemAccessMode::Read,
-    }]);
-
-    assert!(matches!(
-        super::ensure_linux_bubblewrap_is_supported(
-            &restricted_policy,
-            /*use_legacy_landlock*/ false,
-            /*allow_network_for_proxy*/ false,
-            /*is_wsl1*/ true,
-        ),
-        Err(super::SandboxTransformError::Wsl1UnsupportedForBubblewrap)
-    ));
-    assert!(matches!(
-        super::ensure_linux_bubblewrap_is_supported(
-            &FileSystemSandboxPolicy::unrestricted(),
-            /*use_legacy_landlock*/ false,
-            /*allow_network_for_proxy*/ true,
-            /*is_wsl1*/ true,
-        ),
-        Err(super::SandboxTransformError::Wsl1UnsupportedForBubblewrap)
-    ));
-    assert!(matches!(
-        super::ensure_linux_bubblewrap_is_supported(
-            &FileSystemSandboxPolicy::unrestricted(),
-            /*use_legacy_landlock*/ true,
-            /*allow_network_for_proxy*/ true,
-            /*is_wsl1*/ true,
-        ),
-        Err(super::SandboxTransformError::Wsl1UnsupportedForBubblewrap)
-    ));
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn wsl1_allows_non_bubblewrap_linux_paths() {
-    assert!(
-        super::ensure_linux_bubblewrap_is_supported(
-            &FileSystemSandboxPolicy::unrestricted(),
-            /*use_legacy_landlock*/ false,
-            /*allow_network_for_proxy*/ false,
-            /*is_wsl1*/ true,
-        )
-        .is_ok()
-    );
-
-    let restricted_policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
-        path: FileSystemPath::Special {
-            value: FileSystemSpecialPath::Root,
-        },
-        access: FileSystemAccessMode::Read,
-    }]);
-    assert!(
-        super::ensure_linux_bubblewrap_is_supported(
-            &restricted_policy,
-            /*use_legacy_landlock*/ true,
-            /*allow_network_for_proxy*/ false,
-            /*is_wsl1*/ true,
-        )
-        .is_ok()
-    );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn transform_linux_seccomp_preserves_helper_path_in_arg0_when_available() {
-    let codex_linux_sandbox_exe = std::path::PathBuf::from("/tmp/codex-linux-sandbox");
-    let exec_request = transform_linux_seccomp_request(&codex_linux_sandbox_exe);
-
-    assert_eq!(
-        exec_request.arg0,
-        Some(codex_linux_sandbox_exe.to_string_lossy().into_owned())
-    );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn transform_linux_seccomp_uses_helper_alias_when_launcher_is_not_helper_path() {
-    let codex_linux_sandbox_exe = std::path::PathBuf::from("/tmp/codex");
-    let exec_request = transform_linux_seccomp_request(&codex_linux_sandbox_exe);
-
-    assert_eq!(exec_request.arg0, Some("codex-linux-sandbox".to_string()));
-}
-
-#[cfg(target_os = "windows")]
 #[test]
 fn transform_for_direct_spawn_windows_preserves_only_wrapper_setup_identity() {
     let mut env = HashMap::from([
@@ -458,7 +319,6 @@ fn transform_for_direct_spawn_windows_preserves_only_wrapper_setup_identity() {
     );
 }
 
-#[cfg(target_os = "windows")]
 #[test]
 fn transform_for_direct_spawn_windows_materializes_inner_helper() {
     let codex_home = tempfile::TempDir::new().expect("codex home");
@@ -494,40 +354,33 @@ fn transform_for_direct_spawn_windows_materializes_inner_helper() {
     let other_workspace_root = AbsolutePathBuf::from_absolute_path(other_workspace.path())
         .expect("absolute other workspace");
     let workspace_roots = vec![cwd, other_workspace_root];
-    let manager = SandboxManager::new();
-    let exec_request = manager
-        .transform_for_direct_spawn_with_codex_home(
-            SandboxDirectSpawnTransformRequest {
-                workspace_roots: workspace_roots.as_slice(),
-                windows_sandbox_proxy_settings_mode:
-                    codex_windows_sandbox::WindowsSandboxProxySettingsMode::Preserve,
-                transform: SandboxTransformRequest {
-                    command: SandboxCommand {
-                        program: configured_helper.as_os_str().to_owned(),
-                        args: vec!["--codex-run-as-fs-helper".to_string()],
-                        cwd: cwd_uri.clone(),
-                        env: HashMap::from([(
-                            "Path".to_string(),
-                            r"C:\Windows\System32".to_string(),
-                        )]),
-                        managed_network: None,
-                        additional_permissions: None,
-                    },
-                    permissions: &permissions,
-                    sandbox: SandboxType::WindowsRestrictedToken,
-                    enforce_managed_network: false,
-                    environment_id: None,
-                    network: None,
-                    sandbox_policy_cwd: &cwd_uri,
-                    codex_linux_sandbox_exe: None,
-                    use_legacy_landlock: false,
-                    windows_sandbox_level: WindowsSandboxLevel::Elevated,
-                    windows_sandbox_private_desktop: false,
+    let exec_request = transform_for_direct_spawn_with_codex_home(
+        SandboxDirectSpawnTransformRequest {
+            workspace_roots: workspace_roots.as_slice(),
+            windows_sandbox_proxy_settings_mode:
+                codex_windows_sandbox::WindowsSandboxProxySettingsMode::Preserve,
+            transform: SandboxTransformRequest {
+                command: SandboxCommand {
+                    program: configured_helper.as_os_str().to_owned(),
+                    args: vec!["--codex-run-as-fs-helper".to_string()],
+                    cwd: cwd_uri.clone(),
+                    env: HashMap::from([("Path".to_string(), r"C:\Windows\System32".to_string())]),
+                    managed_network: None,
+                    additional_permissions: None,
                 },
+                permissions: &permissions,
+                sandbox: SandboxType::WindowsRestrictedToken,
+                enforce_managed_network: false,
+                environment_id: None,
+                network: None,
+                sandbox_policy_cwd: &cwd_uri,
+                windows_sandbox_level: WindowsSandboxLevel::Elevated,
+                windows_sandbox_private_desktop: false,
             },
-            codex_home.path(),
-        )
-        .expect("transform for direct spawn");
+        },
+        codex_home.path(),
+    )
+    .expect("transform for direct spawn");
 
     let separator_index = exec_request
         .command

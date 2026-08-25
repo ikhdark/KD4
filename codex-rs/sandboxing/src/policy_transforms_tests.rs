@@ -15,14 +15,7 @@ use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use dunce::canonicalize;
 use pretty_assertions::assert_eq;
-#[cfg(unix)]
-use std::path::Path;
 use tempfile::TempDir;
-
-#[cfg(unix)]
-fn symlink_dir(original: &Path, link: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(original, link)
-}
 
 #[test]
 fn full_access_restricted_policy_skips_platform_sandbox_when_network_is_enabled() {
@@ -120,39 +113,6 @@ fn normalize_additional_permissions_preserves_network() {
         Some(FileSystemPermissions::from_read_write_roots(
             Some(vec![path.clone()]),
             Some(vec![path]),
-        ))
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn normalize_additional_permissions_preserves_symlinked_write_paths() {
-    let temp_dir = TempDir::new().expect("create temp dir");
-    let real_root = temp_dir.path().join("real");
-    let link_root = temp_dir.path().join("link");
-    let write_dir = real_root.join("write");
-    std::fs::create_dir_all(&write_dir).expect("create write dir");
-    symlink_dir(&real_root, &link_root).expect("create symlinked root");
-
-    let link_write_dir =
-        AbsolutePathBuf::from_absolute_path(link_root.join("write")).expect("link write dir");
-    let permissions = normalize_additional_permissions(PermissionProfile {
-        file_system: Some(FileSystemPermissions::from_read_write_roots(
-            Some(vec![]),
-            Some(vec![link_write_dir]),
-        )),
-        ..Default::default()
-    })
-    .expect("permissions");
-
-    assert_eq!(
-        permissions.file_system,
-        Some(FileSystemPermissions::from_read_write_roots(
-            Some(vec![]),
-            Some(vec![
-                AbsolutePathBuf::from_absolute_path(link_root.join("write"))
-                    .expect("link write dir"),
-            ]),
         ))
     );
 }

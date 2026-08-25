@@ -112,7 +112,7 @@ foo = true"#;
 }
 
 #[test]
-fn strict_config_accepts_deprecated_feature_config_fields() {
+fn strict_config_rejects_removed_code_mode_waiting_policy() {
     let path = Path::new("/tmp/config.toml");
     let contents = r#"
 [features.code_mode]
@@ -120,9 +120,10 @@ enabled = true
 waiting_policy = "yield_after"
 "#;
 
-    let error = config_error_from_ignored_toml_fields::<ConfigToml>(path, contents);
+    let error = config_error_from_ignored_toml_fields::<ConfigToml>(path, contents)
+        .expect("removed waiting_policy should be rejected");
 
-    assert_eq!(error, None);
+    assert_eq!(error.path, path);
 }
 
 #[test]

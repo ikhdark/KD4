@@ -1,5 +1,5 @@
 use super::*;
-#[cfg(windows)]
+
 use base64::Engine;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
@@ -118,7 +118,7 @@ fn make_exec_output(
 fn sandbox_detection_requires_keywords() {
     let output = make_exec_output(/*exit_code*/ 1, "", "", "");
     assert!(!is_likely_sandbox_denied(
-        SandboxType::LinuxSeccomp,
+        SandboxType::WindowsRestrictedToken,
         &output
     ));
 }
@@ -126,14 +126,17 @@ fn sandbox_detection_requires_keywords() {
 #[test]
 fn sandbox_detection_identifies_keyword_in_stderr() {
     let output = make_exec_output(/*exit_code*/ 1, "", "Operation not permitted", "");
-    assert!(is_likely_sandbox_denied(SandboxType::LinuxSeccomp, &output));
+    assert!(is_likely_sandbox_denied(
+        SandboxType::WindowsRestrictedToken,
+        &output
+    ));
 }
 
 #[test]
 fn sandbox_detection_respects_quick_reject_exit_codes() {
     let output = make_exec_output(/*exit_code*/ 127, "", "command not found", "");
     assert!(!is_likely_sandbox_denied(
-        SandboxType::LinuxSeccomp,
+        SandboxType::WindowsRestrictedToken,
         &output
     ));
 }
@@ -164,7 +167,7 @@ fn sandbox_detection_uses_aggregated_output() {
         "cargo failed: Read-only file system when writing target",
     );
     assert!(is_likely_sandbox_denied(
-        SandboxType::MacosSeatbelt,
+        SandboxType::WindowsRestrictedToken,
         &output
     ));
 }
@@ -179,7 +182,7 @@ fn sandbox_detection_ignores_network_policy_text_with_zero_exit_code() {
     );
 
     assert!(!is_likely_sandbox_denied(
-        SandboxType::LinuxSeccomp,
+        SandboxType::WindowsRestrictedToken,
         &output
     ));
 }
@@ -477,19 +480,12 @@ fn full_buffer_capture_policy_disables_caps_and_exec_expiration() {
 
 #[tokio::test]
 async fn exec_full_buffer_capture_ignores_expiration() -> Result<()> {
-    #[cfg(windows)]
     let command = vec![
         "powershell.exe".to_string(),
         "-NonInteractive".to_string(),
         "-NoLogo".to_string(),
         "-Command".to_string(),
         "Start-Sleep -Milliseconds 50; [Console]::Out.Write('hello')".to_string(),
-    ];
-    #[cfg(not(windows))]
-    let command = vec![
-        "/bin/sh".to_string(),
-        "-c".to_string(),
-        "sleep 0.05; printf hello".to_string(),
     ];
 
     let env: HashMap<String, String> = std::env::vars().collect();
@@ -520,7 +516,6 @@ async fn exec_full_buffer_capture_ignores_expiration() -> Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
 #[tokio::test]
 async fn windows_direct_exec_completes_for_trivial_command() -> Result<()> {
     let env: HashMap<String, String> = std::env::vars().collect();
@@ -556,44 +551,6 @@ async fn windows_direct_exec_completes_for_trivial_command() -> Result<()> {
 
     assert_eq!(output.exit_status.code(), Some(0));
     assert!(!output.timed_out);
-    Ok(())
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn exec_full_buffer_capture_keeps_io_drain_timeout_when_descendant_holds_pipe_open()
--> Result<()> {
-    let output = tokio::time::timeout(
-        Duration::from_millis(IO_DRAIN_TIMEOUT_MS * 3),
-        exec(
-            ExecParams {
-                command: vec![
-                    "/bin/sh".to_string(),
-                    "-c".to_string(),
-                    "printf hello; sleep 30 &".to_string(),
-                ],
-                cwd: codex_utils_absolute_path::AbsolutePathBuf::current_dir()?,
-                expiration: 1.into(),
-                capture_policy: ExecCapturePolicy::FullBuffer,
-                env: std::env::vars().collect(),
-                network: None,
-                network_environment_id: None,
-                sandbox_permissions: SandboxPermissions::UseDefault,
-                windows_sandbox_level: WindowsSandboxLevel::Disabled,
-                windows_sandbox_private_desktop: false,
-                justification: None,
-                arg0: None,
-            },
-            NetworkSandboxPolicy::Enabled,
-            /*stdout_stream*/ None,
-            /*after_spawn*/ None,
-        ),
-    )
-    .await
-    .expect("full-buffer exec should return once the I/O drain guard fires")?;
-
-    assert!(!output.timed_out);
-
     Ok(())
 }
 
@@ -726,19 +683,13 @@ async fn output_drain_stdout_join_error_precedes_stderr_io_error() {
 #[tokio::test]
 async fn process_exec_tool_call_preserves_full_buffer_capture_policy() -> Result<()> {
     let byte_count = EXEC_OUTPUT_MAX_BYTES.saturating_add(128 * 1024);
-    #[cfg(windows)]
+
     let command = vec![
         "powershell.exe".to_string(),
         "-NonInteractive".to_string(),
         "-NoLogo".to_string(),
         "-Command".to_string(),
         format!("Start-Sleep -Milliseconds 50; [Console]::Out.Write('a' * {byte_count})"),
-    ];
-    #[cfg(not(windows))]
-    let command = vec![
-        "/bin/sh".to_string(),
-        "-c".to_string(),
-        format!("sleep 0.05; head -c {byte_count} /dev/zero | tr '\\0' 'a'"),
     ];
 
     let cwd = codex_utils_absolute_path::AbsolutePathBuf::current_dir()?;
@@ -761,8 +712,6 @@ async fn process_exec_tool_call_preserves_full_buffer_capture_policy() -> Result
         &permission_profile,
         &cwd,
         std::slice::from_ref(&cwd),
-        &None,
-        /*use_legacy_landlock*/ false,
         /*stdout_stream*/ None,
     )
     .await?;
@@ -1404,90 +1353,12 @@ fn build_exec_request_preserves_windows_workspace_roots() -> Result<()> {
         &PermissionProfile::Disabled,
         &cwd,
         workspace_roots.as_slice(),
-        &None,
-        /*use_legacy_landlock*/ false,
     )?;
 
     assert_eq!(
         exec_request.windows_sandbox_workspace_roots,
         workspace_roots
     );
-    Ok(())
-}
-
-#[cfg(unix)]
-#[test]
-fn sandbox_detection_flags_sigsys_exit_code() {
-    let exit_code = EXIT_CODE_SIGNAL_BASE + libc::SIGSYS;
-    let output = make_exec_output(exit_code, "", "", "");
-    assert!(is_likely_sandbox_denied(SandboxType::LinuxSeccomp, &output));
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn kill_child_process_group_kills_grandchildren_on_timeout() -> Result<()> {
-    // On Linux/macOS, /bin/bash is typically present; on FreeBSD/OpenBSD,
-    // prefer /bin/sh to avoid NotFound errors.
-    #[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
-    let command = vec![
-        "/bin/sh".to_string(),
-        "-c".to_string(),
-        "sleep 60 & echo $!; sleep 60".to_string(),
-    ];
-    #[cfg(all(unix, not(any(target_os = "freebsd", target_os = "openbsd"))))]
-    let command = vec![
-        "/bin/bash".to_string(),
-        "-c".to_string(),
-        "sleep 60 & echo $!; sleep 60".to_string(),
-    ];
-    let cwd = codex_utils_absolute_path::AbsolutePathBuf::current_dir()?;
-    let env: HashMap<String, String> = std::env::vars().collect();
-    let params = ExecParams {
-        command,
-        cwd,
-        expiration: 500.into(),
-        capture_policy: ExecCapturePolicy::ShellTool,
-        env,
-        network: None,
-        network_environment_id: None,
-        sandbox_permissions: SandboxPermissions::UseDefault,
-        windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
-        windows_sandbox_private_desktop: false,
-        justification: None,
-        arg0: None,
-    };
-
-    let output = exec(
-        params,
-        NetworkSandboxPolicy::Restricted,
-        /*stdout_stream*/ None,
-        /*after_spawn*/ None,
-    )
-    .await?;
-    assert!(output.timed_out);
-
-    let stdout = output.stdout.from_utf8_lossy().text;
-    let pid_line = stdout.lines().next().unwrap_or("").trim();
-    let pid: i32 = pid_line.parse().map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Failed to parse pid from stdout '{pid_line}': {error}"),
-        )
-    })?;
-
-    let mut killed = false;
-    for _ in 0..20 {
-        // Use kill(pid, 0) to check if the process is alive.
-        if unsafe { libc::kill(pid, 0) } == -1
-            && let Some(libc::ESRCH) = std::io::Error::last_os_error().raw_os_error()
-        {
-            killed = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    assert!(killed, "grandchild process with pid {pid} is still alive");
     Ok(())
 }
 
@@ -1618,8 +1489,6 @@ async fn process_exec_tool_call_respects_cancellation_token() -> Result<()> {
             &PermissionProfile::Disabled,
             &cwd,
             std::slice::from_ref(&cwd),
-            &None,
-            /*use_legacy_landlock*/ false,
             /*stdout_stream*/ None,
         ),
     )
@@ -1632,127 +1501,6 @@ async fn process_exec_tool_call_respects_cancellation_token() -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn process_exec_tool_call_cancellation_allows_sigterm_cleanup() -> Result<()> {
-    let temp_dir = tempfile::TempDir::new()?;
-    let ready_marker = temp_dir.path().join("ready");
-    let cleanup_marker = temp_dir.path().join("cleanup");
-    let descendant_pid_marker = temp_dir.path().join("descendant-pid");
-    // The parent handles TERM and records cleanup, while a TERM-ignoring child
-    // proves cancellation still escalates any survivors in the process group.
-    let command = vec![
-        "/bin/sh".to_string(),
-        "-c".to_string(),
-        r#"(trap '' TERM; sleep 60) &
-printf '%s' "$!" > "$DESCENDANT_PID_MARKER"
-trap 'printf cleaned > "$CLEANUP_MARKER"; exit 0' TERM
-printf ready > "$READY_MARKER"
-while :; do sleep 1; done"#
-            .to_string(),
-    ];
-    let cwd = codex_utils_absolute_path::AbsolutePathBuf::current_dir()?;
-    let mut env: HashMap<String, String> = std::env::vars().collect();
-    env.insert(
-        "READY_MARKER".to_string(),
-        ready_marker.to_string_lossy().into_owned(),
-    );
-    env.insert(
-        "CLEANUP_MARKER".to_string(),
-        cleanup_marker.to_string_lossy().into_owned(),
-    );
-    env.insert(
-        "DESCENDANT_PID_MARKER".to_string(),
-        descendant_pid_marker.to_string_lossy().into_owned(),
-    );
-    let cancel_token = CancellationToken::new();
-    let cancel_tx = cancel_token.clone();
-    tokio::spawn(async move {
-        for _ in 0..50 {
-            if ready_marker.exists() {
-                cancel_tx.cancel();
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        cancel_tx.cancel();
-    });
-    let params = ExecParams {
-        command,
-        cwd: cwd.clone(),
-        expiration: ExecExpiration::DefaultTimeout.with_cancellation(cancel_token),
-        capture_policy: ExecCapturePolicy::ShellTool,
-        env,
-        network: None,
-        network_environment_id: None,
-        sandbox_permissions: SandboxPermissions::UseDefault,
-        windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
-        windows_sandbox_private_desktop: false,
-        justification: None,
-        arg0: None,
-    };
-
-    let result = timeout(
-        Duration::from_secs(5),
-        process_exec_tool_call(
-            params,
-            &PermissionProfile::Disabled,
-            &cwd,
-            std::slice::from_ref(&cwd),
-            &None,
-            /*use_legacy_landlock*/ false,
-            /*stdout_stream*/ None,
-        ),
-    )
-    .await
-    .expect("cancellation should stop the process promptly");
-    let output = result.expect("cancellation should return a non-timeout exec result");
-    assert!(!output.timed_out);
-    assert_eq!(
-        std::fs::read_to_string(cleanup_marker)?,
-        "cleaned",
-        "SIGTERM cleanup trap should run before cancellation falls back to a hard kill"
-    );
-    let descendant_pid = std::fs::read_to_string(descendant_pid_marker)?
-        .parse::<i32>()
-        .map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("failed to parse descendant pid: {error}"),
-            )
-        })?;
-    let mut killed = false;
-    for _ in 0..20 {
-        if unsafe { libc::kill(descendant_pid, 0) } == -1
-            && let Some(libc::ESRCH) = std::io::Error::last_os_error().raw_os_error()
-        {
-            killed = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    if !killed {
-        unsafe {
-            libc::kill(descendant_pid, libc::SIGKILL);
-        }
-    }
-    assert!(
-        killed,
-        "TERM-ignoring descendant process with pid {descendant_pid} is still alive"
-    );
-    Ok(())
-}
-
-#[cfg(unix)]
-fn long_running_command() -> Vec<String> {
-    vec![
-        "/bin/sh".to_string(),
-        "-c".to_string(),
-        "sleep 30".to_string(),
-    ]
-}
-
-#[cfg(windows)]
 fn long_running_command() -> Vec<String> {
     vec![
         "powershell.exe".to_string(),

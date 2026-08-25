@@ -57,7 +57,6 @@ use crate::diff_model::FileChange;
 use crate::git_action_directives::parse_assistant_markdown;
 use crate::legacy_core::config::Config;
 use crate::legacy_core::config::PermissionProfileSnapshot;
-use crate::mention_codec::LinkedMention;
 use crate::mention_codec::encode_history_mentions;
 use crate::model_catalog::ModelCatalog;
 use crate::multi_agents;
@@ -109,7 +108,6 @@ use codex_app_server_protocol::ThreadGoalStatus as AppThreadGoalStatus;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadSettings;
 use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
-use codex_app_server_protocol::ThreadTokenUsage;
 use codex_app_server_protocol::ToolRequestUserInputParams;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnCompletedNotification;
@@ -130,6 +128,8 @@ use codex_git_utils::get_git_repo_root;
 use codex_otel::RuntimeMetricsSummary;
 use codex_otel::SessionTelemetry;
 use codex_plugin::PluginCapabilitySummary;
+use codex_plugin::mention_syntax::PLUGIN_TEXT_MENTION_SIGIL;
+use codex_plugin::mention_syntax::TOOL_MENTION_SIGIL;
 use codex_protocol::ThreadId;
 use codex_protocol::account::PlanType;
 use codex_protocol::approvals::GuardianAssessmentAction;
@@ -141,7 +141,7 @@ use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::Settings;
-#[cfg(any(target_os = "windows", test))]
+
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::AgentMessageItem;
@@ -155,11 +155,10 @@ use codex_terminal_detection::Multiplexer;
 use codex_terminal_detection::TerminalInfo;
 use codex_terminal_detection::TerminalName;
 use codex_terminal_detection::terminal_info;
+use codex_thread_store::normalize_thread_name;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_cli::resume_hint;
 use codex_utils_path_uri::PathUri;
-use codex_utils_plugins::mention_syntax::PLUGIN_TEXT_MENTION_SIGIL;
-use codex_utils_plugins::mention_syntax::TOOL_MENTION_SIGIL;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
@@ -177,6 +176,7 @@ use ratatui::widgets::Clear;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget;
 use ratatui::widgets::Wrap;
+#[cfg(test)]
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::debug;
 use tracing::warn;
@@ -246,11 +246,6 @@ fn queued_message_edit_hint_binding(
         .or_else(|| bindings.first().copied())
 }
 
-fn normalize_thread_name(name: &str) -> Option<String> {
-    let trimmed = name.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
-}
-
 use crate::app_event::AppEvent;
 use crate::app_event::ExitMode;
 use crate::app_event::PermissionProfileSelection;
@@ -264,7 +259,6 @@ use crate::bottom_pane::BottomPaneParams;
 use crate::bottom_pane::CancellationEvent;
 use crate::bottom_pane::CollaborationModeIndicator;
 use crate::bottom_pane::ColumnWidthMode;
-use crate::bottom_pane::DOUBLE_PRESS_QUIT_SHORTCUT_ENABLED;
 use crate::bottom_pane::ExperimentalFeatureItem;
 use crate::bottom_pane::ExperimentalFeaturesView;
 use crate::bottom_pane::GoalStatusIndicator;
@@ -274,7 +268,6 @@ use crate::bottom_pane::LocalImageAttachment;
 use crate::bottom_pane::McpServerElicitationFormRequest;
 use crate::bottom_pane::MemoriesSettingsView;
 use crate::bottom_pane::MentionBinding;
-use crate::bottom_pane::QUIT_SHORTCUT_TIMEOUT;
 use crate::bottom_pane::QueuedInputAction;
 use crate::bottom_pane::SelectionAction;
 use crate::bottom_pane::SelectionItem;
@@ -346,13 +339,11 @@ use self::interrupts::InterruptManager;
 mod keymap_picker;
 mod mcp_startup;
 use self::mcp_startup::McpStartupStatus;
-mod pets;
-mod session_flow;
-mod session_header;
-use self::session_header::SessionHeader;
 mod hook_lifecycle;
 mod hooks;
 mod interaction;
+mod pets;
+mod session_flow;
 mod skills;
 mod slash_dispatch;
 use self::skills::collect_tool_mentions;
@@ -418,7 +409,6 @@ use self::user_messages::PendingSteerCompareKey;
 use self::user_messages::QueueDrain;
 use self::user_messages::QueuedUserMessage;
 use self::user_messages::ShellEscapePolicy;
-use self::user_messages::ThreadComposerState;
 pub(crate) use self::user_messages::ThreadInputState;
 pub(crate) use self::user_messages::UserMessage;
 use self::user_messages::UserMessageDisplay;
@@ -444,6 +434,8 @@ use crate::streaming::controller::PlanStreamController;
 use crate::streaming::controller::StreamController;
 use crate::workspace_command::WorkspaceCommandRunner;
 
+use crate::approval_presets::ApprovalPreset;
+use crate::approval_presets::builtin_approval_presets;
 use chrono::Local;
 use codex_app_server_protocol::AskForApproval;
 use codex_file_search::FileMatch;
@@ -454,8 +446,6 @@ use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
-use codex_utils_approval_presets::ApprovalPreset;
-use codex_utils_approval_presets::builtin_approval_presets;
 use strum::IntoEnumIterator;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -536,7 +526,6 @@ pub(crate) struct ChatWidget {
     has_codex_backend_auth: bool,
     model_catalog: Arc<ModelCatalog>,
     session_telemetry: SessionTelemetry,
-    session_header: SessionHeader,
     initial_user_message: Option<UserMessage>,
     status_account_display: Option<StatusAccountDisplay>,
     runtime_model_provider_base_url: Option<String>,
@@ -664,14 +653,6 @@ pub(crate) struct ChatWidget {
     queued_message_edit_hint_binding: Option<KeyBinding>,
     // Pending notification to show when unfocused on next Draw
     pending_notification: Option<Notification>,
-    /// When `Some`, the user has pressed a quit shortcut and the second press
-    /// must occur before `quit_shortcut_expires_at`.
-    quit_shortcut_expires_at: Option<Instant>,
-    /// Tracks which quit shortcut key was pressed first.
-    ///
-    /// We require the second press to match this key so `Ctrl+C` followed by
-    /// `Ctrl+D` (or vice versa) doesn't quit accidentally.
-    quit_shortcut_key: Option<KeyBinding>,
     // Runtime metrics accumulated across delta snapshots for the active turn.
     turn_runtime_metrics: RuntimeMetricsSummary,
     last_rendered_width: std::cell::Cell<Option<usize>>,
@@ -741,8 +722,8 @@ pub(crate) struct ChatWidget {
     last_non_retry_error: Option<(String, String)>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 enum CodexOpTarget {
+    #[cfg(test)]
     Direct(UnboundedSender<AppCommand>),
     AppEvent,
 }
@@ -899,26 +880,6 @@ fn request_permissions_from_params(
     })
 }
 
-fn token_usage_info_from_app_server(token_usage: ThreadTokenUsage) -> TokenUsageInfo {
-    TokenUsageInfo {
-        total_token_usage: TokenUsage {
-            total_tokens: token_usage.total.total_tokens,
-            input_tokens: token_usage.total.input_tokens,
-            cached_input_tokens: token_usage.total.cached_input_tokens,
-            output_tokens: token_usage.total.output_tokens,
-            reasoning_output_tokens: token_usage.total.reasoning_output_tokens,
-        },
-        last_token_usage: TokenUsage {
-            total_tokens: token_usage.last.total_tokens,
-            input_tokens: token_usage.last.input_tokens,
-            cached_input_tokens: token_usage.last.cached_input_tokens,
-            output_tokens: token_usage.last.output_tokens,
-            reasoning_output_tokens: token_usage.last.reasoning_output_tokens,
-        },
-        model_context_window: token_usage.model_context_window,
-    }
-}
-
 impl ChatWidget {
     /// Stores or overwrites the cached nickname and role for a collab agent thread.
     ///
@@ -1011,12 +972,11 @@ impl ChatWidget {
 
     pub(crate) fn open_feedback_consent(&mut self, category: crate::app_event::FeedbackCategory) {
         let snapshot = self.feedback.snapshot(self.thread_id);
-        #[cfg(target_os = "windows")]
+
         let include_windows_sandbox_log =
             codex_windows_sandbox::current_log_file_path_for_codex_home(&self.config.codex_home)
                 .is_file();
-        #[cfg(not(target_os = "windows"))]
-        let include_windows_sandbox_log = false;
+
         let params = crate::bottom_pane::feedback_upload_consent_params(
             self.app_event_tx.clone(),
             category,
@@ -1237,7 +1197,8 @@ impl ChatWidget {
             self.review.pre_review_token_info = Some(self.token_info.clone());
         }
         if !from_replay && !self.bottom_pane.is_task_running() {
-            self.bottom_pane.set_task_running(/*running*/ true);
+            self.input_queue.user_turn_pending_start = true;
+            self.update_task_running_state();
         }
         self.review.is_review_mode = true;
         let banner = format!(">> Code review started: {hint} <<");
@@ -1494,7 +1455,7 @@ impl ChatWidget {
                 config.cwd.to_path_buf(),
                 CODEX_CLI_VERSION,
             )
-            .with_yolo_mode(history_cell::is_yolo_mode(config)),
+            .with_full_access_mode(history_cell::is_full_access_mode(config)),
         )
     }
 
@@ -1805,6 +1766,7 @@ impl ChatWidget {
         let op: AppCommand = op.into();
         self.prepare_local_op_submission(&op);
         match &self.codex_op_target {
+            #[cfg(test)]
             CodexOpTarget::Direct(codex_op_tx) => {
                 crate::session_log::log_outbound_op(&op);
                 if let Err(e) = codex_op_tx.send(op) {

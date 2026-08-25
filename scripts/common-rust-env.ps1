@@ -165,14 +165,22 @@ function Get-CodexRustLldLinkPath {
 }
 
 function Set-CodexRustMsvcLinkerEnvironment {
-    $envName = "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"
-    if (-not [string]::IsNullOrWhiteSpace([System.Environment]::GetEnvironmentVariable($envName, "Process"))) {
+    $envNames = @(
+        "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER",
+        "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER"
+    )
+    $missingEnvNames = @($envNames | Where-Object {
+            [string]::IsNullOrWhiteSpace([System.Environment]::GetEnvironmentVariable($_, "Process"))
+        })
+    if ($missingEnvNames.Count -eq 0) {
         return
     }
 
     $lldLink = Get-CodexRustLldLinkPath
     if (-not [string]::IsNullOrWhiteSpace($lldLink)) {
-        Set-Item -Path "Env:$envName" -Value $lldLink
+        foreach ($envName in $missingEnvNames) {
+            Set-Item -Path "Env:$envName" -Value $lldLink
+        }
     }
 }
 

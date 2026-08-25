@@ -10,6 +10,7 @@ mod diagnostics;
 mod fingerprint;
 mod hook_config;
 mod host_name;
+mod json_to_toml;
 mod key_aliases;
 pub mod loader;
 mod marketplace_edit;
@@ -34,6 +35,21 @@ mod tui_keymap;
 pub mod types;
 
 pub const CONFIG_TOML_FILE: &str = "config.toml";
+
+pub(crate) fn read_or_create_config_document(
+    config_path: Option<&std::path::Path>,
+) -> std::io::Result<toml_edit::DocumentMut> {
+    let Some(config_path) = config_path else {
+        return Ok(toml_edit::DocumentMut::new());
+    };
+    match std::fs::read_to_string(config_path) {
+        Ok(raw) => raw
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(toml_edit::DocumentMut::new()),
+        Err(err) => Err(err),
+    }
+}
 
 pub use auth_policy::ManagedAuthPolicy;
 pub use cloud_config_bundle::CloudConfigBundle;
@@ -90,6 +106,8 @@ pub use config_requirements::Sourced;
 pub use config_requirements::WebSearchModeRequirement;
 pub use config_requirements::WindowsRequirementsToml;
 pub use config_requirements::sandbox_mode_requirement_for_permission_profile;
+pub use config_toml::DEFAULT_CHATGPT_BASE_URL;
+pub use config_toml::canonicalize_chatgpt_base_url;
 pub use constraint::Constrained;
 pub use constraint::ConstraintError;
 pub use constraint::ConstraintResult;
@@ -113,6 +131,7 @@ pub use hook_config::HooksToml;
 pub use hook_config::ManagedHooksRequirementsToml;
 pub use hook_config::MatcherGroup;
 pub use host_name::host_name;
+pub use json_to_toml::json_to_toml;
 pub use marketplace_edit::MarketplaceConfigUpdate;
 pub use marketplace_edit::RemoveMarketplaceConfigOutcome;
 pub use marketplace_edit::record_user_marketplace;
@@ -120,6 +139,8 @@ pub use marketplace_edit::remove_user_marketplace;
 pub use marketplace_edit::remove_user_marketplace_config;
 pub use mcp_edit::ConfigEditsBuilder;
 pub use mcp_edit::load_global_mcp_servers;
+pub use mcp_edit::serialize_mcp_server;
+pub use mcp_edit::serialize_mcp_server_inline;
 pub use mcp_requirements::McpServerCommandMatcher;
 pub use mcp_requirements::McpServerIdentity;
 pub use mcp_requirements::McpServerRequirement;
@@ -171,4 +192,5 @@ pub use thread_config::ThreadConfigLoader;
 pub use thread_config::ThreadConfigLoaderFuture;
 pub use thread_config::ThreadConfigSource;
 pub use thread_config::UserThreadConfig;
+pub use thread_config::thread_config_loader_for_endpoint;
 pub use toml::Value as TomlValue;

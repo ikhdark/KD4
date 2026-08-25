@@ -2,7 +2,7 @@
 
 mod ipc;
 mod prompt;
-#[cfg(windows)]
+
 mod windows_pipe;
 
 pub(crate) use ipc::fetch_ide_context;

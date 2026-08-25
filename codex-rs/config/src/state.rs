@@ -10,8 +10,6 @@ use crate::ConfigLayer;
 use crate::ConfigLayerMetadata;
 use crate::ConfigLayerSource;
 use crate::ProfileV2Name;
-use codex_features::feature_for_key;
-use codex_features::legacy_feature_keys;
 use codex_file_system::ExecutorFileSystem;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde_json::Value as JsonValue;
@@ -49,10 +47,6 @@ pub struct LoaderOverrides {
     pub ignore_managed_requirements: bool,
     pub ignore_user_config: bool,
     pub ignore_user_and_project_exec_policy_rules: bool,
-    //TODO(gt): Add a macos_ prefix to this field and remove the target_os check.
-    #[cfg(target_os = "macos")]
-    pub managed_preferences_base64: Option<String>,
-    pub macos_managed_config_requirements_base64: Option<String>,
 }
 
 impl LoaderOverrides {
@@ -70,9 +64,6 @@ impl LoaderOverrides {
             ignore_managed_requirements: false,
             ignore_user_config: false,
             ignore_user_and_project_exec_policy_rules: false,
-            #[cfg(target_os = "macos")]
-            managed_preferences_base64: Some(String::new()),
-            macos_managed_config_requirements_base64: Some(String::new()),
         }
     }
 
@@ -251,6 +242,7 @@ pub struct ProjectDiscoveryContext {
     project_root_markers: Vec<String>,
     git_checkout_root: Option<AbsolutePathBuf>,
     git_trust_root: Option<AbsolutePathBuf>,
+    active_project_lookup_keys: Option<Vec<String>>,
     filesystem_identity: usize,
 }
 
@@ -269,8 +261,14 @@ impl ProjectDiscoveryContext {
             project_root_markers,
             git_checkout_root,
             git_trust_root,
+            active_project_lookup_keys: None,
             filesystem_identity: filesystem_identity(fs),
         }
+    }
+
+    pub fn with_active_project_lookup_keys(mut self, lookup_keys: Vec<String>) -> Self {
+        self.active_project_lookup_keys = Some(lookup_keys);
+        self
     }
 
     pub fn matches(&self, cwd: &AbsolutePathBuf, fs: &dyn ExecutorFileSystem) -> bool {
@@ -299,6 +297,10 @@ impl ProjectDiscoveryContext {
 
     pub fn git_trust_root(&self) -> Option<&AbsolutePathBuf> {
         self.git_trust_root.as_ref()
+    }
+
+    pub fn active_project_lookup_keys(&self) -> Option<&[String]> {
+        self.active_project_lookup_keys.as_deref()
     }
 }
 
@@ -595,7 +597,6 @@ impl ConfigLayerStack {
             let config = normalized_with_key_aliases(&layer.config, &[]);
             let metadata = layer.metadata();
             record_origins(&config, &metadata, &mut path, &mut origins);
-            apply_feature_alias_overlay_origin(&config, &metadata, &mut origins);
         }
 
         origins
@@ -628,33 +629,6 @@ impl ConfigLayerStack {
             layers.reverse();
         }
         layers
-    }
-}
-
-fn apply_feature_alias_overlay_origin(
-    config: &TomlValue,
-    metadata: &ConfigLayerMetadata,
-    origins: &mut HashMap<String, ConfigLayerMetadata>,
-) {
-    let Some(features) = config.get("features").and_then(TomlValue::as_table) else {
-        return;
-    };
-
-    for legacy_key in legacy_feature_keys() {
-        if !features.contains_key(legacy_key) {
-            continue;
-        }
-        let Some(feature) = feature_for_key(legacy_key) else {
-            continue;
-        };
-        let canonical_key = feature.key();
-        if features.contains_key(canonical_key) {
-            continue;
-        }
-        let canonical_path = format!("features.{canonical_key}");
-        if origins.contains_key(&canonical_path) {
-            origins.insert(canonical_path, metadata.clone());
-        }
     }
 }
 

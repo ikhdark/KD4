@@ -66,27 +66,56 @@ fn typed_preflight_enforces_code_mode_registered_schema() {
         output_schema: None,
     });
     let name = ToolName::plain("typed_helper");
+    let valid_payload = ToolPayload::Function {
+        arguments: serde_json::json!({ "path": "src/lib.rs" }).to_string(),
+    };
+    let valid_arguments = ParsedFunctionArguments::from_payload(&valid_payload);
 
     assert_eq!(
-        preflight_code_mode_arguments(
-            &name,
-            &spec,
-            &ToolPayload::Function {
-                arguments: serde_json::json!({ "path": "src/lib.rs" }).to_string(),
-            },
-        ),
+        preflight_code_mode_arguments(&name, &spec, &valid_payload, valid_arguments.as_ref(),),
         Ok(())
     );
-    let error = preflight_code_mode_arguments(
-        &name,
-        &spec,
-        &ToolPayload::Function {
-            arguments: serde_json::json!({ "path": 7, "extra": true }).to_string(),
-        },
-    )
-    .expect_err("invalid typed arguments must be rejected before dispatch");
+    let invalid_payload = ToolPayload::Function {
+        arguments: serde_json::json!({ "path": 7, "extra": true }).to_string(),
+    };
+    let invalid_arguments = ParsedFunctionArguments::from_payload(&invalid_payload);
+    let error =
+        preflight_code_mode_arguments(&name, &spec, &invalid_payload, invalid_arguments.as_ref())
+            .expect_err("invalid typed arguments must be rejected before dispatch");
     assert!(error.contains("argument preflight failed"));
     assert!(error.contains("/path") || error.contains("additional"));
+}
+
+#[tokio::test]
+async fn parsed_function_arguments_feed_hooks_and_typed_handlers() {
+    #[derive(Debug, serde::Deserialize, PartialEq)]
+    struct Arguments {
+        path: String,
+        line: u64,
+    }
+
+    let raw = r#"{"path":"src/lib.rs","line":7}"#;
+    let payload = ToolPayload::Function {
+        arguments: raw.to_string(),
+    };
+    let parsed = ParsedFunctionArguments::from_payload(&payload)
+        .expect("function payload should have a parsed representation");
+
+    with_parsed_function_arguments(Some(parsed), async {
+        assert_eq!(
+            function_hook_tool_input(raw),
+            serde_json::json!({"path": "src/lib.rs", "line": 7})
+        );
+        assert_eq!(
+            crate::tools::handlers::parse_arguments::<Arguments>(raw)
+                .expect("typed arguments should deserialize from the canonical value"),
+            Arguments {
+                path: "src/lib.rs".to_string(),
+                line: 7,
+            }
+        );
+    })
+    .await;
 }
 
 #[test]
@@ -1853,6 +1882,145 @@ impl ToolExecutor<ToolInvocation> for TestHandler {
 
 impl CoreToolRuntime for TestHandler {}
 
+struct SpecCountingHandler {
+    tool_name: codex_tools::ToolName,
+    spec_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ToolExecutor<ToolInvocation> for SpecCountingHandler {
+    fn tool_name(&self) -> codex_tools::ToolName {
+        self.tool_name.clone()
+    }
+
+    fn spec(&self) -> codex_tools::ToolSpec {
+        self.spec_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        test_spec(&self.tool_name)
+    }
+
+    fn handle(&self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+        Box::pin(async {
+            Ok(
+                Box::new(crate::tools::context::FunctionToolOutput::from_text(
+                    "ok".to_string(),
+                    Some(true),
+                )) as Box<dyn crate::tools::context::ToolOutput>,
+            )
+        })
+    }
+}
+
+impl CoreToolRuntime for SpecCountingHandler {}
+
+struct IndependentNameHandler;
+
+impl ToolExecutor<ToolInvocation> for IndependentNameHandler {
+    fn tool_name(&self) -> ToolName {
+        ToolName::plain("legacy_independent_name")
+    }
+
+    fn spec(&self) -> ToolSpec {
+        test_spec(&ToolName::plain("authoritative_name"))
+    }
+
+    fn handle(&self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+        Box::pin(async {
+            Ok(
+                Box::new(crate::tools::context::FunctionToolOutput::from_text(
+                    "ok".to_string(),
+                    Some(true),
+                )) as Box<dyn crate::tools::context::ToolOutput>,
+            )
+        })
+    }
+}
+
+impl CoreToolRuntime for IndependentNameHandler {}
+
+#[test]
+fn registry_caches_each_runtime_spec_once() {
+    let tool_name = ToolName::plain("counted_spec");
+    let spec_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let runtime: Arc<dyn CoreToolRuntime> = Arc::new(SpecCountingHandler {
+        tool_name,
+        spec_calls: Arc::clone(&spec_calls),
+    });
+    let registry = ToolRegistry::from_tools([runtime]);
+
+    let first = registry.manifest_entries();
+    let second = registry.manifest_entries();
+
+    assert_eq!(first, second);
+    assert_eq!(spec_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+#[test]
+fn registry_dispatch_identity_is_derived_from_the_cached_spec() {
+    let runtime: Arc<dyn CoreToolRuntime> = Arc::new(IndependentNameHandler);
+    let authoritative_name = ToolName::plain("authoritative_name");
+    let registry = ToolRegistry::from_tools([runtime]);
+
+    assert_eq!(registry.tool_names_for_test(), vec![authoritative_name]);
+    assert!(
+        registry
+            .tool(&ToolName::plain("legacy_independent_name"))
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn tool_invocation_retains_turn_only_through_step_context() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let turn = Arc::new(turn);
+    let initial_turn_refs = Arc::strong_count(&turn);
+
+    let invocation = test_invocation(
+        Arc::new(session),
+        Arc::clone(&turn),
+        "single-turn-owner",
+        ToolName::plain("single_turn_owner"),
+    );
+
+    assert_eq!(Arc::strong_count(&turn), initial_turn_refs + 1);
+    assert!(Arc::ptr_eq(&turn, &invocation.step_context.turn));
+}
+
+#[test]
+fn registered_tool_keeps_exposure_as_registry_metadata() {
+    let tool_name = ToolName::plain("metadata_exposure");
+    let runtime: Arc<dyn CoreToolRuntime> = Arc::new(TestHandler {
+        tool_name: tool_name.clone(),
+    });
+    let registered = RegisteredTool::with_exposure(Arc::clone(&runtime), ToolExposure::Hidden);
+
+    assert_eq!(registered.exposure(), ToolExposure::Hidden);
+    assert_eq!(registered.runtime().exposure(), ToolExposure::Direct);
+
+    let registry = ToolRegistry::from_unique_registered_tools([registered]);
+    assert_eq!(
+        registry.tool_exposure(&tool_name),
+        Some(ToolExposure::Hidden)
+    );
+    assert!(Arc::ptr_eq(
+        &runtime,
+        &registry.tool(&tool_name).expect("registered runtime")
+    ));
+}
+
+#[test]
+fn prevalidated_registry_constructor_does_not_repeat_duplicate_filtering() {
+    let source = include_str!("registry.rs");
+    let constructor = source
+        .split_once("fn from_unique_registered_tools")
+        .expect("prevalidated registry constructor")
+        .1
+        .split_once("pub(crate) fn")
+        .map_or(source, |(body, _)| body);
+
+    assert!(!constructor.contains("contains_key"));
+    assert!(!constructor.contains("continue"));
+}
+
 #[derive(Clone)]
 enum LifecycleTestResult {
     Ok { success: bool },
@@ -1900,14 +2068,22 @@ impl LifecycleTestHandler {
 impl CoreToolRuntime for LifecycleTestHandler {}
 
 fn test_spec(tool_name: &codex_tools::ToolName) -> codex_tools::ToolSpec {
-    codex_tools::ToolSpec::Function(codex_tools::ResponsesApiTool {
+    let tool = codex_tools::ResponsesApiTool {
         name: tool_name.name.clone(),
         description: "Test tool.".to_string(),
         strict: false,
         defer_loading: None,
         parameters: codex_tools::JsonSchema::default(),
         output_schema: None,
-    })
+    };
+    match &tool_name.namespace {
+        Some(namespace) => codex_tools::ToolSpec::Namespace(codex_tools::ResponsesApiNamespace {
+            name: namespace.clone(),
+            description: "Test namespace.".to_string(),
+            tools: vec![codex_tools::ResponsesApiNamespaceTool::Function(tool)],
+        }),
+        None => codex_tools::ToolSpec::Function(tool),
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1976,10 +2152,8 @@ fn handler_looks_up_namespaced_aliases_explicitly() {
     let namespaced_handler = Arc::new(TestHandler {
         tool_name: namespaced_name.clone(),
     }) as Arc<dyn CoreToolRuntime>;
-    let registry = ToolRegistry::new(HashMap::from([
-        (plain_name.clone(), Arc::clone(&plain_handler)),
-        (namespaced_name.clone(), Arc::clone(&namespaced_handler)),
-    ]));
+    let registry =
+        ToolRegistry::from_tools([Arc::clone(&plain_handler), Arc::clone(&namespaced_handler)]);
 
     let plain = registry.tool(&plain_name);
     let namespaced = registry.tool(&namespaced_name);
@@ -2236,10 +2410,7 @@ async fn dispatch_notifies_tool_lifecycle_contributors() -> anyhow::Result<()> {
         tool_name: failing_tool.clone(),
         result: LifecycleTestResult::Err,
     }) as Arc<dyn CoreToolRuntime>;
-    let registry = ToolRegistry::new(HashMap::from([
-        (ok_tool.clone(), ok_handler),
-        (failing_tool.clone(), failing_handler),
-    ]));
+    let registry = ToolRegistry::from_tools([ok_handler, failing_handler]);
     let session = Arc::new(session);
     let turn = Arc::new(turn);
     let ok_terminal_outcome = Arc::new(AtomicBool::new(false));
@@ -2317,7 +2488,6 @@ fn test_invocation(
     ToolInvocation {
         session,
         step_context,
-        turn,
         cancellation_token: tokio_util::sync::CancellationToken::new(),
         tracker: Arc::new(tokio::sync::Mutex::new(
             crate::turn_diff_tracker::TurnDiffTracker::new(),
@@ -2344,12 +2514,24 @@ fn invocation_identity_is_order_independent_but_action_sensitive() {
     };
 
     assert_eq!(
-        canonical_tool_invocation_sha256(&first),
-        canonical_tool_invocation_sha256(&reordered)
+        canonical_tool_invocation_sha256(
+            &first,
+            ParsedFunctionArguments::from_payload(&first).as_ref()
+        ),
+        canonical_tool_invocation_sha256(
+            &reordered,
+            ParsedFunctionArguments::from_payload(&reordered).as_ref()
+        )
     );
     assert_ne!(
-        canonical_tool_invocation_sha256(&first),
-        canonical_tool_invocation_sha256(&different_action)
+        canonical_tool_invocation_sha256(
+            &first,
+            ParsedFunctionArguments::from_payload(&first).as_ref()
+        ),
+        canonical_tool_invocation_sha256(
+            &different_action,
+            ParsedFunctionArguments::from_payload(&different_action).as_ref()
+        )
     );
 }
 

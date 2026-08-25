@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Cross-platform shell launcher for `just` recipes.
+"""Windows PowerShell launcher for `just` recipes.
 
 This keeps recipe bodies as normal shell snippets while giving the justfile one
-portable placeholder, `{args}`, for forwarding variadic recipe arguments.
+placeholder, `{args}`, for forwarding variadic recipe arguments.
 """
 
 from __future__ import annotations
@@ -21,6 +21,12 @@ from collections.abc import Callable
 from collections.abc import Mapping
 from pathlib import Path
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import rust_tool_env as shared_rust_tool_env  # noqa: E402
+
 
 ARGS_TOKEN = "{args}"
 STDERR_NULL_TOKEN = "{stderr-null}"
@@ -28,8 +34,6 @@ POWERSHELL_ARGS = "@($args | Select-Object -Skip 1)"
 # This placeholder must be the final token in a recipe snippet because the
 # PowerShell expansion also exits with the command's last exit code.
 POWERSHELL_STDERR_NULL = "2>$null; exit $LASTEXITCODE"
-SH_ARGS = '"$@"'
-SH_STDERR_NULL = "2>/dev/null"
 PROBE_CACHE_TTL_SECONDS = 60 * 60
 TOOL_RUN_TIMEOUT_SECONDS = 2.0
 # sccache --show-stats exceeds 2s even against a warm server, and server
@@ -41,12 +45,13 @@ PYTHON_CPU_COUNT_ENV_VAR = "PYTHON_CPU_COUNT"
 MAX_DEFAULT_PYTHON_CPU_COUNT = 30
 # One shared local default with codex_package/cargo.py and common-rust-env.ps1;
 # override everywhere with CODEX_SCCACHE_CACHE_SIZE.
-SCCACHE_CACHE_SIZE_ENV_VAR = "CODEX_SCCACHE_CACHE_SIZE"
-DEFAULT_SCCACHE_CACHE_SIZE = "80G"
-LINUX_GNU_LINKER_ENV_VAR = "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER"
-LINUX_GNU_RUSTFLAGS_ENV_VAR = "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS"
-WINDOWS_MSVC_LINKER_ENV_VAR = "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"
-WINDOWS_LLVM_LLD_LINK_DEFAULT = Path("C:/Program Files/LLVM/bin/lld-link.exe")
+SCCACHE_CACHE_SIZE_ENV_VAR = shared_rust_tool_env.SCCACHE_CACHE_SIZE_ENV_VAR
+DEFAULT_SCCACHE_CACHE_SIZE = shared_rust_tool_env.DEFAULT_SCCACHE_CACHE_SIZE
+WINDOWS_MSVC_LINKER_ENV_VARS = (
+    "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER",
+    "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER",
+)
+WINDOWS_LLVM_LLD_LINK_DEFAULT = shared_rust_tool_env.WINDOWS_LLVM_LLD_LINK_DEFAULT
 DISABLE_SCRIPT_VENV_VALUES = frozenset({"1", "true", "yes", "on"})
 TOOL_RUN_RESULTS: dict[tuple[str, ...], bool] = {}
 RUST_COMMAND_PATTERN = re.compile(
@@ -67,7 +72,6 @@ def main() -> int:
     os.environ.update(python_cpu_env(os.environ))
     python_updates = python_tool_env(
         os.environ,
-        os_name=os.name,
         repo_root=repo_root,
         cache_dir=cache_dir,
     )
@@ -79,7 +83,6 @@ def main() -> int:
         os.environ.update(
             rust_tool_env(
                 os.environ,
-                os_name=os.name,
                 which=which,
                 cache_dir=cache_dir,
                 repo_root=repo_root,
@@ -88,11 +91,9 @@ def main() -> int:
         ensure_sccache_server_env(os.environ, which=which, cache_dir=cache_dir)
 
     try:
-        if os.name == "nt":
-            return run_powershell(
-                command, recipe_name, recipe_args, which=which, cache_dir=cache_dir
-            )
-        return run_sh(command, recipe_name, recipe_args)
+        return run_powershell(
+            command, recipe_name, recipe_args, which=which, cache_dir=cache_dir
+        )
     except ValueError as exc:
         print(f"just shell adapter: {exc}", file=sys.stderr)
         return 1
@@ -111,11 +112,9 @@ def command_needs_rust_tooling(command: str) -> bool:
 def rust_tool_env(
     env: Mapping[str, str],
     *,
-    os_name: str,
     which: Callable[[str], str | None],
     cache_dir: Path | None = None,
     repo_root: Path | None = None,
-    platform_name: str | None = None,
 ) -> dict[str, str]:
     if is_ci(env):
         return {}
@@ -141,17 +140,7 @@ def rust_tool_env(
         if not env.get("SCCACHE_CACHE_SIZE"):
             updates["SCCACHE_CACHE_SIZE"] = sccache_cache_size(env)
 
-    if os_name == "nt":
-        updates.update(windows_msvc_linker_env(env, which=which))
-        return updates
-
-    updates.update(
-        linux_gnu_linker_env(
-            env,
-            which=which,
-            platform_name=platform_name or sys.platform,
-        )
-    )
+    updates.update(windows_msvc_linker_env(env, which=which))
     return updates
 
 
@@ -160,7 +149,8 @@ def windows_msvc_linker_env(
     *,
     which: Callable[[str], str | None],
 ) -> dict[str, str]:
-    if env.get(WINDOWS_MSVC_LINKER_ENV_VAR):
+    missing_env_vars = [name for name in WINDOWS_MSVC_LINKER_ENV_VARS if not env.get(name)]
+    if not missing_env_vars:
         return {}
 
     lld_link = which("lld-link")
@@ -169,7 +159,7 @@ def windows_msvc_linker_env(
         if not lld_link:
             return {}
 
-    return {WINDOWS_MSVC_LINKER_ENV_VAR: lld_link}
+    return {name: lld_link for name in missing_env_vars}
 
 
 def first_existing_windows_lld_link(env: Mapping[str, str]) -> str | None:
@@ -180,33 +170,11 @@ def first_existing_windows_lld_link(env: Mapping[str, str]) -> str | None:
 
 
 def windows_lld_link_fallbacks(env: Mapping[str, str]) -> list[Path]:
-    candidates: list[Path] = []
-    scoop = env.get("SCOOP")
-    if scoop:
-        candidates.append(
-            Path(scoop) / "apps" / "llvm" / "current" / "bin" / "lld-link.exe"
+    return list(
+        shared_rust_tool_env.windows_lld_link_fallbacks(
+            env, default_path=WINDOWS_LLVM_LLD_LINK_DEFAULT
         )
-    user_profile = env.get("USERPROFILE")
-    if user_profile:
-        candidates.append(
-            Path(user_profile)
-            / "scoop"
-            / "apps"
-            / "llvm"
-            / "current"
-            / "bin"
-            / "lld-link.exe"
-        )
-    candidates.append(WINDOWS_LLVM_LLD_LINK_DEFAULT)
-
-    seen: set[str] = set()
-    unique: list[Path] = []
-    for candidate in candidates:
-        key = normalize_path_for_compare(str(candidate))
-        if key not in seen:
-            seen.add(key)
-            unique.append(candidate)
-    return unique
+    )
 
 
 def sccache_basedir(repo_root: Path) -> str:
@@ -214,16 +182,11 @@ def sccache_basedir(repo_root: Path) -> str:
 
 
 def is_sccache_wrapper(value: str) -> bool:
-    leaf = os.path.basename(value).lower()
-    return value.lower() in {"sccache", "sccache.exe"} or leaf in {
-        "sccache",
-        "sccache.exe",
-    }
+    return shared_rust_tool_env.is_sccache_wrapper(value)
 
 
 def sccache_cache_size(env: Mapping[str, str]) -> str:
-    override = (env.get(SCCACHE_CACHE_SIZE_ENV_VAR) or "").strip()
-    return override or DEFAULT_SCCACHE_CACHE_SIZE
+    return shared_rust_tool_env.sccache_cache_size(env)
 
 
 def expected_sccache_stats_cache_size(value: str) -> str:
@@ -372,38 +335,9 @@ def sccache_env_ok_cache_key(sccache: str, cache_size: str) -> list[str]:
     ]
 
 
-def linux_gnu_linker_env(
-    env: Mapping[str, str],
-    *,
-    which: Callable[[str], str | None],
-    platform_name: str,
-) -> dict[str, str]:
-    if not platform_name.startswith("linux"):
-        return {}
-    if env.get(LINUX_GNU_LINKER_ENV_VAR) or env.get(LINUX_GNU_RUSTFLAGS_ENV_VAR):
-        return {}
-
-    clang = which("clang")
-    if not clang:
-        return {}
-
-    if which("mold"):
-        linker = "mold"
-    elif which("ld.lld"):
-        linker = "lld"
-    else:
-        return {}
-
-    return {
-        LINUX_GNU_LINKER_ENV_VAR: clang,
-        LINUX_GNU_RUSTFLAGS_ENV_VAR: f"-C link-arg=-fuse-ld={linker}",
-    }
-
-
 def python_tool_env(
     env: Mapping[str, str],
     *,
-    os_name: str,
     repo_root: Path,
     cache_dir: Path | None = None,
     stderr=sys.stderr,
@@ -416,8 +350,8 @@ def python_tool_env(
         return {}
 
     venv = repo_root / "scripts" / ".venv"
-    bin_dir = venv / ("Scripts" if os_name == "nt" else "bin")
-    python_exe = bin_dir / ("python.exe" if os_name == "nt" else "python")
+    bin_dir = venv / "Scripts"
+    python_exe = bin_dir / "python.exe"
     if not python_exe.is_file():
         if (repo_root / "scripts" / "uv.lock").exists():
             warn_once(
@@ -616,26 +550,6 @@ def memoized_which(
         return cache[program]
 
     return lookup
-
-
-def run_sh(
-    command: str,
-    recipe_name: str,
-    recipe_args: list[str],
-    *,
-    which: Callable[[str], str | None] = shutil.which,
-    stderr=sys.stderr,
-) -> int:
-    sh = which("sh")
-    if sh is None:
-        print("POSIX shell ('sh') is required for just recipes.", file=stderr)
-        return 1
-    command = render_command(command, args=SH_ARGS, stderr_null=SH_STDERR_NULL)
-    try:
-        os.execv(sh, ["sh", "-cu", command, recipe_name, *recipe_args])
-    except OSError as exc:
-        print(f"Failed to launch POSIX shell ('sh'): {exc}", file=stderr)
-        return 1
 
 
 def run_powershell(

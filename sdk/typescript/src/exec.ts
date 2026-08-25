@@ -48,13 +48,14 @@ const STDERR_TAIL_MAX_BYTES = 64 * 1024;
 const STDERR_DRAIN_GRACE_MS = 1_000;
 const STDERR_TRUNCATION_MARKER = `[stderr truncated; showing last ${STDERR_TAIL_MAX_BYTES} bytes]\n`;
 
-const PLATFORM_PACKAGE_BY_TARGET: Record<string, string> = {
-  "x86_64-unknown-linux-musl": "@openai/codex-linux-x64",
-  "aarch64-unknown-linux-musl": "@openai/codex-linux-arm64",
-  "x86_64-apple-darwin": "@openai/codex-darwin-x64",
-  "aarch64-apple-darwin": "@openai/codex-darwin-arm64",
-  "x86_64-pc-windows-msvc": "@openai/codex-win32-x64",
-  "aarch64-pc-windows-msvc": "@openai/codex-win32-arm64",
+type NativeTarget = {
+  targetTriple: string;
+  package: string;
+  binary: string;
+};
+
+type CodexPackageManifest = {
+  codexNativeTargets?: Record<string, unknown>;
 };
 
 const moduleRequire = createRequire(import.meta.url);
@@ -415,64 +416,25 @@ function isPlainObject(value: unknown): value is CodexConfigObject {
 
 function findCodexPath(): CodexPathResolution {
   const { platform, arch } = process;
-
-  let targetTriple = null;
-  switch (platform) {
-    case "linux":
-    case "android":
-      switch (arch) {
-        case "x64":
-          targetTriple = "x86_64-unknown-linux-musl";
-          break;
-        case "arm64":
-          targetTriple = "aarch64-unknown-linux-musl";
-          break;
-        default:
-          break;
-      }
-      break;
-    case "darwin":
-      switch (arch) {
-        case "x64":
-          targetTriple = "x86_64-apple-darwin";
-          break;
-        case "arm64":
-          targetTriple = "aarch64-apple-darwin";
-          break;
-        default:
-          break;
-      }
-      break;
-    case "win32":
-      switch (arch) {
-        case "x64":
-          targetTriple = "x86_64-pc-windows-msvc";
-          break;
-        case "arm64":
-          targetTriple = "aarch64-pc-windows-msvc";
-          break;
-        default:
-          break;
-      }
-      break;
-    default:
-      break;
+  let codexPackageJsonPath: string;
+  try {
+    codexPackageJsonPath = moduleRequire.resolve(`${CODEX_NPM_NAME}/package.json`);
+  } catch {
+    throw new Error(
+      `Unable to locate Codex CLI binaries. Ensure ${CODEX_NPM_NAME} is installed with optional dependencies.`,
+    );
   }
 
-  if (!targetTriple) {
+  const manifest = moduleRequire(codexPackageJsonPath) as CodexPackageManifest;
+  const nativeTarget = resolveNativeTarget(manifest, platform, arch);
+  if (!nativeTarget) {
     throw new Error(`Unsupported platform: ${platform} (${arch})`);
-  }
-
-  const platformPackage = PLATFORM_PACKAGE_BY_TARGET[targetTriple];
-  if (!platformPackage) {
-    throw new Error(`Unsupported target triple: ${targetTriple}`);
   }
 
   let vendorRoot: string;
   try {
-    const codexPackageJsonPath = moduleRequire.resolve(`${CODEX_NPM_NAME}/package.json`);
     const codexRequire = createRequire(codexPackageJsonPath);
-    const platformPackageJsonPath = codexRequire.resolve(`${platformPackage}/package.json`);
+    const platformPackageJsonPath = codexRequire.resolve(`${nativeTarget.package}/package.json`);
     vendorRoot = path.join(path.dirname(platformPackageJsonPath), "vendor");
   } catch {
     throw new Error(
@@ -480,15 +442,39 @@ function findCodexPath(): CodexPathResolution {
     );
   }
 
-  const codexBinaryName = process.platform === "win32" ? "codex.exe" : "codex";
-  const nativePackage = resolveNativePackage(vendorRoot, targetTriple, codexBinaryName);
+  const nativePackage = resolveNativePackage(
+    vendorRoot,
+    nativeTarget.targetTriple,
+    nativeTarget.binary,
+  );
   if (!nativePackage) {
     throw new Error(
-      `Unable to locate Codex CLI binaries for ${targetTriple}. Ensure ${CODEX_NPM_NAME} is installed with optional dependencies.`,
+      `Unable to locate Codex CLI binaries for ${nativeTarget.targetTriple}. Ensure ${CODEX_NPM_NAME} is installed with optional dependencies.`,
     );
   }
 
   return nativePackage;
+}
+
+export function resolveNativeTarget(
+  manifest: CodexPackageManifest,
+  platform: string,
+  arch: string,
+): NativeTarget | null {
+  const candidate = manifest.codexNativeTargets?.[`${platform}-${arch}`];
+  if (
+    typeof candidate !== "object" ||
+    candidate === null ||
+    !("targetTriple" in candidate) ||
+    typeof candidate.targetTriple !== "string" ||
+    !("package" in candidate) ||
+    typeof candidate.package !== "string" ||
+    !("binary" in candidate) ||
+    typeof candidate.binary !== "string"
+  ) {
+    return null;
+  }
+  return candidate as NativeTarget;
 }
 
 export function resolveNativePackage(
@@ -505,14 +491,6 @@ export function resolveNativePackage(
     };
   }
 
-  const legacyBinaryPath = path.join(packageRoot, "codex", codexBinaryName);
-  if (isFile(legacyBinaryPath)) {
-    return {
-      executablePath: legacyBinaryPath,
-      pathDirs: existingDirs(path.join(packageRoot, "path")),
-    };
-  }
-
   return null;
 }
 
@@ -523,14 +501,11 @@ function existingDirs(...dirs: string[]): string[] {
 export function prependPathDirs(
   env: Record<string, string>,
   pathDirs: string[],
-  platform: NodeJS.Platform = process.platform,
 ): void {
-  const pathKey = pathEnvKey(env, platform);
-  if (platform === "win32") {
-    for (const key of Object.keys(env)) {
-      if (key.toLowerCase() === "path" && key !== pathKey) {
-        delete env[key];
-      }
+  const pathKey = pathEnvKey(env);
+  for (const key of Object.keys(env)) {
+    if (key.toLowerCase() === "path" && key !== pathKey) {
+      delete env[key];
     }
   }
 
@@ -540,11 +515,7 @@ export function prependPathDirs(
   env[pathKey] = [...pathDirs, ...existingEntries].join(path.delimiter);
 }
 
-function pathEnvKey(env: Record<string, string>, platform: NodeJS.Platform): string {
-  if (platform !== "win32") {
-    return "PATH";
-  }
-
+function pathEnvKey(env: Record<string, string>): string {
   const matchingKeys = Object.keys(env).filter((key) => key.toLowerCase() === "path");
   return matchingKeys.includes("Path") ? "Path" : (matchingKeys.at(-1) ?? "PATH");
 }

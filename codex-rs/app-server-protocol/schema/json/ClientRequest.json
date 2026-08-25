@@ -388,7 +388,7 @@
         "size": {
           "anyOf": [
             {
-              "$ref": "#/definitions/CommandExecTerminalSize"
+              "$ref": "#/definitions/PtyTerminalSize"
             },
             {
               "type": "null"
@@ -432,7 +432,7 @@
         "size": {
           "allOf": [
             {
-              "$ref": "#/definitions/CommandExecTerminalSize"
+              "$ref": "#/definitions/PtyTerminalSize"
             }
           ],
           "description": "New PTY size in character cells."
@@ -441,28 +441,6 @@
       "required": [
         "processId",
         "size"
-      ],
-      "type": "object"
-    },
-    "CommandExecTerminalSize": {
-      "description": "PTY size in character cells for `command/exec` PTY sessions.",
-      "properties": {
-        "cols": {
-          "description": "Terminal width in character cells.",
-          "format": "uint16",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "rows": {
-          "description": "Terminal height in character cells.",
-          "format": "uint16",
-          "minimum": 0.0,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "cols",
-        "rows"
       ],
       "type": "object"
     },
@@ -699,14 +677,6 @@
           "type": "object"
         }
       ]
-    },
-    "ConversationTextRole": {
-      "enum": [
-        "user",
-        "developer",
-        "assistant"
-      ],
-      "type": "string"
     },
     "DynamicToolNamespaceTool": {
       "oneOf": [
@@ -2133,31 +2103,6 @@
     "ModelProviderCapabilitiesReadParams": {
       "type": "object"
     },
-    "MultiAgentMode": {
-      "description": "Controls the effective multi-agent delegation instructions for a turn. `custom` means the configured mode hint defines the policy instead of a built-in policy.",
-      "oneOf": [
-        {
-          "enum": [
-            "explicitRequestOnly",
-            "proactive"
-          ],
-          "type": "string"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "custom": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "custom"
-          ],
-          "title": "CustomMultiAgentMode",
-          "type": "object"
-        }
-      ]
-    },
     "NetworkAccess": {
       "enum": [
         "restricted",
@@ -2570,8 +2515,8 @@
       ],
       "type": "object"
     },
-    "ProcessTerminalSize": {
-      "description": "PTY size in character cells for `process/spawn` PTY sessions.",
+    "PtyTerminalSize": {
+      "description": "Canonical PTY size payload shared by app-server process APIs.",
       "properties": {
         "cols": {
           "description": "Terminal width in character cells.",
@@ -2591,44 +2536,6 @@
         "rows"
       ],
       "type": "object"
-    },
-    "RealtimeConversationVersion": {
-      "enum": [
-        "v1",
-        "v2"
-      ],
-      "type": "string"
-    },
-    "RealtimeOutputModality": {
-      "enum": [
-        "text",
-        "audio"
-      ],
-      "type": "string"
-    },
-    "RealtimeVoice": {
-      "enum": [
-        "alloy",
-        "arbor",
-        "ash",
-        "ballad",
-        "breeze",
-        "cedar",
-        "coral",
-        "cove",
-        "echo",
-        "ember",
-        "juniper",
-        "maple",
-        "marin",
-        "sage",
-        "shimmer",
-        "sol",
-        "spruce",
-        "vale",
-        "verse"
-      ],
-      "type": "string"
     },
     "ReasoningEffort": {
       "description": "A non-empty reasoning effort value advertised by the model.",
@@ -4218,7 +4125,7 @@
           ]
         },
         "searchTerm": {
-          "description": "Optional substring filter for the extracted thread title.",
+          "description": "Optional substring filter for thread summary metadata used by listing (the title and, when available, cached preview text). This does not scan arbitrary rollout content or return match snippets; use the experimental `thread/search` method for that capability.",
           "type": [
             "string",
             "null"
@@ -4356,86 +4263,6 @@
         "threadId"
       ],
       "type": "object"
-    },
-    "ThreadRealtimeAudioChunk": {
-      "description": "EXPERIMENTAL - thread realtime audio chunk.",
-      "properties": {
-        "data": {
-          "type": "string"
-        },
-        "itemId": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "numChannels": {
-          "format": "uint16",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "sampleRate": {
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "samplesPerChannel": {
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "data",
-        "numChannels",
-        "sampleRate"
-      ],
-      "type": "object"
-    },
-    "ThreadRealtimeStartTransport": {
-      "description": "EXPERIMENTAL - transport used by thread realtime.",
-      "oneOf": [
-        {
-          "properties": {
-            "type": {
-              "enum": [
-                "websocket"
-              ],
-              "title": "WebsocketThreadRealtimeStartTransportType",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type"
-          ],
-          "title": "WebsocketThreadRealtimeStartTransport",
-          "type": "object"
-        },
-        {
-          "properties": {
-            "sdp": {
-              "description": "SDP offer generated by a WebRTC RTCPeerConnection after configuring audio and the realtime events data channel.",
-              "type": "string"
-            },
-            "type": {
-              "enum": [
-                "webrtc"
-              ],
-              "title": "WebrtcThreadRealtimeStartTransportType",
-              "type": "string"
-            }
-          },
-          "required": [
-            "sdp",
-            "type"
-          ],
-          "title": "WebrtcThreadRealtimeStartTransport",
-          "type": "object"
-        }
-      ]
     },
     "ThreadResumeInitialTurnsPageParams": {
       "properties": {
@@ -4629,7 +4456,29 @@
       "type": "string"
     },
     "ThreadSource": {
-      "type": "string"
+      "oneOf": [
+        {
+          "enum": [
+            "User",
+            "Subagent",
+            "MemoryConsolidation"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "Feature": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "Feature"
+          ],
+          "title": "FeatureThreadSource",
+          "type": "object"
+        }
+      ]
     },
     "ThreadSourceKind": {
       "enum": [
@@ -5799,7 +5648,7 @@
         },
         "method": {
           "enum": [
-            "thread/inject_items"
+            "thread/injectItems"
           ],
           "title": "Thread/injectItemsRequestMethod",
           "type": "string"

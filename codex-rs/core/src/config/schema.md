@@ -7,5 +7,5 @@ When you change any fields included in `ConfigToml` (or nested config types),
 regenerate the schema:
 
 ```
-just write-config-schema
+just config-schema-regenerate <owner>
 ```

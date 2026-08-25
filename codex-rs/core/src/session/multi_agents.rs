@@ -1,7 +1,7 @@
 use crate::config::MultiAgentV2Config;
+use crate::context::EffectiveMultiAgentMode;
 use crate::context::TaskCapsuleFragment;
 use crate::session::turn_context::TurnContext;
-use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -43,7 +43,9 @@ fn configured_usage_hint_text_for_source<'a>(
     }
 }
 
-pub(crate) fn effective_multi_agent_mode(turn_context: &TurnContext) -> Option<MultiAgentMode> {
+pub(crate) fn effective_multi_agent_mode(
+    turn_context: &TurnContext,
+) -> Option<EffectiveMultiAgentMode> {
     if turn_context.multi_agent_version != MultiAgentVersion::V2 {
         return None;
     }
@@ -55,8 +57,8 @@ pub(crate) fn effective_multi_agent_mode(turn_context: &TurnContext) -> Option<M
         .multi_agent_v2
         .multi_agent_mode_hint_text
     {
-        Some(hint_text) => MultiAgentMode::Custom(hint_text.clone()),
-        None => MultiAgentMode::ExplicitRequestOnly,
+        Some(hint_text) => EffectiveMultiAgentMode::Custom(hint_text.clone()),
+        None => EffectiveMultiAgentMode::ExplicitRequestOnly,
     };
 
     match &turn_context.session_source {
@@ -73,14 +75,13 @@ pub(crate) fn effective_multi_agent_mode(turn_context: &TurnContext) -> Option<M
 
 pub(crate) fn spawn_is_authorized(turn_context: &TurnContext) -> bool {
     match effective_multi_agent_mode(turn_context) {
-        Some(MultiAgentMode::Proactive) => true,
-        Some(MultiAgentMode::Custom(policy)) => policy
+        Some(EffectiveMultiAgentMode::Custom(policy)) => policy
             .lines()
             .flat_map(|line| line.split(['.', ';', '\n']))
             .filter_map(parse_spawn_authorization_directive)
             .next_back()
             .is_some_and(|directive| directive == SpawnAuthorizationDirective::Grant),
-        Some(MultiAgentMode::ExplicitRequestOnly) => turn_context
+        Some(EffectiveMultiAgentMode::ExplicitRequestOnly) => turn_context
             .multi_agent_spawn_authorized
             .load(Ordering::Acquire),
         None => false,

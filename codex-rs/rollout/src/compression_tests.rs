@@ -1,7 +1,6 @@
 use std::fs;
 use std::fs::FileTimes;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+
 use std::time::Duration;
 use std::time::SystemTime;
 
@@ -516,58 +515,6 @@ async fn resume_materialization_preserves_rollout_modified_time() -> anyhow::Res
     Ok(())
 }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn compression_preserves_rollout_permissions() -> anyhow::Result<()> {
-    let home = TempDir::new()?;
-    let uuid = Uuid::from_u128(6);
-    let thread_id = ThreadId::from_string(&uuid.to_string())?;
-    let rollout_path = archived_rollout_path(home.path(), "2025-01-03T12-00-00", uuid);
-    write_rollout(&rollout_path, thread_id, "restricted transcript")?;
-    fs::set_permissions(&rollout_path, fs::Permissions::from_mode(0o600))?;
-    set_old_mtime(&rollout_path)?;
-
-    worker::run(home.path().to_path_buf()).await?;
-
-    let compressed_path = compressed_rollout_path(&rollout_path);
-    assert!(!rollout_path.exists());
-    assert_eq!(
-        fs::metadata(&compressed_path)?.permissions().mode() & 0o777,
-        0o600
-    );
-    Ok(())
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn append_materialization_preserves_compressed_rollout_permissions() -> anyhow::Result<()> {
-    let home = TempDir::new()?;
-    let uuid = Uuid::from_u128(6);
-    let thread_id = ThreadId::from_string(&uuid.to_string())?;
-    let rollout_path = rollout_path(home.path(), "2025-01-03T12-00-00", uuid);
-    write_rollout(&rollout_path, thread_id, "restricted transcript")?;
-    compress_now(&rollout_path)?;
-    let compressed_path = compressed_rollout_path(&rollout_path);
-    fs::set_permissions(&compressed_path, fs::Permissions::from_mode(0o600))?;
-
-    append_rollout_item_to_path(
-        &rollout_path,
-        &RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
-            message: "materialize restricted transcript".to_string(),
-            ..Default::default()
-        })),
-    )
-    .await?;
-
-    assert!(rollout_path.exists());
-    assert!(!compressed_path.exists());
-    assert_eq!(
-        fs::metadata(&rollout_path)?.permissions().mode() & 0o777,
-        0o600
-    );
-    Ok(())
-}
-
 #[test]
 fn persist_temp_file_noclobber_installs_completed_temp() -> anyhow::Result<()> {
     let home = TempDir::new()?;
@@ -594,28 +541,6 @@ fn persist_temp_file_noclobber_does_not_replace_existing_destination() -> anyhow
 
     assert!(!temp_path.exists());
     assert_eq!(fs::read_to_string(destination)?, "existing rollout");
-    Ok(())
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn compression_preserves_read_only_rollout_permissions() -> anyhow::Result<()> {
-    let home = TempDir::new()?;
-    let uuid = Uuid::from_u128(7);
-    let thread_id = ThreadId::from_string(&uuid.to_string())?;
-    let rollout_path = archived_rollout_path(home.path(), "2025-01-03T12-00-00", uuid);
-    write_rollout(&rollout_path, thread_id, "read-only transcript")?;
-    set_old_mtime(&rollout_path)?;
-    fs::set_permissions(&rollout_path, fs::Permissions::from_mode(0o400))?;
-    let source_modified = fs::metadata(&rollout_path)?.modified()?;
-
-    worker::run(home.path().to_path_buf()).await?;
-
-    let compressed_path = compressed_rollout_path(&rollout_path);
-    let compressed_metadata = fs::metadata(&compressed_path)?;
-    assert!(!rollout_path.exists());
-    assert_eq!(compressed_metadata.permissions().mode() & 0o777, 0o400);
-    assert_eq!(compressed_metadata.modified()?, source_modified);
     Ok(())
 }
 

@@ -22,12 +22,12 @@ use codex_utils_path_uri::PathUri;
 use futures::TryStreamExt;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
-#[cfg(any(unix, windows))]
+
 use std::time::Duration;
 use tempfile::TempDir;
-#[cfg(windows)]
+
 use tokio::net::windows::named_pipe::ServerOptions;
-#[cfg(any(unix, windows))]
+
 use tokio::time::timeout;
 use uuid::Uuid;
 
@@ -107,48 +107,6 @@ async fn stream_rejects_platform_sandbox() -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn file_reads_reject_fifo_without_waiting_for_a_writer() -> Result<()> {
-    let server = exec_server().await?;
-    let file_system = connect_file_system(server.websocket_url())?;
-    let tmp = TempDir::new()?;
-    let path = tmp.path().join("named-pipe");
-    let output = std::process::Command::new("mkfifo").arg(&path).output()?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "mkfifo failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    let path_uri = PathUri::from_host_native_path(&path)?;
-    let read_error = timeout(
-        Duration::from_secs(1),
-        file_system.read_file(&path_uri, /*sandbox*/ None),
-    )
-    .await
-    .expect("reading a FIFO should not wait for a writer")
-    .expect_err("reading a FIFO should be rejected");
-    let stream_result = timeout(
-        Duration::from_secs(1),
-        file_system.read_file_stream(&path_uri, /*sandbox*/ None),
-    )
-    .await
-    .expect("streaming a FIFO should not wait for a writer");
-    let Err(stream_error) = stream_result else {
-        panic!("streaming a FIFO should be rejected");
-    };
-    let expected = format!("path `{}` is not a file", path.display());
-    assert_eq!(
-        (read_error.to_string(), stream_error.to_string()),
-        (expected.clone(), expected)
-    );
-    Ok(())
-}
-
-#[cfg(windows)]
 #[tokio::test]
 async fn file_reads_reject_named_pipes() -> Result<()> {
     let server = exec_server().await?;
@@ -193,38 +151,6 @@ async fn file_reads_reject_named_pipes() -> Result<()> {
             std::io::ErrorKind::InvalidInput,
         )
     );
-    Ok(())
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn stream_keeps_reading_the_open_file_after_path_replacement() -> Result<()> {
-    let server = exec_server().await?;
-    let file_system = connect_file_system(server.websocket_url())?;
-    let tmp = TempDir::new()?;
-    let path = tmp.path().join("replaceable.bin");
-    std::fs::write(&path, vec![b'a'; BLOCK_SIZE + 1])?;
-    let mut stream = file_system
-        .read_file_stream(
-            &PathUri::from_host_native_path(&path)?,
-            /*sandbox*/ None,
-        )
-        .await?;
-
-    assert_eq!(
-        stream.try_next().await?,
-        Some(bytes::Bytes::from(vec![b'a'; BLOCK_SIZE]))
-    );
-    let replacement = tmp.path().join("replacement.bin");
-    std::fs::write(&replacement, vec![b'b'; BLOCK_SIZE + 1])?;
-    std::fs::remove_file(&path)?;
-    std::fs::rename(replacement, &path)?;
-
-    assert_eq!(
-        stream.try_next().await?,
-        Some(bytes::Bytes::from_static(b"a"))
-    );
-    assert_eq!(stream.try_next().await?, None);
     Ok(())
 }
 

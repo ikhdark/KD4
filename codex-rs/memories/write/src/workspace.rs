@@ -93,7 +93,7 @@ fn append_bounded_diff(rendered: &mut String, diff: &str) {
         return;
     }
 
-    let boundary = previous_char_boundary(diff, crate::workspace_diff::MAX_BYTES);
+    let boundary = diff.floor_char_boundary(crate::workspace_diff::MAX_BYTES);
     rendered.push_str(&diff[..boundary]);
     if !rendered.ends_with('\n') {
         rendered.push('\n');
@@ -102,17 +102,6 @@ fn append_bounded_diff(rendered: &mut String, diff: &str) {
         "\n[workspace diff truncated at {} bytes]\n",
         crate::workspace_diff::MAX_BYTES
     ));
-}
-
-fn previous_char_boundary(value: &str, max_bytes: usize) -> usize {
-    if max_bytes >= value.len() {
-        return value.len();
-    }
-    let mut index = max_bytes;
-    while !value.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
 }
 
 #[cfg(test)]

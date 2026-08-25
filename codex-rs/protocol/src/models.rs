@@ -1729,6 +1729,47 @@ pub enum WebSearchAction {
     Other,
 }
 
+fn web_search_query_detail(query: &Option<String>, queries: &Option<Vec<String>>) -> String {
+    query
+        .clone()
+        .filter(|query| !query.is_empty())
+        .unwrap_or_else(|| {
+            let items = queries.as_ref();
+            let first = items
+                .and_then(|queries| queries.first())
+                .cloned()
+                .unwrap_or_default();
+            if items.is_some_and(|queries| queries.len() > 1) && !first.is_empty() {
+                format!("{first} ...")
+            } else {
+                first
+            }
+        })
+}
+
+pub fn web_search_action_detail(action: &WebSearchAction) -> String {
+    match action {
+        WebSearchAction::Search { query, queries } => web_search_query_detail(query, queries),
+        WebSearchAction::OpenPage { url } => url.clone().unwrap_or_default(),
+        WebSearchAction::FindInPage { url, pattern } => match (pattern, url) {
+            (Some(pattern), Some(url)) => format!("'{pattern}' in {url}"),
+            (Some(pattern), None) => format!("'{pattern}'"),
+            (None, Some(url)) => url.clone(),
+            (None, None) => String::new(),
+        },
+        WebSearchAction::Other => String::new(),
+    }
+}
+
+pub fn web_search_detail(action: Option<&WebSearchAction>, query: &str) -> String {
+    let detail = action.map(web_search_action_detail).unwrap_or_default();
+    if detail.is_empty() {
+        query.to_string()
+    } else {
+        detail
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ReasoningItemReasoningSummary {
@@ -2260,6 +2301,28 @@ mod tests {
     ];
 
     #[test]
+    fn web_search_detail_uses_shared_action_formatting_and_query_fallback() {
+        let search = WebSearchAction::Search {
+            query: None,
+            queries: Some(vec!["first".to_string(), "second".to_string()]),
+        };
+        assert_eq!(web_search_detail(Some(&search), "fallback"), "first ...");
+
+        let find = WebSearchAction::FindInPage {
+            url: Some("https://example.com".to_string()),
+            pattern: Some("needle".to_string()),
+        };
+        assert_eq!(
+            web_search_detail(Some(&find), "fallback"),
+            "'needle' in https://example.com"
+        );
+        assert_eq!(
+            web_search_detail(Some(&WebSearchAction::Other), "fallback"),
+            "fallback"
+        );
+    }
+
+    #[test]
     fn plaintext_agent_message_content_rejects_mixed_encrypted_content() {
         let content = vec![
             AgentMessageInputContent::InputText {
@@ -2729,12 +2792,8 @@ mod tests {
 
     #[test]
     fn file_system_permissions_with_glob_scan_depth_uses_canonical_json() -> Result<()> {
-        let path = AbsolutePathBuf::try_from(PathBuf::from(if cfg!(windows) {
-            r"C:\tmp\allowed"
-        } else {
-            "/tmp/allowed"
-        }))
-        .expect("absolute path");
+        let path =
+            AbsolutePathBuf::try_from(PathBuf::from(r"C:\tmp\allowed")).expect("absolute path");
         let file_system_permissions = FileSystemPermissions {
             entries: vec![FileSystemSandboxEntry {
                 path: FileSystemPath::Path { path },

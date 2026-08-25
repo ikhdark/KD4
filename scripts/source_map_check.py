@@ -198,11 +198,16 @@ def declared_non_rust_manifests(markdown: str) -> list[tuple[int, str]]:
     )
 
 
-def git_source_paths(repo_root: Path, *, tracked_only: bool) -> set[str]:
-    args = ["git", "ls-files", "--cached"]
-    if not tracked_only:
-        args.extend(["--others", "--exclude-standard"])
-    args.append("-z")
+def repository_source_inventory(repo_root: Path) -> tuple[set[str], set[str]]:
+    args = [
+        "git",
+        "ls-files",
+        "-t",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "-z",
+    ]
     result = subprocess.run(
         args,
         cwd=repo_root,
@@ -215,19 +220,28 @@ def git_source_paths(repo_root: Path, *, tracked_only: bool) -> set[str]:
     if result.returncode != 0:
         detail = result.stderr.strip() or f"git ls-files exited {result.returncode}"
         raise ValueError(f"failed to enumerate repository sources: {detail}")
-    return {
-        PurePosixPath(path).as_posix()
-        for path in result.stdout.split("\0")
-        if path and (repo_root / path).is_file()
-    }
+    source_paths: set[str] = set()
+    tracked_source_paths: set[str] = set()
+    for record in result.stdout.split("\0"):
+        if not record:
+            continue
+        if len(record) < 3 or record[1] != " ":
+            raise ValueError("git ls-files returned an invalid tagged path record")
+        path = PurePosixPath(record[2:]).as_posix()
+        if not (repo_root / path).is_file():
+            continue
+        source_paths.add(path)
+        if record[0] != "?":
+            tracked_source_paths.add(path)
+    return source_paths, tracked_source_paths
 
 
 def repository_source_paths(repo_root: Path) -> set[str]:
-    return git_source_paths(repo_root, tracked_only=False)
+    return repository_source_inventory(repo_root)[0]
 
 
 def repository_tracked_source_paths(repo_root: Path) -> set[str]:
-    return git_source_paths(repo_root, tracked_only=True)
+    return repository_source_inventory(repo_root)[1]
 
 
 def tracked_path_snapshot(source_paths: set[str]) -> tuple[int, str]:
@@ -255,9 +269,7 @@ def sync_tracked_path_snapshot(
     root = repo_root if repo_root is not None else source_map.resolve().parent
     raw_markdown = source_map.read_bytes().decode("utf-8")
     newline = "\r\n" if "\r\n" in raw_markdown else "\n"
-    sources = (
-        source_paths if source_paths is not None else repository_source_paths(root)
-    )
+    sources = source_paths if source_paths is not None else repository_tracked_source_paths(root)
     snapshot = render_tracked_path_snapshot(sources, newline=newline)
     block_re = re.compile(
         rf"{re.escape(TRACKED_PATH_SNAPSHOT_BEGIN)}.*?"
@@ -360,18 +372,19 @@ def check_source_map(
         instruction_scopes = declared_instruction_scopes(markdown)
         rust_packages = declared_rust_package_roots(markdown)
         non_rust_manifests = declared_non_rust_manifests(markdown)
-        sources = (
-            source_paths if source_paths is not None else repository_source_paths(root)
-        )
-        tracked_sources = (
-            tracked_source_paths
-            if tracked_source_paths is not None
-            else (
+        if source_paths is None and tracked_source_paths is None:
+            sources, tracked_sources = repository_source_inventory(root)
+        else:
+            sources = (
                 source_paths
                 if source_paths is not None
-                else repository_tracked_source_paths(root)
+                else repository_source_paths(root)
             )
-        )
+            tracked_sources = (
+                tracked_source_paths
+                if tracked_source_paths is not None
+                else sources
+            )
     except (OSError, UnicodeError, ValueError) as exc:
         print(f"{source_map}: {exc}", file=sys.stderr)
         return 1
@@ -444,11 +457,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         else args.source_map.resolve().parent
     )
     try:
-        sync_tracked_path_snapshot(args.source_map, repo_root=root)
+        source_paths, tracked_source_paths = repository_source_inventory(root)
+        sync_tracked_path_snapshot(
+            args.source_map,
+            repo_root=root,
+            source_paths=tracked_source_paths,
+        )
     except (OSError, UnicodeError, ValueError) as exc:
         print(f"{args.source_map}: {exc}", file=sys.stderr)
         return 1
-    return check_source_map(args.source_map, repo_root=args.repo_root)
+    return check_source_map(
+        args.source_map,
+        repo_root=root,
+        source_paths=source_paths,
+        tracked_source_paths=tracked_source_paths,
+    )
 
 
 if __name__ == "__main__":

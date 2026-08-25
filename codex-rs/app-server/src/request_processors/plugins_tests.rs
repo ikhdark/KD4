@@ -8,6 +8,55 @@ use futures::FutureExt;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 
+#[test]
+fn remote_catalog_jsonrpc_error_preserves_typed_recovery_data() {
+    let error = remote_plugin_catalog_error_to_jsonrpc(
+        codex_core_plugins::remote::RemotePluginCatalogError::UnexpectedStatus {
+            url: "https://example.test/plugins".to_string(),
+            status: reqwest::StatusCode::FORBIDDEN,
+            body: "localized body".to_string(),
+        },
+        "list remote plugins",
+    );
+
+    assert_eq!(error.code, crate::error_code::INVALID_REQUEST_ERROR_CODE);
+    assert_eq!(
+        serde_json::from_value::<PluginRemoteErrorData>(error.data.expect("typed error data"))
+            .expect("valid error data"),
+        PluginRemoteErrorData {
+            reason: PluginRemoteErrorReason::AccessDenied,
+            retryable: false,
+        }
+    );
+}
+
+#[test]
+fn missing_error_path_remote_uninstall_cache_failure_is_not_tracked_as_success() {
+    assert_eq!(
+        remote_plugin_uninstall_effects(&Err(RemotePluginCatalogError::CacheRemove(
+            "injected cache failure".to_string(),
+        ))),
+        RemotePluginUninstallEffects {
+            track_success: false,
+            refresh_caches: true,
+        }
+    );
+    assert_eq!(
+        remote_plugin_uninstall_effects(&Ok(())),
+        RemotePluginUninstallEffects {
+            track_success: true,
+            refresh_caches: true,
+        }
+    );
+    assert_eq!(
+        remote_plugin_uninstall_effects(&Err(RemotePluginCatalogError::AuthRequired)),
+        RemotePluginUninstallEffects {
+            track_success: false,
+            refresh_caches: false,
+        }
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn plugin_uninstall_invalidates_caches_before_returning() -> anyhow::Result<()> {
     let codex_home = TempDir::new()?;

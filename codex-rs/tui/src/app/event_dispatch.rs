@@ -5,16 +5,16 @@
 
 use super::resize_reflow::trailing_run_start;
 use super::*;
+use crate::approval_presets::ApprovalPreset;
 use crate::config_update::format_config_error;
 use crate::external_agent_config_migration_flow::ExternalAgentConfigMigrationFlowOutcome;
 use codex_app_server_protocol::WindowsSandboxGrantReadRootParams;
 use codex_app_server_protocol::WindowsSandboxReadiness;
 use codex_app_server_protocol::WindowsSandboxSetupMode;
 use codex_app_server_protocol::WindowsSandboxSetupStartParams;
-#[cfg(target_os = "windows")]
+
 use codex_config::types::WindowsSandboxModeToml;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use codex_utils_approval_presets::ApprovalPreset;
 
 const SHUTDOWN_FIRST_EXIT_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 2);
 
@@ -276,7 +276,11 @@ impl App {
                     &self.transcript_cells,
                 );
                 let consolidated: Arc<dyn HistoryCell> =
-                    Arc::new(history_cell::new_proposed_plan(source, &self.config.cwd));
+                    Arc::new(history_cell::new_proposed_plan_with_file_opener(
+                        source,
+                        &self.config.cwd,
+                        self.config.file_opener,
+                    ));
 
                 if start < end {
                     self.transcript_cells
@@ -1159,7 +1163,6 @@ impl App {
                 preset,
                 profile_selection,
             } => {
-                #[cfg(any(target_os = "windows", test))]
                 if !self.chat_widget.windows_sandbox_mode_allowed(
                     codex_config::types::WindowsSandboxModeToml::Elevated,
                 ) {
@@ -1225,7 +1228,6 @@ impl App {
                 preset,
                 profile_selection,
             } => {
-                #[cfg(any(target_os = "windows", test))]
                 if !self.chat_widget.windows_sandbox_mode_allowed(
                     codex_config::types::WindowsSandboxModeToml::Unelevated,
                 ) {
@@ -1321,7 +1323,6 @@ impl App {
                 mode,
                 profile_selection,
             } => {
-                #[cfg(target_os = "windows")]
                 {
                     self.chat_widget.clear_windows_sandbox_setup_status();
                     if let Some(started_at) = self.windows_sandbox.setup_started_at.take() {
@@ -1402,7 +1403,6 @@ impl App {
                                         /*approvals_reviewer*/ None,
                                         /*permission_profile*/ None,
                                         /*active_permission_profile*/ None,
-                                        #[cfg(target_os = "windows")]
                                         Some(windows_sandbox_level),
                                         /*model*/ None,
                                         /*effort*/ None,
@@ -1429,7 +1429,6 @@ impl App {
                                         /*approvals_reviewer*/ None,
                                         /*permission_profile*/ None,
                                         /*active_permission_profile*/ None,
-                                        #[cfg(target_os = "windows")]
                                         Some(windows_sandbox_level),
                                         /*model*/ None,
                                         /*effort*/ None,
@@ -1458,7 +1457,6 @@ impl App {
                                         Some(self.config.approvals_reviewer),
                                         Some(preset.permission_profile.clone()),
                                         Some(preset.active_permission_profile.clone()),
-                                        #[cfg(target_os = "windows")]
                                         Some(windows_sandbox_level),
                                         /*model*/ None,
                                         /*effort*/ None,
@@ -1495,10 +1493,6 @@ impl App {
                             ));
                         }
                     }
-                }
-                #[cfg(not(target_os = "windows"))]
-                {
-                    let _ = (preset, mode, profile_selection);
                 }
             }
             AppEvent::PersistModelSelection { model, effort } => {
@@ -1648,7 +1642,7 @@ impl App {
                 else {
                     return Ok(AppRunControl::Continue);
                 };
-                #[cfg(target_os = "windows")]
+
                 let permission_profile_is_managed_restricted =
                     managed_filesystem_sandbox_is_restricted(&permission_profile);
                 let permission_profile_for_chat = permission_profile.clone();
@@ -1676,7 +1670,7 @@ impl App {
 
                 // If a managed filesystem sandbox is active, run the Windows
                 // world-writable scan.
-                #[cfg(target_os = "windows")]
+
                 {
                     // One-shot suppression if the user just confirmed continue.
                     if self.windows_sandbox.skip_world_writable_scan_once {
@@ -2401,8 +2395,8 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approval_presets::builtin_approval_presets;
     use codex_config::types::ApprovalsReviewer;
-    use codex_utils_approval_presets::builtin_approval_presets;
 
     #[test]
     fn windows_sandbox_setup_params_preserve_pending_permission_selection() {

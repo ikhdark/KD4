@@ -9,6 +9,10 @@ doctest = false
 name = "codex_features"
 path = "src/lib.rs"
 
+[[bin]]
+name = "codex-features-export"
+path = "src/bin/export.rs"
+
 [lints]
 workspace = true
 
@@ -17,6 +21,7 @@ codex-otel = { workspace = true }
 codex-protocol = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true, features = ["log"] }
 

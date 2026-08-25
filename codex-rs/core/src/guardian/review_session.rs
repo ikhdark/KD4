@@ -76,7 +76,7 @@ pub(crate) struct GuardianReviewSessionParams {
     pub(crate) parent_session: Arc<Session>,
     pub(crate) parent_turn: Arc<TurnContext>,
     pub(crate) spawn_config: Config,
-    pub(crate) request: GuardianApprovalRequest,
+    pub(crate) request: Arc<GuardianApprovalRequest>,
     pub(crate) retry_reason: Option<String>,
     pub(crate) schema: Value,
     pub(crate) model: String,
@@ -164,9 +164,6 @@ struct GuardianReviewSessionReuseKey {
     compact_prompt: Option<String>,
     cwd: AbsolutePathBuf,
     mcp_servers: Constrained<HashMap<String, McpServerConfig>>,
-    codex_linux_sandbox_exe: Option<PathBuf>,
-    main_execve_wrapper_exe: Option<PathBuf>,
-    zsh_path: Option<PathBuf>,
     features: ManagedFeatures,
     use_experimental_unified_exec_tool: bool,
 }
@@ -192,9 +189,6 @@ impl GuardianReviewSessionReuseKey {
             compact_prompt: spawn_config.compact_prompt.clone(),
             cwd: spawn_config.cwd.clone(),
             mcp_servers: spawn_config.mcp_servers.clone(),
-            codex_linux_sandbox_exe: spawn_config.codex_linux_sandbox_exe.clone(),
-            main_execve_wrapper_exe: spawn_config.main_execve_wrapper_exe.clone(),
-            zsh_path: spawn_config.zsh_path.clone(),
             features: spawn_config.features.clone(),
             use_experimental_unified_exec_tool: spawn_config.use_experimental_unified_exec_tool,
         }
@@ -762,7 +756,7 @@ async fn run_review_on_session(
                 params.parent_session.as_ref(),
                 Some(params.parent_turn.as_ref()),
                 params.retry_reason.clone(),
-                params.request.clone(),
+                params.request.as_ref(),
                 prompt_mode,
             )
             .await
@@ -1240,8 +1234,7 @@ mod tests {
         let reasoning_effort = turn.reasoning_effort.clone();
         let reasoning_summary = turn.reasoning_summary;
         let personality = turn.personality;
-        #[allow(deprecated)]
-        let cwd = turn.cwd.clone();
+        let cwd = turn.cwd().clone();
         let spawn_config = build_guardian_review_session_config(
             turn.config.as_ref(),
             /*live_network_config*/ None,
@@ -1254,14 +1247,14 @@ mod tests {
             parent_session: Arc::new(session),
             parent_turn: Arc::new(turn),
             spawn_config,
-            request: GuardianApprovalRequest::Shell {
+            request: Arc::new(GuardianApprovalRequest::Shell {
                 id: "shell-1".to_string(),
                 command: vec!["git".to_string(), "status".to_string()],
                 cwd,
                 sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
                 additional_permissions: None,
                 justification: Some("Inspect repo state.".to_string()),
-            },
+            }),
             retry_reason: None,
             schema: super::super::prompt::guardian_output_schema(),
             model,
@@ -1546,6 +1539,15 @@ mod tests {
                 transcript_entry_count: 42,
             }
         }));
+    }
+
+    #[tokio::test]
+    async fn review_params_share_the_approval_request_payload() {
+        let params = test_review_params().await;
+        let request = Arc::clone(&params.request);
+
+        assert!(Arc::ptr_eq(&request, &params.request));
+        assert_eq!(Arc::strong_count(&params.request), 2);
     }
 
     #[test]

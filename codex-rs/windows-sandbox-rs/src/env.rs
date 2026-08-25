@@ -1,6 +1,5 @@
 use anyhow::Result;
 use anyhow::anyhow;
-use dirs_next::home_dir;
 use std::collections::HashMap;
 use std::env;
 use std::fs::File;
@@ -103,6 +102,14 @@ fn reorder_pathext_for_stubs(env_map: &mut HashMap<String, String>) {
 }
 
 fn ensure_denybin(tools: &[&str], denybin_dir: Option<&Path>) -> Result<PathBuf> {
+    ensure_denybin_with_home(tools, denybin_dir, dirs::home_dir)
+}
+
+fn ensure_denybin_with_home(
+    tools: &[&str],
+    denybin_dir: Option<&Path>,
+    home_dir: impl FnOnce() -> Option<PathBuf>,
+) -> Result<PathBuf> {
     let base = match denybin_dir {
         Some(p) => p.to_path_buf(),
         None => {
@@ -174,4 +181,27 @@ pub fn apply_no_network_to_env(env_map: &mut HashMap<String, String>) -> Result<
     prepend_path(env_map, &base.to_string_lossy());
     reorder_pathext_for_stubs(env_map);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_denybin_with_home;
+
+    #[test]
+    fn ensure_denybin_uses_home_fallback() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let base =
+            ensure_denybin_with_home(&["ssh", "scp"], None, || Some(home.path().to_path_buf()))?;
+
+        assert_eq!(base, home.path().join(".sbx-denybin"));
+        for tool in ["ssh", "scp"] {
+            for extension in ["bat", "cmd"] {
+                assert_eq!(
+                    std::fs::read(base.join(format!("{tool}.{extension}")))?,
+                    b"@echo off\\r\\nexit /b 1\\r\\n"
+                );
+            }
+        }
+        Ok(())
+    }
 }

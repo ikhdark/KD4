@@ -7,6 +7,9 @@ mod info;
 mod operations;
 mod platform;
 
+/// Platform null device used to keep internal Git commands from invoking hooks.
+pub const DISABLED_HOOKS_PATH: &str = "NUL";
+
 pub use apply::ApplyGitRequest;
 pub use apply::ApplyGitResult;
 pub use apply::apply_git_patch;

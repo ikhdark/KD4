@@ -25,7 +25,6 @@ use crate::protocol::v2::ThreadItem;
 use codex_protocol::ThreadId;
 use codex_protocol::parse_command::ParsedCommand;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
-use codex_protocol::protocol::ExecApprovalRequestEvent;
 use codex_protocol::protocol::ExecCommandBeginEvent;
 use codex_protocol::protocol::ExecCommandEndEvent;
 use codex_protocol::protocol::FileChange;
@@ -38,6 +37,7 @@ use codex_protocol::review_format::REVIEW_FALLBACK_MESSAGE;
 use codex_protocol::review_format::render_review_output_text;
 use codex_shell_command::parse_command::parse_command;
 use codex_shell_command::parse_command::shlex_join;
+use codex_utils_absolute_path::is_windows_absolute_path;
 use codex_utils_path_uri::PathConvention;
 use codex_utils_path_uri::PathUri;
 use std::collections::HashMap;
@@ -73,28 +73,6 @@ pub fn build_file_change_end_item(payload: &PatchApplyEndEvent) -> ThreadItem {
         id: payload.call_id.clone(),
         changes: convert_patch_changes(&payload.changes),
         status: (&payload.status).into(),
-    }
-}
-
-pub fn build_command_execution_approval_request_item(
-    payload: &ExecApprovalRequestEvent,
-) -> ThreadItem {
-    ThreadItem::CommandExecution {
-        id: payload.call_id.clone(),
-        command: command_display_string(&payload.command),
-        cwd: payload.cwd.clone().into(),
-        process_id: None,
-        source: CommandExecutionSource::Agent,
-        status: CommandExecutionStatus::InProgress,
-        command_actions: payload
-            .parsed_cmd
-            .iter()
-            .cloned()
-            .map(|parsed| CommandAction::from_core_with_cwd(parsed, &payload.cwd))
-            .collect(),
-        aggregated_output: None,
-        exit_code: None,
-        duration_ms: None,
     }
 }
 
@@ -149,61 +127,16 @@ pub fn command_display_string(command: &[String]) -> String {
 
     if command
         .first()
-        .is_some_and(|program| looks_like_windows_absolute_path(program))
+        .is_some_and(|program| is_windows_absolute_path(program))
     {
         command
             .iter()
-            .map(|arg| quote_windows_display_arg(arg))
+            .map(|arg| codex_shell_command::quote_windows_arg(arg))
             .collect::<Vec<_>>()
             .join(" ")
     } else {
         shlex_join(command)
     }
-}
-
-fn looks_like_windows_absolute_path(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    matches!(
-        bytes,
-        [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic()
-    ) || value.starts_with(r"\\")
-}
-
-/// Quote one display argument using the rules followed by CommandLineToArgvW/the CRT.
-fn quote_windows_display_arg(arg: &str) -> String {
-    let needs_quotes = arg.is_empty()
-        || arg
-            .chars()
-            .any(|ch| matches!(ch, ' ' | '\t' | '\n' | '\r' | '"'));
-    if !needs_quotes {
-        return arg.to_string();
-    }
-
-    let mut quoted = String::with_capacity(arg.len() + 2);
-    quoted.push('"');
-    let mut backslashes = 0;
-    for ch in arg.chars() {
-        match ch {
-            '\\' => backslashes += 1,
-            '"' => {
-                quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
-                quoted.push('"');
-                backslashes = 0;
-            }
-            _ => {
-                if backslashes > 0 {
-                    quoted.push_str(&"\\".repeat(backslashes));
-                    backslashes = 0;
-                }
-                quoted.push(ch);
-            }
-        }
-    }
-    if backslashes > 0 {
-        quoted.push_str(&"\\".repeat(backslashes * 2));
-    }
-    quoted.push('"');
-    quoted
 }
 
 pub(crate) fn command_actions_for_path_uri(

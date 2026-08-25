@@ -2,17 +2,16 @@ use std::sync::Arc;
 
 use codex_git_utils::get_git_repo_root;
 use codex_protocol::models::ShellCommandToolCallParams;
-use codex_tools::ShellCommandBackendConfig;
 use codex_tools::ToolName;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
+use crate::FunctionCallError;
 use crate::agent::task_capabilities::is_independent_review_source;
 use crate::exec::DEFAULT_EXEC_COMMAND_TIMEOUT_MS;
 use crate::exec::ExecCapturePolicy;
 use crate::exec::ExecParams;
 use crate::exec_env::create_env;
 use crate::exec_env::inject_permission_profile_env;
-use crate::function_tool::FunctionCallError;
 use crate::maybe_emit_implicit_skill_invocation;
 use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
@@ -20,12 +19,11 @@ use crate::shell::Shell;
 use crate::shell::ShellType;
 use crate::shell::get_shell;
 use crate::tools::command_execution::CommandAttemptKey;
-use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
-use crate::tools::handlers::command_preflight::classify_rg_search_narrowing;
 use crate::tools::handlers::command_preflight::preflight_invocation_with_equivalent_repair;
+use crate::tools::handlers::command_search::classify_rg_search_narrowing;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::parse_arguments_with_base_path;
 use crate::tools::handlers::resolve_workdir_base_path;
@@ -36,31 +34,24 @@ use crate::tools::registry::PostToolUsePayload;
 use crate::tools::registry::PreToolUsePayload;
 use crate::tools::registry::ToolExecutionTiming;
 use crate::tools::registry::ToolExecutor;
-use crate::tools::runtimes::shell::ShellRuntimeBackend;
 use crate::validation_admission::ValidationAdmission;
 use crate::validation_admission::ValidationLaunchPlan;
 use crate::validation_admission::ValidationLeader;
 use crate::validation_admission::ValidationLeaderOwnership;
 use crate::validation_admission::ValidationRegistration;
 use crate::validation_admission::admit_validation;
-use crate::validation_admission::register_if_absent;
-use crate::validation_admission::scoped_validation_configuration_identity;
-use crate::validation_admission::validation_identity;
-use crate::validation_admission::validation_identity_with_scope;
 use codex_tools::ToolSpec;
 
 use super::super::shell_spec::CommandToolOptions;
 use super::super::shell_spec::create_shell_command_tool;
 use super::RunExecLikeArgs;
+use super::ValidationProofPreparation;
+use super::ValidationProofPreparationArgs;
 use super::parse_shell_command_hook_invocation;
+use super::prepare_validation_proof;
 use super::run_exec_like;
 use super::shell_command_payload_command;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ShellCommandBackend {
-    Classic,
-    ZshFork,
-}
+use super::validation_structured_output;
 
 pub(super) fn effective_stall_timeout_ms(
     timeout_ms: Option<u64>,
@@ -109,13 +100,11 @@ pub(super) async fn await_validation_execution<T>(
 }
 
 pub struct ShellCommandHandler {
-    backend: ShellCommandBackend,
     options: ShellCommandHandlerOptions,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct ShellCommandHandlerOptions {
-    pub(crate) backend_config: ShellCommandBackendConfig,
     pub(crate) allow_login_shell: bool,
     pub(crate) exec_permission_approvals_enabled: bool,
 }
@@ -129,18 +118,7 @@ impl ShellCommandHandler {
     }
 
     pub(crate) fn new(options: ShellCommandHandlerOptions) -> Self {
-        let backend = match options.backend_config {
-            ShellCommandBackendConfig::Classic => ShellCommandBackend::Classic,
-            ShellCommandBackendConfig::ZshFork => ShellCommandBackend::ZshFork,
-        };
-        Self { backend, options }
-    }
-
-    fn shell_runtime_backend(&self) -> ShellRuntimeBackend {
-        match self.backend {
-            ShellCommandBackend::Classic => ShellRuntimeBackend::ShellCommandClassic,
-            ShellCommandBackend::ZshFork => ShellRuntimeBackend::ShellCommandZshFork,
-        }
+        Self { options }
     }
 
     pub(super) fn resolve_use_login_shell(
@@ -202,10 +180,9 @@ impl ShellCommandHandler {
     }
 }
 
-impl From<ShellCommandBackendConfig> for ShellCommandHandler {
-    fn from(backend_config: ShellCommandBackendConfig) -> Self {
+impl Default for ShellCommandHandler {
+    fn default() -> Self {
         Self::new(ShellCommandHandlerOptions {
-            backend_config,
             allow_login_shell: false,
             exec_permission_approvals_enabled: false,
         })
@@ -214,7 +191,7 @@ impl From<ShellCommandBackendConfig> for ShellCommandHandler {
 
 impl ToolExecutor<ToolInvocation> for ShellCommandHandler {
     fn tool_name(&self) -> ToolName {
-        ToolName::plain("shell_command")
+        ToolName::plain(crate::tools::SHELL_COMMAND_TOOL_NAME)
     }
 
     fn spec(&self) -> ToolSpec {
@@ -240,7 +217,6 @@ impl ShellCommandHandler {
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let ToolInvocation {
             session,
-            turn,
             step_context,
             cancellation_token,
             tracker,
@@ -248,6 +224,7 @@ impl ShellCommandHandler {
             payload,
             ..
         } = invocation;
+        let turn = Arc::clone(&step_context.turn);
 
         let tool_name = self.tool_name();
         let ToolPayload::Function { arguments } = payload else {
@@ -342,6 +319,7 @@ impl ShellCommandHandler {
                 observation: Some(observation),
                 proof_key: None,
                 structured_route: None,
+                bound_plan_step: None,
                 validation_call_id: None,
                 turn_timing_state: Some(Arc::clone(&turn.turn_timing_state)),
                 force_fresh: params.force_fresh.unwrap_or(false),
@@ -400,8 +378,7 @@ impl ShellCommandHandler {
             exec_params.windows_sandbox_private_desktop,
         );
         let runtime_context = format!(
-            "backend={:?};shell={shell_type:?};login={use_login_shell};capture={:?};network_environment={:?};network={:?};stall_timeout_ms={:?}",
-            self.backend,
+            "shell={shell_type:?};login={use_login_shell};capture={:?};network_environment={:?};network={:?};stall_timeout_ms={:?}",
             exec_params.capture_policy,
             exec_params.network_environment_id,
             exec_params.network,
@@ -421,92 +398,33 @@ impl ShellCommandHandler {
                 exec_params.cwd.as_path(),
             )
             .await;
+        let validation_cwd = exec_params.cwd.to_string_lossy().into_owned();
         let ValidationRegistrationRoles {
             execution: validation_leader,
             worker_waiter: validation_waiter,
             owner_waiter: validation_owner_waiter,
-        } = if validation_launch.is_some() {
-            let environment = super::validation_environment_hash(&exec_params.env);
-            let toolchain = super::child_env_value(&exec_params.env, "RUSTUP_TOOLCHAIN")
-                .map(|value| value.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let identity = if let Some(route) = direct_validation_route.as_ref() {
-                let Some(leaf) = route.leaves.first() else {
-                    return Err(FunctionCallError::RespondToModel(
-                        "direct validation route changed before launch".to_string(),
-                    ));
-                };
-                let implementation_identity = session
-                    .services
-                    .task_evidence
-                    .direct_validation_implementation_identity_for_leaf(leaf)
-                    .await
-                    .map_err(FunctionCallError::RespondToModel)?;
-                let configuration =
-                    scoped_validation_configuration_identity(turn.config.features.get());
-                validation_identity_with_scope(
-                    repository_key.as_bytes(),
-                    exec_params.cwd.to_string_lossy(),
-                    &command_invocation,
-                    environment,
-                    toolchain,
-                    configuration,
-                    implementation_identity,
-                    &leaf.uncertainty,
-                    &leaf.covered_paths,
-                    &leaf.covered_contracts,
-                )
-            } else {
-                validation_identity(
-                    repository_key.as_bytes(),
-                    exec_params.cwd.to_string_lossy(),
-                    &command_invocation,
-                    environment,
-                    toolchain,
-                    repository_epoch,
-                )
-            };
-            if !params.force_fresh.unwrap_or(false)
-                && let Some(result) = session
-                    .services
-                    .command_execution
-                    .reusable_validation(&identity)
-                    .await
-            {
-                tracing::info!(
-                    disposition = "reused",
-                    duplicate_of_call_id = %result.call_id,
-                    coverage_identity = %result.proof_key.coverage_identity,
-                    implementation_identity = %result.proof_key.implementation_identity,
-                    "validation proof reused without process execution"
-                );
-                turn.turn_timing_state.record_reused_validation();
-                return Ok(boxed_tool_output(validation_structured_output(
-                    serde_json::json!({
-                        "success": true,
-                        "admission_disposition": "reused",
-                        "validation_result": result,
-                    }),
-                )));
+        } = match prepare_validation_proof(ValidationProofPreparationArgs {
+            session: session.as_ref(),
+            turn: turn.as_ref(),
+            validation_launch: &mut validation_launch,
+            direct_validation_route: direct_validation_route.as_ref(),
+            repository_key: repository_key.as_bytes(),
+            cwd: &validation_cwd,
+            command_invocation: &command_invocation,
+            environment: &exec_params.env,
+            execution_context: &runtime_context,
+            repository_epoch,
+            call_id: &call_id,
+            cancellation_token: &cancellation_token,
+            force_fresh: params.force_fresh.unwrap_or(false),
+        })
+        .await?
+        {
+            ValidationProofPreparation::NotValidation => ValidationRegistrationRoles::default(),
+            ValidationProofPreparation::Reused(output) => return Ok(boxed_tool_output(output)),
+            ValidationProofPreparation::Registered(registration) => {
+                validation_registration_roles(registration)
             }
-            if let (Some(launch), Some(route)) =
-                (validation_launch.as_mut(), direct_validation_route.as_ref())
-            {
-                launch.proof_key = Some(identity.clone());
-                launch.structured_route = Some(route.clone());
-                launch.validation_call_id = Some(call_id.clone());
-            }
-            validation_registration_roles(
-                register_if_absent(
-                    &turn.validation_singleflight,
-                    identity,
-                    &call_id,
-                    &cancellation_token,
-                )
-                .await,
-            )
-        } else {
-            ValidationRegistrationRoles::default()
         };
         let attempt_key = CommandAttemptKey::new(
             tool_name.name.as_str(),
@@ -559,7 +477,6 @@ impl ShellCommandHandler {
             turn_environment,
             tracker,
             call_id,
-            shell_runtime_backend: self.shell_runtime_backend(),
             track_validation_freshness: true,
             attempt_key: Some(attempt_key),
             repair_notice,
@@ -585,32 +502,6 @@ impl ShellCommandHandler {
             run_exec_like(run_args).await.map(boxed_tool_output)
         }
     }
-}
-
-pub(super) fn validation_structured_output(value: serde_json::Value) -> FunctionToolOutput {
-    let text = value
-        .get("text")
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| value.to_string());
-    let execution_outcome = super::ValidationExecutionOutcome::from_value_or_legacy_success(&value);
-    let skip_disposition = value
-        .get("skip_disposition")
-        .cloned()
-        .and_then(|value| serde_json::from_value(value).ok());
-    let mut output = FunctionToolOutput::from_text(text, execution_outcome.success())
-        .with_outcome(execution_outcome.tool_outcome());
-    if let Some(skip_disposition) = skip_disposition {
-        output = output.with_skip_disposition(skip_disposition);
-    } else if value
-        .get("execution_outcome")
-        .and_then(serde_json::Value::as_str)
-        == Some("not_executed")
-    {
-        output = output.with_outcome(codex_tools::ToolOutputOutcome::Skipped);
-    }
-    output.post_tool_use_response = Some(value);
-    output
 }
 
 pub(super) fn resolve_command_shell(

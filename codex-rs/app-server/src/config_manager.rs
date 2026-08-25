@@ -4,16 +4,16 @@ use codex_config::CloudConfigBundleLoader;
 use codex_config::ConfigLayerStack;
 use codex_config::LoaderOverrides;
 use codex_config::ThreadConfigLoader;
+use codex_config::json_to_toml;
 use codex_config::loader::load_config_layers_state;
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
 use codex_exec_server::LOCAL_FS;
 use codex_features::Features;
-use codex_features::feature_for_key;
+use codex_features::user_settable_feature_for_key;
 use codex_login::AuthManager;
 use codex_login::default_client::set_default_client_residency_requirement;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use codex_utils_json_to_toml::json_to_toml;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -314,8 +314,6 @@ impl ConfigManager {
 
     fn apply_arg0_paths(&self, config: &mut Config) {
         config.codex_self_exe = self.arg0_paths.codex_self_exe.clone();
-        config.codex_linux_sandbox_exe = self.arg0_paths.codex_linux_sandbox_exe.clone();
-        config.main_execve_wrapper_exe = self.arg0_paths.main_execve_wrapper_exe.clone();
     }
 
     #[cfg(test)]
@@ -375,7 +373,7 @@ pub(crate) fn apply_runtime_feature_enablement(
         if protected_features.contains(name) {
             continue;
         }
-        let Some(feature) = feature_for_key(name) else {
+        let Some(feature) = user_settable_feature_for_key(name) else {
             continue;
         };
         if let Err(err) = config.features.set_enabled(feature, *enabled) {
@@ -398,7 +396,7 @@ fn apply_runtime_feature_enablement_to_features(
         if protected_features.contains(name) {
             continue;
         }
-        let Some(feature) = feature_for_key(name) else {
+        let Some(feature) = user_settable_feature_for_key(name) else {
             continue;
         };
         features.set_enabled(feature, *enabled);

@@ -7,8 +7,8 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from scripts import kd4_first_useful_action_analysis
 from scripts import kd4_turn_latency_audit
 from scripts import rollout_snapshot
 
@@ -71,12 +71,20 @@ class RolloutSnapshotTest(unittest.TestCase):
                 "sha256": hashlib.sha256(data).hexdigest(),
             }
 
-            first_action = kd4_first_useful_action_analysis.analyze([path])
-            latency = kd4_turn_latency_audit.analyze_session_path(path, root)
+            with mock.patch.object(
+                kd4_turn_latency_audit,
+                "read_rollout_snapshot",
+                wraps=rollout_snapshot.read_rollout_snapshot,
+            ) as snapshot_reader:
+                latency = kd4_turn_latency_audit.analyze_session_path(path, root)
 
-            self.assertEqual(first_action["sourceSnapshots"], [expected])
             self.assertEqual(latency["coverage"]["snapshots"], [expected])
+            self.assertEqual(
+                latency["firstUsefulActionAnalysis"]["sourceSnapshots"],
+                [expected],
+            )
             self.assertEqual(latency["coverage"]["bytes"], len(data))
+            snapshot_reader.assert_called_once_with(path)
 
 
 if __name__ == "__main__":

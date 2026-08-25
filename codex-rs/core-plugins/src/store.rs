@@ -1,10 +1,11 @@
 use crate::manifest::PluginManifest;
 use crate::manifest::load_plugin_manifest;
 use crate::manifest::parse_plugin_manifest;
+use codex_file_system::write_bytes_atomically;
 use codex_plugin::PluginId;
+use codex_plugin::find_plugin_manifest_path;
 use codex_plugin::validate_plugin_segment;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use codex_utils_plugins::find_plugin_manifest_path;
 use semver::Version;
 use serde::Deserialize;
 use serde::Serialize;
@@ -13,7 +14,6 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
-use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use tracing::warn;
@@ -263,12 +263,6 @@ impl PluginStore {
             ));
         }
         let path = self.remote_plugin_install_metadata_path(plugin_id);
-        let parent = path.as_path().parent().ok_or_else(|| {
-            PluginStoreError::Invalid(format!(
-                "remote plugin install metadata path has no parent: {}",
-                path.display()
-            ))
-        })?;
         let mut contents = serde_json::to_vec_pretty(&RemotePluginInstallMetadata {
             schema_version: REMOTE_PLUGIN_INSTALL_METADATA_SCHEMA_VERSION,
             remote_plugin_id: remote_plugin_id.to_string(),
@@ -279,23 +273,8 @@ impl PluginStore {
             ))
         })?;
         contents.push(b'\n');
-        let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|err| {
-            PluginStoreError::io(
-                "failed to create temporary remote plugin install metadata",
-                err,
-            )
-        })?;
-        temporary.write_all(&contents).map_err(|err| {
+        write_bytes_atomically(path.as_path(), &contents).map_err(|err| {
             PluginStoreError::io("failed to write remote plugin install metadata", err)
-        })?;
-        temporary.as_file_mut().flush().map_err(|err| {
-            PluginStoreError::io("failed to flush remote plugin install metadata", err)
-        })?;
-        temporary.persist(path.as_path()).map_err(|err| {
-            PluginStoreError::io(
-                "failed to persist remote plugin install metadata",
-                err.error,
-            )
         })?;
         Ok(())
     }

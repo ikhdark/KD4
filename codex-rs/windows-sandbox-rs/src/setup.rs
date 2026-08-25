@@ -25,6 +25,8 @@ use crate::setup_error::SetupFailure;
 use crate::setup_error::clear_setup_error_report;
 use crate::setup_error::failure;
 use crate::setup_error::read_setup_error_report;
+use crate::setup_protocol::SetupMode;
+use crate::setup_protocol::SetupPayload;
 use crate::ssh_config_dependencies::ssh_config_dependency_paths;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -237,7 +239,7 @@ fn run_setup_refresh_inner(
     let deny_write_paths = build_payload_deny_write_paths(&request, overrides.deny_write_paths);
     let offline_proxy_settings =
         offline_proxy_settings_for_request(&request, offline_proxy_settings_override);
-    let payload = ElevationPayload {
+    let payload = SetupPayload {
         version: SETUP_VERSION,
         offline_username: OFFLINE_USERNAME.to_string(),
         online_username: ONLINE_USERNAME.to_string(),
@@ -403,7 +405,11 @@ fn is_elevated() -> Result<bool> {
             ));
         }
         let mut is_member = 0i32;
-        let check = CheckTokenMembership(0, administrators_group, &mut is_member as *mut _);
+        let check = CheckTokenMembership(
+            std::ptr::null_mut(),
+            administrators_group,
+            &mut is_member as *mut _,
+        );
         FreeSid(administrators_group as *mut _);
         if check == 0 {
             return Err(anyhow!("CheckTokenMembership failed: {}", GetLastError()));
@@ -554,37 +560,6 @@ pub(crate) fn effective_write_roots_for_permissions(
     let write_roots = filter_user_profile_root_exclusions(write_roots);
     let write_roots = filter_ssh_config_dependency_roots(write_roots);
     filter_sensitive_write_roots(write_roots, codex_home)
-}
-
-#[derive(Serialize)]
-struct ElevationPayload {
-    version: u32,
-    offline_username: String,
-    online_username: String,
-    codex_home: PathBuf,
-    command_cwd: PathBuf,
-    read_roots: Vec<PathBuf>,
-    write_roots: Vec<PathBuf>,
-    #[serde(default)]
-    deny_read_paths: Vec<PathBuf>,
-    #[serde(default)]
-    deny_write_paths: Vec<PathBuf>,
-    proxy_ports: Vec<u16>,
-    #[serde(default)]
-    allow_local_binding: bool,
-    otel: Option<codex_otel::StatsigMetricsSettings>,
-    real_user: String,
-    mode: SetupMode,
-    #[serde(default)]
-    refresh_only: bool,
-}
-
-#[derive(Clone, Copy, Serialize)]
-#[serde(rename_all = "kebab-case")]
-enum SetupMode {
-    Full,
-    ProvisionOnly,
-    ReadAclsOnlyStrict,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -771,11 +746,7 @@ fn verify_setup_completed(codex_home: &Path) -> Result<()> {
     }
 }
 
-fn run_setup_exe(
-    payload: &ElevationPayload,
-    needs_elevation: bool,
-    codex_home: &Path,
-) -> Result<()> {
+fn run_setup_exe(payload: &SetupPayload, needs_elevation: bool, codex_home: &Path) -> Result<()> {
     use windows_sys::Win32::System::Threading::GetExitCodeProcess;
     use windows_sys::Win32::System::Threading::INFINITE;
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
@@ -849,7 +820,7 @@ fn run_setup_exe(
     // Hide the window for the elevated helper.
     sei.nShow = 0; // SW_HIDE
     let ok = unsafe { ShellExecuteExW(&mut sei) };
-    if ok == 0 || sei.hProcess == 0 {
+    if ok == 0 || sei.hProcess.is_null() {
         let last_error = unsafe { GetLastError() };
         let code = if last_error == ERROR_CANCELLED {
             SetupErrorCode::OrchestratorHelperLaunchCanceled
@@ -922,7 +893,7 @@ fn run_elevated_setup_inner(
     let deny_write_paths = build_payload_deny_write_paths(&request, overrides.deny_write_paths);
     let offline_proxy_settings =
         offline_proxy_settings_for_request(&request, offline_proxy_settings_override);
-    let payload = ElevationPayload {
+    let payload = SetupPayload {
         version: SETUP_VERSION,
         offline_username: OFFLINE_USERNAME.to_string(),
         online_username: ONLINE_USERNAME.to_string(),
@@ -967,7 +938,7 @@ pub fn run_elevated_provisioning_setup(codex_home: &Path, real_user: &str) -> Re
             "sandbox provisioning setup must be run from an elevated process",
         ));
     }
-    let payload = ElevationPayload {
+    let payload = SetupPayload {
         version: SETUP_VERSION,
         offline_username: OFFLINE_USERNAME.to_string(),
         online_username: ONLINE_USERNAME.to_string(),

@@ -4,6 +4,7 @@
 //! Use [`crate::default_client`] or [`codex_login::default_client`] from other crates in this
 //! workspace.
 
+use codex_http_client::BuildCustomCaTransportError;
 use codex_http_client::BuildRouteAwareHttpClientError;
 use codex_http_client::ClientRouteClass;
 use codex_http_client::HttpClient;
@@ -218,12 +219,14 @@ fn sanitize_user_agent(candidate: String, fallback: &str) -> String {
 ///
 /// This supported default path preserves the transport's existing proxy behavior and does not opt into
 /// Codex's route-aware system/PAC resolution.
-pub fn create_client() -> HttpClient {
+pub fn create_client() -> Result<HttpClient, BuildCustomCaTransportError> {
     build_default_client(default_http_client_builder())
 }
 
 /// Creates the default client with configured ChatGPT cookies and no sensitive-response logging.
-pub fn create_client_with_chatgpt_cookies(http_client_factory: &HttpClientFactory) -> HttpClient {
+pub fn create_client_with_chatgpt_cookies(
+    http_client_factory: &HttpClientFactory,
+) -> Result<HttpClient, BuildCustomCaTransportError> {
     build_default_client(
         default_http_client_builder()
             .with_chatgpt_cookies(http_client_factory)
@@ -233,9 +236,9 @@ pub fn create_client_with_chatgpt_cookies(http_client_factory: &HttpClientFactor
 
 /// Create the default HTTP client without request URL or response-header diagnostics.
 ///
-/// This preserves the default client's legacy custom-CA fallback and transport proxy behavior while
-/// avoiding diagnostics that could expose credentials embedded in request URLs or headers.
-pub fn create_client_without_request_logging() -> HttpClient {
+/// This preserves the default client's transport proxy behavior while avoiding diagnostics that
+/// could expose credentials embedded in request URLs or headers.
+pub fn create_client_without_request_logging() -> Result<HttpClient, BuildCustomCaTransportError> {
     build_default_client(default_http_client_builder().without_request_logging())
 }
 
@@ -252,15 +255,10 @@ pub fn create_client_for_route(
     if matches!(
         http_client_factory.outbound_proxy_policy(),
         OutboundProxyPolicy::ReqwestDefault
-    ) {
-        return Ok(create_client());
+    ) || is_sandboxed()
+    {
+        return create_client().map_err(Into::into);
     }
-    if is_sandboxed() {
-        // Preserve the sandbox's existing no-proxy policy; sandboxed command egress is routed
-        // separately through network-proxy.
-        return Ok(create_client());
-    }
-
     default_http_client_builder().build_respecting_outbound_proxy_policy(
         http_client_factory,
         request_url,
@@ -294,14 +292,13 @@ fn default_http_client_builder() -> HttpClientBuilder {
         .with_chatgpt_cloudflare_cookie_store()
 }
 
-// These legacy constructors intentionally preserve the infallible behavior of `create_client`.
-// New endpoint-aware call sites use `create_client_for_route` and propagate construction errors.
-#[allow(deprecated)]
-fn build_default_client(builder: HttpClientBuilder) -> HttpClient {
+fn build_default_client(
+    builder: HttpClientBuilder,
+) -> Result<HttpClient, BuildCustomCaTransportError> {
     if is_sandboxed() {
-        builder.build_direct_with_custom_ca_fallback()
+        builder.build_direct()
     } else {
-        builder.build_with_transport_default_proxy_and_custom_ca_fallback()
+        builder.build_with_transport_default_proxy()
     }
 }
 

@@ -379,8 +379,8 @@ async fn cancelled_review_does_not_forward_delegate_mcp_startup() {
 /// lifecycle still occurs and the plain text is surfaced via
 /// ExitedReviewMode(Some(..)) as the overall_explanation.
 // Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.
-#[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
-#[cfg_attr(not(windows), tokio::test(flavor = "multi_thread", worker_threads = 2))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+
 async fn review_op_with_plain_text_emits_review_fallback() {
     skip_if_no_network!();
 
@@ -429,8 +429,8 @@ async fn review_op_with_plain_text_emits_review_fallback() {
 /// - AgentMessageContentDelta
 /// - ItemCompleted for TurnItem::AgentMessage
 // Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.
-#[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
-#[cfg_attr(not(windows), tokio::test(flavor = "multi_thread", worker_threads = 2))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+
 async fn review_filters_agent_message_related_events() {
     skip_if_no_network!();
 
@@ -491,8 +491,8 @@ async fn review_filters_agent_message_related_events() {
 /// non-streaming AgentMessage is emitted; the UI consumes the structured
 /// result via ExitedReviewMode plus a final assistant message.
 // Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.
-#[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
-#[cfg_attr(not(windows), tokio::test(flavor = "multi_thread", worker_threads = 2))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+
 async fn review_does_not_emit_agent_message_on_structured_output() {
     skip_if_no_network!();
 
@@ -668,8 +668,8 @@ async fn review_uses_session_model_when_review_model_unset() {
 /// the parent session. The request `input` should contain only the review
 /// prompt from the user.
 // Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.
-#[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
-#[cfg_attr(not(windows), tokio::test(flavor = "multi_thread", worker_threads = 2))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+
 async fn review_input_isolated_from_parent_history() {
     skip_if_no_network!();
 

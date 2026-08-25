@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 use std::time::Duration;
 
-use codex_utils_path::normalize_for_path_comparison;
+use codex_utils_absolute_path::normalize_for_path_comparison;
 use sha1::digest::Output;
 #[cfg(test)]
 use sha2::Digest;
@@ -881,13 +881,7 @@ impl TurnDiffTracker {
             if metadata.file_type().is_symlink() {
                 return Some("120000");
             }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if metadata.permissions().mode() & 0o111 != 0 {
-                    return Some("100755");
-                }
-            }
+
             return Some(REGULAR_FILE_MODE);
         }
 
@@ -965,12 +959,8 @@ fn normalize_tracked_path(path: &Path) -> PathBuf {
         normalize_for_path_comparison(&lexical)
             .unwrap_or_else(|_| normalize_from_existing_ancestor(&lexical).unwrap_or(lexical))
     };
-    #[cfg(windows)]
-    {
-        PathBuf::from(normalized.to_string_lossy().to_lowercase())
-    }
-    #[cfg(not(windows))]
-    normalized
+
+    PathBuf::from(normalized.to_string_lossy().to_lowercase())
 }
 
 fn normalize_from_existing_ancestor(path: &Path) -> Option<PathBuf> {
@@ -1260,65 +1250,22 @@ fn package_validation_coverage(package: &str, cwd: Option<&Path>) -> ValidationC
 }
 
 fn find_package_directory(package: &str, cwd: &Path) -> Option<PathBuf> {
-    let mut roots = Vec::new();
-    for ancestor in cwd.ancestors() {
-        for candidate in [ancestor.to_path_buf(), ancestor.join("codex-rs")] {
-            let manifest = candidate.join("Cargo.toml");
-            let Ok(contents) = std::fs::read_to_string(&manifest) else {
-                continue;
-            };
-            let Ok(value) = toml::from_str::<toml::Value>(&contents) else {
-                continue;
-            };
-            if value.get("workspace").is_some() {
-                roots.push(candidate);
-            }
-        }
-    }
-    roots.sort();
-    roots.dedup();
-
-    for root in roots {
-        if let Some(directory) = find_package_directory_in_tree(package, &root) {
-            return Some(directory);
-        }
-    }
-    None
+    crate::tool_history::find_cargo_package_directory(package, cwd)
+        .map(|path| normalize_tracked_path(&path))
 }
 
-fn find_package_directory_in_tree(package: &str, root: &Path) -> Option<PathBuf> {
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        let entries = std::fs::read_dir(&directory).ok()?;
-        for entry in entries {
-            let entry = entry.ok()?;
-            let file_type = entry.file_type().ok()?;
-            if file_type.is_dir() {
-                if !matches!(
-                    entry.file_name().to_str(),
-                    Some(".git" | "target" | "vendor" | "third_party" | "node_modules")
-                ) {
-                    pending.push(entry.path());
-                }
-                continue;
-            }
-            if !file_type.is_file() || entry.file_name() != "Cargo.toml" {
-                continue;
-            }
-            let contents = std::fs::read_to_string(entry.path()).ok()?;
-            let Ok(value) = toml::from_str::<toml::Value>(&contents) else {
-                continue;
-            };
-            let name = value
-                .get("package")
-                .and_then(|package| package.get("name"))
-                .and_then(toml::Value::as_str);
-            if name == Some(package) {
-                return entry.path().parent().map(normalize_tracked_path);
-            }
-        }
-    }
-    None
+#[cfg(test)]
+fn find_package_directory_with_manifest_reader(
+    package: &str,
+    cwd: &Path,
+    read_manifest: impl FnMut(&Path) -> Option<String>,
+) -> Option<PathBuf> {
+    crate::tool_history::find_cargo_package_directory_with_manifest_reader(
+        package,
+        cwd,
+        read_manifest,
+    )
+    .map(|path| normalize_tracked_path(&path))
 }
 
 fn path_validation_coverage(

@@ -30,7 +30,6 @@ use codex_app_server_client::RemoteAppServerConnectArgs;
 pub use codex_app_server_client::RemoteAppServerEndpoint;
 use codex_app_server_protocol::Account as AppServerAccount;
 use codex_app_server_protocol::AskForApproval;
-use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::Thread as AppServerThread;
 use codex_app_server_protocol::ThreadListCwdFilter;
 use codex_app_server_protocol::ThreadListParams;
@@ -39,7 +38,9 @@ use codex_app_server_protocol::ThreadSourceKind;
 use codex_cloud_config::cloud_config_bundle_loader_for_storage;
 use codex_config::CloudConfigBundleLoader;
 use codex_config::ConfigLoadError;
+use codex_config::DEFAULT_CHATGPT_BASE_URL;
 use codex_config::LoaderOverrides;
+use codex_config::canonicalize_chatgpt_base_url;
 use codex_config::format_config_error_with_source;
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::ExecServerRuntimePaths;
@@ -51,10 +52,10 @@ use codex_protocol::ThreadId;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::config_types::AltScreenMode;
 use codex_protocol::config_types::SandboxMode;
-#[cfg(target_os = "windows")]
+
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_rollout::StateDbHandle;
-use codex_rollout::state_db;
+use codex_rollout::state_integration;
 use codex_state::log_db;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::canonicalize_existing_preserving_symlinks;
@@ -84,6 +85,7 @@ use uuid::Uuid;
 pub(crate) use codex_app_server_client::legacy_core;
 
 mod additional_dirs;
+pub mod ansi_escape;
 mod app;
 mod app_backtrack;
 mod app_command;
@@ -93,6 +95,7 @@ mod app_info;
 mod app_server_approval_conversions;
 mod app_server_session;
 mod approval_events;
+mod approval_presets;
 mod ascii_animation;
 mod bottom_pane;
 mod branch_summary;
@@ -111,6 +114,7 @@ mod cwd_prompt;
 mod debug_config;
 mod diff_model;
 mod diff_render;
+mod duration_format;
 mod exec_cell;
 mod exec_command;
 mod external_agent_config_migration;
@@ -119,6 +123,7 @@ mod external_agent_config_migration_model;
 mod external_editor;
 mod file_search;
 mod frames;
+mod fuzzy_match;
 mod get_git_diff;
 mod git_action_directives;
 mod goal_display;
@@ -134,6 +139,7 @@ mod keymap_setup;
 mod line_truncation;
 pub(crate) mod live_wrap;
 pub use live_wrap::RowBuilder;
+mod composer_input;
 mod local_chatgpt_auth;
 mod managed_new_thread_defaults;
 mod markdown;
@@ -152,7 +158,6 @@ pub(crate) mod onboarding;
 mod oss_selection;
 mod pager_overlay;
 mod permission_compat;
-pub(crate) mod public_widgets;
 mod render;
 mod resize_reflow_cap;
 mod resume_picker;
@@ -189,14 +194,12 @@ pub use update_action::UpdateAction;
 #[cfg(not(debug_assertions))]
 pub use update_action::get_update_action;
 mod update_prompt;
-#[cfg(any(not(debug_assertions), test))]
-mod update_versions;
 mod updates;
 #[cfg(any(not(debug_assertions), test))]
 mod updates_cache;
 mod version;
 mod width;
-#[cfg(any(target_os = "windows", test))]
+
 mod windows_sandbox;
 mod workspace_command;
 mod workspace_messages;
@@ -217,16 +220,12 @@ use crate::startup_hooks_review::maybe_run_startup_hooks_review;
 use crate::tui::Tui;
 pub use cli::Cli;
 use codex_arg0::Arg0DispatchPaths;
+pub use composer_input::ComposerAction;
+pub use composer_input::ComposerInput;
 pub use markdown_render::render_markdown_text;
-pub use public_widgets::composer_input::ComposerAction;
-pub use public_widgets::composer_input::ComposerInput;
 // (tests access modules directly within the crate)
 
 const TUI_LOG_FILE_NAME: &str = "codex-tui.log";
-
-#[cfg(unix)]
-const AUTO_CONNECT_DAEMON_CONNECT_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_millis(50);
 
 #[allow(clippy::too_many_arguments)]
 async fn start_embedded_app_server(
@@ -283,16 +282,23 @@ async fn init_state_db_for_app_server_target(
     app_server_target: &AppServerTarget,
 ) -> std::io::Result<Option<StateDbHandle>> {
     match app_server_target {
-        AppServerTarget::Embedded => state_db::try_init(config).await.map(Some).map_err(|err| {
-            let database_path = codex_state::runtime_db_path_for_corruption_error(&err)
-                .unwrap_or_else(|| codex_state::state_db_path(config.sqlite_home.as_path()));
-            std::io::Error::other(LocalStateDbStartupError::new(
-                database_path,
-                format!("{err:#}"),
-            ))
-        }),
+        AppServerTarget::Embedded => {
+            state_integration::try_init(config)
+                .await
+                .map(Some)
+                .map_err(|err| {
+                    let database_path = codex_state::runtime_db_path_for_corruption_error(&err)
+                        .unwrap_or_else(|| {
+                            codex_state::state_db_path(config.sqlite_home.as_path())
+                        });
+                    std::io::Error::other(LocalStateDbStartupError::new(
+                        database_path,
+                        format!("{err:#}"),
+                    ))
+                })
+        }
         AppServerTarget::LocalDaemon { .. } | AppServerTarget::Remote { .. } => {
-            Ok(state_db::get_state_db(config).await)
+            Ok(state_integration::get_state_db(config).await)
         }
     }
 }
@@ -331,16 +337,6 @@ fn remote_addr_has_explicit_port(addr: &str, parsed: &Url) -> bool {
         host.to_string()
     };
     host_and_port == format!("{expected_host}:{explicit_default_port}")
-}
-
-fn websocket_url_supports_auth_token(parsed: &Url) -> bool {
-    match (parsed.scheme(), parsed.host()) {
-        ("wss", Some(_)) => true,
-        ("ws", Some(url::Host::Domain(domain))) => domain.eq_ignore_ascii_case("localhost"),
-        ("ws", Some(url::Host::Ipv4(addr))) => addr.is_loopback(),
-        ("ws", Some(url::Host::Ipv6(addr))) => addr.is_loopback(),
-        _ => false,
-    }
 }
 
 pub fn resolve_remote_addr(addr: &str) -> color_eyre::Result<RemoteAppServerEndpoint> {
@@ -383,12 +379,7 @@ pub fn resolve_remote_addr(addr: &str) -> color_eyre::Result<RemoteAppServerEndp
 }
 
 pub fn remote_addr_supports_auth_token(endpoint: &RemoteAppServerEndpoint) -> bool {
-    match endpoint {
-        RemoteAppServerEndpoint::WebSocket { websocket_url, .. } => {
-            Url::parse(websocket_url).is_ok_and(|parsed| websocket_url_supports_auth_token(&parsed))
-        }
-        RemoteAppServerEndpoint::UnixSocket { .. } => false,
-    }
+    endpoint.supports_auth_token()
 }
 
 async fn connect_remote_app_server(
@@ -408,36 +399,6 @@ async fn connect_remote_app_server(
     Ok(AppServerClient::Remote(app_server))
 }
 
-#[cfg(unix)]
-async fn maybe_probe_default_daemon_socket(codex_home: &Path) -> Option<AbsolutePathBuf> {
-    let socket_path = codex_app_server_client::app_server_control_socket_path(codex_home).ok()?;
-    if !socket_path.as_path().try_exists().unwrap_or(false) {
-        return None;
-    }
-
-    match tokio::time::timeout(
-        AUTO_CONNECT_DAEMON_CONNECT_TIMEOUT,
-        tokio::net::UnixStream::connect(socket_path.as_path()),
-    )
-    .await
-    {
-        Ok(Ok(_stream)) => Some(socket_path),
-        Ok(Err(err)) => {
-            tracing::debug!(%err, socket_path = %socket_path.display(), "skipping default app-server daemon socket");
-            None
-        }
-        Err(_) => {
-            tracing::debug!(
-                socket_path = %socket_path.display(),
-                timeout_ms = AUTO_CONNECT_DAEMON_CONNECT_TIMEOUT.as_millis(),
-                "timed out probing default app-server daemon socket"
-            );
-            None
-        }
-    }
-}
-
-#[cfg(not(unix))]
 async fn maybe_probe_default_daemon_socket(_codex_home: &Path) -> Option<AbsolutePathBuf> {
     None
 }
@@ -535,16 +496,6 @@ where
     F: FnOnce(InProcessClientStartArgs) -> Fut,
     Fut: Future<Output = std::io::Result<InProcessAppServerClient>>,
 {
-    let config_warnings = config
-        .startup_warnings
-        .iter()
-        .map(|warning| ConfigWarningNotification {
-            summary: warning.clone(),
-            details: None,
-            path: None,
-            range: None,
-        })
-        .collect();
     let client = start_client(InProcessClientStartArgs {
         arg0_paths,
         config: Arc::new(config),
@@ -556,7 +507,7 @@ where
         log_db,
         state_db,
         environment_manager,
-        config_warnings,
+        config_warnings: Vec::new(),
         session_source: serde_json::from_value(serde_json::json!("cli"))
             .unwrap_or_else(|err| panic!("cli session source should deserialize: {err}")),
         enable_codex_api_key_env: false,
@@ -820,7 +771,7 @@ fn app_server_target_for_launch(
 }
 
 fn loader_overrides_are_default(loader_overrides: &LoaderOverrides) -> bool {
-    let loader_overrides_are_default = loader_overrides.user_config_path.is_none()
+    loader_overrides.user_config_path.is_none()
         && loader_overrides.user_config_profile.is_none()
         && loader_overrides.managed_config_path.is_none()
         && loader_overrides.system_config_path.is_none()
@@ -828,13 +779,6 @@ fn loader_overrides_are_default(loader_overrides: &LoaderOverrides) -> bool {
         && !loader_overrides.ignore_managed_requirements
         && !loader_overrides.ignore_user_config
         && !loader_overrides.ignore_user_and_project_exec_policy_rules
-        && loader_overrides
-            .macos_managed_config_requirements_base64
-            .is_none();
-    #[cfg(target_os = "macos")]
-    let loader_overrides_are_default =
-        loader_overrides_are_default && loader_overrides.managed_preferences_base64.is_none();
-    loader_overrides_are_default
 }
 
 fn can_reuse_implicit_local_daemon(
@@ -928,10 +872,8 @@ pub async fn run_main(
         .clone()
         .filter(|_| app_server_target.uses_remote_workspace());
 
-    let local_runtime_paths = ExecServerRuntimePaths::from_optional_paths(
-        arg0_paths.codex_self_exe.clone(),
-        arg0_paths.codex_linux_sandbox_exe.clone(),
-    )?;
+    let local_runtime_paths =
+        ExecServerRuntimePaths::from_optional_path(arg0_paths.codex_self_exe.clone())?;
     let environment_manager =
         if should_load_configured_environments(&loader_overrides, &app_server_target) {
             EnvironmentManager::from_codex_home(codex_home.clone(), Some(local_runtime_paths)).await
@@ -961,10 +903,12 @@ pub async fn run_main(
     .await;
     let bootstrap_config_toml = &bootstrap_config.config_toml;
 
-    let chatgpt_base_url = bootstrap_config_toml
-        .chatgpt_base_url
-        .clone()
-        .unwrap_or_else(|| "https://chatgpt.com/backend-api/".to_string());
+    let chatgpt_base_url = canonicalize_chatgpt_base_url(
+        bootstrap_config_toml
+            .chatgpt_base_url
+            .as_deref()
+            .unwrap_or(DEFAULT_CHATGPT_BASE_URL),
+    );
     let auth_route_config = resolve_bootstrap_auth_route_config(
         bootstrap_config_toml,
         bootstrap_config
@@ -1056,15 +1000,13 @@ pub async fn run_main(
         cwd: cwd_override,
         model_provider: model_provider_override.clone(),
         codex_self_exe: arg0_paths.codex_self_exe.clone(),
-        codex_linux_sandbox_exe: arg0_paths.codex_linux_sandbox_exe.clone(),
-        main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe.clone(),
         show_raw_agent_reasoning: cli.oss.then_some(true),
         bypass_hook_trust: cli.bypass_hook_trust.then_some(true),
         additional_writable_roots: additional_dirs,
         ..Default::default()
     };
 
-    let mut config = load_config_or_exit(
+    let config = load_config_or_exit(
         cli_kv_overrides.clone(),
         overrides.clone(),
         loader_overrides.clone(),
@@ -1108,36 +1050,6 @@ pub async fn run_main(
     }
     let state_db = init_state_db_for_app_server_target(&config, &app_server_target).await?;
 
-    let effective_toml = config.config_layer_stack.effective_config();
-    match effective_toml.try_into() {
-        Ok(config_toml) => {
-            match codex_app_server_client::migrate_personality_if_needed(
-                &config.codex_home,
-                &config_toml,
-                state_db.clone(),
-            )
-            .await
-            {
-                Ok(true) => {
-                    config = load_config_or_exit(
-                        cli_kv_overrides.clone(),
-                        overrides.clone(),
-                        loader_overrides.clone(),
-                        cloud_config_bundle.clone(),
-                        strict_config,
-                    )
-                    .await;
-                }
-                Ok(false) => {}
-                Err(err) => {
-                    tracing::warn!(error = %err, "failed to run personality migration");
-                }
-            }
-        }
-        Err(err) => {
-            tracing::warn!(error = %err, "failed to deserialize config for personality migration");
-        }
-    }
     let config_toml_log_dir_configured = config
         .config_layer_stack
         .effective_config()
@@ -1187,11 +1099,6 @@ pub async fn run_main(
         // Ensure the file is only readable and writable by the current user.
         // Doing the equivalent to `chmod 600` on Windows is quite a bit more
         // code and requires the Windows API crates.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            log_file_opts.mode(0o600);
-        }
 
         let log_file = log_file_opts.open(log_dir.join(TUI_LOG_FILE_NAME))?;
         let (non_blocking, guard) = non_blocking(log_file);
@@ -1377,7 +1284,7 @@ async fn run_ratatui_app(
 
     let should_show_trust_screen_flag =
         !uses_remote_workspace && should_show_trust_screen(&initial_config);
-    #[cfg(target_os = "windows")]
+
     let mut trust_decision_was_made = false;
     let login_status = if initial_config.model_provider.requires_openai_auth {
         let Some(app_server) = app_server.as_mut() else {
@@ -1423,7 +1330,7 @@ async fn run_ratatui_app(
                 exit_reason: ExitReason::UserRequested,
             });
         }
-        #[cfg(target_os = "windows")]
+
         {
             trust_decision_was_made = onboarding_result.directory_trust_persisted;
         }
@@ -1686,9 +1593,9 @@ async fn run_ratatui_app(
 
     set_default_client_residency_requirement(config.enforce_residency.value());
     let should_show_trust_screen = should_show_trust_screen(&config);
-    #[cfg(target_os = "windows")]
+
     let windows_sandbox_level = crate::windows_sandbox::level_from_config(&config);
-    #[cfg(target_os = "windows")]
+
     let should_check_windows_sandbox_readiness = (trust_decision_was_made
         && windows_sandbox_level == WindowsSandboxLevel::Disabled)
         || (windows_sandbox_level == WindowsSandboxLevel::Elevated
@@ -1698,8 +1605,6 @@ async fn run_ratatui_app(
                 .windows_sandbox_mode
                 .source
                 .is_some());
-    #[cfg(not(target_os = "windows"))]
-    let should_check_windows_sandbox_readiness = false;
 
     let Cli {
         prompt,
@@ -2031,6 +1936,27 @@ mod tests {
     use serial_test::serial;
     use tempfile::TempDir;
 
+    #[test]
+    fn startup_does_not_call_retired_personality_migration() {
+        let source = include_str!("lib.rs");
+        let wrapper_name = ["migrate_personality_", "if_needed"].concat();
+
+        assert!(!source.contains(&wrapper_name));
+    }
+
+    #[test]
+    fn single_child_ui_namespaces_are_collapsed() {
+        let tui_lib = include_str!("lib.rs");
+        let status_mod = include_str!("status/mod.rs");
+        let obsolete_widgets_module = ["mod public_", "widgets;"].concat();
+        let obsolete_account_module = ["mod acc", "ount;"].concat();
+
+        assert!(!tui_lib.contains(&obsolete_widgets_module));
+        assert!(tui_lib.contains("mod composer_input;"));
+        assert!(!status_mod.contains(&obsolete_account_module));
+        assert!(status_mod.contains("enum StatusAccountDisplay"));
+    }
+
     async fn build_config(temp_dir: &TempDir) -> std::io::Result<Config> {
         let mut config = ConfigBuilder::default()
             .codex_home(temp_dir.path().to_path_buf())
@@ -2267,22 +2193,6 @@ mod tests {
             maybe_probe_default_daemon_socket(codex_home.path())
                 .await
                 .is_none()
-        );
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn default_daemon_auto_connect_probes_socket_only() -> color_eyre::Result<()> {
-        let codex_home = TempDir::new()?;
-        let socket_path =
-            codex_app_server_client::app_server_control_socket_path(codex_home.path())?;
-        std::fs::create_dir_all(socket_path.as_path().parent().expect("socket parent"))?;
-        let _listener = tokio::net::UnixListener::bind(socket_path.as_path())?;
-
-        assert_eq!(
-            maybe_probe_default_daemon_socket(codex_home.path()).await,
-            Some(socket_path)
         );
         Ok(())
     }
@@ -2680,11 +2590,7 @@ mod tests {
     #[tokio::test]
     async fn config_cwd_for_app_server_target_omits_cwd_for_remote_sessions() -> std::io::Result<()>
     {
-        let remote_only_cwd = if cfg!(windows) {
-            Path::new(r"C:\definitely\not\local\to\this\test")
-        } else {
-            Path::new("/definitely/not/local/to/this/test")
-        };
+        let remote_only_cwd = Path::new(r"C:\definitely\not\local\to\this\test");
         let target = AppServerTarget::Remote {
             endpoint: RemoteAppServerEndpoint::UnixSocket {
                 socket_path: AbsolutePathBuf::relative_to_current_dir("codex.sock")?,
@@ -2759,17 +2665,12 @@ mod tests {
     #[tokio::test]
     async fn config_cwd_for_app_server_target_omits_cwd_for_remote_exec_server()
     -> std::io::Result<()> {
-        let remote_only_cwd = if cfg!(windows) {
-            Path::new(r"C:\definitely\not\local\to\this\test")
-        } else {
-            Path::new("/definitely/not/local/to/this/test")
-        };
+        let remote_only_cwd = Path::new(r"C:\definitely\not\local\to\this\test");
         let target = AppServerTarget::Embedded;
         let environment_manager = EnvironmentManager::create_for_tests(
             Some("ws://127.0.0.1:8765".to_string()),
             Some(ExecServerRuntimePaths::new(
                 std::env::current_exe().expect("current exe"),
-                /*codex_linux_sandbox_exe*/ None,
             )?),
         )
         .await;
@@ -2984,17 +2885,10 @@ mod tests {
         config.set_windows_sandbox_enabled(/*value*/ true);
 
         let should_show = should_show_trust_screen(&config);
-        if cfg!(target_os = "windows") {
-            assert!(
-                should_show,
-                "Windows trust prompt should be shown on native Windows with sandbox enabled"
-            );
-        } else {
-            assert!(
-                should_show,
-                "Non-Windows should still show trust prompt when project is untrusted"
-            );
-        }
+        assert!(
+            should_show,
+            "Windows trust prompt should be shown on native Windows with sandbox enabled"
+        );
         Ok(())
     }
     #[tokio::test]

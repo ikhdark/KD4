@@ -1,0 +1,10 @@
+{
+  "lane_path_pattern": "target[\\\\/]+lanes[\\\\/]+([A-Za-z0-9_.-]+)",
+  "script_lane_pattern": "(?:^|\\s)-Lane\\s+([A-Za-z0-9_.-]+)(?:\\s|$)",
+  "just_lane_pattern": "\\b(?:test-lane(?:-fast)?|cargo-lane(?:-(?:home|isolated-home))?|test-lane-package|check-lane|clippy-lane|watch-lane|coverage-lane|fix-lane)\\s+([A-Za-z0-9_.-]+)\\b",
+  "just_fixed_lane_pattern": "\\b(test-lane-main|release-lane)\\b",
+  "just_fixed_lane_names": {
+    "test-lane-main": "main",
+    "release-lane": "release"
+  }
+}

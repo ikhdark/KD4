@@ -156,10 +156,10 @@ async fn mitm_policy_blocks_disallowed_method_and_records_telemetry() {
         .body(Body::empty())
         .unwrap();
 
-    let response = mitm_blocking_response(&req, &ctx)
-        .await
-        .unwrap()
-        .expect("POST should be blocked in limited mode");
+    let decision = evaluate_mitm_policy(&req, &ctx).await.unwrap();
+    let MitmPolicyDecision::Block(response) = decision else {
+        panic!("POST should be blocked in limited mode");
+    };
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert_eq!(
@@ -195,10 +195,10 @@ async fn mitm_policy_rejects_host_mismatch() {
         .body(Body::empty())
         .unwrap();
 
-    let response = mitm_blocking_response(&req, &ctx)
-        .await
-        .unwrap()
-        .expect("mismatched host should be rejected");
+    let decision = evaluate_mitm_policy(&req, &ctx).await.unwrap();
+    let MitmPolicyDecision::Block(response) = decision else {
+        panic!("mismatched host should be rejected");
+    };
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(app_state.blocked_snapshot().await.unwrap().len(), 0);
@@ -225,10 +225,10 @@ async fn mitm_policy_rechecks_local_private_target_after_connect() {
         .body(Body::empty())
         .unwrap();
 
-    let response = mitm_blocking_response(&req, &ctx)
-        .await
-        .unwrap()
-        .expect("local/private target should be blocked on inner request");
+    let decision = evaluate_mitm_policy(&req, &ctx).await.unwrap();
+    let MitmPolicyDecision::Block(response) = decision else {
+        panic!("local/private target should be blocked on inner request");
+    };
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
@@ -268,10 +268,10 @@ async fn mitm_policy_allows_matching_hooked_write_in_full_mode() {
         .body(Body::empty())
         .unwrap();
 
-    let response = mitm_blocking_response(&req, &ctx).await.unwrap();
+    let decision = evaluate_mitm_policy(&req, &ctx).await.unwrap();
 
     assert!(
-        response.is_none(),
+        matches!(decision, MitmPolicyDecision::Allow { .. }),
         "matching hook should bypass method clamp"
     );
     assert_eq!(app_state.blocked_snapshot().await.unwrap().len(), 0);
@@ -302,10 +302,10 @@ async fn mitm_policy_blocks_matching_hooked_write_in_limited_mode() {
         .body(Body::empty())
         .unwrap();
 
-    let response = mitm_blocking_response(&req, &ctx)
-        .await
-        .unwrap()
-        .expect("matching POST hook should still be blocked in limited mode");
+    let decision = evaluate_mitm_policy(&req, &ctx).await.unwrap();
+    let MitmPolicyDecision::Block(response) = decision else {
+        panic!("matching POST hook should still be blocked in limited mode");
+    };
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert_eq!(
@@ -351,10 +351,10 @@ async fn mitm_policy_blocks_hook_miss_for_hooked_host_and_records_telemetry_in_f
         .body(Body::empty())
         .unwrap();
 
-    let response = mitm_blocking_response(&req, &ctx)
-        .await
-        .unwrap()
-        .expect("hook miss should be blocked");
+    let decision = evaluate_mitm_policy(&req, &ctx).await.unwrap();
+    let MitmPolicyDecision::Block(response) = decision else {
+        panic!("hook miss should be blocked");
+    };
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert_eq!(

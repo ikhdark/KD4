@@ -44,6 +44,7 @@ use crate::style::proposed_plan_style;
 use crate::terminal_hyperlinks::HyperlinkLine;
 use crate::terminal_hyperlinks::plain_hyperlink_lines;
 use crate::terminal_hyperlinks::prefix_hyperlink_lines;
+use codex_config::types::UriBasedFileOpener;
 use ratatui::prelude::Stylize;
 use ratatui::text::Line;
 use std::path::Path;
@@ -84,6 +85,7 @@ struct StreamCore {
     emitted_stable_len: usize,
     /// Session cwd used to keep local file-link display stable during stream re-renders.
     cwd: PathBuf,
+    file_opener: UriBasedFileOpener,
     render_mode: HistoryRenderMode,
     /// Cached rendered line count for prefix-before-table keyed by source start and width.
     stable_prefix_len_cache: Option<StablePrefixLenCache>,
@@ -104,7 +106,12 @@ struct StablePrefixLenCache {
 }
 
 impl StreamCore {
-    fn new(width: Option<usize>, cwd: &Path, render_mode: HistoryRenderMode) -> Self {
+    fn new(
+        width: Option<usize>,
+        cwd: &Path,
+        file_opener: UriBasedFileOpener,
+        render_mode: HistoryRenderMode,
+    ) -> Self {
         Self {
             state: StreamState::new(width, cwd),
             width,
@@ -113,6 +120,7 @@ impl StreamCore {
             enqueued_stable_len: 0,
             emitted_stable_len: 0,
             cwd: cwd.to_path_buf(),
+            file_opener,
             render_mode,
             stable_prefix_len_cache: None,
             holdback_scanner: TableHoldbackScanner::new(),
@@ -281,6 +289,7 @@ impl StreamCore {
                 source,
                 self.width,
                 Some(self.cwd.as_path()),
+                self.file_opener,
             ),
             HistoryRenderMode::Raw => plain_hyperlink_lines(raw_lines_from_source(source)),
         }
@@ -438,6 +447,7 @@ impl StreamCore {
             &self.raw_source[..source_start.min(self.raw_source.len())],
             self.width,
             Some(self.cwd.as_path()),
+            self.file_opener,
         );
         let stable_prefix_len = stable_prefix_render.len();
         tracing::trace!(
@@ -470,9 +480,14 @@ impl StreamController {
     /// `width` is the content width available to markdown rendering, not necessarily the full
     /// terminal width. Passing a stale width after resize will keep queued live output wrapped for
     /// the old viewport until app-level reflow repairs the finalized transcript.
-    pub(crate) fn new(width: Option<usize>, cwd: &Path, render_mode: HistoryRenderMode) -> Self {
+    pub(crate) fn new(
+        width: Option<usize>,
+        cwd: &Path,
+        file_opener: UriBasedFileOpener,
+        render_mode: HistoryRenderMode,
+    ) -> Self {
         Self {
-            core: StreamCore::new(width, cwd, render_mode),
+            core: StreamCore::new(width, cwd, file_opener, render_mode),
             header_emitted: false,
         }
     }
@@ -583,9 +598,14 @@ impl PlanStreamController {
     ///
     /// The width has the same meaning as in `StreamController`: it is the markdown body width, and
     /// callers must update it when the terminal width changes.
-    pub(crate) fn new(width: Option<usize>, cwd: &Path, render_mode: HistoryRenderMode) -> Self {
+    pub(crate) fn new(
+        width: Option<usize>,
+        cwd: &Path,
+        file_opener: UriBasedFileOpener,
+        render_mode: HistoryRenderMode,
+    ) -> Self {
         Self {
-            core: StreamCore::new(width, cwd, render_mode),
+            core: StreamCore::new(width, cwd, file_opener, render_mode),
             header_emitted: false,
             top_padding_emitted: false,
         }
@@ -741,11 +761,21 @@ mod tests {
     }
 
     fn stream_controller(width: Option<usize>) -> StreamController {
-        StreamController::new(width, &test_cwd(), HistoryRenderMode::Rich)
+        StreamController::new(
+            width,
+            &test_cwd(),
+            UriBasedFileOpener::None,
+            HistoryRenderMode::Rich,
+        )
     }
 
     fn plan_stream_controller(width: Option<usize>) -> PlanStreamController {
-        PlanStreamController::new(width, &test_cwd(), HistoryRenderMode::Rich)
+        PlanStreamController::new(
+            width,
+            &test_cwd(),
+            UriBasedFileOpener::None,
+            HistoryRenderMode::Rich,
+        )
     }
 
     fn lines_to_plain_strings(lines: &[ratatui::text::Line<'_>]) -> Vec<String> {
@@ -1695,6 +1725,7 @@ mod tests {
         let mut ctrl = PlanStreamController::new(
             /*width*/ Some(32),
             &test_cwd(),
+            UriBasedFileOpener::None,
             HistoryRenderMode::Rich,
         );
         ctrl.push(&source);

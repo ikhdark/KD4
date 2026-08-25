@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::agent::task_capabilities::classify_typed_tool;
 use crate::config::Config;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
@@ -438,6 +439,28 @@ async fn specs_filter_deferred_dynamic_tools() -> anyhow::Result<()> {
     assert_eq!(hidden_manifest_entry["exposure"], "deferred");
     assert_eq!(hidden_manifest_entry["activated"], false);
 
+    let base_schemas = router.model_visible_schemas_for_turn(turn.as_ref());
+    assert!(Arc::ptr_eq(
+        &base_schemas,
+        &router.model_visible_schemas_for_turn(turn.as_ref())
+    ));
+    let hidden_name = router
+        .registered_tool_names_for_test()
+        .into_iter()
+        .find(|name| name.to_string().contains(hidden_tool))
+        .expect("registered deferred dynamic tool name");
+    turn.refresh_deferred_tool_capabilities(router.deferred_tool_capability_revisions());
+    turn.activate_deferred_tools([hidden_name]);
+    let activated_schemas = router.model_visible_schemas_for_turn(turn.as_ref());
+    assert_eq!(
+        namespace_function_names(activated_schemas.specs(), "codex_app"),
+        vec![visible_tool.to_string(), hidden_tool.to_string()]
+    );
+    assert!(Arc::ptr_eq(
+        &activated_schemas,
+        &router.model_visible_schemas_for_turn(turn.as_ref())
+    ));
+
     Ok(())
 }
 
@@ -540,9 +563,14 @@ fn independent_review_policy_allows_inspection_and_denies_mutation() {
                     arguments: "{}".to_string(),
                 },
             };
+            let class = classify_typed_tool(
+                call.tool_name.namespace.as_deref(),
+                &call.tool_name.name,
+                None,
+            );
             authorize_independent_review_tool_call(
                 &source,
-                None,
+                class,
                 &call,
                 ExternalMutationIntent::ProvenReadOnly,
             )
@@ -556,9 +584,14 @@ fn independent_review_policy_allows_inspection_and_denies_mutation() {
                 arguments: "{}".to_string(),
             },
         };
+        let class = classify_typed_tool(
+            repo_atlas_call.tool_name.namespace.as_deref(),
+            &repo_atlas_call.tool_name.name,
+            None,
+        );
         authorize_independent_review_tool_call(
             &source,
-            None,
+            class,
             &repo_atlas_call,
             ExternalMutationIntent::ProvenReadOnly,
         )
@@ -576,10 +609,15 @@ fn independent_review_policy_allows_inspection_and_denies_mutation() {
                     arguments: "{}".to_string(),
                 },
             };
+            let class = classify_typed_tool(
+                call.tool_name.namespace.as_deref(),
+                &call.tool_name.name,
+                None,
+            );
             assert!(
                 authorize_independent_review_tool_call(
                     &source,
-                    None,
+                    class,
                     &call,
                     ExternalMutationIntent::MayMutate,
                 )
@@ -668,13 +706,13 @@ async fn extension_tool_executors_are_model_visible_and_dispatchable() -> anyhow
             let value: serde_json::Value =
                 serde_json::from_str(&text).expect("extension tool output should be json");
             assert_eq!(
-                value,
-                json!({
+                core_test_support::responses::strip_response_item_ids_from_json(value),
+                core_test_support::responses::strip_response_item_ids_from_json(json!({
                     "arguments": { "message": "hello" },
                     "callId": "call-extension",
                     "conversationHistory": [expected_history_item],
                     "ok": true,
-                })
+                }))
             );
         }
         other => panic!("expected function call output, got {other:?}"),

@@ -1,7 +1,6 @@
 """Supported package targets and default binary discovery."""
 
 import platform
-import stat
 from dataclasses import dataclass
 from dataclasses import field
 from functools import cache
@@ -24,28 +23,22 @@ MACHINE_ALIASES: dict[str, str] = {
 @dataclass(frozen=True, slots=True)
 class TargetSpec:
     target: str
-    is_windows: bool
-    is_linux: bool
     dotslash_platform: str
-    exe_suffix: str = field(init=False)
     rg_name: str = field(init=False)
     code_mode_host_name: str = field(init=False)
 
     def __post_init__(self) -> None:
-        exe_suffix = ".exe" if self.is_windows else ""
-        object.__setattr__(self, "exe_suffix", exe_suffix)
-        object.__setattr__(self, "rg_name", f"rg{exe_suffix}")
+        object.__setattr__(self, "rg_name", "rg.exe")
         object.__setattr__(
             self,
             "code_mode_host_name",
-            f"{CODE_MODE_HOST_STEM}{exe_suffix}",
+            f"{CODE_MODE_HOST_STEM}.exe",
         )
 
 
 @dataclass(frozen=True, slots=True)
 class ReleaseTarget:
     target: str
-    npm_tag: str
     platform_label: str
     host_system: str
     host_machine: str
@@ -54,8 +47,19 @@ class ReleaseTarget:
     def package_asset_prefix(self) -> str:
         return f"codex-package-{self.target}"
 
-    def legacy_npm_asset(self, version: str) -> str:
-        return f"codex-npm-{self.npm_tag}-{version}.tgz"
+
+@dataclass(frozen=True, slots=True)
+class NpmTarget:
+    package: str
+    npm_name: str
+    npm_tag: str
+    node_platform: str
+    node_arch: str
+    executable_name: str
+
+    @property
+    def node_platform_key(self) -> str:
+        return f"{self.node_platform}-{self.node_arch}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,7 +75,7 @@ class PackageVariant:
             if entrypoint is not None:
                 return entrypoint
 
-        return f"{self.executable_stem}{spec.exe_suffix}"
+        return f"{self.executable_stem}.exe"
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,8 +83,6 @@ class PackageInputs:
     entrypoint_bin: Path
     code_mode_host_bin: Path
     rg_bin: Path
-    zsh_bin: Path | None
-    bwrap_bin: Path | None
     codex_command_runner_bin: Path | None
     codex_windows_sandbox_setup_bin: Path | None
 
@@ -100,99 +102,47 @@ PACKAGE_VARIANTS: dict[str, PackageVariant] = {
 
 
 TARGET_SPECS: dict[str, TargetSpec] = {
-    "x86_64-unknown-linux-gnu": TargetSpec(
-        target="x86_64-unknown-linux-gnu",
-        is_windows=False,
-        is_linux=True,
-        dotslash_platform="linux-x86_64",
-    ),
-    "x86_64-unknown-linux-musl": TargetSpec(
-        target="x86_64-unknown-linux-musl",
-        is_windows=False,
-        is_linux=True,
-        dotslash_platform="linux-x86_64",
-    ),
-    "aarch64-unknown-linux-gnu": TargetSpec(
-        target="aarch64-unknown-linux-gnu",
-        is_windows=False,
-        is_linux=True,
-        dotslash_platform="linux-aarch64",
-    ),
-    "aarch64-unknown-linux-musl": TargetSpec(
-        target="aarch64-unknown-linux-musl",
-        is_windows=False,
-        is_linux=True,
-        dotslash_platform="linux-aarch64",
-    ),
-    "x86_64-apple-darwin": TargetSpec(
-        target="x86_64-apple-darwin",
-        is_windows=False,
-        is_linux=False,
-        dotslash_platform="macos-x86_64",
-    ),
-    "aarch64-apple-darwin": TargetSpec(
-        target="aarch64-apple-darwin",
-        is_windows=False,
-        is_linux=False,
-        dotslash_platform="macos-aarch64",
-    ),
     "x86_64-pc-windows-msvc": TargetSpec(
         target="x86_64-pc-windows-msvc",
-        is_windows=True,
-        is_linux=False,
         dotslash_platform="windows-x86_64",
     ),
     "aarch64-pc-windows-msvc": TargetSpec(
         target="aarch64-pc-windows-msvc",
-        is_windows=True,
-        is_linux=False,
         dotslash_platform="windows-aarch64",
     ),
 }
 
 
 RELEASE_TARGETS: dict[str, ReleaseTarget] = {
-    "x86_64-unknown-linux-musl": ReleaseTarget(
-        target="x86_64-unknown-linux-musl",
-        npm_tag="linux-x64",
-        platform_label="Linux (x64)",
-        host_system="linux",
-        host_machine="x86_64",
-    ),
-    "aarch64-unknown-linux-musl": ReleaseTarget(
-        target="aarch64-unknown-linux-musl",
-        npm_tag="linux-arm64",
-        platform_label="Linux (ARM64)",
-        host_system="linux",
-        host_machine="aarch64",
-    ),
-    "x86_64-apple-darwin": ReleaseTarget(
-        target="x86_64-apple-darwin",
-        npm_tag="darwin-x64",
-        platform_label="macOS (Intel)",
-        host_system="darwin",
-        host_machine="x86_64",
-    ),
-    "aarch64-apple-darwin": ReleaseTarget(
-        target="aarch64-apple-darwin",
-        npm_tag="darwin-arm64",
-        platform_label="macOS (Apple Silicon)",
-        host_system="darwin",
-        host_machine="aarch64",
-    ),
     "x86_64-pc-windows-msvc": ReleaseTarget(
         target="x86_64-pc-windows-msvc",
-        npm_tag="win32-x64",
         platform_label="Windows (x64)",
         host_system="windows",
         host_machine="x86_64",
     ),
     "aarch64-pc-windows-msvc": ReleaseTarget(
         target="aarch64-pc-windows-msvc",
-        npm_tag="win32-arm64",
         platform_label="Windows (ARM64)",
         host_system="windows",
         host_machine="aarch64",
+    ),
+}
+NPM_TARGETS: dict[str, NpmTarget] = {
+    "x86_64-pc-windows-msvc": NpmTarget(
+        package="codex-win32-x64",
+        npm_name="@openai/codex-win32-x64",
+        npm_tag="win32-x64",
+        node_platform="win32",
+        node_arch="x64",
+        executable_name="codex.exe",
+    ),
+    "aarch64-pc-windows-msvc": NpmTarget(
+        package="codex-win32-arm64",
+        npm_name="@openai/codex-win32-arm64",
+        npm_tag="win32-arm64",
+        node_platform="win32",
+        node_arch="arm64",
+        executable_name="codex.exe",
     ),
 }
 BINARY_TARGETS: tuple[str, ...] = tuple(RELEASE_TARGETS)
@@ -200,30 +150,28 @@ SUPPORTED_TARGETS: tuple[str, ...] = tuple(sorted(TARGET_SPECS))
 SUPPORTED_VARIANTS: tuple[str, ...] = tuple(sorted(PACKAGE_VARIANTS))
 PACKAGE_ENTRYPOINT_NAMES: dict[str, dict[str, str]] = {
     variant_name: {
-        target_name: f"{variant.executable_stem}{spec.exe_suffix}"
+        target_name: f"{variant.executable_stem}.exe"
         for target_name, spec in TARGET_SPECS.items()
     }
     for variant_name, variant in PACKAGE_VARIANTS.items()
 }
 
 
-HOST_RELEASE_TARGETS: dict[tuple[str, str], str] = {
-    (release.host_system, release.host_machine): target
+HOST_RELEASE_TARGETS: dict[str, str] = {
+    release.host_machine: target
     for target, release in RELEASE_TARGETS.items()
 }
 
 
 @cache
 def default_target() -> str:
-    system_name = platform.system()
     machine_name = platform.machine()
-    system = system_name.lower()
     machine = normalize_machine(machine_name)
-    target = HOST_RELEASE_TARGETS.get((system, machine))
+    target = HOST_RELEASE_TARGETS.get(machine)
     if target is None:
         supported = ", ".join(SUPPORTED_TARGETS)
         raise RuntimeError(
-            f"Unsupported host platform {system_name}/{machine_name}. "
+            f"Unsupported Windows architecture {machine_name}. "
             f"Pass --target explicitly. Supported targets: {supported}"
         )
     return target
@@ -250,14 +198,7 @@ def resolve_input_path(
 
 
 def is_executable(path: Path) -> bool:
-    # On a Windows HOST, stat() never reports execute bits for extension-less
-    # files, so a prebuilt Linux/mac binary staged cross-target would always
-    # be rejected. Existence is the only meaningful check there (mirrors
-    # layout.is_executable).
-    if platform.system().lower() == "windows":
-        return path.is_file()
-
-    return bool(path.stat().st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
+    return path.is_file()
 
 
 def normalize_machine(machine: str) -> str:

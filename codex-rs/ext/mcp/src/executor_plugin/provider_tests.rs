@@ -1,28 +1,35 @@
 use super::DEFAULT_MCP_CONFIG_FILE;
 use super::ExecutorPluginMcpProviderError;
+use super::load_executor_plugin_mcp_servers;
 use super::load_from_file_system;
 use codex_config::McpServerConfig;
 use codex_config::McpServerTransportConfig;
+use codex_core_plugins::ExecutorPluginProvider;
 use codex_exec_server::CopyOptions;
 use codex_exec_server::CreateDirectoryOptions;
+use codex_exec_server::EnvironmentManager;
 use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::ExecutorFileSystemFuture;
 use codex_exec_server::FileMetadata;
 use codex_exec_server::FileSystemReadStream;
 use codex_exec_server::FileSystemResult;
 use codex_exec_server::FileSystemSandboxContext;
+use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_exec_server::ReadDirectoryEntry;
 use codex_exec_server::RemoveOptions;
 use codex_plugin::ResolvedPlugin;
 use codex_plugin::manifest::PluginManifest;
 use codex_plugin::manifest::PluginManifestMcpServers;
 use codex_plugin::manifest::PluginManifestPaths;
+use codex_protocol::capabilities::CapabilityRootLocation;
+use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::LegacyAppPathString;
 use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 use std::io;
+use std::sync::Arc;
 use std::sync::Mutex;
 
 const MCP_CONFIG_CONTENTS: &str = r#"{
@@ -36,6 +43,52 @@ struct SyntheticExecutorFileSystem {
     config_path: AbsolutePathBuf,
     config_contents: Option<&'static str>,
     reads: Mutex<Vec<AbsolutePathBuf>>,
+}
+
+#[tokio::test]
+async fn loads_resolved_plugin_through_function_entry_point() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let plugin_root = temp_dir.path().join("plugin");
+    std::fs::create_dir_all(plugin_root.join(".codex-plugin")).expect("create manifest directory");
+    std::fs::write(
+        plugin_root.join(".codex-plugin/plugin.json"),
+        r#"{"name":"demo-plugin"}"#,
+    )
+    .expect("write manifest");
+    std::fs::write(
+        plugin_root.join(DEFAULT_MCP_CONFIG_FILE),
+        MCP_CONFIG_CONTENTS,
+    )
+    .expect("write MCP config");
+    let selected_root = SelectedCapabilityRoot {
+        id: "selected-root".to_string(),
+        location: CapabilityRootLocation::Environment {
+            environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
+            path: PathUri::from_host_native_path(&plugin_root).expect("plugin root URI"),
+        },
+    };
+    let plugin = ExecutorPluginProvider::new(Arc::new(EnvironmentManager::default_for_tests()))
+        .resolve_bound(&selected_root)
+        .await
+        .expect("resolve selected plugin")
+        .expect("resolved plugin");
+
+    let servers = load_executor_plugin_mcp_servers(&plugin)
+        .await
+        .expect("load executor MCP config");
+
+    assert_eq!(
+        servers
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["demo", "hosted"]
+    );
+    assert!(
+        servers
+            .iter()
+            .all(|(_, server)| { server.environment_id == LOCAL_ENVIRONMENT_ID })
+    );
 }
 
 impl SyntheticExecutorFileSystem {

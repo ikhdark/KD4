@@ -1,4 +1,4 @@
-use crate::function_tool::FunctionCallError;
+use crate::FunctionCallError;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
@@ -8,6 +8,7 @@ use crate::tools::registry::ToolExecutionTiming;
 use crate::tools::registry::ToolExecutor;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
+use std::sync::Arc;
 
 use super::ExecContext;
 use super::PUBLIC_TOOL_NAME;
@@ -65,10 +66,10 @@ impl CodeModeExecuteHandler {
             .execute(codex_code_mode::ExecuteRequest {
                 tool_call_id: call_id.clone(),
                 enabled_tools,
-                source: args.code.clone(),
-                // Initial observation is an internal hand-off from the
-                // runtime to the code-mode owner. The owner applies the
-                // requested cadence to all subsequent observations.
+                source: args.code.to_owned(),
+                // Initial observation is an immediate internal hand-off from
+                // the runtime to the code-mode owner. Subsequent observations
+                // wake on output or terminal state.
                 yield_time_ms: Some(0),
                 max_output_tokens: args.max_output_tokens,
             })
@@ -84,7 +85,7 @@ impl CodeModeExecuteHandler {
                 exec.turn.sub_id.as_str(),
                 runtime_cell_id.as_str(),
                 call_id.as_str(),
-                args.code.as_str(),
+                args.code,
             );
         exec.session
             .services
@@ -206,13 +207,14 @@ impl CodeModeExecuteHandler {
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let ToolInvocation {
             session,
-            turn,
+            step_context,
             call_id,
             tool_name,
             payload,
             cancellation_token,
             ..
         } = invocation;
+        let turn = Arc::clone(&step_context.turn);
 
         match payload {
             ToolPayload::Custom { input } if is_exec_tool_name(&tool_name) => self

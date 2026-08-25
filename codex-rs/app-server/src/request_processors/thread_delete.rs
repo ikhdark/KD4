@@ -24,6 +24,12 @@ impl ThreadRequestProcessor {
                     .await;
                 Ok(None)
             }
+            Err(error) if !deleted_thread_ids.is_empty() => {
+                self.outgoing.send_error(request_id, error).await;
+                self.send_thread_deleted_notifications(deleted_thread_ids)
+                    .await;
+                Ok(None)
+            }
             Err(error) => Err(error),
         }
     }
@@ -40,13 +46,23 @@ impl ThreadRequestProcessor {
 
         self.validate_root_thread_delete(thread_id, thread_ids.len() > 1)
             .await?;
-        for thread_id_to_delete in thread_ids.iter().copied() {
-            self.prepare_thread_for_delete(thread_id_to_delete).await;
-        }
-
         let mut delete_order: Vec<_> = thread_ids.iter().skip(1).rev().copied().collect();
         delete_order.push(thread_id);
 
+        for thread_id_to_delete in delete_order.iter().copied() {
+            match self
+                .thread_store
+                .preflight_delete_thread(StoreDeleteThreadParams {
+                    thread_id: thread_id_to_delete,
+                })
+                .await
+            {
+                Ok(()) | Err(ThreadStoreError::ThreadNotFound { .. }) => {}
+                Err(err) => return Err(thread_store_delete_error(err)),
+            }
+        }
+
+        let mut completed_thread_ids = Vec::new();
         for thread_id_to_delete in delete_order.iter().copied() {
             match self
                 .thread_store
@@ -62,14 +78,19 @@ impl ThreadRequestProcessor {
                     );
                 }
                 Err(err) => {
+                    self.cleanup_deleted_thread_state(completed_thread_ids.as_slice(), thread_id)
+                        .await;
                     return Err(thread_store_delete_error(err));
                 }
             }
+            self.prepare_thread_for_delete(thread_id_to_delete).await;
+            completed_thread_ids.push(thread_id_to_delete);
+            deleted_thread_ids.push(thread_id_to_delete.to_string());
         }
 
         if let Some(state_db) = self.state_db.as_ref() {
             state_db
-                .delete_threads_strict(thread_ids.as_slice())
+                .delete_threads_strict(completed_thread_ids.as_slice())
                 .await
                 .map_err(|err| {
                     internal_error(format!(
@@ -78,12 +99,25 @@ impl ThreadRequestProcessor {
                 })?;
         }
 
-        deleted_thread_ids.extend(
-            delete_order
-                .into_iter()
-                .map(|thread_id| thread_id.to_string()),
-        );
         Ok(ThreadDeleteResponse {})
+    }
+
+    async fn cleanup_deleted_thread_state(
+        &self,
+        thread_ids: &[ThreadId],
+        root_thread_id: ThreadId,
+    ) {
+        if thread_ids.is_empty() {
+            return;
+        }
+        let Some(state_db) = self.state_db.as_ref() else {
+            return;
+        };
+        if let Err(err) = state_db.delete_threads_strict(thread_ids).await {
+            error!(
+                "failed to clean up app-server state for partially deleted subtree {root_thread_id}: {err}"
+            );
+        }
     }
 
     async fn send_thread_deleted_notifications(&self, deleted_thread_ids: Vec<String>) {

@@ -53,7 +53,7 @@ pub(crate) struct ToolSuggestMetadataFragment {
     config_name: String,
     display_name: String,
     description: Option<String>,
-    mcp_server_names: Vec<String>,
+    mcp_servers: HashMap<String, ()>,
     app_declarations: Vec<AppDeclaration>,
     skill_inventory: Option<PluginSkillInventory>,
 }
@@ -65,12 +65,7 @@ impl ToolSuggestMetadataFragment {
         auth_mode: Option<AuthMode>,
     ) -> PluginCapabilitySummary {
         let mut app_declarations = self.app_declarations.clone();
-        let mut mcp_servers = self
-            .mcp_server_names
-            .iter()
-            .cloned()
-            .map(|name| (name, ()))
-            .collect::<HashMap<_, _>>();
+        let mut mcp_servers = self.mcp_servers.clone();
         if auth_mode.is_some() {
             apply_app_mcp_routing_policy(
                 &mut app_declarations,
@@ -200,7 +195,7 @@ async fn load_plugin_metadata(
             description: prompt_safe_plugin_description(Some(
                 &remote_plugin_install_required_description(&plugin.source),
             )),
-            mcp_server_names: Vec::new(),
+            mcp_servers: HashMap::new(),
             app_declarations: Vec::new(),
             skill_inventory: None,
         }));
@@ -218,21 +213,49 @@ async fn load_plugin_metadata(
         /*plugin_skill_snapshots*/ None,
     )
     .await;
-    let mut mcp_server_names =
-        load_plugin_mcp_servers(plugin_root.as_path(), /*auth_mode*/ None)
-            .await
-            .into_keys()
-            .collect::<Vec<_>>();
-    mcp_server_names.sort_unstable();
-    mcp_server_names.dedup();
+    let mcp_servers = load_plugin_mcp_servers(plugin_root.as_path(), /*auth_mode*/ None)
+        .await
+        .into_keys()
+        .map(|name| (name, ()))
+        .collect();
     let app_declarations = load_plugin_apps(plugin_root.as_path()).await;
 
     Ok(Arc::new(ToolSuggestMetadataFragment {
         config_name: plugin.id.clone(),
         display_name: plugin.name.clone(),
         description: prompt_safe_plugin_description(manifest.description.as_deref()),
-        mcp_server_names,
+        mcp_servers,
         app_declarations,
         skill_inventory: Some(skill_inventory),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_plugin::AppConnectorId;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn projection_filters_cached_server_map_then_orders_names_once() {
+        let fragment = ToolSuggestMetadataFragment {
+            config_name: "example".to_string(),
+            display_name: "Example".to_string(),
+            description: None,
+            mcp_servers: ["zeta", "app", "alpha"]
+                .into_iter()
+                .map(|name| (name.to_string(), ()))
+                .collect(),
+            app_declarations: vec![AppDeclaration {
+                name: "app".to_string(),
+                connector_id: AppConnectorId("connector-app".to_string()),
+                category: None,
+            }],
+            skill_inventory: None,
+        };
+
+        let projected = fragment.project(&SkillConfigRules::default(), Some(AuthMode::Chatgpt));
+
+        assert_eq!(projected.mcp_server_names, ["alpha", "zeta"]);
+    }
 }

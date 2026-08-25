@@ -1,10 +1,10 @@
 use super::*;
+use crate::FunctionCallError;
 use crate::ThreadManager;
 use crate::agent::control::AgentControlTestBarrier;
 use crate::config::AgentRoleConfig;
 use crate::config::Constrained;
 use crate::config::DEFAULT_AGENT_MAX_DEPTH;
-use crate::function_tool::FunctionCallError;
 use crate::init_state_db;
 use crate::local_agent_graph_store_from_state_db;
 use crate::session::step_context::StepContext;
@@ -25,6 +25,7 @@ use crate::tools::handlers::multi_agents_v2::WaitAgentHandler as WaitAgentHandle
 use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_extension_api::empty_extension_registry;
 use codex_features::Feature;
+use codex_features::MULTI_AGENT_MIN_WAIT_TIMEOUT_MS;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_model_provider::create_model_provider;
@@ -131,7 +132,6 @@ fn invocation(
     ToolInvocation {
         session,
         step_context,
-        turn,
         cancellation_token: CancellationToken::new(),
         tracker: Arc::new(Mutex::new(TurnDiffTracker::default())),
         call_id: "call-1".to_string(),
@@ -837,10 +837,6 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
         .features
         .enable(Feature::MultiAgentV2)
         .expect("test config should allow feature update");
-    config
-        .features
-        .enable(Feature::Sqlite)
-        .expect("test config should allow sqlite");
     config.ephemeral = false;
     let state_runtime = init_state_db(&config)
         .await
@@ -1145,10 +1141,6 @@ async fn multi_agent_v2_spawn_reuses_completed_explorer_result() {
         .features
         .enable(Feature::MultiAgentV2)
         .expect("test config should allow feature update");
-    config
-        .features
-        .enable(Feature::Sqlite)
-        .expect("test config should allow sqlite");
     config.ephemeral = false;
     let state_runtime = init_state_db(&config)
         .await
@@ -1294,10 +1286,6 @@ async fn multi_agent_v2_typed_spawn_admits_overlapping_write_claims() {
         .features
         .enable(Feature::MultiAgentV2)
         .expect("test config should allow feature update");
-    config
-        .features
-        .enable(Feature::Sqlite)
-        .expect("test config should allow sqlite");
     config.ephemeral = false;
     let state_runtime = init_state_db(&config)
         .await
@@ -1452,10 +1440,6 @@ async fn multi_agent_v2_typed_spawn_failure_releases_write_claim() {
         .features
         .enable(Feature::MultiAgentV2)
         .expect("test config should allow feature update");
-    config
-        .features
-        .enable(Feature::Sqlite)
-        .expect("test config should allow sqlite");
     let state_runtime = init_state_db(&config)
         .await
         .expect("typed spawn requires persistent test state");
@@ -3408,9 +3392,8 @@ async fn spawn_agent_reapplies_runtime_sandbox_when_role_does_not_override_permi
     let manager = thread_manager();
     session.services.agent_control = manager.agent_control();
     let expected_sandbox = turn.config.legacy_sandbox_policy();
-    #[allow(deprecated)]
     let mut expected_file_system_sandbox_policy =
-        FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(&expected_sandbox, &turn.cwd);
+        FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(&expected_sandbox, turn.cwd());
     expected_file_system_sandbox_policy
         .entries
         .push(FileSystemSandboxEntry {
@@ -4841,7 +4824,7 @@ async fn wait_agent_times_out_when_status_is_not_final() {
         "wait_agent",
         function_payload(json!({
             "targets": [agent_id.to_string()],
-            "timeout_ms": MIN_WAIT_TIMEOUT_MS
+            "timeout_ms": MULTI_AGENT_MIN_WAIT_TIMEOUT_MS
         })),
     );
     let output = WaitAgentHandler::default()
@@ -5561,10 +5544,6 @@ async fn multi_agent_v2_interrupt_agent_accepts_unloaded_task_name_target() {
         .features
         .enable(Feature::MultiAgentV2)
         .expect("test config should allow feature update");
-    config
-        .features
-        .enable(Feature::Sqlite)
-        .expect("test config should allow sqlite");
     let state_db = init_state_db(&config)
         .await
         .expect("sqlite state db should initialize");
@@ -5927,10 +5906,6 @@ async fn close_agent_submits_shutdown_and_returns_previous_status() {
 async fn close_agent_completed_item_reports_failed_when_durable_close_fails() {
     let (mut session, turn, rx) = make_session_and_context_with_rx().await;
     let mut config = turn.config.as_ref().clone();
-    config
-        .features
-        .enable(Feature::Sqlite)
-        .expect("test config should allow sqlite");
     config.ephemeral = false;
     let state_db = init_state_db(&config).await;
     let manager = ThreadManager::new(
@@ -6026,10 +6001,6 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
     let mut config = turn.config.as_ref().clone();
     config.agent_max_depth = 3;
     let _ = config.features.disable(Feature::MultiAgentV2);
-    config
-        .features
-        .enable(Feature::Sqlite)
-        .expect("test config should allow sqlite");
     let state_db = init_state_db(&config).await;
     let manager = ThreadManager::new(
         &config,
@@ -6266,15 +6237,10 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
         use_profile: true,
         ..ShellEnvironmentPolicy::default()
     };
-    config.codex_linux_sandbox_exe = Some(PathBuf::from("/bin/echo"));
-    turn.config = Arc::new(config);
     let temp_dir = tempfile::tempdir().expect("temp dir");
-    #[allow(deprecated)]
-    {
-        turn.cwd = temp_dir.abs();
-    }
-    #[allow(deprecated)]
-    let turn_cwd = turn.cwd.clone();
+    config.cwd = temp_dir.abs();
+    turn.config = Arc::new(config);
+    let turn_cwd = turn.cwd().clone();
     let sandbox_policy = pick_allowed_sandbox_policy(
         &turn.config.permissions,
         turn.config.legacy_sandbox_policy(),
@@ -6301,10 +6267,7 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
     expected.model_reasoning_effort = turn.reasoning_effort.clone();
     expected.model_reasoning_summary = Some(turn.reasoning_summary);
     expected.developer_instructions = turn.developer_instructions.clone();
-    #[allow(deprecated)]
-    {
-        expected.cwd = turn.cwd.clone();
-    }
+    expected.cwd = turn.cwd().clone();
     expected
         .permissions
         .approval_policy
@@ -6336,10 +6299,7 @@ async fn build_agent_resume_config_clears_base_instructions() {
     expected.model_reasoning_effort = turn.reasoning_effort.clone();
     expected.model_reasoning_summary = Some(turn.reasoning_summary);
     expected.developer_instructions = turn.developer_instructions.clone();
-    #[allow(deprecated)]
-    {
-        expected.cwd = turn.cwd.clone();
-    }
+    expected.cwd = turn.cwd().clone();
     expected
         .permissions
         .approval_policy

@@ -848,26 +848,6 @@ async fn inject_plaintext_credentials_if_enabled(
 }
 
 async fn proxy_via_unix_socket(req: Request, socket_path: &str) -> Result<Response> {
-    #[cfg(target_os = "macos")]
-    {
-        let client = UpstreamClient::unix_socket(socket_path);
-
-        let (mut parts, body) = req.into_parts();
-        let path = parts
-            .uri
-            .path_and_query()
-            .map(rama_http::uri::PathAndQuery::as_str)
-            .unwrap_or("/");
-        parts.uri = path
-            .parse()
-            .with_context(|| format!("invalid unix socket request path: {path}"))?;
-        parts.headers.remove("x-unix-socket");
-        remove_hop_by_hop_request_headers(&mut parts.headers);
-
-        let req = Request::from_parts(parts, body);
-        client.serve(req).await.map_err(anyhow::Error::from)
-    }
-    #[cfg(not(target_os = "macos"))]
     {
         let _ = req;
         let _ = socket_path;
@@ -1459,40 +1439,7 @@ mod tests {
         .await
         .unwrap();
 
-        if cfg!(target_os = "macos") {
-            assert_eq!(response.status(), StatusCode::FORBIDDEN);
-            assert_eq!(
-                response.headers().get("x-proxy-error").unwrap(),
-                "blocked-by-allowlist"
-            );
-        } else {
-            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[tokio::test(flavor = "current_thread")]
-    async fn http_plain_proxy_attempts_allowed_unix_socket_proxy() {
-        let state = Arc::new(network_proxy_state_for_policy({
-            let mut network = NetworkProxyConfig::default();
-            network.set_allow_unix_sockets(vec!["/tmp/test.sock".to_string()]);
-            network
-        }));
-
-        let mut req = Request::builder()
-            .method(Method::GET)
-            .uri("http://example.com")
-            .header("x-unix-socket", "/tmp/test.sock")
-            .body(Body::empty())
-            .expect("request should build");
-        req.extensions_mut().insert(state);
-
-        let response = http_plain_proxy(
-            /*policy_decider*/ None, /*environment_id*/ None, req,
-        )
-        .await
-        .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     #[tokio::test]

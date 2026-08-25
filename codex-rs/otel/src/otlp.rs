@@ -104,40 +104,16 @@ fn build_http_client_inner(
 ) -> Result<reqwest::blocking::Client, Box<dyn Error>> {
     let mut builder =
         reqwest::blocking::Client::builder().timeout(resolve_otlp_timeout(timeout_var));
+    let ReqwestTlsMaterial {
+        ca_certificate,
+        client_identity,
+    } = load_reqwest_tls_material(tls)?;
 
-    if let Some(path) = tls.ca_certificate.as_ref() {
-        let (pem, location) = read_bytes(path)?;
-        let certificate = ReqwestCertificate::from_pem(pem.as_slice()).map_err(|error| {
-            config_error(format!(
-                "failed to parse certificate {}: {error}",
-                location.display()
-            ))
-        })?;
-        builder = builder
-            .tls_built_in_root_certs(false)
-            .add_root_certificate(certificate);
+    if let Some(certificate) = ca_certificate {
+        builder = builder.tls_certs_only([certificate]);
     }
-
-    match (&tls.client_certificate, &tls.client_private_key) {
-        (Some(cert_path), Some(key_path)) => {
-            let (mut cert_pem, cert_location) = read_bytes(cert_path)?;
-            let (key_pem, key_location) = read_bytes(key_path)?;
-            cert_pem.extend_from_slice(key_pem.as_slice());
-            let identity = ReqwestIdentity::from_pem(cert_pem.as_slice()).map_err(|error| {
-                config_error(format!(
-                    "failed to parse client identity using {} and {}: {error}",
-                    cert_location.display(),
-                    key_location.display()
-                ))
-            })?;
-            builder = builder.identity(identity).https_only(true);
-        }
-        (Some(_), None) | (None, Some(_)) => {
-            return Err(config_error(
-                "client_certificate and client_private_key must both be provided for mTLS",
-            ));
-        }
-        (None, None) => {}
+    if let Some(identity) = client_identity {
+        builder = builder.identity(identity).https_only(true);
     }
 
     builder
@@ -152,45 +128,70 @@ pub(crate) fn build_async_http_client(
     let mut builder = reqwest::Client::builder().timeout(resolve_otlp_timeout(timeout_var));
 
     if let Some(tls) = tls {
-        if let Some(path) = tls.ca_certificate.as_ref() {
-            let (pem, location) = read_bytes(path)?;
-            let certificate = ReqwestCertificate::from_pem(pem.as_slice()).map_err(|error| {
-                config_error(format!(
-                    "failed to parse certificate {}: {error}",
-                    location.display()
-                ))
-            })?;
-            builder = builder
-                .tls_built_in_root_certs(false)
-                .add_root_certificate(certificate);
+        let ReqwestTlsMaterial {
+            ca_certificate,
+            client_identity,
+        } = load_reqwest_tls_material(tls)?;
+        if let Some(certificate) = ca_certificate {
+            builder = builder.tls_certs_only([certificate]);
         }
-
-        match (&tls.client_certificate, &tls.client_private_key) {
-            (Some(cert_path), Some(key_path)) => {
-                let (mut cert_pem, cert_location) = read_bytes(cert_path)?;
-                let (key_pem, key_location) = read_bytes(key_path)?;
-                cert_pem.extend_from_slice(key_pem.as_slice());
-                let identity = ReqwestIdentity::from_pem(cert_pem.as_slice()).map_err(|error| {
-                    config_error(format!(
-                        "failed to parse client identity using {} and {}: {error}",
-                        cert_location.display(),
-                        key_location.display()
-                    ))
-                })?;
-                builder = builder.identity(identity).https_only(true);
-            }
-            (Some(_), None) | (None, Some(_)) => {
-                return Err(config_error(
-                    "client_certificate and client_private_key must both be provided for mTLS",
-                ));
-            }
-            (None, None) => {}
+        if let Some(identity) = client_identity {
+            builder = builder.identity(identity).https_only(true);
         }
     }
 
     builder
         .build()
         .map_err(|error| Box::new(error) as Box<dyn Error>)
+}
+
+struct ReqwestTlsMaterial {
+    ca_certificate: Option<ReqwestCertificate>,
+    client_identity: Option<ReqwestIdentity>,
+}
+
+fn load_reqwest_tls_material(tls: &OtelTlsConfig) -> Result<ReqwestTlsMaterial, Box<dyn Error>> {
+    let ca_certificate = tls
+        .ca_certificate
+        .as_ref()
+        .map(|path| {
+            let (pem, location) = read_bytes(path)?;
+            ReqwestCertificate::from_pem(pem.as_slice()).map_err(|error| {
+                config_error(format!(
+                    "failed to parse certificate {}: {error}",
+                    location.display()
+                ))
+            })
+        })
+        .transpose()?;
+
+    let client_identity = match (&tls.client_certificate, &tls.client_private_key) {
+        (Some(cert_path), Some(key_path)) => {
+            let (mut cert_pem, cert_location) = read_bytes(cert_path)?;
+            let (key_pem, key_location) = read_bytes(key_path)?;
+            cert_pem.extend_from_slice(key_pem.as_slice());
+            Some(
+                ReqwestIdentity::from_pem(cert_pem.as_slice()).map_err(|error| {
+                    config_error(format!(
+                        "failed to parse client identity using {} and {}: {error}",
+                        cert_location.display(),
+                        key_location.display()
+                    ))
+                })?,
+            )
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(config_error(
+                "client_certificate and client_private_key must both be provided for mTLS",
+            ));
+        }
+        (None, None) => None,
+    };
+
+    Ok(ReqwestTlsMaterial {
+        ca_certificate,
+        client_identity,
+    })
 }
 
 pub(crate) fn resolve_otlp_timeout(signal_var: &str) -> Duration {
@@ -268,5 +269,60 @@ mod tests {
         });
 
         assert!(client.is_ok());
+    }
+
+    #[test]
+    fn build_http_client_accepts_custom_ca_certificate() {
+        let ca_certificate = AbsolutePathBuf::try_from(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../http-client/tests/fixtures/test-ca.pem"),
+        )
+        .expect("absolute CA certificate path");
+        let tls = OtelTlsConfig {
+            ca_certificate: Some(ca_certificate),
+            ..OtelTlsConfig::default()
+        };
+
+        let client = build_http_client(&tls, OTEL_EXPORTER_OTLP_TIMEOUT);
+
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn build_async_http_client_accepts_custom_ca_certificate() {
+        let ca_certificate = AbsolutePathBuf::try_from(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../http-client/tests/fixtures/test-ca.pem"),
+        )
+        .expect("absolute CA certificate path");
+        let tls = OtelTlsConfig {
+            ca_certificate: Some(ca_certificate),
+            ..OtelTlsConfig::default()
+        };
+
+        let client = build_async_http_client(Some(&tls), OTEL_EXPORTER_OTLP_TIMEOUT);
+
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn reqwest_tls_material_rejects_unpaired_client_credentials() {
+        let client_certificate = AbsolutePathBuf::try_from(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("unused-client-cert.pem"),
+        )
+        .expect("absolute client certificate path");
+        let tls = OtelTlsConfig {
+            client_certificate: Some(client_certificate),
+            ..OtelTlsConfig::default()
+        };
+
+        let error = load_reqwest_tls_material(&tls)
+            .err()
+            .expect("unpaired client credentials should fail");
+
+        assert_eq!(
+            error.to_string(),
+            "client_certificate and client_private_key must both be provided for mTLS"
+        );
     }
 }

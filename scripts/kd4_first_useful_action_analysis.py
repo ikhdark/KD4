@@ -1,20 +1,17 @@
-#!/usr/bin/env python3
-"""Analyze first-useful-action latency from Codex rollout JSONL files."""
+"""Internal first-useful-action metrics for the canonical turn latency audit."""
 
 from __future__ import annotations
 
-import argparse
 import io
 import json
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 try:
-    from scripts.rollout_snapshot import read_rollout_snapshot
+    from scripts.rollout_snapshot import RolloutSnapshot
 except ImportError:
-    from rollout_snapshot import read_rollout_snapshot
+    from rollout_snapshot import RolloutSnapshot
 
 
 CANONICAL_TIMING_SCHEMA_VERSION = 20
@@ -100,30 +97,17 @@ class _Turn:
     useful_tool_name: str | None = None
 
 
-def _rollout_files(inputs: Sequence[Path]) -> list[Path]:
-    files: dict[str, Path] = {}
-    for input_path in inputs:
-        candidates = (
-            input_path.rglob("*.jsonl") if input_path.is_dir() else (input_path,)
-        )
-        for candidate in candidates:
-            if candidate.is_file():
-                resolved = candidate.resolve()
-                files[str(resolved).casefold()] = resolved
-    return sorted(files.values())
+def analyze_snapshots(snapshots: Sequence[RolloutSnapshot]) -> dict[str, Any]:
+    """Analyze snapshots already captured by ``kd4_turn_latency_audit``."""
 
-
-def analyze(inputs: Sequence[Path]) -> dict[str, Any]:
-    files = _rollout_files(inputs)
     exclusions = {"invalidJsonLines": 0, "invalidTimestamps": 0, "incompleteTurns": 0}
     legacy_rows: list[dict[str, float]] = []
     canonical_rows: list[dict[str, float]] = []
-    snapshots: list[dict[str, str | int]] = []
+    snapshot_metadata: list[dict[str, str | int]] = []
     completed_turns = 0
 
-    for path in files:
-        snapshot = read_rollout_snapshot(path)
-        snapshots.append(snapshot.metadata())
+    for snapshot in snapshots:
+        snapshot_metadata.append(snapshot.metadata())
         active: _Turn | None = None
         with io.StringIO(snapshot.data.decode("utf-8")) as handle:
             for raw_line in handle:
@@ -277,8 +261,8 @@ def analyze(inputs: Sequence[Path]) -> dict[str, Any]:
                 "not handler entry and not a runtime benchmark"
             ),
         },
-        "sourceFileCount": len(files),
-        "sourceSnapshots": snapshots,
+        "sourceFileCount": len(snapshots),
+        "sourceSnapshots": snapshot_metadata,
         "completedTurnCount": completed_turns,
         "canonicalTurnCount": len(canonical_rows),
         "legacyReconstructedTurnCount": len(legacy_rows),
@@ -286,41 +270,3 @@ def analyze(inputs: Sequence[Path]) -> dict[str, Any]:
         "legacyReconstructed": legacy_metrics,
         "exclusions": exclusions,
     }
-
-
-def render(analysis: dict[str, Any]) -> str:
-    def milliseconds(value: Any) -> str:
-        return "None" if value is None else f"{value}ms"
-
-    def metric(label: str, value: dict[str, Any]) -> str:
-        return (
-            f"{label}: n={value['count']} p50={milliseconds(value['p50'])} "
-            f"p95={milliseconds(value['p95'])} max={milliseconds(value['max'])}"
-        )
-
-    lines = [
-        "First-useful-action latency",
-        f"files={analysis['sourceFileCount']} completed_turns={analysis['completedTurnCount']} ",
-        f"canonical_turns={analysis['canonicalTurnCount']} legacy_turns={analysis['legacyReconstructedTurnCount']}",
-        "Legacy values are tool-emission approximations, not handler-entry runtime measurements.",
-    ]
-    lines.extend(metric(name, value) for name, value in analysis["canonical"].items())
-    lines.extend(
-        metric(f"legacy.{name}", value)
-        for name, value in analysis["legacyReconstructed"].items()
-    )
-    return "\n".join(lines)
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("inputs", nargs="+", type=Path)
-    parser.add_argument("--json", action="store_true")
-    args = parser.parse_args(argv)
-    result = analyze(args.inputs)
-    print(json.dumps(result, sort_keys=True) if args.json else render(result))
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

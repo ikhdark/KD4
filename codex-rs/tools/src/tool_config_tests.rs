@@ -56,9 +56,7 @@ fn model_with_shell_type(shell_type: ConfigShellToolType) -> ModelInfo {
 fn shell_features() -> Features {
     let mut features = Features::with_defaults();
     features.enable(Feature::ShellTool);
-    features.disable(Feature::ShellZshFork);
     features.disable(Feature::UnifiedExec);
-    features.disable(Feature::UnifiedExecZshFork);
     features
 }
 
@@ -98,18 +96,6 @@ fn shell_type_is_derived_from_model_and_feature_gates() {
         expected_unified_exec
     );
 
-    features.enable(Feature::ShellZshFork);
-    assert_eq!(
-        shell_type_for_model_and_features(&model, &features),
-        ConfigShellToolType::ShellCommand
-    );
-
-    features.enable(Feature::UnifiedExecZshFork);
-    assert_eq!(
-        shell_type_for_model_and_features(&model, &features),
-        expected_unified_exec
-    );
-
     features.disable(Feature::ShellTool);
     assert_eq!(
         shell_type_for_model_and_features(&model, &features),
@@ -118,28 +104,7 @@ fn shell_type_is_derived_from_model_and_feature_gates() {
 }
 
 #[test]
-fn shell_command_backend_requires_both_shell_tool_and_zsh_fork() {
-    let mut features = shell_features();
-    assert_eq!(
-        shell_command_backend_for_features(&features),
-        ShellCommandBackendConfig::Classic
-    );
-
-    features.enable(Feature::ShellZshFork);
-    assert_eq!(
-        shell_command_backend_for_features(&features),
-        ShellCommandBackendConfig::ZshFork
-    );
-
-    features.disable(Feature::ShellTool);
-    assert_eq!(
-        shell_command_backend_for_features(&features),
-        ShellCommandBackendConfig::Classic
-    );
-}
-
-#[test]
-fn unified_exec_feature_mode_follows_composition_dependencies() {
+fn unified_exec_feature_mode_follows_shell_and_unified_exec_gates() {
     let mut features = shell_features();
     assert_eq!(
         unified_exec_feature_mode_for_features(&features),
@@ -150,25 +115,6 @@ fn unified_exec_feature_mode_follows_composition_dependencies() {
     assert_eq!(
         unified_exec_feature_mode_for_features(&features),
         UnifiedExecFeatureMode::Direct
-    );
-
-    features.enable(Feature::UnifiedExecZshFork);
-    assert_eq!(
-        unified_exec_feature_mode_for_features(&features),
-        UnifiedExecFeatureMode::Direct
-    );
-
-    features.enable(Feature::ShellZshFork);
-    features.disable(Feature::UnifiedExecZshFork);
-    assert_eq!(
-        unified_exec_feature_mode_for_features(&features),
-        UnifiedExecFeatureMode::Disabled
-    );
-
-    features.enable(Feature::UnifiedExecZshFork);
-    assert_eq!(
-        unified_exec_feature_mode_for_features(&features),
-        UnifiedExecFeatureMode::ZshFork
     );
 
     features.disable(Feature::ShellTool);
@@ -196,33 +142,5 @@ fn request_user_input_modes_follow_default_mode_feature() {
     assert_eq!(
         request_user_input_available_modes(&features),
         vec![ModeKind::Default, ModeKind::Plan]
-    );
-}
-
-#[test]
-fn unified_exec_shell_mode_uses_zsh_fork_only_when_all_inputs_match() {
-    let exe = std::env::current_exe().expect("current exe path");
-    let shell = exe.clone();
-
-    let mode = UnifiedExecShellMode::for_session(
-        UnifiedExecFeatureMode::ZshFork,
-        ToolUserShellType::Zsh,
-        Some(&shell),
-        Some(&exe),
-    );
-    if cfg!(unix) {
-        assert!(matches!(mode, UnifiedExecShellMode::ZshFork(_)));
-    } else {
-        assert_eq!(mode, UnifiedExecShellMode::Direct);
-    }
-
-    assert_eq!(
-        UnifiedExecShellMode::for_session(
-            UnifiedExecFeatureMode::Direct,
-            ToolUserShellType::Zsh,
-            Some(&shell),
-            Some(&exe),
-        ),
-        UnifiedExecShellMode::Direct
     );
 }

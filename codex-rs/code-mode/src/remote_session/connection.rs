@@ -100,8 +100,7 @@ impl Drop for CallerCancellation {
 impl Connection {
     pub(super) async fn spawn(host_program: &Path) -> Result<Self, String> {
         let mut command = Command::new(host_program);
-        #[cfg(unix)]
-        command.process_group(0);
+
         let managed = Arc::new(
             ManagedRootProcess::reserve_with_reclaim()
                 .await
@@ -122,7 +121,7 @@ impl Connection {
         let process_id = child
             .id()
             .ok_or_else(|| "spawned code-mode host has no process id".to_string())?;
-        #[cfg(windows)]
+
         if let Err(err) = managed.attach(process_id) {
             kill_and_reap(&mut child, &managed).await;
             return Err(format!(
@@ -130,8 +129,6 @@ impl Connection {
                 host_program.display()
             ));
         }
-        #[cfg(not(windows))]
-        let _ = process_id;
 
         if let Some(stderr) = child.stderr.take() {
             tokio::spawn(async move {
@@ -474,10 +471,8 @@ fn failure_message(failure: &std::sync::Mutex<Option<String>>) -> String {
 }
 
 async fn kill_and_reap(child: &mut Child, managed: &ManagedRootProcess) {
-    #[cfg(windows)]
     let _ = managed.terminate();
-    #[cfg(not(windows))]
-    let _ = managed;
+
     let _ = child.start_kill();
     let _ = child.wait().await;
 }

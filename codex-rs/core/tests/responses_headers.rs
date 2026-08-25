@@ -131,7 +131,6 @@ async fn responses_stream_includes_subagent_header_on_review() {
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
-        /*item_ids_enabled*/ false,
         /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
         config.http_client_factory(),
@@ -269,7 +268,6 @@ async fn responses_stream_includes_subagent_header_on_other() {
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
-        /*item_ids_enabled*/ false,
         /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
         config.http_client_factory(),
@@ -316,7 +314,7 @@ async fn responses_stream_includes_subagent_header_on_other() {
 }
 
 #[tokio::test]
-async fn responses_respects_model_info_overrides_from_config() {
+async fn responses_includes_configured_reasoning_summary_for_supported_model() {
     core_test_support::skip_if_no_network!();
 
     let server = responses::start_mock_server().await;
@@ -350,10 +348,9 @@ async fn responses_respects_model_info_overrides_from_config() {
 
     let codex_home = TempDir::new().expect("failed to create TempDir");
     let mut config = load_default_config_for_test(&codex_home).await;
-    config.model = Some("gpt-3.5-turbo".to_string());
+    config.model = Some("gpt-5.4".to_string());
     config.model_provider_id = provider.name.clone();
     config.model_provider = provider.clone();
-    config.model_supports_reasoning_summaries = Some(true);
     config.model_reasoning_summary = Some(ReasoningSummary::Detailed);
     let effort = config.model_reasoning_effort.clone();
     let summary = config.model_reasoning_summary;
@@ -367,8 +364,9 @@ async fn responses_respects_model_info_overrides_from_config() {
             .map(TelemetryAuthMode::from);
     let session_source =
         SessionSource::SubAgent(SubAgentSource::Other("override-check".to_string()));
-    let model_info =
+    let mut model_info =
         codex_core::test_support::construct_model_info_offline(model.as_str(), &config);
+    model_info.supports_reasoning_summaries = true;
     let session_telemetry = SessionTelemetry::new(
         thread_id,
         model.as_str(),
@@ -393,7 +391,6 @@ async fn responses_respects_model_info_overrides_from_config() {
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
-        /*item_ids_enabled*/ false,
         /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
         config.http_client_factory(),

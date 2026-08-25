@@ -28,7 +28,6 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
-use tokio::process::Command;
 
 #[cfg(test)]
 use nucleo::Utf32Str;
@@ -36,10 +35,6 @@ use nucleo::Utf32Str;
 use nucleo::pattern::AtomKind;
 #[cfg(test)]
 use nucleo::pattern::Pattern;
-
-mod cli;
-
-pub use cli::Cli;
 
 const FILE_SEARCH_MAX_WALK_DEPTH: usize = 64;
 const FILE_SEARCH_MAX_WALK_DIRECTORIES: usize = 10_000;
@@ -150,8 +145,10 @@ pub trait SessionReporter: Send + Sync + 'static {
     /// Called when the debounced top-N changes.
     fn on_update(&self, snapshot: &FileSearchSnapshot);
 
-    /// Called with the completed query when the session becomes idle or is cancelled.
-    /// Guaranteed to be called at least once per `update_query`.
+    /// Called with the latest query when the session becomes idle or is cancelled.
+    ///
+    /// Rapid query updates may be coalesced, so completion is not reported once
+    /// per call to [`FileSearchSession::update_query`].
     fn on_complete(&self, query: &str);
 }
 
@@ -242,82 +239,6 @@ fn create_session_with_walk_limits(
     thread::spawn(move || walker_worker(walker_inner, override_matcher, injector));
 
     Ok(FileSearchSession { inner })
-}
-
-pub trait Reporter {
-    fn report_match(&self, file_match: &FileMatch);
-    fn warn_matches_truncated(&self, total_match_count: usize, shown_match_count: usize);
-    fn warn_no_search_pattern(&self, search_directory: &Path);
-}
-
-pub async fn run_main<T: Reporter>(
-    Cli {
-        pattern,
-        limit,
-        cwd,
-        compute_indices,
-        json: _,
-        exclude,
-        threads,
-    }: Cli,
-    reporter: T,
-) -> anyhow::Result<()> {
-    let search_directory = match cwd {
-        Some(dir) => dir,
-        None => std::env::current_dir()?,
-    };
-    let pattern_text = match pattern {
-        Some(pattern) => pattern,
-        None => {
-            reporter.warn_no_search_pattern(&search_directory);
-            #[cfg(unix)]
-            Command::new("ls")
-                .arg("-al")
-                .current_dir(search_directory)
-                .stdout(std::process::Stdio::inherit())
-                .stderr(std::process::Stdio::inherit())
-                .status()
-                .await?;
-            #[cfg(windows)]
-            {
-                Command::new("cmd")
-                    .arg("/c")
-                    .arg(search_directory)
-                    .stdout(std::process::Stdio::inherit())
-                    .stderr(std::process::Stdio::inherit())
-                    .status()
-                    .await?;
-            }
-            return Ok(());
-        }
-    };
-
-    let FileSearchResults {
-        total_match_count,
-        matches,
-    } = run(
-        &pattern_text,
-        vec![search_directory.to_path_buf()],
-        FileSearchOptions {
-            limit,
-            exclude,
-            threads,
-            compute_indices,
-            respect_gitignore: true,
-        },
-        /*cancel_flag*/ None,
-    )?;
-    let match_count = matches.len();
-    let matches_truncated = total_match_count > match_count;
-
-    for file_match in matches {
-        reporter.report_match(&file_match);
-    }
-    if matches_truncated {
-        reporter.warn_matches_truncated(total_match_count, match_count);
-    }
-
-    Ok(())
 }
 
 /// The worker threads will periodically check `cancel_flag` to see if they
@@ -945,19 +866,8 @@ mod tests {
         snapshot
     }
 
-    #[cfg(unix)]
-    fn try_symlink_directory(target: &Path, link: &Path) -> bool {
-        std::os::unix::fs::symlink(target, link).is_ok()
-    }
-
-    #[cfg(windows)]
     fn try_symlink_directory(target: &Path, link: &Path) -> bool {
         std::os::windows::fs::symlink_dir(target, link).is_ok()
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    fn try_symlink_directory(_target: &Path, _link: &Path) -> bool {
-        false
     }
 
     #[test]

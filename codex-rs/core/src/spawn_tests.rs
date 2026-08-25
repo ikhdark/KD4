@@ -20,7 +20,6 @@ fn enabled_network_policy_removes_inherited_disabled_marker() {
     assert_eq!(env.get("KEEP_ME").map(String::as_str), Some("value"));
 }
 
-#[cfg(windows)]
 #[test]
 fn enabled_network_policy_removes_differently_cased_disabled_marker() {
     let mut env = HashMap::from([(

@@ -15,7 +15,6 @@ use codex_experimental_api_macros::ExperimentalApi;
 pub use codex_protocol::capabilities::CapabilityRootLocation;
 pub use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::config_types::CollaborationMode;
-use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
 pub use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
@@ -25,6 +24,7 @@ pub use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::ThreadGoalStatus as CoreThreadGoalStatus;
+pub use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::TokenUsage as CoreTokenUsage;
 use codex_protocol::protocol::TokenUsageInfo as CoreTokenUsageInfo;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -44,6 +44,24 @@ use ts_rs::TS;
 pub enum ThreadStartSource {
     Startup,
     Clear,
+}
+
+/// Stable classification for recoverable thread request failures.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub enum ThreadErrorReason {
+    NotFound,
+    NotLoaded,
+    NotMaterialized,
+    EphemeralTurnsUnavailable,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub struct ThreadErrorData {
+    pub reason: ThreadErrorReason,
 }
 
 // === Threads, Turns, and Items ===
@@ -100,10 +118,6 @@ pub struct ThreadStartParams {
     pub developer_instructions: Option<String>,
     #[ts(optional = nullable)]
     pub personality: Option<Personality>,
-    /// @deprecated Ignored. Configure delegation independently of reasoning effort.
-    #[experimental("thread/start.multiAgentMode")]
-    #[ts(optional = nullable)]
-    pub multi_agent_mode: Option<MultiAgentMode>,
     #[ts(optional = nullable)]
     pub ephemeral: Option<bool>,
     /// Persisted thread history contract to use for this new thread.
@@ -194,10 +208,6 @@ pub struct ThreadStartResponse {
     #[serde(default)]
     pub active_permission_profile: Option<ActivePermissionProfile>,
     pub reasoning_effort: Option<ReasoningEffort>,
-    /// @deprecated Always `explicitRequestOnly`. Use `reasoningEffort` for Ultra behavior.
-    #[experimental("thread/start.multiAgentMode")]
-    #[serde(default)]
-    pub multi_agent_mode: MultiAgentMode,
 }
 
 impl ThreadStartResponse {
@@ -353,10 +363,6 @@ pub struct ThreadSettingsUpdateParams {
     #[experimental("thread/settings/update.collaborationMode")]
     #[ts(optional = nullable)]
     pub collaboration_mode: Option<CollaborationMode>,
-    /// @deprecated Ignored. Configure delegation independently of reasoning effort.
-    #[experimental("thread/settings/update.multiAgentMode")]
-    #[ts(optional = nullable)]
-    pub multi_agent_mode: Option<MultiAgentMode>,
     /// Override the personality for subsequent turns.
     #[ts(optional = nullable)]
     pub personality: Option<Personality>,
@@ -382,10 +388,6 @@ pub struct ThreadSettings {
     pub effort: Option<ReasoningEffort>,
     pub summary: Option<ReasoningSummary>,
     pub collaboration_mode: CollaborationMode,
-    /// @deprecated Always `explicitRequestOnly`. Use `effort` for Ultra behavior.
-    #[experimental("thread/settings.multiAgentMode")]
-    #[serde(default)]
-    pub multi_agent_mode: MultiAgentMode,
     pub personality: Option<Personality>,
 }
 
@@ -522,10 +524,6 @@ pub struct ThreadResumeResponse {
     #[serde(default)]
     pub active_permission_profile: Option<ActivePermissionProfile>,
     pub reasoning_effort: Option<ReasoningEffort>,
-    /// @deprecated Always `explicitRequestOnly`. Use `reasoningEffort` for Ultra behavior.
-    #[experimental("thread/resume.multiAgentMode")]
-    #[serde(default)]
-    pub multi_agent_mode: MultiAgentMode,
     /// `thread/turns/list` page returned when requested by `initialTurnsPage`.
     #[experimental("thread/resume.initialTurnsPage")]
     #[serde(default)]
@@ -688,10 +686,6 @@ pub struct ThreadForkResponse {
     #[serde(default)]
     pub active_permission_profile: Option<ActivePermissionProfile>,
     pub reasoning_effort: Option<ReasoningEffort>,
-    /// @deprecated Always `explicitRequestOnly`. Use `reasoningEffort` for Ultra behavior.
-    #[experimental("thread/fork.multiAgentMode")]
-    #[serde(default)]
-    pub multi_agent_mode: MultiAgentMode,
 }
 
 impl ThreadForkResponse {
@@ -765,7 +759,7 @@ pub enum ThreadUnsubscribeStatus {
     Unsubscribed,
 }
 
-/// Parameters for `thread/increment_elicitation`.
+/// Parameters for `thread/incrementElicitation`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -774,7 +768,7 @@ pub struct ThreadIncrementElicitationParams {
     pub thread_id: String,
 }
 
-/// Response for `thread/increment_elicitation`.
+/// Response for `thread/incrementElicitation`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -787,7 +781,7 @@ pub struct ThreadIncrementElicitationResponse {
     pub paused: bool,
 }
 
-/// Parameters for `thread/decrement_elicitation`.
+/// Parameters for `thread/decrementElicitation`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -798,7 +792,7 @@ pub struct ThreadDecrementElicitationParams {
     pub lease_id: String,
 }
 
-/// Response for `thread/decrement_elicitation`.
+/// Response for `thread/decrementElicitation`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -983,30 +977,6 @@ pub struct ThreadMetadataUpdateResponse {
     pub thread: Thread,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "lowercase")]
-#[ts(rename_all = "lowercase")]
-pub enum ThreadMemoryMode {
-    Enabled,
-    Disabled,
-}
-
-impl ThreadMemoryMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Enabled => "enabled",
-            Self::Disabled => "disabled",
-        }
-    }
-
-    pub fn to_core(self) -> codex_protocol::protocol::ThreadMemoryMode {
-        match self {
-            Self::Enabled => codex_protocol::protocol::ThreadMemoryMode::Enabled,
-            Self::Disabled => codex_protocol::protocol::ThreadMemoryMode::Disabled,
-        }
-    }
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -1024,6 +994,23 @@ pub struct ThreadMemoryModeSetResponse {}
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct MemoryResetResponse {}
+
+#[cfg(test)]
+mod mode_mirror_tests {
+    use super::ThreadHistoryMode;
+    use super::ThreadMemoryMode;
+    use codex_protocol::protocol::ThreadHistoryMode as CoreThreadHistoryMode;
+    use codex_protocol::protocol::ThreadMemoryMode as CoreThreadMemoryMode;
+
+    #[test]
+    fn thread_modes_round_trip_through_core_contracts() {
+        let history: CoreThreadHistoryMode = ThreadHistoryMode::default();
+        let memory: CoreThreadMemoryMode = ThreadMemoryMode::Enabled;
+
+        assert_eq!(history, CoreThreadHistoryMode::Legacy);
+        assert_eq!(memory.as_str(), "enabled");
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -1201,7 +1188,10 @@ pub struct ThreadListParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional = nullable)]
     pub use_state_db_only: Option<bool>,
-    /// Optional substring filter for the extracted thread title.
+    /// Optional substring filter for thread summary metadata used by listing
+    /// (the title and, when available, cached preview text). This does not scan
+    /// arbitrary rollout content or return match snippets; use the experimental
+    /// `thread/search` method for that capability.
     #[ts(optional = nullable)]
     pub search_term: Option<String>,
     /// Optional direct parent thread filter. Mutually exclusive with `ancestorThreadId`.
@@ -1239,7 +1229,9 @@ pub struct ThreadSearchParams {
     /// If false or null, only non-archived threads are returned.
     #[ts(optional = nullable)]
     pub archived: Option<bool>,
-    /// Required substring/full-text query for thread search.
+    /// Required query for full rollout-content search. Unlike
+    /// `thread/list.searchTerm`, this scans persisted rollout content and each
+    /// result includes a matching snippet.
     pub search_term: String,
 }
 
@@ -1305,6 +1297,7 @@ pub struct ThreadListResponse {
 #[ts(export_to = "v2/")]
 pub struct ThreadSearchResult {
     pub thread: Thread,
+    /// The first matching excerpt from persisted rollout content.
     pub snippet: String,
 }
 
@@ -1496,6 +1489,16 @@ impl From<CoreTokenUsageInfo> for ThreadTokenUsage {
     }
 }
 
+impl From<ThreadTokenUsage> for CoreTokenUsageInfo {
+    fn from(value: ThreadTokenUsage) -> Self {
+        Self {
+            total_token_usage: value.total.into(),
+            last_token_usage: value.last.into(),
+            model_context_window: value.model_context_window,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -1521,6 +1524,47 @@ impl From<CoreTokenUsage> for TokenUsageBreakdown {
             output_tokens: value.output_tokens,
             reasoning_output_tokens: value.reasoning_output_tokens,
         }
+    }
+}
+
+impl From<TokenUsageBreakdown> for CoreTokenUsage {
+    fn from(value: TokenUsageBreakdown) -> Self {
+        Self {
+            total_tokens: value.total_tokens,
+            input_tokens: value.input_tokens,
+            cached_input_tokens: value.cached_input_tokens,
+            output_tokens: value.output_tokens,
+            reasoning_output_tokens: value.reasoning_output_tokens,
+        }
+    }
+}
+
+#[cfg(test)]
+mod token_usage_conversion_tests {
+    use super::*;
+
+    #[test]
+    fn app_server_token_usage_round_trips_through_the_core_contract() {
+        let core = CoreTokenUsageInfo {
+            total_token_usage: CoreTokenUsage {
+                input_tokens: 100,
+                cached_input_tokens: 40,
+                output_tokens: 20,
+                reasoning_output_tokens: 5,
+                total_tokens: 120,
+            },
+            last_token_usage: CoreTokenUsage {
+                input_tokens: 60,
+                cached_input_tokens: 10,
+                output_tokens: 15,
+                reasoning_output_tokens: 3,
+                total_tokens: 75,
+            },
+            model_context_window: Some(200_000),
+        };
+
+        let app_server = ThreadTokenUsage::from(core.clone());
+        assert_eq!(CoreTokenUsageInfo::from(app_server), core);
     }
 }
 
@@ -1591,13 +1635,4 @@ pub struct ThreadGoalUpdatedNotification {
 #[ts(export_to = "v2/")]
 pub struct ThreadGoalClearedNotification {
     pub thread_id: String,
-}
-
-/// Deprecated: Use `ContextCompaction` item type instead.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-pub struct ContextCompactedNotification {
-    pub thread_id: String,
-    pub turn_id: String,
 }

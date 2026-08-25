@@ -474,10 +474,8 @@ fn reference_context_item() -> TurnContextItem {
         collaboration_mode: None,
         multi_agent_version: None,
         multi_agent_mode: None,
-        realtime_active: Some(false),
         effort: None,
         context_provenance: None,
-        summary: codex_protocol::config_types::ReasoningSummary::Auto,
     }
 }
 
@@ -1868,42 +1866,6 @@ fn format_exec_output_prefers_line_marker_when_both_limits_exceeded() {
     let truncated = truncate_exec_output(&content);
 
     assert_truncated_message_matches(&truncated, "line-0-", /*expected_removed*/ 17_495);
-}
-
-#[cfg(not(debug_assertions))]
-#[test]
-fn normalize_adds_missing_output_for_function_call() {
-    let items = vec![ResponseItem::FunctionCall {
-        id: None,
-        name: "do_it".to_string(),
-        namespace: None,
-        arguments: "{}".to_string(),
-        call_id: "call-x".to_string(),
-        internal_chat_message_metadata_passthrough: None,
-    }];
-    let mut h = create_history_with_items(items);
-
-    h.normalize_history(&default_input_modalities());
-
-    assert_eq!(
-        h.raw_items(),
-        vec![
-            ResponseItem::FunctionCall {
-                id: None,
-                name: "do_it".to_string(),
-                namespace: None,
-                arguments: "{}".to_string(),
-                call_id: "call-x".to_string(),
-                internal_chat_message_metadata_passthrough: None,
-            },
-            ResponseItem::FunctionCallOutput {
-                id: None,
-                call_id: "call-x".to_string(),
-                output: FunctionCallOutputPayload::from_text("aborted".to_string()),
-                internal_chat_message_metadata_passthrough: None,
-            },
-        ]
-    );
 }
 
 #[cfg(not(debug_assertions))]

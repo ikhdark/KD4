@@ -12,8 +12,6 @@ pub use codex_rollout::ThreadSortKey;
 pub use codex_rollout::ThreadsPage;
 pub use codex_rollout::append_thread_name;
 pub use codex_rollout::find_archived_thread_path_by_id_str;
-#[deprecated(note = "use find_thread_path_by_id_str")]
-pub use codex_rollout::find_conversation_path_by_id_str;
 pub use codex_rollout::find_thread_meta_by_name_str;
 pub use codex_rollout::find_thread_name_by_id;
 pub use codex_rollout::find_thread_names_by_ids;

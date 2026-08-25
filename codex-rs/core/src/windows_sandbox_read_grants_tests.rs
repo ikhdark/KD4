@@ -60,7 +60,6 @@ fn rejects_file_path() {
     assert!(err.to_string().contains("path must be a directory"));
 }
 
-#[cfg(target_os = "windows")]
 #[test]
 fn rejects_permission_profiles_without_managed_windows_sandbox_permissions() {
     let tmp = TempDir::new().expect("tempdir");

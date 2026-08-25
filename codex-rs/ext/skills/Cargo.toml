@@ -21,7 +21,6 @@ codex-mcp = { workspace = true }
 codex-protocol = { workspace = true }
 codex-tools = { workspace = true }
 codex-utils-path-uri = { workspace = true }
-codex-utils-string = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

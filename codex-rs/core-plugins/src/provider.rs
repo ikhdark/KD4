@@ -1,14 +1,13 @@
 use crate::manifest::parse_plugin_manifest_uri;
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::ExecutorFileSystem;
-use codex_plugin::PluginProvider;
+use codex_plugin::DISCOVERABLE_PLUGIN_MANIFEST_PATHS;
 use codex_plugin::ResolvedPlugin;
 use codex_plugin::ResolvedPluginError;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_utils_path_uri::PathUri;
 use codex_utils_path_uri::PathUriParseError;
-use codex_utils_plugins::DISCOVERABLE_PLUGIN_MANIFEST_PATHS;
 use std::io;
 use std::sync::Arc;
 use thiserror::Error;
@@ -126,19 +125,6 @@ impl ExecutorPluginProvider {
             plugin,
             file_system,
         }))
-    }
-}
-
-impl PluginProvider for ExecutorPluginProvider {
-    type Error = ExecutorPluginProviderError;
-
-    async fn resolve(
-        &self,
-        selected_root: &SelectedCapabilityRoot,
-    ) -> Result<Option<ResolvedPlugin>, Self::Error> {
-        self.resolve_bound(selected_root)
-            .await
-            .map(|plugin| plugin.map(|plugin| plugin.plugin))
     }
 }
 

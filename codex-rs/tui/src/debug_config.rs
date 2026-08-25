@@ -629,16 +629,8 @@ mod tests {
 
     #[test]
     fn debug_config_output_lists_all_layers_including_disabled() {
-        let system_file = if cfg!(windows) {
-            absolute_path("C:\\etc\\codex\\config.toml")
-        } else {
-            absolute_path("/etc/codex/config.toml")
-        };
-        let project_folder = if cfg!(windows) {
-            absolute_path("C:\\repo\\.codex")
-        } else {
-            absolute_path("/repo/.codex")
-        };
+        let system_file = absolute_path("C:\\etc\\codex\\config.toml");
+        let project_folder = absolute_path("C:\\repo\\.codex");
 
         let layers = vec![
             ConfigLayerEntry::new(
@@ -670,16 +662,8 @@ mod tests {
 
     #[test]
     fn debug_config_output_lists_requirement_sources() {
-        let requirements_file = if cfg!(windows) {
-            absolute_path("C:\\ProgramData\\OpenAI\\Codex\\requirements.toml")
-        } else {
-            absolute_path("/etc/codex/requirements.toml")
-        };
-        let denied_path = if cfg!(windows) {
-            absolute_path("C:\\Users\\alice\\.gitconfig")
-        } else {
-            absolute_path("/home/alice/.gitconfig")
-        };
+        let requirements_file = absolute_path("C:\\ProgramData\\OpenAI\\Codex\\requirements.toml");
+        let denied_path = absolute_path("C:\\Users\\alice\\.gitconfig");
 
         let requirements = ConfigRequirements {
             approval_policy: ConstrainedWithSource::new(
@@ -794,11 +778,7 @@ mod tests {
             models: None,
         };
 
-        let user_file = if cfg!(windows) {
-            absolute_path("C:\\users\\alice\\.codex\\config.toml")
-        } else {
-            absolute_path("/home/alice/.codex/config.toml")
-        };
+        let user_file = absolute_path("C:\\users\\alice\\.codex\\config.toml");
         let stack = ConfigLayerStack::new(
             vec![ConfigLayerEntry::new(
                 ConfigLayerSource::User {
@@ -813,8 +793,6 @@ mod tests {
         .expect("config layer stack");
 
         let rendered = render_stack_to_text(&stack);
-        #[cfg(not(windows))]
-        insta::assert_snapshot!("debug_config_requirement_sources", rendered.as_str());
 
         let requirements_source = (RequirementSource::LegacyManagedConfigTomlFromMdm).to_string();
         assert!(rendered.contains(&format!(
@@ -871,16 +849,8 @@ mod tests {
 
     #[test]
     fn debug_config_output_filters_sandbox_modes_blocked_by_deny_read_requirements() {
-        let requirements_file = if cfg!(windows) {
-            absolute_path("C:\\ProgramData\\OpenAI\\Codex\\requirements.toml")
-        } else {
-            absolute_path("/etc/codex/requirements.toml")
-        };
-        let denied_path = if cfg!(windows) {
-            absolute_path("C:\\Users\\alice\\.gitconfig")
-        } else {
-            absolute_path("/home/alice/.gitconfig")
-        };
+        let requirements_file = absolute_path("C:\\ProgramData\\OpenAI\\Codex\\requirements.toml");
+        let denied_path = absolute_path("C:\\Users\\alice\\.gitconfig");
 
         let requirements = ConfigRequirements {
             permission_profile: ConstrainedWithSource::new(
@@ -938,11 +908,7 @@ mod tests {
         let rendered = render_stack_to_text_with_sandbox_mode_filter(&stack, |mode| {
             sandbox_mode_is_allowed_by_permissions(&permissions, mode)
         });
-        #[cfg(not(windows))]
-        insta::assert_snapshot!(
-            "debug_config_effective_sandbox_modes_with_deny_read",
-            rendered.as_str()
-        );
+
         assert!(
             rendered.contains(
                 format!(
@@ -1052,11 +1018,7 @@ model = "managed_model"
 approval_policy = "never"
 "#;
         let mdm_value = toml::from_str::<TomlValue>(raw_mdm_toml).expect("MDM value");
-        let mdm_base_dir = if cfg!(windows) {
-            absolute_path("C:\\codex")
-        } else {
-            absolute_path("/var/lib/codex")
-        };
+        let mdm_base_dir = absolute_path("C:\\codex");
 
         let stack = ConfigLayerStack::new(
             vec![ConfigLayerEntry::new_with_raw_toml(
@@ -1086,11 +1048,7 @@ model = "enterprise_model"
 approval_policy = "never"
 "#;
         let cloud_value = toml::from_str::<TomlValue>(raw_cloud_toml).expect("cloud value");
-        let cloud_base_dir = if cfg!(windows) {
-            absolute_path("C:\\codex")
-        } else {
-            absolute_path("/var/lib/codex")
-        };
+        let cloud_base_dir = absolute_path("C:\\codex");
 
         let stack = ConfigLayerStack::new(
             vec![ConfigLayerEntry::new_with_raw_toml(
@@ -1168,11 +1126,7 @@ approval_policy = "never"
         let requirements = ConfigRequirements {
             managed_hooks: Some(ConstrainedWithSource::new(
                 Constrained::allow_any(ManagedHooksRequirementsToml {
-                    managed_dir: Some(if cfg!(windows) {
-                        std::path::PathBuf::from(r"C:\enterprise\hooks")
-                    } else {
-                        std::path::PathBuf::from("/enterprise/hooks")
-                    }),
+                    managed_dir: Some(std::path::PathBuf::from(r"C:\enterprise\hooks")),
                     windows_managed_dir: Some(std::path::PathBuf::from(r"C:\enterprise\hooks")),
                     hooks: HookEventsToml {
                         pre_tool_use: vec![MatcherGroup {

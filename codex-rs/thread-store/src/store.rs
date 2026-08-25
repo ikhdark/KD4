@@ -150,4 +150,20 @@ pub trait ThreadStore: Any + Send + Sync {
 
     /// Deletes a thread's persisted rollout data and associated metadata.
     fn delete_thread(&self, params: DeleteThreadParams) -> ThreadStoreFuture<'_, ()>;
+
+    /// Checks whether deleting a thread can begin without mutating persisted state.
+    ///
+    /// Callers that delete related threads as one operation use this to reject a known failure
+    /// before stopping any live thread or deleting any member of the group.
+    fn preflight_delete_thread(&self, params: DeleteThreadParams) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            self.read_thread(ReadThreadParams {
+                thread_id: params.thread_id,
+                include_archived: true,
+                include_history: false,
+            })
+            .await
+            .map(|_| ())
+        })
+    }
 }

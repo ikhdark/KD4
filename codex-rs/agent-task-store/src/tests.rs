@@ -2595,7 +2595,6 @@ async fn wake_wait_observes_a_commit_from_an_independent_store_instance() {
     let mut waiters = Vec::new();
     for _ in 0..8 {
         let waiter_store = fixture.store.clone();
-        let cursor = cursor.clone();
         waiters.push(tokio::spawn(async move {
             waiter_store
                 .wait_for_wake_events("external-wait-root".to_string(), cursor)

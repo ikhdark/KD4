@@ -1,7 +1,5 @@
 use std::borrow::Cow;
 
-use codex_utils_string::take_bytes_at_char_boundary;
-
 use crate::catalog::SkillCatalog;
 use crate::catalog::SkillCatalogEntry;
 use crate::catalog::SkillSourceKind;
@@ -100,6 +98,16 @@ pub(crate) fn truncate_main_prompt_contents(contents: &str) -> (String, bool) {
 }
 
 pub(crate) fn truncate_utf8_to_bytes(contents: &str, max_bytes: usize) -> (String, bool) {
-    let truncated = take_bytes_at_char_boundary(contents, max_bytes);
+    let truncated = &contents[..contents.floor_char_boundary(max_bytes)];
     (truncated.to_string(), truncated.len() < contents.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_utf8_to_bytes_stops_before_split_character() {
+        assert_eq!(truncate_utf8_to_bytes("a😀z", 4), ("a".to_string(), true));
+    }
 }

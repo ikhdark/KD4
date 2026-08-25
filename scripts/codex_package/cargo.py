@@ -10,29 +10,31 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+try:
+    from scripts import rust_tool_env as shared_rust_tool_env
+except ImportError:
+    import rust_tool_env as shared_rust_tool_env
+
 from .targets import REPO_ROOT
 from .targets import PackageVariant
 from .targets import TargetSpec
-from .v8 import resolve_codex_v8_cargo_env
 
 
 CODEX_RS_ROOT = REPO_ROOT / "codex-rs"
 DEFAULT_RUST_MIN_STACK = "8388608"
 # One shared local default with scripts/just-shell.py and common-rust-env.ps1;
 # override everywhere with CODEX_SCCACHE_CACHE_SIZE.
-SCCACHE_CACHE_SIZE_ENV_VAR = "CODEX_SCCACHE_CACHE_SIZE"
-DEFAULT_SCCACHE_CACHE_SIZE = "80G"
+SCCACHE_CACHE_SIZE_ENV_VAR = shared_rust_tool_env.SCCACHE_CACHE_SIZE_ENV_VAR
+DEFAULT_SCCACHE_CACHE_SIZE = shared_rust_tool_env.DEFAULT_SCCACHE_CACHE_SIZE
 PACKAGE_TARGET_DIR_ENV = "CODEX_PACKAGE_TARGET_DIR"
 SOURCE_BUILD_STAMP = "codex-package-source-builds.json"
-WINDOWS_LLVM_LLD_LINK_DEFAULT = Path("C:/Program Files/LLVM/bin/lld-link.exe")
-SCOOP_LLVM_LLD_LINK = Path("apps/llvm/current/bin/lld-link.exe")
+WINDOWS_LLVM_LLD_LINK_DEFAULT = shared_rust_tool_env.WINDOWS_LLVM_LLD_LINK_DEFAULT
 
 
 @dataclass(frozen=True)
 class SourceBuildOutputs:
     entrypoint_bin: Path
     code_mode_host_bin: Path
-    bwrap_bin: Path | None
     codex_command_runner_bin: Path | None
     codex_windows_sandbox_setup_bin: Path | None
 
@@ -45,7 +47,6 @@ def build_source_binaries(
     profile: str,
     entrypoint_bin: Path | None,
     code_mode_host_bin: Path | None,
-    bwrap_bin: Path | None,
     codex_command_runner_bin: Path | None,
     codex_windows_sandbox_setup_bin: Path | None,
     reuse_existing: bool = False,
@@ -53,14 +54,12 @@ def build_source_binaries(
 ) -> SourceBuildOutputs:
     validate_prebuilt_resource_inputs(
         spec,
-        bwrap_bin=bwrap_bin,
         codex_command_runner_bin=codex_command_runner_bin,
         codex_windows_sandbox_setup_bin=codex_windows_sandbox_setup_bin,
     )
     validate_explicit_output_paths(
         entrypoint_bin=entrypoint_bin,
         code_mode_host_bin=code_mode_host_bin,
-        bwrap_bin=bwrap_bin,
         codex_command_runner_bin=codex_command_runner_bin,
         codex_windows_sandbox_setup_bin=codex_windows_sandbox_setup_bin,
     )
@@ -76,17 +75,13 @@ def build_source_binaries(
             code_mode_host_bin,
             output_dir / spec.code_mode_host_name,
         ),
-        bwrap_bin=resolve_output_path(
-            bwrap_bin,
-            output_dir / "bwrap" if spec.is_linux else None,
-        ),
         codex_command_runner_bin=resolve_output_path(
             codex_command_runner_bin,
-            output_dir / "codex-command-runner.exe" if spec.is_windows else None,
+            output_dir / "codex-command-runner.exe",
         ),
         codex_windows_sandbox_setup_bin=resolve_output_path(
             codex_windows_sandbox_setup_bin,
-            output_dir / "codex-windows-sandbox-setup.exe" if spec.is_windows else None,
+            output_dir / "codex-windows-sandbox-setup.exe",
         ),
     )
 
@@ -95,10 +90,8 @@ def build_source_binaries(
         variant,
         build_entrypoint=entrypoint_bin is None,
         build_code_mode_host=code_mode_host_bin is None,
-        build_bwrap=spec.is_linux and bwrap_bin is None,
-        build_codex_command_runner=spec.is_windows and codex_command_runner_bin is None,
-        build_codex_windows_sandbox_setup=spec.is_windows
-        and codex_windows_sandbox_setup_bin is None,
+        build_codex_command_runner=codex_command_runner_bin is None,
+        build_codex_windows_sandbox_setup=codex_windows_sandbox_setup_bin is None,
     )
     binaries = binaries_missing_for_reuse(
         requested_binaries,
@@ -124,9 +117,6 @@ def build_source_binaries(
             profile,
             binaries,
             target_dir=target_dir,
-            include_v8_env=(
-                variant.cargo_bin in binaries or "codex-code-mode-host" in binaries
-            ),
         )
 
     validate_source_outputs(outputs)
@@ -149,7 +139,6 @@ def run_cargo_build(
     binaries: list[str],
     *,
     target_dir: Path,
-    include_v8_env: bool,
 ) -> None:
     cmd = [
         cargo,
@@ -166,11 +155,6 @@ def run_cargo_build(
         cmd.extend(["--bin", binary])
 
     cargo_env = cargo_build_env(spec, profile, target_dir=target_dir)
-    if include_v8_env:
-        codex_v8_env = resolve_codex_v8_cargo_env(spec)
-        if codex_v8_env:
-            cargo_env.update(codex_v8_env)
-
     print("+", " ".join(cmd))
     start = time.perf_counter()
     try:
@@ -205,7 +189,6 @@ def source_binaries_for_target(
     *,
     build_entrypoint: bool,
     build_code_mode_host: bool,
-    build_bwrap: bool,
     build_codex_command_runner: bool,
     build_codex_windows_sandbox_setup: bool,
 ) -> list[str]:
@@ -214,8 +197,6 @@ def source_binaries_for_target(
         binaries.append(variant.cargo_bin)
     if build_code_mode_host:
         binaries.append("codex-code-mode-host")
-    if build_bwrap:
-        binaries.append("bwrap")
     if build_codex_command_runner:
         binaries.append("codex-command-runner")
     if build_codex_windows_sandbox_setup:
@@ -226,27 +207,16 @@ def source_binaries_for_target(
 def validate_prebuilt_resource_inputs(
     spec: TargetSpec,
     *,
-    bwrap_bin: Path | None,
     codex_command_runner_bin: Path | None,
     codex_windows_sandbox_setup_bin: Path | None,
 ) -> None:
-    if bwrap_bin is not None and not spec.is_linux:
-        raise RuntimeError("--bwrap-bin is only supported for Linux targets.")
-    if codex_command_runner_bin is not None and not spec.is_windows:
-        raise RuntimeError(
-            "--codex-command-runner-bin is only supported for Windows targets."
-        )
-    if codex_windows_sandbox_setup_bin is not None and not spec.is_windows:
-        raise RuntimeError(
-            "--codex-windows-sandbox-setup-bin is only supported for Windows targets."
-        )
+    _ = (spec, codex_command_runner_bin, codex_windows_sandbox_setup_bin)
 
 
 def validate_explicit_output_paths(
     *,
     entrypoint_bin: Path | None,
     code_mode_host_bin: Path | None,
-    bwrap_bin: Path | None,
     codex_command_runner_bin: Path | None,
     codex_windows_sandbox_setup_bin: Path | None,
 ) -> None:
@@ -257,7 +227,6 @@ def validate_explicit_output_paths(
             "prebuilt code-mode host executable",
             code_mode_host_bin,
         ),
-        ("--bwrap-bin", "prebuilt Linux bwrap executable", bwrap_bin),
         (
             "--codex-command-runner-bin",
             "prebuilt Windows codex-command-runner.exe executable",
@@ -350,7 +319,7 @@ def cargo_build_env(
         existing = env.get(env_name, "").strip()
         flags = " ".join(static_msvc_flags)
         env[env_name] = f"{existing} {flags}".strip()
-    if spec.is_windows and spec.target.endswith("-msvc"):
+    if spec.target.endswith("-msvc"):
         linker_env_name = cargo_target_linker_env_name(spec.target)
         if not env.get(linker_env_name):
             lld_link = find_windows_lld_link()
@@ -367,16 +336,11 @@ def cargo_build_env(
 
 def set_sccache_env(env: dict[str, str]) -> None:
     env["SCCACHE_BASEDIR"] = str(REPO_ROOT.resolve())
-    override = (env.get(SCCACHE_CACHE_SIZE_ENV_VAR) or "").strip()
-    env["SCCACHE_CACHE_SIZE"] = override or DEFAULT_SCCACHE_CACHE_SIZE
+    env["SCCACHE_CACHE_SIZE"] = shared_rust_tool_env.sccache_cache_size(env)
 
 
 def is_sccache_wrapper(value: str) -> bool:
-    leaf = Path(value).name.lower()
-    return value.lower() in {"sccache", "sccache.exe"} or leaf in {
-        "sccache",
-        "sccache.exe",
-    }
+    return shared_rust_tool_env.is_sccache_wrapper(value)
 
 
 def cargo_target_rustflags_env_name(target: str) -> str:
@@ -388,33 +352,15 @@ def cargo_target_linker_env_name(target: str) -> str:
 
 
 def find_windows_lld_link() -> str | None:
-    lld_link = shutil.which("lld-link")
-    if lld_link:
-        return lld_link
-    if WINDOWS_LLVM_LLD_LINK_DEFAULT.exists():
-        return str(WINDOWS_LLVM_LLD_LINK_DEFAULT)
-    for root in scoop_roots():
-        candidate = root / SCOOP_LLVM_LLD_LINK
-        if candidate.exists():
-            return str(candidate)
-    return None
-
-
-def scoop_roots() -> tuple[Path, ...]:
-    roots: list[Path] = []
-    for raw in (os.environ.get("SCOOP"), os.environ.get("USERPROFILE")):
-        if not raw:
-            continue
-        root = Path(raw)
-        if raw == os.environ.get("USERPROFILE"):
-            root = root / "scoop"
-        if root not in roots:
-            roots.append(root)
-    return tuple(roots)
+    return shared_rust_tool_env.find_windows_lld_link(
+        os.environ,
+        which=shutil.which,
+        default_path=WINDOWS_LLVM_LLD_LINK_DEFAULT,
+    )
 
 
 def static_msvc_rustflags(spec: TargetSpec, profile: str) -> tuple[str, ...]:
-    if not spec.is_windows or not spec.target.endswith("-msvc") or profile == "dev":
+    if not spec.target.endswith("-msvc") or profile == "dev":
         return ()
 
     flags = ["-C", "link-arg=/STACK:8388608", "-C", "target-feature=+crt-static"]
@@ -488,8 +434,6 @@ def expected_output_for_binary(
         return outputs.entrypoint_bin
     if binary == "codex-code-mode-host":
         return outputs.code_mode_host_bin
-    if binary == "bwrap" and outputs.bwrap_bin is not None:
-        return outputs.bwrap_bin
     if (
         binary == "codex-command-runner"
         and outputs.codex_command_runner_bin is not None
@@ -512,8 +456,6 @@ def source_output_key_for_binary(
         return "entrypoint_bin"
     if binary == "codex-code-mode-host":
         return "code_mode_host_bin"
-    if binary == "bwrap":
-        return "bwrap_bin"
     if binary == "codex-command-runner":
         return "codex_command_runner_bin"
     if binary == "codex-windows-sandbox-setup":
@@ -525,7 +467,6 @@ def validate_source_outputs(outputs: SourceBuildOutputs) -> None:
     for path in [
         outputs.entrypoint_bin,
         outputs.code_mode_host_bin,
-        outputs.bwrap_bin,
         outputs.codex_command_runner_bin,
         outputs.codex_windows_sandbox_setup_bin,
     ]:
@@ -780,7 +721,6 @@ def source_output_fingerprints(outputs: SourceBuildOutputs) -> dict[str, dict | 
     return {
         "entrypoint_bin": source_output_fingerprint(outputs.entrypoint_bin),
         "code_mode_host_bin": source_output_fingerprint(outputs.code_mode_host_bin),
-        "bwrap_bin": source_output_fingerprint(outputs.bwrap_bin),
         "codex_command_runner_bin": source_output_fingerprint(
             outputs.codex_command_runner_bin
         ),
@@ -816,7 +756,6 @@ def source_outputs_match_fingerprints(
         for key, path in {
             "entrypoint_bin": outputs.entrypoint_bin,
             "code_mode_host_bin": outputs.code_mode_host_bin,
-            "bwrap_bin": outputs.bwrap_bin,
             "codex_command_runner_bin": outputs.codex_command_runner_bin,
             "codex_windows_sandbox_setup_bin": outputs.codex_windows_sandbox_setup_bin,
         }.items()

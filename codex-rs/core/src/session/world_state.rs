@@ -9,7 +9,6 @@ use crate::context::world_state::PluginsInstructionsState;
 use crate::context::world_state::TaskEvidenceState;
 use crate::context::world_state::WorldState;
 use codex_extension_api::WorldStateContributionInput;
-use codex_utils_path_uri::PathUri;
 use futures::StreamExt;
 use futures::stream::FuturesOrdered;
 
@@ -53,7 +52,7 @@ impl Session {
         let mut world_state = WorldState::default();
         world_state.add_section(AgentsMdState::new_cached(
             step_context.loaded_agents_md.as_deref(),
-            &PathUri::from_abs_path(&turn_context.config.cwd),
+            step_context.agents_md_stable_context.as_ref(),
             step_context.agents_md_freshness,
         ));
         if turn_context.config.include_environment_context {

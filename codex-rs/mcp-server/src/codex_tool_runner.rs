@@ -140,6 +140,7 @@ pub async fn run_codex_tool_session(
         thread_id,
         thread,
         session_configured,
+        ..
     } = match thread_manager.start_thread(config.clone()).await {
         Ok(res) => res,
         Err(e) => {
@@ -426,7 +427,7 @@ async fn run_codex_tool_session_inner(
                     | EventMsg::AgentReasoningSectionBreak(_)
                     | EventMsg::McpToolCallBegin(_)
                     | EventMsg::McpToolCallEnd(_)
-                    | EventMsg::RealtimeConversationListVoicesResponse(_)
+                    | EventMsg::McpToolCallProgress(_)
                     | EventMsg::ExecCommandBegin(_)
                     | EventMsg::TerminalInteraction(_)
                     | EventMsg::ExecCommandOutputDelta(_)
@@ -474,10 +475,6 @@ async fn run_codex_tool_session_inner(
                     | EventMsg::CollabResumeBegin(_)
                     | EventMsg::CollabResumeEnd(_)
                     | EventMsg::SubAgentActivity(_)
-                    | EventMsg::RealtimeConversationStarted(_)
-                    | EventMsg::RealtimeConversationSdp(_)
-                    | EventMsg::RealtimeConversationRealtime(_)
-                    | EventMsg::RealtimeConversationClosed(_)
                     | EventMsg::DeprecationNotice(_) => {
                         // For now, we do not do anything extra for these
                         // events. Note that

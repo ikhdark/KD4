@@ -24,6 +24,7 @@ use codex_config::Constrained;
 use codex_config::McpServerAuth;
 use codex_config::McpServerConfig;
 use codex_config::McpServerTransportConfig;
+use codex_config::canonicalize_chatgpt_base_url;
 use codex_config::types::AppToolApproval;
 use codex_config::types::AuthKeyringBackendKind;
 use codex_config::types::OAuthCredentialsStoreMode;
@@ -45,13 +46,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::ResolvedMcpCatalog;
 use crate::codex_apps_cache::CodexAppsToolsCache;
+use crate::codex_apps_cache::DEFAULT_CODEX_APPS_MCP_PRODUCT_SKU;
 use crate::codex_apps_cache::codex_apps_tools_cache_key;
 use crate::connection_manager::McpConnectionManager;
 use crate::runtime::McpRuntimeContext;
 use crate::server::EffectiveMcpServer;
 
 pub const CODEX_APPS_MCP_SERVER_NAME: &str = "codex_apps";
-const DEFAULT_CODEX_APPS_MCP_PRODUCT_SKU: &str = "codex";
 const MCP_TOOL_NAME_PREFIX: &str = "mcp";
 const MCP_TOOL_NAME_DELIMITER: &str = "__";
 const CODEX_CONNECTORS_TOKEN_ENV_VAR: &str = "CODEX_CONNECTORS_TOKEN";
@@ -132,10 +133,6 @@ pub struct McpConfig {
     pub skill_mcp_dependency_install_enabled: bool,
     /// Approval policy used for MCP tool calls and MCP elicitation requests.
     pub approval_policy: Constrained<AskForApproval>,
-    /// Optional path to `codex-linux-sandbox` for sandboxed MCP tool execution.
-    pub codex_linux_sandbox_exe: Option<PathBuf>,
-    /// Whether to use legacy Landlock behavior in the MCP sandbox state.
-    pub use_legacy_landlock: bool,
     /// Whether the app MCP integration is enabled by config.
     ///
     /// ChatGPT auth is checked separately before a materialized host-owned Apps
@@ -333,7 +330,11 @@ pub async fn read_mcp_resource(
         runtime_context,
         config.codex_home.clone(),
         codex_apps_tools_cache,
-        codex_apps_tools_cache_key(auth),
+        codex_apps_tools_cache_key(
+            auth,
+            &config.chatgpt_base_url,
+            config.apps_mcp_product_sku.as_deref(),
+        ),
         config.prefix_mcp_tool_names,
         config.client_elicitation_capability.clone(),
         /*supports_openai_form_elicitation*/ false,
@@ -412,7 +413,11 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
         runtime_context,
         config.codex_home.clone(),
         codex_apps_tools_cache,
-        codex_apps_tools_cache_key(auth),
+        codex_apps_tools_cache_key(
+            auth,
+            &config.chatgpt_base_url,
+            config.apps_mcp_product_sku.as_deref(),
+        ),
         config.prefix_mcp_tool_names,
         config.client_elicitation_capability.clone(),
         /*supports_openai_form_elicitation*/ false,
@@ -467,19 +472,8 @@ fn codex_apps_mcp_bearer_token_env_var() -> Option<String> {
     }
 }
 
-fn normalize_codex_apps_base_url(base_url: &str) -> String {
-    let mut base_url = base_url.trim_end_matches('/').to_string();
-    if (base_url.starts_with("https://chatgpt.com")
-        || base_url.starts_with("https://chat.openai.com"))
-        && !base_url.contains("/backend-api")
-    {
-        base_url = format!("{base_url}/backend-api");
-    }
-    base_url
-}
-
 fn codex_apps_mcp_url_for_base_url(base_url: &str) -> String {
-    let base_url = normalize_codex_apps_base_url(base_url);
+    let base_url = canonicalize_chatgpt_base_url(base_url);
     let (base_url, default_path) = if base_url.contains("/backend-api") {
         (base_url, "wham/apps")
     } else if base_url.contains("/api/codex") {
@@ -495,8 +489,9 @@ pub fn codex_apps_mcp_server_config(
     apps_mcp_product_sku: Option<&str>,
     originator: Option<&str>,
 ) -> McpServerConfig {
+    let chatgpt_base_url = canonicalize_chatgpt_base_url(chatgpt_base_url);
     mcp_server_config_for_url(
-        codex_apps_mcp_url_for_base_url(chatgpt_base_url),
+        codex_apps_mcp_url_for_base_url(&chatgpt_base_url),
         apps_mcp_product_sku,
         originator,
         McpServerAuth::ChatGpt,
@@ -509,12 +504,13 @@ pub fn hosted_plugin_runtime_mcp_server_config(
     apps_mcp_product_sku: Option<&str>,
     originator: Option<&str>,
 ) -> McpServerConfig {
-    let base_url = normalize_codex_apps_base_url(chatgpt_base_url);
-    let base_url = if base_url.contains("/backend-api") || base_url.contains("/api/codex") {
-        base_url
-    } else {
-        format!("{base_url}/api/codex")
-    };
+    let chatgpt_base_url = canonicalize_chatgpt_base_url(chatgpt_base_url);
+    let base_url =
+        if chatgpt_base_url.contains("/backend-api") || chatgpt_base_url.contains("/api/codex") {
+            chatgpt_base_url
+        } else {
+            format!("{chatgpt_base_url}/api/codex")
+        };
     mcp_server_config_for_url(
         format!("{base_url}/ps/mcp"),
         apps_mcp_product_sku,

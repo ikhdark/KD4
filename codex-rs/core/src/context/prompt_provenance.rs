@@ -336,19 +336,13 @@ impl PromptContextBreakdown {
         sidecar: &PromptProvenanceSidecar,
     ) -> serde_json::Result<Self> {
         let mut breakdown = Self::default();
-        let mut item_bytes = 0_u64;
         for item in items {
             let serialized_item = serde_json::to_vec(item)?;
-            item_bytes =
-                item_bytes.saturating_add(u64::try_from(serialized_item.len()).unwrap_or(u64::MAX));
             breakdown.record_response_item(item, &serialized_item, sidecar)?;
         }
-        let serialized_input = serde_json::to_vec(items)?;
         breakdown.record_overhead(
             PromptContextCategory::OtherInjected,
-            u64::try_from(serialized_input.len())
-                .unwrap_or(u64::MAX)
-                .saturating_sub(item_bytes),
+            sequence_envelope_bytes(items.len()),
             b"response_input_array_envelope",
         );
         Ok(breakdown)
@@ -373,6 +367,21 @@ impl PromptContextBreakdown {
         self.categories
             .get(&category)
             .map_or(0, |entry| entry.estimated_tokens)
+    }
+
+    pub(crate) fn total_estimated_tokens(&self) -> u64 {
+        self.categories.values().fold(0_u64, |total, entry| {
+            total.saturating_add(entry.estimated_tokens)
+        })
+    }
+
+    pub(crate) fn record_sequence_envelope(
+        &mut self,
+        category: PromptContextCategory,
+        item_count: usize,
+        stable_source: &[u8],
+    ) {
+        self.record_overhead(category, sequence_envelope_bytes(item_count), stable_source);
     }
 
     pub(crate) fn total_bytes(&self) -> u64 {
@@ -494,6 +503,11 @@ impl PromptContextBreakdown {
     }
 }
 
+fn sequence_envelope_bytes(item_count: usize) -> u64 {
+    let separators = item_count.saturating_sub(1);
+    u64::try_from(2_usize.saturating_add(separators)).unwrap_or(u64::MAX)
+}
+
 fn response_item_fingerprint(item: &ResponseItem) -> serde_json::Result<[u8; 32]> {
     let mut normalized = item.clone();
     normalized.clear_internal_chat_message_metadata_passthrough();
@@ -532,8 +546,7 @@ fn category_for_stable_kind(kind: StableContextKind) -> PromptContextCategory {
         | StableContextKind::DynamicHistory
         | StableContextKind::TaskModelGuidance
         | StableContextKind::ModelSwitch
-        | StableContextKind::Personality
-        | StableContextKind::Realtime => PromptContextCategory::OtherInjected,
+        | StableContextKind::Personality => PromptContextCategory::OtherInjected,
     }
 }
 

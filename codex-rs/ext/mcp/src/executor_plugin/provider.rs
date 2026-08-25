@@ -13,10 +13,6 @@ use thiserror::Error;
 
 const DEFAULT_MCP_CONFIG_FILE: &str = ".mcp.json";
 
-/// Loads MCP declarations from resolved plugins through their owning executor.
-#[derive(Clone, Copy, Debug, Default)]
-pub(super) struct ExecutorPluginMcpProvider;
-
 /// Failure to load an executor plugin's MCP declarations.
 #[derive(Debug, Error)]
 pub(super) enum ExecutorPluginMcpProviderError {
@@ -46,16 +42,13 @@ pub(super) enum ExecutorPluginMcpProviderError {
     },
 }
 
-impl ExecutorPluginMcpProvider {
-    /// Returns MCP servers declared by `plugin`, bound to its environment.
-    pub(super) async fn load(
-        &self,
-        plugin: &ResolvedExecutorPlugin,
-    ) -> Result<Vec<(String, McpServerConfig)>, ExecutorPluginMcpProviderError> {
-        let ResolvedPluginLocation::Environment { root, .. } = plugin.plugin().location();
+/// Returns MCP servers declared by `plugin`, bound to its environment.
+pub(super) async fn load_executor_plugin_mcp_servers(
+    plugin: &ResolvedExecutorPlugin,
+) -> Result<Vec<(String, McpServerConfig)>, ExecutorPluginMcpProviderError> {
+    let ResolvedPluginLocation::Environment { root, .. } = plugin.plugin().location();
 
-        load_from_file_system(plugin.plugin(), root, plugin.file_system()).await
-    }
+    load_from_file_system(plugin.plugin(), root, plugin.file_system()).await
 }
 
 async fn load_from_file_system(

@@ -46,10 +46,8 @@ def run_version(path: str | None, *, enabled: bool) -> str | None:
 def desktop_target() -> str | None:
     publish_dir = os.environ.get("CODEX_LOCAL_PUBLISH_DIR")
     if publish_dir:
-        return str(Path(publish_dir) / ("codex.exe" if os.name == "nt" else "codex"))
-    if os.name == "nt":
-        return str(Path.home() / "Desktop" / "LOCAL-KD" / "codex.exe")
-    return None
+        return str(Path(publish_dir) / "codex.exe")
+    return str(Path.home() / "Desktop" / "LOCAL-KD" / "codex.exe")
 
 
 def extension_candidates(limit: int = 8) -> list[str]:

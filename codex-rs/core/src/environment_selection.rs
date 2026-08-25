@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::Weak;
 
 use arc_swap::ArcSwap;
 use codex_exec_server::Environment;
@@ -14,8 +16,10 @@ use codex_utils_path_uri::PathUri;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use futures::future::Shared;
+use tokio_util::sync::CancellationToken;
 
 use crate::session::turn_context::TurnEnvironment;
+use crate::session::turn_context::TurnEnvironmentLifecycle;
 use crate::shell::Shell;
 use crate::shell_snapshot::ShellSnapshot;
 
@@ -40,6 +44,7 @@ type TurnEnvironmentResolution = Shared<BoxFuture<'static, TurnEnvironmentResult
 struct SelectedTurnEnvironment {
     selection: TurnEnvironmentSelection,
     resolution: TurnEnvironmentResolution,
+    lifecycle: Option<Arc<TurnEnvironmentLifecycle>>,
 }
 
 #[derive(Clone)]
@@ -52,6 +57,7 @@ struct SelectedTurnEnvironmentState {
 pub(crate) struct StartingTurnEnvironment {
     pub(crate) selection: TurnEnvironmentSelection,
     resolution: TurnEnvironmentResolution,
+    _lifecycle: Option<Arc<TurnEnvironmentLifecycle>>,
 }
 
 impl fmt::Debug for StartingTurnEnvironment {
@@ -76,6 +82,7 @@ pub(crate) struct ThreadEnvironments {
     shell_snapshot: ShellSnapshot,
     non_blocking_snapshots: bool,
     environments: ArcSwap<SelectedTurnEnvironmentState>,
+    lifecycles: Mutex<Vec<Weak<TurnEnvironmentLifecycle>>>,
 }
 
 impl ThreadEnvironments {
@@ -88,18 +95,24 @@ impl ThreadEnvironments {
     ) -> Self {
         // Reuse only attached environments from the supplied snapshot; drop starting entries.
         let generation = current.generation;
-        let environments = current
+        let environments: Vec<SelectedTurnEnvironment> = current
             .turn_environments
             .into_iter()
             .map(|environment| {
                 let selection = environment.selection();
+                let lifecycle = environment.lifecycle();
                 let resolution: TurnEnvironmentResolution =
                     futures::future::ready(Ok(environment)).boxed().shared();
                 SelectedTurnEnvironment {
                     selection,
                     resolution,
+                    lifecycle,
                 }
             })
+            .collect();
+        let lifecycles = environments
+            .iter()
+            .filter_map(|environment| environment.lifecycle.as_ref().map(Arc::downgrade))
             .collect();
         Self {
             environment_manager,
@@ -110,6 +123,7 @@ impl ThreadEnvironments {
                 generation,
                 environments,
             }),
+            lifecycles: Mutex::new(lifecycles),
         }
     }
 
@@ -137,11 +151,18 @@ impl ThreadEnvironments {
                 tracing::warn!("skipping unknown turn environment `{environment_id}`");
                 continue;
             };
+            let lifecycle = Arc::new(TurnEnvironmentLifecycle::new());
+            self.lifecycles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(Arc::downgrade(&lifecycle));
             let resolution = Self::resolve_environment(
                 selected_environment.clone(),
                 environment,
                 self.local_shell.clone(),
                 self.shell_snapshot.clone(),
+                Arc::downgrade(&lifecycle),
+                lifecycle.cancellation_token(),
             )
             .shared();
             if resolution.clone().now_or_never().is_none() {
@@ -151,6 +172,7 @@ impl ThreadEnvironments {
             next.push(SelectedTurnEnvironment {
                 selection: selected_environment.clone(),
                 resolution,
+                lifecycle: Some(lifecycle),
             });
         }
         let selections_changed = previous.environments.len() != next.len()
@@ -174,15 +196,27 @@ impl ThreadEnvironments {
         environment: Arc<Environment>,
         local_shell: Shell,
         shell_snapshot: ShellSnapshot,
+        lifecycle: Weak<TurnEnvironmentLifecycle>,
+        cancellation: CancellationToken,
     ) -> BoxFuture<'static, TurnEnvironmentResult> {
         async move {
             let environment_id = &selection.environment_id;
-            if let Err(err) = environment.wait_until_ready().await {
+            let ready = tokio::select! {
+                _ = cancellation.cancelled() => return Err(cancelled_environment_resolution()),
+                ready = environment.wait_until_ready() => ready,
+            };
+            if let Err(err) = ready {
                 tracing::warn!("turn environment `{environment_id}` failed to start: {err}");
                 return Err(Arc::new(err));
             }
             let shell = if environment.is_remote() {
-                match environment.info().await {
+                let info = tokio::select! {
+                    _ = cancellation.cancelled() => {
+                        return Err(cancelled_environment_resolution());
+                    }
+                    info = environment.info() => info,
+                };
+                match info {
                     Ok(info) => match Shell::from_environment_shell_info(info.shell) {
                         Ok(shell) => Some(shell),
                         Err(err) => {
@@ -202,12 +236,23 @@ impl ThreadEnvironments {
             } else {
                 Some(local_shell)
             };
+            let Some(lifecycle) = lifecycle.upgrade() else {
+                return Err(cancelled_environment_resolution());
+            };
             let mut turn_environment =
                 TurnEnvironment::new(selection.environment_id, environment, selection.cwd, shell);
-            let task = shell_snapshot
-                .build(turn_environment.clone())
-                .boxed()
-                .shared();
+            turn_environment.attach_lifecycle(lifecycle);
+            let mut snapshot_environment = turn_environment.clone();
+            snapshot_environment.detach_lifecycle();
+            let snapshot_cancellation = cancellation.clone();
+            let task = async move {
+                tokio::select! {
+                    _ = snapshot_cancellation.cancelled() => None,
+                    snapshot = shell_snapshot.build(snapshot_environment) => snapshot,
+                }
+            }
+            .boxed()
+            .shared();
             drop(tokio::spawn(task.clone()));
             turn_environment.shell_snapshot = task;
             Ok(turn_environment)
@@ -239,6 +284,7 @@ impl ThreadEnvironments {
                 None => starting.push(StartingTurnEnvironment {
                     selection: environment.selection.clone(),
                     resolution: environment.resolution.clone(),
+                    _lifecycle: environment.lifecycle.clone(),
                 }),
             }
         }
@@ -252,6 +298,27 @@ impl ThreadEnvironments {
     pub(crate) fn environment_manager(&self) -> Arc<EnvironmentManager> {
         Arc::clone(&self.environment_manager)
     }
+
+    pub(crate) fn shutdown(&self) {
+        let mut lifecycles = self
+            .lifecycles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lifecycles.retain(|lifecycle| {
+            if let Some(lifecycle) = lifecycle.upgrade() {
+                lifecycle.cancel();
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
+fn cancelled_environment_resolution() -> Arc<ExecServerError> {
+    Arc::new(ExecServerError::Disconnected(
+        "turn environment resolution was cancelled".to_string(),
+    ))
 }
 
 #[derive(Clone, Debug, Default)]
@@ -282,12 +349,6 @@ impl TurnEnvironmentSnapshot {
 
     pub(crate) fn primary(&self) -> Option<&TurnEnvironment> {
         self.turn_environments.first()
-    }
-
-    pub(crate) fn local(&self) -> Option<&TurnEnvironment> {
-        self.turn_environments
-            .iter()
-            .find(|environment| !environment.environment.is_remote())
     }
 
     #[cfg(test)]
@@ -367,11 +428,8 @@ mod tests {
     }
 
     fn test_runtime_paths() -> ExecServerRuntimePaths {
-        ExecServerRuntimePaths::new(
-            std::env::current_exe().expect("current exe"),
-            /*codex_linux_sandbox_exe*/ None,
-        )
-        .expect("runtime paths")
+        ExecServerRuntimePaths::new(std::env::current_exe().expect("current exe"))
+            .expect("runtime paths")
     }
 
     async fn read_websocket_json(websocket: &mut WebSocketStream<TcpStream>) -> Value {
@@ -733,6 +791,103 @@ url = "ws://127.0.0.1:8765"
         );
         assert_eq!(attached.to_selections(), vec![remote, local]);
         server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn superseded_resolution_is_cancelled_after_captured_snapshot_is_dropped() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind websocket listener");
+        let manager = Arc::new(
+            EnvironmentManager::create_for_tests(
+                Some(format!(
+                    "ws://{}",
+                    listener.local_addr().expect("listener address")
+                )),
+                Some(test_runtime_paths()),
+            )
+            .await,
+        );
+        let selection = TurnEnvironmentSelection {
+            environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
+            cwd: PathUri::from_abs_path(&AbsolutePathBuf::current_dir().expect("cwd")),
+        };
+        let turn_environments = ThreadEnvironments::new(
+            manager,
+            crate::shell::default_user_shell(),
+            ShellSnapshot::disabled(),
+            TurnEnvironmentSnapshot::default(),
+            /*non_blocking_snapshots*/ true,
+        );
+        turn_environments.update_selections(std::slice::from_ref(&selection));
+        let cancellation = {
+            let current = turn_environments.environments.load();
+            current.environments[0]
+                .lifecycle
+                .as_ref()
+                .expect("resolution lifecycle")
+                .cancellation_token()
+        };
+        let snapshot = turn_environments.snapshot().await;
+        assert_eq!(snapshot.starting.len(), 1);
+
+        turn_environments.update_selections(&[]);
+        assert!(
+            !cancellation.is_cancelled(),
+            "a captured turn must retain its starting environment"
+        );
+
+        drop(snapshot);
+        tokio::task::yield_now().await;
+        assert!(cancellation.is_cancelled());
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_resolution_even_when_snapshot_is_captured() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind websocket listener");
+        let manager = Arc::new(
+            EnvironmentManager::create_for_tests(
+                Some(format!(
+                    "ws://{}",
+                    listener.local_addr().expect("listener address")
+                )),
+                Some(test_runtime_paths()),
+            )
+            .await,
+        );
+        let selection = TurnEnvironmentSelection {
+            environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
+            cwd: PathUri::from_abs_path(&AbsolutePathBuf::current_dir().expect("cwd")),
+        };
+        let turn_environments = ThreadEnvironments::new(
+            manager,
+            crate::shell::default_user_shell(),
+            ShellSnapshot::disabled(),
+            TurnEnvironmentSnapshot::default(),
+            /*non_blocking_snapshots*/ true,
+        );
+        turn_environments.update_selections(std::slice::from_ref(&selection));
+        let cancellation = {
+            let current = turn_environments.environments.load();
+            current.environments[0]
+                .lifecycle
+                .as_ref()
+                .expect("resolution lifecycle")
+                .cancellation_token()
+        };
+        let snapshot = turn_environments.snapshot().await;
+        assert_eq!(snapshot.starting.len(), 1);
+
+        turn_environments.update_selections(&[]);
+        assert!(!cancellation.is_cancelled());
+        turn_environments.shutdown();
+
+        assert!(cancellation.is_cancelled());
+        drop(snapshot);
+        drop(listener);
     }
 
     #[tokio::test]

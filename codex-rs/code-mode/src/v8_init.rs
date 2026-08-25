@@ -63,3 +63,24 @@ impl V8JitMode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn exposes_embedded_v8_version() {
+        assert!(!v8::V8::get_version().is_empty());
+    }
+
+    #[test]
+    fn sandbox_feature_matches_linked_v8() {
+        unsafe extern "C" {
+            fn v8__V8__IsSandboxEnabled() -> bool;
+        }
+
+        // `rusty_v8` exposes this symbol for its own sandbox verification tests.
+        let linked_v8_has_sandbox = unsafe { v8__V8__IsSandboxEnabled() };
+        assert_eq!(linked_v8_has_sandbox, cfg!(feature = "sandbox"));
+    }
+}

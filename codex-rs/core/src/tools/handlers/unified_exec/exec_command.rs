@@ -2,8 +2,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
+use crate::FunctionCallError;
 use crate::agent::task_capabilities::validate_independent_review_shell;
-use crate::function_tool::FunctionCallError;
 use crate::maybe_emit_implicit_skill_invocation;
 use crate::shell::Shell;
 use crate::shell::ShellType;
@@ -18,15 +18,16 @@ use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::apply_granted_turn_permissions;
 use crate::tools::handlers::apply_patch::intercept_apply_patch;
-use crate::tools::handlers::command_preflight::classify_rg_search_narrowing;
 use crate::tools::handlers::command_preflight::preflight_invocation_with_equivalent_repair;
-use crate::tools::handlers::command_preflight::reject_rg_search_without_native_scope;
+use crate::tools::handlers::command_search::classify_rg_search_narrowing;
+use crate::tools::handlers::command_search::reject_rg_search_without_native_scope;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::command_shape::powershell_script_failure_advisory;
 use crate::tools::handlers::implicit_granted_permissions;
 use crate::tools::handlers::normalize_and_validate_additional_permissions;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::handlers::parse_arguments_with_base_path;
+use crate::tools::handlers::resolve_repository_root;
 use crate::tools::handlers::resolve_tool_environment;
 use crate::tools::handlers::rewrite_function_command_invocation;
 use crate::tools::hook_names::HookToolName;
@@ -45,17 +46,12 @@ use crate::validation_admission::ValidationAdmission;
 use crate::validation_admission::ValidationLaunchPlan;
 use crate::validation_admission::ValidationRegistration;
 use crate::validation_admission::admit_validation;
-use crate::validation_admission::register_if_absent;
-use crate::validation_admission::scoped_validation_configuration_identity;
-use crate::validation_admission::validation_identity;
-use crate::validation_admission::validation_identity_with_scope;
 use codex_features::Feature;
-use codex_git_utils::get_git_repo_root;
 use codex_otel::SessionTelemetry;
 use codex_otel::TOOL_CALL_UNIFIED_EXEC_METRIC;
-use codex_sandboxing::SandboxManager;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::SandboxablePreference;
+use codex_sandboxing::select_initial;
 use codex_shell_command::is_safe_command::is_known_safe_command;
 use codex_shell_command::shell_detect::detect_shell_type;
 use codex_tools::ToolName;
@@ -64,40 +60,17 @@ use codex_utils_output_truncation::approx_token_count;
 use codex_utils_path_uri::PathConvention;
 use serde::Deserialize;
 
+use super::super::shell::ValidationProofPreparation;
+use super::super::shell::ValidationProofPreparationArgs;
+use super::super::shell::joined_validation_structured_output;
+use super::super::shell::prepare_validation_proof;
+use super::super::shell::validation_structured_output;
 use super::super::shell_spec::CommandToolOptions;
 use super::super::shell_spec::create_exec_command_tool_with_environment_id;
 use super::ExecCommandArgs;
 use super::ExecCommandEnvironmentArgs;
 use super::get_command;
 use super::post_unified_exec_tool_use_payload;
-use super::shell_mode_for_environment;
-
-fn validation_structured_output(value: serde_json::Value) -> FunctionToolOutput {
-    let text = value
-        .get("text")
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| value.to_string());
-    let execution_outcome =
-        super::super::shell::ValidationExecutionOutcome::from_value_or_legacy_success(&value);
-    let skip_disposition = value
-        .get("skip_disposition")
-        .cloned()
-        .and_then(|value| serde_json::from_value(value).ok());
-    let mut output = FunctionToolOutput::from_text(text, execution_outcome.success())
-        .with_outcome(execution_outcome.tool_outcome());
-    if let Some(skip_disposition) = skip_disposition {
-        output = output.with_skip_disposition(skip_disposition);
-    } else if value
-        .get("execution_outcome")
-        .and_then(serde_json::Value::as_str)
-        == Some("not_executed")
-    {
-        output = output.with_outcome(codex_tools::ToolOutputOutcome::Skipped);
-    }
-    output.post_tool_use_response = Some(value);
-    output
-}
 
 pub(super) fn completed_validation_not_applicable_output(
     response: &ExecCommandToolOutput,
@@ -114,22 +87,6 @@ pub(super) fn completed_validation_not_applicable_output(
     });
     validation_structured_output(value)
         .with_skip_disposition(codex_tools::ToolOutputSkipDisposition::NotApplicable)
-}
-
-fn joined_validation_structured_output(
-    mut value: serde_json::Value,
-    call_id: &str,
-    shared_from_call_id: &str,
-) -> FunctionToolOutput {
-    if let Some(object) = value.as_object_mut() {
-        object.insert("call_id".to_string(), call_id.into());
-        object.insert("admission_disposition".to_string(), "joined".into());
-        object.insert(
-            "shared_from_call_id".to_string(),
-            shared_from_call_id.into(),
-        );
-    }
-    validation_structured_output(value)
 }
 
 #[derive(Debug, Deserialize)]
@@ -249,7 +206,7 @@ pub(super) fn attach_powershell_failure_advisory(
 
 impl ToolExecutor<ToolInvocation> for ExecCommandHandler {
     fn tool_name(&self) -> ToolName {
-        ToolName::plain("exec_command")
+        ToolName::plain(crate::tools::EXEC_COMMAND_TOOL_NAME)
     }
 
     fn spec(&self) -> ToolSpec {
@@ -279,7 +236,6 @@ impl ExecCommandHandler {
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let ToolInvocation {
             session,
-            turn,
             step_context,
             tracker,
             call_id,
@@ -287,6 +243,7 @@ impl ExecCommandHandler {
             payload,
             ..
         } = invocation;
+        let turn = Arc::clone(&step_context.turn);
         let arguments = match payload {
             ToolPayload::Function { arguments } => arguments,
             _ => {
@@ -329,7 +286,7 @@ impl ExecCommandHandler {
         // A foreign cwd cannot seed the AbsolutePathBufGuard used to resolve relative paths in the
         // permissions config below. Consult the configured platform-sandbox requirement before
         // deciding whether parsing may continue without that base path.
-        let sandbox = SandboxManager::new().select_initial(
+        let sandbox = select_initial(
             &turn.file_system_sandbox_policy(),
             turn.network_sandbox_policy(),
             SandboxablePreference::Auto,
@@ -367,8 +324,6 @@ impl ExecCommandHandler {
         let original_invocation = args
             .command_invocation()
             .map_err(FunctionCallError::RespondToModel)?;
-        let shell_mode =
-            shell_mode_for_environment(&turn.unified_exec_shell_mode, environment.as_ref());
         let environment_is_remote = environment.is_remote();
         if environment_is_remote && !original_invocation.is_argv() {
             if turn_environment.shell.is_none() {
@@ -396,7 +351,6 @@ impl ExecCommandHandler {
         let original_resolved_command = get_command(
             &args,
             Arc::clone(&shell),
-            &shell_mode,
             turn.config.permissions.allow_login_shell,
             environment_is_remote,
         )
@@ -422,7 +376,6 @@ impl ExecCommandHandler {
             get_command(
                 &args,
                 Arc::clone(&shell),
-                &shell_mode,
                 turn.config.permissions.allow_login_shell,
                 environment_is_remote,
             )
@@ -432,19 +385,18 @@ impl ExecCommandHandler {
         };
         let native_repository = native_cwd
             .as_ref()
-            .map(|cwd| get_git_repo_root(cwd.as_path()).unwrap_or_else(|| cwd.to_path_buf()));
+            .map(|cwd| resolve_repository_root(cwd.as_path()));
         let repository_key = native_repository
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_else(|| cwd.to_string());
         let search_narrowing = if let Some(native_cwd) = native_cwd.as_ref() {
-            let repository_root =
-                get_git_repo_root(native_cwd.as_path()).unwrap_or_else(|| native_cwd.to_path_buf());
+            let repository_root = native_repository.as_deref().unwrap_or(native_cwd.as_path());
             let search = classify_rg_search_narrowing(
                 &resolved_command.safety_command,
                 resolved_command.preflight_shell_type,
                 native_cwd.as_path(),
-                &repository_root,
+                repository_root,
             )
             .map_err(FunctionCallError::RespondToModel)?;
             search.map(|search| (repository_root.to_string_lossy().into_owned(), search))
@@ -485,6 +437,7 @@ impl ExecCommandHandler {
                 observation: Some(observation),
                 proof_key: None,
                 structured_route: None,
+                bound_plan_step: None,
                 validation_call_id: None,
                 turn_timing_state: Some(Arc::clone(&turn.turn_timing_state)),
                 force_fresh: args.force_fresh,
@@ -539,6 +492,7 @@ impl ExecCommandHandler {
         let command = resolved_command.command;
         let safety_command = resolved_command.safety_command;
         let shell_type = resolved_command.shell_type;
+        let use_login_shell = resolved_command.use_login_shell;
         let is_powershell_script = command_invocation.is_powershell_script();
         let command_for_display = hook_command.clone();
 
@@ -620,7 +574,7 @@ impl ExecCommandHandler {
             context.turn.windows_sandbox_level,
         );
         let runtime_context = format!(
-            "shell={shell_type:?};mode={shell_mode:?};tty={tty};network={:?}",
+            "shell={shell_type:?};login={use_login_shell};tty={tty};network={:?}",
             context.turn.network,
         );
         let input_context = format!("prefix={prefix_rule:?}");
@@ -705,6 +659,56 @@ impl ExecCommandHandler {
         let known_delta_hit = known_delta
             .as_ref()
             .is_some_and(crate::tools::known_delta_store::PreparedKnownDelta::is_hit);
+        let validation_cwd = cwd.to_string();
+        let (validation_leader, validation_waiter) = loop {
+            match prepare_validation_proof(ValidationProofPreparationArgs {
+                session: session.as_ref(),
+                turn: turn.as_ref(),
+                validation_launch: &mut validation_launch,
+                direct_validation_route: direct_validation_route.as_ref(),
+                repository_key: repository_key.as_bytes(),
+                cwd: &validation_cwd,
+                command_invocation: &command_invocation,
+                environment: &effective_environment,
+                execution_context: &runtime_context,
+                repository_epoch,
+                call_id: &call_id,
+                cancellation_token: &cancellation_token,
+                force_fresh,
+            })
+            .await?
+            {
+                ValidationProofPreparation::NotValidation => break (None, None),
+                ValidationProofPreparation::Reused(output) => {
+                    return Ok(boxed_tool_output(output));
+                }
+                ValidationProofPreparation::Registered(ValidationRegistration::Leader {
+                    execution,
+                    waiter,
+                }) => break (Some(*execution), Some(waiter)),
+                ValidationProofPreparation::Registered(ValidationRegistration::Follower(
+                    waiter,
+                )) => {
+                    let shared_from_call_id = waiter.shared_from_call_id().to_string();
+                    let joined = tokio::select! {
+                        result = waiter.join() => result,
+                        _ = cancellation_token.cancelled() => {
+                            return Err(FunctionCallError::RespondToModel(
+                                "shared validation wait was cancelled".to_string(),
+                            ));
+                        }
+                    };
+                    if let Some(result) = joined {
+                        return Ok(boxed_tool_output(joined_validation_structured_output(
+                            result.value,
+                            &call_id,
+                            &shared_from_call_id,
+                        )));
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        };
         if !known_delta_hit {
             session
                 .services
@@ -713,143 +717,6 @@ impl ExecCommandHandler {
                 .await
                 .map_err(|blocked| FunctionCallError::RespondToModel(blocked.render_for_model()))?;
         }
-        let (validation_leader, validation_waiter) = if validation_launch.is_some() {
-            let environment =
-                crate::tools::handlers::shell::validation_environment_hash(&effective_environment);
-            let toolchain = crate::tools::handlers::shell::child_env_value(
-                &effective_environment,
-                "RUSTUP_TOOLCHAIN",
-            )
-            .map(|value| value.to_string_lossy().into_owned())
-            .unwrap_or_default();
-            let identity = if let Some(route) = direct_validation_route.as_ref() {
-                let Some(leaf) = route.leaves.first() else {
-                    return Err(FunctionCallError::RespondToModel(
-                        "direct validation route changed before launch".to_string(),
-                    ));
-                };
-                let implementation_identity = session
-                    .services
-                    .task_evidence
-                    .direct_validation_implementation_identity_for_leaf(leaf)
-                    .await
-                    .map_err(FunctionCallError::RespondToModel)?;
-                validation_identity_with_scope(
-                    repository_key.as_bytes(),
-                    cwd.to_string(),
-                    &command_invocation,
-                    environment,
-                    toolchain,
-                    scoped_validation_configuration_identity(turn.config.features.get()),
-                    implementation_identity,
-                    &leaf.uncertainty,
-                    &leaf.covered_paths,
-                    &leaf.covered_contracts,
-                )
-            } else {
-                validation_identity(
-                    repository_key.as_bytes(),
-                    cwd.to_string(),
-                    &command_invocation,
-                    environment,
-                    toolchain,
-                    observed_mutation_revision,
-                )
-            };
-            if !force_fresh
-                && let Some(result) = session
-                    .services
-                    .command_execution
-                    .reusable_validation(&identity)
-                    .await
-            {
-                tracing::info!(
-                    disposition = "reused",
-                    duplicate_of_call_id = %result.call_id,
-                    coverage_identity = %result.proof_key.coverage_identity,
-                    implementation_identity = %result.proof_key.implementation_identity,
-                    "validation proof reused without process execution"
-                );
-                turn.turn_timing_state.record_reused_validation();
-                return Ok(boxed_tool_output(validation_structured_output(
-                    serde_json::json!({
-                        "success": true,
-                        "admission_disposition": "reused",
-                        "validation_result": result,
-                    }),
-                )));
-            }
-            if let (Some(launch), Some(route)) =
-                (validation_launch.as_mut(), direct_validation_route.as_ref())
-            {
-                launch.proof_key = Some(identity.clone());
-                launch.structured_route = Some(route.clone());
-                launch.validation_call_id = Some(call_id.clone());
-            }
-            loop {
-                match register_if_absent(
-                    &turn.validation_singleflight,
-                    identity.clone(),
-                    &call_id,
-                    &cancellation_token,
-                )
-                .await
-                {
-                    ValidationRegistration::Leader { execution, waiter } => {
-                        break (Some(*execution), Some(waiter));
-                    }
-                    ValidationRegistration::Follower(waiter) => {
-                        let shared_from_call_id = waiter.shared_from_call_id().to_string();
-                        let joined = tokio::select! {
-                            result = waiter.join() => result,
-                            _ = cancellation_token.cancelled() => {
-                                session
-                                    .services
-                                    .command_execution
-                                    .record_exit(&attempt_key, -1)
-                                    .await;
-                                return Err(FunctionCallError::RespondToModel(
-                                    "shared validation wait was cancelled".to_string(),
-                                ));
-                            }
-                        };
-                        if let Some(result) = joined {
-                            let execution_outcome = super::super::shell::ValidationExecutionOutcome::from_value_or_legacy_success(&result.value);
-                            if execution_outcome
-                                != super::super::shell::ValidationExecutionOutcome::NotExecuted
-                            {
-                                let exit_code = result
-                                    .value
-                                    .get("exit_code")
-                                    .and_then(serde_json::Value::as_i64)
-                                    .and_then(|code| i32::try_from(code).ok())
-                                    .unwrap_or_else(|| match execution_outcome {
-                                        super::super::shell::ValidationExecutionOutcome::ExecutedSuccess => 0,
-                                        super::super::shell::ValidationExecutionOutcome::ExecutedFailure => 1,
-                                        super::super::shell::ValidationExecutionOutcome::ExecutedNotApplicable => 0,
-                                        super::super::shell::ValidationExecutionOutcome::NotExecuted => unreachable!(
-                                            "not-executed validation was filtered before exit bookkeeping"
-                                        ),
-                                    });
-                                session
-                                    .services
-                                    .command_execution
-                                    .record_exit(&attempt_key, exit_code)
-                                    .await;
-                            }
-                            return Ok(boxed_tool_output(joined_validation_structured_output(
-                                result.value,
-                                &call_id,
-                                &shared_from_call_id,
-                            )));
-                        }
-                        tokio::task::yield_now().await;
-                    }
-                }
-            }
-        } else {
-            (None, None)
-        };
         let validation_leader = Arc::new(StdMutex::new(validation_leader));
         let interception_started_at = std::time::Instant::now();
         let intercepted = intercept_apply_patch(
@@ -936,7 +803,7 @@ impl ExecCommandHandler {
                     yield_time_ms,
                     max_output_tokens,
                     cwd,
-                    #[cfg(windows)]
+
                     normalization_cwd: if turn_environment.environment.is_remote() {
                         None
                     } else {
@@ -944,7 +811,6 @@ impl ExecCommandHandler {
                     },
                     sandbox_cwd: native_environment_cwd,
                     turn_environment: turn_environment.clone(),
-                    shell_mode,
                     network: context.turn.network.clone(),
                     tty,
                     sandbox_permissions: effective_additional_permissions.sandbox_permissions,
@@ -1023,7 +889,7 @@ impl ExecCommandHandler {
                 let skip_disposition = direct_validation_route.as_ref().and_then(|route| {
                     response.exit_code.and_then(|exit_code| {
                         crate::tools::command_execution::completed_validation_skip_disposition(
-                            route,
+                            route.route(),
                             &response.raw_output,
                             exit_code,
                         )

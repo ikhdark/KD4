@@ -11,13 +11,12 @@ use std::sync::Arc;
 
 use codex_config::McpServerConfig;
 use codex_protocol::ToolName;
+use codex_utils_string::sha1_hex;
 use rmcp::model::Tool;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Map;
 use serde_json::Value as JsonValue;
-use sha1::Digest;
-use sha1::Sha1;
 use tracing::warn;
 
 use crate::mcp::sanitize_responses_api_tool_name;
@@ -316,15 +315,8 @@ fn callable_namespace_with_prefix(namespace: &str, prefix_mcp_tool_names: bool) 
     }
 }
 
-fn sha1_hex(s: &str) -> String {
-    let mut hasher = Sha1::new();
-    hasher.update(s.as_bytes());
-    let sha1 = hasher.finalize();
-    format!("{sha1:x}")
-}
-
 fn callable_name_hash_suffix(raw_identity: &str) -> String {
-    let hash = sha1_hex(raw_identity);
+    let hash = sha1_hex(raw_identity.as_bytes());
     format!("_{}", &hash[..CALLABLE_NAME_HASH_LEN])
 }
 

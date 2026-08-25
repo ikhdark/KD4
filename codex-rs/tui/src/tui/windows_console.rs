@@ -36,7 +36,7 @@ fn current_input_mode() -> std::io::Result<Option<(windows_sys::Win32::Foundatio
     if handle == INVALID_HANDLE_VALUE {
         return Err(std::io::Error::last_os_error());
     }
-    if handle == 0 {
+    if handle.is_null() {
         return Ok(None);
     }
 

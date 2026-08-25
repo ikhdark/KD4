@@ -5,6 +5,7 @@ import io
 import json
 import tempfile
 import textwrap
+import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -58,6 +59,28 @@ class CheckKd4FeaturesTest(unittest.TestCase):
         )
         return path
 
+    def write_source_owner(self) -> None:
+        (self.repo_root / "source_owners.toml").write_text(
+            textwrap.dedent(
+                """
+                schema_version = 2
+
+                [[owners]]
+                id = "feature-owner"
+                feature_ids = ["feature"]
+                primary_entries = [{ path = "src/feature.py", symbol = "main" }]
+                tests = ["tests/test_feature.py"]
+
+                [[owners.relationships]]
+                category = "runtime_registration"
+                kind = "registers"
+                target = "path:src/registry.py"
+                evidence = [{ path = "src/registry.py", symbol = "COMMANDS" }]
+                """
+            ),
+            encoding="utf-8",
+        )
+
     @staticmethod
     def valid_evidence() -> str:
         return textwrap.dedent(
@@ -88,6 +111,19 @@ class CheckKd4FeaturesTest(unittest.TestCase):
         self.assertTrue(result.ok, result.findings)
         self.assertGreaterEqual(result.feature_count, 1)
 
+    def test_desktop_runtime_receipt_is_not_claimed_as_enabled(self) -> None:
+        with check_kd4_features.DEFAULT_MANIFEST.open("rb") as manifest_file:
+            manifest = tomllib.load(manifest_file)
+
+        feature = next(
+            feature
+            for feature in manifest["features"]
+            if feature["id"] == "desktop-runtime-receipt"
+        )
+        self.assertEqual(feature["status"], "planned")
+        self.assertNotIn("source_owner", feature)
+        self.assertNotIn("evidence", feature)
+
     def test_valid_enabled_feature_passes(self) -> None:
         result = check_kd4_features.validate_manifest(
             self.write_manifest(self.valid_evidence()),
@@ -97,6 +133,89 @@ class CheckKd4FeaturesTest(unittest.TestCase):
         self.assertTrue(result.ok, result.findings)
         self.assertEqual(result.status_counts, {"enabled": 1})
         self.assertEqual(result.runtime_status_counts, {})
+
+    def test_source_owner_supplies_reachability_without_inline_markers(self) -> None:
+        self.write_source_owner()
+        result = check_kd4_features.validate_manifest(
+            self.write_manifest('source_owner = "feature-owner"'),
+            repo_root=self.repo_root,
+        )
+
+        self.assertTrue(result.ok, result.findings)
+
+    def test_source_owner_must_explicitly_own_feature(self) -> None:
+        self.write_source_owner()
+        owner_path = self.repo_root / "source_owners.toml"
+        owner_path.write_text(
+            owner_path.read_text(encoding="utf-8").replace(
+                'feature_ids = ["feature"]', 'feature_ids = ["different-feature"]'
+            ),
+            encoding="utf-8",
+        )
+
+        result = check_kd4_features.validate_manifest(
+            self.write_manifest('source_owner = "feature-owner"'),
+            repo_root=self.repo_root,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn(
+            "source-owner-feature-mismatch",
+            {finding.code for finding in result.findings},
+        )
+
+    def test_source_owner_markers_must_resolve_to_live_symbols(self) -> None:
+        self.write_source_owner()
+        owner_path = self.repo_root / "source_owners.toml"
+        owner_path.write_text(
+            owner_path.read_text(encoding="utf-8").replace(
+                'symbol = "main"', 'symbol = "removed_entrypoint"'
+            ),
+            encoding="utf-8",
+        )
+
+        result = check_kd4_features.validate_manifest(
+            self.write_manifest('source_owner = "feature-owner"'),
+            repo_root=self.repo_root,
+        )
+
+        codes = {finding.code for finding in result.findings}
+        self.assertIn("stale-source-owner-evidence", codes)
+        self.assertIn("missing-entrypoint", codes)
+
+    def test_source_owner_registration_must_have_live_evidence(self) -> None:
+        self.write_source_owner()
+        owner_path = self.repo_root / "source_owners.toml"
+        owner_path.write_text(
+            owner_path.read_text(encoding="utf-8").replace(
+                'symbol = "COMMANDS"', 'symbol = "REMOVED_REGISTRY"'
+            ),
+            encoding="utf-8",
+        )
+
+        result = check_kd4_features.validate_manifest(
+            self.write_manifest('source_owner = "feature-owner"'),
+            repo_root=self.repo_root,
+        )
+
+        codes = {finding.code for finding in result.findings}
+        self.assertIn("stale-source-owner-evidence", codes)
+        self.assertIn("missing-registration", codes)
+
+    def test_source_owner_cannot_duplicate_inline_evidence(self) -> None:
+        self.write_source_owner()
+        result = check_kd4_features.validate_manifest(
+            self.write_manifest(
+                'source_owner = "feature-owner"\n' + self.valid_evidence()
+            ),
+            repo_root=self.repo_root,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn(
+            "duplicate-evidence-authority",
+            {finding.code for finding in result.findings},
+        )
 
     def test_feature_config_requires_runtime_status(self) -> None:
         manifest = self.write_manifest(self.valid_evidence())
@@ -116,6 +235,35 @@ class CheckKd4FeaturesTest(unittest.TestCase):
         self.assertIn(
             "invalid-runtime-status", {finding.code for finding in result.findings}
         )
+
+    @mock.patch.object(check_kd4_features.subprocess, "run")
+    def test_feature_default_comes_from_machine_readable_rust_export(
+        self, run: mock.Mock
+    ) -> None:
+        (self.repo_root / "codex-rs").mkdir()
+        (self.repo_root / "codex-rs" / "Cargo.toml").write_text(
+            "[workspace]\n", encoding="utf-8"
+        )
+        run.return_value = subprocess_completed = mock.Mock(
+            returncode=0,
+            stdout='[{"key":"platform_feature","defaultEnabled":true}]',
+        )
+
+        cache: dict[str, dict[str, bool] | None] = {}
+        self.assertEqual(
+            check_kd4_features._feature_default(
+                self.repo_root, "features.platform_feature", cache
+            ),
+            True,
+        )
+        self.assertEqual(
+            check_kd4_features._feature_default(
+                self.repo_root, "features.missing", cache
+            ),
+            None,
+        )
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(subprocess_completed.stdout.count("defaultEnabled"), 1)
 
     def test_project_runtime_status_must_match_effective_config(self) -> None:
         (self.repo_root / ".codex").mkdir()

@@ -105,16 +105,17 @@ pub(super) fn emit_project_config_warnings(app_event_tx: &AppEventSender, config
     )));
 }
 
-pub(super) fn emit_system_bwrap_warning(app_event_tx: &AppEventSender, config: &Config) {
-    let Some(message) =
-        codex_sandboxing::system_bwrap_warning(config.permissions.permission_profile())
-    else {
-        return;
-    };
-
-    app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
-        history_cell::new_warning_event(message),
-    )));
+pub(super) fn emit_app_server_runtime_warnings(
+    app_event_tx: &AppEventSender,
+    warnings: &[codex_app_server_protocol::ServerRuntimeWarning],
+) {
+    for warning in warnings {
+        app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+            history_cell::new_warning_event(codex_app_server_client::format_runtime_warning(
+                warning,
+            )),
+        )));
+    }
 }
 
 pub(super) fn should_show_model_migration_prompt(
@@ -155,19 +156,6 @@ pub(super) fn should_show_model_migration_prompt(
     }
 
     false
-}
-
-pub(super) fn migration_prompt_hidden(config: &Config, migration_config_key: &str) -> bool {
-    match migration_config_key {
-        HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG => config
-            .notices
-            .hide_gpt_5_1_codex_max_migration_prompt
-            .unwrap_or(false),
-        HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG => {
-            config.notices.hide_gpt5_1_migration_prompt.unwrap_or(false)
-        }
-        _ => false,
-    }
 }
 
 pub(super) fn target_preset_for_upgrade<'a>(
@@ -282,16 +270,12 @@ pub(super) async fn handle_model_migration_prompt_if_needed(
 
     if let Some(ModelUpgrade {
         id: target_model,
-        migration_config_key,
         model_link,
         upgrade_copy,
         migration_markdown,
+        ..
     }) = upgrade
     {
-        if migration_prompt_hidden(config, migration_config_key.as_str()) {
-            return None;
-        }
-
         let target_model = target_model.to_string();
         if !should_show_model_migration_prompt(
             model,
@@ -382,6 +366,25 @@ mod tests {
     use tokio::sync::mpsc::unbounded_channel;
 
     #[test]
+    fn retired_model_prompt_suppression_infrastructure_stays_removed() {
+        let startup_prompts = include_str!("startup_prompts.rs");
+        let config_types = include_str!("../../../config/src/types.rs");
+        let config_edit = include_str!("../../../core/src/config/edit.rs");
+        let retired_keys = [
+            ["hide_", "gpt5_1_migration_prompt"].concat(),
+            ["hide_", "gpt-5.1-codex-max_migration_prompt"].concat(),
+        ];
+
+        for retired_key in retired_keys {
+            assert!(!startup_prompts.contains(&retired_key));
+            assert!(!config_types.contains(&retired_key));
+            assert!(!config_edit.contains(&retired_key));
+        }
+        assert!(!startup_prompts.contains(&["migration_prompt_", "hidden"].concat()));
+        assert!(!config_edit.contains(&["set_hide_", "model_migration_prompt"].concat()));
+    }
+
+    #[test]
     fn normalize_harness_overrides_resolves_relative_add_dirs() -> Result<()> {
         let temp_dir = tempdir()?;
         let base_cwd = temp_dir.path().join("base").abs();
@@ -429,6 +432,33 @@ mod tests {
             );
         }
         rendered.join("\n")
+    }
+
+    #[test]
+    fn app_server_runtime_warnings_are_rendered_with_diagnostic_action() {
+        let (tx, mut rx) = unbounded_channel();
+        let app_event_tx = AppEventSender::new(tx);
+        emit_app_server_runtime_warnings(
+            &app_event_tx,
+            &[codex_app_server_protocol::ServerRuntimeWarning {
+                code: "localBinaryMismatch".to_string(),
+                message: "Desktop is using a stale local binary.".to_string(),
+                action: Some("restartCodexDesktop".to_string()),
+            }],
+        );
+
+        let AppEvent::InsertHistoryCell(cell) = rx.try_recv().expect("warning event") else {
+            panic!("expected warning history cell");
+        };
+        let rendered = cell
+            .display_lines(/*width*/ 120)
+            .iter()
+            .map(render_line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("localBinaryMismatch"));
+        assert!(rendered.contains("Desktop is using a stale local binary."));
+        assert!(rendered.contains("restartCodexDesktop"));
     }
 
     #[test]

@@ -19,6 +19,8 @@ use axum::http::StatusCode;
 use axum::routing::get;
 use codex_app_server_protocol::AppsInstalledParams;
 use codex_app_server_protocol::AppsInstalledResponse;
+use codex_app_server_protocol::AppsReadParams;
+use codex_app_server_protocol::AppsReadResponse;
 use codex_app_server_protocol::InstalledApp;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
@@ -44,6 +46,35 @@ use tokio::time::timeout;
 use super::app_list::connector_tool;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[tokio::test]
+async fn app_read_include_tools_controls_public_tool_summaries() -> Result<()> {
+    let fixture = InstalledAppsFixture::start().await?;
+    let codex_home = configured_codex_home(fixture.base_url())?;
+    let mut app_server = start_app_server(codex_home.path()).await?;
+
+    send_installed_request(&mut app_server, /*force_refresh*/ true).await?;
+
+    let without_tools = send_read_request(&mut app_server, /*include_tools*/ false).await?;
+    assert_eq!(without_tools.apps.len(), 1);
+    assert_eq!(without_tools.apps[0].id, "alpha");
+    assert_eq!(without_tools.apps[0].tool_summaries, None);
+
+    let with_tools = send_read_request(&mut app_server, /*include_tools*/ true).await?;
+    assert_eq!(with_tools.apps.len(), 1);
+    let summaries = with_tools.apps[0]
+        .tool_summaries
+        .as_ref()
+        .expect("includeTools should return tool summaries");
+    assert_eq!(summaries.len(), 2);
+    assert_eq!(summaries[0].name, "connector_alpha");
+    assert_eq!(summaries[1].name, "connector_alpha_duplicate");
+    assert!(summaries.iter().all(|summary| {
+        summary.title.is_none() && summary.description == "Connector test tool"
+    }));
+    assert_eq!(fixture.list_tools_calls(), 1);
+    Ok(())
+}
 
 #[tokio::test]
 async fn installed_apps_force_refresh_only_refreshes_tools_snapshot() -> Result<()> {
@@ -288,6 +319,24 @@ async fn send_installed_request(
     to_response(response)
 }
 
+async fn send_read_request(
+    app_server: &mut TestAppServer,
+    include_tools: bool,
+) -> Result<AppsReadResponse> {
+    let request_id = app_server
+        .send_apps_read_request(AppsReadParams {
+            app_ids: vec!["alpha".to_string()],
+            include_tools,
+        })
+        .await?;
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        app_server.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    to_response(response)
+}
+
 fn configured_codex_home(base_url: &str) -> Result<TempDir> {
     let codex_home = TempDir::new()?;
     std::fs::write(
@@ -385,12 +434,14 @@ impl InstalledAppsFixture {
             .expect("connector tool should have metadata")
             .0
             .insert("_codex_apps".to_string(), json!({ "synthetic_link": true }));
+        let mut duplicate_alpha = connector_tool("alpha", "Duplicate Alpha Tool Name")?;
+        duplicate_alpha.name = "connector_alpha_duplicate".into();
         let state = Arc::new(InstalledAppsServerState {
             tools: Mutex::new(vec![
                 connector_tool("alpha", "Alpha Tool Name")?,
                 connector_tool("blocked", "Policy Blocked Tool Name")?,
                 connector_tool("disabled", "Locally Disabled Tool Name")?,
-                connector_tool("alpha", "Duplicate Alpha Tool Name")?,
+                duplicate_alpha,
                 connector_tool("", "Empty Connector ID")?,
                 Tool::new(
                     "missing_connector_id",
@@ -484,7 +535,14 @@ async fn list_directory_apps(
     State(state): State<Arc<InstalledAppsServerState>>,
 ) -> Json<serde_json::Value> {
     state.directory_calls.fetch_add(1, Ordering::SeqCst);
-    Json(json!({ "apps": [], "next_token": null }))
+    Json(json!({
+        "apps": [{
+            "id": "alpha",
+            "name": "Alpha",
+            "description": "Alpha connector"
+        }],
+        "next_token": null
+    }))
 }
 
 async fn workspace_settings(

@@ -70,7 +70,7 @@ approval_policy = "on-request"
 
 [notice]
 # Preserve this comment
-hide_full_access_warning = true
+hide_world_writable_warning = true
 
 [features]
 unified_exec = true
@@ -96,7 +96,7 @@ approval_policy = "on-request"
 
 [notice]
 # Preserve this comment
-hide_full_access_warning = true
+hide_world_writable_warning = true
 
 [features]
 unified_exec = true
@@ -410,54 +410,6 @@ async fn read_includes_origins_and_layers() {
     ));
 }
 
-#[cfg(target_os = "macos")]
-#[tokio::test]
-async fn write_value_succeeds_when_managed_preferences_expand_home_directory_paths() -> Result<()> {
-    use base64::Engine;
-
-    let tmp = tempdir().expect("tempdir");
-    std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "model = \"user\"\n")?;
-
-    let mut loader_overrides =
-        LoaderOverrides::with_managed_config_path_for_tests(tmp.path().join("managed_config.toml"));
-    loader_overrides.managed_preferences_base64 = Some(
-        base64::prelude::BASE64_STANDARD.encode(
-            r#"
-sandbox_mode = "workspace-write"
-[sandbox_workspace_write]
-writable_roots = ["~/code"]
-"#
-            .as_bytes(),
-        ),
-    );
-
-    let service = ConfigManager::new_for_tests(
-        tmp.path().to_path_buf(),
-        vec![],
-        loader_overrides,
-        CloudConfigBundleLoader::default(),
-    );
-
-    let response = service
-        .write_value(ConfigValueWriteParams {
-            file_path: Some(tmp.path().join(CONFIG_TOML_FILE).display().to_string()),
-            key_path: "model".to_string(),
-            value: serde_json::json!("updated"),
-            merge_strategy: MergeStrategy::Replace,
-            expected_version: None,
-        })
-        .await
-        .expect("write succeeds");
-
-    assert_eq!(response.status, WriteStatus::Ok);
-    assert_eq!(
-        std::fs::read_to_string(tmp.path().join(CONFIG_TOML_FILE)).expect("read config"),
-        "model = \"updated\"\n"
-    );
-
-    Ok(())
-}
-
 #[tokio::test]
 async fn write_value_reports_override() {
     let tmp = tempdir().expect("tempdir");
@@ -544,10 +496,16 @@ async fn concurrent_writes_with_the_same_version_have_one_winner() {
     let user_path = tmp.path().join(CONFIG_TOML_FILE);
     let initial_toml = "model = \"initial\"\n";
     std::fs::write(&user_path, initial_toml).expect("seed config");
-    let initial: TomlValue = toml::from_str(initial_toml).expect("parse seed");
-    let expected_version = codex_config::version_for_toml(&initial);
     let first_service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
     let second_service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+    let loaded_layers = first_service
+        .load_thread_agnostic_config()
+        .await
+        .expect("load seeded config");
+    let loaded_user_layer = loaded_layers
+        .get_active_user_layer()
+        .expect("seeded user layer");
+    let expected_version = loaded_user_layer.version.clone();
 
     let first = first_service.write_value(ConfigValueWriteParams {
         file_path: Some(user_path.display().to_string()),
@@ -577,8 +535,8 @@ async fn concurrent_writes_with_the_same_version_have_one_winner() {
         })
         .count();
 
-    assert_eq!(successes, 1);
-    assert_eq!(conflicts, 1);
+    assert_eq!(successes, 1, "concurrent write results: {results:?}");
+    assert_eq!(conflicts, 1, "concurrent write results: {results:?}");
 }
 
 #[tokio::test]

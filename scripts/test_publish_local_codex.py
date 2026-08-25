@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 
+import ast
 import json
 from pathlib import Path
-import os
-import shutil
 import subprocess
 import tempfile
 import unittest
+
+from scripts.publish_local_codex_test_support import clean_env
+from scripts.publish_local_codex_test_support import powershell
+from scripts.publish_local_codex_test_support import ps_single_quote
 
 
 SCRIPT = Path(__file__).resolve().parent / "publish-local-codex.ps1"
@@ -16,44 +19,29 @@ FIXTURE_TIME = 946684900
 FRESH_SOURCE_TIME = FIXTURE_TIME + 10_000
 
 
-def powershell() -> str | None:
-    # Prefer Windows PowerShell 5.1: production invokes publish-local-codex.ps1
-    # via `powershell -NoProfile -File ...` from the justfile, and 5.1 has
-    # stricter native-stderr and StrictMode semantics than pwsh 7 — bugs in
-    # that class are invisible when the tests run under pwsh.
-    return shutil.which("powershell") or shutil.which("pwsh")
-
-
-PUBLISH_ENV_VARS = (
-    "CODEX_LOCAL_PUBLISH_DIR",
-    "CODEX_LOCAL_CODEX_HOME",
-    "CODEX_LOCAL_CODEX_SQLITE_HOME",
-    "CODEX_HOME",
-    "CODEX_SQLITE_HOME",
-    "CODEX_CLI_PATH",
-)
-
-
-def clean_env() -> dict[str, str]:
-    # A prior -ConfigureDesktopLocalCli publish persists these at User scope,
-    # so the inherited environment can carry them; the script prefers
-    # CODEX_LOCAL_PUBLISH_DIR over the test's temp USERPROFILE, which makes
-    # assertions machine-state-dependent unless they are stripped.
-    env = os.environ.copy()
-    for name in PUBLISH_ENV_VARS:
-        env.pop(name, None)
-    return env
-
-
-def ps_single_quote(value: str | Path) -> str:
-    return "'" + str(value).replace("'", "''") + "'"
-
-
 def publish_source_text() -> str:
     return SCRIPT.read_text(encoding="utf-8")
 
 
 class PublishLocalCodexSourceLayoutTest(unittest.TestCase):
+    def test_publish_test_helpers_are_shared_by_sibling_suites(self) -> None:
+        helper_names = {"clean_env", "powershell", "ps_single_quote"}
+        scripts_dir = Path(__file__).resolve().parent
+
+        for filename in (
+            "test_publish_local_codex.py",
+            "test_publish_local_codex_apply.py",
+            "test_publish_local_codex_build.py",
+            "test_publish_local_codex_dry_run.py",
+        ):
+            module = ast.parse((scripts_dir / filename).read_text(encoding="utf-8"))
+            local_helpers = {
+                node.name
+                for node in module.body
+                if isinstance(node, ast.FunctionDef) and node.name in helper_names
+            }
+            self.assertEqual(local_helpers, set(), filename)
+
     def test_publish_implementation_is_consolidated_in_entrypoint(self) -> None:
         entrypoint = SCRIPT.read_text(encoding="utf-8")
 
@@ -81,6 +69,101 @@ class PublishLocalCodexSourceLayoutTest(unittest.TestCase):
         self.assertIn("Get-CachedLocalPublishFileSha256", publish_script)
         self.assertIn("LastWriteTimeUtcTicks", publish_script)
         self.assertIn("$before.Length -ne $after.Length", publish_script)
+
+    def test_build_input_snapshot_reuses_one_inventory_for_hash_and_newest_time(
+        self,
+    ) -> None:
+        shell = powershell()
+        if shell is None:
+            self.skipTest("PowerShell is not available")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir()
+            first = repo / "first.txt"
+            second = repo / "second.txt"
+            first.write_text("first", encoding="utf-8")
+            second.write_text("second", encoding="utf-8")
+            for args in (
+                ("init", "--quiet"),
+                ("add", "first.txt", "second.txt"),
+                (
+                    "-c",
+                    "user.name=Codex Test",
+                    "-c",
+                    "user.email=codex@example.com",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "fixture",
+                ),
+            ):
+                result = subprocess.run(
+                    ["git", "-C", str(repo), *args],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=RUN_TIMEOUT_SECONDS,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+            command = rf"""
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile({ps_single_quote(SCRIPT)}, [ref]$tokens, [ref]$errors)
+if ($errors.Count -ne 0) {{ throw "Failed to parse publish script: $($errors[0].Message)" }}
+$functionAst = $ast.FindAll({{
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Get-LocalPublishBuildInputSnapshot'
+}}, $true)
+if (@($functionAst).Count -ne 1) {{ throw 'Snapshot function was not found exactly once.' }}
+Invoke-Expression $functionAst[0].Extent.Text
+$script:listCalls = 0
+function Invoke-GitNulDelimitedList {{
+    param([string]$GitPath, [string]$RepoRoot, [string[]]$Arguments)
+    $script:listCalls++
+    return [pscustomobject]@{{ ExitCode = 0; Records = @('first.txt', 'second.txt') }}
+}}
+function Test-LocalPublishBuildRelevantPath {{ param([string]$Path) return $true }}
+function Get-CachedLocalPublishFileSha256 {{
+    param([string]$Path, [switch]$ForceRefresh)
+    return ('a' * 64)
+}}
+function Test-Sha256Text {{
+    param([AllowNull()][object]$Value)
+    return $null -ne $Value -and ([string]$Value) -cmatch '\A[0-9a-f]{{64}}\z'
+}}
+[IO.File]::SetLastWriteTimeUtc({ps_single_quote(first)}, [DateTime]::Parse('2000-01-01T00:00:00Z').ToUniversalTime())
+[IO.File]::SetLastWriteTimeUtc({ps_single_quote(second)}, [DateTime]::Parse('2000-01-02T00:00:00Z').ToUniversalTime())
+$snapshot = Get-LocalPublishBuildInputSnapshot -RepoRoot {ps_single_quote(repo)}
+[pscustomobject]@{{
+    listCalls = $script:listCalls
+    fingerprint = $snapshot.Fingerprint
+    newestMatches = $snapshot.NewestWriteUtc -eq [IO.File]::GetLastWriteTimeUtc({ps_single_quote(second)})
+}} | ConvertTo-Json -Compress
+"""
+            result = subprocess.run(
+                [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+                cwd=SCRIPT.parent.parent,
+                capture_output=True,
+                text=True,
+                timeout=RUN_TIMEOUT_SECONDS,
+                check=False,
+                creationflags=CREATE_NO_WINDOW,
+            )
+
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            output = json.loads(result.stdout)
+            self.assertEqual(output["listCalls"], 1)
+            self.assertEqual(len(output["fingerprint"]), 64)
+            self.assertTrue(output["newestMatches"])
 
     def test_publish_binary_proof_force_refreshes_cached_source_hashes(self) -> None:
         publish_script = publish_source_text()

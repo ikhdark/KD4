@@ -41,6 +41,26 @@ const MAX_ADDITIONAL_CONTEXT_AGGREGATE_RENDERED_BYTES: usize = 128 * 1_024;
 const MAX_ADDITIONAL_CONTEXT_VALUE_RENDERED_BYTES: usize = 16 * 1_024;
 const ESTIMATED_ADDITIONAL_CONTEXT_WRAPPER_BYTES: usize = 96;
 
+fn validate_turn_interrupt_target(
+    latest_turn: Option<(&str, &TurnStatus)>,
+    is_running: bool,
+    requested_turn_id: &str,
+) -> Result<(), JSONRPCErrorError> {
+    if let Some((latest_turn_id, status)) = latest_turn {
+        if *status != TurnStatus::InProgress {
+            return Err(invalid_request("no active turn to interrupt"));
+        }
+        if latest_turn_id != requested_turn_id {
+            return Err(invalid_request(format!(
+                "expected active turn id {requested_turn_id} but found {latest_turn_id}"
+            )));
+        }
+    } else if !is_running {
+        return Err(invalid_request("no active turn to interrupt"));
+    }
+    Ok(())
+}
+
 fn normalize_task_fingerprint_json(value: &mut Value) {
     match value {
         Value::Array(values) => {
@@ -83,6 +103,24 @@ fn normalized_task_fingerprint(
     format!("{:x}", Sha256::digest(identity.to_string().as_bytes()))
 }
 
+fn task_workspace_identity(
+    params: &TurnStartParams,
+    fallback_cwd: &AbsolutePathBuf,
+    fallback_roots: &[AbsolutePathBuf],
+) -> String {
+    let effective_cwd = params
+        .cwd
+        .as_ref()
+        .and_then(|cwd| AbsolutePathBuf::from_absolute_path(cwd).ok())
+        .map(|cwd| format!("{cwd:?}"))
+        .unwrap_or_else(|| format!("{fallback_cwd:?}"));
+    let effective_roots = params
+        .runtime_workspace_roots
+        .as_deref()
+        .unwrap_or(fallback_roots);
+    format!("cwd={effective_cwd};roots={effective_roots:?}")
+}
+
 fn identical_task_in_flight_error(
     existing: &crate::thread_state::InFlightTaskReference,
 ) -> JSONRPCErrorError {
@@ -99,14 +137,48 @@ fn identical_task_in_flight_error(
 }
 
 fn in_flight_task_capacity_error() -> JSONRPCErrorError {
-    let mut error = invalid_request(
+    codex_app_server_protocol::overloaded_error(
+        codex_app_server_protocol::OverloadReason::InFlightTaskCapacity,
         "too many distinct tasks are already running; retry after an active task completes",
-    );
-    error.data = Some(serde_json::json!({
-        "reason": "inFlightTaskCapacityExceeded",
-        "retryable": true,
-    }));
-    error
+    )
+}
+
+async fn claim_in_flight_task_before_connection_updates<F, Fut>(
+    thread_state_manager: &ThreadStateManager,
+    task_fingerprint: Option<&String>,
+    thread_id: ThreadId,
+    turn_id: &str,
+    apply_connection_updates: F,
+) -> Result<(), JSONRPCErrorError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), JSONRPCErrorError>>,
+{
+    if let Some(fingerprint) = task_fingerprint {
+        match thread_state_manager
+            .claim_in_flight_task(fingerprint.clone(), thread_id, turn_id.to_string())
+            .await
+        {
+            crate::thread_state::InFlightTaskClaim::Claimed => {}
+            crate::thread_state::InFlightTaskClaim::Existing(existing) => {
+                return Err(identical_task_in_flight_error(&existing));
+            }
+            crate::thread_state::InFlightTaskClaim::CapacityExceeded => {
+                return Err(in_flight_task_capacity_error());
+            }
+        }
+    }
+
+    if let Err(error) = apply_connection_updates().await {
+        if task_fingerprint.is_some() {
+            thread_state_manager
+                .release_in_flight_task(thread_id, turn_id)
+                .await;
+        }
+        return Err(error);
+    }
+
+    Ok(())
 }
 
 fn validate_user_input_image_urls(input: &[V2UserInput]) -> Result<(), JSONRPCErrorError> {
@@ -167,14 +239,10 @@ pub(crate) struct TurnRequestProcessor {
     thread_manager: Arc<ThreadManager>,
     outgoing: Arc<OutgoingMessageSender>,
     analytics_events_client: AnalyticsEventsClient,
-    arg0_paths: Arg0DispatchPaths,
+    _arg0_paths: Arg0DispatchPaths,
     config: Arc<Config>,
     config_manager: ConfigManager,
-    pending_thread_unloads: Arc<PendingThreadUnloads>,
     thread_state_manager: ThreadStateManager,
-    thread_watch_manager: ThreadWatchManager,
-    thread_list_state_permit: Arc<Semaphore>,
-    skills_watcher: Arc<SkillsWatcher>,
     bug_worker_shutdown: CancellationToken,
 }
 
@@ -285,11 +353,7 @@ impl TurnRequestProcessor {
         arg0_paths: Arg0DispatchPaths,
         config: Arc<Config>,
         config_manager: ConfigManager,
-        pending_thread_unloads: Arc<PendingThreadUnloads>,
         thread_state_manager: ThreadStateManager,
-        thread_watch_manager: ThreadWatchManager,
-        thread_list_state_permit: Arc<Semaphore>,
-        skills_watcher: Arc<SkillsWatcher>,
         bug_worker_shutdown: CancellationToken,
     ) -> Self {
         Self {
@@ -297,14 +361,10 @@ impl TurnRequestProcessor {
             thread_manager,
             outgoing,
             analytics_events_client,
-            arg0_paths,
+            _arg0_paths: arg0_paths,
             config,
             config_manager,
-            pending_thread_unloads,
             thread_state_manager,
-            thread_watch_manager,
-            thread_list_state_permit,
-            skills_watcher,
             bug_worker_shutdown,
         }
     }
@@ -331,106 +391,21 @@ impl TurnRequestProcessor {
         .map(|response| Some(response.into()))
     }
 
-    pub(crate) async fn thread_inject_items(
-        &self,
-        params: ThreadInjectItemsParams,
-    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.thread_inject_items_response_inner(params)
-            .await
-            .map(|response| Some(response.into()))
-    }
-
-    pub(crate) async fn thread_settings_update(
-        &self,
-        request_id: &ConnectionRequestId,
-        params: ThreadSettingsUpdateParams,
-    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.thread_settings_update_inner(request_id, params)
-            .await
-            .map(|response| Some(response.into()))
-    }
-
     pub(crate) async fn turn_steer(
         &self,
         request_id: &ConnectionRequestId,
         mut params: TurnSteerParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        validate_user_input_image_urls(&params.input)?;
-        let additional_context = map_additional_context(params.additional_context.take())?;
+        validate_user_input_image_urls(&params.input).inspect_err(|_| {
+            self.track_error_response(request_id, /*error_type*/ None);
+        })?;
+        let additional_context = map_additional_context(params.additional_context.take())
+            .inspect_err(|_| {
+                self.track_error_response(request_id, /*error_type*/ None);
+            })?;
         self.turn_steer_inner(request_id, params, additional_context)
             .await
             .map(|response| Some(response.into()))
-    }
-
-    pub(crate) async fn turn_interrupt(
-        &self,
-        request_id: &ConnectionRequestId,
-        params: TurnInterruptParams,
-    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.turn_interrupt_inner(request_id, params)
-            .await
-            .map(|response| response.map(Into::into))
-    }
-
-    pub(crate) async fn thread_realtime_start(
-        &self,
-        request_id: &ConnectionRequestId,
-        params: ThreadRealtimeStartParams,
-    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.thread_realtime_start_inner(request_id, params)
-            .await
-            .map(|response| response.map(Into::into))
-    }
-
-    pub(crate) async fn thread_realtime_append_audio(
-        &self,
-        request_id: &ConnectionRequestId,
-        params: ThreadRealtimeAppendAudioParams,
-    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.thread_realtime_append_audio_inner(request_id, params)
-            .await
-            .map(|response| response.map(Into::into))
-    }
-
-    pub(crate) async fn thread_realtime_append_text(
-        &self,
-        request_id: &ConnectionRequestId,
-        params: ThreadRealtimeAppendTextParams,
-    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.thread_realtime_append_text_inner(request_id, params)
-            .await
-            .map(|response| response.map(Into::into))
-    }
-
-    pub(crate) async fn thread_realtime_append_speech(
-        &self,
-        request_id: &ConnectionRequestId,
-        params: ThreadRealtimeAppendSpeechParams,
-    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.thread_realtime_append_speech_inner(request_id, params)
-            .await
-            .map(|response| response.map(Into::into))
-    }
-
-    pub(crate) async fn thread_realtime_stop(
-        &self,
-        request_id: &ConnectionRequestId,
-        params: ThreadRealtimeStopParams,
-    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.thread_realtime_stop_inner(request_id, params)
-            .await
-            .map(|response| response.map(Into::into))
-    }
-
-    pub(crate) async fn thread_realtime_list_voices(
-        &self,
-    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        Ok(Some(
-            ThreadRealtimeListVoicesResponse {
-                voices: RealtimeVoicesList::builtin(),
-            }
-            .into(),
-        ))
     }
 
     pub(crate) async fn bug_create(
@@ -510,13 +485,11 @@ impl TurnRequestProcessor {
     fn track_error_response(
         &self,
         request_id: &ConnectionRequestId,
-        error: &JSONRPCErrorError,
         error_type: Option<AnalyticsJsonRpcError>,
     ) {
         self.analytics_events_client.track_error_response(
             request_id.connection_id.0,
             request_id.request_id.clone(),
-            error.clone(),
             error_type,
         );
     }
@@ -550,7 +523,7 @@ impl TurnRequestProcessor {
             )
         {
             let error = invalid_request(DIRECT_INPUT_TO_MULTI_AGENT_V2_SUBAGENT_ERROR);
-            self.track_error_response(request_id, &error, /*error_type*/ None);
+            self.track_error_response(request_id, /*error_type*/ None);
             return Err(error);
         }
 
@@ -613,18 +586,9 @@ impl TurnRequestProcessor {
     }
 
     async fn turn_task_fingerprint(params: &TurnStartParams, thread: &CodexThread) -> String {
-        let config = thread.config().await;
         let snapshot = thread.config_snapshot().await;
-        let effective_cwd = params
-            .cwd
-            .as_ref()
-            .map(|cwd| format!("{cwd:?}"))
-            .unwrap_or_else(|| format!("{:?}", config.cwd));
-        let effective_roots = params
-            .runtime_workspace_roots
-            .as_ref()
-            .unwrap_or(&snapshot.workspace_roots);
-        let workspace_identity = format!("cwd={effective_cwd};roots={effective_roots:?}");
+        let workspace_identity =
+            task_workspace_identity(params, snapshot.cwd(), &snapshot.workspace_roots);
         let settings_identity = serde_json::json!({
             "model": snapshot.model,
             "modelProviderId": snapshot.model_provider_id,
@@ -655,18 +619,14 @@ impl TurnRequestProcessor {
         app_server_client_version: Option<String>,
         supports_openai_form_elicitation: bool,
     ) -> Result<TurnStartResponse, JSONRPCErrorError> {
-        let (thread_id, thread) =
-            self.load_thread(&params.thread_id)
-                .await
-                .inspect_err(|error| {
-                    self.track_error_response(&request_id, error, /*error_type*/ None);
-                })?;
+        let (thread_id, thread) = self.load_thread(&params.thread_id).await.inspect_err(|_| {
+            self.track_error_response(&request_id, /*error_type*/ None);
+        })?;
         self.ensure_direct_input_allowed(&request_id, thread.as_ref())
             .await?;
         if let Err(error) = Self::validate_v2_input_limit(&params.input) {
             self.track_error_response(
                 &request_id,
-                &error,
                 Some(AnalyticsJsonRpcError::Input(InputError::TooLarge)),
             );
             return Err(error);
@@ -712,26 +672,6 @@ impl TurnRequestProcessor {
             )
             .await?;
 
-        // Finish fallible request preflight before applying connection capabilities to shared
-        // thread and MCP state. A rejected turn must leave the active thread unchanged.
-        Self::set_app_server_client_info(
-            thread.as_ref(),
-            app_server_client_name,
-            app_server_client_version,
-        )
-        .await
-        .inspect_err(|error| {
-            self.track_error_response(&request_id, error, /*error_type*/ None);
-        })?;
-        thread
-            .set_openai_form_elicitation_support(supports_openai_form_elicitation)
-            .await
-            .map_err(|err| {
-                internal_error(format!(
-                    "failed to update OpenAI form elicitation support: {err}"
-                ))
-            })?;
-
         // Start the turn by submitting the user input. Return its submission id as turn_id.
         let turn_op = Op::UserInput {
             items: mapped_items,
@@ -741,21 +681,37 @@ impl TurnRequestProcessor {
             thread_settings,
         };
         let turn_id = thread.reserve_turn_id();
-        if let Some(fingerprint) = task_fingerprint.as_ref() {
-            match self
-                .thread_state_manager
-                .claim_in_flight_task(fingerprint.clone(), thread_id, turn_id.clone())
-                .await
-            {
-                crate::thread_state::InFlightTaskClaim::Claimed => {}
-                crate::thread_state::InFlightTaskClaim::Existing(existing) => {
-                    return Err(identical_task_in_flight_error(&existing));
-                }
-                crate::thread_state::InFlightTaskClaim::CapacityExceeded => {
-                    return Err(in_flight_task_capacity_error());
-                }
-            }
-        }
+
+        // Admission must precede connection capability mutations. Duplicate or overloaded turns
+        // are rejected without changing shared thread or MCP state, and a failed capability update
+        // releases the claim so the request can be retried.
+        claim_in_flight_task_before_connection_updates(
+            &self.thread_state_manager,
+            task_fingerprint.as_ref(),
+            thread_id,
+            &turn_id,
+            || async {
+                Self::set_app_server_client_info(
+                    thread.as_ref(),
+                    app_server_client_name,
+                    app_server_client_version,
+                )
+                .await?;
+                thread
+                    .set_openai_form_elicitation_support(supports_openai_form_elicitation)
+                    .await
+                    .map_err(|err| {
+                        internal_error(format!(
+                            "failed to update OpenAI form elicitation support: {err}"
+                        ))
+                    })?;
+                Ok(())
+            },
+        )
+        .await
+        .inspect_err(|_| {
+            self.track_error_response(&request_id, /*error_type*/ None);
+        })?;
         let turn_origin_tracker = {
             let thread_state = self.thread_state_manager.thread_state(thread_id).await;
             thread_state.lock().await.turn_origin_tracker()
@@ -778,7 +734,7 @@ impl TurnRequestProcessor {
                     .await;
             }
             let error = internal_error(format!("failed to start turn: {err}"));
-            self.track_error_response(&request_id, &error, /*error_type*/ None);
+            self.track_error_response(&request_id, /*error_type*/ None);
             return Err(error);
         }
         origin_reservation.commit();
@@ -926,8 +882,6 @@ impl TurnRequestProcessor {
                             .unwrap_or_else(|| snapshot.workspace_roots.clone()),
                     ),
                     default_permissions: Some(permissions),
-                    codex_linux_sandbox_exe: self.arg0_paths.codex_linux_sandbox_exe.clone(),
-                    main_execve_wrapper_exe: self.arg0_paths.main_execve_wrapper_exe.clone(),
                     ..Default::default()
                 };
                 let config = self
@@ -938,7 +892,7 @@ impl TurnRequestProcessor {
                         Some(snapshot.cwd().to_path_buf()),
                     )
                     .await
-                    .map_err(|err| config_load_error(&err))?;
+                    .map_config_load_error()?;
                 // Startup config is allowed to fall back when requirements
                 // disallow a configured profile. An explicit settings update
                 // is different: reject it before accepting the request.
@@ -1003,7 +957,7 @@ impl TurnRequestProcessor {
         })
     }
 
-    async fn thread_settings_update_inner(
+    pub(crate) async fn thread_settings_update(
         &self,
         request_id: &ConnectionRequestId,
         params: ThreadSettingsUpdateParams,
@@ -1047,7 +1001,7 @@ impl TurnRequestProcessor {
         Ok(ThreadSettingsUpdateResponse {})
     }
 
-    async fn thread_inject_items_response_inner(
+    pub(crate) async fn thread_inject_items(
         &self,
         params: ThreadInjectItemsParams,
     ) -> Result<ThreadInjectItemsResponse, JSONRPCErrorError> {
@@ -1096,16 +1050,14 @@ impl TurnRequestProcessor {
         params: TurnSteerParams,
         additional_context: IndexMap<String, CoreAdditionalContextEntry>,
     ) -> Result<TurnSteerResponse, JSONRPCErrorError> {
-        let (_, thread) = self
-            .load_thread(&params.thread_id)
-            .await
-            .inspect_err(|error| {
-                self.track_error_response(request_id, error, /*error_type*/ None);
-            })?;
+        let (_, thread) = self.load_thread(&params.thread_id).await.inspect_err(|_| {
+            self.track_error_response(request_id, /*error_type*/ None);
+        })?;
         self.ensure_direct_input_allowed(request_id, thread.as_ref())
             .await?;
 
         if params.expected_turn_id.is_empty() {
+            self.track_error_response(request_id, /*error_type*/ None);
             return Err(invalid_request("expectedTurnId must not be empty"));
         }
         self.outgoing
@@ -1114,7 +1066,6 @@ impl TurnRequestProcessor {
         if let Err(error) = Self::validate_v2_input_limit(&params.input) {
             self.track_error_response(
                 request_id,
-                &error,
                 Some(AnalyticsJsonRpcError::Input(InputError::TooLarge)),
             );
             return Err(error);
@@ -1192,187 +1143,13 @@ impl TurnRequestProcessor {
                 };
                 let mut error = invalid_request(message);
                 error.data = data;
-                self.track_error_response(request_id, &error, error_type);
+                self.track_error_response(request_id, error_type);
                 error
             })?;
         Ok(TurnSteerResponse { turn_id })
     }
 
-    async fn prepare_realtime_conversation_thread(
-        &self,
-        request_id: &ConnectionRequestId,
-        thread_id: &str,
-    ) -> Result<Option<(ThreadId, Arc<CodexThread>)>, JSONRPCErrorError> {
-        let (thread_id, thread) = self.load_thread(thread_id).await?;
-
-        match self
-            .ensure_conversation_listener(
-                thread_id,
-                request_id.connection_id,
-                /*raw_events_enabled*/ false,
-            )
-            .await
-        {
-            Ok(EnsureConversationListenerResult::Attached) => {}
-            Ok(EnsureConversationListenerResult::ConnectionClosed) => {
-                return Ok(None);
-            }
-            Err(error) => return Err(error),
-        }
-
-        if !thread.enabled(Feature::RealtimeConversation) {
-            return Err(invalid_request(format!(
-                "thread {thread_id} does not support realtime conversation"
-            )));
-        }
-
-        Ok(Some((thread_id, thread)))
-    }
-
-    async fn thread_realtime_start_inner(
-        &self,
-        request_id: &ConnectionRequestId,
-        params: ThreadRealtimeStartParams,
-    ) -> Result<Option<ThreadRealtimeStartResponse>, JSONRPCErrorError> {
-        let Some((_, thread)) = self
-            .prepare_realtime_conversation_thread(request_id, &params.thread_id)
-            .await?
-        else {
-            return Ok(None);
-        };
-        self.submit_core_op(
-            request_id,
-            thread.as_ref(),
-            Op::RealtimeConversationStart(ConversationStartParams {
-                client_managed_handoffs: params.client_managed_handoffs.unwrap_or(false),
-                flush_transcript_tail_on_session_end: flush_transcript_tail_on_session_end(
-                    params.flush_transcript_tail_on_session_end,
-                ),
-                codex_responses_as_items: params.codex_responses_as_items.unwrap_or(false),
-                codex_response_item_prefix: params.codex_response_item_prefix,
-                codex_response_handoff_prefix: params.codex_response_handoff_prefix,
-                model: params.model,
-                output_modality: params.output_modality,
-                include_startup_context: params.include_startup_context.unwrap_or(true),
-                prompt: params.prompt,
-                realtime_session_id: params.realtime_session_id,
-                transport: params.transport.map(|transport| match transport {
-                    ThreadRealtimeStartTransport::Websocket => {
-                        ConversationStartTransport::Websocket
-                    }
-                    ThreadRealtimeStartTransport::Webrtc { sdp } => {
-                        ConversationStartTransport::Webrtc { sdp }
-                    }
-                }),
-                version: params.version,
-                voice: params.voice,
-            }),
-        )
-        .await
-        .map_err(|err| internal_error(format!("failed to start realtime conversation: {err}")))?;
-        Ok(Some(ThreadRealtimeStartResponse::default()))
-    }
-
-    async fn thread_realtime_append_audio_inner(
-        &self,
-        request_id: &ConnectionRequestId,
-        params: ThreadRealtimeAppendAudioParams,
-    ) -> Result<Option<ThreadRealtimeAppendAudioResponse>, JSONRPCErrorError> {
-        let Some((_, thread)) = self
-            .prepare_realtime_conversation_thread(request_id, &params.thread_id)
-            .await?
-        else {
-            return Ok(None);
-        };
-        self.submit_core_op(
-            request_id,
-            thread.as_ref(),
-            Op::RealtimeConversationAudio(ConversationAudioParams {
-                frame: params.audio.into(),
-            }),
-        )
-        .await
-        .map_err(|err| {
-            internal_error(format!(
-                "failed to append realtime conversation audio: {err}"
-            ))
-        })?;
-        Ok(Some(ThreadRealtimeAppendAudioResponse::default()))
-    }
-
-    async fn thread_realtime_append_text_inner(
-        &self,
-        request_id: &ConnectionRequestId,
-        params: ThreadRealtimeAppendTextParams,
-    ) -> Result<Option<ThreadRealtimeAppendTextResponse>, JSONRPCErrorError> {
-        let Some((_, thread)) = self
-            .prepare_realtime_conversation_thread(request_id, &params.thread_id)
-            .await?
-        else {
-            return Ok(None);
-        };
-        self.submit_core_op(
-            request_id,
-            thread.as_ref(),
-            Op::RealtimeConversationText(ConversationTextParams {
-                text: params.text,
-                role: params.role,
-            }),
-        )
-        .await
-        .map_err(|err| {
-            internal_error(format!(
-                "failed to append realtime conversation text: {err}"
-            ))
-        })?;
-        Ok(Some(ThreadRealtimeAppendTextResponse::default()))
-    }
-
-    async fn thread_realtime_append_speech_inner(
-        &self,
-        request_id: &ConnectionRequestId,
-        params: ThreadRealtimeAppendSpeechParams,
-    ) -> Result<Option<ThreadRealtimeAppendSpeechResponse>, JSONRPCErrorError> {
-        let Some((_, thread)) = self
-            .prepare_realtime_conversation_thread(request_id, &params.thread_id)
-            .await?
-        else {
-            return Ok(None);
-        };
-        self.submit_core_op(
-            request_id,
-            thread.as_ref(),
-            Op::RealtimeConversationSpeech(ConversationSpeechParams { text: params.text }),
-        )
-        .await
-        .map_err(|err| {
-            internal_error(format!(
-                "failed to append realtime conversation speech: {err}"
-            ))
-        })?;
-        Ok(Some(ThreadRealtimeAppendSpeechResponse::default()))
-    }
-
-    async fn thread_realtime_stop_inner(
-        &self,
-        request_id: &ConnectionRequestId,
-        params: ThreadRealtimeStopParams,
-    ) -> Result<Option<ThreadRealtimeStopResponse>, JSONRPCErrorError> {
-        let Some((_, thread)) = self
-            .prepare_realtime_conversation_thread(request_id, &params.thread_id)
-            .await?
-        else {
-            return Ok(None);
-        };
-        self.submit_core_op(request_id, thread.as_ref(), Op::RealtimeConversationClose)
-            .await
-            .map_err(|err| {
-                internal_error(format!("failed to stop realtime conversation: {err}"))
-            })?;
-        Ok(Some(ThreadRealtimeStopResponse::default()))
-    }
-
-    async fn turn_interrupt_inner(
+    pub(crate) async fn turn_interrupt(
         &self,
         request_id: &ConnectionRequestId,
         params: TurnInterruptParams,
@@ -1389,18 +1166,14 @@ impl TurnRequestProcessor {
             let is_running = matches!(thread.agent_status().await, AgentStatus::Running);
             {
                 let mut thread_state = thread_state.lock().await;
-                if let Some(active_turn) = thread_state.active_turn_snapshot() {
-                    if active_turn.id != turn_id {
-                        return Err(invalid_request(format!(
-                            "expected active turn id {turn_id} but found {}",
-                            active_turn.id
-                        )));
-                    }
-                } else if thread_state.last_terminal_turn_id.as_deref() == Some(turn_id.as_str())
-                    || !is_running
-                {
-                    return Err(invalid_request("no active turn to interrupt"));
-                }
+                let latest_turn = thread_state.active_turn_snapshot();
+                validate_turn_interrupt_target(
+                    latest_turn
+                        .as_ref()
+                        .map(|turn| (turn.id.as_str(), &turn.status)),
+                    is_running,
+                    &turn_id,
+                )?;
                 thread_state.pending_interrupts.push(request_id.clone());
             }
 
@@ -1435,35 +1208,6 @@ impl TurnRequestProcessor {
                 )))
             }
         }
-    }
-
-    fn listener_task_context(&self) -> ListenerTaskContext {
-        ListenerTaskContext {
-            thread_manager: Arc::clone(&self.thread_manager),
-            thread_state_manager: self.thread_state_manager.clone(),
-            outgoing: Arc::clone(&self.outgoing),
-            pending_thread_unloads: Arc::clone(&self.pending_thread_unloads),
-            thread_watch_manager: self.thread_watch_manager.clone(),
-            thread_list_state_permit: self.thread_list_state_permit.clone(),
-            fallback_model_provider: self.config.model_provider_id.clone(),
-            codex_home: self.config.codex_home.to_path_buf(),
-            skills_watcher: Arc::clone(&self.skills_watcher),
-        }
-    }
-
-    async fn ensure_conversation_listener(
-        &self,
-        conversation_id: ThreadId,
-        connection_id: ConnectionId,
-        raw_events_enabled: bool,
-    ) -> Result<EnsureConversationListenerResult, JSONRPCErrorError> {
-        super::thread_lifecycle::ensure_conversation_listener(
-            self.listener_task_context(),
-            conversation_id,
-            connection_id,
-            raw_events_enabled,
-        )
-        .await
     }
 }
 
@@ -1594,7 +1338,6 @@ async fn classify_bug_report(
             .enabled(Feature::EnableRequestCompression),
         context.config.features.enabled(Feature::RuntimeMetrics),
         None,
-        context.config.features.enabled(Feature::ItemIds),
         context
             .config
             .features
@@ -1821,10 +1564,6 @@ fn cited_fact_schema() -> Value {
             }
         }
     })
-}
-
-fn flush_transcript_tail_on_session_end(configured: Option<bool>) -> bool {
-    configured.unwrap_or(true)
 }
 
 #[cfg(test)]

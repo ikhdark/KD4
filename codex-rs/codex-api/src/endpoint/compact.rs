@@ -3,6 +3,7 @@ use crate::common::CompactionInput;
 use crate::endpoint::session::EndpointSession;
 use crate::error::ApiError;
 use crate::provider::Provider;
+use crate::responses_stream::X_CODEX_TURN_STATE_HEADER;
 use codex_client::HttpTransport;
 use codex_client::RequestTelemetry;
 use codex_protocol::models::ResponseItem;
@@ -12,8 +13,6 @@ use serde::Deserialize;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
-
-const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 
 pub struct CompactClient<T: HttpTransport> {
     session: EndpointSession<T>,

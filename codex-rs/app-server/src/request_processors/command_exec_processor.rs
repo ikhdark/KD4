@@ -3,7 +3,7 @@ use crate::connection_rpc_gate::ConnectionRpcGate;
 
 #[derive(Clone)]
 pub(crate) struct CommandExecRequestProcessor {
-    arg0_paths: Arg0DispatchPaths,
+    _arg0_paths: Arg0DispatchPaths,
     config: Arc<Config>,
     outgoing: Arc<OutgoingMessageSender>,
     config_manager: ConfigManager,
@@ -20,7 +20,7 @@ impl CommandExecRequestProcessor {
         environment_manager: Arc<EnvironmentManager>,
     ) -> Self {
         Self {
-            arg0_paths,
+            _arg0_paths: arg0_paths,
             config,
             outgoing,
             config_manager,
@@ -36,7 +36,7 @@ impl CommandExecRequestProcessor {
         rpc_gate: &ConnectionRpcGate,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         self.require_local_environment()?;
-        self.exec_one_off_command(request_id, params, rpc_gate)
+        self.exec_one_off_command_inner(request_id.clone(), params, rpc_gate)
             .await
             .map(|()| None)
     }
@@ -88,16 +88,6 @@ impl CommandExecRequestProcessor {
             .ok_or_else(|| internal_error("local environment is not configured"))
     }
 
-    async fn exec_one_off_command(
-        &self,
-        request_id: &ConnectionRequestId,
-        params: CommandExecParams,
-        rpc_gate: &ConnectionRpcGate,
-    ) -> Result<(), JSONRPCErrorError> {
-        self.exec_one_off_command_inner(request_id.clone(), params, rpc_gate)
-            .await
-    }
-
     async fn exec_one_off_command_inner(
         &self,
         request_id: ConnectionRequestId,
@@ -108,9 +98,7 @@ impl CommandExecRequestProcessor {
 
         let request = request_id.clone();
 
-        if params.command.is_empty() {
-            return Err(invalid_request("command must not be empty"));
-        }
+        crate::command_exec::validate_command_argv(&params.command)?;
 
         let CommandExecParams {
             command,
@@ -312,12 +300,12 @@ impl CommandExecRequestProcessor {
             arg0: None,
         };
 
-        let codex_linux_sandbox_exe = self.arg0_paths.codex_linux_sandbox_exe.clone();
         let outgoing = self.outgoing.clone();
         let request_for_task = request.clone();
         let started_network_proxy_for_task = started_network_proxy;
-        let use_legacy_landlock = self.config.features.use_legacy_landlock();
-        let size = match size.map(crate::command_exec::terminal_size_from_protocol) {
+        let size = match size.map(|size| {
+            crate::command_exec::terminal_size_from_protocol(size.into_inner(), "command/exec")
+        }) {
             Some(Ok(size)) => Some(size),
             Some(Err(error)) => return Err(error),
             None => None,
@@ -328,8 +316,6 @@ impl CommandExecRequestProcessor {
             &effective_permission_profile,
             &sandbox_cwd,
             windows_sandbox_workspace_roots.as_slice(),
-            &codex_linux_sandbox_exe,
-            use_legacy_landlock,
         )
         .map_err(|err| internal_error(format!("exec failed: {err}")))?;
         self.command_exec_manager

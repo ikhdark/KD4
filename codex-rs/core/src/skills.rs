@@ -4,9 +4,9 @@ use crate::session::turn_context::TurnContext;
 use codex_analytics::InvocationType;
 use codex_analytics::SkillInvocation;
 use codex_analytics::build_track_events_context;
+use codex_plugin::PluginSkillRoot;
 use codex_protocol::protocol::SkillScope;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use codex_utils_plugins::PluginSkillRoot;
 
 pub use codex_core_skills::SkillError;
 pub use codex_core_skills::SkillLoadOutcome;
@@ -30,7 +30,6 @@ pub use codex_core_skills::injection::collect_explicit_skill_mentions;
 pub use codex_core_skills::injection::plan_skill_injections;
 pub use codex_core_skills::loader;
 pub use codex_core_skills::model;
-pub use codex_core_skills::remote;
 pub use codex_core_skills::render;
 pub use codex_core_skills::render::SkillRenderSideEffects;
 pub use codex_core_skills::service;

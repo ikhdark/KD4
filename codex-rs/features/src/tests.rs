@@ -6,14 +6,79 @@ use crate::Features;
 use crate::FeaturesToml;
 use crate::Stage;
 use crate::feature_for_key;
-use crate::legacy_feature_keys;
+use crate::is_known_feature_key;
 use crate::unstable_features_warning_event;
+use crate::user_settable_feature_for_key;
+use crate::user_settable_features;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::WarningEvent;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 use toml::Table;
 use toml::Value as TomlValue;
+
+#[test]
+fn feature_metadata_is_exhaustive_and_single_sourced() {
+    assert_eq!(crate::ALL_FEATURES.len(), crate::FEATURES.len());
+
+    for (feature, spec) in crate::ALL_FEATURES.iter().zip(crate::FEATURES) {
+        assert_eq!(*feature, spec.id);
+        assert_eq!(feature.key(), spec.key);
+        assert_eq!(feature.stage(), spec.stage);
+        assert_eq!(feature.default_enabled(), spec.default_enabled);
+    }
+}
+
+#[test]
+fn machine_readable_registry_projection_uses_evaluated_defaults() {
+    let entries = crate::feature_registry_entries();
+
+    assert_eq!(entries.len(), crate::FEATURES.len());
+    assert_eq!(
+        entries
+            .iter()
+            .find(|entry| entry.key == Feature::SecretAuthStorage.key())
+            .map(|entry| entry.default_enabled),
+        Some(true)
+    );
+    assert_eq!(
+        serde_json::to_value(&entries).expect("serialize feature registry"),
+        serde_json::json!(
+            crate::FEATURES
+                .iter()
+                .map(|spec| serde_json::json!({
+                    "key": spec.key,
+                    "defaultEnabled": spec.default_enabled,
+                }))
+                .collect::<Vec<_>>()
+        )
+    );
+}
+
+#[test]
+fn user_settable_registry_excludes_internal_features_and_legacy_aliases() {
+    assert_eq!(
+        user_settable_feature_for_key("unified_exec"),
+        Some(Feature::UnifiedExec)
+    );
+    assert_eq!(
+        user_settable_feature_for_key("terminal_resize_reflow"),
+        None
+    );
+    assert_eq!(
+        user_settable_feature_for_key("experimental_use_unified_exec_tool"),
+        None
+    );
+    assert!(user_settable_features().all(|spec| !matches!(spec.stage, Stage::Internal)));
+}
+
+#[test]
+fn deleted_zombie_feature_keys_are_unknown() {
+    for key in ["artifact", "enable_mcp_apps", "realtime_conversation"] {
+        assert_eq!(feature_for_key(key), None, "{key}");
+        assert_eq!(user_settable_feature_for_key(key), None, "{key}");
+    }
+}
 
 #[test]
 fn under_development_features_are_disabled_by_default() {
@@ -33,8 +98,8 @@ fn default_enabled_features_are_stable() {
     for spec in crate::FEATURES {
         if spec.default_enabled {
             assert!(
-                matches!(spec.stage, Stage::Stable | Stage::Removed),
-                "feature `{}` is enabled by default but is not stable/removed ({:?})",
+                matches!(spec.stage, Stage::Stable),
+                "feature `{}` is enabled by default but is not stable ({:?})",
                 spec.key,
                 spec.stage
             );
@@ -43,95 +108,28 @@ fn default_enabled_features_are_stable() {
 }
 
 #[test]
-fn use_legacy_landlock_is_removed_and_disabled_by_default() {
-    assert_eq!(Feature::UseLegacyLandlock.stage(), Stage::Removed);
-    assert_eq!(Feature::UseLegacyLandlock.default_enabled(), false);
+fn retired_feature_keys_are_unknown() {
+    for key in [
+        "terminal_resize_reflow",
+        "apps_mcp_path_override",
+        "item_ids",
+        "remote_compaction_v2",
+    ] {
+        assert!(!is_known_feature_key(key), "{key}");
+        assert_eq!(feature_for_key(key), None, "{key}");
+    }
 }
 
 #[test]
-fn use_linux_sandbox_bwrap_is_removed_and_disabled_by_default() {
-    assert_eq!(Feature::UseLinuxSandboxBwrap.stage(), Stage::Removed);
-    assert_eq!(Feature::UseLinuxSandboxBwrap.default_enabled(), false);
-}
-
-#[test]
-fn undo_is_removed_and_disabled_by_default() {
-    assert_eq!(Feature::GhostCommit.stage(), Stage::Removed);
-    assert_eq!(Feature::GhostCommit.default_enabled(), false);
-}
-
-#[test]
-fn image_detail_original_is_removed_and_disabled_by_default() {
-    assert_eq!(Feature::ImageDetailOriginal.stage(), Stage::Removed);
-    assert_eq!(Feature::ImageDetailOriginal.default_enabled(), false);
-}
-
-#[test]
-fn apply_patch_freeform_is_removed_and_disabled_by_default() {
-    assert_eq!(Feature::ApplyPatchFreeform.stage(), Stage::Removed);
-    assert_eq!(Feature::ApplyPatchFreeform.default_enabled(), false);
-    assert_eq!(
-        feature_for_key("apply_patch_freeform"),
-        Some(Feature::ApplyPatchFreeform)
-    );
-}
-
-#[test]
-fn plugin_hooks_is_removed_and_disabled_by_default() {
-    assert_eq!(Feature::PluginHooks.stage(), Stage::Removed);
-    assert_eq!(Feature::PluginHooks.default_enabled(), false);
-    assert_eq!(feature_for_key("plugin_hooks"), Some(Feature::PluginHooks));
-}
-
-#[test]
-fn external_migration_is_removed_and_disabled_by_default() {
-    assert_eq!(Feature::ExternalMigration.stage(), Stage::Removed);
-    assert_eq!(Feature::ExternalMigration.default_enabled(), false);
-    assert_eq!(
-        feature_for_key("external_migration"),
-        Some(Feature::ExternalMigration)
-    );
-}
-
-#[test]
-fn removed_apps_mcp_path_override_shapes_are_ignored() {
-    let features = [
-        toml::from_str::<FeaturesToml>("apps_mcp_path_override = true")
-            .expect("boolean compatibility form should deserialize"),
-        toml::from_str::<FeaturesToml>(
-            r#"
-[apps_mcp_path_override]
-enabled = true
-path = "/custom/mcp"
-"#,
-        )
-        .expect("structured compatibility form should deserialize"),
-    ];
-
-    assert_eq!(
-        features.map(|features| features.entries()),
-        [BTreeMap::new(), BTreeMap::new()]
-    );
-}
-
-#[test]
-fn removed_strict_feature_config_fields_deserialize_for_compatibility() {
-    let features = toml::from_str::<FeaturesToml>(
+fn removed_code_mode_waiting_policy_is_rejected() {
+    toml::from_str::<FeaturesToml>(
         r#"
 [code_mode]
 enabled = true
 waiting_policy = "yield_after"
 "#,
     )
-    .expect("removed compatibility fields should deserialize");
-
-    let Some(FeatureToml::Config(code_mode)) = features.code_mode else {
-        panic!("code_mode should deserialize as structured config");
-    };
-    assert_eq!(
-        code_mode.waiting_policy,
-        Some(crate::CodeModeWaitingPolicy::YieldAfter)
-    );
+    .expect_err("removed waiting_policy field should be rejected");
 }
 
 #[test]
@@ -193,12 +191,7 @@ fn completed_runtime_mechanisms_are_stable_and_enabled_by_default() {
 
 #[test]
 fn terminal_resize_reflow_is_removed_and_enabled_by_default() {
-    assert_eq!(
-        feature_for_key("terminal_resize_reflow"),
-        Some(Feature::TerminalResizeReflow)
-    );
-    assert_eq!(Feature::TerminalResizeReflow.stage(), Stage::Removed);
-    assert_eq!(Feature::TerminalResizeReflow.default_enabled(), true);
+    assert_eq!(feature_for_key("terminal_resize_reflow"), None);
 }
 
 #[test]
@@ -211,14 +204,12 @@ fn from_sources_ignores_removed_terminal_resize_reflow_feature_key() {
     let features = Features::from_sources(
         FeatureConfigSource {
             features: Some(&features_toml),
-            ..Default::default()
         },
         FeatureConfigSource::default(),
         FeatureOverrides::default(),
     );
 
     assert_eq!(features, Features::with_defaults());
-    assert_eq!(features.enabled(Feature::TerminalResizeReflow), true);
 }
 
 #[test]
@@ -241,16 +232,9 @@ fn network_proxy_is_experimental_and_disabled_by_default() {
 }
 
 #[test]
-fn tool_search_is_removed_and_disabled_by_default() {
-    assert_eq!(Feature::ToolSearch.stage(), Stage::Removed);
-    assert_eq!(Feature::ToolSearch.default_enabled(), false);
-    assert_eq!(feature_for_key("tool_search"), Some(Feature::ToolSearch));
-}
-
-#[test]
-fn secret_auth_storage_defaults_to_windows_only() {
+fn secret_auth_storage_defaults_to_enabled() {
     assert_eq!(Feature::SecretAuthStorage.stage(), Stage::Stable);
-    assert_eq!(Feature::SecretAuthStorage.default_enabled(), cfg!(windows));
+    assert!(Feature::SecretAuthStorage.default_enabled());
     assert_eq!(
         feature_for_key("secret_auth_storage"),
         Some(Feature::SecretAuthStorage)
@@ -283,29 +267,14 @@ fn browser_controls_are_stable_and_enabled_by_default() {
 }
 
 #[test]
-fn use_linux_sandbox_bwrap_is_a_removed_feature_key() {
-    assert_eq!(
-        feature_for_key("use_legacy_landlock"),
-        Some(Feature::UseLegacyLandlock)
-    );
-    assert_eq!(
-        feature_for_key("use_linux_sandbox_bwrap"),
-        Some(Feature::UseLinuxSandboxBwrap)
-    );
-}
-
-#[test]
-fn image_generation_is_stable_and_extension_alias_is_supported() {
+fn image_generation_is_stable_and_legacy_alias_is_unknown() {
     assert_eq!(Feature::ImageGeneration.stage(), Stage::Stable);
     assert_eq!(Feature::ImageGeneration.default_enabled(), true);
     assert_eq!(
         feature_for_key("image_generation"),
         Some(Feature::ImageGeneration)
     );
-    assert_eq!(
-        feature_for_key("imagegenext"),
-        Some(Feature::ImageGeneration)
-    );
+    assert_eq!(feature_for_key("imagegenext"), None);
 }
 
 #[test]
@@ -323,95 +292,21 @@ fn image_generation_toggle_controls_extension_backed_generation() {
 }
 
 #[test]
-fn canonical_feature_toggles_win_over_every_legacy_alias_within_a_source() {
-    for alias in legacy_feature_keys() {
-        let feature = feature_for_key(alias).expect("legacy alias should resolve");
-        let canonical_key = feature.key();
-
-        for (canonical, legacy) in [(false, true), (true, false)] {
-            let entries = BTreeMap::from([
-                (canonical_key.to_string(), canonical),
-                (alias.to_string(), legacy),
-            ]);
-            let mut features = Features::with_defaults();
-            features.apply_map(&entries);
-
-            assert_eq!(
-                features.enabled(feature),
-                canonical,
-                "canonical feature `{canonical_key}` should win over alias `{alias}`"
-            );
-            assert!(
-                features
-                    .legacy_feature_usages()
-                    .any(|usage| usage.alias == alias && usage.feature == feature)
-            );
-        }
-
-        for (base_canonical, profile_legacy) in [(false, true), (true, false)] {
-            let base_features = FeaturesToml::from(BTreeMap::from([(
-                canonical_key.to_string(),
-                base_canonical,
-            )]));
-            let profile_features =
-                FeaturesToml::from(BTreeMap::from([(alias.to_string(), profile_legacy)]));
-            let features = Features::from_sources(
-                FeatureConfigSource {
-                    features: Some(&base_features),
-                    ..Default::default()
-                },
-                FeatureConfigSource {
-                    features: Some(&profile_features),
-                    ..Default::default()
-                },
-                FeatureOverrides::default(),
-            );
-
-            assert_eq!(
-                features.enabled(feature),
-                profile_legacy,
-                "profile alias `{alias}` should override base feature `{canonical_key}`"
-            );
-        }
-    }
-}
-
-#[test]
 fn removed_transitional_features_are_no_op() {
     let entries = BTreeMap::from([
-        ("use_legacy_landlock".to_string(), true),
         ("mentions_v2".to_string(), false),
         ("remote_compaction_v2".to_string(), false),
     ]);
     let mut features = Features::with_defaults();
     features.apply_map(&entries);
 
-    assert!(!features.use_legacy_landlock());
-    assert!(features.enabled(Feature::MentionsV2));
-    assert!(features.enabled(Feature::RemoteCompactionV2));
+    assert_eq!(feature_for_key("remote_compaction_v2"), None);
     assert_eq!(features.legacy_feature_usages().count(), 0);
 }
 
 #[test]
 fn image_detail_original_is_a_removed_feature_key() {
-    assert_eq!(
-        feature_for_key("image_detail_original"),
-        Some(Feature::ImageDetailOriginal)
-    );
-}
-
-#[test]
-fn js_repl_features_are_removed_feature_keys() {
-    assert_eq!(Feature::JsRepl.stage(), Stage::Removed);
-    assert_eq!(Feature::JsRepl.default_enabled(), false);
-    assert_eq!(feature_for_key("js_repl"), Some(Feature::JsRepl));
-
-    assert_eq!(Feature::JsReplToolsOnly.stage(), Stage::Removed);
-    assert_eq!(Feature::JsReplToolsOnly.default_enabled(), false);
-    assert_eq!(
-        feature_for_key("js_repl_tools_only"),
-        Some(Feature::JsReplToolsOnly)
-    );
+    assert_eq!(feature_for_key("image_detail_original"), None);
 }
 
 #[test]
@@ -431,30 +326,13 @@ fn auth_elicitation_is_stable_and_enabled_by_default() {
 }
 
 #[test]
-fn mentions_v2_is_removed_and_enabled_by_default() {
-    assert_eq!(Feature::MentionsV2.stage(), Stage::Removed);
-    assert_eq!(Feature::MentionsV2.default_enabled(), true);
-    assert_eq!(feature_for_key("mentions_v2"), Some(Feature::MentionsV2));
-}
-
-#[test]
-fn remote_compaction_v2_is_removed_and_enabled_by_default() {
-    assert_eq!(Feature::RemoteCompactionV2.stage(), Stage::Removed);
-    assert_eq!(Feature::RemoteCompactionV2.default_enabled(), true);
-    assert_eq!(
-        feature_for_key("remote_compaction_v2"),
-        Some(Feature::RemoteCompactionV2)
-    );
+fn remote_compaction_v2_is_a_removed_feature_key() {
+    assert_eq!(feature_for_key("remote_compaction_v2"), None);
 }
 
 #[test]
 fn remote_control_is_removed_and_disabled_by_default() {
-    assert_eq!(Feature::RemoteControl.stage(), Stage::Removed);
-    assert_eq!(Feature::RemoteControl.default_enabled(), false);
-    assert_eq!(
-        feature_for_key("remote_control"),
-        Some(Feature::RemoteControl)
-    );
+    assert_eq!(feature_for_key("remote_control"), None);
 }
 
 #[test]
@@ -465,37 +343,41 @@ fn remote_control_config_is_ignored() {
     let mut features = Features::with_defaults();
     features.apply_map(&entries);
 
-    assert_eq!(features.enabled(Feature::RemoteControl), false);
+    assert_eq!(features, Features::with_defaults());
 }
 
 #[test]
-fn workspace_dependencies_is_stable_and_enabled_by_default() {
-    assert_eq!(Feature::WorkspaceDependencies.stage(), Stage::Stable);
-    assert_eq!(Feature::WorkspaceDependencies.default_enabled(), true);
-    assert_eq!(
-        feature_for_key("workspace_dependencies"),
-        Some(Feature::WorkspaceDependencies)
-    );
+fn workspace_dependencies_is_removed_and_disabled_by_default() {
+    assert_eq!(feature_for_key("workspace_dependencies"), None);
 }
 
 #[test]
-fn telepathy_is_legacy_alias_for_chronicle() {
-    assert_eq!(Feature::Chronicle.stage(), Stage::UnderDevelopment);
-    assert_eq!(Feature::Chronicle.default_enabled(), false);
-    assert_eq!(feature_for_key("chronicle"), Some(Feature::Chronicle));
-    assert_eq!(feature_for_key("telepathy"), Some(Feature::Chronicle));
+fn workspace_dependencies_config_is_ignored() {
+    let mut entries = BTreeMap::new();
+    entries.insert("workspace_dependencies".to_string(), true);
+
+    let mut features = Features::with_defaults();
+    features.apply_map(&entries);
+
+    assert_eq!(features, Features::with_defaults());
 }
 
 #[test]
-fn collab_is_legacy_alias_for_multi_agent() {
+fn chronicle_and_legacy_alias_are_unknown() {
+    assert_eq!(feature_for_key("chronicle"), None);
+    assert_eq!(feature_for_key("telepathy"), None);
+}
+
+#[test]
+fn multi_agent_legacy_alias_is_unknown() {
     assert_eq!(feature_for_key("multi_agent"), Some(Feature::Collab));
-    assert_eq!(feature_for_key("collab"), Some(Feature::Collab));
+    assert_eq!(feature_for_key("collab"), None);
 }
 
 #[test]
-fn codex_hooks_is_legacy_alias_for_hooks() {
+fn hooks_legacy_alias_is_unknown() {
     assert_eq!(feature_for_key("hooks"), Some(Feature::CodexHooks));
-    assert_eq!(feature_for_key("codex_hooks"), Some(Feature::CodexHooks));
+    assert_eq!(feature_for_key("codex_hooks"), None);
 }
 
 #[test]
@@ -554,11 +436,9 @@ fn from_sources_applies_base_profile_and_overrides() {
     let features = Features::from_sources(
         FeatureConfigSource {
             features: Some(&base_features),
-            ..Default::default()
         },
         FeatureConfigSource {
             features: Some(&profile_features),
-            ..Default::default()
         },
         FeatureOverrides {
             web_search_request: Some(false),
@@ -568,7 +448,6 @@ fn from_sources_applies_base_profile_and_overrides() {
     assert_eq!(features.enabled(Feature::Plugins), true);
     assert_eq!(features.enabled(Feature::CodeModeOnly), true);
     assert_eq!(features.enabled(Feature::CodeMode), true);
-    assert_eq!(features.enabled(Feature::ApplyPatchFreeform), false);
     assert_eq!(features.enabled(Feature::WebSearchRequest), false);
 }
 
@@ -582,7 +461,6 @@ fn from_sources_ignores_removed_image_detail_original_feature_key() {
     let features = Features::from_sources(
         FeatureConfigSource {
             features: Some(&features_toml),
-            ..Default::default()
         },
         FeatureConfigSource::default(),
         FeatureOverrides::default(),
@@ -599,7 +477,6 @@ fn from_sources_ignores_removed_resize_all_images_feature_key() {
     let features = Features::from_sources(
         FeatureConfigSource {
             features: Some(&features_toml),
-            ..Default::default()
         },
         FeatureConfigSource::default(),
         FeatureOverrides::default(),
@@ -609,13 +486,28 @@ fn from_sources_ignores_removed_resize_all_images_feature_key() {
 }
 
 #[test]
+fn from_sources_ignores_removed_item_ids_feature_key() {
+    let features_toml = FeaturesToml::from(BTreeMap::from([("item_ids".to_string(), true)]));
+
+    let features = Features::from_sources(
+        FeatureConfigSource {
+            features: Some(&features_toml),
+        },
+        FeatureConfigSource::default(),
+        FeatureOverrides::default(),
+    );
+
+    assert_eq!(features, Features::with_defaults());
+    assert_eq!(feature_for_key("item_ids"), None);
+}
+
+#[test]
 fn from_sources_ignores_removed_undo_feature_key() {
     let features_toml = FeaturesToml::from(BTreeMap::from([("undo".to_string(), true)]));
 
     let features = Features::from_sources(
         FeatureConfigSource {
             features: Some(&features_toml),
-            ..Default::default()
         },
         FeatureConfigSource::default(),
         FeatureOverrides::default(),
@@ -634,7 +526,6 @@ fn from_sources_ignores_removed_js_repl_feature_keys() {
     let features = Features::from_sources(
         FeatureConfigSource {
             features: Some(&features_toml),
-            ..Default::default()
         },
         FeatureConfigSource::default(),
         FeatureOverrides::default(),
@@ -651,7 +542,6 @@ fn from_sources_ignores_removed_apply_patch_freeform_feature_key() {
     let features = Features::from_sources(
         FeatureConfigSource {
             features: Some(&features_toml),
-            ..Default::default()
         },
         FeatureConfigSource::default(),
         FeatureOverrides::default(),
@@ -667,7 +557,6 @@ fn from_sources_ignores_removed_plugin_hooks_feature_key() {
     let features = Features::from_sources(
         FeatureConfigSource {
             features: Some(&features_toml),
-            ..Default::default()
         },
         FeatureConfigSource::default(),
         FeatureOverrides::default(),
@@ -686,7 +575,6 @@ fn from_sources_ignores_removed_tool_search_always_defer_mcp_tools_feature_key()
     let features = Features::from_sources(
         FeatureConfigSource {
             features: Some(&features_toml),
-            ..Default::default()
         },
         FeatureConfigSource::default(),
         FeatureOverrides::default(),
@@ -721,7 +609,6 @@ max_concurrent_threads_per_session = 4
 min_wait_timeout_ms = 2500
 max_wait_timeout_ms = 120000
 default_wait_timeout_ms = 30000
-usage_hint_enabled = false
 usage_hint_text = "Custom delegation guidance."
 root_agent_usage_hint_text = "Root guidance."
 subagent_usage_hint_text = "Subagent guidance."
@@ -746,7 +633,6 @@ allow_full_history_forks = true
             min_wait_timeout_ms: Some(2500),
             max_wait_timeout_ms: Some(120000),
             default_wait_timeout_ms: Some(30000),
-            usage_hint_enabled: Some(false),
             usage_hint_text: Some("Custom delegation guidance.".to_string()),
             root_agent_usage_hint_text: Some("Root guidance.".to_string()),
             subagent_usage_hint_text: Some("Subagent guidance.".to_string()),
@@ -760,13 +646,69 @@ allow_full_history_forks = true
 }
 
 #[test]
-fn materialize_resolved_enabled_writes_all_features_and_preserves_custom_config() {
+fn multi_agent_v2_schema_uses_authoritative_policy_bounds() {
+    let schema = schemars::schema_for!(crate::MultiAgentV2ConfigToml);
+    let properties = schema
+        .schema
+        .object
+        .as_ref()
+        .expect("multi-agent v2 config should have an object schema")
+        .properties
+        .clone();
+    let number_bounds = |field: &str| {
+        let schemars::schema::Schema::Object(schema) = properties
+            .get(field)
+            .unwrap_or_else(|| panic!("missing schema for {field}"))
+        else {
+            panic!("{field} should have an integer schema");
+        };
+        let number = schema
+            .number
+            .as_ref()
+            .unwrap_or_else(|| panic!("{field} should have numeric bounds"));
+        (number.minimum, number.maximum)
+    };
+
+    assert_eq!(
+        number_bounds("max_concurrent_threads_per_session"),
+        (
+            Some(crate::MULTI_AGENT_V2_MIN_CONCURRENT_THREADS_PER_SESSION as f64),
+            None,
+        )
+    );
+    for field in [
+        "min_wait_timeout_ms",
+        "max_wait_timeout_ms",
+        "default_wait_timeout_ms",
+    ] {
+        assert_eq!(
+            number_bounds(field),
+            (
+                Some(crate::MULTI_AGENT_MIN_WAIT_TIMEOUT_MS as f64),
+                Some(crate::MULTI_AGENT_MAX_WAIT_TIMEOUT_MS as f64),
+            )
+        );
+    }
+    assert!(
+        (crate::MULTI_AGENT_MIN_WAIT_TIMEOUT_MS..=crate::MULTI_AGENT_MAX_WAIT_TIMEOUT_MS)
+            .contains(&crate::MULTI_AGENT_DEFAULT_WAIT_TIMEOUT_MS)
+    );
+}
+
+#[test]
+fn materialize_resolved_enabled_omits_internal_features_and_preserves_custom_config() {
     let mut features = Features::with_defaults();
     features.enable(Feature::CodeMode);
     features.enable(Feature::MultiAgentV2);
     features.enable(Feature::NetworkProxy);
     features.enable(Feature::RespectSystemProxy);
 
+    let mut entries = BTreeMap::from([("custom_extension".to_string(), false)]);
+    for spec in crate::FEATURES {
+        if matches!(spec.stage, Stage::Internal) {
+            entries.insert(spec.key.to_string(), true);
+        }
+    }
     let mut features_toml = FeaturesToml {
         multi_agent_v2: Some(FeatureToml::Config(crate::MultiAgentV2ConfigToml {
             enabled: Some(false),
@@ -778,20 +720,25 @@ fn materialize_resolved_enabled_writes_all_features_and_preserves_custom_config(
             proxy_url: Some("http://127.0.0.1:43128".to_string()),
             ..Default::default()
         })),
-        entries: BTreeMap::new(),
+        entries,
         ..Default::default()
     };
 
     features_toml.materialize_resolved_enabled(&features);
 
     let entries = features_toml.entries();
+    assert_eq!(entries.get("custom_extension"), Some(&false));
     for spec in crate::FEATURES {
-        assert_eq!(
-            entries.get(spec.key),
-            Some(&features.enabled(spec.id)),
-            "{}",
-            spec.key
-        );
+        if matches!(spec.stage, Stage::Internal) {
+            assert_eq!(entries.get(spec.key), None, "{}", spec.key);
+        } else {
+            assert_eq!(
+                entries.get(spec.key),
+                Some(&features.enabled(spec.id)),
+                "{}",
+                spec.key
+            );
+        }
     }
     assert_eq!(
         features_toml.multi_agent_v2,
@@ -812,12 +759,11 @@ fn materialize_resolved_enabled_writes_all_features_and_preserves_custom_config(
     let replayed = Features::from_sources(
         FeatureConfigSource {
             features: Some(&features_toml),
-            ..Default::default()
         },
         FeatureConfigSource::default(),
         FeatureOverrides::default(),
     );
-    assert_eq!(replayed.enabled(Feature::ApplyPatchFreeform), false);
+    assert_eq!(replayed.enabled_features(), features.enabled_features());
 }
 
 #[test]
@@ -878,10 +824,10 @@ enable_fanout = true
 }
 
 #[test]
-fn unstable_warning_event_resolves_legacy_aliases_to_canonical_keys() {
-    let (alias, feature) = ("telepathy", Feature::Chronicle);
+fn unstable_warning_event_uses_canonical_keys() {
+    let feature = Feature::CurrentTimeReminder;
     let mut configured_features = Table::new();
-    configured_features.insert(alias.to_string(), TomlValue::Boolean(true));
+    configured_features.insert(feature.key().to_string(), TomlValue::Boolean(true));
 
     let mut features = Features::with_defaults();
     features.enable(feature);
@@ -901,19 +847,6 @@ fn unstable_warning_event_resolves_legacy_aliases_to_canonical_keys() {
         feature.key()
     );
     assert_eq!(message, expected);
-
-    configured_features.insert(feature.key().to_string(), TomlValue::Boolean(true));
-    let warning = unstable_features_warning_event(
-        Some(&configured_features),
-        /*suppress_unstable_features_warning*/ false,
-        &features,
-        "/tmp/config.toml",
-    )
-    .expect("warning event");
-    let EventMsg::Warning(WarningEvent { message }) = warning.msg else {
-        panic!("expected warning event");
-    };
-    assert_eq!(message, expected);
 }
 
 #[test]
@@ -931,4 +864,9 @@ fn known_delta_store_is_enabled_by_default() {
         feature_for_key("known_delta_store"),
         Some(Feature::KnownDeltaStore)
     );
+}
+#[test]
+fn windows_only_feature_catalog_excludes_unix_shell_backends() {
+    assert!(super::feature_for_key("shell_zsh_fork").is_none());
+    assert!(super::feature_for_key("unified_exec_zsh_fork").is_none());
 }

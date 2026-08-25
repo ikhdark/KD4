@@ -15,7 +15,6 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::Span;
 
-use codex_extension_api::ExtensionData;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::protocol::SamplingGenerationId;
 use codex_protocol::protocol::TurnEnvironmentSelection;
@@ -31,7 +30,7 @@ use crate::agent::control::AgentExecutionGuard;
 use crate::session::TurnInputQueue;
 use crate::session::reasoning_governor::ReasoningPolicyRecorder;
 use crate::session::turn_context::TurnContext;
-use crate::tasks::AnySessionTask;
+use crate::tasks::SessionTask;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::TokenUsage;
@@ -86,13 +85,12 @@ pub(crate) enum TaskKind {
 pub(crate) struct RunningTask {
     pub(crate) done: Arc<Notify>,
     pub(crate) kind: TaskKind,
-    pub(crate) task: Arc<dyn AnySessionTask>,
+    pub(crate) task: Arc<dyn SessionTask>,
     pub(crate) cancellation_token: CancellationToken,
     pub(crate) worker_abort_handle: AbortHandle,
     pub(crate) _supervisor_handle: JoinHandle<()>,
     pub(crate) task_span: Span,
     pub(crate) turn_context: Arc<TurnContext>,
-    pub(crate) turn_extension_data: Arc<ExtensionData>,
     pub(crate) _agent_execution_guard: Option<AgentExecutionGuard>,
 }
 

@@ -14,6 +14,7 @@ use std::io;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 use tempfile::tempdir;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -26,6 +27,14 @@ fn test_tracing_subscriber() -> impl tracing::Subscriber + Send + Sync {
 #[test]
 fn exec_defaults_analytics_to_enabled() {
     assert_eq!(DEFAULT_ANALYTICS_ENABLED, true);
+}
+
+#[test]
+fn current_time_response_uses_whole_unix_seconds() {
+    let response = current_time_read_response(UNIX_EPOCH + Duration::from_millis(98_765))
+        .expect("post-epoch time should produce a response");
+
+    assert_eq!(response.current_time_at, 98);
 }
 
 #[derive(Clone)]
@@ -540,7 +549,7 @@ async fn thread_resume_params_only_include_explicit_review_policy_override() {
 }
 
 #[tokio::test]
-async fn build_exec_config_retries_without_invalid_headless_policy_for_auto_review() {
+async fn headless_approval_policy_defers_to_auto_review_in_one_config_build() {
     let codex_home = tempdir().expect("create temp codex home");
     let cwd = tempdir().expect("create temp cwd");
     std::fs::write(
@@ -564,8 +573,8 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
     loader_overrides.system_requirements_path = Some(requirements_path);
     let overrides = ConfigOverrides {
         cwd: Some(cwd.path().to_path_buf()),
-        approval_policy: Some(AskForApproval::Never),
-        sandbox_mode: Some(SandboxMode::DangerFullAccess),
+        headless_approval_policy: Some(AskForApproval::Never),
+        sandbox_mode: Some(SandboxMode::ReadOnly),
         ..Default::default()
     };
     let build_config = |overrides| {
@@ -576,22 +585,9 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
             .build()
     };
 
-    let error = build_config(overrides.clone())
+    let config = build_config(overrides)
         .await
-        .expect_err("synthetic headless approval policy should fail");
-    assert!(
-        error
-            .to_string()
-            .contains("`approval_policy = \"never\"` cannot be used")
-    );
-
-    let config = build_exec_config(
-        overrides,
-        /*preserve_headless_approval_policy*/ false,
-        build_config,
-    )
-    .await
-    .expect("auto-review config should retry without the synthetic approval policy");
+        .expect("auto-review config should ignore the synthetic headless policy");
 
     assert_eq!(
         config.permissions.approval_policy.value(),
@@ -601,28 +597,25 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
 }
 
 #[tokio::test]
-async fn build_exec_config_preserves_headless_error_when_retry_fails() {
-    let overrides = ConfigOverrides {
-        approval_policy: Some(AskForApproval::Never),
-        ..Default::default()
-    };
+async fn headless_approval_policy_applies_for_user_review() {
+    let codex_home = tempdir().expect("create temp codex home");
+    let cwd = tempdir().expect("create temp cwd");
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .harness_overrides(ConfigOverrides {
+            cwd: Some(cwd.path().to_path_buf()),
+            headless_approval_policy: Some(AskForApproval::Never),
+            approvals_reviewer: Some(ApprovalsReviewer::User),
+            ..Default::default()
+        })
+        .build()
+        .await
+        .expect("user-reviewed headless config should apply the headless policy");
 
-    let error = build_exec_config(
-        overrides,
-        /*preserve_headless_approval_policy*/ false,
-        |overrides| async move {
-            let message = if overrides.approval_policy == Some(AskForApproval::Never) {
-                "headless error"
-            } else {
-                "retry error"
-            };
-            Err(std::io::Error::other(message))
-        },
-    )
-    .await
-    .expect_err("failed speculative retry should preserve the original error");
-
-    assert_eq!(error.to_string(), "headless error");
+    assert_eq!(
+        config.permissions.approval_policy.value(),
+        AskForApproval::Never
+    );
 }
 
 #[tokio::test]
@@ -658,11 +651,6 @@ async fn thread_lifecycle_params_preserve_hook_trust_bypass() {
         .build()
         .await
         .expect("build config with hook trust bypass");
-    let expected_config = Some(HashMap::from([(
-        "bypass_hook_trust".to_string(),
-        serde_json::Value::Bool(true),
-    )]));
-
     let start_params = thread_start_params_from_config(&config);
     let resume_params = thread_resume_params_from_config(
         &config,
@@ -670,8 +658,14 @@ async fn thread_lifecycle_params_preserve_hook_trust_bypass() {
         /*approvals_reviewer_override*/ None,
     );
 
-    assert_eq!(start_params.config, expected_config);
-    assert_eq!(resume_params.config, expected_config);
+    assert_eq!(start_params.config, resume_params.config);
+    assert_eq!(
+        start_params
+            .config
+            .as_ref()
+            .and_then(|config| config.get("bypass_hook_trust")),
+        Some(&serde_json::Value::Bool(true))
+    );
 }
 
 #[test]
@@ -850,6 +844,5 @@ fn sample_thread_start_response() -> ThreadStartResponse {
         },
         active_permission_profile: None,
         reasoning_effort: None,
-        multi_agent_mode: Default::default(),
     }
 }

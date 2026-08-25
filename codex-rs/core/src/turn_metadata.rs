@@ -13,7 +13,6 @@ use crate::git_workspace::GitWorkspaceMetadata;
 use crate::git_workspace::GitWorkspaceMetadataSource;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
-use crate::responses_metadata::TurnMetadataWorkspace;
 use crate::responses_metadata::filter_extra_metadata;
 use crate::responses_metadata::subagent_header_value;
 use crate::responses_metadata::subagent_metadata_kind;
@@ -34,41 +33,6 @@ const WORKSPACE_KIND_KEY: &str = "workspace_kind";
 pub(crate) struct McpTurnMetadataContext<'a> {
     pub(crate) model: &'a str,
     pub(crate) reasoning_effort: Option<ReasoningEffortConfig>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct WorkspaceGitMetadata {
-    associated_remote_urls: Option<BTreeMap<String, String>>,
-    latest_git_commit_hash: Option<String>,
-    has_changes: Option<bool>,
-}
-
-impl From<GitWorkspaceMetadata> for WorkspaceGitMetadata {
-    fn from(value: GitWorkspaceMetadata) -> Self {
-        Self {
-            associated_remote_urls: value.associated_remote_urls,
-            latest_git_commit_hash: value.latest_git_commit_hash,
-            has_changes: value.has_changes,
-        }
-    }
-}
-
-impl WorkspaceGitMetadata {
-    fn is_empty(&self) -> bool {
-        self.associated_remote_urls.is_none()
-            && self.latest_git_commit_hash.is_none()
-            && self.has_changes.is_none()
-    }
-}
-
-impl From<WorkspaceGitMetadata> for TurnMetadataWorkspace {
-    fn from(value: WorkspaceGitMetadata) -> Self {
-        Self {
-            associated_remote_urls: value.associated_remote_urls,
-            latest_git_commit_hash: value.latest_git_commit_hash,
-            has_changes: value.has_changes,
-        }
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -103,7 +67,7 @@ pub(crate) struct TurnMetadataState {
     thread_source: Option<ThreadSource>,
     turn_id: String,
     sandbox: Option<String>,
-    enriched_workspaces: Arc<RwLock<Option<BTreeMap<String, TurnMetadataWorkspace>>>>,
+    enriched_workspaces: Arc<RwLock<Option<BTreeMap<String, GitWorkspaceMetadata>>>>,
     turn_started_at_unix_ms: Arc<RwLock<Option<i64>>>,
     responsesapi_client_metadata: Arc<RwLock<BTreeMap<String, String>>>,
     user_input_requested_during_turn: Arc<AtomicBool>,
@@ -292,7 +256,7 @@ impl TurnMetadataState {
         }
     }
 
-    fn current_workspaces(&self) -> BTreeMap<String, TurnMetadataWorkspace> {
+    fn current_workspaces(&self) -> BTreeMap<String, GitWorkspaceMetadata> {
         self.enriched_workspaces
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -339,7 +303,7 @@ impl TurnMetadataState {
             }
 
             let mut workspaces = BTreeMap::new();
-            workspaces.insert(repo_root, workspace_git_metadata.into());
+            workspaces.insert(repo_root, workspace_git_metadata);
             *state
                 .enriched_workspaces
                 .write()
@@ -357,23 +321,23 @@ impl TurnMetadataState {
         }
     }
 
-    async fn fetch_workspace_git_metadata(&self) -> WorkspaceGitMetadata {
+    async fn fetch_workspace_git_metadata(&self) -> GitWorkspaceMetadata {
         match self.git_metadata_source.as_ref() {
-            Some(source) => source.metadata().await.into(),
-            None => WorkspaceGitMetadata::default(),
+            Some(source) => source.metadata().await,
+            None => GitWorkspaceMetadata::default(),
         }
     }
 }
 
-async fn memory_workspaces(cwd: &AbsolutePathBuf) -> BTreeMap<String, TurnMetadataWorkspace> {
+async fn memory_workspaces(cwd: &AbsolutePathBuf) -> BTreeMap<String, GitWorkspaceMetadata> {
     let Some(source) = GitWorkspaceMetadataSource::discover_local(cwd.clone()) else {
         return BTreeMap::new();
     };
     let repo_root = source.repo_root().to_string_lossy().into_owned();
-    let workspace_git_metadata: WorkspaceGitMetadata = source.metadata().await.into();
+    let workspace_git_metadata = source.metadata().await;
     let mut workspaces = BTreeMap::new();
     if !workspace_git_metadata.is_empty() {
-        workspaces.insert(repo_root, workspace_git_metadata.into());
+        workspaces.insert(repo_root, workspace_git_metadata);
     }
     workspaces
 }

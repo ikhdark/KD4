@@ -19,11 +19,30 @@ use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
 use codex_rollout::ARCHIVED_SESSIONS_SUBDIR;
 use codex_rollout::ThreadItem;
+use codex_rollout::find_archived_thread_path_by_id_str;
+use codex_rollout::find_thread_path_by_id_str;
 use codex_state::ThreadMetadata;
 
+use super::LocalThreadStore;
+use super::live_writer;
 use crate::StoredThread;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
+
+pub(super) fn rollout_lookup_error(
+    thread_id: ThreadId,
+    archived: bool,
+    err: std::io::Error,
+) -> ThreadStoreError {
+    let thread_kind = if archived {
+        "archived thread"
+    } else {
+        "thread"
+    };
+    ThreadStoreError::Internal {
+        message: format!("failed to locate {thread_kind} id {thread_id}: {err}"),
+    }
+}
 
 pub(super) fn scoped_rollout_path(
     root: PathBuf,
@@ -61,6 +80,64 @@ pub(super) fn rollout_path_is_archived(codex_home: &Path, path: &Path) -> bool {
         || path
             .components()
             .any(|component| component.as_os_str() == OsStr::new(ARCHIVED_SESSIONS_SUBDIR))
+}
+
+pub(super) struct ResolvedRolloutPath {
+    pub(super) path: PathBuf,
+    pub(super) archived: bool,
+}
+
+/// Resolve a thread id through the live writer, active rollouts, and finally
+/// archived rollouts. This is the single owner of that precedence policy.
+pub(super) async fn resolve_rollout_path(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    include_archived: bool,
+    require_materialized: bool,
+) -> ThreadStoreResult<Option<ResolvedRolloutPath>> {
+    if let Ok(path) = live_writer::rollout_path(store, thread_id).await {
+        let archived = rollout_path_is_archived(store.config.codex_home.as_path(), path.as_path());
+        let materialized = !require_materialized
+            || codex_rollout::existing_rollout_path(path.as_path())
+                .await
+                .is_some();
+        if materialized && (include_archived || !archived) {
+            return Ok(Some(ResolvedRolloutPath { path, archived }));
+        }
+    }
+
+    let state_db_ctx = store.state_db().await;
+    if let Some(path) = find_thread_path_by_id_str(
+        store.config.codex_home.as_path(),
+        &thread_id.to_string(),
+        state_db_ctx.as_deref(),
+    )
+    .await
+    .map_err(|err| rollout_lookup_error(thread_id, /*archived*/ false, err))?
+    {
+        return Ok(Some(ResolvedRolloutPath {
+            path,
+            archived: false,
+        }));
+    }
+
+    if !include_archived {
+        return Ok(None);
+    }
+
+    find_archived_thread_path_by_id_str(
+        store.config.codex_home.as_path(),
+        &thread_id.to_string(),
+        state_db_ctx.as_deref(),
+    )
+    .await
+    .map_err(|err| rollout_lookup_error(thread_id, /*archived*/ true, err))
+    .map(|path| {
+        path.map(|path| ResolvedRolloutPath {
+            path,
+            archived: true,
+        })
+    })
 }
 
 pub(super) fn matching_rollout_file_name(
@@ -269,6 +346,25 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    #[test]
+    fn rollout_lookup_failures_are_internal_store_errors() {
+        let thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000401").expect("valid thread id");
+        let err = rollout_lookup_error(
+            thread_id,
+            /*archived*/ true,
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "index unavailable"),
+        );
+
+        assert!(matches!(
+            err,
+            ThreadStoreError::Internal { message }
+                if message == format!(
+                    "failed to locate archived thread id {thread_id}: index unavailable"
+                )
+        ));
+    }
 
     #[test]
     fn stored_thread_from_rollout_item_returns_logical_rollout_path() {

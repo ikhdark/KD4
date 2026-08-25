@@ -31,7 +31,7 @@ impl CodexImagesBackend {
             .await
             .map_err(|err| err.to_string())?;
         Ok(ImagesClient::new(
-            ReqwestTransport::from_http_client(create_client()),
+            ReqwestTransport::from_http_client(create_client().map_err(|err| err.to_string())?),
             provider,
             auth,
         ))

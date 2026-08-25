@@ -4,6 +4,8 @@ use crate::session::InputQueueActivity;
 use crate::session::session::Session;
 use crate::tools::handlers::multi_agents_spec::WaitAgentTimeoutOptions;
 use crate::tools::handlers::multi_agents_spec::create_wait_agent_tool_v1;
+use codex_features::MULTI_AGENT_MAX_WAIT_TIMEOUT_MS;
+use codex_features::MULTI_AGENT_MIN_WAIT_TIMEOUT_MS;
 use codex_protocol::error::CodexErr;
 use codex_tools::ToolSpec;
 use futures::FutureExt;
@@ -55,12 +57,13 @@ impl Handler {
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let ToolInvocation {
             session,
-            turn,
+            step_context,
             payload,
             call_id,
             cancellation_token,
             ..
         } = invocation;
+        let turn = Arc::clone(&step_context.turn);
         let arguments = function_arguments(payload)?;
         let args: WaitArgs = parse_arguments(&arguments)?;
         let mut receiver_thread_ids = parse_agent_id_targets(args.targets)?;
@@ -90,12 +93,15 @@ impl Handler {
         }
 
         let timeout_ms = match args.timeout_ms {
-            Some(ms) if ms < MIN_WAIT_TIMEOUT_MS => {
+            Some(ms) if ms < MULTI_AGENT_MIN_WAIT_TIMEOUT_MS => {
                 return Err(FunctionCallError::RespondToModel(
                     "Omit timeout_ms for the normal wait. wait_agent returns immediately when a target has already completed.".to_owned(),
                 ));
             }
-            Some(ms) => Some(ms.clamp(MIN_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS)),
+            Some(ms) => Some(ms.clamp(
+                MULTI_AGENT_MIN_WAIT_TIMEOUT_MS,
+                MULTI_AGENT_MAX_WAIT_TIMEOUT_MS,
+            )),
             None => None,
         };
 

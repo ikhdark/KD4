@@ -902,7 +902,6 @@ impl App {
         true
     }
 
-    #[cfg(target_os = "windows")]
     pub(super) async fn sync_windows_sandbox_after_overridden_write(
         &mut self,
         app_server: &mut AppServerSession,
@@ -931,7 +930,6 @@ impl App {
     }
 
     fn propagate_windows_sandbox_turn_context(&self) {
-        #[cfg(target_os = "windows")]
         {
             let windows_sandbox_level = crate::windows_sandbox::level_from_config(&self.config);
             self.app_event_tx
@@ -1009,7 +1007,6 @@ fn features_toml_from_json(value: &serde_json::Value) -> Option<FeaturesToml> {
     serde_json::from_value(value.clone()).ok()
 }
 
-#[cfg(target_os = "windows")]
 fn windows_sandbox_mode_from_effective_config(
     effective_config: &ConfigReadResponse,
 ) -> Option<codex_config::types::WindowsSandboxModeToml> {
@@ -1021,7 +1018,6 @@ fn windows_sandbox_mode_from_effective_config(
     root_windows.and_then(|windows| windows.sandbox)
 }
 
-#[cfg(target_os = "windows")]
 fn windows_toml_from_json(value: &serde_json::Value) -> Option<WindowsToml> {
     serde_json::from_value(value.clone()).ok()
 }

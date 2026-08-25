@@ -131,6 +131,7 @@ impl ChatWidget {
             self.plan_stream_controller = Some(PlanStreamController::new(
                 self.current_stream_width(/*reserved_cols*/ 4),
                 &self.config.cwd,
+                self.config.file_opener,
                 self.history_render_mode(),
             ));
         }
@@ -189,7 +190,11 @@ impl ChatWidget {
                     .send(AppEvent::ConsolidateProposedPlan(source));
             }
         } else if !plan_text.is_empty() {
-            self.add_to_history(history_cell::new_proposed_plan(plan_text, &self.config.cwd));
+            self.add_to_history(history_cell::new_proposed_plan_with_file_opener(
+                plan_text,
+                &self.config.cwd,
+                self.config.file_opener,
+            ));
         } else if let Some(source) = consolidated_plan_source {
             self.note_stream_consolidation_queued();
             self.app_event_tx
@@ -415,6 +420,7 @@ impl ChatWidget {
             self.stream_controller = Some(StreamController::new(
                 self.current_stream_width(/*reserved_cols*/ 2),
                 &self.config.cwd,
+                self.config.file_opener,
                 self.history_render_mode(),
             ));
         }

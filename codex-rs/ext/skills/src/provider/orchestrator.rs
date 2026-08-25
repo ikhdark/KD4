@@ -13,13 +13,11 @@ use crate::catalog::SkillPackageId;
 use crate::catalog::SkillProviderError;
 use crate::catalog::SkillReadResult;
 use crate::catalog::SkillResourceId;
-use crate::catalog::SkillSearchResult;
 use crate::catalog::SkillSourceKind;
 use crate::provider::SkillListQuery;
 use crate::provider::SkillProvider;
 use crate::provider::SkillProviderFuture;
 use crate::provider::SkillReadRequest;
-use crate::provider::SkillSearchRequest;
 
 const ORCHESTRATOR_SKILL_MIME_TYPE: &str = "mcp/skill";
 const ORCHESTRATOR_SKILL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -212,10 +210,6 @@ impl SkillProvider for OrchestratorSkillProvider {
                 contents,
             })
         })
-    }
-
-    fn search(&self, _request: SkillSearchRequest) -> SkillProviderFuture<'_, SkillSearchResult> {
-        Box::pin(async { Ok(SkillSearchResult::default()) })
     }
 }
 

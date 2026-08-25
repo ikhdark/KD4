@@ -22,6 +22,7 @@ use crate::client::X_CODEX_PARENT_THREAD_ID_HEADER;
 use crate::client::X_CODEX_TURN_METADATA_HEADER;
 use crate::client::X_CODEX_WINDOW_ID_HEADER;
 use crate::client::X_OPENAI_SUBAGENT_HEADER;
+use crate::git_workspace::GitWorkspaceMetadata;
 
 pub(crate) const INSTALLATION_ID_KEY: &str = "installation_id";
 pub(crate) const SESSION_ID_KEY: &str = "session_id";
@@ -134,16 +135,6 @@ impl CodexResponsesRequestKind {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Default)]
-pub(crate) struct TurnMetadataWorkspace {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) associated_remote_urls: Option<BTreeMap<String, String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) latest_git_commit_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) has_changes: Option<bool>,
-}
-
 /// Caller-owned snapshot of Codex metadata sent to ResponsesAPI.
 ///
 /// The full Codex turn metadata blob is transported canonically as
@@ -164,7 +155,7 @@ pub struct CodexResponsesMetadata {
     pub(crate) subagent_kind: Option<String>,
     pub(crate) thread_source: Option<ThreadSource>,
     pub(crate) sandbox: Option<String>,
-    pub(crate) workspaces: BTreeMap<String, TurnMetadataWorkspace>,
+    pub(crate) workspaces: BTreeMap<String, GitWorkspaceMetadata>,
     pub(crate) turn_started_at_unix_ms: Option<i64>,
     pub(crate) extra: BTreeMap<String, String>,
 }
@@ -350,8 +341,8 @@ pub(crate) fn filter_extra_metadata(extra: HashMap<String, String>) -> BTreeMap<
 }
 
 fn non_empty_workspaces(
-    workspaces: &BTreeMap<String, TurnMetadataWorkspace>,
-) -> Option<&BTreeMap<String, TurnMetadataWorkspace>> {
+    workspaces: &BTreeMap<String, GitWorkspaceMetadata>,
+) -> Option<&BTreeMap<String, GitWorkspaceMetadata>> {
     (!workspaces.is_empty()).then_some(workspaces)
 }
 
@@ -380,7 +371,7 @@ struct CodexTurnMetadataPayload<'a> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sandbox: Option<&'a str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    workspaces: Option<&'a BTreeMap<String, TurnMetadataWorkspace>>,
+    workspaces: Option<&'a BTreeMap<String, GitWorkspaceMetadata>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     turn_started_at_unix_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

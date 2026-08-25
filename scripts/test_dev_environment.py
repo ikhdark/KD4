@@ -2,19 +2,21 @@
 
 import contextlib
 import io
-from pathlib import Path, PurePosixPath
 import os
 import subprocess
 import tempfile
 import unittest
+from pathlib import Path, PureWindowsPath
 from unittest import mock
 
-from scripts import app_server_schema_runtime_check
-from scripts import config_schema_check
-from scripts import dev_env_doctor
-from scripts import generated_output_lock
-from scripts import git_doctor
-from scripts import vscode_runtime_proof
+from scripts import (
+    app_server_schema_runtime_check,
+    config_schema_check,
+    dev_env_doctor,
+    generated_output_lock,
+    git_doctor,
+    vscode_runtime_proof,
+)
 
 
 class DevEnvironmentDoctorTest(unittest.TestCase):
@@ -138,35 +140,11 @@ class DevEnvironmentDoctorTest(unittest.TestCase):
 
 
 class GitDoctorTest(unittest.TestCase):
-    def test_path_kind_detects_wsl_windows_mount(self) -> None:
-        with (
-            mock.patch.object(git_doctor.os, "name", "posix"),
-            mock.patch.dict(git_doctor.os.environ, {}, clear=True),
-            mock.patch.object(
-                git_doctor.platform,
-                "uname",
-                return_value=mock.Mock(release="5.15.90.1-microsoft-standard-WSL2"),
-            ),
-        ):
-            self.assertEqual(
-                git_doctor.path_kind(PurePosixPath("/mnt/c/Users/kuh/repo")),
-                "wsl-windows-mount",
-            )
-
-    def test_path_kind_does_not_treat_plain_linux_mnt_as_wsl(self) -> None:
-        with (
-            mock.patch.object(git_doctor.os, "name", "posix"),
-            mock.patch.dict(git_doctor.os.environ, {}, clear=True),
-            mock.patch.object(
-                git_doctor.platform,
-                "uname",
-                return_value=mock.Mock(release="6.8.0-generic"),
-            ),
-            mock.patch.object(git_doctor.platform, "system", return_value="Linux"),
-        ):
-            self.assertEqual(
-                git_doctor.path_kind(PurePosixPath("/mnt/data/repo")), "linux"
-            )
+    def test_path_kind_is_windows(self) -> None:
+        self.assertEqual(
+            git_doctor.path_kind(PureWindowsPath(r"C:\Users\kuh\repo")),
+            "windows",
+        )
 
     def test_recommendations_include_git_tuning_when_unset(self) -> None:
         recs = "\n".join(git_doctor.recommendations("windows", None, None))
@@ -176,7 +154,7 @@ class GitDoctorTest(unittest.TestCase):
     def test_recommendations_accept_fsmonitor_hook_path(self) -> None:
         recs = "\n".join(
             git_doctor.recommendations(
-                "linux", "/usr/libexec/git-core/query-watchman", "true"
+                "windows", r"C:\Program Files\Git\query-watchman.exe", "true"
             )
         )
         self.assertNotIn("core.fsmonitor", recs)
@@ -227,10 +205,9 @@ class VscodeRuntimeProofTest(unittest.TestCase):
             {"CODEX_LOCAL_PUBLISH_DIR": "C:/tmp/local"},
             clear=False,
         ):
-            binary = "codex.exe" if os.name == "nt" else "codex"
             self.assertEqual(
                 vscode_runtime_proof.desktop_target().replace("\\", "/"),
-                f"C:/tmp/local/{binary}",
+                "C:/tmp/local/codex.exe",
             )
 
     def test_extension_candidates_are_sorted_and_bounded(self) -> None:
@@ -317,30 +294,11 @@ class ConfigSchemaCheckTest(unittest.TestCase):
         )
         self.assertNotIn("Traceback", stderr.getvalue())
 
-    def test_config_schema_auto_is_check_only_after_failure(self) -> None:
-        with (
-            mock.patch.object(
-                config_schema_check, "repo_root", return_value=Path("/repo")
-            ),
-            mock.patch.object(
-                config_schema_check, "schema_inputs_changed", return_value=False
-            ),
-            mock.patch.object(
-                config_schema_check, "run_protocol_check", return_value=1
-            ) as run_check,
-            mock.patch.object(
-                config_schema_check, "regenerate_schema", return_value=True
-            ) as regenerate,
-            mock.patch.object(
-                config_schema_check,
-                "generated_output_lock",
-                return_value=contextlib.nullcontext(),
-            ),
-        ):
-            self.assertEqual(config_schema_check.main(["--mode", "auto"]), 1)
+    def test_config_schema_rejects_removed_auto_mode(self) -> None:
+        with self.assertRaises(SystemExit) as raised:
+            config_schema_check.main(["--mode", "auto"])
 
-        regenerate.assert_not_called()
-        run_check.assert_called_once_with(Path("/repo"))
+        self.assertEqual(raised.exception.code, 2)
 
     def test_config_schema_force_routes_the_generation_owner(self) -> None:
         with (
@@ -533,38 +491,11 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
             ["--experimental"],
         )
 
-    def test_auto_is_check_only_after_failure(self) -> None:
-        with (
-            mock.patch.object(
-                app_server_schema_runtime_check, "repo_root", return_value=Path("/repo")
-            ),
-            mock.patch.object(
-                app_server_schema_runtime_check,
-                "schema_inputs_changed",
-                return_value=False,
-            ),
-            mock.patch.object(
-                app_server_schema_runtime_check,
-                "run_protocol_check",
-                return_value=1,
-            ) as run_check,
-            mock.patch.object(
-                app_server_schema_runtime_check,
-                "regenerate_schemas",
-                return_value=True,
-            ) as regenerate,
-            mock.patch.object(
-                app_server_schema_runtime_check,
-                "generated_output_lock",
-                return_value=contextlib.nullcontext(),
-            ),
-        ):
-            self.assertEqual(
-                app_server_schema_runtime_check.main(["--mode", "auto"]), 1
-            )
+    def test_app_server_schema_rejects_removed_auto_mode(self) -> None:
+        with self.assertRaises(SystemExit) as raised:
+            app_server_schema_runtime_check.main(["--mode", "auto"])
 
-        regenerate.assert_not_called()
-        run_check.assert_called_once_with(Path("/repo"))
+        self.assertEqual(raised.exception.code, 2)
 
 
 if __name__ == "__main__":

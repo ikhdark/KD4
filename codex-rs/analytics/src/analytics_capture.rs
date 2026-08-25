@@ -25,10 +25,6 @@ pub(crate) fn append_payload(path: &Path, payload: &TrackEventsRequest) -> io::R
 fn open_capture_file(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
+
     options.open(path)
 }

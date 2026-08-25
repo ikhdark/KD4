@@ -126,16 +126,7 @@ fn analytics_destination_uses_explicit_capture_file() {
         fs::read_to_string(&capture_path).expect("read capture file"),
         ""
     );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
 
-        let mode = fs::metadata(&capture_path)
-            .expect("read capture file metadata")
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o600);
-    }
     fs::remove_file(capture_path).expect("remove capture file");
 }
 
@@ -316,7 +307,6 @@ fn sample_thread_start_response() -> ClientResponsePayload {
         sandbox: AppServerSandboxPolicy::DangerFullAccess,
         active_permission_profile: None,
         reasoning_effort: None,
-        multi_agent_mode: Default::default(),
     })
 }
 
@@ -334,7 +324,6 @@ fn sample_thread_resume_response() -> ClientResponsePayload {
         sandbox: AppServerSandboxPolicy::DangerFullAccess,
         active_permission_profile: None,
         reasoning_effort: None,
-        multi_agent_mode: Default::default(),
         initial_turns_page: None,
     })
 }
@@ -353,7 +342,6 @@ fn sample_thread_fork_response() -> ClientResponsePayload {
         sandbox: AppServerSandboxPolicy::DangerFullAccess,
         active_permission_profile: None,
         reasoning_effort: None,
-        multi_agent_mode: Default::default(),
     })
 }
 

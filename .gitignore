@@ -45,6 +45,7 @@ AGENTS.override.md
 .jest/
 *.tsbuildinfo
 /target/
+*.pdb
 
 # logs
 *.log
@@ -77,7 +78,6 @@ personal/
 /task-evidence/
 /WORKTREE_REVIEW.txt
 .codex/harness/runs/
-.codex/evals/investigation/
 .codex/locks/
 
 # os
@@ -104,4 +104,3 @@ __pycache__/
 *.pyc
 
 # Local phase-effort benchmark scratch crates and Cargo outputs.
-/.codex/evals/phase-effort-benchmark/*/work/

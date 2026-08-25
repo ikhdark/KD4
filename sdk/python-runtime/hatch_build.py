@@ -4,6 +4,8 @@ import os
 
 from hatchling.builders.hooks.plugin.interface import BuildHookInterface
 
+WINDOWS_PLATFORM_TAGS = frozenset({"win_amd64", "win_arm64"})
+
 
 def _platform_tag() -> str:
     from packaging.tags import sys_tags
@@ -24,6 +26,11 @@ class RuntimeBuildHook(BuildHookInterface):
         )
         if not isinstance(platform_tag, str) or not platform_tag:
             platform_tag = _platform_tag()
+        if platform_tag not in WINDOWS_PLATFORM_TAGS:
+            raise RuntimeError(
+                "openai-codex-cli-bin is Windows-only; "
+                f"unsupported wheel platform tag: {platform_tag}"
+            )
 
         build_data["pure_python"] = False
         build_data["infer_tag"] = False

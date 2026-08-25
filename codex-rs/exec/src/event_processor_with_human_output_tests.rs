@@ -21,7 +21,6 @@ use pretty_assertions::assert_eq;
 
 use super::EventProcessorWithHumanOutput;
 use super::config_summary_entries;
-use super::final_message_from_turn_items;
 use super::reasoning_text;
 use super::should_print_final_message_to_stdout;
 use super::should_print_final_message_to_tty;
@@ -238,51 +237,6 @@ async fn config_summary_entries_include_runtime_workspace_roots() {
             && sandbox_summary.contains(&expected_extra_root_name),
         "expected runtime workspace root in sandbox summary: {summary_entries:?}"
     );
-}
-
-#[test]
-fn final_message_from_turn_items_uses_latest_agent_message() {
-    let message = final_message_from_turn_items(&[
-        ThreadItem::AgentMessage {
-            id: "msg-1".to_string(),
-            text: "first".to_string(),
-            phase: None,
-            memory_citation: None,
-        },
-        ThreadItem::Plan {
-            id: "plan-1".to_string(),
-            text: "plan".to_string(),
-        },
-        ThreadItem::AgentMessage {
-            id: "msg-2".to_string(),
-            text: "second".to_string(),
-            phase: None,
-            memory_citation: None,
-        },
-    ]);
-
-    assert_eq!(message.as_deref(), Some("second"));
-}
-
-#[test]
-fn final_message_from_turn_items_falls_back_to_latest_plan() {
-    let message = final_message_from_turn_items(&[
-        ThreadItem::Reasoning {
-            id: "reasoning-1".to_string(),
-            summary: vec!["inspect".to_string()],
-            content: Vec::new(),
-        },
-        ThreadItem::Plan {
-            id: "plan-1".to_string(),
-            text: "first plan".to_string(),
-        },
-        ThreadItem::Plan {
-            id: "plan-2".to_string(),
-            text: "final plan".to_string(),
-        },
-    ]);
-
-    assert_eq!(message.as_deref(), Some("final plan"));
 }
 
 #[test]

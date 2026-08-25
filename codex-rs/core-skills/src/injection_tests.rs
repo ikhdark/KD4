@@ -1,4 +1,5 @@
 use super::*;
+use codex_context_fragments::ContextualUserFragment;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::test_support::PathBufExt;
 use codex_utils_absolute_path::test_support::test_path_buf;
@@ -24,6 +25,18 @@ fn set<'a>(items: &'a [&'a str]) -> HashSet<&'a str> {
     items.iter().copied().collect()
 }
 
+#[test]
+fn mention_name_predicates_share_namespaced_ascii_grammar() {
+    for byte in 0_u8..=u8::MAX {
+        assert_eq!(
+            is_mention_name_char(byte),
+            is_mention_name_char_char(char::from(byte)),
+            "byte {byte:#04x}"
+        );
+    }
+    assert!(is_mention_name_char_char(':'));
+}
+
 fn assert_mentions(text: &str, expected_names: &[&str], expected_paths: &[&str]) {
     let mentions = extract_tool_mentions(text);
     assert_eq!(mentions.names, set(expected_names));
@@ -32,6 +45,22 @@ fn assert_mentions(text: &str, expected_names: &[&str], expected_paths: &[&str])
 
 fn linked_skill_mention(name: &str, unix_path: &str) -> String {
     format!("[${name}]({})", test_path_buf(unix_path).display())
+}
+
+#[test]
+fn skill_injection_renders_as_the_context_fragment() {
+    let skill = SkillInjection {
+        name: "review".to_string(),
+        path: "/tmp/review/SKILL.md".to_string(),
+        contents: "Keep review comments concise.".to_string(),
+    };
+
+    assert_eq!(skill.role(), "user");
+    assert_eq!(skill.markers(), ("<skill>", "</skill>"));
+    assert_eq!(
+        skill.body(),
+        "\n<name>review</name>\n<path>/tmp/review/SKILL.md</path>\nKeep review comments concise.\n"
+    );
 }
 
 fn collect_mentions(
@@ -90,6 +119,18 @@ fn extract_tool_mentions_handles_plain_and_linked_mentions() {
         "use $alpha and [$beta](/tmp/beta)",
         &["alpha", "beta"],
         &["/tmp/beta"],
+    );
+}
+
+#[test]
+fn extract_tool_mentions_preserves_first_linked_path_per_name() {
+    let mentions = extract_tool_mentions(
+        "use [$alpha](skill:///tmp/alpha/SKILL.md) then [$alpha](app://alpha)",
+    );
+
+    assert_eq!(
+        mentions.linked_paths().collect::<Vec<_>>(),
+        vec![("alpha", "skill:///tmp/alpha/SKILL.md")]
     );
 }
 

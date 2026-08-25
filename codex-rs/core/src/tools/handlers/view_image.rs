@@ -10,9 +10,9 @@ use codex_protocol::openai_models::InputModality;
 use codex_utils_image::MAX_PROMPT_IMAGE_SOURCE_BYTES;
 use codex_utils_image::data_url_from_bytes;
 use serde::Deserialize;
+use std::sync::Arc;
 
-use crate::function_tool::FunctionCallError;
-use crate::original_image_detail::can_request_original_image_detail;
+use crate::FunctionCallError;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
@@ -27,6 +27,7 @@ use codex_tools::ToolName;
 use codex_tools::ToolSearchInfo;
 use codex_tools::ToolSearchSourceInfo;
 use codex_tools::ToolSpec;
+use codex_tools::can_request_original_image_detail;
 
 pub struct ViewImageHandler {
     options: ViewImageToolOptions,
@@ -102,6 +103,7 @@ impl ViewImageHandler {
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         if !invocation
+            .step_context
             .turn
             .model_info
             .input_modalities
@@ -114,12 +116,12 @@ impl ViewImageHandler {
 
         let ToolInvocation {
             session,
-            turn,
             step_context,
             payload,
             call_id,
             ..
         } = invocation;
+        let turn = Arc::clone(&step_context.turn);
 
         let arguments = match payload {
             ToolPayload::Function { arguments } => arguments,
@@ -348,7 +350,6 @@ mod tests {
             .handle(ToolInvocation {
                 session: Arc::new(session),
                 step_context: StepContext::for_test(Arc::clone(&turn)),
-                turn,
                 cancellation_token: tokio_util::sync::CancellationToken::new(),
                 tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
                 call_id: "call-view-image".to_string(),
@@ -378,7 +379,6 @@ mod tests {
             .handle(ToolInvocation {
                 session: Arc::new(session),
                 step_context: StepContext::for_test(Arc::clone(&turn)),
-                turn,
                 cancellation_token: tokio_util::sync::CancellationToken::new(),
                 tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
                 call_id: "call-view-image".to_string(),
@@ -415,7 +415,6 @@ mod tests {
             .handle(ToolInvocation {
                 session: Arc::new(session),
                 step_context: StepContext::for_test(Arc::clone(&turn)),
-                turn,
                 cancellation_token: tokio_util::sync::CancellationToken::new(),
                 tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
                 call_id: "call-view-image".to_string(),
@@ -448,7 +447,6 @@ mod tests {
             .handle(ToolInvocation {
                 session: Arc::new(session),
                 step_context: StepContext::for_test(Arc::clone(&turn)),
-                turn,
                 cancellation_token: tokio_util::sync::CancellationToken::new(),
                 tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
                 call_id: "call-view-image".to_string(),

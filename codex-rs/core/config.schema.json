@@ -384,441 +384,6 @@
       },
       "type": "object"
     },
-    "ConfigProfile": {
-      "additionalProperties": false,
-      "description": "Collection of common configuration options that a user can define as a unit in `config.toml`.",
-      "properties": {
-        "analytics": {
-          "$ref": "#/definitions/AnalyticsConfigToml"
-        },
-        "approval_policy": {
-          "$ref": "#/definitions/AskForApproval"
-        },
-        "approvals_reviewer": {
-          "$ref": "#/definitions/ApprovalsReviewer"
-        },
-        "chatgpt_base_url": {
-          "type": "string"
-        },
-        "experimental_compact_prompt_file": {
-          "$ref": "#/definitions/AbsolutePathBuf"
-        },
-        "experimental_use_unified_exec_tool": {
-          "type": "boolean"
-        },
-        "features": {
-          "additionalProperties": false,
-          "default": null,
-          "description": "Optional feature toggles scoped to this profile.",
-          "properties": {
-            "apply_patch_freeform": {
-              "type": "boolean"
-            },
-            "apply_patch_streaming_events": {
-              "type": "boolean"
-            },
-            "apps": {
-              "type": "boolean"
-            },
-            "apps_mcp_path_override": {
-              "anyOf": [
-                {
-                  "type": "boolean"
-                },
-                {
-                  "additionalProperties": false,
-                  "properties": {
-                    "enabled": {
-                      "type": "boolean"
-                    },
-                    "path": {
-                      "type": "string"
-                    }
-                  },
-                  "type": "object"
-                }
-              ]
-            },
-            "auth_elicitation": {
-              "type": "boolean"
-            },
-            "browser_use": {
-              "type": "boolean"
-            },
-            "browser_use_external": {
-              "type": "boolean"
-            },
-            "browser_use_full_cdp_access": {
-              "type": "boolean"
-            },
-            "chronicle": {
-              "type": "boolean"
-            },
-            "code_mode": {
-              "$ref": "#/definitions/FeatureToml_for_CodeModeConfigToml"
-            },
-            "code_mode_host": {
-              "type": "boolean"
-            },
-            "code_mode_only": {
-              "type": "boolean"
-            },
-            "codex_git_commit": {
-              "type": "boolean"
-            },
-            "codex_hooks": {
-              "type": "boolean"
-            },
-            "collab": {
-              "type": "boolean"
-            },
-            "collaboration_modes": {
-              "type": "boolean"
-            },
-            "computer_use": {
-              "type": "boolean"
-            },
-            "concurrent_reasoning_summaries": {
-              "type": "boolean"
-            },
-            "connectors": {
-              "type": "boolean"
-            },
-            "current_time_reminder": {
-              "$ref": "#/definitions/FeatureToml_for_CurrentTimeReminderConfigToml"
-            },
-            "default_mode_request_user_input": {
-              "type": "boolean"
-            },
-            "deferred_executor": {
-              "type": "boolean"
-            },
-            "elevated_windows_sandbox": {
-              "type": "boolean"
-            },
-            "enable_experimental_windows_sandbox": {
-              "type": "boolean"
-            },
-            "enable_fanout": {
-              "type": "boolean"
-            },
-            "enable_mcp_apps": {
-              "type": "boolean"
-            },
-            "enable_request_compression": {
-              "type": "boolean"
-            },
-            "exec_permission_approvals": {
-              "type": "boolean"
-            },
-            "experimental_use_unified_exec_tool": {
-              "type": "boolean"
-            },
-            "experimental_windows_sandbox": {
-              "type": "boolean"
-            },
-            "external_migration": {
-              "type": "boolean"
-            },
-            "fast_mode": {
-              "type": "boolean"
-            },
-            "goals": {
-              "type": "boolean"
-            },
-            "guardian_approval": {
-              "type": "boolean"
-            },
-            "hooks": {
-              "type": "boolean"
-            },
-            "image_detail_original": {
-              "type": "boolean"
-            },
-            "image_generation": {
-              "type": "boolean"
-            },
-            "imagegenext": {
-              "type": "boolean"
-            },
-            "in_app_browser": {
-              "type": "boolean"
-            },
-            "item_ids": {
-              "type": "boolean"
-            },
-            "js_repl": {
-              "type": "boolean"
-            },
-            "js_repl_tools_only": {
-              "type": "boolean"
-            },
-            "known_delta_store": {
-              "type": "boolean"
-            },
-            "local_thread_store_compression": {
-              "type": "boolean"
-            },
-            "memories": {
-              "type": "boolean"
-            },
-            "memory_tool": {
-              "type": "boolean"
-            },
-            "mentions_v2": {
-              "type": "boolean"
-            },
-            "multi_agent": {
-              "type": "boolean"
-            },
-            "multi_agent_mode": {
-              "type": "boolean"
-            },
-            "multi_agent_v2": {
-              "$ref": "#/definitions/FeatureToml_for_MultiAgentV2ConfigToml"
-            },
-            "network_proxy": {
-              "$ref": "#/definitions/FeatureToml_for_NetworkProxyConfigToml"
-            },
-            "non_prefixed_mcp_tool_names": {
-              "type": "boolean"
-            },
-            "personality": {
-              "type": "boolean"
-            },
-            "plugin_hooks": {
-              "type": "boolean"
-            },
-            "plugin_sharing": {
-              "type": "boolean"
-            },
-            "plugins": {
-              "type": "boolean"
-            },
-            "prevent_idle_sleep": {
-              "type": "boolean"
-            },
-            "realtime_conversation": {
-              "type": "boolean"
-            },
-            "remote_compaction_v2": {
-              "type": "boolean"
-            },
-            "remote_control": {
-              "type": "boolean"
-            },
-            "remote_models": {
-              "type": "boolean"
-            },
-            "remote_plugin": {
-              "type": "boolean"
-            },
-            "request_permissions": {
-              "type": "boolean"
-            },
-            "request_permissions_tool": {
-              "type": "boolean"
-            },
-            "request_rule": {
-              "type": "boolean"
-            },
-            "resize_all_images": {
-              "type": "boolean"
-            },
-            "respect_system_proxy": {
-              "type": "boolean"
-            },
-            "responses_websockets": {
-              "type": "boolean"
-            },
-            "responses_websockets_v2": {
-              "type": "boolean"
-            },
-            "runtime_metrics": {
-              "type": "boolean"
-            },
-            "search_tool": {
-              "type": "boolean"
-            },
-            "secret_auth_storage": {
-              "type": "boolean"
-            },
-            "shell_snapshot": {
-              "type": "boolean"
-            },
-            "shell_tool": {
-              "type": "boolean"
-            },
-            "shell_zsh_fork": {
-              "type": "boolean"
-            },
-            "skill_env_var_dependency_prompt": {
-              "type": "boolean"
-            },
-            "skill_mcp_dependency_install": {
-              "type": "boolean"
-            },
-            "sqlite": {
-              "type": "boolean"
-            },
-            "standalone_web_search": {
-              "type": "boolean"
-            },
-            "steer": {
-              "type": "boolean"
-            },
-            "task_completion_reviewer": {
-              "type": "boolean"
-            },
-            "telepathy": {
-              "type": "boolean"
-            },
-            "terminal_resize_reflow": {
-              "type": "boolean"
-            },
-            "terminal_visualization_instructions": {
-              "type": "boolean"
-            },
-            "tool_call_mcp_elicitation": {
-              "type": "boolean"
-            },
-            "tool_search": {
-              "type": "boolean"
-            },
-            "tool_search_always_defer_mcp_tools": {
-              "type": "boolean"
-            },
-            "tool_suggest": {
-              "type": "boolean"
-            },
-            "tui_app_server": {
-              "type": "boolean"
-            },
-            "unavailable_dummy_tools": {
-              "type": "boolean"
-            },
-            "undo": {
-              "type": "boolean"
-            },
-            "unified_exec": {
-              "type": "boolean"
-            },
-            "unified_exec_zsh_fork": {
-              "type": "boolean"
-            },
-            "use_agent_identity": {
-              "type": "boolean"
-            },
-            "use_legacy_landlock": {
-              "type": "boolean"
-            },
-            "use_linux_sandbox_bwrap": {
-              "type": "boolean"
-            },
-            "web_search": {
-              "type": "boolean"
-            },
-            "web_search_cached": {
-              "type": "boolean"
-            },
-            "web_search_request": {
-              "type": "boolean"
-            },
-            "workspace_dependencies": {
-              "type": "boolean"
-            },
-            "workspace_owner_usage_nudge": {
-              "type": "boolean"
-            }
-          },
-          "type": "object"
-        },
-        "include_apps_instructions": {
-          "type": "boolean"
-        },
-        "include_collaboration_mode_instructions": {
-          "type": "boolean"
-        },
-        "include_environment_context": {
-          "type": "boolean"
-        },
-        "include_permissions_instructions": {
-          "type": "boolean"
-        },
-        "model": {
-          "type": "string"
-        },
-        "model_catalog_json": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/AbsolutePathBuf"
-            }
-          ],
-          "description": "Optional path to a JSON model catalog (applied on startup only)."
-        },
-        "model_instructions_file": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/AbsolutePathBuf"
-            }
-          ],
-          "description": "Optional path to a file containing model instructions."
-        },
-        "model_provider": {
-          "description": "The key in the `model_providers` map identifying the [`ModelProviderInfo`] to use.",
-          "type": "string"
-        },
-        "model_reasoning_effort": {
-          "$ref": "#/definitions/ReasoningEffort"
-        },
-        "model_reasoning_summary": {
-          "$ref": "#/definitions/ReasoningSummary"
-        },
-        "model_verbosity": {
-          "$ref": "#/definitions/Verbosity"
-        },
-        "oss_provider": {
-          "type": "string"
-        },
-        "personality": {
-          "$ref": "#/definitions/Personality"
-        },
-        "plan_mode_reasoning_effort": {
-          "$ref": "#/definitions/ReasoningEffort"
-        },
-        "sandbox_mode": {
-          "$ref": "#/definitions/SandboxMode"
-        },
-        "service_tier": {
-          "description": "Optional explicit service tier request id for new turns (for example `default`, `priority`, or `flex`; legacy `fast` also works).",
-          "type": "string"
-        },
-        "tools": {
-          "$ref": "#/definitions/ToolsToml"
-        },
-        "tui": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/ProfileTui"
-            }
-          ],
-          "default": null,
-          "description": "TUI settings scoped to this profile."
-        },
-        "web_search": {
-          "$ref": "#/definitions/WebSearchMode"
-        },
-        "windows": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/WindowsToml"
-            }
-          ],
-          "default": null
-        }
-      },
-      "type": "object"
-    },
     "CurrentTimeReminderConfigToml": {
       "additionalProperties": false,
       "properties": {
@@ -914,39 +479,6 @@
         "enabled": {
           "default": true,
           "type": "boolean"
-        }
-      },
-      "type": "object"
-    },
-    "ExternalConfigMigrationPrompts": {
-      "additionalProperties": false,
-      "description": "Settings for notices we display to users via the tui and app-server clients (primarily the Codex IDE extension). NOTE: these are different from notifications - notices are warnings, NUX screens, acknowledgements, etc.",
-      "properties": {
-        "home": {
-          "description": "Tracks whether home-level external config migration prompts are hidden.",
-          "type": "boolean"
-        },
-        "home_last_prompted_at": {
-          "description": "Tracks the last time the home-level external config migration prompt was shown.",
-          "format": "int64",
-          "type": "integer"
-        },
-        "project_last_prompted_at": {
-          "additionalProperties": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "default": {},
-          "description": "Tracks the last time a project-level external config migration prompt was shown.",
-          "type": "object"
-        },
-        "projects": {
-          "additionalProperties": {
-            "type": "boolean"
-          },
-          "default": {},
-          "description": "Tracks which project paths have opted out of external config migration prompts.",
-          "type": "object"
         }
       },
       "type": "object"
@@ -1064,26 +596,6 @@
         "api"
       ],
       "type": "string"
-    },
-    "GhostSnapshotToml": {
-      "additionalProperties": false,
-      "properties": {
-        "disable_warnings": {
-          "description": "Legacy no-op setting retained for compatibility.",
-          "type": "boolean"
-        },
-        "ignore_large_untracked_dirs": {
-          "description": "Legacy no-op setting retained for compatibility.",
-          "format": "int64",
-          "type": "integer"
-        },
-        "ignore_large_untracked_files": {
-          "description": "Legacy no-op setting retained for compatibility.",
-          "format": "int64",
-          "type": "integer"
-        }
-      },
-      "type": "object"
     },
     "GranularApprovalConfig": {
       "properties": {
@@ -1718,7 +1230,6 @@
           "type": "boolean"
         },
         "default_wait_timeout_ms": {
-          "format": "int64",
           "maximum": 3600000.0,
           "minimum": 60000.0,
           "type": "integer"
@@ -1730,18 +1241,15 @@
           "type": "boolean"
         },
         "max_concurrent_threads_per_session": {
-          "format": "uint",
           "minimum": 1.0,
           "type": "integer"
         },
         "max_wait_timeout_ms": {
-          "format": "int64",
           "maximum": 3600000.0,
           "minimum": 60000.0,
           "type": "integer"
         },
         "min_wait_timeout_ms": {
-          "format": "int64",
           "maximum": 3600000.0,
           "minimum": 60000.0,
           "type": "integer"
@@ -1764,14 +1272,16 @@
           "pattern": "^[a-zA-Z0-9_-]+$",
           "type": "string"
         },
-        "usage_hint_enabled": {
-          "description": "Deprecated compatibility field. Its value is ignored.",
-          "type": "boolean"
-        },
         "usage_hint_text": {
           "type": "string"
         }
       },
+      "required": [
+        "default_wait_timeout_ms",
+        "max_concurrent_threads_per_session",
+        "max_wait_timeout_ms",
+        "min_wait_timeout_ms"
+      ],
       "type": "object"
     },
     "NetworkDomainPermissionToml": {
@@ -2029,35 +1539,10 @@
     },
     "Notice": {
       "additionalProperties": false,
+      "description": "Settings for notices we display to users via the tui and app-server clients (primarily the Codex IDE extension). NOTE: these are different from notifications - notices are warnings, NUX screens, acknowledgements, etc.",
       "properties": {
-        "external_config_migration_prompts": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/ExternalConfigMigrationPrompts"
-            }
-          ],
-          "default": {
-            "home": null,
-            "home_last_prompted_at": null,
-            "project_last_prompted_at": {},
-            "projects": {}
-          },
-          "description": "Tracks scopes where external config migration prompts should be suppressed."
-        },
         "fast_default_opt_out": {
           "description": "Tracks whether the user opted out of Codex-managed fast defaults.",
-          "type": "boolean"
-        },
-        "hide_full_access_warning": {
-          "description": "Tracks whether the user has acknowledged the full access warning prompt.",
-          "type": "boolean"
-        },
-        "hide_gpt-5.1-codex-max_migration_prompt": {
-          "description": "Tracks whether the user has seen the gpt-5.1-codex-max migration prompt",
-          "type": "boolean"
-        },
-        "hide_gpt5_1_migration_prompt": {
-          "description": "Tracks whether the user has seen the model migration prompt",
           "type": "boolean"
         },
         "hide_rate_limit_model_nudge": {
@@ -2312,25 +1797,16 @@
       ]
     },
     "OtelHttpProtocol": {
-      "oneOf": [
-        {
-          "description": "Binary payload",
-          "enum": [
-            "binary"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "JSON payload",
-          "enum": [
-            "json"
-          ],
-          "type": "string"
-        }
-      ]
+      "description": "HTTP payload encoding used by OTLP/HTTP exporters.",
+      "enum": [
+        "binary",
+        "json"
+      ],
+      "type": "string"
     },
     "OtelTlsConfig": {
       "additionalProperties": false,
+      "description": "TLS material used by OTLP exporters.",
       "properties": {
         "ca-certificate": {
           "$ref": "#/definitions/AbsolutePathBuf"
@@ -2430,22 +1906,6 @@
           },
           "description": "Per-tool approval settings keyed by tool name.",
           "type": "object"
-        }
-      },
-      "type": "object"
-    },
-    "ProfileTui": {
-      "additionalProperties": false,
-      "description": "TUI settings supported inside a named profile.",
-      "properties": {
-        "session_picker_view": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/SessionPickerViewMode"
-            }
-          ],
-          "default": null,
-          "description": "Preferred layout for resume/fork session picker results."
         }
       },
       "type": "object"
@@ -2609,81 +2069,6 @@
         }
       },
       "type": "object"
-    },
-    "RealtimeAudioToml": {
-      "additionalProperties": false,
-      "properties": {
-        "microphone": {
-          "type": "string"
-        },
-        "speaker": {
-          "type": "string"
-        }
-      },
-      "type": "object"
-    },
-    "RealtimeConversationVersion": {
-      "enum": [
-        "v1",
-        "v2"
-      ],
-      "type": "string"
-    },
-    "RealtimeToml": {
-      "additionalProperties": false,
-      "properties": {
-        "transport": {
-          "$ref": "#/definitions/RealtimeTransport"
-        },
-        "type": {
-          "$ref": "#/definitions/RealtimeWsMode"
-        },
-        "version": {
-          "$ref": "#/definitions/RealtimeConversationVersion"
-        },
-        "voice": {
-          "$ref": "#/definitions/RealtimeVoice"
-        }
-      },
-      "type": "object"
-    },
-    "RealtimeTransport": {
-      "enum": [
-        "webrtc",
-        "websocket"
-      ],
-      "type": "string"
-    },
-    "RealtimeVoice": {
-      "enum": [
-        "alloy",
-        "arbor",
-        "ash",
-        "ballad",
-        "breeze",
-        "cedar",
-        "coral",
-        "cove",
-        "echo",
-        "ember",
-        "juniper",
-        "maple",
-        "marin",
-        "sage",
-        "shimmer",
-        "sol",
-        "spruce",
-        "vale",
-        "verse"
-      ],
-      "type": "string"
-    },
-    "RealtimeWsMode": {
-      "enum": [
-        "conversational",
-        "transcription"
-      ],
-      "type": "string"
     },
     "ReasoningEffort": {
       "description": "A non-empty reasoning effort value advertised by the model.",
@@ -4632,15 +4017,6 @@
       "description": "Optional product SKU forwarded on host-owned Codex Apps MCP requests.",
       "type": "string"
     },
-    "audio": {
-      "allOf": [
-        {
-          "$ref": "#/definitions/RealtimeAudioToml"
-        }
-      ],
-      "default": null,
-      "description": "Machine-local realtime audio device preferences used by realtime voice."
-    },
     "auto_review": {
       "allOf": [
         {
@@ -4681,6 +4057,13 @@
       "description": "Whether completed textual tool outputs may be represented by bounded, exactly retrievable receipts in manually managed prompt history.",
       "type": "boolean"
     },
+    "config_version": {
+      "default": 1,
+      "description": "Version of the persisted configuration shape. Unversioned files are upgraded by the loader before this structure is deserialized.",
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": "integer"
+    },
     "debug": {
       "allOf": [
         {
@@ -4711,30 +4094,6 @@
     "experimental_compact_prompt_file": {
       "$ref": "#/definitions/AbsolutePathBuf"
     },
-    "experimental_realtime_start_instructions": {
-      "description": "Experimental / do not use. Replaces the built-in realtime start instructions inserted into developer messages when realtime becomes active.",
-      "type": "string"
-    },
-    "experimental_realtime_webrtc_call_base_url": {
-      "description": "Experimental / do not use. Overrides only the WebRTC realtime call creation base URL. This is separate from `experimental_realtime_ws_base_url` because WebRTC call creation is HTTP, while sideband control is websocket.",
-      "type": "string"
-    },
-    "experimental_realtime_ws_backend_prompt": {
-      "description": "Experimental / do not use. Overrides only the realtime conversation websocket transport instructions (the `Op::RealtimeConversation` `/ws` session.update instructions) without changing normal prompts.",
-      "type": "string"
-    },
-    "experimental_realtime_ws_base_url": {
-      "description": "Experimental / do not use. Overrides only the realtime conversation websocket transport base URL (the `Op::RealtimeConversation` `/v1/realtime` connection) without changing normal provider HTTP requests.",
-      "type": "string"
-    },
-    "experimental_realtime_ws_model": {
-      "description": "Experimental / do not use. Selects the realtime websocket model/snapshot used for the `Op::RealtimeConversation` connection.",
-      "type": "string"
-    },
-    "experimental_realtime_ws_startup_context": {
-      "description": "Experimental / do not use. Replaces the synthesized realtime startup context appended to websocket session instructions. An empty string disables startup context injection entirely.",
-      "type": "string"
-    },
     "experimental_thread_config_endpoint": {
       "description": "Experimental / do not use. When set, app-server fetches thread-scoped config from a remote service at this endpoint.",
       "type": "string"
@@ -4747,41 +4106,16 @@
       ],
       "description": "Experimental / do not use. Selects the thread store implementation."
     },
-    "experimental_use_unified_exec_tool": {
-      "type": "boolean"
-    },
     "features": {
       "additionalProperties": false,
       "default": null,
       "description": "Centralized feature flags (new). Prefer this over individual toggles.",
       "properties": {
-        "apply_patch_freeform": {
-          "type": "boolean"
-        },
         "apply_patch_streaming_events": {
           "type": "boolean"
         },
         "apps": {
           "type": "boolean"
-        },
-        "apps_mcp_path_override": {
-          "anyOf": [
-            {
-              "type": "boolean"
-            },
-            {
-              "additionalProperties": false,
-              "properties": {
-                "enabled": {
-                  "type": "boolean"
-                },
-                "path": {
-                  "type": "string"
-                }
-              },
-              "type": "object"
-            }
-          ]
         },
         "auth_elicitation": {
           "type": "boolean"
@@ -4795,9 +4129,6 @@
         "browser_use_full_cdp_access": {
           "type": "boolean"
         },
-        "chronicle": {
-          "type": "boolean"
-        },
         "code_mode": {
           "$ref": "#/definitions/FeatureToml_for_CodeModeConfigToml"
         },
@@ -4807,25 +4138,10 @@
         "code_mode_only": {
           "type": "boolean"
         },
-        "codex_git_commit": {
-          "type": "boolean"
-        },
-        "codex_hooks": {
-          "type": "boolean"
-        },
-        "collab": {
-          "type": "boolean"
-        },
-        "collaboration_modes": {
-          "type": "boolean"
-        },
         "computer_use": {
           "type": "boolean"
         },
         "concurrent_reasoning_summaries": {
-          "type": "boolean"
-        },
-        "connectors": {
           "type": "boolean"
         },
         "current_time_reminder": {
@@ -4837,31 +4153,13 @@
         "deferred_executor": {
           "type": "boolean"
         },
-        "elevated_windows_sandbox": {
-          "type": "boolean"
-        },
-        "enable_experimental_windows_sandbox": {
-          "type": "boolean"
-        },
         "enable_fanout": {
-          "type": "boolean"
-        },
-        "enable_mcp_apps": {
           "type": "boolean"
         },
         "enable_request_compression": {
           "type": "boolean"
         },
         "exec_permission_approvals": {
-          "type": "boolean"
-        },
-        "experimental_use_unified_exec_tool": {
-          "type": "boolean"
-        },
-        "experimental_windows_sandbox": {
-          "type": "boolean"
-        },
-        "external_migration": {
           "type": "boolean"
         },
         "fast_mode": {
@@ -4876,25 +4174,10 @@
         "hooks": {
           "type": "boolean"
         },
-        "image_detail_original": {
-          "type": "boolean"
-        },
         "image_generation": {
           "type": "boolean"
         },
-        "imagegenext": {
-          "type": "boolean"
-        },
         "in_app_browser": {
-          "type": "boolean"
-        },
-        "item_ids": {
-          "type": "boolean"
-        },
-        "js_repl": {
-          "type": "boolean"
-        },
-        "js_repl_tools_only": {
           "type": "boolean"
         },
         "known_delta_store": {
@@ -4906,16 +4189,7 @@
         "memories": {
           "type": "boolean"
         },
-        "memory_tool": {
-          "type": "boolean"
-        },
-        "mentions_v2": {
-          "type": "boolean"
-        },
         "multi_agent": {
-          "type": "boolean"
-        },
-        "multi_agent_mode": {
           "type": "boolean"
         },
         "multi_agent_v2": {
@@ -4930,9 +4204,6 @@
         "personality": {
           "type": "boolean"
         },
-        "plugin_hooks": {
-          "type": "boolean"
-        },
         "plugin_sharing": {
           "type": "boolean"
         },
@@ -4942,46 +4213,16 @@
         "prevent_idle_sleep": {
           "type": "boolean"
         },
-        "realtime_conversation": {
-          "type": "boolean"
-        },
-        "remote_compaction_v2": {
-          "type": "boolean"
-        },
-        "remote_control": {
-          "type": "boolean"
-        },
-        "remote_models": {
-          "type": "boolean"
-        },
         "remote_plugin": {
-          "type": "boolean"
-        },
-        "request_permissions": {
           "type": "boolean"
         },
         "request_permissions_tool": {
           "type": "boolean"
         },
-        "request_rule": {
-          "type": "boolean"
-        },
-        "resize_all_images": {
-          "type": "boolean"
-        },
         "respect_system_proxy": {
           "type": "boolean"
         },
-        "responses_websockets": {
-          "type": "boolean"
-        },
-        "responses_websockets_v2": {
-          "type": "boolean"
-        },
         "runtime_metrics": {
-          "type": "boolean"
-        },
-        "search_tool": {
           "type": "boolean"
         },
         "secret_auth_storage": {
@@ -4993,31 +4234,13 @@
         "shell_tool": {
           "type": "boolean"
         },
-        "shell_zsh_fork": {
-          "type": "boolean"
-        },
-        "skill_env_var_dependency_prompt": {
-          "type": "boolean"
-        },
         "skill_mcp_dependency_install": {
-          "type": "boolean"
-        },
-        "sqlite": {
           "type": "boolean"
         },
         "standalone_web_search": {
           "type": "boolean"
         },
-        "steer": {
-          "type": "boolean"
-        },
         "task_completion_reviewer": {
-          "type": "boolean"
-        },
-        "telepathy": {
-          "type": "boolean"
-        },
-        "terminal_resize_reflow": {
           "type": "boolean"
         },
         "terminal_visualization_instructions": {
@@ -5026,52 +4249,19 @@
         "tool_call_mcp_elicitation": {
           "type": "boolean"
         },
-        "tool_search": {
-          "type": "boolean"
-        },
-        "tool_search_always_defer_mcp_tools": {
-          "type": "boolean"
-        },
         "tool_suggest": {
-          "type": "boolean"
-        },
-        "tui_app_server": {
-          "type": "boolean"
-        },
-        "unavailable_dummy_tools": {
-          "type": "boolean"
-        },
-        "undo": {
           "type": "boolean"
         },
         "unified_exec": {
           "type": "boolean"
         },
-        "unified_exec_zsh_fork": {
-          "type": "boolean"
-        },
         "use_agent_identity": {
-          "type": "boolean"
-        },
-        "use_legacy_landlock": {
-          "type": "boolean"
-        },
-        "use_linux_sandbox_bwrap": {
-          "type": "boolean"
-        },
-        "web_search": {
           "type": "boolean"
         },
         "web_search_cached": {
           "type": "boolean"
         },
         "web_search_request": {
-          "type": "boolean"
-        },
-        "workspace_dependencies": {
-          "type": "boolean"
-        },
-        "workspace_owner_usage_nudge": {
           "type": "boolean"
         }
       },
@@ -5091,7 +4281,7 @@
           "$ref": "#/definitions/UriBasedFileOpener"
         }
       ],
-      "description": "Optional URI-based file opener. If set, citations to files in the model output will be hyperlinked using the specified URI scheme."
+      "description": "Optional URI-based file opener. If set, local Markdown links in model output will be hyperlinked using the specified URI scheme."
     },
     "forced_chatgpt_workspace_id": {
       "allOf": [
@@ -5110,15 +4300,6 @@
       ],
       "default": null,
       "description": "When set, restricts the login mechanism users may use."
-    },
-    "ghost_snapshot": {
-      "allOf": [
-        {
-          "$ref": "#/definitions/GhostSnapshotToml"
-        }
-      ],
-      "default": null,
-      "description": "Compatibility-only settings retained so legacy `ghost_snapshot` config still loads."
     },
     "hide_agent_reasoning": {
       "default": false,
@@ -5272,10 +4453,6 @@
     "model_reasoning_summary": {
       "$ref": "#/definitions/ReasoningSummary"
     },
-    "model_supports_reasoning_summaries": {
-      "description": "Override to force-enable reasoning summaries for the configured model.",
-      "type": "boolean"
-    },
     "model_verbosity": {
       "allOf": [
         {
@@ -5352,18 +4529,6 @@
       "description": "User-level plugin config entries keyed by plugin name.",
       "type": "object"
     },
-    "profile": {
-      "description": "Profile to use from the `profiles` map.",
-      "type": "string"
-    },
-    "profiles": {
-      "additionalProperties": {
-        "$ref": "#/definitions/ConfigProfile"
-      },
-      "default": {},
-      "description": "Named profiles to facilitate switching between different configurations.",
-      "type": "object"
-    },
     "project_doc_fallback_filenames": {
       "default": [],
       "description": "Ordered list of fallback filenames to look for when AGENTS.md is missing.",
@@ -5392,15 +4557,6 @@
         "$ref": "#/definitions/ProjectConfig"
       },
       "type": "object"
-    },
-    "realtime": {
-      "allOf": [
-        {
-          "$ref": "#/definitions/RealtimeToml"
-        }
-      ],
-      "default": null,
-      "description": "Experimental / do not use. Realtime websocket session selection. `version` controls v1/v2 and `type` controls conversational/transcription."
     },
     "reasoning_phase_efforts": {
       "$ref": "#/definitions/ReasoningPhaseEfforts"

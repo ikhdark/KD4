@@ -16,7 +16,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-#[cfg(windows)]
+
 use tokio::time::Duration;
 
 use crate::ManagedRootProcess;
@@ -26,27 +26,20 @@ use crate::process::ProcessSignal;
 use crate::process::SpawnedProcess;
 use crate::process::exit_code_from_status;
 
-#[cfg(target_os = "linux")]
-use libc;
-
-#[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
-#[cfg(windows)]
+
 use std::os::windows::io::BorrowedHandle;
-#[cfg(windows)]
+
 use std::os::windows::io::OwnedHandle;
-#[cfg(windows)]
+
 use std::os::windows::io::RawHandle;
 
-#[cfg(windows)]
 enum WindowsChildTerminator {
     Job { process: OwnedHandle },
 }
 
-#[cfg(windows)]
 const WINDOWS_PROCESS_SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[cfg(windows)]
 async fn run_windows_spawn_operation<T, F>(timeout: Duration, operation: F) -> io::Result<T>
 where
     T: Send + 'static,
@@ -68,58 +61,30 @@ where
 
 struct PipeChildTerminator {
     managed: Arc<ManagedRootProcess>,
-    #[cfg(windows)]
     windows: WindowsChildTerminator,
-    #[cfg(unix)]
-    process_group_id: u32,
 }
 
 impl ChildTerminator for PipeChildTerminator {
     fn signal(&mut self, signal: ProcessSignal) -> io::Result<()> {
         match signal {
-            ProcessSignal::Interrupt => {
-                #[cfg(unix)]
-                {
-                    crate::process_group::interrupt_process_group(self.process_group_id)
-                }
-
-                #[cfg(not(unix))]
-                {
-                    Err(crate::process::unsupported_signal(signal))
-                }
-            }
+            ProcessSignal::Interrupt => Err(crate::process::unsupported_signal(signal)),
         }
     }
 
     fn kill(&mut self) -> io::Result<()> {
-        #[cfg(unix)]
-        {
-            crate::process_group::kill_process_group(self.process_group_id)
-        }
-
-        #[cfg(windows)]
-        {
-            match &self.windows {
-                WindowsChildTerminator::Job { process } => self
-                    .managed
-                    .terminate()
-                    .or_else(|_| terminate_process(process)),
-            }
-        }
-
-        #[cfg(not(any(unix, windows)))]
-        {
-            Ok(())
+        match &self.windows {
+            WindowsChildTerminator::Job { process } => self
+                .managed
+                .terminate()
+                .or_else(|_| terminate_process(process)),
         }
     }
 }
 
-#[cfg(windows)]
 fn duplicate_process_handle(process: RawHandle) -> io::Result<OwnedHandle> {
     unsafe { BorrowedHandle::borrow_raw(process) }.try_clone_to_owned()
 }
 
-#[cfg(windows)]
 fn terminate_process(process: &OwnedHandle) -> io::Result<()> {
     let success =
         unsafe { winapi::um::processthreadsapi::TerminateProcess(process.as_raw_handle(), 1) };
@@ -168,30 +133,10 @@ async fn spawn_process_with_stdin_mode(
         anyhow::bail!("missing program for pipe spawn");
     }
 
-    #[cfg(not(unix))]
     let _ = inherited_fds;
+    let _ = arg0;
 
     let mut command = Command::new(program);
-    #[cfg(unix)]
-    if let Some(arg0) = arg0 {
-        command.arg0(arg0);
-    }
-    #[cfg(target_os = "linux")]
-    let parent_pid = unsafe { libc::getpid() };
-    #[cfg(unix)]
-    let inherited_fds = inherited_fds.to_vec();
-    #[cfg(unix)]
-    unsafe {
-        command.pre_exec(move || {
-            crate::process_group::detach_from_tty()?;
-            #[cfg(target_os = "linux")]
-            crate::process_group::set_parent_death_signal(parent_pid)?;
-            crate::pty::close_inherited_fds_except(&inherited_fds);
-            Ok(())
-        });
-    }
-    #[cfg(not(unix))]
-    let _ = arg0;
     command.current_dir(cwd);
     command.env_clear();
     for (key, value) in env {
@@ -212,7 +157,7 @@ async fn spawn_process_with_stdin_mode(
     command.stderr(Stdio::piped());
 
     let managed = Arc::new(ManagedRootProcess::reserve_with_reclaim().await?);
-    #[cfg(windows)]
+
     let mut child = {
         // CreateProcessW can block inside the Windows loader. Keep that synchronous call off the
         // async runtime so timers and cancellation continue to make progress. kill_on_drop also
@@ -221,9 +166,7 @@ async fn spawn_process_with_stdin_mode(
         command.kill_on_drop(true);
         run_windows_spawn_operation(WINDOWS_PROCESS_SPAWN_TIMEOUT, move || command.spawn()).await?
     };
-    #[cfg(not(windows))]
-    let mut child = command.spawn()?;
-    #[cfg(windows)]
+
     let windows_terminator = {
         let pid = child
             .id()
@@ -248,10 +191,6 @@ async fn spawn_process_with_stdin_mode(
         };
         WindowsChildTerminator::Job { process }
     };
-    #[cfg(unix)]
-    let process_group_id = child
-        .id()
-        .ok_or_else(|| io::Error::other("missing child pid"))?;
 
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
@@ -310,7 +249,6 @@ async fn spawn_process_with_stdin_mode(
     let wait_handle: JoinHandle<()> = tokio::spawn(async move {
         let code = match child.wait().await {
             Ok(status) => {
-                #[cfg(windows)]
                 if let Err(err) = wait_managed.preserve_descendants() {
                     log::warn!(
                         "Windows pipe failed to preserve descendants after root exit: {err}"
@@ -331,10 +269,7 @@ async fn spawn_process_with_stdin_mode(
         writer_tx,
         Box::new(PipeChildTerminator {
             managed,
-            #[cfg(windows)]
             windows: windows_terminator,
-            #[cfg(unix)]
-            process_group_id,
         }),
         reader_handle,
         reader_abort_handles,
@@ -398,6 +333,6 @@ pub async fn spawn_process_no_stdin_with_inherited_fds(
     .await
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 #[path = "pipe_tests.rs"]
 mod tests;

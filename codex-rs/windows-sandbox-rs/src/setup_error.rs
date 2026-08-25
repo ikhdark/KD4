@@ -233,13 +233,9 @@ fn redact_username_segments(value: &str, usernames: &[String]) -> String {
     segments.push(current);
 
     for segment in &mut segments {
-        let matches = if cfg!(windows) {
-            usernames
-                .iter()
-                .any(|name| segment.eq_ignore_ascii_case(name))
-        } else {
-            usernames.iter().any(|name| segment == name)
-        };
+        let matches = usernames
+            .iter()
+            .any(|name| segment.eq_ignore_ascii_case(name));
         if matches {
             *segment = "<user>".to_string();
         }

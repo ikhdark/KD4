@@ -1,4 +1,5 @@
 use codex_api::OpenAiVerbosity;
+use codex_api::ResponseCreateWsRequest;
 use codex_api::ResponsesApiRequest;
 use codex_api::TextControls;
 use codex_api::create_text_param_for_request;
@@ -137,7 +138,7 @@ fn serializes_text_verbosity_when_set() {
         model: "gpt-5.4".to_string(),
         instructions: "i".to_string(),
         input: input.into(),
-        tools: Some(tools),
+        tools: Some(tools.into()),
         tool_choice: "auto".to_string(),
         parallel_tool_calls: true,
         reasoning: None,
@@ -153,6 +154,11 @@ fn serializes_text_verbosity_when_set() {
         }),
         client_metadata: None,
     };
+    let ws_request = ResponseCreateWsRequest::from(&req);
+    assert!(Arc::ptr_eq(
+        req.tools.as_ref().expect("HTTP tools"),
+        ws_request.tools.as_ref().expect("WebSocket tools")
+    ));
 
     let v = serde_json::to_value(&req).expect("json");
     assert_eq!(
@@ -185,7 +191,7 @@ fn serializes_text_schema_with_strict_format() {
         model: "gpt-5.4".to_string(),
         instructions: "i".to_string(),
         input: input.into(),
-        tools: Some(tools),
+        tools: Some(tools.into()),
         tool_choice: "auto".to_string(),
         parallel_tool_calls: true,
         reasoning: None,
@@ -247,7 +253,7 @@ fn omits_text_when_not_set() {
         model: "gpt-5.4".to_string(),
         instructions: "i".to_string(),
         input: input.into(),
-        tools: Some(tools),
+        tools: Some(tools.into()),
         tool_choice: "auto".to_string(),
         parallel_tool_calls: true,
         reasoning: None,
@@ -271,7 +277,7 @@ fn serializes_flex_service_tier_when_set() {
         model: "gpt-5.4".to_string(),
         instructions: "i".to_string(),
         input: Arc::from([]),
-        tools: Some(vec![]),
+        tools: Some(Vec::new().into()),
         tool_choice: "auto".to_string(),
         parallel_tool_calls: true,
         reasoning: None,

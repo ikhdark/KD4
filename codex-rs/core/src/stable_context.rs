@@ -11,8 +11,6 @@ use sha2::Sha256;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::LazyLock;
-use std::sync::Mutex;
 
 const STABLE_CONTEXT_CONTRACT_VERSION: u16 = 1;
 const STABLE_CONTEXT_HASH_DOMAIN: &[u8] = b"codex.stable-context.component.v1";
@@ -26,10 +24,6 @@ const REPOSITORY_REMOVAL_NOTICE: &str =
 const COLLABORATION_RESET_NOTICE: &str = "No collaboration-mode-specific instructions are currently active. Any previously provided collaboration-mode instructions no longer apply.";
 const ROOT_COORDINATOR_PREFIX: &str =
     "You are `/root`, the primary agent in a team of agents collaborating";
-const BASE_COMPONENT_CACHE_CAPACITY: usize = 64;
-
-static BASE_COMPONENT_CACHE: LazyLock<Mutex<HashMap<[u8; 32], StableContextComponent>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum StableContextKind {
@@ -48,7 +42,6 @@ pub(crate) enum StableContextKind {
     Memory,
     ModelSwitch,
     Personality,
-    Realtime,
     RootCoordinator,
     MultiAgent,
     TaskModelGuidance,
@@ -76,7 +69,6 @@ impl StableContextKind {
             Self::Memory => "memory",
             Self::ModelSwitch => "model_switch",
             Self::Personality => "personality",
-            Self::Realtime => "realtime",
             Self::RootCoordinator => "root_coordinator",
             Self::MultiAgent => "multi_agent",
             Self::TaskModelGuidance => "task_model_guidance",
@@ -199,7 +191,7 @@ impl StableContextManifest {
 
     pub(crate) fn with_base_model(&self, model_slug: &str, base_instructions: &str) -> Self {
         let mut components = self.components.to_vec();
-        components.push(cached_base_component(model_slug, base_instructions));
+        components.push(base_component(model_slug, base_instructions));
         Self::from_components(components, self.projection_enabled, self.fail_open)
     }
 
@@ -309,7 +301,6 @@ enum StableContextSlot {
     Memory,
     ModelSwitch,
     Personality,
-    Realtime,
     MultiAgent,
     RootCoordinator,
 }
@@ -332,7 +323,6 @@ impl StableContextSlot {
             Self::Memory => StableContextKind::Memory,
             Self::ModelSwitch => StableContextKind::ModelSwitch,
             Self::Personality => StableContextKind::Personality,
-            Self::Realtime => StableContextKind::Realtime,
             Self::MultiAgent => StableContextKind::MultiAgent,
             Self::RootCoordinator => StableContextKind::RootCoordinator,
         }
@@ -355,7 +345,6 @@ impl StableContextSlot {
             Self::Memory => "memory",
             Self::ModelSwitch => "model_switch",
             Self::Personality => "personality",
-            Self::Realtime => "realtime",
             Self::MultiAgent => "multi_agent",
             Self::RootCoordinator => "root_coordinator",
         }
@@ -381,9 +370,8 @@ impl StableContextSlot {
             Self::SelectedSkill => 12,
             Self::AppContext => 13,
             Self::ModelSwitch => 14,
-            Self::Realtime => 15,
-            Self::Environment => 16,
-            Self::RecommendedPlugins => 17,
+            Self::Environment => 15,
+            Self::RecommendedPlugins => 16,
         }
     }
 
@@ -397,7 +385,6 @@ impl StableContextSlot {
             Self::SelectedSkill
                 | Self::AppContext
                 | Self::ModelSwitch
-                | Self::Realtime
                 | Self::Environment
                 | Self::RecommendedPlugins
         )
@@ -411,11 +398,6 @@ struct Occurrence {
     slot: StableContextSlot,
     text: String,
     turn_id: Option<String>,
-}
-
-pub(crate) fn stable_context_projection_enabled() -> bool {
-    !std::env::var("CODEX_STABLE_CONTEXT_PROJECTION")
-        .is_ok_and(|value| value.eq_ignore_ascii_case("baseline"))
 }
 
 pub(crate) fn project_stable_context(
@@ -469,9 +451,7 @@ pub(crate) fn project_stable_context(
     }
 
     let target_fail_open = target == StableContextTarget::FailOpen;
-    let enabled = target == StableContextTarget::Sampling
-        && stable_context_projection_enabled()
-        && !ambiguous;
+    let enabled = target == StableContextTarget::Sampling && !ambiguous;
     let fail_open = ambiguous || target_fail_open;
     let (projected, components) = if enabled {
         project_items(&items, &occurrences, latest_real_user.as_ref())
@@ -862,11 +842,6 @@ fn classify_stable_text(role: &str, text: &str) -> Option<StableContextSlot> {
             "</personality_spec>",
             StableContextSlot::Personality,
         ),
-        (
-            "<realtime_conversation>",
-            "</realtime_conversation>",
-            StableContextSlot::Realtime,
-        ),
     ]
     .into_iter()
     .find_map(|(open, close, slot)| marked(text, open, close).then_some(slot))
@@ -890,7 +865,6 @@ fn contains_known_open_marker(text: &str) -> bool {
         MULTI_AGENT_MODE_OPEN_TAG,
         "<model_switch>",
         "<personality_spec>",
-        "<realtime_conversation>",
     ]
     .iter()
     .any(|marker| text.trim_start().starts_with(marker))
@@ -919,24 +893,7 @@ fn component_from_text(
     component_from_bytes(kind, semantic_key, text.as_bytes(), active, disposition)
 }
 
-fn cached_base_component(model_slug: &str, base_instructions: &str) -> StableContextComponent {
-    let mut key_hasher = Sha256::new();
-    key_hasher.update(b"codex.stable-context.base-cache.v1");
-    key_hasher.update(STABLE_CONTEXT_CONTRACT_VERSION.to_be_bytes());
-    key_hasher.update((model_slug.len() as u64).to_be_bytes());
-    key_hasher.update(model_slug.as_bytes());
-    key_hasher.update((base_instructions.len() as u64).to_be_bytes());
-    key_hasher.update(base_instructions.as_bytes());
-    let key: [u8; 32] = key_hasher.finalize().into();
-    let mut cache = BASE_COMPONENT_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(cached) = cache.get(&key) {
-        let mut component = cached.clone();
-        component.local_reused = true;
-        return component;
-    }
-
+fn base_component(model_slug: &str, base_instructions: &str) -> StableContextComponent {
     let mut component = component_from_text(
         StableContextKind::BaseModel,
         "base_model",
@@ -948,10 +905,6 @@ fn cached_base_component(model_slug: &str, base_instructions: &str) -> StableCon
         StableContextKind::BaseModel,
         &[model_slug.as_bytes(), &component.identity.content_hash],
     );
-    if cache.len() >= BASE_COMPONENT_CACHE_CAPACITY {
-        cache.clear();
-    }
-    cache.insert(key, component.clone());
     component
 }
 

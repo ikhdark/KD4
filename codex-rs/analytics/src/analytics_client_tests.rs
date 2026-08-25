@@ -95,7 +95,6 @@ use codex_app_server_protocol::AskForApproval as AppServerAskForApproval;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ClientResponsePayload;
-use codex_app_server_protocol::CodexErrorInfo;
 use codex_app_server_protocol::CollabAgentTool;
 use codex_app_server_protocol::CollabAgentToolCallStatus;
 use codex_app_server_protocol::CommandAction;
@@ -115,11 +114,9 @@ use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemGuardianApprovalReviewCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
-use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::McpToolCallStatus;
 use codex_app_server_protocol::NetworkPolicyAmendment;
 use codex_app_server_protocol::NetworkPolicyRuleAction;
-use codex_app_server_protocol::NonSteerableTurnKind;
 use codex_app_server_protocol::PatchApplyStatus;
 use codex_app_server_protocol::PermissionsRequestApprovalParams;
 use codex_app_server_protocol::RequestId;
@@ -251,7 +248,6 @@ fn sample_thread_start_response(
         sandbox: AppServerSandboxPolicy::DangerFullAccess,
         active_permission_profile: None,
         reasoning_effort: None,
-        multi_agent_mode: Default::default(),
     })
 }
 
@@ -316,7 +312,6 @@ fn sample_thread_resume_response_with_source(
         sandbox: AppServerSandboxPolicy::DangerFullAccess,
         active_permission_profile: None,
         reasoning_effort: None,
-        multi_agent_mode: Default::default(),
         initial_turns_page: None,
     })
 }
@@ -504,49 +499,12 @@ fn sample_turn_steer_response(turn_id: &str) -> ClientResponsePayload {
     })
 }
 
-fn no_active_turn_steer_error() -> JSONRPCErrorError {
-    JSONRPCErrorError {
-        code: -32600,
-        message: "no active turn to steer".to_string(),
-        data: None,
-    }
-}
-
 fn no_active_turn_steer_error_type() -> AnalyticsJsonRpcError {
     AnalyticsJsonRpcError::TurnSteer(TurnSteerRequestError::NoActiveTurn)
 }
 
-fn non_steerable_review_error() -> JSONRPCErrorError {
-    JSONRPCErrorError {
-        code: -32600,
-        message: "cannot steer a review turn".to_string(),
-        data: Some(
-            serde_json::to_value(AppServerTurnError {
-                message: "cannot steer a review turn".to_string(),
-                codex_error_info: Some(CodexErrorInfo::ActiveTurnNotSteerable {
-                    turn_kind: NonSteerableTurnKind::Review,
-                }),
-                additional_details: None,
-            })
-            .expect("serialize turn error"),
-        ),
-    }
-}
-
 fn non_steerable_review_error_type() -> AnalyticsJsonRpcError {
     AnalyticsJsonRpcError::TurnSteer(TurnSteerRequestError::NonSteerableReview)
-}
-
-fn input_too_large_steer_error() -> JSONRPCErrorError {
-    JSONRPCErrorError {
-        code: -32602,
-        message: "Input exceeds the maximum length of 1048576 characters.".to_string(),
-        data: Some(json!({
-            "input_error_code": "input_too_large",
-            "actual_chars": 1048577,
-            "max_chars": 1048576,
-        })),
-    }
 }
 
 fn input_too_large_error_type() -> AnalyticsJsonRpcError {
@@ -556,7 +514,6 @@ fn input_too_large_error_type() -> AnalyticsJsonRpcError {
 async fn ingest_rejected_turn_steer(
     reducer: &mut AnalyticsReducer,
     out: &mut Vec<TrackEventRequest>,
-    error: JSONRPCErrorError,
     error_type: Option<AnalyticsJsonRpcError>,
 ) -> serde_json::Value {
     ingest_turn_prerequisites(
@@ -614,7 +571,6 @@ async fn ingest_rejected_turn_steer(
             AnalyticsFact::ErrorResponse {
                 connection_id: 7,
                 request_id: RequestId::Integer(4),
-                error,
                 error_type,
             },
             out,
@@ -4511,7 +4467,6 @@ async fn rejected_turn_steer_uses_request_connection_metadata() {
     let payload = ingest_rejected_turn_steer(
         &mut reducer,
         &mut out,
-        no_active_turn_steer_error(),
         Some(no_active_turn_steer_error_type()),
     )
     .await;
@@ -4552,7 +4507,6 @@ async fn rejected_turn_steer_maps_active_turn_not_steerable_error_type() {
     let payload = ingest_rejected_turn_steer(
         &mut reducer,
         &mut out,
-        non_steerable_review_error(),
         Some(non_steerable_review_error_type()),
     )
     .await;
@@ -4567,13 +4521,9 @@ async fn rejected_turn_steer_maps_active_turn_not_steerable_error_type() {
 async fn rejected_turn_steer_maps_input_too_large_error_type() {
     let mut reducer = AnalyticsReducer::default();
     let mut out = Vec::new();
-    let payload = ingest_rejected_turn_steer(
-        &mut reducer,
-        &mut out,
-        input_too_large_steer_error(),
-        Some(input_too_large_error_type()),
-    )
-    .await;
+    let payload =
+        ingest_rejected_turn_steer(&mut reducer, &mut out, Some(input_too_large_error_type()))
+            .await;
 
     assert_eq!(
         payload["event_params"]["rejection_reason"],
@@ -4591,7 +4541,6 @@ async fn turn_steer_does_not_emit_without_pending_request() {
             AnalyticsFact::ErrorResponse {
                 connection_id: 7,
                 request_id: RequestId::Integer(4),
-                error: no_active_turn_steer_error(),
                 error_type: Some(no_active_turn_steer_error_type()),
             },
             &mut out,
@@ -4622,7 +4571,6 @@ async fn turn_start_error_response_discards_pending_start_request() {
             AnalyticsFact::ErrorResponse {
                 connection_id: 7,
                 request_id: RequestId::Integer(3),
-                error: no_active_turn_steer_error(),
                 error_type: None,
             },
             &mut out,
@@ -5055,7 +5003,6 @@ async fn accepted_steers_increment_turn_steer_count() {
             AnalyticsFact::ErrorResponse {
                 connection_id: 7,
                 request_id: RequestId::Integer(5),
-                error: no_active_turn_steer_error(),
                 error_type: Some(no_active_turn_steer_error_type()),
             },
             &mut out,

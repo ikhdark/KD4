@@ -4,21 +4,19 @@
   "description": "Tools for repo-wide maintenance.",
   "scripts": {
     "audit:scripts": "node scripts/run-python.js scripts/root_maintenance.py audit-scripts",
-    "format": "prettier --check *.json *.md **/*.js",
-    "format:fix": "prettier --write *.json *.md **/*.js",
-    "format:python": "node scripts/run-python.js scripts/root_maintenance.py format-python",
-    "format:python:fix": "node scripts/run-python.js scripts/root_maintenance.py format-python --write",
+    "format": "node scripts/run-python.js scripts/format.py --check --only prettier",
+    "format:fix": "node scripts/run-python.js scripts/format.py --write --only prettier",
+    "format:python": "node scripts/run-python.js scripts/format.py --check --only python-scripts",
+    "format:python:fix": "node scripts/run-python.js scripts/format.py --write --only python-scripts",
     "lint:markdown": "markdownlint-cli2",
     "lint:python": "node scripts/run-python.js scripts/root_maintenance.py lint-python",
     "lint:python:fix": "node scripts/run-python.js scripts/root_maintenance.py lint-python --fix",
     "test:scripts": "node scripts/run-python.js scripts/root_maintenance.py test-python",
-    "test:scripts:target": "node scripts/run-python.js scripts/root_maintenance.py test-python --changed",
-    "test:scripts:changed": "node scripts/run-python.js scripts/root_maintenance.py test-python --changed",
-    "write-hooks-schema": "cargo run --manifest-path ./codex-rs/Cargo.toml -p codex-hooks --bin write_hooks_schema_fixtures"
+    "test:scripts:changed": "node scripts/run-python.js scripts/root_maintenance.py test-python --changed"
   },
   "devDependencies": {
     "markdownlint-cli2": "0.18.1",
-    "prettier": "^3.5.3"
+    "prettier": "^3.9.6"
   },
   "engines": {
     "node": ">=22.22.2",

@@ -211,21 +211,73 @@ fn environment_snapshot_with_environment(
 }
 
 #[tokio::test]
-async fn stable_refresh_reuses_loaded_arc_and_semantic_digest() {
+async fn repository_stable_context_reuse_is_scoped_to_one_manager() {
     let root = tempfile::tempdir().expect("workspace");
     fs::write(root.path().join("AGENTS.md"), "stable instructions").expect("write AGENTS.md");
     let config = config_for(&root).await;
     let environments = environment_snapshot(&config.cwd, 3);
     let manager = AgentsMdManager::new(/*user_instructions*/ None);
 
-    manager.refresh(&config, &environments).await;
-    let first = manager.get_loaded().await.expect("first load");
-    manager.refresh(&config, &environments).await;
-    let second = manager.get_loaded().await.expect("cached load");
+    let first_observation = manager.refresh_and_observe(&config, &environments).await;
+    let first = first_observation.loaded.expect("first load");
+    let first_stable = first_observation
+        .stable_context
+        .expect("first stable context");
+    assert!(!first_stable.reused);
+
+    let second_observation = manager.refresh_and_observe(&config, &environments).await;
+    let second = second_observation.loaded.expect("cached load");
+    let second_stable = second_observation
+        .stable_context
+        .expect("cached stable context");
 
     assert!(Arc::ptr_eq(&first, &second));
+    assert!(second_stable.reused);
+    assert!(!second_stable.semantic_replacement);
+    assert!(Arc::ptr_eq(&first_stable.rendered, &second_stable.rendered));
     let expected_digest: [u8; 32] = Sha256::digest(first.text().as_bytes()).into();
     assert_eq!(first.semantic_digest(), expected_digest);
+
+    let independent_manager = AgentsMdManager::new(/*user_instructions*/ None);
+    let independent = independent_manager
+        .refresh_and_observe(&config, &environments)
+        .await
+        .stable_context
+        .expect("independent stable context");
+    assert!(!independent.reused);
+    assert!(!independent.semantic_replacement);
+    assert!(!Arc::ptr_eq(&first_stable.rendered, &independent.rendered));
+}
+
+#[tokio::test]
+async fn repository_stable_context_detects_same_session_provenance_replacement() {
+    let root = tempfile::tempdir().expect("workspace");
+    let agents_path = root.path().join("AGENTS.md");
+    fs::write(&agents_path, "stable instructions").expect("write AGENTS.md");
+    let mut config = config_for(&root).await;
+    let environments = environment_snapshot(&config.cwd, 3);
+    let manager = AgentsMdManager::new(/*user_instructions*/ None);
+
+    let first = manager
+        .refresh_and_observe(&config, &environments)
+        .await
+        .stable_context
+        .expect("first stable context");
+    fs::remove_file(agents_path).expect("remove AGENTS.md");
+    fs::write(root.path().join("WORKFLOW.md"), "stable instructions")
+        .expect("write fallback instructions");
+    config.project_doc_fallback_filenames = vec!["WORKFLOW.md".to_string()];
+
+    let replacement = manager
+        .refresh_and_observe(&config, &environments)
+        .await
+        .stable_context
+        .expect("replacement stable context");
+
+    assert_ne!(first.identity, replacement.identity);
+    assert_eq!(first.rendered, replacement.rendered);
+    assert!(!replacement.reused);
+    assert!(replacement.semantic_replacement);
 }
 
 #[tokio::test]

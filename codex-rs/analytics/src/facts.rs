@@ -4,7 +4,6 @@ use crate::events::GuardianReviewEventParams;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ClientResponsePayload;
 use codex_app_server_protocol::InitializeParams;
-use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
@@ -202,16 +201,11 @@ pub enum CodexErrKind {
     RetryLimit,
     InternalAgentDied,
     Sandbox,
-    LandlockSandboxExecutableNotProvided,
     UnsupportedOperation,
     RefreshTokenFailed,
     Fatal,
     Io,
     Json,
-    #[cfg(target_os = "linux")]
-    LandlockRuleset,
-    #[cfg(target_os = "linux")]
-    LandlockPathFd,
     TokioJoin,
     EnvVar,
 }
@@ -260,18 +254,11 @@ impl From<&CodexErr> for CodexErrKind {
             CodexErr::RetryLimit(_) => CodexErrKind::RetryLimit,
             CodexErr::InternalAgentDied => CodexErrKind::InternalAgentDied,
             CodexErr::Sandbox(_) => CodexErrKind::Sandbox,
-            CodexErr::LandlockSandboxExecutableNotProvided => {
-                CodexErrKind::LandlockSandboxExecutableNotProvided
-            }
             CodexErr::UnsupportedOperation(_) => CodexErrKind::UnsupportedOperation,
             CodexErr::RefreshTokenFailed(_) => CodexErrKind::RefreshTokenFailed,
             CodexErr::Fatal(_) => CodexErrKind::Fatal,
             CodexErr::Io(_) => CodexErrKind::Io,
             CodexErr::Json(_) => CodexErrKind::Json,
-            #[cfg(target_os = "linux")]
-            CodexErr::LandlockRuleset(_) => CodexErrKind::LandlockRuleset,
-            #[cfg(target_os = "linux")]
-            CodexErr::LandlockPathFd(_) => CodexErrKind::LandlockPathFd,
             CodexErr::TokioJoin(_) => CodexErrKind::TokioJoin,
             CodexErr::EnvVar(_) => CodexErrKind::EnvVar,
         }
@@ -427,7 +414,6 @@ pub enum CompactionPhase {
 #[serde(rename_all = "snake_case")]
 pub enum CompactionStrategy {
     Memento,
-    PrefixCompaction,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -504,7 +490,6 @@ pub(crate) enum AnalyticsFact {
     ErrorResponse {
         connection_id: u64,
         request_id: RequestId,
-        error: JSONRPCErrorError,
         error_type: Option<AnalyticsJsonRpcError>,
     },
     ServerRequest {
@@ -650,4 +635,20 @@ pub(crate) enum PluginState {
     Uninstalled,
     Enabled,
     Disabled,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CompactionStrategy;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn compaction_strategy_has_only_memento_variant() {
+        let strategy = CompactionStrategy::Memento;
+        let serialized_name = match strategy {
+            CompactionStrategy::Memento => "memento",
+        };
+
+        assert_eq!(serialized_name, "memento");
+    }
 }

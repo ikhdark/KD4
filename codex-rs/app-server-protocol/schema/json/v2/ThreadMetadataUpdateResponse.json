@@ -1984,7 +1984,29 @@
       ]
     },
     "ThreadSource": {
-      "type": "string"
+      "oneOf": [
+        {
+          "enum": [
+            "User",
+            "Subagent",
+            "MemoryConsolidation"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "Feature": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "Feature"
+          ],
+          "title": "FeatureThreadSource",
+          "type": "object"
+        }
+      ]
     },
     "ThreadStatus": {
       "oneOf": [

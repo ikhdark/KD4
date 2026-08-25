@@ -13,7 +13,7 @@ use crate::LIST_TOOL_NAME;
 use crate::MAX_LIST_RESULTS;
 use crate::backend::ListMemoriesRequest;
 use crate::backend::ListMemoriesResponse;
-use crate::backend::MemoriesBackend;
+use crate::local::LocalMemoriesBackend;
 use crate::metrics::record_tool_call;
 use crate::metrics::scope_from_optional_path;
 use crate::metrics::truncated_tag;
@@ -34,15 +34,12 @@ struct ListArgs {
 }
 
 #[derive(Clone)]
-pub(super) struct ListTool<B> {
-    pub(super) backend: B,
+pub(super) struct ListTool {
+    pub(super) backend: LocalMemoriesBackend,
     pub(super) metrics_client: Option<MetricsClient>,
 }
 
-impl<B> ToolExecutor<ToolCall> for ListTool<B>
-where
-    B: MemoriesBackend,
-{
+impl ToolExecutor<ToolCall> for ListTool {
     fn tool_name(&self) -> ToolName {
         memory_tool_name(LIST_TOOL_NAME)
     }
@@ -59,19 +56,16 @@ where
     }
 }
 
-impl<B> ListTool<B>
-where
-    B: MemoriesBackend,
-{
+impl ListTool {
     async fn handle_call(
         &self,
         call: ToolCall,
     ) -> Result<Box<dyn codex_extension_api::ToolOutput>, codex_extension_api::FunctionCallError>
     {
-        let backend = self.backend.clone();
         let args: ListArgs = parse_args(&call)?;
         let scope = scope_from_optional_path(args.path.as_deref(), "root");
-        let response = backend
+        let response = self
+            .backend
             .list(ListMemoriesRequest {
                 path: args.path,
                 cursor: args.cursor,

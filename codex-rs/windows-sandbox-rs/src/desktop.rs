@@ -39,6 +39,7 @@ use windows_sys::Win32::System::StationsAndDesktops::DESKTOP_SWITCHDESKTOP;
 use windows_sys::Win32::System::StationsAndDesktops::DESKTOP_WRITE_DAC;
 use windows_sys::Win32::System::StationsAndDesktops::DESKTOP_WRITE_OWNER;
 use windows_sys::Win32::System::StationsAndDesktops::DESKTOP_WRITEOBJECTS;
+use windows_sys::Win32::System::StationsAndDesktops::HDESK;
 
 const DESKTOP_ALL_ACCESS: u32 = DESKTOP_READOBJECTS
     | DESKTOP_CREATEWINDOW
@@ -82,14 +83,16 @@ impl LaunchDesktop {
 }
 
 struct PrivateDesktop {
-    handle: isize,
+    // The desktop is kept alive by the process-wait thread. Store the opaque
+    // pointer value as an address because windows-sys raw pointers are not Send.
+    handle: usize,
     name: String,
 }
 
 impl PrivateDesktop {
     fn create(logs_base_dir: Option<&Path>) -> Result<Self> {
-        let mut rng = SmallRng::from_entropy();
-        let name = format!("CodexSandboxDesktop-{:x}", rng.r#gen::<u128>());
+        let mut rng = SmallRng::from_os_rng();
+        let name = format!("CodexSandboxDesktop-{:x}", rng.random::<u128>());
         let name_wide = to_wide(&name);
         let handle = unsafe {
             CreateDesktopW(
@@ -101,7 +104,7 @@ impl PrivateDesktop {
                 ptr::null_mut(),
             )
         };
-        if handle == 0 {
+        if handle.is_null() {
             let err = unsafe { GetLastError() } as i32;
             logging::debug_log(
                 &format!(
@@ -121,11 +124,14 @@ impl PrivateDesktop {
             }
         }
 
-        Ok(Self { handle, name })
+        Ok(Self {
+            handle: handle as usize,
+            name,
+        })
     }
 }
 
-unsafe fn grant_desktop_access(handle: isize, logs_base_dir: Option<&Path>) -> Result<()> {
+unsafe fn grant_desktop_access(handle: HDESK, logs_base_dir: Option<&Path>) -> Result<()> {
     let token = get_current_token_for_restriction()?;
     let mut logon_sid = get_logon_sid_bytes(token)?;
     CloseHandle(token);
@@ -187,9 +193,10 @@ unsafe fn grant_desktop_access(handle: isize, logs_base_dir: Option<&Path>) -> R
 
 impl Drop for PrivateDesktop {
     fn drop(&mut self) {
+        let handle = self.handle as HDESK;
         unsafe {
-            if self.handle != 0 {
-                let _ = CloseDesktop(self.handle);
+            if !handle.is_null() {
+                let _ = CloseDesktop(handle);
             }
         }
     }

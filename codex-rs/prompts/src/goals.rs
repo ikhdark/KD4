@@ -37,7 +37,7 @@ pub fn continuation_prompt(goal: &ThreadGoal) -> String {
     let token_budget = goal
         .token_budget
         .map(|budget| budget.to_string())
-        .unwrap_or_else(|| "none".to_string());
+        .unwrap_or_else(|| "unbounded".to_string());
     let remaining_tokens = goal
         .token_budget
         .map(|budget| (budget - goal.tokens_used).max(0).to_string())
@@ -83,7 +83,7 @@ pub fn objective_updated_prompt(goal: &ThreadGoal) -> String {
     let token_budget = goal
         .token_budget
         .map(|budget| budget.to_string())
-        .unwrap_or_else(|| "none".to_string());
+        .unwrap_or_else(|| "unbounded".to_string());
     let remaining_tokens = goal
         .token_budget
         .map(|budget| (budget - goal.tokens_used).max(0).to_string())

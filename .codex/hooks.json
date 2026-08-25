@@ -5,8 +5,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"C:\\Users\\kuh\\Desktop\\kd4\\.codex\\hooks\\task-continuity-entry.ps1\" -ExpectedEvent UserPromptSubmit",
-            "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"C:\\Users\\kuh\\Desktop\\kd4\\.codex\\hooks\\task-continuity-entry.ps1\" -ExpectedEvent UserPromptSubmit",
+            "command": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$repoRoot = git rev-parse --show-toplevel; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; & (Join-Path $repoRoot '.codex/hooks/task-continuity-entry.ps1') -ExpectedEvent UserPromptSubmit\"",
+            "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$repoRoot = git rev-parse --show-toplevel; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; & (Join-Path $repoRoot '.codex/hooks/task-continuity-entry.ps1') -ExpectedEvent UserPromptSubmit\"",
             "timeout": 5
           }
         ]
@@ -17,8 +17,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"C:\\Users\\kuh\\Desktop\\kd4\\.codex\\hooks\\task-continuity-entry.ps1\" -ExpectedEvent PreCompact",
-            "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"C:\\Users\\kuh\\Desktop\\kd4\\.codex\\hooks\\task-continuity-entry.ps1\" -ExpectedEvent PreCompact",
+            "command": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$repoRoot = git rev-parse --show-toplevel; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; & (Join-Path $repoRoot '.codex/hooks/task-continuity-entry.ps1') -ExpectedEvent PreCompact\"",
+            "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$repoRoot = git rev-parse --show-toplevel; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; & (Join-Path $repoRoot '.codex/hooks/task-continuity-entry.ps1') -ExpectedEvent PreCompact\"",
             "timeout": 5
           }
         ]
@@ -29,8 +29,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"C:\\Users\\kuh\\Desktop\\kd4\\.codex\\hooks\\task-continuity-entry.ps1\" -ExpectedEvent PostCompact",
-            "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"C:\\Users\\kuh\\Desktop\\kd4\\.codex\\hooks\\task-continuity-entry.ps1\" -ExpectedEvent PostCompact",
+            "command": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$repoRoot = git rev-parse --show-toplevel; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; & (Join-Path $repoRoot '.codex/hooks/task-continuity-entry.ps1') -ExpectedEvent PostCompact\"",
+            "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$repoRoot = git rev-parse --show-toplevel; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; & (Join-Path $repoRoot '.codex/hooks/task-continuity-entry.ps1') -ExpectedEvent PostCompact\"",
             "timeout": 5
           }
         ]
@@ -41,8 +41,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"C:\\Users\\kuh\\Desktop\\kd4\\.codex\\hooks\\task-continuity-entry.ps1\" -ExpectedEvent SessionStart",
-            "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"C:\\Users\\kuh\\Desktop\\kd4\\.codex\\hooks\\task-continuity-entry.ps1\" -ExpectedEvent SessionStart",
+            "command": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$repoRoot = git rev-parse --show-toplevel; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; & (Join-Path $repoRoot '.codex/hooks/task-continuity-entry.ps1') -ExpectedEvent SessionStart\"",
+            "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$repoRoot = git rev-parse --show-toplevel; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; & (Join-Path $repoRoot '.codex/hooks/task-continuity-entry.ps1') -ExpectedEvent SessionStart\"",
             "timeout": 5
           }
         ]
@@ -53,8 +53,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"C:\\Users\\kuh\\Desktop\\kd4\\.codex\\hooks\\task-continuity-entry.ps1\" -ExpectedEvent Stop",
-            "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"C:\\Users\\kuh\\Desktop\\kd4\\.codex\\hooks\\task-continuity-entry.ps1\" -ExpectedEvent Stop",
+            "command": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$repoRoot = git rev-parse --show-toplevel; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; & (Join-Path $repoRoot '.codex/hooks/task-continuity-entry.ps1') -ExpectedEvent Stop\"",
+            "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$repoRoot = git rev-parse --show-toplevel; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; & (Join-Path $repoRoot '.codex/hooks/task-continuity-entry.ps1') -ExpectedEvent Stop\"",
             "timeout": 5
           }
         ]

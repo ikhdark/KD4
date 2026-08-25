@@ -8,6 +8,7 @@ use super::plugin_mentions::fetch_plugin_mentions;
 use super::*;
 use crate::app_event::ConnectorsSnapshot;
 use crate::app_info::app_info_from_api;
+use crate::app_server_session::server_error_data_from_report;
 use crate::config_update::format_config_error;
 use codex_app_server_protocol::AppsListParams;
 use codex_app_server_protocol::AppsListResponse;
@@ -19,6 +20,8 @@ use codex_app_server_protocol::MarketplaceRemoveParams;
 use codex_app_server_protocol::MarketplaceRemoveResponse;
 use codex_app_server_protocol::MarketplaceUpgradeParams;
 use codex_app_server_protocol::MarketplaceUpgradeResponse;
+use codex_app_server_protocol::PluginRemoteErrorData;
+use codex_app_server_protocol::PluginRemoteErrorReason;
 
 use codex_app_server_protocol::RequestId;
 
@@ -923,11 +926,10 @@ pub(super) async fn fetch_additional_plugin_remote_sections(
                 marketplaces.extend(response.marketplaces);
             }
             Err(err) => {
-                let message = format!("{err:#}");
                 section_errors.push(PluginRemoteSectionError {
                     section_id: section_id.to_string(),
                     label: label.to_string(),
-                    message: plugin_remote_section_error_message(label, &message),
+                    message: plugin_remote_section_error_message(&err),
                 });
             }
         }
@@ -936,50 +938,40 @@ pub(super) async fn fetch_additional_plugin_remote_sections(
     (marketplaces, section_errors)
 }
 
-fn plugin_remote_section_error_message(label: &str, err: &str) -> String {
-    let next_step = plugin_remote_section_error_next_step(label, err);
+fn plugin_remote_section_error_message(err: &color_eyre::Report) -> String {
+    let message = format!("{err:#}");
+    let next_step = plugin_remote_section_error_next_step(err);
     if next_step.is_empty() {
-        err.to_string()
+        message
     } else {
-        format!("{err} {next_step}")
+        format!("{message} {next_step}")
     }
 }
 
-fn plugin_remote_section_error_next_step(label: &str, err: &str) -> &'static str {
-    let err = err.to_ascii_lowercase();
-    if err.contains("api key auth is not supported") {
-        "Sign in with ChatGPT auth; API key auth cannot load remote plugin catalogs."
-    } else if err.contains("authentication required")
-        || err.contains("not signed in")
-        || err.contains("not logged in")
-    {
-        "Sign in to ChatGPT, then try loading this section again."
-    } else if err.contains("codex plugins are disabled")
-        || err.contains("plugin sharing is disabled")
-        || err.contains("plugin sharing is not enabled")
-        || err.contains("feature disabled")
-    {
-        "Ask a workspace admin to enable Codex plugins or plugin sharing."
-    } else if err.contains("workspace") && (err.contains("access") || err.contains("mismatch")) {
-        "Switch to the matching workspace or ask the sharer for access."
-    } else if err.contains("not found") || err.contains("status 404") {
-        "Check that you are signed in to the correct workspace and still have access."
-    } else if err.contains("old build") || err.contains("update codex") || err.contains("stale") {
-        "Update Codex, then try opening the shared plugin again."
-    } else if err.contains("service unavailable")
-        || err.contains("temporarily unavailable")
-        || err.contains("status 503")
-        || err.contains("failed to send")
-        || err.contains("request")
-        || err.contains("status")
-    {
-        "Try again later; local plugin functionality is still available."
-    } else if err.contains("disabled by admin") || err.contains("admin disabled") {
-        "Ask a workspace admin to confirm plugin access."
-    } else if label == "Shared with me" && err.contains("plugin") && err.contains("disabled") {
-        "Ask the sharer or a workspace admin to confirm plugin access."
-    } else {
-        ""
+fn plugin_remote_section_error_next_step(err: &color_eyre::Report) -> &'static str {
+    let reason =
+        server_error_data_from_report::<PluginRemoteErrorData>(err).map(|data| data.reason);
+    match reason {
+        Some(PluginRemoteErrorReason::AuthenticationRequired) => {
+            "Sign in to ChatGPT, then try loading this section again."
+        }
+        Some(PluginRemoteErrorReason::UnsupportedAuthMode) => {
+            "Sign in with ChatGPT auth; API key auth cannot load remote plugin catalogs."
+        }
+        Some(PluginRemoteErrorReason::AccessDenied) => {
+            "Switch to the matching workspace or ask a workspace admin for access."
+        }
+        Some(PluginRemoteErrorReason::NotFound) => {
+            "Check that you are signed in to the correct workspace and still have access."
+        }
+        Some(PluginRemoteErrorReason::Transient) => {
+            "Try again later; local plugin functionality is still available."
+        }
+        Some(PluginRemoteErrorReason::InvalidResponse) => {
+            "Update Codex, then try loading this section again."
+        }
+        Some(PluginRemoteErrorReason::InvalidRequest | PluginRemoteErrorReason::Internal)
+        | None => "",
     }
 }
 
@@ -1293,11 +1285,7 @@ mod tests {
 
     #[test]
     fn marketplace_add_source_for_request_resolves_relative_local_paths() {
-        let cwd = if cfg!(windows) {
-            PathBuf::from(r"C:\workspace\project")
-        } else {
-            PathBuf::from("/workspace/project")
-        };
+        let cwd = PathBuf::from(r"C:\workspace\project");
 
         let resolved = marketplace_add_source_for_request(&cwd, "./marketplace".to_string());
         assert!(std::path::Path::new(&resolved).is_absolute());
@@ -1374,53 +1362,58 @@ mod tests {
     fn plugin_remote_section_error_message_adds_concrete_next_steps() {
         let cases = [
             (
-                "Workspace",
-                "chatgpt authentication required for remote plugin catalog",
+                PluginRemoteErrorReason::AuthenticationRequired,
                 "Sign in to ChatGPT, then try loading this section again.",
             ),
             (
-                "OpenAI Curated",
-                "chatgpt authentication required for remote plugin catalog; api key auth is not supported",
+                PluginRemoteErrorReason::UnsupportedAuthMode,
                 "Sign in with ChatGPT auth; API key auth cannot load remote plugin catalogs.",
             ),
             (
-                "Shared with me",
-                "remote plugin catalog request failed with status 404: missing",
+                PluginRemoteErrorReason::NotFound,
                 "Check that you are signed in to the correct workspace and still have access.",
             ),
             (
-                "Shared with me",
-                "workspace access mismatch",
-                "Switch to the matching workspace or ask the sharer for access.",
+                PluginRemoteErrorReason::AccessDenied,
+                "Switch to the matching workspace or ask a workspace admin for access.",
             ),
             (
-                "Shared with me",
-                "old build fallback",
-                "Update Codex, then try opening the shared plugin again.",
+                PluginRemoteErrorReason::InvalidResponse,
+                "Update Codex, then try loading this section again.",
             ),
             (
-                "Shared with me",
-                "remote service unavailable",
+                PluginRemoteErrorReason::Transient,
                 "Try again later; local plugin functionality is still available.",
-            ),
-            (
-                "Workspace",
-                "plugin disabled by admin",
-                "Ask a workspace admin to confirm plugin access.",
-            ),
-            (
-                "Shared with me",
-                "plugin sharing is not enabled",
-                "Ask a workspace admin to enable Codex plugins or plugin sharing.",
             ),
         ];
 
-        for (label, err, next_step) in cases {
-            assert_eq!(
-                plugin_remote_section_error_message(label, err),
-                format!("{err} {next_step}")
-            );
+        for (reason, next_step) in cases {
+            let err = plugin_remote_error_report(reason, "localized server message");
+            let message = plugin_remote_section_error_message(&err);
+            assert!(message.contains("localized server message"));
+            assert!(message.ends_with(next_step));
         }
+    }
+
+    fn plugin_remote_error_report(
+        reason: PluginRemoteErrorReason,
+        message: &str,
+    ) -> color_eyre::Report {
+        let source = codex_app_server_protocol::JSONRPCErrorError {
+            code: -32603,
+            message: message.to_string(),
+            data: Some(
+                serde_json::to_value(PluginRemoteErrorData {
+                    reason,
+                    retryable: reason == PluginRemoteErrorReason::Transient,
+                })
+                .expect("plugin error data"),
+            ),
+        };
+        color_eyre::Report::new(codex_app_server_client::TypedRequestError::Server {
+            method: "plugin/list".to_string(),
+            source,
+        })
     }
 
     #[test]

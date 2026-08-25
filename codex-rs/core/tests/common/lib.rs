@@ -18,6 +18,10 @@ use codex_core::config::ConfigOverrides;
 pub use codex_core::test_support::TestCodexResponsesRequestKind;
 pub use codex_core::test_support::responses_metadata;
 use codex_features::Feature;
+use codex_protocol::models::FileSystemPermissions;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
 pub use codex_utils_absolute_path::test_support::PathBufExt;
 pub use codex_utils_absolute_path::test_support::PathExt;
@@ -35,7 +39,6 @@ pub mod test_codex;
 pub mod test_codex_exec;
 mod test_environment;
 pub mod tracing;
-pub mod zsh_fork;
 
 pub(crate) use test_environment::TestEnvironment;
 pub use test_environment::TestTargetOs;
@@ -49,18 +52,18 @@ pub use test_environment::test_target_os;
 
 static TEST_ARG0_PATH_ENTRY: OnceLock<Option<Arg0PathEntryGuard>> = OnceLock::new();
 
-#[ctor]
+#[ctor(unsafe)]
 fn enable_deterministic_unified_exec_process_ids_for_tests() {
     codex_core::test_support::set_thread_manager_test_mode(/*enabled*/ true);
     codex_core::test_support::set_deterministic_process_ids(/*enabled*/ true);
 }
 
-#[ctor]
+#[ctor(unsafe)]
 fn configure_arg0_dispatch_for_test_binaries() {
     let _ = TEST_ARG0_PATH_ENTRY.get_or_init(codex_arg0::arg0_dispatch);
 }
 
-#[ctor]
+#[ctor(unsafe)]
 fn configure_insta_workspace_root_for_snapshot_tests() {
     if std::env::var_os("INSTA_WORKSPACE_ROOT").is_some() {
         return;
@@ -89,21 +92,17 @@ pub fn assert_regex_match<'s>(pattern: &str, actual: &'s str) -> regex_lite::Cap
 }
 
 pub fn test_path_buf_with_windows(unix_path: &str, windows_path: Option<&str>) -> PathBuf {
-    if cfg!(windows) {
-        if let Some(windows) = windows_path {
-            PathBuf::from(windows)
-        } else {
-            let mut path = PathBuf::from(r"C:\");
-            path.extend(
-                unix_path
-                    .trim_start_matches('/')
-                    .split('/')
-                    .filter(|segment| !segment.is_empty()),
-            );
-            path
-        }
+    if let Some(windows) = windows_path {
+        PathBuf::from(windows)
     } else {
-        PathBuf::from(unix_path)
+        let mut path = PathBuf::from(r"C:\");
+        path.extend(
+            unix_path
+                .trim_start_matches('/')
+                .split('/')
+                .filter(|segment| !segment.is_empty()),
+        );
+        path
     }
 }
 
@@ -123,13 +122,6 @@ pub fn test_absolute_path(unix_path: &str) -> AbsolutePathBuf {
     test_absolute_path_with_windows(unix_path, /*windows_path*/ None)
 }
 
-#[cfg(unix)]
-#[allow(clippy::expect_used)]
-pub fn create_directory_symlink(source: &Path, link: &Path) {
-    std::os::unix::fs::symlink(source, link).expect("create directory symlink");
-}
-
-#[cfg(windows)]
 #[allow(clippy::expect_used)]
 pub fn create_directory_symlink(source: &Path, link: &Path) {
     // Running this test locally may require Windows Developer Mode or an elevated process.
@@ -153,6 +145,39 @@ pub fn test_tmp_path() -> AbsolutePathBuf {
 
 pub fn test_tmp_path_buf() -> PathBuf {
     test_tmp_path().into_path_buf()
+}
+
+pub fn workspace_write_excluding_tmp() -> PermissionProfile {
+    PermissionProfile::workspace_write_with(
+        &[],
+        NetworkSandboxPolicy::Restricted,
+        /*exclude_tmpdir_env_var*/ true,
+        /*exclude_slash_tmp*/ true,
+    )
+}
+
+pub fn requested_directory_write_permissions(path: &Path) -> RequestPermissionProfile {
+    RequestPermissionProfile {
+        file_system: Some(FileSystemPermissions::from_read_write_roots(
+            Some(vec![]),
+            Some(vec![
+                AbsolutePathBuf::try_from(path).expect("absolute path"),
+            ]),
+        )),
+        ..RequestPermissionProfile::default()
+    }
+}
+
+pub fn normalized_directory_write_permissions(
+    path: &Path,
+) -> anyhow::Result<RequestPermissionProfile> {
+    Ok(RequestPermissionProfile {
+        file_system: Some(FileSystemPermissions::from_read_write_roots(
+            Some(vec![]),
+            Some(vec![AbsolutePathBuf::try_from(path.canonicalize()?)?]),
+        )),
+        ..RequestPermissionProfile::default()
+    })
 }
 
 /// Fetch a DotSlash resource and return the resolved executable/file path.
@@ -235,40 +260,11 @@ allow_local_binding = true
     )
 }
 
-#[cfg(target_os = "linux")]
-fn default_test_overrides(codex_home: &Path) -> ConfigOverrides {
-    ConfigOverrides {
-        cwd: Some(codex_home.to_path_buf()),
-        codex_linux_sandbox_exe: Some(
-            find_codex_linux_sandbox_exe().expect("should find binary for codex-linux-sandbox"),
-        ),
-        ..ConfigOverrides::default()
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
 fn default_test_overrides(codex_home: &Path) -> ConfigOverrides {
     ConfigOverrides {
         cwd: Some(codex_home.to_path_buf()),
         ..ConfigOverrides::default()
     }
-}
-
-#[cfg(target_os = "linux")]
-pub fn find_codex_linux_sandbox_exe() -> Result<PathBuf, CargoBinError> {
-    if let Some(path) = TEST_ARG0_PATH_ENTRY
-        .get()
-        .and_then(Option::as_ref)
-        .and_then(|path_entry| path_entry.paths().codex_linux_sandbox_exe.clone())
-    {
-        return Ok(path);
-    }
-
-    if let Ok(path) = std::env::current_exe() {
-        return Ok(path);
-    }
-
-    codex_utils_cargo_bin::cargo_bin("codex-linux-sandbox")
 }
 
 pub async fn wait_for_event<F>(
@@ -556,32 +552,6 @@ pub mod fs_wait {
 }
 
 #[macro_export]
-macro_rules! skip_if_sandbox {
-    () => {{
-        if ::std::env::var($crate::sandbox_env_var())
-            == ::core::result::Result::Ok("seatbelt".to_string())
-        {
-            eprintln!(
-                "{} is set to 'seatbelt', skipping test.",
-                $crate::sandbox_env_var()
-            );
-            return;
-        }
-    }};
-    ($return_value:expr $(,)?) => {{
-        if ::std::env::var($crate::sandbox_env_var())
-            == ::core::result::Result::Ok("seatbelt".to_string())
-        {
-            eprintln!(
-                "{} is set to 'seatbelt', skipping test.",
-                $crate::sandbox_env_var()
-            );
-            return $return_value;
-        }
-    }};
-}
-
-#[macro_export]
 macro_rules! skip_if_no_network {
     () => {{
         if ::std::env::var($crate::sandbox_network_env_var()).is_ok() {
@@ -670,70 +640,5 @@ macro_rules! skip_if_wine_exec {
             "the Wine-exec test environment",
             $reason,
         );
-    }};
-}
-
-#[macro_export]
-macro_rules! skip_if_target_windows {
-    ($reason:expr $(,)?) => {{
-        $crate::skip_if_test_condition!(
-            $crate::test_target_os() == $crate::TestTargetOs::Windows,
-            "a Windows target environment",
-            $reason,
-        );
-    }};
-    ($return_value:expr, $reason:expr $(,)?) => {{
-        $crate::skip_if_test_condition!(
-            $return_value,
-            $crate::test_target_os() == $crate::TestTargetOs::Windows,
-            "a Windows target environment",
-            $reason,
-        );
-    }};
-}
-
-#[macro_export]
-macro_rules! codex_linux_sandbox_exe_or_skip {
-    () => {{
-        #[cfg(target_os = "linux")]
-        {
-            match $crate::find_codex_linux_sandbox_exe() {
-                Ok(path) => Some(path),
-                Err(err) => {
-                    eprintln!("codex-linux-sandbox binary not available, skipping test: {err}");
-                    return;
-                }
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            None
-        }
-    }};
-    ($return_value:expr $(,)?) => {{
-        #[cfg(target_os = "linux")]
-        {
-            match $crate::find_codex_linux_sandbox_exe() {
-                Ok(path) => Some(path),
-                Err(err) => {
-                    eprintln!("codex-linux-sandbox binary not available, skipping test: {err}");
-                    return $return_value;
-                }
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            None
-        }
-    }};
-}
-
-#[macro_export]
-macro_rules! skip_if_host_windows {
-    ($return_value:expr $(,)?) => {{
-        if cfg!(target_os = "windows") {
-            println!("Skipping test because it cannot execute on Windows.");
-            return $return_value;
-        }
     }};
 }

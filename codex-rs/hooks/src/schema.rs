@@ -1,3 +1,4 @@
+use codex_config::schema::canonicalize as canonicalize_json;
 use schemars::JsonSchema;
 use schemars::r#gen::SchemaGenerator;
 use schemars::r#gen::SchemaSettings;
@@ -7,7 +8,6 @@ use schemars::schema::Schema;
 use schemars::schema::SchemaObject;
 use serde::Deserialize;
 use serde::Serialize;
-use serde_json::Map;
 use serde_json::Value;
 use std::path::Path;
 use std::path::PathBuf;
@@ -722,22 +722,6 @@ where
         })
         .into_generator()
         .into_root_schema_for::<T>()
-}
-
-fn canonicalize_json(value: &Value) -> Value {
-    match value {
-        Value::Array(items) => Value::Array(items.iter().map(canonicalize_json).collect()),
-        Value::Object(map) => {
-            let mut entries: Vec<_> = map.iter().collect();
-            entries.sort_by_key(|(key, _)| *key);
-            let mut sorted = Map::with_capacity(map.len());
-            for (key, child) in entries {
-                sorted.insert(key.clone(), canonicalize_json(child));
-            }
-            Value::Object(sorted)
-        }
-        _ => value.clone(),
-    }
 }
 
 fn session_start_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema {

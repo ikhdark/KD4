@@ -52,6 +52,8 @@ use codex_protocol::items::McpToolCallItem;
 use codex_protocol::items::McpToolCallStatus;
 use codex_protocol::items::TurnItem;
 use codex_protocol::mcp::CallToolResult;
+use codex_protocol::mcp::with_tool_call_progress_token_meta;
+use codex_protocol::mcp::with_tool_call_thread_id_meta;
 use codex_protocol::mcp_approval_meta::APPROVAL_KIND_KEY as MCP_TOOL_APPROVAL_KIND_KEY;
 use codex_protocol::mcp_approval_meta::APPROVAL_KIND_MCP_TOOL_CALL as MCP_TOOL_APPROVAL_KIND_MCP_TOOL_CALL;
 use codex_protocol::mcp_approval_meta::CONNECTOR_DESCRIPTION_KEY as MCP_TOOL_APPROVAL_CONNECTOR_DESCRIPTION_KEY;
@@ -77,7 +79,7 @@ use codex_protocol::request_user_input::RequestUserInputQuestionOption;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_rmcp_client::ElicitationAction;
 use codex_rmcp_client::ElicitationResponse;
-use codex_rollout::state_db;
+use codex_rollout::state_integration;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::truncate_text;
@@ -738,7 +740,7 @@ async fn execute_mcp_tool_call(
 ) -> Result<ExecutedMcpToolCall, String> {
     let turn_context = step_context.turn.as_ref();
     let manager = step_context.mcp.manager();
-    let request_meta = with_mcp_tool_call_thread_id_meta(request_meta, &sess.thread_id.to_string());
+    let request_meta = with_tool_call_thread_id_meta(request_meta, &sess.thread_id.to_string());
     let request_meta = augment_mcp_tool_request_meta_with_sandbox_state(
         step_context,
         manager,
@@ -752,6 +754,8 @@ async fn execute_mcp_tool_call(
         .rollout_thread_trace
         .start_mcp_call_trace(call_id);
     let request_meta = mcp_call_trace.add_request_meta(request_meta);
+    let request_meta =
+        with_tool_call_progress_token_meta(request_meta, turn_context.sub_id.as_str(), call_id);
     let tool_execution_timing_guard = turn_context.turn_timing_state.begin_tool_execution();
     let result = manager
         .call_tool(
@@ -853,29 +857,13 @@ async fn maybe_request_codex_apps_auth_elicitation(
         return result;
     }
 
-    refresh_codex_apps_after_connector_auth(sess, turn_context, manager).await;
+    refresh_codex_apps_after_connector_auth(manager).await;
     auth_elicitation_completed_result(&plan.auth_failure, result.meta)
 }
 
-async fn refresh_codex_apps_after_connector_auth(
-    sess: &Session,
-    turn_context: &TurnContext,
-    manager: &McpConnectionManager,
-) {
-    let mcp_tools_result = manager.hard_refresh_codex_apps_tools_cache().await;
-
-    match mcp_tools_result {
-        Ok(mcp_tools) => {
-            let auth = sess.services.auth_manager.auth().await;
-            connectors::refresh_accessible_connectors_cache_from_mcp_tools(
-                &turn_context.config,
-                auth.as_ref(),
-                &mcp_tools,
-            );
-        }
-        Err(err) => {
-            tracing::warn!("failed to refresh Codex Apps tools after connector auth: {err:#}");
-        }
+async fn refresh_codex_apps_after_connector_auth(manager: &McpConnectionManager) {
+    if let Err(err) = manager.hard_refresh_codex_apps_tools_cache().await {
+        tracing::warn!("failed to refresh Codex Apps tools after connector auth: {err:#}");
     }
 }
 
@@ -903,9 +891,7 @@ async fn augment_mcp_tool_request_meta_with_sandbox_state(
     let permission_profile = turn_context.permission_profile();
     let sandbox_state = serde_json::to_value(SandboxState {
         permission_profile,
-        codex_linux_sandbox_exe: step_context.mcp.config().codex_linux_sandbox_exe.clone(),
         sandbox_cwd,
-        use_legacy_landlock: step_context.mcp.config().use_legacy_landlock,
     })?;
 
     match meta.as_mut() {
@@ -940,8 +926,7 @@ fn sandbox_cwd_for_mcp_server(step_context: &StepContext, environment_id: &str) 
     }
 
     if environment_id == codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID {
-        #[allow(deprecated)]
-        return Some(PathUri::from_abs_path(&step_context.turn.cwd));
+        return Some(step_context.turn.cwd_uri());
     }
 
     None
@@ -960,7 +945,7 @@ async fn maybe_mark_thread_memory_mode_polluted(
     if !pollutes_memory {
         return;
     }
-    state_db::mark_thread_memory_mode_polluted(
+    state_integration::mark_thread_memory_mode_polluted(
         sess.services.state_db.as_deref(),
         sess.thread_id,
         "mcp_tool_call",
@@ -1303,7 +1288,6 @@ const MCP_TOOL_OPENAI_OUTPUT_TEMPLATE_META_KEY: &str = "openai/outputTemplate";
 const MCP_TOOL_UI_RESOURCE_URI_META_KEY: &str = "ui/resourceUri";
 const MCP_TOOL_LINK_ID_META_KEY: &str = "link_id";
 const MCP_TOOL_PLUGIN_ID_META_KEY: &str = "plugin_id";
-const MCP_TOOL_THREAD_ID_META_KEY: &str = "threadId";
 const MCP_TOOL_CONNECTED_ACCOUNT_EMAIL_META_KEY: &str = "connected_account_email";
 const MCP_TOOL_TEMPLATE_ID_META_KEY: &str = "template_id";
 const MCP_TOOL_RESOURCE_URI_META_KEY: &str = "resource_uri";
@@ -1399,30 +1383,6 @@ fn build_mcp_tool_call_request_meta(
     }
 
     (!request_meta.is_empty()).then_some(serde_json::Value::Object(request_meta))
-}
-
-fn with_mcp_tool_call_thread_id_meta(
-    meta: Option<serde_json::Value>,
-    thread_id: &str,
-) -> Option<serde_json::Value> {
-    match meta {
-        Some(serde_json::Value::Object(mut map)) => {
-            map.insert(
-                MCP_TOOL_THREAD_ID_META_KEY.to_string(),
-                serde_json::Value::String(thread_id.to_string()),
-            );
-            Some(serde_json::Value::Object(map))
-        }
-        None => {
-            let mut map = serde_json::Map::new();
-            map.insert(
-                MCP_TOOL_THREAD_ID_META_KEY.to_string(),
-                serde_json::Value::String(thread_id.to_string()),
-            );
-            Some(serde_json::Value::Object(map))
-        }
-        other => other,
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -1770,24 +1730,26 @@ async fn mcp_tool_metadata_from_tool_info(
         .plugin_id_for_mcp_server_name(server)
         .map(str::to_string);
     let connector_description = if server == CODEX_APPS_MCP_SERVER_NAME {
-        let connectors = match connectors::list_cached_accessible_connectors_from_mcp_tools(
-            turn_context.config.as_ref(),
-        )
-        .await
-        {
-            Some(connectors) => Some(connectors),
-            None => {
-                connectors::list_accessible_connectors_from_mcp_tools_with_mcp_manager(
-                    turn_context.config.as_ref(),
-                    /*force_refetch*/ false,
-                    sess.services.turn_environments.environment_manager(),
-                    Arc::clone(&sess.services.mcp_manager),
-                )
-                .await
-                .ok()
-                .map(|status| status.connectors)
-            }
-        };
+        let connectors =
+            match connectors::list_cached_accessible_connectors_from_mcp_tools_with_mcp_manager(
+                turn_context.config.as_ref(),
+                sess.services.mcp_manager.as_ref(),
+            )
+            .await
+            {
+                Some(connectors) => Some(connectors),
+                None => {
+                    connectors::list_accessible_connectors_from_mcp_tools_with_mcp_manager(
+                        turn_context.config.as_ref(),
+                        /*force_refetch*/ false,
+                        sess.services.turn_environments.environment_manager(),
+                        Arc::clone(&sess.services.mcp_manager),
+                    )
+                    .await
+                    .ok()
+                    .map(|status| status.connectors)
+                }
+            };
         connectors.and_then(|connectors| {
             let connector_id = tool_info.connector_id.as_deref()?;
             connectors

@@ -11,6 +11,140 @@ use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use tempfile::tempdir;
 
+#[test]
+fn unversioned_config_is_migrated_to_current_canonical_shape() {
+    let path = Path::new("config.toml");
+    let value: TomlValue = toml::from_str(
+        r#"
+experimental_use_unified_exec_tool = true
+model_supports_reasoning_summaries = true
+
+[features]
+connectors = true
+terminal_resize_reflow = true
+enable_experimental_windows_sandbox = true
+chronicle = true
+
+[notice]
+hide_full_access_warning = true
+
+[notice.external_config_migration_prompts]
+home = true
+
+[profiles.work]
+experimental_use_unified_exec_tool = false
+
+[profiles.work.features]
+telepathy = true
+elevated_windows_sandbox = true
+"#,
+    )
+    .expect("valid legacy config");
+
+    let migrated = migrate_config_toml(value, path).expect("migration succeeds");
+    assert_eq!(migrated["config_version"].as_integer(), Some(1));
+    assert_eq!(migrated["features"]["unified_exec"].as_bool(), Some(true));
+    assert_eq!(migrated["features"]["apps"].as_bool(), Some(true));
+    assert!(migrated["features"].get("terminal_resize_reflow").is_none());
+    assert!(
+        migrated["features"]
+            .get("enable_experimental_windows_sandbox")
+            .is_none()
+    );
+    assert_eq!(migrated["windows"]["sandbox"].as_str(), Some("unelevated"));
+    assert!(migrated.get("model_supports_reasoning_summaries").is_none());
+    assert_eq!(
+        migrated["profiles"]["work"]["features"]["unified_exec"].as_bool(),
+        Some(false)
+    );
+    assert!(migrated["notice"].get("hide_full_access_warning").is_none());
+    assert!(
+        migrated["notice"]
+            .get("external_config_migration_prompts")
+            .is_none()
+    );
+    assert!(migrated["features"].get("chronicle").is_none());
+    assert!(
+        migrated["profiles"]["work"]["features"]
+            .get("chronicle")
+            .is_none()
+    );
+    assert!(
+        migrated["profiles"]["work"]["features"]
+            .get("elevated_windows_sandbox")
+            .is_none()
+    );
+    assert_eq!(
+        migrated["profiles"]["work"]["windows"]["sandbox"].as_str(),
+        Some("elevated")
+    );
+}
+
+#[test]
+fn config_rejects_versions_outside_current_boundary() {
+    let value: TomlValue = toml::from_str("config_version = 2").expect("valid TOML");
+    let error = migrate_config_toml(value, Path::new("config.toml"))
+        .expect_err("future config version must fail");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("supports version 1"));
+}
+
+#[test]
+fn current_config_discards_obsolete_settings() {
+    let path = Path::new("config.toml");
+    let value: TomlValue = toml::from_str(
+        r#"
+config_version = 1
+
+[features]
+chronicle = true
+telepathy = true
+
+[notice]
+hide_full_access_warning = true
+
+[notice.external_config_migration_prompts]
+home = true
+
+[profiles.work.features]
+chronicle = true
+
+[profiles.work.notice]
+hide_full_access_warning = true
+
+[profiles.work.notice.external_config_migration_prompts]
+project = true
+"#,
+    )
+    .expect("valid current config");
+
+    let migrated = migrate_config_toml(value, path).expect("cleanup succeeds");
+    assert_eq!(migrated["config_version"].as_integer(), Some(1));
+    assert!(migrated["features"].get("chronicle").is_none());
+    assert!(migrated["features"].get("telepathy").is_none());
+    assert!(migrated["notice"].get("hide_full_access_warning").is_none());
+    assert!(
+        migrated["notice"]
+            .get("external_config_migration_prompts")
+            .is_none()
+    );
+    assert!(
+        migrated["profiles"]["work"]["features"]
+            .get("chronicle")
+            .is_none()
+    );
+    assert!(
+        migrated["profiles"]["work"]["notice"]
+            .get("hide_full_access_warning")
+            .is_none()
+    );
+    assert!(
+        migrated["profiles"]["work"]["notice"]
+            .get("external_config_migration_prompts")
+            .is_none()
+    );
+}
+
 struct TestFileSystem;
 
 impl ExecutorFileSystem for TestFileSystem {
@@ -283,6 +417,9 @@ async fn config_layer_stack_preserves_project_discovery_context() {
     let cwd = AbsolutePathBuf::from_absolute_path(&nested).expect("absolute cwd");
     let project_root = AbsolutePathBuf::from_absolute_path(workspace.path()).expect("project root");
     let fs = TestFileSystem;
+    let cwd_key = toml::Value::String(cwd.as_path().to_string_lossy().into_owned()).to_string();
+    let user_config = format!("[projects.{cwd_key}]\ntrust_level = \"trusted\"\n");
+    std::fs::write(codex_home.path().join(CONFIG_TOML_FILE), &user_config).expect("user config");
 
     let stack = load_config_layers_state(
         &fs,
@@ -304,6 +441,18 @@ async fn config_layer_stack_preserves_project_discovery_context() {
     assert_eq!(discovery.project_root(), &project_root);
     assert_eq!(discovery.project_root_markers(), &[".codex-root"]);
     assert_eq!(discovery.git_checkout_root(), Some(&project_root));
+    let lookup_keys = discovery
+        .active_project_lookup_keys()
+        .expect("normalized active-project keys");
+    assert!(lookup_keys.starts_with(&normalized_project_lookup_keys(cwd.as_path())));
+    let config: ConfigToml = toml::from_str(&user_config).expect("typed user config");
+    assert_eq!(
+        config
+            .get_active_project_for_lookup_keys(lookup_keys)
+            .expect("active project")
+            .trust_level,
+        Some(TrustLevel::Trusted)
+    );
 
     let updated = stack.with_user_config(
         &AbsolutePathBuf::resolve_path_against_base(CONFIG_TOML_FILE, codex_home.path()),

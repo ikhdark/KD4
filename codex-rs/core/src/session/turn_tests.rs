@@ -2,7 +2,6 @@ use super::*;
 use crate::session::reasoning_governor::AuthoritativeWaitOwnerResult;
 use crate::state::TaskKind;
 use crate::tasks::SessionTask;
-use crate::tasks::SessionTaskContext;
 use crate::tasks::SessionTaskResult;
 use crate::tools::exposure::AgentSurfaceStage;
 use crate::tools::exposure::EnvironmentSurfaceMode;
@@ -74,6 +73,49 @@ fn turn_submission_type_distinguishes_queued_continuations() {
         turn_submission_type(&input),
         TurnSubmissionType::Default
     ));
+}
+
+#[tokio::test]
+async fn consecutive_turn_contexts_share_the_unchanged_picker_snapshot() {
+    let (session, first_turn) = crate::session::tests::make_session_and_context().await;
+
+    let second_turn = session
+        .new_default_turn_with_sub_id("shared-picker-snapshot".to_string())
+        .await;
+
+    assert!(Arc::ptr_eq(
+        &first_turn.available_models,
+        &second_turn.available_models
+    ));
+}
+
+#[tokio::test]
+async fn kd4_latency_deferred_tool_schema_lease_releases_only_advertised_tools() {
+    let (_, turn_context) = crate::session::tests::make_session_and_context().await;
+    let advertised = codex_tools::ToolName::plain("advertised_deferred");
+    let discovered_during_request = codex_tools::ToolName::plain("newly_discovered_deferred");
+    turn_context.refresh_deferred_tool_capabilities(HashMap::from([
+        (advertised.clone(), "revision-a".to_string()),
+        (discovered_during_request.clone(), "revision-b".to_string()),
+    ]));
+    turn_context.activate_deferred_tools(std::iter::once(advertised.clone()));
+    let advertised_for_request = turn_context.activated_deferred_tools();
+
+    turn_context.activate_deferred_tools(std::iter::once(discovered_during_request.clone()));
+    turn_context.release_advertised_deferred_tools(&advertised_for_request);
+
+    assert!(!turn_context.deferred_tool_is_activated(&advertised));
+    assert!(
+        turn_context.deferred_tool_is_activated(&discovered_during_request),
+        "discovery performed during the request must remain visible to its continuation"
+    );
+}
+
+#[test]
+fn kd4_latency_continuation_prefetch_rejects_stale_or_steered_state() {
+    assert!(continuation_workspace_prefetch_is_current(7, 7, false));
+    assert!(!continuation_workspace_prefetch_is_current(7, 8, false));
+    assert!(!continuation_workspace_prefetch_is_current(7, 7, true));
 }
 
 #[test]
@@ -331,18 +373,20 @@ impl SessionTask for SignalCompletingTask {
         "session_task.phase_68_signal_completing"
     }
 
-    async fn run(
+    fn run(
         self: Arc<Self>,
-        _session: Arc<SessionTaskContext>,
+        _session: Arc<Session>,
         _ctx: Arc<TurnContext>,
         _input: Vec<TurnInput>,
         cancellation_token: CancellationToken,
-    ) -> SessionTaskResult {
-        tokio::select! {
-            _ = self.finish.cancelled() => {}
-            _ = cancellation_token.cancelled() => {}
-        }
-        Ok(crate::tasks::TurnTaskResult::default())
+    ) -> futures::future::BoxFuture<'static, SessionTaskResult> {
+        Box::pin(async move {
+            tokio::select! {
+                _ = self.finish.cancelled() => {}
+                _ = cancellation_token.cancelled() => {}
+            }
+            Ok(crate::tasks::TurnTaskResult::default())
+        })
     }
 }
 
@@ -678,9 +722,6 @@ async fn extension_turn_input_contributors_share_one_hard_budget() {
 
 #[tokio::test]
 async fn extension_turn_input_contributors_receive_foreign_environment_uris() {
-    #[cfg(unix)]
-    let foreign_cwd = PathUri::parse("file:///C:/workspace").expect("Windows cwd URI");
-    #[cfg(windows)]
     let foreign_cwd = PathUri::parse("file:///usr/local/project").expect("POSIX cwd URI");
     assert!(
         foreign_cwd.to_abs_path().is_err(),
@@ -725,12 +766,7 @@ fn streamed_item_with_empty_id_gets_a_generated_id() -> Result<()> {
 async fn streamed_item_with_empty_id_gets_a_generated_id_impl() -> Result<()> {
     core_test_support::skip_if_no_network!(Ok(()));
     let server = responses::start_mock_server().await;
-    let test = test_codex()
-        .with_config(|config| {
-            let _ = config.features.enable(Feature::ItemIds);
-        })
-        .build(&server)
-        .await?;
+    let test = test_codex().build(&server).await?;
     let response_mock = responses::mount_sse_once(
         &server,
         responses::sse(vec![
@@ -863,6 +899,24 @@ async fn drain_in_flight_returns_first_error_after_draining_remaining_futures() 
         error,
         CodexErr::Fatal(message) if message == "first tool failure"
     ));
+}
+
+#[tokio::test]
+async fn drain_in_flight_keeps_successful_delivery_independent_of_telemetry_state() {
+    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let mut in_flight: FuturesOrdered<BoxFuture<'static, InFlightToolResult>> =
+        FuturesOrdered::new();
+    in_flight.push_back(Box::pin(
+        InFlightToolCall::from_test_future(
+            "successful",
+            Box::pin(async { Ok(synthetic_tool_result("successful")) }),
+        )
+        .into_future(),
+    ));
+
+    drain_in_flight(&mut in_flight, Arc::new(session), Arc::new(turn_context))
+        .await
+        .expect("successful tool delivery must not depend on telemetry-only state");
 }
 
 #[tokio::test]
@@ -1043,7 +1097,6 @@ async fn initial_response_item_triggers_compaction_before_the_stream_request_imp
             codex_protocol::config_types::AutoCompactTokenLimitScope::Total;
         config.model_provider.request_max_retries = Some(0);
         config.model_provider.stream_max_retries = Some(0);
-        let _ = config.features.disable(Feature::RemoteCompactionV2);
     });
     let test = builder.build(&server).await?;
 
@@ -1164,7 +1217,6 @@ async fn oversized_pending_input_compacts_once_when_committed_history_is_also_ov
                 codex_protocol::config_types::AutoCompactTokenLimitScope::Total;
             config.model_provider.request_max_retries = Some(0);
             config.model_provider.stream_max_retries = Some(0);
-            let _ = config.features.disable(Feature::RemoteCompactionV2);
         });
     let test = builder.build(&server).await?;
 
@@ -1961,7 +2013,6 @@ async fn unchanged_model_and_comp_hash_skip_previous_model_context_reconstructio
         .set_previous_turn_settings(Some(crate::session::PreviousTurnSettings {
             model: turn_context.model_info.slug.clone(),
             comp_hash: turn_context.model_info.comp_hash.clone(),
-            realtime_active: Some(turn_context.realtime_active),
         }))
         .await;
     let mut client_session = session.services.model_client.new_session();
@@ -2299,16 +2350,27 @@ fn projected_prompt_pressure_does_not_add_stable_tools_to_server_usage_twice() {
     assert_eq!(
         projected_prompt_tokens_from_estimates(
             /*active_context_tokens*/ 900, /*committed_history_tokens*/ 500,
-            /*pending_token_estimate*/ 450,
+            /*pending_token_estimate*/ 450, /*pending_body_growth_tokens*/ 50,
         ),
         950
     );
     assert_eq!(
         projected_prompt_tokens_from_estimates(
             /*active_context_tokens*/ 1_200, /*committed_history_tokens*/ 500,
-            /*pending_token_estimate*/ 450,
+            /*pending_token_estimate*/ 450, /*pending_body_growth_tokens*/ 0,
         ),
         1_200
+    );
+}
+
+#[test]
+fn projected_prompt_pressure_adds_pending_body_growth_to_server_usage() {
+    assert_eq!(
+        projected_prompt_tokens_from_estimates(
+            /*active_context_tokens*/ 1_200, /*committed_history_tokens*/ 500,
+            /*pending_token_estimate*/ 450, /*pending_body_growth_tokens*/ 50,
+        ),
+        1_250
     );
 }
 
@@ -2329,4 +2391,32 @@ fn plan_mode_memory_citations_are_parsed_once_for_live_events() {
         take_new_memory_citation(&mut state, vec![raw.to_string()]),
         None
     );
+}
+
+#[test]
+fn pending_turn_mechanism_retries_remain_bounded_without_fixed_point_state() {
+    let mut iterations = 0;
+    for _ in 0..MAX_PENDING_TURN_PLAN_ITERATIONS {
+        advance_pending_turn_plan_iteration(&mut iterations).expect("within retry bound");
+    }
+    assert!(advance_pending_turn_plan_iteration(&mut iterations).is_err());
+}
+
+#[test]
+fn pending_turn_mechanism_does_not_replay_the_completed_mcp_effect() {
+    let completed = ("install:tool@v1".to_string(), None);
+    assert!(mcp_dependency_effect_is_completed(
+        Some(&completed),
+        "install:tool@v1"
+    ));
+    assert!(!mcp_dependency_effect_is_completed(
+        Some(&completed),
+        "install:tool@v2"
+    ));
+}
+
+#[test]
+fn pending_turn_mechanism_inventory_effect_requires_a_newer_generation() {
+    assert!(require_newer_planning_generation(4, 4).is_err());
+    assert!(require_newer_planning_generation(4, 5).is_ok());
 }

@@ -4,7 +4,7 @@
 //! and Windows sandbox helper actions that are compiled only on Windows.
 
 use super::*;
-use codex_utils_approval_presets::ApprovalPreset;
+use crate::approval_presets::ApprovalPreset;
 
 #[derive(Default)]
 pub(super) struct WindowsSandboxState {
@@ -21,7 +21,6 @@ pub(super) struct PendingWindowsSandboxSetup {
 }
 
 impl App {
-    #[cfg(target_os = "windows")]
     pub(super) fn spawn_world_writable_scan(
         cwd: AbsolutePathBuf,
         workspace_roots: Vec<AbsolutePathBuf>,
@@ -57,7 +56,6 @@ impl App {
     }
 }
 
-#[cfg(target_os = "windows")]
 fn send_world_writable_scan_failed(tx: &AppEventSender) {
     tx.send(AppEvent::OpenWorldWritableWarningConfirmation {
         preset: None,

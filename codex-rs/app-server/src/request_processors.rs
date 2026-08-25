@@ -64,7 +64,9 @@ use codex_app_server_protocol::DeprecationNoticeNotification;
 use codex_app_server_protocol::DesktopActivationChallenge as ApiDesktopActivationChallenge;
 use codex_app_server_protocol::DesktopActivationObligation as ApiDesktopActivationObligation;
 use codex_app_server_protocol::DesktopActivationUnavailableReason;
+#[cfg(test)]
 use codex_app_server_protocol::DynamicToolFunctionSpec;
+#[cfg(test)]
 use codex_app_server_protocol::DynamicToolNamespaceTool;
 use codex_app_server_protocol::DynamicToolSpec;
 use codex_app_server_protocol::EnvironmentAddParams;
@@ -245,18 +247,6 @@ use codex_app_server_protocol::ThreadMetadataUpdateResponse;
 use codex_app_server_protocol::ThreadNameUpdatedNotification;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
-use codex_app_server_protocol::ThreadRealtimeAppendAudioParams;
-use codex_app_server_protocol::ThreadRealtimeAppendAudioResponse;
-use codex_app_server_protocol::ThreadRealtimeAppendSpeechParams;
-use codex_app_server_protocol::ThreadRealtimeAppendSpeechResponse;
-use codex_app_server_protocol::ThreadRealtimeAppendTextParams;
-use codex_app_server_protocol::ThreadRealtimeAppendTextResponse;
-use codex_app_server_protocol::ThreadRealtimeListVoicesResponse;
-use codex_app_server_protocol::ThreadRealtimeStartParams;
-use codex_app_server_protocol::ThreadRealtimeStartResponse;
-use codex_app_server_protocol::ThreadRealtimeStartTransport;
-use codex_app_server_protocol::ThreadRealtimeStopParams;
-use codex_app_server_protocol::ThreadRealtimeStopResponse;
 use codex_app_server_protocol::ThreadResumeInitialTurnsPageParams;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
@@ -320,6 +310,7 @@ use codex_backend_client::RequestError as BackendRequestError;
 use codex_backend_client::TokenUsageProfile;
 use codex_chatgpt::connectors;
 use codex_chatgpt::workspace_settings;
+use codex_chatgpt::workspace_settings::codex_plugins_enabled_for_workspace_or_default as workspace_codex_plugins_enabled;
 use codex_config::CloudConfigBundleLoadError;
 use codex_config::CloudConfigBundleLoadErrorCode;
 use codex_config::ConfigLayerStack;
@@ -347,7 +338,6 @@ use codex_core::exec::ExecCapturePolicy;
 use codex_core::exec::ExecExpiration;
 use codex_core::exec::ExecParams;
 use codex_core::exec_env::create_env;
-use codex_core::path_utils;
 #[cfg(test)]
 use codex_core::read_head_for_summary;
 use codex_core::sandboxing::SandboxPermissions;
@@ -383,7 +373,6 @@ use codex_core_plugins::remote::RemotePluginSummary as RemoteCatalogPluginSummar
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_exec_server::LOCAL_FS;
-use codex_features::FEATURES;
 use codex_features::Feature;
 use codex_features::Stage;
 use codex_feedback::CodexFeedback;
@@ -429,18 +418,12 @@ use codex_protocol::openai_models::ReasoningEffort;
 #[cfg(test)]
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::protocol::AgentStatus;
-use codex_protocol::protocol::ConversationAudioParams;
-use codex_protocol::protocol::ConversationSpeechParams;
-use codex_protocol::protocol::ConversationStartParams;
-use codex_protocol::protocol::ConversationStartTransport;
-use codex_protocol::protocol::ConversationTextParams;
 use codex_protocol::protocol::EventMsg;
 #[cfg(test)]
 use codex_protocol::protocol::GitInfo as CoreGitInfo;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::McpAuthStatus as CoreMcpAuthStatus;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::RealtimeVoicesList;
 use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionConfiguredEvent;
@@ -454,8 +437,8 @@ use codex_protocol::user_input::MAX_USER_INPUT_TEXT_CHARS;
 use codex_protocol::user_input::UserInput as CoreInputItem;
 use codex_rmcp_client::perform_oauth_login_return_url_with_http_client;
 use codex_rollout::is_persisted_rollout_item;
-use codex_rollout::state_db::StateDbHandle;
-use codex_rollout::state_db::reconcile_rollout;
+use codex_rollout::state_integration::StateDbHandle;
+use codex_rollout::state_integration::reconcile_rollout;
 #[cfg(test)]
 use codex_state::ThreadMetadata;
 use codex_state::log_db::LogDbLayer;
@@ -476,6 +459,7 @@ use codex_thread_store::ThreadRelationFilter as StoreThreadRelationFilter;
 use codex_thread_store::ThreadSortKey as StoreThreadSortKey;
 use codex_thread_store::ThreadStore;
 use codex_thread_store::ThreadStoreError;
+use codex_utils_absolute_path as path_utils;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_pty::DEFAULT_OUTPUT_BYTES_CAP;
 use std::collections::HashMap;
@@ -490,7 +474,6 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio::sync::SemaphorePermit;
-use tokio::sync::broadcast;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -540,7 +523,7 @@ pub(crate) use external_agent_config_processor::ExternalAgentConfigRequestProces
 pub(crate) use external_agent_config_processor::ExternalAgentConfigRequestProcessorArgs;
 pub(crate) use feedback_processor::FeedbackRequestProcessor;
 pub(crate) use fs_processor::FsRequestProcessor;
-pub(crate) use git_processor::GitRequestProcessor;
+pub(crate) use git_processor::git_diff_to_remote_response;
 pub(crate) use initialize_processor::InitializeRequestProcessor;
 pub(crate) use marketplace_processor::MarketplaceRequestProcessor;
 pub(crate) use mcp_processor::McpRequestProcessor;
@@ -557,6 +540,7 @@ use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
 use crate::filters::compute_source_filters;
 use crate::filters::source_kind_matches;
+#[cfg(test)]
 use crate::thread_state::ConnectionCapabilities;
 use crate::thread_state::ThreadListenerCommand;
 use crate::thread_state::ThreadState;
@@ -601,6 +585,55 @@ fn resolve_turn_environment_selections(
     Ok(Some(selections))
 }
 
+fn environment_selection_error(err: CodexErr) -> JSONRPCErrorError {
+    match err {
+        CodexErr::InvalidRequest(message) => invalid_request(message),
+        err => internal_error(format!("failed to validate environment selections: {err}")),
+    }
+}
+
+#[cfg(test)]
+mod tiny_module_collapse_tests {
+    use super::*;
+    use crate::error_code::INTERNAL_ERROR_CODE;
+    use crate::error_code::INVALID_REQUEST_ERROR_CODE;
+
+    #[test]
+    fn environment_selection_errors_keep_their_json_rpc_mapping() {
+        let invalid = environment_selection_error(CodexErr::InvalidRequest(
+            "unknown turn environment id `missing`".to_string(),
+        ));
+        assert_eq!(invalid.code, INVALID_REQUEST_ERROR_CODE);
+        assert_eq!(invalid.message, "unknown turn environment id `missing`");
+
+        let internal = environment_selection_error(CodexErr::Fatal(
+            "environment registry unavailable".to_string(),
+        ));
+        assert_eq!(internal.code, INTERNAL_ERROR_CODE);
+        assert_eq!(
+            internal.message,
+            "failed to validate environment selections: Fatal error: environment registry unavailable"
+        );
+    }
+
+    #[test]
+    fn request_processors_do_not_keep_a_single_error_forwarding_module() {
+        let obsolete_declaration = ["mod request_", "errors;"].concat();
+        assert!(!include_str!("request_processors.rs").contains(&obsolete_declaration));
+    }
+
+    #[test]
+    fn app_server_does_not_keep_single_child_or_conversion_forwarders() {
+        let app_server_lib = include_str!("lib.rs");
+        let obsolete_auth_module = ["mod auth_", "mode;"].concat();
+        let obsolete_config_module = ["mod con", "fig;"].concat();
+
+        assert!(!app_server_lib.contains(&obsolete_auth_module));
+        assert!(!app_server_lib.contains(&obsolete_config_module));
+        assert!(app_server_lib.contains("mod external_agent_config;"));
+    }
+}
+
 fn resolve_runtime_workspace_roots(workspace_roots: Vec<AbsolutePathBuf>) -> Vec<AbsolutePathBuf> {
     let mut resolved_roots = Vec::new();
     for root in workspace_roots {
@@ -612,7 +645,6 @@ fn resolve_runtime_workspace_roots(workspace_roots: Vec<AbsolutePathBuf>) -> Vec
 }
 
 mod config_errors;
-mod request_errors;
 mod thread_delete;
 mod thread_goal_processor;
 mod thread_lifecycle;
@@ -620,7 +652,6 @@ mod thread_resume_redaction;
 mod thread_summary;
 
 use self::config_errors::*;
-use self::request_errors::*;
 use self::thread_goal_processor::api_thread_goal_from_state;
 use self::thread_lifecycle::*;
 use self::thread_resume_redaction::*;

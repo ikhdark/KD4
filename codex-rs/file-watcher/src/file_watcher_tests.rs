@@ -20,12 +20,6 @@ fn notify_event(kind: EventKind, paths: Vec<PathBuf>) -> Event {
     event
 }
 
-#[cfg(unix)]
-fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(target, link)
-}
-
-#[cfg(windows)]
 fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
     std::os::windows::fs::symlink_dir(target, link)
 }

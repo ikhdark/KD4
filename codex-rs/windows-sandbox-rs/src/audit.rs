@@ -12,6 +12,7 @@ use crate::setup::effective_write_roots_for_permissions;
 use crate::token::LocalSid;
 use crate::token::world_sid;
 use anyhow::Result;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::ffi::c_void;
@@ -34,6 +35,41 @@ const SKIP_DIR_SUFFIXES: &[&str] = &[
     "/windows/registration",
     "/programdata",
 ];
+
+fn normalize_windows_path_for_display(path: impl AsRef<Path>) -> String {
+    let path = dunce::canonicalize(path.as_ref()).unwrap_or_else(|_| path.as_ref().to_path_buf());
+    path.display().to_string().replace('/', "\\")
+}
+
+fn world_writable_warning_details_from_scan(
+    scan: Result<Vec<PathBuf>>,
+) -> Option<(Vec<String>, usize, bool)> {
+    match scan {
+        Ok(paths) if paths.is_empty() => None,
+        Ok(paths) => {
+            let paths = paths
+                .iter()
+                .map(normalize_windows_path_for_display)
+                .collect::<Vec<_>>();
+            let sample_paths = paths.iter().take(3).cloned().collect::<Vec<_>>();
+            let extra_count = paths.len().saturating_sub(sample_paths.len());
+            Some((sample_paths, extra_count, false))
+        }
+        Err(_) => Some((Vec::new(), 0, true)),
+    }
+}
+
+pub fn world_writable_warning_details(
+    codex_home: impl AsRef<Path>,
+    cwd: impl AsRef<Path>,
+) -> Option<(Vec<String>, usize, bool)> {
+    let env_map: HashMap<String, String> = std::env::vars().collect();
+    world_writable_warning_details_from_scan(audit_everyone_writable(
+        cwd.as_ref(),
+        &env_map,
+        Some(codex_home.as_ref()),
+    ))
+}
 
 fn unique_push(set: &mut HashSet<PathBuf>, out: &mut Vec<PathBuf>, p: PathBuf) {
     if let Ok(abs) = p.canonicalize()
@@ -314,6 +350,8 @@ fn apply_capability_denies_for_world_writable_for_permissions(
 #[cfg(test)]
 mod tests {
     use super::gather_candidates;
+    use super::world_writable_warning_details_from_scan;
+    use anyhow::anyhow;
     use std::collections::HashMap;
     use std::fs;
 
@@ -346,5 +384,37 @@ mod tests {
         assert!(candidates.contains(&canon_a));
         assert!(candidates.contains(&canon_b));
         assert!(candidates.contains(&canon_space));
+    }
+
+    #[test]
+    fn warning_details_sample_paths_and_report_scan_failures() {
+        let details = world_writable_warning_details_from_scan(Ok(vec![
+            "C:/one".into(),
+            "C:/two".into(),
+            "C:/three".into(),
+            "C:/four".into(),
+        ]))
+        .expect("non-empty scan should produce warning details");
+        assert_eq!(
+            details,
+            (
+                vec![
+                    "C:\\one".to_string(),
+                    "C:\\two".to_string(),
+                    "C:\\three".to_string(),
+                ],
+                1,
+                false,
+            )
+        );
+
+        assert_eq!(
+            world_writable_warning_details_from_scan(Ok(Vec::new())),
+            None
+        );
+        assert_eq!(
+            world_writable_warning_details_from_scan(Err(anyhow!("scan failed"))),
+            Some((Vec::new(), 0, true))
+        );
     }
 }

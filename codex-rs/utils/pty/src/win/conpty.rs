@@ -30,7 +30,6 @@ use portable_pty::PtySystem;
 use portable_pty::SlavePty;
 use portable_pty::cmdbuilder::CommandBuilder;
 use std::mem::ManuallyDrop;
-use std::os::windows::io::RawHandle;
 use std::ptr;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -76,10 +75,6 @@ impl RawConPty {
             input_write,
             output_read,
         })
-    }
-
-    pub fn pseudoconsole_handle(&self) -> RawHandle {
-        self.con.raw_handle()
     }
 
     pub fn into_handles(self) -> (PsuedoCon, FileDescriptor, FileDescriptor) {

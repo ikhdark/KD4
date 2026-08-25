@@ -1,5 +1,6 @@
-use crate::function_tool::FunctionCallError;
-use crate::task_evidence::PlanUpdateEffect;
+use crate::FunctionCallError;
+use crate::plan_store::PlanUpdateEffect;
+use crate::task_evidence::AutoValidationCandidate;
 use crate::task_evidence::PlanningTier;
 use crate::task_evidence::PlanningUpdateInput;
 use crate::task_evidence::ResultProvenance;
@@ -20,7 +21,6 @@ use codex_tools::ToolSpec;
 use serde_json::Value as JsonValue;
 #[cfg(test)]
 use std::collections::HashMap;
-#[cfg(test)]
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::LazyLock;
@@ -29,7 +29,17 @@ use std::sync::Mutex;
 #[cfg(test)]
 use tokio::sync::Notify;
 
-pub struct PlanHandler;
+pub struct PlanHandler {
+    include_task_evidence_schema: bool,
+}
+
+impl PlanHandler {
+    pub(crate) fn new(include_task_evidence_schema: bool) -> Self {
+        Self {
+            include_task_evidence_schema,
+        }
+    }
+}
 
 pub struct PlanToolOutput {
     current_plan: UpdatePlanArgs,
@@ -161,7 +171,7 @@ impl ToolExecutor<ToolInvocation> for PlanHandler {
     }
 
     fn spec(&self) -> ToolSpec {
-        create_update_plan_tool()
+        create_update_plan_tool(self.include_task_evidence_schema)
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
@@ -176,8 +186,7 @@ impl PlanHandler {
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let ToolInvocation {
             session,
-            turn,
-            step_context: _,
+            step_context,
             cancellation_token,
             tracker: _,
             call_id: _call_id,
@@ -185,6 +194,7 @@ impl PlanHandler {
             payload,
             ..
         } = invocation;
+        let turn = Arc::clone(&step_context.turn);
 
         let arguments = match payload {
             ToolPayload::Function { arguments } => arguments,
@@ -201,26 +211,43 @@ impl PlanHandler {
             ));
         }
 
-        let requested_input = parse_update_plan_arguments(&arguments)?;
-        let repository = codex_git_utils::get_git_repo_root(turn.config.cwd.as_path())
-            .unwrap_or_else(|| turn.config.cwd.to_path_buf());
-        let routes = requested_input.validation_route.iter().chain(
-            requested_input
-                .plan
-                .iter()
-                .filter_map(|item| item.validation_route.as_ref()),
-        );
-        for route in routes {
-            for leaf in &route.leaves {
-                super::shell::validate_structured_validation_leaf(leaf, &repository).map_err(
-                    |reason| {
-                        FunctionCallError::RespondToModel(format!(
-                            "structured validation route could not be bound: {reason}"
-                        ))
-                    },
-                )?;
+        let use_task_evidence = self.include_task_evidence_schema
+            && session.services.task_evidence.allows_kd4_completion();
+        let (requested_input, requested_args) = if use_task_evidence {
+            let requested_input = parse_task_evidence_arguments(&arguments)?;
+            let repository = codex_git_utils::get_git_repo_root(turn.config.cwd.as_path())
+                .unwrap_or_else(|| turn.config.cwd.to_path_buf());
+            let routes = requested_input.validation_route.iter().chain(
+                requested_input
+                    .plan
+                    .iter()
+                    .filter_map(|item| item.validation_route.as_ref()),
+            );
+            for route in routes {
+                for leaf in &route.leaves {
+                    super::shell::validate_structured_validation_leaf(leaf, &repository).map_err(
+                        |reason| {
+                            FunctionCallError::RespondToModel(format!(
+                                "structured validation route could not be bound: {reason}"
+                            ))
+                        },
+                    )?;
+                }
             }
-        }
+            let requested_args = UpdatePlanArgs {
+                explanation: requested_input.explanation.clone(),
+                plan: requested_input.plan.clone(),
+            };
+            (Some(requested_input), requested_args)
+        } else {
+            let requested_args =
+                serde_json::from_str::<UpdatePlanArgs>(&arguments).map_err(|e| {
+                    FunctionCallError::RespondToModel(format!(
+                        "failed to parse function arguments: {e}"
+                    ))
+                })?;
+            (None, requested_args)
+        };
         if cancellation_token.is_cancelled() {
             return Err(FunctionCallError::RespondToModel(
                 "update_plan was cancelled before the plan update began".to_string(),
@@ -228,39 +255,57 @@ impl PlanHandler {
         }
         #[cfg(test)]
         pause_at_plan_commit_boundary(&_call_id).await;
-        let outcome = session
-            .services
-            .task_evidence
-            .record_planning_update(requested_input.clone())
-            .await;
-        if !outcome.durably_recorded {
-            return Err(FunctionCallError::RespondToModel(
-                "update_plan could not be durably persisted; no plan update was acknowledged"
-                    .to_string(),
-            ));
-        }
-        match outcome.effect {
+        let (args, effect, unfinished_mutation_obligation, validation_candidate) =
+            if use_task_evidence {
+                let Some(requested_input) = requested_input else {
+                    return Err(FunctionCallError::RespondToModel(
+                        "task evidence input was unavailable".to_string(),
+                    ));
+                };
+                let outcome = session
+                    .services
+                    .task_evidence
+                    .record_planning_update(requested_input)
+                    .await;
+                if !outcome.durably_recorded {
+                    return Err(FunctionCallError::RespondToModel(
+                    "update_plan could not be durably persisted; no plan update was acknowledged"
+                        .to_string(),
+                ));
+                }
+                let validation_candidate = session
+                    .services
+                    .task_evidence
+                    .auto_validation_candidate()
+                    .await;
+                (
+                    outcome.public_update,
+                    outcome.effect,
+                    outcome.unfinished_mutation_obligation,
+                    validation_candidate,
+                )
+            } else {
+                let update = session
+                    .services
+                    .plan_store
+                    .update(requested_args.clone())
+                    .await;
+                (update.current, update.effect, None, None)
+            };
+        match effect {
             PlanUpdateEffect::Initial => turn.turn_timing_state.record_initial_plan_generation(),
             PlanUpdateEffect::StructuralRevision => {
                 turn.turn_timing_state.record_plan_revision_generation()
             }
             PlanUpdateEffect::StatusOnly | PlanUpdateEffect::NoOp => {}
         }
-        let args = outcome.public_update;
-        let requested_args = UpdatePlanArgs {
-            explanation: requested_input.explanation,
-            plan: requested_input.plan,
-        };
-        let validation_candidate = session
-            .services
-            .task_evidence
-            .auto_validation_candidate()
-            .await;
-        let normalized_plan = (args != requested_args).then(|| args.clone());
+        let was_normalized = args != requested_args;
+        let normalized_plan = was_normalized.then(|| args.clone());
         let normalization_reason = plan_normalization_reason(
             &requested_args,
             &args,
-            outcome.effect,
+            was_normalized,
+            effect,
             validation_candidate
                 .as_ref()
                 .map(|candidate| candidate.step_id.as_str()),
@@ -270,19 +315,7 @@ impl PlanHandler {
             .await;
 
         let validation_results = if let Some(candidate) = validation_candidate {
-            let unsupported_runner = candidate.route.leaves.iter().find_map(|leaf| {
-                super::shell::validate_structured_validation_leaf(leaf, &repository).err()
-            });
-            vec![serde_json::json!({
-                "missing_proof": {
-                    "step_id": candidate.step_id,
-                    "implementation_identity": candidate.implementation_identity,
-                },
-                "stale_epoch": serde_json::Value::Null,
-                "unsupported_runner": unsupported_runner,
-                "validation_route": candidate.route,
-                "runner_dispatch": "not_started",
-            })]
+            vec![pending_validation_result(candidate)]
         } else {
             Vec::new()
         };
@@ -290,22 +323,39 @@ impl PlanHandler {
         Ok(boxed_tool_output(PlanToolOutput {
             current_plan: args.clone(),
             normalized_plan,
-            effect: outcome.effect,
+            effect,
             normalization_reason,
-            governor_plan: outcome.effect.requests_generation().then_some(args),
-            unfinished_mutation_obligation: outcome.unfinished_mutation_obligation,
+            governor_plan: effect.requests_generation().then_some(args),
+            unfinished_mutation_obligation,
             validation_results,
         }))
     }
 }
 
+fn pending_validation_result(candidate: AutoValidationCandidate) -> JsonValue {
+    // Rendering does not execute the route and is not a trust boundary. The
+    // plan-input handler admits new leaves above, while command execution
+    // independently admits any validation command before launch.
+    serde_json::json!({
+        "missing_proof": {
+            "step_id": candidate.step_id,
+            "implementation_identity": candidate.implementation_identity,
+        },
+        "stale_epoch": serde_json::Value::Null,
+        "unsupported_runner": serde_json::Value::Null,
+        "validation_route": candidate.route,
+        "runner_dispatch": "not_started",
+    })
+}
+
 fn plan_normalization_reason(
     requested: &UpdatePlanArgs,
     current: &UpdatePlanArgs,
+    was_normalized: bool,
     effect: PlanUpdateEffect,
     missing_proof_step: Option<&str>,
 ) -> Option<String> {
-    if requested == current {
+    if !was_normalized {
         return (effect == PlanUpdateEffect::NoOp)
             .then(|| "request matched the authoritative plan; no plan state changed".to_string());
     }
@@ -350,7 +400,28 @@ impl CoreToolRuntime for PlanHandler {
     }
 }
 
-fn parse_update_plan_arguments(arguments: &str) -> Result<PlanningUpdateInput, FunctionCallError> {
+fn parse_task_evidence_arguments(
+    arguments: &str,
+) -> Result<PlanningUpdateInput, FunctionCallError> {
+    fn is_completion_review_path(value: &str) -> bool {
+        let replaced = value.replace('\\', "/");
+        if replaced.trim().is_empty()
+            || replaced.starts_with('/')
+            || replaced.as_bytes().get(1) == Some(&b':')
+        {
+            return false;
+        }
+        let mut has_component = false;
+        for component in replaced.split('/') {
+            match component {
+                "" | "." => {}
+                ".." => return false,
+                _ => has_component = true,
+            }
+        }
+        has_component
+    }
+
     let input = serde_json::from_str::<PlanningUpdateInput>(arguments).map_err(|e| {
         FunctionCallError::RespondToModel(format!("failed to parse function arguments: {e}"))
     })?;
@@ -388,6 +459,37 @@ fn parse_update_plan_arguments(arguments: &str) -> Result<PlanningUpdateInput, F
         if removal.id.trim().is_empty() || removal.reason.trim().is_empty() {
             return Err(FunctionCallError::RespondToModel(
                 "planning removals require a stable id and non-empty reason".to_string(),
+            ));
+        }
+    }
+    const REVIEW_SURFACE_ROLES: &[&str] = &[
+        "lifecycle",
+        "persistence",
+        "schema",
+        "security",
+        "packaging",
+        "pipeline",
+        "validation",
+    ];
+    for evidence in &input.step_evidence {
+        if evidence
+            .surface_roles
+            .iter()
+            .any(|role| !REVIEW_SURFACE_ROLES.contains(&role.as_str()))
+        {
+            return Err(FunctionCallError::RespondToModel(
+                "step evidence surface_roles must use a supported completion-review role"
+                    .to_string(),
+            ));
+        }
+        if evidence
+            .validation_asset_paths
+            .iter()
+            .any(|path| !is_completion_review_path(path))
+        {
+            return Err(FunctionCallError::RespondToModel(
+                "step evidence validation_asset_paths must contain non-empty repository-relative paths"
+                    .to_string(),
             ));
         }
     }

@@ -6,6 +6,7 @@ use codex_protocol::protocol::ExecCommandBeginEvent;
 use codex_protocol::protocol::ExecCommandEndEvent;
 use codex_protocol::protocol::ExecCommandSource;
 use codex_protocol::protocol::ExecCommandStatus;
+use codex_protocol::protocol::McpToolCallProgressEvent;
 use codex_protocol::protocol::ReasoningPolicyHistory;
 use codex_protocol::protocol::ReasoningPolicyPhase;
 use codex_protocol::protocol::ReasoningPolicySnapshot;
@@ -20,6 +21,7 @@ use std::time::Duration;
 use super::ToolRuntimeTraceEvent;
 use super::codex_turn_trace_event;
 use super::tool_runtime_trace_event;
+use super::wrapped_protocol_event_type;
 use crate::ExecutionStatus;
 
 #[test]
@@ -93,6 +95,17 @@ fn reasoning_policy_events_are_omitted_from_turn_traces() {
         )
         .is_none()
     );
+}
+
+#[test]
+fn mcp_tool_call_progress_is_not_a_trace_boundary_or_wrapped_event() {
+    let event = EventMsg::McpToolCallProgress(McpToolCallProgressEvent {
+        call_id: "call-mcp".to_string(),
+        message: "still working".to_string(),
+    });
+
+    assert!(tool_runtime_trace_event(&event).is_none());
+    assert!(wrapped_protocol_event_type(&event).is_none());
 }
 
 #[test]

@@ -145,7 +145,7 @@ def repository_paths_are_case_insensitive(root: Path) -> bool:
                 return True
         except OSError:
             continue
-    return os.name == "nt"
+    return True
 
 
 def claim_covers(

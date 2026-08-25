@@ -36,7 +36,7 @@ class TurnResult:
 def _agent_message_item_from_thread_item(
     item: ThreadItem,
 ) -> AgentMessageThreadItem | None:
-    thread_item = item.root if hasattr(item, "root") else item
+    thread_item = item.root
     if isinstance(thread_item, AgentMessageThreadItem):
         return thread_item
     return None

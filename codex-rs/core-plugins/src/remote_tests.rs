@@ -2,6 +2,58 @@ use super::*;
 use pretty_assertions::assert_eq;
 
 #[test]
+fn remote_catalog_http_client_error_is_classified() {
+    let error =
+        RemotePluginCatalogError::HttpClient(codex_login::BuildLoginHttpClientError::ReadCaFile {
+            source_env: "TEST_CA_BUNDLE",
+            path: std::path::PathBuf::from("missing.pem"),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "missing test CA"),
+        });
+
+    assert_eq!(error.telemetry_type(), "remote_catalog_http_client");
+    assert_eq!(
+        error.error_data(),
+        PluginRemoteErrorData {
+            reason: PluginRemoteErrorReason::Internal,
+            retryable: false,
+        }
+    );
+}
+
+#[test]
+fn remote_catalog_error_data_owns_http_recovery_classification() {
+    let forbidden = RemotePluginCatalogError::UnexpectedStatus {
+        url: "https://example.test/plugins".to_string(),
+        status: reqwest::StatusCode::FORBIDDEN,
+        body: "localized body".to_string(),
+    };
+    let unavailable = RemotePluginCatalogError::UnexpectedStatus {
+        url: "https://example.test/plugins".to_string(),
+        status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        body: "localized body".to_string(),
+    };
+
+    assert_eq!(
+        forbidden.error_data(),
+        PluginRemoteErrorData {
+            reason: PluginRemoteErrorReason::AccessDenied,
+            retryable: false,
+        }
+    );
+    assert_eq!(
+        unavailable.error_data(),
+        PluginRemoteErrorData {
+            reason: PluginRemoteErrorReason::Transient,
+            retryable: true,
+        }
+    );
+    assert_eq!(
+        unavailable.telemetry_type(),
+        "remote_catalog_unexpected_status"
+    );
+}
+
+#[test]
 fn build_remote_marketplace_preserves_directory_order_and_appends_installed_only_plugins() {
     let directory_plugins = vec![
         directory_plugin("plugin-z", "zulu"),

@@ -4,6 +4,7 @@ use codex_rollout::rollout_date_parts;
 
 use super::LocalThreadStore;
 use super::helpers::matching_rollout_file_name;
+use super::helpers::rollout_lookup_error;
 use super::helpers::scoped_rollout_path;
 use super::helpers::stored_thread_from_rollout_item;
 use super::helpers::touch_modified_time;
@@ -24,12 +25,8 @@ pub(super) async fn unarchive_thread(
         state_db_ctx.as_deref(),
     )
     .await
-    .map_err(|err| ThreadStoreError::InvalidRequest {
-        message: format!("failed to locate archived thread id {thread_id}: {err}"),
-    })?
-    .ok_or_else(|| ThreadStoreError::InvalidRequest {
-        message: format!("no archived rollout found for thread id {thread_id}"),
-    })?;
+    .map_err(|err| rollout_lookup_error(thread_id, /*archived*/ true, err))?
+    .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
 
     let canonical_archived_path = scoped_rollout_path(
         store
@@ -155,6 +152,25 @@ mod tests {
             thread.first_user_message.as_deref(),
             Some("Archived user message")
         );
+    }
+
+    #[tokio::test]
+    async fn unarchive_thread_reports_typed_not_found() {
+        let home = TempDir::new().expect("temp dir");
+        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+        let thread_id = ThreadId::new();
+
+        let error = store
+            .unarchive_thread(ArchiveThreadParams { thread_id })
+            .await
+            .expect_err("missing archived thread should fail");
+
+        assert!(matches!(
+            error,
+            ThreadStoreError::ThreadNotFound {
+                thread_id: missing_thread_id
+            } if missing_thread_id == thread_id
+        ));
     }
 
     #[tokio::test]

@@ -406,7 +406,7 @@ impl TextArea {
         self.wrapped_lines(width).len() as u16
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
         self.cursor_pos_with_state(area, TextAreaState::default())
     }
@@ -3193,7 +3193,6 @@ mod tests {
         assert_eq!(t.cursor(), 3);
     }
 
-    #[cfg_attr(not(windows), ignore = "AltGr modifier only applies on Windows")]
     #[test]
     fn altgr_ctrl_alt_char_inserts_literal() {
         let mut t = ta_with("");

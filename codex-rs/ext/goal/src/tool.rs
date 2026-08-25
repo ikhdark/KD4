@@ -264,7 +264,7 @@ impl GoalToolExecutor {
                 self.thread_id,
                 codex_state::GoalUpdate {
                     objective: None,
-                    status: Some(state_status_from_protocol(args.status)),
+                    status: Some(args.status),
                     token_budget: None,
                     expected_goal_id: None,
                 },
@@ -463,36 +463,12 @@ pub(crate) fn protocol_goal_from_state(goal: codex_state::ThreadGoal) -> ThreadG
     ThreadGoal {
         thread_id: goal.thread_id,
         objective: goal.objective,
-        status: protocol_status_from_state(goal.status),
+        status: goal.status,
         token_budget: goal.token_budget,
         tokens_used: goal.tokens_used,
         time_used_seconds: goal.time_used_seconds,
         created_at: goal.created_at.timestamp(),
         updated_at: goal.updated_at.timestamp(),
-    }
-}
-
-fn protocol_status_from_state(status: codex_state::ThreadGoalStatus) -> ThreadGoalStatus {
-    match status {
-        codex_state::ThreadGoalStatus::Active => ThreadGoalStatus::Active,
-        codex_state::ThreadGoalStatus::Paused => ThreadGoalStatus::Paused,
-        codex_state::ThreadGoalStatus::Blocked => ThreadGoalStatus::Blocked,
-        codex_state::ThreadGoalStatus::UsageLimited => ThreadGoalStatus::UsageLimited,
-        codex_state::ThreadGoalStatus::BudgetLimited => ThreadGoalStatus::BudgetLimited,
-        codex_state::ThreadGoalStatus::Complete => ThreadGoalStatus::Complete,
-    }
-}
-
-pub(crate) fn state_status_from_protocol(
-    status: ThreadGoalStatus,
-) -> codex_state::ThreadGoalStatus {
-    match status {
-        ThreadGoalStatus::Active => codex_state::ThreadGoalStatus::Active,
-        ThreadGoalStatus::Paused => codex_state::ThreadGoalStatus::Paused,
-        ThreadGoalStatus::Blocked => codex_state::ThreadGoalStatus::Blocked,
-        ThreadGoalStatus::UsageLimited => codex_state::ThreadGoalStatus::UsageLimited,
-        ThreadGoalStatus::BudgetLimited => codex_state::ThreadGoalStatus::BudgetLimited,
-        ThreadGoalStatus::Complete => codex_state::ThreadGoalStatus::Complete,
     }
 }
 

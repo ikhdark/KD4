@@ -132,10 +132,6 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         | EventMsg::DynamicToolCallResponse(_)
         | EventMsg::Warning(_)
         | EventMsg::GuardianWarning(_)
-        | EventMsg::RealtimeConversationStarted(_)
-        | EventMsg::RealtimeConversationSdp(_)
-        | EventMsg::RealtimeConversationRealtime(_)
-        | EventMsg::RealtimeConversationClosed(_)
         | EventMsg::SafetyBuffering(_)
         | EventMsg::ModelReroute(_)
         | EventMsg::ModelVerification(_)
@@ -145,6 +141,7 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         | EventMsg::RawResponseItem(_)
         | EventMsg::SessionConfigured(_)
         | EventMsg::McpToolCallBegin(_)
+        | EventMsg::McpToolCallProgress(_)
         | EventMsg::ExecCommandBegin(_)
         | EventMsg::TerminalInteraction(_)
         | EventMsg::ExecCommandOutputDelta(_)
@@ -157,7 +154,6 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         | EventMsg::PatchApplyBegin(_)
         | EventMsg::PatchApplyUpdated(_)
         | EventMsg::TurnDiff(_)
-        | EventMsg::RealtimeConversationListVoicesResponse(_)
         | EventMsg::McpStartupUpdate(_)
         | EventMsg::McpStartupComplete(_)
         | EventMsg::WebSearchBegin(_)
@@ -185,6 +181,7 @@ mod tests {
     use super::should_persist_event_msg;
     use codex_protocol::openai_models::ReasoningEffort;
     use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::McpToolCallProgressEvent;
     use codex_protocol::protocol::ReasoningPolicyHistory;
     use codex_protocol::protocol::ReasoningPolicyPhase;
     use codex_protocol::protocol::ReasoningPolicySnapshot;
@@ -223,6 +220,17 @@ mod tests {
                 }),
                 history_mode
             ));
+        }
+    }
+
+    #[test]
+    fn mcp_tool_call_progress_is_transient() {
+        let event = EventMsg::McpToolCallProgress(McpToolCallProgressEvent {
+            call_id: "call-1".to_string(),
+            message: "halfway".to_string(),
+        });
+        for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
+            assert!(!should_persist_event_msg(&event, history_mode));
         }
     }
 }

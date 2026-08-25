@@ -18,15 +18,7 @@ pub enum TestTargetOs {
 
 impl TestTargetOs {
     const fn host() -> Self {
-        if cfg!(target_os = "macos") {
-            Self::MacOs
-        } else if cfg!(target_os = "windows") {
-            Self::Windows
-        } else if cfg!(target_os = "linux") {
-            Self::Linux
-        } else {
-            unreachable!()
-        }
+        Self::Windows
     }
 
     const fn path_convention(self) -> PathConvention {
@@ -95,7 +87,7 @@ pub(crate) fn test_environment() -> TestEnvironment {
     )
     .expect("invalid test environment configuration");
 
-    if matches!(environment, TestEnvironment::WineExec) && !cfg!(target_os = "linux") {
+    if matches!(environment, TestEnvironment::WineExec) {
         panic!("{TEST_ENVIRONMENT_ENV_VAR}=wine-exec is only supported on Linux");
     }
 

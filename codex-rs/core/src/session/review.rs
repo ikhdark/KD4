@@ -27,18 +27,11 @@ pub(super) async fn spawn_review_thread(
     let available_models = sess
         .services
         .models_manager
-        .list_models(
+        .list_models_shared(
             RefreshStrategy::OnlineIfUncached,
             config.http_client_factory(),
         )
         .await;
-    let unified_exec_shell_mode = UnifiedExecShellMode::for_session(
-        codex_tools::unified_exec_feature_mode_for_features(review_features.get()),
-        crate::tools::tool_user_shell_type(sess.services.user_shell.as_ref()),
-        sess.services.shell_zsh_path.as_ref(),
-        sess.services.main_execve_wrapper_exe.as_ref(),
-    );
-
     let review_prompt = resolved.prompt.clone();
     let provider = parent_turn_context.provider.clone();
     let auth_manager = parent_turn_context.auth_manager.clone();
@@ -53,8 +46,6 @@ pub(super) async fn spawn_review_thread(
         .permissions
         .shell_environment_policy
         .clone();
-    per_turn_config.codex_linux_sandbox_exe =
-        parent_turn_context.config.codex_linux_sandbox_exe.clone();
     per_turn_config.compact_prompt = parent_turn_context.config.compact_prompt.clone();
     if let Err(err) = per_turn_config.web_search_mode.set(review_web_search_mode) {
         let fallback_value = per_turn_config.web_search_mode.value();
@@ -86,6 +77,7 @@ pub(super) async fn spawn_review_thread(
         )
     };
 
+    per_turn_config.cwd = parent_turn_context.cwd().clone();
     let per_turn_config = Arc::new(per_turn_config);
     let review_turn_id = sub_id.to_string();
     let turn_metadata_state = Arc::new(TurnMetadataState::new_with_git_metadata_source(
@@ -112,7 +104,6 @@ pub(super) async fn spawn_review_thread(
     let review_turn_context = TurnContext {
         sub_id: review_turn_id.clone(),
         trace_id: current_span_trace_id(),
-        realtime_active: parent_turn_context.realtime_active,
         config: per_turn_config,
         auth_manager: auth_manager_for_context,
         model_info: model_info.clone(),
@@ -127,7 +118,6 @@ pub(super) async fn spawn_review_thread(
         originator: parent_turn_context.originator.clone(),
         environments: parent_turn_context.environments.clone(),
         available_models,
-        unified_exec_shell_mode,
         current_date: parent_turn_context.current_date.clone(),
         timezone: parent_turn_context.timezone.clone(),
         app_server_client_name: parent_turn_context.app_server_client_name.clone(),
@@ -140,8 +130,6 @@ pub(super) async fn spawn_review_thread(
         permission_profile: parent_turn_context.permission_profile(),
         network: parent_turn_context.network.clone(),
         windows_sandbox_level: parent_turn_context.windows_sandbox_level,
-        #[allow(deprecated)]
-        cwd: parent_turn_context.cwd.clone(),
         final_output_json_schema: None,
         dynamic_tools: parent_turn_context.dynamic_tools.clone(),
         deferred_tool_activations: Arc::new(std::sync::RwLock::new(

@@ -5,8 +5,15 @@
       "description": "A path that is guaranteed to be absolute and normalized (though it is not guaranteed to be canonicalized or exist on the filesystem).\n\nIMPORTANT: When deserializing an `AbsolutePathBuf`, a base path must be set using [AbsolutePathBufGuard::new]. If no base path is set, the deserialization will fail unless the path being deserialized is already absolute.",
       "type": "string"
     },
-    "CommandExecTerminalSize": {
-      "description": "PTY size in character cells for `command/exec` PTY sessions.",
+    "NetworkAccess": {
+      "enum": [
+        "restricted",
+        "enabled"
+      ],
+      "type": "string"
+    },
+    "PtyTerminalSize": {
+      "description": "Canonical PTY size payload shared by app-server process APIs.",
       "properties": {
         "cols": {
           "description": "Terminal width in character cells.",
@@ -26,13 +33,6 @@
         "rows"
       ],
       "type": "object"
-    },
-    "NetworkAccess": {
-      "enum": [
-        "restricted",
-        "enabled"
-      ],
-      "type": "string"
     },
     "SandboxPolicy": {
       "oneOf": [
@@ -201,7 +201,7 @@
     "size": {
       "anyOf": [
         {
-          "$ref": "#/definitions/CommandExecTerminalSize"
+          "$ref": "#/definitions/PtyTerminalSize"
         },
         {
           "type": "null"

@@ -20,10 +20,8 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
-#[cfg(windows)]
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(25);
-#[cfg(not(windows))]
-const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
 const CURRENT_TIME_AT: i64 = 1_781_717_655;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

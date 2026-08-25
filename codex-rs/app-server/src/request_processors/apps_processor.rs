@@ -1,6 +1,12 @@
 use super::*;
 use crate::app_info::app_info_to_api;
 use crate::app_info::connector_metadata_to_api;
+use codex_app_server_protocol::AppToolSummary;
+use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
+use codex_mcp::MCP_TOOL_CODEX_APPS_META_KEY;
+use codex_mcp::ToolInfo;
+use codex_mcp::codex_apps_tools_cache_key;
+use codex_mcp::tool_is_model_visible;
 
 mod installed;
 
@@ -55,7 +61,7 @@ impl AppsRequestProcessor {
 
         let AppsReadParams {
             app_ids,
-            include_tools: _,
+            include_tools,
         } = params;
         if app_ids.len() > APP_READ_MAX_IDS {
             return Err(invalid_params(format!(
@@ -73,9 +79,12 @@ impl AppsRequestProcessor {
         if !config
             .features
             .apps_enabled_for_auth(auth.as_ref().is_some_and(CodexAuth::uses_codex_backend))
-            || !self
-                .workspace_codex_plugins_enabled(&config, auth.as_ref())
-                .await
+            || !workspace_codex_plugins_enabled(
+                &config,
+                auth.as_ref(),
+                Some(&self.workspace_settings_cache),
+            )
+            .await
         {
             return Ok(Some(
                 AppsReadResponse {
@@ -96,6 +105,31 @@ impl AppsRequestProcessor {
                 loaded_plugins.capability_summaries(),
             );
         let plugin_apps = connector_snapshot.connector_ids().to_vec();
+        let mut tool_summaries_by_app_id = if include_tools {
+            let mcp_manager = self.thread_manager.mcp_manager();
+            connectors::list_accessible_connectors_from_mcp_tools_with_mcp_manager(
+                &config,
+                /*force_refetch*/ false,
+                self.thread_manager.environment_manager(),
+                Arc::clone(&mcp_manager),
+            )
+            .await
+            .map_err(|err| internal_error(format!("failed to read app tools: {err}")))?;
+            let tools = mcp_manager
+                .codex_apps_tools_cache()
+                .current_tools(
+                    config.codex_home.to_path_buf(),
+                    codex_apps_tools_cache_key(
+                        auth.as_ref(),
+                        &config.chatgpt_base_url,
+                        config.apps_mcp_product_sku.as_deref(),
+                    ),
+                )
+                .unwrap_or_default();
+            app_tool_summaries_by_connector(&tools)
+        } else {
+            HashMap::new()
+        };
         let available_apps = connectors::list_all_connectors_with_options(
             &config,
             /*force_refetch*/ false,
@@ -111,7 +145,11 @@ impl AppsRequestProcessor {
         let mut missing_app_ids = Vec::new();
         for app_id in app_ids {
             match available_apps.remove(&app_id) {
-                Some(app) => apps.push(connector_metadata_to_api(app)),
+                Some(app) => {
+                    let tool_summaries = include_tools
+                        .then(|| tool_summaries_by_app_id.remove(&app_id).unwrap_or_default());
+                    apps.push(connector_metadata_to_api(app, tool_summaries));
+                }
                 None => missing_app_ids.push(app_id),
             }
         }
@@ -163,9 +201,12 @@ impl AppsRequestProcessor {
             return Ok(Some(response));
         }
 
-        if !self
-            .workspace_codex_plugins_enabled(&config, auth.as_ref())
-            .await
+        if !workspace_codex_plugins_enabled(
+            &config,
+            auth.as_ref(),
+            Some(&self.workspace_settings_cache),
+        )
+        .await
         {
             let response = AppsListResponse {
                 data: Vec::new(),
@@ -295,7 +336,10 @@ impl AppsRequestProcessor {
             );
         let plugin_apps = connector_snapshot.connector_ids().to_vec();
         let (mut accessible_connectors, mut all_connectors) = tokio::join!(
-            connectors::list_cached_accessible_connectors_from_mcp_tools(&config),
+            connectors::list_cached_accessible_connectors_from_mcp_tools_with_mcp_manager(
+                &config,
+                mcp_manager.as_ref(),
+            ),
             connectors::list_cached_all_connectors(&config, &plugin_apps)
         );
         let cached_all_connectors = all_connectors.clone();
@@ -448,30 +492,47 @@ impl AppsRequestProcessor {
         self.config_manager
             .load_latest_config(fallback_cwd)
             .await
-            .map_err(|err| internal_error(format!("failed to reload config: {err}")))
+            .map_config_load_error()
     }
+}
 
-    async fn workspace_codex_plugins_enabled(
-        &self,
-        config: &Config,
-        auth: Option<&CodexAuth>,
-    ) -> bool {
-        match workspace_settings::codex_plugins_enabled_for_workspace(
-            config,
-            auth,
-            Some(&self.workspace_settings_cache),
-        )
-        .await
-        {
-            Ok(enabled) => enabled,
-            Err(err) => {
-                warn!(
-                    "failed to fetch workspace Codex plugins setting; allowing Codex plugins: {err:#}"
-                );
-                true
-            }
+fn app_tool_summaries_by_connector(tools: &[ToolInfo]) -> HashMap<String, Vec<AppToolSummary>> {
+    let mut summaries = HashMap::<String, Vec<AppToolSummary>>::new();
+    for tool in tools {
+        if tool.server_name != CODEX_APPS_MCP_SERVER_NAME || !tool_is_model_visible(tool) {
+            continue;
         }
+        if codex_connectors::connector_tool_is_synthetic(
+            tool.tool
+                .meta
+                .as_deref()
+                .and_then(|meta| meta.get(MCP_TOOL_CODEX_APPS_META_KEY)),
+        ) {
+            continue;
+        }
+        let Some(connector_id) = tool
+            .connector_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|connector_id| !connector_id.is_empty())
+        else {
+            continue;
+        };
+        summaries
+            .entry(connector_id.to_string())
+            .or_default()
+            .push(AppToolSummary {
+                name: tool.tool.name.to_string(),
+                title: tool.tool.title.as_deref().map(str::to_string),
+                description: tool
+                    .tool
+                    .description
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_string(),
+            });
     }
+    summaries
 }
 
 const APP_LIST_LOAD_TIMEOUT: Duration = Duration::from_secs(90);

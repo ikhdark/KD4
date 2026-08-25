@@ -53,6 +53,11 @@ pub fn backoff(base: Duration, retry_number: u64) -> Duration {
     Duration::from_millis((raw as f64 * jitter) as u64)
 }
 
+/// Computes exponential backoff and caps the result at `maximum`.
+pub fn capped_backoff(base: Duration, retry_number: u64, maximum: Duration) -> Duration {
+    backoff(base, retry_number).min(maximum)
+}
+
 /// Runs an operation once and retries it up to `policy.max_retries` times.
 ///
 /// The operation receives a zero-based attempt index. If all allowed attempts
@@ -82,5 +87,20 @@ where
             }
             Err(err) => return Err(err),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capped_backoff_never_exceeds_the_maximum() {
+        let maximum = Duration::from_secs(2);
+
+        assert_eq!(
+            capped_backoff(Duration::from_secs(1), u64::MAX, maximum),
+            maximum
+        );
     }
 }

@@ -32,7 +32,7 @@ fn config_schema_matches_fixture() {
             .to_string();
         panic!(
             "Current schema for `config.toml` doesn't match the fixture. \
-Run `just write-config-schema` to overwrite with your changes.\n\n{diff}"
+Run `just config-schema-regenerate <owner>` to overwrite with your changes.\n\n{diff}"
         );
     }
 
@@ -42,9 +42,9 @@ Run `just write-config-schema` to overwrite with your changes.\n\n{diff}"
     write_config_schema(&tmp_path).expect("write config schema to temp path");
     let tmp_contents =
         std::fs::read_to_string(&tmp_path).expect("read back config schema from temp path");
-    #[cfg(windows)]
+
     let fixture = fixture.replace("\r\n", "\n");
-    #[cfg(windows)]
+
     let tmp_contents = tmp_contents.replace("\r\n", "\n");
 
     assert_eq!(
@@ -75,7 +75,7 @@ fn config_schema_hides_unsupported_inline_mcp_bearer_token() {
 }
 
 #[test]
-fn config_schema_hides_deprecated_code_mode_waiting_policy() {
+fn config_schema_excludes_removed_code_mode_waiting_policy() {
     let schema_json = config_schema_json().expect("serialize config schema");
     let schema_value: serde_json::Value =
         serde_json::from_slice(&schema_json).expect("decode schema json");

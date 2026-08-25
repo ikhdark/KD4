@@ -2,12 +2,12 @@ use std::env;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
-#[cfg(windows)]
+
 use std::process::Stdio;
 
 use anyhow::Context;
 use anyhow::Result;
-#[cfg(windows)]
+
 use anyhow::bail;
 
 pub(super) fn runtime_dir() -> PathBuf {
@@ -36,7 +36,6 @@ pub(super) fn build_serve_command(
     config_overrides: &[String],
     listen: &str,
 ) -> Result<Command> {
-    #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
 
@@ -45,25 +44,8 @@ pub(super) fn build_serve_command(
         command.creation_flags(0x0000_0200 | 0x0800_0000); // CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
         Ok(command)
     }
-
-    #[cfg(not(windows))]
-    {
-        let mut cmdline = format!(
-            "tail -f /dev/null | RUST_BACKTRACE=full RUST_LOG=warn,codex_=trace {}",
-            shell_quote(&codex_bin.display().to_string())
-        );
-        for override_kv in config_overrides {
-            cmdline.push_str(&format!(" --config {}", shell_quote(override_kv)));
-        }
-        cmdline.push_str(&format!(" app-server --listen {}", shell_quote(listen)));
-
-        let mut command = Command::new("nohup");
-        command.arg("sh").arg("-c").arg(cmdline);
-        Ok(command)
-    }
 }
 
-#[cfg(windows)]
 fn build_direct_codex_command(codex_bin: &Path, config_overrides: &[String]) -> Result<Command> {
     let mut command = Command::new(codex_bin);
     add_codex_parent_to_path(&mut command, codex_bin)?;
@@ -77,7 +59,6 @@ fn build_direct_codex_command(codex_bin: &Path, config_overrides: &[String]) -> 
     Ok(command)
 }
 
-#[cfg(windows)]
 fn build_windows_serve_preflight_command(
     codex_bin: &Path,
     config_overrides: &[String],
@@ -92,7 +73,6 @@ fn build_windows_serve_preflight_command(
 }
 
 pub(super) fn preflight_serve_restart(codex_bin: &Path, config_overrides: &[String]) -> Result<()> {
-    #[cfg(windows)]
     {
         let status = build_windows_serve_preflight_command(codex_bin, config_overrides)?
             .status()
@@ -110,12 +90,6 @@ pub(super) fn preflight_serve_restart(codex_bin: &Path, config_overrides: &[Stri
         }
         Ok(())
     }
-
-    #[cfg(not(windows))]
-    {
-        let _ = (codex_bin, config_overrides);
-        Ok(())
-    }
 }
 
 pub(super) fn start_prepared_serve<T>(
@@ -131,7 +105,6 @@ pub(super) fn start_prepared_serve<T>(
     spawn()
 }
 
-#[cfg(windows)]
 pub(super) fn listener_pids_on_port(port: u16) -> Result<Vec<u32>> {
     let output = Command::new("netstat")
         .arg("-ano")
@@ -149,23 +122,6 @@ pub(super) fn listener_pids_on_port(port: u16) -> Result<Vec<u32>> {
     ))
 }
 
-#[cfg(not(windows))]
-pub(super) fn listener_pids_on_port(port: u16) -> Result<Vec<u32>> {
-    let output = Command::new("lsof")
-        .arg("-nP")
-        .arg(format!("-tiTCP:{port}"))
-        .arg("-sTCP:LISTEN")
-        .output()
-        .with_context(|| format!("failed to run lsof for port {port}"))?;
-
-    if !output.status.success() {
-        return Ok(Vec::new());
-    }
-
-    Ok(parse_pid_lines(&String::from_utf8_lossy(&output.stdout)))
-}
-
-#[cfg(windows)]
 fn parse_windows_listener_pids(output: &str, port: u16) -> Vec<u32> {
     sorted_unique_pids(output.lines().filter_map(|line| {
         let columns = line.split_whitespace().collect::<Vec<_>>();
@@ -182,7 +138,6 @@ fn parse_windows_listener_pids(output: &str, port: u16) -> Vec<u32> {
     }))
 }
 
-#[cfg(windows)]
 fn address_has_port(address: &str, port: u16) -> bool {
     address
         .rsplit_once(':')
@@ -190,7 +145,7 @@ fn address_has_port(address: &str, port: u16) -> bool {
         == Some(port)
 }
 
-#[cfg(any(not(windows), test))]
+#[cfg(test)]
 fn parse_pid_lines(output: &str) -> Vec<u32> {
     sorted_unique_pids(output.lines().filter_map(|line| line.trim().parse().ok()))
 }
@@ -202,7 +157,6 @@ fn sorted_unique_pids(pids: impl IntoIterator<Item = u32>) -> Vec<u32> {
     pids
 }
 
-#[cfg(windows)]
 pub(super) fn terminate_process(pid: u32, force: bool) -> Result<std::process::ExitStatus> {
     let mut command = Command::new("taskkill");
     command.arg("/PID").arg(pid.to_string()).arg("/T");
@@ -221,27 +175,8 @@ pub(super) fn terminate_process(pid: u32, force: bool) -> Result<std::process::E
     })
 }
 
-#[cfg(not(windows))]
-pub(super) fn terminate_process(pid: u32, force: bool) -> Result<std::process::ExitStatus> {
-    let mut command = Command::new("kill");
-    if force {
-        command.arg("-9");
-    }
-    command.arg(pid.to_string());
-    command.status().with_context(|| {
-        format!(
-            "failed to {} pid {pid}",
-            if force {
-                "force terminate"
-            } else {
-                "terminate"
-            }
-        )
-    })
-}
-
-pub(super) fn shell_quote(input: &str) -> String {
-    format!("'{}'", input.replace('\'', "'\\''"))
+pub(super) fn powershell_quote(input: &str) -> String {
+    format!("'{}'", input.replace('\'', "''"))
 }
 
 #[cfg(test)]
@@ -260,11 +195,7 @@ mod tests {
 
     #[test]
     fn codex_parent_is_prepended_using_platform_path_rules() -> Result<()> {
-        let codex_bin = env::temp_dir().join("codex-bin").join(if cfg!(windows) {
-            "codex.exe"
-        } else {
-            "codex"
-        });
+        let codex_bin = env::temp_dir().join("codex-bin").join("codex.exe");
         let mut command = Command::new(&codex_bin);
 
         add_codex_parent_to_path(&mut command, &codex_bin)?;
@@ -316,8 +247,8 @@ mod tests {
     }
 
     #[test]
-    fn shell_quote_preserves_single_quotes() {
-        assert_eq!(shell_quote("alpha'beta"), "'alpha'\\''beta'");
+    fn powershell_quote_preserves_single_quotes() {
+        assert_eq!(powershell_quote("alpha'beta"), "'alpha''beta'");
     }
 
     #[test]
@@ -369,7 +300,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(windows)]
     #[test]
     fn windows_serve_uses_codex_directly_without_unix_launchers() -> Result<()> {
         let codex_bin = Path::new(r"C:\local codex\codex.exe");
@@ -393,7 +323,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(windows)]
     #[test]
     fn windows_restart_preflight_checks_the_same_codex_app_server() -> Result<()> {
         let codex_bin = Path::new(r"C:\local codex\codex.exe");
@@ -415,28 +344,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(not(windows))]
-    #[test]
-    fn unix_serve_keeps_the_nohup_shell_launcher() -> Result<()> {
-        let command = build_serve_command(
-            Path::new("/tmp/local codex/codex"),
-            &["model_provider=local test".to_string()],
-            "ws://127.0.0.1:4222",
-        )?;
-
-        assert_eq!(command.get_program(), "nohup");
-        assert_eq!(
-            command.get_args().collect::<Vec<_>>(),
-            vec![
-                "sh",
-                "-c",
-                "tail -f /dev/null | RUST_BACKTRACE=full RUST_LOG=warn,codex_=trace '/tmp/local codex/codex' --config 'model_provider=local test' app-server --listen 'ws://127.0.0.1:4222'",
-            ]
-        );
-        Ok(())
-    }
-
-    #[cfg(windows)]
     #[test]
     fn windows_netstat_parser_keeps_only_matching_tcp_listeners() {
         let output = r#"

@@ -13,15 +13,20 @@ fn cached_state_consumes_the_stable_rendering() {
     )
     .expect("absolute current directory");
     let cwd = codex_utils_path_uri::PathUri::from_abs_path(&cwd);
+    let stable_context = loaded.stable_context_bundle(&cwd);
 
-    let state = AgentsMdState::new_cached(Some(&loaded), &cwd, AgentsMdFreshness::CachedFallback);
+    let state = AgentsMdState::new_cached(
+        Some(&loaded),
+        Some(&stable_context),
+        AgentsMdFreshness::CachedFallback,
+    );
     assert_eq!(
         state.snapshot().text.as_deref(),
         Some(
             "Result provenance: cached_observation; freshness: cached_may_be_stale.\n\ncached instructions"
         )
     );
-    assert!(loaded.stable_context_bundle(&cwd).reused);
+    assert_eq!(stable_context.rendered.as_ref(), "cached instructions");
 }
 
 #[test]

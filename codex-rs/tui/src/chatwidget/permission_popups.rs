@@ -19,7 +19,7 @@ impl ChatWidget {
             return;
         }
 
-        let include_read_only = cfg!(target_os = "windows");
+        let include_read_only = true;
         let current_approval =
             AskForApproval::from(self.config.permissions.approval_policy.value());
         let current_permission_profile = self.config.permissions.permission_profile().clone();
@@ -28,13 +28,10 @@ impl ChatWidget {
         let mut items: Vec<SelectionItem> = Vec::new();
         let presets: Vec<ApprovalPreset> = builtin_approval_presets();
 
-        #[cfg(target_os = "windows")]
         let windows_sandbox_level = crate::windows_sandbox::level_from_config(&self.config);
-        #[cfg(target_os = "windows")]
+
         let windows_degraded_sandbox_enabled =
             matches!(windows_sandbox_level, WindowsSandboxLevel::RestrictedToken);
-        #[cfg(not(target_os = "windows"))]
-        let windows_degraded_sandbox_enabled = false;
 
         let show_elevate_sandbox_hint =
             windows_degraded_sandbox_enabled && presets.iter().any(|preset| preset.id == "auto");
@@ -317,7 +314,6 @@ impl ChatWidget {
             })];
         }
         if approvals_reviewer == ApprovalsReviewer::User && preset.id == "auto" {
-            #[cfg(target_os = "windows")]
             {
                 if crate::windows_sandbox::level_from_config(&self.config)
                     == WindowsSandboxLevel::Disabled

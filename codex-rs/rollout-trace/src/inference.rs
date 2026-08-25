@@ -353,7 +353,7 @@ fn write_json_payload_best_effort(
     kind: RawPayloadKind,
     payload: &impl Serialize,
 ) -> Option<crate::RawPayloadRef> {
-    writer.write_json_payload(kind, payload).ok()
+    writer.write_json_payload_best_effort(kind, payload)
 }
 
 fn write_response_payload_best_effort(
@@ -384,7 +384,9 @@ fn append_with_context_best_effort(
         thread_id: Some(context.thread_id.clone()),
         codex_turn_id: Some(context.codex_turn_id.clone()),
     };
-    let _ = context.writer.append_with_context(event_context, payload);
+    context
+        .writer
+        .append_with_context_best_effort(event_context, payload);
 }
 
 #[cfg(test)]

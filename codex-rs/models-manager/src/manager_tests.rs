@@ -636,6 +636,30 @@ fn openai_manager_for_tests_with_auth(
     )
 }
 
+#[tokio::test]
+async fn offline_refresh_checks_cache_identity_once_before_the_cache_read() {
+    let codex_home = tempdir().expect("temp dir");
+    let identity_reads = Arc::new(AtomicUsize::new(0));
+    let identity_reads_for_cache = Arc::clone(&identity_reads);
+    let manager = OpenAiModelsManager::new(
+        codex_home.path().to_path_buf(),
+        TestModelsEndpoint::without_refresh(Vec::new()),
+        None,
+        Arc::new(move || {
+            identity_reads_for_cache.fetch_add(1, Ordering::SeqCst);
+            "counted-provider-identity".to_string()
+        }),
+    );
+    identity_reads.store(0, Ordering::SeqCst);
+
+    manager
+        .refresh_available_models(RefreshStrategy::Offline, &DEFAULT_HTTP_CLIENT_FACTORY)
+        .await
+        .expect("offline cache refresh should succeed");
+
+    assert_eq!(identity_reads.load(Ordering::SeqCst), 2);
+}
+
 fn static_manager_for_tests(model_catalog: ModelsResponse) -> StaticModelsManager {
     StaticModelsManager::new(/*auth_manager*/ None, model_catalog)
 }
@@ -792,6 +816,7 @@ async fn static_manager_preserves_unsupported_requested_model_when_fallback_is_d
         .await;
 
     assert_eq!(model, "unsupported");
+    assert_eq!(manager.list_models_call_count(), 0);
 }
 
 #[tokio::test]
@@ -989,6 +1014,53 @@ async fn refresh_available_models_sorts_by_priority() {
 }
 
 #[tokio::test]
+async fn picker_snapshot_is_reused_until_the_catalog_changes() {
+    let remote_models = vec![remote_model(
+        "shared-picker-snapshot",
+        "Shared Picker Snapshot",
+        /*priority*/ 0,
+    )];
+    let codex_home = tempdir().expect("temp dir");
+    let endpoint = TestModelsEndpoint::new(vec![remote_models]);
+    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint);
+
+    let initial = manager
+        .try_list_models_shared()
+        .expect("initial picker snapshot should be available");
+    let repeated = manager
+        .list_models_shared(RefreshStrategy::Offline, DEFAULT_HTTP_CLIENT_FACTORY)
+        .await;
+    assert!(Arc::ptr_eq(&initial, &repeated));
+
+    let initial_slug = initial
+        .first()
+        .expect("bundled catalog should have a model")
+        .model
+        .clone();
+    manager
+        .get_model_info(&initial_slug, &ModelsManagerConfig::default())
+        .await;
+    let after_lookup = manager
+        .try_list_models_shared()
+        .expect("model lookup should leave the picker snapshot available");
+    assert!(Arc::ptr_eq(&initial, &after_lookup));
+
+    let refreshed = manager
+        .list_models_shared(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
+        .await;
+    assert!(!Arc::ptr_eq(&initial, &refreshed));
+    assert!(
+        refreshed
+            .iter()
+            .any(|model| model.model == "shared-picker-snapshot")
+    );
+    let refreshed_again = manager
+        .list_models_shared(RefreshStrategy::Offline, DEFAULT_HTTP_CLIENT_FACTORY)
+        .await;
+    assert!(Arc::ptr_eq(&refreshed, &refreshed_again));
+}
+
+#[tokio::test]
 async fn refresh_available_models_uses_remote_only_catalog_for_chatgpt_auth() {
     let remote_models = vec![remote_model(
         "chatgpt-visible-source-of-truth",
@@ -1061,7 +1133,7 @@ async fn get_model_info_uses_fallback_for_bundled_models_when_chatgpt_remote_is_
     let codex_home = tempdir().expect("temp dir");
     let endpoint = TestModelsEndpoint::new(vec![remote_models]);
     let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint);
-    let bundled_slug = load_remote_models_from_file()
+    let bundled_slug = load_bundled_models()
         .expect("bundled models should parse")
         .first()
         .expect("bundled models should contain at least one model")
@@ -1089,7 +1161,7 @@ async fn refresh_available_models_preserves_bundled_catalog_for_empty_chatgpt_re
     let codex_home = tempdir().expect("temp dir");
     let endpoint = TestModelsEndpoint::new(vec![Vec::new()]);
     let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint);
-    let expected = load_remote_models_from_file().expect("bundled models should parse");
+    let expected = load_bundled_models().expect("bundled models should parse");
 
     manager
         .refresh_available_models(
@@ -1113,7 +1185,7 @@ async fn refresh_available_models_merges_hidden_only_chatgpt_remote_with_bundled
     let codex_home = tempdir().expect("temp dir");
     let endpoint = TestModelsEndpoint::new(vec![vec![hidden_remote.clone()]]);
     let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint);
-    let mut expected = load_remote_models_from_file().expect("bundled models should parse");
+    let mut expected = load_bundled_models().expect("bundled models should parse");
     expected.push(hidden_remote);
 
     manager
@@ -1149,7 +1221,7 @@ async fn refresh_available_models_keeps_merging_for_api_auth() {
             "test-api-key",
         ))),
     );
-    let mut expected = load_remote_models_from_file().expect("bundled models should parse");
+    let mut expected = load_bundled_models().expect("bundled models should parse");
     expected.extend(remote_models);
 
     manager
@@ -1262,6 +1334,119 @@ async fn runtime_identity_change_does_not_reuse_disk_or_in_memory_catalog() {
     assert_eq!(endpoint.fetch_count(), 2);
 }
 
+#[tokio::test]
+async fn direct_catalog_reads_reset_state_after_runtime_identity_change() {
+    let codex_home = tempdir().expect("temp dir");
+    let first_model = remote_model("direct-read-first", "Direct Read First", 1);
+    let endpoint = TestModelsEndpoint::new(vec![vec![first_model.clone()]]);
+    let identity = Arc::new(Mutex::new("direct-read-scope-one".to_string()));
+    let identity_for_cache = Arc::clone(&identity);
+    let manager = OpenAiModelsManager::new(
+        codex_home.path().to_path_buf(),
+        endpoint,
+        Some(AuthManager::from_auth_for_testing(
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        )),
+        Arc::new(move || {
+            identity_for_cache
+                .lock()
+                .expect("identity lock should not be poisoned")
+                .clone()
+        }),
+    );
+
+    manager
+        .refresh_available_models(RefreshStrategy::Online, &DEFAULT_HTTP_CLIENT_FACTORY)
+        .await
+        .expect("initial refresh should succeed");
+    assert!(
+        !manager
+            .get_model_info(&first_model.slug, &ModelsManagerConfig::default())
+            .await
+            .used_fallback_model_metadata
+    );
+
+    *identity
+        .lock()
+        .expect("identity lock should not be poisoned") = "direct-read-scope-two".to_string();
+    assert!(
+        manager
+            .get_model_info(&first_model.slug, &ModelsManagerConfig::default())
+            .await
+            .used_fallback_model_metadata,
+        "model lookup must not use the previous identity's catalog"
+    );
+
+    let second_model = remote_model("direct-read-second", "Direct Read Second", 1);
+    let second_identity = manager.ensure_current_cache_identity().await;
+    assert!(
+        manager
+            .apply_remote_models_and_etag_for_identity(
+                vec![second_model.clone()],
+                None,
+                &second_identity,
+            )
+            .await
+    );
+    *identity
+        .lock()
+        .expect("identity lock should not be poisoned") = "direct-read-scope-three".to_string();
+    assert!(
+        !manager
+            .get_remote_models()
+            .await
+            .iter()
+            .any(|model| model.slug == second_model.slug),
+        "async catalog reads must not use the previous identity's catalog"
+    );
+
+    let third_model = remote_model("direct-read-third", "Direct Read Third", 1);
+    let third_identity = manager.ensure_current_cache_identity().await;
+    assert!(
+        manager
+            .apply_remote_models_and_etag_for_identity(
+                vec![third_model.clone()],
+                None,
+                &third_identity,
+            )
+            .await
+    );
+    *identity
+        .lock()
+        .expect("identity lock should not be poisoned") = "direct-read-scope-four".to_string();
+    assert!(
+        !manager
+            .try_get_remote_models()
+            .expect("model state should not be locked")
+            .iter()
+            .any(|model| model.slug == third_model.slug),
+        "synchronous catalog reads must not use the previous identity's catalog"
+    );
+
+    let fourth_model = remote_model("direct-read-fourth", "Direct Read Fourth", 1);
+    let fourth_identity = manager.ensure_current_cache_identity().await;
+    assert!(
+        manager
+            .apply_remote_models_and_etag_for_identity(
+                vec![fourth_model.clone()],
+                None,
+                &fourth_identity,
+            )
+            .await
+    );
+    *identity
+        .lock()
+        .expect("identity lock should not be poisoned") = "direct-read-scope-five".to_string();
+    assert!(
+        !manager
+            .try_list_models_shared()
+            .expect("model state should not be locked")
+            .iter()
+            .any(|model| model.model == fourth_model.slug),
+        "synchronous preset reads must not use the previous identity's catalog"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_model_state_access_completes_with_coherent_snapshots() {
     let codex_home = tempdir().expect("temp dir");
@@ -1318,22 +1503,23 @@ async fn concurrent_model_state_access_completes_with_coherent_snapshots() {
         let reader_manager = Arc::clone(&manager);
         let reader_task = tokio::spawn(async move {
             for _ in 0..512 {
-                let state = reader_manager.state.read().await;
-                if let Some(index) = state
-                    .etag
-                    .as_deref()
-                    .and_then(|etag| etag.strip_prefix("coherent-etag-"))
                 {
-                    let expected_slug = format!("coherent-model-{index}");
-                    assert!(
-                        state
-                            .remote_models
-                            .iter()
-                            .any(|model| model.slug == expected_slug),
-                        "catalog and ETag must come from the same state update"
-                    );
+                    let state = reader_manager.state.read().await;
+                    if let Some(index) = state
+                        .etag
+                        .as_deref()
+                        .and_then(|etag| etag.strip_prefix("coherent-etag-"))
+                    {
+                        let expected_slug = format!("coherent-model-{index}");
+                        assert!(
+                            state
+                                .remote_models
+                                .iter()
+                                .any(|model| model.slug == expected_slug),
+                            "catalog and ETag must come from the same state update"
+                        );
+                    }
                 }
-                drop(state);
 
                 let _ = reader_manager.get_remote_models().await;
                 let _ = reader_manager.get_etag().await;
@@ -1734,6 +1920,25 @@ fn build_available_models_picks_default_after_hiding_hidden_models() {
     let available = manager.build_available_models(vec![hidden_model, visible_model]);
 
     assert_eq!(available, vec![expected_hidden, expected_visible]);
+}
+
+#[test]
+fn build_available_models_filters_unsupported_model_info_before_projection() {
+    let mut chatgpt_only = remote_model("chatgpt-only", "ChatGPT Only", 0);
+    chatgpt_only.supported_in_api = false;
+    let api_model = remote_model("api-model", "API Model", 1);
+    let models = build_available_models_for_auth(
+        vec![chatgpt_only, api_model],
+        /*uses_codex_backend*/ false,
+    );
+
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| model.model.as_str())
+            .collect::<Vec<_>>(),
+        vec!["api-model"]
+    );
 }
 
 #[tokio::test]

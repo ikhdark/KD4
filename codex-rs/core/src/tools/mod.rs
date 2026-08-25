@@ -39,11 +39,16 @@ pub use router::ToolRouter;
 use shell_output_summary::ShellOutputSummaryOptions;
 use shell_output_summary::summarize_shell_output_for_model;
 
-// Telemetry preview limits: keep log events smaller than model budgets.
-pub(crate) const TELEMETRY_PREVIEW_MAX_BYTES: usize = 2 * 1024; // 2 KiB
-pub(crate) const TELEMETRY_PREVIEW_MAX_LINES: usize = 64; // lines
-pub(crate) const TELEMETRY_PREVIEW_TRUNCATION_NOTICE: &str =
-    "[... telemetry preview truncated ...]";
+pub(crate) const SHELL_COMMAND_TOOL_NAME: &str = "shell_command";
+pub(crate) const EXEC_COMMAND_TOOL_NAME: &str = "exec_command";
+
+pub(crate) fn is_shell_family_tool_name(tool_name: &ToolName) -> bool {
+    tool_name.namespace.is_none()
+        && matches!(
+            tool_name.name.as_str(),
+            SHELL_COMMAND_TOOL_NAME | EXEC_COMMAND_TOOL_NAME
+        )
+}
 
 /// Legacy boundaries such as hook payloads, telemetry tags, and Responses tool
 /// names still require a single flattened string. Keep comparisons and sorting
@@ -57,18 +62,6 @@ pub(crate) fn flat_tool_name(tool_name: &ToolName) -> Cow<'_, str> {
             Cow::Owned(name)
         }
         None => Cow::Borrowed(tool_name.name.as_str()),
-    }
-}
-
-pub(crate) fn tool_user_shell_type(
-    user_shell: &crate::shell::Shell,
-) -> codex_tools::ToolUserShellType {
-    match user_shell.shell_type {
-        crate::shell::ShellType::Zsh => codex_tools::ToolUserShellType::Zsh,
-        crate::shell::ShellType::Bash => codex_tools::ToolUserShellType::Bash,
-        crate::shell::ShellType::PowerShell => codex_tools::ToolUserShellType::PowerShell,
-        crate::shell::ShellType::Sh => codex_tools::ToolUserShellType::Sh,
-        crate::shell::ShellType::Cmd => codex_tools::ToolUserShellType::Cmd,
     }
 }
 

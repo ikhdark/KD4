@@ -4,6 +4,7 @@ use codex_exec_server::ExecutorFileSystem;
 use codex_protocol::protocol::Product;
 use codex_utils_path_uri::PathUri;
 use futures::StreamExt;
+use noyalib::compat::serde_yaml;
 
 use crate::model::SkillDependencies;
 use crate::model::SkillPolicy;
@@ -49,20 +50,13 @@ impl EnvironmentSkillMetadata {
     pub fn allows_implicit_invocation(&self) -> bool {
         self.policy
             .as_ref()
-            .and_then(|policy| policy.allow_implicit_invocation)
-            .unwrap_or(true)
+            .is_none_or(SkillPolicy::allows_implicit_invocation)
     }
 
     fn matches_product_restriction(&self, restriction_product: Option<Product>) -> bool {
-        match &self.policy {
-            Some(policy) => {
-                policy.products.is_empty()
-                    || restriction_product.is_some_and(|product| {
-                        product.matches_product_restriction(&policy.products)
-                    })
-            }
-            None => true,
-        }
+        self.policy
+            .as_ref()
+            .is_none_or(|policy| policy.matches_product_restriction(restriction_product))
     }
 }
 

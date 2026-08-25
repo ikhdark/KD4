@@ -209,63 +209,6 @@ ON CONFLICT(child_thread_id) DO UPDATE SET
             .await
     }
 
-    /// Find a direct spawned child of `parent_thread_id` by canonical agent path.
-    pub async fn find_thread_spawn_child_by_path(
-        &self,
-        parent_thread_id: ThreadId,
-        agent_path: &str,
-    ) -> anyhow::Result<Option<ThreadId>> {
-        let rows = sqlx::query(
-            r#"
-SELECT threads.id
-FROM thread_spawn_edges
-JOIN threads ON threads.id = thread_spawn_edges.child_thread_id
-WHERE thread_spawn_edges.parent_thread_id = ?
-  AND threads.agent_path = ?
-ORDER BY threads.id
-LIMIT 2
-            "#,
-        )
-        .bind(parent_thread_id.to_string())
-        .bind(agent_path)
-        .fetch_all(self.pool.as_ref())
-        .await?;
-        one_thread_id_from_rows(rows, agent_path)
-    }
-
-    /// Find a spawned descendant of `root_thread_id` by canonical agent path.
-    pub async fn find_thread_spawn_descendant_by_path(
-        &self,
-        root_thread_id: ThreadId,
-        agent_path: &str,
-    ) -> anyhow::Result<Option<ThreadId>> {
-        let rows = sqlx::query(
-            r#"
-WITH RECURSIVE subtree(child_thread_id) AS (
-    SELECT child_thread_id
-    FROM thread_spawn_edges
-    WHERE parent_thread_id = ?
-    UNION
-    SELECT edge.child_thread_id
-    FROM thread_spawn_edges AS edge
-    JOIN subtree ON edge.parent_thread_id = subtree.child_thread_id
-)
-SELECT threads.id
-FROM subtree
-JOIN threads ON threads.id = subtree.child_thread_id
-WHERE threads.agent_path = ? AND threads.id != ?
-ORDER BY threads.id
-LIMIT 2
-            "#,
-        )
-        .bind(root_thread_id.to_string())
-        .bind(agent_path)
-        .bind(root_thread_id.to_string())
-        .fetch_all(self.pool.as_ref())
-        .await?;
-        one_thread_id_from_rows(rows, agent_path)
-    }
-
     async fn list_thread_spawn_children_matching(
         &self,
         parent_thread_id: ThreadId,
@@ -623,8 +566,21 @@ ON CONFLICT(child_thread_id) DO NOTHING
 
     /// Insert or replace thread metadata directly.
     pub async fn upsert_thread(&self, metadata: &crate::ThreadMetadata) -> anyhow::Result<()> {
-        self.upsert_thread_with_creation_memory_mode(metadata, /*creation_memory_mode*/ None)
-            .await
+        self.upsert_thread_with_creation_memory_mode(
+            metadata, /*creation_memory_mode*/ None, /*allocate_timestamps*/ true,
+        )
+        .await
+    }
+
+    /// Insert rollout metadata without changing its persisted file timestamps.
+    pub async fn upsert_thread_preserving_timestamps(
+        &self,
+        metadata: &crate::ThreadMetadata,
+    ) -> anyhow::Result<()> {
+        self.upsert_thread_with_creation_memory_mode(
+            metadata, /*creation_memory_mode*/ None, /*allocate_timestamps*/ false,
+        )
+        .await
     }
 
     pub async fn insert_thread_if_absent(
@@ -881,9 +837,18 @@ WHERE id = ?
         &self,
         metadata: &crate::ThreadMetadata,
         creation_memory_mode: Option<&str>,
+        allocate_timestamps: bool,
     ) -> anyhow::Result<()> {
-        let updated_at = self.allocate_thread_updated_at(metadata.updated_at)?;
-        let insert_recency_at = self.allocate_thread_recency_at(metadata.recency_at)?;
+        let updated_at = if allocate_timestamps {
+            self.allocate_thread_updated_at(metadata.updated_at)?
+        } else {
+            metadata.updated_at
+        };
+        let insert_recency_at = if allocate_timestamps {
+            self.allocate_thread_recency_at(metadata.recency_at)?
+        } else {
+            metadata.recency_at
+        };
         let preview = metadata_preview(metadata);
         // Backfill/reconcile callers merge existing git info before upserting, but that
         // read/modify/write is not atomic. Preserve non-null SQLite git fields here so
@@ -1031,8 +996,12 @@ ON CONFLICT(id) DO UPDATE SET
             metadata.updated_at = updated_at;
         }
         let upsert_result = if existing_metadata.is_none() {
-            self.upsert_thread_with_creation_memory_mode(&metadata, new_thread_memory_mode)
-                .await
+            self.upsert_thread_with_creation_memory_mode(
+                &metadata,
+                new_thread_memory_mode,
+                /*allocate_timestamps*/ true,
+            )
+            .await
         } else {
             self.upsert_thread(&metadata).await
         };
@@ -1259,26 +1228,6 @@ SELECT EXISTS(
     }
 
     Ok(())
-}
-
-fn one_thread_id_from_rows(
-    rows: Vec<sqlx::sqlite::SqliteRow>,
-    agent_path: &str,
-) -> anyhow::Result<Option<ThreadId>> {
-    let mut ids = rows
-        .into_iter()
-        .map(|row| {
-            let id: String = row.try_get("id")?;
-            ThreadId::try_from(id).map_err(anyhow::Error::from)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    match ids.len() {
-        0 => Ok(None),
-        1 => Ok(ids.pop()),
-        _ => Err(anyhow::anyhow!(
-            "multiple agents found for canonical path `{agent_path}`"
-        )),
-    }
 }
 
 fn push_list_threads_query(
@@ -1604,7 +1553,11 @@ mod tests {
         let mut metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
 
         runtime
-            .upsert_thread_with_creation_memory_mode(&metadata, Some("disabled"))
+            .upsert_thread_with_creation_memory_mode(
+                &metadata,
+                Some("disabled"),
+                /*allocate_timestamps*/ true,
+            )
             .await
             .expect("initial insert should succeed");
 
@@ -2922,6 +2875,45 @@ mod tests {
             vec![first_id]
         );
         assert_eq!(third_page.next_anchor, None);
+    }
+
+    #[tokio::test]
+    async fn rollout_upserts_preserve_equal_persisted_timestamps() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("state db should initialize");
+        let first_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000911").expect("valid thread id");
+        let second_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000912").expect("valid thread id");
+        let persisted_at =
+            DateTime::<Utc>::from_timestamp_millis(1_700_001_222_123).expect("timestamp millis");
+        let mut first = test_thread_metadata(&codex_home, first_id, codex_home.clone());
+        first.updated_at = persisted_at;
+        first.recency_at = persisted_at;
+        let mut second = test_thread_metadata(&codex_home, second_id, codex_home.clone());
+        second.updated_at = persisted_at;
+        second.recency_at = persisted_at;
+
+        runtime
+            .upsert_thread_preserving_timestamps(&first)
+            .await
+            .expect("first rollout upsert should succeed");
+        runtime
+            .upsert_thread_preserving_timestamps(&second)
+            .await
+            .expect("second rollout upsert should succeed");
+
+        for thread_id in [first_id, second_id] {
+            let metadata = runtime
+                .get_thread(thread_id)
+                .await
+                .expect("thread should load")
+                .expect("thread should exist");
+            assert_eq!(metadata.updated_at, persisted_at);
+            assert_eq!(metadata.recency_at, persisted_at);
+        }
     }
 
     #[tokio::test]

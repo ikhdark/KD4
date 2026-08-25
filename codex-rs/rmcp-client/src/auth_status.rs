@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use codex_exec_server::HttpClient;
+use codex_http_client::build_reqwest_client_with_custom_ca;
 use codex_protocol::protocol::McpAuthStatus;
 use futures::FutureExt;
 use reqwest::Client;
@@ -211,7 +212,8 @@ async fn discover_streamable_http_oauth_with_headers(
     // Use no_proxy to avoid a bug in the system-configuration crate that
     // can result in a panic. See #8912.
     let builder = Client::builder().timeout(DISCOVERY_TIMEOUT).no_proxy();
-    let client = apply_default_headers(builder, default_headers).build()?;
+    let client =
+        build_reqwest_client_with_custom_ca(apply_default_headers(builder, default_headers))?;
     let mut authorization_manager = AuthorizationManager::new(url).await?;
     authorization_manager.with_client(client)?;
     discover_streamable_http_oauth_with_manager(&authorization_manager).await
@@ -386,6 +388,27 @@ mod tests {
         .expect("status should compute");
 
         assert_eq!(status, McpAuthState::BearerToken);
+    }
+
+    #[tokio::test]
+    #[serial(auth_status_env)]
+    async fn oauth_discovery_reports_invalid_custom_ca_before_network_access() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let missing_ca = temp_dir.path().join("missing-ca.pem");
+        let _guard = EnvVarGuard::set(
+            "CODEX_CA_CERTIFICATE",
+            missing_ca.to_string_lossy().as_ref(),
+        );
+
+        let error = discover_streamable_http_oauth("https://example.invalid/mcp", None, None)
+            .await
+            .expect_err("missing custom CA should fail discovery");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to read CA certificate file")
+        );
     }
 
     #[tokio::test]

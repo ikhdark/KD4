@@ -1,5 +1,4 @@
 use super::*;
-use crate::auth_mode::auth_mode_to_api;
 use crate::external_auth::ExternalAuthBridge;
 use chrono::DateTime;
 
@@ -186,7 +185,7 @@ impl AccountRequestProcessor {
             auth_mode: auth
                 .as_ref()
                 .map(CodexAuth::api_auth_mode)
-                .map(auth_mode_to_api),
+                .map(AuthMode::from),
             plan_type: auth.as_ref().and_then(CodexAuth::account_plan_type),
         }
     }
@@ -755,7 +754,7 @@ impl AccountRequestProcessor {
                 auth_mode: auth
                     .as_ref()
                     .map(CodexAuth::api_auth_mode)
-                    .map(auth_mode_to_api),
+                    .map(AuthMode::from),
                 plan_type: auth.as_ref().and_then(CodexAuth::account_plan_type),
             };
             outgoing
@@ -793,7 +792,7 @@ impl AccountRequestProcessor {
             .auth_cached()
             .as_ref()
             .map(CodexAuth::api_auth_mode)
-            .map(auth_mode_to_api))
+            .map(AuthMode::from))
     }
 
     async fn logout_v2(&self, request_id: ConnectionRequestId) -> Result<(), JSONRPCErrorError> {
@@ -864,7 +863,7 @@ impl AccountRequestProcessor {
                 Some(auth) => {
                     let permanent_refresh_failure =
                         self.auth_manager.refresh_failure_for_auth(&auth).is_some();
-                    let auth_mode = auth_mode_to_api(auth.api_auth_mode());
+                    let auth_mode = AuthMode::from(auth.api_auth_mode());
                     let (reported_auth_method, token_opt) = if matches!(
                         auth,
                         CodexAuth::Headers(_)

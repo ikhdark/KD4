@@ -104,7 +104,7 @@ struct IpcSpawnedProcess {
     stderr_handle: HANDLE,
     stdin_handle: Option<HANDLE>,
     conpty_owner: Option<codex_windows_sandbox::ConptyInstance>,
-    hpc_handle: Option<HANDLE>,
+    hpc_handle: Option<isize>,
     control_process_handle: OwnedWinHandle,
     _pipe_handles: Option<PipeSpawnHandles>,
 }
@@ -114,23 +114,23 @@ struct IpcSpawnedProcess {
 /// The elevated runner has a few early-return paths where we acquire a token, job, or pipe
 /// handle and then may fail while preparing the child. Keeping those handles in a guard makes
 /// the error paths read more directly and closes the gaps that were previously leaking them.
-struct OwnedWinHandle(HANDLE);
+struct OwnedWinHandle(usize);
 
 impl OwnedWinHandle {
     fn new(handle: HANDLE) -> Self {
-        Self(handle)
+        Self(handle as usize)
     }
 
     fn raw(&self) -> HANDLE {
-        self.0
+        self.0 as HANDLE
     }
 
     fn duplicate(handle: HANDLE) -> Result<Self> {
-        if handle == 0 || handle == INVALID_HANDLE_VALUE {
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             anyhow::bail!("cannot duplicate an invalid Windows handle");
         }
         let current_process = unsafe { GetCurrentProcess() };
-        let mut duplicate = 0;
+        let mut duplicate = std::ptr::null_mut();
         let duplicated = unsafe {
             DuplicateHandle(
                 current_process,
@@ -151,7 +151,7 @@ impl OwnedWinHandle {
     fn into_raw(mut self) -> HANDLE {
         // Transfer ownership to the caller. After this point the caller is responsible for
         // eventually closing the returned HANDLE.
-        let handle = self.0;
+        let handle = self.raw();
         self.0 = 0;
         handle
     }
@@ -159,9 +159,10 @@ impl OwnedWinHandle {
 
 impl Drop for OwnedWinHandle {
     fn drop(&mut self) {
-        if self.0 != 0 && self.0 != INVALID_HANDLE_VALUE {
+        let handle = self.raw();
+        if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
             unsafe {
-                CloseHandle(self.0);
+                CloseHandle(handle);
             }
         }
     }
@@ -178,7 +179,7 @@ fn open_pipe(name: &str, access: u32) -> Result<HANDLE> {
             std::ptr::null_mut(),
             OPEN_EXISTING,
             0,
-            0,
+            std::ptr::null_mut(),
         )
     };
     if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
@@ -237,7 +238,7 @@ fn read_spawn_request(reader: &mut File) -> Result<SpawnRequest> {
 fn read_acl_mutex_exists() -> Result<bool> {
     let name = to_wide(OsStr::new(READ_ACL_MUTEX_NAME));
     let handle = unsafe { OpenMutexW(MUTEX_ALL_ACCESS, 0, name.as_ptr()) };
-    if handle == 0 {
+    if handle.is_null() {
         let err = unsafe { GetLastError() };
         if err == ERROR_FILE_NOT_FOUND {
             return Ok(false);
@@ -319,17 +320,20 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
     let effective_cwd = effective_cwd(&req.cwd, Some(log_dir.as_path()));
 
     let mut conpty_owner = None;
-    let mut hpc_handle: Option<HANDLE> = None;
+    let mut hpc_handle: Option<isize> = None;
     let mut pipe_handles = None;
     let (pi, job, stdout_handle, stderr_handle, stdin_handle) = if req.tty {
-        let (pi, mut conpty) = codex_windows_sandbox::spawn_conpty_process_as_user(
-            h_token.raw(),
-            &req.command,
-            &effective_cwd,
-            &req.env,
-            req.use_private_desktop,
-            Some(log_dir.as_path()),
-        )?;
+        // SAFETY: `h_token` owns the valid primary token through this synchronous spawn.
+        let (pi, mut conpty) = unsafe {
+            codex_windows_sandbox::spawn_conpty_process_as_user(
+                h_token.raw(),
+                &req.command,
+                &effective_cwd,
+                &req.env,
+                req.use_private_desktop,
+                Some(log_dir.as_path()),
+            )
+        }?;
         let job = conpty
             .job()
             .context("spawned ConPTY is missing its process job")?;
@@ -358,21 +362,24 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
         } else {
             StdinMode::Closed
         };
-        let spawned_pipes: PipeSpawnHandles = spawn_process_with_pipes(
-            h_token.raw(),
-            &req.command,
-            &effective_cwd,
-            &req.env,
-            stdin_mode,
-            StderrMode::Separate,
-            if req.command.get(1).is_some_and(|arg| arg == FS_HELPER_ARG) {
-                ConsoleMode::NoWindow
-            } else {
-                ConsoleMode::Inherit
-            },
-            req.use_private_desktop,
-            Some(log_dir.as_path()),
-        )?;
+        // SAFETY: `h_token` owns the valid primary token through this synchronous spawn.
+        let spawned_pipes: PipeSpawnHandles = unsafe {
+            spawn_process_with_pipes(
+                h_token.raw(),
+                &req.command,
+                &effective_cwd,
+                &req.env,
+                stdin_mode,
+                StderrMode::Separate,
+                if req.command.get(1).is_some_and(|arg| arg == FS_HELPER_ARG) {
+                    ConsoleMode::NoWindow
+                } else {
+                    ConsoleMode::Inherit
+                },
+                req.use_private_desktop,
+                Some(log_dir.as_path()),
+            )
+        }?;
         let pi = spawned_pipes.process;
         let stdout_handle = spawned_pipes.stdout_read;
         let stderr_handle = spawned_pipes
@@ -509,7 +516,7 @@ fn wait_for_terminated_root(process: HANDLE, log_dir: Option<&Path>) -> bool {
 fn spawn_input_loop(
     reader: File,
     stdin_handle: Option<HANDLE>,
-    hpc_handle: Arc<StdMutex<Option<HANDLE>>>,
+    hpc_handle: Arc<StdMutex<Option<isize>>>,
     job: Arc<JobObject>,
     process: OwnedWinHandle,
     log_dir: Option<PathBuf>,
@@ -523,7 +530,7 @@ fn spawn_input_loop(
 fn spawn_input_loop_with_terminator<F>(
     mut reader: File,
     stdin_handle: Option<HANDLE>,
-    hpc_handle: Arc<StdMutex<Option<HANDLE>>>,
+    hpc_handle: Arc<StdMutex<Option<isize>>>,
     log_dir: Option<PathBuf>,
     terminate_process_tree: F,
 ) -> std::thread::JoinHandle<()>
@@ -626,7 +633,9 @@ where
 
 fn spawn_stdin_writer(handle: HANDLE, log_dir: Option<PathBuf>) -> mpsc::Sender<Option<Vec<u8>>> {
     let (stdin_tx, stdin_rx) = mpsc::channel::<Option<Vec<u8>>>();
+    let handle_addr = handle as usize;
     std::thread::spawn(move || {
+        let handle = handle_addr as HANDLE;
         'writer: while let Ok(Some(bytes)) = stdin_rx.recv() {
             let mut offset = 0usize;
             while offset < bytes.len() {
@@ -825,10 +834,10 @@ pub fn main() -> Result<()> {
         } else {
             exit_code = 1;
         }
-        if pi.hThread != 0 {
+        if !pi.hThread.is_null() {
             CloseHandle(pi.hThread);
         }
-        if pi.hProcess != 0 {
+        if !pi.hProcess.is_null() {
             CloseHandle(pi.hProcess);
         }
     }
@@ -920,7 +929,7 @@ mod tests {
     #[test]
     fn invalid_process_wait_is_not_treated_as_exit() {
         assert_eq!(
-            wait_for_process(/*invalid process handle*/ 0, 0),
+            wait_for_process(/*invalid process handle*/ std::ptr::null_mut(), 0),
             ProcessWaitOutcome::Failed {
                 wait_result: WAIT_FAILED,
                 windows_error: Some(ERROR_INVALID_HANDLE),
@@ -944,8 +953,8 @@ mod tests {
         )?;
         control_reader.rewind()?;
 
-        let mut stdin_read: HANDLE = 0;
-        let mut stdin_write: HANDLE = 0;
+        let mut stdin_read: HANDLE = std::ptr::null_mut();
+        let mut stdin_write: HANDLE = std::ptr::null_mut();
         let pipe_created = unsafe { CreatePipe(&mut stdin_read, &mut stdin_write, ptr::null(), 0) };
         assert_ne!(pipe_created, 0, "CreatePipe failed: {}", unsafe {
             windows_sys::Win32::Foundation::GetLastError()
@@ -1018,8 +1027,8 @@ mod tests {
             "descendant did not start"
         );
 
-        let mut control_read = 0;
-        let mut control_write = 0;
+        let mut control_read: HANDLE = std::ptr::null_mut();
+        let mut control_write: HANDLE = std::ptr::null_mut();
         if unsafe { CreatePipe(&mut control_read, &mut control_write, ptr::null_mut(), 0) } == 0 {
             return Err(std::io::Error::last_os_error().into());
         }

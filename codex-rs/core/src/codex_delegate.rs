@@ -28,6 +28,7 @@ use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputArgs;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::user_input::UserInput;
+use codex_utils_path_uri::PathUri;
 use serde_json::Value;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -703,10 +704,7 @@ async fn handle_patch_approval(
     let guardian_decision = if routes_approval_to_guardian(parent_ctx) {
         let files = changes
             .keys()
-            .map(|path| {
-                #[allow(deprecated)]
-                parent_ctx.cwd.join(path)
-            })
+            .map(|path| parent_ctx.cwd().join(path))
             .collect::<Vec<_>>();
         let review_cancel = cancel_token.child_token();
         let patch = changes
@@ -742,9 +740,8 @@ async fn handle_patch_approval(
             new_guardian_review_id(),
             GuardianApprovalRequest::ApplyPatch {
                 id: approval_id.clone(),
-                #[allow(deprecated)]
-                cwd: parent_ctx.cwd.clone(),
-                files,
+                cwd: PathUri::from_abs_path(parent_ctx.cwd()),
+                files: files.iter().map(PathUri::from_abs_path).collect(),
                 patch,
             },
             reason.clone(),
@@ -1034,10 +1031,7 @@ async fn handle_request_permissions(
         reason: event.reason,
         permissions: event.permissions,
     };
-    let cwd = event.cwd.unwrap_or_else(|| {
-        #[allow(deprecated)]
-        parent_ctx.cwd.clone()
-    });
+    let cwd = event.cwd.unwrap_or_else(|| parent_ctx.cwd().clone());
     let response_fut = parent_session.request_permissions_for_cwd(
         parent_ctx,
         call_id.clone(),

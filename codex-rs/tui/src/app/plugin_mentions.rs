@@ -49,23 +49,12 @@ fn plugin_mention_from_summary(
 
     Some(PluginCapabilitySummary {
         config_name: plugin.id.clone(),
-        display_name: plugin_mention_display_name(&plugin),
+        display_name: plugin.display_name(),
         description: plugin_mention_description(marketplace_name, &plugin),
         has_skills: false,
         mcp_server_names: Vec::new(),
         app_connector_ids: Vec::new(),
     })
-}
-
-fn plugin_mention_display_name(plugin: &PluginSummary) -> String {
-    plugin
-        .interface
-        .as_ref()
-        .and_then(|interface| interface.display_name.as_deref())
-        .map(str::trim)
-        .filter(|display_name| !display_name.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| plugin.name.clone())
 }
 
 fn plugin_mention_description(marketplace_name: &str, plugin: &PluginSummary) -> Option<String> {
@@ -88,6 +77,7 @@ mod tests {
     use codex_app_server_protocol::PluginAuthPolicy;
     use codex_app_server_protocol::PluginAvailability;
     use codex_app_server_protocol::PluginInstallPolicy;
+    use codex_app_server_protocol::PluginInterface;
     use codex_app_server_protocol::PluginListResponse;
     use codex_app_server_protocol::PluginMarketplaceEntry;
     use codex_app_server_protocol::PluginShareContext;
@@ -97,7 +87,28 @@ mod tests {
 
     #[test]
     fn plugin_mentions_use_plugin_list_summaries_and_gui_eligibility() {
-        let active = plugin_summary("active");
+        let mut active = plugin_summary("active");
+        active.interface = Some(PluginInterface {
+            display_name: Some("  Active Display  ".to_string()),
+            short_description: None,
+            long_description: None,
+            developer_name: None,
+            category: None,
+            capabilities: Vec::new(),
+            website_url: None,
+            privacy_policy_url: None,
+            terms_of_service_url: None,
+            default_prompt: None,
+            brand_color: None,
+            composer_icon: None,
+            composer_icon_url: None,
+            logo: None,
+            logo_dark: None,
+            logo_url: None,
+            logo_url_dark: None,
+            screenshots: Vec::new(),
+            screenshot_urls: Vec::new(),
+        });
         let active_shared = shared_plugin_summary("active-shared");
         let mut disabled_by_admin = plugin_summary("disabled-by-admin");
         disabled_by_admin.availability = PluginAvailability::DisabledByAdmin;
@@ -128,7 +139,7 @@ mod tests {
             vec![
                 PluginCapabilitySummary {
                     config_name: "active@server-marketplace".to_string(),
-                    display_name: "active".to_string(),
+                    display_name: "Active Display".to_string(),
                     description: Some("server-marketplace".to_string()),
                     has_skills: false,
                     mcp_server_names: Vec::new(),

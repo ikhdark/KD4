@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts import source_map_check
 
@@ -347,6 +348,7 @@ class SourceMapCheckTest(unittest.TestCase):
                 check=True,
             )
             (root / "AGENTS.md").write_text("# Policy\n", encoding="utf-8")
+            (root / "local-untracked.txt").write_text("local\n", encoding="utf-8")
             source_map = root / "SOURCEMAP.md"
             source_map.write_text(
                 "\n".join(
@@ -375,9 +377,30 @@ class SourceMapCheckTest(unittest.TestCase):
                 check=True,
             )
 
+            original_run = source_map_check.subprocess.run
+            with mock.patch.object(
+                source_map_check.subprocess,
+                "run",
+                wraps=original_run,
+            ) as git_run:
+                self.assertEqual(
+                    source_map_check.main(
+                        [str(source_map), "--repo-root", str(root)]
+                    ),
+                    0,
+                )
+            git_run.assert_called_once()
             self.assertEqual(
-                source_map_check.main([str(source_map), "--repo-root", str(root)]),
-                0,
+                git_run.call_args.args[0],
+                [
+                    "git",
+                    "ls-files",
+                    "-t",
+                    "--cached",
+                    "--others",
+                    "--exclude-standard",
+                    "-z",
+                ],
             )
             synchronized = source_map.read_text(encoding="utf-8")
             self.assertIn(source_map_check.TRACKED_PATH_SNAPSHOT_BEGIN, synchronized)

@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 use std::io;
-#[cfg(unix)]
-use std::os::unix::process::ExitStatusExt;
-#[cfg(target_os = "windows")]
+
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitStatus;
@@ -40,7 +38,6 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecCommandOutputDeltaEvent;
 use codex_protocol::protocol::ExecOutputStream;
 use codex_sandboxing::SandboxCommand;
-use codex_sandboxing::SandboxManager;
 use codex_sandboxing::SandboxTransformRequest;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::SandboxablePreference;
@@ -48,8 +45,12 @@ use codex_sandboxing::WindowsSandboxFilesystemOverrides;
 pub(crate) use codex_sandboxing::is_likely_sandbox_denied;
 #[cfg(test)]
 use codex_sandboxing::permission_profile_supports_windows_restricted_token_sandbox;
+#[cfg(test)]
 use codex_sandboxing::resolve_windows_elevated_filesystem_overrides;
+#[cfg(test)]
 use codex_sandboxing::resolve_windows_restricted_token_filesystem_overrides;
+use codex_sandboxing::select_initial;
+use codex_sandboxing::transform;
 #[cfg(test)]
 use codex_sandboxing::unsupported_windows_restricted_token_sandbox_reason;
 use codex_sandboxing::windows_sandbox_uses_elevated_backend;
@@ -57,7 +58,6 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use codex_utils_pty::DEFAULT_OUTPUT_BYTES_CAP;
 use codex_utils_pty::ManagedRootProcess;
-use codex_utils_pty::process_group::kill_child_process_group;
 
 pub const DEFAULT_EXEC_COMMAND_TIMEOUT_MS: u64 = 10_000;
 
@@ -155,7 +155,7 @@ fn select_process_exec_tool_sandbox_type(
     windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel,
     enforce_managed_network: bool,
 ) -> SandboxType {
-    SandboxManager::new().select_initial(
+    select_initial(
         file_system_sandbox_policy,
         network_sandbox_policy,
         SandboxablePreference::Auto,
@@ -250,7 +250,6 @@ impl ExecExpiration {
         }
     }
 
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub(crate) fn cancellation_token(&self) -> Option<CancellationToken> {
         match self {
             ExecExpiration::Timeout(_) | ExecExpiration::DefaultTimeout => None,
@@ -371,8 +370,6 @@ pub async fn process_exec_tool_call(
     permission_profile: &PermissionProfile,
     sandbox_cwd: &AbsolutePathBuf,
     windows_sandbox_workspace_roots: &[AbsolutePathBuf],
-    codex_linux_sandbox_exe: &Option<PathBuf>,
-    use_legacy_landlock: bool,
     stdout_stream: Option<StdoutStream>,
 ) -> Result<ExecToolCallOutput> {
     let exec_req = build_exec_request(
@@ -380,8 +377,6 @@ pub async fn process_exec_tool_call(
         permission_profile,
         sandbox_cwd,
         windows_sandbox_workspace_roots,
-        codex_linux_sandbox_exe,
-        use_legacy_landlock,
     )?;
 
     // Route through the sandboxing module for a single, unified execution path.
@@ -395,8 +390,6 @@ pub fn build_exec_request(
     permission_profile: &PermissionProfile,
     sandbox_cwd: &AbsolutePathBuf,
     windows_sandbox_workspace_roots: &[AbsolutePathBuf],
-    codex_linux_sandbox_exe: &Option<PathBuf>,
-    use_legacy_landlock: bool,
 ) -> Result<ExecRequest> {
     let ExecParams {
         command,
@@ -443,7 +436,6 @@ pub fn build_exec_request(
     let cwd = PathUri::from_abs_path(&cwd);
     let sandbox_policy_cwd_uri = PathUri::from_abs_path(sandbox_cwd);
 
-    let manager = SandboxManager::new();
     let command = SandboxCommand {
         program: program.clone().into(),
         args: args.to_vec(),
@@ -456,54 +448,24 @@ pub fn build_exec_request(
         expiration,
         capture_policy,
     };
-    let mut exec_req = manager
-        .transform(SandboxTransformRequest {
-            command,
-            permissions: permission_profile,
-            sandbox: sandbox_type,
-            enforce_managed_network,
-            environment_id: network_environment_id.as_deref(),
-            network: network.as_ref(),
-            sandbox_policy_cwd: &sandbox_policy_cwd_uri,
-            codex_linux_sandbox_exe: codex_linux_sandbox_exe.as_deref(),
-            use_legacy_landlock,
-            windows_sandbox_level,
-            windows_sandbox_private_desktop,
-        })
-        .map(|request| {
-            let windows_sandbox_workspace_roots = if windows_sandbox_workspace_roots.is_empty() {
-                vec![sandbox_cwd.clone()]
-            } else {
-                windows_sandbox_workspace_roots.to_vec()
-            };
-            ExecRequest::from_sandbox_exec_request(
-                request,
-                options,
-                windows_sandbox_workspace_roots,
-            )
-        })
-        .map_err(CodexErr::from)?;
-    let use_windows_elevated_backend = windows_sandbox_uses_elevated_backend(
-        exec_req.windows_sandbox_level,
-        exec_req.network.is_some(),
-    );
-    exec_req.windows_sandbox_filesystem_overrides = if use_windows_elevated_backend {
-        resolve_windows_elevated_filesystem_overrides(
-            exec_req.sandbox,
-            &exec_req.permission_profile,
-            sandbox_cwd,
-            use_windows_elevated_backend,
-        )
+    let request = transform(SandboxTransformRequest {
+        command,
+        permissions: permission_profile,
+        sandbox: sandbox_type,
+        enforce_managed_network,
+        environment_id: network_environment_id.as_deref(),
+        network: network.as_ref(),
+        sandbox_policy_cwd: &sandbox_policy_cwd_uri,
+        windows_sandbox_level,
+        windows_sandbox_private_desktop,
+    })
+    .map_err(CodexErr::from)?;
+    let windows_sandbox_workspace_roots = if windows_sandbox_workspace_roots.is_empty() {
+        vec![sandbox_cwd.clone()]
     } else {
-        resolve_windows_restricted_token_filesystem_overrides(
-            exec_req.sandbox,
-            &exec_req.permission_profile,
-            sandbox_cwd,
-            exec_req.windows_sandbox_level,
-        )
-    }
-    .map_err(CodexErr::UnsupportedOperation)?;
-    Ok(exec_req)
+        windows_sandbox_workspace_roots.to_vec()
+    };
+    ExecRequest::from_sandbox_exec_request(request, options, windows_sandbox_workspace_roots)
 }
 
 pub(crate) async fn execute_exec_request(
@@ -582,16 +544,13 @@ async fn get_raw_output_result(
     network_sandbox_policy: NetworkSandboxPolicy,
     stdout_stream: Option<StdoutStream>,
     after_spawn: Option<Box<dyn FnOnce() + Send>>,
-    #[cfg_attr(not(windows), allow(unused_variables))] sandbox: SandboxType,
-    #[cfg_attr(not(windows), allow(unused_variables))] permission_profile: &PermissionProfile,
-    #[cfg_attr(not(windows), allow(unused_variables))] windows_sandbox_policy_cwd: &AbsolutePathBuf,
-    #[cfg_attr(not(windows), allow(unused_variables))]
+    sandbox: SandboxType,
+    permission_profile: &PermissionProfile,
+    windows_sandbox_policy_cwd: &AbsolutePathBuf,
+
     windows_sandbox_workspace_roots: &[AbsolutePathBuf],
-    #[cfg_attr(not(windows), allow(unused_variables))] windows_sandbox_filesystem_overrides: Option<
-        &WindowsSandboxFilesystemOverrides,
-    >,
+    windows_sandbox_filesystem_overrides: Option<&WindowsSandboxFilesystemOverrides>,
 ) -> Result<RawExecToolCallOutput> {
-    #[cfg(target_os = "windows")]
     if sandbox == SandboxType::WindowsRestrictedToken {
         return exec_windows_sandbox(
             params,
@@ -607,7 +566,6 @@ async fn get_raw_output_result(
     exec(params, network_sandbox_policy, stdout_stream, after_spawn).await
 }
 
-#[cfg(target_os = "windows")]
 fn extract_create_process_as_user_error_code(err: &str) -> Option<String> {
     let marker = "CreateProcessAsUserW failed: ";
     let start = err.find(marker)? + marker.len();
@@ -620,7 +578,6 @@ fn extract_create_process_as_user_error_code(err: &str) -> Option<String> {
     }
 }
 
-#[cfg(target_os = "windows")]
 fn windowsapps_path_kind(path: &str) -> &'static str {
     let lower = path.to_ascii_lowercase();
     if lower.contains("\\program files\\windowsapps\\") {
@@ -635,7 +592,6 @@ fn windowsapps_path_kind(path: &str) -> &'static str {
     "other"
 }
 
-#[cfg(target_os = "windows")]
 fn record_windows_sandbox_spawn_failure(
     command_path: Option<&str>,
     windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel,
@@ -673,7 +629,6 @@ fn record_windows_sandbox_spawn_failure(
     }
 }
 
-#[cfg(target_os = "windows")]
 async fn exec_windows_sandbox(
     params: ExecParams,
     stdout_stream: Option<StdoutStream>,
@@ -870,17 +825,6 @@ fn finalize_exec_result(
             #[allow(unused_mut)]
             let mut timed_out = raw_output.timed_out;
 
-            #[cfg(target_family = "unix")]
-            {
-                if let Some(signal) = raw_output.exit_status.signal() {
-                    if signal == TIMEOUT_CODE {
-                        timed_out = true;
-                    } else {
-                        return Err(CodexErr::Sandbox(SandboxErr::Signal(signal)));
-                    }
-                }
-            }
-
             let mut exit_code = raw_output.exit_status.code().unwrap_or(-1);
             if timed_out {
                 exit_code = EXEC_TIMEOUT_EXIT_CODE;
@@ -1047,11 +991,11 @@ async fn exec(
         network: None,
         stdio_policy: StdioPolicy::RedirectForShellTool,
         env,
-        #[cfg(windows)]
+
         creation_flags: 0,
     })
     .await?;
-    #[cfg(target_os = "windows")]
+
     if let Err(err) = managed_root.attach(
         child
             .id()
@@ -1074,11 +1018,7 @@ async fn exec(
     .await
 }
 
-fn kill_child_process_tree(
-    child: &mut Child,
-    #[cfg(target_os = "windows")] managed_root: &ManagedRootProcess,
-) -> io::Result<()> {
-    #[cfg(target_os = "windows")]
+fn kill_child_process_tree(child: &mut Child, managed_root: &ManagedRootProcess) -> io::Result<()> {
     match managed_root.terminate() {
         Ok(()) => return Ok(()),
         Err(err) => {
@@ -1089,7 +1029,6 @@ fn kill_child_process_tree(
         }
     }
 
-    kill_child_process_group(child)?;
     child.start_kill()
 }
 
@@ -1145,7 +1084,6 @@ async fn consume_output(
     let (exit_status, timed_out) = tokio::select! {
         status_result = child.wait() => {
             let exit_status = status_result?;
-            #[cfg(target_os = "windows")]
             if let Err(err) = managed_root.preserve_descendants() {
                 tracing::warn!(
                     "Windows direct exec failed to preserve descendants after root exit: {err}"
@@ -1158,7 +1096,6 @@ async fn consume_output(
                 Some(ExecExpirationOutcome::TimedOut) => {
                     kill_child_process_tree(
                         &mut child,
-                        #[cfg(target_os = "windows")]
                         &managed_root,
                     )?;
                     (
@@ -1167,51 +1104,14 @@ async fn consume_output(
                     )
                 }
                 Some(ExecExpirationOutcome::Cancelled) => {
-                    #[cfg(target_os = "windows")]
+                    kill_child_process_tree(&mut child, &managed_root)?;
+                    if let Ok(status) = tokio::time::timeout(
+                        CANCELLATION_TERMINATION_GRACE_PERIOD,
+                        child.wait(),
+                    )
+                    .await
                     {
-                        kill_child_process_tree(&mut child, &managed_root)?;
-                        if let Ok(status) = tokio::time::timeout(
-                            CANCELLATION_TERMINATION_GRACE_PERIOD,
-                            child.wait(),
-                        )
-                        .await
-                        {
-                            status?;
-                        }
-                    }
-                    #[cfg(not(target_os = "windows"))]
-                    {
-                        // Let TERM-aware processes run cleanup briefly, then kill any
-                        // remaining members of the original process group.
-                        let process_group_id = child.id();
-                        let should_escalate = if let Some(process_group_id) = process_group_id {
-                            codex_utils_pty::process_group::terminate_process_group(
-                                process_group_id,
-                            )?
-                        } else {
-                            false
-                        };
-                        match tokio::time::timeout(
-                            CANCELLATION_TERMINATION_GRACE_PERIOD,
-                            child.wait(),
-                        )
-                        .await
-                        {
-                            Ok(status) => {
-                                status?;
-                                if should_escalate
-                                    && let Some(process_group_id) = process_group_id
-                                {
-                                    codex_utils_pty::process_group::kill_process_group(
-                                        process_group_id,
-                                    )?;
-                                }
-                            }
-                            Err(_) => {
-                                kill_child_process_group(&mut child)?;
-                                child.start_kill()?;
-                            }
-                        }
+                        status?;
                     }
                     (synthetic_exit_status_for_code(/*code*/ 1), false)
                 }
@@ -1221,7 +1121,6 @@ async fn consume_output(
         _ = tokio::signal::ctrl_c() => {
             kill_child_process_tree(
                 &mut child,
-                #[cfg(target_os = "windows")]
                 &managed_root,
             )?;
             (synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + SIGKILL_CODE), false)
@@ -1411,19 +1310,6 @@ async fn send_limited_output_delta(
     continue_streaming
 }
 
-#[cfg(unix)]
-fn synthetic_exit_status(code: i32) -> ExitStatus {
-    use std::os::unix::process::ExitStatusExt;
-    std::process::ExitStatus::from_raw(code)
-}
-
-#[cfg(unix)]
-fn synthetic_exit_status_for_code(code: i32) -> ExitStatus {
-    use std::os::unix::process::ExitStatusExt;
-    std::process::ExitStatus::from_raw(code << 8)
-}
-
-#[cfg(windows)]
 fn synthetic_exit_status(code: i32) -> ExitStatus {
     use std::os::windows::process::ExitStatusExt;
     // On Windows the raw status is a u32. Use a direct cast to avoid
@@ -1431,7 +1317,6 @@ fn synthetic_exit_status(code: i32) -> ExitStatus {
     std::process::ExitStatus::from_raw(code as u32)
 }
 
-#[cfg(windows)]
 fn synthetic_exit_status_for_code(code: i32) -> ExitStatus {
     synthetic_exit_status(code)
 }

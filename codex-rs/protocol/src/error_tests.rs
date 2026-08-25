@@ -148,6 +148,15 @@ fn sandbox_denied_reports_both_streams_when_available() {
 }
 
 #[test]
+fn truncation_policy_owns_text_dispatch() {
+    let content = "abcdefghij";
+    assert_eq!(
+        TruncationPolicy::Bytes(6).truncate_text(content),
+        codex_utils_string::truncate_middle_chars(content, 6)
+    );
+}
+
+#[test]
 fn sandbox_denied_reports_stdout_when_no_stderr() {
     let output = ExecToolCallOutput {
         exit_code: 11,

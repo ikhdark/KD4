@@ -24,9 +24,7 @@ use ratatui::text::Span;
 
 #[cfg(test)]
 const ALT_PREFIX: &str = "⌥ + ";
-#[cfg(all(not(test), target_os = "macos"))]
-const ALT_PREFIX: &str = "⌥ + ";
-#[cfg(all(not(test), not(target_os = "macos")))]
+#[cfg(not(test))]
 const ALT_PREFIX: &str = "alt + ";
 const CTRL_PREFIX: &str = "ctrl + ";
 const SHIFT_PREFIX: &str = "shift + ";
@@ -202,16 +200,9 @@ pub(crate) fn has_ctrl_or_alt(mods: KeyModifiers) -> bool {
     (mods.contains(KeyModifiers::CONTROL) || mods.contains(KeyModifiers::ALT)) && !is_altgr(mods)
 }
 
-#[cfg(windows)]
 #[inline]
 pub(crate) fn is_altgr(mods: KeyModifiers) -> bool {
     mods.contains(KeyModifiers::ALT) && mods.contains(KeyModifiers::CONTROL)
-}
-
-#[cfg(not(windows))]
-#[inline]
-pub(crate) fn is_altgr(_mods: KeyModifiers) -> bool {
-    false
 }
 
 #[cfg(test)]
@@ -373,9 +364,6 @@ mod tests {
         assert!(has_ctrl_or_alt(KeyModifiers::CONTROL));
         assert!(has_ctrl_or_alt(KeyModifiers::ALT));
 
-        #[cfg(windows)]
         assert!(!has_ctrl_or_alt(KeyModifiers::CONTROL | KeyModifiers::ALT));
-        #[cfg(not(windows))]
-        assert!(has_ctrl_or_alt(KeyModifiers::CONTROL | KeyModifiers::ALT));
     }
 }

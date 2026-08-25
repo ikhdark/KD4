@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::path::PathBuf;
 
 use codex_app_server_protocol::ServerPackageLayout;
@@ -7,10 +6,9 @@ use codex_app_server_protocol::ServerRuntimeWarning;
 use codex_install_context::CodexPackageLayout;
 use codex_install_context::InstallContext;
 use codex_install_context::InstallMethod;
-use codex_install_context::StandalonePlatform;
+use codex_utils_absolute_path as path_utils;
 use codex_utils_absolute_path::AbsolutePathBuf;
-
-use crate::build_info::BuildInfo;
+use codex_utils_build_info::BuildInfo;
 
 const LOCAL_PUBLISH_DIR_ENV: &str = "CODEX_LOCAL_PUBLISH_DIR";
 const LOCAL_CLI_PATH_ENV: &str = "CODEX_CLI_PATH";
@@ -25,7 +23,9 @@ pub(crate) fn current() -> ServerRuntimeInfo {
     let local_binary_match = executable_path
         .as_ref()
         .zip(expected_local_binary_path.as_ref())
-        .map(|(actual, expected)| paths_match(actual.as_path(), expected.as_path()));
+        .map(|(actual, expected)| {
+            path_utils::paths_match_after_normalization(actual.as_path(), expected.as_path())
+        });
 
     let mut warnings = local_binary_warnings(
         executable_path.as_ref(),
@@ -68,12 +68,7 @@ fn expected_local_binary_path() -> Option<AbsolutePathBuf> {
         .or_else(|| std::env::var_os("HOME").filter(|value| !value.is_empty()))
         .map(PathBuf::from);
 
-    expected_local_binary_path_from_inputs(
-        local_cli_path,
-        local_publish_dir,
-        default_home,
-        cfg!(windows),
-    )
+    expected_local_binary_path_from_inputs(local_cli_path, local_publish_dir, default_home, true)
 }
 
 fn expected_local_binary_path_from_inputs(
@@ -108,18 +103,10 @@ fn package_layout_info(layout: &CodexPackageLayout) -> ServerPackageLayout {
 
 fn install_method_label(method: &InstallMethod) -> &'static str {
     match method {
-        InstallMethod::Standalone {
-            platform: StandalonePlatform::Windows,
-            ..
-        } => "standalone-windows",
-        InstallMethod::Standalone {
-            platform: StandalonePlatform::Unix,
-            ..
-        } => "standalone-unix",
+        InstallMethod::Standalone { .. } => "standalone-windows",
         InstallMethod::Npm => "npm",
         InstallMethod::Bun => "bun",
         InstallMethod::Pnpm => "pnpm",
-        InstallMethod::Brew => "brew",
         InstallMethod::Other => "other",
     }
 }
@@ -184,17 +171,6 @@ fn build_warnings(
     }]
 }
 
-fn paths_match(left: &Path, right: &Path) -> bool {
-    let left = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
-    let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
-    if cfg!(windows) {
-        left.to_string_lossy()
-            .eq_ignore_ascii_case(&right.to_string_lossy())
-    } else {
-        left == right
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,7 +186,6 @@ mod tests {
         assert_eq!(install_method_label(&InstallMethod::Npm), "npm");
         assert_eq!(install_method_label(&InstallMethod::Bun), "bun");
         assert_eq!(install_method_label(&InstallMethod::Pnpm), "pnpm");
-        assert_eq!(install_method_label(&InstallMethod::Brew), "brew");
     }
 
     #[test]

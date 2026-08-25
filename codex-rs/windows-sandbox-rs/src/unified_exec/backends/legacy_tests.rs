@@ -1,10 +1,26 @@
 use super::finalize_exit;
+use super::raw_handle;
+use super::sendable_handle;
+use crate::conpty::ConptyInstance;
+use crate::desktop::LaunchDesktop;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::mpsc;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::oneshot;
+
+#[test]
+fn wait_thread_state_uses_sendable_handle_storage() {
+    fn assert_send<T: Send>() {}
+
+    assert_send::<LaunchDesktop>();
+    assert_send::<ConptyInstance>();
+    assert_send::<Arc<Mutex<Option<super::SendableHandle>>>>();
+
+    let address = 0x1234usize;
+    assert_eq!(sendable_handle(raw_handle(address)), address);
+}
 
 #[test]
 fn final_wait_failure_does_not_join_output_reader() {

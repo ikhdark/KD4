@@ -46,8 +46,8 @@ pub fn find_runner_exe(codex_home: &Path, log_dir: Option<&Path>) -> PathBuf {
 
 /// Generates a unique named-pipe path used to communicate with the runner process.
 pub fn pipe_pair() -> (String, String) {
-    let mut rng = SmallRng::from_entropy();
-    let nonce: u128 = rng.r#gen();
+    let mut rng = SmallRng::from_os_rng();
+    let nonce: u128 = rng.random();
     let base = format!(r"\\.\pipe\codex-runner-{nonce:x}");
     (format!("{base}-in"), format!("{base}-out"))
 }
@@ -94,7 +94,7 @@ pub fn create_named_pipe(name: &str, access: u32, sandbox_username: &str) -> io:
     unsafe {
         LocalFree(sd as HLOCAL);
     }
-    if h == 0 || h == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+    if h.is_null() || h == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
         return Err(io::Error::from_raw_os_error(unsafe {
             GetLastError() as i32
         }));

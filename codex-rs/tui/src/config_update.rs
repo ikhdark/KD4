@@ -96,7 +96,6 @@ pub(crate) fn build_service_tier_selection_edits(service_tier: Option<&str>) -> 
     vec![service_tier_edit]
 }
 
-#[cfg(target_os = "windows")]
 pub(crate) fn build_windows_sandbox_mode_edits(elevated_enabled: bool) -> Vec<ConfigEdit> {
     let feature_key_path = |feature: &str| format!("features.{feature}");
     vec![

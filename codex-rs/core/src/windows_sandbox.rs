@@ -16,12 +16,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
 
-/// Kill switch for the elevated sandbox NUX on Windows.
-///
-/// When false, revert to the previous sandbox NUX, which only
-/// prompts users to enable the legacy sandbox feature.
-pub const ELEVATED_SANDBOX_NUX_ENABLED: bool = true;
-
 pub trait WindowsSandboxLevelExt {
     fn from_config(config: &Config) -> WindowsSandboxLevel;
     fn from_features(features: &Features) -> WindowsSandboxLevel;
@@ -102,17 +96,10 @@ pub fn legacy_windows_sandbox_mode_from_entries(
     }
 }
 
-#[cfg(target_os = "windows")]
 pub fn sandbox_setup_is_complete(codex_home: &Path) -> bool {
     codex_windows_sandbox::sandbox_setup_is_complete(codex_home)
 }
 
-#[cfg(not(target_os = "windows"))]
-pub fn sandbox_setup_is_complete(_codex_home: &Path) -> bool {
-    false
-}
-
-#[cfg(target_os = "windows")]
 pub fn elevated_setup_failure_details(err: &anyhow::Error) -> Option<(String, String)> {
     let failure = codex_windows_sandbox::extract_setup_failure(err)?;
     let code = failure.code.as_str().to_string();
@@ -120,12 +107,6 @@ pub fn elevated_setup_failure_details(err: &anyhow::Error) -> Option<(String, St
     Some((code, message))
 }
 
-#[cfg(not(target_os = "windows"))]
-pub fn elevated_setup_failure_details(_err: &anyhow::Error) -> Option<(String, String)> {
-    None
-}
-
-#[cfg(target_os = "windows")]
 pub fn elevated_setup_failure_metric_name(err: &anyhow::Error) -> &'static str {
     if codex_windows_sandbox::extract_setup_failure(err).is_some_and(|failure| {
         matches!(
@@ -139,12 +120,6 @@ pub fn elevated_setup_failure_metric_name(err: &anyhow::Error) -> &'static str {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
-pub fn elevated_setup_failure_metric_name(_err: &anyhow::Error) -> &'static str {
-    panic!("elevated_setup_failure_metric_name is only supported on Windows")
-}
-
-#[cfg(target_os = "windows")]
 pub fn run_elevated_setup(
     permission_profile: &PermissionProfile,
     workspace_roots: &[AbsolutePathBuf],
@@ -169,28 +144,10 @@ pub fn run_elevated_setup(
     )
 }
 
-#[cfg(target_os = "windows")]
 pub fn run_elevated_provisioning_setup(codex_home: &Path, real_user: &str) -> anyhow::Result<()> {
     codex_windows_sandbox::run_elevated_provisioning_setup(codex_home, real_user)
 }
 
-#[cfg(not(target_os = "windows"))]
-pub fn run_elevated_setup(
-    _permission_profile: &PermissionProfile,
-    _workspace_roots: &[AbsolutePathBuf],
-    _command_cwd: &Path,
-    _env_map: &HashMap<String, String>,
-    _codex_home: &Path,
-) -> anyhow::Result<()> {
-    anyhow::bail!("elevated Windows sandbox setup is only supported on Windows")
-}
-
-#[cfg(not(target_os = "windows"))]
-pub fn run_elevated_provisioning_setup(_codex_home: &Path, _real_user: &str) -> anyhow::Result<()> {
-    anyhow::bail!("elevated Windows sandbox setup is only supported on Windows")
-}
-
-#[cfg(target_os = "windows")]
 pub fn run_legacy_setup_preflight(
     permission_profile: &PermissionProfile,
     workspace_roots: &[AbsolutePathBuf],
@@ -207,7 +164,6 @@ pub fn run_legacy_setup_preflight(
     )
 }
 
-#[cfg(target_os = "windows")]
 pub fn run_setup_refresh_with_extra_read_roots(
     permission_profile: &PermissionProfile,
     workspace_roots: &[AbsolutePathBuf],
@@ -227,7 +183,6 @@ pub fn run_setup_refresh_with_extra_read_roots(
     )
 }
 
-#[cfg(target_os = "windows")]
 pub fn run_strict_read_root_grant(
     permission_profile: &PermissionProfile,
     workspace_roots: &[AbsolutePathBuf],
@@ -247,46 +202,7 @@ pub fn run_strict_read_root_grant(
     )
 }
 
-#[cfg(not(target_os = "windows"))]
-pub fn run_legacy_setup_preflight(
-    _permission_profile: &PermissionProfile,
-    _workspace_roots: &[AbsolutePathBuf],
-    _command_cwd: &Path,
-    _env_map: &HashMap<String, String>,
-    _codex_home: &Path,
-) -> anyhow::Result<()> {
-    anyhow::bail!("legacy Windows sandbox setup is only supported on Windows")
-}
-
-#[cfg(not(target_os = "windows"))]
-pub fn run_setup_refresh_with_extra_read_roots(
-    _permission_profile: &PermissionProfile,
-    _workspace_roots: &[AbsolutePathBuf],
-    _command_cwd: &Path,
-    _env_map: &HashMap<String, String>,
-    _codex_home: &Path,
-    _extra_read_roots: Vec<PathBuf>,
-) -> anyhow::Result<()> {
-    anyhow::bail!("Windows sandbox read-root refresh is only supported on Windows")
-}
-
-#[cfg(not(target_os = "windows"))]
-pub fn run_strict_read_root_grant(
-    _permission_profile: &PermissionProfile,
-    _workspace_roots: &[AbsolutePathBuf],
-    _command_cwd: &Path,
-    _env_map: &HashMap<String, String>,
-    _codex_home: &Path,
-    _read_root: PathBuf,
-) -> anyhow::Result<()> {
-    anyhow::bail!("Windows sandbox read-root grants are only supported on Windows")
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WindowsSandboxSetupMode {
-    Elevated,
-    Unelevated,
-}
+pub use codex_protocol::config_types::WindowsSandboxSetupMode;
 
 #[derive(Debug, Clone)]
 pub struct WindowsSandboxSetupRequest {
@@ -425,7 +341,6 @@ fn emit_windows_sandbox_setup_failure_metrics(
     );
 
     if matches!(mode, WindowsSandboxSetupMode::Elevated) {
-        #[cfg(target_os = "windows")]
         {
             let mut failure_tags: Vec<(&str, &str)> = vec![("originator", originator_tag)];
             let mut code_tag: Option<String> = None;

@@ -7,6 +7,7 @@ use chrono::Timelike;
 use chrono::Utc;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::CompactedItem;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::GitInfo;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
@@ -14,10 +15,12 @@ use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::TurnStartedEvent;
 use codex_state::BackfillStatus;
 use codex_state::ThreadMetadataBuilder;
 use pretty_assertions::assert_eq;
 use std::fs::File;
+use std::fs::FileTimes;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -87,6 +90,83 @@ async fn extract_metadata_from_rollout_uses_session_meta() {
     assert_eq!(outcome.parent_thread_id, Some(parent_thread_id));
     assert_eq!(outcome.memory_mode, None);
     assert_eq!(outcome.parse_errors, 0);
+}
+
+#[tokio::test]
+async fn extract_metadata_preserves_persisted_turn_start_recency_over_file_mtime() {
+    let dir = tempdir().expect("tempdir");
+    let uuid = Uuid::new_v4();
+    let id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = dir
+        .path()
+        .join(format!("rollout-2026-01-27T12-34-56-{uuid}.jsonl"));
+    let session_meta_line = SessionMetaLine {
+        meta: SessionMeta {
+            session_id: id.into(),
+            id,
+            forked_from_id: None,
+            parent_thread_id: None,
+            timestamp: "2026-01-27T12:34:56Z".to_string(),
+            cwd: dir.path().to_path_buf(),
+            originator: "cli".to_string(),
+            cli_version: "0.0.0".to_string(),
+            source: SessionSource::default(),
+            thread_source: None,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: None,
+            model_provider: Some("openai".to_string()),
+            base_instructions: None,
+            dynamic_tools: None,
+            selected_capability_roots: Vec::new(),
+            memory_mode: None,
+            history_mode: ThreadHistoryMode::Paginated,
+            multi_agent_version: None,
+            context_window: None,
+        },
+        git: None,
+    };
+    let started_at = 1_769_518_923;
+    let lines = [
+        RolloutLine {
+            timestamp: "2026-01-27T12:34:56Z".to_string(),
+            item: RolloutItem::SessionMeta(session_meta_line),
+        },
+        RolloutLine {
+            timestamp: "2026-01-27T12:35:23Z".to_string(),
+            item: RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-1".to_string(),
+                trace_id: None,
+                started_at: Some(started_at),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+        },
+    ];
+    let mut file = File::create(&path).expect("create rollout");
+    for line in lines {
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&line).expect("rollout json")
+        )
+        .expect("write rollout");
+    }
+    let updated_at =
+        DateTime::<Utc>::from_timestamp(started_at + 3_600, 0).expect("valid updated timestamp");
+    file.set_times(FileTimes::new().set_modified(updated_at.into()))
+        .expect("set rollout mtime");
+    drop(file);
+
+    let outcome = extract_metadata_from_rollout(&path, "openai")
+        .await
+        .expect("extract");
+
+    assert_eq!(
+        outcome.metadata.recency_at,
+        DateTime::<Utc>::from_timestamp(started_at, 0).expect("valid timestamp")
+    );
+    assert_eq!(outcome.metadata.updated_at, updated_at);
 }
 
 #[tokio::test]

@@ -386,15 +386,7 @@ fn config_toml_source_path(layer: &ConfigLayerEntry) -> AbsolutePathBuf {
 }
 
 fn synthetic_layer_path(path: &str) -> AbsolutePathBuf {
-    #[cfg(windows)]
-    {
-        AbsolutePathBuf::resolve_path_against_base(path, r"C:\")
-    }
-
-    #[cfg(not(windows))]
-    {
-        AbsolutePathBuf::resolve_path_against_base(path, "/")
-    }
+    AbsolutePathBuf::resolve_path_against_base(path, r"C:\")
 }
 
 fn escape_xml_text(value: &str) -> String {
@@ -467,11 +459,7 @@ fn append_matcher_groups(
                     r#async,
                     status_message,
                 } => {
-                    let command = if cfg!(windows) {
-                        command_windows.unwrap_or(command)
-                    } else {
-                        command
-                    };
+                    let command = command_windows.unwrap_or(command);
                     if r#async {
                         warnings.push(format!(
                             "skipping async hook in {}: async hooks are not supported yet",
@@ -1006,14 +994,7 @@ mod tests {
 
         assert_eq!(warnings, Vec::<String>::new());
         assert_eq!(handlers.len(), 1);
-        assert_eq!(
-            handlers[0].command,
-            if cfg!(windows) {
-                "echo windows"
-            } else {
-                "echo unix"
-            }
-        );
+        assert_eq!(handlers[0].command, "echo windows");
     }
 
     fn config_with_malformed_state_and_session_start_hook() -> TomlValue {

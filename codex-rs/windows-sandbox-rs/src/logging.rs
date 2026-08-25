@@ -3,7 +3,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use codex_utils_string::take_bytes_at_char_boundary;
 use tracing_appender::rolling::RollingFileAppender;
 use tracing_appender::rolling::Rotation;
 
@@ -27,7 +26,7 @@ fn preview(command: &[String]) -> String {
     if joined.len() <= LOG_COMMAND_PREVIEW_LIMIT {
         joined
     } else {
-        take_bytes_at_char_boundary(&joined, LOG_COMMAND_PREVIEW_LIMIT).to_string()
+        joined[..joined.floor_char_boundary(LOG_COMMAND_PREVIEW_LIMIT)].to_string()
     }
 }
 
@@ -110,7 +109,7 @@ mod tests {
         let result = std::panic::catch_unwind(|| preview(&command));
         assert!(result.is_ok());
         let previewed = result.unwrap();
-        assert!(previewed.len() <= LOG_COMMAND_PREVIEW_LIMIT);
+        assert_eq!(previewed, prefix);
     }
 
     #[test]

@@ -7,9 +7,6 @@ use codex_exec_server::Environment;
 use codex_git_utils::get_git_repo_root;
 use codex_protocol::models::PermissionProfile;
 use codex_tools::ToolExecutor;
-use codex_tools::UnifiedExecShellMode;
-use codex_tools::ZshForkConfig;
-use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_output_truncation::TruncationPolicy;
 use pretty_assertions::assert_eq;
 use std::path::PathBuf;
@@ -40,7 +37,6 @@ async fn run_exec_command_for_test(
         .handle(ToolInvocation {
             session: Arc::clone(session),
             step_context: StepContext::for_test(Arc::clone(turn)),
-            turn: Arc::clone(turn),
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
             call_id: call_id.to_string(),
@@ -50,6 +46,39 @@ async fn run_exec_command_for_test(
         })
         .await
         .expect("exec_command test invocation succeeds")
+}
+
+async fn wait_for_exec_command_end(
+    rx_event: &async_channel::Receiver<codex_protocol::protocol::Event>,
+    call_id: &str,
+) -> (bool, bool) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut begin_has_process_id = None;
+        loop {
+            let event = rx_event
+                .recv()
+                .await
+                .expect("session event channel remains open");
+            match event.msg {
+                codex_protocol::protocol::EventMsg::ExecCommandBegin(event)
+                    if event.call_id == call_id =>
+                {
+                    begin_has_process_id = Some(event.process_id.is_some());
+                }
+                codex_protocol::protocol::EventMsg::ExecCommandEnd(event)
+                    if event.call_id == call_id =>
+                {
+                    break (
+                        begin_has_process_id.expect("exec command begin event arrives before end"),
+                        event.process_id.is_some(),
+                    );
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("exec command end event arrives for {call_id}"))
 }
 
 #[test]
@@ -130,7 +159,6 @@ async fn invocation_for_payload(
     ToolInvocation {
         session: session.into(),
         step_context: StepContext::for_test(Arc::clone(&turn)),
-        turn,
         cancellation_token: tokio_util::sync::CancellationToken::new(),
         tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
         call_id: call_id.to_string(),
@@ -152,7 +180,6 @@ async fn invocation_for_payload_without_sandbox(
     ToolInvocation {
         session: session.into(),
         step_context: StepContext::for_test(Arc::clone(&turn)),
-        turn,
         cancellation_token: tokio_util::sync::CancellationToken::new(),
         tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
         call_id: call_id.to_string(),
@@ -185,7 +212,6 @@ async fn invocation_for_payload_with_shellless_remote(
     ToolInvocation {
         session: session.into(),
         step_context: StepContext::for_test(Arc::clone(&turn)),
-        turn,
         cancellation_token: tokio_util::sync::CancellationToken::new(),
         tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
         call_id: call_id.to_string(),
@@ -206,7 +232,6 @@ fn test_get_command_uses_default_shell_when_unspecified() -> anyhow::Result<()> 
     let resolved = get_command(
         &args,
         Arc::new(default_user_shell()),
-        &UnifiedExecShellMode::Direct,
         /*allow_login_shell*/ true,
         /*environment_is_remote*/ false,
     )
@@ -226,7 +251,6 @@ fn test_get_command_launches_structured_argv_without_shell_wrapping() -> anyhow:
     let resolved = get_command(
         &args,
         Arc::new(default_user_shell()),
-        &UnifiedExecShellMode::Direct,
         /*allow_login_shell*/ false,
         /*environment_is_remote*/ false,
     )
@@ -288,7 +312,6 @@ async fn repeated_rg_miss_uses_workspace_identity_across_epoch_advance() {
                 .handle(ToolInvocation {
                     session: Arc::clone(&session),
                     step_context: StepContext::for_test(Arc::clone(&turn)),
-                    turn: Arc::clone(&turn),
                     cancellation_token: tokio_util::sync::CancellationToken::new(),
                     tracker: Arc::clone(&second_tracker),
                     call_id: "negative-cache-repeated-miss".to_string(),
@@ -356,7 +379,6 @@ async fn rg_miss_in_alternate_repository_is_invalidated_after_mutation() {
                 .handle(ToolInvocation {
                     session: Arc::clone(&session),
                     step_context: StepContext::for_test(Arc::clone(&turn)),
-                    turn: Arc::clone(&turn),
                     cancellation_token: tokio_util::sync::CancellationToken::new(),
                     tracker: second_tracker,
                     call_id: "alternate-repository-after-mutation".to_string(),
@@ -389,8 +411,8 @@ async fn known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_la
             .features()
             .enabled(codex_features::Feature::KnownDeltaStore)
     );
-    #[allow(deprecated)]
-    let repo_root = get_git_repo_root(turn.cwd.as_path()).expect("test cwd is in a git repository");
+    let repo_root =
+        get_git_repo_root(turn.cwd().as_path()).expect("test cwd is in a git repository");
     let blob_output = std::process::Command::new("git")
         .args(["rev-parse", "HEAD:codex-rs/core/src/task_evidence.rs"])
         .current_dir(&repo_root)
@@ -415,7 +437,7 @@ async fn known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_la
         .to_string(),
     };
 
-    let ((first, second, third), launches) =
+    let ((first, second, third, cached_lifecycle), launches) =
         crate::tools::runtimes::unified_exec::test_observation::observe(
             crate::tools::known_delta_store::test_observation::with_profitability_costs(
                 async {
@@ -426,6 +448,7 @@ async fn known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_la
                         payload.clone(),
                     )
                     .await;
+                    wait_for_exec_command_end(&rx_event, "known-delta-unified-first").await;
                     let second = run_exec_command_for_test(
                         &session,
                         &turn,
@@ -433,6 +456,7 @@ async fn known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_la
                         payload.clone(),
                     )
                     .await;
+                    wait_for_exec_command_end(&rx_event, "known-delta-unified-second").await;
                     let third = run_exec_command_for_test(
                         &session,
                         &turn,
@@ -440,7 +464,9 @@ async fn known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_la
                         payload.clone(),
                     )
                     .await;
-                    (first, second, third)
+                    let cached_lifecycle =
+                        wait_for_exec_command_end(&rx_event, "known-delta-unified-third").await;
+                    (first, second, third, cached_lifecycle)
                 },
                 std::time::Duration::from_millis(1),
                 std::time::Duration::from_millis(1),
@@ -449,6 +475,7 @@ async fn known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_la
         )
         .await;
     assert_eq!(launches.process_launches, 2);
+    assert_eq!(cached_lifecycle, (false, false));
 
     let canonical_text = |output: &dyn ToolOutput| {
         String::from_utf8(
@@ -498,6 +525,7 @@ async fn known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_la
         ),
     )
     .await;
+    wait_for_exec_command_end(&rx_event, "known-delta-unified-force-fresh").await;
     assert_eq!(fresh_launches.process_launches, 1);
     let fresh_text = String::from_utf8(
         fresh
@@ -523,57 +551,9 @@ async fn known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_la
             ),
         )
         .await;
+    wait_for_exec_command_end(&rx_event, "known-delta-unified-after-fresh").await;
     assert_eq!(post_fresh_launches.process_launches, 0);
     assert!(canonical_text(reused_after_fresh.as_ref()).contains("known-delta cache hit"));
-
-    let expected_call_ids = [
-        "known-delta-unified-first",
-        "known-delta-unified-second",
-        "known-delta-unified-third",
-        "known-delta-unified-force-fresh",
-        "known-delta-unified-after-fresh",
-    ];
-    let mut begin_ids = Vec::new();
-    let mut end_ids = Vec::new();
-    let mut cached_begin_has_process_id = None;
-    let mut cached_end_has_process_id = None;
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while begin_ids.len() < expected_call_ids.len() || end_ids.len() < expected_call_ids.len() {
-            let event = rx_event
-                .recv()
-                .await
-                .expect("session event channel remains open");
-            match event.msg {
-                codex_protocol::protocol::EventMsg::ExecCommandBegin(event)
-                    if expected_call_ids.contains(&event.call_id.as_str()) =>
-                {
-                    if event.call_id == "known-delta-unified-third" {
-                        cached_begin_has_process_id = Some(event.process_id.is_some());
-                    }
-                    begin_ids.push(event.call_id);
-                }
-                codex_protocol::protocol::EventMsg::ExecCommandEnd(event)
-                    if expected_call_ids.contains(&event.call_id.as_str()) =>
-                {
-                    if event.call_id == "known-delta-unified-third" {
-                        cached_end_has_process_id = Some(event.process_id.is_some());
-                    }
-                    end_ids.push(event.call_id);
-                }
-                _ => {}
-            }
-        }
-    })
-    .await
-    .expect("all unified exec begin/end events arrive");
-    begin_ids.sort();
-    end_ids.sort();
-    let mut expected = expected_call_ids.map(str::to_string).to_vec();
-    expected.sort();
-    assert_eq!(begin_ids, expected);
-    assert_eq!(end_ids, expected);
-    assert_eq!(cached_begin_has_process_id, Some(false));
-    assert_eq!(cached_end_has_process_id, Some(false));
 }
 
 #[test]
@@ -588,7 +568,6 @@ fn test_get_command_encodes_powershell_script_but_keeps_plain_safety_shape() -> 
     let resolved = get_command(
         &args,
         Arc::new(powershell),
-        &UnifiedExecShellMode::Direct,
         /*allow_login_shell*/ false,
         /*environment_is_remote*/ false,
     )
@@ -616,7 +595,6 @@ fn test_get_command_rejects_powershell_script_for_non_powershell_remote() -> any
     let err = get_command(
         &args,
         Arc::new(bash),
-        &UnifiedExecShellMode::Direct,
         /*allow_login_shell*/ false,
         /*environment_is_remote*/ true,
     )
@@ -642,7 +620,6 @@ fn accepted_remote_shell_uses_the_remote_reported_path() -> anyhow::Result<()> {
     let resolved = get_command(
         &args,
         Arc::new(remote_shell.clone()),
-        &UnifiedExecShellMode::Direct,
         /*allow_login_shell*/ false,
         /*environment_is_remote*/ true,
     )
@@ -750,7 +727,8 @@ async fn read_only_preflight_repair_executes_and_releases_process_id() {
             arguments: serde_json::json!({
                 "kind": "argv",
                 "program": "rg",
-                "args": ["--ignorecase", "--version"]
+                "args": ["--ignorecase", "--version"],
+                "yield_time_ms": 10_000
             })
             .to_string(),
         },
@@ -844,7 +822,6 @@ async fn intercepted_apply_patch_failure_releases_process_id_and_remains_retryab
             .handle(ToolInvocation {
                 session: Arc::clone(&session),
                 step_context: StepContext::for_test(Arc::clone(&turn)),
-                turn: Arc::clone(&turn),
                 cancellation_token: tokio_util::sync::CancellationToken::new(),
                 tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
                 call_id: format!("intercept-failure-{attempt}"),
@@ -885,7 +862,6 @@ async fn intercepted_apply_patch_failure_releases_process_id_and_remains_retryab
         .handle(ToolInvocation {
             session: Arc::clone(&session),
             step_context: StepContext::for_test(Arc::clone(&turn)),
-            turn: Arc::clone(&turn),
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
             call_id: "intercept-failure-blocked".to_string(),
@@ -912,6 +888,26 @@ async fn intercepted_apply_patch_failure_releases_process_id_and_remains_retryab
             .await
             .expect("inspect artifact directory")
     );
+}
+
+#[test]
+fn test_get_command_rejects_non_windows_shell_override() -> anyhow::Result<()> {
+    let args: ExecCommandArgs =
+        parse_arguments(r#"{"kind":"script","cmd":"echo hello","shell":"bash"}"#)?;
+    let powershell = Shell {
+        shell_type: ShellType::PowerShell,
+        shell_path: PathBuf::from("pwsh.exe"),
+    };
+
+    let err = get_command(
+        &args,
+        Arc::new(powershell),
+        /*allow_login_shell*/ false,
+        /*environment_is_remote*/ false,
+    )
+    .expect_err("non-Windows shell override must be rejected");
+    assert!(err.contains("unsupported Windows shell"));
+    Ok(())
 }
 
 #[tokio::test]
@@ -942,7 +938,6 @@ async fn repeated_apply_patch_environment_mismatch_is_suppressed_before_process_
     let invoke = |call_id: &str| ToolInvocation {
         session: Arc::clone(&session),
         step_context: StepContext::for_test(Arc::clone(&turn)),
-        turn: Arc::clone(&turn),
         cancellation_token: tokio_util::sync::CancellationToken::new(),
         tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
         call_id: call_id.to_string(),
@@ -1082,7 +1077,6 @@ async fn kd4_latency_unpolled_background_failure_retires_live_metadata() {
     let invocation = ToolInvocation {
         session: Arc::clone(&session),
         step_context: StepContext::for_test(Arc::clone(&turn)),
-        turn,
         cancellation_token: tokio_util::sync::CancellationToken::new(),
         tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
         call_id: "background-finalization".to_string(),
@@ -1190,7 +1184,6 @@ async fn foreground_output_artifact_retains_bytes_beyond_transcript_cap() {
     let invocation = ToolInvocation {
         session,
         step_context: StepContext::for_test(Arc::clone(&turn)),
-        turn,
         cancellation_token: tokio_util::sync::CancellationToken::new(),
         tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
         call_id: "full-output-artifact".to_string(),
@@ -1245,6 +1238,7 @@ async fn foreground_output_artifact_retains_bytes_beyond_transcript_cap() {
 }
 
 #[test]
+#[cfg(not(windows))]
 fn test_get_command_respects_explicit_bash_shell() -> anyhow::Result<()> {
     let json = r#"{"cmd": "echo hello", "shell": "/bin/bash"}"#;
 
@@ -1255,7 +1249,6 @@ fn test_get_command_respects_explicit_bash_shell() -> anyhow::Result<()> {
     let resolved = get_command(
         &args,
         Arc::new(default_user_shell()),
-        &UnifiedExecShellMode::Direct,
         /*allow_login_shell*/ true,
         /*environment_is_remote*/ false,
     )
@@ -1275,11 +1268,7 @@ fn test_get_command_respects_explicit_bash_shell() -> anyhow::Result<()> {
 #[test]
 fn test_get_command_respects_explicit_powershell_shell() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
-    let powershell_path = temp_dir.path().join(if cfg!(windows) {
-        "powershell.exe"
-    } else {
-        "powershell"
-    });
+    let powershell_path = temp_dir.path().join("powershell.exe");
     std::fs::write(&powershell_path, "")?;
     let json = serde_json::json!({
         "cmd": "echo hello",
@@ -1297,7 +1286,6 @@ fn test_get_command_respects_explicit_powershell_shell() -> anyhow::Result<()> {
     let resolved = get_command(
         &args,
         Arc::new(default_user_shell()),
-        &UnifiedExecShellMode::Direct,
         /*allow_login_shell*/ true,
         /*environment_is_remote*/ false,
     )
@@ -1320,7 +1308,6 @@ fn test_get_command_respects_explicit_cmd_shell() -> anyhow::Result<()> {
     let resolved = get_command(
         &args,
         Arc::new(default_user_shell()),
-        &UnifiedExecShellMode::Direct,
         /*allow_login_shell*/ true,
         /*environment_is_remote*/ false,
     )
@@ -1339,7 +1326,6 @@ fn test_get_command_rejects_explicit_login_when_disallowed() -> anyhow::Result<(
     let err = get_command(
         &args,
         Arc::new(default_user_shell()),
-        &UnifiedExecShellMode::Direct,
         /*allow_login_shell*/ false,
         /*environment_is_remote*/ false,
     )
@@ -1349,72 +1335,6 @@ fn test_get_command_rejects_explicit_login_when_disallowed() -> anyhow::Result<(
         err.contains("login shell is disabled by config"),
         "unexpected error: {err}"
     );
-    Ok(())
-}
-
-#[test]
-fn test_get_command_rejects_explicit_shell_in_zsh_fork_mode() -> anyhow::Result<()> {
-    let json = r#"{"cmd": "echo hello", "shell": "/bin/bash"}"#;
-    let args: ExecCommandArgs = parse_arguments(json)?;
-    let shell_zsh_path = AbsolutePathBuf::from_absolute_path(if cfg!(windows) {
-        r"C:\opt\codex\zsh"
-    } else {
-        "/opt/codex/zsh"
-    })?;
-    let shell_mode = UnifiedExecShellMode::ZshFork(ZshForkConfig {
-        shell_zsh_path,
-        main_execve_wrapper_exe: AbsolutePathBuf::from_absolute_path(if cfg!(windows) {
-            r"C:\opt\codex\codex-execve-wrapper"
-        } else {
-            "/opt/codex/codex-execve-wrapper"
-        })?,
-    });
-
-    let err = get_command(
-        &args,
-        Arc::new(default_user_shell()),
-        &shell_mode,
-        /*allow_login_shell*/ true,
-        /*environment_is_remote*/ false,
-    )
-    .expect_err("explicit shell should be rejected");
-
-    assert!(
-        err.contains("`shell` is not supported for local zsh-fork exec"),
-        "unexpected error: {err}"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn shell_mode_for_environment_uses_direct_mode_for_remote_environments() -> anyhow::Result<()>
-{
-    let shell_zsh_path = AbsolutePathBuf::from_absolute_path(if cfg!(windows) {
-        r"C:\opt\codex\zsh"
-    } else {
-        "/opt/codex/zsh"
-    })?;
-    let shell_mode = UnifiedExecShellMode::ZshFork(ZshForkConfig {
-        shell_zsh_path,
-        main_execve_wrapper_exe: AbsolutePathBuf::from_absolute_path(if cfg!(windows) {
-            r"C:\opt\codex\codex-execve-wrapper"
-        } else {
-            "/opt/codex/codex-execve-wrapper"
-        })?,
-    });
-    let local_environment = Environment::default_for_tests();
-    let remote_environment =
-        Environment::create_for_tests(Some("ws://127.0.0.1:1/remote-exec-server".to_string()))?;
-
-    assert_eq!(
-        shell_mode_for_environment(&shell_mode, &local_environment),
-        shell_mode
-    );
-    assert_eq!(
-        shell_mode_for_environment(&shell_mode, &remote_environment),
-        UnifiedExecShellMode::Direct
-    );
-
     Ok(())
 }
 
@@ -1437,7 +1357,6 @@ async fn exec_command_pre_tool_use_payload_ignores_base_sensitive_permission_fie
     let invocation = ToolInvocation {
         session: session.into(),
         step_context: StepContext::for_test(Arc::clone(&turn)),
-        turn,
         cancellation_token: tokio_util::sync::CancellationToken::new(),
         tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
         call_id: "call-43".to_string(),
@@ -1525,7 +1444,6 @@ async fn exec_command_hook_preserves_and_rewrites_direct_argv_structurally() {
     let resolved = get_command(
         &args,
         Arc::new(default_user_shell()),
-        &UnifiedExecShellMode::Direct,
         /*allow_login_shell*/ false,
         /*environment_is_remote*/ false,
     )
@@ -1557,7 +1475,6 @@ async fn exec_command_hook_preserves_and_rewrites_direct_argv_structurally() {
     let resolved = get_command(
         &args,
         Arc::new(default_user_shell()),
-        &UnifiedExecShellMode::Direct,
         /*allow_login_shell*/ false,
         /*environment_is_remote*/ false,
     )
@@ -1602,7 +1519,6 @@ async fn exec_command_pre_tool_use_payload_skips_write_stdin() {
         handler.pre_tool_use_payload(&ToolInvocation {
             session: session.into(),
             step_context: StepContext::for_test(Arc::clone(&turn)),
-            turn,
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
             call_id: "call-44".to_string(),

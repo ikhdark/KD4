@@ -125,10 +125,7 @@ def _installed_codex_path() -> Path:
 
 
 def _installed_codex_path_dirs() -> tuple[Path, ...]:
-    try:
-        from codex_cli_bin import bundled_path_dir
-    except (ImportError, AttributeError):
-        return ()
+    from codex_cli_bin import bundled_path_dir
 
     path_dir = bundled_path_dir()
     return (path_dir,) if path_dir is not None else ()
@@ -139,10 +136,9 @@ def _prepend_path_dirs(env: dict[str, str], path_dirs: tuple[Path, ...]) -> None
         return
 
     path_key = _path_env_key(env)
-    if os.name == "nt":
-        for key in list(env):
-            if key.upper() == "PATH" and key != path_key:
-                env.pop(key)
+    for key in list(env):
+        if key.upper() == "PATH" and key != path_key:
+            env.pop(key)
 
     path_sep = os.pathsep
     existing_path = env.get(path_key, "")
@@ -154,9 +150,6 @@ def _prepend_path_dirs(env: dict[str, str], path_dirs: tuple[Path, ...]) -> None
 
 
 def _path_env_key(env: dict[str, str]) -> str:
-    if os.name != "nt":
-        return "PATH"
-
     matching_keys = [key for key in env if key.upper() == "PATH"]
     if "Path" in matching_keys:
         return "Path"

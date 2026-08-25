@@ -90,9 +90,6 @@ def fetch_dotslash_executable(
             raise
 
     extract_archive_member(archive_path, artifact, dest, artifact_label)
-    if not spec.is_windows:
-        mode = dest.stat().st_mode
-        dest.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     write_extracted_member_stamp(dest, artifact)
     _FETCHED_EXECUTABLES[cache_key_tuple] = (dest, artifact)
     return dest

@@ -23,7 +23,7 @@ class RipgrepResolverTest(unittest.TestCase):
             return_value=expected,
         ) as resolve_input_path:
             actual = ripgrep.resolve_rg_bin(
-                TARGET_SPECS["x86_64-apple-darwin"],
+                TARGET_SPECS["x86_64-pc-windows-msvc"],
                 explicit,
             )
 
@@ -56,7 +56,7 @@ class RipgrepResolverTest(unittest.TestCase):
         )
 
     def test_fetch_rg_rejects_missing_artifact(self) -> None:
-        spec = TARGET_SPECS["x86_64-apple-darwin"]
+        spec = TARGET_SPECS["x86_64-pc-windows-msvc"]
 
         with (
             mock.patch.object(
@@ -80,10 +80,7 @@ class RipgrepResolverTest(unittest.TestCase):
                 )
 
                 self.assertEqual(Path(artifact.archive_member).name, spec.rg_name)
-                if spec.is_windows:
-                    self.assertEqual(artifact.archive_format, "zip")
-                else:
-                    self.assertEqual(artifact.archive_format, "tar.gz")
+                self.assertEqual(artifact.archive_format, "zip")
 
 
 if __name__ == "__main__":

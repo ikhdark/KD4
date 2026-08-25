@@ -76,10 +76,10 @@ ref = "main"
     ] {
         assert!(validate_source(&stack, &denied).is_err());
     }
-    let normalized = MarketplacePolicy::from_requirements(stack.requirements())
-        .validate_git_source("example/plugins", Some("main".to_string()))
-        .expect("allowlisted shorthand should validate")
-        .expect("restricted policy should normalize the source");
+    let normalized = parse_source("example/plugins", Some("main"));
+    MarketplacePolicy::from_requirements(stack.requirements())
+        .validate_source(&normalized)
+        .expect("allowlisted shorthand should validate");
     assert_eq!(
         normalized,
         MarketplaceSource::Git {
@@ -331,6 +331,13 @@ restrict_to_allowed_sources = true
         curated_plugins_repo_path(codex_home.path()).join(".agents/plugins/marketplace.json"),
     )
     .expect("absolute marketplace path");
+    let marketplace_root = marketplace_root_dir(&marketplace_path).expect("marketplace root");
+    let curated_root = curated_plugins_repo_path(codex_home.path());
+    assert_eq!(marketplace_root.as_path(), curated_root.as_path());
+    assert!(paths_match_after_normalization(
+        marketplace_root.as_path(),
+        curated_root.as_path()
+    ));
     let policy = MarketplacePolicy::from_requirements(stack.requirements());
 
     assert_eq!(

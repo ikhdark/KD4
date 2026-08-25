@@ -26,51 +26,11 @@ class CliPerformanceFlagsTest(unittest.TestCase):
                 "codex_package",
                 "--code-mode-host-bin",
                 "codex-code-mode-host",
-                "--zsh-manifest",
-                "standalone-zsh",
             ],
         ):
             args = cli.parse_args()
 
         self.assertEqual(args.code_mode_host_bin, Path("codex-code-mode-host"))
-        self.assertEqual(args.zsh_manifest, Path("standalone-zsh"))
-
-    def test_zsh_manifest_is_forwarded_to_resolver(self) -> None:
-        spec = cli.TARGET_SPECS["x86_64-unknown-linux-musl"]
-        variant = cli.PACKAGE_VARIANTS["codex"]
-        manifest = Path("standalone-zsh")
-        outputs = SourceBuildOutputs(
-            entrypoint_bin=Path("codex"),
-            code_mode_host_bin=Path("codex-code-mode-host"),
-            bwrap_bin=Path("bwrap"),
-            codex_command_runner_bin=None,
-            codex_windows_sandbox_setup_bin=None,
-        )
-        args = cli.argparse.Namespace(
-            rg_bin=None,
-            zsh_bin=None,
-            zsh_manifest=manifest,
-        )
-
-        with (
-            mock.patch.object(cli, "resolve_source_outputs", return_value=outputs),
-            mock.patch.object(cli, "read_workspace_version", return_value="1.2.3"),
-            mock.patch.object(cli, "resolve_rg_bin", return_value=Path("rg")),
-            mock.patch.object(
-                cli,
-                "resolve_zsh_bin",
-                return_value=Path("zsh"),
-            ) as resolve_zsh,
-        ):
-            version, inputs = cli.resolve_package_inputs(args, spec, variant)
-
-        self.assertEqual(version, "1.2.3")
-        self.assertEqual(inputs.zsh_bin, Path("zsh"))
-        resolve_zsh.assert_called_once_with(
-            spec,
-            None,
-            manifest_path=manifest,
-        )
 
     def test_skip_build_if_present_uses_existing_outputs_and_reuses_archive_entries(
         self,
@@ -109,12 +69,9 @@ class CliPerformanceFlagsTest(unittest.TestCase):
                         cargo_profile="debug",
                         entrypoint_bin=None,
                         code_mode_host_bin=None,
-                        bwrap_bin=None,
                         codex_command_runner_bin=None,
                         codex_windows_sandbox_setup_bin=None,
                         rg_bin=target_dir / "rg.exe",
-                        zsh_bin=None,
-                        zsh_manifest=None,
                         skip_build_if_present=True,
                         skip_validate=False,
                         fast_validate=True,
@@ -144,7 +101,6 @@ class CliPerformanceFlagsTest(unittest.TestCase):
                 mock.patch.object(
                     cli, "resolve_rg_bin", return_value=target_dir / "rg.exe"
                 ) as resolve_rg_bin,
-                mock.patch.object(cli, "resolve_zsh_bin", return_value=None),
                 mock.patch.object(cli, "source_build_stamp_matches", return_value=True),
             ):
                 rc = cli.main()
@@ -161,7 +117,6 @@ class CliPerformanceFlagsTest(unittest.TestCase):
                 cli.PACKAGE_VARIANTS["codex"],
                 cli.TARGET_SPECS["x86_64-pc-windows-msvc"],
                 expected_version="1.2.3",
-                include_zsh=False,
                 fast=True,
             )
             entries.assert_called_once_with(package_dir)
@@ -183,7 +138,6 @@ class CliPerformanceFlagsTest(unittest.TestCase):
             outputs = SourceBuildOutputs(
                 entrypoint_bin=out / "codex",
                 code_mode_host_bin=out / "codex-code-mode-host",
-                bwrap_bin=None,
                 codex_command_runner_bin=None,
                 codex_windows_sandbox_setup_bin=None,
             )
@@ -200,7 +154,7 @@ class CliPerformanceFlagsTest(unittest.TestCase):
                     cli,
                     "parse_args",
                     return_value=cli.argparse.Namespace(
-                        target="x86_64-apple-darwin",
+                        target="x86_64-pc-windows-msvc",
                         variant="codex",
                         package_dir=package_dir,
                         archive_output=[],
@@ -209,12 +163,9 @@ class CliPerformanceFlagsTest(unittest.TestCase):
                         cargo_profile="debug",
                         entrypoint_bin=None,
                         code_mode_host_bin=None,
-                        bwrap_bin=None,
                         codex_command_runner_bin=None,
                         codex_windows_sandbox_setup_bin=None,
                         rg_bin=out / "rg",
-                        zsh_bin=None,
-                        zsh_manifest=None,
                         skip_build_if_present=False,
                         skip_validate=True,
                         fast_validate=False,
@@ -235,13 +186,11 @@ class CliPerformanceFlagsTest(unittest.TestCase):
                 mock.patch.object(cli, "validate_package_dir") as validate,
                 mock.patch.object(cli, "read_workspace_version", return_value="1.2.3"),
                 mock.patch.object(cli, "resolve_rg_bin", return_value=out / "rg"),
-                mock.patch.object(cli, "resolve_zsh_bin", return_value=None),
             ):
                 rc = cli.main()
 
             self.assertEqual(rc, 0)
             build.assert_called_once()
-            self.assertIsNone(build.call_args.kwargs["bwrap_bin"])
             self.assertIsNone(build.call_args.kwargs["codex_command_runner_bin"])
             self.assertIsNone(build.call_args.kwargs["codex_windows_sandbox_setup_bin"])
             validate.assert_not_called()
@@ -255,7 +204,6 @@ class CliPerformanceFlagsTest(unittest.TestCase):
             outputs = SourceBuildOutputs(
                 entrypoint_bin=out / "codex-app-server",
                 code_mode_host_bin=out / "codex-code-mode-host",
-                bwrap_bin=None,
                 codex_command_runner_bin=None,
                 codex_windows_sandbox_setup_bin=None,
             )
@@ -272,7 +220,7 @@ class CliPerformanceFlagsTest(unittest.TestCase):
                     cli,
                     "parse_args",
                     return_value=cli.argparse.Namespace(
-                        target="x86_64-apple-darwin",
+                        target="x86_64-pc-windows-msvc",
                         variant="codex-app-server",
                         package_dir=package_dir,
                         archive_output=[],
@@ -281,12 +229,9 @@ class CliPerformanceFlagsTest(unittest.TestCase):
                         cargo_profile="debug",
                         entrypoint_bin=None,
                         code_mode_host_bin=None,
-                        bwrap_bin=None,
                         codex_command_runner_bin=None,
                         codex_windows_sandbox_setup_bin=None,
                         rg_bin=out / "rg",
-                        zsh_bin=None,
-                        zsh_manifest=None,
                         skip_build_if_present=False,
                         skip_validate=True,
                         fast_validate=False,
@@ -306,7 +251,6 @@ class CliPerformanceFlagsTest(unittest.TestCase):
                 mock.patch.object(cli, "build_package_dir") as build_package_dir,
                 mock.patch.object(cli, "read_workspace_version", return_value="1.2.3"),
                 mock.patch.object(cli, "resolve_rg_bin", return_value=out / "rg"),
-                mock.patch.object(cli, "resolve_zsh_bin", return_value=None),
             ):
                 rc = cli.main()
 
@@ -326,7 +270,6 @@ class CliPerformanceFlagsTest(unittest.TestCase):
             outputs = SourceBuildOutputs(
                 entrypoint_bin=out / "codex.exe",
                 code_mode_host_bin=out / "codex-code-mode-host.exe",
-                bwrap_bin=None,
                 codex_command_runner_bin=out / "codex-command-runner.exe",
                 codex_windows_sandbox_setup_bin=out / "codex-windows-sandbox-setup.exe",
             )
@@ -353,12 +296,9 @@ class CliPerformanceFlagsTest(unittest.TestCase):
                         cargo_profile="release",
                         entrypoint_bin=None,
                         code_mode_host_bin=None,
-                        bwrap_bin=None,
                         codex_command_runner_bin=None,
                         codex_windows_sandbox_setup_bin=None,
                         rg_bin=out / "rg.exe",
-                        zsh_bin=None,
-                        zsh_manifest=None,
                         reuse_source_builds=True,
                         skip_build_if_present=False,
                         force_source_rebuild=True,
@@ -380,7 +320,6 @@ class CliPerformanceFlagsTest(unittest.TestCase):
                 mock.patch.object(cli, "build_package_dir"),
                 mock.patch.object(cli, "read_workspace_version", return_value="1.2.3"),
                 mock.patch.object(cli, "resolve_rg_bin", return_value=out / "rg.exe"),
-                mock.patch.object(cli, "resolve_zsh_bin", return_value=None),
             ):
                 rc = cli.main()
 
@@ -391,16 +330,6 @@ class CliPerformanceFlagsTest(unittest.TestCase):
 
 
 class CliPreflightTest(unittest.TestCase):
-    def test_rejects_platform_incompatible_helper_override(self) -> None:
-        args = request_args(bwrap_bin=Path("bwrap"))
-
-        with self.assertRaisesRegex(RuntimeError, "only supported for Linux"):
-            cli.validate_cli_request(
-                args,
-                cli.TARGET_SPECS["x86_64-apple-darwin"],
-                Path("package"),
-            )
-
     def test_skip_build_rejects_ignored_source_override(self) -> None:
         args = request_args(
             skip_build_if_present=True,
@@ -464,9 +393,6 @@ def request_args(**overrides) -> cli.argparse.Namespace:
         "reuse_package_dir": False,
         "archive_output": [],
         "archive_compression": "fast",
-        "zsh_bin": None,
-        "zsh_manifest": None,
-        "bwrap_bin": None,
         "codex_command_runner_bin": None,
         "codex_windows_sandbox_setup_bin": None,
         "skip_build_if_present": False,

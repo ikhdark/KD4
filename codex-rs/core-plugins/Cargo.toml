@@ -20,6 +20,7 @@ codex-config = { workspace = true }
 codex-connectors = { workspace = true }
 codex-core-skills = { workspace = true }
 codex-exec-server = { workspace = true }
+codex-file-system = { workspace = true }
 codex-git-utils = { workspace = true }
 codex-hooks = { workspace = true }
 codex-http-client = { workspace = true }
@@ -31,9 +32,7 @@ codex-plugin = { workspace = true }
 codex-protocol = { workspace = true }
 codex-tools = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
-codex-utils-path = { workspace = true }
 codex-utils-path-uri = { workspace = true }
-codex-utils-plugins = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
 flate2 = { workspace = true }
@@ -51,11 +50,7 @@ tracing = { workspace = true }
 url = { workspace = true }
 zip = { workspace = true }
 
-[target.'cfg(target_os = "macos")'.dependencies]
-which = { workspace = true }
-
 [dev-dependencies]
-libc = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }

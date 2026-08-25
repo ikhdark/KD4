@@ -1,6 +1,6 @@
 #![allow(warnings, clippy::all)]
 
-use codex_utils_path as path_utils;
+use codex_utils_absolute_path as path_utils;
 use std::cmp::Reverse;
 use std::ffi::OsStr;
 use std::io;
@@ -19,15 +19,18 @@ use super::ARCHIVED_SESSIONS_SUBDIR;
 use super::SESSIONS_SUBDIR;
 use super::compression;
 use crate::protocol::EventMsg;
-use crate::state_db;
+use crate::state_integration;
 use codex_file_search as file_search;
 use codex_protocol::ThreadId;
 use codex_protocol::items::TurnItem;
+use codex_protocol::persisted_thread_settings::PersistedThreadSettingsReducer;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
+pub use codex_protocol::protocol::SortDirection;
 use codex_protocol::protocol::ThreadHistoryMode;
+pub use codex_protocol::protocol::ThreadSortKey;
 use codex_protocol::protocol::user_message_preview;
 use serde_json::Value;
 
@@ -88,13 +91,6 @@ pub struct ThreadItem {
     pub recency_at: Option<String>,
 }
 
-#[allow(dead_code)]
-#[deprecated(note = "use ThreadItem")]
-pub type ConversationItem = ThreadItem;
-#[allow(dead_code)]
-#[deprecated(note = "use ThreadsPage")]
-pub type ConversationsPage = ThreadsPage;
-
 #[derive(Default)]
 struct HeadTailSummary {
     saw_session_meta: bool,
@@ -114,25 +110,13 @@ struct HeadTailSummary {
     cli_version: Option<String>,
     created_at: Option<String>,
     updated_at: Option<String>,
+    recency_at: Option<String>,
 }
 
 /// Hard cap to bound worst‑case work per request.
 const MAX_SCAN_FILES: usize = 10000;
 const HEAD_RECORD_LIMIT: usize = 10;
 const USER_EVENT_SCAN_LIMIT: usize = 200;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThreadSortKey {
-    CreatedAt,
-    UpdatedAt,
-    RecencyAt,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SortDirection {
-    Asc,
-    Desc,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadListLayout {
@@ -371,6 +355,35 @@ pub async fn get_threads(
     .await
 }
 
+/// Retrieve a filesystem-backed page in ascending order with one bounded
+/// traversal. Unlike reversing paginated descending results, this does not
+/// revisit the same rollout files for every intermediate page.
+pub async fn get_threads_ascending(
+    codex_home: &Path,
+    page_size: usize,
+    cursor: Option<&Cursor>,
+    sort_key: ThreadSortKey,
+    allowed_sources: &[SessionSource],
+    model_providers: Option<&[String]>,
+    cwd_filters: Option<&[PathBuf]>,
+    default_provider: &str,
+) -> io::Result<ThreadsPage> {
+    get_threads_in_root_ascending(
+        codex_home.join(SESSIONS_SUBDIR),
+        page_size,
+        cursor,
+        sort_key,
+        ThreadListConfig {
+            allowed_sources,
+            model_providers,
+            cwd_filters,
+            default_provider,
+            layout: ThreadListLayout::NestedByDate,
+        },
+    )
+    .await
+}
+
 pub async fn get_threads_in_root(
     root: PathBuf,
     page_size: usize,
@@ -420,6 +433,85 @@ pub async fn get_threads_in_root(
         }
     };
     Ok(result)
+}
+
+pub async fn get_threads_in_root_ascending(
+    root: PathBuf,
+    page_size: usize,
+    cursor: Option<&Cursor>,
+    sort_key: ThreadSortKey,
+    config: ThreadListConfig<'_>,
+) -> io::Result<ThreadsPage> {
+    if !root.exists() {
+        return Ok(ThreadsPage::default());
+    }
+
+    let provider_matcher = config
+        .model_providers
+        .and_then(|filters| ProviderMatcher::new(filters, config.default_provider));
+    let mut scanned_files = 0usize;
+    let candidates = match config.layout {
+        ThreadListLayout::NestedByDate => {
+            collect_files_by_updated_at(&root, &mut scanned_files).await?
+        }
+        ThreadListLayout::Flat => {
+            collect_flat_files_by_updated_at(&root, &mut scanned_files).await?
+        }
+    };
+    let reached_scan_cap = scanned_files >= MAX_SCAN_FILES;
+    let anchor = cursor.map(|cursor| {
+        (
+            cursor.timestamp(),
+            cursor
+                .thread_id()
+                .and_then(|id| Uuid::parse_str(&id.to_string()).ok()),
+        )
+    });
+    let mut keyed_items = Vec::new();
+    for candidate in candidates {
+        let updated_at = candidate.updated_at.and_then(format_rfc3339);
+        let Some(item) = build_thread_item(
+            candidate.path,
+            config.allowed_sources,
+            provider_matcher.as_ref(),
+            config.cwd_filters,
+            updated_at,
+        )
+        .await
+        else {
+            continue;
+        };
+        let Some(key) = thread_item_sort_key(&item, sort_key) else {
+            continue;
+        };
+        if anchor.is_some_and(|(anchor_ts, anchor_id)| match anchor_id {
+            Some(anchor_id) if sort_key == ThreadSortKey::RecencyAt => {
+                key <= (anchor_ts, anchor_id)
+            }
+            Some(_) | None => key.0 <= anchor_ts,
+        }) {
+            continue;
+        }
+        keyed_items.push((key, item));
+    }
+    keyed_items.sort_by_key(|(key, _)| *key);
+
+    let more_matches_available = keyed_items.len() > page_size || reached_scan_cap;
+    keyed_items.truncate(page_size);
+    let items = keyed_items
+        .into_iter()
+        .map(|(_, item)| item)
+        .collect::<Vec<_>>();
+    let next_cursor = more_matches_available
+        .then(|| build_next_cursor(&items, sort_key))
+        .flatten();
+
+    Ok(ThreadsPage {
+        items,
+        next_cursor,
+        num_scanned_files: scanned_files,
+        reached_scan_cap,
+    })
 }
 
 /// Load thread file paths from disk using directory traversal.
@@ -771,6 +863,30 @@ fn build_next_cursor(items: &[ThreadItem], sort_key: ThreadSortKey) -> Option<Cu
     ))
 }
 
+pub(crate) fn thread_item_sort_key(
+    item: &ThreadItem,
+    sort_key: ThreadSortKey,
+) -> Option<(OffsetDateTime, Uuid)> {
+    let file_name = item.path.file_name()?.to_str()?;
+    let (created_at, id) = parse_timestamp_uuid_from_filename(file_name)?;
+    let timestamp = match sort_key {
+        ThreadSortKey::CreatedAt => created_at,
+        ThreadSortKey::UpdatedAt => {
+            let updated_at = item.updated_at.as_deref().or(item.created_at.as_deref())?;
+            OffsetDateTime::parse(updated_at, &Rfc3339).ok()?
+        }
+        ThreadSortKey::RecencyAt => {
+            let recency_at = item
+                .recency_at
+                .as_deref()
+                .or(item.updated_at.as_deref())
+                .or(item.created_at.as_deref())?;
+            OffsetDateTime::parse(recency_at, &Rfc3339).ok()?
+        }
+    };
+    Some((timestamp, id))
+}
+
 async fn build_thread_item(
     path: PathBuf,
     allowed_sources: &[SessionSource],
@@ -808,6 +924,7 @@ async fn build_thread_item(
     // Apply filters: must have session meta and a discoverable preview.
     if summary.saw_session_meta && summary.preview.is_some() {
         let HeadTailSummary {
+            saw_session_meta: _,
             thread_id,
             first_user_message,
             preview,
@@ -824,7 +941,7 @@ async fn build_thread_item(
             cli_version,
             created_at,
             updated_at: mut summary_updated_at,
-            ..
+            recency_at,
         } = summary;
         if summary_updated_at.is_none() {
             summary_updated_at = updated_at.or_else(|| created_at.clone());
@@ -847,7 +964,7 @@ async fn build_thread_item(
             model_provider,
             cli_version,
             created_at,
-            recency_at: summary_updated_at.clone(),
+            recency_at: recency_at.or_else(|| summary_updated_at.clone()),
             updated_at: summary_updated_at,
         });
     }
@@ -1114,15 +1231,10 @@ impl<'a> ProviderMatcher<'a> {
 async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTailSummary> {
     let mut lines = compression::open_rollout_line_reader(path).await?;
     let mut summary = HeadTailSummary::default();
+    let mut settings_reducer = PersistedThreadSettingsReducer::default();
     let mut lines_scanned = 0usize;
 
-    while lines_scanned < head_limit
-        || (summary.saw_session_meta
-            && (summary.preview.is_none() || summary.first_user_message.is_none())
-            && lines_scanned < head_limit + USER_EVENT_SCAN_LIMIT)
-    {
-        let line_opt = lines.next_line().await?;
-        let Some(line) = line_opt else { break };
+    while let Some(line) = lines.next_line().await? {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -1144,6 +1256,17 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
                 continue;
             }
         };
+        settings_reducer.apply_item(&rollout_line.item);
+        if let Some(recency_at) =
+            codex_state::latest_rollout_recency_at(std::slice::from_ref(&rollout_line.item))
+        {
+            summary.recency_at =
+                Some(recency_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+        }
+        let may_collect_preview = lines_scanned <= head_limit
+            || (summary.saw_session_meta
+                && (summary.preview.is_none() || summary.first_user_message.is_none())
+                && lines_scanned <= head_limit + USER_EVENT_SCAN_LIMIT);
 
         match rollout_line.item {
             RolloutItem::SessionMeta(session_meta_line) => {
@@ -1191,7 +1314,7 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
                 // Not included in `head`; skip.
             }
             RolloutItem::EventMsg(ev) => {
-                if let Some(preview) = event_msg_preview(&ev) {
+                if may_collect_preview && let Some(preview) = event_msg_preview(&ev) {
                     // Legacy rollouts persist UserMessage while paginated rollouts persist
                     // ItemCompleted(UserMessage), so summaries must recognize both formats.
                     let is_user_message = match &ev {
@@ -1210,13 +1333,14 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
                 }
             }
         }
+    }
 
-        if summary.saw_session_meta
-            && summary.preview.is_some()
-            && summary.first_user_message.is_some()
-        {
-            break;
-        }
+    let settings = settings_reducer.into_settings();
+    if let Some(model_provider) = settings.model_provider_id {
+        summary.model_provider = Some(model_provider);
+    }
+    if let Some(environments) = settings.environments {
+        summary.cwd = Some(environments.legacy_fallback_cwd.into_path_buf());
     }
 
     Ok(summary)
@@ -1469,7 +1593,7 @@ async fn find_thread_path_by_id_str_in_subdir(
                 /*telemetry_override*/ None,
             );
         }
-        state_db::read_repair_rollout_path(
+        state_integration::read_repair_rollout_path(
             state_db_ctx,
             thread_id,
             archived_only,
@@ -1550,4 +1674,19 @@ pub fn rollout_date_parts(file_name: &OsStr) -> Option<(String, String, String)>
     let month = date.get(5..7)?.to_string();
     let day = date.get(8..10)?.to_string();
     Some((year, month, day))
+}
+
+#[cfg(test)]
+mod consolidated_type_tests {
+    use super::SortDirection;
+    use super::ThreadSortKey;
+
+    #[test]
+    fn listing_value_types_are_protocol_owned() {
+        let sort_key: codex_protocol::protocol::ThreadSortKey = ThreadSortKey::RecencyAt;
+        let direction: codex_protocol::protocol::SortDirection = SortDirection::Desc;
+
+        assert_eq!(sort_key, ThreadSortKey::RecencyAt);
+        assert_eq!(direction, SortDirection::Desc);
+    }
 }

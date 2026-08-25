@@ -2,10 +2,9 @@
 
 import argparse
 import importlib
-import importlib.metadata
+import importlib.util
 import json
 import os
-import platform
 import re
 import shutil
 import subprocess
@@ -22,6 +21,7 @@ SDK_DISTRIBUTION_NAME = "openai-codex"
 RUNTIME_DISTRIBUTION_NAME = "openai-codex-cli-bin"
 RUNTIME_PACKAGE_ROOT = Path("src") / "codex_cli_bin"
 CODEX_PACKAGE_METADATA = "codex-package.json"
+GENERATED_PACKAGE_INIT = '"""Auto-generated Python types derived from the app-server schemas."""\n'
 
 
 def repo_root() -> Path:
@@ -30,6 +30,11 @@ def repo_root() -> Path:
 
 def sdk_root() -> Path:
     return repo_root() / "sdk" / "python"
+
+
+def app_server_schema_dir() -> Path:
+    """Return the fork-local app-server schema directory owned by the Rust generator."""
+    return repo_root() / "codex-rs" / "app-server-protocol" / "schema" / "json"
 
 
 def python_runtime_root() -> Path:
@@ -42,20 +47,16 @@ def sdk_pyproject_path() -> Path:
 
 
 def schema_bundle_path(schema_dir: Path) -> Path:
-    """Return the aggregate v2 schema bundle emitted by the runtime binary."""
+    """Return the aggregate v2 schema bundle emitted by the app-server generator."""
     return schema_dir / "codex_app_server_protocol.v2.schemas.json"
 
 
-def _is_windows() -> bool:
-    return platform.system().lower().startswith("win")
-
-
 def runtime_binary_name() -> str:
-    return "codex.exe" if _is_windows() else "codex"
+    return "codex.exe"
 
 
 def runtime_code_mode_host_name() -> str:
-    return "codex-code-mode-host.exe" if _is_windows() else "codex-code-mode-host"
+    return "codex-code-mode-host.exe"
 
 
 def staged_runtime_package_root(root: Path) -> Path:
@@ -82,7 +83,7 @@ def current_sdk_version() -> str:
 
 
 def pinned_runtime_version() -> str:
-    """Read the exact runtime package pin used for schema generation."""
+    """Read the exact runtime package pin used to launch Codex from the SDK."""
     pyproject_text = sdk_pyproject_path().read_text()
     match = re.search(r"(?ms)^dependencies = \[(.*?)\]$", pyproject_text)
     if match is None:
@@ -98,37 +99,6 @@ def pinned_runtime_version() -> str:
             "in sdk/python/pyproject.toml"
         )
     return normalize_codex_version(pins[0])
-
-
-def pinned_runtime_codex_path() -> Path:
-    """Return the bundled Codex binary from the installed pinned runtime wheel."""
-    expected_version = pinned_runtime_version()
-    try:
-        installed_version = importlib.metadata.version(RUNTIME_DISTRIBUTION_NAME)
-    except importlib.metadata.PackageNotFoundError as exc:
-        raise RuntimeError(
-            f"Install {RUNTIME_DISTRIBUTION_NAME}=={expected_version} before "
-            "generating Python SDK types."
-        ) from exc
-
-    normalized_installed_version = normalize_codex_version(installed_version)
-    if normalized_installed_version != expected_version:
-        raise RuntimeError(
-            f"Expected {RUNTIME_DISTRIBUTION_NAME}=={expected_version}, "
-            f"but found {installed_version}."
-        )
-
-    try:
-        from codex_cli_bin import bundled_codex_path
-    except ImportError as exc:
-        raise RuntimeError(
-            f"Installed {RUNTIME_DISTRIBUTION_NAME} package does not expose bundled_codex_path."
-        ) from exc
-
-    codex_path = bundled_codex_path()
-    if not codex_path.exists():
-        raise RuntimeError(f"Pinned Codex runtime binary not found at {codex_path}.")
-    return codex_path
 
 
 def normalize_codex_version(version: str) -> str:
@@ -181,6 +151,21 @@ def _rewrite_project_version(pyproject_text: str, version: str) -> str:
     return updated
 
 
+def _rewrite_runtime_dependency(pyproject_text: str, runtime_version: str) -> str:
+    package_version = normalize_codex_version(runtime_version)
+    updated, count = re.subn(
+        rf'"{re.escape(RUNTIME_DISTRIBUTION_NAME)}==[^"]+"',
+        f'"{RUNTIME_DISTRIBUTION_NAME}=={package_version}"',
+        pyproject_text,
+        count=1,
+    )
+    if count != 1:
+        raise RuntimeError(
+            f"Could not rewrite {RUNTIME_DISTRIBUTION_NAME} dependency in pyproject.toml"
+        )
+    return updated
+
+
 def _rewrite_runtime_platform_tag(pyproject_text: str, platform_tag: str) -> str:
     section = "[tool.hatch.build.targets.wheel.hooks.custom]"
     section_index = pyproject_text.find(section)
@@ -221,7 +206,11 @@ def _rewrite_project_name(pyproject_text: str, name: str) -> str:
     return updated
 
 
-def stage_python_sdk_package(staging_dir: Path, sdk_version: str) -> Path:
+def stage_python_sdk_package(
+    staging_dir: Path,
+    sdk_version: str,
+    runtime_version: str,
+) -> Path:
     package_version = normalize_codex_version(sdk_version)
     _copy_package_tree(sdk_root(), staging_dir)
     sdk_bin_dir = staging_dir / "src" / "openai_codex" / "bin"
@@ -232,6 +221,7 @@ def stage_python_sdk_package(staging_dir: Path, sdk_version: str) -> Path:
     pyproject_text = pyproject_path.read_text()
     pyproject_text = _rewrite_project_name(pyproject_text, SDK_DISTRIBUTION_NAME)
     pyproject_text = _rewrite_project_version(pyproject_text, package_version)
+    pyproject_text = _rewrite_runtime_dependency(pyproject_text, runtime_version)
     pyproject_path.write_text(pyproject_text)
     return staging_dir
 
@@ -559,25 +549,6 @@ def _make_chatgpt_account_email_nullable(schema: dict[str, Any]) -> None:
     raise RuntimeError("Schema bundle is missing the ChatGPT account variant")
 
 
-def generate_schema_from_pinned_runtime(schema_dir: Path) -> Path:
-    """Generate app-server schemas by invoking the installed pinned runtime binary."""
-    codex_path = pinned_runtime_codex_path()
-    if schema_dir.exists():
-        shutil.rmtree(schema_dir)
-    schema_dir.mkdir(parents=True)
-    run(
-        [
-            str(codex_path),
-            "app-server",
-            "generate-json-schema",
-            "--out",
-            str(schema_dir),
-        ],
-        cwd=sdk_root(),
-    )
-    return schema_dir
-
-
 def _normalized_schema_bundle_text(schema_dir: Path) -> str:
     """Normalize the schema bundle before feeding it to the Python type generator."""
     schema = json.loads(schema_bundle_path(schema_dir).read_text())
@@ -835,7 +806,7 @@ class PublicFieldSpec:
 @dataclass(frozen=True)
 class CliOps:
     generate_types: Callable[[], None]
-    stage_python_sdk_package: Callable[[Path, str], Path]
+    stage_python_sdk_package: Callable[[Path, str, str], Path]
     stage_python_runtime_package: Callable[[Path, str, Path, str | None], Path]
     current_sdk_version: Callable[[], str]
 
@@ -1299,19 +1270,27 @@ def generate_public_api_flat_methods() -> None:
     run_python_module("ruff", ["format", str(public_api_path)], cwd=sdk_root())
 
 
+def prepare_generated_package() -> None:
+    """Replace the generated package tree so obsolete generated modules cannot survive."""
+    generated_dir = sdk_root() / "src" / "openai_codex" / "generated"
+    if generated_dir.exists():
+        shutil.rmtree(generated_dir)
+    generated_dir.mkdir(parents=True)
+    (generated_dir / "__init__.py").write_text(GENERATED_PACKAGE_INIT)
+
+
 def generate_types_from_schema_dir(schema_dir: Path) -> None:
     """Regenerate every SDK artifact derived from an existing schema directory."""
     # v2_all is the authoritative generated surface.
+    prepare_generated_package()
     generate_v2_all(schema_dir)
     generate_notification_registry(schema_dir)
     generate_public_api_flat_methods()
 
 
 def generate_types() -> None:
-    """Generate schemas from the pinned runtime and then refresh SDK artifacts."""
-    with tempfile.TemporaryDirectory(prefix="codex-python-schema-") as td:
-        schema_dir = generate_schema_from_pinned_runtime(Path(td) / "schema")
-        generate_types_from_schema_dir(schema_dir)
+    """Refresh SDK artifacts from this checkout's generated app-server schemas."""
+    generate_types_from_schema_dir(app_server_schema_dir())
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1322,7 +1301,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     stage_sdk_parser = subparsers.add_parser(
         "stage-sdk",
-        help="Stage a releasable SDK package while preserving its reviewed runtime pin",
+        help="Stage a releasable SDK package pinned to its matching Codex runtime",
     )
     stage_sdk_parser.add_argument(
         "staging_dir",
@@ -1335,6 +1314,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Python SDK release version to write into the staged package. "
             "Accepts PEP 440 versions such as 0.1.0b1."
+        ),
+    )
+    stage_sdk_parser.add_argument(
+        "--codex-version",
+        required=True,
+        help=(
+            "Codex release version used to stage the matching runtime wheel. "
+            "Accepts PEP 440 versions or release tags such as rust-v0.116.0-alpha.1."
         ),
     )
 
@@ -1362,10 +1349,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     stage_runtime_parser.add_argument(
         "--platform-tag",
-        help=(
-            "Optional wheel platform tag override, for example "
-            "macosx_11_0_arm64 or manylinux_2_17_x86_64."
-        ),
+        help=("Optional Windows wheel platform tag override, for example win_amd64."),
     )
     return parser
 
@@ -1391,6 +1375,7 @@ def run_command(args: argparse.Namespace, ops: CliOps) -> None:
         ops.stage_python_sdk_package(
             args.staging_dir,
             normalize_codex_version(args.sdk_version),
+            normalize_codex_version(args.codex_version),
         )
     elif args.command == "stage-runtime":
         ops.stage_python_runtime_package(

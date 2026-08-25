@@ -193,22 +193,21 @@ def collect_checks() -> list[ToolCheck]:
             required_version=package_manager_version(pnpm_pin),
         ),
     ]
-    if os.name == "nt":
-        checks.append(
-            check_tool(
+    checks.append(
+        check_tool(
+            "pwsh",
+            [
                 "pwsh",
-                [
-                    "pwsh",
-                    "-NoLogo",
-                    "-NoProfile",
-                    "-Command",
-                    "$PSVersionTable.PSVersion.ToString()",
-                ],
-                required=True,
-                guidance="Install PowerShell 7.4 or newer for maintained Windows recipes.",
-                min_version=(7, 4),
-            )
+                "-NoLogo",
+                "-NoProfile",
+                "-Command",
+                "$PSVersionTable.PSVersion.ToString()",
+            ],
+            required=True,
+            guidance="Install PowerShell 7.4 or newer for maintained Windows recipes.",
+            min_version=(7, 4),
         )
+    )
     return checks
 
 

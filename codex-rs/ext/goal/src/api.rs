@@ -17,7 +17,6 @@ use crate::runtime::GoalRuntimeHandle;
 use crate::runtime::PreviousGoalSnapshot;
 use crate::tool::fill_empty_thread_preview_if_possible;
 use crate::tool::protocol_goal_from_state;
-use crate::tool::state_status_from_protocol;
 use crate::tool::validate_goal_budget;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,7 +116,6 @@ impl GoalService {
             status,
             token_budget,
         } = request;
-        let status = status.map(state_status_from_protocol);
         let objective = match objective {
             GoalObjectiveUpdate::Keep => None,
             GoalObjectiveUpdate::Set(objective) => Some(objective.trim()),

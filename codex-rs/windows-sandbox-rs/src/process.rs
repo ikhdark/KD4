@@ -70,7 +70,7 @@ pub fn make_env_block(env: &HashMap<String, String>) -> Vec<u16> {
 unsafe fn ensure_inheritable_stdio(si: &mut STARTUPINFOW) -> Result<()> {
     for kind in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
         let h = GetStdHandle(kind);
-        if h == 0 || h == INVALID_HANDLE_VALUE {
+        if h.is_null() || h == INVALID_HANDLE_VALUE {
             return Err(anyhow!("GetStdHandle failed: {}", GetLastError()));
         }
         if SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
@@ -220,8 +220,13 @@ impl PipeSpawnHandles {
 }
 
 /// Spawns a process with anonymous pipes and returns the relevant handles.
+///
+/// # Safety
+///
+/// `h_token` must be a valid primary token handle with the access rights required by
+/// `CreateProcessAsUserW`, and it must remain valid for the duration of this call.
 #[allow(clippy::too_many_arguments)]
-pub fn spawn_process_with_pipes(
+pub unsafe fn spawn_process_with_pipes(
     h_token: HANDLE,
     argv: &[String],
     cwd: &Path,
@@ -232,12 +237,12 @@ pub fn spawn_process_with_pipes(
     use_private_desktop: bool,
     logs_base_dir: Option<&Path>,
 ) -> Result<PipeSpawnHandles> {
-    let mut in_r: HANDLE = 0;
-    let mut in_w: HANDLE = 0;
-    let mut out_r: HANDLE = 0;
-    let mut out_w: HANDLE = 0;
-    let mut err_r: HANDLE = 0;
-    let mut err_w: HANDLE = 0;
+    let mut in_r: HANDLE = ptr::null_mut();
+    let mut in_w: HANDLE = ptr::null_mut();
+    let mut out_r: HANDLE = ptr::null_mut();
+    let mut out_w: HANDLE = ptr::null_mut();
+    let mut err_r: HANDLE = ptr::null_mut();
+    let mut err_w: HANDLE = ptr::null_mut();
     unsafe {
         if CreatePipe(&mut in_r, &mut in_w, ptr::null_mut(), 0) == 0 {
             return Err(anyhow!("CreatePipe stdin failed: {}", GetLastError()));
@@ -331,7 +336,13 @@ pub fn read_handle_loop<F>(handle: HANDLE, mut on_chunk: F) -> std::thread::Join
 where
     F: FnMut(&[u8]) + Send + 'static,
 {
+    // Raw Win32 handles are pointer-typed in windows-sys 0.61. Transfer the
+    // address value across the thread boundary and reconstruct the opaque
+    // handle in the reader thread; the caller retains responsibility for the
+    // handle's lifetime.
+    let handle_addr = handle as usize;
     std::thread::spawn(move || {
+        let handle = handle_addr as HANDLE;
         let mut buf = [0u8; 8192];
         loop {
             let mut read_bytes: u32 = 0;

@@ -23,7 +23,9 @@ use codex_arg0::Arg0DispatchPaths;
 use codex_cloud_config::cloud_config_bundle_loader_for_storage;
 use codex_config::CloudConfigBundleLoader;
 use codex_config::ConfigLoadOptions;
+use codex_config::DEFAULT_CHATGPT_BASE_URL;
 use codex_config::LoaderOverrides;
+use codex_config::canonicalize_chatgpt_base_url;
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::ExecServerRuntimePaths;
 use codex_protocol::ThreadId;
@@ -289,11 +291,9 @@ async fn start_app_server_for_archive_command(
         .clone()
         .filter(|_| app_server_target.uses_remote_workspace());
 
-    let local_runtime_paths = ExecServerRuntimePaths::from_optional_paths(
-        arg0_paths.codex_self_exe.clone(),
-        arg0_paths.codex_linux_sandbox_exe.clone(),
-    )
-    .wrap_err("failed to resolve local runtime paths")?;
+    let local_runtime_paths =
+        ExecServerRuntimePaths::from_optional_path(arg0_paths.codex_self_exe.clone())
+            .wrap_err("failed to resolve local runtime paths")?;
     let environment_manager = EnvironmentManager::from_env(Some(local_runtime_paths))
         .await
         .map(Arc::new)
@@ -327,10 +327,12 @@ async fn start_app_server_for_archive_command(
     .await
     .wrap_err("failed to load config.toml")?;
     let config_toml = &bootstrap_config.config_toml;
-    let chatgpt_base_url = config_toml
-        .chatgpt_base_url
-        .clone()
-        .unwrap_or_else(|| "https://chatgpt.com/backend-api/".to_string());
+    let chatgpt_base_url = canonicalize_chatgpt_base_url(
+        config_toml
+            .chatgpt_base_url
+            .as_deref()
+            .unwrap_or(DEFAULT_CHATGPT_BASE_URL),
+    );
     let auth_route_config = resolve_bootstrap_auth_route_config(
         config_toml,
         bootstrap_config
@@ -372,8 +374,6 @@ async fn start_app_server_for_archive_command(
             },
             model_provider,
             codex_self_exe: arg0_paths.codex_self_exe.clone(),
-            codex_linux_sandbox_exe: arg0_paths.codex_linux_sandbox_exe.clone(),
-            main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe.clone(),
             show_raw_agent_reasoning: cli.oss.then_some(true),
             bypass_hook_trust: cli.bypass_hook_trust.then_some(true),
             ..Default::default()

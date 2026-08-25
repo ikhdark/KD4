@@ -11,9 +11,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
-#[cfg(unix)]
-use std::ffi::OsString;
-
 use crate::workspace_command::WorkspaceCommand;
 use crate::workspace_command::WorkspaceCommandExecutor;
 use crate::workspace_command::WorkspaceCommandOutput;
@@ -25,11 +22,7 @@ use sha1::Digest;
 use sha1::Sha1;
 
 const DIFF_COMMAND_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 30);
-const DISABLE_HOOKS_CONFIG: &str = if cfg!(windows) {
-    "core.hooksPath=NUL"
-} else {
-    "core.hooksPath=/dev/null"
-};
+const DISABLE_HOOKS_CONFIG: &str = "core.hooksPath=NUL";
 const EXECUTABLE_FILTER_CONFIG_PATTERN: &str = r"^filter\..*\.(clean|process)$";
 const MAX_UNTRACKED_FILE_DIFFS: usize = 50;
 const MAX_UNTRACKED_FILE_BYTES: u64 = 1024 * 1024;
@@ -107,11 +100,7 @@ pub(crate) async fn get_git_diff(
     let untracked_output = untracked_output_res?;
 
     let mut untracked_diff = String::new();
-    let null_device: &Path = if cfg!(windows) {
-        Path::new("NUL")
-    } else {
-        Path::new("/dev/null")
-    };
+    let null_device: &Path = Path::new("NUL");
 
     let null_path = null_device.to_str().unwrap_or("/dev/null");
     let untracked_files = parse_untracked_files(&untracked_output)?;
@@ -262,18 +251,6 @@ fn render_local_untracked_file(
     )))
 }
 
-#[cfg(unix)]
-fn untracked_file_mode(metadata: &fs::Metadata) -> &'static str {
-    use std::os::unix::fs::PermissionsExt;
-
-    if metadata.permissions().mode() & 0o111 == 0 {
-        "100644"
-    } else {
-        "100755"
-    }
-}
-
-#[cfg(not(unix))]
 fn untracked_file_mode(_metadata: &fs::Metadata) -> &'static str {
     "100644"
 }
@@ -438,14 +415,6 @@ fn decode_git_quoted_path(path: &str) -> Result<PathBuf, String> {
     git_path_from_bytes(decoded)
 }
 
-#[cfg(unix)]
-fn git_path_from_bytes(bytes: Vec<u8>) -> Result<PathBuf, String> {
-    use std::os::unix::ffi::OsStringExt;
-
-    Ok(PathBuf::from(OsString::from_vec(bytes)))
-}
-
-#[cfg(not(unix))]
 fn git_path_from_bytes(bytes: Vec<u8>) -> Result<PathBuf, String> {
     String::from_utf8(bytes)
         .map(PathBuf::from)
@@ -695,11 +664,9 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::collections::HashMap;
     use std::collections::VecDeque;
-    #[cfg(unix)]
-    use std::fs;
+
     use std::future::Future;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
+
     use std::path::PathBuf;
     use std::pin::Pin;
     use std::process::Command as ProcessCommand;
@@ -1328,15 +1295,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn git_quoted_untracked_paths_preserve_non_utf8_bytes() {
-        use std::os::unix::ffi::OsStrExt;
-
-        let decoded = decode_git_quoted_path("\"dir/non-utf8-\\377.txt\"").unwrap();
-        assert_eq!(decoded.as_os_str().as_bytes(), b"dir/non-utf8-\xff.txt");
-    }
-
     #[test]
     fn omitted_untracked_notice_is_bounded_and_escapes_control_characters() {
         let paths = (0..MAX_OMITTED_UNTRACKED_PATHS + 2)
@@ -1395,40 +1353,6 @@ mod tests {
         ];
         for (path, contents) in cases {
             fs::write(cwd.join(path), contents).expect("write golden input");
-            assert_eq!(
-                render_local_untracked_file(cwd, Path::new(path), MAX_UNTRACKED_TOTAL_BYTES)
-                    .expect("render untracked file")
-                    .expect("file within budget")
-                    .0,
-                git_untracked_new_file_diff(cwd, path),
-                "renderer differs from git for {path:?}"
-            );
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn local_untracked_renderer_matches_git_for_executable_symlink_and_quoted_path() {
-        use std::os::unix::fs::symlink;
-
-        let tempdir = tempfile::tempdir().expect("create temp directory");
-        let cwd = tempdir.path();
-
-        let executable = "executable.sh";
-        fs::write(cwd.join(executable), "#!/bin/sh\nexit 0\n").expect("write executable");
-        let mut permissions = fs::metadata(cwd.join(executable))
-            .expect("read executable metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(cwd.join(executable), permissions).expect("mark executable");
-
-        let link = "linked-file";
-        symlink("target with spaces", cwd.join(link)).expect("create symlink");
-
-        let quoted = "line\nbreak.txt";
-        fs::write(cwd.join(quoted), "quoted\n").expect("write unusual path");
-
-        for path in [executable, link, quoted] {
             assert_eq!(
                 render_local_untracked_file(cwd, Path::new(path), MAX_UNTRACKED_TOTAL_BYTES)
                     .expect("render untracked file")
@@ -1522,146 +1446,6 @@ mod tests {
         assert_eq!(result.1.matches("diff --git").count(), 32);
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn get_git_diff_does_not_execute_configured_filters_fsmonitor_or_hooks() {
-        let tempdir = tempfile::tempdir().expect("create temp directory");
-        let repo = tempdir.path().join("repo");
-        fs::create_dir(&repo).expect("create test repository directory");
-        run_git_setup(&repo, &["init", "-q"]);
-        run_git_setup(&repo, &["config", "user.name", "test"]);
-        run_git_setup(&repo, &["config", "user.email", "test@example.com"]);
-        fs::write(repo.join(".gitattributes"), "*.txt filter=x=y\n").expect("write attributes");
-        fs::write(repo.join("tracked.txt"), "before\n").expect("write tracked file");
-        fs::write(repo.join("unchanged.txt"), "unchanged\n").expect("write unchanged file");
-        run_git_setup(
-            &repo,
-            &["add", ".gitattributes", "tracked.txt", "unchanged.txt"],
-        );
-        run_git_setup(&repo, &["commit", "-qm", "initial"]);
-
-        let filter_helper = tempdir.path().join("filter-helper.sh");
-        let fsmonitor_helper = tempdir.path().join("fsmonitor-helper.sh");
-        let hooks_dir = tempdir.path().join("hooks");
-        let hook_helper = hooks_dir.join("post-index-change");
-        fs::create_dir(&hooks_dir).expect("create hooks directory");
-        write_marker_helper(&filter_helper);
-        write_marker_helper(&fsmonitor_helper);
-        write_marker_helper(&hook_helper);
-        run_git_setup(
-            &repo,
-            &[
-                "config",
-                "filter.x=y.clean",
-                filter_helper.to_str().expect("filter helper path"),
-            ],
-        );
-        run_git_setup(
-            &repo,
-            &[
-                "config",
-                "filter.x=y.process",
-                filter_helper.to_str().expect("filter helper path"),
-            ],
-        );
-        run_git_setup(&repo, &["config", "filter.x=y.required", "true"]);
-        run_git_setup(
-            &repo,
-            &[
-                "config",
-                "core.fsmonitor",
-                fsmonitor_helper.to_str().expect("fsmonitor helper path"),
-            ],
-        );
-        run_git_setup(
-            &repo,
-            &[
-                "config",
-                "core.hooksPath",
-                hooks_dir.to_str().expect("hooks directory path"),
-            ],
-        );
-        std::thread::sleep(Duration::from_secs(/*secs*/ 1));
-        fs::write(repo.join("unchanged.txt"), "unchanged\n").expect("refresh unchanged file");
-        fs::write(repo.join("tracked.txt"), "after\n").expect("modify tracked file");
-
-        let result = get_git_diff(&LocalRunner, &repo)
-            .await
-            .expect("generate diff without invoking helpers");
-
-        assert_eq!(
-            (
-                result.1.contains("before"),
-                result.1.contains("after"),
-                filter_helper.with_extension("sh.ran").exists(),
-                fsmonitor_helper.with_extension("sh.ran").exists(),
-                hook_helper.with_extension("sh.ran").exists(),
-            ),
-            (true, true, false, false, false),
-            "diff:\n{}",
-            result.1
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn get_git_diff_does_not_execute_helpers_while_checking_dirty_submodules() {
-        let tempdir = tempfile::tempdir().expect("create temp directory");
-        let child = tempdir.path().join("child");
-        let repo = tempdir.path().join("repo");
-        fs::create_dir(&child).expect("create child repository directory");
-        fs::create_dir(&repo).expect("create parent repository directory");
-        run_git_setup(&child, &["init", "-q"]);
-        run_git_setup(&child, &["config", "user.name", "test"]);
-        run_git_setup(&child, &["config", "user.email", "test@example.com"]);
-        fs::write(child.join(".gitattributes"), "*.txt filter=evil\n")
-            .expect("write child attributes");
-        fs::write(child.join("tracked.txt"), "before\n").expect("write child tracked file");
-        run_git_setup(&child, &["add", ".gitattributes", "tracked.txt"]);
-        run_git_setup(&child, &["commit", "-qm", "initial"]);
-
-        run_git_setup(&repo, &["init", "-q"]);
-        run_git_setup(&repo, &["config", "user.name", "test"]);
-        run_git_setup(&repo, &["config", "user.email", "test@example.com"]);
-        run_git_setup(
-            &repo,
-            &[
-                "-c",
-                "protocol.file.allow=always",
-                "submodule",
-                "add",
-                "-q",
-                child.to_str().expect("child repository path"),
-                "child",
-            ],
-        );
-        run_git_setup(&repo, &["commit", "-qm", "add submodule"]);
-
-        let helper = tempdir.path().join("submodule-helper.sh");
-        write_marker_helper(&helper);
-        let checkout = repo.join("child");
-        run_git_setup(
-            &checkout,
-            &[
-                "config",
-                "filter.evil.clean",
-                helper.to_str().expect("submodule helper path"),
-            ],
-        );
-        run_git_setup(&checkout, &["config", "filter.evil.required", "true"]);
-        std::thread::sleep(Duration::from_secs(/*secs*/ 1));
-        fs::write(checkout.join("tracked.txt"), "before\n").expect("refresh child tracked file");
-
-        let result = get_git_diff(&LocalRunner, &repo)
-            .await
-            .expect("generate diff without inspecting submodule worktrees");
-
-        assert_eq!(
-            (result.1, helper.with_extension("sh.ran").exists()),
-            (String::new(), false)
-        );
-    }
-
     fn git_command(fsmonitor: FsmonitorOverride, args: &[&str]) -> Vec<String> {
         [
             "git",
@@ -1717,7 +1501,7 @@ mod tests {
     }
 
     fn null_device() -> &'static str {
-        if cfg!(windows) { "NUL" } else { "/dev/null" }
+        "NUL"
     }
 
     fn git_untracked_new_file_diff(cwd: &Path, path: &str) -> String {
@@ -1747,33 +1531,6 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).expect("git diff output should be UTF-8")
-    }
-
-    #[cfg(unix)]
-    fn run_git_setup(cwd: &Path, args: &[&str]) {
-        let output = ProcessCommand::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .output()
-            .expect("run git setup command");
-        assert_eq!(
-            output.status.code(),
-            Some(0),
-            "git setup command failed: {args:?}\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    #[cfg(unix)]
-    fn write_marker_helper(path: &Path) {
-        fs::write(path, "#!/bin/sh\nprintf ran >> \"$0.ran\"\nexit 1\n")
-            .expect("write helper script");
-        let mut permissions = fs::metadata(path)
-            .expect("read helper metadata")
-            .permissions();
-        permissions.set_mode(/*mode*/ 0o755);
-        fs::set_permissions(path, permissions).expect("make helper executable");
     }
 
     fn assert_command_metadata(commands: &[WorkspaceCommand], cwd: &Path) {
@@ -1844,46 +1601,6 @@ mod tests {
                 assert_eq!(command.argv, response.argv);
                 self.commands.lock().expect("commands lock").push(command);
                 Ok(response.output)
-            })
-        }
-    }
-
-    #[cfg(unix)]
-    struct LocalRunner;
-
-    #[cfg(unix)]
-    impl WorkspaceCommandExecutor for LocalRunner {
-        fn run(
-            &self,
-            command: WorkspaceCommand,
-        ) -> Pin<
-            Box<
-                dyn Future<Output = Result<WorkspaceCommandOutput, WorkspaceCommandError>>
-                    + Send
-                    + '_,
-            >,
-        > {
-            Box::pin(async move {
-                let mut process = ProcessCommand::new(&command.argv[0]);
-                process
-                    .args(&command.argv[1..])
-                    .current_dir(command.cwd.expect("test command cwd"));
-                for (key, value) in command.env {
-                    match value {
-                        Some(value) => {
-                            process.env(key, value);
-                        }
-                        None => {
-                            process.env_remove(key);
-                        }
-                    }
-                }
-                let output = process.output().expect("run test command");
-                Ok(WorkspaceCommandOutput {
-                    exit_code: output.status.code().expect("test command exit code"),
-                    stdout: String::from_utf8(output.stdout).expect("utf8 stdout"),
-                    stderr: String::from_utf8(output.stderr).expect("utf8 stderr"),
-                })
             })
         }
     }

@@ -6,7 +6,6 @@ use codex_agent_task_store::AgentStatusClaim;
 use codex_agent_task_store::AgentTask;
 use codex_agent_task_store::AgentTaskBinding;
 use codex_agent_task_store::AgentTaskBindingDraft;
-use codex_agent_task_store::AgentTaskStore;
 use codex_agent_task_store::Assignment;
 use codex_agent_task_store::AssignmentDraft;
 use codex_agent_task_store::AssignmentId;
@@ -126,7 +125,7 @@ const MAX_DIAGNOSTIC_ATTEMPT_IDENTITIES: usize = 4_096;
 /// assignment/attempt identity. Legacy agents simply have no binding and bypass this layer.
 #[derive(Clone, Default)]
 pub(crate) struct AgentTaskCoordinator {
-    store: Arc<OnceCell<Arc<dyn AgentTaskStore>>>,
+    store: Arc<OnceCell<Arc<LocalAgentTaskStore>>>,
     fallback_state_runtime: Arc<OnceCell<Arc<StateRuntime>>>,
     root_session_id: Arc<OnceCell<String>>,
     bindings: Arc<RwLock<BindingIndex>>,
@@ -155,7 +154,7 @@ impl AgentTaskCoordinator {
             .store
             .get_or_try_init(|| async move {
                 let store = LocalAgentTaskStore::initialize(state_runtime.as_ref()).await?;
-                Ok::<Arc<dyn AgentTaskStore>, StoreError>(Arc::new(store))
+                Ok::<Arc<LocalAgentTaskStore>, StoreError>(Arc::new(store))
             })
             .await?
             .clone();
@@ -208,7 +207,7 @@ impl AgentTaskCoordinator {
         self.initialize(state_runtime, root_session_id).await
     }
 
-    pub(crate) fn store(&self) -> Option<Arc<dyn AgentTaskStore>> {
+    pub(crate) fn store(&self) -> Option<Arc<LocalAgentTaskStore>> {
         self.store.get().cloned()
     }
 
@@ -812,7 +811,7 @@ impl AgentTaskCoordinator {
         }
     }
 
-    fn required_store(&self) -> StoreResult<Arc<dyn AgentTaskStore>> {
+    fn required_store(&self) -> StoreResult<Arc<LocalAgentTaskStore>> {
         self.store().ok_or_else(|| {
             StoreError::CorruptData(
                 "typed agent task store is unavailable for this legacy or uninitialized session"
@@ -944,7 +943,7 @@ const fn observation_metric_label(kind: ObservationKind) -> &'static str {
 }
 
 async fn binding_no_longer_needs_receipt(
-    store: &dyn AgentTaskStore,
+    store: &LocalAgentTaskStore,
     binding: &AgentTaskBinding,
 ) -> StoreResult<bool> {
     let task = store.get_agent_task(binding.assignment_id, Some(0)).await?;

@@ -13,7 +13,6 @@ use std::sync::atomic::Ordering;
 use codex_protocol::models::ResponseItem;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
-use tracing::warn;
 
 use crate::inference::trace_response_item_json;
 use crate::model::AgentThreadId;
@@ -147,30 +146,24 @@ impl CompactionTraceContext {
         let CompactionTraceContextState::Enabled(context) = &self.state else {
             return;
         };
-        let checkpoint_payload = match context
+        let Some(checkpoint_payload) = context
             .writer
-            .write_json_payload(RawPayloadKind::CompactionCheckpoint, checkpoint)
-        {
-            Ok(payload_ref) => payload_ref,
-            Err(err) => {
-                warn!("failed to write rollout trace payload: {err:#}");
-                return;
-            }
+            .write_json_payload_best_effort(RawPayloadKind::CompactionCheckpoint, checkpoint)
+        else {
+            return;
         };
 
         let event_context = RawTraceEventContext {
             thread_id: Some(context.thread_id.clone()),
             codex_turn_id: Some(context.codex_turn_id.clone()),
         };
-        if let Err(err) = context.writer.append_with_context(
+        context.writer.append_with_context_best_effort(
             event_context,
             RawTraceEventPayload::CompactionInstalled {
                 compaction_id: context.compaction_id.clone(),
                 checkpoint_payload,
             },
-        ) {
-            warn!("failed to append rollout trace event: {err:#}");
-        }
+        );
     }
 }
 
@@ -272,7 +265,7 @@ fn write_json_payload_best_effort(
     kind: RawPayloadKind,
     payload: &impl Serialize,
 ) -> Option<crate::RawPayloadRef> {
-    writer.write_json_payload(kind, payload).ok()
+    writer.write_json_payload_best_effort(kind, payload)
 }
 
 fn append_with_context_best_effort(
@@ -283,5 +276,7 @@ fn append_with_context_best_effort(
         thread_id: Some(context.thread_id.clone()),
         codex_turn_id: Some(context.codex_turn_id.clone()),
     };
-    let _ = context.writer.append_with_context(event_context, payload);
+    context
+        .writer
+        .append_with_context_best_effort(event_context, payload);
 }

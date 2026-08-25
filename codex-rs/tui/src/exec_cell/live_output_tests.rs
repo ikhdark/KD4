@@ -2,7 +2,7 @@ use super::LIVE_COMMAND_OUTPUT_LINE_HEAD_BYTES;
 use super::LIVE_COMMAND_OUTPUT_LINE_TAIL_BYTES;
 use super::LIVE_COMMAND_OUTPUT_MAX_BYTES;
 use super::LiveCommandOutput;
-use codex_ansi_escape::ansi_escape_line;
+use crate::ansi_escape::ansi_escape_line;
 use pretty_assertions::assert_eq;
 
 #[test]

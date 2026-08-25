@@ -48,6 +48,24 @@ pub enum LoadableToolSpec {
     Namespace(ResponsesApiNamespace),
 }
 
+impl LoadableToolSpec {
+    /// Returns every callable name declared by this loadable specification.
+    pub fn callable_tool_names(&self) -> Vec<ToolName> {
+        match self {
+            Self::Function(tool) => vec![ToolName::plain(tool.name.clone())],
+            Self::Namespace(namespace) => namespace
+                .tools
+                .iter()
+                .map(|tool| match tool {
+                    ResponsesApiNamespaceTool::Function(tool) => {
+                        ToolName::namespaced(namespace.name.clone(), tool.name.clone())
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ResponsesApiNamespace {
     pub name: String,

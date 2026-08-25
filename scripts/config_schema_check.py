@@ -8,15 +8,13 @@ import hashlib
 import os
 import subprocess
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 try:
-    from scripts.generated_output_lock import GenerationLockError
-    from scripts.generated_output_lock import generated_output_lock
+    from scripts.generated_output_lock import GenerationLockError, generated_output_lock
 except ModuleNotFoundError:
-    from generated_output_lock import GenerationLockError
-    from generated_output_lock import generated_output_lock
+    from generated_output_lock import GenerationLockError, generated_output_lock
 
 
 SCHEMA_INPUTS = (
@@ -128,9 +126,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--mode",
-        choices=("auto", "check", "force"),
+        choices=("check", "force"),
         required=True,
-        help="auto is a backwards-compatible alias for the check-only mode",
     )
     parser.add_argument("--baseline", default="HEAD")
     parser.add_argument(

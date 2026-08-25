@@ -52,20 +52,6 @@ Preflight receipt:
 
 - <risk>
 
-## Performance Contract (Delete Unless Active)
-
-- Exercised hot path:
-- Required quality contract and checks:
-- Benchmark command and workload:
-- Latency metric and acceptance threshold:
-- Token metric and budget:
-- Baseline or comparison build:
-- Candidate build identity:
-- Best known correct build:
-- Candidate selection rule:
-- Required samples/statistic:
-- Quality checks that must remain green:
-
 ## Milestones
 
 - [ ] Inspect owner scope and nearest `AGENTS.md`
@@ -73,5 +59,4 @@ Preflight receipt:
 - [ ] Inspect call path and validation route
 - [ ] Implement focused changes
 - [ ] Run focused validation
-- [ ] If performance-sensitive, pass the quality gate before latency and token contracts
 - [ ] Summarize evidence and remaining risk

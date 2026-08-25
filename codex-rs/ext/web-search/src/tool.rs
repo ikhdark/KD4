@@ -106,7 +106,9 @@ impl WebSearchTool {
                     .await
                     .map_err(|err| FunctionCallError::Fatal(err.to_string()))?;
                 Ok::<_, FunctionCallError>(SearchClient::new(
-                    ReqwestTransport::from_http_client(create_client()),
+                    ReqwestTransport::from_http_client(
+                        create_client().map_err(|err| FunctionCallError::Fatal(err.to_string()))?,
+                    ),
                     provider,
                     auth,
                 ))

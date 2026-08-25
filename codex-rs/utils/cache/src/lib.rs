@@ -43,32 +43,6 @@ where
         value()
     }
 
-    /// Like `get_or_insert_with`, but the value factory may fail.
-    pub fn get_or_try_insert_with<E>(
-        &self,
-        key: K,
-        value: impl FnOnce() -> Result<V, E>,
-    ) -> Result<V, E>
-    where
-        V: Clone,
-    {
-        if let Some(mut guard) = lock_if_runtime(&self.inner) {
-            if let Some(v) = guard.get(&key) {
-                return Ok(v.clone());
-            }
-            let v = value()?;
-            guard.put(key, v.clone());
-            return Ok(v);
-        }
-        value()
-    }
-
-    /// Builds a cache if `capacity` is non-zero, returning `None` otherwise.
-    #[must_use]
-    pub fn try_with_capacity(capacity: usize) -> Option<Self> {
-        NonZeroUsize::new(capacity).map(Self::new)
-    }
-
     /// Returns a clone of the cached value corresponding to `key`, if present.
     pub fn get<Q>(&self, key: &Q) -> Option<V>
     where

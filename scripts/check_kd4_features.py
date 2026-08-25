@@ -18,6 +18,7 @@ import tomllib
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_FILE_NAME = "kd4_features.toml"
 DEFAULT_MANIFEST = REPO_ROOT / MANIFEST_FILE_NAME
+SOURCE_OWNERS_FILE_NAME = "source_owners.toml"
 SELF_FEATURE_ID = "kd4-feature-manifest"
 SCHEMA_VERSION = 2
 STATUS_SEMANTICS = "implementation_lifecycle"
@@ -107,22 +108,66 @@ def _project_feature_override(repo_root: Path, feature_key: str) -> bool | None:
     return None
 
 
-def _feature_default(repo_root: Path, feature_key: str) -> bool | None:
-    key = feature_key.removeprefix("features.")
-    registry_path = repo_root / "codex-rs" / "features" / "src" / "lib.rs"
+def _load_feature_defaults(repo_root: Path) -> dict[str, bool] | None:
+    manifest_path = repo_root / "codex-rs" / "Cargo.toml"
+    if not manifest_path.is_file():
+        return None
     try:
-        registry = registry_path.read_text(encoding="utf-8")
+        completed = subprocess.run(
+            [
+                "cargo",
+                "run",
+                "--quiet",
+                "--manifest-path",
+                str(manifest_path),
+                "-p",
+                "codex-features",
+                "--bin",
+                "codex-features-export",
+            ],
+            cwd=repo_root,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
     except (OSError, UnicodeError):
         return None
-    pattern = re.compile(
-        rf'FeatureSpec\s*\{{(?:(?!FeatureSpec\s*\{{).)*?key:\s*"{re.escape(key)}"'
-        rf"(?:(?!FeatureSpec\s*\{{).)*?default_enabled:\s*(true|false)",
-        flags=re.DOTALL,
-    )
-    match = pattern.search(registry)
-    if match is None:
+    if completed.returncode != 0:
         return None
-    return match.group(1) == "true"
+    try:
+        entries = json.loads(completed.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(entries, list):
+        return None
+    defaults: dict[str, bool] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return None
+        key = entry.get("key")
+        default_enabled = entry.get("defaultEnabled")
+        if (
+            not isinstance(key, str)
+            or not key
+            or not isinstance(default_enabled, bool)
+            or key in defaults
+        ):
+            return None
+        defaults[key] = default_enabled
+    return defaults
+
+
+def _feature_default(
+    repo_root: Path,
+    feature_key: str,
+    registry_cache: dict[str, dict[str, bool] | None],
+) -> bool | None:
+    key = feature_key.removeprefix("features.")
+    if "defaults" not in registry_cache:
+        registry_cache["defaults"] = _load_feature_defaults(repo_root)
+    defaults = registry_cache["defaults"]
+    return defaults.get(key) if defaults is not None else None
 
 
 def _validate_runtime_status(
@@ -131,6 +176,7 @@ def _validate_runtime_status(
     feature_id: str,
     repo_root: Path,
     findings: list[Finding],
+    feature_registry_cache: dict[str, dict[str, bool] | None],
 ) -> str | None:
     config_keys = feature.get("config_keys")
     feature_config_keys = (
@@ -198,7 +244,9 @@ def _validate_runtime_status(
         expected_enabled = project_override
         expected_source = ".codex/config.toml"
     else:
-        feature_default = _feature_default(repo_root, runtime_feature_key)
+        feature_default = _feature_default(
+            repo_root, runtime_feature_key, feature_registry_cache
+        )
         if feature_default is None:
             findings.append(
                 Finding(
@@ -435,6 +483,196 @@ def _validate_evidence(
     return kinds
 
 
+def _source_owner_evidence(
+    *,
+    source_owner_id: object,
+    repo_root: Path,
+    feature_id: str,
+    findings: list[Finding],
+    owner_cache: dict[str, dict[str, Any]] | None,
+    text_cache: dict[Path, str],
+) -> tuple[Counter[str], dict[str, dict[str, Any]] | None]:
+    kinds: Counter[str] = Counter()
+    if not isinstance(source_owner_id, str) or not source_owner_id.strip():
+        findings.append(
+            Finding(
+                "error",
+                "invalid-source-owner",
+                "source_owner must be a non-empty source_owners.toml owner id",
+                feature_id,
+            )
+        )
+        return kinds, owner_cache
+
+    if owner_cache is None:
+        owner_path = repo_root / SOURCE_OWNERS_FILE_NAME
+        try:
+            with owner_path.open("rb") as owner_file:
+                owner_manifest = tomllib.load(owner_file)
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            findings.append(
+                Finding(
+                    "error",
+                    "source-owner-load",
+                    f"failed to load {SOURCE_OWNERS_FILE_NAME}: {exc}",
+                    feature_id,
+                )
+            )
+            return kinds, {}
+        owners = owner_manifest.get("owners")
+        if not isinstance(owners, list):
+            findings.append(
+                Finding(
+                    "error",
+                    "source-owner-load",
+                    f"{SOURCE_OWNERS_FILE_NAME} owners must be an array",
+                    feature_id,
+                )
+            )
+            return kinds, {}
+        owner_cache = {
+            owner["id"]: owner
+            for owner in owners
+            if isinstance(owner, dict)
+            and isinstance(owner.get("id"), str)
+            and owner["id"]
+        }
+
+    owner = owner_cache.get(source_owner_id)
+    if owner is None:
+        findings.append(
+            Finding(
+                "error",
+                "missing-source-owner",
+                f"{SOURCE_OWNERS_FILE_NAME} has no owner {source_owner_id!r}",
+                feature_id,
+            )
+        )
+        return kinds, owner_cache
+
+    feature_ids = owner.get("feature_ids")
+    if not isinstance(feature_ids, list) or feature_id not in feature_ids:
+        findings.append(
+            Finding(
+                "error",
+                "source-owner-feature-mismatch",
+                f"owner {source_owner_id!r} does not declare feature {feature_id!r}",
+                feature_id,
+            )
+        )
+        return kinds, owner_cache
+
+    def marker_is_live(marker: object, label: str) -> bool:
+        if isinstance(marker, str):
+            path_text = marker
+            symbol = None
+        elif isinstance(marker, dict):
+            path_text = marker.get("path")
+            symbol = marker.get("symbol")
+        else:
+            findings.append(
+                Finding(
+                    "error",
+                    "invalid-source-owner-evidence",
+                    f"{label} must be a path string or evidence table",
+                    feature_id,
+                )
+            )
+            return False
+
+        path, path_error = _safe_repo_path(repo_root, path_text)
+        if path_error is not None:
+            findings.append(
+                Finding(
+                    "error", "invalid-source-owner-evidence", f"{label}: {path_error}", feature_id
+                )
+            )
+            return False
+        assert path is not None
+        if not path.is_file():
+            findings.append(
+                Finding(
+                    "error",
+                    "stale-source-owner-evidence",
+                    f"{label} path {path_text!r} does not exist",
+                    feature_id,
+                )
+            )
+            return False
+        if symbol is None:
+            return True
+        if not isinstance(symbol, str) or not symbol:
+            findings.append(
+                Finding(
+                    "error",
+                    "invalid-source-owner-evidence",
+                    f"{label} symbol must be a non-empty string",
+                    feature_id,
+                )
+            )
+            return False
+        try:
+            if path not in text_cache:
+                text_cache[path] = path.read_text(encoding="utf-8")
+            text = text_cache[path]
+        except (OSError, UnicodeError) as exc:
+            findings.append(
+                Finding(
+                    "error",
+                    "unreadable-source-owner-evidence",
+                    f"failed to read {path}: {exc}",
+                    feature_id,
+                )
+            )
+            return False
+        if symbol not in text:
+            findings.append(
+                Finding(
+                    "error",
+                    "stale-source-owner-evidence",
+                    f"{label} path {path_text!r} no longer contains {symbol!r}",
+                    feature_id,
+                )
+            )
+            return False
+        return True
+
+    primary_entries = owner.get("primary_entries")
+    if isinstance(primary_entries, list):
+        kinds["entrypoint"] = sum(
+            marker_is_live(marker, f"primary_entries[{index}]")
+            for index, marker in enumerate(primary_entries)
+        )
+    tests = owner.get("tests")
+    if isinstance(tests, list):
+        kinds["test"] = sum(
+            marker_is_live(marker, f"tests[{index}]")
+            for index, marker in enumerate(tests)
+        )
+    relationships = owner.get("relationships")
+    if isinstance(relationships, list):
+        for index, relationship in enumerate(relationships):
+            if not isinstance(relationship, dict) or relationship.get("category") != "runtime_registration":
+                continue
+            evidence = relationship.get("evidence")
+            if not isinstance(evidence, list) or not evidence:
+                findings.append(
+                    Finding(
+                        "error",
+                        "invalid-source-owner-evidence",
+                        f"relationships[{index}] runtime registration has no evidence",
+                        feature_id,
+                    )
+                )
+                continue
+            if all(
+                marker_is_live(marker, f"relationships[{index}].evidence[{marker_index}]")
+                for marker_index, marker in enumerate(evidence)
+            ):
+                kinds["registration"] += 1
+    return kinds, owner_cache
+
+
 def validate_manifest(
     manifest_path: Path = DEFAULT_MANIFEST,
     *,
@@ -515,6 +753,8 @@ def validate_manifest(
     status_counts: Counter[str] = Counter()
     runtime_status_counts: Counter[str] = Counter()
     text_cache: dict[Path, str] = {}
+    feature_registry_cache: dict[str, dict[str, bool] | None] = {}
+    owner_cache: dict[str, dict[str, Any]] | None = None
     for index, feature in enumerate(features):
         if not isinstance(feature, dict):
             findings.append(
@@ -624,6 +864,7 @@ def validate_manifest(
             feature_id=feature_id,
             repo_root=repo_root,
             findings=findings,
+            feature_registry_cache=feature_registry_cache,
         )
         if runtime_status is not None:
             runtime_status_counts[runtime_status] += 1
@@ -645,13 +886,33 @@ def validate_manifest(
             findings=findings,
         )
 
-        evidence_kinds = _validate_evidence(
-            feature_id=feature_id,
-            evidence_items=feature.get("evidence", []),
-            repo_root=repo_root,
-            findings=findings,
-            text_cache=text_cache,
-        )
+        source_owner = feature.get("source_owner")
+        if source_owner is None:
+            evidence_kinds = _validate_evidence(
+                feature_id=feature_id,
+                evidence_items=feature.get("evidence", []),
+                repo_root=repo_root,
+                findings=findings,
+                text_cache=text_cache,
+            )
+        else:
+            if feature.get("evidence"):
+                findings.append(
+                    Finding(
+                        "error",
+                        "duplicate-evidence-authority",
+                        "source_owner and inline evidence cannot both author reachability",
+                        feature_id,
+                    )
+                )
+            evidence_kinds, owner_cache = _source_owner_evidence(
+                source_owner_id=source_owner,
+                repo_root=repo_root,
+                feature_id=feature_id,
+                findings=findings,
+                owner_cache=owner_cache,
+                text_cache=text_cache,
+            )
         if status == "enabled":
             if evidence_kinds["entrypoint"] == 0:
                 findings.append(

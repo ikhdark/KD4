@@ -2,6 +2,7 @@ use super::*;
 use crate::tools::handlers::multi_agents_spec::create_close_agent_tool_v1;
 use codex_protocol::error::CodexErr;
 use codex_tools::ToolSpec;
+use std::sync::Arc;
 
 pub(crate) struct Handler;
 
@@ -31,11 +32,12 @@ async fn handle_close_agent(
 ) -> Result<CloseAgentResult, FunctionCallError> {
     let ToolInvocation {
         session,
-        turn,
+        step_context,
         payload,
         call_id,
         ..
     } = invocation;
+    let turn = Arc::clone(&step_context.turn);
     let arguments = function_arguments(payload)?;
     let args: CloseAgentArgs = parse_arguments(&arguments)?;
     let agent_id = parse_agent_id_target(&args.target)?;

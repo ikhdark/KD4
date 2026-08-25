@@ -12,13 +12,14 @@ fn render_workspace_diff_file_bounds_large_diff() {
             status: GitBaselineChangeStatus::Modified,
             path: "MEMORY.md".to_string(),
         }],
-        unified_diff: "a".repeat(crate::workspace_diff::MAX_BYTES + 128),
+        unified_diff: format!("{}😀tail", "a".repeat(crate::workspace_diff::MAX_BYTES - 1)),
     };
 
     let rendered = render_workspace_diff_file(&diff);
 
     assert!(rendered.contains("- M MEMORY.md"));
     assert!(rendered.contains("[workspace diff truncated at 4194304 bytes]"));
+    assert!(!rendered.contains('😀'));
     assert!(rendered.ends_with("```\n"));
 }
 
@@ -69,10 +70,4 @@ async fn prepare_memory_workspace_recovers_unusable_git_dir() {
         .await
         .expect("load workspace diff");
     assert_eq!(diff.changes, Vec::new());
-}
-
-#[test]
-fn previous_char_boundary_handles_multibyte_text() {
-    let text = "aé";
-    assert_eq!(previous_char_boundary(text, /*max_bytes*/ 2), 1);
 }

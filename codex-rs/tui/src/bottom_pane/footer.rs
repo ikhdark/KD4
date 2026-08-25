@@ -5,15 +5,11 @@
 //! `ChatComposer` (which selects a `FooterMode`) and by higher-level state machines like
 //! `ChatWidget` (which decides when quit/interrupt is allowed).
 //!
-//! Some footer content is time-based rather than event-based, such as the "press again to quit"
-//! hint. The owning widgets schedule redraws so time-based hints can expire even if the UI is
-//! otherwise idle.
-//!
 //! Terminology used in this module:
 //! - "status line" means the configurable contextual row built from `/statusline` items such as
 //!   model, git branch, and context usage.
 //! - "instructional footer" means a row that tells the user what to do next, such as quit
-//!   confirmation, shortcut help, or queue hints.
+//!   shortcut help or queue hints.
 //! - "contextual footer" means the footer is free to show ambient context instead of an
 //!   instruction. In that state, the footer may render the configured status line, the active
 //!   agent label, side-conversation state, or some combination of those.
@@ -70,11 +66,6 @@ pub(crate) struct FooterProps {
     pub(crate) is_task_running: bool,
     pub(crate) queue_submissions: bool,
     pub(crate) collaboration_modes_enabled: bool,
-    pub(crate) is_wsl: bool,
-    /// Which key the user must press again to quit.
-    ///
-    /// This is rendered when `mode` is `FooterMode::QuitShortcutReminder`.
-    pub(crate) quit_shortcut_key: KeyBinding,
     pub(crate) status_line_value: Option<Line<'static>>,
     pub(crate) status_line_enabled: bool,
     pub(crate) key_hints: FooterKeyHints,
@@ -89,10 +80,6 @@ pub(crate) struct FooterProps {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CollaborationModeIndicator {
     Plan,
-    #[allow(dead_code)] // Hidden by current mode filtering; kept for future UI re-enablement.
-    PairProgramming,
-    #[allow(dead_code)] // Hidden by current mode filtering; kept for future UI re-enablement.
-    Execute,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -145,35 +132,22 @@ impl CollaborationModeIndicator {
         } else {
             String::new()
         };
-        match self {
-            CollaborationModeIndicator::Plan => format!("Plan mode{suffix}"),
-            CollaborationModeIndicator::PairProgramming => {
-                format!("Pair Programming mode{suffix}")
-            }
-            CollaborationModeIndicator::Execute => format!("Execute mode{suffix}"),
-        }
+        format!("Plan mode{suffix}")
     }
 
     fn styled_span(self, show_cycle_hint: bool) -> Span<'static> {
         let label = self.label(show_cycle_hint);
-        match self {
-            CollaborationModeIndicator::Plan => Span::from(label).magenta(),
-            CollaborationModeIndicator::PairProgramming => Span::from(label).cyan(),
-            CollaborationModeIndicator::Execute => Span::from(label).dim(),
-        }
+        Span::from(label).magenta()
     }
 }
 
 /// Selects which footer content is rendered.
 ///
-/// The current mode is owned by `ChatComposer`, which may override it based on transient state
-/// (for example, showing `QuitShortcutReminder` only while its timer is active).
+/// The current mode is owned by `ChatComposer`, which may override it based on transient state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FooterMode {
     /// Single-line incremental history search prompt shown while Ctrl+R search is active.
     HistorySearch,
-    /// Transient "press again to quit" reminder (Ctrl+C/Ctrl+D).
-    QuitShortcutReminder,
     /// Multi-line shortcut overlay shown after pressing `?`.
     ShortcutOverlay,
     /// Transient "press Esc again" hint shown after the first Esc while idle.
@@ -187,15 +161,7 @@ pub(crate) enum FooterMode {
     ComposerHasDraft,
 }
 
-pub(crate) fn toggle_shortcut_mode(
-    current: FooterMode,
-    ctrl_c_hint: bool,
-    is_empty: bool,
-) -> FooterMode {
-    if ctrl_c_hint && matches!(current, FooterMode::QuitShortcutReminder) {
-        return current;
-    }
-
+pub(crate) fn toggle_shortcut_mode(current: FooterMode, is_empty: bool) -> FooterMode {
     let base_mode = if is_empty {
         FooterMode::ComposerEmpty
     } else {
@@ -203,7 +169,7 @@ pub(crate) fn toggle_shortcut_mode(
     };
 
     match current {
-        FooterMode::ShortcutOverlay | FooterMode::QuitShortcutReminder => base_mode,
+        FooterMode::ShortcutOverlay => base_mode,
         _ => FooterMode::ShortcutOverlay,
     }
 }
@@ -220,7 +186,6 @@ pub(crate) fn reset_mode_after_activity(current: FooterMode) -> FooterMode {
     match current {
         FooterMode::EscHint
         | FooterMode::ShortcutOverlay
-        | FooterMode::QuitShortcutReminder
         | FooterMode::HistorySearch
         | FooterMode::ComposerHasDraft => FooterMode::ComposerEmpty,
         other => other,
@@ -231,15 +196,11 @@ pub(crate) fn footer_height(props: &FooterProps) -> u16 {
     let show_shortcuts_hint = match props.mode {
         FooterMode::ComposerEmpty => true,
         FooterMode::ComposerHasDraft => false,
-        FooterMode::HistorySearch
-        | FooterMode::QuitShortcutReminder
-        | FooterMode::ShortcutOverlay
-        | FooterMode::EscHint => false,
+        FooterMode::HistorySearch | FooterMode::ShortcutOverlay | FooterMode::EscHint => false,
     };
     let show_queue_hint = match props.mode {
         FooterMode::ComposerHasDraft => props.is_task_running,
-        FooterMode::QuitShortcutReminder
-        | FooterMode::HistorySearch
+        FooterMode::HistorySearch
         | FooterMode::ComposerEmpty
         | FooterMode::ShortcutOverlay
         | FooterMode::EscHint => false,
@@ -267,7 +228,7 @@ pub(crate) fn render_footer_line(area: Rect, buf: &mut Buffer, line: Line<'stati
 /// Render footer content directly from `FooterProps`.
 ///
 /// This is intentionally not part of the width-based collapse/fallback logic.
-/// Transient instructional states (shortcut overlay, Esc hint, quit reminder)
+/// Transient instructional states (shortcut overlay and Esc hint)
 /// prioritize "what to do next" instructions and currently suppress the
 /// collaboration mode label entirely. When collapse logic has already chosen a
 /// specific single line, prefer `render_footer_line`.
@@ -701,7 +662,7 @@ pub(crate) fn render_footer_hint_items(area: Rect, buf: &mut Buffer, items: &[(S
 /// Map `FooterProps` to footer lines without width-based collapse.
 ///
 /// This is the canonical FooterMode-to-text mapping. It powers transient,
-/// instructional states (shortcut overlay, Esc hint, quit reminder) and also
+/// instructional states (shortcut overlay and Esc hint) and also
 /// the default rendering for base states when collapse is not applied (or when
 /// `single_line_footer_layout` returns `SummaryLeft::Default`). Collapse and
 /// fallback decisions live in `single_line_footer_layout`; this function only
@@ -720,9 +681,6 @@ fn footer_from_props_lines(
         return vec![status_line];
     }
     match props.mode {
-        FooterMode::QuitShortcutReminder => {
-            vec![quit_shortcut_reminder_line(props.quit_shortcut_key)]
-        }
         FooterMode::HistorySearch => vec![Line::from("reverse-i-search: ").dim()],
         FooterMode::ComposerEmpty => {
             let state = LeftSideState {
@@ -745,7 +703,6 @@ fn footer_from_props_lines(
                 esc_backtrack_hint: props.esc_backtrack_hint,
                 is_task_running: props.is_task_running,
                 queue_submissions: props.queue_submissions,
-                is_wsl: props.is_wsl,
                 collaboration_modes_enabled: props.collaboration_modes_enabled,
                 key_hints,
             };
@@ -775,8 +732,8 @@ fn footer_from_props_lines(
 /// Returns the contextual footer row when the footer is not busy showing an instructional hint.
 ///
 /// The returned line may contain the configured status line, the currently viewed agent label, or
-/// both combined. Active instructional states such as quit reminders, shortcut overlays, and queue
-/// prompts deliberately return `None` so those call-to-action hints stay visible.
+/// both combined. Active instructional states such as shortcut overlays and queue prompts
+/// deliberately return `None` so those call-to-action hints stay visible.
 pub(crate) fn passive_footer_status_line(props: &FooterProps) -> Option<Line<'static>> {
     if !shows_passive_footer_line(props) {
         return None;
@@ -808,10 +765,7 @@ pub(crate) fn shows_passive_footer_line(props: &FooterProps) -> bool {
     match props.mode {
         FooterMode::ComposerEmpty => true,
         FooterMode::ComposerHasDraft => !props.is_task_running,
-        FooterMode::HistorySearch
-        | FooterMode::QuitShortcutReminder
-        | FooterMode::ShortcutOverlay
-        | FooterMode::EscHint => false,
+        FooterMode::HistorySearch | FooterMode::ShortcutOverlay | FooterMode::EscHint => false,
     }
 }
 
@@ -869,13 +823,8 @@ struct ShortcutsState {
     esc_backtrack_hint: bool,
     is_task_running: bool,
     queue_submissions: bool,
-    is_wsl: bool,
     collaboration_modes_enabled: bool,
     key_hints: FooterKeyHints,
-}
-
-fn quit_shortcut_reminder_line(key: KeyBinding) -> Line<'static> {
-    Line::from(vec![key.into(), " again to quit".into()]).dim()
 }
 
 fn esc_hint_line(esc_backtrack_hint: bool) -> Line<'static> {
@@ -1054,7 +1003,6 @@ enum DisplayCondition {
     Always,
     WhenShiftEnterHint,
     WhenNotShiftEnterHint,
-    WhenUnderWSL,
     WhenCollaborationModesEnabled,
 }
 
@@ -1064,7 +1012,6 @@ impl DisplayCondition {
             DisplayCondition::Always => true,
             DisplayCondition::WhenShiftEnterHint => state.use_shift_enter_hint,
             DisplayCondition::WhenNotShiftEnterHint => !state.use_shift_enter_hint,
-            DisplayCondition::WhenUnderWSL => state.is_wsl,
             DisplayCondition::WhenCollaborationModesEnabled => state.collaboration_modes_enabled,
         }
     }
@@ -1186,18 +1133,10 @@ const SHORTCUTS: &[ShortcutDescriptor] = &[
     },
     ShortcutDescriptor {
         id: ShortcutId::PasteImage,
-        // Show Ctrl+Alt+V when running under WSL (terminals often intercept plain
-        // Ctrl+V); otherwise fall back to Ctrl+V.
-        bindings: &[
-            ShortcutBinding {
-                key: key_hint::ctrl_alt(KeyCode::Char('v')),
-                condition: DisplayCondition::WhenUnderWSL,
-            },
-            ShortcutBinding {
-                key: key_hint::ctrl(KeyCode::Char('v')),
-                condition: DisplayCondition::Always,
-            },
-        ],
+        bindings: &[ShortcutBinding {
+            key: key_hint::ctrl(KeyCode::Char('v')),
+            condition: DisplayCondition::Always,
+        }],
         prefix: "",
         label: " to paste images",
     },
@@ -1286,6 +1225,16 @@ mod tests {
     use ratatui::backend::Backend;
     use ratatui::backend::TestBackend;
 
+    #[test]
+    fn collaboration_mode_indicator_has_only_plan_variant() {
+        let indicator = CollaborationModeIndicator::Plan;
+        let mode_name = match indicator {
+            CollaborationModeIndicator::Plan => "Plan",
+        };
+
+        assert_eq!(mode_name, "Plan");
+    }
+
     fn snapshot_footer(name: &str, props: FooterProps) {
         snapshot_footer_with_mode_indicator(
             name, /*width*/ 80, &props, /*collaboration_mode_indicator*/ None,
@@ -1323,14 +1272,12 @@ mod tests {
                     FooterMode::ComposerEmpty => true,
                     FooterMode::ComposerHasDraft => false,
                     FooterMode::HistorySearch
-                    | FooterMode::QuitShortcutReminder
                     | FooterMode::ShortcutOverlay
                     | FooterMode::EscHint => false,
                 };
                 let show_queue_hint = match props.mode {
                     FooterMode::ComposerHasDraft => props.is_task_running,
                     FooterMode::HistorySearch
-                    | FooterMode::QuitShortcutReminder
                     | FooterMode::ComposerEmpty
                     | FooterMode::ShortcutOverlay
                     | FooterMode::EscHint => false,
@@ -1467,7 +1414,6 @@ mod tests {
                             props.mode,
                             FooterMode::EscHint
                                 | FooterMode::HistorySearch
-                                | FooterMode::QuitShortcutReminder
                                 | FooterMode::ShortcutOverlay
                         );
                     if show_context && let Some(line) = &right_line {
@@ -1563,8 +1509,6 @@ mod tests {
                 is_task_running: false,
                 queue_submissions: false,
                 collaboration_modes_enabled: false,
-                is_wsl: false,
-                quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
                 status_line_value: None,
                 status_line_enabled: false,
                 key_hints: FooterKeyHints::default_bindings(),
@@ -1581,8 +1525,6 @@ mod tests {
                 is_task_running: false,
                 queue_submissions: false,
                 collaboration_modes_enabled: false,
-                is_wsl: false,
-                quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
                 status_line_value: None,
                 status_line_enabled: false,
                 key_hints: FooterKeyHints {
@@ -1602,8 +1544,6 @@ mod tests {
                 is_task_running: false,
                 queue_submissions: false,
                 collaboration_modes_enabled: true,
-                is_wsl: false,
-                quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
                 status_line_value: None,
                 status_line_enabled: false,
                 key_hints: FooterKeyHints::default_bindings(),
@@ -1620,44 +1560,6 @@ mod tests {
                 is_task_running: true,
                 queue_submissions: false,
                 collaboration_modes_enabled: false,
-                is_wsl: false,
-                quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
-                status_line_value: None,
-                status_line_enabled: false,
-                key_hints: FooterKeyHints::default_bindings(),
-                active_agent_label: None,
-            },
-        );
-
-        snapshot_footer(
-            "footer_ctrl_c_quit_idle",
-            FooterProps {
-                mode: FooterMode::QuitShortcutReminder,
-                esc_backtrack_hint: false,
-                use_shift_enter_hint: false,
-                is_task_running: false,
-                queue_submissions: false,
-                collaboration_modes_enabled: false,
-                is_wsl: false,
-                quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
-                status_line_value: None,
-                status_line_enabled: false,
-                key_hints: FooterKeyHints::default_bindings(),
-                active_agent_label: None,
-            },
-        );
-
-        snapshot_footer(
-            "footer_ctrl_c_quit_running",
-            FooterProps {
-                mode: FooterMode::QuitShortcutReminder,
-                esc_backtrack_hint: false,
-                use_shift_enter_hint: false,
-                is_task_running: true,
-                queue_submissions: false,
-                collaboration_modes_enabled: false,
-                is_wsl: false,
-                quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
                 status_line_value: None,
                 status_line_enabled: false,
                 key_hints: FooterKeyHints::default_bindings(),
@@ -1674,8 +1576,6 @@ mod tests {
                 is_task_running: false,
                 queue_submissions: false,
                 collaboration_modes_enabled: false,
-                is_wsl: false,
-                quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
                 status_line_value: None,
                 status_line_enabled: false,
                 key_hints: FooterKeyHints::default_bindings(),
@@ -1692,8 +1592,6 @@ mod tests {
                 is_task_running: false,
                 queue_submissions: false,
                 collaboration_modes_enabled: false,
-                is_wsl: false,
-                quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
                 status_line_value: None,
                 status_line_enabled: false,
                 key_hints: FooterKeyHints::default_bindings(),
@@ -1710,8 +1608,6 @@ mod tests {
                 is_task_running: true,
                 queue_submissions: false,
                 collaboration_modes_enabled: false,
-                is_wsl: false,
-                quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
                 status_line_value: None,
                 status_line_enabled: false,
                 key_hints: FooterKeyHints::default_bindings(),
@@ -1730,8 +1626,6 @@ mod tests {
                 is_task_running: false,
                 queue_submissions: false,
                 collaboration_modes_enabled: false,
-                is_wsl: false,
-                quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
                 status_line_value: None,
                 status_line_enabled: false,
                 key_hints: FooterKeyHints::default_bindings(),
@@ -1750,8 +1644,6 @@ mod tests {
                 is_task_running: true,
                 queue_submissions: false,
                 collaboration_modes_enabled: false,
-                is_wsl: false,
-                quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
                 status_line_value: None,
                 status_line_enabled: false,
                 key_hints: FooterKeyHints::default_bindings(),
@@ -1766,8 +1658,6 @@ mod tests {
             is_task_running: false,
             queue_submissions: false,
             collaboration_modes_enabled: true,
-            is_wsl: false,
-            quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
             status_line_value: None,
             status_line_enabled: false,
             key_hints: FooterKeyHints::default_bindings(),
@@ -1795,8 +1685,6 @@ mod tests {
             is_task_running: true,
             queue_submissions: false,
             collaboration_modes_enabled: true,
-            is_wsl: false,
-            quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
             status_line_value: None,
             status_line_enabled: false,
             key_hints: FooterKeyHints::default_bindings(),
@@ -1817,8 +1705,6 @@ mod tests {
             is_task_running: false,
             queue_submissions: false,
             collaboration_modes_enabled: false,
-            is_wsl: false,
-            quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
             status_line_value: Some(Line::from("Status line content".to_string())),
             status_line_enabled: true,
             key_hints: FooterKeyHints::default_bindings(),
@@ -1834,8 +1720,6 @@ mod tests {
             is_task_running: true,
             queue_submissions: false,
             collaboration_modes_enabled: false,
-            is_wsl: false,
-            quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
             status_line_value: Some(Line::from("Status line content".to_string())),
             status_line_enabled: true,
             key_hints: FooterKeyHints::default_bindings(),
@@ -1851,8 +1735,6 @@ mod tests {
             is_task_running: false,
             queue_submissions: false,
             collaboration_modes_enabled: false,
-            is_wsl: false,
-            quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
             status_line_value: Some(Line::from("Status line content".to_string())),
             status_line_enabled: true,
             key_hints: FooterKeyHints::default_bindings(),
@@ -1868,8 +1750,6 @@ mod tests {
             is_task_running: false,
             queue_submissions: false,
             collaboration_modes_enabled: true,
-            is_wsl: false,
-            quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
             status_line_value: None, // command timed out / empty
             status_line_enabled: true,
             key_hints: FooterKeyHints::default_bindings(),
@@ -1899,8 +1779,6 @@ mod tests {
             is_task_running: false,
             queue_submissions: false,
             collaboration_modes_enabled: true,
-            is_wsl: false,
-            quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
             status_line_value: None,
             status_line_enabled: false,
             key_hints: FooterKeyHints::default_bindings(),
@@ -1922,8 +1800,6 @@ mod tests {
             is_task_running: false,
             queue_submissions: false,
             collaboration_modes_enabled: false,
-            is_wsl: false,
-            quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
             status_line_value: None,
             status_line_enabled: true,
             key_hints: FooterKeyHints::default_bindings(),
@@ -1946,8 +1822,6 @@ mod tests {
             is_task_running: false,
             queue_submissions: false,
             collaboration_modes_enabled: true,
-            is_wsl: false,
-            quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
             status_line_value: Some(Line::from(
                 "Status line content that should truncate before the mode indicator".to_string(),
             )),
@@ -1971,8 +1845,6 @@ mod tests {
             is_task_running: false,
             queue_submissions: false,
             collaboration_modes_enabled: false,
-            is_wsl: false,
-            quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
             status_line_value: None,
             status_line_enabled: false,
             key_hints: FooterKeyHints::default_bindings(),
@@ -1988,8 +1860,6 @@ mod tests {
             is_task_running: false,
             queue_submissions: false,
             collaboration_modes_enabled: false,
-            is_wsl: false,
-            quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
             status_line_value: Some(Line::from("Status line content".to_string())),
             status_line_enabled: true,
             key_hints: FooterKeyHints::default_bindings(),
@@ -2008,8 +1878,6 @@ mod tests {
             is_task_running: false,
             queue_submissions: false,
             collaboration_modes_enabled: true,
-            is_wsl: false,
-            quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
             status_line_value: Some(Line::from(
                 "Status line content that is definitely too long to fit alongside the mode label"
                     .to_string(),
@@ -2041,28 +1909,11 @@ mod tests {
     }
 
     #[test]
-    fn paste_image_shortcut_prefers_ctrl_alt_v_under_wsl() {
+    fn paste_image_shortcut_uses_ctrl_v() {
         let descriptor = SHORTCUTS
             .iter()
             .find(|descriptor| descriptor.id == ShortcutId::PasteImage)
             .expect("paste image shortcut");
-
-        let is_wsl = {
-            #[cfg(target_os = "linux")]
-            {
-                crate::clipboard_paste::is_probably_wsl()
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                false
-            }
-        };
-
-        let expected_key = if is_wsl {
-            key_hint::ctrl_alt(KeyCode::Char('v'))
-        } else {
-            key_hint::ctrl(KeyCode::Char('v'))
-        };
 
         let actual_key = descriptor
             .binding_for(ShortcutsState {
@@ -2070,13 +1921,12 @@ mod tests {
                 esc_backtrack_hint: false,
                 is_task_running: false,
                 queue_submissions: false,
-                is_wsl,
                 collaboration_modes_enabled: false,
                 key_hints: FooterKeyHints::default_bindings(),
             })
             .expect("shortcut binding")
             .key;
 
-        assert_eq!(actual_key, expected_key);
+        assert_eq!(actual_key, key_hint::ctrl(KeyCode::Char('v')));
     }
 }

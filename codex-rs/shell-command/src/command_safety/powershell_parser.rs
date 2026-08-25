@@ -25,15 +25,6 @@ use std::time::Duration;
 
 const POWERSHELL_PARSER_SCRIPT: &str = include_str!("powershell_parser.ps1");
 const POWERSHELL_PARSER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
-#[cfg(not(windows))]
-const TRUSTED_PWSH_ROOTS: &[&str] = &[
-    "/usr/bin",
-    "/usr/local/microsoft/powershell",
-    "/opt/microsoft/powershell",
-    "/opt/homebrew",
-    "/nix/store",
-    "/snap",
-];
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum PowershellFlavor {
@@ -51,6 +42,67 @@ pub(crate) struct PowershellResolutionState {
     pub cwd: String,
     pub path: String,
     pub pathext: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PowershellInvocation<'a> {
+    InlineCommand { script: &'a str, no_profile: bool },
+    Opaque,
+    Bare,
+    Empty,
+    Invalid,
+}
+
+/// Parse the PowerShell host argument envelope once for every command-safety consumer.
+///
+/// Only `-Command` exposes source that can be inspected. File, encoded, bare, and unknown forms
+/// remain opaque so callers cannot accidentally reinterpret them as inline script text.
+pub(super) fn parse_powershell_invocation(args: &[String]) -> PowershellInvocation<'_> {
+    if args.is_empty() {
+        return PowershellInvocation::Empty;
+    }
+
+    let mut idx = 0;
+    let mut no_profile = false;
+    while idx < args.len() {
+        let arg = &args[idx];
+        let lower = arg.to_ascii_lowercase();
+        match lower.as_str() {
+            "-command" | "/command" | "-c" => {
+                let Some(script) = args.get(idx + 1) else {
+                    return PowershellInvocation::Invalid;
+                };
+                if idx + 2 != args.len() {
+                    return PowershellInvocation::Invalid;
+                }
+                return PowershellInvocation::InlineCommand { script, no_profile };
+            }
+            _ if lower.starts_with("-command:") || lower.starts_with("/command:") => {
+                if idx + 1 != args.len() {
+                    return PowershellInvocation::Invalid;
+                }
+                let Some((_, script)) = arg.split_once(':') else {
+                    return PowershellInvocation::Invalid;
+                };
+                return PowershellInvocation::InlineCommand { script, no_profile };
+            }
+            "-noprofile" => {
+                no_profile = true;
+                idx += 1;
+            }
+            "-nologo" | "-noninteractive" | "-mta" | "-sta" => {
+                idx += 1;
+            }
+            "-encodedcommand" | "-ec" | "-file" | "/file" | "-windowstyle" | "-executionpolicy"
+            | "-workingdirectory" => {
+                return PowershellInvocation::Opaque;
+            }
+            _ if lower.starts_with('-') => return PowershellInvocation::Opaque,
+            _ => return PowershellInvocation::Bare,
+        }
+    }
+
+    PowershellInvocation::Empty
 }
 
 /// Cache one long-lived parser process per trusted PowerShell flavor. The map lock only protects
@@ -424,14 +476,9 @@ impl PowershellFlavor {
 fn requested_executable_matches_trusted(executable: &str, trusted: &Path) -> bool {
     let requested = Path::new(executable);
     if requested.is_absolute() || requested.components().count() > 1 {
-        #[cfg(windows)]
         return windows_explicit_path_matches_trusted(requested, trusted);
-
-        #[cfg(not(windows))]
-        return non_windows_explicit_path_matches_trusted(requested, trusted);
     }
 
-    #[cfg(windows)]
     {
         // Windows executable lookup checks the application directory and current directory before
         // PATH. Reject a same-named shadow executable there even when PATH resolves to the trusted
@@ -454,40 +501,11 @@ fn requested_executable_matches_trusted(executable: &str, trusted: &Path) -> boo
 
     which::which(executable)
         .ok()
-        .filter(|path| {
-            #[cfg(windows)]
-            {
-                !windows_path_is_remote_or_device(path)
-            }
-            #[cfg(not(windows))]
-            {
-                true
-            }
-        })
+        .filter(|path| !windows_path_is_remote_or_device(path))
         .and_then(|path| fs::canonicalize(path).ok())
         .is_some_and(|path| path == trusted)
 }
 
-#[cfg(not(windows))]
-fn non_windows_explicit_path_matches_trusted(requested: &Path, trusted: &Path) -> bool {
-    let requested = if requested.is_absolute() {
-        requested.to_path_buf()
-    } else {
-        let Ok(current_dir) = std::env::current_dir() else {
-            return false;
-        };
-        current_dir.join(requested)
-    };
-    if !TRUSTED_PWSH_ROOTS
-        .iter()
-        .any(|root| requested.starts_with(Path::new(root)))
-    {
-        return false;
-    }
-    existing_path_matches_trusted(&requested, trusted).unwrap_or(false)
-}
-
-#[cfg(windows)]
 fn windows_explicit_path_matches_trusted(requested: &Path, trusted: &Path) -> bool {
     if windows_path_is_remote_or_device(requested) {
         return false;
@@ -512,12 +530,10 @@ fn windows_explicit_path_matches_trusted(requested: &Path, trusted: &Path) -> bo
     false
 }
 
-#[cfg(windows)]
 fn windows_path_is_remote_or_device(path: &Path) -> bool {
     path.as_os_str().to_string_lossy().starts_with(r"\\")
 }
 
-#[cfg(windows)]
 fn windows_path_lookup_key(path: &Path) -> String {
     let text = path.as_os_str().to_string_lossy().replace('/', "\\");
     text.strip_prefix(r"\\?\")
@@ -527,12 +543,11 @@ fn windows_path_lookup_key(path: &Path) -> String {
 }
 
 fn existing_path_matches_trusted(path: &Path, trusted: &Path) -> Option<bool> {
-    #[cfg(windows)]
     if windows_path_is_remote_or_device(path) {
         return Some(false);
     }
     let mut candidates = vec![path.to_path_buf()];
-    #[cfg(windows)]
+
     if path.extension().is_none() {
         let mut with_exe = path.to_path_buf();
         with_exe.set_extension("exe");
@@ -551,7 +566,6 @@ fn existing_path_matches_trusted(path: &Path, trusted: &Path) -> Option<bool> {
     })
 }
 
-#[cfg(windows)]
 fn trusted_parser_executable(flavor: PowershellFlavor) -> Option<PathBuf> {
     match flavor {
         PowershellFlavor::WindowsPowerShell => trusted_executable_under(
@@ -567,25 +581,6 @@ fn trusted_parser_executable(flavor: PowershellFlavor) -> Option<PathBuf> {
     }
 }
 
-#[cfg(not(windows))]
-fn trusted_parser_executable(_flavor: PowershellFlavor) -> Option<PathBuf> {
-    // PowerShell Core is the only supported host off Windows. Resolve it independently from the
-    // executable being classified, canonicalize the result, and require a standard system/package
-    // installation root. This preserves cross-platform command-preflight parsing without executing
-    // a model-supplied path that merely has a PowerShell-looking basename.
-    let candidate = fs::canonicalize(which::which("pwsh").ok()?).ok()?;
-    let current_dir = fs::canonicalize(std::env::current_dir().ok()?).ok()?;
-    let under_trusted_root = TRUSTED_PWSH_ROOTS
-        .iter()
-        .any(|root| candidate.starts_with(Path::new(root)));
-    (candidate.is_absolute()
-        && candidate.is_file()
-        && under_trusted_root
-        && !candidate.starts_with(current_dir))
-    .then_some(candidate)
-}
-
-#[cfg(windows)]
 fn trusted_executable_under(root: PathBuf, relative_components: &[&str]) -> Option<PathBuf> {
     if !root.is_absolute() || windows_path_is_remote_or_device(&root) {
         return None;
@@ -715,7 +710,7 @@ fn kill_child(child: &mut Option<Child>) {
         });
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::powershell::try_find_powershell_executable_blocking;

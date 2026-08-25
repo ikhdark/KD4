@@ -15,8 +15,29 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.root_maintenance import PRETTIER_TARGETS  # noqa: E402
+from scripts.root_maintenance import python_lint_targets  # noqa: E402
+from scripts.root_maintenance import resolved_changed_paths  # noqa: E402
 from scripts.tool_versions import RUSTFMT_TOOLCHAIN  # noqa: E402
+
+
+PRETTIER_TARGETS = (
+    "*.json",
+    "*.md",
+    "**/*.js",
+    "pnpm-workspace.yaml",
+    "sdk/typescript/**/*.ts",
+)
+FORMATTER_NAMES = (
+    "just",
+    "rust",
+    "prettier",
+    "python-sdk",
+    "python-scripts",
+)
+FORMATTER_ALIASES = {
+    "python sdk": "python-sdk",
+    "python scripts": "python-scripts",
+}
 
 
 @dataclass(frozen=True)
@@ -104,7 +125,9 @@ def python_sdk_formatter_group(*, check: bool) -> FormatterGroup:
     )
 
 
-def python_scripts_formatter_group(*, check: bool) -> FormatterGroup:
+def python_scripts_formatter_group(
+    *, check: bool, targets: Sequence[str] = ("scripts",)
+) -> FormatterGroup:
     # The SDK and internal scripts intentionally use separate project roots so
     # uv and Ruff retain each project's configuration context.
     args = [
@@ -118,7 +141,7 @@ def python_scripts_formatter_group(*, check: bool) -> FormatterGroup:
     ]
     if check:
         args.append("--check")
-    args.append("scripts")
+    args.extend(targets)
     return FormatterGroup("Python scripts", (Command(tuple(args)),))
 
 
@@ -127,6 +150,7 @@ def formatter_groups(
     check: bool,
     fast_local: bool = False,
     selected_groups: set[str] | None = None,
+    python_script_targets: Sequence[str] = ("scripts",),
 ) -> tuple[FormatterGroup, ...]:
     factories: list[FormatterGroupFactory] = [
         ("just", lambda: just_formatter_group(check=check)),
@@ -136,15 +160,23 @@ def formatter_groups(
         factories.extend(
             [
                 ("prettier", lambda: prettier_formatter_group(check=check)),
-                ("python sdk", lambda: python_sdk_formatter_group(check=check)),
-                ("python scripts", lambda: python_scripts_formatter_group(check=check)),
+                ("python-sdk", lambda: python_sdk_formatter_group(check=check)),
+                (
+                    "python-scripts",
+                    lambda: python_scripts_formatter_group(
+                        check=check, targets=python_script_targets
+                    ),
+                ),
             ]
         )
     if selected_groups is None:
         selected_factories = factories
     else:
+        normalized_groups = {
+            FORMATTER_ALIASES.get(name, name) for name in selected_groups
+        }
         selected_factories = [
-            factory for factory in factories if factory[0].lower() in selected_groups
+            factory for factory in factories if factory[0].lower() in normalized_groups
         ]
     return tuple(create_group() for _name, create_group in selected_factories)
 
@@ -180,10 +212,16 @@ def run_formatter_group(group: FormatterGroup) -> FormatterResult:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--check",
         action="store_true",
         help="check formatting without modifying files",
+    )
+    mode.add_argument(
+        "--write",
+        action="store_true",
+        help="write formatting changes (the default when no mode is provided)",
     )
     parser.add_argument(
         "--fast-local",
@@ -193,17 +231,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--only",
         action="append",
-        choices=(
-            "just",
-            "rust",
-            "prettier",
-            "python sdk",
-            "python scripts",
-        ),
+        choices=(*FORMATTER_NAMES, *FORMATTER_ALIASES),
         help="run only the named formatter group; may be provided multiple times",
     )
+    parser.add_argument(
+        "--changed",
+        action="append",
+        nargs="?",
+        const=None,
+        default=[],
+        help=(
+            "format changed scripts/*.py paths; with no path, detect changed "
+            "paths from git (requires --only python-scripts)"
+        ),
+    )
     args = parser.parse_args(argv)
-    selected_groups = {name.lower() for name in args.only} if args.only else None
+    selected_groups = (
+        {FORMATTER_ALIASES.get(name.lower(), name.lower()) for name in args.only}
+        if args.only
+        else None
+    )
     if args.fast_local and selected_groups:
         incompatible_groups = sorted(selected_groups - {"just", "rust"})
         if incompatible_groups:
@@ -211,10 +258,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "--fast-local excludes formatter groups selected by --only: "
                 + ", ".join(incompatible_groups)
             )
+    if args.changed and selected_groups != {"python-scripts"}:
+        parser.error("--changed requires --only python-scripts")
+    python_script_targets: Sequence[str] = ("scripts",)
+    if args.changed:
+        changed_paths = resolved_changed_paths(args.changed)
+        if changed_paths is None:
+            return 2
+        python_script_targets = (
+            python_lint_targets(changed_paths) if changed_paths else []
+        )
+        if not python_script_targets:
+            print("No matching changed Python files to format.")
+            return 0
     groups = formatter_groups(
         check=args.check,
         fast_local=args.fast_local,
         selected_groups=selected_groups,
+        python_script_targets=python_script_targets,
     )
     if not groups:
         print("No formatter groups selected.", file=sys.stderr)

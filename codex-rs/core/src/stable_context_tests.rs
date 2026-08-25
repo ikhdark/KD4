@@ -280,6 +280,44 @@ fn generic_preparation_target_retains_all_recognized_history() {
 }
 
 #[test]
+fn sampling_projection_ignores_removed_environment_switch() {
+    const CHILD_PROCESS: &str = "KD4_TEST_STABLE_CONTEXT_FIXED_BEHAVIOR";
+    const REMOVED_ENVIRONMENT_SWITCH: &str = "CODEX_STABLE_CONTEXT_PROJECTION";
+
+    if std::env::var_os(CHILD_PROCESS).is_some() {
+        let old = repository("old");
+        let current = repository("current");
+        let projection = project_stable_context(
+            vec![text_message("user", &old), text_message("user", &current)].into(),
+            StableContextTarget::Sampling,
+        );
+
+        assert!(projection.manifest.projection_enabled());
+        assert_eq!(visible_text(&projection.items), vec![current.as_str()]);
+        return;
+    }
+
+    let output = std::process::Command::new(
+        std::env::current_exe().expect("current test executable should be available"),
+    )
+    .args([
+        "sampling_projection_ignores_removed_environment_switch",
+        "--nocapture",
+    ])
+    .env(CHILD_PROCESS, "1")
+    .env(REMOVED_ENVIRONMENT_SWITCH, "baseline")
+    .output()
+    .expect("isolated stable-context test process should run");
+
+    assert!(
+        output.status.success(),
+        "isolated stable-context test failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
 fn mixed_registered_message_is_split_into_canonical_prefix_and_dynamic_history() {
     let old = repository("old");
     let current = repository("current");
@@ -434,7 +472,7 @@ fn memory_context_has_dedicated_stable_provenance() {
 }
 
 #[test]
-fn base_and_compact_catalog_identities_are_deterministic_and_state_free() {
+fn base_and_compact_catalog_identities_are_deterministic_without_local_reuse() {
     let catalog = "<skills_instructions>\nfull catalog\n</skills_instructions>";
     let selected = skill("deterministic");
     let items = vec![
@@ -450,9 +488,11 @@ fn base_and_compact_catalog_identities_are_deterministic_and_state_free() {
         .with_base_model("gpt-test", "stable base");
 
     assert_eq!(first.fingerprint(), second.fingerprint());
-    assert!(second.components().iter().any(|component| {
-        component.kind == StableContextKind::BaseModel && component.local_reused
-    }));
+    for manifest in [&first, &second] {
+        assert!(manifest.components().iter().any(|component| {
+            component.kind == StableContextKind::BaseModel && !component.local_reused
+        }));
+    }
     let catalog = first
         .components()
         .iter()
@@ -508,19 +548,11 @@ fn runtime_context_variants_are_stable_and_replace_by_semantic_slot() {
         ("developer", "<app-context>old</app-context>"),
         ("developer", "<model_switch>old</model_switch>"),
         ("developer", "<personality_spec>old</personality_spec>"),
-        (
-            "developer",
-            "<realtime_conversation>old</realtime_conversation>",
-        ),
         ("user", "<environment_context>current</environment_context>"),
         ("user", "<recommended_plugins>current</recommended_plugins>"),
         ("developer", "<app-context>current</app-context>"),
         ("developer", "<model_switch>current</model_switch>"),
         ("developer", "<personality_spec>current</personality_spec>"),
-        (
-            "developer",
-            "<realtime_conversation>current</realtime_conversation>",
-        ),
     ];
     let items = fragments
         .into_iter()
@@ -533,14 +565,13 @@ fn runtime_context_variants_are_stable_and_replace_by_semantic_slot() {
     assert_eq!(first.manifest.fingerprint(), second.manifest.fingerprint());
     let visible = visible_text(&first.items);
     assert!(visible.iter().all(|text| !text.contains("old")));
-    assert_eq!(visible.len(), 6);
+    assert_eq!(visible.len(), 5);
     for kind in [
         StableContextKind::Environment,
         StableContextKind::RecommendedPlugins,
         StableContextKind::AppContext,
         StableContextKind::ModelSwitch,
         StableContextKind::Personality,
-        StableContextKind::Realtime,
     ] {
         assert!(first.manifest.components().iter().any(|component| {
             component.kind == kind

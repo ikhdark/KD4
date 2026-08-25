@@ -52,20 +52,12 @@ fn sleep_argv() -> Vec<String> {
     shell_argv("sleep 0.1", "ping -n 2 127.0.0.1 >NUL")
 }
 
-fn shell_argv(unix_script: &str, windows_script: &str) -> Vec<String> {
-    if cfg!(windows) {
-        vec![
-            windows_command_processor(),
-            "/C".to_string(),
-            windows_script.to_string(),
-        ]
-    } else {
-        vec![
-            "/bin/sh".to_string(),
-            "-c".to_string(),
-            unix_script.to_string(),
-        ]
-    }
+fn shell_argv(_unix_script: &str, windows_script: &str) -> Vec<String> {
+    vec![
+        windows_command_processor(),
+        "/C".to_string(),
+        windows_script.to_string(),
+    ]
 }
 
 fn windows_command_processor() -> String {
@@ -73,11 +65,8 @@ fn windows_command_processor() -> String {
 }
 
 fn test_runtime_paths() -> ExecServerRuntimePaths {
-    ExecServerRuntimePaths::new(
-        std::env::current_exe().expect("current exe"),
-        /*codex_linux_sandbox_exe*/ None,
-    )
-    .expect("runtime paths")
+    ExecServerRuntimePaths::new(std::env::current_exe().expect("current exe"))
+        .expect("runtime paths")
 }
 
 async fn initialized_handler() -> Arc<ExecServerHandler> {

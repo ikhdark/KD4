@@ -20,15 +20,10 @@ fn exec_command_tool_matches_expected_spec() {
         exec_permission_approvals_enabled: false,
     });
 
-    let description = if cfg!(windows) {
-        format!(
-            "Runs a command in a PTY, returning output or a session ID for ongoing interaction.{}",
-            windows_shell_guidance_description()
-        )
-    } else {
-        "Runs a command in a PTY, returning output or a session ID for ongoing interaction."
-            .to_string()
-    };
+    let description = format!(
+        "Runs a command in a PTY, returning output or a session ID for ongoing interaction.{}",
+        windows_shell_guidance_description()
+    );
 
     let mut properties = BTreeMap::from([
         (
@@ -249,8 +244,7 @@ fn shell_command_tool_matches_expected_spec() {
         exec_permission_approvals_enabled: false,
     });
 
-    let description = if cfg!(windows) {
-        r#"Runs a Powershell command (Windows) and returns its output.
+    let description = r#"Runs a Powershell command (Windows) and returns its output.
 
 Examples of valid command strings:
 
@@ -261,12 +255,7 @@ Examples of valid command strings:
 - setting an env var: "$env:FOO='bar'; echo $env:FOO"
 - running an inline Python script: "@'\\nprint('Hello, world!')\\n'@ | python -""#
             .to_string()
-            + &windows_shell_guidance_description()
-    } else {
-        r#"Runs a shell command and returns its output.
-- Always set the `workdir` param when using the shell_command function. Do not use `cd` unless absolutely necessary."#
-            .to_string()
-    };
+            + &windows_shell_guidance_description();
 
     let mut properties = BTreeMap::from([
         (

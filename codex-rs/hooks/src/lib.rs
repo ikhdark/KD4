@@ -45,10 +45,10 @@ pub const HOOK_EVENT_NAMES_WITH_MATCHERS: [&str; 8] = [
     "SubagentStop",
 ];
 
+pub use events::common::ContextInjectingHookOutcome;
+pub use events::common::StatelessHookOutcome;
 pub use events::compact::PostCompactRequest;
-pub use events::compact::PreCompactOutcome;
 pub use events::compact::PreCompactRequest;
-pub use events::compact::StatelessHookOutcome;
 pub use events::permission_request::PermissionRequestDecision;
 pub use events::permission_request::PermissionRequestOutcome;
 pub use events::permission_request::PermissionRequestRequest;
@@ -56,14 +56,12 @@ pub use events::post_tool_use::PostToolUseOutcome;
 pub use events::post_tool_use::PostToolUseRequest;
 pub use events::pre_tool_use::PreToolUseOutcome;
 pub use events::pre_tool_use::PreToolUseRequest;
-pub use events::session_start::SessionStartOutcome;
 pub use events::session_start::SessionStartRequest;
 pub use events::session_start::SessionStartSource;
 pub use events::session_start::StartHookTarget;
 pub use events::stop::StopHookTarget;
 pub use events::stop::StopOutcome;
 pub use events::stop::StopRequest;
-pub use events::user_prompt_submit::UserPromptSubmitOutcome;
 pub use events::user_prompt_submit::UserPromptSubmitRequest;
 pub use legacy_notify::legacy_notify_json;
 pub use legacy_notify::mutating_finalizer_hook;

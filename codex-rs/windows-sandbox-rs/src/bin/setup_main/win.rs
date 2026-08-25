@@ -6,7 +6,6 @@ use anyhow::Context;
 use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use codex_otel::StatsigMetricsSettings;
 use codex_windows_sandbox::SETUP_VERSION;
 use codex_windows_sandbox::SetupErrorCode;
 use codex_windows_sandbox::SetupErrorReport;
@@ -24,17 +23,18 @@ use codex_windows_sandbox::log_note;
 use codex_windows_sandbox::log_writer;
 use codex_windows_sandbox::path_mask_allows;
 use codex_windows_sandbox::path_mask_has_explicit_allow_ace;
+use codex_windows_sandbox::resolve_sid;
 use codex_windows_sandbox::sandbox_bin_dir;
 use codex_windows_sandbox::sandbox_dir;
 use codex_windows_sandbox::sandbox_secrets_dir;
+use codex_windows_sandbox::setup_protocol::SetupMode;
+use codex_windows_sandbox::setup_protocol::SetupPayload as Payload;
 use codex_windows_sandbox::string_from_sid_bytes;
 use codex_windows_sandbox::sync_persistent_deny_read_acls;
 use codex_windows_sandbox::to_wide;
 use codex_windows_sandbox::workspace_write_cap_sid_for_root;
 use codex_windows_sandbox::workspace_write_root_overlaps_path;
 use codex_windows_sandbox::write_setup_error_report;
-use serde::Deserialize;
-use serde::Serialize;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::ffi::c_void;
@@ -78,44 +78,8 @@ use sandbox_users::commit_setup_marker;
 use sandbox_users::prepare_setup_marker;
 use sandbox_users::provision_sandbox_users;
 use sandbox_users::resolve_sandbox_users_group_sid;
-use sandbox_users::resolve_sid;
 use sandbox_users::sid_bytes_to_psid;
 use setup_mutex::acquire_setup_mutex;
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct Payload {
-    version: u32,
-    offline_username: String,
-    online_username: String,
-    codex_home: PathBuf,
-    command_cwd: PathBuf,
-    read_roots: Vec<PathBuf>,
-    write_roots: Vec<PathBuf>,
-    #[serde(default)]
-    deny_read_paths: Vec<PathBuf>,
-    #[serde(default)]
-    deny_write_paths: Vec<PathBuf>,
-    proxy_ports: Vec<u16>,
-    #[serde(default)]
-    allow_local_binding: bool,
-    #[serde(default)]
-    otel: Option<StatsigMetricsSettings>,
-    real_user: String,
-    #[serde(default)]
-    mode: SetupMode,
-    #[serde(default)]
-    refresh_only: bool,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "kebab-case")]
-enum SetupMode {
-    #[default]
-    Full,
-    ProvisionOnly,
-    ReadAclsOnly,
-    ReadAclsOnlyStrict,
-}
 
 fn log_line(log: &mut dyn Write, msg: &str) -> Result<()> {
     let ts = chrono::Utc::now().to_rfc3339();

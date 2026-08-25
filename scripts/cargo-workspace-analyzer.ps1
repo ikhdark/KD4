@@ -10,7 +10,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $cargoLaneScript = Join-Path $PSScriptRoot "cargo-lane.ps1"
-$v8SandboxPackages = @("codex-code-mode", "codex-v8-poc")
+$v8SandboxPackage = "codex-code-mode"
 
 function Invoke-CargoLane {
     param(
@@ -85,18 +85,15 @@ if (-not $needsWindowsV8Fallback) {
 }
 
 # rusty_v8 does not publish a Windows archive for the ptrcomp+sandbox feature
-# combination. Analyze the complete workspace with only the two forwarding
-# packages excluded, then analyze those packages without that unavailable
-# upstream feature. Their Rust sources contain no sandbox-gated code.
+# combination. Analyze the complete workspace with the forwarding packages
+# excluded, then analyze those packages without that unavailable upstream
+# feature. Their Rust sources contain no sandbox-gated code.
 Write-Warning (
     "rusty_v8 has no Windows ptrcomp+sandbox archive; " +
     "checking the full workspace while omitting only that upstream feature."
 )
 
-$workspaceArgs = $cargoArgs + @(
-    "--exclude", $v8SandboxPackages[0],
-    "--exclude", $v8SandboxPackages[1]
-)
+$workspaceArgs = $cargoArgs + @("--exclude", $v8SandboxPackage)
 $exitCode = Invoke-CargoLane -Lane $lane -CargoArgs $workspaceArgs
 if ($exitCode -ne 0) {
     exit $exitCode
@@ -108,10 +105,7 @@ if ($Analyzer -eq "clippy") {
 } else {
     $packageArgs = @("check", "--all-targets")
 }
-$packageArgs += @(
-    "--package", $v8SandboxPackages[0],
-    "--package", $v8SandboxPackages[1]
-)
+$packageArgs += @("--package", $v8SandboxPackage)
 $packageArgs += $packageForwarded
 
 exit (Invoke-CargoLane -Lane $lane -CargoArgs $packageArgs)

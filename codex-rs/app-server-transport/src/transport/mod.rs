@@ -4,8 +4,11 @@ use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::OutgoingError;
 use crate::outgoing_message::OutgoingMessage;
 use crate::outgoing_message::QueuedOutgoingMessage;
-use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::JSONRPCMessage;
+#[cfg(test)]
+use codex_app_server_protocol::OVERLOADED_ERROR_CODE;
+use codex_app_server_protocol::OverloadReason;
+use codex_app_server_protocol::overloaded_error;
 use codex_core::config::find_codex_home;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::net::SocketAddr;
@@ -46,8 +49,6 @@ pub use unix_socket::acquire_app_server_startup_lock;
 pub use unix_socket::prepare_control_socket_path;
 pub use unix_socket::start_control_socket_acceptor;
 pub use websocket::start_websocket_acceptor;
-
-const OVERLOADED_ERROR_CODE: i64 = -32001;
 
 const APP_SERVER_CONTROL_SOCKET_DIR_NAME: &str = "app-server-control";
 const APP_SERVER_CONTROL_SOCKET_FILE_NAME: &str = "app-server-control.sock";
@@ -233,11 +234,10 @@ async fn enqueue_incoming_message(
         })) => {
             let overload_error = OutgoingMessage::Error(OutgoingError {
                 id: request.id,
-                error: JSONRPCErrorError {
-                    code: OVERLOADED_ERROR_CODE,
-                    message: "Server overloaded; retry later.".to_string(),
-                    data: None,
-                },
+                error: overloaded_error(
+                    OverloadReason::TransportIngress,
+                    "Server overloaded; retry later.",
+                ),
             });
             match writer.try_send(QueuedOutgoingMessage::new(overload_error)) {
                 Ok(()) => true,
@@ -256,17 +256,10 @@ async fn enqueue_incoming_message(
 }
 
 fn serialize_outgoing_message(outgoing_message: OutgoingMessage) -> Option<String> {
-    let value = match serde_json::to_value(outgoing_message) {
-        Ok(value) => value,
-        Err(err) => {
-            error!("Failed to convert OutgoingMessage to JSON value: {err}");
-            return None;
-        }
-    };
-    match serde_json::to_string(&value) {
+    match serde_json::to_string(&outgoing_message) {
         Ok(json) => Some(json),
         Err(err) => {
-            error!("Failed to serialize JSONRPCMessage: {err}");
+            error!("Failed to serialize OutgoingMessage: {err}");
             None
         }
     }
@@ -275,6 +268,7 @@ fn serialize_outgoing_message(outgoing_message: OutgoingMessage) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::outgoing_message::OutgoingResponse;
     use codex_app_server_protocol::ConfigWarningNotification;
     use codex_app_server_protocol::JSONRPCNotification;
     use codex_app_server_protocol::JSONRPCRequest;
@@ -292,6 +286,29 @@ mod tests {
             AppServerTransport::from_listen_url("off"),
             Ok(AppServerTransport::Off)
         );
+    }
+
+    #[test]
+    fn serialize_outgoing_message_uses_one_json_serialization_pass() {
+        let message = OutgoingMessage::Response(OutgoingResponse {
+            id: RequestId::Integer(7),
+            result: json!({ "ok": true }),
+        });
+
+        assert_eq!(
+            serialize_outgoing_message(message).as_deref(),
+            Some(r#"{"id":7,"result":{"ok":true}}"#)
+        );
+
+        let source = include_str!("mod.rs");
+        let function = source
+            .split("fn serialize_outgoing_message")
+            .nth(1)
+            .expect("serializer function exists")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production serializer body exists");
+        assert!(!function.contains("serde_json::to_value"));
     }
 
     #[tokio::test]
@@ -349,7 +366,11 @@ mod tests {
                 "id": 7,
                 "error": {
                     "code": OVERLOADED_ERROR_CODE,
-                    "message": "Server overloaded; retry later."
+                    "message": "Server overloaded; retry later.",
+                    "data": {
+                        "reason": "transportIngress",
+                        "retryable": true
+                    }
                 }
             })
         );

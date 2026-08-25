@@ -1213,41 +1213,12 @@ fn native_file_metadata_changed(before: &std::fs::Metadata, after: &std::fs::Met
         || platform_file_metadata_changed(before, after)
 }
 
-#[cfg(unix)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct NativeFileIdentity {
-    device: u64,
-    inode: u64,
-}
-
-#[cfg(unix)]
-fn native_file_identity(
-    _file: &tokio::fs::File,
-    metadata: &std::fs::Metadata,
-) -> io::Result<NativeFileIdentity> {
-    use std::os::unix::fs::MetadataExt;
-
-    Ok(NativeFileIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
-}
-
-#[cfg(unix)]
-fn platform_file_metadata_changed(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    before.ctime() != after.ctime() || before.ctime_nsec() != after.ctime_nsec()
-}
-
-#[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativeFileIdentity {
     volume_serial_number: u32,
     file_index: u64,
 }
 
-#[cfg(windows)]
 fn native_file_identity(
     file: &tokio::fs::File,
     _metadata: &std::fs::Metadata,
@@ -1276,30 +1247,12 @@ fn native_file_identity(
     })
 }
 
-#[cfg(windows)]
 fn platform_file_metadata_changed(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
 
     before.file_attributes() != after.file_attributes()
         || before.creation_time() != after.creation_time()
         || before.last_write_time() != after.last_write_time()
-}
-
-#[cfg(not(any(unix, windows)))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct NativeFileIdentity;
-
-#[cfg(not(any(unix, windows)))]
-fn native_file_identity(
-    _file: &tokio::fs::File,
-    _metadata: &std::fs::Metadata,
-) -> io::Result<NativeFileIdentity> {
-    Ok(NativeFileIdentity)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn platform_file_metadata_changed(_before: &std::fs::Metadata, _after: &std::fs::Metadata) -> bool {
-    false
 }
 
 fn is_changed_file_race_error(kind: io::ErrorKind) -> bool {
@@ -1386,11 +1339,7 @@ pub(crate) fn current_sandbox_cwd() -> io::Result<PathBuf> {
 
 fn copy_symlink(source: &Path, target: &Path) -> io::Result<()> {
     let link_target = std::fs::read_link(source)?;
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(&link_target, target)
-    }
-    #[cfg(windows)]
+
     {
         if symlink_points_to_directory(source)? {
             std::os::windows::fs::symlink_dir(&link_target, target)
@@ -1398,18 +1347,8 @@ fn copy_symlink(source: &Path, target: &Path) -> io::Result<()> {
             std::os::windows::fs::symlink_file(&link_target, target)
         }
     }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = link_target;
-        let _ = target;
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "copying symlinks is unsupported on this platform",
-        ))
-    }
 }
 
-#[cfg(windows)]
 fn symlink_points_to_directory(source: &Path) -> io::Result<bool> {
     use std::os::windows::fs::FileTypeExt;
 
@@ -1425,42 +1364,11 @@ fn system_time_to_unix_ms(time: SystemTime) -> i64 {
         .unwrap_or(0)
 }
 
-#[cfg(all(test, any(unix, windows)))]
+#[cfg(test)]
 #[path = "local_file_system_path_uri_tests.rs"]
 mod path_uri_tests;
 
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    use pretty_assertions::assert_eq;
-    use std::os::unix::fs::symlink;
-
-    #[test]
-    fn resolve_existing_path_handles_symlink_parent_dotdot_escape() -> io::Result<()> {
-        let temp_dir = tempfile::TempDir::new()?;
-        let allowed_dir = temp_dir.path().join("allowed");
-        let outside_dir = temp_dir.path().join("outside");
-        std::fs::create_dir_all(&allowed_dir)?;
-        std::fs::create_dir_all(&outside_dir)?;
-        symlink(&outside_dir, allowed_dir.join("link"))?;
-
-        let resolved = resolve_existing_path(
-            allowed_dir
-                .join("link")
-                .join("..")
-                .join("secret.txt")
-                .as_path(),
-        )?;
-
-        assert_eq!(
-            resolved,
-            resolve_existing_path(temp_dir.path())?.join("secret.txt")
-        );
-        Ok(())
-    }
-}
-
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;

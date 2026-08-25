@@ -542,11 +542,7 @@ fn resolve_host_program(
     if let Some(path) = override_path {
         return PathBuf::from(path);
     }
-    let executable_name = if cfg!(windows) {
-        "codex-code-mode-host.exe"
-    } else {
-        "codex-code-mode-host"
-    };
+    let executable_name = "codex-code-mode-host.exe";
     if let Ok(current_exe) = current_exe
         && let Some(parent) = current_exe.parent()
     {

@@ -331,17 +331,6 @@ async fn forward_request(req: Request, request_ctx: &MitmRequestContext) -> Resu
     )
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-async fn mitm_blocking_response(
-    req: &Request,
-    policy: &MitmPolicyContext,
-) -> Result<Option<Response>> {
-    match evaluate_mitm_policy(req, policy).await? {
-        MitmPolicyDecision::Allow { .. } => Ok(None),
-        MitmPolicyDecision::Block(response) => Ok(Some(response)),
-    }
-}
-
 async fn evaluate_mitm_policy(
     req: &Request,
     policy: &MitmPolicyContext,

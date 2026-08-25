@@ -9,12 +9,10 @@ use codex_experimental_api_macros::ExperimentalApi;
 pub use codex_protocol::protocol::ReasoningPolicyHistory;
 use codex_protocol::protocol::SessionSource as CoreSessionSource;
 use codex_protocol::protocol::SubAgentSource as CoreSubAgentSource;
-use codex_protocol::protocol::ThreadHistoryMode as CoreThreadHistoryMode;
-use codex_protocol::protocol::ThreadSource as CoreThreadSource;
+pub use codex_protocol::protocol::ThreadHistoryMode;
+pub use codex_protocol::protocol::ThreadSource;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use schemars::JsonSchema;
-use schemars::r#gen::SchemaGenerator;
-use schemars::schema::Schema;
 use serde::Deserialize;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -65,90 +63,6 @@ impl From<SessionSource> for CoreSessionSource {
             SessionSource::Custom(source) => CoreSessionSource::Custom(source),
             SessionSource::SubAgent(sub) => CoreSessionSource::SubAgent(sub),
             SessionSource::Unknown => CoreSessionSource::Unknown,
-        }
-    }
-}
-
-#[derive(Default, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "lowercase")]
-#[ts(rename_all = "lowercase", export_to = "v2/")]
-pub enum ThreadHistoryMode {
-    #[default]
-    Legacy,
-    Paginated,
-}
-
-impl From<CoreThreadHistoryMode> for ThreadHistoryMode {
-    fn from(value: CoreThreadHistoryMode) -> Self {
-        match value {
-            CoreThreadHistoryMode::Legacy => Self::Legacy,
-            CoreThreadHistoryMode::Paginated => Self::Paginated,
-        }
-    }
-}
-
-impl From<ThreadHistoryMode> for CoreThreadHistoryMode {
-    fn from(value: ThreadHistoryMode) -> Self {
-        match value {
-            ThreadHistoryMode::Legacy => Self::Legacy,
-            ThreadHistoryMode::Paginated => Self::Paginated,
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, TS)]
-#[serde(try_from = "String", into = "String")]
-#[ts(type = "string")]
-#[ts(export_to = "v2/")]
-pub enum ThreadSource {
-    User,
-    Subagent,
-    Feature(String),
-    MemoryConsolidation,
-}
-
-impl JsonSchema for ThreadSource {
-    fn schema_name() -> String {
-        "ThreadSource".to_string()
-    }
-
-    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
-        String::json_schema(generator)
-    }
-}
-
-impl TryFrom<String> for ThreadSource {
-    type Error = String;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        value.parse::<CoreThreadSource>().map(Into::into)
-    }
-}
-
-impl From<ThreadSource> for String {
-    fn from(value: ThreadSource) -> Self {
-        CoreThreadSource::from(value).into()
-    }
-}
-
-impl From<CoreThreadSource> for ThreadSource {
-    fn from(value: CoreThreadSource) -> Self {
-        match value {
-            CoreThreadSource::User => ThreadSource::User,
-            CoreThreadSource::Subagent => ThreadSource::Subagent,
-            CoreThreadSource::Feature(feature) => ThreadSource::Feature(feature),
-            CoreThreadSource::MemoryConsolidation => ThreadSource::MemoryConsolidation,
-        }
-    }
-}
-
-impl From<ThreadSource> for CoreThreadSource {
-    fn from(value: ThreadSource) -> Self {
-        match value {
-            ThreadSource::User => CoreThreadSource::User,
-            ThreadSource::Subagent => CoreThreadSource::Subagent,
-            ThreadSource::Feature(feature) => CoreThreadSource::Feature(feature),
-            ThreadSource::MemoryConsolidation => CoreThreadSource::MemoryConsolidation,
         }
     }
 }

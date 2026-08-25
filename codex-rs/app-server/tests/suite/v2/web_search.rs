@@ -36,10 +36,8 @@ use wiremock::matchers::path;
 
 // macOS and Windows CI can spend tens of seconds starting app-server
 // subprocesses or processing test RPCs under load.
-#[cfg(any(target_os = "macos", windows))]
+
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
-#[cfg(not(any(target_os = "macos", windows)))]
-const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[tokio::test]
 async fn standalone_web_search_round_trips_output() -> Result<()> {
@@ -170,8 +168,18 @@ async fn standalone_web_search_round_trips_output() -> Result<()> {
         }))
     );
 
+    let mut function_call_output = requests[1].function_call_output(call_id);
+    let output_id = function_call_output
+        .get("id")
+        .and_then(Value::as_str)
+        .context("function call output should have a stable id")?;
+    assert!(output_id.starts_with("fco_"));
+    function_call_output
+        .as_object_mut()
+        .context("function call output should be an object")?
+        .remove("id");
     assert_eq!(
-        responses::strip_metadata_from_json(requests[1].function_call_output(call_id)),
+        responses::strip_metadata_from_json(function_call_output),
         json!({
             "type": "function_call_output",
             "call_id": call_id,

@@ -52,6 +52,7 @@ use crate::terminal_hyperlinks::web_destination;
 use crate::wrapping::RtOptions;
 use crate::wrapping::adaptive_wrap_line;
 use crate::wrapping::word_wrap_line;
+use codex_config::types::UriBasedFileOpener;
 use codex_utils_string::normalize_markdown_hash_location_suffix;
 use dirs::home_dir;
 use pulldown_cmark::Alignment;
@@ -320,11 +321,25 @@ pub(crate) fn render_markdown_lines_with_width_and_cwd(
     width: Option<usize>,
     cwd: Option<&Path>,
 ) -> Vec<HyperlinkLine> {
+    render_markdown_lines_with_width_cwd_and_file_opener(
+        input,
+        width,
+        cwd,
+        UriBasedFileOpener::None,
+    )
+}
+
+pub(crate) fn render_markdown_lines_with_width_cwd_and_file_opener(
+    input: &str,
+    width: Option<usize>,
+    cwd: Option<&Path>,
+    file_opener: UriBasedFileOpener,
+) -> Vec<HyperlinkLine> {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TABLES);
     let parser = DecodedTextMerge::new(Parser::new_ext(input, options).into_offset_iter());
-    let mut w = Writer::new(input, parser, width, cwd);
+    let mut w = Writer::new(input, parser, width, cwd, file_opener);
     w.run();
     w.text
 }
@@ -387,6 +402,7 @@ where
     code_block_buffer: String,
     wrap_width: Option<usize>,
     cwd: Option<PathBuf>,
+    file_opener: UriBasedFileOpener,
     line_ends_with_local_link_target: bool,
     pending_local_link_soft_break: bool,
     current_line_content: Option<HyperlinkLine>,
@@ -401,7 +417,13 @@ impl<'a, I> Writer<'a, I>
 where
     I: Iterator<Item = (Event<'a>, Range<usize>)>,
 {
-    fn new(input: &'a str, iter: I, wrap_width: Option<usize>, cwd: Option<&Path>) -> Self {
+    fn new(
+        input: &'a str,
+        iter: I,
+        wrap_width: Option<usize>,
+        cwd: Option<&Path>,
+        file_opener: UriBasedFileOpener,
+    ) -> Self {
         Self {
             input,
             iter,
@@ -421,6 +443,7 @@ where
             code_block_buffer: String::new(),
             wrap_width,
             cwd: cwd.map(Path::to_path_buf),
+            file_opener,
             line_ends_with_local_link_target: false,
             pending_local_link_soft_break: false,
             current_line_content: None,
@@ -1784,14 +1807,27 @@ where
                     .copied()
                     .unwrap_or_default()
                     .patch(self.styles.code);
-                let span = Span::styled(local_target_display, style);
+                let destination = local_file_opener_destination(
+                    &link.destination,
+                    self.cwd.as_deref(),
+                    self.file_opener,
+                );
+                let mut annotated = HyperlinkLine::new(Line::default());
+                annotated.push_span(
+                    Span::styled(local_target_display, style),
+                    destination.as_deref(),
+                );
                 if self.in_table_cell() {
-                    self.push_span_to_table_cell(span);
+                    if let Some(table_state) = self.table_state.as_mut()
+                        && let Some(cell) = table_state.current_cell.as_mut()
+                    {
+                        cell.push_annotated(annotated);
+                    }
                 } else {
                     if self.pending_marker_line {
                         self.push_line(Line::default());
                     }
-                    self.push_span(span);
+                    self.push_annotated(annotated);
                     self.line_ends_with_local_link_target = true;
                 }
             }
@@ -2014,6 +2050,44 @@ fn render_local_link_target(dest_url: &str, cwd: Option<&Path>) -> Option<String
         rendered.push_str(&location_suffix);
     }
     Some(rendered)
+}
+
+fn local_file_opener_destination(
+    dest_url: &str,
+    cwd: Option<&Path>,
+    file_opener: UriBasedFileOpener,
+) -> Option<String> {
+    let scheme = file_opener.get_scheme()?;
+    let (path_text, location_suffix) = parse_local_link_target(dest_url)?;
+    if path_text.chars().any(char::is_control) {
+        return None;
+    }
+
+    let absolute_path = if is_absolute_local_link_path(&path_text) {
+        path_text
+    } else {
+        let cwd = cwd?;
+        normalize_local_link_path_text(&cwd.join(path_text).to_string_lossy())
+    };
+    let uri_path = if matches!(
+        absolute_path.as_bytes(),
+        [drive, b':', b'/', ..] if drive.is_ascii_alphabetic()
+    ) {
+        format!("/{absolute_path}")
+    } else {
+        absolute_path
+    };
+    let mut destination = Url::parse(&format!("{scheme}://file/")).ok()?;
+    destination.set_path(&uri_path);
+    let mut destination = destination.to_string();
+    if let Some(location_suffix) = location_suffix {
+        let start = location_suffix
+            .split(['-', '–'])
+            .next()
+            .unwrap_or(&location_suffix);
+        destination.push_str(start);
+    }
+    Some(destination)
 }
 
 /// Split a local-link destination into `(normalized_path_text, location_suffix)`.
@@ -2404,7 +2478,13 @@ mod tests {
         cell.hard_break();
         cell.push_span("second line".into());
 
-        let writer = W::new("", std::iter::empty(), Some(80), /*cwd*/ None);
+        let writer = W::new(
+            "",
+            std::iter::empty(),
+            Some(80),
+            /*cwd*/ None,
+            UriBasedFileOpener::None,
+        );
         let wrapped = writer.wrap_cell(&cell, /*width*/ 40);
         let rendered = wrapped
             .iter()
@@ -2686,6 +2766,35 @@ mod tests {
                 .iter()
                 .all(|link| link.destination == "https://example.com/reference")
         );
+    }
+
+    #[test]
+    fn configured_file_opener_controls_local_link_annotations() {
+        let markdown = "See [source](/workspace/src/main.rs#L12C3-L14C9).";
+        let cursor_lines = render_markdown_lines_with_width_cwd_and_file_opener(
+            markdown,
+            /*width*/ Some(80),
+            /*cwd*/ None,
+            UriBasedFileOpener::Cursor,
+        );
+        let cursor_destinations = cursor_lines
+            .iter()
+            .flat_map(|line| line.hyperlinks.iter().map(|link| link.destination.as_str()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            cursor_destinations,
+            vec!["cursor://file/workspace/src/main.rs:12:3"]
+        );
+
+        let disabled_lines = render_markdown_lines_with_width_cwd_and_file_opener(
+            markdown,
+            /*width*/ Some(80),
+            /*cwd*/ None,
+            UriBasedFileOpener::None,
+        );
+        assert!(disabled_lines.iter().all(|line| line.hyperlinks.is_empty()));
+        assert_eq!(visible_lines(cursor_lines), visible_lines(disabled_lines));
     }
 
     #[test]

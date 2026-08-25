@@ -244,14 +244,21 @@ impl UnifiedExecProcess {
     }
 
     pub(super) fn finish_termination(&self) {
-        if let Some(output_task) = &self.output_task {
-            output_task.abort();
+        match &self.process_handle {
+            ProcessHandle::Local(process_handle) => {
+                // Closing the PTY helpers drops the output senders. Let the output task observe
+                // that closure so it can finalize the raw-output artifact before publishing the
+                // output-closed lifecycle signal.
+                process_handle.finish();
+            }
+            ProcessHandle::ExecServer(_) => {
+                if let Some(output_task) = &self.output_task {
+                    output_task.abort();
+                }
+                self.output_closed.store(true, Ordering::Release);
+                self.output_closed_notify.notify_waiters();
+            }
         }
-        if let ProcessHandle::Local(process_handle) = &self.process_handle {
-            process_handle.finish();
-        }
-        self.output_closed.store(true, Ordering::Release);
-        self.output_closed_notify.notify_waiters();
         self.cancellation_token.cancel();
     }
 

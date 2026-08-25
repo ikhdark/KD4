@@ -12,11 +12,13 @@ use super::helpers::distinct_thread_metadata_title;
 use super::helpers::set_thread_name_from_title;
 use super::helpers::stored_thread_from_rollout_item;
 use super::helpers::thread_item_titles;
+use super::read_thread::stored_thread_from_sqlite_metadata;
 use crate::ListThreadsParams;
 use crate::SortDirection;
 use crate::StoredThread;
 use crate::ThreadListStorageMode;
 use crate::ThreadPage;
+#[cfg(test)]
 use crate::ThreadRelationFilter;
 use crate::ThreadSortKey;
 use crate::ThreadStoreError;
@@ -42,6 +44,7 @@ pub(super) async fn list_threads(
         .map(parse_bound_cursor)
         .transpose()?;
     let state_db = store.state_db().await;
+    let hydration_db = state_db.clone();
     let rollout_config = RolloutConfig {
         codex_home: store.config.codex_home.clone(),
         sqlite_home: store.config.sqlite_home.clone(),
@@ -64,17 +67,28 @@ pub(super) async fn list_threads(
         .map(|cursor| encode_rollout_cursor(storage_path, cursor))
         .transpose()?;
     let (mut names, resolved_title_ids) = thread_item_titles(&page.items);
-    let mut items = page
-        .items
-        .into_iter()
-        .filter_map(|item| {
-            stored_thread_from_rollout_item(
-                item,
-                params.archived,
-                store.config.default_model_provider_id.as_str(),
-            )
-        })
-        .collect::<Vec<_>>();
+    let mut items = Vec::with_capacity(page.items.len());
+    for item in page.items {
+        let Some(mut thread) = stored_thread_from_rollout_item(
+            item,
+            params.archived,
+            store.config.default_model_provider_id.as_str(),
+        ) else {
+            continue;
+        };
+        let relation_parent_thread_id = thread.parent_thread_id;
+        if let Some(state_db_ctx) = hydration_db.as_deref()
+            && let Ok(Some(metadata)) = state_db_ctx.get_thread(thread.thread_id).await
+            && let Ok(authoritative_thread) =
+                stored_thread_from_sqlite_metadata(store, metadata).await
+        {
+            thread = authoritative_thread;
+            if params.relation_filter.is_some() {
+                thread.parent_thread_id = relation_parent_thread_id;
+            }
+        }
+        items.push(thread);
+    }
 
     let thread_ids = items
         .iter()
@@ -192,8 +206,8 @@ pub(super) async fn list_rollout_threads_for_storage(
     cursor: Option<&codex_rollout::Cursor>,
     storage_path: ThreadListStoragePath,
 ) -> ThreadStoreResult<codex_rollout::ThreadsPage> {
-    let sort_key = rollout_sort_key(params.sort_key);
-    let sort_direction = rollout_sort_direction(params.sort_direction);
+    let sort_key = params.sort_key;
+    let sort_direction = params.sort_direction;
     if let Some(relation_filter) = params.relation_filter {
         if storage_path != ThreadListStoragePath::StateDb {
             return Err(ThreadStoreError::InvalidRequest {
@@ -201,15 +215,7 @@ pub(super) async fn list_rollout_threads_for_storage(
                     .to_string(),
             });
         }
-        let relation_filter = match relation_filter {
-            ThreadRelationFilter::DirectChildrenOf(parent_thread_id) => {
-                codex_state::ThreadRelationFilter::DirectChildrenOf(parent_thread_id)
-            }
-            ThreadRelationFilter::DescendantsOf(ancestor_thread_id) => {
-                codex_state::ThreadRelationFilter::DescendantsOf(ancestor_thread_id)
-            }
-        };
-        let page = codex_rollout::state_db::list_threads_db(
+        let page = codex_rollout::state_integration::list_threads_db(
             state_db.as_deref(),
             config.codex_home.as_path(),
             params.page_size,
@@ -294,21 +300,6 @@ pub(super) async fn list_rollout_threads_for_storage(
     page.map_err(|err| ThreadStoreError::Internal {
         message: format!("failed to list threads: {err}"),
     })
-}
-
-fn rollout_sort_key(sort_key: ThreadSortKey) -> codex_rollout::ThreadSortKey {
-    match sort_key {
-        ThreadSortKey::CreatedAt => codex_rollout::ThreadSortKey::CreatedAt,
-        ThreadSortKey::UpdatedAt => codex_rollout::ThreadSortKey::UpdatedAt,
-        ThreadSortKey::RecencyAt => codex_rollout::ThreadSortKey::RecencyAt,
-    }
-}
-
-fn rollout_sort_direction(sort_direction: SortDirection) -> codex_rollout::SortDirection {
-    match sort_direction {
-        SortDirection::Asc => codex_rollout::SortDirection::Asc,
-        SortDirection::Desc => codex_rollout::SortDirection::Desc,
-    }
 }
 
 fn storage_path_for_request(
@@ -424,8 +415,10 @@ fn backwards_cursor_position(
 mod tests {
     use chrono::Utc;
     use codex_protocol::ThreadId;
+    use codex_protocol::openai_models::ReasoningEffort;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::ThreadHistoryMode;
+    use codex_protocol::protocol::ThreadSource;
     use pretty_assertions::assert_eq;
     use std::fs;
     use tempfile::TempDir;
@@ -786,6 +779,9 @@ mod tests {
         metadata.title = "needle title".to_string();
         metadata.first_user_message = Some("plain preview".to_string());
         metadata.preview = metadata.first_user_message.clone();
+        metadata.thread_source = Some(ThreadSource::Subagent);
+        metadata.model = Some("persisted-model".to_string());
+        metadata.reasoning_effort = Some(ReasoningEffort::High);
         runtime
             .upsert_thread(&metadata)
             .await
@@ -819,6 +815,9 @@ mod tests {
             Some("plain preview")
         );
         assert_eq!(page.items[0].name.as_deref(), Some("needle title"));
+        assert_eq!(page.items[0].thread_source, Some(ThreadSource::Subagent));
+        assert_eq!(page.items[0].model.as_deref(), Some("persisted-model"));
+        assert_eq!(page.items[0].reasoning_effort, Some(ReasoningEffort::High));
     }
 
     #[tokio::test]

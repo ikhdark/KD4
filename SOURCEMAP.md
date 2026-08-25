@@ -49,7 +49,7 @@ an SDK, schema, package, installed binary, or Codex Desktop.
 Update it in the same change whenever the repository materially changes.
 
 <!-- BEGIN TRACKED PATH SNAPSHOT -->
-Tracked repository path snapshot: `count=17260 sha256=27391419c6d166c5298ecc32d7001fb00540fed4876fdc4d447a030a47d98d49`.
+Tracked repository path snapshot: `count=4964 sha256=9141878c8cfaae819b100d0d145a102201b7e0b2b0d6d78bc976e1df88e78934`.
 <!-- END TRACKED PATH SNAPSHOT -->
 
 Every repository file or directory add, delete, move, or rename also requires
@@ -151,10 +151,8 @@ below.
 | Path | Owns |
 | --- | --- |
 | `.codex/` | Repo-local Codex configuration, environment setup, durable harness material, fork-local skills, and workspace policy |
-| `.devcontainer/` | Development-container image, bootstrap, and container-local Codex installation inputs |
 | `.vscode/` | Checked-in editor and workspace defaults |
 | `architecture_index.json` | Generated, manifest-keyed source-owner relationship graph consumed by task-scoped architecture discovery |
-| `bugs/` | Historical bug, audit, and evidence corpus organized by implementation language and audit date; records are evidence, not implementation source |
 | `codex-cli/` | npm-facing `@openai/codex` wrapper, native binary discovery, and npm package inputs |
 | `codex-rs/` | Primary Rust workspace and nearly all CLI, runtime, app-server, TUI, tool, protocol, state, plugin, extension, and sandbox behavior |
 | `docs/` | Checked-in documentation contracts and schemas, including investigation-evidence interchange |
@@ -167,8 +165,7 @@ below.
 | `.markdownlint-cli2.yaml`, `.prettierignore`, `.prettierrc.toml` | Markdown and Prettier formatting policy |
 | `.npmrc` | npm and pnpm behavior used by the JavaScript workspace |
 | `AGENTS.md`, `SOURCEMAP.md` | Repository-wide editing policy and this cross-cutting ownership contract, including the complete `codex-rs` edit and upstream-sync classification |
-| `CHANGELOG.md`, `LICENSE`, `NOTICE` | Release history and legal notices |
-| `flake.nix`, `flake.lock` | Nix development/build environment and its locked inputs |
+| `LICENSE`, `NOTICE` | Legal notices |
 | `justfile`, `kd4_features.toml`, `source_owners.toml` | Preferred command router, KD4 feature inventory, and machine-readable source ownership routing |
 | `package.json`, `pnpm-lock.yaml`, `pnpm-workspace.yaml` | Root maintenance commands, JavaScript dependency state, and workspace membership |
 
@@ -193,7 +190,7 @@ below.
 | --- | --- | --- |
 | npm `codex` launcher | `codex-cli/bin/codex.js` | `codex-cli/package.json`, staged native packages, platform binary discovery |
 | Rust multitool CLI | `codex-rs/cli/src/main.rs` | CLI dispatch, login/auth, plugin/marketplace commands, TUI, exec, app-server, MCP, sandbox setup |
-| CLI library support | `codex-rs/cli/src/lib.rs` | shared build info and exit-status helpers |
+| CLI library support | `codex-rs/cli/src/lib.rs` | `codex-rs/utils/build-info`, exit-status helpers |
 | Interactive TUI | `codex-rs/tui/src/main.rs` | `codex-rs/tui/src/lib.rs`, app/session routing, chat widget, bottom pane, core/protocol |
 | Headless execution | `codex-rs/exec/src/main.rs` | `codex-rs/exec`, core, protocol, JSONL/event output |
 | App server | `codex-rs/app-server/src/main.rs` | app-server library, protocol, transport, daemon, core |
@@ -204,7 +201,6 @@ below.
 | Responses API proxy | `codex-rs/responses-api-proxy/src/main.rs` | Rust proxy library and `codex-rs/responses-api-proxy/npm/bin/codex-responses-api-proxy.js` |
 | File search CLI | `codex-rs/file-search/src/main.rs` | file-search library and TUI/core consumers |
 | Patch application helper | `codex-rs/apply-patch/src/main.rs` | apply-patch parser/library and core tool wiring |
-| Linux sandbox helper | `codex-rs/linux-sandbox/src/main.rs` | sandboxing policy and Bubblewrap helper |
 | Windows sandbox setup | `codex-rs/windows-sandbox-rs/src/bin/setup_main/main.rs` | Windows sandbox installation and policy |
 | Windows command runner | `codex-rs/windows-sandbox-rs/src/bin/command_runner/main.rs` | sandboxed Windows process execution |
 | State log client | `codex-rs/state/src/bin/logs_client.rs` | state DB log queries and `just log` |
@@ -221,19 +217,19 @@ below.
 | Workspace and repository tooling | `codex-rs`, `tools/argument-comment-lint` |
 | CLI, authentication, home, and install context | `codex-rs/arg0`, `codex-rs/aws-auth`, `codex-rs/cli`, `codex-rs/codex-home`, `codex-rs/install-context`, `codex-rs/keyring-store`, `codex-rs/login`, `codex-rs/secrets` |
 | Interactive and headless clients | `codex-rs/tui`, `codex-rs/exec` |
-| Core runtime, configuration, context, and prompts | `codex-rs/collaboration-mode-templates`, `codex-rs/config`, `codex-rs/context-fragments`, `codex-rs/core`, `codex-rs/core/tests/common`, `codex-rs/core-api`, `codex-rs/features`, `codex-rs/prompts` |
-| App server and shared protocol | `codex-rs/app-server`, `codex-rs/app-server/tests/common`, `codex-rs/app-server-client`, `codex-rs/app-server-daemon`, `codex-rs/app-server-protocol`, `codex-rs/app-server-test-client`, `codex-rs/app-server-transport`, `codex-rs/protocol` |
+| Core runtime, configuration, context, and prompts | `codex-rs/config`, `codex-rs/context-fragments`, `codex-rs/core`, `codex-rs/core/tests/common`, `codex-rs/features`, `codex-rs/prompts` |
+| App server and shared protocol | `codex-rs/app-server`, `codex-rs/app-server/tests/common`, `codex-rs/app-server-client`, `codex-rs/app-server-protocol`, `codex-rs/app-server-test-client`, `codex-rs/app-server-transport`, `codex-rs/protocol` |
 | Code mode | `codex-rs/code-mode`, `codex-rs/code-mode-host`, `codex-rs/code-mode-protocol` |
-| Tools, shell, exec policy, and hooks | `codex-rs/apply-patch`, `codex-rs/exec-server`, `codex-rs/exec-server-protocol`, `codex-rs/execpolicy`, `codex-rs/execpolicy-legacy`, `codex-rs/file-search`, `codex-rs/file-system`, `codex-rs/file-watcher`, `codex-rs/hooks`, `codex-rs/shell-command`, `codex-rs/shell-escalation`, `codex-rs/terminal-detection`, `codex-rs/tools` |
-| Sandbox, network policy, and process hardening | `codex-rs/bwrap`, `codex-rs/linux-sandbox`, `codex-rs/network-proxy`, `codex-rs/process-hardening`, `codex-rs/sandboxing`, `codex-rs/windows-sandbox-rs` |
+| Tools, shell, exec policy, and hooks | `codex-rs/apply-patch`, `codex-rs/exec-server`, `codex-rs/exec-server-protocol`, `codex-rs/execpolicy`, `codex-rs/file-search`, `codex-rs/file-system`, `codex-rs/file-watcher`, `codex-rs/hooks`, `codex-rs/shell-command`, `codex-rs/terminal-detection`, `codex-rs/tools` |
+| Sandbox, network policy, and process hardening | `codex-rs/network-proxy`, `codex-rs/process-hardening`, `codex-rs/sandboxing`, `codex-rs/windows-sandbox-rs` |
 | State, threads, rollouts, history, and memories | `codex-rs/agent-task-store`, `codex-rs/memories/read`, `codex-rs/memories/write`, `codex-rs/message-history`, `codex-rs/rollout`, `codex-rs/rollout-trace`, `codex-rs/state`, `codex-rs/thread-store` |
-| Models, backend clients, and network transports | `codex-rs/backend-client`, `codex-rs/chatgpt`, `codex-rs/codex-api`, `codex-rs/codex-backend-openapi-models`, `codex-rs/codex-client`, `codex-rs/http-client`, `codex-rs/lmstudio`, `codex-rs/model-provider`, `codex-rs/model-provider-info`, `codex-rs/models-manager`, `codex-rs/ollama`, `codex-rs/realtime-webrtc`, `codex-rs/responses-api-proxy`, `codex-rs/websocket-client` |
+| Models, backend clients, and network transports | `codex-rs/backend-client`, `codex-rs/chatgpt`, `codex-rs/codex-api`, `codex-rs/codex-backend-openapi-models`, `codex-rs/codex-client`, `codex-rs/http-client`, `codex-rs/lmstudio`, `codex-rs/model-provider`, `codex-rs/model-provider-info`, `codex-rs/models-manager`, `codex-rs/ollama`, `codex-rs/responses-api-proxy`, `codex-rs/websocket-client` |
 | Plugins, skills, connectors, and MCP | `codex-rs/codex-mcp`, `codex-rs/connectors`, `codex-rs/core-plugins`, `codex-rs/core-skills`, `codex-rs/mcp-server`, `codex-rs/mcp-server/tests/common`, `codex-rs/plugin`, `codex-rs/rmcp-client`, `codex-rs/skills` |
 | Extension API and built-in extensions | `codex-rs/ext/connectors`, `codex-rs/ext/extension-api`, `codex-rs/ext/goal`, `codex-rs/ext/guardian`, `codex-rs/ext/image-generation`, `codex-rs/ext/items`, `codex-rs/ext/mcp`, `codex-rs/ext/memories`, `codex-rs/ext/skills`, `codex-rs/ext/web-search` |
 | Cloud and external agents | `codex-rs/agent-graph-store`, `codex-rs/agent-identity`, `codex-rs/cloud-config`, `codex-rs/cloud-tasks`, `codex-rs/cloud-tasks-client`, `codex-rs/cloud-tasks-mock-client`, `codex-rs/external-agent-migration`, `codex-rs/external-agent-sessions` |
 | Telemetry, feedback, and diagnostics | `codex-rs/analytics`, `codex-rs/feedback`, `codex-rs/otel`, `codex-rs/response-debug-context` |
-| Support crates, samples, and narrow binaries | `codex-rs/ansi-escape`, `codex-rs/async-utils`, `codex-rs/codex-experimental-api-macros`, `codex-rs/git-utils`, `codex-rs/stdio-to-uds`, `codex-rs/test-binary-support`, `codex-rs/thread-manager-sample`, `codex-rs/uds`, `codex-rs/v8-poc` |
-| Shared utility crates | `codex-rs/utils/absolute-path`, `codex-rs/utils/approval-presets`, `codex-rs/utils/cache`, `codex-rs/utils/cargo-bin`, `codex-rs/utils/cli`, `codex-rs/utils/elapsed`, `codex-rs/utils/fuzzy-match`, `codex-rs/utils/home-dir`, `codex-rs/utils/image`, `codex-rs/utils/json-to-toml`, `codex-rs/utils/oss`, `codex-rs/utils/output-truncation`, `codex-rs/utils/path-uri`, `codex-rs/utils/path-utils`, `codex-rs/utils/plugins`, `codex-rs/utils/pty`, `codex-rs/utils/readiness`, `codex-rs/utils/rustls-provider`, `codex-rs/utils/sandbox-summary`, `codex-rs/utils/sleep-inhibitor`, `codex-rs/utils/stream-parser`, `codex-rs/utils/string`, `codex-rs/utils/template` |
+| Support crates and narrow binaries | `codex-rs/async-utils`, `codex-rs/codex-experimental-api-macros`, `codex-rs/git-utils`, `codex-rs/stdio-to-uds`, `codex-rs/test-binary-support`, `codex-rs/uds` |
+| Shared utility crates | `codex-rs/utils/absolute-path`, `codex-rs/utils/cache`, `codex-rs/utils/cargo-bin`, `codex-rs/utils/cli`, `codex-rs/utils/home-dir`, `codex-rs/utils/image`, `codex-rs/utils/oss`, `codex-rs/utils/output-truncation`, `codex-rs/utils/path-uri`, `codex-rs/utils/pty`, `codex-rs/utils/rustls-provider`, `codex-rs/utils/sandbox-summary`, `codex-rs/utils/stream-parser`, `codex-rs/utils/string`, `codex-rs/utils/template` |
 
 ## Rust edit and upstream synchronization boundaries
 
@@ -253,14 +249,13 @@ The audited upstream baseline is OpenAI Codex `main`
 
 ### Protected source: exact upstream mirrors
 
-These four paths, and only these four paths, are exact mirrors:
+These three paths, and only these three paths, are exact mirrors:
 
 | Path | Why it is protected |
 | --- | --- |
 | `codex-rs/backend-client/` | Backend HTTP plumbing, not model-request or harness behavior |
 | `codex-rs/codex-backend-openapi-models/` | Upstream-generated models and wrapper consumed by `backend-client` |
 | `codex-rs/login/` | Stable authentication acquisition, refresh, storage, and callback boundary |
-| `codex-rs/vendor/` | Third-party Bubblewrap source and its Codex build metadata |
 
 ### Mixed areas: editable parents and workflow-managed children
 
@@ -273,7 +268,7 @@ upstream independently.
 | `codex-rs/cli/` | Checked-in `*.snap` test snapshots | Regenerate through the owning snapshot test and review the resulting diff |
 | `codex-rs/config/` | `src/thread_config/proto/codex.thread_config.v1.rs` | `just generate-config-proto-check`; intentional regeneration uses `just generate-config-proto` |
 | `codex-rs/core/` | `config.schema.json` and checked-in `*.snap` test snapshots | Use `just config-schema-check` or the owning snapshot test; intentional schema regeneration uses `just config-schema-regenerate <owner>` |
-| `codex-rs/exec-server/` | `src/proto/codex.exec_server.relay.v1.rs` | No recipe is checked in; first restore a reproducible generator and check |
+| `codex-rs/exec-server/` | `src/proto/codex.exec_server.relay.v1.rs` | `just generate-exec-server-relay-proto-check`; intentional regeneration uses `just generate-exec-server-relay-proto` |
 | `codex-rs/hooks/` | `schema/generated/` | Run focused hook tests; intentional regeneration uses `just write-hooks-schema` |
 | `codex-rs/tui/` | Checked-in `*.snap` test snapshots | Regenerate through the owning snapshot test and review the resulting UI diff |
 
@@ -295,7 +290,6 @@ revalidate tree equality, generated outputs, and affected callers on every sync.
 | Manifest | Owns |
 | --- | --- |
 | `package.json` | Root formatting, Python maintenance dispatch, dependency policy, and JavaScript toolchain pins |
-| `.devcontainer/codex-install/package.json` | Dev-container Codex installation helper |
 | `codex-cli/package.json` | Published npm CLI wrapper |
 | `codex-rs/responses-api-proxy/npm/package.json` | npm wrapper for the Responses API proxy |
 | `sdk/typescript/package.json` | TypeScript SDK package |
@@ -314,10 +308,14 @@ revalidate tree equality, generated outputs, and affected callers on every sync.
 | Model-visible context | `codex-rs/core/src/context`, `codex-rs/core/src/context_manager`, `codex-rs/prompts` | context fragments, skills/plugins/apps instructions, compaction, prompt snapshots |
 | Model requests and retries | `codex-rs/core/src/client.rs` | model-provider, backend/client crates, auth, telemetry, response debug context |
 | Tool planning and dispatch | `codex-rs/core/src/tools`, `codex-rs/tools` | built-in handlers, extension tools, MCP calls, approvals, shell and sandbox owners |
+| Durable plan state | `codex-rs/core/src/plan_store.rs`, `codex-rs/core/src/tools/handlers/plan.rs` | plan tool schema, reasoning governor, task-evidence acknowledgement |
 | Retained command output | `codex-rs/core/src/tools/command_output_artifact.rs` | unified exec and shell producers, `ExecCommandToolOutput` model/code-mode projection, opaque current-thread `read_tool_output` handler/spec, generic retention and receipt-scoped protected evidence-artifact lifecycle |
 | Command retry and validation reuse | `codex-rs/core/src/tools/command_execution.rs` | session initialization, content-identified `CODEX_HOME/command-execution-cache` persistence, retained validation artifacts, shell/unified-exec producers, repository mutation epochs |
-| Task and external evidence ledger | `codex-rs/core/src/task_evidence.rs` | session initialization, KD4 completion-only plan acknowledgement and mutation reopening, repository-contained current generated-artifact checks, direct MCP handler receipt capture, thread-scoped output artifacts for oversized canonical payloads |
-| Shell execution and approvals | `codex-rs/core/src/exec.rs`, `codex-rs/core/src/exec_policy.rs` | shell-command, shell-escalation, execpolicy, sandboxing, platform sandboxes |
+| Task evidence ledger | `codex-rs/core/src/task_evidence.rs` | session initialization, completion admission, plan acknowledgement, mutation reopening, generated-artifact checks |
+| Desktop activation evidence protocol | `codex-rs/core/src/task_evidence/desktop_activation.rs` | `codex-rs/core/src/codex_thread.rs`, app-server Desktop activation callers, task-evidence persistence |
+| External MCP evidence protocol | `codex-rs/core/src/task_evidence/external_evidence.rs` | MCP handler receipt capture, canonical oversized-payload artifacts, task-evidence persistence |
+| Runtime source-owner projection | `codex-rs/core/src/task_evidence/source_owner_index.rs` | `source_owners.toml`, task-evidence plan and validation ownership derivation |
+| Shell execution and approvals | `codex-rs/core/src/exec.rs`, `codex-rs/core/src/exec_policy.rs` | shell-command, execpolicy, sandboxing, Windows sandbox |
 | Configuration resolution | `codex-rs/config`, `codex-rs/core/src/config`, `codex-rs/features` | profiles, permissions, requirements, hooks, MCP, schema generator, consuming runtime |
 | Interactive presentation | `codex-rs/tui/src/app.rs`, `codex-rs/tui/src/chatwidget.rs` | app-server session bridge, bottom pane, history cells, protocol conversion, snapshots |
 | App-server request lifecycle | `codex-rs/app-server/src/lib.rs` | request processors, thread/turn state, app-server protocol, core runtime, transport |
@@ -355,6 +353,7 @@ hook engine and policy surface, not a substitute for the typed extension API.
 | --- | --- | --- |
 | In-memory session and turn state | `codex-rs/core/src/session`, `codex-rs/core/src/state` | core tasks, TUI, app-server, extension stores |
 | SQLite state and migrations | `codex-rs/state/src`, especially `migrations.rs` and `runtime` | thread lists, goals, logs, memories, agent jobs, recovery |
+| Rollout-to-SQLite integration | `codex-rs/rollout/src/state_integration.rs` | process initialization, rollout backfill and reconciliation, filesystem fallback |
 | Thread indexing and lookup | `codex-rs/thread-store` | CLI/TUI resume paths and app-server thread APIs |
 | Rollout recording | `codex-rs/rollout` | persisted JSONL session history and replay/resume consumers |
 | Rollout tracing | `codex-rs/rollout-trace` | diagnostics and execution tracing |
@@ -374,7 +373,9 @@ owner must trace every reader and writer before completion.
 | App-server schema tree | `codex-rs/app-server-protocol/schema` | Generated output; never hand-edit; inspect the generator-produced diff |
 | Config schema | `codex-rs/config`, `codex-rs/features`, `codex-rs/core` | Focused config/core tests plus check-only `just config-schema-check`; intentional regeneration uses serialized `just config-schema-regenerate <owner>` and outputs `codex-rs/core/config.schema.json` |
 | Thread-config protobuf binding | `codex-rs/config/src/thread_config/proto/codex.thread_config.v1.proto` | `just generate-config-proto-check`; intentional regeneration uses `just generate-config-proto` |
+| Exec-server relay protobuf binding | `codex-rs/exec-server/src/proto/codex.exec_server.relay.v1.proto` | `just generate-exec-server-relay-proto-check`; intentional regeneration uses `just generate-exec-server-relay-proto` |
 | Hook schemas | `codex-rs/hooks/src` | Focused hook tests; intentional regeneration uses `just write-hooks-schema` and produces `codex-rs/hooks/schema/generated` |
+| Python SDK generated package | Fork-local app-server schema bundle under `codex-rs/app-server-protocol/schema/json` via `sdk/python/scripts/update_sdk_artifacts.py` | `generate-types` replaces the complete `src/openai_codex/generated` tree, including its initializer, and the focused Python SDK freshness test rejects drift, retired contracts, or abandoned files |
 | npm package layout | `codex-cli`, `scripts/stage_npm_packages.py`, `scripts/codex_package` | Staging/package tests, archive inspection, and the owning dry-run |
 | Cargo package membership and dependency state | Rust package manifests, `codex-rs/Cargo.toml`, `codex-rs/Cargo.lock` | Cargo owns the lock update; never hand-edit generated dependency state |
 | JavaScript workspace and dependency state | root/package manifests and `pnpm-workspace.yaml` | pnpm owns `pnpm-lock.yaml`; use the configured package-manager workflow |
@@ -388,17 +389,16 @@ owner must trace every reader and writer before completion.
 | Rust workspace build/test | `codex-rs/Cargo.toml`, `codex-rs/.cargo/config.toml`, `codex-rs/.config/nextest.toml`, root `justfile`, crate manifests | bounded local compiler/test fanout by default; focused crate check/test; use isolated lanes when parallel Rust work exists |
 | npm CLI wrapper staging | `codex-cli/bin/codex.js`, `codex-cli/package.json`, `scripts/stage_npm_packages.py` | wrapper lint, staging/package tests, platform layout inspection |
 | Canonical package archives | `scripts/codex_package` | package-local tests and archive/content checks |
-| Standalone installers | `scripts/install/install.sh`, `scripts/install/install.ps1` | installer tests, digest/layout/locking/PATH/migration behavior |
+| Standalone installer | `scripts/install/install.ps1` | installer tests, digest/layout/locking/PATH/migration behavior |
 | TypeScript SDK | `sdk/typescript` | `just sdk-ts-check` and package-facing type/tests |
 | Python SDK | `sdk/python` | focused `uv run pytest` and `uv run ruff check .` |
 | Python runtime package | `sdk/python-runtime` | focused runtime-package tests and lint |
-| Nix environment | `flake.nix`, `flake.lock` | Nix evaluation/build appropriate to the changed input |
-| Windows local publish | `scripts/publish-local-codex.ps1`, `just publish-local-codex-final` | dry-run argument proof, release build, doctor, backup/rollback guards, installed hash/version |
+| Windows local publish | `scripts/publish-local-codex.ps1`, `just publish-local-codex-final` | dry-run argument proof, one artifact-producing release build, doctor, backup/rollback guards, installed hash/version |
 | Desktop-visible completion | local publish output plus app-server/CLI runtime | publish final, restart Desktop, prove process path and binary hash/version, inspect initialize/model metadata, capture visible evidence |
-| Source-owner and architecture index refresh | `source_owners.toml`, `scripts/source_owners.py`, `scripts/architecture_comprehension_eval.py` | regenerate `architecture_index.json` and the marked `SOURCEMAP.md` block through the owner workflow; run source-owner freshness and architecture-recall checks |
+| Source-owner and architecture index refresh | `source_owners.toml`, `scripts/source_owners.py`, `scripts/test_source_owners.py` | regenerate `architecture_index.json` and the marked `SOURCEMAP.md` block through the owner workflow; run source-owner freshness and representative relationship-recall checks |
 | Generated schema freshness | `scripts/config_schema_check.py`, `scripts/app_server_schema_runtime_check.py`, `scripts/generated_output_lock.py` | use the owning check/regeneration command under the shared generated-output lock; never hand-edit generated schemas |
 | Shared-worktree workflow preflight | `scripts/workflow_preflight.py` | preserve manifest/lease, path and contract claims, dependencies, generated-output ownership, validation ownership, Cargo-lane routing, and machine-readable diagnostics |
-| KD4 audits, evaluation, and measurement | `scripts/kd4_sync_audit.py`, `scripts/kd4_model_attempt_analysis.py`, `scripts/kd4_perf_snapshot.py`, `scripts/architecture_comprehension_eval.py`, `scripts/investigation_evidence_smoke.py`, `scripts/investigation_eval` | matching fixture/unit test; keep audits non-mutating and distinguish measured subprocess wall time from startup-only timing, test duration, estimates, and stale binaries |
+| KD4 audits, evaluation, and measurement | `scripts/kd4_sync_audit.py`, `scripts/kd4_model_attempt_analysis.py`, `scripts/kd4_perf_snapshot.py`, `scripts/investigation_evidence_smoke.py`, `scripts/investigation_eval` | matching fixture/unit test; keep audits non-mutating and distinguish measured subprocess wall time from startup-only timing, test duration, estimates, and stale binaries |
 | Runtime binary selection proof | `scripts/vscode_runtime_proof.py` | read-only path, version, and environment evidence; binary replacement remains owned by the explicit publish/update flow |
 
 The expected installed target is
@@ -412,7 +412,7 @@ remain required.
 | Changed surface | Smallest owning proof |
 | --- | --- |
 | Source map or structural inventory | `python -m unittest scripts.test_source_map_check` and `just source-map-check` |
-| Source-owner manifest or architecture index | `python -m unittest scripts.test_source_owners scripts.test_architecture_comprehension_eval` and `just source-owners-check` |
+| Source-owner manifest or architecture index | `python -m unittest scripts.test_source_owners` and `just source-owners-check` |
 | Root or Python maintenance scripts | closest `python -m unittest scripts.test_<name>` plus syntax/lint appropriate to the script |
 | Shared-worktree workflow preflight | `python -m unittest scripts.test_workflow_preflight` |
 | KD4 audit, evaluation, or measurement script | closest matching `python -m unittest scripts.test_<name>` plus only the fixture/freshness check owned by the changed surface |
@@ -441,7 +441,7 @@ duplicated in the automatically loaded `codex-rs/AGENTS.md`.
 | File or text discovery | `rg --files`, `rg`, or `fd` when its path filtering is useful |
 | Structured source or data inspection | `ast-grep`, `jq`, `yq`, or the repository's configured parser |
 | Build and test entrypoints | Prefer the owning `just` recipe, then focused Cargo or `cargo nextest`; use an isolated lane when another Rust build is active |
-| Rust build diagnostics and target cleanup | `just rust-build-doctor`, `just target-disk`, and `just target-prune`; never prune while Rust jobs are active |
+| Rust build diagnostics and target cleanup | `just rust-build-doctor`, `just target-disk`, and `just target-prune`; `scripts/cargo_lane_patterns.json` is the canonical lane-command detection registry shared by the Python diagnostics and no-Python PowerShell adapter; never prune while Rust jobs are active |
 | Formatting and configured document checks | `cargo fmt --check`, `taplo`, `dprint`, and `git diff --check` as applicable |
 | Dependency health | `cargo shear`, `cargo audit`, or `cargo deny` when the accepted task touches that risk |
 | Performance or size measurement | `hyperfine` or `tokei` when measurement is part of the accepted task |
@@ -491,7 +491,7 @@ This map owns cross-cutting navigation and structural inventory.
 | Dependency or build-system change | owning manifest -> lock state -> workspace/recipe consumers -> focused build/test/package proof |
 | New top-level area, package, or instruction scope | add the owner and policy boundary -> update the machine-checked inventory in this file -> add routing/validation -> run `just source-map-check` |
 
-<!-- BEGIN KD4 SOURCE OWNERS schema=2 manifest_sha256=cfe5b481db6c34c607bef05d83b53c6e7cd196302857b20fc0fdb848add67ab9 -->
+<!-- BEGIN KD4 SOURCE OWNERS schema=2 manifest_sha256=0261a42e2585112e5ea6091da977aa85a2a2befcce4254fa7cc1c352f0c30e98 -->
 ### Managed KD4 source-owner index
 
 This table is generated by `scripts/source_owners.py`; edit `source_owners.toml`, not this block.
@@ -501,11 +501,17 @@ This table is generated by `scripts/source_owners.py`; edit `source_owners.toml`
 | `app-server-protocol-contracts` | `codex-rs/app-server-protocol` | `codex-rs/app-server-protocol/src/bin/write_schema_fixtures.rs::main` | `control_flow:calls` -> `path:codex-rs/app-server-protocol/src/schema_fixtures.rs`<br>`callers_consumers:consumed_by` -> `owner:app-server-runtime`<br>`runtime_registration:registers` -> `path:justfile`<br>+2 more | `compatibility:schema-source-parity` | `app-server-schema-focused` |
 | `app-server-runtime` | `codex-rs/app-server` | `codex-rs/app-server/src/lib.rs::run_main` | `callers_consumers:calls` -> `owner:core-agent-runtime`<br>`runtime_registration:registers` -> `path:codex-rs/app-server/src/lib.rs`<br>`tests_contracts:validated_by` -> `path:codex-rs/app-server/tests` | `compatibility:transport-dispatch-contract` | `app-server-focused` |
 | `cli-entrypoints` | `codex-rs/cli` | `codex-rs/cli/src/main.rs::main` | `control_flow:calls` -> `owner:app-server-runtime`<br>`runtime_registration:registers` -> `path:codex-rs/cli/src/main.rs` | `semantic:subcommand-dispatch` | `cli-focused` |
-| `core-agent-runtime` | `codex-rs/core/src` | `codex-rs/core/src/session/mod.rs::Codex` | `callers_consumers:consumed_by` -> `owner:app-server-runtime`<br>`configuration:gated_by` -> `owner:feature-registry`<br>`tests_contracts:validated_by` -> `path:codex-rs/core/tests` | `semantic:registered-tool-routing` | `core-focused` |
-| `feature-registry` | `codex-rs/features` | `codex-rs/features/src/lib.rs::Feature` | `configuration:reads_config` -> `config:kd4_features.toml`<br>`callers_consumers:consumed_by` -> `owner:core-agent-runtime` | `compatibility:feature-key-compatibility` | `features-focused` |
-| `planning-architecture-runtime` | `codex-rs/core/src/tools/handlers`<br>`codex-rs/core/src/session`<br>`codex-rs/core/src/task_evidence.rs` | `codex-rs/core/src/tools/handlers/plan.rs::PlanHandler` | `control_flow:calls` -> `path:codex-rs/core/src/task_evidence.rs`<br>`callers_consumers:consumed_by` -> `path:codex-rs/core/src/session/reasoning_governor.rs`<br>`runtime_registration:registers` -> `path:codex-rs/core/src/tools/spec_plan.rs`<br>+1 more | `semantic:durable-plan-update` | `planning-focused` |
+| `code-mode-protocol-contracts` | `codex-rs/code-mode-protocol` | `codex-rs/code-mode-protocol/src/lib.rs::build_exec_tool_description` | `callers_consumers:consumed_by` -> `path:codex-rs/code-mode-host`<br>`control_flow:calls` -> `path:codex-rs/code-mode-protocol/src/description.rs`<br>`runtime_registration:registers` -> `path:codex-rs/code-mode-protocol/src/lib.rs`<br>+1 more | `compatibility:code-mode-description-contract` | `code-mode-protocol-focused` |
+| `core-agent-runtime` | `codex-rs/core/src`<br>`codex-rs/core/tests`<br>`codex-rs/core/benches` | `codex-rs/core/src/session/mod.rs::Codex` | `callers_consumers:consumed_by` -> `owner:app-server-runtime`<br>`configuration:gated_by` -> `owner:feature-registry`<br>`tests_contracts:validated_by` -> `path:codex-rs/core/tests` | `semantic:registered-tool-routing` | `core-focused` |
+| `feature-registry` | `codex-rs/features` | `codex-rs/features/src/lib.rs::Feature` | `callers_consumers:consumed_by` -> `owner:core-agent-runtime` | `compatibility:feature-key-compatibility` | `features-focused` |
+| `kd4-capability-manifest` | `kd4_features.toml`<br>`scripts/check_kd4_features.py` | `scripts/check_kd4_features.py::validate_manifest` | `configuration:reads_config` -> `config:kd4_features.toml`<br>`callers_consumers:consumed_by` -> `path:scripts/kd4_perf_snapshot.py`<br>`runtime_registration:registers` -> `path:justfile`<br>+1 more | `semantic:capability-evidence-reachability` | `kd4-capability-manifest-focused` |
+| `model-catalog-runtime` | `codex-rs/models-manager` | `codex-rs/models-manager/src/manager.rs::ModelsManager` | `callers_consumers:consumed_by` -> `owner:core-agent-runtime`<br>`control_flow:calls` -> `path:codex-rs/models-manager/src/model_info.rs`<br>`runtime_registration:constructs` -> `path:codex-rs/models-manager/src/manager.rs`<br>+1 more | `semantic:model-instruction-resolution` | `models-manager-focused` |
+| `planning-architecture-runtime` | `codex-rs/core/src/plan_store.rs`<br>`codex-rs/core/src/tools/handlers/plan.rs`<br>`codex-rs/core/src/tools/handlers/plan_tests.rs`<br>`codex-rs/core/src/tools/spec_plan.rs`<br>`codex-rs/core/src/session/reasoning_governor.rs` | `codex-rs/core/src/tools/handlers/plan.rs::PlanHandler`<br>`codex-rs/core/src/plan_store.rs::PlanStore` | `control_flow:calls` -> `path:codex-rs/core/src/task_evidence.rs`<br>`callers_consumers:consumed_by` -> `path:codex-rs/core/src/session/reasoning_governor.rs`<br>`runtime_registration:registers` -> `path:codex-rs/core/src/tools/spec_plan.rs`<br>+1 more | `semantic:durable-plan-update` | `planning-focused` |
 | `repository-context-discovery` | `codex-rs/core/src/git_workspace.rs`<br>`codex-rs/core/src/agents_md.rs` | `codex-rs/core/src/git_workspace.rs::GitWorkspaceCache`<br>`codex-rs/core/src/agents_md.rs::load_project_instructions` | `control_flow:calls` -> `path:codex-rs/core/src/agents_md.rs`<br>`callers_consumers:consumed_by` -> `path:codex-rs/core/src/session/mod.rs`<br>`runtime_registration:constructs` -> `path:codex-rs/core/src/git_workspace.rs`<br>+1 more | `semantic:snapshot-scoped-discovery` | `repository-context-focused` |
-| `semantic-quality-gate` | `codex-rs/kda.toml` | `codex-rs/kda.toml::version` | `configuration:gated_by` -> `config:codex-rs/kda.toml`<br>`tests_contracts:validated_by` -> `path:codex-rs/kda.toml` | `semantic:source-bound-agent-admission` | `kda-config-syntax` |
+| `rust-turn-latency-benchmark` | `codex-rs/core/benches/turn_latency.rs`<br>`codex-rs/core/tests/turn_latency_bench.rs` | `codex-rs/core/benches/turn_latency.rs::main` | `control_flow:calls` -> `owner:core-agent-runtime`<br>`callers_consumers:consumed_by` -> `path:codex-rs/core/Cargo.toml`<br>`runtime_registration:registers` -> `path:codex-rs/core/Cargo.toml`<br>+1 more | `semantic:separate-capture-and-comparison-verdicts` | `rust-turn-latency-focused` |
+| `shared-protocol-contracts` | `codex-rs/protocol` | `codex-rs/protocol/src/lib.rs::protocol` | `callers_consumers:consumed_by` -> `owner:core-agent-runtime`<br>`control_flow:consumed_by` -> `owner:app-server-runtime`<br>`runtime_registration:registers` -> `path:codex-rs/protocol/src/lib.rs`<br>+1 more | `compatibility:shared-protocol-compatibility` | `protocol-focused` |
+| `shared-utility-crates` | `codex-rs/utils` | `codex-rs/utils/build-info/src/lib.rs::BuildInfo`<br>`codex-rs/utils/der/src/lib.rs::first_der_item` | `control_flow:consumed_by` -> `owner:cli-entrypoints`<br>`callers_consumers:consumed_by` -> `owner:app-server-runtime`<br>`runtime_registration:registers` -> `path:codex-rs/Cargo.toml`<br>+1 more | `semantic:shared-utility-single-source` | `shared-utilities-focused` |
 | `source-owner-index` | `scripts/source_owners.py`<br>`source_owners.toml` | `scripts/source_owners.py::main` | `control_flow:generates` -> `generated:architecture_index.json`<br>`callers_consumers:consumed_by` -> `path:SOURCEMAP.md`<br>`configuration:reads_config` -> `config:source_owners.toml`<br>+3 more | `compatibility:fresh-index` | `source-owner-focused` |
+| `task-evidence-runtime` | `codex-rs/core/src/task_evidence.rs`<br>`codex-rs/core/src/task_evidence` | `codex-rs/core/src/task_evidence.rs::TaskEvidenceLedger` | `control_flow:calls` -> `owner:planning-architecture-runtime`<br>`callers_consumers:consumed_by` -> `path:codex-rs/core/src/tools/handlers/mcp.rs`<br>`runtime_registration:constructs` -> `path:codex-rs/core/src/session/session.rs`<br>+1 more | `semantic:current-evidence-completion` | `task-evidence-focused` |
 | `tool-output-recovery` | `codex-rs/core/src/tools/command_output_artifact.rs`<br>`codex-rs/core/src/tools/handlers/read_tool_output.rs` | `codex-rs/core/src/tools/handlers/read_tool_output.rs::ReadToolOutputHandler` | `control_flow:calls` -> `path:codex-rs/core/src/tools/command_output_artifact.rs`<br>`callers_consumers:consumed_by` -> `path:codex-rs/core/src/context_manager/history.rs`<br>`runtime_registration:registers` -> `path:codex-rs/core/src/tools/spec_plan.rs`<br>+1 more | `compatibility:exact-bounded-recovery` | `tool-output-focused` |
 <!-- END KD4 SOURCE OWNERS -->

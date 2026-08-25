@@ -274,6 +274,8 @@ async fn classified_requirement_fixture() -> (
                 validation_disposition: Some(ValidationDisposition::NotRequired),
                 source_owner: None,
                 implementation_surfaces: Vec::new(),
+                surface_roles: Vec::new(),
+                validation_asset_paths: Vec::new(),
                 mutation_obligations: Vec::new(),
                 external_validation_route: None,
             }],
@@ -336,6 +338,49 @@ async fn classified_requirement_fixture() -> (
         .await
         .expect("classified dossier");
     (temp, repo, ledger, dossier)
+}
+
+#[tokio::test]
+async fn completion_review_dossier_collects_step_review_metadata() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    ledger
+        .record_planning_update(PlanningUpdateInput {
+            plan: vec![proof_free_plan_item("reviewed", StepStatus::Passed)],
+            step_evidence: vec![PlanStepEvidenceInput {
+                step_id: "reviewed".to_string(),
+                source_owner: None,
+                implementation_surfaces: Vec::new(),
+                surface_roles: vec!["packaging".to_string()],
+                validation_asset_paths: vec!["quality/plain.data".to_string()],
+                mutation_obligations: Vec::new(),
+                validation_disposition: Some(ValidationDisposition::NotRequired),
+                external_validation_route: None,
+            }],
+            ..PlanningUpdateInput::default()
+        })
+        .await;
+
+    let dossier = ledger
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
+        .await
+        .expect("completion review dossier");
+
+    assert_eq!(
+        dossier.review_lens_selection_facts.surface_roles,
+        vec!["packaging".to_string()]
+    );
+    assert_eq!(
+        dossier.review_lens_selection_facts.validation_asset_paths,
+        vec!["quality/plain.data".to_string()]
+    );
 }
 
 fn legacy_task_evidence_fixture(
@@ -413,12 +458,6 @@ fn legacy_task_evidence_fixture(
     value
 }
 
-#[cfg(unix)]
-fn create_directory_alias(target: &Path, alias: &Path) {
-    std::os::unix::fs::symlink(target, alias).expect("create directory symlink");
-}
-
-#[cfg(windows)]
 fn create_directory_alias(target: &Path, alias: &Path) {
     let output = std::process::Command::new("cmd")
         .args(["/C", "mklink", "/J"])
@@ -490,7 +529,6 @@ async fn existing_evidence_reuses_canonical_repository_identity() {
     }
 }
 
-#[cfg(windows)]
 #[test]
 fn repository_identity_canonicalizes_drive_letter_case() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -747,11 +785,7 @@ async fn persisted_external_evidence_from_before_strict_ingress_still_loads() {
     let (_temp, repo, ledger) = ledger_fixture().await;
     let home = ledger.codex_home.as_ref().expect("codex home").clone();
     let thread_id = ledger.thread_id.as_ref().expect("thread id").clone();
-    let evidence_path = ledger
-        .evidence_path
-        .as_ref()
-        .expect("evidence path")
-        .clone();
+    let evidence_path = ledger.evidence_path().expect("evidence path");
     let result = evidence_result("test-provider", "diagnostic", serde_json::json!({}));
     assert_eq!(
         ledger
@@ -1024,11 +1058,7 @@ async fn restart_drops_external_receipt_whose_payload_artifact_is_missing() {
     let (_temp, repo, ledger) = ledger_fixture().await;
     let home = ledger.codex_home.as_ref().expect("codex home").clone();
     let thread_id = ledger.thread_id.as_ref().expect("thread id").clone();
-    let evidence_path = ledger
-        .evidence_path
-        .as_ref()
-        .expect("evidence path")
-        .clone();
+    let evidence_path = ledger.evidence_path().expect("evidence path");
     assert_eq!(
         ledger
             .record_external_mcp_evidence("server", "tool", "call", &result)
@@ -1090,7 +1120,7 @@ async fn trimming_and_persistence_failure_cleanup_external_evidence_artifacts() 
         &"second-artifact-".repeat(2_000),
         serde_json::json!({"value": 2}),
     );
-    let (temp, _repo, mut ledger) = ledger_fixture().await;
+    let (temp, _repo, ledger) = ledger_fixture().await;
     for (call_id, result) in [("first", &first), ("second", &second)] {
         assert_eq!(
             ledger
@@ -1145,7 +1175,11 @@ async fn trimming_and_persistence_failure_cleanup_external_evidence_artifacts() 
     tokio::fs::write(&blocked_parent, b"not a directory")
         .await
         .expect("blocked parent");
-    ledger.evidence_path = Some(blocked_parent.join("evidence.json"));
+    *ledger
+        .evidence_path
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some(blocked_parent.join("evidence.json"));
     assert!(matches!(
         ledger
             .record_external_mcp_evidence_with_limit(
@@ -1262,7 +1296,7 @@ async fn duplicate_external_receipt_ids_are_repaired_by_migration() {
 }
 
 #[tokio::test]
-async fn non_kd4_git_repository_uses_evidence_only_mode() {
+async fn non_kd4_git_repository_disables_task_evidence() {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path().join("repo");
     let home = temp.path().join("home");
@@ -1270,16 +1304,17 @@ async fn non_kd4_git_repository_uses_evidence_only_mode() {
     initialize_git_repo(&repo).await;
     let thread_id = ThreadId::new();
     let ledger = TaskEvidenceLedger::load_or_new(home.clone(), thread_id, &repo).await;
-    assert_eq!(ledger.mode(), TaskEvidenceMode::EvidenceOnly);
+    assert_eq!(ledger.mode(), TaskEvidenceMode::Disabled);
     assert!(
-        home.join("task-evidence")
+        !home
+            .join("task-evidence")
             .join(format!("{thread_id}.json"))
             .is_file()
     );
 }
 
 #[tokio::test]
-async fn evidence_only_mode_never_derives_completion_state() {
+async fn disabled_non_kd4_mode_never_records_task_state() {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path().join("repo");
     tokio::fs::create_dir_all(&repo).await.expect("repo");
@@ -1292,12 +1327,7 @@ async fn evidence_only_mode_never_derives_completion_state() {
     assert!(ledger.completion_gate().await.is_none());
     assert!(ledger.finalization_advisory().await.is_none());
     let guard = ledger.document.lock().await;
-    let document = guard.as_ref().expect("document");
-    assert_eq!(document.host_mutation_revision, 1);
-    assert_eq!(document.evidence_epoch, 1);
-    assert!(document.plan.is_empty());
-    assert!(document.edit_receipts.is_empty());
-    assert!(document.command_receipts.is_empty());
+    assert!(guard.is_none());
 }
 
 #[tokio::test]
@@ -1481,7 +1511,8 @@ async fn structured_plan_actions_without_an_active_step_are_outside_plan() {
     let guard = ledger.document.lock().await;
     let document = guard.as_ref().expect("document");
     assert_eq!(document.planning.outside_plan_actions.len(), 1);
-    assert_eq!(document.planning.counters.outside_plan_actions, 1);
+    let persisted = serde_json::to_value(document).expect("serialize task evidence");
+    assert!(persisted["planning"].get("counters").is_none());
     assert!(document.command_receipts[0].step_id.is_none());
     assert!(document.command_receipts[0].step_revision.is_none());
     assert!(document.command_receipts[0].work_unit_id.is_none());
@@ -1533,6 +1564,8 @@ roots = ["codex-rs/core/src/task_evidence_tests.rs"]
                 step_id: "implement".to_string(),
                 source_owner: Some("core-agent-runtime".to_string()),
                 implementation_surfaces: vec!["codex-rs/core/src/task_evidence.rs".to_string()],
+                surface_roles: Vec::new(),
+                validation_asset_paths: Vec::new(),
                 mutation_obligations: Vec::new(),
                 validation_disposition: None,
                 external_validation_route: None,
@@ -1716,8 +1749,6 @@ async fn stable_planning_patches_preserve_omissions_and_audit_reasoned_removals(
     assert!(document.planning.facts.is_empty());
     assert!(document.plan.is_empty());
     assert_eq!(document.planning.audit_history.len(), 2);
-    assert_eq!(document.planning.counters.fact_removals, 1);
-    assert_eq!(document.planning.counters.step_removals, 1);
 }
 
 #[tokio::test]
@@ -1778,6 +1809,8 @@ async fn multi_obligation_step_requires_all_matching_edits() {
                 step_id: "implement".to_string(),
                 source_owner: Some("core".to_string()),
                 implementation_surfaces: vec!["src".to_string()],
+                surface_roles: Vec::new(),
+                validation_asset_paths: Vec::new(),
                 mutation_obligations: vec![
                     MutationObligationInput {
                         id: "one".to_string(),
@@ -2012,6 +2045,81 @@ async fn direct_validation_identity_ignores_unrelated_changes() {
         .await
         .expect("identity after covered mutation");
     assert_ne!(before, after_covered);
+}
+
+#[tokio::test]
+async fn successful_validation_infers_its_current_plan_binding_atomically() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    tokio::fs::create_dir_all(repo.join("src"))
+        .await
+        .expect("source directory");
+    tokio::fs::write(repo.join("src/step.rs"), "implemented")
+        .await
+        .expect("implementation fixture");
+
+    let route = focused_validation_route(vec!["src/step.rs".to_string()]);
+    let mut initial = plan_item("step", StepStatus::InProgress);
+    initial.validation_route = Some(route.clone());
+    ledger.record_plan_update(&plan_with(vec![initial])).await;
+    ledger
+        .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Implemented)]))
+        .await;
+    let candidate = ledger
+        .auto_validation_candidate()
+        .await
+        .expect("validation candidate");
+    let implementation_identity = candidate.leaf_implementation_identities[0].clone();
+    let repository = repo.to_string_lossy().into_owned();
+    let cwd = AbsolutePathBuf::from_absolute_path(&repo).expect("repo");
+    let cwd_uri = PathUri::from_abs_path(&cwd);
+    let validation_result = codex_protocol::validation::ValidationResult {
+        proof_key: codex_protocol::validation::ValidationProofKey {
+            repository: repository.clone(),
+            cwd: repository,
+            canonical_route_hash: "route".to_string(),
+            implementation_identity: implementation_identity.clone(),
+            coverage_identity: "coverage".to_string(),
+            environment_identity: "test-environment".to_string(),
+            toolchain_identity: "test-toolchain".to_string(),
+            configuration_identity: "test-configuration".to_string(),
+            validation_contract_version: codex_protocol::validation::VALIDATION_CONTRACT_VERSION,
+        },
+        route: route.clone(),
+        call_id: "validation".to_string(),
+        process_id: None,
+        status: codex_protocol::validation::ValidationTerminalStatus::Succeeded,
+        duration_ms: 1,
+        summary: Some("focused validation succeeded".to_string()),
+        failure_excerpt: None,
+        raw_artifact_ref: None,
+        raw_artifact_sha256: None,
+        freshness: codex_protocol::validation::ValidationFreshness::Executed,
+    };
+
+    ledger
+        .record_command_bound_with_validation_result(
+            &route.leaves[0].argv,
+            &cwd_uri,
+            0,
+            false,
+            1,
+            false,
+            None,
+            None,
+            Some(&implementation_identity),
+            Some(validation_result),
+            None,
+        )
+        .await;
+
+    let guard = ledger.document.lock().await;
+    let document = guard.as_ref().expect("document");
+    let step = &document.plan[0];
+    assert_eq!(step.status, StepStatus::Passed);
+    assert!(step.validation_receipt_id.is_some());
+    let receipt = document.command_receipts.last().expect("command receipt");
+    assert_eq!(receipt.step_id.as_deref(), Some("step"));
+    assert_eq!(receipt.step_revision, Some(candidate.step_revision));
 }
 
 #[tokio::test]
@@ -2297,6 +2405,8 @@ fn repository_wide_validation_coverage_invalidates_for_disjoint_mutations() {
         validation_disposition: ValidationDisposition::Executable,
         source_owner: None,
         implementation_surfaces: vec!["src/owned.rs".to_string()],
+        surface_roles: Vec::new(),
+        validation_asset_paths: Vec::new(),
         mutation_obligations: Vec::new(),
         validation_receipt_id: Some("receipt".to_string()),
         edit_paths: BTreeSet::new(),
@@ -2649,6 +2759,8 @@ async fn migration_repairs_duplicate_command_receipts_without_reopening_current_
         validation_disposition: ValidationDisposition::NotRequired,
         source_owner: None,
         implementation_surfaces: Vec::new(),
+        surface_roles: Vec::new(),
+        validation_asset_paths: Vec::new(),
         mutation_obligations: Vec::new(),
         validation_receipt_id: None,
         edit_paths: BTreeSet::from(["src/step.rs".to_string()]),
@@ -2691,6 +2803,8 @@ async fn migration_drops_unattributed_legacy_file_hashes() {
         validation_disposition: ValidationDisposition::NotRequired,
         source_owner: None,
         implementation_surfaces: Vec::new(),
+        surface_roles: Vec::new(),
+        validation_asset_paths: Vec::new(),
         mutation_obligations: Vec::new(),
         validation_receipt_id: None,
         edit_paths: BTreeSet::from(["src/owned.rs".to_string()]),
@@ -2790,6 +2904,8 @@ async fn completed_plan_step_requires_validation_proof() {
                 step_id: "step".to_string(),
                 source_owner: None,
                 implementation_surfaces: vec!["src/step.rs".to_string()],
+                surface_roles: Vec::new(),
+                validation_asset_paths: Vec::new(),
                 mutation_obligations: Vec::new(),
                 validation_disposition: Some(ValidationDisposition::NotRequired),
                 external_validation_route: None,
@@ -2872,6 +2988,8 @@ roots = ["codex-rs/app-server"]
                 implementation_surfaces: vec![
                     "codex-rs/core/src/tools/handlers/plan.rs".to_string(),
                 ],
+                surface_roles: Vec::new(),
+                validation_asset_paths: Vec::new(),
                 mutation_obligations: Vec::new(),
                 validation_disposition: None,
                 external_validation_route: None,
@@ -2899,6 +3017,8 @@ roots = ["codex-rs/app-server"]
                     "codex-rs/core/src/task_evidence.rs".to_string(),
                     "codex-rs/app-server/src/lib.rs".to_string(),
                 ],
+                surface_roles: Vec::new(),
+                validation_asset_paths: Vec::new(),
                 mutation_obligations: Vec::new(),
                 validation_disposition: None,
                 external_validation_route: None,
@@ -3001,6 +3121,115 @@ roots = ["src"]
             .expect("work unit")
             .source_owner
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn repository_source_owner_manifest_keeps_planning_boundaries_exact() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("repository root");
+    let index = load_source_owner_index(repo_root)
+        .await
+        .expect("repository source owner index");
+
+    for planning_surface in [
+        "codex-rs/core/src/plan_store.rs",
+        "codex-rs/core/src/tools/handlers/plan.rs",
+        "codex-rs/core/src/session/reasoning_governor.rs",
+    ] {
+        assert_eq!(
+            index.derive(&[planning_surface.to_string()]).as_deref(),
+            Some("planning-architecture-runtime"),
+            "{planning_surface} must remain planning-owned"
+        );
+    }
+
+    for core_surface in [
+        "codex-rs/core/src/tools/handlers/request_plugin_install.rs",
+        "codex-rs/core/src/session/mcp_runtime.rs",
+    ] {
+        assert_eq!(
+            index.derive(&[core_surface.to_string()]).as_deref(),
+            Some("core-agent-runtime"),
+            "{core_surface} must not be swallowed by planning ownership"
+        );
+    }
+
+    assert_eq!(
+        index
+            .derive(&["codex-rs/core/src/task_evidence.rs".to_string()])
+            .as_deref(),
+        Some("task-evidence-runtime")
+    );
+    assert_eq!(
+        index
+            .derive(&["codex-rs/utils/build-info/src/lib.rs".to_string()])
+            .as_deref(),
+        Some("shared-utility-crates")
+    );
+}
+
+#[tokio::test]
+async fn source_owner_snapshot_reuses_unchanged_index_and_rejects_stale_refreshes() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let manifest = temp.path().join("source_owners.toml");
+    tokio::fs::write(
+        &manifest,
+        "schema_version = 2\n[[owners]]\nid = \"first\"\nroots = [\"src\"]\n",
+    )
+    .await
+    .expect("write first manifest");
+    let mut snapshot = SourceOwnerIndexSnapshot::load(temp.path()).await;
+    let first = snapshot.shared_index().expect("first index");
+
+    let unchanged = snapshot
+        .refresh(temp.path())
+        .await
+        .expect("unchanged index");
+    assert!(Arc::ptr_eq(&first, &unchanged));
+
+    tokio::fs::write(
+        &manifest,
+        "schema_version = 2\n[[owners]]\nid = \"second-owner\"\nroots = [\"src\"]\n",
+    )
+    .await
+    .expect("write changed manifest");
+    let changed = snapshot.refresh(temp.path()).await.expect("changed index");
+    assert!(!Arc::ptr_eq(&first, &changed));
+    assert_eq!(
+        changed.derive(&["src/lib.rs".to_string()]).as_deref(),
+        Some("second-owner")
+    );
+
+    let stale_base = snapshot.clone();
+    tokio::fs::write(
+        &manifest,
+        "schema_version = 2\n[[owners]]\nid = \"stale-third-owner\"\nroots = [\"src\"]\n",
+    )
+    .await
+    .expect("write stale candidate manifest");
+    let stale_refresh = stale_base.refreshed(temp.path()).await;
+
+    tokio::fs::write(
+        &manifest,
+        "schema_version = 2\n[[owners]]\nid = \"current-fourth-owner-longer\"\nroots = [\"src\"]\n",
+    )
+    .await
+    .expect("write current manifest");
+    let current_base = snapshot.clone();
+    let current_refresh = current_base.refreshed(temp.path()).await;
+    snapshot.install_if_unchanged(&current_base, current_refresh);
+    snapshot.install_if_unchanged(&stale_base, stale_refresh);
+
+    assert_eq!(
+        snapshot
+            .shared_index()
+            .expect("current index")
+            .derive(&["src/lib.rs".to_string()])
+            .as_deref(),
+        Some("current-fourth-owner-longer")
     );
 }
 
@@ -3189,7 +3418,7 @@ async fn skipped_step_artifact_and_desktop_requirements_do_not_block_completion(
     assert!(gate.reasons.is_empty());
     let guard = ledger.document.lock().await;
     let document = guard.as_ref().expect("document");
-    assert!(document.generated_artifact_requirements.is_empty());
+    assert!(declared_generated_artifact_requirements(document).is_empty());
     assert!(document.latest_generated_artifact_hashes.is_empty());
     assert!(document.desktop_activation_receipt.is_none());
 }
@@ -3223,6 +3452,7 @@ async fn current_schema_reload_removes_stale_skipped_step_requirements() {
     )
     .expect("valid evidence");
     assert_eq!(persisted["schema_version"], TASK_EVIDENCE_SCHEMA_VERSION);
+    persisted["schema_version"] = serde_json::json!(FROZEN_TASK_EVIDENCE_V12_SCHEMA_VERSION);
     persisted["generated_artifact_requirements"] = serde_json::json!([{
         "id": "plan:skipped:artifact:0",
         "step_id": "skipped",
@@ -3241,7 +3471,9 @@ async fn current_schema_reload_removes_stale_skipped_step_requirements() {
         let document = guard.as_ref().expect("reloaded document");
         assert_eq!(document.schema_version, TASK_EVIDENCE_SCHEMA_VERSION);
         assert_eq!(document.plan[0].status, StepStatus::Skipped);
-        assert!(document.generated_artifact_requirements.is_empty());
+        assert!(declared_generated_artifact_requirements(document).is_empty());
+        let migrated = serde_json::to_value(document).expect("serialize migrated evidence");
+        assert!(migrated.get("generated_artifact_requirements").is_none());
     }
     let gate = reloaded.completion_gate().await.expect("completion gate");
     assert_eq!(gate.status, TaskCompletionStatus::Passed);
@@ -3421,7 +3653,7 @@ async fn v3_obsolete_validation_state_is_discarded_during_shape_migration() {
     assert_eq!(migrated.plan[0].status, StepStatus::Implemented);
     assert!(migrated.completion.is_none());
     assert!(migrated.risks.is_empty());
-    assert!(migrated.generated_artifact_requirements.is_empty());
+    assert!(declared_generated_artifact_requirements(&migrated).is_empty());
     let persisted = serde_json::to_value(migrated).expect("serialize migrated");
     for obsolete in [
         "validation_epoch",
@@ -3446,11 +3678,7 @@ async fn v3_to_current_discards_obsolete_repair_counter_without_reopening_passed
     assert_eq!(gate.status, TaskCompletionStatus::Passed);
 
     let codex_home = ledger.codex_home.as_ref().expect("codex home").clone();
-    let evidence_path = ledger
-        .evidence_path
-        .as_ref()
-        .expect("evidence path")
-        .clone();
+    let evidence_path = ledger.evidence_path().expect("evidence path");
     let thread_id = ledger.thread_id.as_deref().expect("thread id").to_string();
     let document = ledger
         .document
@@ -3560,11 +3788,7 @@ async fn frozen_v4_loader_refuses_v5_without_modifying_the_file() {
     ledger
         .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Passed)]))
         .await;
-    let evidence_path = ledger
-        .evidence_path
-        .as_ref()
-        .expect("evidence path")
-        .clone();
+    let evidence_path = ledger.evidence_path().expect("evidence path");
     let document = ledger
         .document
         .lock()
@@ -3785,6 +4009,19 @@ async fn rich_v4_to_v5_migration_preserves_evidence_and_seeds_terminal_lineage()
         assert_eq!(document.plan[0].runtime_paths, ["core/runtime/prepare"]);
         assert_eq!(document.plan[0].generated_artifacts, ["generated/out.json"]);
         assert_eq!(document.plan[0].risks, ["preserve the v4 contract"]);
+        assert!(document.risks.iter().all(|risk| risk.source != "plan"));
+        assert!(effective_risks(document).any(|risk| {
+            risk.source == "plan" && risk.description == "preserve the v4 contract"
+        }));
+        let persisted = serde_json::to_value(document).expect("serialize migrated evidence");
+        assert!(persisted.get("generated_artifact_requirements").is_none());
+        assert!(
+            persisted["risks"]
+                .as_array()
+                .expect("persisted risks")
+                .iter()
+                .all(|risk| risk["source"] != "plan")
+        );
         assert_eq!(document.edit_intents.len(), 1);
         assert_eq!(document.edit_receipts.len(), 1);
         assert_eq!(document.command_receipts.len(), 1);
@@ -3839,7 +4076,7 @@ async fn rich_v4_to_v5_migration_preserves_evidence_and_seeds_terminal_lineage()
         );
         let review = document.completion_review_v2.as_ref().expect("V2 ledger");
         assert_eq!(review.receipts.len(), 2);
-        assert_eq!(review.next_review_sequence, 3);
+        assert_eq!(next_review_sequence(review), 3);
         assert_eq!(
             review.receipts[0].attempt_kind,
             CompletionReviewAttemptKind::InitialReview
@@ -3858,7 +4095,7 @@ async fn rich_v4_to_v5_migration_preserves_evidence_and_seeds_terminal_lineage()
         );
         assert!(!review.review_risk.unresolved);
         assert_eq!(
-            review.last_terminal_closure.as_deref(),
+            latest_terminal_closure(review).map(|receipt| receipt.review_id.as_str()),
             Some(review.receipts[1].review_id.as_str())
         );
     }
@@ -3901,11 +4138,7 @@ async fn newer_schema_payload_disables_ledger_without_modifying_the_file() {
         .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Passed)]))
         .await;
     let home = ledger.codex_home.as_ref().expect("codex home").clone();
-    let evidence_path = ledger
-        .evidence_path
-        .as_ref()
-        .expect("evidence path")
-        .clone();
+    let evidence_path = ledger.evidence_path().expect("evidence path");
     let thread_id = ledger.thread_id.as_deref().expect("thread id").to_string();
     let document = ledger
         .document
@@ -4018,8 +4251,11 @@ async fn terminal_acknowledgement_resolves_only_recoverable_nonblocking_risks() 
 
 #[tokio::test]
 async fn storage_failure_is_tracked_and_fail_closed() {
-    let (_temp, _repo, mut ledger) = ledger_fixture().await;
-    ledger.evidence_path = None;
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    *ledger
+        .evidence_path
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     {
         let mut guard = ledger.document.lock().await;
         let document = guard.as_mut().expect("document");
@@ -4190,17 +4426,13 @@ async fn tracked_and_artifact_lexical_aliases_hash_once_and_keep_associations() 
     let tracked_path = "target/out.txt";
     let artifact_path = "target/./out.txt";
     install_tracked_freshness_file(&ledger, &repo, tracked_path, b"shared output\n").await;
+    let mut artifact = proof_free_plan_item("artifact", StepStatus::Pending);
+    artifact.generated_artifacts = vec![artifact_path.to_string()];
+    ledger.record_plan_update(&plan_with(vec![artifact])).await;
     let artifact_snapshot = snapshot_file(&repo, artifact_path).await;
     {
         let mut guard = ledger.document.lock().await;
         let document = guard.as_mut().expect("document");
-        document
-            .generated_artifact_requirements
-            .push(GeneratedArtifactRequirement {
-                id: "artifact".to_string(),
-                step_id: None,
-                path: Some(artifact_path.to_string()),
-            });
         document
             .latest_generated_artifact_hashes
             .insert(artifact_path.to_string(), artifact_snapshot);
@@ -4253,17 +4485,13 @@ async fn requirement_manifest_change_starts_a_new_completion_proof_scan() {
     ledger
         .refresh_external_file_freshness_for(FreshnessPurpose::CompletionFresh)
         .await;
+    let mut artifact = proof_free_plan_item("artifact", StepStatus::Pending);
+    artifact.generated_artifacts = vec!["artifact.txt".to_string()];
+    ledger.record_plan_update(&plan_with(vec![artifact])).await;
     let artifact_snapshot = snapshot_file(&repo, "artifact.txt").await;
     {
         let mut guard = ledger.document.lock().await;
         let document = guard.as_mut().expect("document");
-        document
-            .generated_artifact_requirements
-            .push(GeneratedArtifactRequirement {
-                id: "artifact".to_string(),
-                step_id: None,
-                path: Some("artifact.txt".to_string()),
-            });
         document
             .latest_generated_artifact_hashes
             .insert("artifact.txt".to_string(), artifact_snapshot);
@@ -5220,7 +5448,7 @@ async fn completion_persistence_failure_is_partial_then_recovers_when_storage_re
         );
     }
     let persisted: TaskEvidenceDocument = serde_json::from_slice(
-        &tokio::fs::read(ledger.evidence_path.as_ref().expect("evidence path"))
+        &tokio::fs::read(ledger.evidence_path().expect("evidence path"))
             .await
             .expect("persisted evidence"),
     )
@@ -5340,7 +5568,7 @@ async fn cancelled_external_persistence_success_keeps_receipt_and_artifact() {
     assert!(artifact_path.with_extension("evidence-protected").exists());
 
     let persisted: TaskEvidenceDocument = serde_json::from_slice(
-        &tokio::fs::read(ledger.evidence_path.as_ref().expect("evidence path"))
+        &tokio::fs::read(ledger.evidence_path().expect("evidence path"))
             .await
             .expect("persisted evidence"),
     )
@@ -5385,7 +5613,7 @@ async fn cancelled_external_persistence_failure_rolls_back_receipt_and_artifact(
         );
     }
     let persisted: TaskEvidenceDocument = serde_json::from_slice(
-        &tokio::fs::read(ledger.evidence_path.as_ref().expect("evidence path"))
+        &tokio::fs::read(ledger.evidence_path().expect("evidence path"))
             .await
             .expect("persisted evidence"),
     )
@@ -5443,7 +5671,7 @@ async fn cancelled_older_generic_persist_cannot_overwrite_newer_snapshot() {
     );
 
     let persisted: TaskEvidenceDocument = serde_json::from_slice(
-        &tokio::fs::read(ledger.evidence_path.as_ref().expect("evidence path"))
+        &tokio::fs::read(ledger.evidence_path().expect("evidence path"))
             .await
             .expect("persisted evidence"),
     )
@@ -5515,11 +5743,7 @@ fn desktop_test_timestamp(value: &str) -> DateTime<Utc> {
 }
 
 fn desktop_test_executable_path() -> &'static str {
-    if cfg!(windows) {
-        "C:/Program Files/Codex/codex.exe"
-    } else {
-        "/opt/codex/codex"
-    }
+    "C:/Program Files/Codex/codex.exe"
 }
 
 fn desktop_test_obligation(implementation_identity: &str) -> DesktopActivationObligation {
@@ -5564,6 +5788,22 @@ fn desktop_running_process() -> DesktopRunningProcessObservation {
         executable_sha256: "a".repeat(64),
         observed_at: "2026-08-14T12:00:02Z".to_string(),
     }
+}
+
+#[tokio::test]
+async fn desktop_activation_attestation_service_owns_serialization_and_runtime_state() {
+    let service = DesktopActivationAttestationService::default();
+
+    assert_eq!(service.gate.available_permits(), 1);
+    assert_eq!(
+        service.snapshot(),
+        DesktopActivationRuntimeSnapshot::default()
+    );
+
+    let permit = service.acquire().await.expect("activation gate is open");
+    assert_eq!(service.gate.available_permits(), 0);
+    drop(permit);
+    assert_eq!(service.gate.available_permits(), 1);
 }
 
 #[test]
@@ -6152,11 +6392,7 @@ async fn terminal_closure_is_atomic_and_reload_preserves_v2_lineage() {
         review_dossier.dossier_snapshot_id,
         closure_dossier.dossier_snapshot_id
     );
-    let evidence_path = ledger
-        .evidence_path
-        .as_ref()
-        .expect("evidence path")
-        .clone();
+    let evidence_path = ledger.evidence_path().expect("evidence path");
     let bytes_before_failed_closure = tokio::fs::read(&evidence_path)
         .await
         .expect("evidence before failed closure");
@@ -6235,9 +6471,31 @@ async fn terminal_closure_is_atomic_and_reload_preserves_v2_lineage() {
         assert_eq!(terminal.terminal_outcome.as_deref(), Some("passed"));
         assert!(!review.review_risk.unresolved);
         assert_eq!(
-            review.last_terminal_closure.as_deref(),
+            latest_terminal_closure(review).map(|receipt| receipt.review_id.as_str()),
             Some(terminal.review_id.as_str())
         );
+        let persisted = serde_json::to_value(document).expect("serialize task evidence");
+        assert!(persisted.get("generated_artifact_requirements").is_none());
+        assert!(persisted["planning"].get("counters").is_none());
+        let persisted_review = &persisted["completion_review_v2"];
+        for field in [
+            "next_source_ordinal",
+            "next_review_sequence",
+            "last_terminal_closure",
+        ] {
+            assert!(persisted_review.get(field).is_none(), "{field}");
+        }
+        assert!(
+            persisted_review["active_review_cycle"]
+                .get("accepted_dossier_snapshot_id")
+                .is_none()
+        );
+        for receipt in persisted_review["receipts"]
+            .as_array()
+            .expect("review receipts")
+        {
+            assert!(receipt.get("candidate_hash").is_none());
+        }
         assert_eq!(
             review.active_review_cycle.as_ref().map(|cycle| cycle.phase),
             Some(CompletionReviewCyclePhase::Closed)
@@ -6634,7 +6892,7 @@ async fn last_second_mutation_invalidates_a_provisional_clean_review() {
         .as_ref()
         .expect("V2 ledger");
     assert!(review.review_risk.unresolved);
-    assert!(review.last_terminal_closure.is_none());
+    assert!(latest_terminal_closure(review).is_none());
 }
 
 #[tokio::test]
@@ -6746,7 +7004,6 @@ async fn implemented_below_ignored_above_stale_supersession_retries_current_revi
         CompletionReviewCyclePhase::InitialReviewPending
     );
     assert!(cycle.accepted_review_id.is_none());
-    assert!(cycle.accepted_dossier_snapshot_id.is_none());
     assert!(review.review_risk.unresolved);
     assert!(document.completion.is_none());
 }
@@ -6810,7 +7067,6 @@ async fn after_agent_reentry_requires_fresh_review_and_preserves_correction_use(
     );
     assert!(cycle.correction_consumed);
     assert!(cycle.accepted_review_id.is_none());
-    assert!(cycle.accepted_dossier_snapshot_id.is_none());
     assert!(review.review_risk.unresolved);
     assert_ne!(
         document.completion.as_ref().map(|gate| gate.status),
@@ -7459,7 +7715,7 @@ async fn reclassification_cannot_erase_a_previously_mapped_requirement() {
 async fn v6_migration_seeds_final_proof_field() {
     let (_temp, repo, ledger) = ledger_fixture().await;
     let home = ledger.codex_home.as_ref().expect("home").clone();
-    let evidence_path = ledger.evidence_path.as_ref().expect("path").clone();
+    let evidence_path = ledger.evidence_path().expect("path");
     let thread_id = ledger.thread_id.as_deref().expect("thread").to_string();
     let mut value = serde_json::to_value(
         ledger
@@ -7707,6 +7963,81 @@ fn typed_validation_proof_fixture(
             freshness: codex_protocol::validation::ValidationFreshness::Executed,
         },
     }
+}
+
+#[tokio::test]
+async fn typed_validation_manifest_observations_are_reused_across_proofs() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    tokio::fs::create_dir_all(&repo).await.expect("create repo");
+    initialize_git_repo(&repo).await;
+    let covered_path = repo.join("covered.rs");
+    tokio::fs::write(&covered_path, b"validated contents")
+        .await
+        .expect("write covered path");
+    let add = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["add", "covered.rs"])
+        .output()
+        .await
+        .expect("git add should run");
+    assert!(add.status.success(), "git add failed");
+    let commit = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args([
+            "-c",
+            "user.name=Codex Test",
+            "-c",
+            "user.email=codex@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture",
+        ])
+        .output()
+        .await
+        .expect("git commit should run");
+    assert!(
+        commit.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    let head = codex_git_utils::get_head_commit_hash(&repo)
+        .await
+        .expect("fixture HEAD")
+        .0;
+    let step = ValidationPlanStepV1 {
+        step_id: "typed-step".to_string(),
+        covered_paths: vec!["covered.rs".to_string()],
+        ..ValidationPlanStepV1::default()
+    };
+    let mut proof = typed_validation_proof_fixture(&repo, 7, &step);
+    proof.covered_manifest = vec![
+        codex_agent_task_store::WorkspaceManifestEntry {
+            path: codex_agent_task_store::REPOSITORY_WIDE_PATH.to_string(),
+            content_hash: Some(head),
+            existed: true,
+        },
+        codex_agent_task_store::WorkspaceManifestEntry {
+            path: "covered.rs".to_string(),
+            content_hash: Some(sha256_file(&covered_path).await.expect("hash covered path")),
+            existed: true,
+        },
+    ];
+
+    let (current, file_observations, head_observations) =
+        current_typed_validation_proofs_with_observation_counts(
+            Some(&repo),
+            "workspace-manifest",
+            vec![proof.clone(), proof],
+        )
+        .await;
+
+    assert_eq!(current.len(), 2);
+    assert_eq!(file_observations, 1);
+    assert_eq!(head_observations, 1);
 }
 
 #[tokio::test]
@@ -8100,4 +8431,221 @@ async fn reviewer_infrastructure_memo_is_exact_to_candidate_config_and_condition
             )
             .await
     );
+}
+
+fn user_history_message(message_id: &str, text: &str) -> ResponseItem {
+    ResponseItem::Message {
+        id: Some(codex_protocol::ResponseItemId::from_server(
+            message_id.to_string(),
+        )),
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: text.to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
+#[tokio::test]
+async fn cwd_rebinds_task_evidence_when_entering_and_leaving_kd4_repositories() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let outside = temp.path().join("outside");
+    let repo = temp.path().join("repo");
+    let codex_home = temp.path().join("home");
+    tokio::fs::create_dir_all(&outside)
+        .await
+        .expect("outside dir");
+    tokio::fs::create_dir_all(repo.join(".git"))
+        .await
+        .expect("git dir");
+    tokio::fs::write(repo.join("kd4_features.toml"), "# fixture")
+        .await
+        .expect("manifest");
+
+    let ledger = TaskEvidenceLedger::load_or_new(codex_home, ThreadId::new(), &outside).await;
+    assert!(!ledger.allows_kd4_completion());
+    assert_eq!(ledger.repository_root(), None);
+
+    ledger.rebind_to_cwd(&repo).await;
+    assert!(ledger.allows_kd4_completion());
+    assert_eq!(ledger.repository_root().as_deref(), Some(repo.as_path()));
+    assert!(
+        ledger
+            .record_user_sources("msg_entered", &[text_input("fix the integration")])
+            .await
+    );
+
+    ledger.rebind_to_cwd(&outside).await;
+    assert!(!ledger.allows_kd4_completion());
+    assert_eq!(ledger.repository_root(), None);
+    assert_eq!(ledger.bound_repo_root(), None);
+    assert_eq!(ledger.evidence_path(), None);
+    assert!(ledger.finalization_advisory().await.is_none());
+
+    ledger.rebind_to_cwd(&repo).await;
+    assert!(ledger.allows_kd4_completion());
+    let guard = ledger.document.lock().await;
+    let evidence = guard
+        .as_ref()
+        .and_then(|document| document.completion_review_v2.as_ref())
+        .expect("reloaded repository evidence");
+    assert!(evidence.source_records.values().any(|source| {
+        source.message_id == "msg_entered" && source.exact_material == "fix the integration"
+    }));
+}
+
+#[tokio::test]
+async fn rollback_history_prunes_removed_sources_and_invalidates_derived_state() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    assert!(
+        ledger
+            .record_user_sources("msg_keep", &[text_input("keep this requirement")])
+            .await
+    );
+    assert!(
+        ledger
+            .record_user_sources("msg_remove", &[text_input("remove this requirement")])
+            .await
+    );
+    ledger
+        .record_plan_update(&plan_with(vec![plan_item(
+            "derived-work",
+            StepStatus::InProgress,
+        )]))
+        .await;
+
+    assert!(
+        ledger
+            .reconcile_rollback_history(&[user_history_message(
+                "msg_keep",
+                "keep this requirement",
+            )])
+            .await
+    );
+
+    let guard = ledger.document.lock().await;
+    let document = guard.as_ref().expect("task evidence document");
+    let evidence = document
+        .completion_review_v2
+        .as_ref()
+        .expect("completion review ledger");
+    let active_sources = evidence
+        .source_records
+        .values()
+        .filter(|source| source.completion_epoch == evidence.completion_epoch)
+        .collect::<Vec<_>>();
+    assert_eq!(active_sources.len(), 1);
+    assert_eq!(active_sources[0].message_id, "msg_keep");
+    assert_eq!(active_sources[0].exact_material, "keep this requirement");
+    assert!(document.plan.is_empty());
+    assert!(document.edit_receipts.is_empty());
+    assert!(document.command_receipts.is_empty());
+    assert!(document.completion_review_receipts.is_empty());
+    assert!(document.completion.is_none());
+    assert_eq!(
+        evidence
+            .active_review_cycle
+            .as_ref()
+            .map(|cycle| cycle.phase),
+        Some(CompletionReviewCyclePhase::ClassificationPending)
+    );
+}
+
+#[tokio::test]
+async fn fork_inherits_only_retained_parent_sources_under_child_identity() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let first_repo = temp.path().join("first-repo");
+    let repo = temp.path().join("current-repo");
+    let codex_home = temp.path().join("home");
+    tokio::fs::create_dir_all(first_repo.join(".git"))
+        .await
+        .expect("first git dir");
+    tokio::fs::write(first_repo.join("kd4_features.toml"), "# fixture")
+        .await
+        .expect("first manifest");
+    tokio::fs::create_dir_all(repo.join(".git"))
+        .await
+        .expect("git dir");
+    tokio::fs::write(repo.join("kd4_features.toml"), "# fixture")
+        .await
+        .expect("manifest");
+    let parent_thread_id = ThreadId::new();
+    let child_thread_id = ThreadId::new();
+    let parent =
+        TaskEvidenceLedger::load_or_new(codex_home.clone(), parent_thread_id, &first_repo).await;
+    parent.rebind_to_cwd(&repo).await;
+    assert!(
+        parent
+            .record_user_sources(
+                "msg_keep",
+                &[
+                    text_input("inherited requirement"),
+                    UserInput::Mention {
+                        name: "inherited attachment".to_string(),
+                        path: "plugin://inherited@example".to_string(),
+                    },
+                ],
+            )
+            .await
+    );
+    assert!(
+        parent
+            .record_user_sources("msg_remove", &[text_input("excluded requirement")])
+            .await
+    );
+    let parent_source_id = {
+        let guard = parent.document.lock().await;
+        guard
+            .as_ref()
+            .and_then(|document| document.completion_review_v2.as_ref())
+            .and_then(|evidence| {
+                evidence
+                    .source_records
+                    .values()
+                    .find(|source| source.message_id == "msg_keep")
+            })
+            .map(|source| source.source_id.clone())
+            .expect("parent source")
+    };
+
+    let child = TaskEvidenceLedger::load_or_new(codex_home, child_thread_id, &repo).await;
+    assert!(
+        child
+            .inherit_forked_history(
+                parent_thread_id,
+                &[user_history_message("msg_keep", "inherited requirement")],
+            )
+            .await
+    );
+
+    let guard = child.document.lock().await;
+    let document = guard.as_ref().expect("child evidence document");
+    let evidence = document
+        .completion_review_v2
+        .as_ref()
+        .expect("child completion review ledger");
+    let active_sources = evidence
+        .source_records
+        .values()
+        .filter(|source| source.completion_epoch == evidence.completion_epoch)
+        .collect::<Vec<_>>();
+    assert_eq!(evidence.root_task_id, child_thread_id.to_string());
+    assert_eq!(active_sources.len(), 2);
+    assert!(
+        active_sources
+            .iter()
+            .all(|source| source.message_id == "msg_keep")
+    );
+    let inherited_text = active_sources
+        .iter()
+        .find(|source| source.source_kind == UserSourceKind::Text)
+        .expect("inherited text source");
+    assert_eq!(inherited_text.exact_material, "inherited requirement");
+    assert_ne!(inherited_text.source_id, parent_source_id);
+    assert!(active_sources.iter().any(|source| {
+        source.source_kind == UserSourceKind::Attachment
+            && source.exact_material == "mention:inherited attachment:plugin://inherited@example"
+    }));
+    assert!(document.plan.is_empty());
 }

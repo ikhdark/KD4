@@ -3,6 +3,7 @@ use crate::JsonSchema;
 use crate::LoadableToolSpec;
 use crate::ResponsesApiNamespace;
 use crate::ResponsesApiTool;
+use crate::ToolName;
 use codex_protocol::config_types::WebSearchContextSize;
 use codex_protocol::config_types::WebSearchFilters as ConfigWebSearchFilters;
 use codex_protocol::config_types::WebSearchUserLocation as ConfigWebSearchUserLocation;
@@ -59,6 +60,35 @@ impl ToolSpec {
             ToolSpec::WebSearch { .. } => "web_search",
             ToolSpec::Freeform(tool) => tool.name.as_str(),
         }
+    }
+
+    /// Returns every callable identity declared by this model-visible spec.
+    ///
+    /// Namespace containers declare one callable identity per nested tool. A
+    /// registered runtime is expected to expose exactly one of these names,
+    /// while hosted and merged specs may expose more than one.
+    pub fn callable_tool_names(&self) -> Vec<ToolName> {
+        match self {
+            ToolSpec::Function(tool) => vec![ToolName::plain(tool.name.clone())],
+            ToolSpec::Namespace(namespace) => namespace
+                .tools
+                .iter()
+                .map(|tool| match tool {
+                    crate::ResponsesApiNamespaceTool::Function(tool) => {
+                        ToolName::namespaced(namespace.name.clone(), tool.name.clone())
+                    }
+                })
+                .collect(),
+            ToolSpec::ToolSearch { .. } => vec![ToolName::plain("tool_search")],
+            ToolSpec::WebSearch { .. } => vec![ToolName::plain("web_search")],
+            ToolSpec::Freeform(tool) => vec![ToolName::plain(tool.name.clone())],
+        }
+    }
+
+    /// Returns the callable identity when this spec declares exactly one.
+    pub fn sole_callable_tool_name(&self) -> Option<ToolName> {
+        let mut names = self.callable_tool_names();
+        (names.len() == 1).then(|| names.remove(0))
     }
 }
 

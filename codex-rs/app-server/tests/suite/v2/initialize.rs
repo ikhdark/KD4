@@ -69,7 +69,7 @@ async fn initialize_uses_client_info_name_as_originator() -> Result<()> {
 }
 
 #[tokio::test]
-async fn initialize_probe_does_not_override_originator() -> Result<()> {
+async fn initialize_retired_daemon_name_uses_client_info_as_originator() -> Result<()> {
     let responses = Vec::new();
     let server = create_mock_responses_server_sequence_unchecked(responses).await;
     let codex_home = TempDir::new()?;
@@ -95,7 +95,7 @@ async fn initialize_probe_does_not_override_originator() -> Result<()> {
     };
     let InitializeResponse { user_agent, .. } = to_response::<InitializeResponse>(response)?;
 
-    assert!(user_agent.starts_with("codex_cli_rs/"));
+    assert!(user_agent.starts_with("codex_app_server_daemon/"));
     Ok(())
 }
 

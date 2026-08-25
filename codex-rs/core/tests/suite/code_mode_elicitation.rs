@@ -143,7 +143,7 @@ async fn submit_turn(test: &TestCodex, permission_profile: PermissionProfile) ->
     .await)
 }
 
-#[cfg_attr(windows, ignore = "no exec_command on Windows")]
+#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_holds_yielded_result_during_command_approval() -> Result<()> {
     skip_if_wine_exec!(
@@ -213,10 +213,6 @@ await tools.apply_patch("*** Begin Patch\n*** Add File: code_mode_patch_approval
     Ok(())
 }
 
-#[cfg_attr(
-    target_os = "linux",
-    ignore = "request_permissions tool integration is not supported on Linux"
-)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_holds_yielded_result_during_permission_request() -> Result<()> {
     skip_if_no_network!(Ok(()));

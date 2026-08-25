@@ -4,6 +4,7 @@ use codex_config::ConfigLayerEntry;
 use codex_config::ConfigLayerStack;
 use codex_config::ConfigRequirements;
 use codex_config::ConfigRequirementsToml;
+use codex_config::ProjectDiscoveryContext;
 use codex_exec_server::LOCAL_FS;
 use codex_protocol::protocol::Product;
 use codex_protocol::protocol::SkillScope;
@@ -131,6 +132,38 @@ async fn load_skills_for_test(config: &TestConfig) -> SkillLoadOutcome {
         /*plugin_skill_snapshots*/ None,
     )
     .await
+}
+
+#[tokio::test]
+async fn repo_skill_roots_reuse_config_project_discovery_snapshot() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let project_root = tmp.path().join("repo");
+    let cwd = project_root.join("nested");
+    let skill_root = project_root.join(AGENTS_DIR_NAME).join(SKILLS_DIR_NAME);
+    fs::create_dir_all(&cwd)?;
+    fs::create_dir_all(&skill_root)?;
+
+    let cwd = cwd.abs();
+    let project_root = project_root.abs();
+    let stack = ConfigLayerStack::new(
+        Vec::new(),
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )?
+    .with_project_discovery(ProjectDiscoveryContext::new(
+        cwd.clone(),
+        project_root.clone(),
+        vec!["marker-removed-after-load".to_string()],
+        None,
+        None,
+        LOCAL_FS.as_ref(),
+    ));
+
+    let roots =
+        skill_roots_from_layer_stack(Arc::clone(&LOCAL_FS), &stack, &cwd, /*home_dir*/ None).await;
+
+    assert!(roots.iter().any(|root| root.path == skill_root.abs()));
+    Ok(())
 }
 
 fn mark_as_git_repo(dir: &Path) {
@@ -432,31 +465,21 @@ async fn loads_skill_dependencies_metadata_from_yaml() {
     write_skill_metadata_at(
         skill_dir,
         r#"
-{
-  "dependencies": {
-    "tools": [
-      {
-        "type": "mcp",
-        "value": "github",
-        "description": "GitHub MCP server",
-        "transport": "streamable_http",
-        "url": "https://example.com/mcp"
-      },
-      {
-        "type": "cli",
-        "value": "gh",
-        "description": "GitHub CLI"
-      },
-      {
-        "type": "mcp",
-        "value": "local-gh",
-        "description": "Local GH MCP server",
-        "transport": "stdio",
-        "command": "gh-mcp"
-      }
-    ]
-  }
-}
+dependencies:
+  tools:
+    - type: mcp
+      value: github
+      description: GitHub MCP server
+      transport: streamable_http
+      url: https://example.com/mcp
+    - type: cli
+      value: gh
+      description: GitHub CLI
+    - type: mcp
+      value: local-gh
+      description: Local GH MCP server
+      transport: stdio
+      command: gh-mcp
 "#,
     );
 
@@ -976,253 +999,7 @@ interface:
     );
 }
 
-#[cfg(unix)]
-fn symlink_dir(target: &Path, link: &Path) {
-    std::os::unix::fs::symlink(target, link).unwrap();
-}
-
-#[cfg(unix)]
-fn symlink_file(target: &Path, link: &Path) {
-    std::os::unix::fs::symlink(target, link).unwrap();
-}
-
-#[tokio::test]
-#[cfg(unix)]
-async fn loads_skills_via_symlinked_subdir_for_user_scope() {
-    let codex_home = tempfile::tempdir().expect("tempdir");
-    let shared = tempfile::tempdir().expect("tempdir");
-
-    let shared_skill_path = write_skill_at(shared.path(), "demo", "linked-skill", "from link");
-
-    fs::create_dir_all(codex_home.path().join("skills")).unwrap();
-    symlink_dir(shared.path(), &codex_home.path().join("skills/shared"));
-
-    let cfg = make_config(&codex_home).await;
-    let outcome = load_skills_for_test(&cfg).await;
-
-    assert!(
-        outcome.errors.is_empty(),
-        "unexpected errors: {:?}",
-        outcome.errors
-    );
-    assert_eq!(
-        outcome.skills,
-        vec![SkillMetadata {
-            name: "linked-skill".to_string(),
-            description: "from link".to_string(),
-            short_description: None,
-            interface: None,
-            dependencies: None,
-            policy: None,
-            path_to_skills_md: normalized(&shared_skill_path),
-            scope: SkillScope::User,
-            plugin_id: None,
-        }]
-    );
-}
-
 // Directory symlinks on Windows can require Developer Mode or administrator privileges.
-#[tokio::test]
-#[cfg(unix)]
-async fn loads_skills_through_visible_alias_to_hidden_directory() {
-    let root = tempfile::tempdir().expect("tempdir");
-    let hidden_root = root.path().join(".hidden");
-    let skill_path = write_skill_at(&hidden_root, "search", "search-skill", "search description");
-    symlink_dir(&hidden_root, &root.path().join("visible"));
-
-    let outcome = load_user_skills_root(root.path()).await;
-
-    assert!(
-        outcome.errors.is_empty(),
-        "unexpected errors: {:?}",
-        outcome.errors
-    );
-    assert_eq!(
-        outcome.skills,
-        vec![expected_user_skill(
-            &skill_path,
-            "search-skill",
-            "search description",
-        )]
-    );
-}
-
-#[tokio::test]
-#[cfg(unix)]
-async fn ignores_symlinked_skill_file_for_user_scope() {
-    let codex_home = tempfile::tempdir().expect("tempdir");
-    let shared = tempfile::tempdir().expect("tempdir");
-
-    let shared_skill_path = write_skill_at(shared.path(), "demo", "linked-file-skill", "from link");
-
-    let skill_dir = codex_home.path().join("skills/demo");
-    fs::create_dir_all(&skill_dir).unwrap();
-    symlink_file(&shared_skill_path, &skill_dir.join(SKILLS_FILENAME));
-
-    let cfg = make_config(&codex_home).await;
-    let outcome = load_skills_for_test(&cfg).await;
-
-    assert!(
-        outcome.errors.is_empty(),
-        "unexpected errors: {:?}",
-        outcome.errors
-    );
-    assert_eq!(outcome.skills, Vec::new());
-}
-
-#[tokio::test]
-#[cfg(unix)]
-async fn does_not_loop_on_symlink_cycle_for_user_scope() {
-    let codex_home = tempfile::tempdir().expect("tempdir");
-
-    // Create a cycle:
-    //   $CODEX_HOME/skills/cycle/loop -> $CODEX_HOME/skills/cycle
-    let cycle_dir = codex_home.path().join("skills/cycle");
-    fs::create_dir_all(&cycle_dir).unwrap();
-    symlink_dir(&cycle_dir, &cycle_dir.join("loop"));
-
-    let skill_path = write_skill_at(&cycle_dir, "demo", "cycle-skill", "still loads");
-
-    let cfg = make_config(&codex_home).await;
-    let outcome = load_skills_for_test(&cfg).await;
-
-    assert!(
-        outcome.errors.is_empty(),
-        "unexpected errors: {:?}",
-        outcome.errors
-    );
-    assert_eq!(
-        outcome.skills,
-        vec![SkillMetadata {
-            name: "cycle-skill".to_string(),
-            description: "still loads".to_string(),
-            short_description: None,
-            interface: None,
-            dependencies: None,
-            policy: None,
-            path_to_skills_md: normalized(&skill_path),
-            scope: SkillScope::User,
-            plugin_id: None,
-        }]
-    );
-}
-
-#[tokio::test]
-#[cfg(unix)]
-async fn loads_skills_via_symlinked_subdir_for_admin_scope() {
-    let admin_root = tempfile::tempdir().expect("tempdir");
-    let shared = tempfile::tempdir().expect("tempdir");
-
-    let shared_skill_path =
-        write_skill_at(shared.path(), "demo", "admin-linked-skill", "from link");
-    fs::create_dir_all(admin_root.path()).unwrap();
-    symlink_dir(shared.path(), &admin_root.path().join("shared"));
-
-    let outcome = load_skills_from_roots(
-        [SkillRoot {
-            path: admin_root.path().abs(),
-            scope: SkillScope::Admin,
-            file_system: Arc::clone(&LOCAL_FS),
-            plugin_id: None,
-            plugin_namespace: None,
-            plugin_root: None,
-        }],
-        /*plugin_skill_snapshots*/ None,
-    )
-    .await;
-
-    assert!(
-        outcome.errors.is_empty(),
-        "unexpected errors: {:?}",
-        outcome.errors
-    );
-    assert_eq!(
-        outcome.skills,
-        vec![SkillMetadata {
-            name: "admin-linked-skill".to_string(),
-            description: "from link".to_string(),
-            short_description: None,
-            interface: None,
-            dependencies: None,
-            policy: None,
-            path_to_skills_md: normalized(&shared_skill_path),
-            scope: SkillScope::Admin,
-            plugin_id: None,
-        }]
-    );
-}
-
-#[tokio::test]
-#[cfg(unix)]
-async fn loads_skills_via_symlinked_subdir_for_repo_scope() {
-    let codex_home = tempfile::tempdir().expect("tempdir");
-    let repo_dir = tempfile::tempdir().expect("tempdir");
-    mark_as_git_repo(repo_dir.path());
-    let shared = tempfile::tempdir().expect("tempdir");
-
-    let linked_skill_path = write_skill_at(shared.path(), "demo", "repo-linked-skill", "from link");
-    let repo_skills_root = repo_dir
-        .path()
-        .join(REPO_ROOT_CONFIG_DIR_NAME)
-        .join(SKILLS_DIR_NAME);
-    fs::create_dir_all(&repo_skills_root).unwrap();
-    symlink_dir(shared.path(), &repo_skills_root.join("shared"));
-
-    let cfg = make_config_for_cwd(&codex_home, repo_dir.path().to_path_buf()).await;
-    let outcome = load_skills_for_test(&cfg).await;
-
-    assert!(
-        outcome.errors.is_empty(),
-        "unexpected errors: {:?}",
-        outcome.errors
-    );
-    assert_eq!(
-        outcome.skills,
-        vec![SkillMetadata {
-            name: "repo-linked-skill".to_string(),
-            description: "from link".to_string(),
-            short_description: None,
-            interface: None,
-            dependencies: None,
-            policy: None,
-            path_to_skills_md: normalized(&linked_skill_path),
-            scope: SkillScope::Repo,
-            plugin_id: None,
-        }]
-    );
-}
-
-#[tokio::test]
-#[cfg(unix)]
-async fn system_scope_ignores_symlinked_subdir() {
-    let codex_home = tempfile::tempdir().expect("tempdir");
-    let shared = tempfile::tempdir().expect("tempdir");
-
-    write_skill_at(shared.path(), "demo", "system-linked-skill", "from link");
-
-    let system_root = codex_home.path().join("skills/.system");
-    fs::create_dir_all(&system_root).unwrap();
-    symlink_dir(shared.path(), &system_root.join("shared"));
-
-    let outcome = load_skills_from_roots(
-        [SkillRoot {
-            path: system_root.abs(),
-            scope: SkillScope::System,
-            file_system: Arc::clone(&LOCAL_FS),
-            plugin_id: None,
-            plugin_namespace: None,
-            plugin_root: None,
-        }],
-        /*plugin_skill_snapshots*/ None,
-    )
-    .await;
-    assert!(
-        outcome.errors.is_empty(),
-        "unexpected errors: {:?}",
-        outcome.errors
-    );
-    assert_eq!(outcome.skills.len(), 0);
-}
 
 #[tokio::test]
 async fn respects_max_scan_depth_for_user_scope() {
@@ -1512,78 +1289,8 @@ async fn invalid_nested_plugin_manifest_falls_back_to_outer_namespace() {
 }
 
 // Directory symlinks on Windows can require Developer Mode or administrator privileges.
-#[cfg(unix)]
-#[tokio::test]
-async fn does_not_inherit_namespace_for_skills_in_symlinked_plain_dir() {
-    // outer-plugin/
-    // ├── .codex-plugin/plugin.json
-    // └── skills/linked-plain -> plain-root/
-    // plain-root/
-    // └── search/SKILL.md
-    let root = tempfile::tempdir().expect("tempdir");
-    let plugin_root = root.path().join("outer-plugin");
-    write_plugin_manifest(&plugin_root, r#"{"name":"outer"}"#);
-    let skills_root = plugin_root.join("skills");
-    let plain_root = tempfile::tempdir().expect("tempdir");
-    let skill_path = write_skill_at(
-        plain_root.path(),
-        "search",
-        "plain-skill",
-        "plain description",
-    );
-    fs::create_dir_all(&skills_root).unwrap();
-    symlink_dir(plain_root.path(), &skills_root.join("linked-plain"));
-
-    let outcome = load_user_skills_root(&skills_root).await;
-
-    assert!(
-        outcome.errors.is_empty(),
-        "unexpected errors: {:?}",
-        outcome.errors
-    );
-    assert_eq!(
-        outcome.skills,
-        vec![expected_user_skill(
-            &skill_path,
-            "plain-skill",
-            "plain description",
-        )]
-    );
-}
 
 // Directory symlinks on Windows can require Developer Mode or administrator privileges.
-#[cfg(unix)]
-#[tokio::test]
-async fn keeps_inherited_namespace_when_symlink_target_is_scan_root_ancestor() {
-    // temp-root/
-    // └── a/b/c/d/e/f/outer-plugin/
-    //     ├── .codex-plugin/plugin.json
-    //     └── skills/
-    //         ├── root/SKILL.md
-    //         └── link -> temp-root/
-    let root = tempfile::tempdir().expect("tempdir");
-    let plugin_root = root.path().join("a/b/c/d/e/f/outer-plugin");
-    write_plugin_manifest(&plugin_root, r#"{"name":"outer"}"#);
-    let skills_root = plugin_root.join("skills");
-    let skill_path = write_skill_at(&skills_root, "root", "root-skill", "root description");
-    symlink_dir(root.path(), &skills_root.join("link"));
-
-    let outcome = load_user_skills_root(&skills_root).await;
-
-    assert!(
-        outcome.errors.is_empty(),
-        "unexpected errors: {:?}",
-        outcome.errors
-    );
-    assert_eq!(
-        outcome.skills,
-        vec![expected_user_skill(
-            &skill_path,
-            "outer:root-skill",
-            "root description",
-        )]
-    );
-}
 
 #[tokio::test]
 async fn plugin_skill_name_length_limit_allows_max_qualified_name() {

@@ -11,6 +11,7 @@ pub(super) use crate::app_event::ExitMode;
 pub(super) use crate::app_event_sender::AppEventSender;
 pub(super) use crate::approval_events::ApplyPatchApprovalRequestEvent;
 pub(super) use crate::approval_events::ExecApprovalRequestEvent;
+pub(super) use crate::approval_presets::builtin_approval_presets;
 pub(super) use crate::bottom_pane::LocalImageAttachment;
 pub(super) use crate::bottom_pane::MentionBinding;
 pub(super) use crate::bottom_pane::QueuedInputAction;
@@ -162,14 +163,13 @@ pub(super) use codex_terminal_detection::Multiplexer;
 pub(super) use codex_terminal_detection::TerminalInfo;
 pub(super) use codex_terminal_detection::TerminalName;
 pub(super) use codex_utils_absolute_path::AbsolutePathBuf;
-pub(super) use codex_utils_approval_presets::builtin_approval_presets;
 pub(super) use codex_utils_path_uri::LegacyAppPathString;
 pub(super) use crossterm::event::KeyCode;
 pub(super) use crossterm::event::KeyEvent;
 pub(super) use crossterm::event::KeyModifiers;
 pub(super) use insta::assert_snapshot;
 pub(super) use serde_json::json;
-#[cfg(target_os = "windows")]
+
 pub(super) use serial_test::serial;
 pub(super) use std::collections::HashMap;
 pub(super) use std::path::PathBuf;
@@ -230,6 +230,19 @@ fn next_goal_draft(
 }
 
 mod app_server;
+
+#[test]
+fn chatwidget_does_not_retain_write_only_session_header_state() {
+    let chatwidget = include_str!("../chatwidget.rs");
+    let constructor = include_str!("constructor.rs");
+    let settings = include_str!("settings.rs");
+
+    assert!(!chatwidget.contains("mod session_header;"));
+    assert!(!chatwidget.contains("session_header: SessionHeader"));
+    assert!(!constructor.contains("SessionHeader::new"));
+    assert!(!settings.contains("self.session_header.set_model"));
+}
+
 mod approval_requests;
 mod composer_submission;
 #[path = "tests/config_errors_tests.rs"]

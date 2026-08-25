@@ -39,6 +39,7 @@ use codex_app_server_protocol::McpServerElicitationRequestParams;
 use codex_app_server_protocol::McpServerElicitationRequestResponse;
 use codex_app_server_protocol::McpServerStartupState;
 use codex_app_server_protocol::McpServerStatusUpdatedNotification;
+use codex_app_server_protocol::McpToolCallProgressNotification;
 use codex_app_server_protocol::ModelReroutedNotification;
 use codex_app_server_protocol::ModelSafetyBufferingUpdatedNotification;
 use codex_app_server_protocol::ModelVerificationNotification;
@@ -54,14 +55,6 @@ use codex_app_server_protocol::ServerRequestPayload;
 use codex_app_server_protocol::TaskCompletionGate;
 use codex_app_server_protocol::ThreadGoalUpdatedNotification;
 use codex_app_server_protocol::ThreadItem;
-use codex_app_server_protocol::ThreadRealtimeClosedNotification;
-use codex_app_server_protocol::ThreadRealtimeErrorNotification;
-use codex_app_server_protocol::ThreadRealtimeItemAddedNotification;
-use codex_app_server_protocol::ThreadRealtimeOutputAudioDeltaNotification;
-use codex_app_server_protocol::ThreadRealtimeSdpNotification;
-use codex_app_server_protocol::ThreadRealtimeStartedNotification;
-use codex_app_server_protocol::ThreadRealtimeTranscriptDeltaNotification;
-use codex_app_server_protocol::ThreadRealtimeTranscriptDoneNotification;
 use codex_app_server_protocol::ThreadRollbackResponse;
 use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
 use codex_app_server_protocol::ThreadStatus;
@@ -101,7 +94,6 @@ use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecApprovalRequestEvent;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::RealtimeEvent;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::SubAgentActivityKind;
 use codex_protocol::protocol::TokenCountEvent;
@@ -127,6 +119,20 @@ use tracing::error;
 enum CommandExecutionApprovalPresentation {
     Network(V2NetworkApprovalContext),
     Command(CommandExecutionCompletionItem),
+}
+
+fn mcp_tool_call_progress_notification(
+    conversation_id: ThreadId,
+    turn_id: String,
+    item_id: String,
+    message: String,
+) -> ServerNotification {
+    ServerNotification::McpToolCallProgress(McpToolCallProgressNotification {
+        thread_id: conversation_id.to_string(),
+        turn_id,
+        item_id,
+        message,
+    })
 }
 
 #[derive(Debug, PartialEq)]
@@ -387,164 +393,6 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .send_server_notification(ServerNotification::ModelSafetyBufferingUpdated(
                     notification,
                 ))
-                .await;
-        }
-        EventMsg::RealtimeConversationStarted(event) => {
-            let notification = ThreadRealtimeStartedNotification {
-                thread_id: conversation_id.to_string(),
-                realtime_session_id: event.realtime_session_id,
-                version: event.version,
-            };
-            outgoing
-                .send_server_notification(ServerNotification::ThreadRealtimeStarted(notification))
-                .await;
-        }
-        EventMsg::RealtimeConversationSdp(event) => {
-            let notification = ThreadRealtimeSdpNotification {
-                thread_id: conversation_id.to_string(),
-                sdp: event.sdp,
-            };
-            outgoing
-                .send_server_notification(ServerNotification::ThreadRealtimeSdp(notification))
-                .await;
-        }
-        EventMsg::RealtimeConversationRealtime(event) => match event.payload {
-            RealtimeEvent::SessionUpdated { .. } => {}
-            RealtimeEvent::InputAudioSpeechStarted(event) => {
-                let notification = ThreadRealtimeItemAddedNotification {
-                    thread_id: conversation_id.to_string(),
-                    item: serde_json::json!({
-                        "type": "input_audio_buffer.speech_started",
-                        "item_id": event.item_id,
-                    }),
-                };
-                outgoing
-                    .send_server_notification(ServerNotification::ThreadRealtimeItemAdded(
-                        notification,
-                    ))
-                    .await;
-            }
-            RealtimeEvent::InputTranscriptDelta(event) => {
-                let notification = ThreadRealtimeTranscriptDeltaNotification {
-                    thread_id: conversation_id.to_string(),
-                    role: "user".to_string(),
-                    delta: event.delta,
-                };
-                outgoing
-                    .send_server_notification(ServerNotification::ThreadRealtimeTranscriptDelta(
-                        notification,
-                    ))
-                    .await;
-            }
-            RealtimeEvent::InputTranscriptDone(event) => {
-                let notification = ThreadRealtimeTranscriptDoneNotification {
-                    thread_id: conversation_id.to_string(),
-                    role: "user".to_string(),
-                    text: event.text,
-                };
-                outgoing
-                    .send_server_notification(ServerNotification::ThreadRealtimeTranscriptDone(
-                        notification,
-                    ))
-                    .await;
-            }
-            RealtimeEvent::OutputTranscriptDelta(event) => {
-                let notification = ThreadRealtimeTranscriptDeltaNotification {
-                    thread_id: conversation_id.to_string(),
-                    role: "assistant".to_string(),
-                    delta: event.delta,
-                };
-                outgoing
-                    .send_server_notification(ServerNotification::ThreadRealtimeTranscriptDelta(
-                        notification,
-                    ))
-                    .await;
-            }
-            RealtimeEvent::OutputTranscriptDone(event) => {
-                let notification = ThreadRealtimeTranscriptDoneNotification {
-                    thread_id: conversation_id.to_string(),
-                    role: "assistant".to_string(),
-                    text: event.text,
-                };
-                outgoing
-                    .send_server_notification(ServerNotification::ThreadRealtimeTranscriptDone(
-                        notification,
-                    ))
-                    .await;
-            }
-            RealtimeEvent::AudioOut(audio) => {
-                let notification = ThreadRealtimeOutputAudioDeltaNotification {
-                    thread_id: conversation_id.to_string(),
-                    audio: audio.into(),
-                };
-                outgoing
-                    .send_server_notification(ServerNotification::ThreadRealtimeOutputAudioDelta(
-                        notification,
-                    ))
-                    .await;
-            }
-            RealtimeEvent::ResponseCreated(_) => {}
-            RealtimeEvent::ResponseCancelled(event) => {
-                let notification = ThreadRealtimeItemAddedNotification {
-                    thread_id: conversation_id.to_string(),
-                    item: serde_json::json!({
-                        "type": "response.cancelled",
-                        "response_id": event.response_id,
-                    }),
-                };
-                outgoing
-                    .send_server_notification(ServerNotification::ThreadRealtimeItemAdded(
-                        notification,
-                    ))
-                    .await;
-            }
-            RealtimeEvent::ResponseDone(_) => {}
-            RealtimeEvent::ConversationItemAdded(item) => {
-                let notification = ThreadRealtimeItemAddedNotification {
-                    thread_id: conversation_id.to_string(),
-                    item,
-                };
-                outgoing
-                    .send_server_notification(ServerNotification::ThreadRealtimeItemAdded(
-                        notification,
-                    ))
-                    .await;
-            }
-            RealtimeEvent::ConversationItemDone { .. } | RealtimeEvent::NoopRequested(_) => {}
-            RealtimeEvent::HandoffRequested(handoff) => {
-                let notification = ThreadRealtimeItemAddedNotification {
-                    thread_id: conversation_id.to_string(),
-                    item: serde_json::json!({
-                        "type": "handoff_request",
-                        "handoff_id": handoff.handoff_id,
-                        "item_id": handoff.item_id,
-                        "input_transcript": handoff.input_transcript,
-                        "active_transcript": handoff.active_transcript,
-                    }),
-                };
-                outgoing
-                    .send_server_notification(ServerNotification::ThreadRealtimeItemAdded(
-                        notification,
-                    ))
-                    .await;
-            }
-            RealtimeEvent::Error(message) => {
-                let notification = ThreadRealtimeErrorNotification {
-                    thread_id: conversation_id.to_string(),
-                    message,
-                };
-                outgoing
-                    .send_server_notification(ServerNotification::ThreadRealtimeError(notification))
-                    .await;
-            }
-        },
-        EventMsg::RealtimeConversationClosed(event) => {
-            let notification = ThreadRealtimeClosedNotification {
-                thread_id: conversation_id.to_string(),
-                reason: event.reason,
-            };
-            outgoing
-                .send_server_notification(ServerNotification::ThreadRealtimeClosed(notification))
                 .await;
         }
         EventMsg::ApplyPatchApprovalRequest(event) => {
@@ -861,6 +709,16 @@ pub(crate) async fn apply_bespoke_event_handling(
             // compatibility consumers.
             // App-server v2 receives TurnItem lifecycle instead, and dispatches dynamic tool
             // requests from DynamicToolCall starts.
+        }
+        EventMsg::McpToolCallProgress(event) => {
+            outgoing
+                .send_server_notification(mcp_tool_call_progress_notification(
+                    conversation_id,
+                    event_turn_id,
+                    event.call_id,
+                    event.message,
+                ))
+                .await;
         }
         EventMsg::McpToolCallBegin(_) | EventMsg::McpToolCallEnd(_) => {
             // Deprecated MCP tool-call events are still fanned out for raw-event and rollout
@@ -2170,9 +2028,8 @@ async fn on_command_execution_request_approval_response(
     };
 
     let suppress_subcommand_completion_item = {
-        // For regular shell/unified_exec approvals, approval_id is null.
-        // For zsh-fork subcommand approvals, approval_id is present and
-        // item_id points to the parent command item.
+        // Subcommand approvals carry an approval ID and point at the parent
+        // command item.
         if approval_id.is_some() {
             let state = thread_state.lock().await;
             state
@@ -3112,21 +2969,9 @@ mod tests {
 
     #[test]
     fn request_permissions_response_accepts_partial_network_and_file_system_grants() {
-        let input_path = if cfg!(target_os = "windows") {
-            r"C:\tmp\input"
-        } else {
-            "/tmp/input"
-        };
-        let output_path = if cfg!(target_os = "windows") {
-            r"C:\tmp\output"
-        } else {
-            "/tmp/output"
-        };
-        let ignored_path = if cfg!(target_os = "windows") {
-            r"C:\tmp\ignored"
-        } else {
-            "/tmp/ignored"
-        };
+        let input_path = r"C:\tmp\input";
+        let output_path = r"C:\tmp\output";
+        let ignored_path = r"C:\tmp\ignored";
         let absolute_path = |path: &str| {
             AbsolutePathBuf::try_from(std::path::PathBuf::from(path)).expect("absolute path")
         };
@@ -4145,15 +3990,20 @@ mod tests {
             &thread_state,
         )
         .await;
-        handle_turn_complete(
-            conversation_a,
-            a_turn1.clone(),
-            turn_complete_event(&a_turn1),
-            &outgoing,
-            &thread_state,
-            None,
-        )
-        .await;
+        let ((), first_message) = tokio::join!(
+            async {
+                handle_turn_complete(
+                    conversation_a,
+                    a_turn1.clone(),
+                    turn_complete_event(&a_turn1),
+                    &outgoing,
+                    &thread_state,
+                    None,
+                )
+                .await;
+            },
+            recv_broadcast_message(&mut rx),
+        );
 
         // Turn 1 on conversation B
         let b_turn1 = "b_turn1".to_string();
@@ -4167,30 +4017,40 @@ mod tests {
             &thread_state,
         )
         .await;
-        handle_turn_complete(
-            conversation_b,
-            b_turn1.clone(),
-            turn_complete_event(&b_turn1),
-            &outgoing,
-            &thread_state,
-            None,
-        )
-        .await;
+        let ((), second_message) = tokio::join!(
+            async {
+                handle_turn_complete(
+                    conversation_b,
+                    b_turn1.clone(),
+                    turn_complete_event(&b_turn1),
+                    &outgoing,
+                    &thread_state,
+                    None,
+                )
+                .await;
+            },
+            recv_broadcast_message(&mut rx),
+        );
 
         // Turn 2 on conversation A
         let a_turn2 = "a_turn2".to_string();
-        handle_turn_complete(
-            conversation_a,
-            a_turn2.clone(),
-            turn_complete_event(&a_turn2),
-            &outgoing,
-            &thread_state,
-            None,
-        )
-        .await;
+        let ((), third_message) = tokio::join!(
+            async {
+                handle_turn_complete(
+                    conversation_a,
+                    a_turn2.clone(),
+                    turn_complete_event(&a_turn2),
+                    &outgoing,
+                    &thread_state,
+                    None,
+                )
+                .await;
+            },
+            recv_broadcast_message(&mut rx),
+        );
 
         // Verify: A turn 1
-        let msg = recv_broadcast_message(&mut rx).await?;
+        let msg = first_message?;
         match msg {
             OutgoingMessage::AppServerNotification(ServerNotification::TurnCompleted(n)) => {
                 assert_eq!(n.turn.id, a_turn1);
@@ -4208,7 +4068,7 @@ mod tests {
         }
 
         // Verify: B turn 1
-        let msg = recv_broadcast_message(&mut rx).await?;
+        let msg = second_message?;
         match msg {
             OutgoingMessage::AppServerNotification(ServerNotification::TurnCompleted(n)) => {
                 assert_eq!(n.turn.id, b_turn1);
@@ -4226,7 +4086,7 @@ mod tests {
         }
 
         // Verify: A turn 2
-        let msg = recv_broadcast_message(&mut rx).await?;
+        let msg = third_message?;
         match msg {
             OutgoingMessage::AppServerNotification(ServerNotification::TurnCompleted(n)) => {
                 assert_eq!(n.turn.id, a_turn2);
@@ -4278,5 +4138,25 @@ mod tests {
         }
         assert!(rx.try_recv().is_err(), "no extra messages expected");
         Ok(())
+    }
+
+    #[test]
+    fn mcp_tool_call_progress_maps_to_existing_v2_notification() {
+        let conversation_id = ThreadId::new();
+
+        let notification = mcp_tool_call_progress_notification(
+            conversation_id,
+            "turn-1".to_string(),
+            "item-1".to_string(),
+            "working".to_string(),
+        );
+
+        let ServerNotification::McpToolCallProgress(notification) = notification else {
+            panic!("expected mcp tool call progress notification");
+        };
+        assert_eq!(notification.thread_id, conversation_id.to_string());
+        assert_eq!(notification.turn_id, "turn-1");
+        assert_eq!(notification.item_id, "item-1");
+        assert_eq!(notification.message, "working");
     }
 }

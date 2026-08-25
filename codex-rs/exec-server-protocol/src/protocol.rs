@@ -129,8 +129,7 @@ pub struct ExecParams {
     /// Keep non-tty stdin writable through `process/write`.
     #[serde(default)]
     pub pipe_stdin: bool,
-    /// Optional process-visible argv0 override. Values such as `codex-linux-sandbox` are command
-    /// names rather than paths, so this is not a [`PathUri`].
+    /// Optional process-visible argv0 override for command aliases rather than paths.
     pub arg0: Option<String>,
     /// Portable sandbox intent. Concrete wrapper argv is resolved by the exec-server.
     #[serde(default)]

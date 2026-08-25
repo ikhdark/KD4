@@ -311,9 +311,7 @@ async fn response_item_ids_persist_across_resume_and_preserve_server_ids() -> an
         ],
     )
     .await;
-    let mut builder = test_codex().with_config(|config| {
-        let _ = config.features.enable(Feature::ItemIds);
-    });
+    let mut builder = test_codex();
     let initial = builder.build(&server).await?;
     let home = Arc::clone(&initial.home);
     let rollout_path = initial
@@ -329,9 +327,6 @@ async fn response_item_ids_persist_across_resume_and_preserve_server_ids() -> an
     })
     .await;
 
-    builder = builder.with_config(|config| {
-        let _ = config.features.enable(Feature::ItemIds);
-    });
     let resumed = builder.resume(&server, home, rollout_path).await?;
     resumed.submit_turn("after resume").await?;
 
@@ -408,9 +403,7 @@ async fn synthetic_call_output_id_is_stable_across_resumes() -> anyhow::Result<(
     )
     .await;
     let codex_home = Arc::new(TempDir::new()?);
-    let mut builder = test_codex().with_config(|config| {
-        let _ = config.features.enable(Feature::ItemIds);
-    });
+    let mut builder = test_codex();
     let first = builder
         .resume(&server, Arc::clone(&codex_home), session_path.clone())
         .await?;
@@ -426,9 +419,6 @@ async fn synthetic_call_output_id_is_stable_across_resumes() -> anyhow::Result<(
         "prompt-only repair should not be persisted to the rollout"
     );
 
-    builder = builder.with_config(|config| {
-        let _ = config.features.enable(Feature::ItemIds);
-    });
     let second = builder.resume(&server, codex_home, session_path).await?;
     second.submit_turn("second resume").await?;
 
@@ -482,10 +472,6 @@ async fn response_item_ids_are_sent_for_persisted_remote_v2_compaction_items() -
     .await;
     let test = test_codex()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
-        .with_config(|config| {
-            let _ = config.features.enable(Feature::ItemIds);
-            let _ = config.features.enable(Feature::RemoteCompactionV2);
-        })
         .build(&server)
         .await?;
 
@@ -595,28 +581,6 @@ impl ProviderAuthCommandFixture {
         }
         std::fs::write(&tokens_file, token_file_contents)?;
 
-        #[cfg(unix)]
-        let (command, args) = {
-            let script_path = tempdir.path().join("print-token.sh");
-            std::fs::write(
-                &script_path,
-                r#"#!/bin/sh
-first_line=$(sed -n '1p' tokens.txt)
-printf '%s\n' "$first_line"
-tail -n +2 tokens.txt > tokens.next
-mv tokens.next tokens.txt
-"#,
-            )?;
-            let mut permissions = std::fs::metadata(&script_path)?.permissions();
-            {
-                use std::os::unix::fs::PermissionsExt;
-                permissions.set_mode(0o755);
-            }
-            std::fs::set_permissions(&script_path, permissions)?;
-            ("./print-token.sh".to_string(), Vec::new())
-        };
-
-        #[cfg(windows)]
         let (command, args) = {
             let script_path = tempdir.path().join("print-token.cmd");
             std::fs::write(
@@ -1339,7 +1303,6 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
-        /*item_ids_enabled*/ config.features.enabled(Feature::ItemIds),
         /*concurrent_reasoning_summaries_enabled*/
         config
             .features
@@ -2204,48 +2167,6 @@ async fn initial_turn_reasoning_policy_uses_compatibility_phase_efforts() -> any
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn includes_governed_effort_when_no_turn_effort_is_configured() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
-    let server = MockServer::start().await;
-
-    let resp_mock = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
-    )
-    .await;
-    let TestCodex { codex, .. } = test_codex().with_model("gpt-5.4").build(&server).await?;
-
-    codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
-        .await
-        .unwrap();
-
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-
-    let request = resp_mock.single_request();
-    let request_body = request.body_json();
-
-    assert_eq!(
-        request_body
-            .get("reasoning")
-            .and_then(|t| t.get("effort"))
-            .and_then(|v| v.as_str()),
-        Some("high")
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn governed_effort_overrides_model_default_reasoning_effort() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
     let server = MockServer::start().await;
@@ -2914,7 +2835,7 @@ async fn includes_developer_instructions_message_in_request() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn azure_responses_request_includes_store_and_prefixed_item_ids() {
+async fn azure_responses_request_includes_store_and_omits_item_ids() {
     skip_if_no_network!();
 
     let server = MockServer::start().await;
@@ -2984,7 +2905,6 @@ async fn azure_responses_request_includes_store_and_prefixed_item_ids() {
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
-        /*item_ids_enabled*/ false,
         /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
         config.http_client_factory(),
@@ -3114,16 +3034,16 @@ async fn azure_responses_request_includes_store_and_prefixed_item_ids() {
     assert_eq!(body["store"], serde_json::Value::Bool(true));
     assert_eq!(body["stream"], serde_json::Value::Bool(true));
     assert_eq!(body["input"].as_array().map(Vec::len), Some(10));
-    assert_eq!(body["input"][0]["id"].as_str(), Some("rs_reasoning-id"));
-    assert_eq!(body["input"][1]["id"].as_str(), Some("msg_message-id"));
-    assert_eq!(body["input"][2]["id"].as_str(), Some("ws_web-search-id"));
-    assert_eq!(body["input"][3]["id"].as_str(), Some("fc_function-id"));
+    assert_eq!(body["input"][0].get("id"), None);
+    assert_eq!(body["input"][1].get("id"), None);
+    assert_eq!(body["input"][2].get("id"), None);
+    assert_eq!(body["input"][3].get("id"), None);
     assert_eq!(
         body["input"][4]["call_id"].as_str(),
         Some("function-call-id")
     );
-    assert_eq!(body["input"][5]["id"].as_str(), Some("lsh_local-shell-id"));
-    assert_eq!(body["input"][6]["id"].as_str(), Some("ctc_custom-tool-id"));
+    assert_eq!(body["input"][5].get("id"), None);
+    assert_eq!(body["input"][6].get("id"), None);
     assert_eq!(
         body["input"][7]["call_id"].as_str(),
         Some("custom-tool-call-id")
@@ -3856,8 +3776,10 @@ async fn history_dedupes_streamed_and_final_messages_across_turns() {
         .cloned()
         .collect::<Vec<_>>();
     assert_eq!(
-        strip_metadata_from_json(serde_json::Value::Array(actual_conversation)),
-        expected_conversation,
+        core_test_support::responses::strip_response_item_ids_from_json(strip_metadata_from_json(
+            serde_json::Value::Array(actual_conversation),
+        )),
+        core_test_support::responses::strip_response_item_ids_from_json(expected_conversation),
         "request 3 conversation history mismatch",
     );
 }

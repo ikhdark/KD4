@@ -86,6 +86,10 @@ pub(crate) mod test_observation {
         ))
     }
 
+    pub(super) fn configured_profitability_costs() -> Option<(Duration, Duration, Duration)> {
+        PROFITABILITY_COSTS.try_with(|costs| *costs).ok()
+    }
+
     pub(super) fn record_immutable_git_show_identity() {
         let _ = COUNTERS.try_with(|counters| {
             counters
@@ -171,6 +175,8 @@ pub(crate) struct PreparedKnownDelta {
     candidate: Option<EvidenceCandidate>,
     hit: Option<KnownDeltaHit>,
     force_fresh: bool,
+    #[cfg(test)]
+    profitability_costs: Option<(Duration, Duration, Duration)>,
 }
 
 impl PreparedKnownDelta {
@@ -285,10 +291,13 @@ pub(crate) async fn immutable_git_show_identity_with_project_namespace(
         .await
         .unwrap_or_default();
     let resolved_blob = git_resolve_blob(cwd, requested).await?;
-    let lineage_key = digest(format!("git_show_resolved_object\0{suffix}").as_bytes());
+    let program_identity = program.replace('\\', "/");
+    let lineage_key = digest(
+        format!("git_show_resolved_object\0program={program_identity}\0{suffix}").as_bytes(),
+    );
     let fingerprint = digest(
         format!(
-            "schema={EVIDENCE_SCHEMA_VERSION}\0project={project_namespace}\0op=git_show\0cwd={cwd_position}\0object={requested}\0blob={resolved_blob}"
+            "schema={EVIDENCE_SCHEMA_VERSION}\0project={project_namespace}\0op=git_show\0program={program_identity}\0cwd={cwd_position}\0object={requested}\0blob={resolved_blob}"
         )
         .as_bytes(),
     );
@@ -326,6 +335,20 @@ pub(crate) async fn prepare_immutable_git_show(
     )
     .await?;
     let candidate = lookup(codex_home, &identity).await;
+    #[cfg(test)]
+    let profitability_costs = test_observation::configured_profitability_costs();
+    #[cfg(test)]
+    let (identity, candidate) = {
+        let mut identity = identity;
+        let mut candidate = candidate;
+        if let Some((lookup_cost, fingerprint_cost, _)) = profitability_costs {
+            identity.fingerprint_cost = fingerprint_cost;
+            if let Some(candidate) = candidate.as_mut() {
+                candidate.lookup_cost = lookup_cost;
+            }
+        }
+        (identity, candidate)
+    };
     let hit = if !force_fresh
         && let Some(candidate) = candidate.as_ref()
         && candidate.reusable()
@@ -347,6 +370,8 @@ pub(crate) async fn prepare_immutable_git_show(
         candidate,
         hit,
         force_fresh,
+        #[cfg(test)]
+        profitability_costs,
     })
 }
 
@@ -469,6 +494,11 @@ pub(crate) async fn record_execution(
             output,
             executor_cost,
         } => {
+            #[cfg(test)]
+            let executor_cost = prepared
+                .profitability_costs
+                .map(|(_, _, executor_cost)| executor_cost)
+                .unwrap_or(executor_cost);
             let _ = record_success(
                 codex_home,
                 &prepared.identity,
@@ -882,6 +912,26 @@ mod tests {
         assert_eq!(observed.immutable_git_show_identity_calls, 1);
         assert_eq!(observed.lookup_calls, 3);
         assert_eq!(observed.fingerprint_git_subprocesses, 3);
+    }
+
+    #[tokio::test]
+    async fn immutable_git_show_identity_is_scoped_to_the_supplied_executable() {
+        let root = TempDir::new().unwrap();
+        let repo = root.path().join("repo");
+        init_repo(&repo, "immutable\n");
+        let blob = run_git(&repo, &["rev-parse", "HEAD:read.txt"]);
+        let args = ["show".to_string(), blob];
+        let alternate_program = repo.join("git.exe").to_string_lossy().into_owned();
+
+        let system = immutable_git_show_identity(&repo, "git", &args)
+            .await
+            .expect("system git identity");
+        let alternate = immutable_git_show_identity(&repo, &alternate_program, &args)
+            .await
+            .expect("alternate git identity");
+
+        assert_ne!(system.lineage_key, alternate.lineage_key);
+        assert_ne!(system.fingerprint, alternate.fingerprint);
     }
 
     #[tokio::test]

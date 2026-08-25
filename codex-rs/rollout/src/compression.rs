@@ -10,11 +10,6 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-
 const COMPRESSED_SUFFIX: &str = ".zst";
 const COMPRESSED_READER_CHANNEL_CAPACITY: usize = 64;
 const MAX_NOT_FOUND_RETRIES: usize = 3;
@@ -131,8 +126,7 @@ fn open_lock_file(lock_path: &Path) -> io::Result<File> {
     }
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true);
-    #[cfg(unix)]
-    options.mode(0o600);
+
     options.open(lock_path)
 }
 
@@ -1149,18 +1143,6 @@ mod reader {
     }
 }
 
-#[cfg(unix)]
-fn create_file_with_permissions(path: &Path, permissions: &Permissions) -> io::Result<File> {
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(permissions.mode() & 0o7777)
-        .open(path)?;
-    file.set_permissions(permissions.clone())?;
-    Ok(file)
-}
-
-#[cfg(not(unix))]
 fn create_file_with_permissions(path: &Path, permissions: &Permissions) -> io::Result<File> {
     let file = std::fs::OpenOptions::new()
         .write(true)

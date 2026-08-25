@@ -10,9 +10,9 @@ use serde_json::json;
 
 use crate::DEFAULT_READ_MAX_TOKENS;
 use crate::READ_TOOL_NAME;
-use crate::backend::MemoriesBackend;
 use crate::backend::ReadMemoryRequest;
 use crate::backend::ReadMemoryResponse;
+use crate::local::LocalMemoriesBackend;
 use crate::metrics::record_tool_call;
 use crate::metrics::scope_from_path;
 use crate::metrics::truncated_tag;
@@ -33,15 +33,12 @@ struct ReadArgs {
 }
 
 #[derive(Clone)]
-pub(super) struct ReadTool<B> {
-    pub(super) backend: B,
+pub(super) struct ReadTool {
+    pub(super) backend: LocalMemoriesBackend,
     pub(super) metrics_client: Option<MetricsClient>,
 }
 
-impl<B> ToolExecutor<ToolCall> for ReadTool<B>
-where
-    B: MemoriesBackend,
-{
+impl ToolExecutor<ToolCall> for ReadTool {
     fn tool_name(&self) -> ToolName {
         memory_tool_name(READ_TOOL_NAME)
     }
@@ -58,20 +55,17 @@ where
     }
 }
 
-impl<B> ReadTool<B>
-where
-    B: MemoriesBackend,
-{
+impl ReadTool {
     async fn handle_call(
         &self,
         call: ToolCall,
     ) -> Result<Box<dyn codex_extension_api::ToolOutput>, codex_extension_api::FunctionCallError>
     {
-        let backend = self.backend.clone();
         let args: ReadArgs = parse_args(&call)?;
         let path = args.path;
         let scope = scope_from_path(path.as_str());
-        let response = backend
+        let response = self
+            .backend
             .read(ReadMemoryRequest {
                 path: path.clone(),
                 line_offset: args.line_offset.unwrap_or(1),

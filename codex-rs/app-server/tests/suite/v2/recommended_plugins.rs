@@ -4,6 +4,8 @@ use app_test_support::TestAppServer;
 use app_test_support::encode_id_token;
 use app_test_support::to_response;
 use app_test_support::write_mock_responses_config_toml_with_chatgpt_base_url;
+use codex_app_server_protocol::ExperimentalFeatureEnablementSetParams;
+use codex_app_server_protocol::ExperimentalFeatureEnablementSetResponse;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::LoginAccountResponse;
 use codex_app_server_protocol::RequestId;
@@ -28,7 +30,7 @@ const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(20);
 const WORKSPACE_ID: &str = "123e4567-e89b-42d3-a456-426614174010";
 
 #[tokio::test]
-async fn first_turn_after_external_login_waits_for_recommended_plugins() -> Result<()> {
+async fn runtime_tool_suggest_disable_refreshes_active_thread() -> Result<()> {
     let server = responses::start_mock_server().await;
     let apps_server = AppsTestServer::mount(&server).await?;
     Mock::given(method("GET"))
@@ -51,12 +53,22 @@ async fn first_turn_after_external_login_waits_for_recommended_plugins() -> Resu
         .expect(1)
         .mount(&server)
         .await;
-    let response = responses::sse(vec![
-        responses::ev_response_created("resp-1"),
-        responses::ev_assistant_message("msg-1", "done"),
-        responses::ev_completed("resp-1"),
-    ]);
-    let responses_mock = responses::mount_sse_once(&server, response).await;
+    let responses_mock = responses::mount_sse_sequence(
+        &server,
+        vec![
+            responses::sse(vec![
+                responses::ev_response_created("resp-1"),
+                responses::ev_assistant_message("msg-1", "done"),
+                responses::ev_completed("resp-1"),
+            ]),
+            responses::sse(vec![
+                responses::ev_response_created("resp-2"),
+                responses::ev_assistant_message("msg-2", "done"),
+                responses::ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
 
     let codex_home = TempDir::new()?;
     write_mock_responses_config_toml_with_chatgpt_base_url(
@@ -64,13 +76,6 @@ async fn first_turn_after_external_login_waits_for_recommended_plugins() -> Resu
         &server.uri(),
         &apps_server.chatgpt_base_url,
     )?;
-    let config_path = codex_home.path().join("config.toml");
-    let config = std::fs::read_to_string(&config_path)?;
-    std::fs::write(
-        config_path,
-        format!("{config}\n[features]\napps = true\nplugins = true\ntool_suggest = true\n"),
-    )?;
-
     let sqlite_home = codex_home.path().to_string_lossy();
     let mut app_server = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -118,7 +123,7 @@ async fn first_turn_after_external_login_waits_for_recommended_plugins() -> Resu
 
     let turn_id = app_server
         .send_turn_start_request(TurnStartParams {
-            thread_id: thread.id,
+            thread_id: thread.id.clone(),
             input: vec![UserInput::Text {
                 text: "suggest a plugin".to_string(),
                 text_elements: Vec::new(),
@@ -160,5 +165,65 @@ async fn first_turn_after_external_login_waits_for_recommended_plugins() -> Resu
         .collect::<Vec<_>>();
     assert!(tool_names.contains(&"request_plugin_install"));
     assert!(!tool_names.contains(&"list_available_plugins_to_install"));
+
+    let feature_request_id = app_server
+        .send_experimental_feature_enablement_set_request(ExperimentalFeatureEnablementSetParams {
+            enablement: [("tool_suggest".to_string(), false)].into(),
+        })
+        .await?;
+    let feature_response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        app_server.read_stream_until_response_message(RequestId::Integer(feature_request_id)),
+    )
+    .await??;
+    assert_eq!(
+        to_response::<ExperimentalFeatureEnablementSetResponse>(feature_response)?,
+        ExperimentalFeatureEnablementSetResponse {
+            enablement: [("tool_suggest".to_string(), false)].into(),
+        }
+    );
+
+    let turn_id = app_server
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id,
+            input: vec![UserInput::Text {
+                text: "do not suggest a plugin".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let _: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        app_server.read_stream_until_response_message(RequestId::Integer(turn_id)),
+    )
+    .await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        app_server.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let request = responses_mock
+        .requests()
+        .into_iter()
+        .find(|request| {
+            request
+                .message_input_texts("user")
+                .iter()
+                .any(|text| text.contains("do not suggest a plugin"))
+        })
+        .expect("turn request after runtime feature disable");
+    let contextual_user_message = request.message_input_texts("user").join("\n");
+    assert!(!contextual_user_message.contains("<recommended_plugins>"));
+    let request_body = request.body_json();
+    let has_install_tool = request_body
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .any(|name| name == "request_plugin_install");
+    assert!(!has_install_tool);
     Ok(())
 }

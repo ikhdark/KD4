@@ -106,7 +106,7 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
     );
     ToolSpec::Function(ResponsesApiTool {
         name: READ_TOOL_OUTPUT_TOOL_NAME.to_string(),
-        description: "Search or select from one validated immutable tool-output snapshot without rerunning its producer. Exact selectors are deduplicated; overlapping or adjacent byte and line ranges are coalesced; results use stable canonical source order. A search selector returns its merged exact contexts in hydrated_ranges in the same call; child_selectors remain exact recovery receipts and continuation advances only when another bounded page exists. Batch independent line, byte, section, and JSON-pointer selectors instead of rereading tiny fragments. Exact values are never clipped: deterministic byte subdivisions are consumed internally only when the complete transaction fits its final budget; otherwise selector_too_large or aggregate_omitted returns exact canonical ranges and deterministic child selectors. complete is true only when every normalized selector is present. After an overflow status, retry only the returned continuation or child_selectors and never broaden or repeat the parent selector. Recovery is deterministically reused, never recursively spills, and never creates a child artifact."
+        description: "Search or select from one validated immutable tool-output snapshot without rerunning its producer. Exact selectors are deduplicated; overlapping or adjacent byte and line ranges are coalesced; results use stable canonical source order. A search selector returns its merged exact contexts in hydrated_ranges in the same call; child_selectors remain exact recovery receipts and continuation advances only when another bounded page exists. Batch independent line, byte, section, and JSON-pointer selectors instead of rereading tiny fragments. Exact values are never clipped: deterministic byte subdivisions are consumed internally only when the complete transaction fits its final budget; otherwise selector_too_large or aggregate_omitted returns exact canonical ranges and deterministic child selectors. complete is true only when every normalized selector is present. After an overflow status, retry only the returned continuation or child_selectors and never broaden or repeat the parent selector. Recovery reopens and validates the retained artifact, never recursively spills, and never creates a child artifact."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -200,6 +200,6 @@ mod tests {
         assert!(description.contains("same call"));
         assert!(description.contains("instead of rereading tiny fragments"));
         assert!(description.contains("retry only the returned continuation or child_selectors"));
-        assert!(description.contains("deterministically reused"));
+        assert!(description.contains("reopens and validates the retained artifact"));
     }
 }

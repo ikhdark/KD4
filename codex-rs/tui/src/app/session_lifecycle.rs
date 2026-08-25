@@ -5,6 +5,9 @@
 //! cache used for multi-agent navigation.
 
 use super::*;
+use crate::app_server_session::server_error_data_from_report;
+use codex_app_server_protocol::ThreadErrorData;
+use codex_app_server_protocol::ThreadErrorReason;
 
 impl App {
     pub(super) async fn open_agent_picker(&mut self, app_server: &mut AppServerSession) {
@@ -138,8 +141,10 @@ impl App {
     }
 
     pub(super) fn is_terminal_thread_read_error(err: &color_eyre::Report) -> bool {
-        err.chain()
-            .any(|cause| cause.to_string().contains("thread not loaded:"))
+        matches!(
+            thread_error_reason(err),
+            Some(ThreadErrorReason::NotLoaded | ThreadErrorReason::NotFound)
+        )
     }
 
     pub(super) fn closed_state_for_thread_read_error(
@@ -150,11 +155,10 @@ impl App {
     }
 
     pub(super) fn can_fallback_from_include_turns_error(err: &color_eyre::Report) -> bool {
-        err.chain().any(|cause| {
-            let message = cause.to_string();
-            message.contains("includeTurns is unavailable before first user message")
-                || message.contains("ephemeral threads do not support includeTurns")
-        })
+        matches!(
+            thread_error_reason(err),
+            Some(ThreadErrorReason::NotMaterialized | ThreadErrorReason::EphemeralTurnsUnavailable)
+        )
     }
 
     /// Updates cached picker metadata and then mirrors any visible-label change into the footer.
@@ -846,15 +850,17 @@ impl App {
     }
 }
 
+fn thread_error_reason(error: &color_eyre::Report) -> Option<ThreadErrorReason> {
+    server_error_data_from_report::<ThreadErrorData>(error).map(|data| data.reason)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn terminal_thread_read_error_detection_matches_not_loaded_errors() {
-        let err = color_eyre::eyre::eyre!(
-            "thread/read failed during TUI session lookup: thread/read failed: thread not loaded: thr_123"
-        );
+        let err = thread_error_report(ThreadErrorReason::NotLoaded, "localized message");
 
         assert!(App::is_terminal_thread_read_error(&err));
     }
@@ -881,9 +887,7 @@ mod tests {
 
     #[test]
     fn closed_state_for_thread_read_error_marks_terminal_uncached_threads_closed() {
-        let err = color_eyre::eyre::eyre!(
-            "thread/read failed during TUI session lookup: thread/read failed: thread not loaded: thr_123"
-        );
+        let err = thread_error_report(ThreadErrorReason::NotLoaded, "localized message");
 
         assert!(App::closed_state_for_thread_read_error(
             &err, /*existing_is_closed*/ None
@@ -892,14 +896,28 @@ mod tests {
 
     #[test]
     fn include_turns_fallback_detection_handles_unmaterialized_and_ephemeral_threads() {
-        let unmaterialized = color_eyre::eyre::eyre!(
-            "thread/read failed during TUI session lookup: thread/read failed: thread thr_123 is not materialized yet; includeTurns is unavailable before first user message"
-        );
-        let ephemeral = color_eyre::eyre::eyre!(
-            "thread/read failed during TUI session lookup: thread/read failed: ephemeral threads do not support includeTurns"
+        let unmaterialized =
+            thread_error_report(ThreadErrorReason::NotMaterialized, "localized message");
+        let ephemeral = thread_error_report(
+            ThreadErrorReason::EphemeralTurnsUnavailable,
+            "localized message",
         );
 
         assert!(App::can_fallback_from_include_turns_error(&unmaterialized));
         assert!(App::can_fallback_from_include_turns_error(&ephemeral));
+    }
+
+    fn thread_error_report(reason: ThreadErrorReason, message: &str) -> color_eyre::Report {
+        let source = codex_app_server_protocol::JSONRPCErrorError {
+            code: -32600,
+            message: message.to_string(),
+            data: Some(
+                serde_json::to_value(ThreadErrorData { reason }).expect("thread error data"),
+            ),
+        };
+        color_eyre::Report::new(codex_app_server_client::TypedRequestError::Server {
+            method: "thread/read".to_string(),
+            source,
+        })
     }
 }

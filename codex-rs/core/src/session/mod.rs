@@ -43,7 +43,6 @@ use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::exec_policy::ExecPolicyManager;
 use crate::image_preparation::prepare_response_items;
 use crate::parse_turn_item;
-use crate::realtime_conversation::RealtimeConversationManager;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnEnvironment;
 use crate::session_prefix::format_inter_agent_completion_message;
@@ -149,7 +148,7 @@ use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputArgs;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_rmcp_client::ElicitationResponse;
-use codex_rollout::state_db;
+use codex_rollout::state_integration;
 use codex_rollout_trace::AgentResultTracePayload;
 use codex_rollout_trace::ThreadStartedTraceMetadata;
 use codex_rollout_trace::ThreadTraceContext;
@@ -252,7 +251,6 @@ pub(crate) use self::session::SessionSettingsUpdate;
 use self::turn::AssistantMessageStreamParsers;
 #[cfg(test)]
 use self::turn::collect_explicit_app_ids_from_skill_items;
-use self::turn::realtime_text_for_event;
 use self::turn_context::TurnContext;
 use self::turn_context::TurnSkillsContext;
 
@@ -414,13 +412,11 @@ impl SteerInputError {
 /// Conceptually this is the same role that `previous_model` used to fill, but
 /// it can carry other prior-turn settings that matter when constructing
 /// sensible state-change diffs or full-context reinjection, such as model
-/// switches, compaction compatibility, or detecting a prior
-/// `realtime_active -> false` transition.
+/// switches or compaction compatibility.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PreviousTurnSettings {
     pub(crate) model: String,
     pub(crate) comp_hash: Option<String>,
-    pub(crate) realtime_active: Option<bool>,
 }
 
 #[cfg(test)]
@@ -508,7 +504,6 @@ use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TurnModerationMetadataEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
-use codex_tools::UnifiedExecShellMode;
 use codex_utils_absolute_path::AbsolutePathBuf;
 #[cfg(test)]
 use codex_utils_stream_parser::ProposedPlanSegment;
@@ -696,12 +691,7 @@ impl Codex {
         } else {
             codex_models_manager::manager::RefreshStrategy::OnlineIfUncached
         };
-        if config.model.is_none()
-            || !matches!(
-                refresh_strategy,
-                codex_models_manager::manager::RefreshStrategy::Offline
-            )
-        {
+        if should_prefetch_models_before_default(config.model.is_some(), refresh_strategy) {
             let _ = models_manager
                 .list_models(refresh_strategy, config.http_client_factory())
                 .await;
@@ -753,6 +743,7 @@ impl Codex {
         } else {
             dynamic_tools
         };
+        codex_tools::validate_dynamic_tools(&dynamic_tools).map_err(CodexErr::InvalidRequest)?;
         // TODO (aibrahim): Consolidate config.model and config.model_reasoning_effort into config.collaboration_mode
         // to avoid extracting these fields separately and constructing CollaborationMode here.
         let collaboration_mode = CollaborationMode {
@@ -1017,13 +1008,24 @@ impl Codex {
             .to_vec()
     }
 
-    pub(crate) fn state_db(&self) -> Option<state_db::StateDbHandle> {
+    pub(crate) fn state_db(&self) -> Option<state_integration::StateDbHandle> {
         self.session.state_db()
     }
 
     pub(crate) fn enabled(&self, feature: Feature) -> bool {
         self.session.enabled(feature)
     }
+}
+
+fn should_prefetch_models_before_default(
+    model_provided: bool,
+    refresh_strategy: codex_models_manager::manager::RefreshStrategy,
+) -> bool {
+    model_provided
+        && !matches!(
+            refresh_strategy,
+            codex_models_manager::manager::RefreshStrategy::Offline
+        )
 }
 
 /// Generate a core submission ID. App-server exposes submission IDs that
@@ -1198,8 +1200,7 @@ impl Session {
             .iter()
             .filter_map(|spec| {
                 let advertise_in_model_client_header =
-                    spec.stage.experimental_menu_description().is_some()
-                        || spec.id == Feature::RemoteCompactionV2;
+                    spec.stage.experimental_menu_description().is_some();
                 if advertise_in_model_client_header && config.features.enabled(spec.id) {
                     Some(spec.key)
                 } else {
@@ -1320,7 +1321,7 @@ impl Session {
         self.tx_event.clone()
     }
 
-    pub(crate) fn state_db(&self) -> Option<state_db::StateDbHandle> {
+    pub(crate) fn state_db(&self) -> Option<state_integration::StateDbHandle> {
         self.services.state_db.clone()
     }
 
@@ -1358,6 +1359,7 @@ impl Session {
                 model: snapshot.model,
                 model_provider_id: snapshot.model_provider_id,
                 service_tier: Some(snapshot.service_tier),
+                developer_instructions: Some(snapshot.developer_instructions),
                 approval_policy: snapshot.approval_policy,
                 approvals_reviewer: snapshot.approvals_reviewer,
                 permission_profile: snapshot.permission_profile,
@@ -1382,6 +1384,22 @@ impl Session {
             .await
     }
 
+    pub(crate) async fn persist_thread_settings_snapshot_if_unmaterialized(
+        &self,
+    ) -> std::io::Result<()> {
+        let Some(path) = self
+            .current_rollout_path()
+            .await
+            .map_err(std::io::Error::other)?
+        else {
+            return Ok(());
+        };
+        if codex_rollout::existing_rollout_path(&path).await.is_some() {
+            return Ok(());
+        }
+        self.persist_thread_settings_snapshot().await
+    }
+
     pub(crate) async fn try_ensure_rollout_materialized(&self) -> std::io::Result<()> {
         if let Some(live_thread) = self.live_thread() {
             live_thread.persist().await.map_err(std::io::Error::other)?;
@@ -1400,25 +1418,6 @@ impl Session {
             .next_internal_sub_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         format!("auto-compact-{id}")
-    }
-
-    pub(crate) async fn route_realtime_text_input(self: &Arc<Self>, text: String) {
-        handlers::user_input_or_turn_inner(
-            self,
-            Uuid::now_v7().to_string(),
-            Op::UserInput {
-                items: vec![UserInput::Text {
-                    text,
-                    text_elements: Vec::new(),
-                }],
-                final_output_json_schema: None,
-                responsesapi_client_metadata: None,
-                additional_context: Default::default(),
-                thread_settings: Default::default(),
-            },
-            /*client_user_message_id*/ None,
-        )
-        .await;
     }
 
     pub(crate) async fn get_total_token_usage(&self) -> i64 {
@@ -1515,12 +1514,15 @@ impl Session {
     }
 
     async fn record_initial_history(&self, conversation_history: InitialHistory) {
-        let is_subagent = {
+        let (is_subagent, forked_from_thread_id) = {
             let state = self.state.lock().await;
-            state
-                .session_configuration
-                .session_source
-                .is_non_root_agent()
+            (
+                state
+                    .session_configuration
+                    .session_source
+                    .is_non_root_agent(),
+                state.session_configuration.forked_from_thread_id,
+            )
         };
         let has_prior_user_turns = initial_history_has_prior_user_turns(&conversation_history);
         {
@@ -1576,15 +1578,31 @@ impl Session {
             }
             InitialHistory::Forked(mut rollout_items) => {
                 let turn_context = self.new_default_turn().await;
-                if turn_context.item_ids_enabled() {
-                    for rollout_item in &mut rollout_items {
-                        if let RolloutItem::ResponseItem(response_item) = rollout_item {
-                            Self::assign_missing_response_item_id(response_item);
-                        }
+                for rollout_item in &mut rollout_items {
+                    if let RolloutItem::ResponseItem(response_item) = rollout_item {
+                        Self::assign_missing_response_item_id(response_item);
                     }
                 }
                 self.apply_rollout_reconstruction(&turn_context, &rollout_items)
                     .await;
+                if let Some(source_thread_id) = forked_from_thread_id {
+                    let forked_history = self.clone_history().await;
+                    if !self
+                        .services
+                        .task_evidence
+                        .inherit_forked_history(source_thread_id, forked_history.raw_items())
+                        .await
+                    {
+                        self.services
+                            .task_evidence
+                            .mark_user_source_capture_failed()
+                            .await;
+                        warn!(
+                            %source_thread_id,
+                            "failed to reconcile inherited task evidence for forked thread"
+                        );
+                    }
+                }
 
                 // Seed usage info from the recorded rollout so UIs can show token counts
                 // immediately on resume/fork.
@@ -1787,6 +1805,12 @@ impl Session {
                 .update_selections(updated_session_configuration.environment_selections());
             self.services.advance_planning_generation(&mut state_owner);
         }
+        if previous_session_configuration.cwd() != updated_session_configuration.cwd() {
+            self.services
+                .task_evidence
+                .rebind_to_cwd(updated_session_configuration.cwd())
+                .await;
+        }
         self.emit_config_changed_contributors(previous_config.as_ref(), new_config.as_ref());
 
         Ok(())
@@ -1843,12 +1867,15 @@ impl Session {
         self.services.agents_md_manager.user_instructions()
     }
 
-    pub(crate) async fn provider(&self) -> ModelProviderInfo {
-        let state = self.state.lock().await;
-        state.session_configuration.provider.clone()
+    pub(crate) async fn refresh_runtime_config(&self, next_config: Config) {
+        self.refresh_runtime_config_features(next_config, &[]).await;
     }
 
-    pub(crate) async fn refresh_runtime_config(&self, next_config: Config) {
+    pub(crate) async fn refresh_runtime_config_features(
+        &self,
+        next_config: Config,
+        refreshed_features: &[Feature],
+    ) {
         // Refresh only the user layer from the incoming snapshot. Preserve thread-local
         // layers such as request/session overrides that were present when this session
         // was created.
@@ -1861,6 +1888,16 @@ impl Session {
             config.config_layer_stack = config
                 .config_layer_stack
                 .with_user_layer_from(&next_config.config_layer_stack);
+            for feature in refreshed_features {
+                let enabled = next_config.features.enabled(*feature);
+                if let Err(err) = config.features.set_enabled(*feature, enabled) {
+                    tracing::warn!(
+                        feature = feature.key(),
+                        error = %err,
+                        "failed to refresh runtime feature enablement"
+                    );
+                }
+            }
             config.tool_suggest =
                 resolve_tool_suggest_config_from_layer_stack(&config.config_layer_stack);
             let config = Arc::new(config);
@@ -2214,7 +2251,7 @@ impl Session {
         true
     }
 
-    /// Completes parent notification, realtime mirroring, and legacy event emission after the
+    /// Completes parent notification and legacy event emission after the
     /// interactive terminal milestone has detached the turn.
     pub(crate) async fn finish_terminal_event_dispatch(
         &self,
@@ -2224,11 +2261,6 @@ impl Session {
         let parent_notification_completed = self
             .maybe_notify_parent_of_terminal_turn(turn_context, legacy_source)
             .await;
-        self.maybe_mirror_event_text_to_realtime(legacy_source)
-            .await;
-        self.maybe_clear_realtime_handoff_for_event(legacy_source)
-            .await;
-
         let show_raw_agent_reasoning = self.show_raw_agent_reasoning();
         for legacy in legacy_source.as_legacy_events(show_raw_agent_reasoning) {
             self.services
@@ -2400,32 +2432,6 @@ impl Session {
                 );
         }
         true
-    }
-
-    async fn maybe_mirror_event_text_to_realtime(&self, msg: &EventMsg) {
-        let Some((text, phase)) = realtime_text_for_event(msg) else {
-            return;
-        };
-        if self.conversation.running_state().await.is_none() {
-            return;
-        }
-        if let Err(err) = self.conversation.handoff_out(text, phase).await {
-            debug!("failed to mirror event text to realtime conversation: {err}");
-        }
-    }
-
-    async fn maybe_clear_realtime_handoff_for_event(&self, msg: &EventMsg) {
-        let (result, clear_after) = match msg {
-            EventMsg::TurnComplete(_) => (self.conversation.handoff_complete().await, true),
-            EventMsg::TurnAborted(_) => (self.conversation.handoff_abort().await, false),
-            _ => return,
-        };
-        if let Err(err) = result {
-            debug!("failed to finalize realtime handoff output: {err}");
-        }
-        if clear_after {
-            self.conversation.clear_active_handoff().await;
-        }
     }
 
     pub(crate) async fn send_event_raw(&self, event: Event) {
@@ -3305,11 +3311,7 @@ impl Session {
         for item in items.to_mut() {
             item.set_turn_id_if_missing(&turn_context.sub_id);
         }
-        if turn_context.item_ids_enabled() {
-            Self::assign_missing_response_item_ids(items)
-        } else {
-            items
-        }
+        Self::assign_missing_response_item_ids(items)
     }
 
     fn assign_missing_response_item_ids(items: Cow<'_, [ResponseItem]>) -> Cow<'_, [ResponseItem]> {
@@ -3573,6 +3575,7 @@ impl Session {
             selected_capability_roots,
             mcp,
             agents_md_observation.loaded,
+            agents_md_observation.stable_context,
             agents_md_observation.freshness,
         ))
     }
@@ -3695,11 +3698,7 @@ impl Session {
         } else {
             None
         };
-        let items = if turn_context.item_ids_enabled() {
-            Self::assign_missing_response_item_ids(Cow::Owned(items)).into_owned()
-        } else {
-            items
-        };
+        let items = Self::assign_missing_response_item_ids(Cow::Owned(items)).into_owned();
         let compacted_item = CompactedItem {
             replacement_history: Some(items.clone()),
             ..compacted_item
@@ -3996,16 +3995,9 @@ impl Session {
         let mut stable_developer_sections = Vec::<String>::with_capacity(4);
         let mut stable_contextual_user_sections = Vec::<String>::with_capacity(2);
         let mut stable_separate_developer_sections = Vec::<String>::new();
-        let (
-            reference_context_item,
-            previous_turn_settings,
-            collaboration_mode,
-            base_instructions,
-            session_source,
-        ) = {
+        let (previous_turn_settings, collaboration_mode, base_instructions, session_source) = {
             let state = self.state.lock().await;
             (
-                state.reference_context_item(),
                 state.previous_turn_settings(),
                 state.session_configuration.collaboration_mode.clone(),
                 state.session_configuration.base_instructions.clone(),
@@ -4034,8 +4026,7 @@ impl Session {
                             .and_then(|messages| messages.approvals.as_ref()),
                     ),
                     self.services.exec_policy.current().as_ref(),
-                    #[allow(deprecated)]
-                    &turn_context.cwd,
+                    turn_context.cwd(),
                     turn_context
                         .config
                         .features
@@ -4071,13 +4062,6 @@ impl Session {
             let root_orchestration = RootOrchestrationInstructions.render();
             developer_sections.push(root_orchestration.clone());
             stable_developer_sections.push(root_orchestration);
-        }
-        if let Some(realtime_update) = crate::context_manager::updates::build_initial_realtime_item(
-            reference_context_item.as_ref(),
-            previous_turn_settings.as_ref(),
-            turn_context,
-        ) {
-            developer_sections.push(realtime_update);
         }
         if self.features.enabled(Feature::Personality)
             && let Some(personality) = turn_context.personality
@@ -4975,7 +4959,11 @@ impl Session {
         // Mint the durable user item before history persistence so the private KD4 ledger can
         // bind exact pre-compaction inputs to the same stable item identity.
         let mut user_message_item = UserMessageItem::new(input);
+        let response_item_id = ResponseItemId::with_suffix("msg", &user_message_item.id);
+        user_message_item.id = response_item_id.to_string();
         user_message_item.client_id = client_id;
+        let mut response_item = self.response_item_from_user_input(input.to_vec());
+        response_item.set_id(Some(response_item_id));
         let completion_evidence_eligible = self.services.task_evidence.allows_kd4_completion()
             && !matches!(
                 turn_context.session_source,
@@ -5009,7 +4997,6 @@ impl Session {
         // Persist the user message to history, but emit the turn item from `UserInput` so
         // UI-only `text_elements` are preserved. `ResponseItem::Message` does not carry
         // those spans, and `record_response_item_and_emit_turn_item` would drop them.
-        let response_item = self.response_item_from_user_input(input.to_vec());
         self.record_conversation_items(turn_context, std::slice::from_ref(&response_item))
             .await;
         let turn_item = TurnItem::UserMessage(user_message_item);
@@ -5043,10 +5030,7 @@ impl Session {
         }
         let (Some(store), Some(repo_root)) = (
             coordinator.store(),
-            self.services
-                .task_evidence
-                .repository_root()
-                .map(Path::to_path_buf),
+            self.services.task_evidence.repository_root(),
         ) else {
             self.services
                 .task_evidence

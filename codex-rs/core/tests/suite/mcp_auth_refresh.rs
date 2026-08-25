@@ -101,7 +101,11 @@ async fn hosted_plugin_runtime_ps_mcp_tool_calls_use_current_auth_manager_token(
         ),
         home.path().to_path_buf(),
         CodexAppsToolsCache::default(),
-        codex_mcp::codex_apps_tools_cache_key(Some(&expected_auth)),
+        codex_mcp::codex_apps_tools_cache_key(
+            Some(&expected_auth),
+            &apps_server.chatgpt_base_url,
+            None,
+        ),
         /*prefix_mcp_tool_names*/ true,
         ElicitationCapability::default(),
         /*supports_openai_form_elicitation*/ false,

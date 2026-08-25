@@ -5,8 +5,6 @@ use codex_network_proxy::CUSTOM_CA_ENV_KEYS;
 use codex_network_proxy::is_managed_mitm_ca_trust_bundle_path;
 use codex_protocol::models::PermissionProfile;
 use codex_sandboxing::SandboxCommand;
-use codex_sandboxing::SandboxDirectSpawnTransformRequest;
-use codex_sandboxing::SandboxManager;
 use codex_sandboxing::SandboxTransformRequest;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::SandboxablePreference;
@@ -16,15 +14,12 @@ use codex_utils_path_uri::PathUri;
 use codex_utils_pty::SpawnedProcess;
 use codex_utils_pty::TerminalSize;
 
-#[cfg(target_os = "windows")]
 use codex_protocol::config_types::WindowsSandboxLevel;
-#[cfg(target_os = "windows")]
 use codex_sandboxing::WindowsSandboxFilesystemOverrides;
-#[cfg(target_os = "windows")]
 use codex_sandboxing::resolve_windows_elevated_filesystem_overrides;
-#[cfg(target_os = "windows")]
 use codex_sandboxing::resolve_windows_restricted_token_filesystem_overrides;
-#[cfg(target_os = "windows")]
+use codex_sandboxing::select_initial;
+use codex_sandboxing::transform;
 use codex_sandboxing::windows_sandbox_uses_elevated_backend;
 
 use crate::ExecServerRuntimePaths;
@@ -37,11 +32,9 @@ pub(crate) struct PreparedExecRequest {
     pub(crate) env: HashMap<String, String>,
     pub(crate) arg0: Option<String>,
     pub(crate) sandbox: SandboxType,
-    #[cfg(target_os = "windows")]
     windows_sandbox: Option<PreparedWindowsSandbox>,
 }
 
-#[cfg(target_os = "windows")]
 struct PreparedWindowsSandbox {
     permission_profile: PermissionProfile,
     workspace_roots: Vec<AbsolutePathBuf>,
@@ -53,17 +46,11 @@ struct PreparedWindowsSandbox {
 
 impl PreparedExecRequest {
     pub(crate) async fn spawn(self, tty: bool, pipe_stdin: bool) -> Result<SpawnedProcess, String> {
-        #[cfg(target_os = "windows")]
-        {
-            let mut request = self;
-            if let Some(windows_sandbox) = request.windows_sandbox.take() {
-                return spawn_windows_sandbox(request, windows_sandbox, tty, pipe_stdin).await;
-            }
-            request.spawn_direct(tty, pipe_stdin).await
+        let mut request = self;
+        if let Some(windows_sandbox) = request.windows_sandbox.take() {
+            return spawn_windows_sandbox(request, windows_sandbox, tty, pipe_stdin).await;
         }
-
-        #[cfg(not(target_os = "windows"))]
-        self.spawn_direct(tty, pipe_stdin).await
+        request.spawn_direct(tty, pipe_stdin).await
     }
 
     async fn spawn_direct(self, tty: bool, pipe_stdin: bool) -> Result<SpawnedProcess, String> {
@@ -104,7 +91,6 @@ impl PreparedExecRequest {
     }
 }
 
-#[cfg(target_os = "windows")]
 async fn spawn_windows_sandbox(
     mut request: PreparedExecRequest,
     windows_sandbox: PreparedWindowsSandbox,
@@ -168,7 +154,6 @@ async fn spawn_windows_sandbox(
     .map_err(|err| err.to_string())
 }
 
-#[cfg(target_os = "windows")]
 fn windows_sandbox_command(
     mut command: Vec<String>,
     arg0: Option<String>,
@@ -183,7 +168,6 @@ fn windows_sandbox_command(
     Ok(command)
 }
 
-#[cfg(target_os = "windows")]
 fn windows_sandbox_stdin_open(tty: bool, pipe_stdin: bool) -> bool {
     tty || pipe_stdin
 }
@@ -200,11 +184,10 @@ pub(crate) fn prepare_exec_request(
             env,
             arg0: params.arg0.clone(),
             sandbox: SandboxType::None,
-            #[cfg(target_os = "windows")]
             windows_sandbox: None,
         });
     };
-    let runtime_paths = runtime_paths
+    runtime_paths
         .ok_or_else(|| invalid_params("sandbox runtime paths are not configured".to_string()))?;
     // TODO(jif): Transport permissions before orchestrator-local paths are materialized,
     // then resolve executor-local helper and workspace paths here.
@@ -241,8 +224,7 @@ pub(crate) fn prepare_exec_request(
         native_sandbox_policy_cwd.as_path(),
     );
     let (file_system_policy, network_policy) = permissions.to_runtime_permissions();
-    let sandbox_manager = SandboxManager::new();
-    let sandbox = sandbox_manager.select_initial(
+    let sandbox = select_initial(
         &file_system_policy,
         network_policy,
         SandboxablePreference::Require,
@@ -259,110 +241,63 @@ pub(crate) fn prepare_exec_request(
         .split_first()
         .ok_or_else(|| invalid_params("argv must not be empty".to_string()))?;
 
-    #[cfg(target_os = "windows")]
-    if sandbox == SandboxType::WindowsRestrictedToken {
-        let request = sandbox_manager
-            .transform(SandboxTransformRequest {
-                command: SandboxCommand {
-                    program: program.into(),
-                    args: args.to_vec(),
-                    cwd: params.cwd.clone(),
-                    env,
-                    managed_network: params.managed_network.clone(),
-                    additional_permissions: None,
-                },
-                permissions: &permissions,
-                sandbox,
-                enforce_managed_network: params.enforce_managed_network,
-                environment_id: None,
-                network: None,
-                sandbox_policy_cwd,
-                codex_linux_sandbox_exe: runtime_paths.codex_linux_sandbox_exe.as_deref(),
-                use_legacy_landlock: sandbox_context.use_legacy_landlock,
-                windows_sandbox_level: sandbox_context.windows_sandbox_level,
-                windows_sandbox_private_desktop: sandbox_context.windows_sandbox_private_desktop,
-            })
-            .map_err(|err| invalid_params(format!("failed to prepare process sandbox: {err}")))?;
-        let proxy_enforced = params.enforce_managed_network;
-        let use_elevated =
-            windows_sandbox_uses_elevated_backend(request.windows_sandbox_level, proxy_enforced);
-        let filesystem_overrides = if use_elevated {
-            resolve_windows_elevated_filesystem_overrides(
-                request.sandbox,
-                &request.permission_profile,
-                &native_sandbox_policy_cwd,
-                use_elevated,
-            )
-        } else {
-            resolve_windows_restricted_token_filesystem_overrides(
-                request.sandbox,
-                &request.permission_profile,
-                &native_sandbox_policy_cwd,
-                request.windows_sandbox_level,
-            )
-        }
-        .map_err(|err| invalid_params(format!("failed to prepare process sandbox: {err}")))?;
-        return Ok(PreparedExecRequest {
-            command: request.command,
-            cwd: native_path(&request.cwd, "cwd")?,
-            env: request.env,
-            arg0: params.arg0.clone(),
-            sandbox: request.sandbox,
-            windows_sandbox: Some(PreparedWindowsSandbox {
-                permission_profile: request.permission_profile,
-                workspace_roots: workspace_roots.to_vec(),
-                windows_sandbox_level: request.windows_sandbox_level,
-                proxy_enforced,
-                filesystem_overrides,
-                use_private_desktop: request.windows_sandbox_private_desktop,
-            }),
-        });
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    if sandbox == SandboxType::WindowsRestrictedToken {
+    if sandbox != SandboxType::WindowsRestrictedToken {
         return Err(invalid_params(
-            "windows sandbox selected on a non-Windows executor".to_string(),
+            "Windows sandbox could not be selected".to_string(),
         ));
     }
-
-    let request = sandbox_manager
-        .transform_for_direct_spawn(SandboxDirectSpawnTransformRequest {
-            workspace_roots,
-            windows_sandbox_proxy_settings_mode:
-                codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
-            transform: SandboxTransformRequest {
-                // TODO(jif): Preserve params.arg0 for the inner command across the sandbox
-                // wrapper, or reject sandboxed requests with a custom arg0.
-                command: SandboxCommand {
-                    program: program.into(),
-                    args: args.to_vec(),
-                    cwd: params.cwd.clone(),
-                    env,
-                    managed_network: params.managed_network.clone(),
-                    additional_permissions: None,
-                },
-                permissions: &permissions,
-                sandbox,
-                enforce_managed_network: params.enforce_managed_network,
-                environment_id: None,
-                network: None,
-                sandbox_policy_cwd,
-                codex_linux_sandbox_exe: runtime_paths.codex_linux_sandbox_exe.as_deref(),
-                use_legacy_landlock: sandbox_context.use_legacy_landlock,
-                windows_sandbox_level: sandbox_context.windows_sandbox_level,
-                windows_sandbox_private_desktop: sandbox_context.windows_sandbox_private_desktop,
-            },
-        })
-        .map_err(|err| invalid_params(format!("failed to prepare process sandbox: {err}")))?;
+    let request = transform(SandboxTransformRequest {
+        command: SandboxCommand {
+            program: program.into(),
+            args: args.to_vec(),
+            cwd: params.cwd.clone(),
+            env,
+            managed_network: params.managed_network.clone(),
+            additional_permissions: None,
+        },
+        permissions: &permissions,
+        sandbox,
+        enforce_managed_network: params.enforce_managed_network,
+        environment_id: None,
+        network: None,
+        sandbox_policy_cwd,
+        windows_sandbox_level: sandbox_context.windows_sandbox_level,
+        windows_sandbox_private_desktop: sandbox_context.windows_sandbox_private_desktop,
+    })
+    .map_err(|err| invalid_params(format!("failed to prepare process sandbox: {err}")))?;
+    let proxy_enforced = params.enforce_managed_network;
+    let use_elevated =
+        windows_sandbox_uses_elevated_backend(request.windows_sandbox_level, proxy_enforced);
+    let filesystem_overrides = if use_elevated {
+        resolve_windows_elevated_filesystem_overrides(
+            request.sandbox,
+            &request.permission_profile,
+            &native_sandbox_policy_cwd,
+            use_elevated,
+        )
+    } else {
+        resolve_windows_restricted_token_filesystem_overrides(
+            request.sandbox,
+            &request.permission_profile,
+            &native_sandbox_policy_cwd,
+            request.windows_sandbox_level,
+        )
+    }
+    .map_err(|err| invalid_params(format!("failed to prepare process sandbox: {err}")))?;
     Ok(PreparedExecRequest {
         command: request.command,
         cwd: native_path(&request.cwd, "cwd")?,
         env: request.env,
-        arg0: request.arg0,
+        arg0: params.arg0.clone(),
         sandbox: request.sandbox,
-        #[cfg(target_os = "windows")]
-        windows_sandbox: None,
+        windows_sandbox: Some(PreparedWindowsSandbox {
+            permission_profile: request.permission_profile,
+            workspace_roots: workspace_roots.to_vec(),
+            windows_sandbox_level: request.windows_sandbox_level,
+            proxy_enforced,
+            filesystem_overrides,
+            use_private_desktop: request.windows_sandbox_private_desktop,
+        }),
     })
 }
 

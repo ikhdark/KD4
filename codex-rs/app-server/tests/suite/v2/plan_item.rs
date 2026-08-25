@@ -18,15 +18,12 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput as V2UserInput;
-use codex_features::FEATURES;
-use codex_features::Feature;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
-use std::collections::BTreeMap;
 use std::path::Path;
 use tempfile::TempDir;
 use tokio::time::sleep;
@@ -257,19 +254,6 @@ async fn wait_for_responses_request_count(
 }
 
 fn create_config_toml(codex_home: &Path, server_uri: &str) -> std::io::Result<()> {
-    let features = BTreeMap::from([(Feature::CollaborationModes, true)]);
-    let feature_entries = features
-        .into_iter()
-        .map(|(feature, enabled)| {
-            let key = FEATURES
-                .iter()
-                .find(|spec| spec.id == feature)
-                .map(|spec| spec.key)
-                .expect("feature should have a config key");
-            format!("{key} = {enabled}")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
     let config_toml = codex_home.join("config.toml");
     std::fs::write(
         config_toml,
@@ -280,9 +264,6 @@ approval_policy = "never"
 sandbox_mode = "read-only"
 
 model_provider = "mock_provider"
-
-[features]
-{feature_entries}
 
 [model_providers.mock_provider]
 name = "Mock provider for test"

@@ -18,9 +18,6 @@ use tracing::error;
 use tracing::info;
 use tracing::warn;
 
-#[cfg(unix)]
-const CONTROL_SOCKET_MODE: u32 = 0o600;
-
 pub async fn start_control_socket_acceptor(
     socket_path: AbsolutePathBuf,
     transport_event_tx: mpsc::Sender<TransportEvent>,
@@ -155,18 +152,6 @@ pub async fn acquire_app_server_startup_lock(
     .map_err(|err| std::io::Error::other(format!("startup lock task failed: {err}")))?
 }
 
-#[cfg(unix)]
-async fn set_control_socket_permissions(socket_path: &Path) -> IoResult<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    tokio::fs::set_permissions(
-        socket_path,
-        std::fs::Permissions::from_mode(CONTROL_SOCKET_MODE),
-    )
-    .await
-}
-
-#[cfg(not(unix))]
 async fn set_control_socket_permissions(_socket_path: &Path) -> IoResult<()> {
     Ok(())
 }

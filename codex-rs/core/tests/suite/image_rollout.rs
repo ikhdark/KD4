@@ -181,7 +181,10 @@ async fn copy_paste_local_image_persists_rollout_request_shape() -> anyhow::Resu
         internal_chat_message_metadata_passthrough: None,
     };
 
-    assert_eq!(responses::strip_metadata(actual), expected);
+    assert_eq!(
+        responses::strip_response_item_ids(&[responses::strip_metadata(actual)]),
+        responses::strip_response_item_ids(&[expected])
+    );
 
     Ok(())
 }
@@ -272,7 +275,10 @@ async fn drag_drop_image_persists_rollout_request_shape() -> anyhow::Result<()> 
         internal_chat_message_metadata_passthrough: None,
     };
 
-    assert_eq!(responses::strip_metadata(actual), expected);
+    assert_eq!(
+        responses::strip_response_item_ids(&[responses::strip_metadata(actual)]),
+        responses::strip_response_item_ids(&[expected])
+    );
 
     Ok(())
 }

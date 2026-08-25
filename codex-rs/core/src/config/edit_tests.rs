@@ -4,13 +4,11 @@ use codex_config::types::McpServerOAuthConfig;
 use codex_config::types::McpServerToolConfig;
 use codex_config::types::McpServerTransportConfig;
 use codex_config::types::SessionPickerViewMode;
-use codex_features::legacy_feature_keys;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::openai_models::ReasoningEffort;
 use pretty_assertions::assert_eq;
-#[cfg(unix)]
-use std::os::unix::fs::symlink;
+
 use tempfile::tempdir;
 use toml::Value as TomlValue;
 
@@ -52,6 +50,8 @@ fn expected_version_is_compared_under_the_persistence_lock() {
             .count(),
         1
     );
+    let persisted = std::fs::read_to_string(config_path).expect("read persisted config");
+    assert!(persisted == "model = \"first\"\n" || persisted == "model = \"second\"\n");
 }
 
 #[test]
@@ -132,66 +132,6 @@ fn builder_with_edits_applies_custom_paths() {
 
     let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
     assert_eq!(contents, "enabled = true\n");
-}
-
-#[test]
-fn set_feature_enabled_migrates_every_legacy_alias_to_its_canonical_key() {
-    for alias in legacy_feature_keys() {
-        let feature = feature_for_key(alias).expect("legacy feature alias should resolve");
-        let canonical_key = feature.key();
-        let tmp = tempdir().expect("tmpdir");
-        let codex_home = tmp.path();
-        std::fs::write(
-            codex_home.join(CONFIG_TOML_FILE),
-            format!("[features]\n{canonical_key} = false\n{alias} = false\n"),
-        )
-        .expect("seed config");
-
-        ConfigEditsBuilder::new(codex_home)
-            .set_feature_enabled(alias, /*enabled*/ true)
-            .apply_blocking()
-            .expect("enable feature through alias");
-
-        let raw = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE))
-            .expect("read enabled config");
-        let config: TomlValue = toml::from_str(&raw).expect("parse enabled config");
-        let features = config
-            .get("features")
-            .and_then(TomlValue::as_table)
-            .expect("features table");
-        assert_eq!(
-            features.get(alias),
-            None,
-            "alias `{alias}` should be removed"
-        );
-        assert_eq!(
-            features.get(canonical_key).and_then(TomlValue::as_bool),
-            Some(true),
-            "canonical feature `{canonical_key}` should be enabled"
-        );
-
-        ConfigEditsBuilder::new(codex_home)
-            .set_feature_enabled(alias, /*enabled*/ false)
-            .apply_blocking()
-            .expect("disable feature through alias");
-
-        let raw = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE))
-            .expect("read disabled config");
-        let config: TomlValue = toml::from_str(&raw).expect("parse disabled config");
-        let features = config.get("features").and_then(TomlValue::as_table);
-        assert_eq!(
-            features.and_then(|features| features.get(alias)),
-            None,
-            "alias `{alias}` should remain removed"
-        );
-        assert_eq!(
-            features
-                .and_then(|features| features.get(canonical_key))
-                .and_then(TomlValue::as_bool),
-            feature.default_enabled().then_some(false),
-            "canonical feature `{canonical_key}` should reflect disabled persistence semantics"
-        );
-    }
 }
 
 #[test]
@@ -512,69 +452,6 @@ profiles = { fast = { model = "gpt-4o", sandbox_mode = "strict" } }
     );
 }
 
-#[cfg(unix)]
-#[test]
-fn blocking_set_model_writes_through_symlink_chain() {
-    let tmp = tempdir().expect("tmpdir");
-    let codex_home = tmp.path();
-    let target_dir = tempdir().expect("target dir");
-    let target_path = target_dir.path().join(CONFIG_TOML_FILE);
-    let link_path = codex_home.join("config-link.toml");
-    let config_path = codex_home.join(CONFIG_TOML_FILE);
-
-    symlink(&target_path, &link_path).expect("symlink link");
-    symlink("config-link.toml", &config_path).expect("symlink config");
-
-    apply_blocking(
-        codex_home,
-        &[ConfigEdit::SetModel {
-            model: Some("gpt-5.4".to_string()),
-            effort: Some(ReasoningEffort::High),
-        }],
-    )
-    .expect("persist");
-
-    let meta = std::fs::symlink_metadata(&config_path).expect("config metadata");
-    assert!(meta.file_type().is_symlink());
-
-    let contents = std::fs::read_to_string(&target_path).expect("read target");
-    let expected = r#"model = "gpt-5.4"
-model_reasoning_effort = "high"
-"#;
-    assert_eq!(contents, expected);
-}
-
-#[cfg(unix)]
-#[test]
-fn blocking_set_model_replaces_symlink_on_cycle() {
-    let tmp = tempdir().expect("tmpdir");
-    let codex_home = tmp.path();
-    let link_a = codex_home.join("a.toml");
-    let link_b = codex_home.join("b.toml");
-    let config_path = codex_home.join(CONFIG_TOML_FILE);
-
-    symlink("b.toml", &link_a).expect("symlink a");
-    symlink("a.toml", &link_b).expect("symlink b");
-    symlink("a.toml", &config_path).expect("symlink config");
-
-    apply_blocking(
-        codex_home,
-        &[ConfigEdit::SetModel {
-            model: Some("gpt-5.4".to_string()),
-            effort: None,
-        }],
-    )
-    .expect("persist");
-
-    let meta = std::fs::symlink_metadata(&config_path).expect("config metadata");
-    assert!(!meta.file_type().is_symlink());
-
-    let contents = std::fs::read_to_string(&config_path).expect("read config");
-    let expected = r#"model = "gpt-5.4"
-"#;
-    assert_eq!(contents, expected);
-}
-
 #[test]
 fn batch_write_table_upsert_preserves_inline_comments() {
     let tmp = tempdir().expect("tmpdir");
@@ -728,62 +605,6 @@ hide_rate_limit_model_nudge = true
 }
 
 #[test]
-fn blocking_set_hide_gpt5_1_migration_prompt_preserves_table() {
-    let tmp = tempdir().expect("tmpdir");
-    let codex_home = tmp.path();
-    std::fs::write(
-        codex_home.join(CONFIG_TOML_FILE),
-        r#"[notice]
-existing = "value"
-"#,
-    )
-    .expect("seed");
-    apply_blocking(
-        codex_home,
-        &[ConfigEdit::SetNoticeHideModelMigrationPrompt(
-            "hide_gpt5_1_migration_prompt".to_string(),
-            true,
-        )],
-    )
-    .expect("persist");
-
-    let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
-    let expected = r#"[notice]
-existing = "value"
-hide_gpt5_1_migration_prompt = true
-"#;
-    assert_eq!(contents, expected);
-}
-
-#[test]
-fn blocking_set_hide_gpt_5_1_codex_max_migration_prompt_preserves_table() {
-    let tmp = tempdir().expect("tmpdir");
-    let codex_home = tmp.path();
-    std::fs::write(
-        codex_home.join(CONFIG_TOML_FILE),
-        r#"[notice]
-existing = "value"
-"#,
-    )
-    .expect("seed");
-    apply_blocking(
-        codex_home,
-        &[ConfigEdit::SetNoticeHideModelMigrationPrompt(
-            "hide_gpt-5.1-codex-max_migration_prompt".to_string(),
-            true,
-        )],
-    )
-    .expect("persist");
-
-    let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
-    let expected = r#"[notice]
-existing = "value"
-"hide_gpt-5.1-codex-max_migration_prompt" = true
-"#;
-    assert_eq!(contents, expected);
-}
-
-#[test]
 fn blocking_record_model_migration_seen_preserves_table() {
     let tmp = tempdir().expect("tmpdir");
     let codex_home = tmp.path();
@@ -809,126 +630,6 @@ existing = "value"
 
 [notice.model_migrations]
 "gpt-5.2" = "gpt-5.4"
-"#;
-    assert_eq!(contents, expected);
-}
-
-#[test]
-fn blocking_set_hide_external_config_migration_prompt_home_preserves_table() {
-    let tmp = tempdir().expect("tmpdir");
-    let codex_home = tmp.path();
-    std::fs::write(
-        codex_home.join(CONFIG_TOML_FILE),
-        r#"[notice]
-existing = "value"
-"#,
-    )
-    .expect("seed");
-    apply_blocking(
-        codex_home,
-        &[ConfigEdit::SetNoticeHideExternalConfigMigrationPromptHome(
-            true,
-        )],
-    )
-    .expect("persist");
-
-    let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
-    let expected = r#"[notice]
-existing = "value"
-
-[notice.external_config_migration_prompts]
-home = true
-"#;
-    assert_eq!(contents, expected);
-}
-
-#[test]
-fn blocking_set_hide_external_config_migration_prompt_project_preserves_table() {
-    let tmp = tempdir().expect("tmpdir");
-    let codex_home = tmp.path();
-    std::fs::write(
-        codex_home.join(CONFIG_TOML_FILE),
-        r#"[notice]
-existing = "value"
-"#,
-    )
-    .expect("seed");
-    apply_blocking(
-        codex_home,
-        &[
-            ConfigEdit::SetNoticeHideExternalConfigMigrationPromptProject(
-                "/Users/alexsong/code/skills".to_string(),
-                true,
-            ),
-        ],
-    )
-    .expect("persist");
-
-    let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
-    let expected = r#"[notice]
-existing = "value"
-
-[notice.external_config_migration_prompts.projects]
-"/Users/alexsong/code/skills" = true
-"#;
-    assert_eq!(contents, expected);
-}
-
-#[test]
-fn blocking_set_external_config_migration_prompt_home_last_prompted_at_preserves_table() {
-    let tmp = tempdir().expect("tmpdir");
-    let codex_home = tmp.path();
-    std::fs::write(
-        codex_home.join(CONFIG_TOML_FILE),
-        r#"[notice]
-existing = "value"
-"#,
-    )
-    .expect("seed");
-    apply_blocking(
-        codex_home,
-        &[ConfigEdit::SetNoticeExternalConfigMigrationPromptHomeLastPromptedAt(1_760_000_000)],
-    )
-    .expect("persist");
-
-    let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
-    let expected = r#"[notice]
-existing = "value"
-
-[notice.external_config_migration_prompts]
-home_last_prompted_at = 1760000000
-"#;
-    assert_eq!(contents, expected);
-}
-
-#[test]
-fn blocking_set_external_config_migration_prompt_project_last_prompted_at_preserves_table() {
-    let tmp = tempdir().expect("tmpdir");
-    let codex_home = tmp.path();
-    std::fs::write(
-        codex_home.join(CONFIG_TOML_FILE),
-        r#"[notice]
-existing = "value"
-"#,
-    )
-    .expect("seed");
-    apply_blocking(
-        codex_home,
-        &[
-            ConfigEdit::SetNoticeExternalConfigMigrationPromptProjectLastPromptedAt(
-                "/Users/alexsong/code/skills".to_string(),
-                1_760_000_000,
-            ),
-        ],
-    )
-    .expect("persist");
-
-    let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
-    let expected = r#"[notice]
-existing = "value"
-
-[notice.external_config_migration_prompts.project_last_prompted_at]
-"/Users/alexsong/code/skills" = 1760000000
 "#;
     assert_eq!(contents, expected);
 }
@@ -1089,6 +790,8 @@ fn blocking_replace_mcp_servers_serializes_tool_approval_overrides() {
 [mcp_servers.docs]
 command = \"docs-server\"
 default_tools_approval_mode = \"prompt\"
+
+[mcp_servers.docs.tools]
 
 [mcp_servers.docs.tools.search]
 approval_mode = \"approve\"
@@ -1415,85 +1118,6 @@ async fn blocking_set_asynchronous_helpers_available() {
         .and_then(|tbl| tbl.get("hide_world_writable_warning"))
         .and_then(toml::Value::as_bool);
     assert_eq!(notice, Some(true));
-}
-
-#[test]
-fn blocking_builder_set_realtime_audio_persists_and_clears() {
-    let tmp = tempdir().expect("tmpdir");
-    let codex_home = tmp.path();
-
-    ConfigEditsBuilder::new(codex_home)
-        .set_realtime_microphone(Some("USB Mic"))
-        .set_realtime_speaker(Some("Desk Speakers"))
-        .apply_blocking()
-        .expect("persist realtime audio");
-
-    let raw = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
-    let config: TomlValue = toml::from_str(&raw).expect("parse config");
-    let realtime_audio = config
-        .get("audio")
-        .and_then(TomlValue::as_table)
-        .expect("audio table should exist");
-    assert_eq!(
-        realtime_audio.get("microphone").and_then(TomlValue::as_str),
-        Some("USB Mic")
-    );
-    assert_eq!(
-        realtime_audio.get("speaker").and_then(TomlValue::as_str),
-        Some("Desk Speakers")
-    );
-
-    ConfigEditsBuilder::new(codex_home)
-        .set_realtime_microphone(/*microphone*/ None)
-        .apply_blocking()
-        .expect("clear realtime microphone");
-
-    let raw = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
-    let config: TomlValue = toml::from_str(&raw).expect("parse config");
-    let realtime_audio = config
-        .get("audio")
-        .and_then(TomlValue::as_table)
-        .expect("audio table should exist");
-    assert_eq!(realtime_audio.get("microphone"), None);
-    assert_eq!(
-        realtime_audio.get("speaker").and_then(TomlValue::as_str),
-        Some("Desk Speakers")
-    );
-}
-
-#[test]
-fn blocking_builder_set_realtime_voice_persists_and_clears() {
-    let tmp = tempdir().expect("tmpdir");
-    let codex_home = tmp.path();
-
-    ConfigEditsBuilder::new(codex_home)
-        .set_realtime_voice(Some("cedar"))
-        .apply_blocking()
-        .expect("persist realtime voice");
-
-    let raw = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
-    let config: TomlValue = toml::from_str(&raw).expect("parse config");
-    let realtime = config
-        .get("realtime")
-        .and_then(TomlValue::as_table)
-        .expect("realtime table should exist");
-    assert_eq!(
-        realtime.get("voice").and_then(TomlValue::as_str),
-        Some("cedar")
-    );
-
-    ConfigEditsBuilder::new(codex_home)
-        .set_realtime_voice(/*voice*/ None)
-        .apply_blocking()
-        .expect("clear realtime voice");
-
-    let raw = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
-    let config: TomlValue = toml::from_str(&raw).expect("parse config");
-    let realtime = config
-        .get("realtime")
-        .and_then(TomlValue::as_table)
-        .expect("realtime table should exist");
-    assert_eq!(realtime.get("voice"), None);
 }
 
 #[test]

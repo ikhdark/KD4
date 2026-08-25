@@ -200,7 +200,11 @@ async fn step_context_with_live_apps(
         runtime_context.clone(),
         cache_home.to_path_buf(),
         codex_mcp::CodexAppsToolsCache::default(),
-        codex_mcp::codex_apps_tools_cache_key(None),
+        codex_mcp::codex_apps_tools_cache_key(
+            None,
+            &turn.config.chatgpt_base_url,
+            turn.config.apps_mcp_product_sku.as_deref(),
+        ),
         turn.config.prefix_mcp_tool_names(),
         rmcp::model::ElicitationCapability::default(),
         /*supports_openai_form_elicitation*/ false,
@@ -469,15 +473,8 @@ print({hook_output:?})
     );
 
     std::fs::write(&script_path, script).expect("write MCP permission hook script");
-    let python = if cfg!(windows) { "python" } else { "python3" };
-    let script_path_arg = if cfg!(windows) {
-        script_path.display().to_string()
-    } else {
-        format!(
-            "'{}'",
-            script_path.display().to_string().replace('\'', "'\\''")
-        )
-    };
+    let python = "python";
+    let script_path_arg = script_path.display().to_string();
     std::fs::write(
         turn_context.config.codex_home.join("hooks.json"),
         serde_json::json!({
@@ -513,12 +510,8 @@ print({hook_output:?})
         .store(Arc::new(Hooks::new(HooksConfig {
             feature_enabled: true,
             config_layer_stack: Some(trusted_config_layer_stack),
-            shell_program: (!cfg!(windows)).then_some("/bin/sh".to_string()),
-            shell_args: if cfg!(windows) {
-                Vec::new()
-            } else {
-                vec!["-c".to_string()]
-            },
+            shell_program: None,
+            shell_args: Vec::new(),
             ..HooksConfig::default()
         })));
 
@@ -2187,14 +2180,15 @@ async fn host_owned_codex_apps_manager(
         turn_context.permission_profile(),
         codex_mcp::McpRuntimeContext::new(
             session.services.turn_environments.environment_manager(),
-            {
-                #[allow(deprecated)]
-                turn_context.cwd.to_path_buf()
-            },
+            turn_context.cwd().to_path_buf(),
         ),
         turn_context.config.codex_home.to_path_buf(),
         session.services.mcp_manager.codex_apps_tools_cache(),
-        codex_mcp::codex_apps_tools_cache_key(auth.as_ref()),
+        codex_mcp::codex_apps_tools_cache_key(
+            auth.as_ref(),
+            &turn_context.config.chatgpt_base_url,
+            turn_context.config.apps_mcp_product_sku.as_deref(),
+        ),
         turn_context.config.prefix_mcp_tool_names(),
         rmcp::model::ElicitationCapability::default(),
         /*supports_openai_form_elicitation*/ false,
@@ -2394,35 +2388,6 @@ async fn codex_apps_auth_elicitation_enabled_by_default_requests_elicitation() {
             "type": "text",
             "text": "Authentication for Google Calendar was requested and accepted. Retry this tool call now.",
         })]
-    );
-}
-
-#[test]
-fn mcp_tool_call_thread_id_meta_is_added_to_request_meta() {
-    assert_eq!(
-        with_mcp_tool_call_thread_id_meta(
-            Some(serde_json::json!({
-                "source": "test-client",
-                "threadId": "stale-thread",
-            })),
-            "thread-live",
-        ),
-        Some(serde_json::json!({
-            "source": "test-client",
-            "threadId": "thread-live",
-        }))
-    );
-
-    assert_eq!(
-        with_mcp_tool_call_thread_id_meta(/*meta*/ None, "thread-live"),
-        Some(serde_json::json!({
-            "threadId": "thread-live",
-        }))
-    );
-
-    assert_eq!(
-        with_mcp_tool_call_thread_id_meta(Some(serde_json::json!("invalid-meta")), "thread-live"),
-        Some(serde_json::json!("invalid-meta"))
     );
 }
 
@@ -3420,8 +3385,7 @@ async fn permission_request_hook_allows_mcp_tool_call() {
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("parse hook input"))
         .collect::<Vec<_>>();
-    #[allow(deprecated)]
-    let turn_cwd = turn_context.cwd.clone();
+    let turn_cwd = turn_context.cwd().clone();
     assert_eq!(
         inputs,
         vec![serde_json::json!({
@@ -3482,8 +3446,7 @@ async fn permission_request_hook_uses_hook_tool_name_without_metadata() {
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("parse hook input"))
         .collect::<Vec<_>>();
-    #[allow(deprecated)]
-    let turn_cwd = turn_context.cwd.clone();
+    let turn_cwd = turn_context.cwd().clone();
     assert_eq!(
         inputs,
         vec![serde_json::json!({

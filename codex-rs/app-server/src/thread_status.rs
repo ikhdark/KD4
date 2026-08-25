@@ -30,6 +30,56 @@ pub(crate) struct ThreadWatchActiveGuard {
     handle: tokio::runtime::Handle,
 }
 
+pub(crate) struct ThreadStatusSubscription {
+    receiver: Option<watch::Receiver<ThreadStatus>>,
+    state: Arc<Mutex<ThreadWatchState>>,
+    thread_id: String,
+    handle: tokio::runtime::Handle,
+}
+
+impl ThreadStatusSubscription {
+    fn new(
+        receiver: watch::Receiver<ThreadStatus>,
+        state: Arc<Mutex<ThreadWatchState>>,
+        thread_id: String,
+    ) -> Self {
+        Self {
+            receiver: Some(receiver),
+            state,
+            thread_id,
+            handle: tokio::runtime::Handle::current(),
+        }
+    }
+
+    pub(crate) fn borrow(&self) -> watch::Ref<'_, ThreadStatus> {
+        match self.receiver.as_ref() {
+            Some(receiver) => receiver.borrow(),
+            None => unreachable!("thread status subscription receiver is only removed on drop"),
+        }
+    }
+
+    pub(crate) async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
+        match self.receiver.as_mut() {
+            Some(receiver) => receiver.changed().await,
+            None => unreachable!("thread status subscription receiver is only removed on drop"),
+        }
+    }
+}
+
+impl Drop for ThreadStatusSubscription {
+    fn drop(&mut self) {
+        drop(self.receiver.take());
+        let state = Arc::clone(&self.state);
+        let thread_id = self.thread_id.clone();
+        self.handle.spawn(async move {
+            state
+                .lock()
+                .await
+                .remove_status_watcher_if_unused(&thread_id);
+        });
+    }
+}
+
 impl ThreadWatchActiveGuard {
     fn new(
         manager: ThreadWatchManager,
@@ -243,11 +293,14 @@ impl ThreadWatchManager {
         }
     }
 
-    pub(crate) async fn subscribe(
-        &self,
-        thread_id: ThreadId,
-    ) -> Option<watch::Receiver<ThreadStatus>> {
-        Some(self.state.lock().await.subscribe(thread_id.to_string()))
+    pub(crate) async fn subscribe(&self, thread_id: ThreadId) -> Option<ThreadStatusSubscription> {
+        let thread_id = thread_id.to_string();
+        let receiver = self.state.lock().await.subscribe(thread_id.clone());
+        Some(ThreadStatusSubscription::new(
+            receiver,
+            Arc::clone(&self.state),
+            thread_id,
+        ))
     }
 
     async fn note_active_guard_released(
@@ -383,7 +436,7 @@ impl ThreadWatchState {
     }
 
     fn update_status_watcher(&mut self, thread_id: &str, status: &ThreadStatus) {
-        let remove_watcher = if let Some(sender) = self.status_watcher_by_thread_id.get(thread_id) {
+        if let Some(sender) = self.status_watcher_by_thread_id.get(thread_id) {
             let status = status.clone();
             let _ = sender.send_if_modified(|current| {
                 if *current == status {
@@ -393,11 +446,16 @@ impl ThreadWatchState {
                     true
                 }
             });
-            sender.receiver_count() == 0
-        } else {
-            false
-        };
-        if remove_watcher {
+        }
+        self.remove_status_watcher_if_unused(thread_id);
+    }
+
+    fn remove_status_watcher_if_unused(&mut self, thread_id: &str) {
+        if self
+            .status_watcher_by_thread_id
+            .get(thread_id)
+            .is_some_and(|sender| sender.receiver_count() == 0)
+        {
             self.status_watcher_by_thread_id.remove(thread_id);
         }
     }
@@ -847,6 +905,52 @@ mod tests {
             "unrelated thread watcher should not receive an update"
         );
         assert_eq!(*non_interactive_rx.borrow(), ThreadStatus::Idle);
+    }
+
+    #[tokio::test]
+    async fn status_watcher_is_pruned_after_subscription_outlives_thread() {
+        let manager = ThreadWatchManager::new();
+        manager
+            .upsert_thread(test_thread(
+                INTERACTIVE_THREAD_ID,
+                codex_app_server_protocol::SessionSource::Cli,
+            ))
+            .await;
+        let thread_id = ThreadId::from_string(INTERACTIVE_THREAD_ID)
+            .expect("interactive thread id should parse");
+        let subscription = manager
+            .subscribe(thread_id)
+            .await
+            .expect("thread status watcher should subscribe");
+
+        manager.remove_thread(INTERACTIVE_THREAD_ID).await;
+        assert!(
+            manager
+                .state
+                .lock()
+                .await
+                .status_watcher_by_thread_id
+                .contains_key(INTERACTIVE_THREAD_ID),
+            "the live subscription should keep its sender until it is dropped"
+        );
+
+        drop(subscription);
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if !manager
+                    .state
+                    .lock()
+                    .await
+                    .status_watcher_by_thread_id
+                    .contains_key(INTERACTIVE_THREAD_ID)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped thread status subscription should prune its sender");
     }
 
     async fn wait_for_status(

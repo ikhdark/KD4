@@ -17,10 +17,8 @@ use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
-#[cfg(windows)]
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(25);
-#[cfg(not(windows))]
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+
 const INSTALLED_MARKETPLACES_DIR: &str = ".tmp/marketplaces";
 
 fn run_git(cwd: &Path, args: &[&str]) -> Result<String> {

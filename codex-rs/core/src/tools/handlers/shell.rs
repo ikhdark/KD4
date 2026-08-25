@@ -2,7 +2,6 @@ use chrono::Utc;
 use codex_agent_task_store::ValidationCallStatus;
 use codex_agent_task_store::ValidationEvidence;
 use codex_features::Feature;
-use codex_git_utils::get_git_repo_root;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::SandboxErr;
 use codex_protocol::exec_output::ExecToolCallOutput;
@@ -18,11 +17,12 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
+use crate::FunctionCallError;
 use crate::agent::task_capabilities::validate_independent_review_shell;
 use crate::exec::ExecExpiration;
 use crate::exec::ExecParams;
 use crate::exec_policy::ExecApprovalRequest;
-use crate::function_tool::FunctionCallError;
+use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
@@ -40,21 +40,27 @@ use crate::tools::handlers::command_shape::powershell_script_failure_advisory;
 use crate::tools::handlers::implicit_granted_permissions;
 use crate::tools::handlers::normalize_and_validate_additional_permissions;
 use crate::tools::handlers::parse_arguments;
+use crate::tools::handlers::resolve_repository_root;
 use crate::tools::known_delta_store;
 use crate::tools::known_delta_store::KnownDeltaExecutionObservation;
 use crate::tools::orchestrator::ToolOrchestrator;
 use crate::tools::runtimes::shell::ShellRequest;
 use crate::tools::runtimes::shell::ShellRuntime;
-use crate::tools::runtimes::shell::ShellRuntimeBackend;
 use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
-#[cfg(any(windows, test))]
+
 use crate::tools::sandboxing::same_exec_authorization_envelope;
+use crate::validation_admission::ValidationLaunchPlan;
+use crate::validation_admission::ValidationRegistration;
+use crate::validation_admission::register_if_absent;
+use crate::validation_admission::scoped_validation_configuration_identity;
+use crate::validation_admission::validation_identity;
+use crate::validation_admission::validation_identity_with_scope;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::plan_tool::ValidationRouteLeaf;
 use codex_protocol::protocol::ExecCommandSource;
 use codex_shell_command::is_safe_command::is_known_safe_command;
-#[cfg(windows)]
+
 use codex_shell_command::powershell::prove_noprofile_powershell_command_as_direct_argv;
 use codex_tools::CanonicalToolResult;
 use codex_tools::ToolName;
@@ -69,7 +75,8 @@ mod shell_command;
 pub use shell_command::ShellCommandHandler;
 pub(crate) use shell_command::ShellCommandHandlerOptions;
 
-const MAX_FOCUSED_VALIDATION_TIMEOUT_MS: u64 = 60 * 60 * 1_000;
+const MAX_FOCUSED_VALIDATION_TIMEOUT_MS: u64 =
+    codex_protocol::plan_tool::MAX_STRUCTURED_VALIDATION_TIMEOUT_MS;
 
 #[derive(Debug, Serialize)]
 struct FocusedValidationViolation {
@@ -164,7 +171,6 @@ pub(super) struct RunExecLikeArgs {
     pub(super) turn_environment: TurnEnvironment,
     pub(super) tracker: crate::tools::context::SharedTurnDiffTracker,
     pub(super) call_id: String,
-    pub(super) shell_runtime_backend: ShellRuntimeBackend,
     pub(super) track_validation_freshness: bool,
     pub(super) attempt_key: Option<CommandAttemptKey>,
     pub(super) repair_notice: Option<String>,
@@ -277,6 +283,173 @@ impl ValidationExecutionOutcome {
             }
         }
     }
+}
+
+pub(super) fn validation_structured_output(value: serde_json::Value) -> FunctionToolOutput {
+    let text = value
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| value.to_string());
+    let execution_outcome = ValidationExecutionOutcome::from_value_or_legacy_success(&value);
+    let skip_disposition = value
+        .get("skip_disposition")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok());
+    let mut output = FunctionToolOutput::from_text(text, execution_outcome.success())
+        .with_outcome(execution_outcome.tool_outcome());
+    if let Some(skip_disposition) = skip_disposition {
+        output = output.with_skip_disposition(skip_disposition);
+    } else if value
+        .get("execution_outcome")
+        .and_then(serde_json::Value::as_str)
+        == Some("not_executed")
+    {
+        output = output.with_outcome(codex_tools::ToolOutputOutcome::Skipped);
+    }
+    output.post_tool_use_response = Some(value);
+    output
+}
+
+pub(super) fn joined_validation_structured_output(
+    mut value: serde_json::Value,
+    call_id: &str,
+    shared_from_call_id: &str,
+) -> FunctionToolOutput {
+    if let Some(object) = value.as_object_mut() {
+        object.insert("call_id".to_string(), call_id.into());
+        object.insert("admission_disposition".to_string(), "joined".into());
+        object.insert(
+            "shared_from_call_id".to_string(),
+            shared_from_call_id.into(),
+        );
+    }
+    validation_structured_output(value)
+}
+
+pub(super) struct ValidationProofPreparationArgs<'a> {
+    pub(super) session: &'a Session,
+    pub(super) turn: &'a TurnContext,
+    pub(super) validation_launch: &'a mut Option<ValidationLaunchPlan>,
+    pub(super) direct_validation_route: Option<&'a DirectValidationRoute>,
+    pub(super) repository_key: &'a [u8],
+    pub(super) cwd: &'a str,
+    pub(super) command_invocation: &'a CommandInvocation,
+    pub(super) environment: &'a HashMap<String, String>,
+    pub(super) execution_context: &'a str,
+    pub(super) repository_epoch: u64,
+    pub(super) call_id: &'a str,
+    pub(super) cancellation_token: &'a CancellationToken,
+    pub(super) force_fresh: bool,
+}
+
+pub(super) enum ValidationProofPreparation {
+    NotValidation,
+    Reused(FunctionToolOutput),
+    Registered(ValidationRegistration),
+}
+
+pub(super) async fn prepare_validation_proof(
+    args: ValidationProofPreparationArgs<'_>,
+) -> Result<ValidationProofPreparation, FunctionCallError> {
+    if args.validation_launch.is_none() {
+        return Ok(ValidationProofPreparation::NotValidation);
+    }
+
+    let environment =
+        validation_execution_environment_hash(args.environment, args.execution_context);
+    let toolchain = child_env_value(args.environment, "RUSTUP_TOOLCHAIN")
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let identity = if let Some(route) = args.direct_validation_route {
+        let leaf = route.leaf();
+        let (implementation_identity, bound_plan_step) = args
+            .session
+            .services
+            .task_evidence
+            .direct_validation_implementation_binding_for_leaf(leaf)
+            .await
+            .map_err(FunctionCallError::RespondToModel)?;
+        if let Some(launch) = args.validation_launch.as_mut() {
+            launch.bound_plan_step = bound_plan_step;
+        }
+        validation_identity_with_scope(
+            args.repository_key,
+            args.cwd,
+            args.command_invocation,
+            environment,
+            toolchain,
+            scoped_validation_configuration_identity(args.turn.config.features.get()),
+            implementation_identity,
+            &leaf.uncertainty,
+            &leaf.covered_paths,
+            &leaf.covered_contracts,
+        )
+    } else {
+        validation_identity(
+            args.repository_key,
+            args.cwd,
+            args.command_invocation,
+            environment,
+            toolchain,
+            args.repository_epoch,
+        )
+    };
+
+    if !args.force_fresh
+        && let Some(result) = args
+            .session
+            .services
+            .command_execution
+            .reusable_validation(&identity)
+            .await
+    {
+        tracing::info!(
+            disposition = "reused",
+            duplicate_of_call_id = %result.call_id,
+            coverage_identity = %result.proof_key.coverage_identity,
+            implementation_identity = %result.proof_key.implementation_identity,
+            "validation proof reused without process execution"
+        );
+        args.turn.turn_timing_state.record_reused_validation();
+        return Ok(ValidationProofPreparation::Reused(
+            validation_structured_output(serde_json::json!({
+                "success": true,
+                "admission_disposition": "reused",
+                "validation_result": result,
+            })),
+        ));
+    }
+
+    if let (Some(launch), Some(route)) = (
+        args.validation_launch.as_mut(),
+        args.direct_validation_route,
+    ) {
+        launch.proof_key = Some(identity.clone());
+        launch.structured_route = Some(route.route().clone());
+        launch.validation_call_id = Some(args.call_id.to_string());
+    }
+
+    Ok(ValidationProofPreparation::Registered(
+        register_if_absent(
+            &args.turn.validation_singleflight,
+            identity,
+            args.call_id,
+            args.cancellation_token,
+        )
+        .await,
+    ))
+}
+
+fn validation_execution_environment_hash(
+    environment: &HashMap<String, String>,
+    execution_context: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(validation_environment_hash(environment).as_bytes());
+    digest.update([0]);
+    digest.update(execution_context.as_bytes());
+    format!("{:x}", digest.finalize())
 }
 
 pub(super) struct LegacyShellToolOutput {
@@ -539,8 +712,7 @@ pub(super) async fn run_exec_like_with_exit_code(
             )));
         }
     }
-    let repo_root = get_git_repo_root(args.exec_params.cwd.as_path())
-        .unwrap_or_else(|| args.exec_params.cwd.to_path_buf());
+    let repo_root = resolve_repository_root(args.exec_params.cwd.as_path());
     let focused_validation_admission = (!inspection_command).then(|| {
         focused_validation_command_summary(
             &args.safety_command,
@@ -856,17 +1028,18 @@ pub(super) async fn run_exec_like_with_exit_code(
             );
         }
         return Ok(RunExecLikeResult {
-            output: shell_command::validation_structured_output(serde_json::json!({
-                "call_id": args.call_id.clone(),
-                "admission_disposition": "joined",
-                "shared_from_call_id": shared_from_call_id,
-                "text": text,
-                "success": execution_outcome.success(),
-                "execution_outcome": execution_outcome.as_str(),
-                "command_was_executed": execution_outcome != ValidationExecutionOutcome::NotExecuted,
-                "skip_disposition": result.value.get("skip_disposition").cloned(),
-                "validation_result": validation_result,
-            })),
+            output: joined_validation_structured_output(
+                serde_json::json!({
+                    "text": text,
+                    "success": execution_outcome.success(),
+                    "execution_outcome": execution_outcome.as_str(),
+                    "command_was_executed": execution_outcome != ValidationExecutionOutcome::NotExecuted,
+                    "skip_disposition": result.value.get("skip_disposition").cloned(),
+                    "validation_result": validation_result,
+                }),
+                &args.call_id,
+                &shared_from_call_id,
+            ),
             exit_code: match execution_outcome {
                 ValidationExecutionOutcome::ExecutedSuccess => Some(0),
                 ValidationExecutionOutcome::ExecutedFailure => Some(1),
@@ -913,7 +1086,8 @@ pub(super) async fn run_exec_like_with_exit_code(
         );
     }
     let validation_leader = args.validation_leader.take();
-    let result = run_exec_like_with_exit_code_inner(args, focused_validation.is_some()).await;
+    let result =
+        run_exec_like_with_exit_code_inner(args, focused_validation.is_some(), repo_root).await;
     if let Some(operation) = owned_operation.as_mut() {
         operation.record_progress();
     }
@@ -1120,7 +1294,6 @@ fn resolve_focused_validation_executable(
     ))
 }
 
-#[cfg(windows)]
 pub(in crate::tools::handlers) fn child_env_value<'a>(
     env: &'a HashMap<String, String>,
     name: &str,
@@ -1128,14 +1301,6 @@ pub(in crate::tools::handlers) fn child_env_value<'a>(
     env.iter()
         .find(|(key, _)| key.eq_ignore_ascii_case(name))
         .map(|(_, value)| std::ffi::OsStr::new(value))
-}
-
-#[cfg(not(windows))]
-pub(in crate::tools::handlers) fn child_env_value<'a>(
-    env: &'a HashMap<String, String>,
-    name: &str,
-) -> Option<&'a std::ffi::OsStr> {
-    env.get(name).map(|value| std::ffi::OsStr::new(value))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1218,11 +1383,29 @@ fn focused_validation_command_summary(
         }
         .render());
     };
+    focused_validation_argv_summary(
+        program,
+        args,
+        command_summary,
+        direct_argv,
+        repo_root,
+        violations,
+    )
+}
+
+fn focused_validation_argv_summary(
+    program: &str,
+    args: &[String],
+    command_summary: &str,
+    direct_argv: bool,
+    repo_root: &Path,
+    mut violations: Vec<FocusedValidationViolation>,
+) -> Result<String, String> {
     let argv_violations = collect_focused_validation_argv_violations(program, args, repo_root);
     let argv_is_permitted = argv_violations.is_empty();
     violations.extend(argv_violations);
     let canonical = CommandInvocation::Argv {
-        program: program.clone(),
+        program: program.to_owned(),
         args: args.to_vec(),
     }
     .display_command();
@@ -1244,9 +1427,12 @@ fn focused_validation_command_summary(
     Ok(canonical)
 }
 
-/// Re-admits a predeclared plan leaf through the same canonical direct-argv
-/// contract used by typed focused validation. No command or coverage inference
-/// is performed here.
+/// Admits the repository-specific semantics of a structured validation leaf.
+///
+/// Wire deserialization owns the non-empty argv and bounded-timeout invariants;
+/// the direct-command producer establishes the same invariants when constructing
+/// its leaf. This boundary therefore checks only command capability, coverage,
+/// and repository semantics.
 pub(crate) fn validate_structured_validation_leaf(
     leaf: &ValidationRouteLeaf,
     repo_root: &Path,
@@ -1263,25 +1449,14 @@ pub(crate) fn validate_structured_validation_leaf(
     for covered_path in &leaf.covered_paths {
         require_safe_repo_relative_path(covered_path, "auto-validation covered path", repo_root)?;
     }
-    let Some((program, args)) = leaf.argv.split_first() else {
-        return Err("the validation route argv cannot be empty".to_string());
-    };
+    let program = &leaf.argv[0];
+    let args = &leaf.argv[1..];
     let invocation = CommandInvocation::Argv {
         program: program.clone(),
         args: args.to_vec(),
     };
     let canonical = invocation.display_command();
-    focused_validation_command_summary(
-        &leaf.argv,
-        &canonical,
-        true,
-        repo_root,
-        repo_root,
-        &ExecExpiration::Timeout(std::time::Duration::from_millis(leaf.timeout_ms)),
-        false,
-        false,
-        false,
-    )?;
+    focused_validation_argv_summary(program, args, &canonical, true, repo_root, Vec::new())?;
     if program == "cargo"
         && cargo_command_args(args)
             .iter()
@@ -1337,12 +1512,28 @@ pub(crate) fn validate_structured_validation_leaf(
     Ok(canonical)
 }
 
+#[derive(Debug)]
+pub(crate) struct DirectValidationRoute {
+    leaf: ValidationRouteLeaf,
+    route: codex_protocol::plan_tool::ValidationRoute,
+}
+
+impl DirectValidationRoute {
+    pub(crate) fn leaf(&self) -> &ValidationRouteLeaf {
+        &self.leaf
+    }
+
+    pub(crate) fn route(&self) -> &codex_protocol::plan_tool::ValidationRoute {
+        &self.route
+    }
+}
+
 pub(crate) fn direct_validation_route(
     context: &codex_protocol::validation::ValidationCommandContext,
     invocation: &CommandInvocation,
     repo_root: &Path,
     timeout_ms: u64,
-) -> Result<codex_protocol::plan_tool::ValidationRoute, String> {
+) -> Result<DirectValidationRoute, String> {
     let CommandInvocation::Argv { program, args } = invocation else {
         return Err(
             "validation commands must use direct argv mode so coverage and proof identity are unambiguous"
@@ -1363,10 +1554,11 @@ pub(crate) fn direct_validation_route(
         semantic_timeout: false,
     };
     validate_structured_validation_leaf(&leaf, repo_root)?;
-    Ok(codex_protocol::plan_tool::ValidationRoute {
-        leaves: vec![leaf],
+    let route = codex_protocol::plan_tool::ValidationRoute {
+        leaves: vec![leaf.clone()],
         ordering: codex_protocol::plan_tool::ValidationRouteOrdering::StopOnFailure,
-    })
+    };
+    Ok(DirectValidationRoute { leaf, route })
 }
 
 fn cargo_args_have_package(args: &[String]) -> bool {
@@ -2141,6 +2333,7 @@ fn reject_focused_effective_permissions(
 async fn run_exec_like_with_exit_code_inner(
     args: RunExecLikeArgs,
     focused_validation: bool,
+    repository_root: std::path::PathBuf,
 ) -> Result<RunExecLikeResult, FunctionCallError> {
     let RunExecLikeArgs {
         tool_name,
@@ -2158,7 +2351,6 @@ async fn run_exec_like_with_exit_code_inner(
         turn_environment,
         tracker,
         call_id,
-        shell_runtime_backend,
         track_validation_freshness,
         attempt_key,
         repair_notice,
@@ -2347,7 +2539,7 @@ async fn run_exec_like_with_exit_code_inner(
     // This is a preliminary resolution used only for the policy compatibility check. The runtime
     // re-proves the exact command against its final cwd and child environment immediately before
     // constructing the sandbox request. A safety/execution mismatch fails closed.
-    #[cfg(windows)]
+
     let proven_direct_argv = (is_powershell_script
         && !turn_environment.environment.is_remote()
         && exec_params.command == safety_command)
@@ -2360,7 +2552,6 @@ async fn run_exec_like_with_exit_code_inner(
         })
         .flatten();
 
-    #[cfg(windows)]
     let canonical_exec_approval_requirement = if let Some(proof) = proven_direct_argv.as_ref() {
         Some(
             session
@@ -2404,7 +2595,6 @@ async fn run_exec_like_with_exit_code_inner(
         })
         .await;
 
-    #[cfg(windows)]
     let approved_powershell_direct_argv = if let (Some(proof), Some(canonical_requirement)) =
         (proven_direct_argv, canonical_exec_approval_requirement)
         && same_exec_authorization_envelope(&exec_approval_requirement, &canonical_requirement)
@@ -2418,15 +2608,12 @@ async fn run_exec_like_with_exit_code_inner(
         None
     };
 
-    let workspace_operation_root = (focused_validation || !is_known_safe_command(&safety_command))
-        .then(|| {
-            get_git_repo_root(exec_params.cwd.as_path())
-                .unwrap_or_else(|| exec_params.cwd.to_path_buf())
-        });
+    let workspace_operation_root =
+        (focused_validation || !is_known_safe_command(&safety_command)).then_some(repository_root);
     let req = ShellRequest {
         command: exec_params.command.clone(),
         command_for_approval: safety_command,
-        #[cfg(windows)]
+
         approved_powershell_direct_argv,
         turn_environment: turn_environment.clone(),
         shell_type,
@@ -2440,9 +2627,6 @@ async fn run_exec_like_with_exit_code_inner(
         network: exec_params.network.clone(),
         sandbox_permissions: effective_additional_permissions.sandbox_permissions,
         additional_permissions: normalized_additional_permissions,
-        #[cfg(unix)]
-        additional_permissions_preapproved: effective_additional_permissions
-            .permissions_preapproved,
         justification: exec_params.justification.clone(),
         exec_approval_requirement,
         known_delta: known_delta.clone(),
@@ -2450,7 +2634,7 @@ async fn run_exec_like_with_exit_code_inner(
         workspace_operation_root,
     };
     let mut orchestrator = ToolOrchestrator::new();
-    let mut runtime = ShellRuntime::for_shell_command(shell_runtime_backend);
+    let mut runtime = ShellRuntime::for_shell_command();
     let validation_started_at = tokio::time::Instant::now();
     let tool_ctx = ToolCtx {
         session: session.clone(),

@@ -49,10 +49,6 @@ ts-rs = { workspace = true, features = [
 uuid = { workspace = true, features = ["serde", "v7", "v4"] }
 wildmatch = { workspace = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-landlock = { workspace = true }
-seccompiler = { workspace = true }
-
 [dev-dependencies]
 anyhow = { workspace = true }
 http = { workspace = true }

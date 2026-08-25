@@ -7,7 +7,7 @@ use codex_protocol::openai_models::InputModality;
 use std::collections::HashSet;
 use uuid::Uuid;
 
-use crate::util::error_or_panic;
+use crate::invariants::error_or_panic;
 use tracing::info;
 
 const IMAGE_CONTENT_OMITTED_PLACEHOLDER: &str =

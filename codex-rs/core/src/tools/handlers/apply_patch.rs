@@ -6,10 +6,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::FunctionCallError;
 use crate::apply_patch;
 use crate::apply_patch::InternalApplyPatchInvocation;
 use crate::apply_patch::convert_apply_patch_to_protocol;
-use crate::function_tool::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
@@ -50,6 +50,7 @@ use codex_features::Feature;
 use codex_git_utils::get_git_repo_root;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::PatchApplyUpdatedEvent;
@@ -358,7 +359,12 @@ async fn effective_patch_permissions(
     codex_protocol::permissions::FileSystemSandboxPolicy,
 )> {
     let file_paths = file_paths_for_action(action);
-    let native_cwd = cwd.to_abs_path()?;
+    let native_cwd = match cwd.to_abs_path() {
+        Ok(native_cwd) => native_cwd,
+        Err(error) => {
+            return external_patch_permissions(turn, file_paths).ok_or(error);
+        }
+    };
     let granted_permissions = merge_permission_profiles(
         session
             .granted_session_permissions(environment_id)
@@ -374,10 +380,16 @@ async fn effective_patch_permissions(
         &base_file_system_sandbox_policy,
         granted_permissions.as_ref(),
     );
-    let native_file_paths = file_paths
+    let native_file_paths = match file_paths
         .iter()
         .map(PathUri::to_abs_path)
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(native_file_paths) => native_file_paths,
+        Err(error) => {
+            return external_patch_permissions(turn, file_paths).ok_or(error);
+        }
+    };
     let effective_additional_permissions = apply_granted_turn_permissions(
         session,
         environment_id,
@@ -394,24 +406,29 @@ async fn effective_patch_permissions(
     ))
 }
 
-fn patch_permissions_without_path_matching(
-    action: &ApplyPatchAction,
-) -> (
+fn external_patch_permissions(
+    turn: &TurnContext,
+    file_paths: Vec<PathUri>,
+) -> Option<(
     Vec<PathUri>,
     crate::tools::handlers::EffectiveAdditionalPermissions,
     codex_protocol::permissions::FileSystemSandboxPolicy,
-) {
-    // TODO(anp): Make permission matching operate on PathUri. Until then, foreign paths skip
-    // permission matching; a managed turn still fails closed at the platform sandbox boundary.
-    (
-        file_paths_for_action(action),
-        crate::tools::handlers::EffectiveAdditionalPermissions {
-            sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
-            additional_permissions: None,
-            permissions_preapproved: false,
-        },
-        codex_protocol::permissions::FileSystemSandboxPolicy::unrestricted(),
+)> {
+    matches!(
+        turn.permission_profile(),
+        PermissionProfile::External { .. }
     )
+    .then(|| {
+        (
+            file_paths,
+            crate::tools::handlers::EffectiveAdditionalPermissions {
+                sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
+                additional_permissions: None,
+                permissions_preapproved: false,
+            },
+            codex_protocol::permissions::FileSystemSandboxPolicy::external_sandbox(),
+        )
+    })
 }
 
 impl ToolExecutor<ToolInvocation> for ApplyPatchHandler {
@@ -435,7 +452,6 @@ impl ApplyPatchHandler {
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let ToolInvocation {
             session,
-            turn,
             step_context,
             tracker,
             call_id,
@@ -443,6 +459,7 @@ impl ApplyPatchHandler {
             payload,
             ..
         } = invocation;
+        let turn = Arc::clone(&step_context.turn);
 
         let ToolPayload::Custom { input: patch_input } = payload else {
             return Err(FunctionCallError::RespondToModel(
@@ -506,7 +523,11 @@ impl ApplyPatchHandler {
                         turn_environment.cwd(),
                     )
                     .await
-                    .unwrap_or_else(|_| patch_permissions_without_path_matching(&changes));
+                    .map_err(|error| {
+                        FunctionCallError::RespondToModel(format!(
+                            "apply_patch cannot enforce filesystem permissions for the selected environment: {error}"
+                        ))
+                    })?;
                 let invocation =
                     apply_patch::apply_patch(turn.as_ref(), &file_system_sandbox_policy, changes)
                         .await;
@@ -691,7 +712,11 @@ pub(crate) async fn intercept_apply_patch(
                     cwd,
                 )
                 .await
-                .unwrap_or_else(|_| patch_permissions_without_path_matching(&changes));
+                .map_err(|error| {
+                    FunctionCallError::RespondToModel(format!(
+                        "apply_patch cannot enforce filesystem permissions for the selected environment: {error}"
+                    ))
+                })?;
             let invocation =
                 apply_patch::apply_patch(turn.as_ref(), &file_system_sandbox_policy, changes).await;
             drop(_workspace_operation_permit);

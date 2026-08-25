@@ -1,5 +1,5 @@
 use super::*;
-#[cfg(target_os = "windows")]
+
 use codex_feedback::WINDOWS_SANDBOX_LOG_ATTACHMENT_FILENAME;
 
 const MAX_FEEDBACK_TREE_THREADS: usize = 8;
@@ -86,7 +86,7 @@ impl FeedbackRequestProcessor {
         }
         let snapshot = self.feedback.snapshot(conversation_id);
         let thread_id = snapshot.thread_id.clone();
-        let (feedback_thread_ids, sqlite_feedback_logs, state_db_ctx) = if include_logs {
+        let (feedback_thread_ids, sqlite_feedback_logs) = if include_logs {
             if let Some(log_db) = self.log_db.as_ref() {
                 log_db.flush().await;
             }
@@ -156,20 +156,31 @@ impl FeedbackRequestProcessor {
             } else {
                 None
             };
-            (feedback_thread_ids, sqlite_feedback_logs, state_db_ctx)
+            (feedback_thread_ids, sqlite_feedback_logs)
         } else {
-            (Vec::new(), None, None)
+            (Vec::new(), None)
         };
 
         let mut attachment_paths = Vec::new();
         let mut seen_attachment_paths = HashSet::new();
         if include_logs {
             for feedback_thread_id in &feedback_thread_ids {
-                let Some(rollout_path) = self
-                    .resolve_rollout_path(*feedback_thread_id, state_db_ctx.as_ref())
+                let rollout_path = match self
+                    .thread_manager
+                    .resolve_existing_rollout_path(
+                        *feedback_thread_id,
+                        /*include_archived*/ true,
+                    )
                     .await
-                else {
-                    continue;
+                {
+                    Ok(Some(path)) => path,
+                    Ok(None) => continue,
+                    Err(err) => {
+                        warn!(
+                            "failed to resolve rollout path for thread_id={feedback_thread_id}: {err}"
+                        );
+                        continue;
+                    }
                 };
                 if seen_attachment_paths.insert(rollout_path.clone()) {
                     attachment_paths.push(FeedbackAttachmentPath {
@@ -249,34 +260,12 @@ impl FeedbackRequestProcessor {
         upload_result.map_err(|err| internal_error(format!("failed to upload feedback: {err}")))?;
         Ok(FeedbackUploadResponse { thread_id })
     }
-
-    async fn resolve_rollout_path(
-        &self,
-        conversation_id: ThreadId,
-        state_db_ctx: Option<&StateDbHandle>,
-    ) -> Option<PathBuf> {
-        if let Ok(conversation) = self.thread_manager.get_thread(conversation_id).await
-            && let Some(rollout_path) = conversation.rollout_path()
-        {
-            return Some(rollout_path);
-        }
-
-        let state_db_ctx = state_db_ctx?;
-        state_db_ctx
-            .find_rollout_path_by_id(conversation_id, /*archived_only*/ None)
-            .await
-            .unwrap_or_else(|err| {
-                warn!("failed to resolve rollout path for thread_id={conversation_id}: {err}");
-                None
-            })
-    }
 }
 
 fn auto_review_rollout_filename(thread_id: ThreadId) -> String {
     format!("auto-review-rollout-{thread_id}.jsonl")
 }
 
-#[cfg(target_os = "windows")]
 fn windows_sandbox_log_attachment(codex_home: &Path) -> Option<FeedbackAttachmentPath> {
     let sandbox_log_path = codex_windows_sandbox::current_log_file_path_for_codex_home(codex_home);
     sandbox_log_path
@@ -287,12 +276,7 @@ fn windows_sandbox_log_attachment(codex_home: &Path) -> Option<FeedbackAttachmen
         })
 }
 
-#[cfg(not(target_os = "windows"))]
-fn windows_sandbox_log_attachment(_codex_home: &Path) -> Option<FeedbackAttachmentPath> {
-    None
-}
-
-#[cfg(all(test, target_os = "windows"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;

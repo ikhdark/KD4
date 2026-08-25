@@ -1,6 +1,132 @@
 #[test]
 fn thread_lifecycle_clients_use_normal_mcp_elicitation_handling() {
-    assert!(!super::MCP_ELICITATIONS_AUTO_DENY);
+    const { assert!(!super::MCP_ELICITATIONS_AUTO_DENY) };
+}
+
+#[test]
+fn typed_thread_responses_reach_the_dispatch_boundary_without_inner_wrappers() {
+    let source = include_str!("thread_processor.rs");
+    for removed_wrapper in [
+        "thread_list_response_inner",
+        "thread_search_response_inner",
+        "thread_loaded_list_response_inner",
+        "thread_read_response_inner",
+        "thread_turns_list_response_inner",
+        "thread_items_list_response_inner",
+        "thread_start_inner",
+        "thread_unsubscribe_response_inner",
+        "thread_resume_inner",
+        "thread_fork_inner",
+        "thread_increment_elicitation_inner",
+        "thread_decrement_elicitation_inner",
+        "thread_metadata_update_response_inner",
+        "thread_memory_mode_set_response_inner",
+        "memory_reset_response_inner",
+        "thread_compact_start_inner",
+        "thread_background_terminals_clean_inner",
+        "thread_background_terminals_list_inner",
+        "thread_background_terminals_terminate_inner",
+        "thread_shell_command_inner",
+        "thread_approve_guardian_denied_action_inner",
+        "get_thread_summary_response_inner",
+        "thread_rollback_inner",
+    ] {
+        assert!(
+            !source.contains(removed_wrapper),
+            "{removed_wrapper} must not reintroduce a pass-through call hop"
+        );
+    }
+}
+
+#[test]
+fn thread_list_trusts_the_store_cwd_filter_contract() {
+    let source = include_str!("thread_processor.rs");
+    let list_threads_common = source
+        .split_once("async fn list_threads_common")
+        .expect("thread list implementation")
+        .1
+        .split_once("const MCP_ELICITATIONS_AUTO_DENY")
+        .expect("end of thread request processor implementation")
+        .0;
+
+    assert!(list_threads_common.contains("cwd_filters: cwd_filters.clone()"));
+    assert!(!list_threads_common.contains("paths_match_after_normalization"));
+}
+
+mod fork_config_snapshot_reuse_tests {
+    use std::cell::Cell;
+
+    use super::super::reuse_or_capture_fork_snapshot;
+
+    #[tokio::test]
+    async fn reuses_captured_snapshot_without_loading_again() {
+        let loads = Cell::new(0);
+
+        let snapshot = reuse_or_capture_fork_snapshot(Some(41), || async {
+            loads.set(loads.get() + 1);
+            42
+        })
+        .await;
+
+        assert_eq!(snapshot, 41);
+        assert_eq!(loads.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn captures_snapshot_once_when_the_branch_has_none() {
+        let loads = Cell::new(0);
+
+        let snapshot = reuse_or_capture_fork_snapshot(None, || async {
+            loads.set(loads.get() + 1);
+            42
+        })
+        .await;
+
+        assert_eq!(snapshot, 42);
+        assert_eq!(loads.get(), 1);
+    }
+}
+
+#[test]
+fn thread_store_absence_maps_to_structured_thread_reason() {
+    let thread_id = codex_protocol::ThreadId::new();
+    let error = super::thread_store_resume_read_error(
+        codex_thread_store::ThreadStoreError::ThreadNotFound { thread_id },
+    );
+
+    assert_eq!(error.code, crate::error_code::INVALID_REQUEST_ERROR_CODE);
+    assert_eq!(
+        serde_json::from_value::<codex_app_server_protocol::ThreadErrorData>(
+            error.data.expect("thread error data")
+        )
+        .expect("valid thread error data"),
+        codex_app_server_protocol::ThreadErrorData {
+            reason: codex_app_server_protocol::ThreadErrorReason::NotMaterialized,
+        }
+    );
+}
+
+#[test]
+fn rollout_materialization_failure_maps_without_parsing_its_message() {
+    let thread_id = codex_protocol::ThreadId::new();
+    let error = super::thread_read_history_load_error(
+        thread_id,
+        codex_thread_store::ThreadStoreError::RolloutNotMaterialized {
+            path: std::path::PathBuf::from("localized-rollout"),
+            reason: "localized diagnostic".to_string(),
+        },
+    );
+    let error = super::thread_read_view_error(error);
+
+    assert_eq!(
+        serde_json::from_value::<codex_app_server_protocol::ThreadErrorData>(
+            error.data.expect("thread error data")
+        )
+        .expect("valid thread error data"),
+        codex_app_server_protocol::ThreadErrorData {
+            reason: codex_app_server_protocol::ThreadErrorReason::NotMaterialized,
+        }
+    );
 }
 
 mod thread_list_cwd_filter_tests {
@@ -12,11 +138,7 @@ mod thread_list_cwd_filter_tests {
 
     #[test]
     fn normalize_thread_list_cwd_filter_preserves_absolute_paths() {
-        let cwd = if cfg!(windows) {
-            String::from(r"C:\srv\repo-b")
-        } else {
-            String::from("/srv/repo-b")
-        };
+        let cwd = String::from(r"C:\srv\repo-b");
 
         assert_eq!(
             normalize_thread_list_cwd_filters(Some(ThreadListCwdFilter::One(cwd.clone())))
@@ -82,7 +204,7 @@ mod background_terminal_pagination_tests {
     use pretty_assertions::assert_eq;
 
     fn terminal(process_id: &str) -> ThreadBackgroundTerminal {
-        let cwd = if cfg!(windows) { r"C:\tmp" } else { "/tmp" };
+        let cwd = r"C:\tmp";
 
         ThreadBackgroundTerminal {
             item_id: format!("item-{process_id}"),
@@ -151,18 +273,18 @@ mod background_terminal_pagination_tests {
 }
 
 mod failed_fork_cleanup_tests {
-    use super::super::should_finalize_failed_fork;
+    use super::super::should_finalize_failed_thread_setup;
 
     #[test]
-    fn finalizes_when_spawn_rollback_reports_already_removed() {
-        assert!(should_finalize_failed_fork(
+    fn missing_error_path_finalizes_when_spawn_rollback_reports_already_removed() {
+        assert!(should_finalize_failed_thread_setup(
             /*rollback_succeeded*/ false, /*thread_id_still_loaded*/ false,
         ));
     }
 
     #[test]
-    fn preserves_cleanup_state_for_a_replacement_thread() {
-        assert!(!should_finalize_failed_fork(
+    fn missing_error_path_preserves_cleanup_state_for_a_replacement_thread() {
+        assert!(!should_finalize_failed_thread_setup(
             /*rollback_succeeded*/ false, /*thread_id_still_loaded*/ true,
         ));
     }
@@ -235,6 +357,32 @@ mod reconstructed_thread_item_pagination_tests {
                 SortDirection::Desc,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_cursor_when_items_are_empty() {
+        assert!(
+            paginate_reconstructed_thread_items(
+                Vec::new(),
+                Some("not-a-cursor"),
+                2,
+                SortDirection::Asc,
+            )
+            .is_err()
+        );
+    }
+}
+
+mod thread_turn_pagination_tests {
+    use super::super::paginate_thread_turns;
+    use codex_app_server_protocol::SortDirection;
+
+    #[test]
+    fn rejects_malformed_cursor_when_turns_are_empty() {
+        assert!(
+            paginate_thread_turns(Vec::new(), Some("not-a-cursor"), None, SortDirection::Asc,)
+                .is_err()
         );
     }
 }
@@ -629,7 +777,11 @@ mod thread_processor_behavior_tests {
             updated_at: updated_at.with_timezone(&Utc),
             recency_at: updated_at.with_timezone(&Utc),
             archived_at: None,
-            cwd: PathBuf::from("/tmp"),
+            cwd: if cfg!(windows) {
+                PathBuf::from(r"\\?\C:\")
+            } else {
+                PathBuf::from("/tmp")
+            },
             cli_version: "0.0.0".to_string(),
             source: SessionSource::Cli,
             history_mode: Default::default(),
@@ -654,6 +806,14 @@ mod thread_processor_behavior_tests {
         assert_eq!(
             summary.updated_at.as_deref(),
             Some("2025-01-02T03:04:06.789Z")
+        );
+        assert_eq!(
+            summary.cwd,
+            if cfg!(windows) {
+                PathBuf::from(r"C:\")
+            } else {
+                PathBuf::from("/tmp")
+            }
         );
     }
 
@@ -734,14 +894,14 @@ mod thread_processor_behavior_tests {
     }
 
     #[test]
-    fn config_load_error_marks_cloud_config_bundle_failures_for_relogin() {
+    fn config_load_result_marks_cloud_config_bundle_failures_for_relogin() {
         let err = std::io::Error::other(CloudConfigBundleLoadError::new(
             CloudConfigBundleLoadErrorCode::Auth,
             Some(401),
             "Your authentication session could not be refreshed automatically. Please log out and sign in again.",
         ));
 
-        let error = config_load_error(&err);
+        let error = Err::<(), _>(err).map_config_load_error().unwrap_err();
 
         assert_eq!(
             error.data,
@@ -761,10 +921,10 @@ mod thread_processor_behavior_tests {
     }
 
     #[test]
-    fn config_load_error_leaves_non_cloud_config_bundle_failures_unmarked() {
+    fn config_load_result_leaves_non_cloud_config_bundle_failures_unmarked() {
         let err = std::io::Error::other("required MCP servers failed to initialize");
 
-        let error = config_load_error(&err);
+        let error = Err::<(), _>(err).map_config_load_error().unwrap_err();
 
         assert_eq!(error.data, None);
         assert!(
@@ -775,14 +935,14 @@ mod thread_processor_behavior_tests {
     }
 
     #[test]
-    fn config_load_error_marks_non_auth_cloud_config_bundle_failures_without_relogin() {
+    fn config_load_result_marks_non_auth_cloud_failures_without_relogin() {
         let err = std::io::Error::other(CloudConfigBundleLoadError::new(
             CloudConfigBundleLoadErrorCode::RequestFailed,
             /*status_code*/ None,
             "Failed to load cloud config bundle (workspace-managed policies).",
         ));
 
-        let error = config_load_error(&err);
+        let error = Err::<(), _>(err).map_config_load_error().unwrap_err();
 
         assert_eq!(
             error.data,
@@ -795,14 +955,14 @@ mod thread_processor_behavior_tests {
     }
 
     #[test]
-    fn config_load_error_marks_invalid_cloud_config_bundle_failures_without_relogin() {
+    fn config_load_result_marks_invalid_cloud_failures_without_relogin() {
         let err = std::io::Error::other(CloudConfigBundleLoadError::new(
             CloudConfigBundleLoadErrorCode::InvalidBundle,
             /*status_code*/ None,
             "invalid cloud config bundle: invalid cloud config fragment Base policy (cfg_123)",
         ));
 
-        let error = config_load_error(&err);
+        let error = Err::<(), _>(err).map_config_load_error().unwrap_err();
 
         assert_eq!(
             error.data,
@@ -908,6 +1068,7 @@ mod thread_processor_behavior_tests {
             model: "gpt-5".to_string(),
             model_provider_id: "openai".to_string(),
             service_tier: Some("flex".to_string()),
+            developer_instructions: None,
             approval_policy: codex_protocol::protocol::AskForApproval::OnRequest,
             approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
             permission_profile: codex_protocol::models::PermissionProfile::Disabled,

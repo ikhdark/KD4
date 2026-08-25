@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use codex_api::AuthProvider;
 use codex_api::SharedAuthProvider;
+use codex_http_client::build_reqwest_client_with_custom_ca;
 use futures::FutureExt;
 use http::HeaderMap;
 use http::HeaderName;
@@ -13,7 +14,7 @@ use serde::Deserialize;
 use tokio::time::sleep;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::connect_async_with_config;
+use tokio_tungstenite::connect_async_tls_with_config;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tracing::debug;
 use tracing::info;
@@ -35,6 +36,7 @@ use crate::NoiseChannelPublicKey;
 use crate::NoiseRendezvousConnectBundle;
 use crate::NoiseRendezvousConnectProvider;
 use crate::client_api::DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT;
+use crate::client_transport::websocket_connector_with_custom_ca;
 use crate::noise_relay::noise_relay_websocket_config;
 use crate::relay::HarnessKeyValidator;
 use crate::relay::run_multiplexed_environment;
@@ -77,9 +79,10 @@ impl EnvironmentRegistryClient {
         Ok(Self {
             base_url,
             auth_provider,
-            http: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()?,
+            http: build_reqwest_client_with_custom_ca(
+                reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()),
+            )
+            .map_err(|error| ExecServerError::EnvironmentRegistryConfig(error.to_string()))?,
             connect_timeout: DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT,
             telemetry,
         })
@@ -562,16 +565,19 @@ async fn connect_rendezvous(
 > {
     let started_at = Instant::now();
     let result = async {
+        let connector = websocket_connector_with_custom_ca()
+            .map_err(|error| tokio_tungstenite::tungstenite::Error::Io(error.into()))?;
         let mut request = url.into_client_request()?;
         request
             .headers_mut()
             .extend(current_trace_context_headers());
-        connect_async_with_config(
+        connect_async_tls_with_config(
             request,
             Some(noise_relay_websocket_config()),
             // Rendezvous sends small, latency-sensitive frames, so avoid Nagle's coalescing delay.
             /*disable_nagle*/
             true,
+            connector,
         )
         .await
         .map(|(websocket, _)| websocket)

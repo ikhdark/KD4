@@ -5,10 +5,12 @@ use codex_network_proxy::ManagedNetworkSandboxContext;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
+use codex_protocol::permissions::FileSystemSpecialPath;
+use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::GranularApprovalConfig;
 use codex_sandboxing::SandboxCommand;
-use codex_sandboxing::SandboxManager;
 use codex_sandboxing::SandboxType;
+use codex_sandboxing::WindowsSandboxFilesystemOverrides;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
@@ -212,18 +214,14 @@ fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
     let permissions = exec_server_permissions
         .clone()
         .materialize_project_roots_with_workspace_roots(std::slice::from_ref(&cwd));
-    let manager = SandboxManager::new();
     let mut attempt = SandboxAttempt {
         sandbox: SandboxType::None,
         sandbox_requested: true,
         permissions: &permissions,
         exec_server_permissions: &exec_server_permissions,
         enforce_managed_network: true,
-        manager: &manager,
         sandbox_cwd: &cwd_uri,
         workspace_roots: std::slice::from_ref(&cwd),
-        codex_linux_sandbox_exe: None,
-        use_legacy_landlock: false,
         windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
         windows_sandbox_private_desktop: false,
         network_denial_cancellation_token: None,
@@ -267,7 +265,6 @@ fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
             workspace_roots: Vec::new(),
             windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
             windows_sandbox_private_desktop: false,
-            use_legacy_landlock: false,
         })
     );
     assert!(request.exec_server_enforce_managed_network);
@@ -284,4 +281,140 @@ fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
     assert_eq!(request.exec_server_sandbox, None);
     assert!(!request.exec_server_enforce_managed_network);
     assert_eq!(request.exec_server_managed_network, Some(managed_network));
+}
+
+#[test]
+fn local_env_carries_restricted_token_filesystem_overrides() {
+    let temp_dir = tempfile::TempDir::new().expect("tempdir");
+    let cwd = AbsolutePathBuf::from_absolute_path(
+        dunce::canonicalize(temp_dir.path()).expect("canonical cwd"),
+    )
+    .expect("absolute cwd");
+    let docs = cwd.join("docs");
+    std::fs::create_dir_all(docs.as_path()).expect("create docs");
+    let permissions = codex_protocol::models::PermissionProfile::from_runtime_permissions(
+        &FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+                },
+                access: FileSystemAccessMode::Write,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path { path: docs.clone() },
+                access: FileSystemAccessMode::Read,
+            },
+        ]),
+        NetworkSandboxPolicy::Restricted,
+    );
+    let cwd_uri = PathUri::from_abs_path(&cwd);
+    let attempt = SandboxAttempt {
+        sandbox: SandboxType::WindowsRestrictedToken,
+        sandbox_requested: true,
+        permissions: &permissions,
+        exec_server_permissions: &permissions,
+        enforce_managed_network: false,
+        sandbox_cwd: &cwd_uri,
+        workspace_roots: std::slice::from_ref(&cwd),
+        windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::RestrictedToken,
+        windows_sandbox_private_desktop: false,
+        network_denial_cancellation_token: None,
+        network_proxy: None,
+    };
+    let request = attempt
+        .env_for(
+            SandboxCommand {
+                program: "cmd.exe".into(),
+                args: vec!["/c".to_string(), "exit 0".to_string()],
+                cwd: cwd_uri.clone(),
+                env: HashMap::new(),
+                managed_network: None,
+                additional_permissions: None,
+            },
+            crate::sandboxing::ExecOptions {
+                expiration: crate::exec::ExecExpiration::DefaultTimeout,
+                capture_policy: crate::exec::ExecCapturePolicy::ShellTool,
+            },
+            /*network*/ None,
+            /*environment_id*/ None,
+        )
+        .expect("prepare local exec request");
+
+    assert_eq!(
+        request.windows_sandbox_filesystem_overrides,
+        Some(WindowsSandboxFilesystemOverrides {
+            read_roots_override: None,
+            read_roots_include_platform_defaults: false,
+            write_roots_override: None,
+            additional_deny_read_paths: vec![],
+            additional_deny_write_paths: vec![docs],
+        })
+    );
+}
+
+#[test]
+fn local_env_carries_elevated_filesystem_overrides() {
+    let temp_dir = tempfile::TempDir::new().expect("tempdir");
+    let cwd = AbsolutePathBuf::from_absolute_path(
+        dunce::canonicalize(temp_dir.path()).expect("canonical cwd"),
+    )
+    .expect("absolute cwd");
+    let docs = cwd.join("docs");
+    std::fs::create_dir_all(docs.as_path()).expect("create docs");
+    let permissions = codex_protocol::models::PermissionProfile::from_runtime_permissions(
+        &FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+            path: FileSystemPath::Path { path: docs.clone() },
+            access: FileSystemAccessMode::Read,
+        }]),
+        NetworkSandboxPolicy::Restricted,
+    );
+    let cwd_uri = PathUri::from_abs_path(&cwd);
+    let attempt = SandboxAttempt {
+        sandbox: SandboxType::WindowsRestrictedToken,
+        sandbox_requested: true,
+        permissions: &permissions,
+        exec_server_permissions: &permissions,
+        enforce_managed_network: false,
+        sandbox_cwd: &cwd_uri,
+        workspace_roots: std::slice::from_ref(&cwd),
+        windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Elevated,
+        windows_sandbox_private_desktop: false,
+        network_denial_cancellation_token: None,
+        network_proxy: None,
+    };
+    let request = attempt
+        .env_for(
+            SandboxCommand {
+                program: "cmd.exe".into(),
+                args: vec!["/c".to_string(), "exit 0".to_string()],
+                cwd: cwd_uri.clone(),
+                env: HashMap::new(),
+                managed_network: None,
+                additional_permissions: None,
+            },
+            crate::sandboxing::ExecOptions {
+                expiration: crate::exec::ExecExpiration::DefaultTimeout,
+                capture_policy: crate::exec::ExecCapturePolicy::ShellTool,
+            },
+            /*network*/ None,
+            /*environment_id*/ None,
+        )
+        .expect("prepare local exec request");
+
+    assert_eq!(
+        request.windows_sandbox_filesystem_overrides,
+        Some(WindowsSandboxFilesystemOverrides {
+            read_roots_override: Some(vec![docs.into_path_buf()]),
+            read_roots_include_platform_defaults: false,
+            write_roots_override: None,
+            additional_deny_read_paths: vec![],
+            additional_deny_write_paths: vec![],
+        })
+    );
 }

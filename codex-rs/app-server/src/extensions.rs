@@ -21,12 +21,10 @@ use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
-use codex_rollout::state_db::StateDbHandle;
+use codex_rollout::state_integration::StateDbHandle;
 use codex_thread_store::ThreadStore;
 
 use crate::outgoing_message::OutgoingMessageSender;
-#[cfg(test)]
-use crate::thread_state::THREAD_LISTENER_COMMAND_CAPACITY;
 use crate::thread_state::ThreadListenerCommand;
 use crate::thread_state::ThreadStateManager;
 #[cfg(test)]
@@ -130,15 +128,9 @@ impl ExtensionEventSink for AppServerExtensionEventSink {
                         turn_id: turn_id.clone(),
                         goal: goal.clone(),
                     };
-                    match listener_command_tx.try_send(command) {
+                    match listener_command_tx.send(command) {
                         Ok(()) => return,
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            tracing::warn!(
-                                "dropping extension goal update for {thread_id}: listener command queue is full"
-                            );
-                            return;
-                        }
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        Err(_) => {
                             tracing::warn!(
                                 "failed to enqueue extension goal update for {thread_id}: listener command channel is closed"
                             );
@@ -210,7 +202,6 @@ mod tests {
         }
         listener_command_tx
             .send(ThreadListenerCommand::EmitThreadGoalCleared)
-            .await
             .expect("listener command channel should be open");
 
         let mut observed = Vec::new();
@@ -241,7 +232,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn listener_command_admission_is_bounded() {
+    async fn listener_command_admission_preserves_every_ordered_update() {
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel(4);
         let outgoing = Arc::new(OutgoingMessageSender::new(
             outgoing_tx,
@@ -253,20 +244,20 @@ mod tests {
         thread_state_manager.register_listener_command_tx(thread_id, listener_command_tx);
         let sink = app_server_extension_event_sink(outgoing, thread_state_manager);
 
-        for index in 0..THREAD_LISTENER_COMMAND_CAPACITY {
+        const COMMAND_COUNT: usize = 300;
+        for index in 0..COMMAND_COUNT {
             sink.emit(thread_goal_updated_event(
                 thread_id,
                 &format!("turn-{index}"),
             ));
         }
-        sink.emit(thread_goal_updated_event(thread_id, "overflow"));
 
-        assert_eq!(listener_command_rx.len(), THREAD_LISTENER_COMMAND_CAPACITY);
+        assert_eq!(listener_command_rx.len(), COMMAND_COUNT);
         assert!(
             outgoing_rx.try_recv().is_err(),
-            "an overflowed listener command must not escape FIFO via broadcast fallback"
+            "listener commands must not escape FIFO via broadcast fallback"
         );
-        for index in 0..THREAD_LISTENER_COMMAND_CAPACITY {
+        for index in 0..COMMAND_COUNT {
             let command = listener_command_rx
                 .recv()
                 .await

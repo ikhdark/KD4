@@ -115,8 +115,6 @@ class CopyFileForStagingTest(unittest.TestCase):
                 entrypoint_bin=root / "codex",
                 code_mode_host_bin=root / "codex-code-mode-host",
                 rg_bin=root / "rg",
-                zsh_bin=None,
-                bwrap_bin=None,
                 codex_command_runner_bin=None,
                 codex_windows_sandbox_setup_bin=None,
             )
@@ -132,7 +130,7 @@ class CopyFileForStagingTest(unittest.TestCase):
                     package_dir,
                     "1.2.3",
                     PACKAGE_VARIANTS["codex"],
-                    TARGET_SPECS["x86_64-apple-darwin"],
+                    TARGET_SPECS["x86_64-pc-windows-msvc"],
                     inputs,
                 )
 
@@ -149,20 +147,25 @@ class CopyFileForStagingTest(unittest.TestCase):
             root = Path(temp_dir)
             package_dir = root / "package"
             package_dir.mkdir()
-            for filename in ["codex", "codex-code-mode-host", "rg"]:
+            for filename in [
+                "codex.exe",
+                "codex-code-mode-host.exe",
+                "rg.exe",
+                "codex-command-runner.exe",
+                "codex-windows-sandbox-setup.exe",
+            ]:
                 path = root / filename
                 path.write_text(filename, encoding="utf-8")
                 path.chmod(0o755)
             inputs = PackageInputs(
-                entrypoint_bin=root / "codex",
-                code_mode_host_bin=root / "codex-code-mode-host",
-                rg_bin=root / "rg",
-                zsh_bin=None,
-                bwrap_bin=None,
-                codex_command_runner_bin=None,
-                codex_windows_sandbox_setup_bin=None,
+                entrypoint_bin=root / "codex.exe",
+                code_mode_host_bin=root / "codex-code-mode-host.exe",
+                rg_bin=root / "rg.exe",
+                codex_command_runner_bin=root / "codex-command-runner.exe",
+                codex_windows_sandbox_setup_bin=root
+                / "codex-windows-sandbox-setup.exe",
             )
-            spec = TARGET_SPECS["x86_64-apple-darwin"]
+            spec = TARGET_SPECS["x86_64-pc-windows-msvc"]
 
             layout.build_package_dir(
                 package_dir,
@@ -182,7 +185,6 @@ class CopyFileForStagingTest(unittest.TestCase):
                     PACKAGE_VARIANTS["codex"],
                     spec,
                     expected_version="1.2.3",
-                    include_zsh=False,
                 )
 
             metadata.pop("version")
@@ -192,7 +194,6 @@ class CopyFileForStagingTest(unittest.TestCase):
                     package_dir,
                     PACKAGE_VARIANTS["codex"],
                     spec,
-                    include_zsh=False,
                 )
 
     def test_app_server_package_variant_uses_app_server_entrypoint(self) -> None:
@@ -200,20 +201,25 @@ class CopyFileForStagingTest(unittest.TestCase):
             root = Path(temp_dir)
             package_dir = root / "package"
             package_dir.mkdir()
-            for filename in ["codex-app-server", "codex-code-mode-host", "rg"]:
+            for filename in [
+                "codex-app-server.exe",
+                "codex-code-mode-host.exe",
+                "rg.exe",
+                "codex-command-runner.exe",
+                "codex-windows-sandbox-setup.exe",
+            ]:
                 path = root / filename
                 path.write_text(filename, encoding="utf-8")
                 path.chmod(0o755)
             inputs = PackageInputs(
-                entrypoint_bin=root / "codex-app-server",
-                code_mode_host_bin=root / "codex-code-mode-host",
-                rg_bin=root / "rg",
-                zsh_bin=None,
-                bwrap_bin=None,
-                codex_command_runner_bin=None,
-                codex_windows_sandbox_setup_bin=None,
+                entrypoint_bin=root / "codex-app-server.exe",
+                code_mode_host_bin=root / "codex-code-mode-host.exe",
+                rg_bin=root / "rg.exe",
+                codex_command_runner_bin=root / "codex-command-runner.exe",
+                codex_windows_sandbox_setup_bin=root
+                / "codex-windows-sandbox-setup.exe",
             )
-            spec = TARGET_SPECS["x86_64-apple-darwin"]
+            spec = TARGET_SPECS["x86_64-pc-windows-msvc"]
 
             layout.build_package_dir(
                 package_dir,
@@ -227,14 +233,15 @@ class CopyFileForStagingTest(unittest.TestCase):
                 (package_dir / "codex-package.json").read_text(encoding="utf-8")
             )
             self.assertEqual(metadata["variant"], "codex-app-server")
-            self.assertEqual(metadata["entrypoint"], "bin/codex-app-server")
-            self.assertTrue((package_dir / "bin" / "codex-code-mode-host").is_file())
+            self.assertEqual(metadata["entrypoint"], "bin/codex-app-server.exe")
+            self.assertTrue(
+                (package_dir / "bin" / "codex-code-mode-host.exe").is_file()
+            )
             layout.validate_package_dir(
                 package_dir,
                 PACKAGE_VARIANTS["codex-app-server"],
                 spec,
                 expected_version="1.2.3",
-                include_zsh=False,
             )
 
     def test_windows_package_layout_writes_apply_patch_aliases(self) -> None:
@@ -254,8 +261,6 @@ class CopyFileForStagingTest(unittest.TestCase):
                 entrypoint_bin=root / "codex.exe",
                 code_mode_host_bin=root / "codex-code-mode-host.exe",
                 rg_bin=root / "rg.exe",
-                zsh_bin=None,
-                bwrap_bin=None,
                 codex_command_runner_bin=root / "codex-command-runner.exe",
                 codex_windows_sandbox_setup_bin=root
                 / "codex-windows-sandbox-setup.exe",
@@ -282,7 +287,6 @@ class CopyFileForStagingTest(unittest.TestCase):
                 package_dir,
                 PACKAGE_VARIANTS["codex"],
                 spec,
-                include_zsh=False,
             )
 
             (package_dir / "codex-path" / "applypatch.bat").unlink()
@@ -291,7 +295,6 @@ class CopyFileForStagingTest(unittest.TestCase):
                     package_dir,
                     PACKAGE_VARIANTS["codex"],
                     spec,
-                    include_zsh=False,
                 )
             self.assertIn("applypatch.bat", str(cm.exception))
 
@@ -303,7 +306,6 @@ class CopyFileForStagingTest(unittest.TestCase):
                     package_dir,
                     PACKAGE_VARIANTS["codex"],
                     spec,
-                    include_zsh=False,
                 )
             self.assertIn("Invalid package file contents", str(cm.exception))
 

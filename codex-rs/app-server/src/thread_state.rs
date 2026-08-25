@@ -13,13 +13,11 @@ use codex_core::ThreadConfigSnapshot;
 use codex_core::terminal_event_fingerprint;
 use codex_file_watcher::WatchRegistration;
 use codex_protocol::ThreadId;
-#[cfg(test)]
-use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
-use codex_rollout::state_db::StateDbHandle;
+use codex_rollout::state_integration::StateDbHandle;
 use codex_utils_path_uri::LegacyAppPathString;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -37,7 +35,6 @@ type PendingInterruptQueue = Vec<ConnectionRequestId>;
 const MAX_TRACKED_TURN_ORIGINS: usize = 256;
 const MAX_TRACKED_IN_FLIGHT_TASKS: usize = 1_024;
 const MAX_ACKNOWLEDGED_TERMINAL_LEDGER_ENTRIES: usize = 1_024;
-pub(crate) const THREAD_LISTENER_COMMAND_CAPACITY: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct InFlightTaskReference {
@@ -182,10 +179,10 @@ pub(crate) enum ThreadListenerCommand {
 }
 
 pub(crate) fn thread_listener_command_channel() -> (
-    mpsc::Sender<ThreadListenerCommand>,
-    mpsc::Receiver<ThreadListenerCommand>,
+    mpsc::UnboundedSender<ThreadListenerCommand>,
+    mpsc::UnboundedReceiver<ThreadListenerCommand>,
 ) {
-    mpsc::channel(THREAD_LISTENER_COMMAND_CAPACITY)
+    mpsc::unbounded_channel()
 }
 
 /// Per-conversation accumulation of the latest states e.g. error message while a turn runs.
@@ -231,15 +228,13 @@ pub(crate) struct ThreadState {
     pub(crate) pending_interrupts: PendingInterruptQueue,
     pub(crate) pending_rollbacks: Option<ConnectionRequestId>,
     pub(crate) turn_summary: TurnSummary,
-    pub(crate) last_terminal_turn_id: Option<String>,
-    active_turn_id: Option<String>,
     terminal_ledger: HashMap<String, TerminalLedgerEntry>,
     acknowledged_terminal_order: VecDeque<String>,
     pub(crate) cancel_tx: Option<oneshot::Sender<()>>,
     pub(crate) experimental_raw_events: bool,
     pub(crate) listener_generation: u64,
     last_thread_settings: Option<ThreadSettings>,
-    listener_command_tx: Option<mpsc::Sender<ThreadListenerCommand>>,
+    listener_command_tx: Option<mpsc::UnboundedSender<ThreadListenerCommand>>,
     current_turn_history: ThreadHistoryBuilder,
     turn_origin_tracker: TurnOriginTracker,
     listener_thread: Option<Weak<CodexThread>>,
@@ -260,7 +255,7 @@ impl ThreadState {
         conversation: &Arc<CodexThread>,
         watch_registration: WatchRegistration,
         thread_settings_baseline: ThreadSettings,
-    ) -> (mpsc::Receiver<ThreadListenerCommand>, u64) {
+    ) -> (mpsc::UnboundedReceiver<ThreadListenerCommand>, u64) {
         if let Some(previous) = self.cancel_tx.replace(cancel_tx) {
             let _ = previous.send(());
         }
@@ -283,11 +278,9 @@ impl ThreadState {
         self.watch_registration = WatchRegistration::default();
     }
 
-    pub(crate) fn set_experimental_raw_events(&mut self, enabled: bool) {
-        self.experimental_raw_events = enabled;
-    }
-
-    pub(crate) fn listener_command_tx(&self) -> Option<mpsc::Sender<ThreadListenerCommand>> {
+    pub(crate) fn listener_command_tx(
+        &self,
+    ) -> Option<mpsc::UnboundedSender<ThreadListenerCommand>> {
         self.listener_command_tx.clone()
     }
 
@@ -295,9 +288,12 @@ impl ThreadState {
         self.current_turn_history.active_turn_snapshot()
     }
 
+    pub(crate) fn in_progress_turn_id(&self) -> Option<&str> {
+        self.current_turn_history.in_progress_turn_id()
+    }
+
     pub(crate) fn track_current_turn_event(&mut self, event_turn_id: &str, event: &EventMsg) {
         if let EventMsg::TurnStarted(payload) = event {
-            self.active_turn_id = Some(event_turn_id.to_string());
             self.turn_summary.started_at = payload.started_at;
             self.turn_summary.origin_connection_id = self.turn_origin_tracker.take(event_turn_id);
         }
@@ -305,11 +301,7 @@ impl ThreadState {
         if matches!(event, EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_))
             && !self.current_turn_history.has_active_turn()
         {
-            self.last_terminal_turn_id = Some(event_turn_id.to_string());
             self.current_turn_history.reset();
-            if self.active_turn_id.as_deref() == Some(event_turn_id) {
-                self.active_turn_id = None;
-            }
         }
     }
 
@@ -359,8 +351,7 @@ impl ThreadState {
             ));
         }
         if self
-            .active_turn_id
-            .as_deref()
+            .in_progress_turn_id()
             .is_some_and(|active_turn_id| active_turn_id != event_turn_id)
         {
             return TerminalEventDisposition::RejectStale;
@@ -384,14 +375,12 @@ impl ThreadState {
     /// Notification acceptance is intentionally not inferred: core must replay the exact event
     /// so the notification can be handed to the current outbound owner.
     pub(crate) fn seed_terminal_ledger_from_history(&mut self, items: &[RolloutItem]) {
-        let mut retained_active_turn_id = None;
+        self.current_turn_history.reset();
         for item in items {
+            self.current_turn_history.handle_rollout_item(item);
             let RolloutItem::EventMsg(event) = item else {
                 continue;
             };
-            if let EventMsg::TurnStarted(started) = event {
-                retained_active_turn_id = Some(started.turn_id.clone());
-            }
             let (Some(turn_id), Some(fingerprint)) =
                 (terminal_turn_id(event), terminal_event_fingerprint(event))
             else {
@@ -408,12 +397,6 @@ impl ThreadState {
                     notification_accepted: false,
                     acknowledged_queued: false,
                 });
-            if retained_active_turn_id.as_deref() == Some(turn_id) {
-                retained_active_turn_id = None;
-            }
-        }
-        if self.active_turn_id.is_none() {
-            self.active_turn_id = retained_active_turn_id;
         }
     }
 
@@ -560,7 +543,6 @@ pub(crate) async fn resolve_server_request_on_thread_listener(
             request_id,
             completion_tx,
         })
-        .await
         .is_err()
     {
         error!(
@@ -586,6 +568,22 @@ mod tests {
     use codex_protocol::config_types::Settings;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn internal_api_visibility_is_minimal() {
+        let source = include_str!("thread_state.rs");
+        let obsolete_declaration = ["fn", " set_experimental_raw_events"].concat();
+        let obsolete_in_flight_order = ["in_flight_task", "_order"].concat();
+
+        assert!(
+            !source.contains(&obsolete_declaration),
+            "single-use thread-state mutator must remain removed"
+        );
+        assert!(
+            !source.contains(&obsolete_in_flight_order),
+            "unused in-flight task ordering state must remain removed"
+        );
+    }
 
     fn terminal_event(turn_id: &str, message: &str) -> EventMsg {
         EventMsg::TurnComplete(codex_protocol::protocol::TurnCompleteEvent {
@@ -690,7 +688,7 @@ mod tests {
         );
 
         manager.release_in_flight_task(first_thread, "turn-1").await;
-        assert!(manager.state.lock().await.in_flight_task_order.is_empty());
+        assert!(manager.state.lock().await.in_flight_tasks.is_empty());
         assert_eq!(
             manager
                 .claim_in_flight_task(
@@ -862,7 +860,7 @@ mod tests {
             state.mark_terminal_acknowledged(&turn_id, &fingerprint);
         }
 
-        let newest_turn_id = format!("acknowledged-{}", MAX_ACKNOWLEDGED_TERMINAL_LEDGER_ENTRIES);
+        let newest_turn_id = format!("acknowledged-{MAX_ACKNOWLEDGED_TERMINAL_LEDGER_ENTRIES}");
         let newest_fingerprint = state
             .terminal_ledger
             .get(&newest_turn_id)
@@ -938,6 +936,39 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_history_snapshot_is_not_live_turn_state() {
+        let mut state = ThreadState::default();
+        state.track_current_turn_event(
+            "turn-1",
+            &EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
+                turn_id: "turn-1".to_string(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: ModeKind::Default,
+            }),
+        );
+        assert_eq!(state.in_progress_turn_id(), Some("turn-1"));
+
+        state.track_current_turn_event(
+            "turn-1",
+            &EventMsg::TurnAborted(codex_protocol::protocol::TurnAbortedEvent {
+                turn_id: Some("turn-1".to_string()),
+                reason: codex_protocol::protocol::TurnAbortReason::Interrupted,
+                completed_at: None,
+                duration_ms: None,
+                timing: None,
+            }),
+        );
+
+        assert_eq!(state.in_progress_turn_id(), None);
+        assert_eq!(
+            state.active_turn_snapshot().map(|turn| turn.status),
+            Some(codex_app_server_protocol::TurnStatus::Interrupted)
+        );
+    }
+
+    #[test]
     fn retained_terminal_history_requires_notification_projection_after_restart() {
         let event = terminal_event("turn-1", "done");
         let mut state = ThreadState::default();
@@ -971,7 +1002,6 @@ mod tests {
                     developer_instructions: None,
                 },
             },
-            multi_agent_mode: MultiAgentMode::ExplicitRequestOnly,
             personality: None,
         }
     }
@@ -1011,7 +1041,6 @@ struct ThreadStateManagerInner {
     out_of_band_elicitation_leases:
         HashMap<ThreadId, HashMap<OutOfBandElicitationLeaseKey, Weak<CodexThread>>>,
     in_flight_tasks: HashMap<String, InFlightTaskReference>,
-    in_flight_task_order: VecDeque<(String, String)>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -1040,7 +1069,8 @@ pub(crate) struct ThreadStateManager {
     state: Arc<Mutex<ThreadStateManagerInner>>,
     // Extension event sinks are synchronous, so they need an await-free way to
     // enqueue work on the active per-thread listener.
-    listener_commands: Arc<StdMutex<HashMap<ThreadId, mpsc::Sender<ThreadListenerCommand>>>>,
+    listener_commands:
+        Arc<StdMutex<HashMap<ThreadId, mpsc::UnboundedSender<ThreadListenerCommand>>>>,
 }
 
 fn core_lease_id(lease: &OutOfBandElicitationLeaseKey) -> OutOfBandElicitationLeaseId {
@@ -1126,7 +1156,6 @@ impl ThreadStateManager {
                 turn_id: turn_id.clone(),
             },
         );
-        state.in_flight_task_order.push_back((fingerprint, turn_id));
         InFlightTaskClaim::Claimed
     }
 
@@ -1135,9 +1164,6 @@ impl ThreadStateManager {
         state
             .in_flight_tasks
             .retain(|_, entry| entry.thread_id != thread_id || entry.turn_id.as_str() != turn_id);
-        state
-            .in_flight_task_order
-            .retain(|(_, queued_turn_id)| queued_turn_id.as_str() != turn_id);
     }
 
     pub(crate) async fn connection_initialized(
@@ -1313,6 +1339,15 @@ impl ThreadStateManager {
             .is_some_and(|capabilities| capabilities.experimental_api)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn is_connection_initialized(&self, connection_id: ConnectionId) -> bool {
+        self.state
+            .lock()
+            .await
+            .live_connections
+            .contains_key(&connection_id)
+    }
+
     pub(crate) async fn thread_state(&self, thread_id: ThreadId) -> Arc<Mutex<ThreadState>> {
         let mut state = self.state.lock().await;
         state.threads.entry(thread_id).or_default().state.clone()
@@ -1321,7 +1356,7 @@ impl ThreadStateManager {
     pub(crate) fn current_listener_command_tx(
         &self,
         thread_id: ThreadId,
-    ) -> Option<mpsc::Sender<ThreadListenerCommand>> {
+    ) -> Option<mpsc::UnboundedSender<ThreadListenerCommand>> {
         self.listener_commands
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1332,7 +1367,7 @@ impl ThreadStateManager {
     pub(crate) fn register_listener_command_tx(
         &self,
         thread_id: ThreadId,
-        tx: mpsc::Sender<ThreadListenerCommand>,
+        tx: mpsc::UnboundedSender<ThreadListenerCommand>,
     ) {
         self.listener_commands
             .lock()
@@ -1475,7 +1510,7 @@ impl ThreadStateManager {
         {
             let mut thread_state_guard = thread_state.lock().await;
             if experimental_raw_events {
-                thread_state_guard.set_experimental_raw_events(/*enabled*/ true);
+                thread_state_guard.experimental_raw_events = true;
             }
         }
         Some(thread_state)

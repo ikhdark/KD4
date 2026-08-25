@@ -5,14 +5,14 @@ use crate::npm_registry;
 use crate::npm_registry::NpmPackageInfo;
 use crate::update_action;
 use crate::update_action::UpdateAction;
-use crate::update_versions::extract_version_from_latest_tag;
-use crate::update_versions::is_newer;
-use crate::update_versions::is_source_build_version;
 use crate::updates_cache::VersionInfo;
 use crate::updates_cache::read_version_info;
 use crate::updates_cache::version_filepath;
 use chrono::Duration;
 use chrono::Utc;
+use codex_install_context::is_newer_version;
+use codex_install_context::is_source_build_version;
+use codex_install_context::version_from_release_tag;
 use codex_login::default_client::create_client;
 use serde::Deserialize;
 use std::path::Path;
@@ -45,7 +45,7 @@ pub fn get_upgrade_version(config: &Config) -> Option<String> {
     }
 
     info.and_then(|info| {
-        if is_newer(&info.latest_version, CODEX_CLI_VERSION).unwrap_or(false) {
+        if is_newer_version(&info.latest_version, CODEX_CLI_VERSION).unwrap_or(false) {
             Some(info.latest_version)
         } else {
             None
@@ -53,8 +53,6 @@ pub fn get_upgrade_version(config: &Config) -> Option<String> {
     })
 }
 
-// We use the latest version from the cask if installation is via homebrew - homebrew does not immediately pick up the latest release and can lag behind.
-const HOMEBREW_CASK_API_URL: &str = "https://formulae.brew.sh/api/cask/codex.json";
 const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/openai/codex/releases/latest";
 
 #[derive(Deserialize, Debug, Clone)]
@@ -62,28 +60,13 @@ struct ReleaseInfo {
     tag_name: String,
 }
 
-#[derive(Deserialize, Debug, Clone)]
-struct HomebrewCaskInfo {
-    version: String,
-}
-
 async fn check_for_update(version_file: &Path, action: Option<UpdateAction>) -> anyhow::Result<()> {
     let latest_version = match action {
-        Some(UpdateAction::BrewUpgrade) => {
-            let HomebrewCaskInfo { version } = create_client()
-                .get(HOMEBREW_CASK_API_URL)
-                .send()
-                .await?
-                .error_for_status()?
-                .json::<HomebrewCaskInfo>()
-                .await?;
-            version
-        }
         Some(UpdateAction::NpmGlobalLatest)
         | Some(UpdateAction::BunGlobalLatest)
         | Some(UpdateAction::PnpmGlobalLatest) => {
             let latest_version = fetch_latest_github_release_version().await?;
-            let package_info = create_client()
+            let package_info = create_client()?
                 .get(npm_registry::PACKAGE_URL)
                 .send()
                 .await?
@@ -93,7 +76,7 @@ async fn check_for_update(version_file: &Path, action: Option<UpdateAction>) -> 
             npm_registry::ensure_version_ready(&package_info, &latest_version)?;
             latest_version
         }
-        Some(UpdateAction::StandaloneUnix) | Some(UpdateAction::StandaloneWindows) | None => {
+        Some(UpdateAction::StandaloneWindows) | None => {
             fetch_latest_github_release_version().await?
         }
     };
@@ -117,14 +100,16 @@ async fn check_for_update(version_file: &Path, action: Option<UpdateAction>) -> 
 async fn fetch_latest_github_release_version() -> anyhow::Result<String> {
     let ReleaseInfo {
         tag_name: latest_tag_name,
-    } = create_client()
+    } = create_client()?
         .get(LATEST_RELEASE_URL)
         .send()
         .await?
         .error_for_status()?
         .json::<ReleaseInfo>()
         .await?;
-    extract_version_from_latest_tag(&latest_tag_name)
+    version_from_release_tag(&latest_tag_name)
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("Failed to parse latest tag name '{latest_tag_name}'"))
 }
 
 /// Returns the latest version to show in a popup, if it should be shown.

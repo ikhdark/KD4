@@ -93,20 +93,22 @@ impl Policy {
             .split_first()
             .ok_or_else(|| Error::InvalidPattern("prefix cannot be empty".to_string()))?;
 
+        let rest = rest
+            .iter()
+            .map(|token| PatternToken::single(token.clone()))
+            .collect::<Result<Vec<_>>>()?;
+        PatternToken::single(first_token.clone())?;
+        let first_token = first_token.clone();
         let rule: RuleRef = Arc::new(PrefixRule {
             pattern: PrefixPattern {
                 first: Arc::from(first_token.as_str()),
-                rest: rest
-                    .iter()
-                    .map(|token| PatternToken::Single(token.clone()))
-                    .collect::<Vec<_>>()
-                    .into(),
+                rest: rest.into(),
             },
             decision,
             justification: None,
         });
 
-        self.rules_by_program.insert(first_token.clone(), rule);
+        self.rules_by_program.insert(first_token, rule);
         Ok(())
     }
 

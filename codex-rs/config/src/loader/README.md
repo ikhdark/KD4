@@ -1,6 +1,6 @@
 # `codex-config` loader
 
-This module is the canonical place to **load and describe Codex configuration layers** (user config, CLI/session overrides, cloud-managed config, managed config, and MDM-managed preferences) and to produce:
+This module is the canonical place to **load and describe Codex configuration layers** (user config, CLI/session overrides, cloud-managed config, and managed config) and to produce:
 
 - An **effective merged** TOML config.
 - **Per-key origins** metadata (which layer “wins” for a given key).
@@ -25,14 +25,13 @@ Exported from `codex_config::loader`:
 
 Precedence is **top overrides bottom**:
 
-1. `LegacyManagedConfigTomlFromMdm` (MDM-delivered `managed_config.toml`, while it is being phased out)
-2. `LegacyManagedConfigTomlFromFile` (`managed_config.toml`, while it is being phased out)
-3. `SessionFlags` (CLI overrides, applied as dotted-path TOML writes)
-4. `Project` config (`.codex/config.toml`)
-5. `User` profile config, when present
-6. `User` config (`config.toml`)
-7. `EnterpriseManaged` cloud-managed config bundle layers
-8. `System` config (`/etc/codex/config.toml` or the Windows system config path)
+1. `LegacyManagedConfigTomlFromFile` (`managed_config.toml`, while it is being phased out)
+2. `SessionFlags` (CLI overrides, applied as dotted-path TOML writes)
+3. `Project` config (`.codex/config.toml`)
+4. `User` profile config, when present
+5. `User` config (`config.toml`)
+6. `EnterpriseManaged` cloud-managed config bundle layers
+7. `System` config (`%ProgramData%\OpenAI\Codex\config.toml`)
 
 `ConfigLayerStack` stores layers in the opposite order internally: lowest
 precedence first, highest precedence last, so later layers override earlier
@@ -76,8 +75,7 @@ let layers_for_ui = layers.layers_high_to_low();
 Implementation is split by concern:
 
 - `state.rs`: public types (`ConfigLayerEntry`, `ConfigLayerStack`) + merge/origins convenience methods.
-- `layer_io.rs`: reading `config.toml`, managed config, and managed preferences inputs.
+- `layer_io.rs`: reading `config.toml` and managed config inputs.
 - `overrides.rs`: CLI dotted-path overrides → TOML “session flags” layer.
 - `merge.rs`: recursive TOML merge.
 - `fingerprint.rs`: stable per-layer hashing and per-key origins traversal.
-- `macos.rs`: managed preferences integration (macOS only).

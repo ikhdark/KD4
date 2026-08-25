@@ -106,94 +106,7 @@ pub enum CodexWorkspaceMessageType {
     Unknown,
 }
 
-#[derive(Clone, Debug)]
-pub struct AccountsCheckResponse {
-    pub accounts: Vec<AccountEntry>,
-    pub account_ordering: Vec<String>,
-    pub default_account_id: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct AccountEntry {
-    pub id: String,
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub profile_picture_url: Option<String>,
-    #[serde(default)]
-    pub structure: String,
-}
-
-#[derive(Deserialize)]
-struct RawAccountsCheckResponse {
-    #[serde(default)]
-    accounts: RawAccounts,
-    #[serde(default)]
-    account_ordering: Vec<String>,
-    #[serde(default)]
-    default_account_id: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum RawAccounts {
-    List(Vec<AccountEntry>),
-    Map(HashMap<String, ChatGptAccountEntry>),
-}
-
-impl Default for RawAccounts {
-    fn default() -> Self {
-        Self::List(Vec::new())
-    }
-}
-
-#[derive(Deserialize)]
-struct ChatGptAccountEntry {
-    account: ChatGptAccountInfo,
-}
-
-#[derive(Deserialize)]
-struct ChatGptAccountInfo {
-    account_id: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    profile_picture_url: Option<String>,
-    #[serde(default)]
-    structure: String,
-}
-
-impl<'de> Deserialize<'de> for AccountsCheckResponse {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let raw = RawAccountsCheckResponse::deserialize(deserializer)?;
-        let accounts = match raw.accounts {
-            RawAccounts::List(accounts) => accounts,
-            RawAccounts::Map(mut accounts) => raw
-                .account_ordering
-                .iter()
-                .filter_map(|account_id| {
-                    let account = accounts.remove(account_id)?.account;
-                    Some(AccountEntry {
-                        id: account.account_id?,
-                        name: account.name,
-                        profile_picture_url: account.profile_picture_url,
-                        structure: account.structure,
-                    })
-                })
-                .collect(),
-        };
-        Ok(Self {
-            accounts,
-            account_ordering: raw.account_ordering,
-            default_account_id: raw.default_account_id,
-        })
-    }
-}
-
-/// Hand-rolled models for the Cloud Tasks task-details response.
+/// Hand-rolled models for the Codex Cloud task-details response.
 /// The generated OpenAPI models are pretty bad. This is a half-step
 /// towards hand-rolling them.
 #[derive(Clone, Debug, Deserialize)]
@@ -437,19 +350,9 @@ impl TurnError {
     }
 }
 
-pub trait CodeTaskDetailsResponseExt {
+impl CodeTaskDetailsResponse {
     /// Attempt to extract a unified diff string from the assistant or diff turn.
-    fn unified_diff(&self) -> Option<String>;
-    /// Extract assistant text output messages (no diff) from current turns.
-    fn assistant_text_messages(&self) -> Vec<String>;
-    /// Extract the user's prompt text from the current user turn, when present.
-    fn user_text_prompt(&self) -> Option<String>;
-    /// Extract an assistant error message (if the turn failed and provided one).
-    fn assistant_error_message(&self) -> Option<String>;
-}
-
-impl CodeTaskDetailsResponseExt for CodeTaskDetailsResponse {
-    fn unified_diff(&self) -> Option<String> {
+    pub fn unified_diff(&self) -> Option<String> {
         [
             self.current_diff_task_turn.as_ref(),
             self.current_assistant_turn.as_ref(),
@@ -459,7 +362,8 @@ impl CodeTaskDetailsResponseExt for CodeTaskDetailsResponse {
         .find_map(Turn::unified_diff)
     }
 
-    fn assistant_text_messages(&self) -> Vec<String> {
+    /// Extract assistant text output messages (no diff) from current turns.
+    pub fn assistant_text_messages(&self) -> Vec<String> {
         let mut out = Vec::new();
         for turn in [
             self.current_diff_task_turn.as_ref(),
@@ -473,11 +377,13 @@ impl CodeTaskDetailsResponseExt for CodeTaskDetailsResponse {
         out
     }
 
-    fn user_text_prompt(&self) -> Option<String> {
+    /// Extract the user's prompt text from the current user turn, when present.
+    pub fn user_text_prompt(&self) -> Option<String> {
         self.current_user_turn.as_ref().and_then(Turn::user_prompt)
     }
 
-    fn assistant_error_message(&self) -> Option<String> {
+    /// Extract an assistant error message (if the turn failed and provided one).
+    pub fn assistant_error_message(&self) -> Option<String> {
         self.current_assistant_turn
             .as_ref()
             .and_then(Turn::error_summary)

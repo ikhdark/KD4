@@ -12,12 +12,12 @@ use crate::TaskStatus;
 use crate::TaskSummary;
 use crate::TurnAttempt;
 use crate::api::TaskText;
+use crate::append_error_log;
 use chrono::DateTime;
 use chrono::Utc;
 
 use codex_api::SharedAuthProvider;
 use codex_backend_client as backend;
-use codex_backend_client::CodeTaskDetailsResponseExt;
 use codex_git_utils::ApplyGitRequest;
 use codex_git_utils::apply_git_patch;
 
@@ -177,7 +177,7 @@ mod api {
                 .map(map_task_list_item_to_summary)
                 .collect();
 
-            append_error_log(&format!(
+            append_error_log(format!(
                 "http.list_tasks: env={} limit={} cursor_in={} cursor_out={} items={}",
                 env.unwrap_or("<all>"),
                 limit_i32
@@ -373,7 +373,7 @@ mod api {
 
             match self.backend.create_task(request_body).await {
                 Ok(id) => {
-                    append_error_log(&format!(
+                    append_error_log(format!(
                         "new_task: created id={id} env={} prompt_chars={}",
                         env_id,
                         prompt.chars().count()
@@ -381,7 +381,7 @@ mod api {
                     Ok(crate::CreatedTask { id: TaskId(id) })
                 }
                 Err(e) => {
-                    append_error_log(&format!(
+                    append_error_log(format!(
                         "new_task: create failed env={} prompt_chars={}: {}",
                         env_id,
                         prompt.chars().count(),
@@ -462,7 +462,7 @@ mod api {
             if !is_unified_diff(&diff) {
                 let summary = summarize_patch_for_logging(&diff);
                 let mode = if preflight { "preflight" } else { "apply" };
-                append_error_log(&format!(
+                append_error_log(format!(
                     "apply_error: id={id} mode={mode} format=non-unified; {summary}"
                 ));
                 return Ok(ApplyOutcome {
@@ -905,17 +905,5 @@ mod api {
         format!(
             "patch_summary: kind={kind} lines={lines} chars={chars} cwd={cwd} ; head=\n{head_trunc}"
         )
-    }
-}
-
-fn append_error_log(message: &str) {
-    let ts = Utc::now().to_rfc3339();
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("error.log")
-    {
-        use std::io::Write as _;
-        let _ = writeln!(f, "[{ts}] {message}");
     }
 }

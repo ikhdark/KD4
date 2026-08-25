@@ -1,9 +1,8 @@
 use std::path::PathBuf;
 
+use codex_utils_string::sha1_hex;
 use serde::Deserialize;
 use serde::Serialize;
-use sha1::Digest;
-use sha1::Sha1;
 use tracing::warn;
 
 use crate::AppInfo;
@@ -28,7 +27,7 @@ impl ConnectorDirectoryCacheContext {
 
     pub(crate) fn cache_path(&self) -> PathBuf {
         let cache_key_json = serde_json::to_string(&self.cache_key).unwrap_or_default();
-        let cache_key_hash = sha1_hex(&cache_key_json);
+        let cache_key_hash = sha1_hex(cache_key_json.as_bytes());
         self.codex_home
             .join(CONNECTOR_DIRECTORY_DISK_CACHE_DIR)
             .join(format!("{cache_key_hash}.json"))
@@ -102,11 +101,4 @@ pub(crate) fn write_cached_directory_connectors_to_disk(
 struct ConnectorDirectoryDiskCache {
     schema_version: u8,
     connectors: Vec<AppInfo>,
-}
-
-fn sha1_hex(value: &str) -> String {
-    let mut hasher = Sha1::new();
-    hasher.update(value.as_bytes());
-    let sha1 = hasher.finalize();
-    format!("{sha1:x}")
 }

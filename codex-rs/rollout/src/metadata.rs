@@ -3,7 +3,7 @@ use crate::SESSIONS_SUBDIR;
 use crate::compression;
 use crate::list::parse_timestamp_uuid_from_filename;
 use crate::recorder::RolloutRecorder;
-use crate::state_db::normalize_cwd_for_state_db;
+use crate::state_integration::normalize_cwd_for_state_db;
 use chrono::DateTime;
 use chrono::NaiveDateTime;
 use chrono::Timelike;
@@ -117,10 +117,13 @@ pub async fn extract_metadata_from_rollout(
     })?;
     let parent_thread_id = builder.parent_thread_id;
     let mut metadata = builder.build(default_provider);
+    let persisted_recency_at = codex_state::latest_rollout_recency_at(&items);
     apply_rollout_items(&mut metadata, &items, default_provider);
     if let Some(updated_at) = file_modified_time_utc(rollout_path).await {
         metadata.updated_at = updated_at;
-        metadata.recency_at = updated_at;
+        if persisted_recency_at.is_none() {
+            metadata.recency_at = updated_at;
+        }
     }
     Ok(ExtractionOutcome {
         metadata,
@@ -292,7 +295,7 @@ pub(crate) async fn backfill_sessions_with_lease(
                             .await
                             .or(Some(fallback_archived_at));
                     }
-                    if let Err(err) = runtime.upsert_thread(&metadata).await {
+                    if let Err(err) = runtime.upsert_thread_preserving_timestamps(&metadata).await {
                         warn!("failed to upsert rollout {}: {err}", rollout.path.display());
                         false
                     } else if let Some(parent_thread_id) = parent_thread_id

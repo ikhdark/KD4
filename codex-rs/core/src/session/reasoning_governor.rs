@@ -9,6 +9,7 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use codex_config::config_toml::ReasoningPhaseEfforts;
+use codex_config::schema::canonicalize as canonicalize_json;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -569,8 +570,7 @@ impl SamplingRequestSignalCollector {
         let wait = is_wait_tool(tool_name);
         let live_process_poll = tool_name_matches(tool_name, "write_stdin");
         let direct_code_mode_exec = crate::tools::code_mode::is_exec_tool_name(tool_name);
-        let action_identity = deterministic_action_identity(tool_name, payload);
-        let structured_action = structured_action_identity(tool_name, payload);
+        let (action_identity, structured_action) = action_identities(tool_name, payload);
         let validation = is_validation_invocation(tool_name, payload);
         let (blocked_wait_guard, suppressed_source_pass, suppressed_failure) = self
             .dispatch_ledger
@@ -929,12 +929,7 @@ impl SamplingRequestSignalCollector {
             .suppressed_blocked_wait
     }
 
-    pub(crate) fn record_failure_with_mutation(
-        &self,
-        ordinal: u64,
-        failure: &str,
-        _mutation_advanced: bool,
-    ) {
+    pub(crate) fn record_failure(&self, ordinal: u64, failure: &str) {
         let mut outcome =
             SamplingToolOutcome::plain(ordinal, SamplingToolOutcomeKind::Failure, None);
         outcome.failure_fingerprint = Some(format!(
@@ -948,14 +943,13 @@ impl SamplingRequestSignalCollector {
         state.outcomes.push(outcome);
     }
 
-    pub(crate) fn record_response_result_with_mutation(
+    pub(crate) fn record_response_result(
         &self,
         ordinal: u64,
         outcome_context: ToolOutputOutcomeContext,
         signal: Option<Value>,
         response: &ResponseInputItem,
         canonical_artifact_required: bool,
-        _mutation_advanced: bool,
     ) {
         let plan = sampling_plan(signal.as_ref());
         let mut outcome =
@@ -1407,18 +1401,68 @@ fn sampling_failure_fingerprint(signal: Option<&Value>) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn deterministic_action_identity(tool_name: &ToolName, payload: &ToolPayload) -> Option<String> {
+struct CanonicalToolAction {
+    kind: &'static str,
+    value: Value,
+    identity_payload: Option<String>,
+}
+
+fn canonical_tool_action(payload: &ToolPayload) -> CanonicalToolAction {
+    match payload {
+        ToolPayload::Function { arguments } => match serde_json::from_str::<Value>(arguments) {
+            Ok(arguments) => {
+                let value = canonicalize_json(&arguments);
+                let identity_payload = serde_json::to_string(&value).ok();
+                CanonicalToolAction {
+                    kind: "function",
+                    value,
+                    identity_payload,
+                }
+            }
+            Err(_) => CanonicalToolAction {
+                kind: "function",
+                value: Value::String(arguments.clone()),
+                identity_payload: None,
+            },
+        },
+        ToolPayload::ToolSearch { arguments } => CanonicalToolAction {
+            kind: "tool_search",
+            value: Value::String(arguments.query.clone()),
+            identity_payload: Some(arguments.query.clone()),
+        },
+        ToolPayload::Custom { input } => CanonicalToolAction {
+            kind: "custom",
+            value: Value::String(input.clone()),
+            identity_payload: Some(input.clone()),
+        },
+    }
+}
+
+fn action_identities(
+    tool_name: &ToolName,
+    payload: &ToolPayload,
+) -> (Option<String>, Option<StructuredActionIdentity>) {
+    let action = canonical_tool_action(payload);
+    (
+        deterministic_action_identity(tool_name, &action),
+        structured_action_identity_from_canonical(tool_name, payload, &action),
+    )
+}
+
+fn deterministic_action_identity(
+    tool_name: &ToolName,
+    action: &CanonicalToolAction,
+) -> Option<String> {
     if !tool_name_matches(tool_name, "wait") && !tool_name_matches(tool_name, "wait_agent") {
         return None;
     }
-    let ToolPayload::Function { arguments } = payload else {
-        return None;
-    };
-    let arguments = serde_json::from_str::<Value>(arguments).ok()?;
-    if arguments.get("force_fresh").and_then(Value::as_bool) == Some(true) {
+    if action.kind != "function" {
         return None;
     }
-    let arguments = serde_json::to_string(&canonicalize_json(arguments)).ok()?;
+    if action.value.get("force_fresh").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let arguments = action.identity_payload.as_deref()?;
     let action_class = serde_json::to_string(tool_name).ok()?;
     Some(format!("{action_class}\n{arguments}"))
 }
@@ -1427,16 +1471,18 @@ fn structured_action_identity(
     tool_name: &ToolName,
     payload: &ToolPayload,
 ) -> Option<StructuredActionIdentity> {
-    let class = source_invocation_class(tool_name, payload);
-    let payload = match payload {
-        ToolPayload::Function { arguments } => {
-            let arguments = serde_json::from_str::<Value>(arguments).ok()?;
-            serde_json::to_string(&canonicalize_json(arguments)).ok()?
-        }
-        ToolPayload::ToolSearch { arguments } => arguments.query.clone(),
-        ToolPayload::Custom { input } => input.clone(),
-    };
-    let action = serde_json::to_string(&(tool_name, payload)).ok()?;
+    let action = canonical_tool_action(payload);
+    structured_action_identity_from_canonical(tool_name, payload, &action)
+}
+
+fn structured_action_identity_from_canonical(
+    tool_name: &ToolName,
+    payload: &ToolPayload,
+    canonical: &CanonicalToolAction,
+) -> Option<StructuredActionIdentity> {
+    let class = source_invocation_class_from_canonical(tool_name, payload, canonical);
+    let action =
+        serde_json::to_string(&(tool_name, canonical.identity_payload.as_deref()?)).ok()?;
     let identity = format!("{:x}", Sha256::digest(action.as_bytes()));
     Some(StructuredActionIdentity { identity, class })
 }
@@ -1465,7 +1511,7 @@ fn response_evidence_identity(response: &ResponseInputItem) -> Option<String> {
 }
 
 fn value_evidence_identity(value: &Value) -> Option<String> {
-    let canonical = serde_json::to_vec(&canonicalize_json(value.clone())).ok()?;
+    let canonical = serde_json::to_vec(&canonicalize_json(value)).ok()?;
     Some(format!("{:x}", Sha256::digest(canonical)))
 }
 
@@ -1500,30 +1546,14 @@ fn code_mode_result_failure_fingerprint(
     if let Some(fingerprint) = value_failure_signature(result) {
         return fingerprint;
     }
+    let action = canonical_tool_action(payload);
     let canonical = serde_json::to_vec(&serde_json::json!({
         "tool_name": tool_name,
-        "payload": canonical_tool_payload(payload),
-        "result": canonicalize_json(result.clone()),
+        "payload": canonical_tool_payload(&action),
+        "result": canonicalize_json(result),
     }))
     .unwrap_or_default();
     format!("code_mode.nested_tool.{:x}", Sha256::digest(canonical))
-}
-
-fn canonicalize_json(value: Value) -> Value {
-    match value {
-        Value::Array(values) => Value::Array(values.into_iter().map(canonicalize_json).collect()),
-        Value::Object(values) => {
-            let mut entries = values.into_iter().collect::<Vec<_>>();
-            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
-            Value::Object(
-                entries
-                    .into_iter()
-                    .map(|(key, value)| (key, canonicalize_json(value)))
-                    .collect(),
-            )
-        }
-        value => value,
-    }
 }
 
 fn canonical_response_body(response: &ResponseInputItem) -> Option<Value> {
@@ -1531,13 +1561,13 @@ fn canonical_response_body(response: &ResponseInputItem) -> Option<Value> {
     if let Value::Object(object) = &mut value {
         object.remove("call_id");
     }
-    Some(canonicalize_json(value))
+    Some(canonicalize_json(&value))
 }
 
 fn canonical_authoritative_result(response: &ResponseInputItem) -> Option<Value> {
     response_output_text(response)
         .and_then(|text| serde_json::from_str::<Value>(text).ok())
-        .map(canonicalize_json)
+        .map(|value| canonicalize_json(&value))
         .or_else(|| canonical_response_body(response))
 }
 
@@ -1588,15 +1618,15 @@ fn authoritative_wait_observation(
     if owner.is_empty() || state_revision.is_empty() {
         return None;
     }
-    let action = canonical_tool_payload(payload);
-    let result = canonicalize_json(result?.clone());
-    let action_identity = deterministic_action_identity(tool_name, payload)?;
+    let action = canonical_tool_action(payload);
+    let result = canonicalize_json(result?);
+    let action_identity = deterministic_action_identity(tool_name, &action)?;
     let identity = serde_json::to_vec(&serde_json::json!({
         "adapter": expected_adapter,
         "disposition": disposition,
         "owner": owner,
         "state_revision": state_revision,
-        "action": action,
+        "action": canonical_tool_payload(&action),
         "receipt_identity": (disposition == AuthoritativeWaitDisposition::Terminal)
             .then_some(receipt_identity),
         "surfaceable_message": surfaceable_message,
@@ -1625,20 +1655,10 @@ fn authoritative_wait_observation(
     })
 }
 
-fn canonical_tool_payload(payload: &ToolPayload) -> Value {
-    let (kind, value) = match payload {
-        ToolPayload::Function { arguments } => (
-            "function",
-            serde_json::from_str(arguments).unwrap_or_else(|_| Value::String(arguments.clone())),
-        ),
-        ToolPayload::ToolSearch { arguments } => {
-            ("tool_search", Value::String(arguments.query.clone()))
-        }
-        ToolPayload::Custom { input } => ("custom", Value::String(input.clone())),
-    };
+fn canonical_tool_payload(action: &CanonicalToolAction) -> Value {
     serde_json::json!({
-        "kind": kind,
-        "value": canonicalize_json(value),
+        "kind": action.kind,
+        "value": action.value,
     })
 }
 
@@ -1706,7 +1726,17 @@ fn is_coordination_tool(tool_name: &ToolName) -> bool {
         .any(|candidate| tool_name_matches(tool_name, candidate))
 }
 
+#[cfg(test)]
 fn source_invocation_class(tool_name: &ToolName, payload: &ToolPayload) -> StructuredActionClass {
+    let canonical = canonical_tool_action(payload);
+    source_invocation_class_from_canonical(tool_name, payload, &canonical)
+}
+
+fn source_invocation_class_from_canonical(
+    tool_name: &ToolName,
+    payload: &ToolPayload,
+    canonical: &CanonicalToolAction,
+) -> StructuredActionClass {
     if ["read_tool_output"]
         .iter()
         .any(|candidate| tool_name_matches(tool_name, candidate))
@@ -1719,12 +1749,10 @@ fn source_invocation_class(tool_name: &ToolName, payload: &ToolPayload) -> Struc
     {
         return StructuredActionClass::Other;
     }
-    let ToolPayload::Function { arguments } = payload else {
+    if !matches!(payload, ToolPayload::Function { .. }) || canonical.identity_payload.is_none() {
         return StructuredActionClass::Other;
-    };
-    let Ok(arguments) = serde_json::from_str::<Value>(arguments) else {
-        return StructuredActionClass::Other;
-    };
+    }
+    let arguments = &canonical.value;
     let program = arguments.get("program").and_then(Value::as_str);
     let args = arguments.get("args").and_then(Value::as_array);
     if let Some(program) = program {
@@ -2190,9 +2218,21 @@ impl SamplingReasoningGovernor {
                 return match observation.disposition {
                     AuthoritativeWaitDisposition::Terminal => {
                         // A terminal owner result without designated assistant
-                        // text still needs the model to produce the semantic
-                        // final response.
-                        SamplingConvergenceDecision::default()
+                        // text still needs one semantic final response. Once
+                        // the exact terminal receipt repeats against unchanged
+                        // state, make that generation tool-free so it cannot
+                        // fall back into another decision-free wait cycle.
+                        SamplingConvergenceDecision {
+                            continuation: ContinuationDisposition::TerminalCompletionRequired,
+                            directive: Some(
+                                "The authoritative owner is terminal and its state is unchanged. Complete now from the existing owner result; do not call another tool."
+                                    .to_string(),
+                            ),
+                            proven_loop_activated: activated,
+                            authoritative_wait: Some(AuthoritativeWaitResolution::Terminal(
+                                observation.result,
+                            )),
+                        }
                     }
                     AuthoritativeWaitDisposition::Blocked => {
                         self.dispatch_ledger
@@ -2419,7 +2459,7 @@ impl SamplingReasoningGovernor {
         let changed_plan = latest_plan.filter(|plan| {
             self.plan
                 .as_ref()
-                .is_none_or(|current| !plans_semantically_equal(current, plan))
+                .is_none_or(|current| current.plan != plan.plan)
         });
         if let Some(plan) = changed_plan.as_ref() {
             self.plan = Some(plan.clone());
@@ -2669,10 +2709,6 @@ fn plan_is_unfinished(plan: &UpdatePlanArgs) -> bool {
                 StepStatus::Passed | StepStatus::Skipped | StepStatus::Completed
             )
         })
-}
-
-fn plans_semantically_equal(left: &UpdatePlanArgs, right: &UpdatePlanArgs) -> bool {
-    left.plan == right.plan
 }
 
 fn phase_for_plan(plan: &UpdatePlanArgs) -> SamplingReasoningPhase {
@@ -2942,7 +2978,7 @@ mod tests {
     }
 
     #[test]
-    fn optimization_priority_elides_proven_residual_generation_only_for_unchanged_state() {
+    fn kd4_latency_stable_continuation_protocol_terminal_elides_sampling_only_when_unchanged() {
         let governor = SamplingReasoningGovernor::new(Some(&ReasoningPhaseEfforts::default()));
         let baselines = governor.baselines(7, ValidationFreshnessStatus::None, None);
         let unchanged = settled(7, ValidationFreshnessStatus::None, None);
@@ -4110,18 +4146,37 @@ mod tests {
     }
 
     #[test]
-    fn terminal_authoritative_wait_without_designated_surface_remains_model_required() {
+    fn kd4_latency_stable_continuation_terminal_wait_gets_one_tool_free_completion() {
         let mut governor = SamplingReasoningGovernor::new(None);
         let (baselines, settled) = unchanged_state(&governor);
 
-        for _ in 0..2 {
-            let collector =
-                authoritative_wait_collector(&governor, &baselines, "same", false, None);
-            assert_eq!(
-                governor.evaluate_convergence(&baselines, &collector, &settled),
-                SamplingConvergenceDecision::default()
-            );
-        }
+        let first = authoritative_wait_collector(&governor, &baselines, "same", false, None);
+        assert_eq!(
+            governor.evaluate_convergence(&baselines, &first, &settled),
+            SamplingConvergenceDecision::default()
+        );
+
+        let repeated = authoritative_wait_collector(&governor, &baselines, "same", false, None);
+        let decision = governor.evaluate_convergence(&baselines, &repeated, &settled);
+        assert_eq!(
+            decision.continuation,
+            ContinuationDisposition::TerminalCompletionRequired
+        );
+        assert!(decision.directive.is_some());
+        assert!(decision.proven_loop_activated);
+        assert!(matches!(
+            decision.authoritative_wait,
+            Some(AuthoritativeWaitResolution::Terminal(_))
+        ));
+
+        let completion = governor
+            .continuation_generation_request(&baselines, &repeated, &settled, false, false)
+            .require_terminal_completion();
+        assert!(completion.terminal_completion_only);
+        assert_eq!(
+            completion.sampling,
+            SamplingGenerationDisposition::DecisionBearing
+        );
     }
 
     #[test]
@@ -4356,12 +4411,11 @@ mod tests {
         if let Some(guard) = registration.suppressed_source_pass.as_ref() {
             collector.record_suppressed_source_pass(registration.ordinal, &guard.evidence_identity);
         } else {
-            collector.record_response_result_with_mutation(
+            collector.record_response_result(
                 registration.ordinal,
                 ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
                 None,
                 &successful_tool_response("read-call", evidence),
-                false,
                 false,
             );
         }
@@ -4382,12 +4436,11 @@ mod tests {
             },
             "exec-call",
         );
-        collector.record_response_result_with_mutation(
+        collector.record_response_result(
             registration.ordinal,
             ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
             None,
             &successful_tool_response("exec-call", evidence),
-            false,
             false,
         );
         collector
@@ -4407,12 +4460,11 @@ mod tests {
                 &ToolPayload::Function { arguments },
                 &call_id,
             );
-            collector.record_response_result_with_mutation(
+            collector.record_response_result(
                 registration.ordinal,
                 ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
                 None,
                 &successful_tool_response(&call_id, evidence),
-                false,
                 false,
             );
         }
@@ -4445,12 +4497,11 @@ mod tests {
                 1,
             ),
         ]);
-        collector.record_response_result_with_mutation(
+        collector.record_response_result(
             registration.ordinal,
             ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
             None,
             &successful_tool_response("artifact-call", evidence),
-            false,
             false,
         );
         collector
@@ -4464,13 +4515,12 @@ mod tests {
         let collector = governor.collector(&baselines);
         let ordinal = collector.register_tool_call();
 
-        collector.record_response_result_with_mutation(
+        collector.record_response_result(
             ordinal,
             ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
             None,
             &successful_tool_response("canonical-call", "artifact"),
             true,
-            false,
         );
 
         let outcomes = collector.snapshot();
@@ -4661,7 +4711,7 @@ mod tests {
                 },
                 "semantic-call",
             );
-            collector.record_response_result_with_mutation(
+            collector.record_response_result(
                 registration.ordinal,
                 ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
                 Some(json!({
@@ -4671,7 +4721,6 @@ mod tests {
                     ),
                 })),
                 &successful_tool_response("semantic-call", presentation),
-                false,
                 false,
             );
             let current_key = collector
@@ -4704,12 +4753,11 @@ mod tests {
                     },
                     &call_id,
                 );
-                collector.record_response_result_with_mutation(
+                collector.record_response_result(
                     registration.ordinal,
                     ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
                     None,
                     &successful_tool_response(&call_id, "same-evidence"),
-                    false,
                     false,
                 );
             }
@@ -4725,6 +4773,23 @@ mod tests {
             one_read.deterministic_cycle_key(),
             two_reads.deterministic_cycle_key()
         );
+    }
+
+    #[test]
+    fn action_identities_share_one_canonical_function_payload() {
+        let tool_name = ToolName::plain("wait_agent");
+        let left = ToolPayload::Function {
+            arguments: r#"{"target":"agent-1","timeout_ms":10}"#.to_string(),
+        };
+        let right = ToolPayload::Function {
+            arguments: r#"{"timeout_ms":10,"target":"agent-1"}"#.to_string(),
+        };
+
+        let (left_deterministic, left_structured) = action_identities(&tool_name, &left);
+        let (right_deterministic, right_structured) = action_identities(&tool_name, &right);
+
+        assert_eq!(left_deterministic, right_deterministic);
+        assert_eq!(left_structured, right_structured);
     }
 
     #[test]
@@ -4779,7 +4844,7 @@ mod tests {
         };
         let registration =
             collector.register_deterministic_tool_call(&tool_name, &payload, "failure-call");
-        collector.record_response_result_with_mutation(
+        collector.record_response_result(
             registration.ordinal,
             ToolOutputOutcomeContext::new(ToolOutputOutcome::Failure),
             Some(json!({
@@ -4788,13 +4853,12 @@ mod tests {
             })),
             &successful_tool_response("failure-call", "diagnostic"),
             false,
-            false,
         );
         collector
     }
 
     #[test]
-    fn failure_signature_convergence_activates_for_direct_failures() {
+    fn kd4_latency_stable_continuation_failure_gets_one_tool_free_completion() {
         let mut governor = SamplingReasoningGovernor::new(None);
         let (baselines, settled) = unchanged_state(&governor);
 
@@ -4808,6 +4872,20 @@ mod tests {
             let decision = governor.evaluate_convergence(&baselines, &collector, &settled);
             assert_eq!(decision.directive.is_some(), generation == 2);
             assert_eq!(decision.proven_loop_activated, generation == 2);
+            assert_eq!(
+                decision.continuation,
+                if generation == 2 {
+                    ContinuationDisposition::TerminalCompletionRequired
+                } else {
+                    ContinuationDisposition::ModelRequired
+                }
+            );
+            if generation == 2 {
+                let completion = governor
+                    .continuation_generation_request(&baselines, &collector, &settled, false, false)
+                    .require_terminal_completion();
+                assert!(completion.terminal_completion_only);
+            }
         }
     }
 
@@ -4857,7 +4935,7 @@ mod tests {
             &payload,
             "cargo-failure",
         );
-        collector.record_response_result_with_mutation(
+        collector.record_response_result(
             registration.ordinal,
             ToolOutputOutcomeContext::new(ToolOutputOutcome::Failure),
             None,
@@ -4865,7 +4943,6 @@ mod tests {
                 "cargo-failure",
                 r#"{"failure_signature":"validation-failure-v1:stable-diagnostic"}"#,
             ),
-            false,
             false,
         );
 
@@ -4888,10 +4965,9 @@ mod tests {
             },
             "missing-call",
         );
-        collector.record_failure_with_mutation(
+        collector.record_failure(
             registration.ordinal,
             "model:artifact `missing` was not found",
-            false,
         );
 
         assert!(
@@ -4954,7 +5030,7 @@ mod tests {
                     &payload,
                     &call_id,
                 );
-                collector.record_response_result_with_mutation(
+                collector.record_response_result(
                     registration.ordinal,
                     ToolOutputOutcomeContext::new(ToolOutputOutcome::Failure),
                     Some(json!({
@@ -4962,7 +5038,6 @@ mod tests {
                         "failure": { "fingerprint": fingerprint },
                     })),
                     &successful_tool_response(&call_id, "diagnostic"),
-                    false,
                     false,
                 );
             }

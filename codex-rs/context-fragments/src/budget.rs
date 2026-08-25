@@ -1,6 +1,5 @@
 use crate::ContextualUserFragment;
 use codex_utils_string::approx_bytes_for_tokens;
-use codex_utils_string::take_bytes_at_char_boundary;
 
 /// Maximum approximate token budget for one aggregate model-context contribution.
 pub const MAX_MODEL_CONTEXT_TOKENS: usize = 10_000;
@@ -51,25 +50,15 @@ impl ModelContextBudget {
 
         let budget = std::mem::take(&mut self.remaining_bytes);
         if budget <= TRUNCATION_MARKER.len() {
-            return Some(take_bytes_at_char_boundary(text, budget).to_string());
+            return Some(text[..text.floor_char_boundary(budget)].to_string());
         }
 
         let text_budget = budget - TRUNCATION_MARKER.len();
-        let prefix = take_bytes_at_char_boundary(text, text_budget.div_ceil(2));
-        let suffix = take_suffix_bytes_at_char_boundary(text, text_budget / 2);
+        let prefix = &text[..text.floor_char_boundary(text_budget.div_ceil(2))];
+        let suffix_start = text.ceil_char_boundary(text.len().saturating_sub(text_budget / 2));
+        let suffix = &text[suffix_start..];
         Some(format!("{prefix}{TRUNCATION_MARKER}{suffix}"))
     }
-}
-
-fn take_suffix_bytes_at_char_boundary(text: &str, max_bytes: usize) -> &str {
-    if text.len() <= max_bytes {
-        return text;
-    }
-    let mut start = text.len().saturating_sub(max_bytes);
-    while !text.is_char_boundary(start) {
-        start += 1;
-    }
-    &text[start..]
 }
 
 /// An already-rendered fragment used after aggregate budget enforcement.

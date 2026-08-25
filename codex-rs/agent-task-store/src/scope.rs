@@ -26,21 +26,11 @@ pub(crate) fn repository_identity(repo_root: &Path) -> StoreResult<RepositoryIde
         ))
     })?;
     let canonical_path = canonical_root.to_string_lossy().into_owned();
-    let workspace_identity_input = if cfg!(windows) {
-        canonical_path.to_lowercase()
-    } else {
-        canonical_path.clone()
-    };
+    let workspace_identity_input = canonical_path.to_lowercase();
     let repository_identity_input = git_common_directory(&canonical_root)
         .and_then(|path| std::fs::canonicalize(path).ok())
         .map(|path| path.to_string_lossy().into_owned())
-        .map(|path| {
-            if cfg!(windows) {
-                path.to_lowercase()
-            } else {
-                path
-            }
-        })
+        .map(|path| path.to_lowercase())
         .unwrap_or_else(|| workspace_identity_input.clone());
     Ok(RepositoryIdentity {
         id: format!("{:x}", Sha256::digest(repository_identity_input.as_bytes())),
@@ -128,11 +118,7 @@ pub fn normalize_repo_scopes(
     for scope in scopes {
         let path = normalize_lexically(&scope.path)?;
         let path = canonical_relative_identity(&canonical_root, &path)?;
-        let duplicate_key = if cfg!(windows) {
-            path.to_lowercase()
-        } else {
-            path.clone()
-        };
+        let duplicate_key = path.to_lowercase();
         if !seen.insert(duplicate_key) {
             return Err(StoreError::InvalidScope(format!(
                 "duplicate scope path {path}"
@@ -263,11 +249,7 @@ fn paths_equal(left: &str, right: &str) -> bool {
 }
 
 fn comparison_key(path: &str) -> String {
-    if cfg!(windows) {
-        path.to_lowercase()
-    } else {
-        path.to_string()
-    }
+    path.to_lowercase()
 }
 
 pub(crate) fn absolute_repo_path(repo_root: &Path, relative: &str) -> PathBuf {

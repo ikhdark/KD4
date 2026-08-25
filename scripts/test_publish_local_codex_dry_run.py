@@ -3,12 +3,12 @@
 from pathlib import Path
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 import unittest
 
 from scripts.publish_local_codex_test_support import PublishLocalCodexTestBase
+from scripts.publish_local_codex_test_support import clean_env
 
 
 SCRIPT = Path(__file__).resolve().parent / "publish-local-codex.ps1"
@@ -16,39 +16,6 @@ CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 RUN_TIMEOUT_SECONDS = 120
 FIXTURE_TIME = 946684900
 FRESH_SOURCE_TIME = FIXTURE_TIME + 10_000
-
-
-def powershell() -> str | None:
-    # Prefer Windows PowerShell 5.1: production invokes publish-local-codex.ps1
-    # via `powershell -NoProfile -File ...` from the justfile, and 5.1 has
-    # stricter native-stderr and StrictMode semantics than pwsh 7 — bugs in
-    # that class are invisible when the tests run under pwsh.
-    return shutil.which("powershell") or shutil.which("pwsh")
-
-
-def ps_single_quote(value: str | Path) -> str:
-    return "'" + str(value).replace("'", "''") + "'"
-
-
-PUBLISH_ENV_VARS = (
-    "CODEX_LOCAL_PUBLISH_DIR",
-    "CODEX_LOCAL_CODEX_HOME",
-    "CODEX_LOCAL_CODEX_SQLITE_HOME",
-    "CODEX_HOME",
-    "CODEX_SQLITE_HOME",
-    "CODEX_CLI_PATH",
-)
-
-
-def clean_env() -> dict[str, str]:
-    # A prior -ConfigureDesktopLocalCli publish persists these at User scope,
-    # so the inherited environment can carry them; the script prefers
-    # CODEX_LOCAL_PUBLISH_DIR over the test's temp USERPROFILE, which makes
-    # assertions machine-state-dependent unless they are stripped.
-    env = os.environ.copy()
-    for name in PUBLISH_ENV_VARS:
-        env.pop(name, None)
-    return env
 
 
 class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):

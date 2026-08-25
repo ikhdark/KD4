@@ -1,24 +1,25 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 
-use codex_utils_plugins::mention_syntax::PLUGIN_TEXT_MENTION_SIGIL;
-use codex_utils_plugins::mention_syntax::TOOL_MENTION_SIGIL;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct LinkedMention {
-    pub(crate) sigil: char,
-    pub(crate) mention: String,
-    pub(crate) path: String,
-}
+use crate::bottom_pane::MentionBinding;
+use codex_core_skills::injection::LinkedToolMention;
+use codex_core_skills::injection::ToolMentionKind;
+use codex_core_skills::injection::is_common_env_var;
+use codex_core_skills::injection::is_mention_name_char;
+use codex_core_skills::injection::is_mention_name_char_char;
+use codex_core_skills::injection::parse_linked_tool_mention;
+use codex_core_skills::injection::tool_kind_for_path;
+use codex_plugin::mention_syntax::PLUGIN_TEXT_MENTION_SIGIL;
+use codex_plugin::mention_syntax::TOOL_MENTION_SIGIL;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DecodedHistoryText {
     pub(crate) text: String,
-    pub(crate) mentions: Vec<LinkedMention>,
+    pub(crate) mentions: Vec<MentionBinding>,
 }
 
 #[allow(dead_code)]
-pub(crate) fn encode_history_mentions(text: &str, mentions: &[LinkedMention]) -> String {
+pub(crate) fn encode_history_mentions(text: &str, mentions: &[MentionBinding]) -> String {
     if mentions.is_empty() || text.is_empty() {
         return text.to_string();
     }
@@ -96,12 +97,11 @@ pub(crate) fn decode_history_mentions(text: &str) -> DecodedHistoryText {
 
     while index < bytes.len() {
         if bytes[index] == b'['
-            && let Some((sigil, name, path, end_index)) =
-                parse_history_linked_mention(text, bytes, index)
+            && let Some((sigil, name, path, end_index)) = parse_history_linked_mention(text, index)
         {
             out.push(sigil);
             out.push_str(name);
-            mentions.push(LinkedMention {
+            mentions.push(MentionBinding {
                 sigil,
                 mention: name.to_string(),
                 path: path.to_string(),
@@ -123,23 +123,25 @@ pub(crate) fn decode_history_mentions(text: &str) -> DecodedHistoryText {
     }
 }
 
-fn parse_history_linked_mention<'a>(
-    text: &'a str,
-    text_bytes: &[u8],
-    start: usize,
-) -> Option<(char, &'a str, &'a str, usize)> {
+fn parse_history_linked_mention(text: &str, start: usize) -> Option<(char, &str, &str, usize)> {
     // TUI historically wrote `$name`, but selected unified `@` mentions should preserve `@` on
     // history round-trip for any canonical tool path.
-    if let Some((name, path, end_index)) =
-        parse_linked_tool_mention(text, text_bytes, start, TOOL_MENTION_SIGIL)
+    if let Some(LinkedToolMention {
+        name,
+        path,
+        end: end_index,
+    }) = parse_linked_tool_mention(text, start, TOOL_MENTION_SIGIL)
         && !is_common_env_var(name)
         && is_tool_path(path)
     {
         return Some((TOOL_MENTION_SIGIL, name, path, end_index));
     }
 
-    if let Some((name, path, end_index)) =
-        parse_linked_tool_mention(text, text_bytes, start, PLUGIN_TEXT_MENTION_SIGIL)
+    if let Some(LinkedToolMention {
+        name,
+        path,
+        end: end_index,
+    }) = parse_linked_tool_mention(text, start, PLUGIN_TEXT_MENTION_SIGIL)
         && !is_common_env_var(name)
         && is_tool_path(path)
     {
@@ -147,67 +149,6 @@ fn parse_history_linked_mention<'a>(
     }
 
     None
-}
-
-fn parse_linked_tool_mention<'a>(
-    text: &'a str,
-    text_bytes: &[u8],
-    start: usize,
-    sigil: char,
-) -> Option<(&'a str, &'a str, usize)> {
-    let sigil_index = start + 1;
-    if text_bytes.get(sigil_index) != Some(&(sigil as u8)) {
-        return None;
-    }
-
-    let name_start = sigil_index + 1;
-    let first_name_byte = text_bytes.get(name_start)?;
-    if !is_mention_name_char(*first_name_byte) {
-        return None;
-    }
-
-    let mut name_end = name_start + 1;
-    while let Some(next_byte) = text_bytes.get(name_end)
-        && is_mention_name_char(*next_byte)
-    {
-        name_end += 1;
-    }
-
-    if text_bytes.get(name_end) != Some(&b']') {
-        return None;
-    }
-
-    let mut path_start = name_end + 1;
-    while let Some(next_byte) = text_bytes.get(path_start)
-        && next_byte.is_ascii_whitespace()
-    {
-        path_start += 1;
-    }
-    if text_bytes.get(path_start) != Some(&b'(') {
-        return None;
-    }
-
-    let mut path_end = path_start + 1;
-    while let Some(next_byte) = text_bytes.get(path_end)
-        && *next_byte != b')'
-    {
-        path_end += 1;
-    }
-    if text_bytes.get(path_end) != Some(&b')') {
-        return None;
-    }
-
-    let path = text[path_start + 1..path_end].trim();
-    if path.is_empty() {
-        return None;
-    }
-
-    let name = &text[name_start..name_end];
-    Some((name, path, path_end + 1))
-}
-
-fn is_mention_name_char(byte: u8) -> bool {
-    matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-')
 }
 
 fn starts_plaintext_mention(text: &str, index: usize) -> bool {
@@ -235,43 +176,25 @@ fn ends_plaintext_mention(text_bytes: &[u8], index: usize) -> bool {
     })
 }
 
-fn is_mention_name_char_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')
-}
-
-fn is_common_env_var(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    matches!(
-        upper.as_str(),
-        "PATH"
-            | "HOME"
-            | "USER"
-            | "SHELL"
-            | "PWD"
-            | "TMPDIR"
-            | "TEMP"
-            | "TMP"
-            | "LANG"
-            | "TERM"
-            | "XDG_CONFIG_HOME"
-    )
-}
-
 fn is_tool_path(path: &str) -> bool {
-    path.starts_with("app://")
-        || path.starts_with("mcp://")
-        || path.starts_with("plugin://")
-        || path.starts_with("skill://")
-        || path
-            .rsplit(['/', '\\'])
-            .next()
-            .is_some_and(|name| name.eq_ignore_ascii_case("SKILL.md"))
+    tool_kind_for_path(path) != ToolMentionKind::Other
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn decoded_mentions_use_the_composer_binding_type() {
+        fn accept_composer_binding(binding: crate::bottom_pane::MentionBinding) -> MentionBinding {
+            binding
+        }
+
+        let mut decoded = decode_history_mentions("Use [$figma](app://figma-1).");
+        let binding = accept_composer_binding(decoded.mentions.remove(0));
+        assert_eq!(binding.mention, "figma");
+    }
 
     #[test]
     fn decode_history_mentions_restores_visible_tokens() {
@@ -282,17 +205,17 @@ mod tests {
         assert_eq!(
             decoded.mentions,
             vec![
-                LinkedMention {
+                MentionBinding {
                     sigil: '$',
                     mention: "figma".to_string(),
                     path: "app://figma-1".to_string(),
                 },
-                LinkedMention {
+                MentionBinding {
                     sigil: '$',
                     mention: "sample".to_string(),
                     path: "plugin://sample@test".to_string(),
                 },
-                LinkedMention {
+                MentionBinding {
                     sigil: '$',
                     mention: "figma".to_string(),
                     path: "/tmp/figma/SKILL.md".to_string(),
@@ -310,12 +233,12 @@ mod tests {
         assert_eq!(
             decoded.mentions,
             vec![
-                LinkedMention {
+                MentionBinding {
                     sigil: '@',
                     mention: "sample".to_string(),
                     path: "plugin://sample@test".to_string(),
                 },
-                LinkedMention {
+                MentionBinding {
                     sigil: '$',
                     mention: "figma".to_string(),
                     path: "app://figma-1".to_string(),
@@ -331,7 +254,7 @@ mod tests {
         assert_eq!(decoded.text, "Use @figma.");
         assert_eq!(
             decoded.mentions,
-            vec![LinkedMention {
+            vec![MentionBinding {
                 sigil: '@',
                 mention: "figma".to_string(),
                 path: "app://figma-1".to_string(),
@@ -345,17 +268,17 @@ mod tests {
         let encoded = encode_history_mentions(
             text,
             &[
-                LinkedMention {
+                MentionBinding {
                     sigil: '$',
                     mention: "figma".to_string(),
                     path: "app://figma-app".to_string(),
                 },
-                LinkedMention {
+                MentionBinding {
                     sigil: '$',
                     mention: "sample".to_string(),
                     path: "plugin://sample@test".to_string(),
                 },
-                LinkedMention {
+                MentionBinding {
                     sigil: '$',
                     mention: "figma".to_string(),
                     path: "/tmp/figma/SKILL.md".to_string(),
@@ -369,10 +292,27 @@ mod tests {
     }
 
     #[test]
+    fn encode_history_mentions_preserves_namespaced_skill_binding() {
+        let encoded = encode_history_mentions(
+            "$google-calendar:availability",
+            &[MentionBinding {
+                sigil: '$',
+                mention: "google-calendar:availability".to_string(),
+                path: "/tmp/google-calendar/availability/SKILL.md".to_string(),
+            }],
+        );
+
+        assert_eq!(
+            encoded,
+            "[$google-calendar:availability](/tmp/google-calendar/availability/SKILL.md)"
+        );
+    }
+
+    #[test]
     fn encode_history_mentions_links_dollar_mentions_after_punctuation() {
         let encoded = encode_history_mentions(
             "($figma)",
-            &[LinkedMention {
+            &[MentionBinding {
                 sigil: '$',
                 mention: "figma".to_string(),
                 path: "app://figma".to_string(),
@@ -383,7 +323,7 @@ mod tests {
 
     #[test]
     fn encode_history_mentions_links_dollar_mentions_with_path_like_suffixes() {
-        let mention = LinkedMention {
+        let mention = MentionBinding {
             sigil: '$',
             mention: "figma".to_string(),
             path: "app://figma".to_string(),
@@ -409,12 +349,12 @@ mod tests {
         let encoded = encode_history_mentions(
             text,
             &[
-                LinkedMention {
+                MentionBinding {
                     sigil: '@',
                     mention: "figma".to_string(),
                     path: "/tmp/figma/SKILL.md".to_string(),
                 },
-                LinkedMention {
+                MentionBinding {
                     sigil: '@',
                     mention: "sample".to_string(),
                     path: "plugin://sample@test".to_string(),
@@ -433,12 +373,12 @@ mod tests {
         let encoded = encode_history_mentions(
             text,
             &[
-                LinkedMention {
+                MentionBinding {
                     sigil: '@',
                     mention: "figma".to_string(),
                     path: "plugin://figma@test".to_string(),
                 },
-                LinkedMention {
+                MentionBinding {
                     sigil: '$',
                     mention: "figma".to_string(),
                     path: "app://figma".to_string(),
@@ -456,7 +396,7 @@ mod tests {
         let text = "@figma then $figma";
         let encoded = encode_history_mentions(
             text,
-            &[LinkedMention {
+            &[MentionBinding {
                 sigil: '$',
                 mention: "figma".to_string(),
                 path: "app://figma-app".to_string(),
@@ -471,7 +411,7 @@ mod tests {
         let text = "foo　@sample";
         let encoded = encode_history_mentions(
             text,
-            &[LinkedMention {
+            &[MentionBinding {
                 sigil: '@',
                 mention: "sample".to_string(),
                 path: "plugin://sample@test".to_string(),
@@ -485,7 +425,7 @@ mod tests {
         let text = "Please ask @figma.";
         let encoded = encode_history_mentions(
             text,
-            &[LinkedMention {
+            &[MentionBinding {
                 sigil: '@',
                 mention: "figma".to_string(),
                 path: "/tmp/figma/SKILL.md".to_string(),
@@ -499,7 +439,7 @@ mod tests {
         let text = "Please ask (@figma)";
         let encoded = encode_history_mentions(
             text,
-            &[LinkedMention {
+            &[MentionBinding {
                 sigil: '@',
                 mention: "figma".to_string(),
                 path: "plugin://figma@test".to_string(),
@@ -513,7 +453,7 @@ mod tests {
         let text = "foo@sample.com npx @sample/pkg then @sample";
         let encoded = encode_history_mentions(
             text,
-            &[LinkedMention {
+            &[MentionBinding {
                 sigil: '@',
                 mention: "sample".to_string(),
                 path: "plugin://sample@test".to_string(),

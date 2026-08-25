@@ -21,11 +21,11 @@ use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ReviewDecision;
 use codex_sandboxing::SandboxCommand;
-use codex_sandboxing::SandboxManager;
 use codex_sandboxing::SandboxTransformRequest;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::SandboxablePreference;
 use codex_sandboxing::policy_transforms::effective_permission_profile;
+use codex_sandboxing::transform;
 use codex_tools::ToolName;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
@@ -198,7 +198,6 @@ impl ExecApprovalRequirement {
     }
 }
 
-#[cfg(any(windows, test))]
 pub(crate) fn same_exec_authorization_envelope(
     original: &ExecApprovalRequirement,
     canonical: &ExecApprovalRequirement,
@@ -434,11 +433,8 @@ pub(crate) struct SandboxAttempt<'a> {
     /// Canonical permissions before this host materializes workspace roots.
     pub exec_server_permissions: &'a codex_protocol::models::PermissionProfile,
     pub enforce_managed_network: bool,
-    pub(crate) manager: &'a SandboxManager,
     pub(crate) sandbox_cwd: &'a PathUri,
     pub(crate) workspace_roots: &'a [AbsolutePathBuf],
-    pub codex_linux_sandbox_exe: Option<&'a std::path::PathBuf>,
-    pub use_legacy_landlock: bool,
     pub windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel,
     pub windows_sandbox_private_desktop: bool,
     pub network_denial_cancellation_token: Option<CancellationToken>,
@@ -461,29 +457,23 @@ impl<'a> SandboxAttempt<'a> {
         environment_id: Option<&str>,
     ) -> Result<crate::sandboxing::ExecRequest, CodexErr> {
         let network = self.network_proxy(network);
-        let request = self
-            .manager
-            .transform(SandboxTransformRequest {
-                command,
-                permissions: self.permissions,
-                sandbox: self.sandbox,
-                enforce_managed_network: self.enforce_managed_network,
-                environment_id,
-                network,
-                sandbox_policy_cwd: self.sandbox_cwd,
-                codex_linux_sandbox_exe: self
-                    .codex_linux_sandbox_exe
-                    .map(std::path::PathBuf::as_path),
-                use_legacy_landlock: self.use_legacy_landlock,
-                windows_sandbox_level: self.windows_sandbox_level,
-                windows_sandbox_private_desktop: self.windows_sandbox_private_desktop,
-            })
-            .map_err(CodexErr::from)?;
-        Ok(crate::sandboxing::ExecRequest::from_sandbox_exec_request(
+        let request = transform(SandboxTransformRequest {
+            command,
+            permissions: self.permissions,
+            sandbox: self.sandbox,
+            enforce_managed_network: self.enforce_managed_network,
+            environment_id,
+            network,
+            sandbox_policy_cwd: self.sandbox_cwd,
+            windows_sandbox_level: self.windows_sandbox_level,
+            windows_sandbox_private_desktop: self.windows_sandbox_private_desktop,
+        })
+        .map_err(CodexErr::from)?;
+        crate::sandboxing::ExecRequest::from_sandbox_exec_request(
             request,
             options,
             self.workspace_roots.to_vec(),
-        ))
+        )
     }
 
     pub fn env_for_exec_server(
@@ -499,28 +489,24 @@ impl<'a> SandboxAttempt<'a> {
             self.exec_server_permissions,
             command.additional_permissions.as_ref(),
         );
-        let request = self
-            .manager
-            .transform(SandboxTransformRequest {
-                command,
-                permissions: self.permissions,
-                // The exec-server must receive the native command, not this host's wrapper.
-                sandbox: SandboxType::None,
-                enforce_managed_network: self.enforce_managed_network,
-                environment_id,
-                network,
-                sandbox_policy_cwd: self.sandbox_cwd,
-                codex_linux_sandbox_exe: None,
-                use_legacy_landlock: self.use_legacy_landlock,
-                windows_sandbox_level: self.windows_sandbox_level,
-                windows_sandbox_private_desktop: self.windows_sandbox_private_desktop,
-            })
-            .map_err(CodexErr::from)?;
+        let request = transform(SandboxTransformRequest {
+            command,
+            permissions: self.permissions,
+            // The exec-server must receive the native command, not this host's wrapper.
+            sandbox: SandboxType::None,
+            enforce_managed_network: self.enforce_managed_network,
+            environment_id,
+            network,
+            sandbox_policy_cwd: self.sandbox_cwd,
+            windows_sandbox_level: self.windows_sandbox_level,
+            windows_sandbox_private_desktop: self.windows_sandbox_private_desktop,
+        })
+        .map_err(CodexErr::from)?;
         let mut exec_request = crate::sandboxing::ExecRequest::from_sandbox_exec_request(
             request,
             options,
             self.workspace_roots.to_vec(),
-        );
+        )?;
         exec_request.exec_server_managed_network = managed_network;
         if self.sandbox_requested {
             exec_request.exec_server_sandbox = Some(FileSystemSandboxContext {
@@ -529,7 +515,6 @@ impl<'a> SandboxAttempt<'a> {
                 workspace_roots: Vec::new(),
                 windows_sandbox_level: self.windows_sandbox_level,
                 windows_sandbox_private_desktop: self.windows_sandbox_private_desktop,
-                use_legacy_landlock: self.use_legacy_landlock,
             });
             exec_request.exec_server_enforce_managed_network = self.enforce_managed_network;
         }

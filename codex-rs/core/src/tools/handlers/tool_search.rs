@@ -1,4 +1,4 @@
-use crate::function_tool::FunctionCallError;
+use crate::FunctionCallError;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::ToolSearchOutput;
@@ -7,9 +7,10 @@ use crate::tools::handlers::tool_search_spec::create_tool_search_tool;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use bm25::Document;
-use bm25::Language;
 use bm25::SearchEngine;
 use bm25::SearchEngineBuilder;
+use bm25::SearchResult;
+use bm25::Tokenizer;
 use codex_tools::LoadableToolSpec;
 use codex_tools::ResponsesApiNamespace;
 use codex_tools::ResponsesApiNamespaceTool;
@@ -17,17 +18,18 @@ use codex_tools::ResponsesApiTool;
 use codex_tools::TOOL_SEARCH_DEFAULT_LIMIT;
 use codex_tools::TOOL_SEARCH_TOOL_NAME;
 use codex_tools::ToolName;
-use codex_tools::ToolSearchEntry;
 use codex_tools::ToolSearchInfo;
 use codex_tools::ToolSpec;
 use sha2::Digest;
 use sha2::Sha256;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tracing::instrument;
+use unicode_segmentation::UnicodeSegmentation;
 
 const MAX_TOOL_SEARCH_HANDLER_CACHE: usize = 4;
 const MAX_TOOL_SEARCH_RESULT_CACHE: usize = 32;
@@ -40,12 +42,81 @@ const MAX_TOOL_SEARCH_QUERY_BYTES: usize = 4 * 1024;
 const MAX_TOOL_SEARCH_LIMIT: usize = 64;
 const TOOL_SEARCH_CANDIDATE_MULTIPLIER: usize = 3;
 
+#[derive(Debug, Default)]
+struct ToolSearchTokenizer;
+
+impl Tokenizer for ToolSearchTokenizer {
+    fn tokenize(&self, input_text: &str) -> Vec<String> {
+        input_text.unicode_words().map(str::to_lowercase).collect()
+    }
+}
+
 pub struct ToolSearchHandler {
     inventory_fingerprint: [u8; 32],
     search_infos: Vec<ToolSearchInfo>,
+    name_indexes: Vec<ToolSearchNameIndex>,
     spec: ToolSpec,
-    search_engine: SearchEngine<usize>,
+    search_engine: SearchEngine<ToolSearchDocumentId, u32, ToolSearchTokenizer>,
     result_cache: Mutex<VecDeque<ToolSearchCacheEntry>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct ToolSearchDocumentId(usize);
+
+impl ToolSearchDocumentId {
+    fn info(self, search_infos: &[ToolSearchInfo]) -> &ToolSearchInfo {
+        &search_infos[self.0]
+    }
+
+    fn name_index(self, name_indexes: &[ToolSearchNameIndex]) -> &ToolSearchNameIndex {
+        &name_indexes[self.0]
+    }
+}
+
+struct ToolSearchNameIndex {
+    entry_names: HashSet<String>,
+    output_names: HashMap<String, HashSet<String>>,
+}
+
+impl ToolSearchNameIndex {
+    fn new(search_info: &ToolSearchInfo) -> Self {
+        let entry_names = search_info
+            .entry
+            .tool_names
+            .iter()
+            .map(|name| normalize_tool_search_query(name))
+            .collect();
+        let mut output_names = HashMap::<String, HashSet<String>>::new();
+        match &search_info.entry.output {
+            LoadableToolSpec::Function(tool) => {
+                output_names
+                    .entry(normalize_tool_search_query(&tool.name))
+                    .or_default()
+                    .insert(tool.name.clone());
+            }
+            LoadableToolSpec::Namespace(namespace) => {
+                for tool in &namespace.tools {
+                    let ResponsesApiNamespaceTool::Function(tool) = tool;
+                    output_names
+                        .entry(normalize_tool_search_query(&tool.name))
+                        .or_default()
+                        .insert(tool.name.clone());
+                }
+            }
+        }
+        Self {
+            entry_names,
+            output_names,
+        }
+    }
+
+    fn has_entry_name(&self, normalized_query: &str) -> bool {
+        self.entry_names.contains(normalized_query)
+    }
+
+    fn output_names_for(&self, normalized_query: &str) -> Option<&HashSet<String>> {
+        self.output_names.get(normalized_query)
+    }
 }
 
 #[derive(Default)]
@@ -274,6 +345,7 @@ impl ToolSearchHandler {
         search_infos: Vec<ToolSearchInfo>,
         inventory_fingerprint: [u8; 32],
     ) -> Self {
+        let name_indexes = search_infos.iter().map(ToolSearchNameIndex::new).collect();
         let has_unnamed_tools = search_infos
             .iter()
             .any(|search_info| search_info.source_info.is_none());
@@ -286,18 +358,27 @@ impl ToolSearchHandler {
             has_unnamed_tools,
             TOOL_SEARCH_DEFAULT_LIMIT,
         );
-        let documents: Vec<Document<usize>> = search_infos
+        let documents: Vec<Document<ToolSearchDocumentId>> = search_infos
             .iter()
             .map(|search_info| search_info.entry.search_text.clone())
             .enumerate()
-            .map(|(idx, search_text)| Document::new(idx, search_text))
+            .map(|(idx, search_text)| Document::new(ToolSearchDocumentId(idx), search_text))
             .collect();
         let search_engine =
-            SearchEngineBuilder::<usize>::with_documents(Language::English, documents).build();
+            SearchEngineBuilder::<
+                ToolSearchDocumentId,
+                u32,
+                ToolSearchTokenizer,
+            >::with_tokenizer_and_documents(
+                ToolSearchTokenizer,
+                documents,
+            )
+            .build();
 
         Self {
             inventory_fingerprint,
             search_infos,
+            name_indexes,
             spec,
             search_engine,
             result_cache: Mutex::new(VecDeque::new()),
@@ -360,7 +441,12 @@ impl ToolSearchHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
-        let ToolInvocation { payload, turn, .. } = invocation;
+        let ToolInvocation {
+            payload,
+            step_context,
+            ..
+        } = invocation;
+        let turn = Arc::clone(&step_context.turn);
 
         let args = match payload {
             ToolPayload::ToolSearch { arguments } => arguments,
@@ -383,18 +469,7 @@ impl ToolSearchHandler {
 }
 
 fn loadable_tool_names(spec: &LoadableToolSpec) -> Vec<ToolName> {
-    match spec {
-        LoadableToolSpec::Function(tool) => vec![ToolName::plain(tool.name.clone())],
-        LoadableToolSpec::Namespace(namespace) => namespace
-            .tools
-            .iter()
-            .map(|tool| match tool {
-                codex_tools::ResponsesApiNamespaceTool::Function(tool) => {
-                    ToolName::namespaced(namespace.name.clone(), tool.name.clone())
-                }
-            })
-            .collect(),
-    }
+    spec.callable_tool_names()
 }
 
 impl CoreToolRuntime for ToolSearchHandler {}
@@ -420,41 +495,39 @@ impl ToolSearchHandler {
         }
 
         let exact_matches = self
-            .search_infos
+            .name_indexes
             .iter()
-            .filter(|search_info| {
-                search_info
-                    .entry
-                    .tool_names
-                    .iter()
-                    .any(|name| normalize_tool_search_query(name) == key.query)
+            .enumerate()
+            .filter_map(|(index, names)| {
+                names
+                    .has_entry_name(&key.query)
+                    .then_some(ToolSearchDocumentId(index))
             })
             .collect::<Vec<_>>();
         let exact_match_count = exact_matches.len();
         let candidate_limit = tool_search_candidate_limit(limit, self.search_infos.len());
-        let mut ranked_results = self.search_engine.search(&key.query, candidate_limit);
-        debug_assert!(ranked_results.len() <= candidate_limit);
-        ranked_results.sort_by(|left, right| {
-            right
-                .score
-                .total_cmp(&left.score)
-                .then_with(|| left.document.id.cmp(&right.document.id))
-        });
+        // bm25 applies its limit before returning results, while equal scores inherit
+        // nondeterministic HashSet order. Fetch every match so the candidate cutoff
+        // happens only after equal-score groups receive a stable document-id order.
+        let mut ranked_results = self
+            .search_engine
+            .search(&key.query, self.search_infos.len());
+        stabilize_equal_score_order(&mut ranked_results);
         let candidates = ranked_results
             .into_iter()
             .take(candidate_limit)
             .map(|result| result.document.id)
-            .filter_map(|id| self.search_infos.get(id))
             .collect::<Vec<_>>();
         let candidate_count = candidates.len();
-        let candidate_source_count = tool_search_info_diversity_count(candidates.iter().copied());
-        let results = promote_exact_name_matches(exact_matches, candidates, limit);
+        let candidate_source_count = tool_search_info_diversity_count(
+            candidates.iter().map(|id| id.info(&self.search_infos)),
+        );
+        let results =
+            promote_exact_name_matches(&self.search_infos, exact_matches, candidates, limit);
         let result_count = results.len();
-        let result_source_count = tool_search_info_diversity_count(results.iter().copied());
-        let result = self.search_output_tools(
-            results.iter().map(|search_info| &search_info.entry),
-            Some(&key.query),
-        )?;
+        let result_source_count =
+            tool_search_info_diversity_count(results.iter().map(|id| id.info(&self.search_infos)));
+        let result = self.search_output_tools(results, Some(&key.query))?;
         tracing::trace!(
             normalized_query_bytes = key.query.len(),
             effective_limit = limit,
@@ -474,21 +547,27 @@ impl ToolSearchHandler {
         Ok(result)
     }
 
-    fn search_output_tools<'a>(
+    fn search_output_tools(
         &self,
-        results: impl IntoIterator<Item = &'a ToolSearchEntry>,
+        results: impl IntoIterator<Item = ToolSearchDocumentId>,
         exact_query: Option<&str>,
     ) -> Result<ToolSearchResult, FunctionCallError> {
         let mut retained = ToolSearchResultBuilder::new();
         let mut omitted_result_count = 0usize;
-        for result in results {
+        for result_id in results {
+            let result = &result_id.info(&self.search_infos).entry;
+            let exact_output_names = exact_query.and_then(|query| {
+                result_id
+                    .name_index(&self.name_indexes)
+                    .output_names_for(query)
+            });
             if retained.try_push(&result.output) {
-            } else if let Some(recovery) =
-                exact_query.and_then(|query| compact_exact_match_recovery(&result.output, query))
+            } else if let Some(recovery) = exact_output_names
+                .and_then(|names| compact_exact_match_recovery(&result.output, names))
             {
                 if retained.try_push(&recovery) {
-                } else if let Some(minimal_recovery) = exact_query
-                    .and_then(|query| minimal_exact_match_recovery(&result.output, query))
+                } else if let Some(minimal_recovery) = exact_output_names
+                    .and_then(|names| minimal_exact_match_recovery(&result.output, names))
                 {
                     if !retained.try_push(&minimal_recovery) {
                         omitted_result_count = omitted_result_count.saturating_add(1);
@@ -554,23 +633,19 @@ impl ToolSearchHandler {
 
 fn compact_exact_match_recovery(
     output: &LoadableToolSpec,
-    exact_query: &str,
+    exact_names: &HashSet<String>,
 ) -> Option<LoadableToolSpec> {
     match output {
-        LoadableToolSpec::Function(tool)
-            if normalize_tool_search_query(&tool.name) == exact_query =>
-        {
-            Some(LoadableToolSpec::Function(compact_recovery_tool(
-                tool, &tool.name,
-            )))
-        }
+        LoadableToolSpec::Function(tool) if exact_names.contains(&tool.name) => Some(
+            LoadableToolSpec::Function(compact_recovery_tool(tool, &tool.name)),
+        ),
         LoadableToolSpec::Namespace(namespace) => {
             let tools = namespace
                 .tools
                 .iter()
                 .filter_map(|tool| match tool {
                     ResponsesApiNamespaceTool::Function(tool)
-                        if normalize_tool_search_query(&tool.name) == exact_query =>
+                        if exact_names.contains(&tool.name) =>
                     {
                         Some(ResponsesApiNamespaceTool::Function(compact_recovery_tool(
                             tool,
@@ -653,23 +728,19 @@ fn strip_schema_descriptions(schema: &mut codex_tools::JsonSchema) {
 
 fn minimal_exact_match_recovery(
     output: &LoadableToolSpec,
-    exact_query: &str,
+    exact_names: &HashSet<String>,
 ) -> Option<LoadableToolSpec> {
     match output {
-        LoadableToolSpec::Function(tool)
-            if normalize_tool_search_query(&tool.name) == exact_query =>
-        {
-            Some(LoadableToolSpec::Function(minimal_recovery_tool(
-                tool, &tool.name,
-            )))
-        }
+        LoadableToolSpec::Function(tool) if exact_names.contains(&tool.name) => Some(
+            LoadableToolSpec::Function(minimal_recovery_tool(tool, &tool.name)),
+        ),
         LoadableToolSpec::Namespace(namespace) => {
             let tools = namespace
                 .tools
                 .iter()
                 .filter_map(|tool| match tool {
                     ResponsesApiNamespaceTool::Function(tool)
-                        if normalize_tool_search_query(&tool.name) == exact_query =>
+                        if exact_names.contains(&tool.name) =>
                     {
                         Some(ResponsesApiNamespaceTool::Function(minimal_recovery_tool(
                             tool,
@@ -755,6 +826,21 @@ fn tool_search_candidate_limit(effective_limit: usize, inventory_size: usize) ->
         .min(inventory_size)
 }
 
+fn stabilize_equal_score_order(ranked_results: &mut [SearchResult<ToolSearchDocumentId>]) {
+    let mut group_start = 0;
+    while group_start < ranked_results.len() {
+        let score = ranked_results[group_start].score;
+        let mut group_end = group_start + 1;
+        while group_end < ranked_results.len()
+            && ranked_results[group_end].score.total_cmp(&score).is_eq()
+        {
+            group_end += 1;
+        }
+        ranked_results[group_start..group_end].sort_by_key(|result| result.document.id);
+        group_start = group_end;
+    }
+}
+
 fn tool_search_cache_entry_fits_budget(
     key: &ToolSearchQueryKey,
     tools: &[LoadableToolSpec],
@@ -766,6 +852,7 @@ fn tool_search_cache_entry_fits_budget(
     serde_json::to_writer(&mut writer, tools).is_ok()
 }
 
+#[cfg(test)]
 fn diversify_search_results(results: Vec<&ToolSearchInfo>, limit: usize) -> Vec<&ToolSearchInfo> {
     if results.len() <= limit {
         return results;
@@ -803,21 +890,64 @@ fn diversify_search_results(results: Vec<&ToolSearchInfo>, limit: usize) -> Vec<
     diversified
 }
 
-fn promote_exact_name_matches<'a>(
-    exact_matches: Vec<&'a ToolSearchInfo>,
-    ranked_results: Vec<&'a ToolSearchInfo>,
+fn promote_exact_name_matches(
+    search_infos: &[ToolSearchInfo],
+    exact_matches: Vec<ToolSearchDocumentId>,
+    ranked_results: Vec<ToolSearchDocumentId>,
     limit: usize,
-) -> Vec<&'a ToolSearchInfo> {
+) -> Vec<ToolSearchDocumentId> {
     let mut results = Vec::with_capacity(exact_matches.len().saturating_add(ranked_results.len()));
-    let mut seen = HashSet::<*const ToolSearchInfo>::new();
+    let mut seen = HashSet::<ToolSearchDocumentId>::new();
 
     for result in exact_matches.into_iter().chain(ranked_results) {
-        if seen.insert(std::ptr::from_ref(result)) {
+        if seen.insert(result) {
             results.push(result);
         }
     }
 
-    diversify_search_results(results, limit)
+    diversify_search_result_ids(search_infos, results, limit)
+}
+
+fn diversify_search_result_ids(
+    search_infos: &[ToolSearchInfo],
+    results: Vec<ToolSearchDocumentId>,
+    limit: usize,
+) -> Vec<ToolSearchDocumentId> {
+    if results.len() <= limit {
+        return results;
+    }
+
+    let mut remaining = results;
+    let mut diversified = Vec::with_capacity(limit);
+    let mut seen_this_pass = HashSet::new();
+
+    while !remaining.is_empty() && diversified.len() < limit {
+        let mut deferred = Vec::new();
+        let mut added_this_pass = false;
+
+        for result_id in remaining {
+            if diversified.len() >= limit {
+                break;
+            }
+            let result = result_id.info(search_infos);
+            if seen_this_pass.insert(tool_search_info_diversity_key(result)) {
+                diversified.push(result_id);
+                added_this_pass = true;
+            } else {
+                deferred.push(result_id);
+            }
+        }
+
+        if !added_this_pass {
+            diversified.extend(deferred.into_iter().take(limit - diversified.len()));
+            break;
+        }
+
+        remaining = deferred;
+        seen_this_pass.clear();
+    }
+
+    diversified
 }
 
 fn tool_search_info_diversity_count<'a>(
@@ -880,6 +1010,41 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn tool_search_tokenizer_splits_unicode_words_and_normalizes_case() {
+        assert_eq!(
+            ToolSearchTokenizer.tokenize("Launch CALENDAR-events for José"),
+            vec!["launch", "calendar", "events", "for", "josé"]
+        );
+    }
+
+    #[test]
+    fn search_ranks_matching_terms_with_lightweight_tokenizer() {
+        let handler = ToolSearchHandler::new(vec![
+            search_info(
+                "reset account password credentials",
+                Some("accounts"),
+                "accounts",
+                "reset_credentials",
+            ),
+            search_info(
+                "inspect network proxy connections",
+                Some("network"),
+                "network",
+                "inspect_proxy",
+            ),
+        ]);
+
+        let result = handler
+            .search("PASSWORD-reset", 1)
+            .expect("matching terms should produce a result");
+
+        let [LoadableToolSpec::Namespace(namespace)] = result.tools.as_slice() else {
+            panic!("search should return one namespace");
+        };
+        assert_eq!(namespace.name, "mcp__accounts");
+    }
+
+    #[test]
     fn cache_reuses_handler_for_identical_search_infos_and_rebuilds_for_changes() {
         let cache = ToolSearchHandlerCache::default();
         let search_infos = vec![
@@ -918,6 +1083,23 @@ mod tests {
         }
         let changed_output = cache.get_or_build(changed_output_infos);
         assert!(!Arc::ptr_eq(&first, &changed_output));
+    }
+
+    #[test]
+    fn handler_precomputes_normalized_entry_and_output_names() {
+        let handler = ToolSearchHandler::new(vec![search_info(
+            "calendar lookup",
+            Some("calendar"),
+            "calendar",
+            "  FIND_EVENT  ",
+        )]);
+
+        let names = &handler.name_indexes[0];
+        assert!(names.has_entry_name("find_event"));
+        assert_eq!(
+            names.output_names_for("find_event"),
+            Some(&HashSet::from(["  FIND_EVENT  ".to_string()]))
+        );
     }
 
     #[test]
@@ -1053,24 +1235,29 @@ mod tests {
     }
 
     #[test]
-    fn search_bounds_the_ranked_candidate_window() {
-        let search_infos = (0..20)
-            .map(|idx| {
-                search_info_with_source(
-                    &format!("shared capability {idx}"),
-                    &format!("source-{idx}"),
-                    &format!("tool-{idx}"),
-                )
-            })
-            .collect();
-        let handler = ToolSearchHandler::new(search_infos);
+    fn search_breaks_score_ties_before_the_candidate_cutoff() {
+        for _ in 0..32 {
+            let search_infos = (0..20)
+                .map(|idx| {
+                    search_info_with_source(
+                        "shared capability",
+                        &format!("source-{idx:02}"),
+                        &format!("tool-{idx:02}"),
+                    )
+                })
+                .collect();
+            let handler = ToolSearchHandler::new(search_infos);
 
-        let tools = handler
-            .search("shared capability", 1)
-            .expect("bounded search should succeed");
+            let tools = handler
+                .search("shared capability", 1)
+                .expect("tied-score search should succeed");
+            let [LoadableToolSpec::Namespace(namespace)] = tools.tools.as_slice() else {
+                panic!("search should return one namespace");
+            };
 
-        assert_eq!(tools.tools.len(), 1);
-        assert_eq!(tools.omitted_result_count, 0);
+            assert_eq!(namespace.name, "mcp__source-00");
+            assert_eq!(tools.omitted_result_count, 0);
+        }
     }
 
     #[test]
@@ -1165,10 +1352,7 @@ mod tests {
             namespace.description = "x".repeat(MAX_TOOL_SEARCH_RESULT_BYTES / 2);
         }
         let handler = ToolSearchHandler::new(vec![first, second]);
-        let results = [
-            &handler.search_infos[0].entry,
-            &handler.search_infos[1].entry,
-        ];
+        let results = [ToolSearchDocumentId(0), ToolSearchDocumentId(1)];
 
         let tools = handler
             .search_output_tools(results, None)
@@ -1194,10 +1378,7 @@ mod tests {
         namespace.description = "x".repeat(MAX_TOOL_SEARCH_RESULT_BYTES);
         let expected = later.entry.output.clone();
         let handler = ToolSearchHandler::new(vec![oversized, later]);
-        let results = [
-            &handler.search_infos[0].entry,
-            &handler.search_infos[1].entry,
-        ];
+        let results = [ToolSearchDocumentId(0), ToolSearchDocumentId(1)];
 
         let tools = handler
             .search_output_tools(results, None)
@@ -1248,9 +1429,9 @@ mod tests {
         }));
         let handler = ToolSearchHandler::new(search_infos);
         let results = [
-            &handler.search_infos[0].entry,
-            &handler.search_infos[2].entry,
-            &handler.search_infos[1].entry,
+            ToolSearchDocumentId(0),
+            ToolSearchDocumentId(2),
+            ToolSearchDocumentId(1),
         ];
 
         let tools = handler
@@ -1406,18 +1587,25 @@ mod tests {
 
     #[test]
     fn exact_name_promotion_preserves_ranked_order_without_duplicates() {
-        let exact = search_info("exact", None, "exact", "target_tool");
-        let ranked_first = search_info("ranked-first", None, "ranked-first", "first");
-        let ranked_second = search_info("ranked-second", None, "ranked-second", "second");
+        let search_infos = vec![
+            search_info("exact", None, "exact", "target_tool"),
+            search_info("ranked-first", None, "ranked-first", "first"),
+            search_info("ranked-second", None, "ranked-second", "second"),
+        ];
 
         let results = promote_exact_name_matches(
-            vec![&exact],
-            vec![&ranked_first, &exact, &ranked_second],
+            &search_infos,
+            vec![ToolSearchDocumentId(0)],
+            vec![
+                ToolSearchDocumentId(1),
+                ToolSearchDocumentId(0),
+                ToolSearchDocumentId(2),
+            ],
             3,
         );
         let search_texts = results
             .iter()
-            .map(|search_info| search_info.entry.search_text.as_str())
+            .map(|result_id| result_id.info(&search_infos).entry.search_text.as_str())
             .collect::<Vec<_>>();
 
         assert_eq!(search_texts, vec!["exact", "ranked-first", "ranked-second"]);

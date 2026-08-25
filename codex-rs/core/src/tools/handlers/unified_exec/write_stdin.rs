@@ -1,5 +1,5 @@
+use crate::FunctionCallError;
 use crate::agent::task_capabilities::validate_independent_review_stdin;
-use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
@@ -18,6 +18,7 @@ use codex_protocol::protocol::ToolLifecycleWakeReason;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use serde::Deserialize;
+use std::sync::Arc;
 
 use super::super::shell_spec::create_write_stdin_tool;
 use super::post_unified_exec_tool_use_payload;
@@ -61,10 +62,11 @@ impl WriteStdinHandler {
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let ToolInvocation {
             session,
-            turn,
+            step_context,
             payload,
             ..
         } = invocation;
+        let turn = Arc::clone(&step_context.turn);
 
         let arguments = match payload {
             ToolPayload::Function { arguments } => arguments,

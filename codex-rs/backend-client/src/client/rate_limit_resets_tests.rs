@@ -147,7 +147,6 @@ fn test_client(base_url: &str, path_style: PathStyle) -> Client {
         auth_provider: codex_model_provider::unauthenticated_auth_provider(),
         user_agent: None,
         chatgpt_account_id: None,
-        chatgpt_account_is_fedramp: false,
         path_style,
     }
 }

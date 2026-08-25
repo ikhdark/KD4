@@ -44,6 +44,13 @@ fn spawn_with_interval(
     let worker_shutdown = shutdown.clone();
     let task = tokio::spawn(async move {
         loop {
+            // Model-dependent requests refresh an empty cache on demand. Wait
+            // before forcing a refresh so app-server startup does not issue an
+            // otherwise unused network request.
+            tokio::select! {
+                _ = worker_shutdown.cancelled() => break,
+                _ = tokio::time::sleep(refresh_interval) => {}
+            }
             if worker_shutdown.is_cancelled() {
                 break;
             }
@@ -54,11 +61,6 @@ fn spawn_with_interval(
                 .list_models(RefreshStrategy::Online, http_client_factory.clone())
                 .await;
             drop(models_manager);
-
-            tokio::select! {
-                _ = worker_shutdown.cancelled() => break,
-                _ = tokio::time::sleep(refresh_interval) => {}
-            }
         }
     });
     ModelsRefreshWorker {

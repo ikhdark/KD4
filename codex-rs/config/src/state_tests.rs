@@ -91,7 +91,7 @@ approval_policy = "on-request"
 }
 
 #[test]
-fn feature_alias_overlay_updates_canonical_origin() {
+fn higher_precedence_feature_updates_canonical_origin() {
     let temp_dir = TempDir::new().expect("tempdir");
     let base_file = test_user_config_path(&temp_dir, "config.toml");
     let profile_file = test_user_config_path(&temp_dir, "work.config.toml");
@@ -116,7 +116,7 @@ apps = false
         toml::from_str(
             r#"
 [features]
-connectors = true
+apps = true
 "#,
         )
         .expect("profile config"),
@@ -141,7 +141,6 @@ connectors = true
 
     let origins = stack.origins();
     assert_eq!(origins.get("features.apps"), Some(&profile_metadata));
-    assert_eq!(origins.get("features.connectors"), Some(&profile_metadata));
 }
 
 #[test]

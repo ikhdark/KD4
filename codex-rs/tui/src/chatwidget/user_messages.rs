@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 use std::ops::Deref;
 use std::path::PathBuf;
 
+use crate::bottom_pane::ComposerDraftSnapshot;
 use crate::bottom_pane::LocalImageAttachment;
 use crate::bottom_pane::MentionBinding;
 use crate::bottom_pane::QueuedInputAction;
@@ -97,30 +98,9 @@ pub(super) enum QueueDrain {
     Stop,
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
-pub(super) struct ThreadComposerState {
-    pub(super) text: String,
-    pub(super) local_images: Vec<LocalImageAttachment>,
-    pub(super) remote_image_urls: Vec<String>,
-    pub(super) text_elements: Vec<TextElement>,
-    pub(super) mention_bindings: Vec<MentionBinding>,
-    pub(super) pending_pastes: Vec<(String, String)>,
-}
-
-impl ThreadComposerState {
-    pub(super) fn has_content(&self) -> bool {
-        !self.text.is_empty()
-            || !self.local_images.is_empty()
-            || !self.remote_image_urls.is_empty()
-            || !self.text_elements.is_empty()
-            || !self.mention_bindings.is_empty()
-            || !self.pending_pastes.is_empty()
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ThreadInputState {
-    pub(super) composer: Option<ThreadComposerState>,
+    pub(super) composer: Option<ComposerDraftSnapshot>,
     pub(super) pending_steers: VecDeque<UserMessage>,
     pub(super) pending_steer_history_records: VecDeque<UserMessageHistoryRecord>,
     pub(super) pending_steer_compare_keys: VecDeque<PendingSteerCompareKey>,
@@ -131,8 +111,25 @@ pub(crate) struct ThreadInputState {
     pub(super) user_turn_pending_start: bool,
     pub(super) current_collaboration_mode: CollaborationMode,
     pub(super) active_collaboration_mask: Option<CollaborationModeMask>,
-    pub(super) task_running: bool,
     pub(super) agent_turn_running: bool,
+}
+
+#[cfg(test)]
+mod duplicate_representation_tests {
+    use super::*;
+
+    #[test]
+    fn thread_input_state_uses_composer_draft_snapshot() {
+        fn composer(
+            state: &ThreadInputState,
+        ) -> &Option<crate::bottom_pane::ComposerDraftSnapshot> {
+            &state.composer
+        }
+
+        let draft = ComposerDraftSnapshot::default();
+        assert!(!draft.has_content());
+        let _ = composer;
+    }
 }
 
 impl From<String> for UserMessage {

@@ -3,12 +3,15 @@ use std::sync::OnceLock;
 
 use crate::agents_md::AgentsMdFreshness;
 use crate::agents_md::LoadedAgentsMd;
+use crate::agents_md::RepositoryStableContextBundle;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::session::McpRuntimeSnapshot;
 use crate::session::turn_context::TurnContext;
 use crate::tools::router::ToolRouter;
 use codex_exec_server::ResolvedSelectedCapabilityRoot;
 use codex_mcp::ToolInfo;
+#[cfg(test)]
+use codex_utils_path_uri::PathUri;
 use tokio::sync::OnceCell;
 
 /// Request-scoped state that may change between model sampling requests.
@@ -25,6 +28,8 @@ pub(crate) struct StepContext {
     tool_router: OnceLock<Arc<ToolRouter>>,
     /// The canonical AGENTS.md value observed with this environment snapshot.
     pub(crate) loaded_agents_md: Option<Arc<LoadedAgentsMd>>,
+    /// The repository-instruction rendering and identity derived for this exact step.
+    pub(crate) agents_md_stable_context: Option<RepositoryStableContextBundle>,
     /// Whether that value came from this step's read or a fallback cache.
     pub(crate) agents_md_freshness: AgentsMdFreshness,
 }
@@ -38,12 +43,16 @@ impl StepContext {
         mcp: Arc<McpRuntimeSnapshot>,
         loaded_agents_md: Option<Arc<LoadedAgentsMd>>,
     ) -> Self {
+        let stable_context = loaded_agents_md
+            .as_deref()
+            .map(|loaded| loaded.stable_context_bundle(&PathUri::from_abs_path(&turn.config.cwd)));
         Self::new_with_agents_md_freshness(
             turn,
             environments,
             selected_capability_roots,
             mcp,
             loaded_agents_md,
+            stable_context,
             AgentsMdFreshness::CachedFallback,
         )
     }
@@ -54,6 +63,7 @@ impl StepContext {
         selected_capability_roots: Vec<ResolvedSelectedCapabilityRoot>,
         mcp: Arc<McpRuntimeSnapshot>,
         loaded_agents_md: Option<Arc<LoadedAgentsMd>>,
+        agents_md_stable_context: Option<RepositoryStableContextBundle>,
         agents_md_freshness: AgentsMdFreshness,
     ) -> Self {
         Self {
@@ -64,6 +74,7 @@ impl StepContext {
             mcp_tool_snapshot: OnceCell::new(),
             tool_router: OnceLock::new(),
             loaded_agents_md,
+            agents_md_stable_context,
             agents_md_freshness,
         }
     }

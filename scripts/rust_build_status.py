@@ -12,7 +12,6 @@ import json
 import os
 from pathlib import Path
 import re
-import shlex
 import shutil
 import stat
 import subprocess
@@ -281,9 +280,7 @@ class BuildStatusSnapshot:
 
 
 def active_rust_processes() -> list[RustProcess]:
-    if os.name == "nt":
-        return active_rust_processes_windows()
-    return active_rust_processes_posix()
+    return active_rust_processes_windows()
 
 
 def active_rust_processes_windows() -> list[RustProcess]:
@@ -301,7 +298,7 @@ def active_rust_processes_windows() -> list[RustProcess]:
             capture_output=True,
             text=True,
             timeout=WINDOWS_PROCESS_SCAN_TIMEOUT_SECONDS,
-            creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         print(f"warning: Windows Rust process scan failed: {exc}", file=sys.stderr)
@@ -328,34 +325,6 @@ def active_rust_processes_windows() -> list[RustProcess]:
             pid = int(row.get("ProcessId"))
         except (TypeError, ValueError):
             continue
-        process = RustProcess(pid=pid, name=name, command_line=command_line)
-        if is_rust_process(process):
-            processes.append(process)
-    return processes
-
-
-def active_rust_processes_posix() -> list[RustProcess]:
-    try:
-        result = subprocess.run(
-            ["ps", "-eo", "pid=,comm=,args="],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return []
-
-    processes = []
-    for line in result.stdout.splitlines():
-        parts = line.strip().split(maxsplit=2)
-        if len(parts) < 2:
-            continue
-        try:
-            pid = int(parts[0])
-        except ValueError:
-            continue
-        name = parts[1]
-        command_line = parts[2] if len(parts) > 2 else name
         process = RustProcess(pid=pid, name=name, command_line=command_line)
         if is_rust_process(process):
             processes.append(process)
@@ -425,24 +394,14 @@ def cargo_lock_is_busy(target_dir: Path) -> bool:
     handle: TextIO | None = None
     try:
         handle = lock_path.open("r+")
-        if os.name == "nt":
-            import msvcrt
+        import msvcrt
 
-            try:
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-                return False
-            except OSError:
-                return True
-        else:
-            import fcntl
-
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-                return False
-            except OSError:
-                return True
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            return False
+        except OSError:
+            return True
     except OSError:
         return True
     finally:
@@ -480,24 +439,14 @@ def lane_active_lock_is_held(lane_dir: Path) -> bool:
             # sharing violation at open means the lane is ACTIVE. Treating it
             # as "not held" here would mark a live lane prunable.
             return True
-        if os.name == "nt":
-            import msvcrt
+        import msvcrt
 
-            handle.seek(0)
-            try:
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            except OSError:
-                return True
-            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            return False
-
-        import fcntl
-
+        handle.seek(0)
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
         except OSError:
             return True
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
         return False
     except OSError:
         return True
@@ -507,12 +456,10 @@ def lane_active_lock_is_held(lane_dir: Path) -> bool:
 
 
 def _is_file_lock_contention(exc: OSError) -> bool:
-    if os.name == "nt":
-        return getattr(exc, "winerror", None) in {32, 33, 36} or exc.errno in {
-            errno.EACCES,
-            errno.EAGAIN,
-        }
-    return exc.errno in {errno.EACCES, errno.EAGAIN}
+    return getattr(exc, "winerror", None) in {32, 33, 36} or exc.errno in {
+        errno.EACCES,
+        errno.EAGAIN,
+    }
 
 
 @contextmanager
@@ -544,68 +491,38 @@ def cargo_lane_coordination_lock(
             handle.write(b"\0")
             handle.flush()
         handle.seek(0)
-        if os.name == "nt":
-            import msvcrt
+        import msvcrt
 
-            while True:
-                try:
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                    acquired = True
-                    break
-                except OSError as exc:
-                    if not _is_file_lock_contention(exc):
-                        raise
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError(
-                            f"timed out waiting for lane coordination lock {lock_path}"
-                        )
-                    time.sleep(0.05)
-        else:
-            import fcntl
-
-            while True:
-                try:
-                    fcntl.flock(
-                        handle.fileno(),
-                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+        while True:
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                acquired = True
+                break
+            except OSError as exc:
+                if not _is_file_lock_contention(exc):
+                    raise
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"timed out waiting for lane coordination lock {lock_path}"
                     )
-                    acquired = True
-                    break
-                except OSError as exc:
-                    if not _is_file_lock_contention(exc):
-                        raise
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError(
-                            f"timed out waiting for lane coordination lock {lock_path}"
-                        ) from exc
-                    time.sleep(0.05)
+                time.sleep(0.05)
         yield
     finally:
         try:
             if acquired:
                 handle.seek(0)
-                if os.name == "nt":
-                    import msvcrt
+                import msvcrt
 
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
         finally:
             handle.close()
 
 
 def _release_binary_file_lock(handle: BinaryIO) -> None:
     handle.seek(0)
-    if os.name == "nt":
-        import msvcrt
+    import msvcrt
 
-        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-    else:
-        import fcntl
-
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def _try_acquire_binary_file_lock(path: Path) -> BinaryIO | None:
@@ -622,27 +539,14 @@ def _try_acquire_binary_file_lock(path: Path) -> BinaryIO | None:
             handle.write(b"\0")
             handle.flush()
         handle.seek(0)
-        if os.name == "nt":
-            import msvcrt
+        import msvcrt
 
-            try:
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            except OSError as exc:
-                if _is_file_lock_contention(exc):
-                    return None
-                raise
-        else:
-            import fcntl
-
-            try:
-                fcntl.flock(
-                    handle.fileno(),
-                    fcntl.LOCK_EX | fcntl.LOCK_NB,
-                )
-            except OSError as exc:
-                if _is_file_lock_contention(exc):
-                    return None
-                raise
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            if _is_file_lock_contention(exc):
+                return None
+            raise
         acquired = True
         return handle
     finally:
@@ -855,13 +759,10 @@ def _cargo_watch_exec_with_target_dir(command: str, target_dir: Path) -> str:
     if not stripped or stripped.split(maxsplit=1)[0] not in build_commands:
         return command
     target_arg = str(target_dir)
-    if os.name == "nt":
-        escaped_target = target_arg.replace('"', '\\"')
-        quoted_target = (
-            f'"{escaped_target}"' if re.search(r"\s", target_arg) else target_arg
-        )
-    else:
-        quoted_target = shlex.quote(target_arg)
+    escaped_target = target_arg.replace('"', '\\"')
+    quoted_target = (
+        f'"{escaped_target}"' if re.search(r"\s", target_arg) else target_arg
+    )
     insertion = f" --target-dir {quoted_target}"
     if separator_index >= 0:
         return command[:separator_index] + insertion + command[separator_index:]
@@ -1030,13 +931,13 @@ def run_in_cargo_lane(
                 file=sys.stderr,
             )
         child_env = os.environ.copy()
-        # The environment is the isolation backstop for nested Cargo launches,
-        # including cargo-watch --shell/-s commands that cannot be rewritten
-        # safely as argv.
-        child_env["CARGO_TARGET_DIR"] = str(target_dir)
+        # Keep the lane out of Cargo's environment so the absolute path does
+        # not fragment compiler-cache keys. Direct Cargo commands receive an
+        # explicit --target-dir; nested just recipes consume the CODEX value.
+        child_env.pop("CARGO_TARGET_DIR", None)
         child_env["CODEX_CARGO_LANE_TARGET_DIR"] = str(target_dir)
         child_command = _cargo_command_with_target_dir(command, target_dir)
-        if os.name == "nt" and not Path(child_command[0]).parent.name:
+        if not Path(child_command[0]).parent.name:
             resolved_program = shutil.which(
                 child_command[0],
                 path=child_env.get("PATH"),

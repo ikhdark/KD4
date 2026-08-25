@@ -45,7 +45,10 @@ MANIFEST_EVENTS = [
 PRODUCTION_COMMANDS = {
     event: (
         "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass "
-        f'-File "{HELPER}" -ExpectedEvent {event}'
+        '-Command "$repoRoot = git rev-parse --show-toplevel; '
+        "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; "
+        "& (Join-Path $repoRoot '.codex/hooks/task-continuity-entry.ps1') "
+        f'-ExpectedEvent {event}"'
     )
     for event in MANIFEST_EVENTS
 }
@@ -68,6 +71,25 @@ def compact_json(value: object) -> str:
 
 def normalize_path(value: str | os.PathLike[str]) -> str:
     return os.path.normcase(os.path.abspath(os.fspath(value)))
+
+
+def traced_git_status_count(path: Path) -> int:
+    count = 0
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        argv = event.get("argv")
+        if (
+            event.get("event") == "start"
+            and isinstance(argv, list)
+            and "status" in argv
+            and "--porcelain=v2" in argv
+            and "--branch" in argv
+        ):
+            count += 1
+    return count
 
 
 def recovery_context(capsule: dict[str, Any]) -> str | None:
@@ -912,10 +934,31 @@ class TaskContinuityHookTest(unittest.TestCase):
             self.assertIn(
                 "-NoLogo -NoProfile -NonInteractive", handler["commandWindows"]
             )
-            self.assertIn(f'-File "{HELPER}"', handler["commandWindows"])
+            self.assertNotIn(str(REPO_ROOT), handler["commandWindows"])
+            self.assertIn("git rev-parse --show-toplevel", handler["commandWindows"])
+            self.assertIn(
+                "Join-Path $repoRoot '.codex/hooks/task-continuity-entry.ps1'",
+                handler["commandWindows"],
+            )
         self.assertTrue(HELPER.is_file())
         self.assertTrue(SLOW_HELPER.is_file())
         self.assertTrue(all(helper.is_file() for helper in FAST_HELPERS))
+
+    def test_manifest_command_resolves_helper_from_nested_working_directory(
+        self,
+    ) -> None:
+        result = subprocess.run(
+            PRODUCTION_COMMANDS["UserPromptSubmit"],
+            cwd=REPO_ROOT / "codex-rs",
+            input="{}",
+            text=True,
+            capture_output=True,
+            shell=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "{}")
 
     def test_helper_parses_as_windows_powershell(self) -> None:
         command = """
@@ -1159,6 +1202,60 @@ if ($errors.Count -ne 0) {
         )
         self.assertGreaterEqual(len(repository["revision"]), 40)
         self.assertIsInstance(repository["dirty_summary"], str)
+
+    def test_changed_repository_state_is_handed_to_canonical_fallback(self) -> None:
+        git = shutil.which("git.exe") or shutil.which("git")
+        if git is None:
+            self.skipTest("Git is not available")
+        for args in (
+            ["init"],
+            ["config", "user.email", "continuity@example.invalid"],
+            ["config", "user.name", "Continuity Test"],
+        ):
+            subprocess.run(
+                [git, *args],
+                cwd=self.sandbox.root,
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+        tracked = self.sandbox.root / "tracked.txt"
+        tracked.write_text("tracked\n", encoding="utf-8")
+        subprocess.run([git, "add", "tracked.txt"], cwd=self.sandbox.root, check=True)
+        subprocess.run(
+            [git, "commit", "-m", "fixture"],
+            cwd=self.sandbox.root,
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+
+        session_id = self.sandbox.session_id()
+        self.invoke_empty(
+            self.sandbox.payload("SessionStart", session_id, source="startup")
+        )
+        tracked.write_text("resume mutation\n", encoding="utf-8")
+        resume_trace = self.sandbox.root / "resume-git-trace.jsonl"
+        resume_env = {**os.environ, "GIT_TRACE2_EVENT": str(resume_trace)}
+        result, _ = self.sandbox.invoke(
+            self.sandbox.payload("SessionStart", session_id, source="resume"),
+            env=resume_env,
+        )
+        self.assertEqual(
+            result.stdout,
+            exact_injection(self.sandbox.capsule(session_id)),
+        )
+        self.assertEqual(traced_git_status_count(resume_trace), 1)
+
+        self.invoke_empty(self.sandbox.payload("PreCompact", session_id))
+        tracked.write_text("compact mutation\n", encoding="utf-8")
+        compact_trace = self.sandbox.root / "compact-git-trace.jsonl"
+        compact_env = {**os.environ, "GIT_TRACE2_EVENT": str(compact_trace)}
+        self.invoke_empty(
+            self.sandbox.payload("PreCompact", session_id),
+            env=compact_env,
+        )
+        self.assertEqual(traced_git_status_count(compact_trace), 1)
 
     def test_resume_rejects_stored_root_after_nested_repository_appears(self) -> None:
         git = shutil.which("git.exe") or shutil.which("git")

@@ -9,6 +9,7 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::strip_metadata;
+use core_test_support::responses::strip_response_item_ids;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
@@ -53,8 +54,15 @@ async fn build_prompt_input_includes_context_and_user_message() -> Result<()> {
         internal_chat_message_metadata_passthrough: None,
     };
     assert_eq!(
-        input.last().cloned().map(strip_metadata),
-        Some(expected_user_message)
+        strip_response_item_ids(
+            &input
+                .last()
+                .cloned()
+                .map(strip_metadata)
+                .into_iter()
+                .collect::<Vec<_>>()
+        ),
+        vec![expected_user_message]
     );
     assert!(input.iter().any(|item| {
         let ResponseItem::Message { content, .. } = item else {

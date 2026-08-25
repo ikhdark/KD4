@@ -607,3 +607,24 @@ fn install_rejects_manifest_names_that_do_not_match_marketplace_plugin_name() {
         "plugin.json name `manifest-name` does not match marketplace plugin name `different-name`"
     );
 }
+
+#[test]
+fn plugin_metadata_writes_use_shared_durable_atomic_writer() {
+    let store = include_str!("store.rs");
+    let local_paths = include_str!("remote/share/local_paths.rs");
+    let checkout = include_str!("remote/share/checkout.rs");
+
+    for (name, source) in [
+        ("store", store),
+        ("local paths", local_paths),
+        ("checkout", checkout),
+    ] {
+        assert!(
+            !source.contains("tempfile::NamedTempFile"),
+            "{name} should not maintain a private atomic writer"
+        );
+    }
+    assert!(store.contains("codex_file_system::write_bytes_atomically"));
+    assert!(local_paths.contains("codex_file_system::write_atomically"));
+    assert!(checkout.contains("codex_file_system::write_atomically"));
+}

@@ -22,11 +22,8 @@ use crate::session::turn_context::TurnEnvironment;
 use crate::shell_snapshot::ShellSnapshot;
 
 fn test_runtime_paths() -> ExecServerRuntimePaths {
-    ExecServerRuntimePaths::new(
-        std::env::current_exe().expect("current exe"),
-        /*codex_linux_sandbox_exe*/ None,
-    )
-    .expect("runtime paths")
+    ExecServerRuntimePaths::new(std::env::current_exe().expect("current exe"))
+        .expect("runtime paths")
 }
 
 async fn local_environment_manager() -> Arc<EnvironmentManager> {
@@ -54,6 +51,46 @@ async fn local_snapshot(cwd: AbsolutePathBuf, generation: u64) -> TurnEnvironmen
         )],
         starting: Vec::new(),
     }
+}
+
+#[tokio::test]
+async fn snapshot_preserves_native_environment_pairing_when_foreign_cwds_are_skipped() {
+    let manager = local_environment_manager().await;
+    let environment = manager
+        .get_environment(LOCAL_ENVIRONMENT_ID)
+        .expect("local environment");
+
+    let foreign_cwd = PathUri::parse("file:///usr/local/workspace").expect("foreign cwd");
+    let temp_dir = TempDir::new().expect("native cwd");
+    let native_cwd =
+        AbsolutePathBuf::from_absolute_path(temp_dir.path()).expect("absolute native cwd");
+    let environments = TurnEnvironmentSnapshot {
+        generation: 1,
+        turn_environments: vec![
+            TurnEnvironment::new(
+                "foreign".to_string(),
+                Arc::clone(&environment),
+                foreign_cwd,
+                None,
+            ),
+            TurnEnvironment::new(
+                LOCAL_ENVIRONMENT_ID.to_string(),
+                environment,
+                PathUri::from_abs_path(&native_cwd),
+                None,
+            ),
+        ],
+        starting: Vec::new(),
+    };
+
+    let snapshot = GitWorkspaceCache::with_noop_watcher_for_tests()
+        .snapshot(&environments)
+        .await;
+
+    assert_eq!(
+        snapshot.display_roots(),
+        vec![(LOCAL_ENVIRONMENT_ID.to_string(), native_cwd.to_path_buf())]
+    );
 }
 
 async fn run_git(repo: &Path, args: &[&str]) -> std::process::Output {
@@ -85,6 +122,60 @@ async fn create_clean_git_repo() -> (TempDir, AbsolutePathBuf) {
     run_git(repo.as_path(), &["add", "README.md"]).await;
     run_git(repo.as_path(), &["commit", "-q", "-m", "initial"]).await;
     (temp_dir, repo)
+}
+
+#[test]
+fn duplicate_repository_reads_combined_diff_preserves_only_the_patch() {
+    let capture = b":100644 100644 aaaaaaa bbbbbbb M\0src/lib.rs\0\
+:100644 100644 aaaaaaa bbbbbbb R100\0old name.rs\0new name.rs\0\0\
+diff --git a/src/lib.rs b/src/lib.rs\npatch body\n";
+
+    let (paths, patch) = candidate_diff_and_paths(capture).expect("combined diff capture");
+
+    assert_eq!(
+        paths,
+        vec!["src/lib.rs".to_string(), "new name.rs".to_string()]
+    );
+    assert_eq!(patch, b"diff --git a/src/lib.rs b/src/lib.rs\npatch body\n");
+}
+
+#[tokio::test]
+async fn duplicate_repository_reads_candidate_diff_uses_combined_layer_observations() {
+    let (_temp, repo) = create_clean_git_repo().await;
+    std::fs::write(repo.join("staged.txt"), "staged\n").expect("write staged file");
+    run_git(repo.as_path(), &["add", "staged.txt"]).await;
+    std::fs::write(repo.join("README.md"), "worktree\n").expect("write worktree file");
+    std::fs::write(repo.join("untracked.txt"), "untracked\n").expect("write untracked file");
+
+    let capture = capture_candidate_diff(repo.as_path())
+        .await
+        .expect("candidate diff capture");
+    let identity = capture.workspace_evidence_identity();
+
+    assert_eq!(
+        capture.changed_paths,
+        vec![
+            "README.md".to_string(),
+            "staged.txt".to_string(),
+            "untracked.txt".to_string(),
+        ]
+    );
+    let raw_diff = String::from_utf8(capture.raw_diff).expect("UTF-8 fixture diff");
+    assert!(raw_diff.contains("diff --git a/staged.txt b/staged.txt"));
+    assert!(raw_diff.contains("diff --git a/README.md b/README.md"));
+    assert!(raw_diff.contains("untracked.txt\0"));
+    assert_eq!(identity.head_identity, capture.head_identity);
+    assert_eq!(identity.index_identity, capture.index_identity);
+    assert_eq!(identity.worktree_identity, capture.worktree_identity);
+    assert_eq!(
+        identity.repository_root,
+        Some(
+            dunce::canonicalize(repo.as_path())
+                .expect("canonical repo")
+                .to_string_lossy()
+                .into_owned()
+        )
+    );
 }
 
 #[tokio::test]
@@ -468,6 +559,29 @@ fn executable_dependency_changes_when_binary_is_replaced() {
     assert_ne!(before, after);
 }
 
+#[test]
+fn duplicate_repository_reads_file_state_hashes_the_already_opened_file() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let path = temp_dir.path().join("dependency");
+    let moved = temp_dir.path().join("opened-dependency");
+    std::fs::write(&path, b"first").expect("write first file");
+    let file = File::open(&path).expect("open first file");
+    std::fs::rename(&path, &moved).expect("move opened file");
+    std::fs::write(&path, b"replacement").expect("write replacement file");
+
+    let state = file_dependency_state(file, true).expect("file state");
+    let expected_digest: [u8; 32] = Sha256::digest(b"first").into();
+
+    assert!(matches!(
+        state,
+        DependencyState::File {
+            len: 5,
+            digest: Some(digest),
+            ..
+        } if digest == expected_digest
+    ));
+}
+
 #[tokio::test]
 async fn watcher_failure_clears_and_disables_cached_identity() {
     let temp_dir = TempDir::new().expect("temp dir");
@@ -561,15 +675,20 @@ async fn workspace_evidence_identity_excludes_codex_eval_artifacts() {
     assert_eq!(second, first);
 }
 
-#[cfg(not(windows))]
 #[test]
-fn generated_eval_path_match_is_case_sensitive() {
-    assert!(is_generated_codex_eval_path(Path::new(
-        ".codex/evals/generated.jsonl"
-    )));
-    assert!(!is_generated_codex_eval_path(Path::new(
-        ".CODEX/evals/generated.jsonl"
-    )));
+fn generated_eval_host_mutations_do_not_advance_workspace_observations() {
+    let root = TempDir::new().expect("workspace observation root");
+    let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::noop())));
+    let observation = cache
+        .begin_workspace_change_observation(root.path())
+        .expect("workspace observation");
+
+    cache.note_host_workspace_mutation_paths(
+        root.path(),
+        &[".codex/evals/generated.jsonl".to_string()],
+    );
+
+    assert!(cache.workspace_change_observation_is_current(&observation));
 }
 
 #[tokio::test]

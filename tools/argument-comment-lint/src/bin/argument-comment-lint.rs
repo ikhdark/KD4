@@ -273,10 +273,10 @@ mod tests {
     fn strips_host_triple_from_nightly_filename() {
         assert_eq!(
             normalize_nightly_library_filename(Path::new(
-                "libargument_comment_lint@nightly-2025-09-18-aarch64-apple-darwin.dylib"
+                "argument_comment_lint@nightly-2025-09-18-x86_64-pc-windows-msvc.dll"
             )),
             Some(String::from(
-                "libargument_comment_lint@nightly-2025-09-18.dylib"
+                "argument_comment_lint@nightly-2025-09-18.dll"
             ))
         );
     }
@@ -285,7 +285,7 @@ mod tests {
     fn leaves_unqualified_nightly_filename_alone() {
         assert_eq!(
             normalize_nightly_library_filename(Path::new(
-                "libargument_comment_lint@nightly-2025-09-18.dylib"
+                "argument_comment_lint@nightly-2025-09-18.dll"
             )),
             None
         );

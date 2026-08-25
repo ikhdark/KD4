@@ -266,34 +266,47 @@ describe("CodexExec", () => {
   it("resolves the package-layout binary and PATH directory", async () => {
     const { resolveNativePackage } = await import("../src/exec");
     const vendorRoot = mkdtempSync(path.join(tmpdir(), "codex-sdk-vendor-"));
-    const packageRoot = path.join(vendorRoot, "x86_64-unknown-linux-musl");
+    const packageRoot = path.join(vendorRoot, "x86_64-pc-windows-msvc");
     const binDir = path.join(packageRoot, "bin");
     const pathDir = path.join(packageRoot, "codex-path");
     mkdirSync(binDir, { recursive: true });
     mkdirSync(pathDir, { recursive: true });
     writeFileSync(path.join(packageRoot, "codex-package.json"), "{}");
-    writeFileSync(path.join(binDir, "codex"), "");
+    writeFileSync(path.join(binDir, "codex.exe"), "");
 
-    expect(resolveNativePackage(vendorRoot, "x86_64-unknown-linux-musl", "codex")).toEqual({
-      executablePath: path.join(binDir, "codex"),
+    expect(resolveNativePackage(vendorRoot, "x86_64-pc-windows-msvc", "codex.exe")).toEqual({
+      executablePath: path.join(binDir, "codex.exe"),
       pathDirs: [pathDir],
     });
   });
 
-  it("falls back to the legacy binary layout", async () => {
+  it("resolves platform metadata from the installed CLI manifest", async () => {
+    const { resolveNativeTarget } = await import("../src/exec");
+    const manifest = {
+      codexNativeTargets: {
+        "win32-x64": {
+          targetTriple: "x86_64-pc-windows-msvc",
+          package: "@openai/codex-win32-x64",
+          binary: "codex.exe",
+        },
+      },
+    };
+
+    expect(resolveNativeTarget(manifest, "win32", "x64")).toEqual(
+      manifest.codexNativeTargets["win32-x64"],
+    );
+    expect(resolveNativeTarget(manifest, "linux", "x64")).toBeNull();
+  });
+
+  it("rejects the retired legacy binary layout", async () => {
     const { resolveNativePackage } = await import("../src/exec");
     const vendorRoot = mkdtempSync(path.join(tmpdir(), "codex-sdk-vendor-"));
-    const packageRoot = path.join(vendorRoot, "x86_64-unknown-linux-musl");
+    const packageRoot = path.join(vendorRoot, "x86_64-pc-windows-msvc");
     const binDir = path.join(packageRoot, "codex");
-    const pathDir = path.join(packageRoot, "path");
     mkdirSync(binDir, { recursive: true });
-    mkdirSync(pathDir, { recursive: true });
-    writeFileSync(path.join(binDir, "codex"), "");
+    writeFileSync(path.join(binDir, "codex.exe"), "");
 
-    expect(resolveNativePackage(vendorRoot, "x86_64-unknown-linux-musl", "codex")).toEqual({
-      executablePath: path.join(binDir, "codex"),
-      pathDirs: [pathDir],
-    });
+    expect(resolveNativePackage(vendorRoot, "x86_64-pc-windows-msvc", "codex.exe")).toBeNull();
   });
 
   it("prepends package PATH entries without duplicating them", async () => {
@@ -311,7 +324,7 @@ describe("CodexExec", () => {
     const pathDir = path.join(tmpdir(), "codex-path");
     const env = { PATH: "/usr/bin", Path: `C\\Windows${path.delimiter}${pathDir}` };
 
-    prependPathDirs(env, [pathDir], "win32");
+    prependPathDirs(env, [pathDir]);
 
     expect(env).toEqual({ Path: `${pathDir}${path.delimiter}C\\Windows` });
   });

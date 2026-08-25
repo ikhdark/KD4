@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use codex_utils_absolute_path::AbsolutePathBuf;
+pub use codex_protocol::config_types::OtelHttpProtocol;
+pub use codex_protocol::config_types::OtelTlsConfig;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -70,21 +71,6 @@ pub struct StatsigMetricsSettings {
 }
 
 #[derive(Clone, Debug)]
-pub enum OtelHttpProtocol {
-    /// HTTP protocol with binary protobuf
-    Binary,
-    /// HTTP protocol with JSON payload
-    Json,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct OtelTlsConfig {
-    pub ca_certificate: Option<AbsolutePathBuf>,
-    pub client_certificate: Option<AbsolutePathBuf>,
-    pub client_private_key: Option<AbsolutePathBuf>,
-}
-
-#[derive(Clone, Debug)]
 pub enum OtelExporter {
     None,
     /// Statsig metrics ingestion exporter using Codex-internal defaults.
@@ -107,7 +93,18 @@ pub enum OtelExporter {
 #[cfg(test)]
 mod tests {
     use super::OtelExporter;
+    use super::OtelHttpProtocol;
+    use super::OtelTlsConfig;
     use super::resolve_exporter;
+
+    #[test]
+    fn exporter_value_types_are_protocol_owned() {
+        let protocol: codex_protocol::config_types::OtelHttpProtocol = OtelHttpProtocol::Json;
+        let tls: codex_protocol::config_types::OtelTlsConfig = OtelTlsConfig::default();
+
+        assert_eq!(protocol, OtelHttpProtocol::Json);
+        assert_eq!(tls, OtelTlsConfig::default());
+    }
 
     #[test]
     fn statsig_default_metrics_exporter_is_disabled_in_debug_builds() {

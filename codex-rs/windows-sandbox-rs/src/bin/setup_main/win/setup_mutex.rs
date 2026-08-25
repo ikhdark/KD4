@@ -33,7 +33,7 @@ pub(super) fn acquire_setup_mutex() -> Result<SetupMutexGuard> {
 fn acquire_named_setup_mutex(name: &str) -> Result<SetupMutexGuard> {
     let name = to_wide(OsStr::new(name));
     let handle = unsafe { CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr()) };
-    if handle == 0 {
+    if handle.is_null() {
         return Err(anyhow::anyhow!("CreateMutexW failed: {}", unsafe {
             GetLastError()
         }));

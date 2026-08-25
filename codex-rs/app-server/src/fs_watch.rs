@@ -175,17 +175,21 @@ impl FsWatchManager {
         });
         drop(task);
 
-        let mut state = self.state.lock().await;
-        let commit_result = rpc_gate.try_commit(|| match state.entries.entry(watch_key) {
-            Entry::Occupied(_) => Err(invalid_request(format!(
-                "watchId already exists: {watch_id}"
-            ))),
-            Entry::Vacant(entry) => {
-                entry.insert(pending_entry.take().expect("watch entry must be available"));
-                Ok(())
-            }
-        });
-        drop(state);
+        let commit_result = {
+            let mut state = self.state.lock().await;
+            rpc_gate.try_commit(|| match state.entries.entry(watch_key) {
+                Entry::Occupied(_) => Err(invalid_request(format!(
+                    "watchId already exists: {watch_id}"
+                ))),
+                Entry::Vacant(entry) => {
+                    let Some(pending_entry) = pending_entry.take() else {
+                        return Err(internal_error("watch entry missing during registration"));
+                    };
+                    entry.insert(pending_entry);
+                    Ok(())
+                }
+            })
+        };
         if commit_result.as_ref().is_some_and(Result::is_ok) {
             let _ = start_tx.send(());
         } else {

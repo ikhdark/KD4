@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from openai_codex.errors import ServerBusyError
+from openai_codex.errors import (
+    CodexRpcError,
+    ServerBusyError,
+    is_retryable_error,
+    map_jsonrpc_error,
+)
 from openai_codex.retry import retry_on_overload
 
 
@@ -43,3 +48,40 @@ def test_retry_clamps_jittered_delay_to_maximum(monkeypatch: pytest.MonkeyPatch)
         == "ok"
     )
     assert sleeps == [1]
+
+
+def test_retry_handles_structured_overload_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    error = map_jsonrpc_error(
+        -32001,
+        "request queue is full",
+        {"reason": "serializedRequestQueue", "retryable": True},
+    )
+    assert isinstance(error, ServerBusyError)
+    assert is_retryable_error(error)
+
+    attempts = 0
+    sleeps: list[float] = []
+
+    def overloaded_once() -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise error
+        return "ok"
+
+    monkeypatch.setattr("openai_codex.retry.time.sleep", sleeps.append)
+
+    assert retry_on_overload(overloaded_once, initial_delay_s=0.25, jitter_ratio=0) == "ok"
+    assert attempts == 2
+    assert sleeps == [0.25]
+
+
+def test_structured_overload_honors_retryable_flag() -> None:
+    error = map_jsonrpc_error(
+        -32001,
+        "request queue rejected",
+        {"reason": "serializedRequestQueue", "retryable": False},
+    )
+
+    assert type(error) is CodexRpcError
+    assert not is_retryable_error(error)

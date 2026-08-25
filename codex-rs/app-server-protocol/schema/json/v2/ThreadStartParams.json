@@ -194,31 +194,6 @@
     "LegacyAppPathString": {
       "type": "string"
     },
-    "MultiAgentMode": {
-      "description": "Controls the effective multi-agent delegation instructions for a turn. `custom` means the configured mode hint defines the policy instead of a built-in policy.",
-      "oneOf": [
-        {
-          "enum": [
-            "explicitRequestOnly",
-            "proactive"
-          ],
-          "type": "string"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "custom": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "custom"
-          ],
-          "title": "CustomMultiAgentMode",
-          "type": "object"
-        }
-      ]
-    },
     "Personality": {
       "enum": [
         "none",
@@ -265,7 +240,29 @@
       "type": "string"
     },
     "ThreadSource": {
-      "type": "string"
+      "oneOf": [
+        {
+          "enum": [
+            "User",
+            "Subagent",
+            "MemoryConsolidation"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "Feature": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "Feature"
+          ],
+          "title": "FeatureThreadSource",
+          "type": "object"
+        }
+      ]
     },
     "ThreadStartSource": {
       "enum": [

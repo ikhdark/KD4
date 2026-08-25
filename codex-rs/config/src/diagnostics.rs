@@ -6,6 +6,8 @@ use crate::ConfigLayerSource;
 use crate::ConfigLayerStack;
 use crate::ConfigLayerStackOrdering;
 use crate::format_config_layer_source;
+pub use codex_execpolicy::TextPosition;
+pub use codex_execpolicy::TextRange;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
 use serde::de::DeserializeOwned;
 use serde_path_to_error::Path as SerdePath;
@@ -19,19 +21,6 @@ use toml_edit::Document;
 use toml_edit::Item;
 use toml_edit::Table;
 use toml_edit::Value;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TextPosition {
-    pub line: usize,
-    pub column: usize,
-}
-
-/// Text range in 1-based line/column coordinates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TextRange {
-    pub start: TextPosition,
-    pub end: TextPosition,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigError {
@@ -494,5 +483,23 @@ fn seq_child<'a>(node: &TomlNode<'a>, index: usize) -> Option<TomlNode<'a>> {
         TomlNode::Item(Item::ArrayOfTables(array)) => array.get(index).map(TomlNode::Table),
         TomlNode::Value(Value::Array(array)) => array.get(index).map(TomlNode::Value),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod consolidated_type_tests {
+    use super::TextPosition;
+    use super::TextRange;
+
+    #[test]
+    fn diagnostic_coordinates_are_execpolicy_owned() {
+        let range = TextRange {
+            start: TextPosition { line: 1, column: 2 },
+            end: TextPosition { line: 3, column: 4 },
+        };
+        let execpolicy_range: codex_execpolicy::TextRange = range;
+
+        assert_eq!(execpolicy_range.start.line, 1);
+        assert_eq!(execpolicy_range.end.column, 4);
     }
 }

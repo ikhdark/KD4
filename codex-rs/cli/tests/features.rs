@@ -74,45 +74,36 @@ async fn features_disable_writes_feature_flag_to_config() -> Result<()> {
 }
 
 #[tokio::test]
-async fn features_enable_under_development_feature_or_alias_prints_canonical_warning() -> Result<()>
-{
-    for (configured_key, canonical_key) in [
-        ("runtime_metrics", "runtime_metrics"),
-        ("telepathy", "chronicle"),
-    ] {
-        let codex_home = TempDir::new()?;
+async fn features_enable_under_development_feature_prints_warning() -> Result<()> {
+    let codex_home = TempDir::new()?;
 
-        let mut cmd = codex_command(codex_home.path())?;
-        cmd.args(["features", "enable", configured_key])
-            .assert()
-            .success()
-            .stderr(contains(format!(
-                "Under-development features enabled: {canonical_key}."
-            )));
+    let mut cmd = codex_command(codex_home.path())?;
+    cmd.args(["features", "enable", "runtime_metrics"])
+        .assert()
+        .success()
+        .stderr(contains(
+            "Under-development features enabled: runtime_metrics.",
+        ));
 
-        let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
-        assert!(config.contains(&format!("{canonical_key} = true")));
-        if configured_key != canonical_key {
-            assert!(!config.contains(&format!("{configured_key} =")));
-        }
-    }
+    let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
+    assert!(config.contains("runtime_metrics = true"));
 
     Ok(())
 }
 
 #[tokio::test]
-async fn features_enable_stable_alias_writes_canonical_key_without_warning() -> Result<()> {
-    let codex_home = TempDir::new()?;
+async fn features_enable_rejects_legacy_aliases() -> Result<()> {
+    for alias in ["telepathy", "request_permissions"] {
+        let codex_home = TempDir::new()?;
 
-    let mut cmd = codex_command(codex_home.path())?;
-    cmd.args(["features", "enable", "request_permissions"])
-        .assert()
-        .success()
-        .stderr(predicates::str::is_empty());
+        let mut cmd = codex_command(codex_home.path())?;
+        cmd.args(["features", "enable", alias])
+            .assert()
+            .failure()
+            .stderr(contains(format!("Unknown feature flag: {alias}")));
 
-    let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
-    assert!(config.contains("exec_permission_approvals = true"));
-    assert!(!config.contains("request_permissions ="));
+        assert!(!codex_home.path().join("config.toml").exists());
+    }
 
     Ok(())
 }

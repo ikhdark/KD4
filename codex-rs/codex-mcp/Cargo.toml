@@ -27,13 +27,12 @@ codex-otel = { workspace = true }
 codex-protocol = { workspace = true }
 codex-rmcp-client = { workspace = true }
 codex-utils-path-uri = { workspace = true }
-codex-utils-plugins = { workspace = true }
+codex-utils-string = { workspace = true }
 futures = { workspace = true }
 regex-lite = { workspace = true }
 rmcp = { workspace = true, default-features = false, features = ["base64", "macros", "schemars", "server"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-sha1 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread"] }
 tokio-util = { workspace = true, features = ["rt"] }

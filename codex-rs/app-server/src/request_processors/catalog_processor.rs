@@ -1,5 +1,6 @@
 use super::*;
 use codex_core::config::permission_profile_catalog;
+use codex_models_manager::manager::SharedModelsManager;
 use futures::StreamExt;
 
 #[derive(Clone)]
@@ -8,6 +9,7 @@ pub(crate) struct CatalogRequestProcessor {
     pub(super) skills_watcher: Arc<SkillsWatcher>,
     pub(super) auth_manager: Arc<AuthManager>,
     pub(super) thread_manager: Arc<ThreadManager>,
+    pub(super) models_manager: SharedModelsManager,
     pub(super) config: Arc<Config>,
     pub(super) config_manager: ConfigManager,
     pub(super) workspace_settings_cache: Arc<workspace_settings::WorkspaceSettingsCache>,
@@ -27,32 +29,8 @@ fn skills_to_info(
                 name: skill.name.clone(),
                 description: skill.description.clone(),
                 short_description: skill.short_description.clone(),
-                interface: skill.interface.clone().map(|interface| {
-                    codex_app_server_protocol::SkillInterface {
-                        display_name: interface.display_name,
-                        short_description: interface.short_description,
-                        icon_small: interface.icon_small,
-                        icon_large: interface.icon_large,
-                        brand_color: interface.brand_color,
-                        default_prompt: interface.default_prompt,
-                    }
-                }),
-                dependencies: skill.dependencies.clone().map(|dependencies| {
-                    codex_app_server_protocol::SkillDependencies {
-                        tools: dependencies
-                            .tools
-                            .into_iter()
-                            .map(|tool| codex_app_server_protocol::SkillToolDependency {
-                                r#type: tool.r#type,
-                                value: tool.value,
-                                description: tool.description,
-                                transport: tool.transport,
-                                command: tool.command,
-                                url: tool.url,
-                            })
-                            .collect(),
-                    }
-                }),
+                interface: skill.interface.clone().map(Into::into),
+                dependencies: skill.dependencies.clone().map(Into::into),
                 path: skill.path_to_skills_md.clone(),
                 scope: skill.scope.into(),
                 enabled,
@@ -106,11 +84,13 @@ impl CatalogRequestProcessor {
         config_manager: ConfigManager,
         workspace_settings_cache: Arc<workspace_settings::WorkspaceSettingsCache>,
     ) -> Self {
+        let models_manager = thread_manager.get_models_manager();
         Self {
             outgoing,
             skills_watcher,
             auth_manager,
             thread_manager,
+            models_manager,
             config,
             config_manager,
             workspace_settings_cache,
@@ -158,7 +138,7 @@ impl CatalogRequestProcessor {
         params: ModelListParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         Self::list_models(
-            self.thread_manager.clone(),
+            self.models_manager.clone(),
             self.config.http_client_factory(),
             params,
         )
@@ -188,7 +168,7 @@ impl CatalogRequestProcessor {
         &self,
         params: CollaborationModeListParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        Self::list_collaboration_modes(self.thread_manager.clone(), params)
+        Self::list_collaboration_modes(self.models_manager.clone(), params)
             .await
             .map(|response| Some(response.into()))
     }
@@ -224,33 +204,11 @@ impl CatalogRequestProcessor {
         self.config_manager
             .load_latest_config(fallback_cwd)
             .await
-            .map_err(|err| internal_error(format!("failed to reload config: {err}")))
-    }
-
-    async fn workspace_codex_plugins_enabled(
-        &self,
-        config: &Config,
-        auth: Option<&CodexAuth>,
-    ) -> bool {
-        match workspace_settings::codex_plugins_enabled_for_workspace(
-            config,
-            auth,
-            Some(&self.workspace_settings_cache),
-        )
-        .await
-        {
-            Ok(enabled) => enabled,
-            Err(err) => {
-                warn!(
-                    "failed to fetch workspace Codex plugins setting; allowing Codex plugins: {err:#}"
-                );
-                true
-            }
-        }
+            .map_config_load_error()
     }
 
     async fn list_models(
-        thread_manager: Arc<ThreadManager>,
+        models_manager: SharedModelsManager,
         http_client_factory: codex_http_client::HttpClientFactory,
         params: ModelListParams,
     ) -> Result<ModelListResponse, JSONRPCErrorError> {
@@ -260,7 +218,7 @@ impl CatalogRequestProcessor {
             include_hidden,
         } = params;
         let models = supported_models(
-            thread_manager,
+            models_manager,
             include_hidden.unwrap_or(false),
             http_client_factory,
         )
@@ -303,11 +261,11 @@ impl CatalogRequestProcessor {
     }
 
     async fn list_collaboration_modes(
-        thread_manager: Arc<ThreadManager>,
+        models_manager: SharedModelsManager,
         params: CollaborationModeListParams,
     ) -> Result<CollaborationModeListResponse, JSONRPCErrorError> {
         let CollaborationModeListParams {} = params;
-        let items = thread_manager
+        let items = models_manager
             .list_collaboration_modes()
             .into_iter()
             .map(Into::into)
@@ -338,17 +296,19 @@ impl CatalogRequestProcessor {
                 self.config_manager
                     .load_latest_config_for_thread(thread_config.as_ref())
                     .await
-                    .map_err(|err| internal_error(format!("failed to reload config: {err}")))?
+                    .map_config_load_error()?
             }
             None => self.load_latest_config(/*fallback_cwd*/ None).await?,
         };
         let auth = self.auth_manager.auth().await;
-        let workspace_codex_plugins_enabled = self
-            .workspace_codex_plugins_enabled(&config, auth.as_ref())
-            .await;
+        let workspace_codex_plugins_enabled = workspace_codex_plugins_enabled(
+            &config,
+            auth.as_ref(),
+            Some(&self.workspace_settings_cache),
+        )
+        .await;
 
-        let data = FEATURES
-            .iter()
+        let data = codex_features::user_settable_features()
             .map(|spec| {
                 let (stage, display_name, description, announcement) = match spec.stage {
                     Stage::Experimental {
@@ -371,7 +331,7 @@ impl CatalogRequestProcessor {
                     Stage::Deprecated => {
                         (ApiExperimentalFeatureStage::Deprecated, None, None, None)
                     }
-                    Stage::Removed => (ApiExperimentalFeatureStage::Removed, None, None, None),
+                    Stage::Internal => (ApiExperimentalFeatureStage::Removed, None, None, None),
                 };
 
                 ApiExperimentalFeature {
@@ -442,7 +402,7 @@ impl CatalogRequestProcessor {
                 .config_manager
                 .load_config_layers(/*cwd*/ None)
                 .await
-                .map_err(|err| internal_error(format!("failed to reload config: {err}")))?,
+                .map_config_load_error()?,
         };
         let profiles = permission_profile_catalog(&config_layer_stack)
             .map_err(|err| internal_error(format!("failed to resolve permission profiles: {err}")))?
@@ -498,9 +458,12 @@ impl CatalogRequestProcessor {
 
         let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
         let auth = self.auth_manager.auth().await;
-        let workspace_codex_plugins_enabled = self
-            .workspace_codex_plugins_enabled(&config, auth.as_ref())
-            .await;
+        let workspace_codex_plugins_enabled = workspace_codex_plugins_enabled(
+            &config,
+            auth.as_ref(),
+            Some(&self.workspace_settings_cache),
+        )
+        .await;
         let skills_service = self.thread_manager.skills_service();
         let plugins_manager = self.thread_manager.plugins_manager();
         let fs = self
@@ -631,9 +594,12 @@ impl CatalogRequestProcessor {
                     continue;
                 }
             };
-            let workspace_codex_plugins_enabled = self
-                .workspace_codex_plugins_enabled(&config, auth.as_ref())
-                .await;
+            let workspace_codex_plugins_enabled = workspace_codex_plugins_enabled(
+                &config,
+                auth.as_ref(),
+                Some(&self.workspace_settings_cache),
+            )
+            .await;
             let plugins_enabled =
                 config.features.enabled(Feature::Plugins) && workspace_codex_plugins_enabled;
             let plugin_hooks = if plugins_enabled {

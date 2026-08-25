@@ -37,9 +37,7 @@ use codex_protocol::protocol::GuardianAssessmentOutcome;
 use codex_protocol::protocol::GuardianCommandSource;
 use codex_protocol::protocol::GuardianRiskLevel;
 use codex_protocol::protocol::GuardianUserAuthorization;
-use codex_protocol::protocol::HookEventName;
 use codex_protocol::protocol::HookRunStatus;
-use codex_protocol::protocol::HookSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsage;
@@ -1238,40 +1236,9 @@ pub(crate) fn codex_hook_run_metadata(
         turn_id: Some(tracking.turn_id.clone()),
         product_client_id: Some(tracking.product_client_id.clone()),
         model_slug: Some(tracking.model_slug.clone()),
-        hook_name: Some(analytics_hook_event_name(hook.event_name).to_owned()),
-        hook_source: Some(analytics_hook_source(hook.hook_source)),
+        hook_name: Some(hook.event_name.as_pascal_case_label().to_owned()),
+        hook_source: Some(hook.hook_source.as_snake_case_label()),
         status: Some(analytics_hook_status(hook.status)),
-    }
-}
-
-fn analytics_hook_event_name(event_name: HookEventName) -> &'static str {
-    match event_name {
-        HookEventName::PreToolUse => "PreToolUse",
-        HookEventName::PermissionRequest => "PermissionRequest",
-        HookEventName::PostToolUse => "PostToolUse",
-        HookEventName::PreCompact => "PreCompact",
-        HookEventName::PostCompact => "PostCompact",
-        HookEventName::SessionStart => "SessionStart",
-        HookEventName::UserPromptSubmit => "UserPromptSubmit",
-        HookEventName::SubagentStart => "SubagentStart",
-        HookEventName::SubagentStop => "SubagentStop",
-        HookEventName::Stop => "Stop",
-    }
-}
-
-fn analytics_hook_source(source: HookSource) -> &'static str {
-    match source {
-        HookSource::System => "system",
-        HookSource::User => "user",
-        HookSource::Project => "project",
-        HookSource::Mdm => "mdm",
-        HookSource::SessionFlags => "session_flags",
-        HookSource::Plugin => "plugin",
-        HookSource::CloudRequirements => "cloud_requirements",
-        HookSource::CloudManagedConfig => "cloud_managed_config",
-        HookSource::LegacyManagedConfigFile => "legacy_managed_config_file",
-        HookSource::LegacyManagedConfigMdm => "legacy_managed_config_mdm",
-        HookSource::Unknown => "unknown",
     }
 }
 

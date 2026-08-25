@@ -26,14 +26,13 @@ use codex_core::config::edit::ConfigEdit;
 use codex_core::config::edit::ConfigEditsBuilder;
 use codex_core::config::resolve_configured_features;
 use codex_core::config::validate_feature_requirements_for_config_toml;
-use codex_core::path_utils;
-use codex_core::path_utils::SymlinkWritePaths;
-use codex_core::path_utils::resolve_symlink_write_paths;
 use codex_features::Features;
+use codex_file_system::SymlinkWritePaths;
+use codex_file_system::resolve_symlink_write_paths;
+use codex_utils_absolute_path as path_utils;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde_json::Value as JsonValue;
 use std::borrow::Cow;
-use std::path::Path;
 use std::path::PathBuf;
 use thiserror::Error;
 use toml::Value as TomlValue;
@@ -220,13 +219,21 @@ impl ConfigManager {
             None => allowed_path.clone(),
         };
 
-        if !paths_match(&allowed_path, &provided_path) {
+        if !path_utils::paths_match_after_normalization(&allowed_path, &provided_path) {
             return Err(ConfigManagerError::write(
                 ConfigWriteErrorCode::ConfigLayerReadonly,
                 "Only writes to the user config are allowed",
             ));
         }
 
+        // Capture the exact on-disk representation before loading the migrated
+        // config layer. The client version fingerprints the migrated layer,
+        // while the atomic writer compares the raw TOML under its file lock.
+        let writer_expected_version = if expected_version.is_some() {
+            Some(read_raw_user_config_version(&provided_path).await?)
+        } else {
+            None
+        };
         let layers = self
             .load_thread_agnostic_config()
             .await
@@ -339,7 +346,7 @@ impl ConfigManager {
 
         let apply_outcome = ConfigEditsBuilder::for_config_path(provided_path.as_path())
             .with_edits(config_edits)
-            .with_expected_version(expected_version)
+            .with_expected_version(writer_expected_version)
             .apply_with_outcome()
             .await
             .map_err(|err| ConfigManagerError::anyhow("failed to persist config.toml", err))?;
@@ -379,6 +386,34 @@ impl ConfigManager {
     async fn load_thread_agnostic_config(&self) -> std::io::Result<ConfigLayerStack> {
         self.load_config_layers(/*cwd*/ None).await
     }
+}
+
+async fn read_raw_user_config_version(
+    config_toml: &AbsolutePathBuf,
+) -> Result<String, ConfigManagerError> {
+    let SymlinkWritePaths {
+        read_path,
+        write_path: _,
+    } = resolve_symlink_write_paths(config_toml.as_path())
+        .map_err(|err| ConfigManagerError::io("failed to resolve user config path", err))?;
+    let toml_value = match read_path {
+        Some(path) => match tokio::fs::read_to_string(&path).await {
+            Ok(contents) => toml::from_str(&contents).map_err(|err| {
+                ConfigManagerError::toml("failed to parse existing user config.toml", err)
+            })?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                TomlValue::Table(toml::map::Map::new())
+            }
+            Err(err) => {
+                return Err(ConfigManagerError::io(
+                    "failed to read user config.toml",
+                    err,
+                ));
+            }
+        },
+        None => TomlValue::Table(toml::map::Map::new()),
+    };
+    Ok(codex_config::version_for_toml(&toml_value))
 }
 
 async fn create_empty_user_layer(
@@ -526,10 +561,7 @@ fn apply_merge(
         return Ok(true);
     }
 
-    let changed = table
-        .get(last)
-        .map(|existing| Some(existing) != Some(value))
-        .unwrap_or(true);
+    let changed = table.get(last) != Some(value);
     table.insert(last.clone(), value.clone());
     Ok(changed)
 }
@@ -602,10 +634,6 @@ fn toml_value_to_value(value: &TomlValue) -> anyhow::Result<toml_edit::Value> {
 fn validate_config(value: &TomlValue) -> Result<(), toml::de::Error> {
     let _: ConfigToml = value.clone().try_into()?;
     Ok(())
-}
-
-fn paths_match(expected: impl AsRef<Path>, provided: impl AsRef<Path>) -> bool {
-    path_utils::paths_match_after_normalization(expected, provided)
 }
 
 fn value_at_path<'a>(root: &'a TomlValue, segments: &[String]) -> Option<&'a TomlValue> {

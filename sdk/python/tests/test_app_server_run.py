@@ -18,7 +18,22 @@ from app_server_helpers import (
 )
 
 from openai_codex import AsyncCodex, Codex
-from openai_codex.generated.v2_all import MessagePhase
+from openai_codex._run import _agent_message_item_from_thread_item
+from openai_codex.generated.v2_all import AgentMessageThreadItem, MessagePhase, ThreadItem
+
+
+def test_agent_message_mapping_requires_generated_thread_item_root() -> None:
+    agent_message = AgentMessageThreadItem(
+        id="message-1",
+        text="hello",
+        type="agentMessage",
+    )
+
+    assert (
+        _agent_message_item_from_thread_item(ThreadItem(root=agent_message)) is agent_message
+    )
+    with pytest.raises(AttributeError):
+        _agent_message_item_from_thread_item(agent_message)  # type: ignore[arg-type]
 
 
 def test_sync_thread_run_uses_mock_responses(

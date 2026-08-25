@@ -266,6 +266,22 @@ fn recommended_fixes_structured_validation_rejects_zero_test_selectors() {
 }
 
 #[test]
+fn structured_validation_timeout_is_owned_by_protocol_deserialization() {
+    let mut leaf = structured_cargo_leaf();
+    leaf.timeout_ms = codex_protocol::plan_tool::MAX_STRUCTURED_VALIDATION_TIMEOUT_MS + 1;
+
+    assert!(
+        super::validate_structured_validation_leaf(&leaf, std::path::Path::new(".")).is_ok(),
+        "repository admission must not repeat the wire timeout check"
+    );
+
+    let encoded = serde_json::to_value(&leaf).expect("validation leaf serializes");
+    let error = serde_json::from_value::<ValidationRouteLeaf>(encoded)
+        .expect_err("wire deserialization must reject an out-of-bounds timeout");
+    assert!(error.to_string().contains("timeout_ms must be between"));
+}
+
+#[test]
 fn direct_validation_requires_explicit_uncertainty_and_direct_argv() {
     let context = ValidationCommandContext {
         uncertainty: "the focused shell contract remains satisfied".to_string(),
@@ -286,9 +302,10 @@ fn direct_validation_requires_explicit_uncertainty_and_direct_argv() {
     let route =
         super::direct_validation_route(&context, &invocation, std::path::Path::new("."), 45_000)
             .expect("focused direct validation route");
-    assert_eq!(route.leaves.len(), 1);
-    assert_eq!(route.leaves[0].uncertainty, context.uncertainty);
-    assert_eq!(route.leaves[0].covered_paths, context.covered_paths);
+    assert_eq!(route.route().leaves.len(), 1);
+    assert_eq!(route.leaf(), &route.route().leaves[0]);
+    assert_eq!(route.leaf().uncertainty, context.uncertainty);
+    assert_eq!(route.leaf().covered_paths, context.covered_paths);
 
     let script =
         CommandInvocation::Script("cargo test -p codex-core direct_validation".to_string());
@@ -429,7 +446,7 @@ fn retry_guard_counts_operational_rejections_but_not_user_declines() {
         codex_protocol::exec_output::ExecToolCallOutput,
         crate::tools::sandboxing::ToolError,
     > = Err(crate::tools::sandboxing::ToolError::Rejected(
-        "zsh fork setup failed".to_string(),
+        "sandbox setup failed".to_string(),
     ));
     let user_declined: Result<
         codex_protocol::exec_output::ExecToolCallOutput,
@@ -466,7 +483,7 @@ fn validation_execution_outcome_distinguishes_success_from_not_executed() {
         super::ValidationExecutionOutcome::NotExecuted
     );
 
-    let projected = super::shell_command::validation_structured_output(serde_json::json!({
+    let projected = super::validation_structured_output(serde_json::json!({
         "text": "validation skipped",
         "execution_outcome": "not_executed",
         "command_was_executed": false,
@@ -480,7 +497,7 @@ fn validation_execution_outcome_distinguishes_success_from_not_executed() {
     );
     assert!(!projected.success_for_logging());
 
-    let not_applicable = super::shell_command::validation_structured_output(serde_json::json!({
+    let not_applicable = super::validation_structured_output(serde_json::json!({
         "text": "running 0 tests",
         "execution_outcome": "executed_not_applicable",
         "command_was_executed": true,
@@ -572,6 +589,165 @@ async fn validation_owner_retains_sole_waiter_until_worker_completion() {
         .expect("validation worker should complete");
 }
 
+#[tokio::test]
+async fn command_surfaces_share_validation_proof_singleflight_preparation() {
+    let (session, turn) = make_session_and_context().await;
+    let invocation = CommandInvocation::Argv {
+        program: "cargo".to_string(),
+        args: vec![
+            "test".to_string(),
+            "-p".to_string(),
+            "codex-core".to_string(),
+        ],
+    };
+    let launch = crate::validation_admission::ValidationLaunchPlan {
+        invocation: invocation.clone(),
+        authorization_revision: 1,
+        observation: None,
+        proof_key: None,
+        structured_route: None,
+        bound_plan_step: None,
+        validation_call_id: None,
+        turn_timing_state: None,
+        force_fresh: false,
+    };
+    let environment = std::collections::HashMap::new();
+    let shell_cancellation = tokio_util::sync::CancellationToken::new();
+    let mut shell_launch = Some(launch.clone());
+    let shell_preparation =
+        super::prepare_validation_proof(super::ValidationProofPreparationArgs {
+            session: &session,
+            turn: &turn,
+            validation_launch: &mut shell_launch,
+            direct_validation_route: None,
+            repository_key: b"repository",
+            cwd: "codex-rs",
+            command_invocation: &invocation,
+            environment: &environment,
+            execution_context: "shell=None;login=false;tty=false",
+            repository_epoch: 7,
+            call_id: "shell-call",
+            cancellation_token: &shell_cancellation,
+            force_fresh: false,
+        })
+        .await
+        .expect("shell boundary preparation");
+    let (execution, owner_waiter) = match shell_preparation {
+        super::ValidationProofPreparation::Registered(
+            crate::validation_admission::ValidationRegistration::Leader { execution, waiter },
+        ) => (*execution, waiter),
+        _ => panic!("first boundary should own the shared validation execution"),
+    };
+
+    let exec_cancellation = tokio_util::sync::CancellationToken::new();
+    let mut exec_launch = Some(launch);
+    let exec_preparation = super::prepare_validation_proof(super::ValidationProofPreparationArgs {
+        session: &session,
+        turn: &turn,
+        validation_launch: &mut exec_launch,
+        direct_validation_route: None,
+        repository_key: b"repository",
+        cwd: "codex-rs",
+        command_invocation: &invocation,
+        environment: &environment,
+        execution_context: "shell=None;login=false;tty=false",
+        repository_epoch: 7,
+        call_id: "exec-call",
+        cancellation_token: &exec_cancellation,
+        force_fresh: false,
+    })
+    .await
+    .expect("exec boundary preparation");
+    let follower = match exec_preparation {
+        super::ValidationProofPreparation::Registered(
+            crate::validation_admission::ValidationRegistration::Follower(waiter),
+        ) => waiter,
+        _ => panic!("second boundary should join the shared validation execution"),
+    };
+    assert_eq!(follower.shared_from_call_id(), "shell-call");
+
+    execution
+        .complete(crate::validation_admission::ReusableValidationResult {
+            value: serde_json::json!({"success": true}),
+        })
+        .await;
+    assert!(follower.join().await.is_some());
+    drop(owner_waiter);
+}
+
+#[tokio::test]
+async fn validation_proof_preparation_isolated_by_execution_context() {
+    let (session, turn) = make_session_and_context().await;
+    let invocation = CommandInvocation::Script("cargo test -p codex-core".to_string());
+    let launch = crate::validation_admission::ValidationLaunchPlan {
+        invocation: invocation.clone(),
+        authorization_revision: 1,
+        observation: None,
+        proof_key: None,
+        structured_route: None,
+        bound_plan_step: None,
+        validation_call_id: None,
+        turn_timing_state: None,
+        force_fresh: false,
+    };
+    let environment = std::collections::HashMap::new();
+
+    let first_cancellation = tokio_util::sync::CancellationToken::new();
+    let mut first_launch = Some(launch.clone());
+    let first = super::prepare_validation_proof(super::ValidationProofPreparationArgs {
+        session: &session,
+        turn: &turn,
+        validation_launch: &mut first_launch,
+        direct_validation_route: None,
+        repository_key: b"repository",
+        cwd: "codex-rs",
+        command_invocation: &invocation,
+        environment: &environment,
+        execution_context: "shell=Bash;login=false;tty=false",
+        repository_epoch: 7,
+        call_id: "bash-call",
+        cancellation_token: &first_cancellation,
+        force_fresh: false,
+    })
+    .await
+    .expect("first execution context preparation");
+    let first_owner = match first {
+        super::ValidationProofPreparation::Registered(
+            crate::validation_admission::ValidationRegistration::Leader { execution, .. },
+        ) => *execution,
+        _ => panic!("first execution context should own its validation"),
+    };
+
+    let second_cancellation = tokio_util::sync::CancellationToken::new();
+    let mut second_launch = Some(launch);
+    let second = super::prepare_validation_proof(super::ValidationProofPreparationArgs {
+        session: &session,
+        turn: &turn,
+        validation_launch: &mut second_launch,
+        direct_validation_route: None,
+        repository_key: b"repository",
+        cwd: "codex-rs",
+        command_invocation: &invocation,
+        environment: &environment,
+        execution_context: "shell=PowerShell;login=true;tty=true",
+        repository_epoch: 7,
+        call_id: "powershell-call",
+        cancellation_token: &second_cancellation,
+        force_fresh: false,
+    })
+    .await
+    .expect("second execution context preparation");
+    let second_owner = match second {
+        super::ValidationProofPreparation::Registered(
+            crate::validation_admission::ValidationRegistration::Leader { execution, .. },
+        ) => *execution,
+        _ => panic!("different execution context must not join or reuse validation"),
+    };
+
+    first_owner.abandon().await;
+    second_owner.abandon().await;
+}
+
 #[test]
 fn known_delta_reuses_only_complete_successes() {
     let mut output = codex_protocol::exec_output::ExecToolCallOutput::default();
@@ -637,12 +813,6 @@ fn admit_validation_in_repo(
     )
 }
 
-#[cfg(unix)]
-fn create_directory_link(target: &std::path::Path, link: &std::path::Path) {
-    std::os::unix::fs::symlink(target, link).expect("directory symlink is created");
-}
-
-#[cfg(windows)]
 fn create_directory_link(target: &std::path::Path, link: &std::path::Path) {
     let status = std::process::Command::new("cmd")
         .args(["/c", "mklink", "/J"])
@@ -653,12 +823,6 @@ fn create_directory_link(target: &std::path::Path, link: &std::path::Path) {
     assert!(status.success(), "directory junction is created");
 }
 
-#[cfg(unix)]
-fn remove_directory_link(link: &std::path::Path) {
-    std::fs::remove_file(link).expect("directory symlink is removed");
-}
-
-#[cfg(windows)]
 fn remove_directory_link(link: &std::path::Path) {
     std::fs::remove_dir(link).expect("directory junction is removed");
 }
@@ -785,7 +949,7 @@ fn focused_validation_rejects_mutating_or_redirected_cargo_and_just_forms() {
         validation_argv("just", &["test-force"]),
         validation_argv("just", &["publish"]),
         validation_argv("just", &["cleanup"]),
-        validation_argv("just", &["write-config-schema"]),
+        validation_argv("just", &["config-schema-regenerate", "validation-test"]),
         validation_argv("just", &["test-fast", "--justfile", "../Justfile"]),
         validation_argv("just", &["source-map-check", "publish"]),
         validation_argv("just", &["fmt-check", "test-fast"]),
@@ -894,7 +1058,6 @@ fn focused_validation_rejects_python_code_config_plugins_and_outside_paths() {
     }
 }
 
-#[cfg(any(unix, windows))]
 #[test]
 fn focused_validation_resolves_python_paths_through_links_and_existing_ancestors() {
     let repository = tempfile::tempdir().expect("repository tempdir");
@@ -954,11 +1117,7 @@ fn focused_validation_resolves_python_paths_through_links_and_existing_ancestors
 #[test]
 fn focused_validation_pins_trusted_executable_and_rejects_path_shadowing() {
     let repository = tempfile::tempdir().expect("repository tempdir");
-    let fake_name = if cfg!(windows) {
-        "python.exe"
-    } else {
-        "python"
-    };
+    let fake_name = "python.exe";
     std::fs::copy(
         std::env::current_exe().expect("current test executable"),
         repository.path().join(fake_name),
@@ -1198,7 +1357,6 @@ fn independent_review_disables_login_shells() {
     ));
 }
 
-#[cfg(windows)]
 #[test]
 fn independent_review_powershell_safety_args_disable_profiles() {
     let Some(powershell) = try_find_powershell_executable_blocking() else {
@@ -1661,13 +1819,12 @@ async fn shell_command_pre_tool_use_payload_uses_raw_command() {
     };
     let (session, turn) = make_session_and_context().await;
     let turn = Arc::new(turn);
-    let handler = ShellCommandHandler::from(codex_tools::ShellCommandBackendConfig::Classic);
+    let handler = ShellCommandHandler::default();
 
     assert_eq!(
         handler.pre_tool_use_payload(&ToolInvocation {
             session: session.into(),
             step_context: StepContext::for_test(Arc::clone(&turn)),
-            turn,
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
             call_id: "call-42".to_string(),
@@ -1698,11 +1855,10 @@ async fn shell_command_hook_rewrite_preserves_powershell_script_mode() {
     };
     let (session, turn) = make_session_and_context().await;
     let turn = Arc::new(turn);
-    let handler = ShellCommandHandler::from(codex_tools::ShellCommandBackendConfig::Classic);
+    let handler = ShellCommandHandler::default();
     let invocation = ToolInvocation {
         session: session.into(),
         step_context: StepContext::for_test(Arc::clone(&turn)),
-        turn,
         cancellation_token: tokio_util::sync::CancellationToken::new(),
         tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
         call_id: "powershell-hook-rewrite".to_string(),
@@ -1772,11 +1928,10 @@ async fn shell_command_hook_rewrite_preserves_direct_argv_mode() {
     };
     let (session, turn) = make_session_and_context().await;
     let turn = Arc::new(turn);
-    let handler = ShellCommandHandler::from(codex_tools::ShellCommandBackendConfig::Classic);
+    let handler = ShellCommandHandler::default();
     let invocation = ToolInvocation {
         session: session.into(),
         step_context: StepContext::for_test(Arc::clone(&turn)),
-        turn,
         cancellation_token: tokio_util::sync::CancellationToken::new(),
         tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
         call_id: "argv-hook-rewrite".to_string(),
@@ -1847,12 +2002,11 @@ async fn shell_command_active_path_applies_read_only_repair_and_retains_output()
     };
     let (session, turn) = make_session_and_context().await;
     let turn = Arc::new(turn);
-    let handler = ShellCommandHandler::from(codex_tools::ShellCommandBackendConfig::Classic);
+    let handler = ShellCommandHandler::default();
     let output = handler
         .handle(ToolInvocation {
             session: session.into(),
             step_context: StepContext::for_test(Arc::clone(&turn)),
-            turn,
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
             call_id: "shell-preflight-repair".to_string(),
@@ -1892,11 +2046,10 @@ async fn shell_command_repeated_apply_patch_environment_mismatch_is_suppressed()
     };
     let session = Arc::new(session);
     let turn = Arc::new(turn);
-    let handler = ShellCommandHandler::from(codex_tools::ShellCommandBackendConfig::Classic);
+    let handler = ShellCommandHandler::default();
     let invoke = |call_id: &str| ToolInvocation {
         session: Arc::clone(&session),
         step_context: StepContext::for_test(Arc::clone(&turn)),
-        turn: Arc::clone(&turn),
         cancellation_token: tokio_util::sync::CancellationToken::new(),
         tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
         call_id: call_id.to_string(),
@@ -1942,13 +2095,12 @@ async fn build_post_tool_use_payload_uses_tool_output_wire_value() {
         deterministic_continuation_owner_key: None,
         skip_disposition: None,
     };
-    let handler = ShellCommandHandler::from(codex_tools::ShellCommandBackendConfig::Classic);
+    let handler = ShellCommandHandler::default();
     let (session, turn) = make_session_and_context().await;
     let turn = Arc::new(turn);
     let invocation = ToolInvocation {
         session: session.into(),
         step_context: StepContext::for_test(Arc::clone(&turn)),
-        turn,
         cancellation_token: tokio_util::sync::CancellationToken::new(),
         tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
         call_id: "call-42".to_string(),

@@ -31,9 +31,13 @@ async fn hydrate_sends_bearer_token_and_preserves_metadata() {
         .await;
 
     let endpoint = whoami_endpoint(&server.uri());
-    let auth = hydrate_personal_access_token(&create_client(), &endpoint, "at-example")
-        .await
-        .expect("personal access token hydration should succeed");
+    let auth = hydrate_personal_access_token(
+        &create_client().expect("default client should build"),
+        &endpoint,
+        "at-example",
+    )
+    .await
+    .expect("personal access token hydration should succeed");
 
     assert_eq!(
         auth,
@@ -62,9 +66,13 @@ async fn hydrate_preserves_missing_email() {
         .await;
 
     let endpoint = whoami_endpoint(&server.uri());
-    let auth = hydrate_personal_access_token(&create_client(), &endpoint, "at-example")
-        .await
-        .expect("personal access token hydration should accept missing email");
+    let auth = hydrate_personal_access_token(
+        &create_client().expect("default client should build"),
+        &endpoint,
+        "at-example",
+    )
+    .await
+    .expect("personal access token hydration should accept missing email");
 
     assert_eq!(
         auth,

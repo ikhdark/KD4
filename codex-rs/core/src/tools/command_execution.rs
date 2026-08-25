@@ -6,11 +6,13 @@ use std::hash::Hasher;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 #[cfg(test)]
 use std::time::Duration;
 
+use codex_agent_task_store::AttemptId;
 use codex_protocol::plan_tool::ValidationRoute;
 use codex_protocol::protocol::ToolExecutionId;
 use codex_protocol::validation::ValidationFreshness;
@@ -26,8 +28,8 @@ use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
 use crate::tools::command_output_artifact::RawOutputArtifact;
-use crate::tools::handlers::command_preflight::RgSearchBreadth;
-use crate::tools::handlers::command_preflight::RgSearchNarrowing;
+use crate::tools::handlers::command_search::RgSearchBreadth;
+use crate::tools::handlers::command_search::RgSearchNarrowing;
 use crate::validation_admission::ValidationLaunchPlan;
 
 const MAX_TRACKED_COMMANDS: usize = 128;
@@ -193,15 +195,22 @@ impl CommandAttemptKey {
     }
 
     fn search_miss_cache_key(&self) -> Option<SearchMissCacheKey> {
-        let search = self.search_narrowing.as_ref()?;
-        if !search.can_record_miss {
-            return None;
-        }
+        let search = self.eligible_search_miss()?;
+        Some(self.search_miss_cache_key_for(search))
+    }
+
+    fn eligible_search_miss(&self) -> Option<&SearchNarrowingAttempt> {
+        self.search_narrowing
+            .as_ref()
+            .filter(|search| search.can_record_miss)
+    }
+
+    fn search_miss_cache_key_for(&self, search: &SearchNarrowingAttempt) -> SearchMissCacheKey {
         let has_workspace_identity = self
             .command
             .iter()
             .any(|argument| argument.starts_with("\0kd4-context:workspace_identity:"));
-        Some(SearchMissCacheKey {
+        SearchMissCacheKey {
             environment_id: search.environment_id.clone(),
             repository_identity: search.repository_identity.clone(),
             search_identity: search.search_identity.clone(),
@@ -215,7 +224,7 @@ impl CommandAttemptKey {
                 })
                 .cloned()
                 .collect(),
-        })
+        }
     }
 
     pub(crate) fn fingerprint(&self) -> String {
@@ -352,9 +361,8 @@ struct CommandCompletionReceipt {
 
 #[derive(Debug, Clone)]
 struct CompletedValidationProof {
-    result: ValidationResult,
+    result: Arc<ValidationResult>,
     artifact: RawOutputArtifact,
-    artifact_thread_id: String,
 }
 
 impl RunningCommand {
@@ -398,30 +406,70 @@ struct CommandExecutionCacheDocument {
     workspace_identity: crate::git_workspace::WorkspaceEvidenceIdentity,
     repository_epoch: u64,
     search_misses: Vec<SearchMissCacheKey>,
-    completed_validations: Vec<PersistedValidationProof>,
+}
+
+#[derive(Default)]
+struct CommandProcessState {
+    running: HashMap<u32, RunningCommand>,
+    pending_by_execution_id: HashMap<CommandExecutionId, PendingCommandCompletion>,
+    completion_receipts: HashMap<CommandExecutionId, CommandCompletionReceipt>,
+    completion_receipt_order: VecDeque<CommandExecutionId>,
+}
+
+#[derive(Default)]
+struct CommandRepositoryState {
+    epoch: u64,
+    observed_workspace_identity: Option<(u64, crate::git_workspace::WorkspaceEvidenceIdentity)>,
+    observed_turn_mutation_revisions: HashMap<String, u64>,
+    uncertain_command_baselines: HashMap<String, UncertainCommandBaseline>,
+    typed_mutation_baselines: HashMap<String, PendingTypedMutationBaseline>,
+}
+
+struct UncertainCommandBaseline {
+    turn_id: String,
+    workspace_identity: Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
+}
+
+pub(crate) struct TypedMutationBaseline {
+    pub(crate) attempt_id: AttemptId,
+    pub(crate) repo_root: PathBuf,
+    pub(crate) paths: Vec<String>,
+}
+
+struct PendingTypedMutationBaseline {
+    turn_id: String,
+    baseline: TypedMutationBaseline,
+}
+
+#[derive(Default)]
+struct CommandRetryState {
+    attempts: HashMap<CommandAttemptKey, AttemptEntry>,
+    insertion_order: VecDeque<CommandAttemptKey>,
+}
+
+#[derive(Default)]
+struct CommandSearchState {
+    allowed_expansions: HashSet<SearchNarrowingScope>,
+    misses: HashSet<SearchMissCacheKey>,
+    miss_order: VecDeque<SearchMissCacheKey>,
+}
+
+#[derive(Default)]
+struct CommandValidationState {
+    completed: HashMap<ValidationProofKey, CompletedValidationProof>,
+    completed_order: VecDeque<ValidationProofKey>,
+    results_by_call: HashMap<String, Arc<ValidationResult>>,
+    bound_plan_steps_by_call: HashMap<String, (String, u64)>,
+    result_call_order: VecDeque<String>,
 }
 
 #[derive(Default)]
 struct CommandExecutionState {
-    attempts: HashMap<CommandAttemptKey, AttemptEntry>,
-    insertion_order: VecDeque<CommandAttemptKey>,
-    running: HashMap<u32, RunningCommand>,
-    running_order: VecDeque<u32>,
-    pending_by_execution_id: HashMap<CommandExecutionId, PendingCommandCompletion>,
-    completion_receipts: HashMap<CommandExecutionId, CommandCompletionReceipt>,
-    completion_receipt_order: VecDeque<CommandExecutionId>,
-    repository_epoch: u64,
-    observed_workspace_identity: Option<(u64, crate::git_workspace::WorkspaceEvidenceIdentity)>,
-    observed_turn_mutation_revisions: HashMap<String, u64>,
-    uncertain_command_baselines:
-        HashMap<String, Option<crate::git_workspace::WorkspaceEvidenceIdentity>>,
-    completed_validations: HashMap<ValidationProofKey, CompletedValidationProof>,
-    completed_validation_order: VecDeque<ValidationProofKey>,
-    validation_results_by_call: HashMap<String, ValidationResult>,
-    validation_result_call_order: VecDeque<String>,
-    allowed_search_expansions: HashSet<SearchNarrowingScope>,
-    search_misses: HashSet<SearchMissCacheKey>,
-    search_miss_order: VecDeque<SearchMissCacheKey>,
+    retry: CommandRetryState,
+    process: CommandProcessState,
+    repository: CommandRepositoryState,
+    validation: CommandValidationState,
+    search: CommandSearchState,
 }
 
 pub(crate) struct CommandExecutionLedger {
@@ -464,7 +512,10 @@ impl CommandExecutionLedger {
         };
         let ledger = Self {
             state: Mutex::new(CommandExecutionState {
-                observed_workspace_identity: Some((0, workspace_identity.clone())),
+                repository: CommandRepositoryState {
+                    observed_workspace_identity: Some((0, workspace_identity.clone())),
+                    ..CommandRepositoryState::default()
+                },
                 ..CommandExecutionState::default()
             }),
             persistence: Some(persistence.clone()),
@@ -475,24 +526,18 @@ impl CommandExecutionLedger {
             && document.workspace_identity == workspace_identity
         {
             let mut state = ledger.state.lock().await;
-            state.repository_epoch = document.repository_epoch;
-            state.observed_workspace_identity =
+            state.repository.epoch = document.repository_epoch;
+            state.repository.observed_workspace_identity =
                 Some((document.repository_epoch, workspace_identity));
             for search_miss in document
                 .search_misses
                 .into_iter()
                 .take(MAX_TRACKED_COMMANDS)
             {
-                if state.search_misses.insert(search_miss.clone()) {
-                    state.search_miss_order.push_back(search_miss);
+                if state.search.misses.insert(search_miss.clone()) {
+                    state.search.miss_order.push_back(search_miss);
                 }
             }
-            restore_persisted_validations(
-                &mut state,
-                &persistence.codex_home,
-                &persistence.thread_id,
-                document.completed_validations,
-            );
         }
         ledger.refresh_shared_validation_cache().await;
         ledger
@@ -500,21 +545,56 @@ impl CommandExecutionLedger {
 
     pub(crate) async fn admit_search_narrowing(
         &self,
-        _key: &CommandAttemptKey,
+        key: &CommandAttemptKey,
     ) -> Result<(), String> {
-        Ok(())
+        let Some(search) = key.search_narrowing.as_ref() else {
+            return Ok(());
+        };
+        if search.breadth == RgSearchBreadth::Narrow {
+            return Ok(());
+        }
+        let scope = SearchNarrowingScope {
+            turn_id: search.turn_id.clone(),
+            environment_id: search.environment_id.clone(),
+            repository_identity: search.repository_identity.clone(),
+            query_identity: search.query_identity.clone(),
+            scope_identity: search.scope_identity.clone(),
+        };
+        if self
+            .state
+            .lock()
+            .await
+            .search
+            .allowed_expansions
+            .contains(&scope)
+        {
+            return Ok(());
+        }
+
+        Err(
+            "repository-wide `rg` search rejected: first search a narrower scope for the same query, then expand only after that search returns no matches"
+                .to_string(),
+        )
     }
 
     pub(crate) async fn record_uncertain_command_baseline(
         &self,
         call_id: &str,
+        turn_id: &str,
         baseline: Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
     ) {
         self.state
             .lock()
             .await
+            .repository
             .uncertain_command_baselines
-            .insert(call_id.to_string(), baseline);
+            .insert(
+                call_id.to_string(),
+                UncertainCommandBaseline {
+                    turn_id: turn_id.to_string(),
+                    workspace_identity: baseline,
+                },
+            );
     }
 
     pub(crate) async fn take_uncertain_command_baseline(
@@ -524,8 +604,52 @@ impl CommandExecutionLedger {
         self.state
             .lock()
             .await
+            .repository
             .uncertain_command_baselines
             .remove(call_id)
+            .map(|baseline| baseline.workspace_identity)
+    }
+
+    pub(crate) async fn record_typed_mutation_baseline(
+        &self,
+        call_id: &str,
+        turn_id: &str,
+        baseline: TypedMutationBaseline,
+    ) {
+        self.state
+            .lock()
+            .await
+            .repository
+            .typed_mutation_baselines
+            .insert(
+                call_id.to_string(),
+                PendingTypedMutationBaseline {
+                    turn_id: turn_id.to_string(),
+                    baseline,
+                },
+            );
+    }
+
+    pub(crate) async fn has_typed_mutation_baseline(&self, call_id: &str) -> bool {
+        self.state
+            .lock()
+            .await
+            .repository
+            .typed_mutation_baselines
+            .contains_key(call_id)
+    }
+
+    pub(crate) async fn take_typed_mutation_baseline(
+        &self,
+        call_id: &str,
+    ) -> Option<TypedMutationBaseline> {
+        self.state
+            .lock()
+            .await
+            .repository
+            .typed_mutation_baselines
+            .remove(call_id)
+            .map(|pending| pending.baseline)
     }
 
     pub(crate) async fn reusable_validation(
@@ -535,37 +659,41 @@ impl CommandExecutionLedger {
         let mut proof = {
             let mut state = self.state.lock().await;
             supersede_validation_proofs_for_new_implementation(&mut state, key);
-            state.completed_validations.get(key).cloned()
+            state.validation.completed.get(key).cloned()
         };
         if proof.is_none() {
             self.refresh_shared_validation_cache().await;
             let mut state = self.state.lock().await;
             supersede_validation_proofs_for_new_implementation(&mut state, key);
-            proof = state.completed_validations.get(key).cloned();
+            proof = state.validation.completed.get(key).cloned();
         }
         let proof = proof?;
         let Some((artifact_ref, artifact_sha256)) = proof.artifact.validation_integrity().await
         else {
-            let mut state = self.state.lock().await;
-            state.completed_validations.remove(key);
-            state
-                .completed_validation_order
-                .retain(|entry| entry != key);
+            self.invalidate_validation_proof(key).await;
             return None;
         };
         if proof.result.raw_artifact_ref.as_deref() != Some(artifact_ref.as_str())
             || proof.result.raw_artifact_sha256.as_deref() != Some(artifact_sha256.as_str())
         {
-            let mut state = self.state.lock().await;
-            state.completed_validations.remove(key);
-            state
-                .completed_validation_order
-                .retain(|entry| entry != key);
+            self.invalidate_validation_proof(key).await;
             return None;
         }
-        let mut result = proof.result;
+        let mut result = proof.result.as_ref().clone();
         result.freshness = ValidationFreshness::Reused;
         Some(result)
+    }
+
+    async fn invalidate_validation_proof(&self, key: &ValidationProofKey) {
+        {
+            let mut state = self.state.lock().await;
+            state.validation.completed.remove(key);
+            state
+                .validation
+                .completed_order
+                .retain(|entry| entry != key);
+        }
+        self.remove_shared_validation(key).await;
     }
 
     async fn refresh_shared_validation_cache(&self) {
@@ -624,6 +752,36 @@ impl CommandExecutionLedger {
         write_cache_document(persistence.shared_validation_cache_path.clone(), bytes).await;
     }
 
+    async fn remove_shared_validation(&self, key: &ValidationProofKey) {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return;
+        };
+        let Ok(_permit) = shared_validation_cache_write_gate().acquire().await else {
+            return;
+        };
+        let Ok(bytes) = tokio::fs::read(&persistence.shared_validation_cache_path).await else {
+            return;
+        };
+        let Ok(mut document) = serde_json::from_slice::<PersistedValidationCacheDocument>(&bytes)
+        else {
+            return;
+        };
+        if document.schema_version != COMMAND_EXECUTION_CACHE_SCHEMA_VERSION {
+            return;
+        }
+        let previous_len = document.completed_validations.len();
+        document
+            .completed_validations
+            .retain(|proof| proof.result.proof_key != *key);
+        if document.completed_validations.len() == previous_len {
+            return;
+        }
+        let Ok(bytes) = serde_json::to_vec_pretty(&document) else {
+            return;
+        };
+        write_cache_document(persistence.shared_validation_cache_path.clone(), bytes).await;
+    }
+
     pub(crate) async fn validation_result_for_call(
         &self,
         call_id: &str,
@@ -631,9 +789,29 @@ impl CommandExecutionLedger {
         self.state
             .lock()
             .await
-            .validation_results_by_call
+            .validation
+            .results_by_call
             .get(call_id)
-            .cloned()
+            .map(|result| result.as_ref().clone())
+    }
+
+    pub(crate) async fn validation_result_with_plan_step_for_call(
+        &self,
+        call_id: &str,
+    ) -> Option<(ValidationResult, Option<(String, u64)>)> {
+        let state = self.state.lock().await;
+        let result = state
+            .validation
+            .results_by_call
+            .get(call_id)?
+            .as_ref()
+            .clone();
+        let bound_plan_step = state
+            .validation
+            .bound_plan_steps_by_call
+            .get(call_id)
+            .cloned();
+        Some((result, bound_plan_step))
     }
 
     pub(crate) async fn observe_repository_revision(
@@ -641,10 +819,21 @@ impl CommandExecutionLedger {
         turn_id: &str,
         mutation_revision: u64,
     ) -> u64 {
-        let (repository_epoch, refresh_workspace_identity) = {
+        self.observe_repository_revision_with_identity(turn_id, mutation_revision, None)
+            .await
+    }
+
+    pub(crate) async fn observe_repository_revision_with_identity(
+        &self,
+        turn_id: &str,
+        mutation_revision: u64,
+        observed_workspace_identity: Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
+    ) -> u64 {
+        let (repository_epoch, refresh_workspace_identity, expected_repository_root) = {
             let mut state = self.state.lock().await;
             let delta = {
                 let observed_revision = state
+                    .repository
                     .observed_turn_mutation_revisions
                     .entry(turn_id.to_string())
                     .or_default();
@@ -652,36 +841,59 @@ impl CommandExecutionLedger {
                 *observed_revision = (*observed_revision).max(mutation_revision);
                 delta
             };
-            state.repository_epoch = state.repository_epoch.saturating_add(delta);
-            let repository_epoch = state.repository_epoch;
+            state.repository.epoch = state.repository.epoch.saturating_add(delta);
+            let repository_epoch = state.repository.epoch;
             let refresh_workspace_identity = delta > 0
                 || state
+                    .repository
                     .observed_workspace_identity
                     .as_ref()
                     .is_none_or(|(epoch, _)| *epoch != repository_epoch);
+            let expected_repository_root = state
+                .repository
+                .observed_workspace_identity
+                .as_ref()
+                .and_then(|(_, identity)| identity.repository_root.clone());
             if refresh_workspace_identity {
-                state.observed_workspace_identity = None;
+                state.repository.observed_workspace_identity = None;
             }
-            (repository_epoch, refresh_workspace_identity)
+            (
+                repository_epoch,
+                refresh_workspace_identity,
+                expected_repository_root,
+            )
         };
 
         if !refresh_workspace_identity {
             return repository_epoch;
         }
-        let Some(persistence) = self.persistence.as_ref() else {
-            return repository_epoch;
-        };
-        let Some(workspace_identity) =
-            crate::git_workspace::capture_workspace_evidence_identity(&persistence.cwd).await
-        else {
-            return repository_epoch;
+        let observed_workspace_identity = observed_workspace_identity.filter(|identity| {
+            identity.repository_root.is_some()
+                && identity.repository_root == expected_repository_root
+        });
+        let workspace_identity = match observed_workspace_identity {
+            Some(workspace_identity) => workspace_identity,
+            None => {
+                let Some(persistence) = self.persistence.as_ref() else {
+                    return repository_epoch;
+                };
+                let Some(workspace_identity) =
+                    crate::git_workspace::capture_workspace_evidence_identity(&persistence.cwd)
+                        .await
+                else {
+                    return repository_epoch;
+                };
+                workspace_identity
+            }
         };
         let mut state = self.state.lock().await;
-        if state.repository_epoch == repository_epoch && state.observed_workspace_identity.is_none()
+        if state.repository.epoch == repository_epoch
+            && state.repository.observed_workspace_identity.is_none()
         {
-            state.observed_workspace_identity = Some((repository_epoch, workspace_identity));
+            state.repository.observed_workspace_identity =
+                Some((repository_epoch, workspace_identity));
         }
-        state.repository_epoch
+        state.repository.epoch
     }
 
     pub(crate) async fn current_workspace_identity_hash(
@@ -695,8 +907,8 @@ impl CommandExecutionLedger {
             return None;
         }
         let state = self.state.lock().await;
-        let (epoch, identity) = state.observed_workspace_identity.as_ref()?;
-        if *epoch != state.repository_epoch {
+        let (epoch, identity) = state.repository.observed_workspace_identity.as_ref()?;
+        if *epoch != state.repository.epoch {
             return None;
         }
         let bytes = serde_json::to_vec(identity).ok()?;
@@ -722,6 +934,7 @@ impl CommandExecutionLedger {
         let mut state = self.state.lock().await;
         if !repaired && !force_fresh {
             if let Some(prior_failure) = state
+                .retry
                 .attempts
                 .get(key)
                 .and_then(|entry| entry.deterministic_failure.clone())
@@ -732,7 +945,7 @@ impl CommandExecutionLedger {
                 });
             }
             if let Some(search_miss_key) = key.search_miss_cache_key()
-                && state.search_misses.contains(&search_miss_key)
+                && state.search.misses.contains(&search_miss_key)
             {
                 return Err(CommandAttemptBlocked {
                     fingerprint: format!("{:016x}", fingerprint_value(&search_miss_key)),
@@ -826,12 +1039,11 @@ impl CommandExecutionLedger {
     ) {
         let mut state = self.state.lock().await;
         debug_assert_command_execution_invariants(&state);
-        if state.running.contains_key(&process_id) {
+        if state.process.running.contains_key(&process_id) {
             tracing::error!(process_id, "refusing to replace live command bookkeeping");
             return;
         }
-        state.running_order.push_back(process_id);
-        state.running.insert(
+        state.process.running.insert(
             process_id,
             RunningCommand {
                 execution_id,
@@ -847,7 +1059,13 @@ impl CommandExecutionLedger {
     }
 
     pub(crate) async fn running_process(&self, process_id: u32) -> Option<RunningCommand> {
-        self.state.lock().await.running.get(&process_id).cloned()
+        self.state
+            .lock()
+            .await
+            .process
+            .running
+            .get(&process_id)
+            .cloned()
     }
 
     pub(crate) async fn process_execution_identity(
@@ -856,6 +1074,7 @@ impl CommandExecutionLedger {
     ) -> Option<(CommandExecutionId, ToolExecutionId)> {
         let state = self.state.lock().await;
         state
+            .process
             .running
             .get(&process_id)
             .map(|running| {
@@ -866,6 +1085,7 @@ impl CommandExecutionLedger {
             })
             .or_else(|| {
                 state
+                    .process
                     .pending_by_execution_id
                     .iter()
                     .find(|(_, pending)| pending.process_id == process_id)
@@ -880,6 +1100,12 @@ impl CommandExecutionLedger {
 
     pub(crate) async fn finish_turn(&self, turn_id: &str) {
         self.forget_turn_repository_revision(turn_id).await;
+        self.state
+            .lock()
+            .await
+            .repository
+            .typed_mutation_baselines
+            .retain(|_, pending| pending.turn_id != turn_id);
         self.persist_cache().await;
     }
 
@@ -887,21 +1113,12 @@ impl CommandExecutionLedger {
         let Some(persistence) = self.persistence.clone() else {
             return;
         };
-        let (repository_epoch, observed_workspace_identity, search_misses, completed_validations) = {
+        let (repository_epoch, observed_workspace_identity, search_misses) = {
             let state = self.state.lock().await;
             (
-                state.repository_epoch,
-                state.observed_workspace_identity.clone(),
-                state.search_miss_order.iter().cloned().collect::<Vec<_>>(),
-                state
-                    .completed_validation_order
-                    .iter()
-                    .filter_map(|key| state.completed_validations.get(key))
-                    .map(|proof| PersistedValidationProof {
-                        result: proof.result.clone(),
-                        artifact_thread_id: proof.artifact_thread_id.clone(),
-                    })
-                    .collect::<Vec<_>>(),
+                state.repository.epoch,
+                state.repository.observed_workspace_identity.clone(),
+                state.search.miss_order.iter().cloned().collect::<Vec<_>>(),
             )
         };
         let Some((observed_epoch, observed_workspace_identity)) = observed_workspace_identity
@@ -924,7 +1141,6 @@ impl CommandExecutionLedger {
             workspace_identity,
             repository_epoch,
             search_misses,
-            completed_validations,
         };
         let Ok(bytes) = serde_json::to_vec_pretty(&document) else {
             return;
@@ -934,10 +1150,18 @@ impl CommandExecutionLedger {
 
     async fn forget_turn_repository_revision(&self, turn_id: &str) {
         let mut state = self.state.lock().await;
-        state.observed_turn_mutation_revisions.remove(turn_id);
         state
-            .allowed_search_expansions
+            .repository
+            .observed_turn_mutation_revisions
+            .remove(turn_id);
+        state
+            .search
+            .allowed_expansions
             .retain(|scope| scope.turn_id != turn_id);
+        state
+            .repository
+            .uncertain_command_baselines
+            .retain(|_, baseline| baseline.turn_id != turn_id);
     }
 
     pub(crate) async fn update_running_artifact(
@@ -948,10 +1172,11 @@ impl CommandExecutionLedger {
         {
             let mut state = self.state.lock().await;
             debug_assert_command_execution_invariants(&state);
-            if let Some(running) = state.running.get_mut(&process_id) {
+            if let Some(running) = state.process.running.get_mut(&process_id) {
                 running.artifact = artifact.clone();
             } else {
                 if let Some(pending) = state
+                    .process
                     .pending_by_execution_id
                     .values_mut()
                     .find(|pending| pending.process_id == process_id)
@@ -973,6 +1198,7 @@ impl CommandExecutionLedger {
         let identity = {
             let state = self.state.lock().await;
             state
+                .process
                 .running
                 .get(&process_id)
                 .map(|running| {
@@ -983,6 +1209,7 @@ impl CommandExecutionLedger {
                 })
                 .or_else(|| {
                     state
+                        .process
                         .pending_by_execution_id
                         .iter()
                         .find(|(_, pending)| pending.process_id == process_id)
@@ -1016,28 +1243,34 @@ impl CommandExecutionLedger {
         {
             let mut state = self.state.lock().await;
             debug_assert_command_execution_invariants(&state);
-            if state.running.get(&process_id).is_some_and(|running| {
-                running.execution_id != execution_id
-                    || &running.parent_tool_execution_id != parent_tool_execution_id
-            }) {
+            if state
+                .process
+                .running
+                .get(&process_id)
+                .is_some_and(|running| {
+                    running.execution_id != execution_id
+                        || &running.parent_tool_execution_id != parent_tool_execution_id
+                })
+            {
                 return CompletionApplyResult::Stale;
             }
-            if let Some(receipt) = state.completion_receipts.get(&execution_id) {
+            if let Some(receipt) = state.process.completion_receipts.get(&execution_id) {
                 return if &receipt.parent_tool_execution_id == parent_tool_execution_id {
                     CompletionApplyResult::AlreadyApplied
                 } else {
                     CompletionApplyResult::Stale
                 };
             }
-            if let Some(pending) = state.pending_by_execution_id.get(&execution_id) {
+            if let Some(pending) = state.process.pending_by_execution_id.get(&execution_id) {
                 return if &pending.command.parent_tool_execution_id == parent_tool_execution_id {
                     CompletionApplyResult::AlreadyApplied
                 } else {
                     CompletionApplyResult::Stale
                 };
             }
-            let Some(live) = state.running.get(&process_id) else {
+            let Some(live) = state.process.running.get(&process_id) else {
                 return if state
+                    .process
                     .pending_by_execution_id
                     .values()
                     .any(|pending| pending.process_id == process_id)
@@ -1052,13 +1285,12 @@ impl CommandExecutionLedger {
             {
                 return CompletionApplyResult::Stale;
             }
-            let Some(mut running) = state.running.remove(&process_id) else {
+            let Some(mut running) = state.process.running.remove(&process_id) else {
                 return CompletionApplyResult::Missing;
             };
-            state.running_order.retain(|tracked| *tracked != process_id);
             running.completed_exit_code = Some(exit_code);
             record_running_exit_locked(&mut state, &running, exit_code);
-            state.pending_by_execution_id.insert(
+            state.process.pending_by_execution_id.insert(
                 execution_id,
                 PendingCommandCompletion {
                     process_id,
@@ -1078,20 +1310,20 @@ impl CommandExecutionLedger {
     ) -> CompletionApplyResult {
         let mut state = self.state.lock().await;
         debug_assert_command_execution_invariants(&state);
-        if let Some(receipt) = state.completion_receipts.get(&execution_id) {
+        if let Some(receipt) = state.process.completion_receipts.get(&execution_id) {
             return if &receipt.parent_tool_execution_id == parent_tool_execution_id {
                 CompletionApplyResult::AlreadyApplied
             } else {
                 CompletionApplyResult::Stale
             };
         }
-        let Some(pending) = state.pending_by_execution_id.get(&execution_id) else {
+        let Some(pending) = state.process.pending_by_execution_id.get(&execution_id) else {
             return CompletionApplyResult::Missing;
         };
         if &pending.command.parent_tool_execution_id != parent_tool_execution_id {
             return CompletionApplyResult::Stale;
         }
-        let Some(pending) = state.pending_by_execution_id.remove(&execution_id) else {
+        let Some(pending) = state.process.pending_by_execution_id.remove(&execution_id) else {
             return CompletionApplyResult::Missing;
         };
         insert_completion_receipt(
@@ -1099,7 +1331,7 @@ impl CommandExecutionLedger {
             execution_id,
             pending.command.parent_tool_execution_id,
         );
-        while state.attempts.len() > MAX_TRACKED_COMMANDS
+        while state.retry.attempts.len() > MAX_TRACKED_COMMANDS
             && evict_oldest_inactive_attempt_locked(&mut state)
         {}
         debug_assert_command_execution_invariants(&state);
@@ -1109,8 +1341,9 @@ impl CommandExecutionLedger {
     async fn publish_completed_validation_if_ready(&self, process_id: u32) {
         let candidate = {
             let state = self.state.lock().await;
-            let running = state.running.get(&process_id).or_else(|| {
+            let running = state.process.running.get(&process_id).or_else(|| {
                 state
+                    .process
                     .pending_by_execution_id
                     .values()
                     .find(|pending| pending.process_id == process_id)
@@ -1136,6 +1369,7 @@ impl CommandExecutionLedger {
                 proof_key,
                 route,
                 call_id,
+                launch.bound_plan_step.clone(),
                 running.artifact.clone(),
                 running.started_at,
                 exit_code,
@@ -1147,6 +1381,7 @@ impl CommandExecutionLedger {
             proof_key,
             route,
             call_id,
+            bound_plan_step,
             artifact,
             started_at,
             exit_code,
@@ -1157,6 +1392,7 @@ impl CommandExecutionLedger {
             proof_key,
             route,
             call_id,
+            bound_plan_step,
             artifact,
             started_at,
             exit_code,
@@ -1185,6 +1421,7 @@ impl CommandExecutionLedger {
             proof_key,
             route,
             call_id,
+            launch.bound_plan_step.clone(),
             artifact,
             started_at,
             exit_code,
@@ -1208,7 +1445,8 @@ impl CommandExecutionLedger {
         process_id: Option<String>,
     ) -> bool {
         self.publish_completed_validation_with_context(
-            proof_key, route, call_id, artifact, started_at, exit_code, process_id, None, false,
+            proof_key, route, call_id, None, artifact, started_at, exit_code, process_id, None,
+            false,
         )
         .await
     }
@@ -1219,6 +1457,7 @@ impl CommandExecutionLedger {
         proof_key: ValidationProofKey,
         route: ValidationRoute,
         call_id: String,
+        bound_plan_step: Option<(String, u64)>,
         artifact: RawOutputArtifact,
         started_at: Instant,
         exit_code: i32,
@@ -1288,39 +1527,49 @@ impl CommandExecutionLedger {
             result: result.clone(),
             artifact_thread_id: artifact_thread_id.clone(),
         });
+        let result = Arc::new(result);
         {
             let mut state = self.state.lock().await;
-            if state.validation_results_by_call.contains_key(&call_id) {
+            if state.validation.results_by_call.contains_key(&call_id) {
                 return true;
             }
-            while state.validation_results_by_call.len() >= MAX_COMPLETED_VALIDATION_PROOFS {
-                let Some(oldest) = state.validation_result_call_order.pop_front() else {
+            while state.validation.results_by_call.len() >= MAX_COMPLETED_VALIDATION_PROOFS {
+                let Some(oldest) = state.validation.result_call_order.pop_front() else {
                     break;
                 };
-                state.validation_results_by_call.remove(&oldest);
+                state.validation.results_by_call.remove(&oldest);
+                state.validation.bound_plan_steps_by_call.remove(&oldest);
             }
             state
-                .validation_result_call_order
+                .validation
+                .result_call_order
                 .push_back(call_id.clone());
             state
-                .validation_results_by_call
-                .insert(call_id.clone(), result.clone());
-            if succeeded && !state.completed_validations.contains_key(&proof_key) {
-                while state.completed_validations.len() >= MAX_COMPLETED_VALIDATION_PROOFS {
-                    let Some(oldest) = state.completed_validation_order.pop_front() else {
+                .validation
+                .results_by_call
+                .insert(call_id.clone(), Arc::clone(&result));
+            if let Some(bound_plan_step) = bound_plan_step {
+                state
+                    .validation
+                    .bound_plan_steps_by_call
+                    .insert(call_id.clone(), bound_plan_step);
+            }
+            if succeeded && !state.validation.completed.contains_key(&proof_key) {
+                while state.validation.completed.len() >= MAX_COMPLETED_VALIDATION_PROOFS {
+                    let Some(oldest) = state.validation.completed_order.pop_front() else {
                         break;
                     };
-                    state.completed_validations.remove(&oldest);
+                    state.validation.completed.remove(&oldest);
                 }
                 state
-                    .completed_validation_order
+                    .validation
+                    .completed_order
                     .push_back(proof_key.clone());
-                state.completed_validations.insert(
+                state.validation.completed.insert(
                     proof_key.clone(),
                     CompletedValidationProof {
-                        result,
+                        result: Arc::clone(&result),
                         artifact,
-                        artifact_thread_id,
                     },
                 );
             }
@@ -1353,6 +1602,7 @@ impl CommandExecutionLedger {
         let identity = {
             let state = self.state.lock().await;
             state
+                .process
                 .running
                 .get(&process_id)
                 .map(|running| {
@@ -1363,6 +1613,7 @@ impl CommandExecutionLedger {
                 })
                 .or_else(|| {
                     state
+                        .process
                         .pending_by_execution_id
                         .iter()
                         .find(|(_, pending)| pending.process_id == process_id)
@@ -1395,21 +1646,25 @@ impl CommandExecutionLedger {
     ) -> CompletionApplyResult {
         let mut state = self.state.lock().await;
         debug_assert_command_execution_invariants(&state);
-        if let Some(receipt) = state.completion_receipts.get(&execution_id) {
+        if let Some(receipt) = state.process.completion_receipts.get(&execution_id) {
             return if &receipt.parent_tool_execution_id == parent_tool_execution_id {
                 CompletionApplyResult::AlreadyApplied
             } else {
                 CompletionApplyResult::Stale
             };
         }
-        if state.running.get(&process_id).is_some_and(|running| {
-            running.execution_id != execution_id
-                || &running.parent_tool_execution_id != parent_tool_execution_id
-        }) {
+        if state
+            .process
+            .running
+            .get(&process_id)
+            .is_some_and(|running| {
+                running.execution_id != execution_id
+                    || &running.parent_tool_execution_id != parent_tool_execution_id
+            })
+        {
             return CompletionApplyResult::Stale;
         }
-        if let Some(mut running) = state.running.remove(&process_id) {
-            state.running_order.retain(|tracked| *tracked != process_id);
+        if let Some(mut running) = state.process.running.remove(&process_id) {
             if running.completed_exit_code.is_none()
                 && let Some(exit_code) = exit_code
             {
@@ -1417,13 +1672,13 @@ impl CommandExecutionLedger {
                 record_running_exit_locked(&mut state, &running, exit_code);
             }
             insert_completion_receipt(&mut state, execution_id, running.parent_tool_execution_id);
-        } else if let Some(pending) = state.pending_by_execution_id.get(&execution_id) {
+        } else if let Some(pending) = state.process.pending_by_execution_id.get(&execution_id) {
             if pending.process_id != process_id
                 || &pending.command.parent_tool_execution_id != parent_tool_execution_id
             {
                 return CompletionApplyResult::Stale;
             }
-            let Some(pending) = state.pending_by_execution_id.remove(&execution_id) else {
+            let Some(pending) = state.process.pending_by_execution_id.remove(&execution_id) else {
                 return CompletionApplyResult::Missing;
             };
             insert_completion_receipt(
@@ -1434,7 +1689,7 @@ impl CommandExecutionLedger {
         } else {
             return CompletionApplyResult::Missing;
         }
-        while state.attempts.len() > MAX_TRACKED_COMMANDS
+        while state.retry.attempts.len() > MAX_TRACKED_COMMANDS
             && evict_oldest_inactive_attempt_locked(&mut state)
         {}
         debug_assert_command_execution_invariants(&state);
@@ -1443,7 +1698,7 @@ impl CommandExecutionLedger {
 
     #[cfg(test)]
     async fn snapshot(&self, key: &CommandAttemptKey) -> Option<AttemptEntry> {
-        self.state.lock().await.attempts.get(key).cloned()
+        self.state.lock().await.retry.attempts.get(key).cloned()
     }
 
     #[cfg(test)]
@@ -1459,55 +1714,76 @@ fn insert_completion_receipt(
     execution_id: CommandExecutionId,
     parent_tool_execution_id: ToolExecutionId,
 ) {
-    if state.completion_receipts.contains_key(&execution_id) {
+    if state
+        .process
+        .completion_receipts
+        .contains_key(&execution_id)
+    {
         return;
     }
-    state.completion_receipts.insert(
+    state.process.completion_receipts.insert(
         execution_id,
         CommandCompletionReceipt {
             parent_tool_execution_id,
         },
     );
-    state.completion_receipt_order.push_back(execution_id);
-    while state.completion_receipt_order.len() > MAX_TRACKED_COMMANDS {
-        if let Some(oldest) = state.completion_receipt_order.pop_front() {
-            state.completion_receipts.remove(&oldest);
+    state
+        .process
+        .completion_receipt_order
+        .push_back(execution_id);
+    while state.process.completion_receipt_order.len() > MAX_TRACKED_COMMANDS {
+        if let Some(oldest) = state.process.completion_receipt_order.pop_front() {
+            state.process.completion_receipts.remove(&oldest);
         }
     }
 }
 
 fn debug_assert_command_execution_invariants(state: &CommandExecutionState) {
-    debug_assert!(state.running.values().all(|running| {
+    debug_assert!(state.process.running.values().all(|running| {
         running.completed_exit_code.is_none()
             && !state
+                .process
                 .pending_by_execution_id
                 .contains_key(&running.execution_id)
             && !state
+                .process
                 .completion_receipts
                 .contains_key(&running.execution_id)
     }));
     debug_assert!(
         state
+            .process
             .pending_by_execution_id
             .iter()
             .all(|(execution_id, pending)| {
                 pending.command.execution_id == *execution_id
                     && pending.command.completed_exit_code.is_some()
-                    && !state.completion_receipts.contains_key(execution_id)
+                    && !state.process.completion_receipts.contains_key(execution_id)
                     && state
+                        .process
                         .running
                         .values()
                         .all(|running| running.execution_id != *execution_id)
             })
     );
-    debug_assert!(state.completion_receipt_order.iter().all(|execution_id| {
-        state.completion_receipts.contains_key(execution_id)
-            && !state.pending_by_execution_id.contains_key(execution_id)
-            && state
-                .running
-                .values()
-                .all(|running| running.execution_id != *execution_id)
-    }));
+    debug_assert!(
+        state
+            .process
+            .completion_receipt_order
+            .iter()
+            .all(|execution_id| {
+                state.process.completion_receipts.contains_key(execution_id)
+                    && !state
+                        .process
+                        .pending_by_execution_id
+                        .contains_key(execution_id)
+                    && state
+                        .process
+                        .running
+                        .values()
+                        .all(|running| running.execution_id != *execution_id)
+            })
+    );
 }
 
 fn record_running_exit_locked(
@@ -1524,31 +1800,27 @@ fn record_search_result_locked(
     key: &CommandAttemptKey,
     exit_code: i32,
 ) {
+    let Some(search) = key.eligible_search_miss() else {
+        return;
+    };
     if exit_code == 1
-        && let Some(search) = key.search_narrowing.as_ref()
-        && search.can_record_miss
         && let Some(parent_scope) = search.parent_scope()
     {
-        state.allowed_search_expansions.insert(parent_scope);
+        state.search.allowed_expansions.insert(parent_scope);
     }
-    if key
-        .search_narrowing
-        .as_ref()
-        .is_some_and(|search| search.can_record_miss)
-        && let Some(search_miss_key) = key.search_miss_cache_key()
-    {
-        if exit_code == 1 && state.search_misses.insert(search_miss_key.clone()) {
-            state.search_miss_order.push_back(search_miss_key);
-            while state.search_misses.len() > MAX_TRACKED_COMMANDS {
-                if let Some(oldest) = state.search_miss_order.pop_front() {
-                    state.search_misses.remove(&oldest);
-                }
+    let search_miss_key = key.search_miss_cache_key_for(search);
+    if exit_code == 1 && state.search.misses.insert(search_miss_key.clone()) {
+        state.search.miss_order.push_back(search_miss_key);
+        while state.search.misses.len() > MAX_TRACKED_COMMANDS {
+            if let Some(oldest) = state.search.miss_order.pop_front() {
+                state.search.misses.remove(&oldest);
             }
-        } else if exit_code == 0 && state.search_misses.remove(&search_miss_key) {
-            state
-                .search_miss_order
-                .retain(|cached| cached != &search_miss_key);
         }
+    } else if exit_code == 0 && state.search.misses.remove(&search_miss_key) {
+        state
+            .search
+            .miss_order
+            .retain(|cached| cached != &search_miss_key);
     }
 }
 
@@ -1567,26 +1839,28 @@ fn attempt_entry_locked<'a>(
     state: &'a mut CommandExecutionState,
     key: &CommandAttemptKey,
 ) -> &'a mut AttemptEntry {
-    if !state.attempts.contains_key(key) {
-        while state.attempts.len() >= MAX_TRACKED_COMMANDS
+    if !state.retry.attempts.contains_key(key) {
+        while state.retry.attempts.len() >= MAX_TRACKED_COMMANDS
             && evict_oldest_inactive_attempt_locked(state)
         {}
-        state.insertion_order.push_back(key.clone());
+        state.retry.insertion_order.push_back(key.clone());
     }
-    state.attempts.entry(key.clone()).or_default()
+    state.retry.attempts.entry(key.clone()).or_default()
 }
 
 fn evict_oldest_inactive_attempt_locked(state: &mut CommandExecutionState) -> bool {
     if let Some(position) = state
+        .retry
         .insertion_order
         .iter()
         .position(|key| !command_attempt_is_active(state, key))
-        && let Some(oldest) = state.insertion_order.remove(position)
+        && let Some(oldest) = state.retry.insertion_order.remove(position)
     {
-        state.attempts.remove(&oldest);
+        state.retry.attempts.remove(&oldest);
         return true;
     }
     let Some(unordered_key) = state
+        .retry
         .attempts
         .keys()
         .find(|key| !command_attempt_is_active(state, key))
@@ -1594,12 +1868,16 @@ fn evict_oldest_inactive_attempt_locked(state: &mut CommandExecutionState) -> bo
     else {
         return false;
     };
-    state.attempts.remove(&unordered_key);
+    state.retry.attempts.remove(&unordered_key);
     true
 }
 
 fn command_attempt_is_active(state: &CommandExecutionState, key: &CommandAttemptKey) -> bool {
-    state.running.values().any(|running| running.key == *key)
+    state
+        .process
+        .running
+        .values()
+        .any(|running| running.key == *key)
 }
 
 fn validation_route_is_test(route: &ValidationRoute) -> bool {
@@ -1640,11 +1918,7 @@ fn shared_validation_cache_path(
         .as_deref()
         .map(str::to_owned)
         .unwrap_or_else(|| cwd.to_string_lossy().into_owned());
-    let repository = if cfg!(windows) {
-        repository.replace('\\', "/").to_ascii_lowercase()
-    } else {
-        repository
-    };
+    let repository = repository.replace('\\', "/").to_ascii_lowercase();
     let identity = format!("{:x}", Sha256::digest(repository.as_bytes()));
     codex_home
         .join("command-execution-cache")
@@ -1657,17 +1931,13 @@ fn restore_persisted_validations(
     fallback_thread_id: &str,
     persisted_validations: Vec<PersistedValidationProof>,
 ) {
-    for persisted in persisted_validations
-        .into_iter()
-        .rev()
-        .take(MAX_COMPLETED_VALIDATION_PROOFS)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-    {
-        let result = persisted.result;
+    let skip = persisted_validations
+        .len()
+        .saturating_sub(MAX_COMPLETED_VALIDATION_PROOFS);
+    for persisted in persisted_validations.into_iter().skip(skip) {
+        let result = Arc::new(persisted.result);
         if result.status != ValidationTerminalStatus::Succeeded
-            || state.completed_validations.contains_key(&result.proof_key)
+            || state.validation.completed.contains_key(&result.proof_key)
         {
             continue;
         }
@@ -1684,40 +1954,44 @@ fn restore_persisted_validations(
         else {
             continue;
         };
-        while state.completed_validations.len() >= MAX_COMPLETED_VALIDATION_PROOFS {
-            let Some(oldest) = state.completed_validation_order.pop_front() else {
+        while state.validation.completed.len() >= MAX_COMPLETED_VALIDATION_PROOFS {
+            let Some(oldest) = state.validation.completed_order.pop_front() else {
                 break;
             };
-            state.completed_validations.remove(&oldest);
+            state.validation.completed.remove(&oldest);
         }
         let proof_key = result.proof_key.clone();
         state
-            .completed_validation_order
+            .validation
+            .completed_order
             .push_back(proof_key.clone());
-        state.completed_validations.insert(
+        state.validation.completed.insert(
             proof_key,
             CompletedValidationProof {
-                result: result.clone(),
+                result: Arc::clone(&result),
                 artifact,
-                artifact_thread_id,
             },
         );
         if !state
-            .validation_results_by_call
+            .validation
+            .results_by_call
             .contains_key(&result.call_id)
         {
-            while state.validation_results_by_call.len() >= MAX_COMPLETED_VALIDATION_PROOFS {
-                let Some(oldest) = state.validation_result_call_order.pop_front() else {
+            while state.validation.results_by_call.len() >= MAX_COMPLETED_VALIDATION_PROOFS {
+                let Some(oldest) = state.validation.result_call_order.pop_front() else {
                     break;
                 };
-                state.validation_results_by_call.remove(&oldest);
+                state.validation.results_by_call.remove(&oldest);
+                state.validation.bound_plan_steps_by_call.remove(&oldest);
             }
             state
-                .validation_result_call_order
+                .validation
+                .result_call_order
                 .push_back(result.call_id.clone());
             state
-                .validation_results_by_call
-                .insert(result.call_id.clone(), result);
+                .validation
+                .results_by_call
+                .insert(result.call_id.clone(), Arc::clone(&result));
         }
     }
 }
@@ -1749,7 +2023,8 @@ fn supersede_validation_proofs_for_new_implementation(
     requested: &ValidationProofKey,
 ) {
     let superseded_keys = state
-        .completed_validations
+        .validation
+        .completed
         .keys()
         .filter(|candidate| {
             candidate.repository == requested.repository
@@ -1766,18 +2041,21 @@ fn supersede_validation_proofs_for_new_implementation(
         .collect::<Vec<_>>();
 
     for superseded_key in superseded_keys {
-        let Some(proof) = state.completed_validations.remove(&superseded_key) else {
+        let Some(proof) = state.validation.completed.remove(&superseded_key) else {
             continue;
         };
         state
-            .completed_validation_order
+            .validation
+            .completed_order
             .retain(|entry| entry != &superseded_key);
         let Some(result) = state
-            .validation_results_by_call
+            .validation
+            .results_by_call
             .get_mut(&proof.result.call_id)
         else {
             continue;
         };
+        let result = Arc::make_mut(result);
         result.status = ValidationTerminalStatus::Superseded;
         result.freshness = ValidationFreshness::Superseded;
         result.summary = Some(format!(
@@ -1813,6 +2091,17 @@ mod tests {
     use std::process::Command;
     use tokio_util::sync::CancellationToken;
 
+    #[test]
+    fn command_process_state_has_no_unused_order_mirror() {
+        let source = include_str!("command_execution.rs");
+        let obsolete_process_queue = ["running", "_order"].concat();
+
+        assert!(
+            !source.contains(&obsolete_process_queue),
+            "unused running process ordering state must remain removed"
+        );
+    }
+
     fn key(command: &str) -> CommandAttemptKey {
         CommandAttemptKey::new("exec_command", "local", "C:/repo", &[command.to_string()])
     }
@@ -1827,6 +2116,7 @@ mod tests {
             observation: None,
             proof_key: None,
             structured_route: None,
+            bound_plan_step: None,
             validation_call_id: None,
             turn_timing_state: None,
             force_fresh: false,
@@ -1916,6 +2206,51 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn supplied_workspace_identity_must_match_persisted_repository() {
+        let temp = tempfile::tempdir().expect("workspace identity fixture");
+        let repository = temp.path().join("repo");
+        let other_repository = temp.path().join("other-repo");
+        initialize_git_repository(&repository);
+        initialize_git_repository(&other_repository);
+        let ledger = CommandExecutionLedger::load_or_new(
+            temp.path().join("codex-home"),
+            "workspace-scope".to_string(),
+            &repository,
+        )
+        .await;
+        tokio::fs::write(repository.join("changed.txt"), b"changed")
+            .await
+            .expect("mutate persisted repository");
+        let expected_identity =
+            crate::git_workspace::capture_workspace_evidence_identity(&repository)
+                .await
+                .expect("expected repository identity");
+        let other_identity =
+            crate::git_workspace::capture_workspace_evidence_identity(&other_repository)
+                .await
+                .expect("other repository identity");
+
+        ledger
+            .observe_repository_revision_with_identity("turn-a", 1, Some(other_identity.clone()))
+            .await;
+
+        let expected_hash = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&expected_identity).expect("serialize identity"))
+        );
+        let other_hash = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&other_identity).expect("serialize identity"))
+        );
+        let observed_hash = ledger
+            .current_workspace_identity_hash(codex_exec_server::LOCAL_ENVIRONMENT_ID, &repository)
+            .await
+            .expect("observed repository identity");
+        assert_eq!(observed_hash, expected_hash);
+        assert_ne!(observed_hash, other_hash);
     }
 
     #[tokio::test]
@@ -2137,6 +2472,12 @@ mod tests {
             .await
             .and_then(|result| result.raw_artifact_ref)
             .expect("retained artifact reference");
+        let shared_validation_cache_path = producer
+            .persistence
+            .as_ref()
+            .expect("persistent producer")
+            .shared_validation_cache_path
+            .clone();
         drop(producer);
         std::fs::write(
             codex_home
@@ -2154,6 +2495,11 @@ mod tests {
         )
         .await;
         assert!(consumer.reusable_validation(&proof_key).await.is_none());
+        let persisted: PersistedValidationCacheDocument = serde_json::from_slice(
+            &std::fs::read(shared_validation_cache_path).expect("read shared validation cache"),
+        )
+        .expect("parse shared validation cache");
+        assert!(persisted.completed_validations.is_empty());
     }
 
     #[tokio::test]
@@ -2247,10 +2593,21 @@ mod tests {
                 )
                 .await
         );
+        let per_thread_cache_path = ledger
+            .persistence
+            .as_ref()
+            .expect("persistent ledger")
+            .cache_path
+            .clone();
 
         std::fs::write(repository.join("external-change.txt"), "changed")
             .expect("mutate repository before persistence");
         ledger.finish_turn("turn-a").await;
+        if let Ok(bytes) = std::fs::read(per_thread_cache_path) {
+            let per_thread_cache: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("parse per-thread command cache");
+            assert!(per_thread_cache.get("completed_validations").is_none());
+        }
 
         let reopened =
             CommandExecutionLedger::load_or_new(codex_home, thread_id.to_string(), &repository)
@@ -2352,6 +2709,7 @@ mod tests {
                     validation_proof_key("telemetry"),
                     focused_cargo_route(),
                     "telemetry-call".to_string(),
+                    None,
                     artifact,
                     Instant::now() - Duration::from_millis(25),
                     0,
@@ -2371,8 +2729,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn broad_rg_is_admitted_without_prior_search_state() {
+    async fn completed_validation_preserves_launch_bound_plan_step() {
+        let temp = tempfile::tempdir().expect("artifact directory");
         let ledger = CommandExecutionLedger::default();
+        let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
+            temp.path(),
+            "bound-plan-step-test",
+            b"running 1 test\ntest focused_case ... ok\n",
+        )
+        .await;
+
+        assert!(
+            ledger
+                .publish_completed_validation_with_context(
+                    validation_proof_key("bound-plan-step"),
+                    focused_cargo_route(),
+                    "bound-plan-step-call".to_string(),
+                    Some(("implementation-step".to_string(), 7)),
+                    artifact,
+                    Instant::now(),
+                    0,
+                    None,
+                    None,
+                    false,
+                )
+                .await
+        );
+
+        let (result, bound_plan_step) = ledger
+            .validation_result_with_plan_step_for_call("bound-plan-step-call")
+            .await
+            .expect("completed validation result");
+        assert_eq!(result.status, ValidationTerminalStatus::Succeeded);
+        assert_eq!(
+            bound_plan_step,
+            Some(("implementation-step".to_string(), 7))
+        );
+    }
+
+    #[tokio::test]
+    async fn broad_rg_requires_a_same_turn_narrow_search_miss() {
+        let ledger = CommandExecutionLedger::default();
+        let narrow = key("rg needle src").with_search_narrowing(
+            "turn-a",
+            "repo-a",
+            Some(RgSearchNarrowing {
+                breadth: RgSearchBreadth::Narrow,
+                query_identity: "needle".to_string(),
+                search_identity: "needle:src".to_string(),
+                scope_identity: "src".to_string(),
+                parent_scope_identity: Some("repo".to_string()),
+                can_record_miss: true,
+            }),
+        );
         let broad = key("rg needle .").with_search_narrowing(
             "turn-a",
             "repo-a",
@@ -2385,9 +2794,87 @@ mod tests {
                 can_record_miss: true,
             }),
         );
-        assert!(ledger.admit_search_narrowing(&broad).await.is_ok());
+
+        let blocked = ledger
+            .admit_search_narrowing(&broad)
+            .await
+            .expect_err("broad search must start blocked");
+        assert!(blocked.contains("first search a narrower scope"));
+        ledger
+            .admit_search_narrowing(&narrow)
+            .await
+            .expect("narrow search is admitted without prior state");
+        ledger.record_exit(&narrow, 1).await;
+        ledger
+            .admit_search_narrowing(&broad)
+            .await
+            .expect("a narrow miss authorizes its immediate parent scope");
+
         ledger.finish_turn("turn-a").await;
-        assert!(ledger.admit_search_narrowing(&broad).await.is_ok());
+        ledger
+            .admit_search_narrowing(&broad)
+            .await
+            .expect_err("expansion authorization must expire with the turn");
+    }
+
+    #[tokio::test]
+    async fn broad_rg_requires_a_miss_for_the_same_query() {
+        let ledger = CommandExecutionLedger::default();
+        let narrow = key("rg other src").with_search_narrowing(
+            "turn-a",
+            "repo-a",
+            Some(RgSearchNarrowing {
+                breadth: RgSearchBreadth::Narrow,
+                query_identity: "other".to_string(),
+                search_identity: "other:src".to_string(),
+                scope_identity: "src".to_string(),
+                parent_scope_identity: Some("repo".to_string()),
+                can_record_miss: true,
+            }),
+        );
+        let broad = key("rg needle .").with_search_narrowing(
+            "turn-a",
+            "repo-a",
+            Some(RgSearchNarrowing {
+                breadth: RgSearchBreadth::Broad,
+                query_identity: "needle".to_string(),
+                search_identity: "needle:repo".to_string(),
+                scope_identity: "repo".to_string(),
+                parent_scope_identity: None,
+                can_record_miss: true,
+            }),
+        );
+
+        ledger.record_exit(&narrow, 1).await;
+
+        ledger
+            .admit_search_narrowing(&broad)
+            .await
+            .expect_err("a miss for a different query must not authorize broad search");
+    }
+
+    #[tokio::test]
+    async fn unattributable_search_does_not_record_miss_state() {
+        let ledger = CommandExecutionLedger::default();
+        let compound = key("rg needle src; echo finished").with_search_narrowing(
+            "turn-a",
+            "repo-a",
+            Some(RgSearchNarrowing {
+                breadth: RgSearchBreadth::Narrow,
+                query_identity: "needle".to_string(),
+                search_identity: "needle:src".to_string(),
+                scope_identity: "src".to_string(),
+                parent_scope_identity: Some("repo".to_string()),
+                can_record_miss: false,
+            }),
+        );
+
+        ledger.record_exit(&compound, 1).await;
+
+        let state = ledger.state.lock().await;
+        assert!(state.search.allowed_expansions.is_empty());
+        assert!(state.search.misses.is_empty());
+        assert!(state.search.miss_order.is_empty());
     }
 
     #[tokio::test]
@@ -2992,24 +3479,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_repository_reads_revision_reuses_supplied_workspace_identity() {
+        let temp = tempfile::tempdir().expect("workspace identity fixture");
+        let repository = temp.path().join("repo");
+        initialize_git_repository(&repository);
+        let ledger = CommandExecutionLedger::load_or_new(
+            temp.path().join("codex-home"),
+            "candidate-snapshot".to_string(),
+            &repository,
+        )
+        .await;
+        tokio::fs::write(repository.join("first.txt"), b"first")
+            .await
+            .expect("first mutation");
+        let identity = crate::git_workspace::capture_workspace_evidence_identity(&repository)
+            .await
+            .expect("candidate identity");
+        tokio::fs::write(repository.join("second.txt"), b"second")
+            .await
+            .expect("mutation after candidate capture");
+
+        assert_eq!(
+            ledger
+                .observe_repository_revision_with_identity("turn", 1, Some(identity.clone()))
+                .await,
+            1
+        );
+
+        let state = ledger.state.lock().await;
+        assert_eq!(
+            state.repository.observed_workspace_identity,
+            Some((1, identity))
+        );
+    }
+
+    #[tokio::test]
     async fn terminal_turn_cleanup_forgets_its_observed_repository_revision() {
         let ledger = CommandExecutionLedger::default();
+        let finished_attempt = AttemptId::new();
+        let active_attempt = AttemptId::new();
 
         ledger.observe_repository_revision("finished-turn", 1).await;
         ledger.observe_repository_revision("active-turn", 2).await;
+        ledger
+            .record_uncertain_command_baseline("finished-call", "finished-turn", None)
+            .await;
+        ledger
+            .record_uncertain_command_baseline("active-call", "active-turn", None)
+            .await;
+        ledger
+            .record_typed_mutation_baseline(
+                "finished-mutation",
+                "finished-turn",
+                TypedMutationBaseline {
+                    attempt_id: finished_attempt,
+                    repo_root: PathBuf::from("finished-repo"),
+                    paths: vec!["finished.txt".to_string()],
+                },
+            )
+            .await;
+        ledger
+            .record_typed_mutation_baseline(
+                "active-mutation",
+                "active-turn",
+                TypedMutationBaseline {
+                    attempt_id: active_attempt,
+                    repo_root: PathBuf::from("active-repo"),
+                    paths: vec!["active.txt".to_string()],
+                },
+            )
+            .await;
         ledger.finish_turn("finished-turn").await;
 
         let state = ledger.state.lock().await;
         assert!(
             !state
+                .repository
                 .observed_turn_mutation_revisions
                 .contains_key("finished-turn")
         );
         assert!(
             state
+                .repository
                 .observed_turn_mutation_revisions
                 .contains_key("active-turn")
         );
+        assert!(
+            !state
+                .repository
+                .uncertain_command_baselines
+                .contains_key("finished-call")
+        );
+        assert!(
+            state
+                .repository
+                .uncertain_command_baselines
+                .contains_key("active-call")
+        );
+        assert!(
+            !state
+                .repository
+                .typed_mutation_baselines
+                .contains_key("finished-mutation")
+        );
+        assert!(
+            state
+                .repository
+                .typed_mutation_baselines
+                .contains_key("active-mutation")
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_mutation_baseline_survives_emitter_reconstruction_until_consumed() {
+        let ledger = CommandExecutionLedger::default();
+        let attempt_id = AttemptId::new();
+        ledger
+            .record_typed_mutation_baseline(
+                "call",
+                "turn",
+                TypedMutationBaseline {
+                    attempt_id,
+                    repo_root: PathBuf::from("repo"),
+                    paths: vec!["src/lib.rs".to_string()],
+                },
+            )
+            .await;
+
+        let baseline = ledger
+            .take_typed_mutation_baseline("call")
+            .await
+            .expect("completion emitter should recover the launch baseline");
+
+        assert_eq!(baseline.attempt_id, attempt_id);
+        assert_eq!(baseline.repo_root, PathBuf::from("repo"));
+        assert_eq!(baseline.paths, vec!["src/lib.rs"]);
+        assert!(ledger.take_typed_mutation_baseline("call").await.is_none());
     }
 
     #[tokio::test]
@@ -3079,7 +3684,7 @@ mod tests {
             ledger.begin_attempt(key, false).await.expect("attempt");
         }
         assert_eq!(
-            ledger.state.lock().await.attempts.len(),
+            ledger.state.lock().await.retry.attempts.len(),
             MAX_TRACKED_COMMANDS
         );
         assert!(ledger.snapshot(&keys[0]).await.is_none());
@@ -3087,7 +3692,7 @@ mod tests {
         ledger.record_exit(&keys[0], 7).await;
 
         assert_eq!(
-            ledger.state.lock().await.attempts.len(),
+            ledger.state.lock().await.retry.attempts.len(),
             MAX_TRACKED_COMMANDS
         );
         assert!(ledger.snapshot(&keys[0]).await.is_some());

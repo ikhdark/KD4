@@ -8,7 +8,7 @@ use codex_tools::ToolSpec;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::function_tool::FunctionCallError;
+use crate::FunctionCallError;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;

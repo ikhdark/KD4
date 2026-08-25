@@ -18,13 +18,12 @@ use std::io::Result as IoResult;
 use std::time::Duration;
 
 use crate::AppServerEvent;
+use crate::AppServerInitializeResponse;
 use crate::RequestResult;
 use crate::SHUTDOWN_TIMEOUT;
 use crate::TypedRequestError;
-use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientNotification;
 use codex_app_server_protocol::ClientRequest;
-use codex_app_server_protocol::InitializeCapabilities;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCErrorError;
@@ -32,11 +31,14 @@ use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::JSONRPCResponse;
+use codex_app_server_protocol::OverloadReason;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::Result as JsonRpcResult;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
+use codex_app_server_protocol::overloaded_error;
 use codex_app_server_protocol::server_notification_requires_delivery;
+use codex_http_client::maybe_build_rustls_client_config_with_custom_ca;
 use codex_uds::UnixStream;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
@@ -49,10 +51,11 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
+use tokio_tungstenite::Connector;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::client_async_with_config;
-use tokio_tungstenite::connect_async_with_config;
+use tokio_tungstenite::connect_async_tls_with_config;
 use tokio_tungstenite::tungstenite::Error as TungsteniteError;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -67,7 +70,6 @@ const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_APP_SERVER_MAX_WEBSOCKET_MESSAGE_SIZE: usize = 128 << 20;
 const METHOD_NOT_FOUND_ERROR_CODE: i64 = -32601;
 const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
-const OVERLOADED_ERROR_CODE: i64 = -32001;
 // Tungstenite still needs an HTTP request URI for the WebSocket handshake;
 // the bytes travel over the Unix socket, not TCP.
 const UDS_WEBSOCKET_HANDSHAKE_URL: &str = "ws://localhost/rpc";
@@ -83,6 +85,19 @@ pub enum RemoteAppServerEndpoint {
     },
 }
 
+impl RemoteAppServerEndpoint {
+    /// Whether this endpoint can carry a bearer token without exposing it over
+    /// a non-loopback plaintext WebSocket connection.
+    pub fn supports_auth_token(&self) -> bool {
+        match self {
+            Self::WebSocket { websocket_url, .. } => {
+                Url::parse(websocket_url).is_ok_and(|url| websocket_url_supports_auth_token(&url))
+            }
+            Self::UnixSocket { .. } => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RemoteAppServerConnectArgs {
     pub endpoint: RemoteAppServerEndpoint,
@@ -96,26 +111,13 @@ pub struct RemoteAppServerConnectArgs {
 }
 impl RemoteAppServerConnectArgs {
     pub(crate) fn initialize_params(&self) -> InitializeParams {
-        let capabilities = InitializeCapabilities {
-            experimental_api: self.experimental_api,
-            request_attestation: false,
-            desktop_activation_receipts: false,
-            opt_out_notification_methods: if self.opt_out_notification_methods.is_empty() {
-                None
-            } else {
-                Some(self.opt_out_notification_methods.clone())
-            },
-            mcp_server_openai_form_elicitation: self.mcp_server_openai_form_elicitation,
-        };
-
-        InitializeParams {
-            client_info: ClientInfo {
-                name: self.client_name.clone(),
-                title: None,
-                version: self.client_version.clone(),
-            },
-            capabilities: Some(capabilities),
-        }
+        crate::initialize_params(
+            &self.client_name,
+            &self.client_version,
+            self.experimental_api,
+            self.mcp_server_openai_form_elicitation,
+            &self.opt_out_notification_methods,
+        )
     }
 }
 
@@ -168,8 +170,7 @@ pub struct RemoteAppServerClient {
     command_tx: mpsc::Sender<RemoteClientCommand>,
     event_rx: mpsc::Receiver<AppServerEvent>,
     pending_events: VecDeque<AppServerEvent>,
-    server_version: Option<String>,
-    codex_home: Option<String>,
+    initialize_response: AppServerInitializeResponse,
     worker_handle: tokio::task::JoinHandle<()>,
 }
 
@@ -201,11 +202,15 @@ impl RemoteAppServerClient {
     }
 
     pub fn server_version(&self) -> Option<&str> {
-        self.server_version.as_deref()
+        self.initialize_response.server_version()
     }
 
     pub fn codex_home(&self) -> Option<&str> {
-        self.codex_home.as_deref()
+        self.initialize_response.codex_home()
+    }
+
+    pub fn initialize_response(&self) -> &AppServerInitializeResponse {
+        &self.initialize_response
     }
 
     async fn connect_with_stream<S>(
@@ -218,7 +223,7 @@ impl RemoteAppServerClient {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let mut stream = stream;
-        let (pending_events, server_version, codex_home) = initialize_remote_connection(
+        let (pending_events, initialize_response) = initialize_remote_connection(
             &mut stream,
             &endpoint,
             initialize_params,
@@ -392,12 +397,10 @@ impl RemoteAppServerClient {
                                                         if let Err(err) = write_jsonrpc_message(
                                                             &mut stream,
                                                             JSONRPCMessage::Error(JSONRPCError {
-                                                                error: JSONRPCErrorError {
-                                                                    code: OVERLOADED_ERROR_CODE,
-                                                                    message: "remote app-server event queue is full"
-                                                                        .to_string(),
-                                                                    data: None,
-                                                                },
+                                                                error: overloaded_error(
+                                                                    OverloadReason::RemoteAppServerEventQueue,
+                                                                    "remote app-server event queue is full",
+                                                                ),
                                                                 id: request_id,
                                                             }),
                                                             &endpoint,
@@ -565,8 +568,7 @@ impl RemoteAppServerClient {
             command_tx,
             event_rx,
             pending_events: pending_events.into(),
-            server_version,
-            codex_home,
+            initialize_response,
             worker_handle,
         })
     }
@@ -689,8 +691,7 @@ impl RemoteAppServerClient {
             command_tx,
             event_rx,
             pending_events: _pending_events,
-            server_version: _server_version,
-            codex_home: _codex_home,
+            initialize_response: _initialize_response,
             worker_handle,
         } = self;
         let mut worker_handle = worker_handle;
@@ -799,13 +800,17 @@ async fn connect_websocket_endpoint(
     }
 
     ensure_rustls_crypto_provider();
+    let connector = maybe_build_rustls_client_config_with_custom_ca()
+        .map_err(IoError::from)?
+        .map(Connector::Rustls);
     let websocket_config = remote_websocket_config();
     let stream = timeout(
         CONNECT_TIMEOUT,
-        connect_async_with_config(
+        connect_async_tls_with_config(
             request,
             Some(websocket_config),
             /*disable_nagle*/ false,
+            connector,
         ),
     )
     .await
@@ -884,14 +889,13 @@ async fn initialize_remote_connection<S>(
     params: InitializeParams,
     pending_event_capacity: usize,
     initialize_timeout: Duration,
-) -> IoResult<(Vec<AppServerEvent>, Option<String>, Option<String>)>
+) -> IoResult<(Vec<AppServerEvent>, AppServerInitializeResponse)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let initialize_request_id = RequestId::String("initialize".to_string());
     let mut pending_events = Vec::new();
-    let mut server_version = None;
-    let mut codex_home = None;
+    let mut initialize_response = None;
     write_jsonrpc_message(
         stream,
         JSONRPCMessage::Request(jsonrpc_request_from_client_request(
@@ -915,20 +919,8 @@ where
                     })?;
                     match message {
                         JSONRPCMessage::Response(response) if response.id == initialize_request_id => {
-                            server_version = response
-                                .result
-                                .get("userAgent")
-                                .and_then(serde_json::Value::as_str)
-                                .and_then(|user_agent| {
-                                    let (_, rest) = user_agent.split_once('/')?;
-                                    rest.split_whitespace().next().map(str::to_string)
-                                });
-                            codex_home = response
-                                .result
-                                .get("codexHome")
-                                .and_then(serde_json::Value::as_str)
-                                .filter(|codex_home| !codex_home.is_empty())
-                                .map(str::to_string);
+                            initialize_response =
+                                Some(AppServerInitializeResponse::from_json(response.result));
                             break Ok(());
                         }
                         JSONRPCMessage::Error(error) if error.id == initialize_request_id => {
@@ -1033,7 +1025,10 @@ where
     )
     .await?;
 
-    Ok((pending_events, server_version, codex_home))
+    let initialize_response = initialize_response.ok_or_else(|| {
+        IoError::new(ErrorKind::InvalidData, "missing remote initialize response")
+    })?;
+    Ok((pending_events, initialize_response))
 }
 
 fn app_server_event_from_notification(notification: JSONRPCNotification) -> Option<AppServerEvent> {
@@ -1220,8 +1215,7 @@ mod tests {
             command_tx,
             event_rx,
             pending_events: VecDeque::new(),
-            server_version: None,
-            codex_home: None,
+            initialize_response: AppServerInitializeResponse::from_json(serde_json::json!({})),
             worker_handle,
         };
 

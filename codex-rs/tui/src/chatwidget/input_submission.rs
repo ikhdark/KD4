@@ -175,7 +175,7 @@ impl ChatWidget {
             });
         }
 
-        for (path, content) in local_path_context::collect(&text, self.config.cwd.as_path()) {
+        for (path, content) in local_path_context::collect(&text, &self.config) {
             items.push(UserInput::LocalPath { path, content });
         }
 
@@ -364,20 +364,12 @@ impl ChatWidget {
 
         // Persist the submitted text to cross-session message history. Mentions are encoded into
         // placeholder syntax so recall can reconstruct the mention bindings in a future session.
-        let encoded_mentions = mention_bindings
-            .iter()
-            .map(|binding| LinkedMention {
-                sigil: binding.sigil,
-                mention: binding.mention.clone(),
-                path: binding.path.clone(),
-            })
-            .collect::<Vec<_>>();
         let history_text = match &history_record {
             UserMessageHistoryRecord::UserMessageText if !text.is_empty() => {
-                Some(encode_history_mentions(&text, &encoded_mentions))
+                Some(encode_history_mentions(&text, &mention_bindings))
             }
             UserMessageHistoryRecord::Override(history) if !history.text.is_empty() => {
-                Some(encode_history_mentions(&history.text, &encoded_mentions))
+                Some(encode_history_mentions(&history.text, &mention_bindings))
             }
             UserMessageHistoryRecord::UserMessageText | UserMessageHistoryRecord::Override(_) => {
                 None

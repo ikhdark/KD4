@@ -167,10 +167,7 @@ fn codex_signature() -> gix::actor::Signature {
     gix::actor::Signature {
         name: "Codex".into(),
         email: "noreply@openai.com".into(),
-        time: gix::date::Time {
-            seconds: chrono::Utc::now().timestamp(),
-            offset: 0,
-        },
+        time: gix::date::Time::now_utc(),
     }
 }
 
@@ -462,58 +459,20 @@ fn mode_label(mode: EntryMode) -> &'static str {
     }
 }
 
-#[cfg(unix)]
-fn file_mode(path: &Path, default: EntryKind) -> anyhow::Result<EntryMode> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mode = fs::metadata(path)?.permissions().mode();
-    Ok(if mode & 0o111 == 0 {
-        default.into()
-    } else {
-        EntryKind::BlobExecutable.into()
-    })
-}
-
-#[cfg(not(unix))]
 fn file_mode(_path: &Path, default: EntryKind) -> anyhow::Result<EntryMode> {
     Ok(default.into())
 }
 
-#[cfg(unix)]
-fn os_str_to_bstring(value: &OsStr) -> gix::bstr::BString {
-    use std::os::unix::ffi::OsStrExt;
-
-    value.as_bytes().into()
-}
-
-#[cfg(not(unix))]
 fn os_str_to_bstring(value: &OsStr) -> gix::bstr::BString {
     value.to_string_lossy().as_bytes().into()
 }
 
-#[cfg(unix)]
-fn path_to_bytes(path: &Path) -> Vec<u8> {
-    use std::os::unix::ffi::OsStrExt;
-
-    path.as_os_str().as_bytes().to_vec()
-}
-
-#[cfg(not(unix))]
 fn path_to_bytes(path: &Path) -> Vec<u8> {
     path.to_string_lossy().as_bytes().to_vec()
 }
 
 fn bstr_to_path(value: &gix::bstr::BStr) -> PathBuf {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-
-        PathBuf::from(OsStr::from_bytes(value))
-    }
-    #[cfg(not(unix))]
-    {
-        PathBuf::from(value.to_string())
-    }
+    PathBuf::from(value.to_string())
 }
 
 fn relative_slash_path(root: &Path, path: &Path) -> anyhow::Result<String> {
@@ -536,6 +495,18 @@ mod tests {
     use std::fs;
     use std::process::Command;
     use tempfile::TempDir;
+
+    #[test]
+    fn codex_signature_uses_current_utc_time() {
+        let before = gix::date::Time::now_utc().seconds;
+        let signature = codex_signature();
+        let after = gix::date::Time::now_utc().seconds;
+
+        assert_eq!(signature.name, "Codex");
+        assert_eq!(signature.email, "noreply@openai.com");
+        assert_eq!(signature.time.offset, 0);
+        assert!((before..=after).contains(&signature.time.seconds));
+    }
 
     fn git_stdout(root: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
@@ -586,51 +557,6 @@ mod tests {
         assert!(!diff.has_changes());
         assert_eq!(git_stdout(&root, &["status", "--porcelain"]), "");
         assert_eq!(git_stdout(&root, &["ls-files"]), "MEMORY.md\n");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn write_index_ignores_configured_hooks_path() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let home = TempDir::new().expect("tempdir");
-        let root = home.path().join("repo");
-        let hooks_dir = root.join(".git/hooks-path-test");
-        let marker_path = root.join("hook-ran");
-        let hook_path = hooks_dir.join("post-index-change");
-
-        fs::create_dir_all(&root).expect("create root");
-        fs::write(root.join("MEMORY.md"), "baseline").expect("write memory");
-        reset_git_repository(&root).await.expect("reset repo");
-        fs::create_dir_all(&hooks_dir).expect("create hook dir");
-        fs::write(
-            &hook_path,
-            format!(
-                "#!/bin/sh\nprintf ran > \"{}\"\n",
-                marker_path.to_string_lossy()
-            ),
-        )
-        .expect("write post-index-change hook");
-        let mut permissions = fs::metadata(&hook_path)
-            .expect("read hook metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&hook_path, permissions).expect("mark hook executable");
-        git_stdout(
-            &root,
-            &[
-                "config",
-                "core.hooksPath",
-                hooks_dir.to_string_lossy().as_ref(),
-            ],
-        );
-
-        write_index_from_head(&root).expect("rewrite baseline index");
-
-        assert!(
-            !marker_path.exists(),
-            "baseline index writes should not invoke configured hook directories"
-        );
     }
 
     #[tokio::test]
@@ -729,32 +655,5 @@ mod tests {
             repo.find_blob(added_oid).is_err(),
             "status scans should hash current files without writing loose git objects"
         );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn reports_executable_bit_changes_as_modified() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let home = TempDir::new().expect("tempdir");
-        let root = home.path().join("repo");
-        fs::create_dir_all(&root).expect("create root");
-        let path = root.join("MEMORY.md");
-        fs::write(&path, "same content").expect("write memory");
-        reset_git_repository(&root).await.expect("reset repo");
-        let mut permissions = fs::metadata(&path).expect("stat memory").permissions();
-        permissions.set_mode(permissions.mode() | 0o111);
-        fs::set_permissions(&path, permissions).expect("chmod memory");
-
-        let diff = diff_since_latest_init(&root).await.expect("diff");
-        assert_eq!(
-            diff.changes,
-            vec![GitBaselineChange {
-                status: GitBaselineChangeStatus::Modified,
-                path: "MEMORY.md".to_string(),
-            }]
-        );
-        assert!(diff.unified_diff.contains("old mode 100644"));
-        assert!(diff.unified_diff.contains("new mode 100755"));
     }
 }

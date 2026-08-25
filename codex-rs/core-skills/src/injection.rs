@@ -9,12 +9,13 @@ use codex_analytics::AnalyticsEventsClient;
 use codex_analytics::InvocationType;
 use codex_analytics::SkillInvocation;
 use codex_analytics::TrackEventsContext;
+use codex_context_fragments::ContextualUserFragment;
 use codex_exec_server::LOCAL_FS;
 use codex_otel::SessionTelemetry;
+use codex_plugin::mention_syntax::TOOL_MENTION_SIGIL;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
-use codex_utils_plugins::mention_syntax::TOOL_MENTION_SIGIL;
 
 #[derive(Debug, Default)]
 pub struct SkillInjections {
@@ -27,6 +28,27 @@ pub struct SkillInjection {
     pub name: String,
     pub path: String,
     pub contents: String,
+}
+
+impl ContextualUserFragment for SkillInjection {
+    fn role(&self) -> &'static str {
+        "user"
+    }
+
+    fn markers(&self) -> (&'static str, &'static str) {
+        Self::type_markers()
+    }
+
+    fn type_markers() -> (&'static str, &'static str) {
+        ("<skill>", "</skill>")
+    }
+
+    fn body(&self) -> String {
+        format!(
+            "\n<name>{}</name>\n<path>{}</path>\n{}\n",
+            self.name, self.path, self.contents
+        )
+    }
 }
 
 /// Read-only skill resolution result. Observability is applied separately so a
@@ -255,6 +277,7 @@ pub struct ToolMentions<'a> {
     names: HashSet<&'a str>,
     paths: HashSet<&'a str>,
     plain_names: HashSet<&'a str>,
+    linked_paths: HashMap<&'a str, &'a str>,
 }
 
 impl<'a> ToolMentions<'a> {
@@ -266,9 +289,24 @@ impl<'a> ToolMentions<'a> {
         self.plain_names.iter().copied()
     }
 
+    pub fn names(&self) -> impl Iterator<Item = &'a str> + '_ {
+        self.names.iter().copied()
+    }
+
     pub fn paths(&self) -> impl Iterator<Item = &'a str> + '_ {
         self.paths.iter().copied()
     }
+
+    pub fn linked_paths(&self) -> impl Iterator<Item = (&'a str, &'a str)> + '_ {
+        self.linked_paths.iter().map(|(name, path)| (*name, *path))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkedToolMention<'a> {
+    pub name: &'a str,
+    pub path: &'a str,
+    pub end: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -315,7 +353,7 @@ pub fn plugin_config_name_from_path(path: &str) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
-pub(crate) fn normalize_skill_path(path: &str) -> &str {
+pub fn normalize_skill_path(path: &str) -> &str {
     path.strip_prefix(SKILL_PATH_PREFIX).unwrap_or(path)
 }
 
@@ -333,13 +371,17 @@ pub fn extract_tool_mentions_with_sigil(text: &str, sigil: char) -> ToolMentions
     let mut mentioned_names: HashSet<&str> = HashSet::new();
     let mut mentioned_paths: HashSet<&str> = HashSet::new();
     let mut plain_names: HashSet<&str> = HashSet::new();
+    let mut linked_paths: HashMap<&str, &str> = HashMap::new();
 
     let mut index = 0;
     while index < text_bytes.len() {
         let byte = text_bytes[index];
         if byte == b'['
-            && let Some((name, path, end_index)) =
-                parse_linked_tool_mention(text, text_bytes, index, sigil)
+            && let Some(LinkedToolMention {
+                name,
+                path,
+                end: end_index,
+            }) = parse_linked_tool_mention(text, index, sigil)
         {
             if !is_common_env_var(name) {
                 if !matches!(
@@ -349,6 +391,7 @@ pub fn extract_tool_mentions_with_sigil(text: &str, sigil: char) -> ToolMentions
                     mentioned_names.insert(name);
                 }
                 mentioned_paths.insert(path);
+                linked_paths.entry(name).or_insert(path);
             }
             index = end_index;
             continue;
@@ -388,6 +431,7 @@ pub fn extract_tool_mentions_with_sigil(text: &str, sigil: char) -> ToolMentions
         names: mentioned_names,
         paths: mentioned_paths,
         plain_names,
+        linked_paths,
     }
 }
 
@@ -469,12 +513,12 @@ fn select_skills_from_mentions(
     }
 }
 
-fn parse_linked_tool_mention<'a>(
+pub fn parse_linked_tool_mention<'a>(
     text: &'a str,
-    text_bytes: &[u8],
     start: usize,
     sigil: char,
-) -> Option<(&'a str, &'a str, usize)> {
+) -> Option<LinkedToolMention<'a>> {
+    let text_bytes = text.as_bytes();
     let sigil_index = start + 1;
     if text_bytes.get(sigil_index) != Some(&(sigil as u8)) {
         return None;
@@ -523,10 +567,14 @@ fn parse_linked_tool_mention<'a>(
     }
 
     let name = &text[name_start..name_end];
-    Some((name, path, path_end + 1))
+    Some(LinkedToolMention {
+        name,
+        path,
+        end: path_end + 1,
+    })
 }
 
-fn is_common_env_var(name: &str) -> bool {
+pub fn is_common_env_var(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     matches!(
         upper.as_str(),
@@ -576,8 +624,12 @@ fn text_mentions_skill(text: &str, skill_name: &str) -> bool {
     false
 }
 
-fn is_mention_name_char(byte: u8) -> bool {
+pub fn is_mention_name_char(byte: u8) -> bool {
     matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' | b':')
+}
+
+pub fn is_mention_name_char_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':')
 }
 
 #[cfg(test)]

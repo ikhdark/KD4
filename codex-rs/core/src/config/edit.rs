@@ -1,13 +1,15 @@
-use crate::path_utils::acquire_atomic_write_lock;
-use crate::path_utils::resolve_symlink_write_paths;
-use crate::path_utils::write_atomically;
 use anyhow::Context;
 use codex_config::CONFIG_TOML_FILE;
+use codex_config::serialize_mcp_server;
+use codex_config::serialize_mcp_server_inline;
 use codex_config::types::McpServerConfig;
 use codex_config::types::SessionPickerViewMode;
 use codex_config::types::ToolSuggestDisabledTool;
 use codex_config::version_for_toml;
 use codex_features::feature_for_key;
+use codex_file_system::acquire_atomic_write_lock;
+use codex_file_system::resolve_symlink_write_paths;
+use codex_file_system::write_atomically;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::TrustLevel;
@@ -44,16 +46,6 @@ pub enum ConfigEdit {
     SetNoticeHideWorldWritableWarning(bool),
     /// Toggle the rate limit model nudge acknowledgement flag.
     SetNoticeHideRateLimitModelNudge(bool),
-    /// Toggle the model migration prompt acknowledgement flag.
-    SetNoticeHideModelMigrationPrompt(String, bool),
-    /// Toggle the home external config migration prompt acknowledgement flag.
-    SetNoticeHideExternalConfigMigrationPromptHome(bool),
-    /// Record when the home external config migration prompt was last shown.
-    SetNoticeExternalConfigMigrationPromptHomeLastPromptedAt(i64),
-    /// Toggle the project external config migration prompt acknowledgement flag.
-    SetNoticeHideExternalConfigMigrationPromptProject(String, bool),
-    /// Record when the project external config migration prompt was last shown.
-    SetNoticeExternalConfigMigrationPromptProjectLastPromptedAt(String, i64),
     /// Record that a migration prompt was shown for an old->new model mapping.
     RecordModelMigrationSeen { from: String, to: String },
     /// Replace the entire `[mcp_servers]` table.
@@ -254,55 +246,6 @@ impl ConfigDocument {
                 &[NOTICE_TABLE_KEY, "hide_rate_limit_model_nudge"],
                 value(*acknowledged),
             )),
-            ConfigEdit::SetNoticeHideModelMigrationPrompt(migration_config, acknowledged) => {
-                Ok(self.write_value(
-                    &[NOTICE_TABLE_KEY, migration_config.as_str()],
-                    value(*acknowledged),
-                ))
-            }
-            ConfigEdit::SetNoticeHideExternalConfigMigrationPromptHome(acknowledged) => Ok(self
-                .write_value(
-                    &[
-                        NOTICE_TABLE_KEY,
-                        "external_config_migration_prompts",
-                        "home",
-                    ],
-                    value(*acknowledged),
-                )),
-            ConfigEdit::SetNoticeExternalConfigMigrationPromptHomeLastPromptedAt(timestamp) => {
-                Ok(self.write_value(
-                    &[
-                        NOTICE_TABLE_KEY,
-                        "external_config_migration_prompts",
-                        "home_last_prompted_at",
-                    ],
-                    value(*timestamp),
-                ))
-            }
-            ConfigEdit::SetNoticeHideExternalConfigMigrationPromptProject(
-                project,
-                acknowledged,
-            ) => Ok(self.write_value(
-                &[
-                    NOTICE_TABLE_KEY,
-                    "external_config_migration_prompts",
-                    "projects",
-                    project.as_str(),
-                ],
-                value(*acknowledged),
-            )),
-            ConfigEdit::SetNoticeExternalConfigMigrationPromptProjectLastPromptedAt(
-                project,
-                timestamp,
-            ) => Ok(self.write_value(
-                &[
-                    NOTICE_TABLE_KEY,
-                    "external_config_migration_prompts",
-                    "project_last_prompted_at",
-                    project.as_str(),
-                ],
-                value(*timestamp),
-            )),
             ConfigEdit::RecordModelMigrationSeen { from, to } => Ok(self.write_value(
                 &[NOTICE_TABLE_KEY, "model_migrations", from.as_str()],
                 value(to.clone()),
@@ -318,7 +261,7 @@ impl ConfigDocument {
                 Ok(self.set_skill_config(SkillConfigSelector::Name(name.clone()), *enabled))
             }
             ConfigEdit::SetPath { segments, value } => Ok(self.insert(segments, value.clone())),
-            ConfigEdit::ClearPath { segments } => Ok(self.clear_owned(segments)),
+            ConfigEdit::ClearPath { segments } => Ok(self.remove(segments)),
             ConfigEdit::SetProjectTrustLevel { path, level } => {
                 // Delegate to the existing, tested logic in config.rs to
                 // ensure tables are explicit and migration is preserved.
@@ -389,10 +332,6 @@ impl ConfigDocument {
         )
     }
 
-    fn clear_owned(&mut self, segments: &[String]) -> bool {
-        self.remove(segments)
-    }
-
     fn replace_mcp_servers(&mut self, servers: &BTreeMap<String, McpServerConfig>) -> bool {
         if servers.is_empty() {
             return self.clear(&["mcp_servers"]);
@@ -433,13 +372,13 @@ impl ConfigDocument {
                 if let TomlItem::Value(value) = existing
                     && let Some(inline) = value.as_inline_table_mut()
                 {
-                    let replacement = document_helpers::serialize_mcp_server_inline(config);
+                    let replacement = serialize_mcp_server_inline(config);
                     document_helpers::merge_inline_table(inline, replacement);
                 } else {
-                    *existing = document_helpers::serialize_mcp_server(config);
+                    *existing = serialize_mcp_server(config);
                 }
             } else {
-                table.insert(name, document_helpers::serialize_mcp_server(config));
+                table.insert(name, serialize_mcp_server(config));
             }
         }
 
@@ -831,37 +770,6 @@ impl ConfigEditsBuilder {
         self
     }
 
-    pub fn set_hide_model_migration_prompt(mut self, model: &str, acknowledged: bool) -> Self {
-        self.edits
-            .push(ConfigEdit::SetNoticeHideModelMigrationPrompt(
-                model.to_string(),
-                acknowledged,
-            ));
-        self
-    }
-
-    pub fn set_hide_external_config_migration_prompt_home(mut self, acknowledged: bool) -> Self {
-        self.edits
-            .push(ConfigEdit::SetNoticeHideExternalConfigMigrationPromptHome(
-                acknowledged,
-            ));
-        self
-    }
-
-    pub fn set_hide_external_config_migration_prompt_project(
-        mut self,
-        project: &str,
-        acknowledged: bool,
-    ) -> Self {
-        self.edits.push(
-            ConfigEdit::SetNoticeHideExternalConfigMigrationPromptProject(
-                project.to_string(),
-                acknowledged,
-            ),
-        );
-        self
-    }
-
     pub fn record_model_migration_seen(mut self, from: &str, to: &str) -> Self {
         self.edits.push(ConfigEdit::RecordModelMigrationSeen {
             from: from.to_string(),
@@ -896,22 +804,12 @@ impl ConfigEditsBuilder {
 
     /// Enable or disable a feature flag by key under the `[features]` table.
     ///
-    /// Legacy aliases are migrated to their canonical key so a stale
-    /// canonical value cannot override the requested edit.
-    ///
     /// Disabling a default-false feature clears the key instead of
     /// persisting `false`, so the config does not pin the feature once it
     /// graduates to globally enabled.
     pub fn set_feature_enabled(mut self, key: &str, enabled: bool) -> Self {
         let feature = feature_for_key(key);
-        let canonical_key = feature.map_or(key, |feature| feature.key());
-        if canonical_key != key {
-            self.edits.push(ConfigEdit::ClearPath {
-                segments: vec!["features".to_string(), key.to_string()],
-            });
-        }
-
-        let segments = vec!["features".to_string(), canonical_key.to_string()];
+        let segments = vec!["features".to_string(), key.to_string()];
         let is_default_false_feature = feature.is_some_and(|feature| !feature.default_enabled());
         if enabled || !is_default_false_feature {
             self.edits.push(ConfigEdit::SetPath {
@@ -929,42 +827,6 @@ impl ConfigEditsBuilder {
             segments: vec!["windows".to_string(), "sandbox".to_string()],
             value: value(mode),
         });
-        self
-    }
-
-    pub fn set_realtime_microphone(mut self, microphone: Option<&str>) -> Self {
-        let segments = vec!["audio".to_string(), "microphone".to_string()];
-        match microphone {
-            Some(microphone) => self.edits.push(ConfigEdit::SetPath {
-                segments,
-                value: value(microphone),
-            }),
-            None => self.edits.push(ConfigEdit::ClearPath { segments }),
-        }
-        self
-    }
-
-    pub fn set_realtime_speaker(mut self, speaker: Option<&str>) -> Self {
-        let segments = vec!["audio".to_string(), "speaker".to_string()];
-        match speaker {
-            Some(speaker) => self.edits.push(ConfigEdit::SetPath {
-                segments,
-                value: value(speaker),
-            }),
-            None => self.edits.push(ConfigEdit::ClearPath { segments }),
-        }
-        self
-    }
-
-    pub fn set_realtime_voice(mut self, voice: Option<&str>) -> Self {
-        let segments = vec!["realtime".to_string(), "voice".to_string()];
-        match voice {
-            Some(voice) => self.edits.push(ConfigEdit::SetPath {
-                segments,
-                value: value(voice),
-            }),
-            None => self.edits.push(ConfigEdit::ClearPath { segments }),
-        }
         self
     }
 

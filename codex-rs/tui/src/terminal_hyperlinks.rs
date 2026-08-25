@@ -52,7 +52,7 @@ impl HyperlinkLine {
         let end = start + span.content.width();
         self.line.push_span(span);
         if end > start
-            && let Some(destination) = destination.and_then(web_destination)
+            && let Some(destination) = destination.and_then(terminal_destination)
         {
             self.hyperlinks.push(TerminalHyperlink {
                 columns: start..end,
@@ -319,8 +319,31 @@ pub(crate) fn web_destination(destination: &str) -> Option<String> {
     Some(safe_destination)
 }
 
+fn terminal_destination(destination: &str) -> Option<String> {
+    if let Some(destination) = web_destination(destination) {
+        return Some(destination);
+    }
+
+    let safe_destination = destination
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .collect::<String>();
+    let parsed = Url::parse(&safe_destination).ok()?;
+    let is_editor_file_uri = matches!(
+        parsed.scheme(),
+        "vscode" | "vscode-insiders" | "windsurf" | "cursor"
+    ) && parsed.host_str() == Some("file")
+        && !parsed.path().is_empty()
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.port().is_none()
+        && parsed.query().is_none()
+        && parsed.fragment().is_none();
+    is_editor_file_uri.then_some(safe_destination)
+}
+
 pub(crate) fn osc8_hyperlink(destination: &str, text: &str) -> String {
-    let Some(safe_destination) = web_destination(destination) else {
+    let Some(safe_destination) = terminal_destination(destination) else {
         return text.to_string();
     };
     format!("\x1b]8;;{safe_destination}\x07{text}\x1b]8;;\x07")
@@ -388,7 +411,7 @@ pub(crate) fn decorate_spans(line: &HyperlinkLine) -> Vec<Span<'static>> {
                     append_to_last_span(&mut out, "\x1b]8;;\x07");
                 }
                 active_destination = selected_link_index
-                    .and_then(|index| web_destination(&line.hyperlinks[index].destination));
+                    .and_then(|index| terminal_destination(&line.hyperlinks[index].destination));
                 if let Some(destination) = active_destination.as_ref() {
                     push_styled_content(
                         &mut out,
@@ -501,7 +524,7 @@ fn mark_matching_cells(
     destination: &str,
     matches: impl Fn(&ratatui::buffer::Cell) -> bool,
 ) {
-    if web_destination(destination).is_none() {
+    if terminal_destination(destination).is_none() {
         return;
     }
     for position in area.positions() {
@@ -519,9 +542,11 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn only_web_destinations_receive_osc8() {
+    fn only_supported_destinations_receive_osc8() {
         assert!(osc8_hyperlink("https://example.com/a", "a").contains("\x1b]8;;"));
+        assert!(osc8_hyperlink("cursor://file/workspace/src/main.rs:12", "a").contains("\x1b]8;;"));
         assert_eq!(osc8_hyperlink("mailto:a@example.com", "a"), "a");
+        assert_eq!(osc8_hyperlink("cursor://host/workspace/a", "a"), "a");
         assert_eq!(
             osc8_hyperlink("https://example.com/\u{7}safe", "a"),
             "\x1b]8;;https://example.com/safe\x07a\x1b]8;;\x07"

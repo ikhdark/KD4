@@ -6,7 +6,6 @@ use codex_core::NewThread;
 use codex_login::CodexAuth;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ModeKind;
-use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::Op;
@@ -76,12 +75,8 @@ fn resume_history(
         collaboration_mode: None,
         multi_agent_version: None,
         multi_agent_mode: None,
-        realtime_active: None,
         effort: config.model_reasoning_effort.clone(),
         context_provenance: None,
-        summary: config
-            .model_reasoning_summary
-            .unwrap_or(ReasoningSummary::Auto),
     };
 
     InitialHistory::Resumed(ResumedHistory {

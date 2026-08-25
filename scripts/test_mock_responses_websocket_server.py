@@ -131,17 +131,15 @@ class MockResponsesWebSocketServerTest(unittest.TestCase):
 
         self.assertEqual(out.flush_count, 2)
 
-    def test_legacy_websocket_path_is_validated(self) -> None:
+    def test_connection_requires_current_request_path_api(self) -> None:
         websocket = FakeWebSocket(["{}", "{}"], path="/unexpected")
         websocket.path = websocket.request.path
         del websocket.request
 
-        completed = asyncio.run(
-            server._handle_connection(websocket, quiet=True, log_json="off")
-        )
-
-        self.assertFalse(completed)
-        self.assertEqual(websocket.close_calls, [(1008, "unexpected websocket path")])
+        with self.assertRaises(AttributeError):
+            asyncio.run(
+                server._handle_connection(websocket, quiet=True, log_json="off")
+            )
 
     def test_invalid_json_closes_with_invalid_payload_code(self) -> None:
         websocket = FakeWebSocket([b"\xff"])

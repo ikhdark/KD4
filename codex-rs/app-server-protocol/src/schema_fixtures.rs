@@ -1,7 +1,10 @@
 use crate::ClientNotification;
 use crate::ClientRequest;
+use crate::OverloadErrorData;
+use crate::PluginRemoteErrorData;
 use crate::ServerNotification;
 use crate::ServerRequest;
+use crate::ThreadErrorData;
 use crate::export::GENERATED_TS_HEADER;
 use crate::export::filter_experimental_ts_tree;
 use crate::export::generate_index_ts_tree;
@@ -24,21 +27,6 @@ use ts_rs::TypeVisitor;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SchemaFixtureOptions {
     pub experimental_api: bool,
-}
-
-pub fn read_schema_fixture_tree(schema_root: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
-    let typescript_root = schema_root.join("typescript");
-    let json_root = schema_root.join("json");
-
-    let mut all = BTreeMap::new();
-    for (rel, bytes) in collect_files_recursive(&typescript_root)? {
-        all.insert(PathBuf::from("typescript").join(rel), bytes);
-    }
-    for (rel, bytes) in collect_files_recursive(&json_root)? {
-        all.insert(PathBuf::from("json").join(rel), bytes);
-    }
-
-    Ok(all)
 }
 
 pub fn read_schema_fixture_subtree(
@@ -66,6 +54,9 @@ pub fn generate_typescript_schema_fixture_subtree_for_tests() -> Result<BTreeMap
         visit_server_response_types(visitor);
     })?;
     collect_typescript_fixture_file::<ServerNotification>(&mut files, &mut seen)?;
+    collect_typescript_fixture_file::<OverloadErrorData>(&mut files, &mut seen)?;
+    collect_typescript_fixture_file::<PluginRemoteErrorData>(&mut files, &mut seen)?;
+    collect_typescript_fixture_file::<ThreadErrorData>(&mut files, &mut seen)?;
 
     filter_experimental_ts_tree(&mut files)?;
     generate_index_ts_tree(&mut files);
@@ -77,14 +68,6 @@ pub fn generate_typescript_schema_fixture_subtree_for_tests() -> Result<BTreeMap
         .into_iter()
         .map(|(path, content)| (path, content.into_bytes()))
         .collect())
-}
-
-/// Regenerates `schema/typescript/` and `schema/json/`.
-///
-/// This is intended to be used by tooling (e.g., `just write-app-server-schema`).
-/// It deletes any previously generated files so stale artifacts are removed.
-pub fn write_schema_fixtures(schema_root: &Path, prettier: Option<&Path>) -> Result<()> {
-    write_schema_fixtures_with_options(schema_root, prettier, SchemaFixtureOptions::default())
 }
 
 /// Regenerates schema fixtures with configurable options.

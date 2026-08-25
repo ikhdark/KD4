@@ -1,3 +1,5 @@
+use super::shared::v2_enum_from_core;
+use codex_protocol::config_types::WindowsSandboxSetupMode as CoreWindowsSandboxSetupMode;
 use codex_protocol::models::PermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use schemars::JsonSchema;
@@ -14,12 +16,13 @@ pub struct WindowsWorldWritableWarningNotification {
     pub failed_scan: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-pub enum WindowsSandboxSetupMode {
-    Elevated,
-    Unelevated,
+v2_enum_from_core! {
+    rename_all = "camelCase";
+    export_to = "v2/";
+    pub enum WindowsSandboxSetupMode from CoreWindowsSandboxSetupMode {
+        Elevated,
+        Unelevated,
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]

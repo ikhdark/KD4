@@ -3,6 +3,7 @@ use codex_rollout::find_thread_path_by_id_str;
 
 use super::LocalThreadStore;
 use super::helpers::matching_rollout_file_name;
+use super::helpers::rollout_lookup_error;
 use super::helpers::scoped_rollout_path;
 use crate::ArchiveThreadParams;
 use crate::ThreadStoreError;
@@ -20,12 +21,8 @@ pub(super) async fn archive_thread(
         state_db_ctx.as_deref(),
     )
     .await
-    .map_err(|err| ThreadStoreError::InvalidRequest {
-        message: format!("failed to locate thread id {thread_id}: {err}"),
-    })?
-    .ok_or_else(|| ThreadStoreError::InvalidRequest {
-        message: format!("no rollout found for thread id {thread_id}"),
-    })?;
+    .map_err(|err| rollout_lookup_error(thread_id, /*archived*/ false, err))?
+    .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
 
     let canonical_rollout_path = scoped_rollout_path(
         store.config.codex_home.join(codex_rollout::SESSIONS_SUBDIR),
@@ -129,6 +126,25 @@ mod tests {
             archived.items[0].archived_at,
             Some(archived.items[0].updated_at)
         );
+    }
+
+    #[tokio::test]
+    async fn archive_thread_reports_typed_not_found() {
+        let home = TempDir::new().expect("temp dir");
+        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+        let thread_id = ThreadId::new();
+
+        let error = store
+            .archive_thread(ArchiveThreadParams { thread_id })
+            .await
+            .expect_err("missing thread should fail");
+
+        assert!(matches!(
+            error,
+            ThreadStoreError::ThreadNotFound {
+                thread_id: missing_thread_id
+            } if missing_thread_id == thread_id
+        ));
     }
 
     #[tokio::test]

@@ -40,11 +40,7 @@ fn absolute_path(path: &str) -> AbsolutePathBuf {
 }
 
 fn host_absolute_path(segments: &[&str]) -> String {
-    let mut path = if cfg!(windows) {
-        PathBuf::from(r"C:\")
-    } else {
-        PathBuf::from("/")
-    };
+    let mut path = PathBuf::from(r"C:\");
     for segment in segments {
         path.push(segment);
     }
@@ -52,11 +48,7 @@ fn host_absolute_path(segments: &[&str]) -> String {
 }
 
 fn host_executable_name(name: &str) -> String {
-    if cfg!(windows) {
-        format!("{name}.exe")
-    } else {
-        name.to_string()
-    }
+    format!("{name}.exe")
 }
 
 fn starlark_string(value: &str) -> String {
@@ -290,6 +282,32 @@ fn add_prefix_rule_rejects_empty_prefix() -> Result<()> {
         other => panic!("expected InvalidPattern(..), got {other:?}"),
     }
     Ok(())
+}
+
+#[test]
+fn add_prefix_rule_rejects_empty_tokens() {
+    let mut policy = Policy::empty();
+
+    for prefix in [tokens(&[""]), tokens(&["git", " "])] {
+        assert!(matches!(
+            policy.add_prefix_rule(&prefix, Decision::Allow),
+            Err(Error::InvalidPattern(message)) if message == "token cannot be empty"
+        ));
+    }
+}
+
+#[test]
+fn starlark_rules_reject_empty_pattern_tokens() {
+    for source in [
+        r#"prefix_rule(pattern = [""], decision = "allow")"#,
+        r#"prefix_rule(pattern = ["git", [""]], decision = "allow")"#,
+    ] {
+        let mut parser = PolicyParser::new();
+        let err = parser
+            .parse("empty.rules", source)
+            .expect_err("empty semantic tokens must be rejected");
+        assert!(err.to_string().contains("token cannot be empty"), "{err:#}");
+    }
 }
 
 #[test]

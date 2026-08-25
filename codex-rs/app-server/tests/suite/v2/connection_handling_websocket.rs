@@ -55,10 +55,8 @@ use tokio_tungstenite::tungstenite::http::header::ORIGIN;
 // macOS and Windows CI can spend tens of seconds starting the app-server test
 // binary before it accepts JSON-RPC or reports its websocket bind
 // address.
-#[cfg(any(target_os = "macos", windows))]
+
 pub(super) const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
-#[cfg(not(any(target_os = "macos", windows)))]
-pub(super) const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(super) type WsClient = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 type HmacSha256 = Hmac<Sha256>;

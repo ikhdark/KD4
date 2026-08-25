@@ -16,12 +16,14 @@ from pathlib import Path
 from typing import Any, Sequence
 
 try:
+    from scripts import kd4_first_useful_action_analysis
     from scripts.rollout_snapshot import read_rollout_snapshot
 except ImportError:
+    import kd4_first_useful_action_analysis
     from rollout_snapshot import read_rollout_snapshot
 
 
-REPORT_SCHEMA_VERSION = 9
+REPORT_SCHEMA_VERSION = 10
 
 _NANOSECONDS_PER_SECOND = 1_000_000_000
 _SLOW_TOOL_CALL_NS = 5 * _NANOSECONDS_PER_SECOND
@@ -325,7 +327,9 @@ def _physical_attempt_count(request: dict[str, Any]) -> int:
 
 def _token_report(requests: Iterable[dict[str, Any]]) -> dict[str, Any]:
     request_list = list(requests)
-    physical_attempts = sum(_physical_attempt_count(request) for request in request_list)
+    physical_attempts = sum(
+        _physical_attempt_count(request) for request in request_list
+    )
     totals = collections.Counter()
     prompt_categories = collections.Counter()
     covered_attempts = 0
@@ -481,13 +485,17 @@ def _token_intervals(
             for item in interval_requests
             if isinstance(item.get("completedMs"), int)
         ]
-        attempt_kinds = [str(item.get("attemptKind", "primary")) for item in interval_requests]
+        attempt_kinds = [
+            str(item.get("attemptKind", "primary")) for item in interval_requests
+        ]
         intervals.append(
             {
                 "requestIndex": request_indexes[0],
                 "requestIndexes": request_indexes,
                 "generationIndex": generation_index,
-                "attemptKind": attempt_kinds[0] if len(attempt_kinds) == 1 else "multiple",
+                "attemptKind": attempt_kinds[0]
+                if len(attempt_kinds) == 1
+                else "multiple",
                 "attemptKinds": attempt_kinds,
                 "physicalAttempts": sum(
                     _physical_attempt_count(item) for item in interval_requests
@@ -721,10 +729,7 @@ def _tool_relay_report(
             incomplete += 1
 
     dominant_phase, dominant_owner, dominant_phase_ms = _dominant_tool_phase(
-        {
-            phase: int(totals.get(phase, 0))
-            for phase in _TOOL_PHASE_OWNERS
-        }
+        {phase: int(totals.get(phase, 0)) for phase in _TOOL_PHASE_OWNERS}
     )
     slow_calls = sorted(
         (
@@ -738,15 +743,15 @@ def _tool_relay_report(
                 "outputModelVisibilityRecorded": isinstance(
                     call.get("outputModelVisibleAtMs"), int
                 ),
-                "dominantPhase": _dominant_tool_phase(
-                    _tool_phase_durations_ms(call)
-                )[0],
+                "dominantPhase": _dominant_tool_phase(_tool_phase_durations_ms(call))[
+                    0
+                ],
                 "dominantPhaseOwner": _dominant_tool_phase(
                     _tool_phase_durations_ms(call)
                 )[1],
-                "dominantPhaseMs": _dominant_tool_phase(
-                    _tool_phase_durations_ms(call)
-                )[2],
+                "dominantPhaseMs": _dominant_tool_phase(_tool_phase_durations_ms(call))[
+                    2
+                ],
             }
             for call in calls
             if _tool_call_end_to_end_duration_ms(call)
@@ -779,8 +784,7 @@ def _tool_relay_report(
             for (turn_id, generation_index), group_calls in generation_calls.items()
             if len(group_calls) > 1
             and sum(
-                max(0, int(call.get("parallelGateWaitMs") or 0))
-                for call in group_calls
+                max(0, int(call.get("parallelGateWaitMs") or 0)) for call in group_calls
             )
             >= _SLOW_TOOL_CALL_NS // 1_000_000
         ),
@@ -843,7 +847,9 @@ def _request_metric(
     ]
     return {
         "logicalGenerations": len(generation_ids),
-        "physicalAttempts": sum(_physical_attempt_count(request) for request in matching),
+        "physicalAttempts": sum(
+            _physical_attempt_count(request) for request in matching
+        ),
         "modelStreamWaitNs": sum(
             int(request.get("modelStreamWaitNs", 0)) for request in matching
         ),
@@ -1232,6 +1238,7 @@ def analyze_session_path(source: Path, repo_root: Path) -> dict[str, Any]:
     line_count = 0
     byte_count = 0
     snapshots: list[dict[str, str | int]] = []
+    captured_snapshots = []
     command_orchestration_records: list[dict[str, Any]] = []
     execution_loop_counts: collections.Counter[str] = collections.Counter()
     execution_loop_ns: collections.Counter[str] = collections.Counter()
@@ -1246,6 +1253,7 @@ def analyze_session_path(source: Path, repo_root: Path) -> dict[str, Any]:
         calls_since_sampling_boundary = 0
         last_tool_output_ns: int | None = None
         snapshot = read_rollout_snapshot(file)
+        captured_snapshots.append(snapshot)
         snapshots.append(snapshot.metadata())
         byte_count += snapshot.byte_length
         cwd = ""
@@ -1587,6 +1595,9 @@ def analyze_session_path(source: Path, repo_root: Path) -> dict[str, Any]:
         "executionLoop": execution_loop,
         "commandOrchestration": command_orchestration,
         "toolRelay": tool_relay,
+        "firstUsefulActionAnalysis": (
+            kd4_first_useful_action_analysis.analyze_snapshots(captured_snapshots)
+        ),
         "perTurn": per_turn,
         "behaviorSignals": _behavior_report(
             per_turn,
@@ -1678,6 +1689,18 @@ def render_report(report: dict[str, Any]) -> str:
             f"{relay.get('dominantPhaseMs', 0) / 1e3:.1f}s; "
             f"exclusive-gate-convoys={relay.get('exclusiveGateConvoyCount', 0)}"
         )
+    first_useful = report["firstUsefulActionAnalysis"]
+    canonical_first_useful = first_useful["canonical"]["startToFirstUsefulActionMs"]
+    legacy_first_useful = first_useful["legacyReconstructed"][
+        "startToUsefulToolEmittedMs"
+    ]
+    lines.append(
+        "first useful action: "
+        f"canonical={canonical_first_useful['count']} "
+        f"p50={canonical_first_useful['p50']}ms; "
+        f"legacy={legacy_first_useful['count']} "
+        f"p50={legacy_first_useful['p50']}ms"
+    )
     for name in ("all", "eval", "repository_root", "other"):
         population = report["populations"].get(name)
         if not population or not population["turns"]:
@@ -1875,6 +1898,24 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
         if name == "all":
             bounded_population.pop("toolRelay", None)
         bounded_populations[name] = bounded_population
+    first_useful = report["firstUsefulActionAnalysis"]
+    bounded_first_useful = {
+        "schemaVersion": first_useful["schemaVersion"],
+        "completedTurnCount": first_useful["completedTurnCount"],
+        "canonicalTurnCount": first_useful["canonicalTurnCount"],
+        "legacyReconstructedTurnCount": first_useful["legacyReconstructedTurnCount"],
+        "canonical": {
+            "startToFirstUsefulActionMs": first_useful["canonical"][
+                "startToFirstUsefulActionMs"
+            ]
+        },
+        "legacyReconstructed": {
+            "startToUsefulToolEmittedMs": first_useful["legacyReconstructed"][
+                "startToUsefulToolEmittedMs"
+            ]
+        },
+        "exclusions": first_useful["exclusions"],
+    }
     return {
         "schemaVersion": report["schemaVersion"],
         "observedAt": report["observedAt"],
@@ -1884,6 +1925,7 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
         "executionLoop": report["executionLoop"],
         "commandOrchestration": report["commandOrchestration"],
         "toolRelay": report["toolRelay"],
+        "firstUsefulActionAnalysis": bounded_first_useful,
         "perTurn": bounded_turns,
         "omittedPerTurnRecords": max(0, len(report["perTurn"]) - len(bounded_turns)),
         "behaviorSignals": report["behaviorSignals"],

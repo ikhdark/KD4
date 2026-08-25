@@ -8,6 +8,8 @@ use codex_app_server_protocol::PluginAvailability;
 use codex_app_server_protocol::PluginInstallPolicy;
 use codex_app_server_protocol::PluginInstallPolicySource;
 use codex_app_server_protocol::PluginInterface;
+use codex_app_server_protocol::PluginRemoteErrorData;
+use codex_app_server_protocol::PluginRemoteErrorReason;
 use codex_app_server_protocol::SkillInterface;
 use codex_http_client::RequestBuilder;
 use codex_login::CodexAuth;
@@ -294,6 +296,9 @@ pub fn validate_remote_plugin_id(plugin_id: &str) -> Result<(), JSONRPCErrorErro
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemotePluginCatalogError {
+    #[error("failed to build remote plugin catalog HTTP client: {0}")]
+    HttpClient(#[from] codex_login::BuildLoginHttpClientError),
+
     #[error("chatgpt authentication required for remote plugin catalog")]
     AuthRequired,
 
@@ -383,6 +388,84 @@ pub enum RemotePluginCatalogError {
 
     #[error("{0}")]
     CacheRemove(String),
+}
+
+impl RemotePluginCatalogError {
+    pub fn telemetry_type(&self) -> &'static str {
+        match self {
+            Self::HttpClient(_) => "remote_catalog_http_client",
+            Self::AuthRequired => "remote_catalog_auth_required",
+            Self::UnsupportedAuthMode => "remote_catalog_unsupported_auth_mode",
+            Self::AuthToken(_) => "remote_catalog_auth_token",
+            Self::Request { .. } => "remote_catalog_request",
+            Self::UnexpectedStatus { .. } => "remote_catalog_unexpected_status",
+            Self::Decode { .. } => "remote_catalog_decode",
+            Self::InvalidBaseUrl(_) => "remote_catalog_invalid_base_url",
+            Self::InvalidBaseUrlPath => "remote_catalog_invalid_base_url_path",
+            Self::UnknownMarketplace { .. } => "remote_catalog_unknown_marketplace",
+            Self::UnexpectedPluginId { .. } => "remote_catalog_unexpected_plugin_id",
+            Self::UnexpectedSkillName { .. } => "remote_catalog_unexpected_skill_name",
+            Self::UnexpectedEnabledState { .. } => "remote_catalog_unexpected_enabled_state",
+            Self::InvalidPluginPath { .. } => "remote_catalog_invalid_plugin_path",
+            Self::PluginShareCheckoutNotAvailable { .. } => {
+                "remote_catalog_plugin_share_checkout_not_available"
+            }
+            Self::Archive { .. } => "remote_catalog_archive",
+            Self::ArchiveJoin(_) => "remote_catalog_archive_join",
+            Self::ArchiveTooLarge { .. } => "remote_catalog_archive_too_large",
+            Self::MissingUploadEtag => "remote_catalog_missing_upload_etag",
+            Self::UnexpectedResponse(_) => "remote_catalog_unexpected_response",
+            Self::CacheRemove(_) => "remote_catalog_cache_remove",
+        }
+    }
+
+    pub fn error_data(&self) -> PluginRemoteErrorData {
+        let reason = match self {
+            Self::AuthRequired => PluginRemoteErrorReason::AuthenticationRequired,
+            Self::UnsupportedAuthMode => PluginRemoteErrorReason::UnsupportedAuthMode,
+            Self::UnexpectedStatus { status, .. }
+                if *status == reqwest::StatusCode::UNAUTHORIZED =>
+            {
+                PluginRemoteErrorReason::AuthenticationRequired
+            }
+            Self::UnexpectedStatus { status, .. } if *status == reqwest::StatusCode::FORBIDDEN => {
+                PluginRemoteErrorReason::AccessDenied
+            }
+            Self::UnexpectedStatus { status, .. } if *status == reqwest::StatusCode::NOT_FOUND => {
+                PluginRemoteErrorReason::NotFound
+            }
+            Self::Request { .. } => PluginRemoteErrorReason::Transient,
+            Self::UnexpectedStatus { status, .. }
+                if *status == reqwest::StatusCode::REQUEST_TIMEOUT
+                    || *status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || status.is_server_error() =>
+            {
+                PluginRemoteErrorReason::Transient
+            }
+            Self::InvalidPluginPath { .. }
+            | Self::ArchiveTooLarge { .. }
+            | Self::UnknownMarketplace { .. } => PluginRemoteErrorReason::InvalidRequest,
+            Self::PluginShareCheckoutNotAvailable { .. } => PluginRemoteErrorReason::NotFound,
+            Self::Decode { .. }
+            | Self::UnexpectedStatus { .. }
+            | Self::UnexpectedPluginId { .. }
+            | Self::UnexpectedSkillName { .. }
+            | Self::UnexpectedEnabledState { .. }
+            | Self::MissingUploadEtag
+            | Self::UnexpectedResponse(_) => PluginRemoteErrorReason::InvalidResponse,
+            Self::HttpClient(_)
+            | Self::AuthToken(_)
+            | Self::InvalidBaseUrl(_)
+            | Self::InvalidBaseUrlPath
+            | Self::Archive { .. }
+            | Self::ArchiveJoin(_)
+            | Self::CacheRemove(_) => PluginRemoteErrorReason::Internal,
+        };
+        PluginRemoteErrorData {
+            reason,
+            retryable: reason == PluginRemoteErrorReason::Transient,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
@@ -849,9 +932,8 @@ pub async fn fetch_recommended_plugins(
     auth: Option<&CodexAuth>,
 ) -> Result<RecommendedPluginsMode, RemotePluginCatalogError> {
     let auth = ensure_chatgpt_auth(auth)?;
-    let base_url = config.chatgpt_base_url.trim_end_matches('/');
-    let url = format!("{base_url}/ps/plugins/suggested");
-    let client = create_client_without_request_logging();
+    let url = format!("{}/ps/plugins/suggested", config.chatgpt_base_url);
+    let client = create_client_without_request_logging()?;
     let request = authenticated_request(client.get(&url), auth)?
         .timeout(RECOMMENDED_PLUGINS_TIMEOUT)
         .query(&[("scope", "GLOBAL")]);
@@ -1160,7 +1242,7 @@ pub async fn fetch_remote_plugin_skill_detail(
     }
 
     let url = remote_plugin_skill_detail_url(config, plugin_id, skill_name)?;
-    let client = create_client_without_request_logging();
+    let client = create_client_without_request_logging()?;
     let request = authenticated_request(client.get(&url), auth)?;
     let response: RemotePluginSkillDetailResponse = send_and_decode(request, &url).await?;
     if response.plugin_id != plugin_id {
@@ -1314,9 +1396,8 @@ pub async fn install_remote_plugin(
     // Remote plugin IDs uniquely identify remote plugins, so the caller-provided
     // marketplace name is not validated before sending the install mutation.
 
-    let base_url = config.chatgpt_base_url.trim_end_matches('/');
-    let url = format!("{base_url}/ps/plugins/{plugin_id}/install");
-    let client = create_client_without_request_logging();
+    let url = format!("{}/ps/plugins/{plugin_id}/install", config.chatgpt_base_url);
+    let client = create_client_without_request_logging()?;
     let request = authenticated_request(
         client
             .post(&url)
@@ -1407,9 +1488,11 @@ pub async fn uninstall_remote_plugin(
     let marketplace_name = plugin_id.marketplace_name().to_string();
     let plugin_name = plugin_id.plugin_name().to_string();
 
-    let base_url = config.chatgpt_base_url.trim_end_matches('/');
-    let url = format!("{base_url}/ps/plugins/{remote_plugin_id}/uninstall");
-    let client = create_client_without_request_logging();
+    let url = format!(
+        "{}/ps/plugins/{remote_plugin_id}/uninstall",
+        config.chatgpt_base_url
+    );
+    let client = create_client_without_request_logging()?;
     let request = authenticated_request(client.post(&url), auth)?;
     let response: RemotePluginMutationResponse = send_and_decode(request, &url).await?;
     if response.id != remote_plugin_id {
@@ -1826,9 +1909,8 @@ async fn get_remote_plugin_list_page(
     page_token: Option<&str>,
     collection: Option<&str>,
 ) -> Result<RemotePluginListResponse, RemotePluginCatalogError> {
-    let base_url = config.chatgpt_base_url.trim_end_matches('/');
-    let url = format!("{base_url}/ps/plugins/list");
-    let client = create_client_without_request_logging();
+    let url = format!("{}/ps/plugins/list", config.chatgpt_base_url);
+    let client = create_client_without_request_logging()?;
     let mut request = authenticated_request(client.get(&url), auth)?;
     request = request.query(&[("scope", scope.api_value())]);
     request = request.query(&[("limit", REMOTE_PLUGIN_LIST_PAGE_LIMIT)]);
@@ -1846,9 +1928,8 @@ async fn get_remote_shared_workspace_plugins_page(
     auth: &CodexAuth,
     page_token: Option<&str>,
 ) -> Result<RemotePluginListResponse, RemotePluginCatalogError> {
-    let base_url = config.chatgpt_base_url.trim_end_matches('/');
-    let url = format!("{base_url}/ps/plugins/workspace/shared");
-    let client = create_client_without_request_logging();
+    let url = format!("{}/ps/plugins/workspace/shared", config.chatgpt_base_url);
+    let client = create_client_without_request_logging()?;
     let mut request = authenticated_request(client.get(&url), auth)?;
     request = request.query(&[("limit", REMOTE_PLUGIN_LIST_PAGE_LIMIT)]);
     if let Some(page_token) = page_token {
@@ -1864,9 +1945,8 @@ async fn get_remote_plugin_installed_page(
     page_token: Option<&str>,
     include_download_urls: bool,
 ) -> Result<RemotePluginInstalledResponse, RemotePluginCatalogError> {
-    let base_url = config.chatgpt_base_url.trim_end_matches('/');
-    let url = format!("{base_url}/ps/plugins/installed");
-    let client = create_client_without_request_logging();
+    let url = format!("{}/ps/plugins/installed", config.chatgpt_base_url);
+    let client = create_client_without_request_logging()?;
     let mut request = authenticated_request(client.get(&url), auth)?;
     request = request.query(&[("scope", scope.api_value())]);
     if include_download_urls {
@@ -1884,9 +1964,8 @@ async fn fetch_plugin_detail(
     plugin_id: &str,
     include_download_urls: bool,
 ) -> Result<RemotePluginDirectoryItem, RemotePluginCatalogError> {
-    let base_url = config.chatgpt_base_url.trim_end_matches('/');
-    let url = format!("{base_url}/ps/plugins/{plugin_id}");
-    let client = create_client_without_request_logging();
+    let url = format!("{}/ps/plugins/{plugin_id}", config.chatgpt_base_url);
+    let client = create_client_without_request_logging()?;
     let mut request = authenticated_request(client.get(&url), auth)?;
     if include_download_urls {
         request = request.query(&[("includeDownloadUrls", true)]);
@@ -1899,8 +1978,8 @@ fn remote_plugin_skill_detail_url(
     plugin_id: &str,
     skill_name: &str,
 ) -> Result<String, RemotePluginCatalogError> {
-    let mut url = Url::parse(config.chatgpt_base_url.trim_end_matches('/'))
-        .map_err(RemotePluginCatalogError::InvalidBaseUrl)?;
+    let mut url =
+        Url::parse(&config.chatgpt_base_url).map_err(RemotePluginCatalogError::InvalidBaseUrl)?;
     {
         let mut segments = url
             .path_segments_mut()

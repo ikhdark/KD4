@@ -5,8 +5,7 @@ use codex_arg0::Arg0DispatchPaths;
 use codex_config::ConfigLayerStackOrdering;
 use codex_config::LoaderOverrides;
 use codex_config::NoopThreadConfigLoader;
-use codex_config::RemoteThreadConfigLoader;
-use codex_config::ThreadConfigLoader;
+use codex_config::thread_config_loader_for_endpoint;
 use codex_core::config::Config;
 use codex_core::resolve_installation_id;
 use codex_login::AuthManager;
@@ -31,6 +30,7 @@ use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::OutgoingEnvelope;
 use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::QueuedOutgoingMessage;
+use crate::thread_state::ConnectionCapabilities;
 use crate::transport::CHANNEL_CAPACITY;
 use crate::transport::ConnectionState;
 use crate::transport::OutboundConnectionState;
@@ -62,7 +62,7 @@ use codex_exec_server::EnvironmentManager;
 use codex_exec_server::ExecServerRuntimePaths;
 use codex_feedback::CodexFeedback;
 use codex_protocol::protocol::SessionSource;
-use codex_rollout::state_db as rollout_state_db;
+use codex_rollout::state_integration as rollout_state_integration;
 use codex_state::log_db;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -83,11 +83,9 @@ mod analytics_utils;
 mod app_info;
 mod app_server_tracing;
 mod attestation;
-mod auth_mode;
 mod bespoke_event_handling;
 mod build_info;
 mod command_exec;
-mod config;
 mod config_layer;
 mod config_manager;
 mod config_manager_service;
@@ -98,13 +96,13 @@ mod desktop_activation;
 mod dynamic_tools;
 mod error_code;
 mod extensions;
+mod external_agent_config;
 mod external_auth;
 mod filters;
 mod fs_watch;
 mod fuzzy_file_search;
 mod image_url;
 pub mod in_process;
-mod local_watermark;
 mod mcp_refresh;
 mod message_processor;
 mod models;
@@ -142,18 +140,12 @@ enum LogFormat {
 
 type StderrLogLayer = Box<dyn Layer<Registry> + Send + Sync + 'static>;
 
-fn configured_thread_config_loader(config: &Config) -> Arc<dyn ThreadConfigLoader> {
-    match config.experimental_thread_config_endpoint.as_deref() {
-        Some(endpoint) => Arc::new(RemoteThreadConfigLoader::new(endpoint)),
-        None => Arc::new(NoopThreadConfigLoader),
-    }
-}
-
 async fn install_config_loaders_from_config(
     config_manager: &ConfigManager,
     config: &Config,
 ) -> Arc<AuthManager> {
-    let discovered_thread_config_loader = configured_thread_config_loader(config);
+    let discovered_thread_config_loader =
+        thread_config_loader_for_endpoint(config.experimental_thread_config_endpoint.as_deref());
     config_manager.replace_thread_config_loader(Arc::clone(&discovered_thread_config_loader));
     let auth_manager =
         AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
@@ -167,7 +159,7 @@ async fn install_config_loaders_from_config(
 
 /// Control-plane messages from the processor/transport side to the outbound router task.
 ///
-/// `run_main_with_transport_options` uses two loops/tasks:
+/// `run_main` uses two loops/tasks:
 /// - processor loop: handles incoming JSON-RPC and request dispatch
 /// - outbound loop: performs potentially slow writes to per-connection writers
 ///
@@ -205,31 +197,12 @@ enum ShutdownAction {
 #[derive(Clone, Copy)]
 enum ShutdownSignal {
     Forceable,
-    #[cfg(unix)]
-    GracefulOnly,
 }
 
 async fn shutdown_signal() -> IoResult<ShutdownSignal> {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::SignalKind;
-        use tokio::signal::unix::signal;
-
-        let mut term = signal(SignalKind::terminate())?;
-        let mut hangup = signal(SignalKind::hangup())?;
-        tokio::select! {
-            ctrl_c_result = tokio::signal::ctrl_c() => ctrl_c_result.map(|_| ShutdownSignal::Forceable),
-            _ = term.recv() => Ok(ShutdownSignal::Forceable),
-            _ = hangup.recv() => Ok(ShutdownSignal::GracefulOnly),
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c()
-            .await
-            .map(|_| ShutdownSignal::Forceable)
-    }
+    tokio::signal::ctrl_c()
+        .await
+        .map(|_| ShutdownSignal::Forceable)
 }
 
 impl ShutdownState {
@@ -323,17 +296,7 @@ fn exec_policy_warning_location(err: &ExecPolicyError) -> (Option<String>, Optio
     match err {
         ExecPolicyError::ParsePolicy { path, source } => {
             if let Some(location) = source.location() {
-                let range = AppTextRange {
-                    start: AppTextPosition {
-                        line: location.range.start.line,
-                        column: location.range.start.column,
-                    },
-                    end: AppTextPosition {
-                        line: location.range.end.line,
-                        column: location.range.end.column,
-                    },
-                };
-                return (Some(location.path), Some(range));
+                return (Some(location.path), Some(app_text_range(&location.range)));
             }
             (Some(path.clone()), None)
         }
@@ -420,27 +383,6 @@ fn log_format_from_env() -> LogFormat {
     LogFormat::from_env_value(value.as_deref())
 }
 
-pub async fn run_main(
-    arg0_paths: Arg0DispatchPaths,
-    cli_config_overrides: CliConfigOverrides,
-    loader_overrides: LoaderOverrides,
-    strict_config: bool,
-    default_analytics_enabled: bool,
-) -> IoResult<()> {
-    run_main_with_transport_options(
-        arg0_paths,
-        cli_config_overrides,
-        loader_overrides,
-        strict_config,
-        default_analytics_enabled,
-        AppServerTransport::Stdio,
-        SessionSource::VSCode,
-        AppServerWebsocketAuthSettings::default(),
-        AppServerRuntimeOptions::default(),
-    )
-    .await
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginStartupTasks {
     Start,
@@ -465,7 +407,7 @@ impl Default for AppServerRuntimeOptions {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn run_main_with_transport_options(
+pub async fn run_main(
     arg0_paths: Arg0DispatchPaths,
     cli_config_overrides: CliConfigOverrides,
     loader_overrides: LoaderOverrides,
@@ -497,10 +439,8 @@ pub async fn run_main_with_transport_options(
         )
     })?;
     let codex_home = find_codex_home()?;
-    let local_runtime_paths = ExecServerRuntimePaths::from_optional_paths(
-        arg0_paths.codex_self_exe.clone(),
-        arg0_paths.codex_linux_sandbox_exe.clone(),
-    )?;
+    let local_runtime_paths =
+        ExecServerRuntimePaths::from_optional_path(arg0_paths.codex_self_exe.clone())?;
     let environment_manager = if loader_overrides.ignore_user_config {
         EnvironmentManager::from_env(Some(local_runtime_paths)).await
     } else {
@@ -536,13 +476,13 @@ pub async fn run_main_with_transport_options(
             // permanently on the bootstrap no-op loaders.
         }
     };
-    let (mut config, should_run_personality_migration, auth_manager) = match config_manager
+    let (config, auth_manager) = match config_manager
         .load_latest_config(/*fallback_cwd*/ None)
         .await
     {
         Ok(config) => {
             let auth_manager = install_config_loaders_from_config(&config_manager, &config).await;
-            (config, true, auth_manager)
+            (config, auth_manager)
         }
         Err(err) => {
             if strict_config {
@@ -559,7 +499,7 @@ pub async fn run_main_with_transport_options(
             })?;
             let auth_manager =
                 install_config_loaders_from_config(&config_manager, &default_config).await;
-            (default_config, false, auth_manager)
+            (default_config, auth_manager)
         }
     };
 
@@ -605,46 +545,6 @@ pub async fn run_main_with_transport_options(
         });
     }
 
-    if should_run_personality_migration {
-        let effective_toml = config.config_layer_stack.effective_config();
-        match effective_toml.try_into() {
-            Ok(config_toml) => {
-                match codex_core::personality_migration::maybe_migrate_personality(
-                    &config.codex_home,
-                    &config_toml,
-                    state_db.clone(),
-                )
-                .await
-                {
-                    Ok(codex_core::personality_migration::PersonalityMigrationStatus::Applied) => {
-                        config = config_manager
-                            .load_latest_config(/*fallback_cwd*/ None)
-                            .await
-                            .map_err(|err| {
-                                std::io::Error::new(
-                                    ErrorKind::InvalidData,
-                                    format!(
-                                        "error reloading config after personality migration: {err}"
-                                    ),
-                                )
-                            })?;
-                    }
-                    Ok(
-                        codex_core::personality_migration::PersonalityMigrationStatus::SkippedMarker
-                        | codex_core::personality_migration::PersonalityMigrationStatus::SkippedExplicitPersonality
-                        | codex_core::personality_migration::PersonalityMigrationStatus::SkippedNoSessions,
-                    ) => {}
-                    Err(err) => {
-                        warn!(error = %err, "Failed to run personality migration");
-                    }
-                }
-            }
-            Err(err) => {
-                warn!(error = %err, "Failed to deserialize config for personality migration");
-            }
-        }
-    }
-
     if let Ok(Some(err)) = check_execpolicy_for_warnings(&config.config_layer_stack).await {
         config_warnings.push(exec_policy_config_warning(&err));
     }
@@ -655,16 +555,6 @@ pub async fn run_main_with_transport_options(
     for warning in &config.startup_warnings {
         config_warnings.push(ConfigWarningNotification {
             summary: warning.clone(),
-            details: None,
-            path: None,
-            range: None,
-        });
-    }
-    if let Some(warning) =
-        codex_core::config::system_bwrap_warning(config.permissions.permission_profile())
-    {
-        config_warnings.push(ConfigWarningNotification {
-            summary: warning,
             details: None,
             path: None,
             range: None,
@@ -927,8 +817,11 @@ pub async fn run_main_with_transport_options(
             plugin_startup_tasks: runtime_options.plugin_startup_tasks,
             desktop_activation_bootstrap,
         }));
-        let mut thread_created_rx = processor.thread_created_receiver();
-        let mut running_turn_count_rx = processor.subscribe_running_assistant_turn_count();
+        let mut thread_created_rx = processor.thread_manager.subscribe_thread_created();
+        let mut running_turn_count_rx = processor
+            .thread_processor
+            .thread_watch_manager
+            .subscribe_running_turn_count();
         let mut connections = HashMap::<ConnectionId, ConnectionState>::new();
         let mut connection_cleanup_tasks = ConnectionCleanupTasks::new();
         let mut remote_control_status_rx = remote_control_handle.status_receiver();
@@ -1084,6 +977,7 @@ pub async fn run_main_with_transport_options(
                                             );
                                         if !was_initialized && is_initialized {
                                             processor
+                                                .initialize_processor
                                                 .send_initialize_notifications_to_connection(
                                                     connection_id,
                                                 )
@@ -1097,12 +991,16 @@ pub async fn run_main_with_transport_options(
                                                 )
                                                 .await;
                                             processor
+                                                .thread_processor
+                                                .thread_state_manager
                                                 .connection_initialized(
                                                     connection_id,
-                                                    connection_state
-                                                        .session
-                                                        .request_attestation(),
-                                                    experimental_api_enabled,
+                                                    ConnectionCapabilities {
+                                                        request_attestation: connection_state
+                                                            .session
+                                                            .request_attestation(),
+                                                        experimental_api: experimental_api_enabled,
+                                                    },
                                                 )
                                                 .await;
                                             connection_state
@@ -1151,44 +1049,24 @@ pub async fn run_main_with_transport_options(
                             .await;
                     }
                     created = thread_created_rx.recv(), if listen_for_threads => {
-                        match created {
-                            Ok(thread_id) => {
-                                let mut initialized_connection_ids = Vec::new();
-                                for (connection_id, connection_state) in &connections {
-                                    if connection_state.session.initialized() {
-                                        initialized_connection_ids.push(*connection_id);
-                                    }
-                                }
-                                processor
-                                    .try_attach_thread_listener(
-                                        thread_id,
-                                        initialized_connection_ids,
-                                    )
-                                    .await;
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                                warn!(skipped, "thread_created receiver lagged; resyncing listeners");
-                                let initialized_connection_ids = connections
-                                    .iter()
-                                    .filter_map(|(connection_id, connection_state)| {
-                                        connection_state
-                                            .session
-                                            .initialized()
-                                            .then_some(*connection_id)
-                                    })
-                                    .collect();
-                                processor
-                                    .resync_thread_listeners(initialized_connection_ids)
-                                    .await;
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                listen_for_threads = false;
-                            }
-                        }
+                        let initialized_connection_ids = connections
+                            .iter()
+                            .filter_map(|(connection_id, connection_state)| {
+                                connection_state
+                                    .session
+                                    .initialized()
+                                    .then_some(*connection_id)
+                            })
+                            .collect();
+                        listen_for_threads = processor
+                            .thread_processor
+                            .handle_thread_created_event(created, initialized_connection_ids)
+                            .await;
                     }
                 }
             };
 
+            processor.account_processor.cancel_active_login().await;
             if !shutdown_state.forced() {
                 futures::future::join_all(
                     connections
@@ -1198,7 +1076,7 @@ pub async fn run_main_with_transport_options(
                 .await;
                 connection_cleanup_tasks.drain().await;
                 processor.drain_background_tasks().await;
-                processor.shutdown_threads().await;
+                processor.thread_processor.shutdown_threads().await;
             } else {
                 connection_cleanup_tasks.abort();
             }
@@ -1238,7 +1116,7 @@ struct RecoveredSqliteDatabase {
 }
 
 struct StateDbInitResult {
-    state_db: Option<rollout_state_db::StateDbHandle>,
+    state_db: Option<rollout_state_integration::StateDbHandle>,
     recovery_notice: Option<SqliteRecoveryNotice>,
 }
 
@@ -1248,7 +1126,7 @@ async fn init_sqlite_state_db_with_fresh_start_on_corruption(
     let mut attempted_backups = HashSet::new();
     let mut recovered_databases = Vec::new();
     loop {
-        let err = match rollout_state_db::try_init(config).await {
+        let err = match rollout_state_integration::try_init(config).await {
             Ok(state_db) => {
                 let recovery_notice = sqlite_recovery_notice(&recovered_databases);
                 if recovery_notice.is_some() {

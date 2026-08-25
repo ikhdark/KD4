@@ -137,6 +137,22 @@ impl LocalThreadStore {
         live_writer::rollout_path(self, thread_id).await
     }
 
+    /// Resolve an existing rollout using the same live/active/archive policy as reads.
+    pub async fn resolve_existing_rollout_path(
+        &self,
+        thread_id: ThreadId,
+        include_archived: bool,
+    ) -> ThreadStoreResult<Option<PathBuf>> {
+        helpers::resolve_rollout_path(
+            self,
+            thread_id,
+            include_archived,
+            /*require_materialized*/ true,
+        )
+        .await
+        .map(|resolved| resolved.map(|resolved| resolved.path))
+    }
+
     pub(super) async fn live_recorder(
         &self,
         thread_id: ThreadId,
@@ -330,6 +346,10 @@ impl ThreadStore for LocalThreadStore {
 
     fn delete_thread(&self, params: DeleteThreadParams) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move { delete_thread::delete_thread(self, params).await })
+    }
+
+    fn preflight_delete_thread(&self, params: DeleteThreadParams) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move { delete_thread::preflight_delete_thread(self, params).await })
     }
 }
 
@@ -1121,7 +1141,12 @@ mod tests {
             })
             .await
             .expect_err("active-only read should reject archived live thread");
-        assert!(matches!(err, ThreadStoreError::InvalidRequest { .. }));
+        assert!(matches!(
+            err,
+            ThreadStoreError::ThreadNotFound {
+                thread_id: missing_thread_id
+            } if missing_thread_id == thread_id
+        ));
 
         let err = store
             .load_history(LoadThreadHistoryParams {

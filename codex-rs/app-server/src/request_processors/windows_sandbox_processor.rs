@@ -45,7 +45,7 @@ impl WindowsSandboxRequestProcessor {
                 Some(command_cwd.clone()),
             )
             .await
-            .map_err(|err| config_load_error(&err))?;
+            .map_config_load_error()?;
         let permission_profile = config.permissions.effective_permission_profile();
         let workspace_roots = config.effective_workspace_roots();
         let codex_home = config.codex_home.to_path_buf();
@@ -114,7 +114,7 @@ impl WindowsSandboxRequestProcessor {
                 Some(command_cwd.clone()),
             )
             .await
-            .map_err(|err| config_load_error(&err))?;
+            .map_config_load_error()?;
         let setup_mode = resolve_allowed_windows_sandbox_setup_mode(
             config.config_layer_stack.requirements(),
             params.mode,
@@ -144,10 +144,7 @@ impl WindowsSandboxRequestProcessor {
             let setup_result =
                 codex_core::windows_sandbox::run_windows_sandbox_setup(setup_request).await;
             let notification = WindowsSandboxSetupCompletedNotification {
-                mode: match setup_mode {
-                    CoreWindowsSandboxSetupMode::Elevated => WindowsSandboxSetupMode::Elevated,
-                    CoreWindowsSandboxSetupMode::Unelevated => WindowsSandboxSetupMode::Unelevated,
-                },
+                mode: setup_mode.into(),
                 success: setup_result.is_ok(),
                 error: setup_result.err().map(|err| err.to_string()),
             };
@@ -205,15 +202,14 @@ fn resolve_allowed_windows_sandbox_setup_mode(
     requirements: &codex_config::ConfigRequirements,
     requested_mode: WindowsSandboxSetupMode,
 ) -> Result<CoreWindowsSandboxSetupMode, JSONRPCErrorError> {
-    let (setup_mode, config_mode) = match requested_mode {
-        WindowsSandboxSetupMode::Elevated => (
-            CoreWindowsSandboxSetupMode::Elevated,
-            codex_config::types::WindowsSandboxModeToml::Elevated,
-        ),
-        WindowsSandboxSetupMode::Unelevated => (
-            CoreWindowsSandboxSetupMode::Unelevated,
-            codex_config::types::WindowsSandboxModeToml::Unelevated,
-        ),
+    let setup_mode = requested_mode.to_core();
+    let config_mode = match setup_mode {
+        CoreWindowsSandboxSetupMode::Elevated => {
+            codex_config::types::WindowsSandboxModeToml::Elevated
+        }
+        CoreWindowsSandboxSetupMode::Unelevated => {
+            codex_config::types::WindowsSandboxModeToml::Unelevated
+        }
     };
     requirements
         .windows_sandbox_mode
@@ -224,7 +220,7 @@ fn resolve_allowed_windows_sandbox_setup_mode(
 
 fn determine_windows_sandbox_readiness(config: &Config) -> WindowsSandboxReadinessResponse {
     determine_windows_sandbox_readiness_for_platform(
-        cfg!(windows),
+        true,
         WindowsSandboxLevel::from_config(config),
         sandbox_setup_is_complete(config.codex_home.as_path()),
     )

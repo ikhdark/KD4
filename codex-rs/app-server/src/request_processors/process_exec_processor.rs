@@ -16,7 +16,6 @@ use codex_app_server_protocol::ProcessResizePtyParams;
 use codex_app_server_protocol::ProcessResizePtyResponse;
 use codex_app_server_protocol::ProcessSpawnParams;
 use codex_app_server_protocol::ProcessSpawnResponse;
-use codex_app_server_protocol::ProcessTerminalSize;
 use codex_app_server_protocol::ProcessWriteStdinParams;
 use codex_app_server_protocol::ProcessWriteStdinResponse;
 use codex_app_server_protocol::ServerNotification;
@@ -38,6 +37,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::command_exec::StdinWriteRequest;
 use crate::command_exec::spawn_stdin_writer;
+use crate::command_exec::terminal_size_from_protocol;
+use crate::command_exec::validate_command_argv;
 use crate::connection_rpc_gate::ConnectionRpcGate;
 use crate::error_code::internal_error;
 use crate::error_code::invalid_params;
@@ -53,7 +54,7 @@ const OUTPUT_CHUNK_SIZE_HINT: usize = 64 * 1024;
 pub(crate) struct ProcessExecRequestProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     environment_manager: Arc<EnvironmentManager>,
-    process_exec_manager: ProcessExecManager,
+    sessions: Arc<Mutex<HashMap<ConnectionProcessHandle, ProcessSession>>>,
 }
 
 impl ProcessExecRequestProcessor {
@@ -64,7 +65,7 @@ impl ProcessExecRequestProcessor {
         Self {
             outgoing,
             environment_manager,
-            process_exec_manager: ProcessExecManager::default(),
+            sessions: Arc::default(),
         }
     }
 
@@ -89,9 +90,7 @@ impl ProcessExecRequestProcessor {
         } = params;
         let method_name = "process/spawn";
         tracing::debug!("{method_name} command: {command:?}");
-        if command.is_empty() {
-            return Err(invalid_request("command must not be empty"));
-        }
+        validate_command_argv(&command)?;
         if process_handle.is_empty() {
             return Err(invalid_request("processHandle must not be empty"));
         }
@@ -124,27 +123,28 @@ impl ProcessExecRequestProcessor {
             None => ExecExpiration::DefaultTimeout,
         };
         let output_bytes_cap = output_bytes_cap.unwrap_or(Some(DEFAULT_OUTPUT_BYTES_CAP));
-        let size = size.map(terminal_size_from_protocol).transpose()?;
+        let size = size
+            .map(|size| terminal_size_from_protocol(size.into_inner(), "process"))
+            .transpose()?;
 
-        self.process_exec_manager
-            .start(
-                StartProcessParams {
-                    outgoing: self.outgoing.clone(),
-                    request_id,
-                    process_handle,
-                    command,
-                    cwd,
-                    env,
-                    expiration,
-                    tty,
-                    stream_stdin,
-                    stream_stdout_stderr,
-                    output_bytes_cap,
-                    size,
-                },
-                rpc_gate,
-            )
-            .await?;
+        self.start(
+            StartProcessParams {
+                outgoing: self.outgoing.clone(),
+                request_id,
+                process_handle,
+                command,
+                cwd,
+                env,
+                expiration,
+                tty,
+                stream_stdin,
+                stream_stdout_stderr,
+                output_bytes_cap,
+                size,
+            },
+            rpc_gate,
+        )
+        .await?;
 
         Ok(())
     }
@@ -154,8 +154,7 @@ impl ProcessExecRequestProcessor {
         request_id: ConnectionRequestId,
         params: ProcessWriteStdinParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.process_exec_manager
-            .write_stdin(request_id, params)
+        self.write_stdin(request_id, params)
             .await
             .map(|response| Some(response.into()))
     }
@@ -165,8 +164,7 @@ impl ProcessExecRequestProcessor {
         request_id: ConnectionRequestId,
         params: ProcessResizePtyParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.process_exec_manager
-            .resize_pty(request_id, params)
+        self.resize_pty(request_id, params)
             .await
             .map(|response| Some(response.into()))
     }
@@ -176,16 +174,13 @@ impl ProcessExecRequestProcessor {
         request_id: ConnectionRequestId,
         params: ProcessKillParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.process_exec_manager
-            .kill(request_id, params)
+        self.kill(request_id, params)
             .await
             .map(|response| Some(response.into()))
     }
 
     pub(crate) async fn connection_closed(&self, connection_id: ConnectionId) {
-        self.process_exec_manager
-            .connection_closed(connection_id)
-            .await;
+        self.close_connection_processes(connection_id).await;
     }
 
     fn require_local_environment(&self) -> Result<(), JSONRPCErrorError> {
@@ -195,11 +190,6 @@ impl ProcessExecRequestProcessor {
             .then_some(())
             .ok_or_else(|| internal_error("local environment is not configured"))
     }
-}
-
-#[derive(Clone, Default)]
-struct ProcessExecManager {
-    sessions: Arc<Mutex<HashMap<ConnectionProcessHandle, ProcessSession>>>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -278,7 +268,7 @@ struct ProcessOutputCapture {
     cap_reached: bool,
 }
 
-impl ProcessExecManager {
+impl ProcessExecRequestProcessor {
     async fn start(
         &self,
         params: StartProcessParams,
@@ -300,9 +290,11 @@ impl ProcessExecManager {
         } = params;
         let connection_cancellation = rpc_gate.cancellation_token().child_token();
 
-        let (program, args) = command
-            .split_first()
-            .ok_or_else(|| invalid_request("command must not be empty"))?;
+        let Some((program, args)) = command.split_first() else {
+            return Err(internal_error(
+                "validated process command unexpectedly empty",
+            ));
+        };
         let stream_stdin = tty || stream_stdin;
         let stream_stdout_stderr = tty || stream_stdout_stderr;
         let arg0 = None;
@@ -442,14 +434,14 @@ impl ProcessExecManager {
             request_id.connection_id,
             params.process_handle,
             ProcessControl::Resize {
-                size: terminal_size_from_protocol(params.size)?,
+                size: terminal_size_from_protocol(params.size.into_inner(), "process")?,
             },
         )
         .await?;
         Ok(ProcessResizePtyResponse {})
     }
 
-    async fn connection_closed(&self, connection_id: ConnectionId) {
+    async fn close_connection_processes(&self, connection_id: ConnectionId) {
         let controls = {
             let mut sessions = self.sessions.lock().await;
             let process_handles = sessions
@@ -738,20 +730,6 @@ fn handle_process_resize(
     session
         .resize(size)
         .map_err(|err| invalid_request(format!("failed to resize PTY: {err}")))
-}
-
-fn terminal_size_from_protocol(
-    size: ProcessTerminalSize,
-) -> Result<TerminalSize, JSONRPCErrorError> {
-    if size.rows == 0 || size.cols == 0 {
-        return Err(invalid_params(
-            "process size rows and cols must be greater than 0",
-        ));
-    }
-    Ok(TerminalSize {
-        rows: size.rows,
-        cols: size.cols,
-    })
 }
 
 fn no_active_process_error(process_handle: &str) -> JSONRPCErrorError {

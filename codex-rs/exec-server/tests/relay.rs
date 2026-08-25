@@ -54,15 +54,11 @@ const REGISTRY_TOKEN: &str = "registry-token";
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn successful_process_argv() -> Vec<String> {
-    if cfg!(windows) {
-        vec![
-            std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string()),
-            "/C".to_string(),
-            "exit /B 0".to_string(),
-        ]
-    } else {
-        vec!["true".to_string()]
-    }
+    vec![
+        std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string()),
+        "/C".to_string(),
+        "exit /B 0".to_string(),
+    ]
 }
 
 #[derive(Debug)]
@@ -110,8 +106,7 @@ async fn remote_environment_routes_encrypted_exec_server_rpc() -> Result<()> {
         .mount(&registry)
         .await;
 
-    let (codex_exe, codex_linux_sandbox_exe) = common::current_test_binary_helper_paths()?;
-    let runtime_paths = ExecServerRuntimePaths::new(codex_exe, codex_linux_sandbox_exe)?;
+    let runtime_paths = ExecServerRuntimePaths::new(common::current_test_binary_path()?)?;
     let config = RemoteEnvironmentConfig::new(
         registry.uri(),
         ENVIRONMENT_ID.to_string(),

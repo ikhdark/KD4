@@ -5,15 +5,18 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import subprocess
-import tempfile
 from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
+
+try:
+    from scripts.atomic_json import write_json_atomic
+except ImportError:  # Direct script execution places scripts/ on sys.path.
+    from atomic_json import write_json_atomic
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -286,32 +289,6 @@ def audit_repository(
         recommended_strategy=recommended_strategy,
         reasons=tuple(reasons),
     )
-
-
-def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    path = path.resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as temporary:
-            temporary_path = Path(temporary.name)
-            json.dump(payload, temporary, indent=2, sort_keys=True)
-            temporary.write("\n")
-        os.replace(temporary_path, path)
-        temporary_path = None
-    finally:
-        if temporary_path is not None:
-            try:
-                temporary_path.unlink()
-            except OSError:
-                pass
 
 
 def build_parser() -> argparse.ArgumentParser:

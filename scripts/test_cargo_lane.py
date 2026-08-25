@@ -34,7 +34,6 @@ def ps_single_quote(value: str | Path) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
-@unittest.skipUnless(os.name == "nt", "cargo-lane is Windows-only")
 class CargoLaneTest(unittest.TestCase):
     def setUp(self) -> None:
         shell = powershell()
@@ -591,9 +590,10 @@ class CargoLaneTest(unittest.TestCase):
             "cmd.exe",
             "/d",
             "/c",
-            "echo linker=%CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER%",
+            "echo x64=%CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER%&echo arm64=%CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER%",
             extra_env={
                 "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER": "",
+                "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER": "",
                 "PATH": path_without_llvm,
                 "SCOOP": "",
                 "USERPROFILE": str(user_profile),
@@ -605,7 +605,8 @@ class CargoLaneTest(unittest.TestCase):
             0,
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
-        self.assertIn(f"linker={lld_link}", result.stdout)
+        self.assertIn(f"x64={lld_link}", result.stdout)
+        self.assertIn(f"arm64={lld_link}", result.stdout)
 
     def test_auto_lane_uses_package_name_for_stable_cache_affinity(self) -> None:
         package = f"unit-core-{os.getpid()}"

@@ -9,6 +9,39 @@ use std::fmt;
 use ts_rs::TS;
 
 pub const JSONRPC_VERSION: &str = "2.0";
+pub const OVERLOADED_ERROR_CODE: i64 = -32001;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub enum OverloadReason {
+    TransportIngress,
+    SerializedRequestQueue,
+    InProcessRequestQueue,
+    InProcessServerRequestQueue,
+    RemoteAppServerEventQueue,
+    InProcessAppServerEventQueue,
+    InFlightTaskCapacity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct OverloadErrorData {
+    pub reason: OverloadReason,
+    pub retryable: bool,
+}
+
+pub fn overloaded_error(reason: OverloadReason, message: impl Into<String>) -> JSONRPCErrorError {
+    JSONRPCErrorError {
+        code: OVERLOADED_ERROR_CODE,
+        message: message.into(),
+        data: Some(serde_json::json!({
+            "reason": reason,
+            "retryable": true,
+        })),
+    }
+}
 
 #[derive(
     Debug, Clone, PartialEq, PartialOrd, Ord, Deserialize, Serialize, Hash, Eq, JsonSchema, TS,
@@ -85,4 +118,25 @@ pub struct JSONRPCErrorError {
     #[ts(optional)]
     pub data: Option<serde_json::Value>,
     pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overloaded_error_has_one_code_and_typed_retryable_data() {
+        let error = overloaded_error(OverloadReason::TransportIngress, "queue full");
+
+        assert_eq!(error.code, OVERLOADED_ERROR_CODE);
+        assert_eq!(error.message, "queue full");
+        assert_eq!(
+            serde_json::from_value::<OverloadErrorData>(error.data.expect("overload data"))
+                .expect("valid overload data"),
+            OverloadErrorData {
+                reason: OverloadReason::TransportIngress,
+                retryable: true,
+            }
+        );
+    }
 }

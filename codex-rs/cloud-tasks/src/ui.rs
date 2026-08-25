@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use crate::app::App;
 use crate::app::AttemptView;
-use crate::util::format_relative_time_now;
+use crate::time::format_relative_time_now;
 use codex_cloud_tasks_client::AttemptStatus;
 use codex_cloud_tasks_client::TaskStatus;
 use codex_tui::render_markdown_text;
@@ -202,13 +202,15 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) {
         let p = ((app.selected as f32) / ((app.tasks.len() - 1) as f32) * 100.0).round() as i32;
         format!("  • {}%", p.clamp(0, 100)).dim()
     };
-    let title_line = {
-        let base = Line::from(vec!["Cloud Tasks".into(), suffix_span, percent_span]);
-        if dim_bg {
-            base.style(Style::default().add_modifier(Modifier::DIM))
-        } else {
-            base
-        }
+    let title_line = Line::from(vec![
+        crate::CODEX_CLOUD_NAME.into(),
+        suffix_span,
+        percent_span,
+    ]);
+    let title_line = if dim_bg {
+        title_line.style(Style::default().add_modifier(Modifier::DIM))
+    } else {
+        title_line
     };
     let block = Block::default().borders(Borders::ALL).title(title_line);
     // Render the outer block first
@@ -1043,4 +1045,26 @@ pub fn draw_best_of_modal(frame: &mut Frame, area: Rect, app: &mut App) {
         .highlight_style(Style::default().bold())
         .block(Block::default().borders(Borders::NONE));
     frame.render_stateful_widget(list, rows[1], &mut list_state);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn draw_list_uses_codex_cloud_name_in_title() {
+        let mut terminal = Terminal::new(TestBackend::new(40, 6)).expect("terminal");
+        let mut app = App::new();
+        terminal
+            .draw(|frame| draw_list(frame, frame.area(), &mut app))
+            .expect("draw list");
+        let text = terminal.backend().buffer().content()[..40]
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+
+        assert!(text.contains("Codex Cloud • All  • 0%"));
+    }
 }

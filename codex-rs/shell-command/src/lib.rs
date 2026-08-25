@@ -9,3 +9,63 @@ pub mod powershell;
 
 pub use command_safety::is_dangerous_command;
 pub use command_safety::is_safe_command;
+
+/// Quote one Windows command-line argument using the rules followed by
+/// `CommandLineToArgvW` and the Microsoft C runtime.
+///
+/// This helper is available on every host because callers can render commands
+/// for a Windows target while running on another platform.
+pub fn quote_windows_arg(arg: &str) -> String {
+    let needs_quotes = arg.is_empty()
+        || arg
+            .chars()
+            .any(|ch| matches!(ch, ' ' | '\t' | '\n' | '\r' | '"'));
+    if !needs_quotes {
+        return arg.to_string();
+    }
+
+    let mut quoted = String::with_capacity(arg.len() + 2);
+    quoted.push('"');
+    let mut backslashes = 0;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                if backslashes > 0 {
+                    quoted.push_str(&"\\".repeat(backslashes));
+                    backslashes = 0;
+                }
+                quoted.push(ch);
+            }
+        }
+    }
+    if backslashes > 0 {
+        quoted.push_str(&"\\".repeat(backslashes * 2));
+    }
+    quoted.push('"');
+    quoted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quote_windows_arg;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn windows_argument_quoting_handles_empty_quotes_and_backslashes() {
+        for (argument, expected) in [
+            ("", "\"\""),
+            ("plain", "plain"),
+            ("argument with space", "\"argument with space\""),
+            ("say \"hello\"", "\"say \\\"hello\\\"\""),
+            ("C:\\path with space\\", "\"C:\\path with space\\\\\""),
+        ] {
+            assert_eq!(quote_windows_arg(argument), expected);
+        }
+    }
+}

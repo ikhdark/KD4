@@ -6,6 +6,7 @@
 
 use std::io::ErrorKind;
 use std::path::Path;
+use std::path::PathBuf;
 
 use codex_rollout::ARCHIVED_SESSIONS_SUBDIR;
 use codex_rollout::SESSIONS_SUBDIR;
@@ -15,6 +16,7 @@ use codex_rollout::remove_thread_name_entries;
 
 use super::LocalThreadStore;
 use super::helpers::matching_rollout_file_name;
+use super::helpers::rollout_lookup_error;
 use super::helpers::scoped_rollout_path;
 use crate::DeleteThreadParams;
 use crate::ThreadStoreError;
@@ -25,45 +27,7 @@ pub(super) async fn delete_thread(
     params: DeleteThreadParams,
 ) -> ThreadStoreResult<()> {
     let thread_id = params.thread_id;
-    let thread_id_str = thread_id.to_string();
-    let state_db_ctx = store.state_db().await;
-    let mut rollout_paths = Vec::new();
-
-    match find_thread_path_by_id_str(
-        store.config.codex_home.as_path(),
-        thread_id_str.as_str(),
-        state_db_ctx.as_deref(),
-    )
-    .await
-    {
-        Ok(Some(path)) => rollout_paths.push(path),
-        Ok(None) => {}
-        Err(err) => {
-            return Err(ThreadStoreError::InvalidRequest {
-                message: format!("failed to locate thread id {thread_id}: {err}"),
-            });
-        }
-    }
-
-    match find_archived_thread_path_by_id_str(
-        store.config.codex_home.as_path(),
-        thread_id_str.as_str(),
-        state_db_ctx.as_deref(),
-    )
-    .await
-    {
-        Ok(Some(path)) => {
-            if !rollout_paths.contains(&path) {
-                rollout_paths.push(path);
-            }
-        }
-        Ok(None) => {}
-        Err(err) => {
-            return Err(ThreadStoreError::InvalidRequest {
-                message: format!("failed to locate archived thread id {thread_id}: {err}"),
-            });
-        }
-    }
+    let rollout_paths = rollout_paths(store, thread_id).await?;
 
     let found_rollout_path = !rollout_paths.is_empty();
     for rollout_path in rollout_paths {
@@ -84,6 +48,114 @@ pub(super) async fn delete_thread(
     Ok(())
 }
 
+pub(super) async fn preflight_delete_thread(
+    store: &LocalThreadStore,
+    params: DeleteThreadParams,
+) -> ThreadStoreResult<()> {
+    let thread_id = params.thread_id;
+    let rollout_paths = rollout_paths(store, thread_id).await?;
+    if rollout_paths.is_empty() {
+        return Err(ThreadStoreError::ThreadNotFound { thread_id });
+    }
+    for rollout_path in rollout_paths {
+        preflight_rollout_file(store, rollout_path.as_path(), thread_id)?;
+    }
+    Ok(())
+}
+
+async fn rollout_paths(
+    store: &LocalThreadStore,
+    thread_id: codex_protocol::ThreadId,
+) -> ThreadStoreResult<Vec<PathBuf>> {
+    let thread_id_str = thread_id.to_string();
+    let state_db_ctx = store.state_db().await;
+    let mut rollout_paths = Vec::new();
+
+    match find_thread_path_by_id_str(
+        store.config.codex_home.as_path(),
+        thread_id_str.as_str(),
+        state_db_ctx.as_deref(),
+    )
+    .await
+    {
+        Ok(Some(path)) => rollout_paths.push(path),
+        Ok(None) => {}
+        Err(err) => {
+            return Err(rollout_lookup_error(
+                thread_id, /*archived*/ false, err,
+            ));
+        }
+    }
+
+    match find_archived_thread_path_by_id_str(
+        store.config.codex_home.as_path(),
+        thread_id_str.as_str(),
+        state_db_ctx.as_deref(),
+    )
+    .await
+    {
+        Ok(Some(path)) if !rollout_paths.contains(&path) => rollout_paths.push(path),
+        Ok(Some(_)) | Ok(None) => {}
+        Err(err) => {
+            return Err(rollout_lookup_error(thread_id, /*archived*/ true, err));
+        }
+    }
+
+    Ok(rollout_paths)
+}
+
+fn preflight_rollout_file(
+    store: &LocalThreadStore,
+    rollout_path: &Path,
+    thread_id: codex_protocol::ThreadId,
+) -> ThreadStoreResult<()> {
+    let plain_path = codex_rollout::plain_rollout_path(rollout_path);
+    for path in [plain_path.clone(), plain_path.with_extension("jsonl.zst")] {
+        if !path
+            .try_exists()
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!(
+                    "failed to inspect rollout file `{}` before deletion: {err}",
+                    path.display()
+                ),
+            })?
+        {
+            continue;
+        }
+        let checked_path = checked_rollout_path(store, path.as_path(), thread_id)?;
+        if checked_path
+            .try_exists()
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!(
+                    "failed to inspect rollout file `{}` before deletion: {err}",
+                    checked_path.display()
+                ),
+            })?
+        {
+            preflight_delete_access(checked_path.as_path())?;
+        }
+    }
+    Ok(())
+}
+
+fn preflight_delete_access(path: &Path) -> ThreadStoreResult<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const DELETE_ACCESS: u32 = 0x0001_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+
+    std::fs::OpenOptions::new()
+        .access_mode(DELETE_ACCESS)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(path)
+        .map(|_| ())
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("rollout file `{}` cannot be deleted: {err}", path.display()),
+        })
+}
+
 fn delete_rollout_file(
     store: &LocalThreadStore,
     rollout_path: &Path,
@@ -101,6 +173,24 @@ fn delete_rollout_path(
     rollout_path: &Path,
     thread_id: codex_protocol::ThreadId,
 ) -> ThreadStoreResult<bool> {
+    let canonical_rollout_path = checked_rollout_path(store, rollout_path, thread_id)?;
+    match std::fs::remove_file(&canonical_rollout_path) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(ThreadStoreError::Internal {
+            message: format!(
+                "failed to delete rollout file `{}`: {err}",
+                canonical_rollout_path.display()
+            ),
+        }),
+    }
+}
+
+fn checked_rollout_path(
+    store: &LocalThreadStore,
+    rollout_path: &Path,
+    thread_id: codex_protocol::ThreadId,
+) -> ThreadStoreResult<PathBuf> {
     let canonical_rollout_path = scoped_rollout_path(
         store.config.codex_home.join(SESSIONS_SUBDIR),
         rollout_path,
@@ -118,16 +208,7 @@ fn delete_rollout_path(
         Ok(true) | Err(_) => Err(err),
     })?;
     matching_rollout_file_name(&canonical_rollout_path, thread_id, rollout_path)?;
-    match std::fs::remove_file(&canonical_rollout_path) {
-        Ok(()) => Ok(true),
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(ThreadStoreError::Internal {
-            message: format!(
-                "failed to delete rollout file `{}`: {err}",
-                canonical_rollout_path.display()
-            ),
-        }),
-    }
+    Ok(canonical_rollout_path)
 }
 
 #[cfg(test)]
@@ -206,5 +287,28 @@ mod tests {
             err.to_string(),
             "thread 00000000-0000-0000-0000-000000000304 not found"
         );
+    }
+
+    #[tokio::test]
+    async fn preflight_delete_rejects_rollout_locked_against_deletion() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let home = TempDir::new().expect("temp dir");
+        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+        let uuid = Uuid::from_u128(306);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+        let path =
+            write_session_file(home.path(), "2025-01-03T12-00-00", uuid).expect("session file");
+        let _lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x0000_0001 | 0x0000_0002)
+            .open(&path)
+            .expect("lock rollout without delete sharing");
+
+        store
+            .preflight_delete_thread(DeleteThreadParams { thread_id })
+            .await
+            .expect_err("locked rollout must fail before deletion begins");
+        assert!(path.exists());
     }
 }

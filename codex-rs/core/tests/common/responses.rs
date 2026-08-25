@@ -109,6 +109,55 @@ pub fn strip_metadata_from_items(items: &[ResponseItem]) -> Vec<ResponseItem> {
     items.iter().cloned().map(strip_metadata).collect()
 }
 
+/// Returns response items without generated item IDs for semantic assertions.
+pub fn strip_response_item_ids(items: &[ResponseItem]) -> Vec<ResponseItem> {
+    items
+        .iter()
+        .cloned()
+        .map(|mut item| {
+            item.set_id(None);
+            item
+        })
+        .collect()
+}
+
+/// Returns JSON without generated response-item IDs for semantic assertions.
+pub fn strip_response_item_ids_from_json(value: Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(strip_response_item_ids_from_json)
+                .collect(),
+        ),
+        Value::Object(mut map) => {
+            let is_response_item = map.get("type").and_then(Value::as_str).is_some_and(|kind| {
+                matches!(
+                    kind,
+                    "message"
+                        | "reasoning"
+                        | "local_shell_call"
+                        | "function_call"
+                        | "function_call_output"
+                        | "custom_tool_call"
+                        | "custom_tool_call_output"
+                        | "web_search_call"
+                        | "compaction"
+                )
+            });
+            if is_response_item {
+                map.remove("id");
+            }
+            Value::Object(
+                map.into_iter()
+                    .map(|(key, value)| (key, strip_response_item_ids_from_json(value)))
+                    .collect(),
+            )
+        }
+        value => value,
+    }
+}
+
 /// Returns JSON without internal transport metadata for semantic assertions.
 pub fn strip_metadata_from_json(value: Value) -> Value {
     match value {

@@ -186,6 +186,7 @@ async fn get_conversation_summary_by_thread_id_reads_pathless_store_thread() -> 
     .await?;
 
     let result = client
+        .sender()
         .request(ClientRequest::GetConversationSummary {
             request_id: RequestId::Integer(1),
             params: GetConversationSummaryParams::ThreadId {

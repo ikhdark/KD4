@@ -1,7 +1,3 @@
-#[cfg(target_os = "macos")]
-use super::macos::ManagedAdminConfigLayer;
-#[cfg(target_os = "macos")]
-use super::macos::load_managed_admin_config_layer;
 use crate::config_toml::ConfigToml;
 use crate::diagnostics::config_error_from_toml;
 use crate::diagnostics::io_error_from_config_error;
@@ -15,9 +11,6 @@ use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use toml::Value as TomlValue;
-
-#[cfg(unix)]
-const CODEX_MANAGED_CONFIG_SYSTEM_PATH: &str = "/etc/codex/managed_config.toml";
 
 #[derive(Debug, Clone)]
 pub(super) struct MangedConfigFromFile {
@@ -35,7 +28,7 @@ pub(super) struct ManagedConfigFromMdm {
 pub(super) struct LoadedConfigLayers {
     /// If present, data read from a file such as `/etc/codex/managed_config.toml`.
     pub managed_config: Option<MangedConfigFromFile>,
-    /// If present, data read from managed preferences (macOS only).
+    /// Reserved compatibility field; managed preferences are not loaded on Windows.
     pub managed_config_from_mdm: Option<ManagedConfigFromMdm>,
 }
 
@@ -45,14 +38,6 @@ pub(super) async fn load_config_layers_internal(
     overrides: LoaderOverrides,
     strict_config: bool,
 ) -> io::Result<LoadedConfigLayers> {
-    #[cfg(target_os = "macos")]
-    let LoaderOverrides {
-        managed_config_path,
-        managed_preferences_base64,
-        ..
-    } = overrides;
-
-    #[cfg(not(target_os = "macos"))]
     let LoaderOverrides {
         managed_config_path,
         ..
@@ -74,31 +59,12 @@ pub(super) async fn load_config_layers_internal(
         file: managed_config_path.clone(),
     });
 
-    #[cfg(target_os = "macos")]
-    let managed_preferences = load_managed_admin_config_layer(
-        managed_preferences_base64.as_deref(),
-        strict_config,
-        codex_home,
-    )
-    .await?
-    .map(map_managed_admin_layer);
-
-    #[cfg(not(target_os = "macos"))]
     let managed_preferences = None;
 
     Ok(LoadedConfigLayers {
         managed_config,
         managed_config_from_mdm: managed_preferences,
     })
-}
-
-#[cfg(target_os = "macos")]
-fn map_managed_admin_layer(layer: ManagedAdminConfigLayer) -> ManagedConfigFromMdm {
-    let ManagedAdminConfigLayer { config, raw_toml } = layer;
-    ManagedConfigFromMdm {
-        managed_config: config,
-        raw_toml,
-    }
 }
 
 pub(super) async fn read_config_from_path(
@@ -170,14 +136,5 @@ fn validate_config_toml_strictly(
 
 /// Return the default managed config path.
 pub(super) fn managed_config_default_path(codex_home: &Path) -> PathBuf {
-    #[cfg(unix)]
-    {
-        let _ = codex_home;
-        PathBuf::from(CODEX_MANAGED_CONFIG_SYSTEM_PATH)
-    }
-
-    #[cfg(not(unix))]
-    {
-        codex_home.join("managed_config.toml")
-    }
+    codex_home.join("managed_config.toml")
 }

@@ -29,6 +29,7 @@ use std::time::Instant;
 use anyhow::Context;
 use clap::Parser;
 use codex_api::ApiError;
+use codex_api::RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE;
 use codex_api::ResponsesWebsocketClient;
 use codex_api::is_azure_responses_provider;
 use codex_arg0::Arg0DispatchPaths;
@@ -42,7 +43,6 @@ use codex_features::FEATURES;
 use codex_install_context::CodexPackageLayout;
 use codex_install_context::InstallContext;
 use codex_install_context::InstallMethod;
-use codex_install_context::StandalonePlatform;
 use codex_login::AuthDotJson;
 use codex_login::AuthManager;
 use codex_login::CODEX_ACCESS_TOKEN_ENV_VAR;
@@ -66,7 +66,6 @@ use http::HeaderValue;
 use serde::Serialize;
 use supports_color::Stream;
 
-mod background;
 mod git;
 mod output;
 mod progress;
@@ -76,7 +75,6 @@ mod thread_inventory;
 mod title;
 mod updates;
 
-use background::background_server_check;
 use git::git_check;
 use output::HumanOutputOptions;
 use output::redact_detail;
@@ -91,7 +89,6 @@ use title::terminal_title_check;
 use updates::updates_check;
 
 const OPENAI_BETA_HEADER: &str = "OpenAI-Beta";
-const RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
 const WEBSOCKET_IMMEDIATE_CLOSE_GRACE: Duration = Duration::from_millis(250);
 const SLOW_CHECK_PROGRESS_THRESHOLD: Duration = Duration::from_secs(2);
 const SLOW_CHECK_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
@@ -116,10 +113,9 @@ const COLOR_ENV_VARS: &[&str] = &[
 const TERMINAL_DIMENSION_ENV_VARS: &[&str] = &["COLUMNS", "LINES"];
 const TERMINFO_ENV_VARS: &[&str] = &["TERMINFO", "TERMINFO_DIRS"];
 const LOCALE_ENV_VARS: &[&str] = &["LC_ALL", "LC_CTYPE", "LANG"];
-#[cfg(windows)]
+
 const NPM_COMMAND: &str = "npm.cmd";
-#[cfg(not(windows))]
-const NPM_COMMAND: &str = "npm";
+
 const REMOTE_TERMINAL_ENV_VARS: &[&str] = &[
     "SSH_TTY",
     "SSH_CONNECTION",
@@ -353,7 +349,7 @@ async fn build_report(
             )
             .await,
         );
-        #[cfg(windows)]
+
         checks.push(
             run_async_check(
                 "desktop",
@@ -385,7 +381,6 @@ async fn build_report(
                 terminal_title_check,
                 state_check,
                 thread_inventory_check,
-                background_server_check,
                 reachability_check,
             ) = tokio::join!(
                 async { run_sync_check("config", progress.clone(), || config_check(config)) },
@@ -398,11 +393,7 @@ async fn build_report(
                     websocket_reachability_check(config, Some(auth_manager)),
                 ),
                 run_async_check("MCP", progress.clone(), mcp_check(config)),
-                async {
-                    run_sync_check("sandbox", progress.clone(), || {
-                        sandbox_check(config, arg0_paths)
-                    })
-                },
+                async { run_sync_check("sandbox", progress.clone(), || { sandbox_check(config) }) },
                 async {
                     run_sync_check("terminal", progress.clone(), || {
                         terminal_check(command.no_color)
@@ -419,11 +410,6 @@ async fn build_report(
                     "thread inventory",
                     progress.clone(),
                     thread_inventory_check(config),
-                ),
-                run_async_check(
-                    "app-server",
-                    progress.clone(),
-                    background_server_check(config)
                 ),
                 run_async_check(
                     "provider reachability",
@@ -444,7 +430,6 @@ async fn build_report(
                 terminal_title_check,
                 state_check,
                 thread_inventory_check,
-                background_server_check,
                 reachability_check,
             ]);
         }
@@ -563,8 +548,6 @@ fn config_overrides_from_interactive(
             .then(|| interactive.oss_provider.clone())
             .flatten(),
         codex_self_exe: arg0_paths.codex_self_exe.clone(),
-        codex_linux_sandbox_exe: arg0_paths.codex_linux_sandbox_exe.clone(),
-        main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe.clone(),
         show_raw_agent_reasoning: interactive.oss.then_some(true),
         additional_writable_roots: interactive.add_dir.clone(),
         ..Default::default()
@@ -597,23 +580,11 @@ struct JsonDoctorCheck {
     summary: String,
     details: BTreeMap<String, JsonDetailValue>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    issues: Vec<JsonDoctorIssue>,
+    issues: Vec<DoctorIssue>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     notes: Vec<String>,
     remediation: Option<String>,
     duration_ms: u64,
-}
-
-/// One redacted issue in the JSON support report.
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct JsonDoctorIssue {
-    severity: CheckStatus,
-    cause: String,
-    measured: Option<String>,
-    expected: Option<String>,
-    remedy: Option<String>,
-    fields: Vec<String>,
 }
 
 /// JSON detail value that preserves repeated detail keys without inventing names.
@@ -668,8 +639,8 @@ fn redacted_json_check(check: &DoctorCheck) -> JsonDoctorCheck {
     }
 }
 
-fn redacted_json_issue(issue: &DoctorIssue) -> JsonDoctorIssue {
-    JsonDoctorIssue {
+fn redacted_json_issue(issue: &DoctorIssue) -> DoctorIssue {
+    DoctorIssue {
         severity: issue.severity,
         cause: redact_detail(&issue.cause),
         measured: issue.measured.as_deref().map(redact_detail),
@@ -930,31 +901,24 @@ fn describe_install_context(context: &InstallContext) -> String {
         InstallMethod::Standalone {
             release_dir,
             resources_dir,
-            platform,
-        } => {
-            let platform = match platform {
-                StandalonePlatform::Unix => "unix",
-                StandalonePlatform::Windows => "windows",
-            };
-            match &context.package_layout {
-                Some(package_layout) => {
-                    let resources = display_optional_path(package_layout.resources_dir.as_deref());
-                    let path = display_optional_path(package_layout.path_dir.as_deref());
-                    format!(
-                        "standalone ({platform}, package {}, bin {}, resources {resources}, path {path})",
-                        package_layout.package_dir.display(),
-                        package_layout.bin_dir.display()
-                    )
-                }
-                None => {
-                    let resources = display_optional_path(resources_dir.as_deref());
-                    format!(
-                        "standalone ({platform}, release {}, resources {resources})",
-                        release_dir.display()
-                    )
-                }
+        } => match &context.package_layout {
+            Some(package_layout) => {
+                let resources = display_optional_path(package_layout.resources_dir.as_deref());
+                let path = display_optional_path(package_layout.path_dir.as_deref());
+                format!(
+                    "standalone (windows, package {}, bin {}, resources {resources}, path {path})",
+                    package_layout.package_dir.display(),
+                    package_layout.bin_dir.display()
+                )
             }
-        }
+            None => {
+                let resources = display_optional_path(resources_dir.as_deref());
+                format!(
+                    "standalone (windows, release {}, resources {resources})",
+                    release_dir.display()
+                )
+            }
+        },
         InstallMethod::Npm => {
             describe_method_with_package_layout("npm", context.package_layout.as_ref())
         }
@@ -963,9 +927,6 @@ fn describe_install_context(context: &InstallContext) -> String {
         }
         InstallMethod::Pnpm => {
             describe_method_with_package_layout("pnpm", context.package_layout.as_ref())
-        }
-        InstallMethod::Brew => {
-            describe_method_with_package_layout("brew", context.package_layout.as_ref())
         }
         InstallMethod::Other => {
             describe_method_with_package_layout("other", context.package_layout.as_ref())
@@ -1045,11 +1006,7 @@ fn compare_npm_package_roots(running_package_root: &Path, npm_root: &Path) -> Np
 fn normalize_path_for_compare(path: &Path) -> String {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let raw = canonical.to_string_lossy().replace('\\', "/");
-    if cfg!(windows) {
-        raw.to_ascii_lowercase()
-    } else {
-        raw
-    }
+    raw.to_ascii_lowercase()
 }
 
 fn display_list<T: AsRef<str>>(items: &[T]) -> String {
@@ -1065,10 +1022,7 @@ fn display_list<T: AsRef<str>>(items: &[T]) -> String {
 }
 
 fn codex_path_entries() -> Vec<String> {
-    #[cfg(windows)]
     let result = run_command("where", ["codex"]);
-    #[cfg(not(windows))]
-    let result = run_command("which", ["-a", "codex"]);
 
     result
         .unwrap_or_default()
@@ -1531,7 +1485,9 @@ async fn mcp_check_from_servers(servers: &HashMap<String, McpServerConfig>) -> D
     let mut details = Vec::new();
     let mut transport_counts: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut disabled = 0usize;
-    let mut missing_env = Vec::new();
+    let mut input_issues = Vec::new();
+    let mut has_configuration_issues = false;
+    let mut has_missing_environment = false;
     let mut unreachable_required_http = Vec::new();
     let mut unreachable_optional_http = Vec::new();
 
@@ -1554,49 +1510,60 @@ async fn mcp_check_from_servers(servers: &HashMap<String, McpServerConfig>) -> D
                 }
                 let command_is_empty = command.trim().is_empty();
                 if command_is_empty {
-                    missing_env.push(format!("{name}: stdio command is empty"));
+                    has_configuration_issues = true;
+                    input_issues.push(format!("{name}: stdio command is empty"));
                 }
                 if server.is_local_environment() {
                     let host_native_cwd = cwd.as_ref().map(|cwd| Path::new(cwd.as_str()));
                     if let Some(cwd) = host_native_cwd
                         && !cwd.exists()
                     {
-                        missing_env.push(format!("{name}: cwd does not exist ({})", cwd.display()));
+                        has_configuration_issues = true;
+                        input_issues
+                            .push(format!("{name}: cwd does not exist ({})", cwd.display()));
                     }
                     if !command_is_empty
                         && let Err(err) =
                             stdio_command_resolves(command, host_native_cwd, env.as_ref())
                     {
-                        missing_env.push(format!(
+                        has_configuration_issues = true;
+                        input_issues.push(format!(
                             "{name}: stdio command {command:?} is not resolvable ({err})"
                         ));
                     }
                 } else {
                     match cwd {
                         Some(cwd) if cwd.to_inferred_path_uri().is_none() => {
-                            missing_env
+                            has_configuration_issues = true;
+                            input_issues
                                 .push(format!("{name}: remote stdio cwd is not absolute ({cwd})"));
                         }
-                        None => missing_env
-                            .push(format!("{name}: remote stdio requires an explicit cwd")),
+                        None => {
+                            has_configuration_issues = true;
+                            input_issues
+                                .push(format!("{name}: remote stdio requires an explicit cwd"));
+                        }
                         Some(_) => {}
                     }
                 }
                 if let Some(env) = env {
                     for key in env.keys().filter(|key| key.trim().is_empty()) {
-                        missing_env.push(format!("{name}: empty env key {key}"));
+                        has_configuration_issues = true;
+                        input_issues.push(format!("{name}: empty env key {key}"));
                     }
                 }
                 for env_var in env_vars {
                     if env_var.is_remote_source() {
                         if server.is_local_environment() {
-                            missing_env.push(format!(
+                            has_configuration_issues = true;
+                            input_issues.push(format!(
                                 "{name}: env_vars entry `{}` uses source `remote`, which requires remote MCP stdio",
                                 env_var.name()
                             ));
                         }
                     } else if !env_var_present(env_var.name()) {
-                        missing_env.push(format!("{name}: env var {} is not set", env_var.name()));
+                        has_missing_environment = true;
+                        input_issues.push(format!("{name}: env var {} is not set", env_var.name()));
                     }
                 }
             }
@@ -1613,12 +1580,14 @@ async fn mcp_check_from_servers(servers: &HashMap<String, McpServerConfig>) -> D
                 if let Some(env_var) = bearer_token_env_var
                     && !env_var_present(env_var)
                 {
-                    missing_env.push(format!("{name}: bearer token env var {env_var} is not set"));
+                    has_missing_environment = true;
+                    input_issues.push(format!("{name}: bearer token env var {env_var} is not set"));
                 }
                 if let Some(headers) = env_http_headers {
                     for env_var in headers.values() {
                         if !env_var_present(env_var) {
-                            missing_env
+                            has_missing_environment = true;
+                            input_issues
                                 .push(format!("{name}: header env var {env_var} is not set"));
                         }
                     }
@@ -1640,7 +1609,7 @@ async fn mcp_check_from_servers(servers: &HashMap<String, McpServerConfig>) -> D
     for (transport, count) in transport_counts {
         details.push(format!("{transport} servers: {count}"));
     }
-    details.extend(missing_env.iter().cloned());
+    details.extend(input_issues.iter().cloned());
     details.extend(
         unreachable_required_http
             .iter()
@@ -1652,15 +1621,15 @@ async fn mcp_check_from_servers(servers: &HashMap<String, McpServerConfig>) -> D
             .map(|detail| format!("optional reachability failed: {detail}")),
     );
 
-    let required_missing = servers.iter().any(|(name, server)| {
+    let required_input_issue = servers.iter().any(|(name, server)| {
         server.required
-            && missing_env
+            && input_issues
                 .iter()
                 .any(|missing| missing.starts_with(&format!("{name}:")))
     });
-    let status = if required_missing || !unreachable_required_http.is_empty() {
+    let status = if required_input_issue || !unreachable_required_http.is_empty() {
         CheckStatus::Fail
-    } else if !missing_env.is_empty() || !unreachable_optional_http.is_empty() {
+    } else if !input_issues.is_empty() || !unreachable_optional_http.is_empty() {
         CheckStatus::Warning
     } else {
         CheckStatus::Ok
@@ -1673,12 +1642,27 @@ async fn mcp_check_from_servers(servers: &HashMap<String, McpServerConfig>) -> D
 
     let mut check = DoctorCheck::new("mcp.config", "mcp", status, summary).details(details);
     if status != CheckStatus::Ok {
-        check = check.remediation("Set the missing MCP env vars or disable the affected server.");
+        let mut remediation = Vec::new();
+        if has_configuration_issues {
+            remediation.push(
+                "Fix the affected MCP server command, working directory, or environment source configuration.",
+            );
+        }
+        if has_missing_environment {
+            remediation.push("Set the missing MCP environment variables.");
+        }
+        if !unreachable_required_http.is_empty() || !unreachable_optional_http.is_empty() {
+            remediation.push(
+                "Check the affected MCP HTTP URL, service availability, and network reachability.",
+            );
+        }
+        remediation.push("Disable the affected server if it is no longer needed.");
+        check = check.remediation(remediation.join(" "));
     }
     check
 }
 
-fn sandbox_check(config: &Config, arg0_paths: &Arg0DispatchPaths) -> DoctorCheck {
+fn sandbox_check(config: &Config) -> DoctorCheck {
     let mut details = Vec::new();
     details.push(format!(
         "approval policy: {:?}",
@@ -1690,27 +1674,13 @@ fn sandbox_check(config: &Config, arg0_paths: &Arg0DispatchPaths) -> DoctorCheck
         "network sandbox: {}",
         config.permissions.network_sandbox_policy()
     ));
-    push_path_detail(
-        &mut details,
-        "codex-linux-sandbox helper",
-        arg0_paths.codex_linux_sandbox_exe.as_deref(),
-    );
-    push_path_detail(
-        &mut details,
-        "execve wrapper helper",
-        arg0_paths.main_execve_wrapper_exe.as_deref(),
-    );
-
-    let mut status = CheckStatus::Ok;
-    let mut summary = "sandbox configuration is readable".to_string();
-    if let Some(helper) = arg0_paths.codex_linux_sandbox_exe.as_deref()
-        && !helper.exists()
-    {
-        status = CheckStatus::Warning;
-        summary = "Linux sandbox helper path does not exist".to_string();
-    }
-
-    DoctorCheck::new("sandbox.helpers", "sandbox", status, summary).details(details)
+    DoctorCheck::new(
+        "sandbox.helpers",
+        "sandbox",
+        CheckStatus::Ok,
+        "Windows sandbox configuration is readable",
+    )
+    .details(details)
 }
 
 #[derive(Clone, Debug)]
@@ -1768,8 +1738,8 @@ fn terminal_check(no_color_flag: bool) -> DoctorCheck {
     terminal_check_from_inputs(TerminalCheckInputs::detect(no_color_flag))
 }
 
-#[cfg(windows)]
 fn windows_console_details() -> Vec<String> {
+    use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::System::Console::ENABLE_VIRTUAL_TERMINAL_PROCESSING;
     use windows_sys::Win32::System::Console::GetConsoleCP;
@@ -1793,8 +1763,8 @@ fn windows_console_details() -> Vec<String> {
         GetStdHandle(STD_ERROR_HANDLE)
     }));
 
-    fn console_mode_detail(label: &str, handle: isize) -> String {
-        if handle == 0 || handle == INVALID_HANDLE_VALUE {
+    fn console_mode_detail(label: &str, handle: HANDLE) -> String {
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             return format!("{label}: unavailable");
         }
         let mut mode = 0_u32;
@@ -1806,11 +1776,6 @@ fn windows_console_details() -> Vec<String> {
     }
 
     details
-}
-
-#[cfg(not(windows))]
-fn windows_console_details() -> Vec<String> {
-    Vec::new()
 }
 
 fn terminal_check_from_inputs(inputs: TerminalCheckInputs) -> DoctorCheck {
@@ -2905,6 +2870,7 @@ async fn mcp_http_probe_url_with_timeout(url: &str, timeout: Duration) -> Result
 
 async fn http_probe_url_with_timeout(url: &str, timeout: Duration) -> Result<String, String> {
     let response = create_client_without_request_logging()
+        .map_err(|err| format!("failed to build HTTP client for {url}: {err}"))?
         .head(url)
         .timeout(timeout)
         .send()
@@ -2931,6 +2897,7 @@ async fn http_get_probe_url_with_timeout(url: &str, timeout: Duration) -> Result
 
 async fn http_get_probe_status_with_timeout(url: &str, timeout: Duration) -> Result<u16, String> {
     let response = create_client_without_request_logging()
+        .map_err(|err| format!("failed to build HTTP client for {url}: {err}"))?
         .get(url)
         .timeout(timeout)
         .send()
@@ -2980,7 +2947,7 @@ fn stdio_command_resolves(
         if executable_path_exists(&candidate).is_ok() {
             return Ok(());
         }
-        #[cfg(windows)]
+
         {
             let pathext = env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
             for extension in pathext.split(';').filter(|extension| !extension.is_empty()) {
@@ -3002,18 +2969,6 @@ fn executable_path_exists(path: &Path) -> Result<(), String> {
     }
 }
 
-#[cfg(unix)]
-fn executable_file_permission(path: &Path, metadata: &std::fs::Metadata) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-
-    if metadata.permissions().mode() & 0o111 == 0 {
-        Err(format!("{} is not executable", path.display()))
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(not(unix))]
 fn executable_file_permission(_path: &Path, _metadata: &std::fs::Metadata) -> Result<(), String> {
     Ok(())
 }
@@ -3276,9 +3231,7 @@ mod tests {
             "/var/tmp",
         ]);
         let arg0_paths = Arg0DispatchPaths {
-            codex_self_exe: Some(PathBuf::from("/bin/codex")),
-            codex_linux_sandbox_exe: Some(PathBuf::from("/bin/codex-linux-sandbox")),
-            main_execve_wrapper_exe: Some(PathBuf::from("/bin/codex-execve-wrapper")),
+            codex_self_exe: Some(PathBuf::from(r"C:\Codex\codex.exe")),
         };
 
         let overrides = config_overrides_from_interactive(&interactive, &arg0_paths);
@@ -3294,14 +3247,23 @@ mod tests {
             vec![PathBuf::from("/var/tmp")]
         );
         assert_eq!(overrides.codex_self_exe, arg0_paths.codex_self_exe);
-        assert_eq!(
-            overrides.codex_linux_sandbox_exe,
-            arg0_paths.codex_linux_sandbox_exe
-        );
-        assert_eq!(
-            overrides.main_execve_wrapper_exe,
-            arg0_paths.main_execve_wrapper_exe
-        );
+    }
+
+    #[test]
+    fn redacted_json_issue_reuses_doctor_issue_shape() {
+        let issue = DoctorIssue::new(
+            CheckStatus::Warning,
+            "https://user:pass@example.com/mcp?x=abc is unreachable",
+        )
+        .measured("https://user:pass@example.com/mcp?x=abc")
+        .expected("reachable")
+        .remedy("Open https://user:pass@example.com/help?x=abc.")
+        .field("endpoint");
+
+        let redacted: DoctorIssue = redacted_json_issue(&issue);
+        assert_eq!(redacted.severity, CheckStatus::Warning);
+        assert_ne!(redacted.cause, issue.cause);
+        assert_eq!(redacted.fields, vec!["endpoint"]);
     }
 
     #[test]
@@ -3462,6 +3424,12 @@ mod tests {
                 .iter()
                 .any(|detail| detail.contains("optional reachability failed: optional:"))
         );
+        assert_eq!(
+            check.remediation.as_deref(),
+            Some(
+                "Check the affected MCP HTTP URL, service availability, and network reachability. Disable the affected server if it is no longer needed."
+            )
+        );
     }
 
     #[tokio::test]
@@ -3490,6 +3458,48 @@ mod tests {
                 "required: env_vars entry `REMOTE_ONLY_TOKEN` uses source `remote`, which requires remote MCP stdio",
             )
         }));
+        assert_eq!(
+            check.remediation.as_deref(),
+            Some(
+                "Fix the affected MCP server command, working directory, or environment source configuration. Disable the affected server if it is no longer needed."
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_check_remediates_missing_environment_variable() {
+        const MISSING_ENV_VAR: &str = "CODEX_DOCTOR_TEST_MCP_ENV_VAR_SHOULD_NOT_EXIST";
+        assert!(
+            std::env::var_os(MISSING_ENV_VAR).is_none(),
+            "test environment unexpectedly defines {MISSING_ENV_VAR}"
+        );
+        let command = toml::Value::String(
+            std::env::current_exe()
+                .expect("current exe")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let server: McpServerConfig = toml::from_str(&format!(
+            r#"
+                command = {command}
+                env_vars = ["{MISSING_ENV_VAR}"]
+            "#,
+        ))
+        .expect("should deserialize MCP config with an environment variable");
+        let servers = HashMap::from([("missing-env".to_string(), server)]);
+
+        let check = mcp_check_from_servers(&servers).await;
+
+        assert_eq!(check.status, CheckStatus::Warning);
+        assert!(check.details.contains(&format!(
+            "missing-env: env var {MISSING_ENV_VAR} is not set"
+        )));
+        assert_eq!(
+            check.remediation.as_deref(),
+            Some(
+                "Set the missing MCP environment variables. Disable the affected server if it is no longer needed."
+            )
+        );
     }
 
     #[tokio::test]
@@ -3936,9 +3946,6 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_check_skips_host_path_checks_for_remote_stdio() {
-        #[cfg(not(windows))]
-        let cwd = r"C:\Users\openai\share";
-        #[cfg(windows)]
         let cwd = "/home/openai/share";
         let cwd = toml::Value::String(cwd.to_string());
         let remote_server: McpServerConfig = toml::from_str(&format!(
@@ -3996,53 +4003,6 @@ mod tests {
                 .details
                 .contains(&"relative: remote stdio cwd is not absolute (relative)".to_string())
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn read_probe_file_rejects_unreadable_file() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let file = tempfile::NamedTempFile::new().expect("create temp file");
-        std::fs::write(file.path(), "cert").expect("write temp file");
-        let mut permissions = std::fs::metadata(file.path())
-            .expect("metadata")
-            .permissions();
-        permissions.set_mode(0o000);
-        std::fs::set_permissions(file.path(), permissions).expect("remove read permissions");
-
-        let result = read_probe_file(file.path());
-
-        let mut permissions = std::fs::metadata(file.path())
-            .expect("metadata")
-            .permissions();
-        permissions.set_mode(0o600);
-        std::fs::set_permissions(file.path(), permissions).expect("restore read permissions");
-        assert!(result.is_err());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn executable_path_exists_rejects_non_executable_file() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let file = tempfile::NamedTempFile::new().expect("create temp file");
-        std::fs::write(file.path(), "#!/bin/sh\n").expect("write temp file");
-        let mut permissions = std::fs::metadata(file.path())
-            .expect("metadata")
-            .permissions();
-        permissions.set_mode(0o600);
-        std::fs::set_permissions(file.path(), permissions).expect("set non-executable mode");
-
-        let result = executable_path_exists(file.path());
-
-        assert!(result.is_err());
-        let mut permissions = std::fs::metadata(file.path())
-            .expect("metadata")
-            .permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(file.path(), permissions).expect("set executable mode");
-        assert_eq!(executable_path_exists(file.path()), Ok(()));
     }
 
     #[test]
@@ -4250,6 +4210,17 @@ mod tests {
                 .details
                 .contains(&"stdout console mode: 0x00000004 (VT processing: true)".to_string())
         );
+    }
+
+    #[test]
+    fn windows_console_details_reports_code_pages_and_standard_stream_modes() {
+        let details = windows_console_details();
+
+        assert_eq!(details.len(), 4);
+        assert!(details[0].starts_with("console input code page: "));
+        assert!(details[1].starts_with("console output code page: "));
+        assert!(details[2].starts_with("stdout console mode: "));
+        assert!(details[3].starts_with("stderr console mode: "));
     }
 
     #[test]

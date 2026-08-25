@@ -9,9 +9,6 @@ mod apply_patch;
 mod apps;
 mod client;
 mod client_common;
-mod realtime_context;
-mod realtime_conversation;
-mod realtime_prompt;
 mod responses_metadata;
 mod responses_retry;
 pub(crate) mod session;
@@ -60,30 +57,22 @@ mod guardian;
 mod hook_runtime;
 mod image_preparation;
 mod installation_id;
-pub(crate) mod landlock;
 mod latency_switches;
-pub use landlock::spawn_command_under_linux_sandbox;
 pub(crate) mod mcp;
 mod mcp_skill_dependencies;
 mod mcp_tool_approval_templates;
 mod mcp_tool_exposure;
 mod network_policy_decision;
 pub(crate) mod network_proxy_loader;
+pub use codex_mcp::SandboxState;
 pub use mcp::McpManager;
 pub use network_proxy_loader::MtimeConfigReloader;
 pub use network_proxy_loader::build_network_proxy_state;
 pub use network_proxy_loader::build_network_proxy_state_and_reloader;
-mod original_image_detail;
-pub use codex_mcp::SandboxState;
 mod mcp_openai_file;
 mod mcp_tool_call;
-pub(crate) mod mention_syntax;
-pub(crate) mod utils;
-pub use mention_syntax::PLUGIN_TEXT_MENTION_SIGIL;
-pub use mention_syntax::TOOL_MENTION_SIGIL;
-pub use utils::path_utils;
-mod pending_turn_plan;
-pub mod personality_migration;
+pub use codex_plugin::mention_syntax::PLUGIN_TEXT_MENTION_SIGIL;
+pub use codex_plugin::mention_syntax::TOOL_MENTION_SIGIL;
 pub(crate) mod plugins;
 #[doc(hidden)]
 pub(crate) mod prompt_debug;
@@ -121,10 +110,12 @@ mod unified_exec;
 pub mod windows_sandbox;
 pub use client::X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER;
 pub use codex_protocol::config_types::ModelProviderAuthInfo;
+pub use codex_protocol::models::web_search_action_detail;
+pub use codex_protocol::models::web_search_detail;
+pub use codex_rollout::state_integration::StateDbHandle;
 mod event_mapping;
 pub use codex_prompts as review_prompts;
 mod thread_manager;
-pub(crate) mod web_search;
 pub(crate) mod windows_sandbox_read_grants;
 pub use thread_manager::ForkSnapshot;
 pub use thread_manager::NewThread;
@@ -136,29 +127,19 @@ pub use thread_manager::ThreadShutdownReport;
 pub use thread_manager::build_models_manager;
 pub use thread_manager::local_agent_graph_store_from_state_db;
 pub use thread_manager::thread_store_from_config;
-pub use web_search::web_search_action_detail;
-pub use web_search::web_search_detail;
 pub use windows_sandbox_read_grants::grant_read_root_non_elevated;
-#[deprecated(note = "use ThreadManager")]
-pub type ConversationManager = ThreadManager;
-#[deprecated(note = "use NewThread")]
-pub type NewConversation = NewThread;
-#[deprecated(note = "use CodexThread")]
-pub type CodexConversation = CodexThread;
 pub(crate) mod agents_md;
 mod agents_md_manager;
 pub use agents_md::DEFAULT_AGENTS_MD_FILENAME;
 pub use agents_md::LOCAL_AGENTS_MD_FILENAME;
 pub use agents_md::LoadedAgentsMd;
+pub use agents_md::project_doc_candidate_filenames;
 mod rollout;
 pub(crate) mod safety;
 mod session_rollout_init_error;
 pub mod shell;
 pub(crate) mod shell_snapshot;
 pub mod spawn;
-pub(crate) mod state_db_bridge;
-pub use state_db_bridge::StateDbHandle;
-pub use state_db_bridge::init_state_db;
 mod thread_rollout_truncation;
 pub use thread_rollout_truncation::truncate_rollout_after_turn_id;
 pub(crate) mod task_evidence;
@@ -169,6 +150,11 @@ mod turn_metadata;
 mod turn_timing;
 mod validation_admission;
 mod workspace_operation_gate;
+pub(crate) use codex_tools::FunctionCallError;
+
+pub async fn init_state_db(config: &config::Config) -> Option<StateDbHandle> {
+    codex_rollout::state_integration::init(config).await
+}
 pub use rollout::ARCHIVED_SESSIONS_SUBDIR;
 pub use rollout::Cursor;
 pub use rollout::INTERACTIVE_SESSION_SOURCES;
@@ -182,8 +168,6 @@ pub use rollout::ThreadSortKey;
 pub use rollout::ThreadsPage;
 pub use rollout::append_thread_name;
 pub use rollout::find_archived_thread_path_by_id_str;
-#[deprecated(note = "use find_thread_path_by_id_str")]
-pub use rollout::find_conversation_path_by_id_str;
 pub use rollout::find_thread_meta_by_name_str;
 pub use rollout::find_thread_name_by_id;
 pub use rollout::find_thread_names_by_ids;
@@ -192,12 +176,14 @@ pub use rollout::parse_cursor;
 pub use rollout::read_head_for_summary;
 pub use rollout::read_session_meta_line;
 pub use rollout::rollout_date_parts;
-mod function_tool;
+mod feedback;
+mod invariants;
+mod plan_store;
+pub mod retry;
 mod state;
 mod tasks;
 mod terminal_event;
 mod user_shell_command;
-pub mod util;
 pub use terminal_event::terminal_event_fingerprint;
 
 pub use attestation::AttestationContext;
@@ -224,3 +210,68 @@ pub use installation_id::resolve_installation_id;
 pub mod compact;
 mod memory_usage;
 pub mod otel_init;
+
+#[cfg(test)]
+mod completed_migration_tests {
+    #[test]
+    fn conversation_to_thread_rename_has_no_legacy_public_exports() {
+        let core_lib = include_str!("lib.rs");
+        let core_rollout = include_str!("rollout.rs");
+        let rollout_lib = include_str!("../../rollout/src/lib.rs");
+
+        for name_parts in [
+            ["Conversation", "Manager"],
+            ["New", "Conversation"],
+            ["Codex", "Conversation"],
+        ] {
+            let obsolete_alias = name_parts.concat();
+            assert!(
+                !core_lib.contains(&format!("pub type {obsolete_alias} =")),
+                "the completed conversation-to-thread rename must not retain {obsolete_alias}"
+            );
+        }
+
+        let obsolete_lookup = ["find_", "conversation_path_by_id_str"].concat();
+        assert!(
+            !core_lib.contains(&format!("pub use rollout::{obsolete_lookup};")),
+            "codex-core must not re-export the obsolete conversation lookup"
+        );
+        assert!(
+            !core_rollout.contains(&format!("pub use codex_rollout::{obsolete_lookup};")),
+            "the core rollout facade must not re-export the obsolete conversation lookup"
+        );
+        assert!(
+            !rollout_lib.contains(&format!(" as {obsolete_lookup};")),
+            "codex-rollout must not retain the obsolete conversation lookup alias"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tiny_module_collapse_tests {
+    #[test]
+    fn extracted_owners_do_not_keep_forwarding_modules() {
+        let core_lib = include_str!("lib.rs");
+        let context_mod = include_str!("context/mod.rs");
+
+        for obsolete_module in [
+            "function_tool",
+            "original_image_detail",
+            "mention_syntax",
+            "state_db_bridge",
+            "utils",
+            "web_search",
+        ] {
+            let obsolete_declaration = format!("mod {obsolete_module};");
+            assert!(
+                !core_lib.contains(&obsolete_declaration),
+                "core must not retain the forwarding module {obsolete_declaration}"
+            );
+        }
+        let permissions_forwarder = ["mod permissions_", "instructions;"].concat();
+        assert!(
+            !context_mod.contains(&permissions_forwarder),
+            "context must re-export permission prompt types from their owner directly"
+        );
+    }
+}

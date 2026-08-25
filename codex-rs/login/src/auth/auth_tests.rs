@@ -1342,7 +1342,7 @@ impl ProviderAuthScript {
         let tempdir = tempfile::tempdir()?;
         let token_file = tempdir.path().join("tokens.txt");
         // `cmd.exe`'s `set /p` treats LF-only input as one line, so use CRLF on Windows.
-        let token_line_ending = if cfg!(windows) { "\r\n" } else { "\n" };
+        let token_line_ending = "\r\n";
         let mut token_file_contents = String::new();
         for token in tokens {
             token_file_contents.push_str(token);
@@ -1350,28 +1350,6 @@ impl ProviderAuthScript {
         }
         std::fs::write(&token_file, token_file_contents)?;
 
-        #[cfg(unix)]
-        let (command, args) = {
-            let script_path = tempdir.path().join("print-token.sh");
-            std::fs::write(
-                &script_path,
-                r#"#!/bin/sh
-first_line=$(sed -n '1p' tokens.txt)
-printf '%s\n' "$first_line"
-tail -n +2 tokens.txt > tokens.next
-mv tokens.next tokens.txt
-"#,
-            )?;
-            let mut permissions = std::fs::metadata(&script_path)?.permissions();
-            {
-                use std::os::unix::fs::PermissionsExt;
-                permissions.set_mode(0o755);
-            }
-            std::fs::set_permissions(&script_path, permissions)?;
-            ("./print-token.sh".to_string(), Vec::new())
-        };
-
-        #[cfg(windows)]
         let (command, args) = {
             let script_path = tempdir.path().join("print-token.cmd");
             std::fs::write(
@@ -1409,25 +1387,6 @@ move /y tokens.next tokens.txt >nul
     fn new_failing() -> std::io::Result<Self> {
         let tempdir = tempfile::tempdir()?;
 
-        #[cfg(unix)]
-        let (command, args) = {
-            let script_path = tempdir.path().join("fail.sh");
-            std::fs::write(
-                &script_path,
-                r#"#!/bin/sh
-exit 1
-"#,
-            )?;
-            let mut permissions = std::fs::metadata(&script_path)?.permissions();
-            {
-                use std::os::unix::fs::PermissionsExt;
-                permissions.set_mode(0o755);
-            }
-            std::fs::set_permissions(&script_path, permissions)?;
-            ("./fail.sh".to_string(), Vec::new())
-        };
-
-        #[cfg(windows)]
         let (command, args) = (
             "cmd.exe".to_string(),
             vec![

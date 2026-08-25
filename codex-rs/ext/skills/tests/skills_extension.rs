@@ -40,7 +40,6 @@ use codex_skills_extension::catalog::SkillPackageId;
 use codex_skills_extension::catalog::SkillProviderError;
 use codex_skills_extension::catalog::SkillReadResult;
 use codex_skills_extension::catalog::SkillResourceId;
-use codex_skills_extension::catalog::SkillSearchResult;
 use codex_skills_extension::catalog::SkillSourceKind;
 use codex_skills_extension::install;
 use codex_skills_extension::install_with_providers;
@@ -48,7 +47,6 @@ use codex_skills_extension::provider::SkillListQuery;
 use codex_skills_extension::provider::SkillProvider;
 use codex_skills_extension::provider::SkillProviderFuture;
 use codex_skills_extension::provider::SkillReadRequest;
-use codex_skills_extension::provider::SkillSearchRequest;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
@@ -863,10 +861,6 @@ impl SkillProvider for StaticSkillProvider {
                 contents: "# Lint Fix\n\nRun the formatter.".to_string(),
             })
         })
-    }
-
-    fn search(&self, _request: SkillSearchRequest) -> SkillProviderFuture<'_, SkillSearchResult> {
-        Box::pin(async { Ok(SkillSearchResult::default()) })
     }
 }
 

@@ -22,10 +22,7 @@ use serde::Serialize;
 #[serde(rename_all = "camelCase")]
 pub struct SandboxState {
     pub permission_profile: PermissionProfile,
-    pub codex_linux_sandbox_exe: Option<PathBuf>,
     pub sandbox_cwd: PathUri,
-    #[serde(default)]
-    pub use_legacy_landlock: bool,
 }
 
 /// Runtime context used when resolving per-server MCP environments.

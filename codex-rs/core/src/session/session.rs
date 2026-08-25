@@ -50,7 +50,6 @@ pub(crate) struct Session {
     pub(super) features: ManagedFeatures,
     pub(super) multi_agent_version: OnceLock<MultiAgentVersion>,
     pub(super) pending_mcp_server_refresh_config: Mutex<Option<McpServerRefreshConfig>>,
-    pub(crate) conversation: Arc<RealtimeConversationManager>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     /// Correlated pre-turn startup phases, frozen at the first model send.
     pub(crate) startup_timing: Arc<StartupTimingState>,
@@ -220,6 +219,7 @@ impl SessionConfiguration {
             model: self.collaboration_mode.model().to_string(),
             model_provider_id: self.original_config_do_not_use.model_provider_id.clone(),
             service_tier: self.service_tier.clone(),
+            developer_instructions: self.developer_instructions.clone(),
             approval_policy: self.approval_policy.value(),
             approvals_reviewer: self.approvals_reviewer,
             permission_profile: self.permission_profile(),
@@ -925,24 +925,10 @@ impl Session {
                 mcp_servers.keys().map(String::as_str).collect(),
             );
 
-            let use_zsh_fork_shell = config.features.enabled(Feature::ShellZshFork);
             let default_shell = if let Some(user_shell_override) =
                 session_configuration.user_shell_override.clone()
             {
                 user_shell_override
-            } else if use_zsh_fork_shell {
-                let zsh_path = config.zsh_path.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "zsh fork feature enabled, but no packaged zsh fork is available for this install"
-                    )
-                })?;
-                let zsh_path = zsh_path.to_path_buf();
-                shell::get_shell(shell::ShellType::Zsh, Some(&zsh_path)).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "zsh fork feature enabled, but packaged zsh fork `{}` is not usable",
-                        zsh_path.display()
-                    )
-                })?
             } else {
                 shell::default_user_shell()
             };
@@ -956,6 +942,7 @@ impl Session {
                         &config.permissions.shell_environment_policy,
                         Some(thread_id),
                     ),
+                    config.permissions.shell_environment_policy.clone(),
                 )
             } else {
                 ShellSnapshot::disabled()
@@ -1048,7 +1035,8 @@ impl Session {
                 .requirements_toml()
                 .network
                 .is_some();
-            let managed_network_requirements_enabled = config.managed_network_requirements_enabled();
+            let managed_network_requirements_enabled =
+                config.managed_network_requirements_enabled();
             let network_approval = Arc::new(NetworkApprovalService::default());
             // The managed proxy can call back into core for allowlist-miss decisions.
             let network_policy_decider_session = if managed_network_requirements_configured {
@@ -1120,7 +1108,7 @@ impl Session {
             let analytics_events_client = analytics_events_client.unwrap_or_else(|| {
                 AnalyticsEventsClient::new(
                     Arc::clone(&auth_manager),
-                    config.chatgpt_base_url.trim_end_matches('/').to_string(),
+                    config.chatgpt_base_url.clone(),
                     config.analytics_enabled,
                 )
             });
@@ -1136,21 +1124,22 @@ impl Session {
                 })
             }));
             for contributor in extensions.thread_lifecycle_contributors() {
-                contributor.on_thread_start(codex_extension_api::ThreadStartInput {
-                    config: config.as_ref(),
-                    session_source: &session_configuration.session_source,
-                    persistent_thread_state_available: state_db_ctx.is_some(),
-                    environments: session_configuration.environment_selections(),
-                    session_store: &session_extension_data,
-                    thread_store: &thread_extension_data,
-                }).await;
+                contributor
+                    .on_thread_start(codex_extension_api::ThreadStartInput {
+                        config: config.as_ref(),
+                        session_source: &session_configuration.session_source,
+                        persistent_thread_state_available: state_db_ctx.is_some(),
+                        environments: session_configuration.environment_selections(),
+                        session_store: &session_extension_data,
+                        thread_store: &thread_extension_data,
+                    })
+                    .await;
             }
             let task_evidence = if config.ephemeral
                 && matches!(
                     session_configuration.session_source,
                     SessionSource::SubAgent(SubAgentSource::Review)
-                )
-            {
+                ) {
                 crate::task_evidence::TaskEvidenceLedger::disabled()
             } else {
                 crate::task_evidence::TaskEvidenceLedger::load_or_new(
@@ -1185,14 +1174,13 @@ impl Session {
                 // setup is straightforward enough and performs well.
                 mcp_runtime,
                 planning_generation: std::sync::atomic::AtomicU64::new(0),
-                mcp_projection_lock: Mutex::new(()),
+                mcp_projection_lock: Semaphore::new(1),
                 mcp_startup_cancellation_token: Mutex::new(CancellationToken::new()),
                 unified_exec_manager,
                 command_execution,
+                plan_store: crate::plan_store::PlanStore::default(),
                 task_evidence,
                 elicitations: crate::elicitation::ElicitationService::new(),
-                shell_zsh_path: config.zsh_path.clone(),
-                main_execve_wrapper_exe: config.main_execve_wrapper_exe.clone(),
                 analytics_events_client,
                 hooks: arc_swap::ArcSwap::from_pointee(hooks),
                 rollout_thread_trace,
@@ -1244,12 +1232,8 @@ impl Session {
                     config.features.enabled(Feature::EnableRequestCompression),
                     config.features.enabled(Feature::RuntimeMetrics),
                     Self::build_model_client_beta_features_header(config.as_ref()),
-                    /*item_ids_enabled*/ config.features.enabled(Feature::ItemIds)
-                        || matches!(
-                            session_configuration.history_mode,
-                            ThreadHistoryMode::Paginated
-                        ),
-                    /*concurrent_reasoning_summaries_enabled*/ config
+                    /*concurrent_reasoning_summaries_enabled*/
+                    config
                         .features
                         .enabled(Feature::ConcurrentReasoningSummaries),
                     attestation_provider,
@@ -1281,7 +1265,6 @@ impl Session {
                 features: config.features.clone(),
                 multi_agent_version,
                 pending_mcp_server_refresh_config: Mutex::new(None),
-                conversation: Arc::new(RealtimeConversationManager::new()),
                 active_turn: Mutex::new(None),
                 startup_timing: Arc::clone(&startup_timing),
                 startup_prepared_router: Default::default(),
@@ -1345,7 +1328,8 @@ impl Session {
                 // Startup metadata must be visible immediately without turning an otherwise
                 // empty thread into a persisted rollout. Resumed/forked rollouts already exist,
                 // so this helper continues to persist their startup events in place.
-                sess.send_event_raw_without_materializing_rollout(event).await;
+                sess.send_event_raw_without_materializing_rollout(event)
+                    .await;
             }
 
             let mcp_startup_cancellation_token = {
@@ -1371,12 +1355,13 @@ impl Session {
                 mcp_runtime_context.clone(),
                 config.codex_home.to_path_buf(),
                 sess.services.mcp_manager.codex_apps_tools_cache(),
-                codex_apps_tools_cache_key(auth),
+                codex_apps_tools_cache_key(
+                    auth,
+                    &mcp_projection.config.chatgpt_base_url,
+                    mcp_projection.config.apps_mcp_product_sku.as_deref(),
+                ),
                 config.prefix_mcp_tool_names(),
-                mcp_projection
-                    .config
-                    .client_elicitation_capability
-                    .clone(),
+                mcp_projection.config.client_elicitation_capability.clone(),
                 sess.services
                     .supports_openai_form_elicitation
                     .load(std::sync::atomic::Ordering::Relaxed),

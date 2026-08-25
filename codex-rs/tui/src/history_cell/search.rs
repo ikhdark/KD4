@@ -2,30 +2,27 @@
 
 use super::*;
 
-fn web_search_header(completed: bool) -> &'static str {
-    if completed {
-        "Searched the web"
-    } else {
-        "Searching the web"
-    }
+fn web_search_query_detail(query: &Option<String>, queries: &Option<Vec<String>>) -> String {
+    query
+        .clone()
+        .filter(|query| !query.is_empty())
+        .unwrap_or_else(|| {
+            let first = queries
+                .as_ref()
+                .and_then(|queries| queries.first())
+                .cloned()
+                .unwrap_or_default();
+            if queries.as_ref().is_some_and(|queries| queries.len() > 1) && !first.is_empty() {
+                format!("{first} ...")
+            } else {
+                first
+            }
+        })
 }
 
 fn web_search_action_detail(action: &WebSearchAction) -> String {
     match action {
-        WebSearchAction::Search { query, queries } => {
-            query.clone().filter(|q| !q.is_empty()).unwrap_or_else(|| {
-                let items = queries.as_ref();
-                let first = items
-                    .and_then(|queries| queries.first())
-                    .cloned()
-                    .unwrap_or_default();
-                if items.is_some_and(|queries| queries.len() > 1) && !first.is_empty() {
-                    format!("{first} ...")
-                } else {
-                    first
-                }
-            })
-        }
+        WebSearchAction::Search { query, queries } => web_search_query_detail(query, queries),
         WebSearchAction::OpenPage { url } => url.clone().unwrap_or_default(),
         WebSearchAction::FindInPage { url, pattern } => match (pattern, url) {
             (Some(pattern), Some(url)) => format!("'{pattern}' in {url}"),
@@ -43,6 +40,14 @@ fn web_search_detail(action: Option<&WebSearchAction>, query: &str) -> String {
         query.to_string()
     } else {
         detail
+    }
+}
+
+fn web_search_header(completed: bool) -> &'static str {
+    if completed {
+        "Searched the web"
+    } else {
+        "Searching the web"
     }
 }
 

@@ -1,4 +1,5 @@
 #![allow(clippy::unwrap_used)]
+use codex_api::RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE;
 use codex_api::WS_REQUEST_HEADER_TRACEPARENT_CLIENT_METADATA_KEY;
 use codex_api::WS_REQUEST_HEADER_TRACESTATE_CLIENT_METADATA_KEY;
 use codex_core::CodexResponsesMetadata;
@@ -66,7 +67,6 @@ use tracing_test::traced_test;
 const MODEL: &str = "gpt-5.4";
 const OPENAI_BETA_HEADER: &str = "OpenAI-Beta";
 const USER_AGENT_HEADER: &str = "user-agent";
-const WS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
 const X_CLIENT_REQUEST_ID_HEADER: &str = "x-client-request-id";
 const WS_REQUEST_HEADER_RESPONSES_LITE_CLIENT_METADATA_KEY: &str =
     "ws_request_header_x_openai_internal_codex_responses_lite";
@@ -179,7 +179,7 @@ async fn responses_websocket_streams_request() {
     let handshake = server.single_handshake();
     assert_eq!(
         handshake.header(OPENAI_BETA_HEADER),
-        Some(WS_V2_BETA_HEADER_VALUE.to_string())
+        Some(RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE.to_string())
     );
     assert_eq!(
         handshake.header(X_CLIENT_REQUEST_ID_HEADER),
@@ -213,7 +213,7 @@ async fn responses_websocket_streams_request() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn responses_websocket_omits_unprefixed_item_ids_without_mutating_prompt() {
+async fn responses_websocket_omits_item_ids_without_mutating_prompt() {
     skip_if_no_network!();
 
     let server = start_websocket_server(vec![vec![vec![
@@ -226,7 +226,7 @@ async fn responses_websocket_omits_unprefixed_item_ids_without_mutating_prompt()
         websocket_provider(&server),
         /*runtime_metrics_enabled*/ false,
         /*concurrent_reasoning_summaries_enabled*/ false,
-        /*enabled_features*/ &[Feature::ItemIds],
+        /*enabled_features*/ &[],
     )
     .await;
     let mut client_session = harness.client.new_session();
@@ -253,7 +253,7 @@ async fn responses_websocket_omits_unprefixed_item_ids_without_mutating_prompt()
     let connection = server.single_connection();
     let body = connection.first().expect("missing request").body_json();
     assert_eq!(body["input"].as_array().map(Vec::len), Some(3));
-    assert_eq!(body["input"][0]["id"].as_str(), Some("msg_existing"));
+    assert_eq!(body["input"][0].get("id"), None);
     assert_eq!(body["input"][1].get("id"), None);
     assert_eq!(body["input"][2].get("id"), None);
     assert_eq!(
@@ -955,7 +955,7 @@ async fn responses_websocket_prewarm_uses_v2_when_provider_supports_websockets()
         openai_beta_header
             .split(',')
             .map(str::trim)
-            .any(|value| value == WS_V2_BETA_HEADER_VALUE)
+            .any(|value| value == RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE)
     );
     stream_until_complete(&mut client_session, &harness, &prompt).await;
     assert_eq!(server.handshakes().len(), 1);
@@ -1020,7 +1020,7 @@ async fn responses_websocket_preconnect_runs_when_only_v2_feature_enabled() {
         openai_beta_header
             .split(',')
             .map(str::trim)
-            .any(|value| value == WS_V2_BETA_HEADER_VALUE)
+            .any(|value| value == RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE)
     );
     server.shutdown().await;
 }
@@ -1069,7 +1069,7 @@ async fn responses_websocket_v2_requests_use_v2_when_provider_supports_websocket
         openai_beta_header
             .split(',')
             .map(str::trim)
-            .any(|value| value == WS_V2_BETA_HEADER_VALUE)
+            .any(|value| value == RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE)
     );
     server.shutdown().await;
 }
@@ -1159,7 +1159,7 @@ async fn responses_websocket_v2_connection_is_reused_but_response_chain_resets_a
     assert_eq!(second["previous_response_id"].as_str(), None);
     assert_eq!(
         second["input"],
-        serialized_prompt_input_without_item_ids(&prompt_two)
+        serde_json::to_value(&prompt_two.input).expect("prompt input should serialize")
     );
 
     // validate third turn
@@ -1168,7 +1168,7 @@ async fn responses_websocket_v2_connection_is_reused_but_response_chain_resets_a
     assert_eq!(third["previous_response_id"].as_str(), None);
     assert_eq!(
         third["input"],
-        serialized_prompt_input_without_item_ids(&prompt_three)
+        serde_json::to_value(&prompt_three.input).expect("prompt input should serialize")
     );
 
     server.shutdown().await;
@@ -1218,7 +1218,7 @@ async fn responses_websocket_v2_wins_when_both_features_enabled() {
         openai_beta_header
             .split(',')
             .map(str::trim)
-            .any(|value| value == WS_V2_BETA_HEADER_VALUE)
+            .any(|value| value == RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE)
     );
     server.shutdown().await;
 }
@@ -1528,8 +1528,18 @@ async fn responses_websocket_usage_limit_error_emits_rate_limit_event() {
         .await
         .expect("submission should succeed while emitting usage limit error events");
 
-    let token_event =
-        wait_for_event(&test.codex, |msg| matches!(msg, EventMsg::TokenCount(_))).await;
+    let token_event = wait_for_event(&test.codex, |msg| {
+        matches!(
+            msg,
+            EventMsg::TokenCount(event)
+                if event
+                    .rate_limits
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.primary.as_ref())
+                    .is_some()
+        )
+    })
+    .await;
     let EventMsg::TokenCount(event) = token_event else {
         unreachable!();
     };
@@ -2223,7 +2233,7 @@ async fn responses_websocket_v2_sets_openai_beta_header() {
         openai_beta_header
             .split(',')
             .map(str::trim)
-            .any(|value| value == WS_V2_BETA_HEADER_VALUE)
+            .any(|value| value == RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE)
     );
     server.shutdown().await;
 }
@@ -2252,19 +2262,6 @@ fn prompt_with_input(input: Vec<ResponseItem>) -> Prompt {
     let mut prompt = Prompt::default();
     prompt.input = input.into();
     prompt
-}
-
-fn serialized_prompt_input_without_item_ids(prompt: &Prompt) -> serde_json::Value {
-    let mut input = serde_json::to_value(&prompt.input).expect("prompt input should serialize");
-    for item in input
-        .as_array_mut()
-        .expect("prompt input should be an array")
-    {
-        item.as_object_mut()
-            .expect("prompt item should be an object")
-            .remove("id");
-    }
-    input
 }
 
 fn prompt_with_input_and_instructions(input: Vec<ResponseItem>, instructions: &str) -> Prompt {
@@ -2404,7 +2401,6 @@ async fn websocket_harness_with_provider_options(
         /*enable_request_compression*/ false,
         runtime_metrics_enabled,
         /*beta_features_header*/ None,
-        /*item_ids_enabled*/ config.features.enabled(Feature::ItemIds),
         /*concurrent_reasoning_summaries_enabled*/
         config
             .features

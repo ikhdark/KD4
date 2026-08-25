@@ -255,9 +255,8 @@ impl ChatWidget {
             }
             SlashCommand::Compact => {
                 self.clear_token_usage();
-                if !self.bottom_pane.is_task_running() {
-                    self.bottom_pane.set_task_running(/*running*/ true);
-                }
+                self.input_queue.user_turn_pending_start = true;
+                self.update_task_running_state();
                 self.app_event_tx.compact();
             }
             SlashCommand::Review => {
@@ -311,7 +310,6 @@ impl ChatWidget {
                 self.open_keymap_picker();
             }
             SlashCommand::ElevateSandbox => {
-                #[cfg(target_os = "windows")]
                 {
                     let windows_sandbox_level =
                         crate::windows_sandbox::level_from_config(&self.config);
@@ -355,11 +353,6 @@ impl ChatWidget {
                             preset,
                             profile_selection: None,
                         });
-                }
-                #[cfg(not(target_os = "windows"))]
-                {
-                    let _ = &self.session_telemetry;
-                    // Not supported; on non-Windows this command should never be reachable.
                 }
             }
             SlashCommand::SandboxReadRoot => {
@@ -1006,13 +999,10 @@ impl ChatWidget {
     }
 
     fn builtin_command_flags(&self) -> BuiltinCommandFlags {
-        #[cfg(target_os = "windows")]
         let allow_elevate_sandbox = {
             let windows_sandbox_level = crate::windows_sandbox::level_from_config(&self.config);
             matches!(windows_sandbox_level, WindowsSandboxLevel::RestrictedToken)
         };
-        #[cfg(not(target_os = "windows"))]
-        let allow_elevate_sandbox = false;
 
         BuiltinCommandFlags {
             collaboration_modes_enabled: self.collaboration_modes_enabled(),

@@ -3,9 +3,9 @@
 use std::time::Duration;
 
 use crate::client::ModelClientSession;
+use crate::retry::backoff;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
-use crate::util::backoff;
 use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::WarningEvent;

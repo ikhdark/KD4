@@ -153,3 +153,8 @@ fn oversized_single_line_retains_bounded_head_and_tail() {
     assert!(summary.contains("[line truncated]"));
     assert!(summary.len() <= SUMMARY_MAX_BYTES + "\n[summary capped]".len());
 }
+
+#[test]
+fn tiny_single_line_budget_stops_before_split_utf8_character() {
+    assert_eq!(summarize_oversized_line("a😀z", 4), "a");
+}

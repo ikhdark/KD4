@@ -106,9 +106,6 @@ pub(super) fn server_notification_thread_target(
         ServerNotification::TerminalInteraction(notification) => {
             Some(notification.thread_id.as_str())
         }
-        ServerNotification::FileChangeOutputDelta(notification) => {
-            Some(notification.thread_id.as_str())
-        }
         ServerNotification::FileChangePatchUpdated(notification) => {
             Some(notification.thread_id.as_str())
         }
@@ -127,7 +124,6 @@ pub(super) fn server_notification_thread_target(
         ServerNotification::ReasoningTextDelta(notification) => {
             Some(notification.thread_id.as_str())
         }
-        ServerNotification::ContextCompacted(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::ModelRerouted(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::ModelVerification(notification) => {
             Some(notification.thread_id.as_str())
@@ -136,30 +132,6 @@ pub(super) fn server_notification_thread_target(
             Some(notification.thread_id.as_str())
         }
         ServerNotification::TurnModerationMetadata(notification) => {
-            Some(notification.thread_id.as_str())
-        }
-        ServerNotification::ThreadRealtimeStarted(notification) => {
-            Some(notification.thread_id.as_str())
-        }
-        ServerNotification::ThreadRealtimeItemAdded(notification) => {
-            Some(notification.thread_id.as_str())
-        }
-        ServerNotification::ThreadRealtimeTranscriptDelta(notification) => {
-            Some(notification.thread_id.as_str())
-        }
-        ServerNotification::ThreadRealtimeTranscriptDone(notification) => {
-            Some(notification.thread_id.as_str())
-        }
-        ServerNotification::ThreadRealtimeOutputAudioDelta(notification) => {
-            Some(notification.thread_id.as_str())
-        }
-        ServerNotification::ThreadRealtimeSdp(notification) => {
-            Some(notification.thread_id.as_str())
-        }
-        ServerNotification::ThreadRealtimeError(notification) => {
-            Some(notification.thread_id.as_str())
-        }
-        ServerNotification::ThreadRealtimeClosed(notification) => {
             Some(notification.thread_id.as_str())
         }
         ServerNotification::Warning(notification) => notification.thread_id.as_deref(),
@@ -248,7 +220,6 @@ mod tests {
                     developer_instructions: None,
                 },
             },
-            multi_agent_mode: Default::default(),
             personality: None,
         }
     }
@@ -381,5 +352,26 @@ mod tests {
         let target = server_notification_thread_target(&notification);
 
         assert_eq!(target, ServerNotificationThreadTarget::Thread(thread_id));
+    }
+
+    #[test]
+    fn notification_dispatch_omits_retired_variants() {
+        let dispatch_sources = [
+            include_str!("app_server_event_targets.rs"),
+            include_str!("../chatwidget/protocol.rs"),
+        ];
+        let retired_variants = [
+            concat!("FileChange", "OutputDelta"),
+            concat!("Context", "Compacted"),
+        ];
+
+        for retired_variant in retired_variants {
+            assert!(
+                dispatch_sources
+                    .iter()
+                    .all(|source| !source.contains(retired_variant)),
+                "retired notification variant remains in TUI dispatch: {retired_variant}"
+            );
+        }
     }
 }

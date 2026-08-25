@@ -472,7 +472,6 @@ impl AnalyticsReducer {
             AnalyticsFact::ErrorResponse {
                 connection_id,
                 request_id,
-                error: _,
                 error_type,
             } => {
                 self.ingest_error_response(connection_id, request_id, error_type, out);
@@ -1419,7 +1418,7 @@ impl AnalyticsReducer {
         let thread_metadata = ThreadMetadataState::from_thread_metadata(
             session_id.clone(),
             &session_source,
-            thread.thread_source.map(Into::into),
+            thread.thread_source,
             parent_thread_id,
             initialization_mode,
         );

@@ -5,9 +5,7 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_rollout::RolloutRecorder;
-use codex_rollout::find_archived_thread_path_by_id_str;
 use codex_rollout::find_thread_name_by_id;
-use codex_rollout::find_thread_path_by_id_str;
 use codex_rollout::read_session_meta_line;
 use codex_rollout::read_thread_item_from_rollout;
 use codex_state::ThreadMetadata;
@@ -16,10 +14,10 @@ use super::LocalThreadStore;
 use super::helpers::distinct_thread_metadata_title;
 use super::helpers::git_info_from_parts;
 use super::helpers::permission_profile_from_metadata_value;
+use super::helpers::resolve_rollout_path;
 use super::helpers::rollout_path_is_archived;
 use super::helpers::set_thread_name_from_title;
 use super::helpers::stored_thread_from_rollout_item;
-use super::live_writer;
 use crate::ReadThreadParams;
 use crate::StoredThread;
 use crate::StoredThreadHistory;
@@ -47,36 +45,32 @@ pub(super) async fn read_thread(
             )
             .await)
     {
-        let metadata_sandbox_policy = metadata.sandbox_policy.clone();
         let mut thread = stored_thread_from_sqlite_metadata(store, metadata).await?;
         if !params.include_history
             && let Some(rollout_path) = thread.rollout_path.clone()
-            && let Ok(mut rollout_thread) = read_thread_from_rollout_path(store, rollout_path).await
+            && let Ok(rollout_thread) = read_thread_from_rollout_path(store, rollout_path).await
             && rollout_thread.thread_id == thread_id
             && (params.include_archived || rollout_thread.archived_at.is_none())
             && !rollout_thread.preview.is_empty()
         {
-            rollout_thread.recency_at = thread.recency_at;
-            if thread.name.is_some() {
-                rollout_thread.name = thread.name;
-            }
-            rollout_thread.git_info = thread.git_info;
-            rollout_thread.permission_profile = permission_profile_from_metadata_value(
-                &metadata_sandbox_policy,
-                rollout_thread.cwd.as_path(),
-            );
-            thread = rollout_thread;
+            // Preview extraction can be newer than the last SQLite flush, but the SQLite-backed
+            // object remains authoritative for every persisted metadata field.
+            thread.preview = rollout_thread.preview;
         }
         reject_paginated_history(&thread, params.include_history)?;
         attach_history_if_requested(&mut thread, params.include_history).await?;
         return Ok(thread);
     }
 
-    let path = resolve_rollout_path(store, thread_id, params.include_archived)
-        .await?
-        .ok_or_else(|| ThreadStoreError::InvalidRequest {
-            message: format!("no rollout found for thread id {thread_id}"),
-        })?;
+    let path = resolve_rollout_path(
+        store,
+        thread_id,
+        params.include_archived,
+        /*require_materialized*/ true,
+    )
+    .await?
+    .map(|resolved| resolved.path)
+    .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
 
     let mut thread = read_thread_from_rollout_path(store, path).await?;
     if !params.include_archived && thread.archived_at.is_some() {
@@ -158,33 +152,28 @@ async fn resolve_requested_rollout_path(
     };
     match tokio::fs::metadata(path.as_path()).await {
         Ok(metadata) if metadata.is_dir() => {
-            return Err(ThreadStoreError::InvalidRequest {
-                message: format!(
-                    "failed to resolve rollout path `{}`: path is a directory",
-                    path.display()
-                ),
+            return Err(ThreadStoreError::RolloutNotMaterialized {
+                path,
+                reason: "path is a directory".to_string(),
             });
         }
         Ok(metadata) if !metadata.is_file() => {
-            return Err(ThreadStoreError::InvalidRequest {
-                message: format!(
-                    "failed to resolve rollout path `{}`: path is not a file",
-                    path.display()
-                ),
+            return Err(ThreadStoreError::RolloutNotMaterialized {
+                path,
+                reason: "path is not a file".to_string(),
             });
         }
         _ => {}
     }
     let Some(path) = codex_rollout::existing_rollout_path(path.as_path()).await else {
-        return Err(ThreadStoreError::InvalidRequest {
-            message: format!(
-                "failed to resolve rollout path `{}`: file does not exist",
-                path.display()
-            ),
+        return Err(ThreadStoreError::RolloutNotMaterialized {
+            path,
+            reason: "file does not exist".to_string(),
         });
     };
-    std::fs::canonicalize(path.as_path()).map_err(|err| ThreadStoreError::InvalidRequest {
-        message: format!("failed to resolve rollout path `{}`: {err}", path.display()),
+    std::fs::canonicalize(path.as_path()).map_err(|err| ThreadStoreError::RolloutNotMaterialized {
+        path,
+        reason: err.to_string(),
     })
 }
 
@@ -204,55 +193,6 @@ async fn attach_history_if_requested(
     let items = load_history_items(&path).await?;
     thread.history = Some(StoredThreadHistory { thread_id, items });
     Ok(())
-}
-
-async fn resolve_rollout_path(
-    store: &LocalThreadStore,
-    thread_id: codex_protocol::ThreadId,
-    include_archived: bool,
-) -> ThreadStoreResult<Option<std::path::PathBuf>> {
-    if let Ok(path) = live_writer::rollout_path(store, thread_id).await
-        && codex_rollout::existing_rollout_path(path.as_path())
-            .await
-            .is_some()
-        && (include_archived || !rollout_path_is_archived(store.config.codex_home.as_path(), &path))
-    {
-        return Ok(Some(path));
-    }
-
-    let state_db_ctx = store.state_db().await;
-    if include_archived {
-        match find_thread_path_by_id_str(
-            store.config.codex_home.as_path(),
-            &thread_id.to_string(),
-            state_db_ctx.as_deref(),
-        )
-        .await
-        .map_err(|err| ThreadStoreError::InvalidRequest {
-            message: format!("failed to locate thread id {thread_id}: {err}"),
-        })? {
-            Some(path) => Ok(Some(path)),
-            None => find_archived_thread_path_by_id_str(
-                store.config.codex_home.as_path(),
-                &thread_id.to_string(),
-                state_db_ctx.as_deref(),
-            )
-            .await
-            .map_err(|err| ThreadStoreError::InvalidRequest {
-                message: format!("failed to locate archived thread id {thread_id}: {err}"),
-            }),
-        }
-    } else {
-        find_thread_path_by_id_str(
-            store.config.codex_home.as_path(),
-            &thread_id.to_string(),
-            state_db_ctx.as_deref(),
-        )
-        .await
-        .map_err(|err| ThreadStoreError::InvalidRequest {
-            message: format!("failed to locate thread id {thread_id}: {err}"),
-        })
-    }
 }
 
 async fn read_thread_from_rollout_path(
@@ -310,7 +250,7 @@ async fn read_sqlite_metadata(
     runtime.get_thread(thread_id).await.ok().flatten()
 }
 
-async fn stored_thread_from_sqlite_metadata(
+pub(super) async fn stored_thread_from_sqlite_metadata(
     store: &LocalThreadStore,
     metadata: ThreadMetadata,
 ) -> ThreadStoreResult<StoredThread> {
@@ -322,25 +262,12 @@ async fn stored_thread_from_sqlite_metadata(
             .flatten()
             .filter(|title| !title.trim().is_empty()),
     };
-    let session_meta = match read_required_session_meta_line(metadata.rollout_path.as_path()).await
-    {
-        Ok(meta_line) => Some(meta_line.meta),
-        Err(_)
-            if codex_rollout::existing_rollout_path(metadata.rollout_path.as_path())
-                .await
-                .is_none() =>
-        {
-            None
-        }
-        Err(err) => {
-            return Err(ThreadStoreError::Internal {
-                message: format!(
-                    "failed to read session metadata {}: {err}",
-                    metadata.rollout_path.display()
-                ),
-            });
-        }
-    };
+    // SQLite owns the persisted projection. Session metadata only supplements fields that are
+    // not stored in the row, so an unavailable or malformed rollout must not discard the row.
+    let session_meta = read_session_meta_line(metadata.rollout_path.as_path())
+        .await
+        .ok()
+        .map(|meta_line| meta_line.meta);
     let rollout_path = codex_rollout::plain_rollout_path(metadata.rollout_path.as_path());
     let forked_from_id = session_meta.as_ref().and_then(|meta| meta.forked_from_id);
     let parent_thread_id = session_meta.as_ref().and_then(|meta| meta.parent_thread_id);
@@ -630,6 +557,21 @@ mod tests {
         let archived_path = write_archived_session_file(home.path(), "2025-01-03T12-00-00", uuid)
             .expect("archived session file");
 
+        assert_eq!(
+            store
+                .resolve_existing_rollout_path(thread_id, /*include_archived*/ false)
+                .await
+                .expect("active-only resolution"),
+            None
+        );
+        assert_eq!(
+            store
+                .resolve_existing_rollout_path(thread_id, /*include_archived*/ true)
+                .await
+                .expect("archived resolution"),
+            Some(archived_path.clone())
+        );
+
         let active_only_err = store
             .read_thread(ReadThreadParams {
                 thread_id,
@@ -638,13 +580,13 @@ mod tests {
             })
             .await
             .expect_err("active-only read should fail for archived rollout");
-        let ThreadStoreError::InvalidRequest { message } = active_only_err else {
-            panic!("expected invalid request error");
+        let ThreadStoreError::ThreadNotFound {
+            thread_id: missing_thread_id,
+        } = active_only_err
+        else {
+            panic!("expected thread-not-found error");
         };
-        assert_eq!(
-            message,
-            format!("no rollout found for thread id {thread_id}")
-        );
+        assert_eq!(missing_thread_id, thread_id);
 
         let thread = store
             .read_thread(ReadThreadParams {
@@ -672,6 +614,14 @@ mod tests {
             write_session_file(home.path(), "2025-01-03T12-00-00", uuid).expect("session file");
         write_archived_session_file(home.path(), "2025-01-03T12-00-00", uuid)
             .expect("archived session file");
+
+        assert_eq!(
+            store
+                .resolve_existing_rollout_path(thread_id, /*include_archived*/ true)
+                .await
+                .expect("active resolution"),
+            Some(active_path.clone())
+        );
 
         let thread = store
             .read_thread(ReadThreadParams {
@@ -840,7 +790,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_thread_preserves_rollout_cwd_when_sqlite_metadata_exists() {
+    async fn read_thread_overlays_rollout_preview_without_replacing_sqlite_metadata() {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
         let runtime = codex_state::StateRuntime::init(
@@ -894,6 +844,8 @@ mod tests {
         let mut metadata = builder.build(config.default_model_provider_id.as_str());
         metadata.title = "Saved title".to_string();
         metadata.first_user_message = Some("Hello from sqlite".to_string());
+        metadata.model = Some("sqlite-model".to_string());
+        metadata.thread_source = Some(codex_protocol::protocol::ThreadSource::Subagent);
         metadata.sandbox_policy = "workspace-write".to_string();
         runtime
             .upsert_thread(&metadata)
@@ -913,8 +865,13 @@ mod tests {
         assert_eq!(thread.rollout_path, Some(rollout_path));
         assert_eq!(thread.preview, "Hello from rollout");
         assert_eq!(thread.name, Some("Saved title".to_string()));
-        assert_eq!(thread.model_provider, "rollout-provider");
-        assert_eq!(thread.cwd, rollout_cwd);
+        assert_eq!(thread.model_provider, config.default_model_provider_id);
+        assert_eq!(thread.model.as_deref(), Some("sqlite-model"));
+        assert_eq!(
+            thread.thread_source,
+            Some(codex_protocol::protocol::ThreadSource::Subagent)
+        );
+        assert_eq!(thread.cwd, home.path().join("sqlite-workspace"));
         let legacy_policy = SandboxPolicy::WorkspaceWrite {
             writable_roots: Vec::new(),
             network_access: false,
@@ -925,7 +882,7 @@ mod tests {
             thread.permission_profile,
             PermissionProfile::from_legacy_sandbox_policy_for_cwd(
                 &legacy_policy,
-                rollout_cwd.as_path()
+                home.path().join("sqlite-workspace").as_path()
             )
         );
     }
@@ -1270,13 +1227,13 @@ mod tests {
             })
             .await
             .expect_err("active-only read should fail for archived metadata");
-        let ThreadStoreError::InvalidRequest { message } = active_only_err else {
-            panic!("expected invalid request error");
+        let ThreadStoreError::ThreadNotFound {
+            thread_id: missing_thread_id,
+        } = active_only_err
+        else {
+            panic!("expected thread-not-found error");
         };
-        assert_eq!(
-            message,
-            format!("no rollout found for thread id {thread_id}")
-        );
+        assert_eq!(missing_thread_id, thread_id);
 
         let thread = store
             .read_thread(ReadThreadParams {
@@ -1355,12 +1312,12 @@ mod tests {
             .await
             .expect_err("read should fail without rollout");
 
-        let ThreadStoreError::InvalidRequest { message } = err else {
-            panic!("expected invalid request error");
+        let ThreadStoreError::ThreadNotFound {
+            thread_id: missing_thread_id,
+        } = err
+        else {
+            panic!("expected thread-not-found error");
         };
-        assert_eq!(
-            message,
-            format!("no rollout found for thread id {thread_id}")
-        );
+        assert_eq!(missing_thread_id, thread_id);
     }
 }

@@ -13,8 +13,7 @@ use codex_features::Feature;
 use codex_features::FeatureConfigSource;
 use codex_features::FeatureOverrides;
 use codex_features::Features;
-use codex_features::canonical_feature_for_key;
-use codex_features::feature_for_key;
+use codex_features::user_settable_feature_for_key;
 
 /// Wrapper around [`Features`] which enforces constraints defined in
 /// `FeatureRequirementsToml` and provides normalization to ensure constraints
@@ -215,19 +214,7 @@ fn parse_feature_requirements(
             continue;
         }
 
-        if let Some(feature) = canonical_feature_for_key(&key) {
-            pinned_features.insert(feature, enabled);
-            continue;
-        }
-
-        if let Some(feature) = feature_for_key(&key) {
-            push_feature_requirement_warning(
-                &mut startup_warnings,
-                format!(
-                    "Using legacy `features` requirement `{key}` from {source}; prefer canonical feature key `{}`",
-                    feature.key()
-                ),
-            );
+        if let Some(feature) = user_settable_feature_for_key(&key) {
             pinned_features.insert(feature, enabled);
             continue;
         }
@@ -256,17 +243,10 @@ fn explicit_feature_settings_in_config(cfg: &ConfigToml) -> Vec<(String, Feature
 
     if let Some(features) = cfg.features.as_ref() {
         for (key, enabled) in features.entries() {
-            if let Some(feature) = feature_for_key(&key) {
+            if let Some(feature) = user_settable_feature_for_key(&key) {
                 explicit_settings.push((format!("features.{key}"), feature, enabled));
             }
         }
-    }
-    if let Some(enabled) = cfg.experimental_use_unified_exec_tool {
-        explicit_settings.push((
-            "experimental_use_unified_exec_tool".to_string(),
-            Feature::UnifiedExec,
-            enabled,
-        ));
     }
     explicit_settings
 }
@@ -320,7 +300,6 @@ pub(crate) fn validate_feature_requirements_in_config_toml(
     let configured_features = Features::from_sources(
         FeatureConfigSource {
             features: cfg.features.as_ref(),
-            experimental_use_unified_exec_tool: cfg.experimental_use_unified_exec_tool,
         },
         FeatureConfigSource::default(),
         FeatureOverrides::default(),

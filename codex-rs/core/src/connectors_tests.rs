@@ -11,10 +11,10 @@ use codex_config::types::ApprovalsReviewer;
 use codex_connectors::merge::plugin_connector_to_app_info;
 use codex_connectors::metadata::connector_install_url;
 use codex_connectors::metadata::sanitize_name;
-use codex_features::Feature;
 use codex_login::CodexAuth;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_mcp::ToolInfo;
+use codex_protocol::auth::AuthMode;
 use pretty_assertions::assert_eq;
 use rmcp::model::JsonObject;
 use rmcp::model::Meta;
@@ -77,25 +77,6 @@ fn codex_app_tool(
     }
 }
 
-fn with_accessible_connectors_cache_cleared<R>(f: impl FnOnce() -> R) -> R {
-    static TEST_MUTEX: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
-    let _test_guard = TEST_MUTEX
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let previous = {
-        let mut cache_guard = ACCESSIBLE_CONNECTORS_CACHE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache_guard.take()
-    };
-    let result = f();
-    let mut cache_guard = ACCESSIBLE_CONNECTORS_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *cache_guard = previous;
-    result
-}
-
 #[test]
 fn accessible_connectors_from_mcp_tools_carries_plugin_display_names() {
     let tools = vec![
@@ -147,6 +128,22 @@ fn accessible_connectors_from_mcp_tools_carries_plugin_display_names() {
             plugin_display_names: plugin_names(&["beta", "sample"]),
         }]
     );
+}
+
+#[tokio::test]
+async fn connector_discovery_plugins_manager_inherits_auth_mode() {
+    let codex_home = tempdir().expect("tempdir should succeed");
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .build()
+        .await
+        .expect("config should build");
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+
+    let plugins_manager = connector_discovery_plugins_manager(&config, auth_manager.as_ref());
+
+    assert_eq!(plugins_manager.auth_mode(), Some(AuthMode::Chatgpt));
 }
 
 #[test]
@@ -216,17 +213,15 @@ fn synthetic_links_are_exposed_to_the_agent_but_not_accessible_in_app_list() {
     );
 }
 
-#[tokio::test]
-async fn refresh_accessible_connectors_cache_from_mcp_tools_writes_latest_installed_apps() {
-    let codex_home = tempdir().expect("tempdir should succeed");
-    let mut config = ConfigBuilder::default()
-        .codex_home(codex_home.path().to_path_buf())
-        .build()
-        .await
-        .expect("config should load");
-    let _ = config.features.set_enabled(Feature::Apps, /*enabled*/ true);
-    let cache_key = accessible_connectors_cache_key(&config, /*auth*/ None);
-    let tools = vec![
+#[test]
+fn accessible_connectors_status_tracks_the_latest_raw_tools() {
+    let initial_tools = vec![codex_app_tool(
+        "calendar_list_events",
+        "calendar",
+        Some("Google Calendar"),
+        &["calendar-plugin"],
+    )];
+    let latest_tools = vec![
         codex_app_tool(
             "calendar_list_events",
             "calendar",
@@ -241,13 +236,17 @@ async fn refresh_accessible_connectors_cache_from_mcp_tools_writes_latest_instal
         ),
     ];
 
-    let cached = with_accessible_connectors_cache_cleared(|| {
-        refresh_accessible_connectors_cache_from_mcp_tools(&config, /*auth*/ None, &tools);
-        read_cached_accessible_connectors(&cache_key).expect("cache should be populated")
-    });
+    let initial =
+        accessible_connectors_status_from_tools(&initial_tools, /*codex_apps_ready*/ false);
+    let latest =
+        accessible_connectors_status_from_tools(&latest_tools, /*codex_apps_ready*/ true);
 
     assert_eq!(
-        (cached.connectors, cached.codex_apps_ready),
+        (initial.connectors.len(), initial.codex_apps_ready),
+        (1, false)
+    );
+    assert_eq!(
+        (latest.connectors, latest.codex_apps_ready),
         (
             vec![
                 AppInfo {
@@ -290,47 +289,13 @@ async fn refresh_accessible_connectors_cache_from_mcp_tools_writes_latest_instal
     );
 }
 
-#[tokio::test]
-async fn accessible_connectors_cache_preserves_not_ready_startup_snapshot() {
-    let codex_home = tempdir().expect("tempdir should succeed");
-    let config = ConfigBuilder::default()
-        .codex_home(codex_home.path().to_path_buf())
-        .build()
-        .await
-        .expect("config should load");
-    let cache_key = accessible_connectors_cache_key(&config, /*auth*/ None);
-    let connector_a = app("connector-a");
-    let connector_b = app("connector-b");
+#[test]
+fn accessible_connectors_status_preserves_raw_readiness() {
+    let startup = accessible_connectors_status_from_tools(&[], false);
+    let live = accessible_connectors_status_from_tools(&[], true);
 
-    let (cache_hit, refreshed) = with_accessible_connectors_cache_cleared(|| {
-        write_cached_accessible_connectors(
-            cache_key.clone(),
-            std::slice::from_ref(&connector_a),
-            /*codex_apps_ready*/ false,
-        );
-        let cache_hit = read_cached_accessible_connectors(&cache_key)
-            .expect("startup cache should be populated");
-
-        write_cached_accessible_connectors(
-            cache_key.clone(),
-            &[connector_a.clone(), connector_b.clone()],
-            /*codex_apps_ready*/ true,
-        );
-        let refreshed = read_cached_accessible_connectors(&cache_key)
-            .expect("refreshed cache should be populated");
-        (cache_hit, refreshed)
-    });
-
-    assert_eq!(
-        (
-            (cache_hit.connectors, cache_hit.codex_apps_ready),
-            (refreshed.connectors, refreshed.codex_apps_ready),
-        ),
-        (
-            (vec![connector_a.clone()], false),
-            (vec![connector_a, connector_b], true),
-        )
-    );
+    assert!(!startup.codex_apps_ready);
+    assert!(live.codex_apps_ready);
 }
 
 #[test]

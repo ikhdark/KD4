@@ -7,10 +7,7 @@ mod url;
 pub use client::OllamaClient;
 use codex_core::config::Config;
 use codex_model_provider_info::ModelProviderInfo;
-pub use pull::CliProgressReporter;
 pub use pull::PullEvent;
-pub use pull::PullProgressReporter;
-pub use pull::TuiProgressReporter;
 use semver::Version;
 
 /// Default OSS model to use when `--oss` is passed without an explicit `-m`.
@@ -34,10 +31,7 @@ pub async fn ensure_oss_ready(config: &Config) -> std::io::Result<()> {
     match ollama_client.fetch_models().await {
         Ok(models) => {
             if !models.iter().any(|m| m == model) {
-                let mut reporter = crate::CliProgressReporter::new();
-                ollama_client
-                    .pull_with_reporter(model, &mut reporter)
-                    .await?;
+                ollama_client.pull_with_cli_progress(model).await?;
             }
         }
         Err(err) => {
@@ -94,5 +88,15 @@ mod tests {
     fn supports_responses_at_or_after_cutoff() {
         assert!(supports_responses(&Version::new(0, 13, 4)));
         assert!(supports_responses(&Version::new(0, 14, 0)));
+    }
+
+    #[test]
+    fn pull_progress_stays_on_the_concrete_cli_path() {
+        let pull_source = include_str!("pull.rs");
+        let removed_reporter_trait = ["trait PullProgress", "Reporter"].concat();
+        let removed_tui_reporter = ["struct TuiProgress", "Reporter"].concat();
+        assert!(!pull_source.contains(&removed_reporter_trait));
+        assert!(!pull_source.contains(&removed_tui_reporter));
+        assert!(include_str!("client.rs").contains("pull_with_cli_progress"));
     }
 }

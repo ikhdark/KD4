@@ -16,6 +16,8 @@ pub use codex_protocol::config_types::AltScreenMode;
 pub use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::EnvironmentVariablePattern;
 pub use codex_protocol::config_types::ModeKind;
+pub use codex_protocol::config_types::OtelHttpProtocol;
+pub use codex_protocol::config_types::OtelTlsConfig;
 pub use codex_protocol::config_types::Personality;
 pub use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::ShellEnvironmentPolicy;
@@ -115,23 +117,14 @@ pub enum OAuthCredentialsStoreMode {
 }
 
 /// Determine how auth credentials should use keyring-backed storage.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum AuthKeyringBackendKind {
     /// Store the serialized auth payload directly in the OS keyring.
     Direct,
     /// Store auth payloads in the local encrypted secrets file, with the file key in the OS keyring.
+    #[default]
     Secrets,
-}
-
-impl Default for AuthKeyringBackendKind {
-    fn default() -> Self {
-        if cfg!(windows) {
-            Self::Secrets
-        } else {
-            Self::Direct
-        }
-    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
@@ -494,24 +487,6 @@ pub struct AppsConfigToml {
 
 // ===== OTEL configuration =====
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
-#[serde(rename_all = "kebab-case")]
-pub enum OtelHttpProtocol {
-    /// Binary payload
-    Binary,
-    /// JSON payload
-    Json,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-#[serde(rename_all = "kebab-case")]
-pub struct OtelTlsConfig {
-    pub ca_certificate: Option<AbsolutePathBuf>,
-    pub client_certificate: Option<AbsolutePathBuf>,
-    pub client_private_key: Option<AbsolutePathBuf>,
-}
-
 /// Which OTEL exporter to use.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
@@ -784,43 +759,18 @@ const fn default_true() -> bool {
 /// Settings for notices we display to users via the tui and app-server clients
 /// (primarily the Codex IDE extension). NOTE: these are different from
 /// notifications - notices are warnings, NUX screens, acknowledgements, etc.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-pub struct ExternalConfigMigrationPrompts {
-    /// Tracks whether home-level external config migration prompts are hidden.
-    pub home: Option<bool>,
-    /// Tracks the last time the home-level external config migration prompt was shown.
-    pub home_last_prompted_at: Option<i64>,
-    /// Tracks which project paths have opted out of external config migration prompts.
-    #[serde(default)]
-    pub projects: BTreeMap<String, bool>,
-    /// Tracks the last time a project-level external config migration prompt was shown.
-    #[serde(default)]
-    pub project_last_prompted_at: BTreeMap<String, i64>,
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct Notice {
-    /// Tracks whether the user has acknowledged the full access warning prompt.
-    pub hide_full_access_warning: Option<bool>,
     /// Tracks whether the user has acknowledged the Windows world-writable directories warning.
     pub hide_world_writable_warning: Option<bool>,
     /// Tracks whether the user opted out of Codex-managed fast defaults.
     pub fast_default_opt_out: Option<bool>,
     /// Tracks whether the user opted out of the rate limit model switch reminder.
     pub hide_rate_limit_model_nudge: Option<bool>,
-    /// Tracks whether the user has seen the model migration prompt
-    pub hide_gpt5_1_migration_prompt: Option<bool>,
-    /// Tracks whether the user has seen the gpt-5.1-codex-max migration prompt
-    #[serde(rename = "hide_gpt-5.1-codex-max_migration_prompt")]
-    pub hide_gpt_5_1_codex_max_migration_prompt: Option<bool>,
     /// Tracks acknowledged model migrations as old->new model slug mappings.
     #[serde(default)]
     pub model_migrations: BTreeMap<String, String>,
-    /// Tracks scopes where external config migration prompts should be suppressed.
-    #[serde(default)]
-    pub external_config_migration_prompts: ExternalConfigMigrationPrompts,
 }
 
 pub use crate::skills_config::BundledSkillsConfig;

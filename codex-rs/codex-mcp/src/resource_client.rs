@@ -124,25 +124,166 @@ impl McpResourceClient {
             .contents
             .into_iter()
             .map(resource_content_from_rmcp)
-            .collect::<Result<Vec<_>>>()?;
+            .collect();
         Ok(McpResourceReadResult { contents })
     }
 }
 
 fn resource_from_rmcp(resource: rmcp::model::Resource) -> Result<Resource> {
-    let value = serde_json::to_value(resource).context("failed to serialize MCP resource")?;
-    Resource::from_mcp_value(value).context("failed to convert MCP resource")
+    let rmcp::model::Annotated { raw, annotations } = resource;
+    let rmcp::model::RawResource {
+        uri,
+        name,
+        title,
+        description,
+        mime_type,
+        size,
+        icons,
+        meta,
+    } = raw;
+
+    let annotations = annotations
+        .map(serde_json::to_value)
+        .transpose()
+        .context("failed to convert MCP resource annotations")?;
+    let icons = icons
+        .map(|icons| {
+            icons
+                .into_iter()
+                .map(serde_json::to_value)
+                .collect::<serde_json::Result<Vec<_>>>()
+        })
+        .transpose()
+        .context("failed to convert MCP resource icons")?;
+
+    Ok(Resource {
+        annotations,
+        description,
+        mime_type,
+        name,
+        size: size.map(i64::from),
+        title,
+        uri,
+        icons,
+        meta: meta.map(|meta| serde_json::Value::Object(meta.0)),
+    })
 }
 
-fn resource_content_from_rmcp(content: rmcp::model::ResourceContents) -> Result<ResourceContent> {
-    let value =
-        serde_json::to_value(content).context("failed to serialize MCP resource content")?;
-    serde_json::from_value(value).context("failed to convert MCP resource content")
+fn resource_content_from_rmcp(content: rmcp::model::ResourceContents) -> ResourceContent {
+    match content {
+        rmcp::model::ResourceContents::TextResourceContents {
+            uri,
+            mime_type,
+            text,
+            meta,
+        } => ResourceContent::Text {
+            uri,
+            mime_type,
+            text,
+            meta: meta.map(|meta| serde_json::Value::Object(meta.0)),
+        },
+        rmcp::model::ResourceContents::BlobResourceContents {
+            uri,
+            mime_type,
+            blob,
+            meta,
+        } => ResourceContent::Blob {
+            uri,
+            mime_type,
+            blob,
+            meta: meta.map(|meta| serde_json::Value::Object(meta.0)),
+        },
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
+    use rmcp::model::Annotated;
+    use rmcp::model::Annotations;
+    use rmcp::model::Icon;
+    use rmcp::model::Meta;
+    use rmcp::model::RawResource;
+    use rmcp::model::ResourceContents;
+    use rmcp::model::Role;
+
+    #[test]
+    fn resource_conversion_preserves_typed_fields_and_opaque_metadata() {
+        let mut annotations = Annotations::default();
+        annotations.audience = Some(vec![Role::User]);
+        annotations.priority = Some(0.75);
+
+        let mut meta = Meta::new();
+        meta.insert("source".to_string(), serde_json::json!("calendar"));
+        let raw = RawResource::new("resource://calendar/today", "today")
+            .with_title("Today's calendar")
+            .with_description("Calendar entries for today")
+            .with_mime_type("application/json")
+            .with_size(42)
+            .with_icons(vec![Icon::new("https://example.com/calendar.png")])
+            .with_meta(meta);
+
+        assert_eq!(
+            resource_from_rmcp(Annotated::new(raw, Some(annotations))).expect("convert resource"),
+            Resource {
+                annotations: Some(serde_json::json!({
+                    "audience": ["user"],
+                    "priority": 0.75,
+                })),
+                description: Some("Calendar entries for today".to_string()),
+                mime_type: Some("application/json".to_string()),
+                name: "today".to_string(),
+                size: Some(42),
+                title: Some("Today's calendar".to_string()),
+                uri: "resource://calendar/today".to_string(),
+                icons: Some(vec![serde_json::json!({
+                    "src": "https://example.com/calendar.png",
+                })]),
+                meta: Some(serde_json::json!({"source": "calendar"})),
+            }
+        );
+    }
+
+    #[test]
+    fn resource_content_conversion_moves_text_blob_and_metadata_directly() {
+        let mut text_meta = Meta::new();
+        text_meta.insert("page".to_string(), serde_json::json!(1));
+        let text = ResourceContents::TextResourceContents {
+            uri: "resource://docs/readme".to_string(),
+            mime_type: Some("text/markdown".to_string()),
+            text: "# Readme".to_string(),
+            meta: Some(text_meta),
+        };
+
+        let mut blob_meta = Meta::new();
+        blob_meta.insert("encoding".to_string(), serde_json::json!("base64"));
+        let blob = ResourceContents::BlobResourceContents {
+            uri: "resource://images/logo".to_string(),
+            mime_type: Some("image/png".to_string()),
+            blob: "iVBORw0KGgo=".to_string(),
+            meta: Some(blob_meta),
+        };
+
+        assert_eq!(
+            resource_content_from_rmcp(text),
+            ResourceContent::Text {
+                uri: "resource://docs/readme".to_string(),
+                mime_type: Some("text/markdown".to_string()),
+                text: "# Readme".to_string(),
+                meta: Some(serde_json::json!({"page": 1})),
+            }
+        );
+        assert_eq!(
+            resource_content_from_rmcp(blob),
+            ResourceContent::Blob {
+                uri: "resource://images/logo".to_string(),
+                mime_type: Some("image/png".to_string()),
+                blob: "iVBORw0KGgo=".to_string(),
+                meta: Some(serde_json::json!({"encoding": "base64"})),
+            }
+        );
+    }
 
     #[tokio::test]
     async fn unavailable_runtime_is_reported_without_panicking() {

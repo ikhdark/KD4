@@ -1,6 +1,6 @@
 use codex_exec_server::ExecutorFileSystem;
+use codex_plugin::plugin_namespace_for_root_uri;
 use codex_utils_path_uri::PathUri;
-use codex_utils_plugins::plugin_namespace_for_root_uri;
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::collections::HashSet;

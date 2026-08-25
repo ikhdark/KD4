@@ -109,12 +109,14 @@ $oldCargoIncremental = $env:CARGO_INCREMENTAL
 $oldCargoTargetDir = $env:CARGO_TARGET_DIR
 $oldRustcWrapper = $env:RUSTC_WRAPPER
 $oldWindowsMsvcLinker = $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER
+$oldWindowsArm64MsvcLinker = $env:CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER
 $hadSccacheBaseDir = Test-Path Env:SCCACHE_BASEDIR
 $hadSccacheCacheSize = Test-Path Env:SCCACHE_CACHE_SIZE
 $hadCargoIncremental = Test-Path Env:CARGO_INCREMENTAL
 $hadCargoTargetDir = Test-Path Env:CARGO_TARGET_DIR
 $hadRustcWrapper = Test-Path Env:RUSTC_WRAPPER
 $hadWindowsMsvcLinker = Test-Path Env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER
+$hadWindowsArm64MsvcLinker = Test-Path Env:CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER
 $oldNativeCommandUseErrorActionPreference = Get-Variable -Name PSNativeCommandUseErrorActionPreference -ValueOnly -ErrorAction SilentlyContinue
 $hadNativeCommandUseErrorActionPreference = $null -ne (Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue)
 $didPushLocation = $false
@@ -173,12 +175,13 @@ try {
         $didPushLocation = $true
     }
 
-    Write-Output ("rustPerfEnv: rustcWrapper={0}; cargoIncremental={1}; sccacheBaseDir={2}; cargoTargetDir={3}; windowsMsvcLinker={4}" -f `
+    Write-Output ("rustPerfEnv: rustcWrapper={0}; cargoIncremental={1}; sccacheBaseDir={2}; cargoTargetDir={3}; windowsMsvcLinker={4}; windowsArm64MsvcLinker={5}" -f `
             (Format-EnvProofValue -Name "RUSTC_WRAPPER"),
             (Format-EnvProofValue -Name "CARGO_INCREMENTAL"),
             (Format-EnvProofValue -Name "SCCACHE_BASEDIR"),
             $cargoTargetDirProof,
-            (Format-EnvProofValue -Name "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"))
+            (Format-EnvProofValue -Name "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"),
+            (Format-EnvProofValue -Name "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER"))
 
     $global:LASTEXITCODE = $null
     $program = $ProgramArgs[0]
@@ -207,6 +210,7 @@ finally {
     Restore-ProcessEnvironmentVariable -Name "CARGO_TARGET_DIR" -Value $oldCargoTargetDir -WasSet $hadCargoTargetDir
     Restore-ProcessEnvironmentVariable -Name "RUSTC_WRAPPER" -Value $oldRustcWrapper -WasSet $hadRustcWrapper
     Restore-ProcessEnvironmentVariable -Name "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER" -Value $oldWindowsMsvcLinker -WasSet $hadWindowsMsvcLinker
+    Restore-ProcessEnvironmentVariable -Name "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER" -Value $oldWindowsArm64MsvcLinker -WasSet $hadWindowsArm64MsvcLinker
     if ($hadNativeCommandUseErrorActionPreference) {
         $PSNativeCommandUseErrorActionPreference = $oldNativeCommandUseErrorActionPreference
     }

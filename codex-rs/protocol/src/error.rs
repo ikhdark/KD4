@@ -15,8 +15,6 @@ use chrono::Datelike;
 use chrono::Local;
 use chrono::Utc;
 use codex_async_utils::CancelErr;
-use codex_utils_string::truncate_middle_chars;
-use codex_utils_string::truncate_middle_with_token_budget;
 use reqwest::StatusCode;
 use serde_json;
 use std::io;
@@ -41,16 +39,6 @@ pub enum SandboxErr {
         network_policy_decision: Option<NetworkPolicyDecisionPayload>,
     },
 
-    /// Error from linux seccomp filter setup
-    #[cfg(target_os = "linux")]
-    #[error("seccomp setup error")]
-    SeccompInstall(#[from] seccompiler::Error),
-
-    /// Error from linux seccomp backend
-    #[cfg(target_os = "linux")]
-    #[error("seccomp backend error")]
-    SeccompBackend(#[from] seccompiler::BackendError),
-
     /// Command timed out
     #[error("command timed out")]
     Timeout { output: Box<ExecToolCallOutput> },
@@ -58,10 +46,6 @@ pub enum SandboxErr {
     /// Command was killed by a signal
     #[error("command was killed by a signal")]
     Signal(i32),
-
-    /// Error from linux landlock
-    #[error("Landlock was not able to fully enforce all sandbox rules")]
-    LandlockRestrict,
 }
 
 #[derive(Error, Debug)]
@@ -136,8 +120,6 @@ pub enum CodexErr {
     /// Sandbox error
     #[error("sandbox error: {0}")]
     Sandbox(#[from] SandboxErr),
-    #[error("codex-linux-sandbox was required but not provided")]
-    LandlockSandboxExecutableNotProvided,
     #[error("unsupported operation: {0}")]
     UnsupportedOperation(String),
     #[error("{0}")]
@@ -151,12 +133,6 @@ pub enum CodexErr {
     Io(#[from] io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
-    #[cfg(target_os = "linux")]
-    #[error(transparent)]
-    LandlockRuleset(#[from] landlock::RulesetError),
-    #[cfg(target_os = "linux")]
-    #[error(transparent)]
-    LandlockPathFd(#[from] landlock::PathFdError),
     #[error(transparent)]
     TokioJoin(#[from] JoinError),
     #[error("{0}")]
@@ -183,7 +159,6 @@ impl CodexErr {
             | CodexErr::RefreshTokenFailed(_)
             | CodexErr::UnsupportedOperation(_)
             | CodexErr::Sandbox(_)
-            | CodexErr::LandlockSandboxExecutableNotProvided
             | CodexErr::RetryLimit(_)
             | CodexErr::ContextWindowExceeded
             | CodexErr::ThreadNotFound(_)
@@ -204,8 +179,6 @@ impl CodexErr {
             | CodexErr::Io(_)
             | CodexErr::Json(_)
             | CodexErr::TokioJoin(_) => true,
-            #[cfg(target_os = "linux")]
-            CodexErr::LandlockRuleset(_) | CodexErr::LandlockPathFd(_) => false,
         }
     }
 
@@ -386,13 +359,6 @@ fn truncate_with_ellipsis(text: &str, max_bytes: usize) -> String {
     let mut truncated = text[..cut].to_string();
     truncated.push_str("...");
     truncated
-}
-
-fn truncate_text(content: &str, policy: TruncationPolicy) -> String {
-    match policy {
-        TruncationPolicy::Bytes(bytes) => truncate_middle_chars(content, bytes),
-        TruncationPolicy::Tokens(tokens) => truncate_middle_with_token_budget(content, tokens).0,
-    }
 }
 
 #[derive(Debug)]
@@ -633,10 +599,7 @@ pub fn get_error_message_ui(e: &CodexErr) -> String {
         _ => e.to_string(),
     };
 
-    truncate_text(
-        &message,
-        TruncationPolicy::Bytes(ERROR_MESSAGE_UI_MAX_BYTES),
-    )
+    TruncationPolicy::Bytes(ERROR_MESSAGE_UI_MAX_BYTES).truncate_text(&message)
 }
 
 #[cfg(test)]

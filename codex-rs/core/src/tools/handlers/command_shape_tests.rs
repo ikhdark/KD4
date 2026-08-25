@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use serde_json::json;
 
-use crate::function_tool::FunctionCallError;
+use crate::FunctionCallError;
 use crate::shell::Shell;
 use crate::shell::ShellType;
 use crate::tools::handlers::command_shape::CommandInvocation;

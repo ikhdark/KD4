@@ -1,13 +1,10 @@
 use crate::config::Config;
 use codex_config::types::OtelExporterKind as Kind;
-use codex_config::types::OtelHttpProtocol as Protocol;
 use codex_features::Feature;
 use codex_login::default_client::originator;
 use codex_otel::OtelExporter;
-use codex_otel::OtelHttpProtocol;
 use codex_otel::OtelProvider;
 use codex_otel::OtelSettings;
-use codex_otel::OtelTlsConfig as OtelTlsSettings;
 use std::error::Error;
 
 /// Build an OpenTelemetry provider from the app Config.
@@ -27,26 +24,15 @@ pub fn build_provider(
             headers,
             protocol,
             tls,
-        } => {
-            let protocol = match protocol {
-                Protocol::Json => OtelHttpProtocol::Json,
-                Protocol::Binary => OtelHttpProtocol::Binary,
-            };
-
-            OtelExporter::OtlpHttp {
-                endpoint: endpoint.clone(),
-                headers: headers
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-                protocol,
-                tls: tls.as_ref().map(|config| OtelTlsSettings {
-                    ca_certificate: config.ca_certificate.clone(),
-                    client_certificate: config.client_certificate.clone(),
-                    client_private_key: config.client_private_key.clone(),
-                }),
-            }
-        }
+        } => OtelExporter::OtlpHttp {
+            endpoint: endpoint.clone(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            protocol: *protocol,
+            tls: tls.clone(),
+        },
         Kind::OtlpGrpc {
             endpoint,
             headers,
@@ -57,11 +43,7 @@ pub fn build_provider(
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
-            tls: tls.as_ref().map(|config| OtelTlsSettings {
-                ca_certificate: config.ca_certificate.clone(),
-                client_certificate: config.client_certificate.clone(),
-                client_private_key: config.client_private_key.clone(),
-            }),
+            tls: tls.clone(),
         },
     };
 

@@ -27,11 +27,10 @@ use anyhow::Error;
 use anyhow::Result;
 use codex_config::types::AuthKeyringBackendKind;
 use codex_config::types::OAuthCredentialsStoreMode;
+use codex_secrets::LocalSecretsBackend;
 use codex_secrets::LocalSecretsNamespace;
 use codex_secrets::SecretName;
 use codex_secrets::SecretScope;
-use codex_secrets::SecretsBackendKind;
-use codex_secrets::SecretsManager;
 use oauth2::AccessToken;
 use oauth2::RefreshToken;
 use oauth2::Scope;
@@ -239,14 +238,13 @@ fn load_oauth_tokens_from_secrets_keyring<K: KeyringStore + Clone + 'static>(
 ) -> Result<Option<StoredOAuthTokens>> {
     let _store_lock = OAuthStoreLock::acquire(OAuthStore::Secrets)?;
     let codex_home = find_codex_home()?;
-    let manager = SecretsManager::new_with_keyring_store_and_namespace(
+    let backend = LocalSecretsBackend::new_with_namespace(
         codex_home.to_path_buf(),
-        SecretsBackendKind::Local,
         Arc::new(keyring_store.clone()),
         LocalSecretsNamespace::McpOAuth,
     );
     let secret_name = compute_secret_name(server_name, url)?;
-    match manager
+    match backend
         .get(&SecretScope::Global, &secret_name)
         .context("failed to load MCP OAuth tokens from encrypted storage")?
     {
@@ -359,14 +357,13 @@ fn save_oauth_tokens_to_secrets_keyring_with_lock_held<K: KeyringStore + Clone +
     serialized: &str,
 ) -> Result<()> {
     let codex_home = find_codex_home()?;
-    let manager = SecretsManager::new_with_keyring_store_and_namespace(
+    let backend = LocalSecretsBackend::new_with_namespace(
         codex_home.to_path_buf(),
-        SecretsBackendKind::Local,
         Arc::new(keyring_store.clone()),
         LocalSecretsNamespace::McpOAuth,
     );
     let secret_name = compute_secret_name(server_name, &tokens.url)?;
-    manager
+    backend
         .set(&SecretScope::Global, &secret_name, serialized)
         .context("failed to write OAuth tokens to encrypted storage")
 }
@@ -474,14 +471,13 @@ fn delete_oauth_tokens_from_secrets_keyring<K: KeyringStore + Clone + 'static>(
 ) -> Result<bool> {
     let _store_lock = OAuthStoreLock::acquire(OAuthStore::Secrets)?;
     let codex_home = find_codex_home()?;
-    let manager = SecretsManager::new_with_keyring_store_and_namespace(
+    let backend = LocalSecretsBackend::new_with_namespace(
         codex_home.to_path_buf(),
-        SecretsBackendKind::Local,
         Arc::new(keyring_store.clone()),
         LocalSecretsNamespace::McpOAuth,
     );
     let secret_name = compute_secret_name(server_name, url)?;
-    let secrets_removed = manager
+    let secrets_removed = backend
         .delete(&SecretScope::Global, &secret_name)
         .context("failed to delete OAuth tokens from encrypted storage")?;
     Ok(secrets_removed)
@@ -844,22 +840,11 @@ fn write_fallback_file(store: &FallbackFile) -> Result<()> {
         .parent()
         .ok_or_else(|| anyhow::anyhow!("credentials path has no parent: {}", path.display()))?;
     let mut temporary = NamedTempFile::new_in(parent)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(0o600);
-        temporary.as_file().set_permissions(perms)?;
-    }
+
     temporary.write_all(serialized.as_bytes())?;
     temporary.flush()?;
     temporary.as_file().sync_all()?;
     temporary.persist(&path).map_err(|error| error.error)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-    }
 
     Ok(())
 }
@@ -1021,14 +1006,13 @@ mod tests {
             &tokens,
         )?;
 
-        let manager = SecretsManager::new_with_keyring_store_and_namespace(
+        let backend = LocalSecretsBackend::new_with_namespace(
             env.path().to_path_buf(),
-            SecretsBackendKind::Local,
             Arc::new(store.clone()),
             LocalSecretsNamespace::McpOAuth,
         );
         let secret_name = super::compute_secret_name(&tokens.server_name, &tokens.url)?;
-        let stored = manager
+        let stored = backend
             .get(&SecretScope::Global, &secret_name)?
             .expect("tokens should be saved to encrypted storage");
         assert_eq!(serde_json::from_str::<StoredOAuthTokens>(&stored)?, tokens);
@@ -1133,15 +1117,14 @@ mod tests {
             &tokens.url,
         )?;
 
-        let manager = SecretsManager::new_with_keyring_store_and_namespace(
+        let backend = LocalSecretsBackend::new_with_namespace(
             env.path().to_path_buf(),
-            SecretsBackendKind::Local,
             Arc::new(store.clone()),
             LocalSecretsNamespace::McpOAuth,
         );
         let secret_name = super::compute_secret_name(&tokens.server_name, &tokens.url)?;
         assert!(removed);
-        assert!(manager.get(&SecretScope::Global, &secret_name)?.is_none());
+        assert!(backend.get(&SecretScope::Global, &secret_name)?.is_none());
         assert!(store.saved_value(&key).is_none());
         assert!(!super::fallback_file_path()?.exists());
         Ok(())

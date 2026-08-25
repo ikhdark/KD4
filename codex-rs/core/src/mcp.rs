@@ -68,7 +68,7 @@ impl McpManager {
         Self {
             plugins_manager,
             extensions,
-            codex_apps_tools_cache: CodexAppsToolsCache::default(),
+            codex_apps_tools_cache: CodexAppsToolsCache::shared(),
         }
     }
 

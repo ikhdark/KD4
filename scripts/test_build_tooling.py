@@ -1,106 +1,29 @@
 #!/usr/bin/env python3
 
 import io
-import importlib.util
 import os
-from pathlib import Path
-import shutil
 import subprocess
 import tempfile
-import tomllib
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from scripts import tool_versions
-
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-
-
-def powershell() -> str | None:
-    # Prefer Windows PowerShell 5.1: the justfile invokes these scripts via
-    # `powershell -NoProfile -File ...`, so tests should exercise the same
-    # host (5.1 has stricter native-stderr and StrictMode semantics).
-    return shutil.which("powershell") or shutil.which("pwsh")
-
-
-def pwsh_only() -> str | None:
-    # invoke-rust-perf-env.ps1 runs under pwsh 7.4+ in production (recipes
-    # invoke it inline in the just-shell pwsh session), and its -NoSccache
-    # proof depends on pwsh's empty-env-var semantics, so its tests must not
-    # fall back to Windows PowerShell 5.1.
-    return shutil.which("pwsh")
-
-
-def bash_executable() -> str | None:
-    if os.name != "nt":
-        return shutil.which("bash")
-
-    git = shutil.which("git")
-    if git is not None:
-        completed = subprocess.run(
-            [git, "--exec-path"],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=False,
-            creationflags=CREATE_NO_WINDOW,
-        )
-        if completed.returncode == 0:
-            exec_path = Path(completed.stdout.strip())
-            if len(exec_path.parents) >= 3:
-                candidate = exec_path.parents[2] / "bin" / "bash.exe"
-                if candidate.is_file():
-                    return str(candidate)
-
-    # System32's bash.exe is a WSL launcher, not a standalone Bash runtime.
-    candidate = shutil.which("bash")
-    system32 = Path(os.environ["SystemRoot"]) / "System32"
-    if candidate is not None and Path(candidate).parent != system32:
-        return candidate
-    return None
-
-
-def ps_single_quote(value: str | Path) -> str:
-    return "'" + str(value).replace("'", "''") + "'"
-
-
-def load_just_shell_module():
-    path = REPO_ROOT / "scripts" / "just-shell.py"
-    spec = importlib.util.spec_from_file_location("just_shell", path)
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def load_format_module():
-    path = REPO_ROOT / "scripts" / "format.py"
-    spec = importlib.util.spec_from_file_location("format_script", path)
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def load_root_maintenance_module():
-    path = REPO_ROOT / "scripts" / "root_maintenance.py"
-    spec = importlib.util.spec_from_file_location("root_maintenance", path)
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def load_toml(path: Path):
-    return tomllib.loads(path.read_text(encoding="utf-8"))
+from scripts.build_tooling_test_support import REPO_ROOT
+from scripts.build_tooling_test_support import load_format_module
+from scripts.build_tooling_test_support import load_just_shell_module
+from scripts.build_tooling_test_support import load_toml
 
 
 class BuildToolingEnvironmentTest(unittest.TestCase):
+    def test_shared_support_loads_hyphenated_repo_script(self) -> None:
+        just_shell = load_just_shell_module()
+
+        self.assertEqual(
+            Path(just_shell.__file__).resolve(),
+            REPO_ROOT / "scripts" / "just-shell.py",
+        )
+
     def test_just_shell_limits_rust_setup_to_rust_commands(self) -> None:
         just_shell = load_just_shell_module()
 
@@ -120,7 +43,6 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
 
         updates = just_shell.rust_tool_env(
             {"PATH": "ignored"},
-            os_name="posix",
             which=lambda program: f"/tools/{program}" if program == "sccache" else None,
             repo_root=REPO_ROOT,
         )
@@ -136,7 +58,6 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
 
         updates = just_shell.rust_tool_env(
             {"RUSTC_WRAPPER": "sccache"},
-            os_name="posix",
             which=lambda program: None,
             repo_root=REPO_ROOT,
         )
@@ -153,7 +74,6 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
 
         updates = just_shell.rust_tool_env(
             {"CODEX_SCCACHE_CACHE_SIZE": "100G"},
-            os_name="posix",
             which=which,
             repo_root=REPO_ROOT,
         )
@@ -161,7 +81,6 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
 
         blank_updates = just_shell.rust_tool_env(
             {"CODEX_SCCACHE_CACHE_SIZE": "   "},
-            os_name="posix",
             which=which,
             repo_root=REPO_ROOT,
         )
@@ -172,7 +91,6 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
 
         updates = just_shell.rust_tool_env(
             {"RUSTC_WRAPPER": "existing-wrapper"},
-            os_name="posix",
             which=lambda program: f"/tools/{program}" if program == "sccache" else None,
         )
 
@@ -332,7 +250,6 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
 
         updates = just_shell.rust_tool_env(
             {"CI": "true"},
-            os_name="nt",
             which=lambda program: f"C:/tools/{program}.exe",
         )
 
@@ -343,7 +260,6 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
 
         updates = just_shell.rust_tool_env(
             {},
-            os_name="nt",
             which=lambda program: (
                 "C:/LLVM/bin/lld-link.exe" if program == "lld-link" else None
             ),
@@ -354,7 +270,10 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             updates["CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"],
             "C:/LLVM/bin/lld-link.exe",
         )
-        self.assertNotIn("CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER", updates)
+        self.assertEqual(
+            updates["CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER"],
+            "C:/LLVM/bin/lld-link.exe",
+        )
 
     def test_windows_local_just_shell_uses_scoop_lld_link_when_not_on_path(
         self,
@@ -369,7 +288,6 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
 
             updates = just_shell.rust_tool_env(
                 {"SCOOP": str(root)},
-                os_name="nt",
                 which=lambda _program: None,
             )
 
@@ -383,7 +301,6 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
 
         updates = just_shell.rust_tool_env(
             {"CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER": "link.exe"},
-            os_name="nt",
             which=lambda program: (
                 "C:/LLVM/bin/lld-link.exe" if program == "lld-link" else None
             ),
@@ -391,45 +308,9 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
 
         self.assertEqual(updates["CARGO_NET_GIT_FETCH_WITH_CLI"], "true")
         self.assertNotIn("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER", updates)
-
-    def test_linux_local_just_shell_prefers_mold_linker_when_available(self) -> None:
-        just_shell = load_just_shell_module()
-
-        updates = just_shell.rust_tool_env(
-            {},
-            os_name="posix",
-            which=lambda program: (
-                f"/usr/bin/{program}"
-                if program in {"clang", "mold", "ld.lld"}
-                else None
-            ),
-            platform_name="linux",
-        )
-
         self.assertEqual(
-            updates["CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER"],
-            "/usr/bin/clang",
-        )
-        self.assertEqual(
-            updates["CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS"],
-            "-C link-arg=-fuse-ld=mold",
-        )
-
-    def test_linux_local_just_shell_falls_back_to_lld_linker(self) -> None:
-        just_shell = load_just_shell_module()
-
-        updates = just_shell.rust_tool_env(
-            {},
-            os_name="posix",
-            which=lambda program: (
-                f"/usr/bin/{program}" if program in {"clang", "ld.lld"} else None
-            ),
-            platform_name="linux",
-        )
-
-        self.assertEqual(
-            updates["CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS"],
-            "-C link-arg=-fuse-ld=lld",
+            updates["CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER"],
+            "C:/LLVM/bin/lld-link.exe",
         )
 
     def test_local_just_shell_prefers_scripts_venv_python_tools(self) -> None:
@@ -443,7 +324,6 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
 
             updates = just_shell.python_tool_env(
                 {"PATH": "C:/Windows/System32"},
-                os_name="nt",
                 repo_root=root,
             )
 
@@ -492,7 +372,6 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
                     "PATH": "C:/Windows/System32",
                     "VIRTUAL_ENV": "C:/other/.venv",
                 },
-                os_name="nt",
                 repo_root=root,
             )
 
@@ -510,7 +389,6 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
 
             updates = just_shell.python_tool_env(
                 {"PATH": existing_path},
-                os_name="nt",
                 repo_root=root,
             )
 
@@ -528,7 +406,6 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
 
             updates = just_shell.python_tool_env(
                 {},
-                os_name="nt",
                 repo_root=root,
                 cache_dir=cache_dir,
                 stderr=stderr,
@@ -536,7 +413,6 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             second_stderr = io.StringIO()
             just_shell.python_tool_env(
                 {},
-                os_name="nt",
                 repo_root=root,
                 cache_dir=cache_dir,
                 stderr=second_stderr,
@@ -555,7 +431,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             python_dir.mkdir(parents=True)
 
             self.assertEqual(
-                just_shell.python_tool_env({}, os_name="nt", repo_root=root),
+                just_shell.python_tool_env({}, repo_root=root),
                 {},
             )
 
@@ -662,17 +538,6 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
                 "tool {stderr-null} | more", args="ARGS", stderr_null="ERR"
             )
 
-    def test_local_just_shell_reports_missing_sh(self) -> None:
-        just_shell = load_just_shell_module()
-        stderr = io.StringIO()
-
-        result = just_shell.run_sh(
-            "echo hi", "recipe", [], which=lambda program: None, stderr=stderr
-        )
-
-        self.assertEqual(result, 1)
-        self.assertIn("POSIX shell", stderr.getvalue())
-
     def test_local_just_shell_rejects_old_powershell(self) -> None:
         just_shell = load_just_shell_module()
         stderr = io.StringIO()
@@ -712,9 +577,86 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         manifest = load_toml(REPO_ROOT / "codex-rs" / "Cargo.toml")
 
         workspace = manifest["workspace"]
+        removed_crates = {
+            "ansi-escape",
+            "collaboration-mode-templates",
+            "core-api",
+            "thread-manager-sample",
+            "v8-poc",
+        }
 
         self.assertNotIn("default-members", workspace)
-        self.assertIn("v8-poc", workspace["members"])
+        self.assertTrue(removed_crates.isdisjoint(workspace["members"]))
+        for crate in removed_crates:
+            self.assertFalse((REPO_ROOT / "codex-rs" / crate).exists())
+        self.assertTrue(
+            {
+                "app-server/tests/common",
+                "chatgpt",
+                "core/tests/common",
+                "mcp-server/tests/common",
+                "message-history",
+                "windows-sandbox-rs",
+            }.issubset(workspace["members"])
+        )
+
+    def test_cli_removes_orphaned_wsl_path_normalization(self) -> None:
+        main = (REPO_ROOT / "codex-rs" / "cli" / "src" / "main.rs").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertNotIn("wsl_paths", main)
+        self.assertFalse(
+            (REPO_ROOT / "codex-rs" / "cli" / "src" / "wsl_paths.rs").exists()
+        )
+
+    def test_rollout_state_integration_has_one_implementation_owner(self) -> None:
+        rollout_src = REPO_ROOT / "codex-rs" / "rollout" / "src"
+        rollout_lib = (rollout_src / "lib.rs").read_text(encoding="utf-8")
+        state_docs = (REPO_ROOT / "codex-rs" / "state" / "src" / "lib.rs").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertTrue((rollout_src / "state_integration.rs").is_file())
+        self.assertFalse((rollout_src / "state_db.rs").exists())
+        self.assertTrue((rollout_src / "state_integration_tests.rs").is_file())
+        self.assertFalse((rollout_src / "state_db_tests.rs").exists())
+        self.assertIn("pub mod state_integration;", rollout_lib)
+        self.assertNotIn("pub use state_integration as state_db;", rollout_lib)
+        self.assertIn("codex-rollout::state_integration", state_docs)
+
+    def test_memories_usage_metric_stays_with_usage_owner(self) -> None:
+        memories_read_src = REPO_ROOT / "codex-rs" / "memories" / "read" / "src"
+        usage = (memories_read_src / "usage.rs").read_text(encoding="utf-8")
+        lib = (memories_read_src / "lib.rs").read_text(encoding="utf-8")
+
+        self.assertFalse((memories_read_src / "metrics.rs").exists())
+        self.assertNotIn("mod metrics;", lib)
+        self.assertIn(
+            'pub const MEMORIES_USAGE_METRIC: &str = "codex.memories.usage";',
+            usage,
+        )
+
+    def test_windows_program_database_artifacts_are_ignored(self) -> None:
+        ignore_rules = (
+            (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+        )
+
+        self.assertIn("*.pdb", ignore_rules)
+
+    def test_rust_workspace_excludes_retired_orphan_crates(self) -> None:
+        manifest = load_toml(REPO_ROOT / "codex-rs" / "Cargo.toml")
+        members = manifest["workspace"]["members"]
+
+        retired_crates = ("execpolicy-legacy", "realtime-webrtc")
+        for crate in retired_crates:
+            self.assertNotIn(crate, members)
+            self.assertFalse((REPO_ROOT / "codex-rs" / crate / "Cargo.toml").exists())
+
+        execpolicy_readme = (
+            REPO_ROOT / "codex-rs" / "execpolicy" / "README.md"
+        ).read_text()
+        self.assertNotIn("codex-execpolicy-legacy", execpolicy_readme)
 
     def test_rust_workspace_uses_upstream_profiles(self) -> None:
         manifest = load_toml(REPO_ROOT / "codex-rs" / "Cargo.toml")
@@ -795,10 +737,6 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         nextest = load_toml(REPO_ROOT / "codex-rs" / ".config" / "nextest.toml")
 
         self.assertIn(
-            "RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo nextest run --no-fail-fast",
-            justfile,
-        )
-        self.assertIn(
             '$env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast',
             justfile,
         )
@@ -817,17 +755,13 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             local_profile["overrides"],
         )
         self.assertIn(local_app_server_override, fast_profile["overrides"])
-        self.assertIn(
-            "RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=fast cargo nextest run",
-            justfile,
-        )
         self.assertIn('$env:NEXTEST_PROFILE = "fast"; cargo nextest run', justfile)
         no_sccache_recipe = justfile.split("test-fast-nosccache *args:", 1)[1].split(
             "\n\n", 1
         )[0]
         self.assertIn('$env:NEXTEST_PROFILE = "fast"', no_sccache_recipe)
         self.assertIn(
-            "RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo nextest run --no-fail-fast --timings=html,json",
+            '$env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast --timings=html,json',
             justfile,
         )
         self.assertNotIn("changed-validation", justfile)
@@ -961,7 +895,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         command = groups[0].commands[0]
         self.assertEqual(command.args[:4], ("pnpm", "exec", "prettier", "--check"))
         self.assertNotIn("docs/*.md", command.args)
-        self.assertIn("codex-cli/**/*.js", command.args)
+        self.assertIn("**/*.js", command.args)
         self.assertIn("sdk/typescript/**/*.ts", command.args)
 
     def test_formatter_only_constructs_selected_group_lazily(self) -> None:
@@ -974,7 +908,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         ):
             groups = format_script.formatter_groups(
                 check=True,
-                selected_groups={"python scripts"},
+                selected_groups={"python-scripts"},
             )
 
         self.assertEqual([group.name for group in groups], ["Python scripts"])
@@ -1086,73 +1020,12 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             publish_script,
         )
 
-    def test_remote_env_missing_container_cleanup_is_idempotent(self) -> None:
-        bash = bash_executable()
-        if bash is None:
-            self.skipTest("standalone bash is required")
-
-        remote_env_script = (REPO_ROOT / "scripts" / "test-remote-env.sh").read_text(
-            encoding="utf-8"
-        )
-        definitions = (
-            "is_sourced() {"
-            + remote_env_script.split("is_sourced() {", 1)[1].split(
-                "\nif ! is_sourced; then", 1
-            )[0]
-        )
-        harness = (
-            definitions
-            + r"""
-set -euo pipefail
-test_root="$(mktemp -d)"
-trap 'rm -rf "${test_root}"' EXIT
-binary_path="${test_root}/codex"
-docker_log="${test_root}/docker.log"
-printf 'codex' >"${binary_path}"
-
-docker() {
-  printf '%s\n' "$*" >>"${docker_log}"
-  if [[ "$1" == "image" && "$2" == "inspect" ]]; then
-    printf 'sha256:test-image\n'
-    return 0
-  fi
-  if [[ "$1" == "rm" && "$2" == "-f" ]]; then
-    return 1
-  fi
-  if [[ "$1" == "run" && "$2" == "-d" ]]; then
-    printf 'test-container\n'
-    return 0
-  fi
-  return 99
-}
-
-CODEX_TEST_REMOTE_ENV_MOUNT_BINARY=0
-CODEX_TEST_REMOTE_ENV_REUSE=0
-start_remote_env_container missing-container test-image "${binary_path}" 4321
-grep -q '^rm -f missing-container$' "${docker_log}"
-grep -q '^run -d ' "${docker_log}"
-"""
-        )
-
-        completed = subprocess.run(
-            [bash, "-s"],
-            input=harness,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            cwd=REPO_ROOT,
-            check=False,
-        )
-
-        self.assertEqual(completed.returncode, 0, completed.stdout)
-
     def test_dependency_policy_dispatches_duplicate_check_recipe(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
         recipe = justfile.split("deps-policy-check *args:", 1)[1].split("\n\n", 1)[0]
 
         self.assertIn("just deps-duplicates-check {args}", recipe)
         self.assertNotIn("just deps-duplicates {args}", recipe)
-
 
 if __name__ == "__main__":
     unittest.main()

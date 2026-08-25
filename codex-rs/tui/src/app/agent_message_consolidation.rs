@@ -53,7 +53,11 @@ impl App {
                 "ConsolidateAgentMessage: replacing cells [{start}..{end}] with AgentMarkdownCell"
             );
             let consolidated: Arc<dyn HistoryCell> =
-                Arc::new(history_cell::AgentMarkdownCell::new(source, &cwd));
+                Arc::new(history_cell::AgentMarkdownCell::new_with_file_opener(
+                    source,
+                    &cwd,
+                    self.config.file_opener,
+                ));
             self.transcript_cells
                 .splice(start..end, std::iter::once(consolidated.clone()));
 

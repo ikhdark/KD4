@@ -27,8 +27,7 @@ pub(crate) fn permission_profile_sandbox_tag(
             }
         }
     }
-    if cfg!(target_os = "windows") && matches!(windows_sandbox_level, WindowsSandboxLevel::Elevated)
-    {
+    if matches!(windows_sandbox_level, WindowsSandboxLevel::Elevated) {
         return "windows_elevated";
     }
 

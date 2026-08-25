@@ -59,11 +59,8 @@ mod tests {
             tracing::callsite::rebuild_interest_cache();
             run_main_with_telemetry(
                 "invalid",
-                ExecServerRuntimePaths::new(
-                    std::env::current_exe().expect("current executable"),
-                    /*codex_linux_sandbox_exe*/ None,
-                )
-                .expect("runtime paths"),
+                ExecServerRuntimePaths::new(std::env::current_exe().expect("current executable"))
+                    .expect("runtime paths"),
                 ExecServerTelemetry::default(),
             )
             .await

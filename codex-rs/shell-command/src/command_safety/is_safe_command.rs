@@ -4,9 +4,10 @@ use crate::command_safety::is_dangerous_command::executable_name_lookup_key;
 // may appear before it (e.g., `-C`, `-c`, `--git-dir`).
 // Implemented in `is_dangerous_command` and shared here.
 use crate::command_safety::is_dangerous_command::find_git_subcommand;
-#[cfg(windows)]
+use crate::parse_command::is_valid_sed_n_arg;
+
 use crate::command_safety::windows_safe_commands::is_safe_command_windows;
-#[cfg(windows)]
+
 use crate::command_safety::windows_safe_commands::is_safe_powershell_words as is_safe_powershell_words_windows;
 
 pub fn is_known_safe_command(command: &[String]) -> bool {
@@ -21,7 +22,6 @@ pub fn is_known_safe_command(command: &[String]) -> bool {
         })
         .collect();
 
-    #[cfg(windows)]
     {
         if is_safe_command_windows(&command) {
             return true;
@@ -52,16 +52,7 @@ pub fn is_known_safe_command(command: &[String]) -> bool {
 /// Returns whether already-tokenized PowerShell words are read-only enough to
 /// be auto-approved by the Windows safelist.
 pub fn is_safe_powershell_words(command: &[String]) -> bool {
-    #[cfg(windows)]
-    {
-        is_safe_powershell_words_windows(command)
-    }
-
-    #[cfg(not(windows))]
-    {
-        let _ = command;
-        false
-    }
+    is_safe_powershell_words_windows(command)
 }
 
 fn is_safe_to_call_with_exec(command: &[String]) -> bool {
@@ -74,8 +65,6 @@ fn is_safe_to_call_with_exec(command: &[String]) -> bool {
     }
 
     match executable_name_lookup_key(cmd0).as_deref() {
-        Some(cmd) if cfg!(target_os = "linux") && matches!(cmd, "numfmt" | "tac") => true,
-
         #[rustfmt::skip]
         Some(
             "cat" |
@@ -336,39 +325,6 @@ fn git_subcommand_args_are_read_only(args: &[String]) -> bool {
 Example
 ---------------------------------------------------------- */
 
-/// Returns true if `arg` matches /^(\d+,)?\d+p$/
-fn is_valid_sed_n_arg(arg: Option<&str>) -> bool {
-    // unwrap or bail
-    let s = match arg {
-        Some(s) => s,
-        None => return false,
-    };
-
-    // must end with 'p', strip it
-    let core = match s.strip_suffix('p') {
-        Some(rest) => rest,
-        None => return false,
-    };
-
-    // split on ',' and ensure 1 or 2 numeric parts
-    let parts: Vec<&str> = core.split(',').collect();
-    match parts.as_slice() {
-        // single number, e.g. "10"
-        [num] => !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()),
-
-        // two numbers, e.g. "1,5"
-        [a, b] => {
-            !a.is_empty()
-                && !b.is_empty()
-                && a.chars().all(|c| c.is_ascii_digit())
-                && b.chars().all(|c| c.is_ascii_digit())
-        }
-
-        // anything else (more than one comma) is invalid
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,13 +358,8 @@ mod tests {
             "find", ".", "-name", "file.txt"
         ])));
 
-        if cfg!(target_os = "linux") {
-            assert!(is_safe_to_call_with_exec(&vec_str(&["numfmt", "1000"])));
-            assert!(is_safe_to_call_with_exec(&vec_str(&["tac", "Cargo.toml"])));
-        } else {
-            assert!(!is_safe_to_call_with_exec(&vec_str(&["numfmt", "1000"])));
-            assert!(!is_safe_to_call_with_exec(&vec_str(&["tac", "Cargo.toml"])));
-        }
+        assert!(!is_safe_to_call_with_exec(&vec_str(&["numfmt", "1000"])));
+        assert!(!is_safe_to_call_with_exec(&vec_str(&["tac", "Cargo.toml"])));
     }
 
     #[test]
@@ -663,10 +614,7 @@ mod tests {
 
     #[test]
     fn windows_powershell_full_path_is_safe() {
-        if !cfg!(windows) {
-            // Windows only because on Linux path splitting doesn't handle `/` separators properly
-            return;
-        }
+        {}
 
         let Some(powershell) = crate::powershell::try_find_pwsh_executable_blocking()
             .or_else(crate::powershell::try_find_powershell_executable_blocking)
@@ -685,9 +633,7 @@ mod tests {
 
     #[test]
     fn windows_git_full_path_is_safe() {
-        if !cfg!(windows) {
-            return;
-        }
+        {}
 
         assert!(!is_known_safe_command(&vec_str(&[
             r"C:\Program Files\Git\cmd\git.exe",
@@ -804,11 +750,7 @@ mod tests {
     fn direct_powershell_words_use_windows_safelist() {
         let command = vec_str(&["Get-Content", "Cargo.toml"]);
 
-        if cfg!(windows) {
-            assert!(is_safe_powershell_words(&command));
-        } else {
-            assert!(!is_safe_powershell_words(&command));
-        }
+        assert!(is_safe_powershell_words(&command));
     }
 
     #[test]
@@ -839,52 +781,5 @@ mod tests {
                 "expected unsafe: {command:?}"
             );
         }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn non_windows_safe_classification_does_not_spawn_repo_powershell_path() {
-        use std::fs;
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-        use std::time::SystemTime;
-        use std::time::UNIX_EPOCH;
-
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after unix epoch")
-            .as_nanos();
-        let temp_dir = std::env::temp_dir().join(format!(
-            "codex-safe-command-pwsh-test-{}-{unique}",
-            std::process::id()
-        ));
-        fs::create_dir(&temp_dir).expect("create temp dir for fake pwsh");
-        let fake_pwsh = temp_dir.join("pwsh");
-        let marker = temp_dir.join("marker");
-        let quoted_marker = marker.to_string_lossy().replace('\'', "'\\''");
-
-        let mut script = fs::File::create(&fake_pwsh).expect("create fake pwsh");
-        writeln!(
-            script,
-            "#!/bin/sh\nprintf spawned > '{quoted_marker}'\nexit 0"
-        )
-        .expect("write fake pwsh");
-        let mut permissions = fs::metadata(&fake_pwsh)
-            .expect("stat fake pwsh")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&fake_pwsh, permissions).expect("make fake pwsh executable");
-
-        assert!(!is_known_safe_command(&[
-            fake_pwsh.to_string_lossy().into_owned(),
-            "-Command".to_string(),
-            "Get-ChildItem".to_string(),
-        ]));
-        assert!(
-            !marker.exists(),
-            "non-Windows safety classification must not spawn a PowerShell-looking path"
-        );
-
-        fs::remove_dir_all(temp_dir).expect("remove temp dir");
     }
 }

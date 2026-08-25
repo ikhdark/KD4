@@ -5,7 +5,6 @@ use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt;
 use codex_utils_string::approx_tokens_from_byte_count;
-use codex_utils_string::take_bytes_at_char_boundary;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -991,8 +990,8 @@ fn content_items_to_code_mode_result(items: &[FunctionCallOutputContentItem]) ->
     )
 }
 
-fn telemetry_preview(content: &str) -> String {
-    let truncated_slice = take_bytes_at_char_boundary(content, TELEMETRY_PREVIEW_MAX_BYTES);
+pub fn telemetry_preview(content: &str) -> String {
+    let truncated_slice = &content[..content.floor_char_boundary(TELEMETRY_PREVIEW_MAX_BYTES)];
     let truncated_by_bytes = truncated_slice.len() < content.len();
 
     let mut preview = String::new();
@@ -1034,6 +1033,51 @@ fn telemetry_preview(content: &str) -> String {
 #[cfg(test)]
 mod canonical_tests {
     use super::*;
+
+    #[test]
+    fn telemetry_preview_stops_before_split_utf8_character() {
+        let content = format!("{}😀", "x".repeat(TELEMETRY_PREVIEW_MAX_BYTES - 1));
+
+        assert_eq!(
+            telemetry_preview(&content),
+            format!(
+                "{}\n{TELEMETRY_PREVIEW_TRUNCATION_NOTICE}",
+                "x".repeat(TELEMETRY_PREVIEW_MAX_BYTES - 1)
+            )
+        );
+    }
+
+    #[test]
+    fn telemetry_preview_returns_original_within_limits() {
+        let content = "short output";
+        assert_eq!(telemetry_preview(content), content);
+    }
+
+    #[test]
+    fn telemetry_preview_truncates_by_bytes() {
+        let content = "x".repeat(TELEMETRY_PREVIEW_MAX_BYTES + 8);
+        let preview = telemetry_preview(&content);
+
+        assert!(preview.contains(TELEMETRY_PREVIEW_TRUNCATION_NOTICE));
+        assert!(
+            preview.len()
+                <= TELEMETRY_PREVIEW_MAX_BYTES + TELEMETRY_PREVIEW_TRUNCATION_NOTICE.len() + 1
+        );
+    }
+
+    #[test]
+    fn telemetry_preview_truncates_by_lines() {
+        let content = (0..(TELEMETRY_PREVIEW_MAX_LINES + 5))
+            .map(|idx| format!("line {idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let preview = telemetry_preview(&content);
+        let lines: Vec<&str> = preview.lines().collect();
+
+        assert!(lines.len() <= TELEMETRY_PREVIEW_MAX_LINES + 1);
+        assert_eq!(lines.last(), Some(&TELEMETRY_PREVIEW_TRUNCATION_NOTICE));
+    }
 
     #[test]
     fn canonical_json_sorts_recursively_and_records_lexical_ranges() {

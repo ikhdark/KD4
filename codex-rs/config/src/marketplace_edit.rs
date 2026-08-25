@@ -2,9 +2,9 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
 
-use codex_utils_path::acquire_atomic_write_lock;
-use codex_utils_path::resolve_symlink_write_paths;
-use codex_utils_path::write_atomically;
+use codex_file_system::acquire_atomic_write_lock;
+use codex_file_system::resolve_symlink_write_paths;
+use codex_file_system::write_atomically;
 use toml_edit::DocumentMut;
 use toml_edit::Item as TomlItem;
 use toml_edit::Table as TomlTable;
@@ -12,6 +12,7 @@ use toml_edit::Value as TomlValue;
 use toml_edit::value;
 
 use crate::CONFIG_TOML_FILE;
+use crate::read_or_create_config_document;
 
 pub struct MarketplaceConfigUpdate<'a> {
     pub last_updated: &'a str,
@@ -37,10 +38,7 @@ pub fn record_user_marketplace(
     let config_path = codex_home.join(CONFIG_TOML_FILE);
     let _lock = acquire_atomic_write_lock(&config_path)?;
     let write_paths = resolve_symlink_write_paths(&config_path)?;
-    let mut doc = match write_paths.read_path.as_deref() {
-        Some(read_path) => read_or_create_document(read_path)?,
-        None => DocumentMut::new(),
-    };
+    let mut doc = read_or_create_config_document(write_paths.read_path.as_deref())?;
     upsert_marketplace(&mut doc, marketplace_name, update);
     write_atomically(&write_paths.write_path, &doc.to_string())
 }
@@ -77,16 +75,6 @@ pub fn remove_user_marketplace_config(
 
     write_atomically(&write_paths.write_path, &doc.to_string())?;
     Ok(RemoveMarketplaceConfigOutcome::Removed)
-}
-
-fn read_or_create_document(config_path: &Path) -> std::io::Result<DocumentMut> {
-    match fs::read_to_string(config_path) {
-        Ok(raw) => raw
-            .parse::<DocumentMut>()
-            .map_err(|err| std::io::Error::new(ErrorKind::InvalidData, err)),
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(DocumentMut::new()),
-        Err(err) => Err(err),
-    }
 }
 
 fn upsert_marketplace(

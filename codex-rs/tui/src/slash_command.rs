@@ -245,10 +245,13 @@ impl SlashCommand {
 
     fn is_visible(self) -> bool {
         match self {
-            SlashCommand::SandboxReadRoot => cfg!(target_os = "windows"),
-            SlashCommand::Copy => !cfg!(target_os = "android"),
-            SlashCommand::App => cfg!(any(target_os = "macos", target_os = "windows")),
-            SlashCommand::Rollout | SlashCommand::TestApproval => cfg!(debug_assertions),
+            SlashCommand::SandboxReadRoot => true,
+            SlashCommand::Copy => true,
+            SlashCommand::App => true,
+            SlashCommand::Rollout
+            | SlashCommand::TestApproval
+            | SlashCommand::MemoryDrop
+            | SlashCommand::MemoryUpdate => cfg!(debug_assertions),
             _ => true,
         }
     }
@@ -268,6 +271,7 @@ mod tests {
     use std::str::FromStr;
 
     use super::SlashCommand;
+    use super::built_in_slash_commands;
 
     #[test]
     fn stop_command_is_canonical_name() {
@@ -303,6 +307,23 @@ mod tests {
         assert_eq!(
             SlashCommand::from_str("approve"),
             Ok(SlashCommand::AutoReview)
+        );
+    }
+
+    #[test]
+    fn unfinished_memory_commands_are_visible_only_in_debug_builds() {
+        let commands = built_in_slash_commands()
+            .into_iter()
+            .map(|(_, command)| command)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            commands.contains(&SlashCommand::MemoryDrop),
+            cfg!(debug_assertions)
+        );
+        assert_eq!(
+            commands.contains(&SlashCommand::MemoryUpdate),
+            cfg!(debug_assertions)
         );
     }
 }

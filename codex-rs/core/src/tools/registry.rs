@@ -1,4 +1,5 @@
-use crate::function_tool::FunctionCallError;
+use crate::FunctionCallError;
+use crate::client_common::ToolSchemaArtifact;
 use crate::hook_runtime::PreToolUseHookResult;
 use crate::hook_runtime::record_additional_contexts;
 use crate::hook_runtime::run_post_tool_use_hooks;
@@ -19,7 +20,10 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::flat_tool_name;
+use crate::tools::handlers::ParsedFunctionArguments;
 use crate::tools::handlers::multi_agents_spec::MULTI_AGENT_V1_NAMESPACE;
+use crate::tools::handlers::parsed_function_argument_value;
+use crate::tools::handlers::with_parsed_function_arguments;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::lifecycle::notify_tool_finish;
 use crate::tools::lifecycle::notify_tool_start;
@@ -31,7 +35,7 @@ use crate::tools::tool_dispatch_trace::record_output_projection;
 use crate::tools::tool_dispatch_trace::record_post_tool_hook;
 use crate::tools::tool_dispatch_trace::record_pre_tool_hook;
 use crate::turn_timing::TurnTimingState;
-use crate::util::error_or_panic;
+use codex_config::schema::canonicalize as canonicalize_json;
 use codex_extension_api::ToolCallOutcome;
 use codex_otel::TOOL_LIFECYCLE_PHASE_DURATION_METRIC;
 use codex_protocol::models::FunctionCallOutputBody;
@@ -42,7 +46,7 @@ use codex_protocol::protocol::DeterministicContinuationClass;
 use codex_protocol::protocol::DeterministicContinuationHostAction;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt;
-use codex_rollout::state_db;
+use codex_rollout::state_integration;
 use codex_tools::CanonicalByteRange;
 use codex_tools::CanonicalJsonPointer;
 use codex_tools::CanonicalToolResult;
@@ -58,7 +62,6 @@ use codex_tools::ToolOutputProjectionRange;
 use codex_tools::ToolProjectionInclusion;
 use codex_tools::ToolProjectionSection;
 use codex_tools::ToolProjectionV1;
-use codex_tools::ToolSearchInfo;
 use codex_tools::ToolSpec;
 use codex_utils_output_truncation::DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS;
 use codex_utils_output_truncation::OutputDiagnosticClass;
@@ -77,7 +80,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
-use tracing::instrument;
 
 pub(crate) type ToolTelemetryTags = Vec<(&'static str, String)>;
 const MIN_PROJECTION_ENVELOPE_TOKENS: usize = 64;
@@ -85,11 +87,15 @@ const MIN_PROJECTION_ENVELOPE_TOKENS: usize = 64;
 fn record_lifecycle_phase(invocation: &ToolInvocation, phase: &'static str, started: Instant) {
     let tool_name = flat_tool_name(&invocation.tool_name);
     let elapsed = started.elapsed();
-    invocation.turn.session_telemetry.record_duration(
-        TOOL_LIFECYCLE_PHASE_DURATION_METRIC,
-        elapsed,
-        &[("phase", phase), ("tool", tool_name.as_ref())],
-    );
+    invocation
+        .step_context
+        .turn
+        .session_telemetry
+        .record_duration(
+            TOOL_LIFECYCLE_PHASE_DURATION_METRIC,
+            elapsed,
+            &[("phase", phase), ("tool", tool_name.as_ref())],
+        );
     match phase {
         "pre_hooks" => record_pre_tool_hook(elapsed),
         "post_hooks" => record_post_tool_hook(elapsed),
@@ -676,114 +682,88 @@ pub(crate) struct PostToolUsePayload {
     pub(crate) tool_response: Value,
 }
 
-pub(crate) fn override_tool_exposure(
-    handler: Arc<dyn CoreToolRuntime>,
+pub(crate) struct RegisteredTool {
+    tool_name: ToolName,
+    runtime: Arc<dyn CoreToolRuntime>,
     exposure: ToolExposure,
-) -> Arc<dyn CoreToolRuntime> {
-    if handler.exposure() == exposure {
-        return handler;
-    }
-
-    Arc::new(ExposureOverride { handler, exposure })
+    spec: ToolSpec,
 }
 
-struct ExposureOverride {
-    handler: Arc<dyn CoreToolRuntime>,
-    exposure: ToolExposure,
-}
-
-impl ToolExecutor<ToolInvocation> for ExposureOverride {
-    fn tool_name(&self) -> ToolName {
-        self.handler.tool_name()
+impl RegisteredTool {
+    pub(crate) fn new(runtime: Arc<dyn CoreToolRuntime>) -> Self {
+        let exposure = runtime.exposure();
+        let spec = runtime.spec();
+        let tool_name = spec.sole_callable_tool_name().unwrap_or_else(|| {
+            panic!("registered runtime specs must declare exactly one callable tool")
+        });
+        Self {
+            tool_name,
+            runtime,
+            exposure,
+            spec,
+        }
     }
 
-    fn spec(&self) -> ToolSpec {
-        self.handler.spec()
+    pub(crate) fn with_exposure(runtime: Arc<dyn CoreToolRuntime>, exposure: ToolExposure) -> Self {
+        let spec = runtime.spec();
+        let tool_name = spec.sole_callable_tool_name().unwrap_or_else(|| {
+            panic!("registered runtime specs must declare exactly one callable tool")
+        });
+        Self {
+            tool_name,
+            runtime,
+            exposure,
+            spec,
+        }
     }
 
-    fn exposure(&self) -> ToolExposure {
+    pub(crate) fn runtime(&self) -> &Arc<dyn CoreToolRuntime> {
+        &self.runtime
+    }
+
+    pub(crate) fn tool_name(&self) -> &ToolName {
+        &self.tool_name
+    }
+
+    pub(crate) fn exposure(&self) -> ToolExposure {
         self.exposure
     }
 
-    fn supports_parallel_tool_calls(&self) -> bool {
-        self.exposure != ToolExposure::Hidden && self.handler.supports_parallel_tool_calls()
+    pub(crate) fn spec(&self) -> &ToolSpec {
+        &self.spec
     }
 
-    fn search_info(&self) -> Option<ToolSearchInfo> {
-        self.handler.search_info()
-    }
-
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        self.handler.handle(invocation)
-    }
-}
-
-impl CoreToolRuntime for ExposureOverride {
-    fn tool_execution_timing(&self) -> ToolExecutionTiming {
-        self.handler.tool_execution_timing()
-    }
-
-    fn matches_kind(&self, payload: &ToolPayload) -> bool {
-        self.handler.matches_kind(payload)
-    }
-
-    fn waits_for_runtime_cancellation(&self) -> bool {
-        self.handler.waits_for_runtime_cancellation()
-    }
-
-    fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
-        self.handler.pre_tool_use_payload(invocation)
-    }
-
-    fn post_tool_use_payload(
-        &self,
-        invocation: &ToolInvocation,
-        result: &dyn ToolOutput,
-    ) -> Option<PostToolUsePayload> {
-        self.handler.post_tool_use_payload(invocation, result)
-    }
-
-    fn with_updated_hook_input(
-        &self,
-        invocation: ToolInvocation,
-        updated_input: Value,
-    ) -> Result<ToolInvocation, FunctionCallError> {
-        self.handler
-            .with_updated_hook_input(invocation, updated_input)
-    }
-
-    fn telemetry_tags<'a>(
-        &'a self,
-        invocation: &'a ToolInvocation,
-    ) -> BoxFuture<'a, ToolTelemetryTags> {
-        self.handler.telemetry_tags(invocation)
-    }
-
-    fn create_diff_consumer(&self) -> Option<Box<dyn ToolArgumentDiffConsumer>> {
-        self.handler.create_diff_consumer()
+    pub(crate) fn set_exposure(&mut self, exposure: ToolExposure) {
+        self.exposure = exposure;
     }
 }
 
 pub struct ToolRegistry {
-    tools: HashMap<ToolName, Arc<dyn CoreToolRuntime>>,
+    tools: HashMap<ToolName, RegisteredTool>,
+    model_visible_schemas: Arc<ToolSchemaArtifact>,
 }
 
 impl ToolRegistry {
-    fn new(tools: HashMap<ToolName, Arc<dyn CoreToolRuntime>>) -> Self {
-        Self { tools }
+    fn new(tools: HashMap<ToolName, RegisteredTool>) -> Self {
+        Self {
+            tools,
+            model_visible_schemas: Arc::new(ToolSchemaArtifact::default()),
+        }
     }
 
-    #[instrument(level = "trace", skip_all)]
+    #[cfg(test)]
+    #[tracing::instrument(level = "trace", skip_all)]
     pub(crate) fn from_tools(tools: impl IntoIterator<Item = Arc<dyn CoreToolRuntime>>) -> Self {
-        let mut tools_by_name = HashMap::new();
-        for tool in tools {
-            let name = tool.tool_name();
-            if tools_by_name.contains_key(&name) {
-                error_or_panic(format!("tool {name} already registered"));
-                continue;
-            }
-            tools_by_name.insert(name, tool);
-        }
+        Self::from_unique_registered_tools(tools.into_iter().map(RegisteredTool::new))
+    }
+
+    pub(crate) fn from_unique_registered_tools(
+        tools: impl IntoIterator<Item = RegisteredTool>,
+    ) -> Self {
+        let tools_by_name = tools
+            .into_iter()
+            .map(|tool| (tool.tool_name().clone(), tool))
+            .collect();
         Self::new(tools_by_name)
     }
 
@@ -797,12 +777,16 @@ impl ToolRegistry {
     where
         T: CoreToolRuntime + 'static,
     {
-        let name = handler.tool_name();
-        Self::new(HashMap::from([(name, handler as Arc<dyn CoreToolRuntime>)]))
+        let runtime = handler as Arc<dyn CoreToolRuntime>;
+        let registered = RegisteredTool::new(runtime);
+        Self::new(HashMap::from([(
+            registered.tool_name().clone(),
+            registered,
+        )]))
     }
 
     fn tool(&self, name: &ToolName) -> Option<Arc<dyn CoreToolRuntime>> {
-        self.tools.get(name).map(Arc::clone)
+        self.tools.get(name).map(|tool| Arc::clone(tool.runtime()))
     }
 
     #[cfg(test)]
@@ -813,14 +797,26 @@ impl ToolRegistry {
     }
 
     pub(crate) fn tool_exposure(&self, name: &ToolName) -> Option<ToolExposure> {
-        self.tools.get(name).map(|tool| tool.exposure())
+        self.tools.get(name).map(RegisteredTool::exposure)
+    }
+
+    pub(crate) fn set_model_visible_specs(&mut self, specs: Vec<ToolSpec>) {
+        self.model_visible_schemas = Arc::new(ToolSchemaArtifact::new(specs));
+    }
+
+    pub(crate) fn model_visible_specs(&self) -> Vec<ToolSpec> {
+        self.model_visible_schemas.specs().to_vec()
+    }
+
+    pub(crate) fn model_visible_schemas(&self) -> Arc<ToolSchemaArtifact> {
+        Arc::clone(&self.model_visible_schemas)
     }
 
     pub(crate) fn manifest_entries(&self) -> Vec<(ToolName, ToolExposure, ToolSpec)> {
         let mut entries = self
             .tools
             .iter()
-            .map(|(name, tool)| (name.clone(), tool.exposure(), tool.spec()))
+            .map(|(name, tool)| (name.clone(), tool.exposure(), tool.spec().clone()))
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| left.0.cmp(&right.0));
         entries
@@ -834,8 +830,11 @@ impl ToolRegistry {
     }
 
     pub(crate) fn supports_parallel_tool_calls(&self, name: &ToolName) -> Option<bool> {
-        let tool = self.tool(name)?;
-        Some(tool.supports_parallel_tool_calls())
+        let tool = self.tools.get(name)?;
+        Some(
+            tool.exposure() != ToolExposure::Hidden
+                && tool.runtime().supports_parallel_tool_calls(),
+        )
     }
 
     pub(crate) fn waits_for_runtime_cancellation(&self, name: &ToolName) -> Option<bool> {
@@ -853,24 +852,25 @@ impl ToolRegistry {
         terminal_outcome_reached: Arc<AtomicBool>,
     ) -> Result<AnyToolResult, FunctionCallError> {
         let tool_name = invocation.tool_name.clone();
+        let mut parsed_function_arguments =
+            ParsedFunctionArguments::from_payload(&invocation.payload);
         let tool_name_flat = flat_tool_name(&tool_name);
         let call_id_owned = invocation.call_id.clone();
-        let otel = invocation.turn.session_telemetry.clone();
+        let otel = invocation.step_context.turn.session_telemetry.clone();
         let base_tool_result_tags = [
             (
                 "sandbox",
                 permission_profile_sandbox_tag(
-                    &invocation.turn.permission_profile,
-                    invocation.turn.windows_sandbox_level,
-                    invocation.turn.network.is_some(),
+                    &invocation.step_context.turn.permission_profile,
+                    invocation.step_context.turn.windows_sandbox_level,
+                    invocation.step_context.turn.network.is_some(),
                 ),
             ),
             (
                 "sandbox_policy",
                 permission_profile_policy_tag(
-                    &invocation.turn.permission_profile,
-                    #[allow(deprecated)]
-                    invocation.turn.cwd.as_path(),
+                    &invocation.step_context.turn.permission_profile,
+                    invocation.step_context.turn.cwd().as_path(),
                 ),
             ),
         ];
@@ -883,8 +883,8 @@ impl ToolRegistry {
             }
         }
         let dispatch_trace = ToolDispatchTrace::start(&invocation);
-        let tool = match self.tool(&tool_name) {
-            Some(tool) => tool,
+        let (tool, tool_spec) = match self.tools.get(&tool_name) {
+            Some(registered) => (Arc::clone(registered.runtime()), registered.spec().clone()),
             None => {
                 let message = unsupported_tool_call_message(&invocation.payload, &tool_name);
                 let log_payload = invocation.payload.log_payload();
@@ -935,8 +935,12 @@ impl ToolRegistry {
         }
 
         if matches!(invocation.source, ToolCallSource::CodeMode { .. })
-            && let Err(message) =
-                preflight_code_mode_arguments(&tool_name, &tool.spec(), &invocation.payload)
+            && let Err(message) = preflight_code_mode_arguments(
+                &tool_name,
+                &tool_spec,
+                &invocation.payload,
+                parsed_function_arguments.as_ref(),
+            )
         {
             let log_payload = invocation.payload.log_payload();
             otel.tool_result_with_tags(
@@ -958,11 +962,16 @@ impl ToolRegistry {
         notify_tool_start(&invocation).await;
         record_lifecycle_phase(&invocation, "notify_start", phase_started);
 
-        if let Some(pre_tool_use_payload) = tool.pre_tool_use_payload(&invocation) {
+        let pre_tool_use_payload =
+            with_parsed_function_arguments(parsed_function_arguments.clone(), async {
+                tool.pre_tool_use_payload(&invocation)
+            })
+            .await;
+        if let Some(pre_tool_use_payload) = pre_tool_use_payload {
             let phase_started = Instant::now();
             let pre_tool_use_result = run_pre_tool_use_hooks(
                 &invocation.session,
-                &invocation.turn,
+                &invocation.step_context.turn,
                 invocation.call_id.clone(),
                 &pre_tool_use_payload.tool_name,
                 &pre_tool_use_payload.tool_input,
@@ -983,30 +992,37 @@ impl ToolRegistry {
                 }
                 PreToolUseHookResult::Continue {
                     updated_input: Some(updated_input),
-                } => match tool.with_updated_hook_input(invocation.clone(), updated_input) {
-                    Ok(updated_invocation) => {
-                        invocation = updated_invocation;
+                } => {
+                    match with_parsed_function_arguments(parsed_function_arguments.clone(), async {
+                        tool.with_updated_hook_input(invocation.clone(), updated_input)
+                    })
+                    .await
+                    {
+                        Ok(updated_invocation) => {
+                            invocation = updated_invocation;
+                            parsed_function_arguments =
+                                ParsedFunctionArguments::from_payload(&invocation.payload);
+                        }
+                        Err(err) => {
+                            dispatch_trace.record_failed(&err);
+                            notify_tool_finish_if_unclaimed(
+                                &invocation,
+                                terminal_outcome_reached.as_ref(),
+                                ToolCallOutcome::Failed {
+                                    handler_executed: false,
+                                },
+                            )
+                            .await;
+                            return Err(err);
+                        }
                     }
-                    Err(err) => {
-                        dispatch_trace.record_failed(&err);
-                        notify_tool_finish_if_unclaimed(
-                            &invocation,
-                            terminal_outcome_reached.as_ref(),
-                            ToolCallOutcome::Failed {
-                                handler_executed: false,
-                            },
-                        )
-                        .await;
-                        return Err(err);
-                    }
-                },
+                }
                 PreToolUseHookResult::Continue {
                     updated_input: None,
                 } => {}
             }
         }
 
-        let response_cell = tokio::sync::Mutex::new(None);
         let invocation_for_tool = invocation.clone();
         let log_payload = invocation.payload.log_payload();
 
@@ -1020,20 +1036,16 @@ impl ToolRegistry {
                 &extra_trace_fields,
                 || {
                     let tool = tool.clone();
-                    let response_cell = &response_cell;
+                    let parsed_function_arguments = parsed_function_arguments.clone();
                     async move {
-                        match handle_any_tool(tool.as_ref(), invocation_for_tool).await {
-                            Ok(result) => {
-                                let preview = result.result.log_preview();
-                                let success = result.success_for_logging();
-                                let mut guard = response_cell.lock().await;
-                                *guard = Some(result);
-                                Ok((preview, success))
-                            }
-                            Err(err) => Err(err),
-                        }
+                        with_parsed_function_arguments(
+                            parsed_function_arguments,
+                            handle_any_tool(tool.as_ref(), invocation_for_tool),
+                        )
+                        .await
                     }
                 },
+                |result| (result.result.log_preview(), result.success_for_logging()),
             )
             .await;
         record_lifecycle_phase(&invocation, "handler", phase_started);
@@ -1051,14 +1063,14 @@ impl ToolRegistry {
             return Err(err);
         }
         let success = match &result {
-            Ok((_, success)) => *success,
+            Ok(result) => result.success_for_logging(),
             Err(_) => false,
         };
         emit_metric_for_tool_read(&invocation, success);
         let post_tool_use_payload = if success {
-            let guard = response_cell.lock().await;
-            guard
+            result
                 .as_ref()
+                .ok()
                 .and_then(|result| result.post_tool_use_payload.clone())
         } else {
             None
@@ -1067,7 +1079,7 @@ impl ToolRegistry {
             let phase_started = Instant::now();
             let outcome = run_post_tool_use_hooks(
                 &invocation.session,
-                &invocation.turn,
+                &invocation.step_context.turn,
                 post_tool_use_payload.tool_use_id,
                 post_tool_use_payload.tool_name.name().to_string(),
                 post_tool_use_payload.tool_name.matcher_aliases().to_vec(),
@@ -1084,7 +1096,7 @@ impl ToolRegistry {
             let phase_started = Instant::now();
             record_additional_contexts(
                 &invocation.session,
-                &invocation.turn,
+                &invocation.step_context.turn,
                 outcome.additional_contexts.clone(),
             )
             .await;
@@ -1093,21 +1105,13 @@ impl ToolRegistry {
 
         // A PostToolUse block rejects the result, not the already-completed tool execution.
         let lifecycle_outcome = match &result {
-            Ok(_) => {
-                let guard = response_cell.lock().await;
-                match guard.as_ref() {
-                    Some(result) => match result.outcome_for_logging() {
-                        ToolOutputOutcome::Skipped => ToolCallOutcome::Skipped,
-                        ToolOutputOutcome::Success => ToolCallOutcome::Completed { success: true },
-                        ToolOutputOutcome::Failure | ToolOutputOutcome::TimedOut => {
-                            ToolCallOutcome::Completed { success: false }
-                        }
-                    },
-                    None => ToolCallOutcome::Failed {
-                        handler_executed: true,
-                    },
+            Ok(result) => match result.outcome_for_logging() {
+                ToolOutputOutcome::Skipped => ToolCallOutcome::Skipped,
+                ToolOutputOutcome::Success => ToolCallOutcome::Completed { success: true },
+                ToolOutputOutcome::Failure | ToolOutputOutcome::TimedOut => {
+                    ToolCallOutcome::Completed { success: false }
                 }
-            }
+            },
             Err(_) => ToolCallOutcome::Failed {
                 handler_executed: true,
             },
@@ -1122,11 +1126,7 @@ impl ToolRegistry {
         record_lifecycle_phase(&invocation, "notify_finish", phase_started);
 
         match result {
-            Ok(_) => {
-                let mut guard = response_cell.lock().await;
-                let mut result = guard.take().ok_or_else(|| {
-                    FunctionCallError::Fatal("tool produced no output".to_string())
-                })?;
+            Ok(mut result) => {
                 if let Some(outcome) = post_tool_use_outcome {
                     if outcome.should_block {
                         let message = outcome.feedback_message.unwrap_or_else(|| {
@@ -1165,12 +1165,17 @@ impl ToolRegistry {
                 );
                 let admission_tracking_enabled = admission_tracking_enabled(
                     &invocation.source,
-                    invocation.turn.config.completed_tool_history_projection,
+                    invocation
+                        .step_context
+                        .turn
+                        .config
+                        .completed_tool_history_projection,
                 );
                 let phase_started = Instant::now();
                 let projection_input = prepare_model_projection(
                     &invocation,
                     &result,
+                    parsed_function_arguments.as_ref(),
                     force_inline_carrier,
                     projection_admission_required,
                 );
@@ -1193,6 +1198,7 @@ impl ToolRegistry {
                 }
                 if let Some(projection) = &model_projection {
                     invocation
+                        .step_context
                         .turn
                         .turn_timing_state
                         .record_tool_output_projection_facts(
@@ -1211,7 +1217,7 @@ impl ToolRegistry {
                         invocation
                             .session
                             .register_tool_history_candidate(
-                                invocation.turn.config.codex_home.as_path(),
+                                invocation.step_context.turn.config.codex_home.as_path(),
                                 candidate.clone(),
                             )
                             .await;
@@ -1270,9 +1276,15 @@ async fn handle_any_tool(
     invocation: ToolInvocation,
 ) -> Result<AnyToolResult, FunctionCallError> {
     let _tool_execution_timing_guard =
-        matches!(tool.tool_execution_timing(), ToolExecutionTiming::Handler)
-            .then(|| invocation.turn.turn_timing_state.begin_tool_execution());
+        matches!(tool.tool_execution_timing(), ToolExecutionTiming::Handler).then(|| {
+            invocation
+                .step_context
+                .turn
+                .turn_timing_state
+                .begin_tool_execution()
+        });
     invocation
+        .step_context
         .turn
         .turn_timing_state
         .record_tool_handler_entry(invocation.tool_name.name.as_str());
@@ -1281,9 +1293,14 @@ async fn handle_any_tool(
     mark_tool_handler_exit();
     let output = output?;
     if output.contains_external_context()
-        && invocation.turn.config.memories.disable_on_external_context
+        && invocation
+            .step_context
+            .turn
+            .config
+            .memories
+            .disable_on_external_context
     {
-        state_db::mark_thread_memory_mode_polluted(
+        state_integration::mark_thread_memory_mode_polluted(
             invocation.session.services.state_db.as_deref(),
             invocation.session.thread_id,
             "tool_output",
@@ -1402,6 +1419,7 @@ struct ProjectionSelectionFacts {
 fn prepare_model_projection(
     invocation: &ToolInvocation,
     result: &AnyToolResult,
+    parsed_function_arguments: Option<&ParsedFunctionArguments>,
     force_inline_carrier: bool,
     track_for_admission: bool,
 ) -> Option<ModelProjectionInput> {
@@ -1562,13 +1580,14 @@ fn prepare_model_projection(
         }
     };
     let source_dependencies = resolve_projection_source_dependencies(
-        invocation.turn.turn_timing_state.as_ref(),
+        invocation.step_context.turn.turn_timing_state.as_ref(),
         precomputed_projection_source_dependencies(),
         || {
-            crate::tool_history::source_dependencies_for_tool_call(
+            crate::tool_history::source_dependencies_for_tool_call_with_parsed_arguments(
                 flat_tool_name(&invocation.tool_name).as_ref(),
                 &invocation.payload,
-                invocation.turn.config.cwd.as_path(),
+                parsed_function_arguments.and_then(|parsed| parsed.value().ok()),
+                invocation.step_context.turn.config.cwd.as_path(),
             )
         },
     );
@@ -1580,7 +1599,8 @@ fn prepare_model_projection(
     } else {
         model_output_tokens as u64
     };
-    let invocation_sha256 = canonical_tool_invocation_sha256(&invocation.payload);
+    let invocation_sha256 =
+        canonical_tool_invocation_sha256(&invocation.payload, parsed_function_arguments);
     Some(ModelProjectionInput {
         spillable_text,
         outcome: metadata.outcome,
@@ -1590,7 +1610,7 @@ fn prepare_model_projection(
         applied_token_limit,
         projected_text,
         preserved_content,
-        codex_home: invocation.turn.config.codex_home.to_path_buf(),
+        codex_home: invocation.step_context.turn.config.codex_home.to_path_buf(),
         thread_id: invocation.session.thread_id.to_string(),
         tool_name: flat_tool_name(&invocation.tool_name).into_owned(),
         canonical,
@@ -1716,44 +1736,38 @@ fn consolidated_history_output_text(response: &ResponseInputItem) -> String {
     }
 }
 
-fn canonical_tool_invocation_sha256(payload: &ToolPayload) -> Option<String> {
+fn canonical_tool_invocation_sha256(
+    payload: &ToolPayload,
+    parsed_function_arguments: Option<&ParsedFunctionArguments>,
+) -> Option<String> {
     let value = match payload {
         ToolPayload::Function { arguments } => serde_json::json!({
             "kind": "function",
-            "arguments": canonical_json_argument(arguments),
+            "arguments": match parsed_function_arguments {
+                Some(parsed) => parsed
+                    .value()
+                    .map(canonicalize_json)
+                    .unwrap_or_else(|_| Value::String(arguments.clone())),
+                None => canonical_json_argument(arguments),
+            },
         }),
         ToolPayload::ToolSearch { arguments } => serde_json::json!({
             "kind": "tool_search",
-            "arguments": canonicalize_json(serde_json::to_value(arguments).ok()?),
+            "arguments": canonicalize_json(&serde_json::to_value(arguments).ok()?),
         }),
         ToolPayload::Custom { input } => serde_json::json!({
             "kind": "custom",
             "input": canonical_json_argument(input),
         }),
     };
-    let bytes = serde_json::to_vec(&canonicalize_json(value)).ok()?;
+    let bytes = serde_json::to_vec(&canonicalize_json(&value)).ok()?;
     Some(crate::tool_history::sha256(&bytes))
 }
 
 fn canonical_json_argument(value: &str) -> Value {
     serde_json::from_str(value)
-        .map(canonicalize_json)
+        .map(|value| canonicalize_json(&value))
         .unwrap_or_else(|_| Value::String(value.to_string()))
-}
-
-fn canonicalize_json(value: Value) -> Value {
-    match value {
-        Value::Array(values) => Value::Array(values.into_iter().map(canonicalize_json).collect()),
-        Value::Object(values) => Value::Object(
-            values
-                .into_iter()
-                .map(|(key, value)| (key, canonicalize_json(value)))
-                .collect::<BTreeMap<_, _>>()
-                .into_iter()
-                .collect(),
-        ),
-        value => value,
-    }
 }
 
 fn generic_projection_is_exempt(tool_name: &ToolName, force_inline_carrier: bool) -> bool {
@@ -2996,12 +3010,20 @@ fn preflight_code_mode_arguments(
     tool_name: &ToolName,
     spec: &ToolSpec,
     payload: &ToolPayload,
+    parsed_function_arguments: Option<&ParsedFunctionArguments>,
 ) -> Result<(), String> {
-    let ToolPayload::Function { arguments } = payload else {
+    let ToolPayload::Function { arguments: _ } = payload else {
         return Ok(());
     };
-    let value: Value = serde_json::from_str(arguments)
-        .map_err(|err| format!("tool `{tool_name}` arguments are not valid JSON: {err}"))?;
+    let value = parsed_function_arguments
+        .and_then(|parsed| parsed.value().ok())
+        .cloned()
+        .ok_or_else(|| {
+            let message = parsed_function_arguments
+                .and_then(|parsed| parsed.value().err())
+                .unwrap_or("unknown JSON parse error");
+            format!("tool `{tool_name}` arguments are not valid JSON: {message}")
+        })?;
     if !value.is_object() {
         return Err(format!(
             "tool `{tool_name}` expects a JSON object for arguments"
@@ -3061,7 +3083,13 @@ fn function_hook_tool_input(arguments: &str) -> Value {
         return Value::Object(serde_json::Map::new());
     }
 
-    serde_json::from_str(arguments).unwrap_or_else(|_| Value::String(arguments.to_string()))
+    match parsed_function_argument_value(arguments) {
+        Some(Ok(value)) => value,
+        Some(Err(_)) => Value::String(arguments.to_string()),
+        None => {
+            serde_json::from_str(arguments).unwrap_or_else(|_| Value::String(arguments.to_string()))
+        }
+    }
 }
 
 fn unsupported_tool_call_message(payload: &ToolPayload, tool_name: &ToolName) -> String {

@@ -12,6 +12,9 @@ use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::plan_tool::PlanItemArg;
 use codex_protocol::plan_tool::StepStatus;
+use codex_protocol::plan_tool::ValidationRoute;
+use codex_protocol::plan_tool::ValidationRouteLeaf;
+use codex_protocol::plan_tool::ValidationRouteOrdering;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -43,6 +46,86 @@ fn plan_output_always_signals_mutation_obligation_state() {
     assert_eq!(signal["effect"], "no_op");
     assert_eq!(signal["no_progress"], true);
     assert!(signal["unfinished_mutation_obligation"].is_null());
+}
+
+#[test]
+fn pending_validation_result_does_not_readmit_a_durable_candidate() {
+    let route = ValidationRoute {
+        leaves: vec![ValidationRouteLeaf {
+            argv: vec!["cargo".to_string(), "test".to_string()],
+            uncertainty: String::new(),
+            covered_paths: vec!["codex-rs/core/src/tools/handlers/plan.rs".to_string()],
+            covered_contracts: vec!["update_plan response rendering".to_string()],
+            timeout_ms: 10_000,
+            semantic_timeout: false,
+        }],
+        ordering: ValidationRouteOrdering::StopOnFailure,
+    };
+    assert!(
+        super::super::shell::validate_structured_validation_leaf(
+            &route.leaves[0],
+            PathBuf::from(".").as_path()
+        )
+        .is_err(),
+        "the fixture must remain semantically inadmissible so this detects a rendering-layer recheck"
+    );
+    let result = pending_validation_result(AutoValidationCandidate {
+        step_id: "step".to_string(),
+        step_revision: 1,
+        route: route.clone(),
+        implementation_revision: 1,
+        implementation_identity: "implementation".to_string(),
+        leaf_implementation_identities: vec!["leaf".to_string()],
+        repository_wide: false,
+    });
+
+    assert!(result["unsupported_runner"].is_null());
+    assert_eq!(result["validation_route"], serde_json::json!(route));
+}
+
+#[tokio::test]
+async fn task_evidence_plan_rejects_unadmitted_validation_route_at_input() {
+    let (mut session, turn, _events) = make_session_and_context_with_rx().await;
+    let (_temp, evidence_path) = enable_task_evidence(&mut session).await;
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "plan": [{
+                "id": "step",
+                "step": "Keep validation at the input boundary",
+                "status": "pending",
+                "validation_route": {
+                    "leaves": [{
+                        "argv": ["cargo", "test"],
+                        "uncertainty": "",
+                        "covered_paths": ["codex-rs/core/src/tools/handlers/plan.rs"],
+                        "covered_contracts": ["update_plan input admission"],
+                        "timeout_ms": 10000
+                    }]
+                }
+            }]
+        })
+        .to_string(),
+    };
+    let result = PlanHandler::new(true)
+        .handle(ToolInvocation {
+            session,
+            step_context: StepContext::for_test(turn),
+            cancellation_token: CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "invalid-plan-validation-route".to_string(),
+            tool_name: ToolName::plain("update_plan"),
+            source: ToolCallSource::Direct,
+            payload,
+        })
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(FunctionCallError::RespondToModel(message))
+            if message == "structured validation route could not be bound: auto-validation must state the uncertainty this command resolves"
+    ));
+    let evidence = read_persisted_plan(&evidence_path).await;
+    assert_eq!(evidence["plan"], serde_json::json!([]));
 }
 
 async fn enable_task_evidence(
@@ -111,11 +194,10 @@ async fn invoke_normalized_plan_update(
     let (_temp, evidence_path) = enable_task_evidence(&mut session).await;
     let arguments = serde_json::to_string(&args).expect("serialize plan update");
     let payload = ToolPayload::Function { arguments };
-    let output = PlanHandler
+    let output = PlanHandler::new(true)
         .handle(ToolInvocation {
             session,
             step_context: StepContext::for_test(Arc::clone(&turn)),
-            turn,
             cancellation_token: CancellationToken::new(),
             tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
             call_id: "normalized-plan-output".to_string(),
@@ -216,12 +298,156 @@ fn recommended_fixes_normalization_identifies_only_changed_steps() {
     let reason = plan_normalization_reason(
         &requested,
         &current,
+        /*was_normalized*/ true,
         PlanUpdateEffect::StatusOnly,
         Some("missing"),
     )
     .expect("one status was normalized");
     assert!(reason.contains("[missing]"));
     assert!(!reason.contains("[proven]"));
+}
+
+#[test]
+fn precomputed_unchanged_plan_produces_the_noop_reason() {
+    let plan = UpdatePlanArgs {
+        explanation: None,
+        plan: Vec::new(),
+    };
+
+    assert_eq!(
+        plan_normalization_reason(
+            &plan,
+            &plan,
+            /*was_normalized*/ false,
+            PlanUpdateEffect::NoOp,
+            None,
+        ),
+        Some("request matched the authoritative plan; no plan state changed".to_string())
+    );
+}
+
+#[test]
+fn ordinary_update_plan_schema_is_a_small_checklist_contract() {
+    let tool = serde_json::to_value(create_update_plan_tool(false)).expect("serialize update_plan");
+    let properties = tool["parameters"]["properties"]
+        .as_object()
+        .expect("top-level checklist properties");
+    let item_properties = tool["parameters"]["properties"]["plan"]["items"]["properties"]
+        .as_object()
+        .expect("checklist item properties");
+
+    assert_eq!(
+        properties.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec!["explanation", "plan"]
+    );
+    assert_eq!(
+        item_properties
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["status", "step"]
+    );
+    assert!(
+        !tool["description"]
+            .as_str()
+            .expect("description")
+            .contains("task evidence")
+    );
+}
+
+#[tokio::test]
+async fn ordinary_plan_updates_use_the_session_checklist_store() {
+    let (session, turn, _events) = make_session_and_context_with_rx().await;
+    let handler = PlanHandler::new(false);
+
+    let initial_payload = ToolPayload::Function {
+        arguments: serde_json::to_string(&plan_update_args(
+            None,
+            "Implement the change",
+            StepStatus::InProgress,
+        ))
+        .expect("serialize initial checklist"),
+    };
+    let initial = handler
+        .handle(ToolInvocation {
+            session: Arc::clone(&session),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            cancellation_token: CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "ordinary-plan-initial".to_string(),
+            tool_name: ToolName::plain("update_plan"),
+            source: ToolCallSource::Direct,
+            payload: initial_payload.clone(),
+        })
+        .await
+        .expect("initial checklist update");
+    assert_eq!(
+        initial.code_mode_result(&initial_payload)["effect"],
+        "initial"
+    );
+
+    let completed_payload = ToolPayload::Function {
+        arguments: serde_json::to_string(&plan_update_args(
+            None,
+            "Implement the change",
+            StepStatus::Completed,
+        ))
+        .expect("serialize completed checklist"),
+    };
+    let completed = handler
+        .handle(ToolInvocation {
+            session,
+            step_context: StepContext::for_test(turn),
+            cancellation_token: CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "ordinary-plan-completed".to_string(),
+            tool_name: ToolName::plain("update_plan"),
+            source: ToolCallSource::Direct,
+            payload: completed_payload.clone(),
+        })
+        .await
+        .expect("completed checklist update");
+    assert_eq!(
+        completed.code_mode_result(&completed_payload)["effect"],
+        "status_only"
+    );
+}
+
+#[tokio::test]
+async fn task_evidence_plan_does_not_mirror_into_session_store() {
+    let (mut session, turn, _events) = make_session_and_context_with_rx().await;
+    let (_temp, evidence_path) = enable_task_evidence(&mut session).await;
+    let payload = ToolPayload::Function {
+        arguments: plan_arguments("Keep one authoritative plan owner"),
+    };
+
+    PlanHandler::new(true)
+        .handle(ToolInvocation {
+            session: Arc::clone(&session),
+            step_context: StepContext::for_test(turn),
+            cancellation_token: CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "task-evidence-single-plan-owner".to_string(),
+            tool_name: ToolName::plain("update_plan"),
+            source: ToolCallSource::Direct,
+            payload,
+        })
+        .await
+        .expect("task-evidence plan update");
+
+    assert_eq!(
+        read_persisted_plan(&evidence_path).await["plan"][0]["step"],
+        "Keep one authoritative plan owner"
+    );
+    assert!(
+        session
+            .services
+            .plan_store
+            .current_for_test()
+            .await
+            .is_none(),
+        "durable task evidence must remain the sole plan owner"
+    );
 }
 
 #[test]
@@ -244,7 +470,7 @@ fn update_plan_schema_exposes_task_evidence_contract() {
             .collect()
     }
 
-    let tool = serde_json::to_value(create_update_plan_tool()).expect("serialize update_plan");
+    let tool = serde_json::to_value(create_update_plan_tool(true)).expect("serialize update_plan");
     let description = tool["description"].as_str().expect("tool description");
     let statuses =
         tool["parameters"]["properties"]["plan"]["items"]["properties"]["status"]["enum"]
@@ -372,7 +598,24 @@ fn update_plan_schema_exposes_task_evidence_contract() {
             "mutation_obligations",
             "source_owner",
             "step_id",
+            "surface_roles",
+            "validation_asset_paths",
             "validation_disposition",
+        ]
+    );
+    assert_eq!(
+        enum_values(
+            &tool,
+            "/parameters/properties/step_evidence/items/properties/surface_roles/items/enum"
+        ),
+        vec![
+            "lifecycle",
+            "persistence",
+            "schema",
+            "security",
+            "packaging",
+            "pipeline",
+            "validation",
         ]
     );
     assert_eq!(
@@ -451,7 +694,7 @@ fn update_plan_schema_exposes_task_evidence_contract() {
 
 #[test]
 fn focused_plan_arguments_require_one_atomic_work_unit_and_reasoned_removals() {
-    let focused = parse_update_plan_arguments(
+    let focused = parse_task_evidence_arguments(
         &serde_json::json!({
             "tier": "focused",
             "source_owner": "codex-core",
@@ -488,13 +731,43 @@ fn focused_plan_arguments_require_one_atomic_work_unit_and_reasoned_removals() {
             "plan": []
         }),
     ] {
-        assert!(parse_update_plan_arguments(&invalid.to_string()).is_err());
+        assert!(parse_task_evidence_arguments(&invalid.to_string()).is_err());
     }
 }
 
 #[test]
+fn task_evidence_review_metadata_rejects_unconsumable_values() {
+    for invalid in [
+        serde_json::json!({
+            "step_evidence": [{"step_id": "step", "surface_roles": ["unknown"]}]
+        }),
+        serde_json::json!({
+            "step_evidence": [{"step_id": "step", "validation_asset_paths": ["../golden.snap"]}]
+        }),
+        serde_json::json!({
+            "step_evidence": [{"step_id": "step", "validation_asset_paths": ["C:\\golden.snap"]}]
+        }),
+    ] {
+        assert!(parse_task_evidence_arguments(&invalid.to_string()).is_err());
+    }
+
+    let parsed = parse_task_evidence_arguments(
+        &serde_json::json!({
+            "step_evidence": [{
+                "step_id": "step",
+                "surface_roles": ["pipeline", "validation"],
+                "validation_asset_paths": ["tests/golden.snap"]
+            }]
+        })
+        .to_string(),
+    )
+    .expect("completion-review metadata");
+    assert_eq!(parsed.step_evidence[0].surface_roles.len(), 2);
+}
+
+#[test]
 fn default_mode_complexity_selects_only_the_complex_internal_tier() {
-    let parsed = parse_update_plan_arguments(
+    let parsed = parse_task_evidence_arguments(
         &serde_json::json!({
             "tier": "complex",
             "plan": [{
@@ -509,7 +782,7 @@ fn default_mode_complexity_selects_only_the_complex_internal_tier() {
     .expect("complex internal representation");
     assert_eq!(parsed.tier, Some(PlanningTier::Complex));
 
-    let tool = serde_json::to_value(create_update_plan_tool()).expect("serialize update_plan");
+    let tool = serde_json::to_value(create_update_plan_tool(true)).expect("serialize update_plan");
     let description = tool["description"].as_str().expect("tool description");
     assert!(description.contains("never changes collaboration mode"));
 }
@@ -616,7 +889,7 @@ async fn normalized_plan_output_returns_the_installed_compatibility_id() {
 
 #[test]
 fn update_plan_waits_for_runtime_cancellation_commit_cleanup() {
-    assert!(PlanHandler.waits_for_runtime_cancellation());
+    assert!(PlanHandler::new(true).waits_for_runtime_cancellation());
 }
 
 #[tokio::test]
@@ -628,11 +901,10 @@ async fn plan_persistence_failure_is_reported() {
         .task_evidence
         .set_persistence_failure_for_test(true);
     let arguments = plan_arguments("Do not acknowledge an unpersisted plan");
-    let result = PlanHandler
+    let result = PlanHandler::new(true)
         .handle(ToolInvocation {
             session,
             step_context: StepContext::for_test(Arc::clone(&turn)),
-            turn,
             cancellation_token: CancellationToken::new(),
             tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
             call_id: "failed-plan-persistence".to_string(),
@@ -668,7 +940,6 @@ async fn cancellation_before_plan_commit_does_not_emit_plan_update() {
     let invocation = ToolInvocation {
         session,
         step_context: StepContext::for_test(Arc::clone(&turn)),
-        turn,
         cancellation_token,
         tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
         call_id: "cancelled-plan".to_string(),
@@ -677,7 +948,7 @@ async fn cancellation_before_plan_commit_does_not_emit_plan_update() {
         payload: ToolPayload::Function { arguments },
     };
 
-    let result = PlanHandler.handle(invocation).await;
+    let result = PlanHandler::new(true).handle(invocation).await;
 
     assert!(matches!(
         result,
@@ -700,7 +971,7 @@ async fn cancellation_after_plan_commit_boundary_waits_for_durable_update() {
     let (_temp, evidence_path) = enable_task_evidence(&mut session).await;
     let call_id = "cancelled-after-plan-commit-boundary";
     let hook = PlanCommitBoundaryHook::install(call_id);
-    let handler = Arc::new(PlanHandler) as Arc<dyn CoreToolRuntime>;
+    let handler = Arc::new(PlanHandler::new(true)) as Arc<dyn CoreToolRuntime>;
     let router = Arc::new(ToolRouter::from_parts(
         ToolRegistry::from_tools([handler]),
         Vec::new(),

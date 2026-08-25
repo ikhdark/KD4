@@ -28,8 +28,6 @@ fn test_mcp_config(codex_home: PathBuf) -> McpConfig {
         mcp_oauth_callback_url: None,
         skill_mcp_dependency_install_enabled: true,
         approval_policy: Constrained::allow_any(AskForApproval::OnRequest),
-        codex_linux_sandbox_exe: None,
-        use_legacy_landlock: false,
         apps_enabled: false,
         prefix_mcp_tool_names: true,
         client_elicitation_capability: ElicitationCapability::default(),
@@ -271,6 +269,21 @@ fn codex_apps_server_config_uses_legacy_codex_apps_path() {
     };
 
     assert_eq!(url, "https://chatgpt.com/backend-api/wham/apps");
+}
+
+#[test]
+fn codex_apps_server_config_uses_shared_chatgpt_url_canonicalization() {
+    let config = codex_apps_mcp_server_config(
+        "HTTPS://CHATGPT-STAGING.COM/codex/",
+        /*apps_mcp_product_sku*/ None,
+        /*originator*/ None,
+    );
+    let url = match &config.transport {
+        McpServerTransportConfig::StreamableHttp { url, .. } => url,
+        _ => panic!("expected streamable http transport for codex apps"),
+    };
+
+    assert_eq!(url, "https://chatgpt-staging.com/backend-api/wham/apps");
 }
 
 #[test]

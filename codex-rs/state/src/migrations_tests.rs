@@ -11,6 +11,7 @@ use super::ensure_kd4_compatibility_indexes;
 use super::migration_checksum;
 use super::migrator_with_line_endings;
 use super::repair_legacy_recency_migration_version;
+use super::repair_legacy_validation_index_migration_order;
 use super::runtime_migrator_for_pool;
 use super::runtime_state_migrator;
 
@@ -438,6 +439,172 @@ ORDER BY type, name
         .expect("fresh schema should load");
     assert_eq!(upgraded_schema, fresh_schema);
     assert_eq!(upgraded_schema.len(), 4);
+}
+
+fn legacy_validation_index_migrator(include_validation: bool) -> Migrator {
+    let validation = STATE_MIGRATOR
+        .migrations
+        .iter()
+        .find(|migration| migration.version == 41)
+        .expect("validation migration should exist");
+    let indexes = STATE_MIGRATOR
+        .migrations
+        .iter()
+        .find(|migration| migration.version == 42)
+        .expect("index migration should exist");
+    let mut migrations = STATE_MIGRATOR
+        .migrations
+        .iter()
+        .filter(|migration| migration.version <= 40)
+        .cloned()
+        .collect::<Vec<_>>();
+    migrations.push(Migration::new(
+        41,
+        indexes.description.clone(),
+        indexes.migration_type,
+        indexes.sql.clone(),
+        indexes.no_tx,
+    ));
+    if include_validation {
+        migrations.push(Migration::new(
+            42,
+            validation.description.clone(),
+            validation.migration_type,
+            validation.sql.clone(),
+            validation.no_tx,
+        ));
+    }
+    Migrator::with_migrations(migrations)
+}
+
+#[tokio::test]
+async fn repairs_swapped_validation_and_index_migration_versions() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("legacy in-memory database should open");
+    legacy_validation_index_migrator(true)
+        .run(&pool)
+        .await
+        .expect("legacy migration ordering should apply");
+    sqlx::query(
+        r#"
+INSERT INTO validation_history_aggregates (
+    scope_kind, repository_id, fingerprint_id, operation, ecosystem, breadth,
+    model_version, key_version, completed_count, updated_at
+) VALUES (1, 'legacy-repository', 'legacy-fingerprint', 2, 3, 4, 5, 6, 7, 8)
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("legacy validation data should insert");
+
+    repair_legacy_validation_index_migration_order(&pool, &STATE_MIGRATOR)
+        .await
+        .expect("recognized legacy ledger should repair");
+    repair_legacy_validation_index_migration_order(&pool, &STATE_MIGRATOR)
+        .await
+        .expect("ledger repair should be idempotent");
+    runtime_migrator_for_pool(&pool, &runtime_state_migrator())
+        .await
+        .expect("repaired ledger should be compatible")
+        .run(&pool)
+        .await
+        .expect("current migrations should accept repaired ledger");
+
+    let versions_and_checksums = sqlx::query_as::<_, (i64, Vec<u8>)>(
+        "SELECT version, checksum FROM _sqlx_migrations WHERE version IN (41, 42) ORDER BY version",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("repaired ledger should load");
+    let expected = STATE_MIGRATOR
+        .migrations
+        .iter()
+        .filter(|migration| matches!(migration.version, 41 | 42))
+        .map(|migration| (migration.version, migration.checksum.to_vec()))
+        .collect::<Vec<_>>();
+    assert_eq!(versions_and_checksums, expected);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT completed_count FROM validation_history_aggregates WHERE repository_id = 'legacy-repository'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("validation data should remain"),
+        7
+    );
+}
+
+#[tokio::test]
+async fn repairs_legacy_index_41_before_validation_was_applied() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("legacy in-memory database should open");
+    legacy_validation_index_migrator(false)
+        .run(&pool)
+        .await
+        .expect("legacy index migration should apply");
+
+    repair_legacy_validation_index_migration_order(&pool, &STATE_MIGRATOR)
+        .await
+        .expect("recognized partial legacy ledger should repair");
+    runtime_migrator_for_pool(&pool, &runtime_state_migrator())
+        .await
+        .expect("repaired ledger should be compatible")
+        .run(&pool)
+        .await
+        .expect("current migrations should apply validation history");
+
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM _sqlx_migrations WHERE version IN (41, 42)",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("ledger count should load"),
+        2
+    );
+    assert!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'validation_history_aggregates'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .expect("schema should load")
+        .is_some()
+    );
+}
+
+#[tokio::test]
+async fn rejects_unknown_legacy_validation_checksum_without_rewriting_the_ledger() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("legacy in-memory database should open");
+    legacy_validation_index_migrator(true)
+        .run(&pool)
+        .await
+        .expect("legacy migration ordering should apply");
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = zeroblob(48) WHERE version = 42")
+        .execute(&pool)
+        .await
+        .expect("test checksum should be corrupted");
+    let original_ledger = migration_ledger(&pool).await;
+
+    let err = repair_legacy_validation_index_migration_order(&pool, &STATE_MIGRATOR)
+        .await
+        .expect_err("an unknown validation checksum must fail closed");
+
+    assert!(
+        err.to_string()
+            .contains("migration 42 was not the recognized validation-history migration")
+    );
+    assert_eq!(migration_ledger(&pool).await, original_ledger);
 }
 
 #[tokio::test]

@@ -15,8 +15,11 @@ use codex_protocol::protocol::GitInfo;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
+pub use codex_protocol::protocol::SortDirection;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode as MemoryMode;
+pub use codex_protocol::protocol::ThreadRelationFilter;
+pub use codex_protocol::protocol::ThreadSortKey;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsage;
 use serde::Deserialize;
@@ -26,6 +29,22 @@ use serde::Serializer;
 
 mod optional_option {
     use super::*;
+
+    #[test]
+    fn thread_listing_value_types_are_protocol_owned() {
+        let sort_key: codex_protocol::protocol::ThreadSortKey = ThreadSortKey::UpdatedAt;
+        let direction: codex_protocol::protocol::SortDirection = SortDirection::Asc;
+        fn relation_is_shared(
+            relation: ThreadRelationFilter,
+        ) -> codex_protocol::protocol::ThreadRelationFilter {
+            relation
+        }
+
+        assert_eq!(sort_key, ThreadSortKey::UpdatedAt);
+        assert_eq!(direction, SortDirection::Asc);
+        let _: fn(ThreadRelationFilter) -> codex_protocol::protocol::ThreadRelationFilter =
+            relation_is_shared;
+    }
 
     pub fn serialize<T, S>(value: &Option<Option<T>>, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -179,37 +198,6 @@ pub struct ReadThreadByRolloutPathParams {
     pub include_archived: bool,
     /// Whether persisted rollout items should be included in the response.
     pub include_history: bool,
-}
-
-/// The sort key to use when listing stored threads.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ThreadSortKey {
-    /// Sort by the thread creation timestamp.
-    #[default]
-    CreatedAt,
-    /// Sort by the thread last-update timestamp.
-    UpdatedAt,
-    /// Sort by the thread's product recency timestamp.
-    RecencyAt,
-}
-
-/// The direction to use when listing stored threads.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SortDirection {
-    /// Return older threads before newer threads.
-    Asc,
-    /// Return newer threads before older threads.
-    #[default]
-    Desc,
-}
-
-/// Spawn-graph relationship used to filter thread listings.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ThreadRelationFilter {
-    /// Return only threads whose immediate parent is the given thread.
-    DirectChildrenOf(ThreadId),
-    /// Return every thread transitively descended from the given thread.
-    DescendantsOf(ThreadId),
 }
 
 /// Storage selection policy for local thread listings.

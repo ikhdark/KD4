@@ -9,7 +9,7 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_rollout::RolloutRecorder;
 use codex_state::ThreadStateAuditRow;
-use codex_utils_path::normalize_for_path_comparison;
+use codex_utils_absolute_path::normalize_for_path_comparison;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;

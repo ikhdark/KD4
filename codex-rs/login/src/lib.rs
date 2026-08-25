@@ -10,6 +10,19 @@ mod pkce;
 mod server;
 mod success_page;
 
+pub(crate) fn form_urlencode<I, K, V>(pairs: I) -> String
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    for (key, value) in pairs {
+        serializer.append_pair(key.as_ref(), value.as_ref());
+    }
+    serializer.finish()
+}
+
 pub use callback_params::LoginCallbackResult;
 pub use callback_params::LoginOnboardingEntrypoint;
 pub use codex_config::types::AuthCredentialsStoreMode;
@@ -63,3 +76,17 @@ pub use auth_env_telemetry::AuthEnvTelemetry;
 pub use auth_env_telemetry::collect_auth_env_telemetry;
 pub use outbound_proxy::AuthRouteConfig;
 pub use token_data::TokenData;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn form_urlencode_uses_html_form_encoding() {
+        assert_eq!(
+            super::form_urlencode([
+                ("label", "two words"),
+                ("redirect_uri", "http://localhost/callback?a=b&c=d"),
+            ]),
+            "label=two+words&redirect_uri=http%3A%2F%2Flocalhost%2Fcallback%3Fa%3Db%26c%3Dd"
+        );
+    }
+}

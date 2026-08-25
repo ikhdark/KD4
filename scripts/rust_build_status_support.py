@@ -77,8 +77,6 @@ def directory_size_bytes(path: Path) -> tuple[int, int]:
 
 
 def _is_reparse_point(entry: os.DirEntry[str]) -> bool:
-    if os.name != "nt":
-        return False
     junction_probe = getattr(entry, "is_junction", None)
     if callable(junction_probe):
         try:

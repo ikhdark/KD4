@@ -3,7 +3,7 @@ use codex_app_server::AppServerRuntimeOptions;
 use codex_app_server::AppServerTransport;
 use codex_app_server::AppServerWebsocketAuthArgs;
 use codex_app_server::PluginStartupTasks;
-use codex_app_server::run_main_with_transport_options;
+use codex_app_server::run_main;
 use codex_arg0::Arg0DispatchPaths;
 use codex_arg0::arg0_dispatch_or_else;
 use codex_config::LoaderOverrides;
@@ -92,7 +92,7 @@ fn main() -> anyhow::Result<()> {
                 (false, false) => codex_app_server::RemoteControlStartupMode::ResolvePersisted,
             };
 
-        run_main_with_transport_options(
+        run_main(
             arg0_paths,
             config_overrides,
             loader_overrides,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from typing import Never
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -21,7 +22,7 @@ from wrapper_common import (
 )
 
 
-def main() -> "Never":
+def main() -> Never:
     root = repo_root()
     parsed = parse_wrapper_args(sys.argv[1:])
     final_args = build_final_args(parsed, root / "codex-rs" / "Cargo.toml")

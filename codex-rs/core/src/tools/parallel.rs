@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
@@ -16,9 +17,8 @@ use tracing::instrument;
 use tracing::trace_span;
 use tracing::warn;
 
+use crate::FunctionCallError;
 use crate::agent::task_capabilities::TypedToolClass;
-use crate::agent::task_capabilities::classify_typed_tool;
-use crate::function_tool::FunctionCallError;
 use crate::session::reasoning_governor::CodeModeToolResult;
 use crate::session::reasoning_governor::SamplingRequestSignalCollector;
 use crate::session::session::Session;
@@ -159,6 +159,27 @@ fn workspace_tool_may_use_parallel_gate(
     supports_parallel && (!workspace_capable || proven_read_only)
 }
 
+fn bypasses_outer_workspace_gate(tool_name: &codex_tools::ToolName) -> bool {
+    // `exec` is only an orchestration carrier. Its nested calls independently
+    // acquire the ordinary workspace gate through this runtime.
+    crate::tools::code_mode::is_exec_tool_name(tool_name)
+}
+
+fn classify_workspace_tool_call_for_dispatch(
+    source: &ToolCallSource,
+    tool_identity: &str,
+    payload: &ToolPayload,
+    default_cwd: &std::path::Path,
+) -> Option<crate::tool_history::WorkspaceCallClassification> {
+    (!matches!(source, ToolCallSource::Direct)).then(|| {
+        crate::tool_history::classify_workspace_tool_call(tool_identity, payload, default_cwd)
+    })
+}
+
+const DISPATCH_WAITING_FOR_ADMISSION: u8 = 0;
+const DISPATCH_ADMITTED: u8 = 1;
+const DISPATCH_CANCELLED_BEFORE_ADMISSION: u8 = 2;
+
 struct WorkspaceEvidenceBaseline {
     revision: Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
     source_dependencies: std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
@@ -205,7 +226,6 @@ async fn capture_workspace_evidence_baseline(
 
 fn finish_workspace_evidence_capture(
     baseline: &WorkspaceEvidenceBaseline,
-    _proven_read_only: bool,
     mutation_advanced: bool,
 ) -> (
     Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
@@ -216,8 +236,8 @@ fn finish_workspace_evidence_capture(
     // it stays unchanged, the authoritative pre-dispatch identity remains the
     // post-dispatch identity even for an opaque command. Sampling refreshes
     // the identity again before projection, so external races still fail
-    // closed. `proven_read_only` controls gate concurrency, not whether an
-    // otherwise unchanged result is allowed to reach the next model request.
+    // closed. Gate concurrency does not control whether an otherwise unchanged
+    // result is allowed to reach the next model request.
     // `None` is an authoritative identity for a non-Git workspace. The
     // mutation tracker, rather than the presence of a Git revision, determines
     // whether the pre-dispatch observation is still current.
@@ -250,54 +270,62 @@ impl ToolCallRuntime {
 
     async fn register_workspace_evidence_for_response(
         &self,
-        call: &ToolCall,
         response: &ResponseInputItem,
         baseline: Option<WorkspaceEvidenceBaseline>,
-        proven_read_only: bool,
         mutation_advanced: bool,
         source_dependencies_override: Option<
             std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
         >,
+        classification: &crate::tool_history::WorkspaceCallClassification,
     ) {
-        if !crate::tool_history::tool_call_observes_workspace(
-            call.tool_name.name.as_str(),
-            &call.payload,
-        ) {
+        if !classification.observes_workspace {
             return;
         }
         let _guard = Arc::clone(&self.parallel_execution).read_owned().await;
+        Self::register_workspace_evidence_after_call(
+            self.session.as_ref(),
+            self.step_context.turn.as_ref(),
+            response,
+            baseline,
+            mutation_advanced,
+            source_dependencies_override,
+            classification,
+        )
+        .await;
+    }
+
+    async fn register_workspace_evidence_after_call(
+        session: &Session,
+        turn: &TurnContext,
+        response: &ResponseInputItem,
+        baseline: Option<WorkspaceEvidenceBaseline>,
+        mutation_advanced: bool,
+        source_dependencies_override: Option<
+            std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
+        >,
+        classification: &crate::tool_history::WorkspaceCallClassification,
+    ) {
+        if !classification.observes_workspace {
+            return;
+        }
         let (revision, captured_current) = match baseline.as_ref() {
             Some(_baseline) if mutation_advanced => {
-                let workspace_cwd = crate::tool_history::workspace_evidence_cwd_for_tool_call(
-                    call.tool_name.name.as_str(),
-                    &call.payload,
-                    self.step_context.turn.config.cwd.as_path(),
-                );
-                let revision = self
-                    .session
+                let revision = session
                     .services
                     .git_workspace
-                    .workspace_evidence_identity(&workspace_cwd)
+                    .workspace_evidence_identity(&classification.workspace_cwd)
                     .await;
                 // A `None` revision is also authoritative for a non-Git workspace: the
                 // observation was captured after the tool completed.
                 let captured_current = true;
                 (revision, captured_current)
             }
-            Some(baseline) => {
-                finish_workspace_evidence_capture(baseline, proven_read_only, mutation_advanced)
-            }
+            Some(baseline) => finish_workspace_evidence_capture(baseline, mutation_advanced),
             None => (None, false),
         };
         let source_dependencies = source_dependencies_override.unwrap_or_else(|| {
             baseline.as_ref().map_or_else(
-                || {
-                    crate::tool_history::source_dependencies_for_tool_call(
-                        call.tool_name.name.as_str(),
-                        &call.payload,
-                        self.step_context.turn.config.cwd.as_path(),
-                    )
-                },
+                || classification.source_dependencies.clone(),
                 |baseline| baseline.source_dependencies.clone(),
             )
         });
@@ -307,58 +335,13 @@ impl ToolCallRuntime {
             .map(|baseline| baseline.source_path_observations.clone())
             .unwrap_or_default();
         Self::register_workspace_evidence_observation(
-            self.session.as_ref(),
-            self.step_context.turn.as_ref(),
-            response,
-            revision,
-            captured_current,
-            source_dependencies,
-            source_path_observations,
-        )
-        .await;
-    }
-
-    async fn register_workspace_evidence_while_guarded(
-        session: &Session,
-        turn: &TurnContext,
-        call: &ToolCall,
-        response: &ResponseInputItem,
-        baseline: WorkspaceEvidenceBaseline,
-        proven_read_only: bool,
-        mutation_advanced: bool,
-    ) {
-        if !crate::tool_history::tool_call_observes_workspace(
-            call.tool_name.name.as_str(),
-            &call.payload,
-        ) {
-            return;
-        }
-        let (revision, captured_current) = if mutation_advanced {
-            let workspace_cwd = crate::tool_history::workspace_evidence_cwd_for_tool_call(
-                call.tool_name.name.as_str(),
-                &call.payload,
-                turn.config.cwd.as_path(),
-            );
-            let revision = session
-                .services
-                .git_workspace
-                .workspace_evidence_identity(&workspace_cwd)
-                .await;
-            // A `None` revision is also authoritative for a non-Git workspace: the
-            // observation was captured after the tool completed.
-            let captured_current = true;
-            (revision, captured_current)
-        } else {
-            finish_workspace_evidence_capture(&baseline, proven_read_only, mutation_advanced)
-        };
-        Self::register_workspace_evidence_observation(
             session,
             turn,
             response,
             revision,
             captured_current,
-            baseline.source_dependencies,
-            baseline.source_path_observations,
+            source_dependencies,
+            source_path_observations,
         )
         .await;
     }
@@ -397,17 +380,14 @@ impl ToolCallRuntime {
             return;
         };
         if result.source_dependencies.is_none() {
-            result.source_dependencies = crate::tool_history::tool_call_observes_workspace(
+            let classification = crate::tool_history::classify_workspace_tool_call(
                 result.tool_name.name.as_str(),
                 result.payload,
-            )
-            .then(|| {
-                crate::tool_history::source_dependencies_for_tool_call(
-                    result.tool_name.name.as_str(),
-                    result.payload,
-                    self.step_context.turn.config.cwd.as_path(),
-                )
-            });
+                self.step_context.turn.config.cwd.as_path(),
+            );
+            result.source_dependencies = classification
+                .observes_workspace
+                .then_some(classification.source_dependencies);
         }
         collector.record_code_mode_result(result);
         collector.record_accepted_deterministic_continuation_receipts(receipts);
@@ -459,37 +439,21 @@ impl ToolCallRuntime {
         call: &ToolCall,
         earlier_calls_eligible: &mut bool,
     ) -> bool {
-        // The outer code-mode carrier owns a serial execution gate. Starting it
-        // as soon as its persisted call item is available removes response-tail
-        // dispatch delay, while closing the eager prefix prevents later calls
-        // from overtaking it.
+        // Start the code-mode orchestration carrier as soon as its persisted
+        // call item is available. The carrier itself bypasses the workspace
+        // gate; each nested call retains its own admission policy. Closing the
+        // eager prefix still prevents later model-issued calls from overtaking
+        // this response item.
         if *earlier_calls_eligible && crate::tools::code_mode::is_exec_tool_name(&call.tool_name) {
             *earlier_calls_eligible = false;
             return true;
         }
-        let collaboration_namespace = self
-            .step_context
-            .turn
-            .provider
-            .capabilities()
-            .namespace_tools
-            .then_some(
-                self.step_context
-                    .turn
-                    .config
-                    .multi_agent_v2
-                    .tool_namespace
-                    .as_deref(),
+        let typed_read = self.step_context.tool_router().is_some_and(|router| {
+            matches!(
+                router.classify_tool_name(self.step_context.turn.as_ref(), &call.tool_name),
+                TypedToolClass::ReadSearch
             )
-            .flatten();
-        let typed_read = matches!(
-            classify_typed_tool(
-                call.tool_name.namespace.as_deref(),
-                &call.tool_name.name,
-                collaboration_namespace,
-            ),
-            TypedToolClass::ReadSearch
-        );
+        });
         let proven_read_only_shell = crate::tool_history::tool_call_is_proven_read_only(
             call.tool_name.name.as_str(),
             &call.payload,
@@ -561,26 +525,12 @@ impl ToolCallRuntime {
             &call,
             &ToolCallSource::Direct,
         );
-        let collaboration_namespace = self
+        let tool_class = self
             .step_context
-            .turn
-            .provider
-            .capabilities()
-            .namespace_tools
-            .then_some(
-                self.step_context
-                    .turn
-                    .config
-                    .multi_agent_v2
-                    .tool_namespace
-                    .as_deref(),
-            )
-            .flatten();
-        let tool_class = classify_typed_tool(
-            call.tool_name.namespace.as_deref(),
-            &call.tool_name.name,
-            collaboration_namespace,
-        );
+            .tool_router()
+            .map_or(TypedToolClass::Unknown, |router| {
+                router.classify_tool_name(self.step_context.turn.as_ref(), &call.tool_name)
+            });
         let authoritative_direct_wait = matches!(&tool_class, TypedToolClass::AgentCommunication);
         let signal_registration = self.sampling_request_signals.as_ref().map(|collector| {
             collector.register_deterministic_tool_call(
@@ -590,6 +540,11 @@ impl ToolCallRuntime {
             )
         });
         let signal_collector = self.sampling_request_signals.clone();
+        let workspace_call_classification = crate::tool_history::classify_workspace_tool_call(
+            call.tool_name.name.as_str(),
+            &call.payload,
+            self.step_context.turn.config.cwd.as_path(),
+        );
         async move {
             timing.mark_first_poll();
             let _tool_call_timing_guard = tool_call_timing_guard;
@@ -614,7 +569,11 @@ impl ToolCallRuntime {
                     );
                 }
                 self.register_workspace_evidence_for_response(
-                    &call, &response, None, false, false, None,
+                    &response,
+                    None,
+                    false,
+                    None,
+                    &workspace_call_classification,
                 )
                 .await;
                 return Ok(response);
@@ -643,7 +602,11 @@ impl ToolCallRuntime {
                     );
                 }
                 self.register_workspace_evidence_for_response(
-                    &call, &response, None, false, false, None,
+                    &response,
+                    None,
+                    false,
+                    None,
+                    &workspace_call_classification,
                 )
                 .await;
                 return Ok(response);
@@ -691,35 +654,17 @@ impl ToolCallRuntime {
             let signal_ordinal = signal_registration
                 .as_ref()
                 .map(|registration| registration.ordinal);
-            let observes_workspace = crate::tool_history::tool_call_observes_workspace(
-                call.tool_name.name.as_str(),
-                &call.payload,
-            );
-            let proven_read_only = crate::tool_history::tool_call_is_proven_read_only(
-                call.tool_name.name.as_str(),
-                &call.payload,
-            );
+            let observes_workspace = workspace_call_classification.observes_workspace;
             // Direct calls own one baseline here. The inner dispatch path skips
             // duplicate evidence work for this source and only nested code-mode
             // calls register inside the execution gate.
             let workspace_revision_before = if observes_workspace {
                 let evidence_capture_started = Instant::now();
-                let workspace_cwd = crate::tool_history::workspace_evidence_cwd_for_tool_call(
-                    call.tool_name.name.as_str(),
-                    &call.payload,
-                    self.step_context.turn.config.cwd.as_path(),
-                );
-                let source_dependencies =
-                    crate::tool_history::source_dependencies_for_tool_call(
-                        call.tool_name.name.as_str(),
-                        &call.payload,
-                        self.step_context.turn.config.cwd.as_path(),
-                    );
                 Some(
                     capture_workspace_evidence_baseline(
                         self.session.services.git_workspace.as_ref(),
-                        &workspace_cwd,
-                        source_dependencies,
+                        &workspace_call_classification.workspace_cwd,
+                        workspace_call_classification.source_dependencies.clone(),
                     )
                     .await,
                 )
@@ -729,7 +674,7 @@ impl ToolCallRuntime {
             } else {
                 None
             };
-            let mutation_revision_before = if signal_ordinal.is_some() || observes_workspace {
+            let mutation_revision_before = if observes_workspace {
                 Some(self.tracker.lock().await.current_mutation_revision())
             } else {
                 None
@@ -802,12 +747,11 @@ impl ToolCallRuntime {
                     let response = response.into_response();
                     let evidence_capture_started = Instant::now();
                     self.register_workspace_evidence_for_response(
-                        &error_call,
                         &response,
                         workspace_revision_before,
-                        proven_read_only,
                         mutation_advanced,
                         source_dependencies_override,
+                        &workspace_call_classification,
                     )
                     .await;
                     if observes_workspace {
@@ -822,29 +766,19 @@ impl ToolCallRuntime {
                             signal.as_ref(),
                             &response,
                         );
-                        collector.record_response_result_with_mutation(
+                        collector.record_response_result(
                             ordinal,
                             outcome_context,
                             signal,
                             &response,
                             canonical_artifact_required,
-                            mutation_advanced,
                         );
                     }
                     Ok(response)
                 }
                 Err(FunctionCallError::Fatal(message)) => {
-                    let mutation_advanced = if let Some(before) = mutation_revision_before {
-                        mutation_tracker.lock().await.current_mutation_revision() > before
-                    } else {
-                        false
-                    };
                     if let (Some(collector), Some(ordinal)) = (&signal_collector, signal_ordinal) {
-                        collector.record_failure_with_mutation(
-                            ordinal,
-                            &format!("fatal:{message}"),
-                            mutation_advanced,
-                        );
+                        collector.record_failure(ordinal, &format!("fatal:{message}"));
                     }
                     Err(CodexErr::Fatal(message))
                 }
@@ -855,21 +789,16 @@ impl ToolCallRuntime {
                         false
                     };
                     if let (Some(collector), Some(ordinal)) = (&signal_collector, signal_ordinal) {
-                        collector.record_failure_with_mutation(
-                            ordinal,
-                            &format!("model:{other}"),
-                            mutation_advanced,
-                        );
+                        collector.record_failure(ordinal, &format!("model:{other}"));
                     }
                     let response = Self::failure_response(error_call.clone(), other);
                     let evidence_capture_started = Instant::now();
                     self.register_workspace_evidence_for_response(
-                        &error_call,
                         &response,
                         workspace_revision_before,
-                        proven_read_only,
                         mutation_advanced,
                         None,
+                        &workspace_call_classification,
                     )
                     .await;
                     if observes_workspace {
@@ -965,7 +894,12 @@ impl ToolCallRuntime {
         // Direct calls own evidence registration in the outer response path,
         // where code-mode dependency overrides are also available. Nested
         // code-mode calls have no such outer layer and register here.
-        let register_workspace_evidence_in_dispatch = !matches!(&source, ToolCallSource::Direct);
+        let workspace_call_classification = classify_workspace_tool_call_for_dispatch(
+            &source,
+            call.tool_name.name.as_str(),
+            &call.payload,
+            turn.config.cwd.as_path(),
+        );
         let model_issued = matches!(&source, ToolCallSource::Direct);
         let abort_turn = Arc::clone(&turn);
         let terminal_outcome_reached = Arc::new(AtomicBool::new(false));
@@ -973,6 +907,8 @@ impl ToolCallRuntime {
         let post_dispatch_terminal_outcome_reached = Arc::clone(&terminal_outcome_reached);
         let abort_requested = Arc::new(AtomicBool::new(false));
         let dispatch_abort_requested = Arc::clone(&abort_requested);
+        let admission_state = Arc::new(AtomicU8::new(DISPATCH_WAITING_FOR_ADMISSION));
+        let dispatch_admission_state = Arc::clone(&admission_state);
         let dispatch_call = call.clone();
         let dispatch_tool_name = call.tool_name.name.clone();
         let evidence_call = call.clone();
@@ -982,11 +918,10 @@ impl ToolCallRuntime {
             evidence_call.tool_name.name.as_str(),
             &evidence_call.payload,
         );
-        let observes_workspace = register_workspace_evidence_in_dispatch
-            && crate::tool_history::tool_call_observes_workspace(
-                evidence_call.tool_name.name.as_str(),
-                &evidence_call.payload,
-            );
+        let bypass_outer_workspace_gate = bypasses_outer_workspace_gate(&evidence_call.tool_name);
+        let observes_workspace = workspace_call_classification
+            .as_ref()
+            .is_some_and(|classification| classification.observes_workspace);
         let evidence_tracker = Arc::clone(&tracker);
 
         let dispatch_span = trace_span!(
@@ -1000,20 +935,40 @@ impl ToolCallRuntime {
 
         let mut dispatch_handle: AbortOnDropHandle<Result<AnyToolResult, FunctionCallError>> =
             AbortOnDropHandle::new(tokio::spawn(async move {
-                let gate_waiter_guard = LifecycleCounterGuard::increment(
-                    &turn.turn_timing_state,
-                    LifecycleCounter::ParallelGateWaiter,
-                );
-                let _guard = if workspace_tool_may_use_parallel_gate(
+                let gate_waiter_guard = (!bypass_outer_workspace_gate).then(|| {
+                    LifecycleCounterGuard::increment(
+                        &turn.turn_timing_state,
+                        LifecycleCounter::ParallelGateWaiter,
+                    )
+                });
+                let gate_guard = if bypass_outer_workspace_gate {
+                    None
+                } else if workspace_tool_may_use_parallel_gate(
                     supports_parallel,
                     proven_read_only,
                     workspace_capable,
                 ) {
-                    Either::Left(lock.read().await)
+                    Some(Either::Left(lock.read().await))
                 } else {
-                    Either::Right(lock.write().await)
+                    Some(Either::Right(lock.write().await))
                 };
                 drop(gate_waiter_guard);
+                if dispatch_admission_state
+                    .compare_exchange(
+                        DISPATCH_WAITING_FOR_ADMISSION,
+                        DISPATCH_ADMITTED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    // The cancellation owner won the admission race. Release
+                    // any newly acquired guard without entering the handler;
+                    // the outer task immediately aborts this pending future and
+                    // emits the single terminal lifecycle result.
+                    drop(gate_guard);
+                    return std::future::pending().await;
+                }
                 // Gate admission is distinct from authorization and actual
                 // handler entry; keep each boundary independently observable.
                 timing.mark_parallel_gate_admitted();
@@ -1031,23 +986,16 @@ impl ToolCallRuntime {
                     LifecycleCounter::ActiveTool,
                 );
 
-                let evidence_revision_before = if observes_workspace {
+                let evidence_revision_before = if let Some(classification) =
+                    workspace_call_classification
+                        .as_ref()
+                        .filter(|classification| classification.observes_workspace)
+                {
                     let evidence_capture_started = Instant::now();
-                    let workspace_cwd = crate::tool_history::workspace_evidence_cwd_for_tool_call(
-                        evidence_call.tool_name.name.as_str(),
-                        &evidence_call.payload,
-                        turn.config.cwd.as_path(),
-                    );
-                    let source_dependencies =
-                        crate::tool_history::source_dependencies_for_tool_call(
-                            evidence_call.tool_name.name.as_str(),
-                            &evidence_call.payload,
-                            turn.config.cwd.as_path(),
-                        );
                     let revision = capture_workspace_evidence_baseline(
                         session.services.git_workspace.as_ref(),
-                        &workspace_cwd,
-                        source_dependencies,
+                        &classification.workspace_cwd,
+                        classification.source_dependencies.clone(),
                     )
                     .await;
                     timing.record_workspace_evidence_before(evidence_capture_started.elapsed());
@@ -1105,9 +1053,11 @@ impl ToolCallRuntime {
                         err.to_string(),
                     )),
                 };
-                if let (Some(response), Some(evidence_revision_before)) =
-                    (evidence_response.as_ref(), evidence_revision_before)
-                {
+                if let (Some(response), Some(evidence_revision_before), Some(classification)) = (
+                    evidence_response.as_ref(),
+                    evidence_revision_before,
+                    workspace_call_classification.as_ref(),
+                ) {
                     let evidence_capture_started = Instant::now();
                     let mutation_advanced = if let Some(before) = evidence_mutation_revision_before
                     {
@@ -1115,14 +1065,14 @@ impl ToolCallRuntime {
                     } else {
                         false
                     };
-                    Self::register_workspace_evidence_while_guarded(
+                    Self::register_workspace_evidence_after_call(
                         session.as_ref(),
                         turn.as_ref(),
-                        &evidence_call,
                         response,
-                        evidence_revision_before,
-                        proven_read_only,
+                        Some(evidence_revision_before),
                         mutation_advanced,
+                        None,
+                        classification,
                     )
                     .await;
                     timing.record_workspace_evidence_after(evidence_capture_started.elapsed());
@@ -1138,10 +1088,18 @@ impl ToolCallRuntime {
                     if terminal_outcome_reached.load(Ordering::Acquire) || dispatch_handle.is_finished() {
                         dispatch_handle.await.map_err(Self::tool_task_join_error)?
                     } else {
+                        let cancelled_before_admission = admission_state
+                            .compare_exchange(
+                                DISPATCH_WAITING_FOR_ADMISSION,
+                                DISPATCH_CANCELLED_BEFORE_ADMISSION,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok();
                         abort_requested.store(true, Ordering::Release);
                         let secs = started.elapsed().as_secs_f32().max(0.1);
                         abort_dispatch_span.record("aborted", true);
-                        if wait_for_runtime_cancellation {
+                        if wait_for_runtime_cancellation && !cancelled_before_admission {
                             if terminal_outcome_reached.swap(true, Ordering::AcqRel) {
                                 return dispatch_handle.await.map_err(Self::tool_task_join_error)?;
                             }
@@ -1251,12 +1209,7 @@ impl ToolCallRuntime {
     }
 
     fn abort_message(call: &ToolCall, secs: f32) -> String {
-        if call.tool_name.namespace.is_none()
-            && matches!(
-                call.tool_name.name.as_str(),
-                "shell_command" | "unified_exec"
-            )
-        {
+        if crate::tools::is_shell_family_tool_name(&call.tool_name) {
             format!("Wall time: {secs:.1} seconds\naborted by user")
         } else {
             format!("aborted by user after {secs:.1}s")
@@ -1435,6 +1388,27 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
+    fn shell_family_abort_messages_share_the_command_format() {
+        for tool_name in [
+            crate::tools::SHELL_COMMAND_TOOL_NAME,
+            crate::tools::EXEC_COMMAND_TOOL_NAME,
+        ] {
+            let call = ToolCall {
+                tool_name: codex_tools::ToolName::plain(tool_name),
+                call_id: format!("{tool_name}-call"),
+                payload: ToolPayload::Function {
+                    arguments: "{}".to_string(),
+                },
+            };
+
+            assert_eq!(
+                ToolCallRuntime::abort_message(&call, 1.25),
+                "Wall time: 1.2 seconds\naborted by user"
+            );
+        }
+    }
+
+    #[test]
     fn reused_stable_failures_require_a_changed_action_or_state() {
         let diagnosis: serde_json::Value = serde_json::from_str(&reused_failure_diagnosis(
             &codex_tools::ToolName::plain("read_tool_output"),
@@ -1464,6 +1438,33 @@ mod tests {
     }
 
     #[test]
+    fn kd4_latency_exec_bypasses_outer_gate_while_nested_mutations_remain_exclusive() {
+        let exec = codex_tools::ToolName::plain(crate::tools::code_mode::PUBLIC_TOOL_NAME);
+        let nested_mutation = codex_tools::ToolName::plain("shell_command");
+
+        assert!(bypasses_outer_workspace_gate(&exec));
+        assert!(!bypasses_outer_workspace_gate(&nested_mutation));
+        assert!(!workspace_tool_may_use_parallel_gate(false, false, true));
+    }
+
+    #[test]
+    fn direct_dispatch_skips_duplicate_workspace_call_classification() {
+        let payload = ToolPayload::Function {
+            arguments: r#"{"cmd":"cargo test","workdir":"missing-workspace"}"#.to_string(),
+        };
+
+        assert_eq!(
+            classify_workspace_tool_call_for_dispatch(
+                &ToolCallSource::Direct,
+                "cargo_test",
+                &payload,
+                std::path::Path::new("missing-workspace"),
+            ),
+            None,
+        );
+    }
+
+    #[test]
     fn unchanged_workspace_command_keeps_its_result_fresh_for_model_delivery() {
         let identity = crate::git_workspace::WorkspaceEvidenceIdentity {
             repository_root: Some("repo".to_string()),
@@ -1478,12 +1479,12 @@ mod tests {
         };
 
         let (unchanged_revision, unchanged_current) =
-            finish_workspace_evidence_capture(&baseline, false, false);
+            finish_workspace_evidence_capture(&baseline, false);
         assert_eq!(unchanged_revision, Some(identity.clone()));
         assert!(unchanged_current);
 
         let (mutated_revision, mutated_current) =
-            finish_workspace_evidence_capture(&baseline, false, true);
+            finish_workspace_evidence_capture(&baseline, true);
         assert_eq!(mutated_revision, Some(identity));
         assert!(!mutated_current);
 
@@ -1493,7 +1494,7 @@ mod tests {
             source_path_observations: Vec::new(),
         };
         let (non_git_revision, non_git_current) =
-            finish_workspace_evidence_capture(&non_git_baseline, false, false);
+            finish_workspace_evidence_capture(&non_git_baseline, false);
         assert_eq!(non_git_revision, None);
         assert!(
             non_git_current,
@@ -1501,7 +1502,7 @@ mod tests {
         );
 
         let (mutated_non_git_revision, mutated_non_git_current) =
-            finish_workspace_evidence_capture(&non_git_baseline, false, true);
+            finish_workspace_evidence_capture(&non_git_baseline, true);
         assert_eq!(mutated_non_git_revision, None);
         assert!(!mutated_non_git_current);
     }
@@ -1773,6 +1774,225 @@ mod tests {
     }
 
     impl CoreToolRuntime for ImmediateHandler {}
+
+    #[tokio::test]
+    async fn non_workspace_sampled_call_does_not_wait_for_mutation_tracker() {
+        let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        let turn_context = Arc::new(turn_context);
+        let tool_name = codex_tools::ToolName::plain("stateless_test_tool");
+        let handler = Arc::new(ImmediateHandler {
+            tool_name: tool_name.clone(),
+        }) as Arc<dyn CoreToolRuntime>;
+        let step_context = StepContext::for_test(Arc::clone(&turn_context));
+        let router = Arc::new(ToolRouter::from_parts(
+            ToolRegistry::from_tools([handler]),
+            Vec::new(),
+        ));
+        let step_context = step_context.with_tool_router_for_test(router);
+        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+        let governor = crate::session::reasoning_governor::SamplingReasoningGovernor::new(None);
+        let baselines = governor.baselines(
+            0,
+            crate::turn_diff_tracker::ValidationFreshnessStatus::None,
+            None,
+        );
+        let runtime = ToolCallRuntime::new(session, step_context, Arc::clone(&tracker))
+            .with_sampling_request_signals(governor.collector(&baselines));
+        let held_tracker = Arc::clone(&tracker).lock_owned().await;
+        let (release_tracker_tx, release_tracker_rx) = std::sync::mpsc::channel();
+        let tracker_holder = std::thread::spawn(move || {
+            let _ = release_tracker_rx.recv();
+            drop(held_tracker);
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            runtime.handle_tool_call(
+                ToolCall {
+                    tool_name,
+                    call_id: "stateless-sampled-call".to_string(),
+                    payload: ToolPayload::Function {
+                        arguments: "{}".to_string(),
+                    },
+                },
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("non-workspace sampling must not read the mutation tracker")
+        .expect("stateless test tool should succeed");
+
+        let _ = release_tracker_tx.send(());
+        tracker_holder.join().expect("tracker holder joins");
+    }
+
+    #[tokio::test]
+    async fn non_workspace_evidence_skips_workspace_gate() {
+        let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+        let turn_context = Arc::new(turn_context);
+        let runtime = ToolCallRuntime::new(
+            Arc::new(session),
+            StepContext::for_test(Arc::clone(&turn_context)),
+            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        );
+        let held_gate = Arc::clone(&runtime.parallel_execution)
+            .try_write_owned()
+            .expect("workspace gate should initially be available");
+        let response = ResponseInputItem::FunctionCallOutput {
+            call_id: "stateless-evidence".to_string(),
+            output: FunctionCallOutputPayload::from_text("ok".to_string()),
+        };
+        let non_workspace = crate::tool_history::WorkspaceCallClassification {
+            observes_workspace: false,
+            workspace_cwd: turn_context.config.cwd.clone().to_path_buf(),
+            source_dependencies: Default::default(),
+        };
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            runtime.register_workspace_evidence_for_response(
+                &response,
+                None,
+                false,
+                None,
+                &non_workspace,
+            ),
+        )
+        .await
+        .expect("non-workspace evidence must return without waiting for the workspace gate");
+
+        let workspace = crate::tool_history::WorkspaceCallClassification {
+            observes_workspace: true,
+            workspace_cwd: turn_context.config.cwd.clone().to_path_buf(),
+            source_dependencies: Default::default(),
+        };
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                runtime.register_workspace_evidence_for_response(
+                    &response, None, false, None, &workspace,
+                ),
+            )
+            .await
+            .is_err(),
+            "workspace evidence must retain gate synchronization"
+        );
+
+        drop(held_gate);
+    }
+
+    struct BlockingHandler {
+        tool_name: codex_tools::ToolName,
+        started: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+        release: Arc<Notify>,
+    }
+
+    impl ToolExecutor<ToolInvocation> for BlockingHandler {
+        fn tool_name(&self) -> codex_tools::ToolName {
+            self.tool_name.clone()
+        }
+
+        fn spec(&self) -> codex_tools::ToolSpec {
+            codex_tools::ToolSpec::Function(codex_tools::ResponsesApiTool {
+                name: self.tool_name.name.clone(),
+                description: "Blocking test tool.".to_string(),
+                strict: false,
+                defer_loading: None,
+                parameters: codex_tools::JsonSchema::default(),
+                output_schema: None,
+            })
+        }
+
+        fn handle(&self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+            Box::pin(async move {
+                if let Some(started) = self
+                    .started
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    let _ = started.send(());
+                }
+                self.release.notified().await;
+                Ok(
+                    Box::new(FunctionToolOutput::from_text("ok".to_string(), Some(true)))
+                        as Box<dyn crate::tools::context::ToolOutput>,
+                )
+            })
+        }
+    }
+
+    impl CoreToolRuntime for BlockingHandler {}
+
+    #[tokio::test]
+    async fn kd4_latency_exec_does_not_hold_workspace_gate_around_nested_runtime() {
+        let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        let turn_context = Arc::new(turn_context);
+        let exec_name = codex_tools::ToolName::plain(crate::tools::code_mode::PUBLIC_TOOL_NAME);
+        let mutation_name = codex_tools::ToolName::plain("shell_command");
+        let (exec_started_tx, exec_started_rx) = oneshot::channel();
+        let release_exec = Arc::new(Notify::new());
+        let handlers = [
+            Arc::new(BlockingHandler {
+                tool_name: exec_name.clone(),
+                started: std::sync::Mutex::new(Some(exec_started_tx)),
+                release: Arc::clone(&release_exec),
+            }) as Arc<dyn CoreToolRuntime>,
+            Arc::new(ImmediateHandler {
+                tool_name: mutation_name.clone(),
+            }) as Arc<dyn CoreToolRuntime>,
+        ];
+        let step_context = StepContext::for_test(Arc::clone(&turn_context));
+        let router = Arc::new(ToolRouter::from_parts(
+            ToolRegistry::from_tools(handlers),
+            Vec::new(),
+        ));
+        let step_context = step_context.with_tool_router_for_test(router);
+        let runtime = ToolCallRuntime::new(
+            session,
+            step_context,
+            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        );
+
+        let exec_task = tokio::spawn(runtime.clone().handle_tool_call(
+            ToolCall {
+                tool_name: exec_name,
+                call_id: "exec-wrapper".to_string(),
+                payload: ToolPayload::Function {
+                    arguments: "{}".to_string(),
+                },
+            },
+            CancellationToken::new(),
+        ));
+        exec_started_rx
+            .await
+            .expect("exec orchestration handler should start");
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            runtime.handle_tool_call(
+                ToolCall {
+                    tool_name: mutation_name,
+                    call_id: "nested-mutation".to_string(),
+                    payload: ToolPayload::Function {
+                        arguments: "{}".to_string(),
+                    },
+                },
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("nested workspace call should not wait for the outer exec wrapper")
+        .expect("nested workspace call should succeed");
+
+        release_exec.notify_one();
+        exec_task
+            .await
+            .expect("exec wrapper task should join")
+            .expect("exec wrapper should succeed");
+    }
 
     #[tokio::test]
     async fn parallel_gate_wait_is_separate_from_handler_and_released_before_relay()
@@ -2180,6 +2400,115 @@ mod tests {
                     .push(outcome);
             })
         }
+    }
+
+    #[tokio::test]
+    async fn kd4_latency_cancellation_before_gate_admission_skips_runtime_cleanup_grace()
+    -> anyhow::Result<()> {
+        let (mut session, turn_context) = crate::session::tests::make_session_and_context().await;
+        let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut builder =
+            codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
+        builder.tool_lifecycle_contributor(Arc::new(FinishRecorder {
+            records: Arc::clone(&records),
+        }));
+        session.services.extensions = Arc::new(builder.build());
+
+        let session = Arc::new(session);
+        let turn_context = Arc::new(turn_context);
+        let tool_name = codex_tools::ToolName::plain("cleanup_tool_waiting_for_gate");
+        let (started_tx, mut started_rx) = oneshot::channel();
+        let (cleanup_started_tx, mut cleanup_started_rx) = oneshot::channel();
+        let handler = Arc::new(CancellationCleanupHandler {
+            tool_name: tool_name.clone(),
+            started: std::sync::Mutex::new(Some(started_tx)),
+            cleanup_started: std::sync::Mutex::new(Some(cleanup_started_tx)),
+            allow_cleanup: Arc::new(Notify::new()),
+        }) as Arc<dyn CoreToolRuntime>;
+        let step_context = StepContext::for_test(Arc::clone(&turn_context));
+        let router = Arc::new(ToolRouter::from_parts(
+            ToolRegistry::from_tools([handler]),
+            Vec::new(),
+        ));
+        let step_context = step_context.with_tool_router_for_test(router);
+        let runtime = ToolCallRuntime::new(
+            session,
+            step_context,
+            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        );
+        let held_gate = Arc::clone(&runtime.parallel_execution)
+            .try_write_owned()
+            .expect("workspace gate should initially be available");
+        let cancellation_token = CancellationToken::new();
+        let response_task = tokio::spawn(runtime.handle_tool_call(
+            ToolCall {
+                tool_name,
+                call_id: "cancel-before-admission".to_string(),
+                payload: ToolPayload::Function {
+                    arguments: "{}".to_string(),
+                },
+            },
+            cancellation_token.clone(),
+        ));
+
+        for _ in 0..100 {
+            if turn_context
+                .turn_timing_state
+                .lifecycle_context()
+                .parallel_gate_waiter_count
+                == 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            turn_context
+                .turn_timing_state
+                .lifecycle_context()
+                .parallel_gate_waiter_count,
+            1,
+            "cleanup-owning handler should be waiting for gate admission"
+        );
+
+        cancellation_token.cancel();
+        let response = tokio::time::timeout(Duration::from_secs(1), response_task)
+            .await
+            .expect("pre-admission cancellation must not wait for runtime cleanup grace")
+            .expect("cancelled tool response task should join")?;
+        let ResponseInputItem::FunctionCallOutput { output, .. } = response else {
+            anyhow::bail!("cancelled tool should return function output");
+        };
+        let FunctionCallOutputBody::Text(text) = output.body else {
+            anyhow::bail!("cancelled tool output should be text");
+        };
+        assert!(text.contains("aborted by user"));
+        assert!(
+            started_rx.try_recv().is_err(),
+            "handler must not enter after cancellation wins the admission race"
+        );
+        assert!(
+            cleanup_started_rx.try_recv().is_err(),
+            "a handler that never started has no runtime cleanup to await"
+        );
+        assert_eq!(
+            records
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice(),
+            &[ToolCallOutcome::Aborted],
+            "pre-admission cancellation emits exactly one terminal lifecycle result"
+        );
+        assert_eq!(
+            turn_context
+                .turn_timing_state
+                .lifecycle_context()
+                .parallel_gate_waiter_count,
+            0
+        );
+        drop(held_gate);
+
+        Ok(())
     }
 
     struct BlockingFinishContributor {

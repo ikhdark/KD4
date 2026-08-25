@@ -6,6 +6,7 @@ use crate::protocol::FileChange;
 use crate::protocol::ReviewDecision;
 use crate::request_permissions::RequestPermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::LegacyAppPathString;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
@@ -147,8 +148,8 @@ pub enum GuardianAssessmentAction {
         cwd: AbsolutePathBuf,
     },
     ApplyPatch {
-        cwd: AbsolutePathBuf,
-        files: Vec<AbsolutePathBuf>,
+        cwd: LegacyAppPathString,
+        files: Vec<LegacyAppPathString>,
     },
     NetworkAccess {
         target: String,
@@ -524,39 +525,6 @@ mod tests {
             GuardianAssessmentAction::Command {
                 source: GuardianCommandSource::Shell,
                 command: "rm -rf /tmp/guardian".to_string(),
-                cwd: test_path_buf("/tmp").abs(),
-            }
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn guardian_assessment_action_round_trips_execve_shape() {
-        let value = serde_json::json!({
-            "type": "execve",
-            "source": "shell",
-            "program": "/bin/rm",
-            "argv": ["/usr/bin/rm", "-f", "/tmp/file.sqlite"],
-            "cwd": "/tmp",
-        });
-        let action: GuardianAssessmentAction =
-            serde_json::from_value(value.clone()).expect("guardian action");
-
-        assert_eq!(
-            serde_json::to_value(&action).expect("serialize guardian action"),
-            value
-        );
-
-        assert_eq!(
-            action,
-            GuardianAssessmentAction::Execve {
-                source: GuardianCommandSource::Shell,
-                program: "/bin/rm".to_string(),
-                argv: vec![
-                    "/usr/bin/rm".to_string(),
-                    "-f".to_string(),
-                    "/tmp/file.sqlite".to_string(),
-                ],
                 cwd: test_path_buf("/tmp").abs(),
             }
         );

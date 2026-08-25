@@ -9,15 +9,13 @@ import os
 import shlex
 import subprocess
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 try:
-    from scripts.generated_output_lock import GenerationLockError
-    from scripts.generated_output_lock import generated_output_lock
+    from scripts.generated_output_lock import GenerationLockError, generated_output_lock
 except ModuleNotFoundError:
-    from generated_output_lock import GenerationLockError
-    from generated_output_lock import generated_output_lock
+    from generated_output_lock import GenerationLockError, generated_output_lock
 
 
 SCHEMA_INPUTS = (
@@ -128,13 +126,6 @@ def regenerate_schemas(
     return False
 
 
-def run_runtime_check(root: Path) -> int:
-    return run(
-        ["just", "--justfile", str(root / "justfile"), "app-server-runtime-check"],
-        cwd=root,
-    )
-
-
 def run_protocol_check(root: Path) -> int:
     return run(
         [
@@ -151,19 +142,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--mode",
-        choices=("auto", "check", "force"),
+        choices=("check", "force"),
         required=True,
-        help="auto is a backwards-compatible alias for the check-only mode",
     )
     parser.add_argument("--baseline", default="HEAD")
     parser.add_argument(
         "--owner",
         help="Required identity for the serialized force-regeneration lane.",
-    )
-    parser.add_argument(
-        "--runtime",
-        action="store_true",
-        help="Also run the focused app-server runtime checks.",
     )
     parser.add_argument(
         "generator_args",
@@ -200,10 +185,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "running a check-only freshness proof."
                 )
             protocol_code = run_protocol_check(root)
-            if protocol_code == 0 and args.runtime:
-                runtime_code = run_runtime_check(root)
-                if runtime_code != 0:
-                    return runtime_code
     except GenerationLockError as error:
         print(str(error), file=sys.stderr)
         return 2

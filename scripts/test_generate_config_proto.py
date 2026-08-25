@@ -273,7 +273,7 @@ class GenerateConfigProtoTest(unittest.TestCase):
         self.assertIn('generate-proto.ps1" @forwarded_args', windows_recipe)
         self.assertIn("generate-config-proto-check:", justfile)
         self.assertIn('generate-proto.ps1" -Check', justfile)
-        self.assertIn('generate-proto.sh" --check', justfile)
+        self.assertNotIn("generate-proto.sh", justfile)
 
 
 if __name__ == "__main__":

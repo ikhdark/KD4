@@ -300,7 +300,6 @@ fn unavailable_system_route_preserves_wss_http_proxy_fallback() {
     );
 }
 
-#[cfg(any(target_os = "windows", target_os = "macos"))]
 #[tokio::test]
 async fn async_resolution_uses_cached_route_before_global_permit() {
     let request_url = "https://cached-fast-path.test/request";

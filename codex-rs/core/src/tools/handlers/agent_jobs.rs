@@ -1,9 +1,9 @@
+use crate::FunctionCallError;
 use crate::agent::control::AgentJobBinding;
 use crate::agent::control::SpawnAgentOptions;
 use crate::agent::role::AgentRoleLocks;
 use crate::agent::status::is_final;
 use crate::config::Config;
-use crate::function_tool::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::handlers::multi_agents::apply_spawn_agent_model_defaults_and_overrides;
@@ -554,8 +554,8 @@ async fn export_job_csv_snapshot(
 
 async fn write_job_csv_atomically(output_path: PathBuf, csv_content: String) -> anyhow::Result<()> {
     tokio::task::spawn_blocking(move || {
-        let write_paths = crate::path_utils::resolve_symlink_write_paths(&output_path)?;
-        crate::path_utils::write_atomically(&write_paths.write_path, &csv_content)
+        let write_paths = codex_file_system::resolve_symlink_write_paths(&output_path)?;
+        codex_file_system::write_atomically(&write_paths.write_path, &csv_content)
     })
     .await
     .map_err(|err| anyhow::anyhow!("atomic csv write task failed: {err}"))??;

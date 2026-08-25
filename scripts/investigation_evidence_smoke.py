@@ -1533,8 +1533,6 @@ def validate_inputs(
     providers: dict[str, Path],
     redactor: Redactor,
 ) -> None:
-    if os.name != "nt":
-        raise SmokeFailure("this guarded smoke test currently supports Windows only")
     if not codex.is_file():
         raise SmokeFailure("KD4 binary does not exist")
     for name, root in providers.items():

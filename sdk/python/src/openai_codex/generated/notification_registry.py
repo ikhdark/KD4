@@ -15,11 +15,10 @@ from .v2_all import AppListUpdatedNotification
 from .v2_all import CommandExecOutputDeltaNotification
 from .v2_all import CommandExecutionOutputDeltaNotification
 from .v2_all import ConfigWarningNotification
-from .v2_all import ContextCompactedNotification
 from .v2_all import DeprecationNoticeNotification
 from .v2_all import ErrorNotification
 from .v2_all import ExternalAgentConfigImportCompletedNotification
-from .v2_all import FileChangeOutputDeltaNotification
+from .v2_all import ExternalAgentConfigImportProgressNotification
 from .v2_all import FileChangePatchUpdatedNotification
 from .v2_all import FsChangedNotification
 from .v2_all import FuzzyFileSearchSessionCompletedNotification
@@ -35,6 +34,7 @@ from .v2_all import McpServerOauthLoginCompletedNotification
 from .v2_all import McpServerStatusUpdatedNotification
 from .v2_all import McpToolCallProgressNotification
 from .v2_all import ModelReroutedNotification
+from .v2_all import ModelSafetyBufferingUpdatedNotification
 from .v2_all import ModelVerificationNotification
 from .v2_all import PlanDeltaNotification
 from .v2_all import ProcessExitedNotification
@@ -48,17 +48,10 @@ from .v2_all import SkillsChangedNotification
 from .v2_all import TerminalInteractionNotification
 from .v2_all import ThreadArchivedNotification
 from .v2_all import ThreadClosedNotification
+from .v2_all import ThreadDeletedNotification
 from .v2_all import ThreadGoalClearedNotification
 from .v2_all import ThreadGoalUpdatedNotification
 from .v2_all import ThreadNameUpdatedNotification
-from .v2_all import ThreadRealtimeClosedNotification
-from .v2_all import ThreadRealtimeErrorNotification
-from .v2_all import ThreadRealtimeItemAddedNotification
-from .v2_all import ThreadRealtimeOutputAudioDeltaNotification
-from .v2_all import ThreadRealtimeSdpNotification
-from .v2_all import ThreadRealtimeStartedNotification
-from .v2_all import ThreadRealtimeTranscriptDeltaNotification
-from .v2_all import ThreadRealtimeTranscriptDoneNotification
 from .v2_all import ThreadSettingsUpdatedNotification
 from .v2_all import ThreadStartedNotification
 from .v2_all import ThreadStatusChangedNotification
@@ -66,11 +59,14 @@ from .v2_all import ThreadTokenUsageUpdatedNotification
 from .v2_all import ThreadUnarchivedNotification
 from .v2_all import TurnCompletedNotification
 from .v2_all import TurnDiffUpdatedNotification
+from .v2_all import TurnModerationMetadataNotification
 from .v2_all import TurnPlanUpdatedNotification
+from .v2_all import TurnReasoningPolicySummaryNotification
+from .v2_all import TurnReasoningPolicyUpdatedNotification
 from .v2_all import TurnStartedNotification
+from .v2_all import TurnTerminalizationCompletedNotification
 from .v2_all import WarningNotification
 from .v2_all import WindowsSandboxSetupCompletedNotification
-from .v2_all import WindowsWorldWritableWarningNotification
 
 GeneratedNotificationPayload: TypeAlias = (
     AccountLoginCompletedNotification
@@ -81,11 +77,10 @@ GeneratedNotificationPayload: TypeAlias = (
     | CommandExecOutputDeltaNotification
     | CommandExecutionOutputDeltaNotification
     | ConfigWarningNotification
-    | ContextCompactedNotification
     | DeprecationNoticeNotification
     | ErrorNotification
     | ExternalAgentConfigImportCompletedNotification
-    | FileChangeOutputDeltaNotification
+    | ExternalAgentConfigImportProgressNotification
     | FileChangePatchUpdatedNotification
     | FsChangedNotification
     | FuzzyFileSearchSessionCompletedNotification
@@ -101,6 +96,7 @@ GeneratedNotificationPayload: TypeAlias = (
     | McpServerStatusUpdatedNotification
     | McpToolCallProgressNotification
     | ModelReroutedNotification
+    | ModelSafetyBufferingUpdatedNotification
     | ModelVerificationNotification
     | PlanDeltaNotification
     | ProcessExitedNotification
@@ -114,17 +110,10 @@ GeneratedNotificationPayload: TypeAlias = (
     | TerminalInteractionNotification
     | ThreadArchivedNotification
     | ThreadClosedNotification
+    | ThreadDeletedNotification
     | ThreadGoalClearedNotification
     | ThreadGoalUpdatedNotification
     | ThreadNameUpdatedNotification
-    | ThreadRealtimeClosedNotification
-    | ThreadRealtimeErrorNotification
-    | ThreadRealtimeItemAddedNotification
-    | ThreadRealtimeOutputAudioDeltaNotification
-    | ThreadRealtimeSdpNotification
-    | ThreadRealtimeStartedNotification
-    | ThreadRealtimeTranscriptDeltaNotification
-    | ThreadRealtimeTranscriptDoneNotification
     | ThreadSettingsUpdatedNotification
     | ThreadStartedNotification
     | ThreadStatusChangedNotification
@@ -132,11 +121,14 @@ GeneratedNotificationPayload: TypeAlias = (
     | ThreadUnarchivedNotification
     | TurnCompletedNotification
     | TurnDiffUpdatedNotification
+    | TurnModerationMetadataNotification
     | TurnPlanUpdatedNotification
+    | TurnReasoningPolicySummaryNotification
+    | TurnReasoningPolicyUpdatedNotification
     | TurnStartedNotification
+    | TurnTerminalizationCompletedNotification
     | WarningNotification
     | WindowsSandboxSetupCompletedNotification
-    | WindowsWorldWritableWarningNotification
 )
 
 NOTIFICATION_MODELS: dict[str, type[BaseModel]] = {
@@ -149,6 +141,7 @@ NOTIFICATION_MODELS: dict[str, type[BaseModel]] = {
     "deprecationNotice": DeprecationNoticeNotification,
     "error": ErrorNotification,
     "externalAgentConfig/import/completed": ExternalAgentConfigImportCompletedNotification,
+    "externalAgentConfig/import/progress": ExternalAgentConfigImportProgressNotification,
     "fs/changed": FsChangedNotification,
     "fuzzyFileSearch/sessionCompleted": FuzzyFileSearchSessionCompletedNotification,
     "fuzzyFileSearch/sessionUpdated": FuzzyFileSearchSessionUpdatedNotification,
@@ -161,7 +154,6 @@ NOTIFICATION_MODELS: dict[str, type[BaseModel]] = {
     "item/commandExecution/outputDelta": CommandExecutionOutputDeltaNotification,
     "item/commandExecution/terminalInteraction": TerminalInteractionNotification,
     "item/completed": ItemCompletedNotification,
-    "item/fileChange/outputDelta": FileChangeOutputDeltaNotification,
     "item/fileChange/patchUpdated": FileChangePatchUpdatedNotification,
     "item/mcpToolCall/progress": McpToolCallProgressNotification,
     "item/plan/delta": PlanDeltaNotification,
@@ -172,6 +164,7 @@ NOTIFICATION_MODELS: dict[str, type[BaseModel]] = {
     "mcpServer/oauthLogin/completed": McpServerOauthLoginCompletedNotification,
     "mcpServer/startupStatus/updated": McpServerStatusUpdatedNotification,
     "model/rerouted": ModelReroutedNotification,
+    "model/safetyBuffering/updated": ModelSafetyBufferingUpdatedNotification,
     "model/verification": ModelVerificationNotification,
     "process/exited": ProcessExitedNotification,
     "process/outputDelta": ProcessOutputDeltaNotification,
@@ -180,18 +173,10 @@ NOTIFICATION_MODELS: dict[str, type[BaseModel]] = {
     "skills/changed": SkillsChangedNotification,
     "thread/archived": ThreadArchivedNotification,
     "thread/closed": ThreadClosedNotification,
-    "thread/compacted": ContextCompactedNotification,
+    "thread/deleted": ThreadDeletedNotification,
     "thread/goal/cleared": ThreadGoalClearedNotification,
     "thread/goal/updated": ThreadGoalUpdatedNotification,
     "thread/name/updated": ThreadNameUpdatedNotification,
-    "thread/realtime/closed": ThreadRealtimeClosedNotification,
-    "thread/realtime/error": ThreadRealtimeErrorNotification,
-    "thread/realtime/itemAdded": ThreadRealtimeItemAddedNotification,
-    "thread/realtime/outputAudio/delta": ThreadRealtimeOutputAudioDeltaNotification,
-    "thread/realtime/sdp": ThreadRealtimeSdpNotification,
-    "thread/realtime/started": ThreadRealtimeStartedNotification,
-    "thread/realtime/transcript/delta": ThreadRealtimeTranscriptDeltaNotification,
-    "thread/realtime/transcript/done": ThreadRealtimeTranscriptDoneNotification,
     "thread/settings/updated": ThreadSettingsUpdatedNotification,
     "thread/started": ThreadStartedNotification,
     "thread/status/changed": ThreadStatusChangedNotification,
@@ -199,19 +184,20 @@ NOTIFICATION_MODELS: dict[str, type[BaseModel]] = {
     "thread/unarchived": ThreadUnarchivedNotification,
     "turn/completed": TurnCompletedNotification,
     "turn/diff/updated": TurnDiffUpdatedNotification,
+    "turn/moderationMetadata": TurnModerationMetadataNotification,
     "turn/plan/updated": TurnPlanUpdatedNotification,
+    "turn/reasoningPolicy/summary": TurnReasoningPolicySummaryNotification,
+    "turn/reasoningPolicy/updated": TurnReasoningPolicyUpdatedNotification,
     "turn/started": TurnStartedNotification,
+    "turn/terminalizationCompleted": TurnTerminalizationCompletedNotification,
     "warning": WarningNotification,
-    "windows/worldWritableWarning": WindowsWorldWritableWarningNotification,
     "windowsSandbox/setupCompleted": WindowsSandboxSetupCompletedNotification,
 }
 
 DIRECT_TURN_ID_NOTIFICATION_TYPES: tuple[type[BaseModel], ...] = (
     AgentMessageDeltaNotification,
     CommandExecutionOutputDeltaNotification,
-    ContextCompactedNotification,
     ErrorNotification,
-    FileChangeOutputDeltaNotification,
     FileChangePatchUpdatedNotification,
     HookCompletedNotification,
     HookStartedNotification,
@@ -221,6 +207,7 @@ DIRECT_TURN_ID_NOTIFICATION_TYPES: tuple[type[BaseModel], ...] = (
     ItemStartedNotification,
     McpToolCallProgressNotification,
     ModelReroutedNotification,
+    ModelSafetyBufferingUpdatedNotification,
     ModelVerificationNotification,
     PlanDeltaNotification,
     ReasoningSummaryPartAddedNotification,
@@ -230,7 +217,11 @@ DIRECT_TURN_ID_NOTIFICATION_TYPES: tuple[type[BaseModel], ...] = (
     ThreadGoalUpdatedNotification,
     ThreadTokenUsageUpdatedNotification,
     TurnDiffUpdatedNotification,
+    TurnModerationMetadataNotification,
     TurnPlanUpdatedNotification,
+    TurnReasoningPolicySummaryNotification,
+    TurnReasoningPolicyUpdatedNotification,
+    TurnTerminalizationCompletedNotification,
 )
 
 NESTED_TURN_NOTIFICATION_TYPES: tuple[type[BaseModel], ...] = (

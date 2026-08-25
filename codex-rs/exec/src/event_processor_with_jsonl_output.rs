@@ -20,6 +20,7 @@ use serde_json::json;
 
 pub use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
+use crate::event_processor::final_message_from_turn_items;
 use crate::event_processor::handle_last_message;
 use crate::exec_events::AgentMessageItem;
 use crate::exec_events::CollabAgentState;
@@ -386,22 +387,6 @@ impl EventProcessorWithJsonOutput {
             .collect()
     }
 
-    fn final_message_from_turn_items(items: &[ThreadItem]) -> Option<String> {
-        items
-            .iter()
-            .rev()
-            .find_map(|item| match item {
-                ThreadItem::AgentMessage { text, .. } => Some(text.clone()),
-                _ => None,
-            })
-            .or_else(|| {
-                items.iter().rev().find_map(|item| match item {
-                    ThreadItem::Plan { text, .. } => Some(text.clone()),
-                    _ => None,
-                })
-            })
-    }
-
     pub fn thread_started_event(session_configured: &SessionConfiguredEvent) -> ThreadEvent {
         ThreadEvent::ThreadStarted(ThreadStartedEvent {
             thread_id: session_configured.thread_id.to_string(),
@@ -555,7 +540,7 @@ impl EventProcessorWithJsonOutput {
                         if let Some(surfaced_result) = notification.surfaced_result.as_ref() {
                             self.final_message = surfaced_result.canonical_message.clone();
                         } else if let Some(final_message) =
-                            Self::final_message_from_turn_items(notification.turn.items.as_slice())
+                            final_message_from_turn_items(notification.turn.items.as_slice())
                         {
                             self.final_message = Some(final_message);
                         }

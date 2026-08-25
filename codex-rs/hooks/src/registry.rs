@@ -5,21 +5,19 @@ use tokio::process::Command;
 use crate::engine::ClaudeHooksEngine;
 use crate::engine::CommandShell;
 use crate::engine::HookListEntry;
+use crate::events::common::ContextInjectingHookOutcome;
+use crate::events::common::StatelessHookOutcome;
 use crate::events::compact::PostCompactRequest;
-use crate::events::compact::PreCompactOutcome;
 use crate::events::compact::PreCompactRequest;
-use crate::events::compact::StatelessHookOutcome;
 use crate::events::permission_request::PermissionRequestOutcome;
 use crate::events::permission_request::PermissionRequestRequest;
 use crate::events::post_tool_use::PostToolUseOutcome;
 use crate::events::post_tool_use::PostToolUseRequest;
 use crate::events::pre_tool_use::PreToolUseOutcome;
 use crate::events::pre_tool_use::PreToolUseRequest;
-use crate::events::session_start::SessionStartOutcome;
 use crate::events::session_start::SessionStartRequest;
 use crate::events::stop::StopOutcome;
 use crate::events::stop::StopRequest;
-use crate::events::user_prompt_submit::UserPromptSubmitOutcome;
 use crate::events::user_prompt_submit::UserPromptSubmitRequest;
 use crate::types::Hook;
 use crate::types::HookEvent;
@@ -145,7 +143,7 @@ impl Hooks {
         &self,
         request: SessionStartRequest,
         turn_id: Option<String>,
-    ) -> SessionStartOutcome {
+    ) -> ContextInjectingHookOutcome {
         self.engine.run_session_start(request, turn_id).await
     }
 
@@ -171,7 +169,7 @@ impl Hooks {
         self.engine.preview_pre_compact(request)
     }
 
-    pub async fn run_pre_compact(&self, request: PreCompactRequest) -> PreCompactOutcome {
+    pub async fn run_pre_compact(&self, request: PreCompactRequest) -> StatelessHookOutcome {
         self.engine.run_pre_compact(request).await
     }
 
@@ -196,7 +194,7 @@ impl Hooks {
     pub async fn run_user_prompt_submit(
         &self,
         request: UserPromptSubmitRequest,
-    ) -> UserPromptSubmitOutcome {
+    ) -> ContextInjectingHookOutcome {
         self.engine.run_user_prompt_submit(request).await
     }
 

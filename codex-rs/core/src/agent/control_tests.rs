@@ -51,6 +51,7 @@ use codex_thread_store::LocalThreadStore;
 use codex_thread_store::LocalThreadStoreConfig;
 use codex_thread_store::ThreadStore;
 use codex_utils_path_uri::PathUri;
+use core_test_support::responses::strip_response_item_ids;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use tokio::time::Duration;
@@ -851,7 +852,6 @@ async fn send_inter_agent_communication_without_turn_queues_message_without_trig
 async fn ensure_v2_agent_loaded_replaces_stopped_registered_agent() {
     let (home, mut config) = test_config().await;
     let _ = config.features.enable(Feature::MultiAgentV2);
-    let _ = config.features.enable(Feature::Sqlite);
     let harness = AgentControlHarness::new_with_config(home, config).await;
     let (parent_thread_id, parent_thread) = harness.start_thread().await;
     parent_thread.codex.session.new_default_turn().await;
@@ -1029,7 +1029,6 @@ fn concurrent_v2_cold_load_is_singleflight_before_residency() {
 async fn concurrent_v2_cold_load_is_singleflight_before_residency_impl() {
     let (home, mut config) = test_config().await;
     let _ = config.features.enable(Feature::MultiAgentV2);
-    let _ = config.features.enable(Feature::Sqlite);
     config.multi_agent_v2.max_concurrent_threads_per_session = 3;
     let harness = AgentControlHarness::new_with_config(home, config).await;
     let (parent_thread_id, parent_thread) = harness.start_thread().await;
@@ -1274,7 +1273,6 @@ fn resume_agent_from_rollout_does_not_reopen_v2_descendants() {
         || async {
             let (home, mut config) = test_config().await;
             let _ = config.features.enable(Feature::MultiAgentV2);
-            let _ = config.features.enable(Feature::Sqlite);
             let harness = AgentControlHarness::new_with_config(home, config).await;
             let (parent_thread_id, parent_thread) = harness.start_thread().await;
             let worker_path = AgentPath::root().join("worker").expect("worker path");
@@ -1849,8 +1847,8 @@ fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
                 },
             ];
             assert_eq!(
-                history.raw_items(),
-                &expected_history,
+                strip_response_item_ids(history.raw_items()),
+                strip_response_item_ids(&expected_history),
                 "full-history forked child history should replace parent usage hints with the child subagent hint while filtering non-final assistant/tool chatter"
             );
             assert_eq!(
@@ -3982,7 +3980,6 @@ fn failed_initial_submission_rollback_closes_edge_and_releases_child() {
 
 async fn failed_initial_submission_rollback_closes_edge_and_releases_child_impl() {
     let (home, mut config) = test_config().await;
-    let _ = config.features.enable(Feature::Sqlite);
     config.sqlite_home = home.path().join("sqlite");
     let harness = AgentControlHarness::new_with_config(home, config).await;
     let (parent_thread_id, _parent_thread) = harness.start_thread().await;
@@ -4077,7 +4074,6 @@ async fn failed_initial_submission_rollback_closes_edge_and_releases_child_impl(
 #[tokio::test]
 async fn close_agent_reports_durable_status_failure_after_shutdown() {
     let (home, mut config) = test_config().await;
-    let _ = config.features.enable(Feature::Sqlite);
     config.sqlite_home = home.path().join("sqlite");
     let harness = AgentControlHarness::new_with_config(home, config).await;
     let (parent_thread_id, _parent_thread) = harness.start_thread().await;
@@ -4587,7 +4583,6 @@ fn resume_agent_from_rollout_closes_unrecoverable_child_and_does_not_retry() {
         "resume_agent_from_rollout_closes_unrecoverable_child_and_does_not_retry",
         || async {
             let (home, mut config) = test_config().await;
-            let _ = config.features.enable(Feature::Sqlite);
             config.sqlite_home = home.path().join("sqlite");
             let harness = AgentControlHarness::new_with_config(home, config).await;
             let (parent_thread_id, parent_thread) = harness.start_thread().await;

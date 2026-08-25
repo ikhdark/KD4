@@ -39,6 +39,9 @@ cwd?: string | Array<string> | null, /**
  * SQLite; false explicitly selects scan-and-repair.
  */
 useStateDbOnly?: boolean | null, /**
- * Optional substring filter for the extracted thread title.
+ * Optional substring filter for thread summary metadata used by listing
+ * (the title and, when available, cached preview text). This does not scan
+ * arbitrary rollout content or return match snippets; use the experimental
+ * `thread/search` method for that capability.
  */
 searchTerm?: string | null};

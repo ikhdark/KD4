@@ -8,7 +8,6 @@
 - `justification` is an optional human-readable rationale for why a rule exists. It can be provided for any `decision` and may be surfaced in different contexts (for example, in approval prompts or rejection messages). When `decision = "forbidden"` is used, include a recommended alternative in the `justification`, when appropriate (e.g., ``"Use `jj` instead of `git`."``).
 - `match` / `not_match` supply example invocations that are validated at load time (think of them as unit tests); examples can be token arrays or strings (strings are tokenized with `shlex`).
 - The CLI always prints the JSON serialization of the evaluation result.
-- The legacy rule matcher lives in `codex-execpolicy-legacy`.
 
 ## Policy shapes
 
@@ -46,7 +45,7 @@ host_executable(
 
 ## CLI
 
-- From the Codex CLI, run `codex execpolicy check` subcommand with one or more policy files (for example `src/default.rules`) to check a command:
+- From the Codex CLI, run `codex execpolicy check` subcommand with one or more policy files (for example `examples/example.codexpolicy`) to check a command:
 
 ```bash
 codex execpolicy check --rules path/to/policy.rules git status

@@ -11,12 +11,12 @@ use codex_app_server_protocol::CommandExecOutputStream;
 use codex_app_server_protocol::CommandExecResizeParams;
 use codex_app_server_protocol::CommandExecResizeResponse;
 use codex_app_server_protocol::CommandExecResponse;
-use codex_app_server_protocol::CommandExecTerminalSize;
 use codex_app_server_protocol::CommandExecTerminateParams;
 use codex_app_server_protocol::CommandExecTerminateResponse;
 use codex_app_server_protocol::CommandExecWriteParams;
 use codex_app_server_protocol::CommandExecWriteResponse;
 use codex_app_server_protocol::JSONRPCErrorError;
+use codex_app_server_protocol::PtyTerminalSize;
 use codex_app_server_protocol::ServerNotification;
 use codex_core::config::StartedNetworkProxy;
 use codex_core::exec::ExecExpiration;
@@ -53,6 +53,17 @@ const OUTPUT_CHUNK_SIZE_HINT: usize = 64 * 1024;
 const OUTPUT_DELIVERY_MAX_QUEUED_BYTES: usize = 256 * 1024;
 const OUTPUT_DELIVERY_QUEUE_ITEMS: usize = 256;
 const OUTPUT_DELIVERY_EVENT_OVERHEAD_BYTES: usize = 1024;
+
+/// Validate command argv at an app-server request boundary.
+///
+/// Execution managers only accept requests produced by those boundaries and
+/// may rely on the first argv entry being present.
+pub(crate) fn validate_command_argv(command: &[String]) -> Result<(), JSONRPCErrorError> {
+    if command.is_empty() {
+        return Err(invalid_request("command must not be empty"));
+    }
+    Ok(())
+}
 
 #[derive(Clone)]
 pub(crate) struct CommandExecManager {
@@ -161,11 +172,7 @@ enum InternalProcessId {
     Client(String),
 }
 
-trait InternalProcessIdExt {
-    fn error_repr(&self) -> String;
-}
-
-impl InternalProcessIdExt for InternalProcessId {
+impl InternalProcessId {
     fn error_repr(&self) -> String {
         match self {
             Self::Generated(id) => id.to_string(),
@@ -363,9 +370,9 @@ impl CommandExecManager {
         };
 
         let sessions = Arc::clone(&self.sessions);
-        let (program, args) = command
-            .split_first()
-            .ok_or_else(|| invalid_request("command must not be empty"))?;
+        let Some((program, args)) = command.split_first() else {
+            return Err(internal_error("validated command unexpectedly empty"));
+        };
         {
             let mut sessions = self.sessions.lock().await;
             rpc_gate
@@ -500,7 +507,7 @@ impl CommandExecManager {
         self.send_control(
             target_process_id,
             CommandControl::Resize {
-                size: terminal_size_from_protocol(params.size)?,
+                size: terminal_size_from_protocol(params.size.into_inner(), "command/exec")?,
             },
         )
         .await?;
@@ -915,12 +922,13 @@ fn handle_process_resize(
 }
 
 pub(crate) fn terminal_size_from_protocol(
-    size: CommandExecTerminalSize,
+    size: PtyTerminalSize,
+    request_name: &str,
 ) -> Result<TerminalSize, JSONRPCErrorError> {
     if size.rows == 0 || size.cols == 0 {
-        return Err(invalid_params(
-            "command/exec size rows and cols must be greater than 0",
-        ));
+        return Err(invalid_params(format!(
+            "{request_name} size rows and cols must be greater than 0"
+        )));
     }
     Ok(TerminalSize {
         rows: size.rows,
@@ -1033,6 +1041,54 @@ mod tests {
         )
     }
 
+    #[test]
+    fn command_argv_validation_preserves_the_rpc_contract() {
+        let error = validate_command_argv(&[]).expect_err("empty argv should be rejected");
+        assert_eq!(error.code, INVALID_REQUEST_ERROR_CODE);
+        assert_eq!(error.message, "command must not be empty");
+        assert!(validate_command_argv(&["codex".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn command_argv_validation_is_centralized_in_request_processors() {
+        for source in [
+            include_str!("request_processors/command_exec_processor.rs"),
+            include_str!("request_processors/process_exec_processor.rs"),
+        ] {
+            assert_eq!(source.matches("validate_command_argv(").count(), 1);
+            assert!(!source.contains("command must not be empty"));
+        }
+
+        let command_exec_source = include_str!("command_exec.rs");
+        let process_exec_source = include_str!("request_processors/process_exec_processor.rs");
+        assert!(!command_exec_source.contains(&["trait InternalProcessId", "Ext"].concat()));
+        assert!(!process_exec_source.contains(&["struct ProcessExec", "Manager"].concat()));
+    }
+
+    #[test]
+    fn terminal_size_validation_is_shared_by_process_apis() {
+        let size = PtyTerminalSize {
+            rows: 40,
+            cols: 120,
+        };
+        let converted =
+            terminal_size_from_protocol(size, "command/exec").expect("valid terminal size");
+        assert_eq!(converted.rows, 40);
+        assert_eq!(converted.cols, 120);
+
+        let invalid = PtyTerminalSize { rows: 0, cols: 1 };
+        let error = terminal_size_from_protocol(invalid, "process")
+            .expect_err("zero rows should be rejected");
+        assert_eq!(
+            error.message,
+            "process size rows and cols must be greater than 0"
+        );
+        assert!(
+            !include_str!("request_processors/process_exec_processor.rs")
+                .contains("fn terminal_size_from_protocol")
+        );
+    }
+
     #[tokio::test]
     async fn windows_sandbox_streaming_exec_uses_execution_path() {
         let (tx, _rx) = mpsc::channel(1);
@@ -1058,141 +1114,6 @@ mod tests {
             })
             .await
             .expect("streaming windows sandbox exec should start");
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    #[tokio::test]
-    async fn windows_sandbox_non_streaming_exec_uses_execution_path() {
-        let (tx, mut rx) = mpsc::channel(1);
-        let manager = CommandExecManager::default();
-        let request_id = ConnectionRequestId {
-            connection_id: ConnectionId(7),
-            request_id: codex_app_server_protocol::RequestId::Integer(99),
-        };
-
-        manager
-            .start(StartCommandExecParams {
-                outgoing: Arc::new(OutgoingMessageSender::new(
-                    tx,
-                    codex_analytics::AnalyticsEventsClient::disabled(),
-                )),
-                request_id: request_id.clone(),
-                process_id: Some("proc-99".to_string()),
-                exec_request: windows_sandbox_exec_request(),
-                started_network_proxy: None,
-                tty: false,
-                stream_stdin: false,
-                stream_stdout_stderr: false,
-                output_bytes_cap: Some(DEFAULT_OUTPUT_BYTES_CAP),
-                size: None,
-            })
-            .await
-            .expect("non-streaming windows sandbox exec should start");
-
-        let envelope = timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("timed out waiting for outgoing message")
-            .expect("channel closed before outgoing message");
-        let OutgoingEnvelope::ToConnection {
-            connection_id,
-            message,
-            ..
-        } = envelope
-        else {
-            panic!("expected connection-scoped outgoing message");
-        };
-        assert_eq!(connection_id, request_id.connection_id);
-        let OutgoingMessage::Error(error) = message else {
-            panic!("expected execution failure to be reported as an error");
-        };
-        assert_eq!(error.id, request_id.request_id);
-        assert!(error.error.message.starts_with("exec failed:"));
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    #[tokio::test]
-    async fn cancellation_expiration_keeps_process_alive_until_terminated() {
-        let (tx, mut rx) = mpsc::channel(4);
-        let manager = CommandExecManager::default();
-        let request_id = ConnectionRequestId {
-            connection_id: ConnectionId(8),
-            request_id: codex_app_server_protocol::RequestId::Integer(100),
-        };
-        let cwd = AbsolutePathBuf::current_dir().expect("current dir");
-
-        manager
-            .start(StartCommandExecParams {
-                outgoing: Arc::new(OutgoingMessageSender::new(
-                    tx,
-                    codex_analytics::AnalyticsEventsClient::disabled(),
-                )),
-                request_id: request_id.clone(),
-                process_id: Some("proc-100".to_string()),
-                exec_request: ExecRequest::new(
-                    vec!["sh".to_string(), "-lc".to_string(), "sleep 30".to_string()],
-                    cwd.clone(),
-                    HashMap::new(),
-                    /*network*/ None,
-                    /*network_environment_id*/ None,
-                    ExecExpiration::Cancellation(CancellationToken::new()),
-                    codex_core::exec::ExecCapturePolicy::ShellTool,
-                    SandboxType::None,
-                    vec![cwd.clone()],
-                    WindowsSandboxLevel::Disabled,
-                    /*windows_sandbox_private_desktop*/ false,
-                    PermissionProfile::read_only(),
-                    /*arg0*/ None,
-                ),
-                started_network_proxy: None,
-                tty: false,
-                stream_stdin: false,
-                stream_stdout_stderr: false,
-                output_bytes_cap: Some(DEFAULT_OUTPUT_BYTES_CAP),
-                size: None,
-            })
-            .await
-            .expect("cancellation-based exec should start");
-
-        assert!(
-            timeout(Duration::from_millis(250), rx.recv())
-                .await
-                .is_err(),
-            "command/exec should remain active until explicit termination",
-        );
-
-        manager
-            .terminate(
-                request_id.clone(),
-                CommandExecTerminateParams {
-                    process_id: "proc-100".to_string(),
-                },
-            )
-            .await
-            .expect("terminate should succeed");
-
-        let envelope = timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("timed out waiting for outgoing message")
-            .expect("channel closed before outgoing message");
-        let OutgoingEnvelope::ToConnection {
-            connection_id,
-            message,
-            ..
-        } = envelope
-        else {
-            panic!("expected connection-scoped outgoing message");
-        };
-        assert_eq!(connection_id, request_id.connection_id);
-        let OutgoingMessage::Response(response) = message else {
-            panic!("expected execution response after termination");
-        };
-        assert_eq!(response.id, request_id.request_id);
-        let response: CommandExecResponse =
-            serde_json::from_value(response.result).expect("deserialize command/exec response");
-        assert_ne!(response.exit_code, 0);
-        assert_eq!(response.stdout, "");
-        // The deferred response now drains any already-emitted stderr before
-        // replying, so shell startup noise is allowed here.
     }
 
     #[tokio::test]
@@ -1287,79 +1208,6 @@ mod tests {
             .await
             .expect("run command did not finish")
             .expect("run command task panicked");
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    #[tokio::test]
-    async fn timeout_or_cancellation_reports_cancellation_without_timeout_exit_code() {
-        let (tx, mut rx) = mpsc::channel(4);
-        let manager = CommandExecManager::default();
-        let request_id = ConnectionRequestId {
-            connection_id: ConnectionId(9),
-            request_id: codex_app_server_protocol::RequestId::Integer(101),
-        };
-        let cancellation = CancellationToken::new();
-        let cancel = cancellation.clone();
-        let cwd = AbsolutePathBuf::current_dir().expect("current dir");
-
-        manager
-            .start(StartCommandExecParams {
-                outgoing: Arc::new(OutgoingMessageSender::new(
-                    tx,
-                    codex_analytics::AnalyticsEventsClient::disabled(),
-                )),
-                request_id: request_id.clone(),
-                process_id: Some("proc-101".to_string()),
-                exec_request: ExecRequest::new(
-                    vec!["sh".to_string(), "-lc".to_string(), "sleep 30".to_string()],
-                    cwd.clone(),
-                    HashMap::new(),
-                    /*network*/ None,
-                    /*network_environment_id*/ None,
-                    ExecExpiration::TimeoutOrCancellation {
-                        timeout: Duration::from_secs(30),
-                        cancellation,
-                    },
-                    codex_core::exec::ExecCapturePolicy::ShellTool,
-                    SandboxType::None,
-                    vec![cwd],
-                    WindowsSandboxLevel::Disabled,
-                    /*windows_sandbox_private_desktop*/ false,
-                    PermissionProfile::read_only(),
-                    /*arg0*/ None,
-                ),
-                started_network_proxy: None,
-                tty: false,
-                stream_stdin: false,
-                stream_stdout_stderr: false,
-                output_bytes_cap: Some(DEFAULT_OUTPUT_BYTES_CAP),
-                size: None,
-            })
-            .await
-            .expect("timeout-or-cancellation exec should start");
-
-        cancel.cancel();
-
-        let envelope = timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("timed out waiting for outgoing message")
-            .expect("channel closed before outgoing message");
-        let OutgoingEnvelope::ToConnection {
-            connection_id,
-            message,
-            ..
-        } = envelope
-        else {
-            panic!("expected connection-scoped outgoing message");
-        };
-        assert_eq!(connection_id, request_id.connection_id);
-        let OutgoingMessage::Response(response) = message else {
-            panic!("expected execution response after cancellation");
-        };
-        assert_eq!(response.id, request_id.request_id);
-        let response: CommandExecResponse =
-            serde_json::from_value(response.result).expect("deserialize command/exec response");
-        assert_ne!(response.exit_code, EXEC_TIMEOUT_EXIT_CODE);
     }
 
     #[tokio::test]

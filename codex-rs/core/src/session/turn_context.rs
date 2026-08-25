@@ -23,6 +23,7 @@ use futures::future::BoxFuture;
 use futures::future::Shared;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
 #[derive(Clone, Debug)]
@@ -41,6 +42,32 @@ impl TurnSkillsContext {
 }
 
 pub(crate) type ShellSnapshotTask = Shared<BoxFuture<'static, Option<Arc<ShellSnapshotFile>>>>;
+
+pub(crate) struct TurnEnvironmentLifecycle {
+    cancellation: CancellationToken,
+}
+
+impl TurnEnvironmentLifecycle {
+    pub(crate) fn new() -> Self {
+        Self {
+            cancellation: CancellationToken::new(),
+        }
+    }
+
+    pub(crate) fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+}
+
+impl Drop for TurnEnvironmentLifecycle {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DeferredToolActivation {
@@ -63,6 +90,7 @@ pub(crate) struct TurnEnvironment {
     cwd: PathUri,
     pub(crate) shell: Option<shell::Shell>,
     pub(crate) shell_snapshot: ShellSnapshotTask,
+    lifecycle: Option<Arc<TurnEnvironmentLifecycle>>,
 }
 
 impl TurnEnvironment {
@@ -78,18 +106,27 @@ impl TurnEnvironment {
             cwd,
             shell,
             shell_snapshot: futures::future::ready(None).boxed().shared(),
+            lifecycle: None,
         }
     }
 
-    pub(crate) async fn shell_snapshot(&self, cwd: &AbsolutePathBuf) -> Option<AbsolutePathBuf> {
-        if self.cwd != PathUri::from_abs_path(cwd) {
+    pub(crate) fn attach_lifecycle(&mut self, lifecycle: Arc<TurnEnvironmentLifecycle>) {
+        self.lifecycle = Some(lifecycle);
+    }
+
+    pub(crate) fn lifecycle(&self) -> Option<Arc<TurnEnvironmentLifecycle>> {
+        self.lifecycle.clone()
+    }
+
+    pub(crate) fn detach_lifecycle(&mut self) {
+        self.lifecycle = None;
+    }
+
+    pub(crate) async fn shell_snapshot(&self, cwd: &PathUri) -> Option<Arc<ShellSnapshotFile>> {
+        if self.cwd != *cwd {
             return None;
         }
-        self.shell_snapshot
-            .clone()
-            .await
-            .as_deref()
-            .map(ShellSnapshotFile::path)
+        self.shell_snapshot.clone().await
     }
 
     pub(crate) fn cwd(&self) -> &PathUri {
@@ -120,7 +157,6 @@ impl std::fmt::Debug for TurnEnvironment {
 pub struct TurnContext {
     pub(crate) sub_id: String,
     pub(crate) trace_id: Option<String>,
-    pub(crate) realtime_active: bool,
     pub config: Arc<Config>,
     pub(crate) auth_manager: Option<Arc<AuthManager>>,
     pub(crate) model_info: ModelInfo,
@@ -136,11 +172,6 @@ pub struct TurnContext {
     pub(crate) parent_thread_id: Option<ThreadId>,
     pub(crate) originator: String,
     pub(crate) environments: TurnEnvironmentSnapshot,
-    /// The session's absolute working directory. All relative paths provided
-    /// by the model as well as sandbox policies are resolved against this path
-    /// instead of `std::env::current_dir()`.
-    #[deprecated(note = "use the selected turn environment cwd instead")]
-    pub(crate) cwd: AbsolutePathBuf,
     pub(crate) current_date: Option<String>,
     pub(crate) timezone: Option<String>,
     pub(crate) app_server_client_name: Option<String>,
@@ -153,8 +184,7 @@ pub struct TurnContext {
     pub(crate) permission_profile: PermissionProfile,
     pub(crate) network: Option<NetworkProxy>,
     pub(crate) windows_sandbox_level: WindowsSandboxLevel,
-    pub(crate) available_models: Vec<ModelPreset>,
-    pub(crate) unified_exec_shell_mode: UnifiedExecShellMode,
+    pub(crate) available_models: Arc<Vec<ModelPreset>>,
     pub(crate) final_output_json_schema: Option<Value>,
     pub(crate) dynamic_tools: Vec<DynamicToolSpec>,
     /// Deferred tools selected during this root task, bound to exact capability revisions.
@@ -176,6 +206,25 @@ enum TurnMultiAgentRuntime {
 }
 
 impl TurnContext {
+    /// Returns the host-native cwd resolved for this turn.
+    ///
+    /// Per-turn config construction derives this value from the primary selected
+    /// environment when its URI uses the host path convention, and otherwise
+    /// preserves the session's explicit legacy fallback.
+    pub(crate) fn cwd(&self) -> &AbsolutePathBuf {
+        &self.config.cwd
+    }
+
+    /// Returns the selected environment cwd without projecting foreign paths
+    /// onto the host. Falls back to the resolved host cwd only when no ready
+    /// environment is selected.
+    pub(crate) fn cwd_uri(&self) -> PathUri {
+        self.environments
+            .primary()
+            .map(|environment| environment.cwd().clone())
+            .unwrap_or_else(|| PathUri::from_abs_path(self.cwd()))
+    }
+
     pub(crate) async fn update_validation_authorization(
         &self,
         input: &[codex_protocol::user_input::UserInput],
@@ -264,6 +313,31 @@ impl TurnContext {
             .collect()
     }
 
+    /// Releases only deferred capabilities that were advertised to the model
+    /// for the sampling request that just settled. Activations created by tool
+    /// discovery during that request are deliberately retained for the next
+    /// request, so schemas remain visible for exactly the continuation that
+    /// can use them instead of accumulating for the rest of the turn.
+    pub(crate) fn release_advertised_deferred_tools(
+        &self,
+        advertised: &HashSet<codex_tools::ToolName>,
+    ) {
+        if advertised.is_empty() {
+            return;
+        }
+        let mut state = self
+            .deferred_tool_activations
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = state.activations.len();
+        state
+            .activations
+            .retain(|tool_name, _| !advertised.contains(tool_name));
+        if state.activations.len() != before {
+            state.revision = state.revision.saturating_add(1);
+        }
+    }
+
     pub(crate) fn refresh_deferred_tool_capabilities(
         &self,
         capability_revisions: HashMap<codex_tools::ToolName, String>,
@@ -287,11 +361,6 @@ impl TurnContext {
         }
     }
 
-    pub(crate) fn item_ids_enabled(&self) -> bool {
-        self.config.features.enabled(Feature::ItemIds)
-            || matches!(self.history_mode, ThreadHistoryMode::Paginated)
-    }
-
     pub(crate) fn permission_profile(&self) -> PermissionProfile {
         self.permission_profile.clone()
     }
@@ -305,11 +374,7 @@ impl TurnContext {
     }
 
     pub(crate) fn sandbox_policy(&self) -> SandboxPolicy {
-        compatibility_sandbox_policy_for_permission_profile(
-            &self.permission_profile,
-            #[allow(deprecated)]
-            &self.cwd,
-        )
+        compatibility_sandbox_policy_for_permission_profile(&self.permission_profile, self.cwd())
     }
 
     pub(crate) fn effective_reasoning_effort(&self) -> Option<ReasoningEffortConfig> {
@@ -387,7 +452,7 @@ impl TurnContext {
             /*developer_instructions*/ None,
         );
         let available_models = models_manager
-            .list_models(
+            .list_models_shared(
                 RefreshStrategy::OnlineIfUncached,
                 config.http_client_factory(),
             )
@@ -396,7 +461,6 @@ impl TurnContext {
         Self {
             sub_id: self.sub_id.clone(),
             trace_id: self.trace_id.clone(),
-            realtime_active: self.realtime_active,
             config: Arc::new(config),
             auth_manager: self.auth_manager.clone(),
             model_info: model_info.clone(),
@@ -413,8 +477,6 @@ impl TurnContext {
             parent_thread_id: self.parent_thread_id,
             originator: self.originator.clone(),
             environments: self.environments.clone(),
-            #[allow(deprecated)]
-            cwd: self.cwd.clone(),
             current_date: self.current_date.clone(),
             timezone: self.timezone.clone(),
             app_server_client_name: self.app_server_client_name.clone(),
@@ -430,7 +492,6 @@ impl TurnContext {
             network: self.network.clone(),
             windows_sandbox_level: self.windows_sandbox_level,
             available_models,
-            unified_exec_shell_mode: self.unified_exec_shell_mode.clone(),
             final_output_json_schema: self.final_output_json_schema.clone(),
             dynamic_tools: self.dynamic_tools.clone(),
             deferred_tool_activations: Arc::clone(&self.deferred_tool_activations),
@@ -484,7 +545,6 @@ impl TurnContext {
                 .config
                 .permissions
                 .windows_sandbox_private_desktop,
-            use_legacy_landlock: self.config.features.use_legacy_landlock(),
         }
     }
 
@@ -496,8 +556,7 @@ impl TurnContext {
         let legacy_file_system_sandbox_policy =
             FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
                 &self.sandbox_policy(),
-                #[allow(deprecated)]
-                &self.cwd,
+                self.cwd(),
             );
         let file_system_sandbox_policy = self.file_system_sandbox_policy();
         (file_system_sandbox_policy != legacy_file_system_sandbox_policy)
@@ -506,8 +565,7 @@ impl TurnContext {
 
     pub(crate) fn to_turn_context_item(&self) -> TurnContextItem {
         let workspace_roots = self.config.effective_workspace_roots();
-        #[allow(deprecated)]
-        let cwd = self.cwd.clone();
+        let cwd = self.cwd().clone();
         TurnContextItem {
             turn_id: Some(self.sub_id.clone()),
             cwd,
@@ -525,11 +583,10 @@ impl TurnContext {
             personality: self.personality,
             collaboration_mode: Some(self.collaboration_mode.clone()),
             multi_agent_version: Some(self.multi_agent_version),
-            multi_agent_mode: super::multi_agents::effective_multi_agent_mode(self),
-            realtime_active: Some(self.realtime_active),
+            multi_agent_mode: super::multi_agents::effective_multi_agent_mode(self)
+                .map(|mode| mode.to_persisted_mode()),
             effort: self.reasoning_effort.clone(),
             context_provenance: None,
-            summary: ReasoningSummaryConfig::Auto,
         }
     }
 
@@ -629,16 +686,12 @@ impl Session {
         provider: ModelProviderInfo,
         session_configuration: &SessionConfiguration,
         multi_agent_version: MultiAgentVersion,
-        user_shell: &shell::Shell,
-        shell_zsh_path: Option<&PathBuf>,
-        main_execve_wrapper_exe: Option<&PathBuf>,
         per_turn_config: Config,
         model_info: ModelInfo,
         models_manager: &SharedModelsManager,
         network: Option<NetworkProxy>,
         environments: TurnEnvironmentSnapshot,
         git_metadata_source: Option<GitWorkspaceMetadataSource>,
-        cwd: AbsolutePathBuf,
         sub_id: String,
         skills_snapshot: HostSkillsSnapshot,
     ) -> TurnContext {
@@ -656,13 +709,7 @@ impl Session {
         let auth_manager_for_context = auth_manager.clone();
         let provider_for_context = create_model_provider(provider, auth_manager);
         let session_telemetry_for_context = session_telemetry;
-        let available_models = models_manager.try_list_models().unwrap_or_default();
-        let unified_exec_shell_mode = UnifiedExecShellMode::for_session(
-            codex_tools::unified_exec_feature_mode_for_features(per_turn_config.features.get()),
-            crate::tools::tool_user_shell_type(user_shell),
-            shell_zsh_path,
-            main_execve_wrapper_exe,
-        );
+        let available_models = models_manager.try_list_models_shared().unwrap_or_default();
 
         let mut per_turn_config = per_turn_config;
         per_turn_config.service_tier = get_service_tier(
@@ -670,6 +717,8 @@ impl Session {
             per_turn_config.features.enabled(Feature::FastMode),
             &model_info,
         );
+        let kd4_workflow_enabled =
+            crate::task_evidence::is_kd4_repository(per_turn_config.cwd.as_path());
         let per_turn_config = Arc::new(per_turn_config);
         let turn_metadata_state = Arc::new(TurnMetadataState::new_with_git_metadata_source(
             session_id.to_string(),
@@ -690,7 +739,6 @@ impl Session {
         TurnContext {
             sub_id,
             trace_id: current_span_trace_id(),
-            realtime_active: false,
             config: per_turn_config,
             auth_manager: auth_manager_for_context,
             model_info,
@@ -704,8 +752,6 @@ impl Session {
             parent_thread_id: session_configuration.parent_thread_id,
             originator: session_configuration.originator.clone(),
             environments,
-            #[allow(deprecated)]
-            cwd,
             current_date: Some(current_date),
             timezone: Some(timezone),
             app_server_client_name: session_configuration.app_server_client_name.clone(),
@@ -719,16 +765,19 @@ impl Session {
             network,
             windows_sandbox_level: session_configuration.windows_sandbox_level,
             available_models,
-            unified_exec_shell_mode,
             final_output_json_schema: None,
             dynamic_tools: session_configuration.dynamic_tools.clone(),
             deferred_tool_activations: Arc::new(std::sync::RwLock::new(
                 DeferredToolActivationState::default(),
             )),
-            validation_authorization: Arc::new(tokio::sync::RwLock::new(
-                crate::validation_admission::ValidationAuthorization::default(),
-            )),
-            validation_singleflight: crate::validation_admission::process_validation_singleflight(),
+            validation_authorization: Arc::new(tokio::sync::RwLock::new(if kd4_workflow_enabled {
+                crate::validation_admission::ValidationAuthorization::enabled()
+            } else {
+                crate::validation_admission::ValidationAuthorization::default()
+            })),
+            validation_singleflight: crate::validation_admission::new_validation_singleflight(
+                kd4_workflow_enabled,
+            ),
             turn_metadata_state,
             extension_data,
             turn_skills: TurnSkillsContext::new(skills_snapshot),
@@ -955,9 +1004,6 @@ impl Session {
             session_configuration.provider.clone(),
             &session_configuration,
             multi_agent_version,
-            self.services.user_shell.as_ref(),
-            self.services.shell_zsh_path.as_ref(),
-            self.services.main_execve_wrapper_exe.as_ref(),
             per_turn_config,
             model_info,
             &self.services.models_manager,
@@ -973,12 +1019,9 @@ impl Session {
                 }),
             turn_environments,
             git_metadata_source,
-            cwd,
             sub_id,
             skills_snapshot,
         );
-        turn_context.realtime_active = self.conversation.running_state().await.is_some();
-
         if let Some(final_schema) = final_output_json_schema {
             turn_context.final_output_json_schema = final_schema;
         }

@@ -1,8 +1,9 @@
-use codex_collaboration_mode_templates::DEFAULT as COLLABORATION_MODE_DEFAULT;
-use codex_collaboration_mode_templates::PLAN as COLLABORATION_MODE_PLAN;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::openai_models::ReasoningEffort;
+
+const COLLABORATION_MODE_DEFAULT: &str = include_str!("../templates/collaboration_mode/default.md");
+const COLLABORATION_MODE_PLAN: &str = include_str!("../templates/collaboration_mode/plan.md");
 
 pub fn builtin_collaboration_mode_presets() -> Vec<CollaborationModeMask> {
     vec![plan_preset(), default_preset()]

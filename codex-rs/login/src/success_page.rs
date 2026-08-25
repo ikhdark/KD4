@@ -95,11 +95,7 @@ pub(crate) fn compose_success_url(
     if codex_streamlined_login {
         params.push(("codex_streamlined_login", "true".to_string()));
     }
-    let query = params
-        .into_iter()
-        .map(|(key, value)| format!("{key}={}", urlencoding::encode(&value)))
-        .collect::<Vec<_>>()
-        .join("&");
+    let query = crate::form_urlencode(params);
     LoginSuccessRedirect::Local(format!("http://localhost:{port}/success?{query}"))
 }
 

@@ -389,7 +389,7 @@ location = { country = "US", city = "New York", timezone = "America/New_York" }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn config_read_ignores_bool_web_search_tool_config() -> Result<()> {
+async fn config_read_rejects_bool_web_search_tool_config_with_migration_guidance() -> Result<()> {
     let codex_home = TempDir::new()?;
     write_config(
         &codex_home,
@@ -412,14 +412,17 @@ web_search = true
             cwd: None,
         })
         .await?;
-    let resp: JSONRPCResponse = timeout(
+    let err: JSONRPCError = timeout(
         DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
     )
     .await??;
-    let ConfigReadResponse { config, .. } = to_response(resp)?;
-
-    assert_eq!(config.tools.expect("tools present").web_search, None,);
+    assert!(
+        err.error
+            .message
+            .contains("`tools.web_search` no longer accepts a boolean"),
+        "unexpected error: {err:?}"
+    );
 
     Ok(())
 }

@@ -246,12 +246,12 @@ contains = ".begin_attempt_with_freshness("
 [[features.evidence]]
 kind = "registration"
 path = "codex-rs/core/src/unified_exec/async_watcher.rs"
-contains = ".mark_running_process_completed(process_id, exit_code)"
+contains = ".mark_process_exited("
 
 [[features.evidence]]
 kind = "test"
 path = "codex-rs/core/src/tools/command_execution.rs"
-contains = "synthetic_input_state_proof_blocks_exact_retry_but_freshness_bypasses"
+contains = "input_state_determined_failure_blocks_exact_retry_but_freshness_bypasses"
 
 [[features]]
 id = "command-output-artifacts"
@@ -286,7 +286,7 @@ contains = "RawOutputArtifactWriter::open(raw_output_artifact.as_ref()).await"
 [[features.evidence]]
 kind = "test"
 path = "codex-rs/core/src/tools/handlers/unified_exec_tests.rs"
-contains = "unpolled_background_failure_finalizes_artifact_and_attempt_ledger"
+contains = "kd4_latency_unpolled_background_failure_retires_live_metadata"
 
 [[features.evidence]]
 kind = "test"
@@ -475,73 +475,14 @@ retired_paths = ["codex-rs/config/src/coding_budgets.rs"]
 
 [[features]]
 id = "task-evidence-completion-gate"
-version = 11
+version = 12
 status = "enabled"
 capability_kind = "runtime"
 owner = "codex-rs/core"
-summary = "Persisted schema-v11 task evidence, including explicit plan acknowledgement, versioned manifests, candidate-bound proof identity, atomic completion-review and terminal-delivery lineage, authenticated Desktop activation receipts, and migration from older schemas."
+summary = "Persisted schema-v12 task evidence, including explicit plan acknowledgement, versioned manifests, candidate-bound proof identity, atomic completion-review and terminal-delivery lineage, authenticated Desktop activation receipts, and migration from older schemas."
 upstream_equivalent = "none"
 config_keys = []
-
-[[features.evidence]]
-kind = "entrypoint"
-path = "codex-rs/core/src/task_evidence.rs"
-contains = "pub(crate) struct TaskEvidenceLedger"
-
-[[features.evidence]]
-kind = "registration"
-path = "codex-rs/core/src/state/service.rs"
-contains = "pub(crate) task_evidence: TaskEvidenceLedger"
-
-[[features.evidence]]
-kind = "registration"
-path = "codex-rs/core/src/tools/handlers/plan.rs"
-contains = ".record_planning_update(requested_input.clone())"
-
-[[features.evidence]]
-kind = "registration"
-path = "codex-rs/core/src/tools/events.rs"
-contains = ".record_edit_intent_with_provenance("
-
-[[features.evidence]]
-kind = "registration"
-path = "codex-rs/core/src/tools/events.rs"
-contains = ".record_command_bound_with_validation_result("
-
-[[features.evidence]]
-kind = "registration"
-path = "codex-rs/core/src/tasks/mod.rs"
-contains = "self.services.task_evidence.completion_gate(),"
-
-[[features.evidence]]
-kind = "registration"
-path = "codex-rs/core/src/tasks/completion_review_v2.rs"
-contains = "implementation_identity_for_evidence"
-
-[[features.evidence]]
-kind = "protocol"
-path = "codex-rs/protocol/src/protocol.rs"
-contains = "pub enum TaskCompletionStatus"
-
-[[features.evidence]]
-kind = "protocol"
-path = "codex-rs/app-server-protocol/src/protocol/v2/turn.rs"
-contains = "pub struct TaskCompletionGate"
-
-[[features.evidence]]
-kind = "test"
-path = "codex-rs/core/src/task_evidence_tests.rs"
-contains = "explicit_passed_and_completed_are_authoritative_success_states"
-
-[[features.evidence]]
-kind = "test"
-path = "codex-rs/core/src/task_evidence_tests.rs"
-contains = "frozen_v4_loader_refuses_v5_without_modifying_the_file"
-
-[[features.evidence]]
-kind = "test"
-path = "codex-rs/agent-task-store/src/tests.rs"
-contains = "mutation_evidence_and_receipts_are_not_gated_by_claim_metadata"
+source_owner = "task-evidence-runtime"
 
 [[features]]
 id = "task-completion-reviewer"
@@ -584,37 +525,12 @@ contains = "sparse_wire_contract_requires_all_five_arrays_and_rejects_legacy_fie
 [[features]]
 id = "desktop-runtime-receipt"
 version = 1
-status = "enabled"
+status = "planned"
 capability_kind = "runtime"
 owner = "codex-rs/app-server"
 summary = "Authenticated, publish-ID-bound proof that Codex Desktop initialized the intended installed binary and live process."
 upstream_equivalent = "none"
 config_keys = []
-
-[[features.evidence]]
-kind = "entrypoint"
-path = "codex-rs/core/src/task_evidence.rs"
-contains = "pub struct DesktopActivationRecordResult"
-
-[[features.evidence]]
-kind = "module"
-path = "codex-rs/app-server/src/lib.rs"
-contains = "mod desktop_activation;"
-
-[[features.evidence]]
-kind = "protocol"
-path = "codex-rs/app-server-protocol/src/protocol/v2/thread.rs"
-contains = "pub struct ThreadDesktopActivationRecordParams"
-
-[[features.evidence]]
-kind = "registration"
-path = "codex-rs/app-server/src/request_processors/thread_processor.rs"
-contains = "pub(crate) async fn desktop_activation_record("
-
-[[features.evidence]]
-kind = "test"
-path = "codex-rs/core/src/task_evidence_tests.rs"
-contains = "authenticated_desktop_activation_is_exact_live_and_single_use"
 
 [[features]]
 id = "repository-intelligence"
@@ -643,8 +559,8 @@ contains = "CREATE TABLE workspace_repositories"
 
 [[features.evidence]]
 kind = "entrypoint"
-path = "codex-rs/agent-task-store/src/workspace.rs"
-contains = "pub(crate) async fn begin_mutation"
+path = "codex-rs/agent-task-store/src/local.rs"
+contains = "fn begin_mutation<'a>("
 
 [[features.evidence]]
 kind = "registration"
@@ -654,7 +570,22 @@ contains = "Durable typed-task progress is available."
 [[features.evidence]]
 kind = "registration"
 path = "codex-rs/core/src/tools/events.rs"
-contains = "note_host_workspace_mutation"
+contains = "begin_exec_mutation_evidence"
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/tools/events.rs"
+contains = "finish_exec_mutation_evidence"
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/tools/runtimes/shell.rs"
+contains = "begin_exec_mutation_evidence"
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/tools/runtimes/unified_exec.rs"
+contains = "begin_exec_mutation_evidence"
 
 [[features.evidence]]
 kind = "workflow"
@@ -664,4 +595,9 @@ contains = '"advisories": []'
 [[features.evidence]]
 kind = "test"
 path = "codex-rs/agent-task-store/src/tests.rs"
-contains = "relevant_drift_supersedes_validation_but_unrelated_drift_preserves_it"
+contains = "focused_validation_dependency_receipt_freshness_is_scoped"
+
+[[features.evidence]]
+kind = "test"
+path = "codex-rs/core/src/tools/events.rs"
+contains = "shell_and_unified_exec_finalize_typed_mutation_evidence"

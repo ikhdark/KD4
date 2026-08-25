@@ -3,7 +3,7 @@
 //! This module owns the normalization that turns ChatGPT-hosted app
 //! connector/tool metadata into model-visible MCP callable names.
 
-use codex_utils_plugins::mcp_connector::sanitize_name;
+use codex_connectors::metadata::sanitize_name;
 
 pub(crate) fn normalize_codex_apps_tool_title(connector_name: Option<&str>, value: &str) -> String {
     let Some(connector_name) = connector_name

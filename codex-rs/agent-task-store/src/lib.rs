@@ -9,7 +9,6 @@ mod id;
 mod local;
 mod model;
 mod scope;
-mod store;
 mod workspace;
 
 pub use error::StoreError;
@@ -19,14 +18,13 @@ pub use id::AttemptId;
 pub use id::MutationEventId;
 pub use id::WakeEventId;
 pub use local::LocalAgentTaskStore;
+pub use local::TaskStoreFuture;
 pub use model::*;
 pub use scope::RepoScope;
 pub use scope::normalize_repo_path;
 pub use scope::normalize_repo_scopes;
 pub use scope::repository_lineage_id;
 pub use scope::repository_workspace_id;
-pub use store::AgentTaskStore;
-pub use store::TaskStoreFuture;
 pub use workspace::REPOSITORY_WIDE_PATH;
 
 #[cfg(test)]

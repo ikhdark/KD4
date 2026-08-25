@@ -69,6 +69,31 @@ fn test_turn_metadata_header(state: &TurnMetadataState) -> String {
         .expect("header")
 }
 
+#[test]
+fn git_workspace_metadata_is_canonical_response_metadata() {
+    let metadata = GitWorkspaceMetadata {
+        associated_remote_urls: Some(BTreeMap::from([(
+            "origin".to_string(),
+            "https://example.test/repository.git".to_string(),
+        )])),
+        latest_git_commit_hash: Some("abc123".to_string()),
+        has_changes: Some(true),
+    };
+
+    assert!(!metadata.is_empty());
+    assert!(GitWorkspaceMetadata::default().is_empty());
+    assert_eq!(
+        serde_json::to_value(metadata).expect("serialize workspace metadata"),
+        serde_json::json!({
+            "associated_remote_urls": {
+                "origin": "https://example.test/repository.git",
+            },
+            "latest_git_commit_hash": "abc123",
+            "has_changes": true,
+        })
+    );
+}
+
 async fn create_clean_git_repo(repo_name: &str) -> (TempDir, AbsolutePathBuf) {
     let temp_dir = TempDir::new().expect("temp dir");
     let repo_path = temp_dir.path().join(repo_name).abs();

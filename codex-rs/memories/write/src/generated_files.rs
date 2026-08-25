@@ -42,8 +42,6 @@ fn write_generated_file_atomic_sync(path: &Path, contents: &[u8]) -> io::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
 
     #[tokio::test]
     async fn write_generated_file_writes_atomically_and_removes_temp_file() {
@@ -120,11 +118,10 @@ mod tests {
             .await
             .expect("read final metadata")
             .permissions();
-        #[cfg(windows)]
+
         #[allow(clippy::permissions_set_readonly_false)]
         permissions.set_readonly(false);
-        #[cfg(unix)]
-        permissions.set_mode(0o600);
+
         tokio::fs::set_permissions(&path, permissions)
             .await
             .expect("restore generated file permissions");

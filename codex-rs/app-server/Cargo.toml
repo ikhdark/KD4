@@ -76,6 +76,7 @@ codex-protocol = { workspace = true }
 codex-app-server-protocol = { workspace = true }
 codex-app-server-transport = { workspace = true }
 codex-feedback = { workspace = true }
+codex-file-system = { workspace = true }
 codex-rmcp-client = { workspace = true }
 codex-rollout = { workspace = true }
 codex-rollout-trace = { workspace = true }
@@ -84,7 +85,7 @@ codex-state = { workspace = true }
 codex-thread-store = { workspace = true }
 codex-tools = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
-codex-utils-json-to-toml = { workspace = true }
+codex-utils-build-info = { workspace = true }
 codex-utils-path-uri = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
@@ -110,9 +111,8 @@ tracing = { workspace = true, features = ["log"] }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "json"] }
 uuid = { workspace = true, features = ["serde", "v7"] }
 
-[target.'cfg(windows)'.dependencies]
 codex-windows-sandbox = { workspace = true }
-windows-sys = { version = "0.52", features = ["Win32_Foundation"] }
+windows-sys = { workspace = true, features = ["Win32_Foundation"] }
 
 [dev-dependencies]
 app_test_support = { workspace = true }
@@ -129,7 +129,7 @@ hmac = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 pretty_assertions = { workspace = true }
-reqwest = { workspace = true, features = ["rustls-tls"] }
+reqwest = { workspace = true, features = ["rustls"] }
 rmcp = { workspace = true, default-features = false, features = [
     "elicitation",
     "server",

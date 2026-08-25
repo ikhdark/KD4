@@ -4,6 +4,7 @@
 //! the focused app submodules.
 
 use crate::AppServerTarget;
+use crate::ansi_escape::ansi_escape_line;
 use crate::app_backtrack::BacktrackState;
 use crate::app_command::AppCommand;
 use crate::app_event::AppEvent;
@@ -21,6 +22,7 @@ use crate::app_server_session::AppServerSession;
 use crate::app_server_session::AppServerStartedThread;
 use crate::app_server_session::TurnPermissionsOverride;
 use crate::app_server_session::app_server_rate_limit_snapshots;
+use crate::approval_presets::builtin_permission_profile_for_active_permission_profile;
 use crate::bottom_pane::AppLinkViewParams;
 use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::FeedbackAudience;
@@ -73,6 +75,7 @@ use crate::test_support::test_path_buf;
 #[cfg(test)]
 use crate::test_support::test_path_display;
 use crate::token_usage::TokenUsage;
+use crate::token_usage::format_token_usage;
 use crate::transcript_reflow::TranscriptReflowState;
 use crate::tui;
 use crate::tui::TuiEvent;
@@ -80,7 +83,6 @@ use crate::update_action::UpdateAction;
 use crate::version::CODEX_CLI_VERSION;
 use crate::workspace_command::AppServerWorkspaceCommandRunner;
 use crate::workspace_command::WorkspaceCommandRunner;
-use codex_ansi_escape::ansi_escape_line;
 use codex_app_server_client::AppServerRequestHandle;
 use codex_app_server_client::TypedRequestError;
 use codex_app_server_protocol::AddCreditsNudgeCreditType;
@@ -134,20 +136,18 @@ use codex_config::LoaderOverrides;
 use codex_config::types::ApprovalsReviewer;
 use codex_config::types::MemoriesToml;
 use codex_config::types::ModelAvailabilityNuxConfig;
-#[cfg(target_os = "windows")]
+
 use codex_config::types::WindowsToml;
 use codex_exec_server::EnvironmentManager;
 use codex_features::Feature;
 use codex_features::FeaturesToml;
 use codex_model_provider::create_model_provider;
 use codex_model_provider_info::ModelProviderInfo;
-use codex_models_manager::model_presets::HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG;
-use codex_models_manager::model_presets::HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG;
 use codex_otel::SessionTelemetry;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::Personality;
-#[cfg(target_os = "windows")]
+
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
@@ -156,12 +156,11 @@ use codex_protocol::openai_models::ModelAvailabilityNux;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelUpgrade;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
-#[cfg(target_os = "windows")]
+
 use codex_protocol::permissions::FileSystemSandboxKind;
 use codex_rollout::StateDbHandle;
 use codex_terminal_detection::user_agent;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use codex_utils_approval_presets::builtin_permission_profile_for_active_permission_profile;
 use color_eyre::eyre::Result;
 use color_eyre::eyre::WrapErr;
 use crossterm::event::KeyCode;
@@ -301,56 +300,6 @@ fn collab_receiver_is_not_found(
     }
 }
 
-fn default_exec_approval_decisions(
-    network_approval_context: Option<&codex_app_server_protocol::NetworkApprovalContext>,
-    proposed_execpolicy_amendment: Option<&codex_app_server_protocol::ExecPolicyAmendment>,
-    proposed_network_policy_amendments: Option<
-        &[codex_app_server_protocol::NetworkPolicyAmendment],
-    >,
-    additional_permissions: Option<&codex_app_server_protocol::AdditionalPermissionProfile>,
-) -> Vec<codex_app_server_protocol::CommandExecutionApprovalDecision> {
-    use codex_app_server_protocol::CommandExecutionApprovalDecision;
-    use codex_app_server_protocol::NetworkPolicyRuleAction;
-
-    if network_approval_context.is_some() {
-        let mut decisions = vec![
-            CommandExecutionApprovalDecision::Accept,
-            CommandExecutionApprovalDecision::AcceptForSession,
-        ];
-        if let Some(amendment) = proposed_network_policy_amendments.and_then(|amendments| {
-            amendments
-                .iter()
-                .find(|amendment| amendment.action == NetworkPolicyRuleAction::Allow)
-        }) {
-            decisions.push(
-                CommandExecutionApprovalDecision::ApplyNetworkPolicyAmendment {
-                    network_policy_amendment: amendment.clone(),
-                },
-            );
-        }
-        decisions.push(CommandExecutionApprovalDecision::Cancel);
-        return decisions;
-    }
-
-    if additional_permissions.is_some() {
-        return vec![
-            CommandExecutionApprovalDecision::Accept,
-            CommandExecutionApprovalDecision::Cancel,
-        ];
-    }
-
-    let mut decisions = vec![CommandExecutionApprovalDecision::Accept];
-    if let Some(execpolicy_amendment) = proposed_execpolicy_amendment {
-        decisions.push(
-            CommandExecutionApprovalDecision::AcceptWithExecpolicyAmendment {
-                execpolicy_amendment: execpolicy_amendment.clone(),
-            },
-        );
-    }
-    decisions.push(CommandExecutionApprovalDecision::Cancel);
-    decisions
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AutoReviewMode {
     approval_policy: AskForApproval,
@@ -380,7 +329,6 @@ impl AutoReviewMode {
     }
 }
 
-#[cfg(target_os = "windows")]
 fn managed_filesystem_sandbox_is_restricted(permission_profile: &PermissionProfile) -> bool {
     matches!(
         permission_profile.file_system_sandbox_policy().kind,
@@ -413,6 +361,34 @@ impl AppExitInfo {
             exit_reason: ExitReason::Fatal(message.into()),
         }
     }
+
+    pub fn format_exit_messages(self, color_enabled: bool) -> Vec<String> {
+        let is_fatal = matches!(&self.exit_reason, ExitReason::Fatal(_));
+        let Self {
+            token_usage,
+            thread_id,
+            resume_hint,
+            ..
+        } = self;
+
+        let mut lines = Vec::new();
+        if !token_usage.is_zero() {
+            lines.push(format_token_usage(token_usage));
+        }
+
+        if let Some(resume_cmd) = resume_hint {
+            let command = if color_enabled {
+                format!("\u{1b}[36m{resume_cmd}\u{1b}[39m")
+            } else {
+                resume_cmd
+            };
+            lines.push(format!("To continue this session, run {command}"));
+        } else if is_fatal && let Some(thread_id) = thread_id {
+            lines.push(format!("Session ID: {thread_id}"));
+        }
+
+        lines
+    }
 }
 
 #[derive(Debug)]
@@ -433,7 +409,7 @@ fn session_summary(
     thread_name: Option<String>,
     rollout_path: Option<&Path>,
 ) -> Option<SessionSummary> {
-    let usage_line = (!token_usage.is_zero()).then(|| token_usage.to_string());
+    let usage_line = (!token_usage.is_zero()).then(|| format_token_usage(token_usage));
     let resume_hint = resume_hint_for_resumable_thread(thread_id, thread_name, rollout_path);
 
     if usage_line.is_none() && resume_hint.is_none() {
@@ -782,8 +758,11 @@ impl App {
         let startup_started_at = Instant::now();
         let (app_event_tx, mut app_event_rx) = unbounded_channel();
         let app_event_tx = AppEventSender::new(app_event_tx);
+        emit_app_server_runtime_warnings(
+            &app_event_tx,
+            app_server.initialize_response().runtime_warnings(),
+        );
         emit_project_config_warnings(&app_event_tx, &config);
-        emit_system_bwrap_warning(&app_event_tx, &config);
         tui.set_notification_settings(
             config.tui_notifications.method,
             config.tui_notifications.condition,
@@ -1084,7 +1063,7 @@ See the Codex keymap documentation for supported actions and examples."
 
         // On startup, if a managed filesystem sandbox is active, warn about
         // world-writable dirs on Windows.
-        #[cfg(target_os = "windows")]
+
         {
             let startup_permission_profile = app.config.permissions.effective_permission_profile();
             let should_check = crate::windows_sandbox::level_from_config(&app.config)

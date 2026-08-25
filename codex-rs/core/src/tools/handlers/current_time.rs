@@ -1,6 +1,6 @@
+use crate::FunctionCallError;
 use crate::context::ContextualUserFragment;
 use crate::context::CurrentTimeReminder;
-use crate::function_tool::FunctionCallError;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;

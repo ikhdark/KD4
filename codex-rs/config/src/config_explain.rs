@@ -99,11 +99,6 @@ pub const CONFIG_OPTION_DOCS: &[ConfigOptionDoc] = &[
         "GPT-5 output detail level: `low`, `medium`, or `high`.",
     ),
     doc(
-        "model_supports_reasoning_summaries",
-        "Reasoning and output",
-        "Force-enable reasoning summaries for the configured model.",
-    ),
-    doc(
         "hide_agent_reasoning",
         "Reasoning and output",
         "Hide reasoning events from UI and output.",
@@ -311,12 +306,12 @@ pub const CONFIG_OPTION_DOCS: &[ConfigOptionDoc] = &[
     doc(
         "profile",
         "Project and profile",
-        "Selected named profile from the profiles map.",
+        "Legacy profile selector kept to fail fast; use `--profile <name>` with `<name>.config.toml`.",
     ),
     doc(
         "profiles",
         "Project and profile",
-        "Named config profiles for switching settings.",
+        "Legacy inline profile tables kept to fail fast; move each profile to `<name>.config.toml`.",
     ),
     doc(
         "projects",
@@ -361,7 +356,7 @@ pub const CONFIG_OPTION_DOCS: &[ConfigOptionDoc] = &[
     doc(
         "file_opener",
         "User experience",
-        "URI opener for file links, such as VS Code, Windsurf, Cursor, or none.",
+        "URI opener for local Markdown file links, such as VS Code, Windsurf, Cursor, or none.",
     ),
     doc("tui", "User experience", "Terminal UI settings."),
     doc(
@@ -399,46 +394,6 @@ pub const CONFIG_OPTION_DOCS: &[ConfigOptionDoc] = &[
         "agents",
         "Search, memory, and agents",
         "Agent thread limits, nesting, runtime, interrupt messages, and roles.",
-    ),
-    doc(
-        "audio",
-        "Realtime",
-        "Preferred microphone and speaker for realtime voice.",
-    ),
-    doc(
-        "realtime",
-        "Realtime",
-        "Realtime architecture, version, session type, transport, and voice.",
-    ),
-    doc(
-        "experimental_realtime_ws_base_url",
-        "Realtime",
-        "Realtime websocket base URL override.",
-    ),
-    doc(
-        "experimental_realtime_webrtc_call_base_url",
-        "Realtime",
-        "WebRTC call creation URL override.",
-    ),
-    doc(
-        "experimental_realtime_ws_model",
-        "Realtime",
-        "Realtime websocket model override.",
-    ),
-    doc(
-        "experimental_realtime_ws_backend_prompt",
-        "Realtime",
-        "Realtime websocket backend prompt override.",
-    ),
-    doc(
-        "experimental_realtime_ws_startup_context",
-        "Realtime",
-        "Realtime websocket startup context override.",
-    ),
-    doc(
-        "experimental_realtime_start_instructions",
-        "Realtime",
-        "Realtime start-instructions override.",
     ),
     doc(
         "analytics",
@@ -485,26 +440,6 @@ pub const CONFIG_OPTION_DOCS: &[ConfigOptionDoc] = &[
         "experimental_thread_store_endpoint",
         "Experimental and compatibility",
         "Removed thread-store endpoint setting kept to fail fast.",
-    ),
-    doc(
-        "experimental_use_unified_exec_tool",
-        "Experimental and compatibility",
-        "Experimental unified exec tool toggle.",
-    ),
-    doc(
-        "ghost_snapshot",
-        "Experimental and compatibility",
-        "Legacy no-op settings retained so old config files still load.",
-    ),
-    doc(
-        "js_repl_node_path",
-        "Experimental and compatibility",
-        "Deprecated and ignored JavaScript REPL node path.",
-    ),
-    doc(
-        "js_repl_node_module_dirs",
-        "Experimental and compatibility",
-        "Deprecated and ignored JavaScript REPL module directories.",
     ),
 ];
 

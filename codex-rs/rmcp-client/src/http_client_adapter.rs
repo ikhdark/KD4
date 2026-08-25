@@ -63,6 +63,11 @@ pub(crate) enum StreamableHttpClientAdapterError {
     SessionExpired404,
     #[error(transparent)]
     HttpRequest(#[from] ExecServerError),
+    #[error("HTTP {status}: {body_preview}")]
+    UnexpectedHttpStatus {
+        status: StatusCode,
+        body_preview: String,
+    },
     #[error("invalid HTTP header: {0}")]
     Header(String),
 }
@@ -199,13 +204,9 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
             {
                 return Ok(StreamableHttpPostResponse::Json(message, session_id));
             }
-            return Err(StreamableHttpError::UnexpectedServerResponse(
-                format!(
-                    "HTTP {}: {}",
-                    response.status,
-                    body_preview(String::from_utf8_lossy(&body).to_string())
-                )
-                .into(),
+            return Err(unexpected_http_status_error(
+                response.status,
+                body_preview(String::from_utf8_lossy(&body).to_string()),
             ));
         }
         match content_type.as_deref() {
@@ -275,8 +276,9 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
             return Ok(());
         }
         if !status_is_success(response.status) {
-            return Err(StreamableHttpError::UnexpectedServerResponse(
-                format!("DELETE returned HTTP {}", response.status).into(),
+            return Err(unexpected_http_status_error(
+                response.status,
+                "DELETE request failed".to_string(),
             ));
         }
         Ok(())
@@ -350,8 +352,9 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
             ));
         }
         if !status_is_success(response.status) {
-            return Err(StreamableHttpError::UnexpectedServerResponse(
-                format!("GET returned HTTP {}", response.status).into(),
+            return Err(unexpected_http_status_error(
+                response.status,
+                "GET request failed".to_string(),
             ));
         }
 
@@ -518,7 +521,7 @@ fn retryable_post_response_status(mcp_method: Option<&str>, status: u16) -> bool
         )
 }
 
-fn is_retryable_http_status(status: StatusCode) -> bool {
+pub(crate) fn is_retryable_http_status(status: StatusCode) -> bool {
     matches!(
         status,
         StatusCode::REQUEST_TIMEOUT
@@ -528,6 +531,23 @@ fn is_retryable_http_status(status: StatusCode) -> bool {
             | StatusCode::SERVICE_UNAVAILABLE
             | StatusCode::GATEWAY_TIMEOUT
     )
+}
+
+fn unexpected_http_status_error(
+    status: u16,
+    body_preview: String,
+) -> StreamableHttpError<StreamableHttpClientAdapterError> {
+    match StatusCode::from_u16(status) {
+        Ok(status) => {
+            StreamableHttpError::Client(StreamableHttpClientAdapterError::UnexpectedHttpStatus {
+                status,
+                body_preview,
+            })
+        }
+        Err(_) => StreamableHttpError::UnexpectedServerResponse(
+            format!("invalid HTTP status {status}: {body_preview}").into(),
+        ),
+    }
 }
 
 fn parse_json_rpc_error(body: &[u8]) -> Option<ServerJsonRpcMessage> {

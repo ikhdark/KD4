@@ -1,6 +1,6 @@
 //! Integration test for the text encoding fix for issue #6178.
 //!
-//! These tests simulate VSCode's shell preview on Windows/WSL where the output
+//! These tests simulate VS Code's shell preview on Windows where the output
 //! may be encoded with a legacy code page before it reaches Codex.
 
 use super::StreamOutput;

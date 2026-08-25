@@ -13,12 +13,9 @@ use codex_app_server_protocol::MockExperimentalMethodParams;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadMemoryMode;
 use codex_app_server_protocol::ThreadMemoryModeSetParams;
-use codex_app_server_protocol::ThreadRealtimeStartParams;
-use codex_app_server_protocol::ThreadRealtimeStartTransport;
 use codex_app_server_protocol::ThreadSettingsUpdateParams;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
-use codex_protocol::protocol::RealtimeOutputModality;
 use pretty_assertions::assert_eq;
 use std::path::Path;
 use std::time::Duration;
@@ -61,58 +58,6 @@ async fn mock_experimental_method_requires_experimental_api_capability() -> Resu
     )
     .await??;
     assert_experimental_capability_error(error, "mock/experimentalMethod");
-    Ok(())
-}
-
-#[tokio::test]
-async fn realtime_conversation_start_requires_experimental_api_capability() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-
-    let init = mcp
-        .initialize_with_capabilities(
-            default_client_info(),
-            Some(InitializeCapabilities {
-                experimental_api: false,
-                request_attestation: false,
-                desktop_activation_receipts: false,
-                opt_out_notification_methods: None,
-                mcp_server_openai_form_elicitation: false,
-            }),
-        )
-        .await?;
-    let JSONRPCMessage::Response(_) = init else {
-        anyhow::bail!("expected initialize response, got {init:?}");
-    };
-
-    let request_id = mcp
-        .send_thread_realtime_start_request(ThreadRealtimeStartParams {
-            client_managed_handoffs: None,
-            flush_transcript_tail_on_session_end: None,
-            codex_responses_as_items: None,
-            codex_response_item_prefix: None,
-            codex_response_handoff_prefix: None,
-            thread_id: "thr_123".to_string(),
-            model: None,
-            output_modality: RealtimeOutputModality::Audio,
-            include_startup_context: None,
-            prompt: Some(Some("hello".to_string())),
-            realtime_session_id: None,
-            transport: None,
-            version: None,
-            voice: None,
-        })
-        .await?;
-    let error = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    assert_experimental_capability_error(error, "thread/realtime/start");
     Ok(())
 }
 
@@ -193,60 +138,6 @@ async fn thread_settings_update_requires_experimental_api_capability() -> Result
     )
     .await??;
     assert_experimental_capability_error(error, "thread/settings/update");
-    Ok(())
-}
-
-#[tokio::test]
-async fn realtime_webrtc_start_requires_experimental_api_capability() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-
-    let init = mcp
-        .initialize_with_capabilities(
-            default_client_info(),
-            Some(InitializeCapabilities {
-                experimental_api: false,
-                request_attestation: false,
-                desktop_activation_receipts: false,
-                opt_out_notification_methods: None,
-                mcp_server_openai_form_elicitation: false,
-            }),
-        )
-        .await?;
-    let JSONRPCMessage::Response(_) = init else {
-        anyhow::bail!("expected initialize response, got {init:?}");
-    };
-
-    let request_id = mcp
-        .send_thread_realtime_start_request(ThreadRealtimeStartParams {
-            client_managed_handoffs: None,
-            flush_transcript_tail_on_session_end: None,
-            codex_responses_as_items: None,
-            codex_response_item_prefix: None,
-            codex_response_handoff_prefix: None,
-            thread_id: "thr_123".to_string(),
-            model: None,
-            output_modality: RealtimeOutputModality::Audio,
-            include_startup_context: None,
-            prompt: Some(Some("hello".to_string())),
-            realtime_session_id: None,
-            transport: Some(ThreadRealtimeStartTransport::Webrtc {
-                sdp: "v=offer\r\n".to_string(),
-            }),
-            version: None,
-            voice: None,
-        })
-        .await?;
-    let error = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    assert_experimental_capability_error(error, "thread/realtime/start");
     Ok(())
 }
 

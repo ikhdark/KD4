@@ -1,6 +1,5 @@
 use super::pairing_unavailable_error;
 use super::protocol::RemoteControlPairingStatusRequest;
-use super::protocol::RemoteControlPairingStatusResponse as BackendRemoteControlPairingStatusResponse;
 use super::protocol::RemoteControlTarget;
 use super::protocol::StartRemoteControlPairingRequest;
 use super::protocol::StartRemoteControlPairingResponse;
@@ -59,7 +58,7 @@ impl RemoteControlEnrollment {
             .as_deref()
             .ok_or_else(pairing_unavailable_error)?;
 
-        let response = create_client_without_request_logging()
+        let response = create_client_without_request_logging()?
             .post(&self.remote_control_target.pair_url)
             .timeout(REMOTE_CONTROL_PAIRING_TIMEOUT)
             .bearer_auth(remote_control_token)
@@ -154,7 +153,7 @@ impl RemoteControlEnrollment {
             .as_deref()
             .ok_or_else(pairing_unavailable_error)?;
 
-        let response = create_client_without_request_logging()
+        let response = create_client_without_request_logging()?
             .post(&self.remote_control_target.pair_status_url)
             .timeout(REMOTE_CONTROL_PAIRING_TIMEOUT)
             .bearer_auth(remote_control_token)
@@ -192,7 +191,7 @@ impl RemoteControlEnrollment {
             ));
         }
 
-        let response = serde_json::from_slice::<BackendRemoteControlPairingStatusResponse>(&body)
+        let response = serde_json::from_slice::<RemoteControlPairingStatusResponse>(&body)
             .map_err(|err| {
                 io::Error::other(format!(
                     "failed to parse remote control pairing status response from `{}`: HTTP {status}, {}, body: {body_preview}, decode error: {err}",
@@ -200,9 +199,7 @@ impl RemoteControlEnrollment {
                     format_headers(&headers)
                 ))
             })?;
-        Ok(RemoteControlPairingStatusResponse {
-            claimed: response.claimed,
-        })
+        Ok(response)
     }
 
     pub(super) fn server_token_refresh_requirement(
@@ -443,6 +440,14 @@ mod tests {
     use tokio::net::TcpStream;
     use tokio::time::Duration;
     use tokio::time::timeout;
+
+    #[test]
+    fn pairing_status_deserializes_into_the_public_response_type() {
+        let response: RemoteControlPairingStatusResponse =
+            serde_json::from_value(json!({ "claimed": true })).expect("valid pairing status");
+
+        assert!(response.claimed);
+    }
 
     async fn remote_control_state_runtime(codex_home: &TempDir) -> Arc<StateRuntime> {
         StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string())

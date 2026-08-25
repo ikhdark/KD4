@@ -28,9 +28,6 @@ use std::time::Instant;
 use tracing::info;
 use tracing::warn;
 
-#[cfg(target_os = "macos")]
-use rama_unix::client::UnixConnector;
-
 #[derive(Clone, Default)]
 struct ProxyConfig {
     http: Option<ProxyAddress>,
@@ -138,15 +135,6 @@ impl UpstreamClient {
             TargetCheckedTcpConnector::from_allow_local_binding(allow_local_binding),
             tls_root_store,
         )
-    }
-
-    #[cfg(target_os = "macos")]
-    pub(crate) fn unix_socket(path: &str) -> Self {
-        let connector = build_unix_connector(path);
-        Self {
-            connector,
-            proxy_config: ProxyConfig::default(),
-        }
     }
 
     fn new(
@@ -262,16 +250,3 @@ fn build_http_connector(
 #[cfg(test)]
 #[path = "upstream_tests.rs"]
 mod tests;
-
-#[cfg(target_os = "macos")]
-fn build_unix_connector(
-    path: &str,
-) -> BoxService<
-    Request<Body>,
-    EstablishedClientConnection<HttpClientService<Body>, Request<Body>>,
-    BoxError,
-> {
-    let transport = UnixConnector::fixed(path);
-    let connector = HttpConnector::new(transport);
-    connector.boxed()
-}

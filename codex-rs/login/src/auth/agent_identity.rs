@@ -15,6 +15,7 @@ use codex_agent_identity::is_retryable_registration_error;
 use codex_agent_identity::public_key_ssh_from_private_key_pkcs8_base64;
 use codex_agent_identity::register_agent_identity;
 use codex_agent_identity::register_agent_task;
+use codex_config::canonicalize_chatgpt_base_url;
 use codex_http_client::HttpClient;
 use codex_protocol::account::PlanType as AccountPlanType;
 use codex_protocol::protocol::SessionSource;
@@ -37,7 +38,7 @@ fn agent_identity_endpoint_override(environment_variable: &str) -> Option<String
 }
 
 fn agent_identity_jwks_base_url_matches(chatgpt_base_url: &str, jwks_base_url: &str) -> bool {
-    chatgpt_base_url.trim().trim_end_matches('/') == jwks_base_url
+    canonicalize_chatgpt_base_url(chatgpt_base_url) == canonicalize_chatgpt_base_url(jwks_base_url)
 }
 
 pub(super) fn agent_identity_authapi_base_url(

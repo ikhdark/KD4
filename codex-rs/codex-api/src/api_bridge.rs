@@ -3,6 +3,7 @@ use crate::error::ApiError;
 use crate::rate_limits::parse_promo_message;
 use crate::rate_limits::parse_rate_limit_for_limit;
 use crate::rate_limits::parse_rate_limit_reached_type;
+use crate::responses_stream::REQUEST_ID_HEADER;
 use base64::Engine;
 use chrono::DateTime;
 use chrono::Utc;
@@ -146,7 +147,6 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
 }
 
 const ACTIVE_LIMIT_HEADER: &str = "x-codex-active-limit";
-const REQUEST_ID_HEADER: &str = "x-request-id";
 const OAI_REQUEST_ID_HEADER: &str = "x-oai-request-id";
 const CF_RAY_HEADER: &str = "cf-ray";
 const X_OPENAI_AUTHORIZATION_ERROR_HEADER: &str = "x-openai-authorization-error";

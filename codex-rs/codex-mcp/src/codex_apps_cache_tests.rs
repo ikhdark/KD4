@@ -7,8 +7,7 @@ use pretty_assertions::assert_eq;
 use rmcp::model::JsonObject;
 use rmcp::model::Tool;
 use std::collections::HashSet;
-#[cfg(unix)]
-use std::os::unix::ffi::OsStringExt;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -55,6 +54,8 @@ fn create_codex_apps_tools_cache_context(
             account_id: account_id.map(ToOwned::to_owned),
             chatgpt_user_id: chatgpt_user_id.map(ToOwned::to_owned),
             is_workspace_account: false,
+            chatgpt_base_url: "https://chatgpt.com".to_string(),
+            product_sku: DEFAULT_CODEX_APPS_MCP_PRODUCT_SKU.to_string(),
         },
     )
 }
@@ -131,6 +132,49 @@ fn codex_apps_tools_cache_is_scoped_per_user() {
         cache_context_user_1.tools_cache_path(),
         cache_context_user_2.tools_cache_path(),
         "each user should get an isolated cache file"
+    );
+}
+
+#[test]
+fn codex_apps_tools_cache_is_scoped_per_endpoint_and_product() {
+    let codex_home = tempdir().expect("tempdir");
+    let cache = CodexAppsToolsCache::default();
+    let endpoint_one = cache.context(
+        codex_home.path().to_path_buf(),
+        codex_apps_tools_cache_key(None, "https://one.example/", None),
+    );
+    let endpoint_two = cache.context(
+        codex_home.path().to_path_buf(),
+        codex_apps_tools_cache_key(None, "https://two.example", None),
+    );
+    let other_product = cache.context(
+        codex_home.path().to_path_buf(),
+        codex_apps_tools_cache_key(None, "https://one.example", Some("other-product")),
+    );
+    let tools = vec![create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "one")];
+
+    endpoint_one.store_current_tools_for_test(tools.clone());
+    write_cached_codex_apps_tools(&endpoint_one, &tools).expect("write endpoint one cache");
+
+    assert!(endpoint_two.current_tools().is_none());
+    assert!(other_product.current_tools().is_none());
+    assert!(read_cached_codex_apps_tools(&endpoint_two).is_none());
+    assert!(read_cached_codex_apps_tools(&other_product).is_none());
+    assert_ne!(
+        endpoint_one.tools_cache_path(),
+        endpoint_two.tools_cache_path()
+    );
+    assert_ne!(
+        endpoint_one.tools_cache_path(),
+        other_product.tools_cache_path()
+    );
+    assert_ne!(
+        endpoint_one.server_info_cache_path(),
+        endpoint_two.server_info_cache_path()
+    );
+    assert_ne!(
+        endpoint_one.server_info_cache_path(),
+        other_product.server_info_cache_path()
     );
 }
 
@@ -361,6 +405,8 @@ fn codex_apps_tools_cache_publishes_newest_shared_snapshot() {
             account_id: Some("account-one".to_string()),
             chatgpt_user_id: Some("user-one".to_string()),
             is_workspace_account: false,
+            chatgpt_base_url: "https://chatgpt.com".to_string(),
+            product_sku: DEFAULT_CODEX_APPS_MCP_PRODUCT_SKU.to_string(),
         },
     );
     let cache_context_2 = cache.context(
@@ -369,6 +415,8 @@ fn codex_apps_tools_cache_publishes_newest_shared_snapshot() {
             account_id: Some("account-one".to_string()),
             chatgpt_user_id: Some("user-one".to_string()),
             is_workspace_account: false,
+            chatgpt_base_url: "https://chatgpt.com".to_string(),
+            product_sku: DEFAULT_CODEX_APPS_MCP_PRODUCT_SKU.to_string(),
         },
     );
     let older_ticket = cache_context_1.begin_fetch(CodexAppsToolsFetchSource::Startup);
@@ -413,6 +461,8 @@ fn codex_apps_tools_cache_keeps_live_publish_when_disk_persistence_fails() {
             account_id: Some("account-one".to_string()),
             chatgpt_user_id: Some("user-one".to_string()),
             is_workspace_account: false,
+            chatgpt_base_url: "https://chatgpt.com".to_string(),
+            product_sku: DEFAULT_CODEX_APPS_MCP_PRODUCT_SKU.to_string(),
         },
     );
     let tools = vec![create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "live")];
@@ -429,36 +479,70 @@ fn codex_apps_tools_cache_keeps_live_publish_when_disk_persistence_fails() {
     );
 }
 
-#[cfg(unix)]
 #[test]
-fn codex_apps_tools_cache_scopes_non_utf8_home_disk_paths() {
-    let codex_home = PathBuf::from(std::ffi::OsString::from_vec(
-        b"/tmp/codex-home-\xff".to_vec(),
-    ));
-    let cache = CodexAppsToolsCache::default();
-    let user_one_context = cache.context(
-        codex_home.clone(),
-        CodexAppsToolsCacheKey {
-            account_id: Some("account-one".to_string()),
-            chatgpt_user_id: Some("user-one".to_string()),
-            is_workspace_account: false,
-        },
-    );
-    let user_two_context = cache.context(
-        codex_home,
-        CodexAppsToolsCacheKey {
-            account_id: Some("account-two".to_string()),
-            chatgpt_user_id: Some("user-two".to_string()),
-            is_workspace_account: false,
-        },
-    );
-    let cache_paths = [
-        user_one_context.tools_cache_path(),
-        user_two_context.tools_cache_path(),
-    ];
+fn shared_codex_apps_tools_cache_exposes_live_publish_when_persistence_fails() {
+    let codex_home = tempdir().expect("tempdir");
+    let codex_home_file = codex_home.path().join("not-a-directory");
+    std::fs::write(&codex_home_file, b"occupied").expect("create codex home file");
+    let auth_key = CodexAppsToolsCacheKey {
+        account_id: Some("account-one".to_string()),
+        chatgpt_user_id: Some("user-one".to_string()),
+        is_workspace_account: false,
+        chatgpt_base_url: "https://chatgpt.com".to_string(),
+        product_sku: DEFAULT_CODEX_APPS_MCP_PRODUCT_SKU.to_string(),
+    };
+    let publisher_cache = CodexAppsToolsCache::shared();
+    let cache_context = publisher_cache.context(codex_home_file.clone(), auth_key.clone());
+    let tools = vec![create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "live")];
 
-    assert_eq!(
-        cache_paths.iter().collect::<HashSet<_>>().len(),
-        cache_paths.len()
+    cache_context.publish_if_newest_accepted(
+        cache_context.begin_fetch(CodexAppsToolsFetchSource::HardRefresh),
+        &create_test_server_info("Codex Apps"),
+        tools.clone(),
     );
+
+    let reader_cache = CodexAppsToolsCache::shared();
+    let snapshot = reader_cache
+        .current_snapshot(codex_home_file, auth_key)
+        .expect("shared live snapshot");
+    assert_eq!(model_tool_names(snapshot.tools()), model_tool_names(&tools));
+    assert!(snapshot.codex_apps_ready());
+}
+
+#[test]
+fn codex_apps_tools_cache_snapshot_tracks_startup_and_live_publication_state() {
+    let codex_home = tempdir().expect("tempdir");
+    let cache = CodexAppsToolsCache::default();
+    let key = CodexAppsToolsCacheKey {
+        account_id: Some("account-one".to_string()),
+        chatgpt_user_id: Some("user-one".to_string()),
+        is_workspace_account: false,
+        chatgpt_base_url: "https://chatgpt.com".to_string(),
+        product_sku: DEFAULT_CODEX_APPS_MCP_PRODUCT_SKU.to_string(),
+    };
+    let cache_context = cache.context(codex_home.path().to_path_buf(), key.clone());
+    cache_context.store_current_tools_for_test(vec![create_test_tool(
+        CODEX_APPS_MCP_SERVER_NAME,
+        "startup",
+    )]);
+
+    let startup_snapshot = cache
+        .current_snapshot(codex_home.path().to_path_buf(), key.clone())
+        .expect("startup snapshot");
+    assert_eq!(startup_snapshot.tools()[0].callable_name, "startup");
+    assert!(!startup_snapshot.codex_apps_ready());
+    assert!(!startup_snapshot.is_fresh_for(std::time::Duration::MAX));
+
+    cache_context.publish_if_newest_accepted(
+        cache_context.begin_fetch(CodexAppsToolsFetchSource::HardRefresh),
+        &create_test_server_info("Codex Apps"),
+        vec![create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "live")],
+    );
+
+    let live_snapshot = cache
+        .current_snapshot(codex_home.path().to_path_buf(), key)
+        .expect("live snapshot");
+    assert_eq!(live_snapshot.tools()[0].callable_name, "live");
+    assert!(live_snapshot.codex_apps_ready());
+    assert!(live_snapshot.is_fresh_for(std::time::Duration::from_secs(1)));
 }

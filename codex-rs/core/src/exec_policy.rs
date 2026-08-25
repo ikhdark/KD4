@@ -110,7 +110,7 @@ static BANNED_PREFIX_SUGGESTIONS: &[&[&str]] = &[
 pub(crate) enum ExecPolicyCommandOrigin {
     /// Use the generic unmatched-command heuristics.
     Generic,
-    #[cfg(windows)]
+
     /// The command words came from the `-Command` body of a top-level
     /// PowerShell wrapper, so use PowerShell-specific unmatched-command
     /// heuristics for the lowered words.
@@ -652,7 +652,7 @@ pub(crate) fn render_decision_for_unmatched_command(
     let file_system_sandbox_policy = permission_profile.file_system_sandbox_policy();
     let is_known_safe = match command_origin {
         ExecPolicyCommandOrigin::Generic => is_known_safe_command(command),
-        #[cfg(windows)]
+
         ExecPolicyCommandOrigin::PowerShell => {
             codex_shell_command::is_safe_command::is_safe_powershell_words(command)
         }
@@ -662,8 +662,8 @@ pub(crate) fn render_decision_for_unmatched_command(
     // restrictions are only a policy shape; there is no platform sandbox to
     // enforce the boundary. Keep that legacy case conservative while still
     // relying on the real Windows sandbox when it is enabled.
-    let windows_managed_fs_restrictions_without_sandbox_backend = cfg!(windows)
-        && windows_sandbox_level == WindowsSandboxLevel::Disabled
+    let windows_managed_fs_restrictions_without_sandbox_backend = windows_sandbox_level
+        == WindowsSandboxLevel::Disabled
         && profile_has_managed_filesystem_restrictions(permission_profile);
 
     if is_known_safe
@@ -682,7 +682,7 @@ pub(crate) fn render_decision_for_unmatched_command(
     // forbid the command.
     let command_is_dangerous = match command_origin {
         ExecPolicyCommandOrigin::Generic => command_might_be_dangerous(command),
-        #[cfg(windows)]
+
         ExecPolicyCommandOrigin::PowerShell => {
             codex_shell_command::is_dangerous_command::is_dangerous_powershell_words(command)
         }
@@ -780,7 +780,6 @@ fn commands_for_exec_policy(command: &[String]) -> ExecPolicyCommands {
         };
     }
 
-    #[cfg(windows)]
     {
         if let Some(commands) =
             codex_shell_command::powershell::parse_noprofile_powershell_command_into_plain_commands(

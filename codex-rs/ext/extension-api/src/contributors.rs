@@ -277,6 +277,19 @@ pub trait TokenUsageContributor: Send + Sync {
 
 /// Extension contribution that exposes native tools owned by a feature.
 pub trait ToolContributor: Send + Sync {
+    /// Cheap identity for state that changes the contributor's model-visible tool surface.
+    ///
+    /// Stateful contributors must change this value whenever a fresh `tools` call could return a
+    /// different set or exposure. Hosts use it to avoid constructing executor vectors merely to
+    /// decide whether an already-built router remains valid.
+    fn surface_revision(
+        &self,
+        _session_store: &ExtensionData,
+        _thread_store: &ExtensionData,
+    ) -> u64 {
+        0
+    }
+
     /// Returns the native tools visible for the supplied extension stores.
     fn tools(
         &self,

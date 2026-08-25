@@ -2869,7 +2869,7 @@ async fn experimental_features_popup_snapshot() {
 
     let features = vec![
         ExperimentalFeatureItem {
-            feature: Feature::JsRepl,
+            feature: Feature::NetworkProxy,
             name: "JavaScript REPL".to_string(),
             description: "Enable a persistent Node-backed JavaScript REPL for interactive website debugging and other inline JavaScript execution capabilities.".to_string(),
             enabled: false,
@@ -2896,7 +2896,7 @@ async fn experimental_features_popup_snapshot() {
 async fn experimental_features_toggle_saves_on_exit() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    let expected_feature = Feature::JsRepl;
+    let expected_feature = Feature::NetworkProxy;
     let view = ExperimentalFeaturesView::new(
         vec![ExperimentalFeatureItem {
             feature: expected_feature,
@@ -3107,12 +3107,8 @@ async fn skills_menu_default_mentions_shortcut_snapshot() {
 }
 
 #[tokio::test]
-async fn removed_mentions_feature_cannot_restore_legacy_skills_shortcuts() {
+async fn skills_shortcuts_do_not_depend_on_removed_mentions_feature() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    assert!(
-        chat.config.features.disable(Feature::MentionsV2).is_ok(),
-        "the mentions feature should be configurable in this test"
-    );
 
     chat.open_skills_list();
     assert_eq!(chat.bottom_pane.composer_text(), "@");
@@ -3329,6 +3325,39 @@ async fn model_reasoning_selection_popup_extra_high_warning_snapshot() {
     assert_chatwidget_snapshot!("model_reasoning_selection_popup_extra_high_warning", popup);
 }
 
+#[tokio::test]
+async fn model_reasoning_selection_popup_warns_for_current_chatgpt_model() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.6-sol")).await;
+
+    set_chatgpt_auth(&mut chat);
+    chat.set_reasoning_effort(Some(ReasoningEffortConfig::XHigh));
+
+    let preset = get_available_model(&chat, "gpt-5.6-sol");
+    chat.open_reasoning_popup(preset);
+
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    let normalized_popup = popup.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        normalized_popup.contains("reasoning effort can quickly consume Plus plan rate limits"),
+        "expected the current ChatGPT model to show the rate-limit warning, got:\n{popup}"
+    );
+}
+
+#[tokio::test]
+async fn model_reasoning_selection_popup_skips_plus_warning_without_chatgpt_account() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
+    chat.set_reasoning_effort(Some(ReasoningEffortConfig::XHigh));
+
+    let preset = get_available_model(&chat, "gpt-5.2");
+    chat.open_reasoning_popup(preset);
+
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(
+        !popup.contains("Plus plan rate limits"),
+        "did not expect a Plus-plan warning without a ChatGPT account, got:\n{popup}"
+    );
+}
+
 async fn assert_reasoning_shortcuts_update_effort(
     key_events: [KeyEvent; 2],
     expected_effort: ReasoningEffortConfig,
@@ -3390,27 +3419,6 @@ async fn reasoning_down_shortcuts_lower_reasoning_effort() {
         /*expect_model_update*/ false,
     )
     .await;
-}
-
-#[tokio::test]
-async fn reasoning_shortcut_clears_armed_quit_shortcut() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
-    chat.thread_id = Some(ThreadId::new());
-    chat.set_reasoning_effort(Some(ReasoningEffortConfig::Medium));
-    chat.arm_quit_shortcut(key_hint::ctrl(KeyCode::Char('c')));
-
-    chat.handle_key_event(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::ALT));
-
-    assert!(!chat.bottom_pane.quit_shortcut_hint_visible());
-    assert!(chat.quit_shortcut_expires_at.is_none());
-    assert!(chat.quit_shortcut_key.is_none());
-    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-    assert!(
-        events
-            .iter()
-            .all(|event| !matches!(event, AppEvent::Exit(_))),
-        "did not expect reasoning shortcut to quit; events: {events:?}"
-    );
 }
 
 #[tokio::test]

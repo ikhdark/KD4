@@ -8,7 +8,6 @@ use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
-use core_test_support::skip_if_host_windows;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodexBuilder;
 use core_test_support::test_codex::TestCodexHarness;
@@ -16,15 +15,9 @@ use core_test_support::test_codex::test_codex;
 use serde_json::json;
 use test_case::test_case;
 
-#[cfg(windows)]
 const DEFAULT_SHELL_TIMEOUT_MS: i64 = 7_000;
-#[cfg(not(windows))]
-const DEFAULT_SHELL_TIMEOUT_MS: i64 = 2_000;
 
-#[cfg(windows)]
 const MEDIUM_TIMEOUT: Duration = Duration::from_secs(10);
-#[cfg(not(windows))]
-const MEDIUM_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn shell_responses_with_timeout(
     call_id: &str,
@@ -210,56 +203,12 @@ async fn multi_line_output_with_login() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pipe_output_with_login() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
-    skip_if_host_windows!(Ok(()));
-
-    let harness = shell_command_harness_with(|builder| builder.with_model("gpt-5.4")).await?;
-
-    let call_id = "shell-command-call-second-extra-no-login";
-    mount_shell_responses(
-        &harness,
-        call_id,
-        "echo 'hello, world' | cat",
-        /*login*/ None,
-    )
-    .await;
-    harness.submit("run the command without login").await?;
-
-    let output = harness.function_call_stdout(call_id).await;
-    assert_shell_command_output(&output, "hello, world")?;
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pipe_output_without_login() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
-    skip_if_host_windows!(Ok(()));
-
-    let harness = shell_command_harness_with(|builder| builder.with_model("gpt-5.4")).await?;
-
-    let call_id = "shell-command-call-third-extra-login-false";
-    mount_shell_responses(&harness, call_id, "echo 'hello, world' | cat", Some(false)).await;
-    harness.submit("run the command without login").await?;
-
-    let output = harness.function_call_stdout(call_id).await;
-    assert_shell_command_output(&output, "hello, world")?;
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shell_command_times_out_with_timeout_ms() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let harness = shell_command_harness_with(|builder| builder.with_model("gpt-5.4")).await?;
     let call_id = "shell-command-timeout";
-    let command = if cfg!(windows) {
-        "powershell.exe -NoProfile -Command \"Start-Sleep -Seconds 5\""
-    } else {
-        "sleep 5"
-    };
+    let command = "powershell.exe -NoProfile -Command \"Start-Sleep -Seconds 5\"";
     mount_shell_responses_with_timeout(
         &harness,
         call_id,
@@ -290,11 +239,7 @@ async fn shell_command_cancels_after_output_stalls() -> anyhow::Result<()> {
 
     let harness = shell_command_harness_with(|builder| builder.with_model("gpt-5.4")).await?;
     let call_id = "shell-command-stall-timeout";
-    let command = if cfg!(windows) {
-        "powershell.exe -NoProfile -Command \"Start-Sleep -Seconds 5\""
-    } else {
-        "sleep 5"
-    };
+    let command = "powershell.exe -NoProfile -Command \"Start-Sleep -Seconds 5\"";
     mount_shell_responses_with_deadlines(
         &harness,
         call_id,
@@ -332,14 +277,10 @@ async fn unicode_output(login: bool) -> anyhow::Result<()> {
     let harness = shell_command_harness_with(|builder| builder.with_model("gpt-5.2")).await?;
 
     let call_id = "unicode_output";
-    let command = if cfg!(windows) {
-        // We use a child process on Windows instead of a PowerShell command
+    let command = // We use a child process on Windows instead of a PowerShell command
         // like `Write-Output` to ensure that the Powershell config is set
         // correctly.
-        "cmd.exe /c echo naïve_café"
-    } else {
-        "echo \"naïve_café\""
-    };
+        "cmd.exe /c echo naïve_café";
     mount_shell_responses_with_timeout(&harness, call_id, command, Some(login), MEDIUM_TIMEOUT)
         .await;
     harness.submit("run the command without login").await?;

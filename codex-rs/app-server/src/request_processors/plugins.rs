@@ -4,6 +4,9 @@ use crate::error_code::invalid_request;
 use codex_analytics::PluginInstallSource;
 use codex_app_server_protocol::PluginAvailability;
 use codex_app_server_protocol::PluginInstallPolicy;
+#[cfg(test)]
+use codex_app_server_protocol::PluginRemoteErrorData;
+use codex_app_server_protocol::PluginRemoteErrorReason;
 use codex_app_server_protocol::PluginSharePrincipalRole;
 use codex_app_server_protocol::PluginShareTargetRole;
 use codex_config::types::McpServerConfig;
@@ -36,6 +39,25 @@ pub(crate) struct PluginRequestProcessor {
     analytics_events_client: AnalyticsEventsClient,
     config_manager: ConfigManager,
     workspace_settings_cache: Arc<workspace_settings::WorkspaceSettingsCache>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RemotePluginUninstallEffects {
+    track_success: bool,
+    refresh_caches: bool,
+}
+
+fn remote_plugin_uninstall_effects(
+    result: &Result<(), RemotePluginCatalogError>,
+) -> RemotePluginUninstallEffects {
+    RemotePluginUninstallEffects {
+        track_success: result.is_ok(),
+        // The remote mutation has committed before local cache removal begins.
+        refresh_caches: matches!(
+            result,
+            Ok(()) | Err(RemotePluginCatalogError::CacheRemove(_))
+        ),
+    }
 }
 
 fn plugin_skills_to_info(
@@ -513,29 +535,7 @@ impl PluginRequestProcessor {
         self.config_manager
             .load_latest_config(fallback_cwd)
             .await
-            .map_err(|err| internal_error(format!("failed to reload config: {err}")))
-    }
-
-    async fn workspace_codex_plugins_enabled(
-        &self,
-        config: &Config,
-        auth: Option<&CodexAuth>,
-    ) -> bool {
-        match workspace_settings::codex_plugins_enabled_for_workspace(
-            config,
-            auth,
-            Some(&self.workspace_settings_cache),
-        )
-        .await
-        {
-            Ok(enabled) => enabled,
-            Err(err) => {
-                warn!(
-                    "failed to fetch workspace Codex plugins setting; allowing Codex plugins: {err:#}"
-                );
-                true
-            }
-        }
+            .map_config_load_error()
     }
 
     async fn plugin_list_response(
@@ -564,9 +564,12 @@ impl PluginRequestProcessor {
             return Ok(empty_response());
         }
         let auth = self.auth_manager.auth().await;
-        if !self
-            .workspace_codex_plugins_enabled(&config, auth.as_ref())
-            .await
+        if !workspace_codex_plugins_enabled(
+            &config,
+            auth.as_ref(),
+            Some(&self.workspace_settings_cache),
+        )
+        .await
         {
             return Ok(empty_response());
         }
@@ -814,9 +817,12 @@ impl PluginRequestProcessor {
             return Ok(empty_response());
         }
         let auth = self.auth_manager.auth().await;
-        if !self
-            .workspace_codex_plugins_enabled(&config, auth.as_ref())
-            .await
+        if !workspace_codex_plugins_enabled(
+            &config,
+            auth.as_ref(),
+            Some(&self.workspace_settings_cache),
+        )
+        .await
         {
             return Ok(empty_response());
         }
@@ -1447,9 +1453,12 @@ impl PluginRequestProcessor {
         let config = self.load_latest_config(config_cwd.clone()).await?;
         let auth = self.auth_manager.auth().await;
 
-        if !self
-            .workspace_codex_plugins_enabled(&config, auth.as_ref())
-            .await
+        if !workspace_codex_plugins_enabled(
+            &config,
+            auth.as_ref(),
+            Some(&self.workspace_settings_cache),
+        )
+        .await
         {
             return Err(invalid_request(
                 "Codex plugins are disabled for this workspace",
@@ -1544,7 +1553,7 @@ impl PluginRequestProcessor {
             )
             .await
             .map_err(|err| {
-                let error_type = remote_plugin_catalog_error_type(&err);
+                let error_type = err.telemetry_type();
                 self.track_plugin_install_failed_for_remote_plugin(
                     &remote_plugin_id,
                     &remote_marketplace_name,
@@ -1636,7 +1645,7 @@ impl PluginRequestProcessor {
         )
         .await
         .map_err(|err| {
-            let error_type = remote_plugin_catalog_error_type(&err);
+            let error_type = err.telemetry_type();
             self.track_plugin_install_failed_for_remote_plugin(
                 &remote_plugin_id,
                 &actual_remote_marketplace_name,
@@ -1781,13 +1790,14 @@ impl PluginRequestProcessor {
         }
 
         let environment_manager = self.thread_manager.environment_manager();
+        let mcp_manager = self.thread_manager.mcp_manager();
         let (all_connectors_result, accessible_connectors_result) = tokio::join!(
             connectors::list_all_connectors_with_options(config, /*force_refetch*/ false, &[]),
             connectors::list_accessible_connectors_from_mcp_tools_with_mcp_manager(
                 config,
                 /*force_refetch*/ true,
                 Arc::clone(&environment_manager),
-                self.thread_manager.mcp_manager(),
+                Arc::clone(&mcp_manager),
             ),
         );
 
@@ -1812,9 +1822,12 @@ impl PluginRequestProcessor {
                     "failed to load accessible apps after plugin install: {err:#}"
                 );
                 (
-                    connectors::list_cached_accessible_connectors_from_mcp_tools(config)
-                        .await
-                        .unwrap_or_default(),
+                    connectors::list_cached_accessible_connectors_from_mcp_tools_with_mcp_manager(
+                        config,
+                        mcp_manager.as_ref(),
+                    )
+                    .await
+                    .unwrap_or_default(),
                     false,
                 )
             }
@@ -1962,9 +1975,6 @@ impl PluginRequestProcessor {
             CorePluginInstallError::Config(err) => {
                 internal_error(format!("failed to persist installed plugin config: {err}"))
             }
-            CorePluginInstallError::Remote(err) => {
-                internal_error(format!("failed to enable remote plugin: {err}"))
-            }
             CorePluginInstallError::Join(err) => {
                 internal_error(format!("failed to install plugin: {err}"))
             }
@@ -1982,9 +1992,6 @@ impl PluginRequestProcessor {
         match err {
             CorePluginUninstallError::Config(err) => {
                 internal_error(format!("failed to clear plugin config: {err}"))
-            }
-            CorePluginUninstallError::Remote(err) => {
-                internal_error(format!("failed to uninstall remote plugin: {err}"))
             }
             CorePluginUninstallError::Join(err) => {
                 internal_error(format!("failed to uninstall plugin: {err}"))
@@ -2052,12 +2059,12 @@ impl PluginRequestProcessor {
         )
         .await;
 
-        if matches!(
-            &uninstall_result,
-            Ok(()) | Err(RemotePluginCatalogError::CacheRemove(_))
-        ) {
+        let effects = remote_plugin_uninstall_effects(&uninstall_result);
+        if effects.track_success {
             self.analytics_events_client
                 .track_plugin_uninstalled(plugin_telemetry);
+        }
+        if effects.refresh_caches {
             if plugins_manager.clear_remote_installed_plugins_cache() {
                 self.on_effective_plugins_changed();
             }
@@ -2292,41 +2299,9 @@ fn remote_plugin_detail_to_info(
     }
 }
 
-fn remote_plugin_catalog_error_type(err: &RemotePluginCatalogError) -> &'static str {
-    match err {
-        RemotePluginCatalogError::AuthRequired => "remote_catalog_auth_required",
-        RemotePluginCatalogError::UnsupportedAuthMode => "remote_catalog_unsupported_auth_mode",
-        RemotePluginCatalogError::AuthToken(_) => "remote_catalog_auth_token",
-        RemotePluginCatalogError::Request { .. } => "remote_catalog_request",
-        RemotePluginCatalogError::UnexpectedStatus { .. } => "remote_catalog_unexpected_status",
-        RemotePluginCatalogError::Decode { .. } => "remote_catalog_decode",
-        RemotePluginCatalogError::InvalidBaseUrl(_) => "remote_catalog_invalid_base_url",
-        RemotePluginCatalogError::InvalidBaseUrlPath => "remote_catalog_invalid_base_url_path",
-        RemotePluginCatalogError::UnknownMarketplace { .. } => "remote_catalog_unknown_marketplace",
-        RemotePluginCatalogError::UnexpectedPluginId { .. } => {
-            "remote_catalog_unexpected_plugin_id"
-        }
-        RemotePluginCatalogError::UnexpectedSkillName { .. } => {
-            "remote_catalog_unexpected_skill_name"
-        }
-        RemotePluginCatalogError::UnexpectedEnabledState { .. } => {
-            "remote_catalog_unexpected_enabled_state"
-        }
-        RemotePluginCatalogError::InvalidPluginPath { .. } => "remote_catalog_invalid_plugin_path",
-        RemotePluginCatalogError::PluginShareCheckoutNotAvailable { .. } => {
-            "remote_catalog_plugin_share_checkout_not_available"
-        }
-        RemotePluginCatalogError::Archive { .. } => "remote_catalog_archive",
-        RemotePluginCatalogError::ArchiveJoin(_) => "remote_catalog_archive_join",
-        RemotePluginCatalogError::ArchiveTooLarge { .. } => "remote_catalog_archive_too_large",
-        RemotePluginCatalogError::MissingUploadEtag => "remote_catalog_missing_upload_etag",
-        RemotePluginCatalogError::UnexpectedResponse(_) => "remote_catalog_unexpected_response",
-        RemotePluginCatalogError::CacheRemove(_) => "remote_catalog_cache_remove",
-    }
-}
-
 fn remote_plugin_bundle_install_error_type(err: &RemotePluginBundleInstallError) -> &'static str {
     match err {
+        RemotePluginBundleInstallError::HttpClient(_) => "remote_bundle_http_client",
         RemotePluginBundleInstallError::MissingReleaseVersion { .. } => {
             "remote_bundle_missing_release_version"
         }
@@ -2366,32 +2341,22 @@ fn remote_plugin_catalog_error_to_jsonrpc(
     context: &str,
 ) -> JSONRPCErrorError {
     let message = format!("{context}: {err}");
-    match &err {
-        RemotePluginCatalogError::AuthRequired | RemotePluginCatalogError::UnsupportedAuthMode => {
-            invalid_request(message)
-        }
-        RemotePluginCatalogError::UnexpectedStatus { status, .. } if status.as_u16() == 404 => {
-            invalid_request(message)
-        }
-        RemotePluginCatalogError::InvalidPluginPath { .. }
-        | RemotePluginCatalogError::PluginShareCheckoutNotAvailable { .. }
-        | RemotePluginCatalogError::ArchiveTooLarge { .. }
-        | RemotePluginCatalogError::UnknownMarketplace { .. } => invalid_request(message),
-        RemotePluginCatalogError::AuthToken(_)
-        | RemotePluginCatalogError::Request { .. }
-        | RemotePluginCatalogError::UnexpectedStatus { .. }
-        | RemotePluginCatalogError::Decode { .. }
-        | RemotePluginCatalogError::InvalidBaseUrl(_)
-        | RemotePluginCatalogError::InvalidBaseUrlPath
-        | RemotePluginCatalogError::UnexpectedPluginId { .. }
-        | RemotePluginCatalogError::UnexpectedSkillName { .. }
-        | RemotePluginCatalogError::UnexpectedEnabledState { .. }
-        | RemotePluginCatalogError::Archive { .. }
-        | RemotePluginCatalogError::ArchiveJoin(_)
-        | RemotePluginCatalogError::MissingUploadEtag
-        | RemotePluginCatalogError::UnexpectedResponse(_)
-        | RemotePluginCatalogError::CacheRemove(_) => internal_error(message),
+    let data = err.error_data();
+    let mut error = match data.reason {
+        PluginRemoteErrorReason::AuthenticationRequired
+        | PluginRemoteErrorReason::UnsupportedAuthMode
+        | PluginRemoteErrorReason::AccessDenied
+        | PluginRemoteErrorReason::NotFound
+        | PluginRemoteErrorReason::InvalidRequest => invalid_request(message),
+        PluginRemoteErrorReason::Transient
+        | PluginRemoteErrorReason::InvalidResponse
+        | PluginRemoteErrorReason::Internal => internal_error(message),
+    };
+    match serde_json::to_value(data) {
+        Ok(data) => error.data = Some(data),
+        Err(err) => warn!("failed to serialize remote plugin error data: {err}"),
     }
+    error
 }
 
 fn remote_plugin_bundle_install_error_to_jsonrpc(

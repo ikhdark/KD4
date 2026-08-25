@@ -1,13 +1,13 @@
 use codex_features::FEATURES;
 use codex_protocol::account::PlanType;
-use lazy_static::lazy_static;
 use rand::Rng;
+use std::sync::LazyLock;
 
 const ANNOUNCEMENT_TIP_URL: &str =
     "https://raw.githubusercontent.com/openai/codex/main/announcement_tip.toml";
 
-const IS_MACOS: bool = cfg!(target_os = "macos");
-const IS_WINDOWS: bool = cfg!(target_os = "windows");
+const IS_MACOS: bool = false;
+const IS_WINDOWS: bool = true;
 
 const APP_TOOLTIP: &str = "Try the **Codex App**. Run 'codex app' or visit https://chatgpt.com/codex?app-landing-page=true";
 const FAST_TOOLTIP: &str =
@@ -19,8 +19,8 @@ const FREE_GO_TOOLTIP: &str =
 
 const RAW_TOOLTIPS: &str = include_str!("../tooltips.txt");
 
-lazy_static! {
-    static ref TOOLTIPS: Vec<&'static str> = RAW_TOOLTIPS
+static TOOLTIPS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    RAW_TOOLTIPS
         .lines()
         .map(str::trim)
         .filter(|line| {
@@ -32,14 +32,14 @@ lazy_static! {
             }
             true
         })
-        .collect();
-    static ref ALL_TOOLTIPS: Vec<&'static str> = {
-        let mut tips = Vec::new();
-        tips.extend(TOOLTIPS.iter().copied());
-        tips.extend(experimental_tooltips());
-        tips
-    };
-}
+        .collect()
+});
+static ALL_TOOLTIPS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    let mut tips = Vec::new();
+    tips.extend(TOOLTIPS.iter().copied());
+    tips.extend(experimental_tooltips());
+    tips
+});
 
 fn experimental_tooltips() -> Vec<&'static str> {
     FEATURES
@@ -125,6 +125,7 @@ pub(crate) mod announcement {
     use crate::version::CODEX_CLI_VERSION;
     use chrono::NaiveDate;
     use chrono::Utc;
+    use codex_http_client::build_blocking_reqwest_client_with_custom_ca;
     use codex_protocol::account::PlanType;
     use regex_lite::Regex;
     use serde::Deserialize;
@@ -188,14 +189,7 @@ pub(crate) mod announcement {
 
     impl TargetOs {
         const fn current() -> Self {
-            if cfg!(target_os = "macos") {
-                Self::Macos
-            } else if cfg!(target_os = "windows") {
-                Self::Windows
-            } else {
-                // Codex currently publishes CLI builds for macOS, Windows, and Linux.
-                Self::Linux
-            }
+            Self::Windows
         }
     }
 
@@ -208,10 +202,10 @@ pub(crate) mod announcement {
 
     fn blocking_init_announcement_tip() -> Option<String> {
         // Avoid system proxy detection to prevent macOS system-configuration panics (#8912).
-        let client = reqwest::blocking::Client::builder()
-            .no_proxy()
-            .build()
-            .ok()?;
+        let client = build_blocking_reqwest_client_with_custom_ca(
+            reqwest::blocking::Client::builder().no_proxy(),
+        )
+        .ok()?;
         let response = client
             .get(ANNOUNCEMENT_TIP_URL)
             .timeout(Duration::from_millis(2000))
@@ -332,6 +326,10 @@ mod tests {
     #[test]
     fn random_tooltip_returns_some_tip_when_available() {
         let mut rng = StdRng::seed_from_u64(42);
+        assert_eq!(
+            ALL_TOOLTIPS.len(),
+            TOOLTIPS.len() + experimental_tooltips().len()
+        );
         assert!(pick_tooltip(&mut rng).is_some());
     }
 
@@ -541,13 +539,7 @@ content = "windows announcement"
 target_oses = ["windows"]
         "#;
 
-        let expected = if cfg!(target_os = "macos") {
-            "macos announcement"
-        } else if cfg!(target_os = "windows") {
-            "windows announcement"
-        } else {
-            "linux announcement"
-        };
+        let expected = "windows announcement";
         assert_eq!(
             Some(expected.to_string()),
             parse_announcement_tip_toml(toml, /*plan*/ None)

@@ -1,9 +1,12 @@
 use std::path::Path;
+use std::sync::LazyLock;
 
-use once_cell::sync::Lazy;
 use regex::Regex;
 use shlex::split as shlex_split;
 use url::Url;
+
+use crate::command_safety::powershell_parser::PowershellInvocation;
+use crate::command_safety::powershell_parser::parse_powershell_invocation;
 
 pub fn is_dangerous_command_windows(command: &[String]) -> bool {
     // Prefer structured parsing for PowerShell/CMD so we can spot URL-bearing
@@ -30,11 +33,15 @@ fn is_dangerous_powershell(command: &[String]) -> bool {
     // Parse the PowerShell invocation to get a flat token list we can scan for
     // dangerous cmdlets/COM calls plus any URL-looking arguments. This is a
     // best-effort shlex split of the script text, not a full PS parser.
-    let Some(parsed) = parse_powershell_invocation(rest) else {
-        return false;
-    };
-
-    is_dangerous_powershell_words(&parsed.tokens)
+    match parse_powershell_invocation(rest) {
+        PowershellInvocation::InlineCommand { script, .. } => shlex_split(script)
+            .map(|tokens| is_dangerous_powershell_words(&tokens))
+            .unwrap_or(true),
+        PowershellInvocation::Opaque
+        | PowershellInvocation::Bare
+        | PowershellInvocation::Empty
+        | PowershellInvocation::Invalid => true,
+    }
 }
 
 pub(crate) fn is_dangerous_powershell_words(words: &[String]) -> bool {
@@ -311,8 +318,8 @@ fn args_have_url(args: &[String]) -> bool {
 fn looks_like_url(token: &str) -> bool {
     // Strip common PowerShell punctuation around inline URLs (quotes, parens, trailing semicolons).
     // Capture the middle token after trimming leading quotes/parens/whitespace and trailing semicolons/closing parens.
-    static RE: Lazy<Option<Regex>> =
-        Lazy::new(|| Regex::new(r#"^[ "'\(\s]*([^\s"'\);]+)[\s;\)]*$"#).ok());
+    static RE: LazyLock<Option<Regex>> =
+        LazyLock::new(|| Regex::new(r#"^[ "'\(\s]*([^\s"'\);]+)[\s;\)]*$"#).ok());
     // If the token embeds a URL alongside other text (e.g., Start-Process('https://...'))
     // as a single shlex token, grab the substring starting at the first URL prefix.
     let lowercase_token = token.to_ascii_lowercase();
@@ -362,58 +369,19 @@ fn is_browser_executable(name: &str) -> bool {
     )
 }
 
-struct ParsedPowershell {
-    tokens: Vec<String>,
-}
-
-fn parse_powershell_invocation(args: &[String]) -> Option<ParsedPowershell> {
-    if args.is_empty() {
-        return None;
-    }
-
-    let mut idx = 0;
-    while idx < args.len() {
-        let arg = &args[idx];
-        let lower = arg.to_ascii_lowercase();
-        match lower.as_str() {
-            "-command" | "/command" | "-c" => {
-                let script = args.get(idx + 1)?;
-                if idx + 2 != args.len() {
-                    return None;
-                }
-                let tokens = shlex_split(script)?;
-                return Some(ParsedPowershell { tokens });
-            }
-            _ if lower.starts_with("-command:") || lower.starts_with("/command:") => {
-                if idx + 1 != args.len() {
-                    return None;
-                }
-                let (_, script) = arg.split_once(':')?;
-                let tokens = shlex_split(script)?;
-                return Some(ParsedPowershell { tokens });
-            }
-            "-nologo" | "-noprofile" | "-noninteractive" | "-mta" | "-sta" => {
-                idx += 1;
-            }
-            _ if lower.starts_with('-') => {
-                idx += 1;
-            }
-            _ => {
-                let rest = args[idx..].to_vec();
-                return Some(ParsedPowershell { tokens: rest });
-            }
-        }
-    }
-
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::is_dangerous_command_windows;
 
     fn vec_str(items: &[&str]) -> Vec<String> {
         items.iter().map(std::string::ToString::to_string).collect()
+    }
+
+    #[test]
+    fn looks_like_url_reuses_initialized_regex() {
+        assert!(super::looks_like_url("('https://example.com');"));
+        assert!(super::looks_like_url("('https://example.org');"));
+        assert!(!super::looks_like_url("('not-a-url');"));
     }
 
     #[test]
@@ -424,6 +392,22 @@ mod tests {
             "-Command",
             "Start-Process 'https://example.com'"
         ])));
+    }
+
+    #[test]
+    fn opaque_powershell_invocations_are_dangerous() {
+        for invocation in [
+            vec_str(&[
+                "powershell",
+                "-EncodedCommand",
+                "UwB0AGEAcgB0AC0AUAByAG8AYwBlAHMAcwA=",
+            ]),
+            vec_str(&["powershell", "-File", "script.ps1"]),
+            vec_str(&["powershell", "-UnknownFlag", "value"]),
+            vec_str(&["powershell", "script.ps1"]),
+        ] {
+            assert!(is_dangerous_command_windows(&invocation), "{invocation:?}");
+        }
     }
 
     #[test]

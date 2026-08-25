@@ -50,93 +50,112 @@ class StageNpmPackagesTests(unittest.TestCase):
         fake_module = types.SimpleNamespace(
             PACKAGE_NATIVE_COMPONENTS={
                 "codex": set(),
-                "codex-linux-x64": {"codex-package"},
+                "codex-win32-x64": {"codex-package"},
             },
-            PACKAGE_EXPANSIONS={"codex": ["codex", "codex-linux-x64"]},
+            PACKAGE_EXPANSIONS={"codex": ["codex", "codex-win32-x64"]},
             CODEX_PLATFORM_PACKAGES={
-                "codex-linux-x64": {
-                    "npm_name": "@openai/codex-linux-x64",
-                    "npm_tag": "linux-x64",
-                    "target_triple": "x86_64-unknown-linux-musl",
-                    "os": "linux",
+                "codex-win32-x64": {
+                    "npm_name": "@openai/codex-win32-x64",
+                    "npm_tag": "win32-x64",
+                    "target_triple": "x86_64-pc-windows-msvc",
+                    "os": "win32",
                     "cpu": "x64",
                 }
             },
             CODEX_PACKAGE_COMPONENT="codex-package",
             PACKAGE_TARGET_FILTERS={
-                "codex-linux-x64": {"x86_64-unknown-linux-musl"},
+                "codex-win32-x64": {"x86_64-pc-windows-msvc"},
             },
         )
 
         self.assertNotIn("_BUILD_MODULE", vars(stage))
         with mock.patch.object(stage, "load_build_module", return_value=fake_module):
             self.assertEqual(
-                stage.native_components_for_package("codex-linux-x64"),
+                stage.native_components_for_package("codex-win32-x64"),
                 ("codex-package",),
             )
             self.assertEqual(
-                stage.expand_packages(["codex"]), ["codex", "codex-linux-x64"]
+                stage.expand_packages(["codex"]), ["codex", "codex-win32-x64"]
             )
             self.assertEqual(
-                stage.native_targets_for_package("codex-linux-x64"),
-                ("x86_64-unknown-linux-musl",),
+                stage.native_targets_for_package("codex-win32-x64"),
+                ("x86_64-pc-windows-msvc",),
             )
             self.assertEqual(
-                stage.collect_native_component_sets(["codex-linux-x64"]),
-                [(("codex-package",), ("x86_64-unknown-linux-musl",))],
+                stage.collect_native_component_sets(["codex-win32-x64"]),
+                [(("codex-package",), ("x86_64-pc-windows-msvc",))],
             )
             self.assertEqual(
-                stage.tarball_name_for_package("codex-linux-x64", "1.2.3"),
-                "codex-npm-linux-x64-1.2.3.tgz",
+                stage.tarball_name_for_package("codex-win32-x64", "1.2.3"),
+                "codex-npm-win32-x64-1.2.3.tgz",
             )
 
-    def test_build_module_reads_platform_metadata_from_package_json(self) -> None:
+    def test_build_module_derives_platform_metadata_from_canonical_targets(
+        self,
+    ) -> None:
         build = stage.load_build_module()
 
-        self.assertIn("codex-linux-x64", build.CODEX_PLATFORM_PACKAGES)
         self.assertEqual(
-            build.CODEX_PLATFORM_PACKAGES["codex-linux-x64"]["target_triple"],
-            "x86_64-unknown-linux-musl",
+            set(build.CODEX_PLATFORM_PACKAGES),
+            {"codex-win32-x64", "codex-win32-arm64"},
         )
         self.assertEqual(
-            build.PACKAGE_TARGET_FILTERS["codex-linux-x64"],
-            "x86_64-unknown-linux-musl",
+            build.CODEX_PLATFORM_PACKAGES["codex-win32-x64"]["target_triple"],
+            "x86_64-pc-windows-msvc",
         )
         self.assertEqual(
-            build.PACKAGE_NATIVE_COMPONENTS["codex-linux-x64"],
+            build.PACKAGE_TARGET_FILTERS["codex-win32-x64"],
+            "x86_64-pc-windows-msvc",
+        )
+        self.assertEqual(
+            build.PACKAGE_NATIVE_COMPONENTS["codex-win32-x64"],
             ["codex-package"],
         )
 
         package_json = build.build_codex_package_json("1.2.3")
+        self.assertEqual(package_json["os"], ["win32"])
         self.assertEqual(
-            package_json["optionalDependencies"]["@openai/codex-linux-x64"],
-            "npm:@openai/codex@1.2.3-linux-x64",
+            package_json["optionalDependencies"]["@openai/codex-win32-x64"],
+            "npm:@openai/codex@1.2.3-win32-x64",
         )
+        self.assertEqual(
+            package_json["codexNativeTargets"]["win32-x64"],
+            {
+                "targetTriple": "x86_64-pc-windows-msvc",
+                "package": "@openai/codex-win32-x64",
+                "binary": "codex.exe",
+            },
+        )
+
+        for launcher_path in (
+            build.CODEX_CLI_ROOT / "bin" / "codex.js",
+            build.CODEX_SDK_ROOT / "src" / "exec.ts",
+        ):
+            launcher = launcher_path.read_text(encoding="utf-8")
+            self.assertIn("codexNativeTargets", launcher)
+            self.assertNotIn("x86_64-pc-windows-msvc", launcher)
+            self.assertNotIn("aarch64-pc-windows-msvc", launcher)
+
+        cli_launcher = (build.CODEX_CLI_ROOT / "bin" / "codex.js").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("@openai/codex@latest", cli_launcher)
+        self.assertIn("same fork release artifact", cli_launcher)
 
     def test_platform_package_manifest_is_minimal(self) -> None:
         build = stage.load_build_module()
 
         package_json = build.build_platform_package_json(
-            "1.2.3-linux-x64",
-            build.CODEX_PLATFORM_PACKAGES["codex-linux-x64"],
+            "1.2.3-win32-x64",
+            build.CODEX_PLATFORM_PACKAGES["codex-win32-x64"],
         )
 
         self.assertEqual(package_json["name"], "@openai/codex")
-        self.assertEqual(package_json["version"], "1.2.3-linux-x64")
-        self.assertEqual(package_json["os"], ["linux", "android"])
+        self.assertEqual(package_json["version"], "1.2.3-win32-x64")
+        self.assertEqual(package_json["os"], ["win32"])
         self.assertEqual(package_json["cpu"], ["x64"])
         self.assertEqual(package_json["files"], ["vendor"])
         self.assertNotIn("packageManager", package_json)
-
-        for package_name, expected_os in (
-            ("codex-darwin-x64", ["darwin"]),
-            ("codex-win32-x64", ["win32"]),
-        ):
-            manifest = build.build_platform_package_json(
-                f"1.2.3-{package_name.removeprefix('codex-')}",
-                build.CODEX_PLATFORM_PACKAGES[package_name],
-            )
-            self.assertEqual(manifest["os"], expected_os)
 
     def test_codex_staging_copies_user_facing_package_readme(self) -> None:
         build = stage.load_build_module()
@@ -147,7 +166,12 @@ class StageNpmPackagesTests(unittest.TestCase):
             (self.root / "README.md").read_text(encoding="utf-8"),
             (build.CODEX_CLI_ROOT / "README.npm.md").read_text(encoding="utf-8"),
         )
-        self.assertNotIn("Repository source map", (self.root / "README.md").read_text())
+        staged_readme = (self.root / "README.md").read_text()
+        self.assertNotIn("Repository source map", staged_readme)
+        self.assertNotIn("github.com/openai/codex/releases", staged_readme)
+        self.assertNotIn("chatgpt.com/codex/install.ps1", staged_readme)
+        self.assertIn("github.com/ikhdark/KD4/releases", staged_readme)
+        self.assertIn("raw.githubusercontent.com/ikhdark/KD4", staged_readme)
 
     def test_codex_sdk_staging_injects_matching_cli_dependency(self) -> None:
         build = stage.load_build_module()
@@ -158,20 +182,29 @@ class StageNpmPackagesTests(unittest.TestCase):
         stage_sdk_sources.assert_called_once_with(self.root)
         package_json = json.loads((self.root / "package.json").read_text())
         self.assertEqual(package_json["dependencies"]["@openai/codex"], "1.2.3")
+        self.assertEqual(package_json["os"], ["win32"])
         self.assertNotIn("prepare", package_json["scripts"])
+
+    def test_responses_proxy_staging_is_windows_only(self) -> None:
+        build = stage.load_build_module()
+
+        build.stage_sources(self.root, "1.2.3", "codex-responses-api-proxy")
+
+        package_json = json.loads((self.root / "package.json").read_text())
+        self.assertEqual(package_json["os"], ["win32"])
 
     def test_copy_native_binaries_filters_target_and_requires_executable(self) -> None:
         build = stage.load_build_module()
         vendor_src = self.root / "vendor-src"
-        selected_target = vendor_src / "x86_64-unknown-linux-musl"
+        selected_target = vendor_src / "x86_64-pc-windows-msvc"
         selected_bin = selected_target / "bin"
         selected_bin.mkdir(parents=True)
-        (selected_bin / "codex").write_text("native", encoding="utf-8")
+        (selected_bin / "codex.exe").write_text("native", encoding="utf-8")
 
-        skipped_target = vendor_src / "aarch64-unknown-linux-musl"
+        skipped_target = vendor_src / "aarch64-pc-windows-msvc"
         skipped_bin = skipped_target / "bin"
         skipped_bin.mkdir(parents=True)
-        (skipped_bin / "codex").write_text("native", encoding="utf-8")
+        (skipped_bin / "codex.exe").write_text("native", encoding="utf-8")
 
         staging_dir = self.root / "staging"
         staging_dir.mkdir()
@@ -179,26 +212,36 @@ class StageNpmPackagesTests(unittest.TestCase):
             vendor_src,
             staging_dir,
             [build.CODEX_PACKAGE_COMPONENT],
-            {"x86_64-unknown-linux-musl"},
+            {"x86_64-pc-windows-msvc"},
         )
 
         self.assertTrue(
             (
-                staging_dir / "vendor" / "x86_64-unknown-linux-musl" / "bin" / "codex"
+                staging_dir / "vendor" / "x86_64-pc-windows-msvc" / "bin" / "codex.exe"
             ).is_file()
         )
-        self.assertFalse(
-            (staging_dir / "vendor" / "aarch64-unknown-linux-musl").exists()
-        )
+        self.assertFalse((staging_dir / "vendor" / "aarch64-pc-windows-msvc").exists())
 
         missing_src = self.root / "missing-src"
-        (missing_src / "x86_64-unknown-linux-musl").mkdir(parents=True)
+        (missing_src / "x86_64-pc-windows-msvc").mkdir(parents=True)
         with self.assertRaisesRegex(RuntimeError, "Missing Codex executable"):
             build.copy_native_binaries(
                 missing_src,
                 self.root / "missing-staging",
                 [build.CODEX_PACKAGE_COMPONENT],
-                {"x86_64-unknown-linux-musl"},
+                {"x86_64-pc-windows-msvc"},
+            )
+
+    def test_copy_native_binaries_rejects_non_windows_targets(self) -> None:
+        build = stage.load_build_module()
+        vendor_src = self.root / "vendor-src"
+        (vendor_src / "x86_64-unknown-linux-gnu").mkdir(parents=True)
+
+        with self.assertRaisesRegex(RuntimeError, "Unsupported non-Windows native target"):
+            build.copy_native_binaries(
+                vendor_src,
+                self.root / "staging",
+                [build.CODEX_PACKAGE_COMPONENT],
             )
 
     def test_parse_args_accepts_max_download_workers(self) -> None:
@@ -257,7 +300,7 @@ class StageNpmPackagesTests(unittest.TestCase):
 
         self.assertIn("repo", check_output.call_args.args[0])
 
-    def test_resolve_github_repo_falls_back_to_upstream_when_gh_unavailable(
+    def test_resolve_github_repo_falls_back_to_kd4_when_gh_unavailable(
         self,
     ) -> None:
         with mock.patch.object(
@@ -266,6 +309,11 @@ class StageNpmPackagesTests(unittest.TestCase):
             side_effect=FileNotFoundError,
         ):
             self.assertEqual(stage.resolve_github_repo(None), stage.DEFAULT_GITHUB_REPO)
+        self.assertEqual(stage.DEFAULT_GITHUB_REPO, "ikhdark/KD4")
+
+    def test_workflow_lookup_requires_an_explicit_locator(self) -> None:
+        with self.assertRaisesRegex(ValueError, "--workflow-url is required"):
+            stage.resolve_workflow_url("1.2.3", None, "ikhdark/KD4", None)
 
     def test_github_repo_can_be_derived_from_workflow_url(self) -> None:
         self.assertEqual(
@@ -377,7 +425,7 @@ class StageNpmPackagesTests(unittest.TestCase):
         with mock.patch.object(
             stage.subprocess,
             "check_output",
-            return_value=(f"42\tx86_64-unknown-linux-musl\t1024\tsha256:{'a' * 64}\n"),
+            return_value=(f"42\tx86_64-pc-windows-msvc\t1024\tsha256:{'a' * 64}\n"),
         ) as check_output:
             first = stage.list_workflow_artifacts("12345", "local/fork")
             second = stage.list_workflow_artifacts("12345", "local/fork")
@@ -385,7 +433,7 @@ class StageNpmPackagesTests(unittest.TestCase):
 
         self.assertEqual(first, second)
         self.assertEqual(first, third)
-        self.assertEqual(first[0].name, "x86_64-unknown-linux-musl")
+        self.assertEqual(first[0].name, "x86_64-pc-windows-msvc")
         self.assertEqual(first[0].artifact_id, 42)
         self.assertEqual(first[0].archive_sha256, "a" * 64)
         self.assertEqual(check_output.call_count, 2)
@@ -401,7 +449,7 @@ class StageNpmPackagesTests(unittest.TestCase):
     def test_select_target_artifacts_uses_requested_targets_only(self) -> None:
         artifacts = (
             stage.WorkflowArtifact("x86_64-pc-windows-msvc", 10, 1, "a" * 64),
-            stage.WorkflowArtifact("x86_64-unknown-linux-musl", 20, 2, "b" * 64),
+            stage.WorkflowArtifact("aarch64-pc-windows-msvc", 20, 2, "b" * 64),
         )
         with mock.patch.object(
             stage,
@@ -441,10 +489,10 @@ class StageNpmPackagesTests(unittest.TestCase):
             stage.select_target_artifacts("123", "local/fork", ["package"], ["target"])
 
     def test_build_stage_command_uses_target_specific_vendor_src(self) -> None:
-        key = (("codex-package",), ("x86_64-unknown-linux-musl",))
+        key = (("codex-package",), ("x86_64-pc-windows-msvc",))
         vendor_src = self.root / "vendor-src"
         _pack_output, command = stage.build_stage_command(
-            "codex-linux-x64",
+            "codex-win32-x64",
             "1.2.3",
             self.root / "dist",
             self.root / "staging",
@@ -457,7 +505,7 @@ class StageNpmPackagesTests(unittest.TestCase):
     def test_download_artifacts_uses_complete_markers(self) -> None:
         archives_by_id: dict[int, bytes] = {}
         artifacts_list: list[stage.WorkflowArtifact] = []
-        for artifact_id, name in ((10, "linux"), (20, "macos")):
+        for artifact_id, name in ((10, "windows-x64"), (20, "windows-arm64")):
             payload = io.BytesIO()
             with zipfile.ZipFile(payload, "w") as archive:
                 archive.writestr(f"{name}.txt", name)
@@ -492,23 +540,25 @@ class StageNpmPackagesTests(unittest.TestCase):
                 "999", "local/fork", self.root / "artifacts", artifacts, 2
             )
 
-        self.assertCountEqual(calls, ["linux", "macos"])
+        self.assertCountEqual(calls, ["windows-x64", "windows-arm64"])
         for artifact in artifacts:
             self.assertTrue(
                 (self.root / "artifacts" / artifact.name / ".complete").is_file()
             )
 
     def test_digest_mismatch_preserves_existing_artifact_cache(self) -> None:
-        artifact_dir = self.root / "artifacts" / "linux"
+        artifact_dir = self.root / "artifacts" / "windows-x64"
         artifact_dir.mkdir(parents=True)
         (artifact_dir / "existing.txt").write_text("existing", encoding="utf-8")
-        old = stage.WorkflowArtifact("linux", 1, 1, "a" * 64)
+        old = stage.WorkflowArtifact("windows-x64", 1, 1, "a" * 64)
         stage.write_complete_marker(artifact_dir, old)
         payload = io.BytesIO()
         with zipfile.ZipFile(payload, "w") as archive:
             archive.writestr("new.txt", "new")
         archive_bytes = payload.getvalue()
-        replacement = stage.WorkflowArtifact("linux", len(archive_bytes), 2, "0" * 64)
+        replacement = stage.WorkflowArtifact(
+            "windows-x64", len(archive_bytes), 2, "0" * 64
+        )
 
         def fake_run(_cmd: list[str], **kwargs: object) -> mock.Mock:
             kwargs["stdout"].write(archive_bytes)  # type: ignore[union-attr]
@@ -527,16 +577,16 @@ class StageNpmPackagesTests(unittest.TestCase):
         self.assertTrue(stage.artifact_is_complete(artifact_dir, old))
 
     def test_changed_remote_artifact_id_invalidates_complete_marker(self) -> None:
-        artifact_dir = self.root / "artifacts" / "linux"
+        artifact_dir = self.root / "artifacts" / "windows-x64"
         artifact_dir.mkdir(parents=True)
         (artifact_dir / "payload.txt").write_text("payload", encoding="utf-8")
-        old = stage.WorkflowArtifact("linux", 10, 1, "a" * 64)
+        old = stage.WorkflowArtifact("windows-x64", 10, 1, "a" * 64)
         stage.write_complete_marker(artifact_dir, old)
-        replacement = stage.WorkflowArtifact("linux", 10, 2, "a" * 64)
+        replacement = stage.WorkflowArtifact("windows-x64", 10, 2, "a" * 64)
         self.assertFalse(stage.artifact_is_complete(artifact_dir, replacement))
 
     def test_codex_package_archive_extraction_is_reused(self) -> None:
-        target = "x86_64-unknown-linux-musl"
+        target = "x86_64-pc-windows-msvc"
         artifact_dir = self.root / "artifacts" / target
         artifact_dir.mkdir(parents=True)
         archive_path = artifact_dir / f"codex-package-{target}.tar.gz"
@@ -572,7 +622,7 @@ class StageNpmPackagesTests(unittest.TestCase):
         self.assertFalse((self.root / "vendor-one" / target / ".complete").exists())
 
     def test_existing_vendor_tree_survives_failed_archive_install(self) -> None:
-        target = "x86_64-unknown-linux-musl"
+        target = "x86_64-pc-windows-msvc"
         artifact_dir = self.root / "artifacts" / target
         artifact_dir.mkdir(parents=True)
         (artifact_dir / f"codex-package-{target}.tar.gz").write_text(
@@ -730,9 +780,9 @@ class StageNpmPackagesTests(unittest.TestCase):
             stage.extract_zstd_archive(archive_path, self.root / "out" / "codex")
 
     def test_failed_binary_extract_preserves_existing_vendor_binary(self) -> None:
-        target = "x86_64-unknown-linux-musl"
-        component = stage.BinaryComponent("codex", "codex", "codex")
-        dest = self.root / "vendor" / target / "codex" / "codex"
+        target = "x86_64-pc-windows-msvc"
+        component = stage.BinaryComponent("codex", "codex", "codex.exe")
+        dest = self.root / "vendor" / target / "codex" / "codex.exe"
         dest.parent.mkdir(parents=True)
         dest.write_bytes(b"existing")
         artifact = (
@@ -763,6 +813,17 @@ class StageNpmPackagesTests(unittest.TestCase):
             )
 
         self.assertEqual(dest.read_bytes(), b"existing")
+
+    def test_install_single_binary_rejects_non_windows_target(self) -> None:
+        component = stage.BinaryComponent("codex", "codex", "codex.exe")
+
+        with self.assertRaisesRegex(RuntimeError, "Unsupported non-Windows native target"):
+            stage.install_single_binary(
+                self.root / "artifacts",
+                self.root / "vendor",
+                "x86_64-unknown-linux-gnu",
+                component,
+            )
 
     def test_kernel_lock_serializes_concurrent_holders(self) -> None:
         lock_path = self.root / "cache" / ".artifact.lock"
@@ -912,17 +973,6 @@ class StageNpmPackagesTests(unittest.TestCase):
         self.assertNotEqual(first, second)
         self.assertEqual((second / "payload.bin").read_bytes(), b"BBBB")
 
-    @unittest.skipIf(os.name == "nt", "POSIX executable modes are required")
-    def test_cache_tree_digest_includes_executable_mode(self) -> None:
-        root = self.root / "tree"
-        root.mkdir()
-        executable = root / "tool"
-        executable.write_text("tool", encoding="utf-8")
-        executable.chmod(0o755)
-        before = archives.cache_tree_digest(root)
-        executable.chmod(0o644)
-        self.assertNotEqual(before, archives.cache_tree_digest(root))
-
     def test_stage_packages_returns_results_in_package_order(self) -> None:
         calls: list[tuple[str, bool]] = []
 
@@ -945,7 +995,7 @@ class StageNpmPackagesTests(unittest.TestCase):
 
         with mock.patch.object(stage, "stage_package", fake_stage_package):
             results = stage.stage_packages(
-                ["codex", "codex-linux-x64"],
+                ["codex", "codex-win32-x64"],
                 "1.2.3",
                 self.root,
                 self.root,
@@ -956,11 +1006,11 @@ class StageNpmPackagesTests(unittest.TestCase):
 
         self.assertEqual(
             [result.package for result in results],
-            ["codex", "codex-linux-x64"],
+            ["codex", "codex-win32-x64"],
         )
         self.assertCountEqual(
             calls,
-            [("codex", True), ("codex-linux-x64", True)],
+            [("codex", True), ("codex-win32-x64", True)],
         )
 
 

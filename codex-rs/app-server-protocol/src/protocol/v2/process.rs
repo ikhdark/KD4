@@ -5,15 +5,22 @@ use serde::Serialize;
 use std::collections::HashMap;
 use ts_rs::TS;
 
+use super::PtyTerminalSize;
+
 /// PTY size in character cells for `process/spawn` PTY sessions.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
+#[serde(transparent)]
 #[ts(export_to = "v2/")]
-pub struct ProcessTerminalSize {
-    /// Terminal height in character cells.
-    pub rows: u16,
-    /// Terminal width in character cells.
-    pub cols: u16,
+pub struct ProcessTerminalSize(pub PtyTerminalSize);
+
+impl ProcessTerminalSize {
+    pub const fn new(rows: u16, cols: u16) -> Self {
+        Self(PtyTerminalSize { rows, cols })
+    }
+
+    pub const fn into_inner(self) -> PtyTerminalSize {
+        self.0
+    }
 }
 
 /// Spawn a standalone process (argv vector) without a Codex sandbox on the host

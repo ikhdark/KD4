@@ -37,6 +37,8 @@ use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::permissions::project_roots_glob_pattern;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_absolute_path::is_windows_absolute_path;
+use codex_utils_absolute_path::normalize_windows_device_path;
 
 use super::ProjectConfig;
 
@@ -50,7 +52,7 @@ pub(crate) fn default_builtin_permission_profile_name(
     windows_sandbox_level: WindowsSandboxLevel,
 ) -> &'static str {
     if (active_project.is_trusted() || active_project.is_untrusted())
-        && !(cfg!(target_os = "windows") && windows_sandbox_level == WindowsSandboxLevel::Disabled)
+        && windows_sandbox_level != WindowsSandboxLevel::Disabled
     {
         BUILT_IN_WORKSPACE_PROFILE
     } else {
@@ -358,7 +360,7 @@ pub(crate) fn compile_permission_profile(
                 missing_filesystem_entries_warning(profile_name),
             );
         } else {
-            if cfg!(not(target_os = "macos")) {
+            {
                 for pattern in unsupported_read_write_glob_paths(filesystem) {
                     push_warning(
                         startup_warnings,
@@ -470,37 +472,6 @@ pub(crate) fn reject_unknown_builtin_permission_profile(profile_name: &str) -> i
     }
 
     Ok(())
-}
-
-/// Returns a list of paths that must be readable by shell tools in order
-/// for Codex to function. These should always be added to the
-/// `FileSystemSandboxPolicy` for a thread.
-pub(crate) fn get_readable_roots_required_for_codex_runtime(
-    codex_home: &Path,
-    zsh_path: Option<&PathBuf>,
-    main_execve_wrapper_exe: Option<&PathBuf>,
-) -> Vec<AbsolutePathBuf> {
-    let arg0_root = AbsolutePathBuf::from_absolute_path(codex_home.join("tmp").join("arg0")).ok();
-    let zsh_path = zsh_path.and_then(|path| AbsolutePathBuf::from_absolute_path(path).ok());
-    let execve_wrapper_root = main_execve_wrapper_exe.and_then(|path| {
-        let path = AbsolutePathBuf::from_absolute_path(path).ok()?;
-        if let Some(arg0_root) = arg0_root.as_ref()
-            && path.as_path().starts_with(arg0_root.as_path())
-        {
-            path.parent()
-        } else {
-            Some(path)
-        }
-    });
-
-    let mut readable_roots = Vec::new();
-    if let Some(zsh_path) = zsh_path {
-        readable_roots.push(zsh_path);
-    }
-    if let Some(execve_wrapper_root) = execve_wrapper_root {
-        readable_roots.push(execve_wrapper_root);
-    }
-    readable_roots
 }
 
 fn compile_network_sandbox_policy(
@@ -747,7 +718,7 @@ fn validate_glob_scan_max_depth(max_depth: Option<usize>) -> io::Result<Option<u
 }
 
 fn contains_glob_chars(path: &str) -> bool {
-    contains_glob_chars_for_platform(path, cfg!(windows))
+    contains_glob_chars_for_platform(path, true)
 }
 
 fn contains_glob_chars_for_platform(path: &str, is_windows: bool) -> bool {
@@ -784,7 +755,7 @@ fn parse_special_path(path: &str) -> Option<FileSystemSpecialPath> {
 }
 
 fn parse_absolute_path(path: &str) -> io::Result<AbsolutePathBuf> {
-    parse_absolute_path_for_platform(path, cfg!(windows))
+    parse_absolute_path_for_platform(path, true)
 }
 
 fn parse_absolute_path_for_platform(path: &str, is_windows: bool) -> io::Result<AbsolutePathBuf> {
@@ -819,38 +790,6 @@ fn normalize_absolute_path_for_platform(path: &str, is_windows: bool) -> Cow<'_,
         Some(normalized) => Cow::Owned(PathBuf::from(normalized)),
         None => Cow::Borrowed(Path::new(path)),
     }
-}
-
-fn normalize_windows_device_path(path: &str) -> Option<String> {
-    if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
-        return Some(format!(r"\\{unc}"));
-    }
-    if let Some(unc) = path.strip_prefix(r"\\.\UNC\") {
-        return Some(format!(r"\\{unc}"));
-    }
-    if let Some(path) = path.strip_prefix(r"\\?\")
-        && is_windows_drive_absolute_path(path)
-    {
-        return Some(path.to_string());
-    }
-    if let Some(path) = path.strip_prefix(r"\\.\")
-        && is_windows_drive_absolute_path(path)
-    {
-        return Some(path.to_string());
-    }
-    None
-}
-
-fn is_windows_absolute_path(path: &str) -> bool {
-    is_windows_drive_absolute_path(path) || path.starts_with(r"\\")
-}
-
-fn is_windows_drive_absolute_path(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'\\' | b'/')
 }
 
 fn parse_relative_subpath(subpath: &str) -> io::Result<PathBuf> {

@@ -13,6 +13,7 @@ use crate::history_cell::split_reasoning_summary_parts;
 use crate::multi_agents::sub_agent_activity_summary;
 use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadItem;
+use codex_config::types::UriBasedFileOpener;
 use codex_protocol::ThreadId;
 use codex_protocol::items::UserMessageItem;
 use ratatui::style::Stylize as _;
@@ -30,6 +31,7 @@ pub(crate) async fn load_session_transcript(
     app_server: &mut AppServerSession,
     thread_id: ThreadId,
     raw_reasoning_visibility: RawReasoningVisibility,
+    file_opener: UriBasedFileOpener,
 ) -> std::io::Result<TranscriptCells> {
     let thread = app_server
         .thread_read(thread_id, /*include_turns*/ true)
@@ -38,12 +40,14 @@ pub(crate) async fn load_session_transcript(
     Ok(thread_to_transcript_cells(
         &thread,
         raw_reasoning_visibility,
+        file_opener,
     ))
 }
 
 pub(crate) fn thread_to_transcript_cells(
     thread: &Thread,
     raw_reasoning_visibility: RawReasoningVisibility,
+    file_opener: UriBasedFileOpener,
 ) -> TranscriptCells {
     let cwd = thread.cwd.as_path();
     let mut cells: TranscriptCells = Vec::new();
@@ -73,18 +77,22 @@ pub(crate) fn thread_to_transcript_cells(
             ThreadItem::AgentMessage { text, .. } => {
                 let parsed = parse_assistant_markdown(text, cwd);
                 if !parsed.visible_markdown.trim().is_empty() {
-                    cells.push(Arc::new(AgentMarkdownCell::new(
+                    cells.push(Arc::new(AgentMarkdownCell::new_with_file_opener(
                         parsed.visible_markdown,
                         cwd,
+                        file_opener,
                     )));
                 }
             }
             ThreadItem::Plan { text, .. } => {
                 if !text.trim().is_empty() {
-                    cells.push(Arc::new(crate::history_cell::new_proposed_plan(
-                        text.clone(),
-                        cwd,
-                    )));
+                    cells.push(Arc::new(
+                        crate::history_cell::new_proposed_plan_with_file_opener(
+                            text.clone(),
+                            cwd,
+                            file_opener,
+                        ),
+                    ));
                 }
             }
             ThreadItem::Reasoning {

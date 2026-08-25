@@ -11,15 +11,14 @@ mod command_exec;
 mod compaction;
 mod config_rpc;
 mod connection_handling_websocket;
-#[cfg(unix)]
-mod connection_handling_websocket_unix;
+
 mod current_time;
+mod desktop_activation;
 mod dynamic_tools;
 mod environment_add;
 mod environment_info;
 mod exec_server_test_support;
-#[cfg(not(target_os = "windows"))]
-mod executor_mcp;
+
 mod executor_skills;
 mod experimental_api;
 mod experimental_feature_list;
@@ -49,7 +48,6 @@ mod plugin_uninstall;
 mod process_exec;
 mod rate_limit_reset_credits;
 mod rate_limits;
-mod realtime_conversation;
 mod recommended_plugins;
 mod remote_control;
 #[cfg(debug_assertions)]
@@ -58,8 +56,7 @@ mod request_permissions;
 mod request_user_input;
 mod request_validation;
 mod safety_check_downgrade;
-#[cfg(not(target_os = "windows"))]
-mod selected_capability_stack;
+
 mod selected_environment;
 mod skills_list;
 mod sleep;
@@ -81,9 +78,6 @@ mod thread_start;
 mod thread_status;
 mod thread_unarchive;
 mod thread_unsubscribe;
-mod turn_interrupt;
 mod turn_start;
-mod turn_start_zsh_fork;
-mod turn_steer;
 mod web_search;
 mod windows_sandbox_setup;

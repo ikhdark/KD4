@@ -5,7 +5,7 @@ use crate::acl::ensure_allow_write_aces;
 use crate::allow::AllowDenyPaths;
 use crate::allow::compute_allow_paths_for_permissions;
 use crate::cap::load_or_create_cap_sids;
-use crate::cap::workspace_write_cap_sid_for_root;
+use crate::cap::workspace_write_cap_sid_for_root_keys;
 use crate::cap::workspace_write_root_contains_path;
 use crate::cap::workspace_write_root_overlaps_path;
 use crate::cap::workspace_write_root_specificity;
@@ -17,6 +17,7 @@ use crate::env::normalize_null_device_env;
 use crate::identity::SandboxCreds;
 use crate::identity::require_logon_sandbox_creds;
 use crate::logging::log_start;
+use crate::path_normalization::canonical_path_key;
 use crate::path_normalization::canonicalize_path;
 use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
 use crate::sandbox_utils::ensure_codex_home_exists;
@@ -209,13 +210,17 @@ pub(crate) fn root_capability_sids(
     cwd: &Path,
     allow_paths: impl IntoIterator<Item = PathBuf>,
 ) -> Result<Vec<RootCapabilitySid>> {
-    let mut roots: Vec<PathBuf> = allow_paths.into_iter().collect();
-    roots.sort_by_key(|root| canonicalize_path(root.as_path()));
-    roots.dedup_by(|a, b| canonicalize_path(a.as_path()) == canonicalize_path(b.as_path()));
+    let cwd_key = canonical_path_key(cwd);
+    let mut roots = allow_paths
+        .into_iter()
+        .map(|root| (canonical_path_key(&root), root))
+        .collect::<Vec<_>>();
+    roots.sort_by(|left, right| left.0.cmp(&right.0));
+    roots.dedup_by(|left, right| left.0 == right.0);
 
     let mut out = Vec::with_capacity(roots.len());
-    for root in roots {
-        let sid_str = workspace_write_cap_sid_for_root(codex_home, cwd, &root)?;
+    for (root_key, root) in roots {
+        let sid_str = workspace_write_cap_sid_for_root_keys(codex_home, &cwd_key, root_key)?;
         let sid = LocalSid::from_string(&sid_str)?;
         out.push(RootCapabilitySid { root, sid, sid_str });
     }

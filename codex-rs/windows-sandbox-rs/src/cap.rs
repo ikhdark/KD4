@@ -37,7 +37,7 @@ pub fn cap_sid_file(codex_home: &Path) -> PathBuf {
 }
 
 fn make_random_cap_sid_string() -> String {
-    let mut rng = SmallRng::from_entropy();
+    let mut rng = SmallRng::from_os_rng();
     let a = rng.next_u32();
     let b = rng.next_u32();
     let c = rng.next_u32();
@@ -87,9 +87,12 @@ pub fn load_or_create_cap_sids(codex_home: &Path) -> Result<CapSids> {
 
 /// Returns the workspace-specific capability SID for `cwd`, creating and persisting it if missing.
 pub fn workspace_cap_sid_for_cwd(codex_home: &Path, cwd: &Path) -> Result<String> {
+    workspace_cap_sid_for_key(codex_home, canonical_path_key(cwd))
+}
+
+fn workspace_cap_sid_for_key(codex_home: &Path, key: String) -> Result<String> {
     let path = cap_sid_file(codex_home);
     let mut caps = load_or_create_cap_sids(codex_home)?;
-    let key = canonical_path_key(cwd);
     if let Some(sid) = caps.workspace_by_cwd.get(&key) {
         return Ok(sid.clone());
     }
@@ -100,10 +103,14 @@ pub fn workspace_cap_sid_for_cwd(codex_home: &Path, cwd: &Path) -> Result<String
 }
 
 /// Returns the capability SID for an additional writable root, creating and persisting it if missing.
+#[cfg(test)]
 pub fn writable_root_cap_sid_for_path(codex_home: &Path, root: &Path) -> Result<String> {
+    writable_root_cap_sid_for_key(codex_home, canonical_path_key(root))
+}
+
+fn writable_root_cap_sid_for_key(codex_home: &Path, key: String) -> Result<String> {
     let path = cap_sid_file(codex_home);
     let mut caps = load_or_create_cap_sids(codex_home)?;
-    let key = canonical_path_key(root);
     if let Some(sid) = caps.writable_root_by_path.get(&key) {
         return Ok(sid.clone());
     }
@@ -118,10 +125,22 @@ pub fn workspace_write_cap_sid_for_root(
     cwd: &Path,
     root: &Path,
 ) -> Result<String> {
-    if canonical_path_key(root) == canonical_path_key(cwd) {
-        workspace_cap_sid_for_cwd(codex_home, cwd)
+    workspace_write_cap_sid_for_root_keys(
+        codex_home,
+        &canonical_path_key(cwd),
+        canonical_path_key(root),
+    )
+}
+
+pub(crate) fn workspace_write_cap_sid_for_root_keys(
+    codex_home: &Path,
+    cwd_key: &str,
+    root_key: String,
+) -> Result<String> {
+    if root_key == cwd_key {
+        workspace_cap_sid_for_key(codex_home, cwd_key.to_string())
     } else {
-        writable_root_cap_sid_for_path(codex_home, root)
+        writable_root_cap_sid_for_key(codex_home, root_key)
     }
 }
 
@@ -140,11 +159,26 @@ pub fn workspace_write_root_specificity(root: &Path) -> usize {
 #[cfg(test)]
 mod tests {
     use super::load_or_create_cap_sids;
+    use super::make_random_cap_sid_string;
     use super::workspace_cap_sid_for_cwd;
     use super::workspace_write_cap_sid_for_root;
+    use super::workspace_write_cap_sid_for_root_keys;
     use super::writable_root_cap_sid_for_path;
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
+
+    #[test]
+    fn generated_cap_sid_matches_windows_capability_shape() {
+        let sid = make_random_cap_sid_string();
+        let components = sid
+            .strip_prefix("S-1-5-21-")
+            .expect("capability SID prefix")
+            .split('-')
+            .collect::<Vec<_>>();
+
+        assert_eq!(components.len(), 4);
+        assert!(components.iter().all(|value| value.parse::<u32>().is_ok()));
+    }
 
     #[test]
     fn equivalent_cwd_spellings_share_workspace_sid_key() {
@@ -199,5 +233,29 @@ mod tests {
         let caps = load_or_create_cap_sids(&codex_home).expect("load caps");
         assert_eq!(caps.workspace_by_cwd.len(), 1);
         assert_eq!(caps.writable_root_by_path.len(), 1);
+    }
+
+    #[test]
+    fn precomputed_write_root_keys_are_reused_for_sid_lookup() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let codex_home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let workspace_sid = workspace_write_cap_sid_for_root_keys(
+            &codex_home,
+            "c:\\workspace",
+            "c:\\workspace".to_string(),
+        )
+        .expect("workspace sid");
+        let extra_sid = workspace_write_cap_sid_for_root_keys(
+            &codex_home,
+            "c:\\workspace",
+            "c:\\extra".to_string(),
+        )
+        .expect("extra-root sid");
+
+        let caps = load_or_create_cap_sids(&codex_home).expect("load caps");
+        assert_eq!(caps.workspace_by_cwd["c:\\workspace"], workspace_sid);
+        assert_eq!(caps.writable_root_by_path["c:\\extra"], extra_sid);
     }
 }

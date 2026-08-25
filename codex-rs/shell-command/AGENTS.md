@@ -6,7 +6,7 @@ This crate owns shell command execution plumbing and command-environment
 handling used by Codex runtime paths. Treat it as an execution-safety surface.
 
 Construction/environment handling belong here; elevation belongs in
-`shell-escalation`; sandbox policy in core/sandbox crates; app-server command
+Windows sandbox policy in core/sandbox crates; app-server command
 APIs in `app-server`.
 
 ## Change Rules

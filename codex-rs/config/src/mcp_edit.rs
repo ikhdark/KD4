@@ -4,12 +4,13 @@ use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
 
-use codex_utils_path::acquire_atomic_write_lock;
-use codex_utils_path::resolve_symlink_write_paths;
-use codex_utils_path::write_atomically;
+use codex_file_system::acquire_atomic_write_lock;
+use codex_file_system::resolve_symlink_write_paths;
+use codex_file_system::write_atomically;
 use tokio::task;
 use toml::Value as TomlValue;
 use toml_edit::DocumentMut;
+use toml_edit::InlineTable;
 use toml_edit::Item as TomlItem;
 use toml_edit::Table as TomlTable;
 use toml_edit::value;
@@ -20,6 +21,7 @@ use crate::McpServerAuth;
 use crate::McpServerConfig;
 use crate::McpServerEnvVar;
 use crate::McpServerTransportConfig;
+use crate::read_or_create_config_document;
 
 pub async fn load_global_mcp_servers(
     codex_home: &Path,
@@ -36,31 +38,10 @@ pub async fn load_global_mcp_servers(
         return Ok(BTreeMap::new());
     };
 
-    ensure_no_inline_bearer_tokens(servers_value)?;
-
     servers_value
         .clone()
         .try_into()
         .map_err(|err| std::io::Error::new(ErrorKind::InvalidData, err))
-}
-
-fn ensure_no_inline_bearer_tokens(value: &TomlValue) -> std::io::Result<()> {
-    let Some(servers_table) = value.as_table() else {
-        return Ok(());
-    };
-
-    for (server_name, server_value) in servers_table {
-        if let Some(server_table) = server_value.as_table()
-            && server_table.contains_key("bearer_token")
-        {
-            let message = format!(
-                "mcp_servers.{server_name} uses unsupported `bearer_token`; set `bearer_token_env_var`."
-            );
-            return Err(std::io::Error::new(ErrorKind::InvalidData, message));
-        }
-    }
-
-    Ok(())
 }
 
 pub struct ConfigEditsBuilder {
@@ -104,10 +85,7 @@ impl ConfigEditsBuilder {
         let config_path = self.codex_home.join(CONFIG_TOML_FILE);
         let _lock = acquire_atomic_write_lock(&config_path)?;
         let write_paths = resolve_symlink_write_paths(&config_path)?;
-        let mut doc = match write_paths.read_path.as_deref() {
-            Some(read_path) => read_or_create_document(read_path)?,
-            None => DocumentMut::new(),
-        };
+        let mut doc = read_or_create_config_document(write_paths.read_path.as_deref())?;
         if let Some(servers) = self.mcp_servers.as_ref() {
             replace_mcp_servers(&mut doc, servers);
         }
@@ -132,21 +110,10 @@ fn mcp_servers_from_document(
     let Some(servers_value) = parsed.get("mcp_servers") else {
         return Ok(BTreeMap::new());
     };
-    ensure_no_inline_bearer_tokens(servers_value)?;
     servers_value
         .clone()
         .try_into()
         .map_err(|err| std::io::Error::new(ErrorKind::InvalidData, err))
-}
-
-fn read_or_create_document(config_path: &Path) -> std::io::Result<DocumentMut> {
-    match fs::read_to_string(config_path) {
-        Ok(raw) => raw
-            .parse::<DocumentMut>()
-            .map_err(|err| std::io::Error::new(ErrorKind::InvalidData, err)),
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(DocumentMut::new()),
-        Err(err) => Err(err),
-    }
 }
 
 fn replace_mcp_servers(doc: &mut DocumentMut, servers: &BTreeMap<String, McpServerConfig>) {
@@ -164,7 +131,7 @@ fn replace_mcp_servers(doc: &mut DocumentMut, servers: &BTreeMap<String, McpServ
     root.insert("mcp_servers", TomlItem::Table(table));
 }
 
-fn serialize_mcp_server(config: &McpServerConfig) -> TomlItem {
+fn serialize_mcp_server_table(config: &McpServerConfig) -> TomlTable {
     let mut entry = TomlTable::new();
     entry.set_implicit(false);
 
@@ -294,7 +261,15 @@ fn serialize_mcp_server(config: &McpServerConfig) -> TomlItem {
         entry.insert("tools", TomlItem::Table(tools));
     }
 
-    TomlItem::Table(entry)
+    entry
+}
+
+pub fn serialize_mcp_server(config: &McpServerConfig) -> TomlItem {
+    TomlItem::Table(serialize_mcp_server_table(config))
+}
+
+pub fn serialize_mcp_server_inline(config: &McpServerConfig) -> InlineTable {
+    serialize_mcp_server_table(config).into_inline_table()
 }
 
 fn array_from_strings(values: &[String]) -> TomlItem {

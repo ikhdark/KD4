@@ -1,3 +1,4 @@
+use super::NoopSpawnLifecycle;
 use super::PendingSpawnRegistration;
 use super::ProcessEntry;
 use super::UNIFIED_EXEC_OUTPUT_MAX_BYTES;
@@ -10,7 +11,7 @@ use super::head_tail_buffer::HeadTailBuffer;
 use super::process::OutputHandles;
 use super::process::UnifiedExecProcess;
 use super::process_manager::PendingProcessRegistration;
-use crate::function_tool::FunctionCallError;
+use crate::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
@@ -34,8 +35,11 @@ use codex_exec_server::ReadResponse;
 use codex_exec_server::StartedExecProcess;
 use codex_exec_server::WriteResponse;
 use codex_exec_server::WriteStatus;
+use codex_sandboxing::SandboxType;
 use codex_tools::ToolExecutor;
+use codex_utils_pty::spawn_pipe_process_no_stdin;
 use pretty_assertions::assert_eq;
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -184,8 +188,7 @@ async fn store_process_for_test(
     process_id: u32,
     process: Arc<UnifiedExecProcess>,
 ) {
-    #[allow(deprecated)]
-    let cwd = turn.cwd.clone().into();
+    let cwd = turn.cwd().clone().into();
     manager.process_store.lock().await.processes.insert(
         process_id,
         ProcessEntry {
@@ -214,7 +217,6 @@ fn write_stdin_invocation(
     ToolInvocation {
         session,
         step_context: StepContext::for_test(Arc::clone(&turn)),
-        turn,
         cancellation_token: CancellationToken::new(),
         tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
         call_id: call_id.to_string(),
@@ -417,8 +419,7 @@ async fn cancelled_startup_keeps_store_and_ledger_until_termination_is_confirmed
     )
     .await;
     let active = Arc::new(AtomicBool::new(true));
-    #[allow(deprecated)]
-    let cwd = turn.cwd.clone().into();
+    let cwd = turn.cwd().clone().into();
     manager.process_store.lock().await.processes.insert(
         process_id,
         ProcessEntry {
@@ -753,6 +754,55 @@ async fn local_output_artifact_is_flushed_and_unlocked_before_output_closed() {
     handle.try_lock().expect("artifact should be unlocked");
     handle.unlock().expect("release test artifact lock");
     output_task.await.expect("local output task should finish");
+}
+
+#[tokio::test]
+async fn terminating_local_process_finalizes_pending_raw_output_artifact() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (program, args) = if cfg!(windows) {
+        (
+            "cmd.exe",
+            vec![
+                "/D".to_string(),
+                "/S".to_string(),
+                "/C".to_string(),
+                "ping -n 30 127.0.0.1 >nul".to_string(),
+            ],
+        )
+    } else {
+        ("sh", vec!["-c".to_string(), "sleep 30".to_string()])
+    };
+    let spawned = spawn_pipe_process_no_stdin(program, &args, temp.path(), &HashMap::new(), &None)
+        .await
+        .expect("local fixture process should spawn");
+    let process = UnifiedExecProcess::from_spawned(
+        spawned,
+        SandboxType::None,
+        Box::new(NoopSpawnLifecycle),
+        Some(RawOutputArtifact::pending(
+            temp.path(),
+            "termination-finalization",
+        )),
+        &PendingSpawnRegistration::default(),
+    )
+    .await
+    .expect("local fixture process should register");
+    let output_handles = process.output_handles();
+    let output_closed = output_handles.output_closed_notify.notified();
+    tokio::pin!(output_closed);
+    output_closed.as_mut().enable();
+
+    process.terminate();
+    if !output_handles.output_closed.load(Ordering::Acquire) {
+        tokio::time::timeout(Duration::from_secs(2), &mut output_closed)
+            .await
+            .expect("local output task should finalize after termination");
+    }
+
+    assert!(
+        process.raw_output_artifact().await.is_some(),
+        "local termination must not leave the raw-output artifact pending"
+    );
 }
 
 #[tokio::test]

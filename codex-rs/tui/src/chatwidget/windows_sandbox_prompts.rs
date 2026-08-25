@@ -2,18 +2,11 @@
 
 use super::*;
 
-#[cfg(target_os = "windows")]
 fn legacy_windows_sandbox_is_compatible() -> bool {
     codex_windows_sandbox::legacy_restricted_token_enforces_delete_child()
 }
 
-#[cfg(all(not(target_os = "windows"), test))]
-fn legacy_windows_sandbox_is_compatible() -> bool {
-    true
-}
-
 impl ChatWidget {
-    #[cfg(any(target_os = "windows", test))]
     pub(crate) fn windows_sandbox_mode_allowed(&self, mode: WindowsSandboxModeToml) -> bool {
         self.config
             .config_layer_stack
@@ -23,7 +16,6 @@ impl ChatWidget {
             .is_ok()
     }
 
-    #[cfg(any(target_os = "windows", test))]
     pub(super) fn elevated_windows_sandbox_setup_required(&self) -> bool {
         crate::windows_sandbox::level_from_config(&self.config) == WindowsSandboxLevel::Elevated
             && self
@@ -35,7 +27,6 @@ impl ChatWidget {
                 .is_some()
     }
 
-    #[cfg(target_os = "windows")]
     pub(crate) fn world_writable_warning_details(&self) -> Option<(Vec<String>, usize, bool)> {
         if self
             .config
@@ -69,13 +60,6 @@ impl ChatWidget {
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
-    #[allow(dead_code)]
-    pub(crate) fn world_writable_warning_details(&self) -> Option<(Vec<String>, usize, bool)> {
-        None
-    }
-
-    #[cfg(target_os = "windows")]
     pub(crate) fn open_world_writable_warning_confirmation(
         &mut self,
         preset: Option<ApprovalPreset>,
@@ -214,18 +198,6 @@ impl ChatWidget {
         });
     }
 
-    #[cfg(not(target_os = "windows"))]
-    pub(crate) fn open_world_writable_warning_confirmation(
-        &mut self,
-        _preset: Option<ApprovalPreset>,
-        _profile_selection: Option<PermissionProfileSelection>,
-        _sample_paths: Vec<String>,
-        _extra_count: usize,
-        _failed_scan: bool,
-    ) {
-    }
-
-    #[cfg(any(target_os = "windows", test))]
     pub(crate) fn open_windows_sandbox_enable_prompt(
         &mut self,
         preset: ApprovalPreset,
@@ -238,7 +210,6 @@ impl ChatWidget {
         );
     }
 
-    #[cfg(any(target_os = "windows", test))]
     pub(crate) fn open_windows_sandbox_enable_prompt_with_legacy_compatibility(
         &mut self,
         preset: ApprovalPreset,
@@ -353,15 +324,6 @@ impl ChatWidget {
         });
     }
 
-    #[cfg(all(not(target_os = "windows"), not(test)))]
-    pub(crate) fn open_windows_sandbox_enable_prompt(
-        &mut self,
-        _preset: ApprovalPreset,
-        _profile_selection: Option<PermissionProfileSelection>,
-    ) {
-    }
-
-    #[cfg(any(target_os = "windows", test))]
     pub(crate) fn open_windows_sandbox_fallback_prompt(
         &mut self,
         preset: ApprovalPreset,
@@ -374,7 +336,6 @@ impl ChatWidget {
         );
     }
 
-    #[cfg(any(target_os = "windows", test))]
     pub(crate) fn open_windows_sandbox_fallback_prompt_with_legacy_compatibility(
         &mut self,
         preset: ApprovalPreset,
@@ -496,7 +457,6 @@ impl ChatWidget {
         });
     }
 
-    #[cfg(any(target_os = "windows", test))]
     pub(crate) fn open_windows_sandbox_legacy_unavailable_prompt(
         &mut self,
         preset: ApprovalPreset,
@@ -565,23 +525,6 @@ impl ChatWidget {
         });
     }
 
-    #[cfg(all(not(target_os = "windows"), not(test)))]
-    pub(crate) fn open_windows_sandbox_legacy_unavailable_prompt(
-        &mut self,
-        _preset: ApprovalPreset,
-        _profile_selection: Option<PermissionProfileSelection>,
-    ) {
-    }
-
-    #[cfg(all(not(target_os = "windows"), not(test)))]
-    pub(crate) fn open_windows_sandbox_fallback_prompt(
-        &mut self,
-        _preset: ApprovalPreset,
-        _profile_selection: Option<PermissionProfileSelection>,
-    ) {
-    }
-
-    #[cfg(target_os = "windows")]
     pub(crate) fn maybe_prompt_windows_sandbox_enable(&mut self, show_now: bool) {
         let windows_sandbox_level = crate::windows_sandbox::level_from_config(&self.config);
         let setup_is_required = windows_sandbox_level == WindowsSandboxLevel::Disabled
@@ -596,10 +539,6 @@ impl ChatWidget {
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
-    pub(crate) fn maybe_prompt_windows_sandbox_enable(&mut self, _show_now: bool) {}
-
-    #[cfg(target_os = "windows")]
     pub(crate) fn show_windows_sandbox_setup_status(&mut self) {
         // While elevated sandbox setup runs, prevent typing so the user doesn't
         // accidentally queue messages that will run under an unexpected mode.
@@ -619,18 +558,10 @@ impl ChatWidget {
         self.request_redraw();
     }
 
-    #[cfg(not(target_os = "windows"))]
-    #[allow(dead_code)]
-    pub(crate) fn show_windows_sandbox_setup_status(&mut self) {}
-
-    #[cfg(target_os = "windows")]
     pub(crate) fn clear_windows_sandbox_setup_status(&mut self) {
         self.bottom_pane
             .set_composer_input_enabled(/*enabled*/ true, /*placeholder*/ None);
         self.bottom_pane.hide_status_indicator();
         self.request_redraw();
     }
-
-    #[cfg(not(target_os = "windows"))]
-    pub(crate) fn clear_windows_sandbox_setup_status(&mut self) {}
 }

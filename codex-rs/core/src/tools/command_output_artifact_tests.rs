@@ -2,6 +2,23 @@ use super::*;
 
 #[tokio::test]
 #[serial_test::serial(command_output_artifact)]
+async fn reduced_output_notice_defers_recovery_syntax_to_the_tool_schema() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let artifact = create_raw_output_artifact(temp.path(), "thread", b"retained output").await;
+
+    let notice = artifact
+        .reduction_notice()
+        .expect("stored artifact reduction notice");
+
+    assert!(notice.contains("advertised read_tool_output schema"));
+    assert!(notice.contains(&artifact.artifact_id().expect("artifact ID").to_string()));
+    assert!(notice.contains("Do not rerun the producer"));
+    assert!(!notice.contains(r#""selectors""#));
+    assert!(!notice.contains(r#"{"artifact_id""#));
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn multi_selector_recovery_returns_several_omitted_sections_exactly() {
     let temp = tempfile::tempdir().expect("tempdir");
     let mut canonical = CanonicalToolResult::text("primary\ncaller\ntest\n");
@@ -70,14 +87,14 @@ async fn multi_selector_recovery_returns_several_omitted_sections_exactly() {
 
 #[tokio::test]
 #[serial_test::serial(command_output_artifact)]
-async fn receipt_reuse_completed_exact_recovery_avoids_reopening_the_artifact() {
+async fn exact_recovery_expires_when_the_artifact_is_deleted() {
     let temp = tempfile::tempdir().expect("tempdir");
     let canonical = CanonicalToolResult::text("one\ntwo\nthree\n");
     let artifact = create_canonical_output_artifact(temp.path(), "thread", &canonical).await;
     let artifact_id = artifact.artifact_id().expect("canonical artifact ID");
     let selectors = vec![ToolOutputSelector::Lines { start: 2, end: 3 }];
 
-    let first = read_tool_output_selectors(temp.path(), "thread", &artifact_id, selectors.clone())
+    read_tool_output_selectors(temp.path(), "thread", &artifact_id, selectors.clone())
         .await
         .expect("first exact recovery");
     std::fs::remove_file(
@@ -87,13 +104,12 @@ async fn receipt_reuse_completed_exact_recovery_avoids_reopening_the_artifact() 
     )
     .expect("remove artifact after its exact result is proved");
 
-    let (replayed, reused) =
+    let error =
         read_tool_output_selectors_with_reuse(temp.path(), "thread", &artifact_id, selectors)
             .await
-            .expect("replay exact recovery");
+            .expect_err("deleted artifact must invalidate exact recovery");
 
-    assert!(reused);
-    assert_eq!(replayed, first);
+    assert_eq!(error, ReadToolOutputError::Expired);
 }
 
 #[derive(Debug, Eq, PartialEq)]

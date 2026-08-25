@@ -58,7 +58,6 @@ def _write_fake_codex_package(package_dir: Path, script) -> Path:
     (package_dir / "codex-package.json").write_text('{"variant":"codex"}\n')
     (package_dir / "bin" / script.runtime_binary_name()).write_text("fake codex\n")
     (package_dir / "bin" / script.runtime_code_mode_host_name()).write_text("fake code mode host\n")
-    (package_dir / "codex-resources" / "bwrap").write_text("fake bwrap\n")
     (package_dir / "codex-path" / "rg").write_text("fake rg\n")
     return package_dir
 
@@ -315,25 +314,53 @@ def test_generate_types_wires_all_generation_steps() -> None:
                 calls.append(fn.id)
 
     assert calls == [
+        "prepare_generated_package",
         "generate_v2_all",
         "generate_notification_registry",
         "generate_public_api_flat_methods",
     ]
 
 
-def _load_runtime_schema_bundle(tmp_path: Path) -> dict:
-    """Ask the pinned runtime package for a real schema bundle used by tests."""
+def test_prepare_generated_package_removes_stale_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     script = _load_update_script_module()
-    schema_dir = script.generate_schema_from_pinned_runtime(tmp_path / "schema")
+    monkeypatch.setattr(script, "sdk_root", lambda: tmp_path)
+    generated_dir = tmp_path / "src" / "openai_codex" / "generated"
+    generated_dir.mkdir(parents=True)
+    (generated_dir / "abandoned.py").write_text("stale\n")
+
+    script.prepare_generated_package()
+
+    assert [path.name for path in generated_dir.iterdir()] == ["__init__.py"]
+    assert (generated_dir / "__init__.py").read_text() == script.GENERATED_PACKAGE_INIT
+
+
+def test_generate_types_uses_fork_local_schema(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    script = _load_update_script_module()
+    schema_dir = tmp_path / "schema"
+    generated_from: list[Path] = []
+    monkeypatch.setattr(script, "app_server_schema_dir", lambda: schema_dir)
+    monkeypatch.setattr(script, "generate_types_from_schema_dir", generated_from.append)
+
+    script.generate_types()
+
+    assert generated_from == [schema_dir]
+
+
+def _load_app_server_schema_bundle() -> dict:
+    """Load the fork-local app-server schema bundle used by SDK generation."""
+    script = _load_update_script_module()
+    schema_dir = script.app_server_schema_dir()
     return json.loads(script.schema_bundle_path(schema_dir).read_text())
 
 
-def test_schema_normalization_only_flattens_string_literal_oneofs(
-    tmp_path: Path,
-) -> None:
+def test_schema_normalization_only_flattens_string_literal_oneofs() -> None:
     """Schema normalization should only flatten the enum-shaped oneOf variants."""
     script = _load_update_script_module()
-    schema = _load_runtime_schema_bundle(tmp_path)
+    schema = _load_app_server_schema_bundle()
     definitions = schema["definitions"]
     flattened = [
         name
@@ -342,15 +369,16 @@ def test_schema_normalization_only_flattens_string_literal_oneofs(
     ]
 
     assert flattened == [
-        "MessagePhase",
-        "TurnItemsView",
         "AuthMode",
-        "PluginAvailability",
-        "InputModality",
-        "ExperimentalFeatureStage",
-        "ProcessOutputStream",
-        "CommandExecOutputStream",
         "AutoCompactTokenLimitScope",
+        "CommandExecOutputStream",
+        "ConsumeAccountRateLimitResetCreditOutcome",
+        "ExperimentalFeatureStage",
+        "InputModality",
+        "MessagePhase",
+        "PluginAvailability",
+        "ProcessOutputStream",
+        "TurnItemsView",
     ]
 
 
@@ -380,12 +408,10 @@ def test_schema_normalization_makes_chatgpt_account_email_nullable() -> None:
     assert "email" in chatgpt_account["required"]
 
 
-def test_python_codegen_schema_annotation_adds_stable_variant_titles(
-    tmp_path: Path,
-) -> None:
+def test_python_codegen_schema_annotation_adds_stable_variant_titles() -> None:
     """Schema annotations should give generated protocol classes stable names."""
     script = _load_update_script_module()
-    schema = _load_runtime_schema_bundle(tmp_path)
+    schema = _load_app_server_schema_bundle()
     script._annotate_schema(schema)
     definitions = schema["definitions"]
 
@@ -478,10 +504,10 @@ def test_source_sdk_template_pins_published_runtime() -> None:
         "dependencies": pyproject["project"]["dependencies"],
     } == {
         "sdk_template_version": "0.0.0-dev",
-        "runtime_pin": "0.137.0a4",
+        "runtime_pin": "0.149.0",
         "dependencies": [
             "pydantic>=2.12",
-            "openai-codex-cli-bin==0.137.0a4",
+            "openai-codex-cli-bin==0.149.0",
         ],
     }
 
@@ -541,6 +567,7 @@ def test_runtime_setup_reads_independent_runtime_pin_and_release_tags() -> None:
 
     assert {
         "package_name": runtime_setup.PACKAGE_NAME,
+        "release_repository": runtime_setup.REPO_SLUG,
         "sdk_template_version": pyproject["project"]["version"],
         "runtime_pin": runtime_setup.pinned_runtime_version(),
         "normalized_release_version": runtime_setup._normalized_package_version(
@@ -549,8 +576,9 @@ def test_runtime_setup_reads_independent_runtime_pin_and_release_tags() -> None:
         "release_tag": runtime_setup._release_tag("0.116.0a1"),
     } == {
         "package_name": "openai-codex-cli-bin",
+        "release_repository": "ikhdark/KD4",
         "sdk_template_version": "0.0.0-dev",
-        "runtime_pin": "0.137.0a4",
+        "runtime_pin": "0.149.0",
         "normalized_release_version": "0.116.0a1",
         "release_tag": "rust-v0.116.0-alpha.1",
     }
@@ -559,8 +587,7 @@ def test_runtime_setup_reads_independent_runtime_pin_and_release_tags() -> None:
 @pytest.mark.parametrize(
     ("system", "machine", "asset_name"),
     [
-        ("Darwin", "arm64", "codex-package-aarch64-apple-darwin.tar.gz"),
-        ("Linux", "x86_64", "codex-package-x86_64-unknown-linux-musl.tar.gz"),
+        ("Windows", "arm64", "codex-package-aarch64-pc-windows-msvc.tar.gz"),
         ("Windows", "AMD64", "codex-package-x86_64-pc-windows-msvc.tar.gz"),
     ],
 )
@@ -575,6 +602,35 @@ def test_runtime_setup_downloads_codex_package_archives(
     monkeypatch.setattr(runtime_setup.platform, "machine", lambda: machine)
 
     assert runtime_setup.platform_asset_name() == asset_name
+
+
+@pytest.mark.parametrize("system", ["Darwin", "Linux"])
+def test_runtime_setup_rejects_non_windows_hosts(
+    monkeypatch: pytest.MonkeyPatch,
+    system: str,
+) -> None:
+    runtime_setup = _load_runtime_setup_module()
+    monkeypatch.setattr(runtime_setup.platform, "system", lambda: system)
+    monkeypatch.setattr(runtime_setup.platform, "machine", lambda: "x86_64")
+
+    with pytest.raises(runtime_setup.RuntimeSetupError, match="Windows is required"):
+        runtime_setup.platform_asset_name()
+
+
+@pytest.mark.parametrize(
+    ("machine", "platform_tag"),
+    [("AMD64", "win_amd64"), ("arm64", "win_arm64")],
+)
+def test_runtime_setup_selects_windows_wheel_tag(
+    monkeypatch: pytest.MonkeyPatch,
+    machine: str,
+    platform_tag: str,
+) -> None:
+    runtime_setup = _load_runtime_setup_module()
+    monkeypatch.setattr(runtime_setup.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(runtime_setup.platform, "machine", lambda: machine)
+
+    assert runtime_setup.platform_wheel_tag() == platform_tag
 
 
 def test_runtime_package_is_wheel_only_and_builds_platform_specific_wheels() -> None:
@@ -642,6 +698,8 @@ def test_runtime_package_is_wheel_only_and_builds_platform_specific_wheels() -> 
         "infer_tag": False,
         "tag": "joined-string",
     }
+    assert 'WINDOWS_PLATFORM_TAGS = frozenset({"win_amd64", "win_arm64"})' in hook_source
+    assert "unsupported wheel platform tag" in hook_source
 
 
 def test_stage_runtime_release_copies_package_layout_and_sets_version(
@@ -661,13 +719,11 @@ def test_stage_runtime_release_copies_package_layout_and_sets_version(
         "metadata": (package_root / "codex-package.json").read_text(),
         "codex": (package_root / "bin" / script.runtime_binary_name()).read_text(),
         "code_mode_host": (package_root / "bin" / script.runtime_code_mode_host_name()).read_text(),
-        "bwrap": (package_root / "codex-resources" / "bwrap").read_text(),
         "rg": (package_root / "codex-path" / "rg").read_text(),
     } == {
         "metadata": '{"variant":"codex"}\n',
         "codex": "fake codex\n",
         "code_mode_host": "fake code mode host\n",
-        "bwrap": "fake bwrap\n",
         "rg": "fake rg\n",
     }
     assert 'name = "openai-codex-cli-bin"' in (staged / "pyproject.toml").read_text()
@@ -711,11 +767,11 @@ def test_stage_runtime_release_can_pin_wheel_platform_tag(tmp_path: Path) -> Non
         tmp_path / "runtime-stage",
         "0.116.0a1",
         package_archive,
-        platform_tag="manylinux_2_17_x86_64",
+        platform_tag="win_amd64",
     )
 
     pyproject = (staged / "pyproject.toml").read_text()
-    assert 'platform-tag = "manylinux_2_17_x86_64"' in pyproject
+    assert 'platform-tag = "win_amd64"' in pyproject
 
 
 def test_stage_runtime_release_rejects_incomplete_package_layout(tmp_path: Path) -> None:
@@ -785,11 +841,12 @@ def test_runtime_package_layout_is_included_by_wheel_config(
     ]
 
 
-def test_stage_sdk_release_preserves_reviewed_runtime_pin(tmp_path: Path) -> None:
+def test_stage_sdk_release_pins_matching_runtime_version(tmp_path: Path) -> None:
     script = _load_update_script_module()
     staged = script.stage_python_sdk_package(
         tmp_path / "sdk-stage",
         "0.1.0b1",
+        "rust-v1.2.3",
     )
 
     pyproject = tomllib.loads((staged / "pyproject.toml").read_text())
@@ -802,7 +859,7 @@ def test_stage_sdk_release_preserves_reviewed_runtime_pin(tmp_path: Path) -> Non
         "version": "0.1.0b1",
         "dependencies": [
             "pydantic>=2.12",
-            "openai-codex-cli-bin==0.137.0a4",
+            "openai-codex-cli-bin==1.2.3",
         ],
     }
     assert (
@@ -823,7 +880,7 @@ def test_stage_sdk_release_replaces_existing_staging_dir(tmp_path: Path) -> None
     old_file.parent.mkdir(parents=True)
     old_file.write_text("stale")
 
-    staged = script.stage_python_sdk_package(staging_dir, "0.1.0b1")
+    staged = script.stage_python_sdk_package(staging_dir, "0.1.0b1", "1.2.3")
 
     assert staged == staging_dir
     assert not old_file.exists()
@@ -836,10 +893,11 @@ def test_sdk_beta_release_can_pin_stable_runtime(tmp_path: Path) -> None:
     sdk_stage = script.stage_python_sdk_package(
         tmp_path / "sdk-stage",
         "0.1.0b1",
+        "1.2.3",
     )
     runtime_stage = script.stage_python_runtime_package(
         tmp_path / "runtime-stage",
-        "0.137.0a4",
+        "1.2.3",
         package_archive,
     )
 
@@ -852,10 +910,10 @@ def test_sdk_beta_release_can_pin_stable_runtime(tmp_path: Path) -> None:
         "sdk_dependencies": sdk_pyproject["project"]["dependencies"],
     } == {
         "sdk_version": "0.1.0b1",
-        "runtime_version": "0.137.0a4",
+        "runtime_version": "1.2.3",
         "sdk_dependencies": [
             "pydantic>=2.12",
-            "openai-codex-cli-bin==0.137.0a4",
+            "openai-codex-cli-bin==1.2.3",
         ],
     }
 
@@ -869,14 +927,16 @@ def test_stage_sdk_runs_type_generation_before_staging(tmp_path: Path) -> None:
             str(tmp_path / "sdk-stage"),
             "--sdk-version",
             "0.1.0b1",
+            "--codex-version",
+            "rust-v1.2.3",
         ]
     )
 
     def fake_generate_types() -> None:
         calls.append("generate_types")
 
-    def fake_stage_sdk_package(_staging_dir: Path, sdk_version: str) -> Path:
-        calls.append(f"stage_sdk:{sdk_version}")
+    def fake_stage_sdk_package(_staging_dir: Path, sdk_version: str, runtime_version: str) -> Path:
+        calls.append(f"stage_sdk:{sdk_version}:{runtime_version}")
         return tmp_path / "sdk-stage"
 
     def fake_stage_runtime_package(
@@ -899,7 +959,7 @@ def test_stage_sdk_runs_type_generation_before_staging(tmp_path: Path) -> None:
 
     script.run_command(args, ops)
 
-    assert calls == ["generate_types", "stage_sdk:0.1.0b1"]
+    assert calls == ["generate_types", "stage_sdk:0.1.0b1:1.2.3"]
 
 
 def test_stage_runtime_stages_package_without_type_generation(tmp_path: Path) -> None:
@@ -914,14 +974,18 @@ def test_stage_runtime_stages_package_without_type_generation(tmp_path: Path) ->
             "--codex-version",
             "rust-v0.116.0-alpha.1",
             "--platform-tag",
-            "manylinux_2_17_x86_64",
+            "win_amd64",
         ]
     )
 
     def fake_generate_types() -> None:
         calls.append("generate_types")
 
-    def fake_stage_sdk_package(_staging_dir: Path, _codex_version: str) -> Path:
+    def fake_stage_sdk_package(
+        _staging_dir: Path,
+        _sdk_version: str,
+        _runtime_version: str,
+    ) -> Path:
         raise AssertionError("sdk staging should not run for stage-runtime")
 
     def fake_stage_runtime_package(
@@ -945,7 +1009,7 @@ def test_stage_runtime_stages_package_without_type_generation(tmp_path: Path) ->
 
     script.run_command(args, ops)
 
-    assert calls == ["stage_runtime:0.116.0a1:manylinux_2_17_x86_64:codex-package.tar.gz"]
+    assert calls == ["stage_runtime:0.116.0a1:win_amd64:codex-package.tar.gz"]
 
 
 def test_default_runtime_is_resolved_from_installed_runtime_package(
@@ -953,7 +1017,7 @@ def test_default_runtime_is_resolved_from_installed_runtime_package(
 ) -> None:
     from openai_codex import client as client_module
 
-    fake_binary = tmp_path / ("codex.exe" if client_module.os.name == "nt" else "codex")
+    fake_binary = tmp_path / "codex.exe"
     fake_binary.write_text("")
     ops = client_module.CodexBinResolverOps(
         installed_codex_path=lambda: fake_binary,
@@ -969,11 +1033,11 @@ def test_runtime_path_dir_is_prepended_without_duplicates(tmp_path: Path) -> Non
     from openai_codex import client as client_module
 
     path_dir = tmp_path / "codex-path"
-    env = {"PATH": os.pathsep.join(["/usr/bin", str(path_dir), "/bin"])}
+    env = {"Path": os.pathsep.join([r"C:\Tools", str(path_dir), r"C:\Windows"])}
 
     client_module._prepend_path_dirs(env, (path_dir,))
 
-    assert env["PATH"] == os.pathsep.join([str(path_dir), "/usr/bin", "/bin"])
+    assert env["Path"] == os.pathsep.join([str(path_dir), r"C:\Tools", r"C:\Windows"])
 
 
 def test_runtime_path_dir_preserves_windows_path_key(
@@ -985,7 +1049,7 @@ def test_runtime_path_dir_preserves_windows_path_key(
     path_dir = tmp_path / "codex-path"
     monkeypatch.setattr(client_module.os, "name", "nt")
     env = {
-        "PATH": "/usr/bin",
+        "PATH": r"C:\Tools",
         "Path": os.pathsep.join(["C\\Windows", str(path_dir)]),
     }
 
@@ -997,9 +1061,7 @@ def test_runtime_path_dir_preserves_windows_path_key(
 def test_explicit_codex_bin_override_takes_priority(tmp_path: Path) -> None:
     from openai_codex import client as client_module
 
-    explicit_binary = tmp_path / (
-        "custom-codex.exe" if client_module.os.name == "nt" else "custom-codex"
-    )
+    explicit_binary = tmp_path / "custom-codex.exe"
     explicit_binary.write_text("")
     ops = client_module.CodexBinResolverOps(
         installed_codex_path=lambda: (_ for _ in ()).throw(

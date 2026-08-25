@@ -407,6 +407,24 @@ impl<C> ToolContributor for GoalExtension<C>
 where
     C: Send + Sync + 'static,
 {
+    fn surface_revision(
+        &self,
+        _session_store: &ExtensionData,
+        thread_store: &ExtensionData,
+    ) -> u64 {
+        let Some(runtime) = goal_runtime_handle(thread_store) else {
+            return 0;
+        };
+        if !runtime.tools_visible() {
+            return 0;
+        }
+        if runtime.accounting_state().has_active_goal() {
+            2
+        } else {
+            1
+        }
+    }
+
     fn tools(
         &self,
         _session_store: &ExtensionData,

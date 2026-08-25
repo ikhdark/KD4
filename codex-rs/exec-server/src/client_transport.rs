@@ -2,12 +2,14 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use codex_http_client::BuildCustomCaTransportError;
+use codex_http_client::maybe_build_rustls_client_config_with_custom_ca;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
 use tokio::process::Command;
 use tokio::time::timeout;
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::connect_async_with_config;
+use tokio_tungstenite::Connector;
+use tokio_tungstenite::connect_async_tls_with_config;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tracing::debug;
 use tracing::warn;
@@ -191,16 +193,30 @@ impl ExecServerClient {
         ensure_rustls_crypto_provider();
         let websocket_url = args.websocket_url.clone();
         let connect_timeout = args.connect_timeout;
-        let (stream, _) = timeout(connect_timeout, connect_async(websocket_url.as_str()))
-            .await
-            .map_err(|_| ExecServerError::WebSocketConnectTimeout {
+        let connector = websocket_connector_with_custom_ca().map_err(|error| {
+            ExecServerError::WebSocketConnect {
                 url: websocket_url.clone(),
-                timeout: connect_timeout,
-            })?
-            .map_err(|source| ExecServerError::WebSocketConnect {
-                url: websocket_url.clone(),
-                source,
-            })?;
+                source: tokio_tungstenite::tungstenite::Error::Io(error.into()),
+            }
+        })?;
+        let (stream, _) = timeout(
+            connect_timeout,
+            connect_async_tls_with_config(
+                websocket_url.as_str(),
+                /*config*/ None,
+                /*disable_nagle*/ false,
+                connector,
+            ),
+        )
+        .await
+        .map_err(|_| ExecServerError::WebSocketConnectTimeout {
+            url: websocket_url.clone(),
+            timeout: connect_timeout,
+        })?
+        .map_err(|source| ExecServerError::WebSocketConnect {
+            url: websocket_url.clone(),
+            source,
+        })?;
 
         let connection_label = format!("exec-server websocket {websocket_url}");
         let connection = if is_rendezvous_harness_url(&websocket_url) {
@@ -259,6 +275,12 @@ impl ExecServerClient {
             .next()
             .unwrap_or(websocket_url.as_str())
             .to_string();
+        let connector = websocket_connector_with_custom_ca().map_err(|error| {
+            ExecServerError::WebSocketConnect {
+                url: diagnostic_url.clone(),
+                source: tokio_tungstenite::tungstenite::Error::Io(error.into()),
+            }
+        })?;
         let mut request = websocket_url
             .as_str()
             .into_client_request()
@@ -271,12 +293,13 @@ impl ExecServerClient {
             .extend(current_trace_context_headers());
         let (stream, _) = timeout(
             connect_timeout,
-            connect_async_with_config(
+            connect_async_tls_with_config(
                 request,
                 Some(noise_relay_websocket_config()),
                 // Rendezvous sends small, latency-sensitive frames, so avoid Nagle's coalescing delay.
                 /*disable_nagle*/
                 true,
+                connector,
             ),
         )
         .await
@@ -352,6 +375,11 @@ impl ExecServerClient {
     }
 }
 
+pub(crate) fn websocket_connector_with_custom_ca()
+-> Result<Option<Connector>, BuildCustomCaTransportError> {
+    maybe_build_rustls_client_config_with_custom_ca().map(|config| config.map(Connector::Rustls))
+}
+
 fn is_rendezvous_harness_url(websocket_url: &str) -> bool {
     let Some((_path, query)) = websocket_url.split_once('?') else {
         return false;
@@ -369,8 +397,7 @@ fn stdio_command_process(stdio_command: &StdioExecServerCommand) -> Command {
     if let Some(cwd) = &stdio_command.cwd {
         command.current_dir(cwd);
     }
-    #[cfg(unix)]
-    command.process_group(0);
+
     command
 }
 

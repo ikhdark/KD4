@@ -117,7 +117,6 @@ impl ChatWidget {
             has_codex_backend_auth,
             model_catalog,
             session_telemetry,
-            session_header: SessionHeader::new(header_model),
             initial_user_message,
             status_account_display,
             runtime_model_provider_base_url,
@@ -207,8 +206,6 @@ impl ChatWidget {
             suppress_session_configured_redraw: false,
             suppress_initial_user_message_submit: false,
             pending_notification: None,
-            quit_shortcut_expires_at: None,
-            quit_shortcut_key: None,
             turn_runtime_metrics: RuntimeMetricsSummary::default(),
             last_rendered_width: std::cell::Cell::new(None),
             feedback,
@@ -263,7 +260,7 @@ impl ChatWidget {
         widget
             .bottom_pane
             .set_queued_message_edit_binding(widget.queued_message_edit_hint_binding);
-        #[cfg(target_os = "windows")]
+
         widget
             .bottom_pane
             .set_windows_degraded_sandbox_active(matches!(

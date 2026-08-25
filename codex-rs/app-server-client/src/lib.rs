@@ -16,13 +16,13 @@
 
 mod path;
 mod remote;
+mod thread_lifecycle;
 
 use std::error::Error;
 use std::fmt;
 use std::io::Error as IoError;
 use std::io::ErrorKind;
 use std::io::Result as IoResult;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,20 +41,19 @@ use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::Result as JsonRpcResult;
+use codex_app_server_protocol::ServerBuildInfo;
+use codex_app_server_protocol::ServerCapabilities;
+use codex_app_server_protocol::ServerLocalWatermark;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
+use codex_app_server_protocol::ServerRuntimeWarning;
 use codex_app_server_protocol::server_notification_requires_delivery;
 use codex_arg0::Arg0DispatchPaths;
 use codex_config::CloudConfigBundleLoader;
 use codex_config::LoaderOverrides;
-use codex_config::NoopThreadConfigLoader;
-use codex_config::RemoteThreadConfigLoader;
-use codex_config::ThreadConfigLoader;
-use codex_config::config_toml::ConfigToml;
+use codex_config::thread_config_loader_for_endpoint;
 use codex_core::config::Config;
 pub use codex_core::otel_init::build_provider as build_otel_provider;
-use codex_core::personality_migration::PersonalityMigrationStatus;
-use codex_core::personality_migration::maybe_migrate_personality;
 pub use codex_exec_server::EnvironmentManager;
 pub use codex_exec_server::ExecServerRuntimePaths;
 use codex_feedback::CodexFeedback;
@@ -71,6 +70,11 @@ pub use crate::path::AppServerPath;
 pub use crate::remote::RemoteAppServerClient;
 pub use crate::remote::RemoteAppServerConnectArgs;
 pub use crate::remote::RemoteAppServerEndpoint;
+pub use crate::thread_lifecycle::ThreadLifecycleOverrides;
+pub use crate::thread_lifecycle::thread_config_overrides_from_config;
+pub use crate::thread_lifecycle::thread_fork_params_from_config;
+pub use crate::thread_lifecycle::thread_resume_params_from_config;
+pub use crate::thread_lifecycle::thread_start_params_from_config;
 
 /// Transitional access to core-only embedded app-server types.
 ///
@@ -89,29 +93,116 @@ pub mod legacy_core {
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Runs the embedded app-server personality migration.
-///
-/// Returns `true` when the migration changed config and the caller should reload it.
-pub async fn migrate_personality_if_needed(
-    codex_home: &Path,
-    config_toml: &ConfigToml,
-    state_db: Option<StateDbHandle>,
-) -> IoResult<bool> {
-    let status = maybe_migrate_personality(codex_home, config_toml, state_db).await?;
-    match status {
-        PersonalityMigrationStatus::Applied => Ok(true),
-        PersonalityMigrationStatus::SkippedMarker
-        | PersonalityMigrationStatus::SkippedExplicitPersonality
-        | PersonalityMigrationStatus::SkippedNoSessions => Ok(false),
-    }
-}
-
 /// Raw app-server request result for typed in-process requests.
 ///
 /// Even on the in-process path, successful responses still travel back through
 /// the same JSON-RPC result envelope used by socket/stdio transports because
 /// `MessageProcessor` continues to produce that shape internally.
 pub type RequestResult = std::result::Result<JsonRpcResult, JSONRPCErrorError>;
+
+/// Initialize metadata retained uniformly by embedded and remote transports.
+///
+/// The raw result remains available because remote paths may use a different
+/// platform's absolute-path syntax, which cannot be safely deserialized into
+/// this process's platform-specific path type.
+#[derive(Debug, Clone)]
+pub struct AppServerInitializeResponse {
+    raw: JsonRpcResult,
+    user_agent: Option<String>,
+    codex_home: Option<String>,
+    build_info: Option<ServerBuildInfo>,
+    runtime_warnings: Vec<ServerRuntimeWarning>,
+    server_capabilities: Option<ServerCapabilities>,
+    local_watermark: Option<ServerLocalWatermark>,
+}
+
+impl AppServerInitializeResponse {
+    pub(crate) fn from_json(raw: JsonRpcResult) -> Self {
+        let user_agent = raw
+            .get("userAgent")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let codex_home = raw
+            .get("codexHome")
+            .and_then(serde_json::Value::as_str)
+            .filter(|codex_home| !codex_home.is_empty())
+            .map(str::to_string);
+        let build_info = raw
+            .get("buildInfo")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok());
+        let runtime_warnings = raw
+            .pointer("/runtimeInfo/warnings")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
+        let server_capabilities = raw
+            .get("serverCapabilities")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok());
+        let local_watermark = raw
+            .get("localWatermark")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok());
+
+        Self {
+            raw,
+            user_agent,
+            codex_home,
+            build_info,
+            runtime_warnings,
+            server_capabilities,
+            local_watermark,
+        }
+    }
+
+    pub fn raw(&self) -> &JsonRpcResult {
+        &self.raw
+    }
+
+    pub fn user_agent(&self) -> Option<&str> {
+        self.user_agent.as_deref()
+    }
+
+    pub fn server_version(&self) -> Option<&str> {
+        let (_, rest) = self.user_agent()?.split_once('/')?;
+        rest.split_whitespace().next()
+    }
+
+    pub fn codex_home(&self) -> Option<&str> {
+        self.codex_home.as_deref()
+    }
+
+    pub fn build_info(&self) -> Option<&ServerBuildInfo> {
+        self.build_info.as_ref()
+    }
+
+    pub fn runtime_info(&self) -> Option<&serde_json::Value> {
+        self.raw.get("runtimeInfo")
+    }
+
+    pub fn runtime_warnings(&self) -> &[ServerRuntimeWarning] {
+        &self.runtime_warnings
+    }
+
+    pub fn server_capabilities(&self) -> Option<&ServerCapabilities> {
+        self.server_capabilities.as_ref()
+    }
+
+    pub fn local_watermark(&self) -> Option<&ServerLocalWatermark> {
+        self.local_watermark.as_ref()
+    }
+}
+
+pub fn format_runtime_warning(warning: &ServerRuntimeWarning) -> String {
+    match warning.action.as_deref() {
+        Some(action) => format!(
+            "App-server warning [{}]: {}\nSuggested action: {action}",
+            warning.code, warning.message
+        ),
+        None => format!("App-server warning [{}]: {}", warning.code, warning.message),
+    }
+}
 
 #[derive(Debug, Clone)]
 // Keep the client event API aligned across remote and in-process transports.
@@ -297,6 +388,16 @@ impl Error for TypedRequestError {
     }
 }
 
+impl TypedRequestError {
+    /// Returns the server's structured JSON-RPC error when this request reached the server.
+    pub fn server_error(&self) -> Option<&JSONRPCErrorError> {
+        match self {
+            Self::Server { source, .. } => Some(source),
+            Self::Transport { .. } | Self::Deserialize { .. } => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct InProcessClientStartArgs {
     /// Resolved argv0 dispatch paths used by command execution internals.
@@ -319,7 +420,10 @@ pub struct InProcessClientStartArgs {
     pub state_db: Option<StateDbHandle>,
     /// Environment manager used by core execution and filesystem operations.
     pub environment_manager: Arc<EnvironmentManager>,
-    /// Startup warnings emitted after initialize succeeds.
+    /// Additional startup warnings emitted after initialize succeeds.
+    ///
+    /// Warnings already present on [`Config::startup_warnings`] are added by
+    /// the client so embedders do not need to register them independently.
     pub config_warnings: Vec<ConfigWarningNotification>,
     /// Session source recorded in app-server thread metadata.
     pub session_source: SessionSource,
@@ -339,41 +443,66 @@ pub struct InProcessClientStartArgs {
     pub channel_capacity: usize,
 }
 
-fn configured_thread_config_loader(config: &Config) -> Arc<dyn ThreadConfigLoader> {
-    match config.experimental_thread_config_endpoint.as_deref() {
-        Some(endpoint) => Arc::new(RemoteThreadConfigLoader::new(endpoint)),
-        None => Arc::new(NoopThreadConfigLoader),
+fn runtime_config_warnings(
+    config: &Config,
+    additional_warnings: Vec<ConfigWarningNotification>,
+) -> Vec<ConfigWarningNotification> {
+    let mut warnings = config
+        .startup_warnings
+        .iter()
+        .map(|warning| ConfigWarningNotification {
+            summary: warning.clone(),
+            details: None,
+            path: None,
+            range: None,
+        })
+        .collect::<Vec<_>>();
+    warnings.extend(additional_warnings);
+    warnings
+}
+
+fn initialize_params(
+    client_name: &str,
+    client_version: &str,
+    experimental_api: bool,
+    mcp_server_openai_form_elicitation: bool,
+    opt_out_notification_methods: &[String],
+) -> InitializeParams {
+    InitializeParams {
+        client_info: ClientInfo {
+            name: client_name.to_string(),
+            title: None,
+            version: client_version.to_string(),
+        },
+        capabilities: Some(InitializeCapabilities {
+            experimental_api,
+            request_attestation: false,
+            desktop_activation_receipts: false,
+            opt_out_notification_methods: (!opt_out_notification_methods.is_empty())
+                .then(|| opt_out_notification_methods.to_vec()),
+            mcp_server_openai_form_elicitation,
+        }),
     }
 }
 
 impl InProcessClientStartArgs {
     /// Builds initialize params from caller-provided metadata.
     pub fn initialize_params(&self) -> InitializeParams {
-        let capabilities = InitializeCapabilities {
-            experimental_api: self.experimental_api,
-            request_attestation: false,
-            desktop_activation_receipts: false,
-            opt_out_notification_methods: if self.opt_out_notification_methods.is_empty() {
-                None
-            } else {
-                Some(self.opt_out_notification_methods.clone())
-            },
-            mcp_server_openai_form_elicitation: self.mcp_server_openai_form_elicitation,
-        };
-
-        InitializeParams {
-            client_info: ClientInfo {
-                name: self.client_name.clone(),
-                title: None,
-                version: self.client_version.clone(),
-            },
-            capabilities: Some(capabilities),
-        }
+        initialize_params(
+            &self.client_name,
+            &self.client_version,
+            self.experimental_api,
+            self.mcp_server_openai_form_elicitation,
+            &self.opt_out_notification_methods,
+        )
     }
 
     fn into_runtime_start_args(self) -> InProcessStartArgs {
         let initialize = self.initialize_params();
-        let thread_config_loader = configured_thread_config_loader(&self.config);
+        let thread_config_loader = thread_config_loader_for_endpoint(
+            self.config.experimental_thread_config_endpoint.as_deref(),
+        );
+        let config_warnings = runtime_config_warnings(&self.config, self.config_warnings);
         InProcessStartArgs {
             arg0_paths: self.arg0_paths,
             config: self.config,
@@ -386,7 +515,7 @@ impl InProcessClientStartArgs {
             log_db: self.log_db,
             state_db: self.state_db,
             environment_manager: self.environment_manager,
-            config_warnings: self.config_warnings,
+            config_warnings,
             session_source: self.session_source,
             enable_codex_api_key_env: self.enable_codex_api_key_env,
             initialize,
@@ -448,6 +577,7 @@ impl ClientCommand {
 pub struct InProcessAppServerClient {
     command_tx: mpsc::Sender<ClientCommand>,
     event_rx: mpsc::Receiver<InProcessServerEvent>,
+    initialize_response: AppServerInitializeResponse,
     worker_handle: tokio::task::JoinHandle<()>,
 }
 
@@ -477,6 +607,11 @@ impl InProcessAppServerClient {
         let channel_capacity = args.channel_capacity.max(1);
         let mut handle =
             codex_app_server::in_process::start(args.into_runtime_start_args()).await?;
+        let initialize_response = handle
+            .initialize_response()
+            .cloned()
+            .map(AppServerInitializeResponse::from_json)
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "missing initialize response"))?;
         let request_sender = handle.sender();
         let (command_tx, mut command_rx) = mpsc::channel::<ClientCommand>(channel_capacity);
         let (event_tx, event_rx) = mpsc::channel::<InProcessServerEvent>(channel_capacity);
@@ -565,12 +700,10 @@ impl InProcessAppServerClient {
                             |request| {
                                 let _ = request_sender.fail_server_request(
                                     request.id().clone(),
-                                    JSONRPCErrorError {
-                                        code: -32001,
-                                        message: "in-process app-server event queue is full"
-                                            .to_string(),
-                                        data: None,
-                                    },
+                                    codex_app_server_protocol::overloaded_error(
+                                        codex_app_server_protocol::OverloadReason::InProcessAppServerEventQueue,
+                                        "in-process app-server event queue is full",
+                                    ),
                                 );
                             },
                         )
@@ -589,8 +722,13 @@ impl InProcessAppServerClient {
         Ok(Self {
             command_tx,
             event_rx,
+            initialize_response,
             worker_handle,
         })
+    }
+
+    pub fn initialize_response(&self) -> &AppServerInitializeResponse {
+        &self.initialize_response
     }
 
     pub fn request_handle(&self) -> InProcessAppServerRequestHandle {
@@ -604,25 +742,7 @@ impl InProcessAppServerClient {
     /// Callers that expect a concrete response type should usually prefer
     /// [`request_typed`](Self::request_typed).
     pub async fn request(&self, request: ClientRequest) -> IoResult<RequestResult> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.command_tx
-            .send(ClientCommand::Request {
-                request: Box::new(request),
-                response_tx,
-            })
-            .await
-            .map_err(|_| {
-                IoError::new(
-                    ErrorKind::BrokenPipe,
-                    "in-process app-server worker channel is closed",
-                )
-            })?;
-        response_rx.await.map_err(|_| {
-            IoError::new(
-                ErrorKind::BrokenPipe,
-                "in-process app-server request channel is closed",
-            )
-        })?
+        self.request_handle().request(request).await
     }
 
     /// Sends a typed client request and decodes the successful response body.
@@ -635,20 +755,7 @@ impl InProcessAppServerClient {
     where
         T: DeserializeOwned,
     {
-        let method = request.method_name().to_string();
-        let response =
-            self.request(request)
-                .await
-                .map_err(|source| TypedRequestError::Transport {
-                    method: method.clone(),
-                    source,
-                })?;
-        let result = response.map_err(|source| TypedRequestError::Server {
-            method: method.clone(),
-            source,
-        })?;
-        serde_json::from_value(result)
-            .map_err(|source| TypedRequestError::Deserialize { method, source })
+        self.request_handle().request_typed(request).await
     }
 
     /// Sends a typed client notification.
@@ -750,6 +857,7 @@ impl InProcessAppServerClient {
         let Self {
             command_tx,
             event_rx,
+            initialize_response: _initialize_response,
             worker_handle,
         } = self;
         let mut worker_handle = worker_handle;
@@ -845,6 +953,13 @@ impl AppServerRequestHandle {
 }
 
 impl AppServerClient {
+    pub fn initialize_response(&self) -> &AppServerInitializeResponse {
+        match self {
+            Self::InProcess(client) => client.initialize_response(),
+            Self::Remote(client) => client.initialize_response(),
+        }
+    }
+
     pub fn codex_home(&self, local_codex_home: &AbsolutePathBuf) -> Option<AppServerPath> {
         match self {
             Self::InProcess(_) => Some(AppServerPath::from_app_server(
@@ -855,20 +970,14 @@ impl AppServerClient {
     }
 
     pub async fn request(&self, request: ClientRequest) -> IoResult<RequestResult> {
-        match self {
-            Self::InProcess(client) => client.request(request).await,
-            Self::Remote(client) => client.request(request).await,
-        }
+        self.request_handle().request(request).await
     }
 
     pub async fn request_typed<T>(&self, request: ClientRequest) -> Result<T, TypedRequestError>
     where
         T: DeserializeOwned,
     {
-        match self {
-            Self::InProcess(client) => client.request_typed(request).await,
-            Self::Remote(client) => client.request_typed(request).await,
-        }
+        self.request_handle().request_typed(request).await
     }
 
     pub async fn notify(&self, notification: ClientNotification) -> IoResult<()> {
@@ -957,6 +1066,44 @@ mod tests {
     use tokio_tungstenite::tungstenite::handshake::server::Response as WebSocketResponse;
     use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 
+    #[test]
+    fn retired_personality_migration_wrapper_is_removed() {
+        let source = include_str!("lib.rs");
+        let wrapper_name = ["migrate_personality_", "if_needed"].concat();
+
+        assert!(!source.contains(&format!("fn {wrapper_name}")));
+    }
+
+    #[test]
+    fn client_request_surfaces_delegate_to_request_handles() {
+        let source = include_str!("lib.rs");
+        let in_process_client_impl = source
+            .split_once("impl InProcessAppServerClient {")
+            .expect("in-process client implementation should exist")
+            .1
+            .split_once("impl InProcessAppServerRequestHandle {")
+            .expect("request handle implementation should follow client implementation")
+            .0;
+        let app_server_client_impl = source
+            .split_once("impl AppServerClient {")
+            .expect("app-server client implementation should exist")
+            .1
+            .split_once("#[cfg(test)]")
+            .expect("tests should follow app-server client implementation")
+            .0;
+
+        for client_impl in [in_process_client_impl, app_server_client_impl] {
+            assert!(
+                client_impl.contains("self.request_handle().request(request).await"),
+                "raw requests should delegate to the canonical request handle"
+            );
+            assert!(
+                client_impl.contains("self.request_handle().request_typed(request).await"),
+                "typed requests should delegate to the canonical request handle"
+            );
+        }
+    }
+
     async fn build_test_config() -> Config {
         match ConfigBuilder::default().build().await {
             Ok(config) => config,
@@ -964,6 +1111,53 @@ mod tests {
                 .await
                 .expect("default config should load"),
         }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_builders_share_config_mapping_and_preserve_resume_reviewer() {
+        let mut config = build_test_config().await;
+        config.bypass_hook_trust = true;
+        config.service_tier = Some("fast".to_string());
+        let overrides = ThreadLifecycleOverrides {
+            model_provider: Some(config.model_provider_id.clone()),
+            cwd: Some(config.cwd.to_string_lossy().to_string()),
+            permissions: None,
+            developer_instructions: Some("developer override".to_string()),
+            exclude_turns: true,
+        };
+
+        let start = thread_start_params_from_config(&config, overrides.clone(), None);
+        let resume = thread_resume_params_from_config(
+            &config,
+            "thread-id".to_string(),
+            overrides.clone(),
+            /*approvals_reviewer_override*/ None,
+        );
+        let fork = thread_fork_params_from_config(&config, "thread-id".to_string(), overrides);
+
+        assert_eq!(start.config, resume.config);
+        assert_eq!(resume.config, fork.config);
+        assert_eq!(
+            start
+                .config
+                .as_ref()
+                .and_then(|overrides| overrides.get("bypass_hook_trust")),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(start.service_tier, Some(Some("fast".to_string())));
+        assert_eq!(start.service_tier, resume.service_tier);
+        assert_eq!(resume.service_tier, fork.service_tier);
+        assert_eq!(
+            start.approvals_reviewer,
+            Some(config.approvals_reviewer.into())
+        );
+        assert_eq!(resume.approvals_reviewer, None);
+        assert_eq!(
+            fork.approvals_reviewer,
+            Some(config.approvals_reviewer.into())
+        );
+        assert!(resume.exclude_turns);
+        assert!(fork.exclude_turns);
     }
 
     #[test]
@@ -1124,6 +1318,33 @@ mod tests {
                 result: serde_json::json!({
                     "userAgent": "codex_cli_rs/9.8.7-test (Test OS; x86_64) rust",
                     "codexHome": "/server/.codex",
+                    "platformFamily": "unix",
+                    "platformOs": "linux",
+                    "buildInfo": {
+                        "version": "9.8.7-test",
+                        "commit": "abc123",
+                        "dirty": "false",
+                        "profile": "release",
+                        "built": "2026-08-24T00:00:00Z"
+                    },
+                    "runtimeInfo": {
+                        "executablePath": "/server/bin/codex",
+                        "installMethod": "npm",
+                        "packageLayout": null,
+                        "expectedLocalBinaryPath": "/server/local/codex",
+                        "localBinaryMatch": false,
+                        "warnings": [{
+                            "code": "localBinaryMismatch",
+                            "message": "Desktop is using a stale local binary.",
+                            "action": "restartCodexDesktop"
+                        }]
+                    },
+                    "serverCapabilities": { "enabledFeatures": ["testFeature"] },
+                    "localWatermark": {
+                        "version": "9.8.7-test",
+                        "label": "local build",
+                        "detail": "test watermark"
+                    }
                 }),
             }),
         )
@@ -1268,6 +1489,43 @@ mod tests {
                 .capabilities
                 .expect("initialize capabilities")
                 .mcp_server_openai_form_elicitation
+        );
+    }
+
+    #[tokio::test]
+    async fn in_process_initialize_metadata_is_retained() {
+        let client = start_test_client(SessionSource::Exec).await;
+        let initialize = client.initialize_response();
+
+        assert_eq!(
+            initialize.user_agent(),
+            initialize
+                .raw()
+                .get("userAgent")
+                .and_then(serde_json::Value::as_str)
+        );
+        assert!(initialize.build_info().is_some());
+        assert!(initialize.runtime_info().is_some());
+        assert!(initialize.server_capabilities().is_some());
+        assert!(initialize.local_watermark().is_some());
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[test]
+    fn runtime_warning_formatter_consumes_code_message_and_action() {
+        let warning = ServerRuntimeWarning {
+            code: "localBinaryMismatch".to_string(),
+            message: "Desktop is using a stale local binary.".to_string(),
+            action: Some("restartCodexDesktop".to_string()),
+        };
+
+        assert_eq!(
+            format_runtime_warning(&warning),
+            concat!(
+                "App-server warning [localBinaryMismatch]: Desktop is using a stale local binary.\n",
+                "Suggested action: restartCodexDesktop"
+            )
         );
     }
 
@@ -1506,6 +1764,37 @@ mod tests {
 
         assert_eq!(client.server_version(), Some("9.8.7-test"));
         assert_eq!(client.codex_home(), Some("/server/.codex"));
+        let initialize = client.initialize_response();
+        assert_eq!(
+            initialize.build_info().map(|info| info.commit.as_str()),
+            Some("abc123")
+        );
+        assert_eq!(
+            initialize
+                .runtime_warnings()
+                .first()
+                .and_then(|warning| warning.action.as_deref()),
+            Some("restartCodexDesktop")
+        );
+        assert_eq!(
+            initialize
+                .server_capabilities()
+                .map(|capabilities| capabilities.enabled_features.as_slice()),
+            Some(["testFeature".to_string()].as_slice())
+        );
+        assert_eq!(
+            initialize
+                .local_watermark()
+                .map(|watermark| watermark.label.as_str()),
+            Some("local build")
+        );
+        assert_eq!(
+            initialize
+                .runtime_info()
+                .and_then(|runtime| runtime.get("executablePath"))
+                .and_then(serde_json::Value::as_str),
+            Some("/server/bin/codex")
+        );
         let response: GetAccountResponse = client
             .request_typed(ClientRequest::GetAccount {
                 request_id: RequestId::Integer(1),
@@ -1685,15 +1974,15 @@ mod tests {
 
     #[test]
     fn remote_auth_token_transport_policy_allows_wss_and_loopback_ws() {
-        assert!(crate::remote::websocket_url_supports_auth_token(
-            &url::Url::parse("wss://example.com:443").expect("wss URL should parse")
-        ));
-        assert!(crate::remote::websocket_url_supports_auth_token(
-            &url::Url::parse("ws://127.0.0.1:4500").expect("loopback ws URL should parse")
-        ));
-        assert!(!crate::remote::websocket_url_supports_auth_token(
-            &url::Url::parse("ws://example.com:4500").expect("non-loopback ws URL should parse")
-        ));
+        let endpoint = |websocket_url: &str| RemoteAppServerEndpoint::WebSocket {
+            websocket_url: websocket_url.to_string(),
+            auth_token: None,
+        };
+
+        assert!(endpoint("wss://example.com:443").supports_auth_token());
+        assert!(endpoint("ws://127.0.0.1:4500").supports_auth_token());
+        assert!(!endpoint("ws://example.com:4500").supports_auth_token());
+        assert!(!endpoint("not a URL").supports_auth_token());
     }
 
     #[tokio::test]
@@ -1866,8 +2155,21 @@ mod tests {
                 panic!("expected saturated server request rejection");
             };
             assert_eq!(error.id, request_id);
-            assert_eq!(error.error.code, -32001);
+            assert_eq!(
+                error.error.code,
+                codex_app_server_protocol::OVERLOADED_ERROR_CODE
+            );
             assert_eq!(error.error.message, "remote app-server event queue is full");
+            assert_eq!(
+                serde_json::from_value::<codex_app_server_protocol::OverloadErrorData>(
+                    error.error.data.expect("overload error data")
+                )
+                .expect("valid overload error data"),
+                codex_app_server_protocol::OverloadErrorData {
+                    reason: codex_app_server_protocol::OverloadReason::RemoteAppServerEventQueue,
+                    retryable: true,
+                }
+            );
             saturated_tx
                 .send(())
                 .expect("saturation signal should send");
@@ -2244,6 +2546,7 @@ mod tests {
         let mut client = InProcessAppServerClient {
             command_tx,
             event_rx,
+            initialize_response: AppServerInitializeResponse::from_json(serde_json::json!({})),
             worker_handle,
         };
 
@@ -2350,11 +2653,8 @@ mod tests {
             EnvironmentManager::create_for_tests(
                 Some("ws://127.0.0.1:8765".to_string()),
                 Some(
-                    ExecServerRuntimePaths::new(
-                        std::env::current_exe().expect("current exe"),
-                        /*codex_linux_sandbox_exe*/ None,
-                    )
-                    .expect("runtime paths"),
+                    ExecServerRuntimePaths::new(std::env::current_exe().expect("current exe"))
+                        .expect("runtime paths"),
                 ),
             )
             .await,
@@ -2440,6 +2740,31 @@ mod tests {
         assert_eq!(
             err.code(),
             codex_config::ThreadConfigLoadErrorCode::RequestFailed
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_config_warnings_include_config_and_additional_warnings() {
+        let mut config = build_test_config().await;
+        config.startup_warnings = vec!["warning from loaded config".to_string()];
+        let additional_warning = ConfigWarningNotification {
+            summary: "warning from embedder".to_string(),
+            details: Some("additional detail".to_string()),
+            path: None,
+            range: None,
+        };
+
+        assert_eq!(
+            runtime_config_warnings(&config, vec![additional_warning.clone()]),
+            vec![
+                ConfigWarningNotification {
+                    summary: "warning from loaded config".to_string(),
+                    details: None,
+                    path: None,
+                    range: None,
+                },
+                additional_warning,
+            ]
         );
     }
 

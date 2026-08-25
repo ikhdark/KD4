@@ -4,10 +4,10 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
+use crate::DISABLED_HOOKS_PATH;
 use crate::GitToolingError;
 use crate::info::get_git_repo_root;
-
-const DISABLED_HOOKS_PATH: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
+use crate::info::is_dubious_ownership_stderr;
 
 pub(crate) fn ensure_git_repository(path: &Path) -> Result<(), GitToolingError> {
     match run_git_for_stdout(
@@ -192,14 +192,6 @@ fn git_args_with_hardening(args: &[OsString], safe_directory: Option<&Path>) -> 
     args_vec
 }
 
-fn is_dubious_ownership_stderr(status_success: bool, stderr: &[u8]) -> bool {
-    if status_success {
-        return false;
-    }
-    let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
-    stderr.contains("detected dubious ownership") && stderr.contains("safe.directory")
-}
-
 fn run_git_attempt(
     git: &Path,
     dir: &Path,
@@ -302,19 +294,12 @@ mod tests {
     }
 
     fn write_fake_git(dir: &Path, script: String) -> std::path::PathBuf {
-        let git = dir.join(if cfg!(windows) { "git.cmd" } else { "git" });
+        let git = dir.join("git.cmd");
         fs::write(&git, script).expect("write fake git");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = fs::metadata(&git).expect("fake git metadata").permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(&git, permissions).expect("mark fake git executable");
-        }
+
         git
     }
 
-    #[cfg(windows)]
     fn fake_git_dubious_then_success(log: &Path) -> String {
         format!(
             "@echo off\r\necho %*>>\"{}\"\r\necho %* | findstr /C:\"safe.directory=\" >NUL\r\nif errorlevel 1 (\r\n  echo fatal: detected dubious ownership in repository at '%CD%' 1>&2\r\n  echo To add an exception for this directory, call: 1>&2\r\n  echo     git config --global --add safe.directory %CD% 1>&2\r\n  exit /b 128\r\n)\r\necho retried-ok\r\nexit /b 0\r\n",
@@ -322,26 +307,9 @@ mod tests {
         )
     }
 
-    #[cfg(unix)]
-    fn fake_git_dubious_then_success(log: &Path) -> String {
-        format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \" $* \" in\n  *safe.directory=*) printf 'retried-ok\\n'; exit 0 ;;\nesac\nprintf '%s\\n' \"fatal: detected dubious ownership in repository at '$PWD'\" >&2\nprintf '%s\\n' \"To add an exception for this directory, call:\" >&2\nprintf '%s\\n' \"git config --global --add safe.directory $PWD\" >&2\nexit 128\n",
-            log.display()
-        )
-    }
-
-    #[cfg(windows)]
     fn fake_git_other_failure(log: &Path) -> String {
         format!(
             "@echo off\r\necho %*>>\"{}\"\r\necho fatal: not a git repository 1>&2\r\nexit /b 128\r\n",
-            log.display()
-        )
-    }
-
-    #[cfg(unix)]
-    fn fake_git_other_failure(log: &Path) -> String {
-        format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf '%s\\n' 'fatal: not a git repository' >&2\nexit 128\n",
             log.display()
         )
     }

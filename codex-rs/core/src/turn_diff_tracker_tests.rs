@@ -6,6 +6,7 @@ use codex_git_utils::ApplyGitRequest;
 use codex_git_utils::apply_git_patch;
 use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -815,6 +816,40 @@ fn attached_cargo_flags_and_scoped_runner_options_are_not_broad_validation() {
 }
 
 #[test]
+fn duplicate_repository_reads_package_discovery_reuses_workspace_manifest() {
+    let dir = tempdir().expect("tempdir");
+    let workspace = dir.path().join("codex-rs");
+    let package = workspace.join("utils/nested");
+    fs::create_dir_all(package.join("src")).expect("nested crate");
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"utils/nested\"]\n",
+    )
+    .expect("workspace manifest");
+    fs::write(
+        package.join("Cargo.toml"),
+        "[package]\nname = \"codex-utils-nested\"\nversion = \"0.0.0\"\n",
+    )
+    .expect("package manifest");
+    let workspace = dunce::canonicalize(workspace).expect("canonical workspace");
+    let package = dunce::canonicalize(package).expect("canonical package");
+    let mut reads = BTreeMap::<PathBuf, usize>::new();
+
+    let found = find_package_directory_with_manifest_reader(
+        "codex-utils-nested",
+        &package.join("src"),
+        |path| {
+            *reads.entry(path.to_path_buf()).or_default() += 1;
+            fs::read_to_string(path).ok()
+        },
+    );
+
+    assert_eq!(found, Some(normalize_tracked_path(&package)));
+    assert_eq!(reads.get(&workspace.join("Cargo.toml")), Some(&1));
+    assert_eq!(reads.get(&package.join("Cargo.toml")), Some(&1));
+}
+
+#[test]
 fn common_in_place_mutators_invalidate_validation_freshness() {
     for command in [
         vec!["chmod".into(), "+x".into(), "run.sh".into()],
@@ -909,89 +944,6 @@ fn validation_identity_survives_exact_revert() {
     assert_eq!(
         tracker.last_successful_validation_revision(),
         Some(tracker.current_mutation_revision())
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn executable_add_uses_the_filesystem_mode_in_generated_diff() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let dir = tempdir().expect("tempdir");
-    let delta = apply_verified_patch(
-        dir.path(),
-        "*** Begin Patch\n*** Add File: run.sh\n+#!/bin/sh\n+exit 0\n*** End Patch",
-    )
-    .await;
-    fs::set_permissions(dir.path().join("run.sh"), fs::Permissions::from_mode(0o755))
-        .expect("executable mode");
-    let mut tracker = tracker_with_root(dir.path());
-    tracker.track_delta("", &delta);
-
-    assert!(
-        tracker
-            .get_unified_diff()
-            .expect("diff")
-            .contains("new file mode 100755")
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn later_delete_preserves_mode_of_previously_tracked_untracked_executable() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let dir = tempdir().expect("tempdir");
-    let path = dir.path().join("run.sh");
-    fs::write(&path, "before\n").expect("seed executable");
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("executable mode");
-    let mut tracker = tracker_with_root(dir.path());
-
-    let update = apply_verified_patch(
-        dir.path(),
-        "*** Begin Patch\n*** Update File: run.sh\n@@\n-before\n+after\n*** End Patch",
-    )
-    .await;
-    tracker.track_delta("", &update);
-    let delete = apply_verified_patch(
-        dir.path(),
-        "*** Begin Patch\n*** Delete File: run.sh\n*** End Patch",
-    )
-    .await;
-    tracker.track_delta("", &delete);
-
-    assert!(
-        tracker
-            .get_unified_diff()
-            .expect("diff")
-            .contains("deleted file mode 100755")
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn tracked_symlink_mode_survives_later_filesystem_deletion() {
-    use std::os::unix::fs::symlink;
-
-    let dir = tempdir().expect("tempdir");
-    let link = dir.path().join("link.txt");
-    symlink("target.txt", &link).expect("create symlink");
-    let mut tracker = tracker_with_root(dir.path());
-    let tracked_path = TrackedPath::new("", &link);
-    let baseline = tracker.tracked_content(&tracked_path, "target.txt");
-    assert_eq!(baseline.mode.as_deref(), Some("120000"));
-    tracker
-        .baseline_by_path
-        .insert(tracked_path.clone(), baseline);
-    fs::remove_file(&link).expect("remove symlink");
-
-    tracker.refresh_unified_diff();
-
-    assert!(
-        tracker
-            .get_unified_diff()
-            .expect("diff")
-            .contains("deleted file mode 120000")
     );
 }
 

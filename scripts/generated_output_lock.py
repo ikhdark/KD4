@@ -16,40 +16,25 @@ class GenerationLockError(RuntimeError):
 
 
 def _acquire_nonblocking(handle: TextIO) -> None:
-    if os.name == "nt":
-        import msvcrt
+    import msvcrt
 
-        handle.seek(0, os.SEEK_END)
-        if handle.tell() == 0:
-            handle.seek(0)
-            handle.write("\0")
-            handle.flush()
+    handle.seek(0, os.SEEK_END)
+    if handle.tell() == 0:
         handle.seek(0)
-        try:
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-        except OSError as error:
-            raise BlockingIOError from error
-        return
-
-    import fcntl
-
+        handle.write("\0")
+        handle.flush()
+    handle.seek(0)
     try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
     except OSError as error:
         raise BlockingIOError from error
 
 
 def _release(handle: TextIO) -> None:
-    if os.name == "nt":
-        import msvcrt
+    import msvcrt
 
-        handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-        return
-
-    import fcntl
-
-    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    handle.seek(0)
+    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 @contextlib.contextmanager

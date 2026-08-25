@@ -11,7 +11,6 @@ use codex_agent_task_store::AgentRole;
 use codex_agent_task_store::AgentStatusClaim;
 use codex_agent_task_store::AgentTask;
 use codex_agent_task_store::AgentTaskBindingDraft;
-use codex_agent_task_store::AgentTaskStore;
 use codex_agent_task_store::ArchitectureContractV1;
 use codex_agent_task_store::AssignmentId;
 use codex_agent_task_store::Attempt;
@@ -23,6 +22,7 @@ use codex_agent_task_store::DEFAULT_OBSERVATION_LIMIT;
 use codex_agent_task_store::DeclaredChange;
 use codex_agent_task_store::GateKind;
 use codex_agent_task_store::GateStatus;
+use codex_agent_task_store::LocalAgentTaskStore;
 use codex_agent_task_store::MAX_MUTATION_EVIDENCE_LIMIT;
 use codex_agent_task_store::MAX_OBSERVATION_LIMIT;
 use codex_agent_task_store::MAX_SNAPSHOT_CHUNK_BYTES;
@@ -49,6 +49,7 @@ use similar::ChangeTag;
 use similar::TextDiff;
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::Arc;
 
 const GET_AGENT_TASK_TOOL: &str = "get_agent_task";
 const SUBMIT_AGENT_RECEIPT_TOOL: &str = "submit_agent_receipt";
@@ -142,10 +143,11 @@ async fn handle_get_agent_task(
 ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
     let ToolInvocation {
         session,
-        turn,
+        step_context,
         payload,
         ..
     } = invocation;
+    let turn = Arc::clone(&step_context.turn);
     let arguments = function_arguments(payload)?;
     let args: GetAgentTaskArgs = parse_arguments(&arguments)?;
     let assignment_id = parse_assignment_id(GET_AGENT_TASK_TOOL, &args.assignment_id)?;
@@ -202,10 +204,11 @@ async fn handle_submit_agent_receipt(
 ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
     let ToolInvocation {
         session,
-        turn,
+        step_context,
         payload,
         ..
     } = invocation;
+    let turn = Arc::clone(&step_context.turn);
     let arguments = function_arguments(payload)?;
     let args: SubmitAgentReceiptArgs = parse_arguments(&arguments)?;
     let coordinator = session.services.agent_control.task_coordinator();
@@ -317,7 +320,7 @@ struct AttemptDiffSummary {
 }
 
 async fn derive_review_reason(
-    store: &dyn AgentTaskStore,
+    store: &LocalAgentTaskStore,
     cwd: &Path,
     task: &AgentTask,
     draft: &ReceiptDraft,
@@ -544,7 +547,7 @@ fn risk_domain_from_hint(hint: &str) -> Option<RiskDomain> {
 }
 
 async fn build_attempt_diff(
-    store: &dyn AgentTaskStore,
+    store: &LocalAgentTaskStore,
     attempt_id: codex_agent_task_store::AttemptId,
     observed_writes: &[MutationEvidence],
 ) -> Result<AttemptDiffSummary, StoreError> {
@@ -596,16 +599,15 @@ async fn build_attempt_diff(
     if truncated {
         const NOTICE: &str = "\n[attempt-specific diff truncated; write hashes remain available]\n";
         let keep = MAX_COLD_REVIEW_DIFF_BYTES.saturating_sub(NOTICE.len());
-        summary
-            .text
-            .truncate(floor_char_boundary(&summary.text, keep));
+        let keep = summary.text.floor_char_boundary(keep);
+        summary.text.truncate(keep);
         summary.text.push_str(NOTICE);
     }
     Ok(summary)
 }
 
 async fn read_snapshot(
-    store: &dyn AgentTaskStore,
+    store: &LocalAgentTaskStore,
     attempt_id: codex_agent_task_store::AttemptId,
     path: &str,
     version: MutationSnapshotVersion,
@@ -739,17 +741,9 @@ fn push_bounded_diff(output: &mut String, section: &str, truncated: &mut bool) {
     if section.len() <= remaining {
         output.push_str(section);
     } else {
-        output.push_str(&section[..floor_char_boundary(section, remaining)]);
+        output.push_str(&section[..section.floor_char_boundary(remaining)]);
         *truncated = true;
     }
-}
-
-fn floor_char_boundary(value: &str, mut index: usize) -> usize {
-    index = index.min(value.len());
-    while index > 0 && !value.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
 }
 
 async fn handle_set_agent_gate(
@@ -757,10 +751,11 @@ async fn handle_set_agent_gate(
 ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
     let ToolInvocation {
         session,
-        turn,
+        step_context,
         payload,
         ..
     } = invocation;
+    let turn = Arc::clone(&step_context.turn);
     let arguments = function_arguments(payload)?;
     let args: SetAgentGateArgs = parse_arguments(&arguments)?;
     let assignment_id = parse_assignment_id(SET_AGENT_GATE_TOOL, &args.assignment_id)?;
@@ -797,10 +792,11 @@ async fn handle_amend_agent_task(
 ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
     let ToolInvocation {
         session,
-        turn,
+        step_context,
         payload,
         ..
     } = invocation;
+    let turn = Arc::clone(&step_context.turn);
     let arguments = function_arguments(payload)?;
     let args: AmendAgentTaskArgs = parse_arguments(&arguments)?;
     require_root(&turn.session_source, AMEND_AGENT_TASK_TOOL)?;
@@ -846,10 +842,11 @@ async fn handle_waive_agent_gate(
 ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
     let ToolInvocation {
         session,
-        turn,
+        step_context,
         payload,
         ..
     } = invocation;
+    let turn = Arc::clone(&step_context.turn);
     let arguments = function_arguments(payload)?;
     let args: WaiveAgentGateArgs = parse_arguments(&arguments)?;
     require_root(&turn.session_source, WAIVE_AGENT_GATE_TOOL)?;
@@ -880,10 +877,11 @@ async fn handle_abandon_agent_task(
 ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
     let ToolInvocation {
         session,
-        turn,
+        step_context,
         payload,
         ..
     } = invocation;
+    let turn = Arc::clone(&step_context.turn);
     let arguments = function_arguments(payload)?;
     let args: AbandonAgentTaskArgs = parse_arguments(&arguments)?;
     require_root(&turn.session_source, ABANDON_AGENT_TASK_TOOL)?;

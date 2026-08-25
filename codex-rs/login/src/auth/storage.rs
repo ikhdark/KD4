@@ -10,11 +10,11 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::io::Write;
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::Mutex;
 use tracing::warn;
 
@@ -28,12 +28,10 @@ use codex_keyring_store::DefaultKeyringStore;
 use codex_keyring_store::KeyringStore;
 use codex_protocol::account::PlanType as AccountPlanType;
 use codex_protocol::auth::AuthMode;
+use codex_secrets::LocalSecretsBackend;
 use codex_secrets::LocalSecretsNamespace;
 use codex_secrets::SecretName;
 use codex_secrets::SecretScope;
-use codex_secrets::SecretsBackendKind;
-use codex_secrets::SecretsManager;
-use once_cell::sync::Lazy;
 
 /// Expected structure for $CODEX_HOME/auth.json.
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
@@ -208,10 +206,7 @@ impl AuthStorageBackend for FileAuthStorage {
         let json_data = serde_json::to_string_pretty(auth_dot_json)?;
         let mut options = OpenOptions::new();
         options.truncate(true).write(true).create(true);
-        #[cfg(unix)]
-        {
-            options.mode(0o600);
-        }
+
         let mut file = options.open(auth_file)?;
         file.write_all(json_data.as_bytes())?;
         file.flush()?;
@@ -223,8 +218,8 @@ impl AuthStorageBackend for FileAuthStorage {
     }
 }
 
-static CODEX_AUTH_SECRET_NAME: Lazy<SecretName> =
-    Lazy::new(|| match SecretName::new("CODEX_AUTH") {
+static CODEX_AUTH_SECRET_NAME: LazyLock<SecretName> =
+    LazyLock::new(|| match SecretName::new("CODEX_AUTH") {
         Ok(name) => name,
         Err(err) => unreachable!("CODEX_AUTH should be a valid secret name: {err}"),
     });
@@ -322,7 +317,7 @@ impl AuthStorageBackend for DirectKeyringAuthStorage {
 struct SecretsKeyringAuthStorage {
     codex_home: PathBuf,
     direct_storage: DirectKeyringAuthStorage,
-    secrets_manager: SecretsManager,
+    secrets_backend: LocalSecretsBackend,
 }
 
 impl Debug for SecretsKeyringAuthStorage {
@@ -337,16 +332,15 @@ impl SecretsKeyringAuthStorage {
     fn new(codex_home: PathBuf, keyring_store: Arc<dyn KeyringStore>) -> Self {
         let direct_storage =
             DirectKeyringAuthStorage::new(codex_home.clone(), Arc::clone(&keyring_store));
-        let secrets_manager = SecretsManager::new_with_keyring_store_and_namespace(
+        let secrets_backend = LocalSecretsBackend::new_with_namespace(
             codex_home.clone(),
-            SecretsBackendKind::Local,
             keyring_store,
             LocalSecretsNamespace::CodexAuth,
         );
         Self {
             codex_home,
             direct_storage,
-            secrets_manager,
+            secrets_backend,
         }
     }
 }
@@ -354,7 +348,7 @@ impl SecretsKeyringAuthStorage {
 impl AuthStorageBackend for SecretsKeyringAuthStorage {
     fn load(&self) -> std::io::Result<Option<AuthDotJson>> {
         match self
-            .secrets_manager
+            .secrets_backend
             .get(&SecretScope::Global, &CODEX_AUTH_SECRET_NAME)
             .map_err(|err| {
                 std::io::Error::other(format!(
@@ -372,7 +366,7 @@ impl AuthStorageBackend for SecretsKeyringAuthStorage {
 
     fn save(&self, auth: &AuthDotJson) -> std::io::Result<()> {
         let serialized = serde_json::to_string(auth).map_err(std::io::Error::other)?;
-        self.secrets_manager
+        self.secrets_backend
             .set(&SecretScope::Global, &CODEX_AUTH_SECRET_NAME, &serialized)
             .map_err(|err| {
                 let message =
@@ -388,7 +382,7 @@ impl AuthStorageBackend for SecretsKeyringAuthStorage {
 
     fn delete(&self) -> std::io::Result<bool> {
         let keyring_removed = self
-            .secrets_manager
+            .secrets_backend
             .delete(&SecretScope::Global, &CODEX_AUTH_SECRET_NAME)
             .map_err(|err| {
                 std::io::Error::other(format!(
@@ -453,8 +447,8 @@ impl AuthStorageBackend for AutoAuthStorage {
 }
 
 // A global in-memory store for mapping codex_home -> AuthDotJson.
-static EPHEMERAL_AUTH_STORE: Lazy<Mutex<HashMap<String, AuthDotJson>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static EPHEMERAL_AUTH_STORE: LazyLock<Mutex<HashMap<String, AuthDotJson>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Clone, Debug)]
 struct EphemeralAuthStorage {

@@ -158,6 +158,36 @@ fn ad_hoc_tool_definition_includes_filename_contract() {
     );
 }
 
+#[test]
+fn add_ad_hoc_request_owns_the_tool_input_contract() {
+    let request: crate::backend::AddAdHocMemoryNoteRequest = serde_json::from_value(json!({
+        "filename": "2026-05-26T13-42-08-remember-review-style.md",
+        "note": "Remember to keep PR review comments concise.",
+    }))
+    .expect("deserialize add-ad-hoc request");
+    assert_eq!(
+        request,
+        crate::backend::AddAdHocMemoryNoteRequest {
+            filename: "2026-05-26T13-42-08-remember-review-style.md".to_string(),
+            note: "Remember to keep PR review comments concise.".to_string(),
+        }
+    );
+
+    let schema = crate::schema::input_schema_for::<crate::backend::AddAdHocMemoryNoteRequest>();
+    assert_eq!(
+        schema.pointer("/properties/filename/type"),
+        Some(&json!("string"))
+    );
+    assert!(
+        serde_json::from_value::<crate::backend::AddAdHocMemoryNoteRequest>(json!({
+            "filename": "2026-05-26T13-42-08-remember-review-style.md",
+            "note": "Remember this.",
+            "unexpected": true,
+        }))
+        .is_err()
+    );
+}
+
 #[tokio::test]
 async fn prompt_contribution_uses_memory_summary_when_enabled() {
     let tempdir = tempfile::tempdir().expect("tempdir");

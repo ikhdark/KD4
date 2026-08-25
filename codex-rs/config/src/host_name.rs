@@ -1,17 +1,11 @@
-#[cfg(unix)]
-use dns_lookup::AddrInfoHints;
-#[cfg(unix)]
-use dns_lookup::getaddrinfo;
 use std::sync::LazyLock;
-#[cfg(windows)]
 use winapi_util::sysinfo::ComputerNameKind;
-#[cfg(windows)]
 use winapi_util::sysinfo::get_computer_name;
 
 static HOST_NAME: LazyLock<Option<String>> = LazyLock::new(compute_host_name);
 
 /// Returns a process-cached canonical hostname, falling back to the normalized
-/// kernel hostname. The first call on Unix may perform blocking DNS resolution.
+/// Windows hostname.
 pub fn host_name() -> Option<String> {
     HOST_NAME.clone()
 }
@@ -38,33 +32,11 @@ fn normalize_host_name(hostname: &str) -> Option<String> {
     (!hostname.is_empty()).then(|| hostname.to_ascii_lowercase())
 }
 
-#[cfg(unix)]
-fn local_fqdn_for_hostname(hostname: &str) -> Option<String> {
-    let hints = AddrInfoHints {
-        flags: libc::AI_CANONNAME,
-        ..AddrInfoHints::default()
-    };
-
-    getaddrinfo(Some(hostname), /*service*/ None, Some(hints))
-        .ok()?
-        .filter_map(Result::ok)
-        .filter_map(|addr| addr.canonname)
-        // getaddrinfo may return the short hostname as canonname when no FQDN
-        // is available. Treat only DNS-qualified names as an FQDN result.
-        .find_map(|hostname| normalize_fqdn_candidate(&hostname))
-}
-
-#[cfg(windows)]
 fn local_fqdn_for_hostname(_hostname: &str) -> Option<String> {
     get_computer_name(ComputerNameKind::PhysicalDnsFullyQualified)
         .ok()
         .and_then(|hostname| hostname.into_string().ok())
         .and_then(|hostname| normalize_fqdn_candidate(&hostname))
-}
-
-#[cfg(not(any(unix, windows)))]
-fn local_fqdn_for_hostname(_hostname: &str) -> Option<String> {
-    None
 }
 
 fn normalize_fqdn_candidate(hostname: &str) -> Option<String> {

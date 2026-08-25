@@ -7,15 +7,22 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use ts_rs::TS;
 
+use super::PtyTerminalSize;
+
 /// PTY size in character cells for `command/exec` PTY sessions.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
+#[serde(transparent)]
 #[ts(export_to = "v2/")]
-pub struct CommandExecTerminalSize {
-    /// Terminal height in character cells.
-    pub rows: u16,
-    /// Terminal width in character cells.
-    pub cols: u16,
+pub struct CommandExecTerminalSize(pub PtyTerminalSize);
+
+impl CommandExecTerminalSize {
+    pub const fn new(rows: u16, cols: u16) -> Self {
+        Self(PtyTerminalSize { rows, cols })
+    }
+
+    pub const fn into_inner(self) -> PtyTerminalSize {
+        self.0
+    }
 }
 
 /// Run a standalone command (argv vector) in the server sandbox without

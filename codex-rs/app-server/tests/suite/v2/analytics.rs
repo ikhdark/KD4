@@ -150,7 +150,7 @@ pub(crate) async fn wait_for_matching_analytics_event(
     read_timeout: Duration,
     matches: impl Fn(&Value) -> bool,
 ) -> Result<Value> {
-    timeout(read_timeout, async {
+    let result = timeout(read_timeout, async {
         loop {
             let Some(requests) = server.received_requests().await else {
                 tokio::time::sleep(Duration::from_millis(25)).await;
@@ -174,7 +174,40 @@ pub(crate) async fn wait_for_matching_analytics_event(
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
-    .await?
+    .await;
+    match result {
+        Ok(event) => event,
+        Err(err) => {
+            let event_types = server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|request| {
+                    request.method == "POST"
+                        && request.url.path() == "/codex/analytics-events/events"
+                })
+                .filter_map(|request| serde_json::from_slice::<Value>(&request.body).ok())
+                .filter_map(|payload| payload["events"].as_array().cloned())
+                .flatten()
+                .filter_map(|event| {
+                    let event_type = event["event_type"].as_str()?;
+                    if event_type == "codex_goal_event" {
+                        Some(format!(
+                            "{event_type}:{}:{}",
+                            event["event_params"]["event_kind"],
+                            event["event_params"]["goal_status"]
+                        ))
+                    } else {
+                        Some(event_type.to_owned())
+                    }
+                })
+                .collect::<Vec<_>>();
+            Err(anyhow::anyhow!(
+                "{err}; observed analytics event types: {event_types:?}"
+            ))
+        }
+    }
 }
 
 pub(crate) fn thread_initialized_event(payload: &Value) -> Result<&Value> {

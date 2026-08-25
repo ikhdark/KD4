@@ -24,7 +24,6 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_token_count;
 use core_test_support::skip_if_no_remote_env;
-use core_test_support::skip_if_sandbox;
 use core_test_support::test_codex::test_env as remote_test_env;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
@@ -99,10 +98,9 @@ async fn exec_command_with_tty(
 ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
     let manager = &session.services.unified_exec_manager;
     let process_id = manager.allocate_process_id().await;
-    #[allow(deprecated)]
     let cwd = workdir
         .as_ref()
-        .map_or_else(|| turn.cwd.clone(), |workdir| turn.cwd.join(workdir));
+        .map_or_else(|| turn.cwd().clone(), |workdir| turn.cwd().join(workdir));
     let command = vec!["bash".to_string(), "-lc".to_string(), cmd.to_string()];
     let request = test_exec_request(turn, command.clone(), cwd.clone(), shell_env());
 
@@ -359,11 +357,8 @@ fn head_tail_buffer_default_preserves_prefix_and_suffix() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unified_exec_persists_across_requests() -> anyhow::Result<()> {
-    skip_if_sandbox!(Ok(()));
-
     let (session, turn) = test_session_and_turn().await;
-    #[allow(deprecated)]
-    let cwd = turn.cwd.clone();
+    let cwd = turn.cwd().clone();
 
     let open_shell = exec_command(
         &session, &turn, "bash -i", /*yield_time_ms*/ 2_500, /*workdir*/ None,
@@ -411,8 +406,6 @@ async fn unified_exec_persists_across_requests() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multi_unified_exec_sessions() -> anyhow::Result<()> {
-    skip_if_sandbox!(Ok(()));
-
     let (session, turn) = test_session_and_turn().await;
 
     let shell_a = exec_command(
@@ -468,8 +461,6 @@ async fn multi_unified_exec_sessions() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn unified_exec_timeouts() -> anyhow::Result<()> {
-    skip_if_sandbox!(Ok(()));
-
     const TEST_VAR_VALUE: &str = "unified_exec_var_123";
 
     let (session, turn) = test_session_and_turn().await;
@@ -518,8 +509,6 @@ async fn unified_exec_timeouts() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unified_exec_pause_blocks_yield_timeout() -> anyhow::Result<()> {
-    skip_if_sandbox!(Ok(()));
-
     let (session, turn) = test_session_and_turn().await;
     let elicitation = session.services.elicitations.register();
 
@@ -619,8 +608,6 @@ async fn completed_commands_do_not_persist_sessions() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reusing_completed_process_returns_unknown_process() -> anyhow::Result<()> {
-    skip_if_sandbox!(Ok(()));
-
     let (session, turn) = test_session_and_turn().await;
 
     let open_shell = exec_command(
@@ -671,8 +658,7 @@ async fn terminating_initial_exec_command_rechecks_initial_response_state() -> a
         Arc::clone(&allow_terminate),
     )
     .await?;
-    #[allow(deprecated)]
-    let cwd = turn.cwd.clone();
+    let cwd = turn.cwd().clone();
     manager.process_store.lock().await.processes.insert(
         process_id,
         ProcessEntry {
@@ -745,8 +731,7 @@ async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Resu
         Arc::clone(&allow_terminate),
     )
     .await?;
-    #[allow(deprecated)]
-    let cwd = turn.cwd.clone();
+    let cwd = turn.cwd().clone();
     let last_used = Instant::now() - Duration::from_secs(1);
     manager.process_store.lock().await.processes.insert(
         process_id,
@@ -807,8 +792,7 @@ async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Resu
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn completed_pipe_commands_preserve_exit_code() -> anyhow::Result<()> {
     let (_, turn) = make_session_and_context().await;
-    #[allow(deprecated)]
-    let cwd = turn.cwd.clone();
+    let cwd = turn.cwd().clone();
     let request = test_exec_request(
         &turn,
         vec!["bash".to_string(), "-lc".to_string(), "exit 17".to_string()],
@@ -846,7 +830,6 @@ async fn completed_pipe_commands_preserve_exit_code() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unified_exec_uses_remote_exec_server_when_configured() -> anyhow::Result<()> {
-    skip_if_sandbox!(Ok(()));
     skip_if_no_remote_env!(Ok(()));
 
     let remote_test_env = remote_test_env().await?;
@@ -898,7 +881,6 @@ async fn unified_exec_uses_remote_exec_server_when_configured() -> anyhow::Resul
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_exec_server_rejects_inherited_fd_launches() -> anyhow::Result<()> {
-    skip_if_sandbox!(Ok(()));
     skip_if_no_remote_env!(Ok(()));
 
     let remote_test_env = remote_test_env().await?;
@@ -906,8 +888,7 @@ async fn remote_exec_server_rejects_inherited_fd_launches() -> anyhow::Result<()
     turn.environments.turn_environments[0].environment =
         Arc::new(remote_test_env.environment().clone());
 
-    #[allow(deprecated)]
-    let cwd = turn.cwd.clone();
+    let cwd = turn.cwd().clone();
     let request = test_exec_request(
         &turn,
         vec!["bash".to_string(), "-lc".to_string(), "echo ok".to_string()],

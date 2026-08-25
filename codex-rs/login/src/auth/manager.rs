@@ -57,6 +57,7 @@ use crate::token_data::TokenData;
 use crate::token_data::parse_chatgpt_jwt_claims;
 use crate::token_data::parse_jwt_expiration;
 use codex_config::ManagedAuthPolicy;
+use codex_config::canonicalize_chatgpt_base_url;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_http_client::HttpClient;
 use codex_http_client::HttpClientFactory;
@@ -269,10 +270,9 @@ impl CodexAuth {
                     "agent identity auth is missing agent identity auth material.",
                 ));
             };
-            let base_url = chatgpt_base_url
-                .unwrap_or(ChatGptEnvironment::default().chatgpt_base_url())
-                .trim_end_matches('/')
-                .to_string();
+            let base_url = canonicalize_chatgpt_base_url(
+                chatgpt_base_url.unwrap_or(ChatGptEnvironment::default().chatgpt_base_url()),
+            );
             let agent_identity_authapi_base_url =
                 require_agent_identity_authapi_base_url(agent_identity_authapi_base_url)?;
             match agent_identity {
@@ -393,10 +393,9 @@ impl CodexAuth {
         agent_identity_authapi_base_url: &str,
         auth_route_config: &AuthRouteConfig,
     ) -> std::io::Result<Self> {
-        let base_url = chatgpt_base_url
-            .unwrap_or(ChatGptEnvironment::default().chatgpt_base_url())
-            .trim_end_matches('/')
-            .to_string();
+        let base_url = canonicalize_chatgpt_base_url(
+            chatgpt_base_url.unwrap_or(ChatGptEnvironment::default().chatgpt_base_url()),
+        );
         Ok(Self::AgentIdentity(
             AgentIdentityAuth::from_jwt(
                 jwt,
@@ -718,9 +717,13 @@ impl CodexAuth {
             bedrock_api_key: None,
         };
 
+        let client = match create_client() {
+            Ok(client) => client,
+            Err(error) => panic!("test HTTP client should build: {error}"),
+        };
         let state = ChatgptAuthState {
             auth_dot_json: Arc::new(Mutex::new(Some(auth_dot_json))),
-            client: create_client(),
+            client,
         };
         let dummy_auth_id = NEXT_DUMMY_AUTH_ID.fetch_add(1, Ordering::Relaxed);
         let storage = create_auth_storage(
@@ -744,7 +747,7 @@ impl CodexAuth {
         )?;
         let state = ChatgptAuthState {
             auth_dot_json: Arc::new(Mutex::new(Some(auth_dot_json))),
-            client: create_client(),
+            client: create_client()?,
         };
         Ok(Self::ChatgptAuthTokens(ChatgptAuthTokens { state }))
     }
@@ -958,10 +961,9 @@ pub async fn login_with_access_token(
         CodexAccessToken::AgentIdentityJwt(jwt) => {
             let record = AgentIdentityAuthRecord::from_agent_identity_jwt(jwt)?;
             ensure_auth_workspace_allowed(forced_chatgpt_workspace_id, &record.account_id)?;
-            let base_url = chatgpt_base_url
-                .unwrap_or(ChatGptEnvironment::default().chatgpt_base_url())
-                .trim_end_matches('/')
-                .to_string();
+            let base_url = canonicalize_chatgpt_base_url(
+                chatgpt_base_url.unwrap_or(ChatGptEnvironment::default().chatgpt_base_url()),
+            );
             verified_record_from_jwt(jwt, &base_url, auth_route_config).await?;
             AuthDotJson {
                 auth_mode: Some(AuthMode::AgentIdentity),

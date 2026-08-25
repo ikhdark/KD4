@@ -173,15 +173,10 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
 
     ToolSpec::Function(ResponsesApiTool {
         name: "exec_command".to_string(),
-        description: if cfg!(windows) {
-            format!(
-                "Runs a command in a PTY, returning output or a session ID for ongoing interaction.\n\n{}",
-                windows_shell_guidance()
-            )
-        } else {
-            "Runs a command in a PTY, returning output or a session ID for ongoing interaction."
-                .to_string()
-        },
+        description: format!(
+            "Runs a command in a PTY, returning output or a session ID for ongoing interaction.\n\n{}",
+            windows_shell_guidance()
+        ),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(properties, /*required*/ None, Some(false.into())),
@@ -318,9 +313,8 @@ pub fn create_shell_command_tool(options: CommandToolOptions) -> ToolSpec {
         )),
     );
 
-    let description = if cfg!(windows) {
-        format!(
-            r#"Runs a Powershell command (Windows) and returns its output.
+    let description = format!(
+        r#"Runs a Powershell command (Windows) and returns its output.
 
 Examples of valid command strings:
 
@@ -332,13 +326,8 @@ Examples of valid command strings:
 - running an inline Python script: "@'\\nprint('Hello, world!')\\n'@ | python -"
 
 {}"#,
-            windows_shell_guidance()
-        )
-    } else {
-        r#"Runs a shell command and returns its output.
-- Always set the `workdir` param when using the shell_command function. Do not use `cd` unless absolutely necessary."#
-            .to_string()
-    };
+        windows_shell_guidance()
+    );
 
     ToolSpec::Function(ResponsesApiTool {
         name: "shell_command".to_string(),

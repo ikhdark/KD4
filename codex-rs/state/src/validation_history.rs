@@ -391,11 +391,7 @@ async fn load_or_create_key(codex_home: &Path) -> anyhow::Result<[u8; 32]> {
         codex_home.join(format!(".{KEY_FILE}.{:032x}.tmp", rand::random::<u128>()));
     let mut options = tokio::fs::OpenOptions::new();
     options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
+
     let mut file = options.open(&temporary_path).await?;
     use tokio::io::AsyncWriteExt;
     if let Err(error) = async {
@@ -450,11 +446,7 @@ async fn install_key_with_locked_rename(
     tokio::task::spawn_blocking(move || {
         let mut options = std::fs::OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
+
         let lock_file = options
             .open(&lock_path)
             .with_context(|| format!("failed to open {}", lock_path.display()))?;

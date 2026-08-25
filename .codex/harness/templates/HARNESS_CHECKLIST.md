@@ -31,18 +31,6 @@
 ## Validation
 
 - [ ] Focused validation ran
-- [ ] Performance-sensitive work defines and passes its quality gate before
-      comparing latency or token use
-- [ ] A faster or lower-token candidate was rejected if it weakened correctness,
-      safety, output fidelity, compatibility, or another required quality property
-- [ ] Performance-sensitive work names a real workload, latency metric and
-      threshold, token metric or budget, build identity, sample count, and statistic
-- [ ] A benchmark miss drove owner-level diagnosis and repair rather than a
-      weakened workload or threshold
-- [ ] After a performance repair, affected quality checks passed before the same
-      latency and token contracts were rerun
-- [ ] Candidate selection retained the best measured quality-preserving
-      version; a relative improvement that still missed threshold was not passed
 - [ ] Evidence records source, provenance, freshness, and exact covered contract
 - [ ] Changed code and its intended path were swept for placeholders or stubs
 - [ ] New public symbols, config fields, commands, or workflow entries were

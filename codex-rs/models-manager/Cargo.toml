@@ -14,13 +14,12 @@ workspace = true
 
 [dependencies]
 chrono = { workspace = true, features = ["serde"] }
-codex-collaboration-mode-templates = { workspace = true }
+codex-file-system = { workspace = true }
 codex-http-client = { workspace = true }
 codex-login = { workspace = true }
 codex-otel = { workspace = true }
 codex-protocol = { workspace = true }
 codex-utils-output-truncation = { workspace = true }
-codex-utils-path = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["fs", "sync", "time"] }

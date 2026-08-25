@@ -468,10 +468,8 @@ fn converts_absolute_api_paths_using_the_inferred_convention() {
 
 #[test]
 fn converts_native_api_path_to_inferred_absolute_path() {
-    #[cfg(windows)]
     let raw_path = r"C:\workspace\file.rs";
-    #[cfg(not(windows))]
-    let raw_path = "/workspace/file.rs";
+
     let path = serde_json::from_value::<LegacyAppPathString>(serde_json::json!(raw_path))
         .expect("absolute API path should deserialize");
     let expected = AbsolutePathBuf::try_from(raw_path).expect("native absolute path should parse");
@@ -499,9 +497,6 @@ fn foreign_absolute_syntax_deserializes_without_host_interpretation() {
 
 #[test]
 fn from_path_preserves_foreign_absolute_path_for_uri_conversion() {
-    #[cfg(not(windows))]
-    let (foreign_path, expected_uri) = (r"C:\Users\openai\share", "file:///C:/Users/openai/share");
-    #[cfg(windows)]
     let (foreign_path, expected_uri) = ("/home/openai/share", "file:///home/openai/share");
 
     let path: PathUri = LegacyAppPathString::from_path(std::path::Path::new(foreign_path))
@@ -516,9 +511,6 @@ fn from_path_preserves_foreign_absolute_path_for_uri_conversion() {
 
 #[test]
 fn renders_an_absolute_path_using_the_host_convention() {
-    #[cfg(unix)]
-    let native_path = "/workspace/a file.rs";
-    #[cfg(windows)]
     let native_path = r"C:\workspace\a file.rs";
     let path = AbsolutePathBuf::from_absolute_path_checked(native_path)
         .expect("native path should be absolute");
@@ -529,7 +521,6 @@ fn renders_an_absolute_path_using_the_host_convention() {
     );
 }
 
-#[cfg(windows)]
 #[test]
 fn renders_native_non_unicode_windows_fallback_lossily() {
     use std::os::windows::ffi::OsStringExt;

@@ -3,13 +3,19 @@ use super::CanonicalPrefixHash;
 use super::CompactConversationRequestSettings;
 use super::LastResponse;
 use super::MODEL_ATTEMPT_RECONCILIATION_TOLERANCE_BYTES;
+use super::ModelAttemptClock;
 use super::ModelAttemptGuard;
 use super::ModelAttemptOffsets;
+use super::ModelAttemptState;
 use super::ModelClient;
 use super::ModelRequestMeasurements;
 use super::PendingUnauthorizedRetry;
 use super::Prompt;
 use super::PromptContextBaseline;
+use super::REQUEST_SCHEMA_CACHE_CAPACITY;
+use super::RequestSchemaCacheKey;
+use super::RequestSchemaCacheValue;
+use super::RequestSchemaSerializationCache;
 use super::UnauthorizedRecoveryExecution;
 use super::WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION;
 use super::WebsocketCachePublicationPermit;
@@ -86,8 +92,6 @@ use codex_utils_output_truncation::approx_token_count;
 use futures::StreamExt;
 use pretty_assertions::assert_eq;
 use serde_json::json;
-use sha2::Digest;
-use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::pin::Pin;
@@ -137,7 +141,6 @@ fn test_model_client_with_thread_id(
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
-        /*item_ids_enabled*/ false,
         /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
@@ -159,7 +162,6 @@ fn websocket_test_model_client() -> ModelClient {
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
-        /*item_ids_enabled*/ false,
         /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
@@ -439,12 +441,15 @@ fn model_attempt_ids_are_opaque_per_lifecycle_not_content_derived() {
 fn model_request_measurements_count_serialized_tools_independently() {
     let without_tools = history_test_request(vec![history_test_item("input", None)]);
     let mut with_tools = without_tools.clone();
-    with_tools.tools = Some(vec![json!({
-        "type": "function",
-        "name": "lookup",
-        "description": "A deliberately verbose schema for directional token counting",
-        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}
-    })]);
+    with_tools.tools = Some(
+        vec![json!({
+            "type": "function",
+            "name": "lookup",
+            "description": "A deliberately verbose schema for directional token counting",
+            "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}
+        })]
+        .into(),
+    );
 
     let baseline = ModelRequestMeasurements::for_responses_request(
         &without_tools,
@@ -458,13 +463,14 @@ fn model_request_measurements_count_serialized_tools_independently() {
         &with_tools.instructions,
     )
     .expect("measure request with tools");
-    let serialized_tools = serde_json::to_string(with_tools.tools.as_ref().unwrap()).unwrap();
+    let serialized_tool = serde_json::to_string(&with_tools.tools.as_ref().unwrap()[0]).unwrap();
 
     assert_eq!(baseline.tool_token_count, 0);
     assert!(measured.tool_token_count > baseline.tool_token_count);
     assert_eq!(
         measured.tool_token_count,
-        i64::try_from(approx_token_count(&serialized_tools)).expect("tool token count fits in i64")
+        i64::try_from(approx_token_count(&serialized_tool) + 1)
+            .expect("tool token count fits in i64")
     );
     assert_ne!(measured.tool_token_count, 123_456);
     let categories = measured.request_token_categories();
@@ -479,25 +485,28 @@ fn model_request_measurements_count_serialized_tools_independently() {
 #[test]
 fn model_request_measurements_flatten_namespaces_and_mark_observed_tool_use() {
     let mut request = history_test_request(vec![history_test_item("input", None)]);
-    request.tools = Some(vec![json!({
-        "type": "namespace",
-        "name": "agents",
-        "description": "Agent lifecycle tools",
-        "tools": [
-            {
-                "type": "function",
-                "name": "spawn_agent",
-                "description": "Spawn one agent",
-                "parameters": {"type": "object"}
-            },
-            {
-                "type": "function",
-                "name": "wait_agent",
-                "description": "Wait for one agent",
-                "parameters": {"type": "object"}
-            }
-        ]
-    })]);
+    request.tools = Some(
+        vec![json!({
+            "type": "namespace",
+            "name": "agents",
+            "description": "Agent lifecycle tools",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "spawn_agent",
+                    "description": "Spawn one agent",
+                    "parameters": {"type": "object"}
+                },
+                {
+                    "type": "function",
+                    "name": "wait_agent",
+                    "description": "Wait for one agent",
+                    "parameters": {"type": "object"}
+                }
+            ]
+        })]
+        .into(),
+    );
     let measured = ModelRequestMeasurements::for_responses_request(
         &request,
         &history_test_provenance(&request),
@@ -670,7 +679,7 @@ fn prompt_context_hashes_track_categories_and_gate_fixed_prefix_reuse() {
     assert!(!category("task_input").unchanged_from_previous_request);
 
     let mut changed_tools = second_request;
-    changed_tools.tools = Some(vec![json!({"type": "function", "name": "changed"})]);
+    changed_tools.tools = Some(vec![json!({"type": "function", "name": "changed"})].into());
     let mut third = ModelRequestMeasurements::for_responses_request(
         &changed_tools,
         &history_test_provenance(&changed_tools),
@@ -951,7 +960,10 @@ fn tool_history_receipt_inside_provider_prefix_forces_transactional_rebase() {
     let original = history_test_request(vec![history_test_tool_output("call-1", bounded)]);
     session.remember_request_history(&original, [7; 32]);
     session.websocket_session.last_request = Some(original);
-    session.prompt_context_baseline = Some(PromptContextBaseline {
+    *session
+        .prompt_context_baseline
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PromptContextBaseline {
         prompt_cache_key: Some("stale".to_string()),
         category_hashes: BTreeMap::new(),
         ordered_fixed_hashes: Vec::new(),
@@ -985,7 +997,13 @@ fn tool_history_receipt_inside_provider_prefix_forces_transactional_rebase() {
     assert_eq!(prepared.input, current.input);
     assert!(session.websocket_session.last_request.is_none());
     assert!(session.websocket_session.last_request_history.is_none());
-    assert!(session.prompt_context_baseline.is_none());
+    assert!(
+        session
+            .prompt_context_baseline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+    );
     // Unknown provider history disables response inheritance, but the authenticated
     // transport remains safe to publish because the cache stores it transport-only.
     assert!(session.websocket_cache_publication.is_some());
@@ -1206,18 +1224,38 @@ fn request_schema_cache_reuses_precomputed_tool_digest() {
     assert_eq!(cache.diagnostics(), (1, 2, 2));
 }
 
+#[test]
+fn request_schema_cache_updates_an_existing_key_without_evicting_another_entry() {
+    let mut cache = RequestSchemaSerializationCache::default();
+    let value = || RequestSchemaCacheValue {
+        tools: Arc::<[serde_json::Value]>::from([]),
+        text: None,
+    };
+
+    for byte in 0..REQUEST_SCHEMA_CACHE_CAPACITY {
+        cache.insert(RequestSchemaCacheKey([byte as u8; 32]), value());
+    }
+    cache.insert(
+        RequestSchemaCacheKey([(REQUEST_SCHEMA_CACHE_CAPACITY - 1) as u8; 32]),
+        value(),
+    );
+
+    assert_eq!(cache.entries.len(), REQUEST_SCHEMA_CACHE_CAPACITY);
+    assert!(cache.get(RequestSchemaCacheKey([0; 32])).is_some());
+}
+
 fn request_schema_cache_test_prompt() -> Prompt {
     Prompt {
-        tools: vec![codex_tools::ToolSpec::Function(
-            codex_tools::ResponsesApiTool {
+        tools: Arc::new(crate::client_common::ToolSchemaArtifact::new(vec![
+            codex_tools::ToolSpec::Function(codex_tools::ResponsesApiTool {
                 name: "schema_cache_probe".to_string(),
                 description: "Request schema cache identity probe.".to_string(),
                 strict: false,
                 defer_loading: None,
                 parameters: codex_tools::JsonSchema::default(),
                 output_schema: None,
-            },
-        )],
+            }),
+        ])),
         output_schema: Some(json!({"type": "object"})),
         ..Prompt::default()
     }
@@ -1227,9 +1265,7 @@ fn request_schema_cache_test_prompt() -> Prompt {
 fn request_schema_cache_reuses_equivalent_raw_and_precomputed_tool_schema_identity() {
     let client = test_model_client(SessionSource::Cli);
     let raw_prompt = request_schema_cache_test_prompt();
-    let tool_bytes = serde_json::to_vec(raw_prompt.tools.as_slice())
-        .expect("tool schemas should serialize for their cache identity");
-    let tool_digest = Sha256::digest(tool_bytes).into();
+    let tool_digest = raw_prompt.tools.digest();
     let digested_prompt = Prompt {
         digests: crate::client_common::PromptDigests {
             tools: Some(tool_digest),
@@ -1246,6 +1282,7 @@ fn request_schema_cache_reuses_equivalent_raw_and_precomputed_tool_schema_identi
         .expect("equivalent precomputed tool identity should hit");
 
     assert_eq!(raw.tools, digested.tools);
+    assert!(Arc::ptr_eq(&raw.tools, &digested.tools));
     assert_eq!(raw.text, digested.text);
     let cache = client
         .state
@@ -1371,7 +1408,6 @@ async fn compact_uses_bearer_after_agent_identity_session_fallback() -> anyhow::
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
-        /*item_ids_enabled*/ false,
         /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
@@ -1785,6 +1821,52 @@ fn build_ws_client_metadata_includes_window_lineage_and_turn_metadata() {
 }
 
 #[tokio::test]
+async fn response_stream_does_not_wait_for_pending_request_measurements() {
+    let measurement_gate = Arc::new(Notify::new());
+    let identity = new_attempt_identity(&new_sampling_request_id());
+    let clock = ModelAttemptClock::new();
+    let task_identity = identity.clone();
+    let task_clock = clock.clone();
+    let task_gate = Arc::clone(&measurement_gate);
+    let attempt_task = tokio::spawn(async move {
+        task_gate.notified().await;
+        ModelAttemptGuard::new(
+            test_session_telemetry(),
+            task_identity,
+            0,
+            ModelAttemptRetryReason::None,
+            ModelAttemptRequestKind::Initial,
+            ModelAttemptTransport::ResponsesHttp,
+            None,
+            ModelRequestMeasurements::default(),
+            task_clock,
+            None,
+            None,
+        )
+    });
+    let api_stream =
+        futures::stream::iter([Ok(ResponseEvent::Created)]).chain(futures::stream::pending());
+    let (mut stream, _) = super::map_response_events(
+        None,
+        api_stream,
+        test_session_telemetry(),
+        InferenceTraceAttempt::disabled(),
+        test_model_provider(),
+        Some(ModelAttemptState::pending(identity, clock, attempt_task)),
+    );
+
+    let event = tokio::time::timeout(Duration::from_millis(250), stream.next())
+        .await
+        .expect("provider event should not wait for request measurements")
+        .expect("mapped stream should remain open")
+        .expect("provider event should remain successful");
+    assert!(matches!(event, ResponseEvent::Created));
+
+    measurement_gate.notify_one();
+    drop(stream);
+}
+
+#[tokio::test]
 async fn dropped_response_stream_traces_cancelled_partial_output() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let attempt = started_inference_attempt(&temp)?;
@@ -2040,7 +2122,6 @@ fn model_client_with_counting_attestation(
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
-        /*item_ids_enabled*/ false,
         /*concurrent_reasoning_summaries_enabled*/ false,
         Some(Arc::new(CountingAttestationProvider {
             calls: attestation_calls.clone(),
@@ -2088,21 +2169,12 @@ async fn non_chatgpt_codex_endpoints_omit_attestation_generation() {
     if let Some(header_value) = model_client.generate_attestation_header_for().await {
         compaction_headers.insert(crate::attestation::X_OAI_ATTESTATION_HEADER, header_value);
     }
-    let mut realtime_headers = http::HeaderMap::new();
-    if let Some(header_value) = model_client.generate_attestation_header_for().await {
-        realtime_headers.insert(crate::attestation::X_OAI_ATTESTATION_HEADER, header_value);
-    }
-
     assert_eq!(
         response_headers.get(crate::attestation::X_OAI_ATTESTATION_HEADER),
         None,
     );
     assert_eq!(
         compaction_headers.get(crate::attestation::X_OAI_ATTESTATION_HEADER),
-        None,
-    );
-    assert_eq!(
-        realtime_headers.get(crate::attestation::X_OAI_ATTESTATION_HEADER),
         None,
     );
     assert_eq!(attestation_calls.load(Ordering::Relaxed), 0);

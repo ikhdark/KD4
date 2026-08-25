@@ -1,9 +1,8 @@
 //! HTTP client construction that makes outbound proxy policy explicit.
 //!
 //! Product traffic should normally enter through [`HttpClientFactory`] for a fixed destination or
-//! [`crate::RouteAwareClientPool`] when request and redirect URLs can vary. The direct and
-//! transport-default terminal methods exist only for narrow exceptional or legacy compatibility
-//! paths.
+//! [`crate::RouteAwareClientPool`] when request and redirect URLs can vary. The remaining direct
+//! and transport-default terminals exist only for narrow exceptional or compatibility paths.
 
 use http::HeaderMap;
 use std::sync::Arc;
@@ -23,8 +22,8 @@ use crate::with_chatgpt_cloudflare_cookie_store;
 /// Configures an [`HttpClient`] without exposing the underlying HTTP implementation.
 ///
 /// Product traffic should prefer [`HttpClientFactory::build_client`] or finish this builder with
-/// [`Self::build_respecting_outbound_proxy_policy`]. The other terminal methods deliberately
-/// bypass the factory and are restricted to documented exceptional or legacy compatibility paths.
+/// [`Self::build_respecting_outbound_proxy_policy`]. The remaining terminal methods deliberately
+/// bypass the factory and are restricted to documented exceptional or compatibility paths.
 #[derive(Clone)]
 pub struct HttpClientBuilder {
     default_headers: Option<HeaderMap>,
@@ -143,22 +142,6 @@ impl HttpClientBuilder {
         Ok(HttpClient::from_parts(inner, request_logging))
     }
 
-    /// Builds a client using the transport's default proxy behavior.
-    ///
-    /// # Legacy compatibility only
-    ///
-    /// This bypasses [`HttpClientFactory`] and therefore does not honor its configured outbound
-    /// proxy policy. New product traffic must use [`Self::build_respecting_outbound_proxy_policy`]
-    /// or [`HttpClientFactory::build_client`].
-    #[deprecated(
-        note = "legacy compatibility only; use HttpClientFactory::build_client or build_respecting_outbound_proxy_policy"
-    )]
-    pub fn build_with_transport_default_proxy(
-        self,
-    ) -> Result<HttpClient, BuildCustomCaTransportError> {
-        self.build_with_proxy_routing(ProxyRouting::TransportDefault)
-    }
-
     /// Builds a client that connects directly without using a proxy.
     ///
     /// # Exceptional use only
@@ -169,93 +152,39 @@ impl HttpClientBuilder {
     /// traffic must use [`Self::build_respecting_outbound_proxy_policy`] or
     /// [`HttpClientFactory::build_client`].
     pub fn build_direct(self) -> Result<HttpClient, BuildCustomCaTransportError> {
-        self.build_with_proxy_routing(ProxyRouting::Direct)
-    }
-
-    /// Builds a transport-default client while preserving the legacy custom-CA fallback.
-    ///
-    /// # Legacy compatibility only
-    ///
-    /// This preserves call sites that historically logged a custom-CA error and continued with
-    /// system roots. New product traffic must propagate construction errors through
-    /// [`Self::build_respecting_outbound_proxy_policy`] or [`HttpClientFactory::build_client`].
-    #[deprecated(
-        note = "legacy custom-CA fallback only; use HttpClientFactory::build_client or build_respecting_outbound_proxy_policy"
-    )]
-    pub fn build_with_transport_default_proxy_and_custom_ca_fallback(self) -> HttpClient {
-        self.build_with_custom_ca_fallback(ProxyRouting::TransportDefault)
-    }
-
-    /// Builds a direct client while preserving the legacy custom-CA fallback.
-    ///
-    /// # Legacy compatibility only
-    ///
-    /// This combines the exceptional proxy bypass described by [`Self::build_direct`] with the
-    /// historical behavior of logging a custom-CA error and continuing with system roots.
-    #[deprecated(
-        note = "legacy custom-CA fallback only; use build_direct and propagate construction errors"
-    )]
-    pub fn build_direct_with_custom_ca_fallback(self) -> HttpClient {
-        self.build_with_custom_ca_fallback(ProxyRouting::Direct)
-    }
-
-    fn build_with_proxy_routing(
-        self,
-        proxy_routing: ProxyRouting,
-    ) -> Result<HttpClient, BuildCustomCaTransportError> {
-        let request_logging = self.request_logging;
-        build_reqwest_client_with_custom_ca(self.reqwest_builder(proxy_routing))
+        let (builder, request_logging) = self.into_reqwest_parts();
+        build_reqwest_client_with_custom_ca(builder.no_proxy())
             .map(|inner| HttpClient::from_parts(inner, request_logging))
     }
 
-    fn build_with_custom_ca_fallback(self, proxy_routing: ProxyRouting) -> HttpClient {
-        self.build_with_custom_ca_fallback_using(proxy_routing, build_reqwest_client_with_custom_ca)
+    /// Builds a client using the transport's default proxy behavior.
+    ///
+    /// # Compatibility boundary
+    ///
+    /// This preserves reqwest's built-in proxy selection for callers that have not opted into
+    /// route-aware proxy resolution. Custom-CA and client-construction failures are returned to the
+    /// caller; this method never retries with a different trust configuration.
+    pub fn build_with_transport_default_proxy(
+        self,
+    ) -> Result<HttpClient, BuildCustomCaTransportError> {
+        self.build_with_transport_default_proxy_using(build_reqwest_client_with_custom_ca)
     }
 
-    fn build_with_custom_ca_fallback_using(
+    fn build_with_transport_default_proxy_using(
         self,
-        proxy_routing: ProxyRouting,
         build_with_custom_ca: impl FnOnce(
             reqwest::ClientBuilder,
         )
             -> Result<reqwest::Client, BuildCustomCaTransportError>,
-    ) -> HttpClient {
+    ) -> Result<HttpClient, BuildCustomCaTransportError> {
         let request_logging = self.request_logging;
-        match build_with_custom_ca(self.clone().reqwest_builder(proxy_routing)) {
-            Ok(inner) => HttpClient::from_parts(inner, request_logging),
-            Err(error) => {
-                tracing::event!(
-                    target: "codex_otel.log_only",
-                    tracing::Level::WARN,
-                    event.name = "codex.http_client.custom_ca_fallback",
-                    "HTTP client fell back to system root certificates"
-                );
-                tracing::warn!(error = %error, "failed to build HTTP client with custom CA");
-                self.reqwest_builder(proxy_routing)
-                    .build()
-                    .map(|inner| HttpClient::from_parts(inner, request_logging))
-                    .unwrap_or_else(|fallback_error| {
-                        tracing::warn!(
-                            error = %fallback_error,
-                            "failed to build fallback HTTP client"
-                        );
-                        HttpClient::from_parts(reqwest::Client::new(), request_logging)
-                    })
-            }
-        }
+        build_with_custom_ca(self.base_reqwest_builder())
+            .map(|inner| HttpClient::from_parts(inner, request_logging))
     }
 
     fn into_reqwest_parts(self) -> (reqwest::ClientBuilder, RequestLogging) {
         let request_logging = self.request_logging;
         (self.base_reqwest_builder(), request_logging)
-    }
-
-    fn reqwest_builder(self, proxy_routing: ProxyRouting) -> reqwest::ClientBuilder {
-        let builder = self.base_reqwest_builder();
-        match proxy_routing {
-            ProxyRouting::TransportDefault => builder,
-            ProxyRouting::Direct => builder.no_proxy(),
-        }
     }
 
     fn base_reqwest_builder(self) -> reqwest::ClientBuilder {
@@ -290,12 +219,6 @@ impl Default for HttpClientBuilder {
             request_logging: RequestLogging::Enabled,
         }
     }
-}
-
-#[derive(Clone, Copy)]
-enum ProxyRouting {
-    TransportDefault,
-    Direct,
 }
 
 #[cfg(test)]

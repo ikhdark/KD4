@@ -19,6 +19,7 @@ use owo_colors::Style;
 
 use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
+use crate::event_processor::final_message_from_turn_items;
 use crate::event_processor::handle_last_message;
 
 pub(crate) struct EventProcessorWithHumanOutput {
@@ -525,22 +526,6 @@ fn reasoning_text(
     } else {
         Some(entries.join("\n"))
     }
-}
-
-fn final_message_from_turn_items(items: &[ThreadItem]) -> Option<String> {
-    items
-        .iter()
-        .rev()
-        .find_map(|item| match item {
-            ThreadItem::AgentMessage { text, .. } => Some(text.clone()),
-            _ => None,
-        })
-        .or_else(|| {
-            items.iter().rev().find_map(|item| match item {
-                ThreadItem::Plan { text, .. } => Some(text.clone()),
-                _ => None,
-            })
-        })
 }
 
 fn blended_total(usage: &ThreadTokenUsage) -> i64 {

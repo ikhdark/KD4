@@ -20,14 +20,8 @@ pub enum PullEvent {
     Error(String),
 }
 
-/// A simple observer for pull progress events. Implementations decide how to
-/// render progress (CLI, TUI, logs, ...).
-pub trait PullProgressReporter {
-    fn on_event(&mut self, event: &PullEvent) -> io::Result<()>;
-}
-
 /// A minimal CLI reporter that writes inline progress to stderr.
-pub struct CliProgressReporter {
+pub(crate) struct CliProgressReporter {
     printed_header: bool,
     last_line_len: usize,
     last_completed_sum: u64,
@@ -42,7 +36,7 @@ impl Default for CliProgressReporter {
 }
 
 impl CliProgressReporter {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             printed_header: false,
             last_line_len: 0,
@@ -51,10 +45,7 @@ impl CliProgressReporter {
             totals_by_digest: HashMap::new(),
         }
     }
-}
-
-impl PullProgressReporter for CliProgressReporter {
-    fn on_event(&mut self, event: &PullEvent) -> io::Result<()> {
+    pub(crate) fn on_event(&mut self, event: &PullEvent) -> io::Result<()> {
         let mut out = std::io::stderr();
         match event {
             PullEvent::Status(status) => {
@@ -132,16 +123,5 @@ impl PullProgressReporter for CliProgressReporter {
                 out.flush()
             }
         }
-    }
-}
-
-/// For now the TUI reporter delegates to the CLI reporter. This keeps UI and
-/// CLI behavior aligned until a dedicated TUI integration is implemented.
-#[derive(Default)]
-pub struct TuiProgressReporter(CliProgressReporter);
-
-impl PullProgressReporter for TuiProgressReporter {
-    fn on_event(&mut self, event: &PullEvent) -> io::Result<()> {
-        self.0.on_event(event)
     }
 }

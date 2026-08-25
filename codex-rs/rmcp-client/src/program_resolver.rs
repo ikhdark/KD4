@@ -14,20 +14,6 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::Path;
 
-/// Resolves a program to its executable path on Unix systems.
-///
-/// Unix systems handle PATH resolution and script execution natively through
-/// the kernel's shebang (`#!`) mechanism, so this function simply returns
-/// the program name unchanged.
-#[cfg(unix)]
-pub fn resolve(
-    program: OsString,
-    _env: &HashMap<OsString, OsString>,
-    _cwd: &Path,
-) -> std::io::Result<OsString> {
-    Ok(program)
-}
-
 /// Resolves a program to its executable path on Windows systems.
 ///
 /// Windows requires explicit file extensions for script execution. This function
@@ -37,7 +23,6 @@ pub fn resolve(
 ///
 /// This enables tools like `npx`, `pnpm`, and `yarn` to work correctly on Windows
 /// without requiring users to specify full paths or extensions in their configuration.
-#[cfg(windows)]
 pub fn resolve(
     program: OsString,
     env: &HashMap<OsString, OsString>,
@@ -70,39 +55,8 @@ mod tests {
     use tempfile::TempDir;
     use tokio::process::Command;
 
-    /// Unix: Verifies the OS handles script execution without file extensions.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_unix_executes_script_without_extension() -> Result<()> {
-        let env = TestExecutableEnv::new()?;
-        // Linux can transiently report ETXTBSY while the freshly written test
-        // script is becoming executable on the backing filesystem.
-        let mut retries = 0;
-        let output = loop {
-            let mut cmd = Command::new(&env.program_name);
-            cmd.envs(&env.mcp_env);
-
-            let output = cmd.output().await;
-            if !output
-                .as_ref()
-                .is_err_and(|err| err.kind() == std::io::ErrorKind::ExecutableFileBusy)
-                || retries == 2
-            {
-                break output;
-            }
-            retries += 1;
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        };
-
-        assert!(
-            output.is_ok(),
-            "Unix should execute PATH-resolved scripts directly: {output:?}"
-        );
-        Ok(())
-    }
-
     /// Windows: Verifies scripts fail to execute without the proper extension.
-    #[cfg(windows)]
+
     #[tokio::test]
     async fn test_windows_fails_without_extension() -> Result<()> {
         let env = TestExecutableEnv::new()?;
@@ -118,7 +72,7 @@ mod tests {
     }
 
     /// Windows: Verifies scripts with an explicit extension execute correctly.
-    #[cfg(windows)]
+
     #[tokio::test]
     async fn test_windows_succeeds_with_extension() -> Result<()> {
         let env = TestExecutableEnv::new()?;
@@ -177,7 +131,6 @@ mod tests {
             let mut extra_env = HashMap::new();
             extra_env.insert(OsString::from("PATH"), Self::build_path_env_var(dir_path));
 
-            #[cfg(windows)]
             extra_env.insert(OsString::from("PATHEXT"), Self::ensure_cmd_extension());
 
             let mcp_env = create_env_for_mcp_server(Some(extra_env), &[])?;
@@ -191,28 +144,11 @@ mod tests {
 
         /// Creates a simple, platform-specific executable script.
         fn create_executable(dir: &Path) -> Result<()> {
-            #[cfg(windows)]
             {
                 let file = dir.join(format!("{}.cmd", Self::TEST_PROGRAM));
                 fs::write(&file, "@echo off\nexit 0")?;
             }
 
-            #[cfg(unix)]
-            {
-                let file = dir.join(Self::TEST_PROGRAM);
-                fs::write(&file, "#!/bin/sh\nexit 0")?;
-                Self::set_executable(&file)?;
-            }
-
-            Ok(())
-        }
-
-        #[cfg(unix)]
-        fn set_executable(path: &Path) -> Result<()> {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(path)?.permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(path, perms)?;
             Ok(())
         }
 
@@ -220,7 +156,7 @@ mod tests {
         fn build_path_env_var(dir: &Path) -> OsString {
             let mut path = OsString::from(dir.as_os_str());
             if let Some(current) = std::env::var_os("PATH") {
-                let sep = if cfg!(windows) { ";" } else { ":" };
+                let sep = ";";
                 path.push(sep);
                 path.push(current);
             }
@@ -228,7 +164,6 @@ mod tests {
         }
 
         /// Ensures `.CMD` is in the `PATHEXT` variable on Windows for script discovery.
-        #[cfg(windows)]
         fn ensure_cmd_extension() -> OsString {
             let current = std::env::var_os("PATHEXT").unwrap_or_default();
             if current

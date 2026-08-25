@@ -5,11 +5,6 @@ use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
 
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-
 use codex_utils_absolute_path::AbsolutePathBuf;
 use tokio::fs;
 use uuid::Uuid;
@@ -23,24 +18,8 @@ pub async fn resolve_installation_id(codex_home: &AbsolutePathBuf) -> Result<Str
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true);
 
-        #[cfg(unix)]
-        {
-            options.mode(0o644);
-        }
-
         let mut file = options.open(&path)?;
         file.lock()?;
-
-        #[cfg(unix)]
-        {
-            let metadata = file.metadata()?;
-            let current_mode = metadata.permissions().mode() & 0o777;
-            if current_mode != 0o644 {
-                let mut permissions = metadata.permissions();
-                permissions.set_mode(0o644);
-                file.set_permissions(permissions)?;
-            }
-        }
 
         let mut contents = String::new();
         file.read_to_string(&mut contents)?;
@@ -72,9 +51,6 @@ mod tests {
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-
     #[tokio::test]
     async fn resolve_installation_id_generates_and_persists_uuid() {
         let codex_home = TempDir::new().expect("create temp dir");
@@ -90,16 +66,6 @@ mod tests {
             installation_id
         );
         assert!(Uuid::parse_str(&installation_id).is_ok());
-
-        #[cfg(unix)]
-        {
-            let mode = std::fs::metadata(&persisted_path)
-                .expect("read installation id metadata")
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(mode, 0o644);
-        }
     }
 
     #[tokio::test]

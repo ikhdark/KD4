@@ -5,12 +5,10 @@ use crate::catalog::SkillCatalog;
 use crate::catalog::SkillProviderError;
 use crate::catalog::SkillProviderResult;
 use crate::catalog::SkillReadResult;
-use crate::catalog::SkillSearchResult;
 use crate::catalog::SkillSourceKind;
 use crate::provider::SkillListQuery;
 use crate::provider::SkillProvider;
 use crate::provider::SkillReadRequest;
-use crate::provider::SkillSearchRequest;
 
 #[derive(Clone)]
 pub struct SkillProviderSource {
@@ -169,31 +167,6 @@ impl SkillProviders {
             .filter(|source| source.owns_kind(&request.authority.kind))
         {
             match source.provider.read(request.clone()).await {
-                Ok(result) => return Ok(result),
-                Err(err) => last_error = Some(err),
-            }
-        }
-
-        match last_error {
-            Some(err) => Err(err),
-            None => Err(SkillProviderError::new(format!(
-                "{} skill provider is not configured",
-                request.authority.kind
-            ))),
-        }
-    }
-
-    pub async fn search(
-        &self,
-        request: SkillSearchRequest,
-    ) -> Result<SkillSearchResult, SkillProviderError> {
-        let mut last_error = None;
-        for source in self
-            .sources
-            .iter()
-            .filter(|source| source.owns_kind(&request.authority.kind))
-        {
-            match source.provider.search(request.clone()).await {
                 Ok(result) => return Ok(result),
                 Err(err) => last_error = Some(err),
             }

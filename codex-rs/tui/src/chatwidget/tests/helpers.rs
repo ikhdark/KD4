@@ -376,16 +376,6 @@ fn thread_id(chat: &ChatWidget) -> String {
     chat.thread_id.map(|id| id.to_string()).unwrap_or_default()
 }
 
-fn token_usage_breakdown(usage: TokenUsage) -> codex_app_server_protocol::TokenUsageBreakdown {
-    codex_app_server_protocol::TokenUsageBreakdown {
-        total_tokens: usage.total_tokens,
-        input_tokens: usage.input_tokens,
-        cached_input_tokens: usage.cached_input_tokens,
-        output_tokens: usage.output_tokens,
-        reasoning_output_tokens: usage.reasoning_output_tokens,
-    }
-}
-
 pub(super) fn handle_token_count(chat: &mut ChatWidget, info: Option<TokenUsageInfo>) {
     match info {
         Some(info) => {
@@ -398,11 +388,7 @@ pub(super) fn handle_token_count(chat: &mut ChatWidget, info: Option<TokenUsageI
                             .last_turn_id
                             .clone()
                             .unwrap_or_else(|| "turn-1".to_string()),
-                        token_usage: codex_app_server_protocol::ThreadTokenUsage {
-                            total: token_usage_breakdown(info.total_token_usage),
-                            last: token_usage_breakdown(info.last_token_usage),
-                            model_context_window: info.model_context_window,
-                        },
+                        token_usage: info.into(),
                     },
                 ),
                 /*replay_kind*/ None,
@@ -1660,7 +1646,7 @@ pub(super) async fn assert_hook_events_snapshot(
     assert!(
         active_hook_blob(&chat).contains(&format!(
             "Running {} hook: {status_message}",
-            hook_event_label(event_name)
+            event_name.to_core().as_pascal_case_label()
         )),
         "hook start should render in the live hook cell"
     );
@@ -1691,19 +1677,4 @@ pub(super) async fn assert_hook_events_snapshot(
         .map(|lines| lines_to_single_string(lines))
         .collect::<String>();
     assert_chatwidget_snapshot!(snapshot_name, combined);
-}
-
-fn hook_event_label(event_name: codex_app_server_protocol::HookEventName) -> &'static str {
-    match event_name {
-        codex_app_server_protocol::HookEventName::PreToolUse => "PreToolUse",
-        codex_app_server_protocol::HookEventName::PermissionRequest => "PermissionRequest",
-        codex_app_server_protocol::HookEventName::PostToolUse => "PostToolUse",
-        codex_app_server_protocol::HookEventName::PreCompact => "PreCompact",
-        codex_app_server_protocol::HookEventName::PostCompact => "PostCompact",
-        codex_app_server_protocol::HookEventName::SessionStart => "SessionStart",
-        codex_app_server_protocol::HookEventName::UserPromptSubmit => "UserPromptSubmit",
-        codex_app_server_protocol::HookEventName::SubagentStart => "SubagentStart",
-        codex_app_server_protocol::HookEventName::SubagentStop => "SubagentStop",
-        codex_app_server_protocol::HookEventName::Stop => "Stop",
-    }
 }

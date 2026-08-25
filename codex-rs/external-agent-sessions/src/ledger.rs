@@ -1,7 +1,7 @@
 use crate::now_unix_seconds;
 use crate::records::stable_source_modified_at;
+use codex_file_system::write_atomically;
 use codex_protocol::ThreadId;
-use codex_utils_path::write_atomically;
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;

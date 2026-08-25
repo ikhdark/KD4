@@ -1,7 +1,6 @@
 use crate::config_toml::ConfigToml;
 use crate::types::RawMcpServerConfig;
-use codex_features::FEATURES;
-use codex_features::legacy_feature_keys;
+use codex_features::user_settable_features;
 use schemars::r#gen::SchemaGenerator;
 use schemars::r#gen::SchemaSettings;
 use schemars::schema::InstanceType;
@@ -9,12 +8,11 @@ use schemars::schema::ObjectValidation;
 use schemars::schema::RootSchema;
 use schemars::schema::Schema;
 use schemars::schema::SchemaObject;
-use schemars::schema::SubschemaValidation;
 use serde_json::Map;
 use serde_json::Value;
 use std::path::Path;
 
-/// Schema for the `[features]` map with known + legacy keys only.
+/// Schema for the public, user-settable `[features]` map.
 pub fn features_schema(schema_gen: &mut SchemaGenerator) -> Schema {
     let mut object = SchemaObject {
         instance_type: Some(InstanceType::Object.into()),
@@ -22,10 +20,7 @@ pub fn features_schema(schema_gen: &mut SchemaGenerator) -> Schema {
     };
 
     let mut validation = ObjectValidation::default();
-    for feature in FEATURES {
-        if feature.id == codex_features::Feature::Artifact {
-            continue;
-        }
+    for feature in user_settable_features() {
         if feature.id == codex_features::Feature::CodeMode {
             validation.properties.insert(
                 feature.key.to_string(),
@@ -53,13 +48,6 @@ pub fn features_schema(schema_gen: &mut SchemaGenerator) -> Schema {
             );
             continue;
         }
-        if feature.id == codex_features::Feature::AppsMcpPathOverride {
-            validation.properties.insert(
-                feature.key.to_string(),
-                removed_apps_mcp_path_override_schema(schema_gen),
-            );
-            continue;
-        }
         if feature.id == codex_features::Feature::NetworkProxy {
             validation.properties.insert(
                 feature.key.to_string(),
@@ -73,39 +61,10 @@ pub fn features_schema(schema_gen: &mut SchemaGenerator) -> Schema {
             .properties
             .insert(feature.key.to_string(), schema_gen.subschema_for::<bool>());
     }
-    for legacy_key in legacy_feature_keys() {
-        validation
-            .properties
-            .insert(legacy_key.to_string(), schema_gen.subschema_for::<bool>());
-    }
     validation.additional_properties = Some(Box::new(Schema::Bool(false)));
     object.object = Some(Box::new(validation));
 
     Schema::Object(object)
-}
-
-fn removed_apps_mcp_path_override_schema(schema_gen: &mut SchemaGenerator) -> Schema {
-    let mut config_validation = ObjectValidation::default();
-    config_validation
-        .properties
-        .insert("enabled".to_string(), schema_gen.subschema_for::<bool>());
-    config_validation
-        .properties
-        .insert("path".to_string(), schema_gen.subschema_for::<String>());
-    config_validation.additional_properties = Some(Box::new(Schema::Bool(false)));
-
-    let config = Schema::Object(SchemaObject {
-        instance_type: Some(InstanceType::Object.into()),
-        object: Some(Box::new(config_validation)),
-        ..Default::default()
-    });
-    Schema::Object(SchemaObject {
-        subschemas: Some(Box::new(SubschemaValidation {
-            any_of: Some(vec![schema_gen.subschema_for::<bool>(), config]),
-            ..Default::default()
-        })),
-        ..Default::default()
-    })
 }
 
 /// Schema for the `[mcp_servers]` map using the raw input shape.
@@ -165,4 +124,48 @@ pub fn write_config_schema(out_path: &Path) -> anyhow::Result<()> {
     let json = config_schema_json()?;
     std::fs::write(out_path, json)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_schema_omits_removed_and_compatibility_only_settings() {
+        let schema = serde_json::to_value(config_schema()).expect("schema should serialize");
+        let properties = schema["properties"]
+            .as_object()
+            .expect("config schema properties");
+
+        for compatibility_key in [
+            "model_supports_reasoning_summaries",
+            "experimental_use_unified_exec_tool",
+            "ghost_snapshot",
+            "profile",
+            "profiles",
+        ] {
+            assert!(!properties.contains_key(compatibility_key));
+        }
+
+        let feature_properties = properties["features"]["properties"]
+            .as_object()
+            .expect("feature schema properties");
+        assert!(feature_properties.contains_key("unified_exec"));
+        assert!(!feature_properties.contains_key("artifact"));
+        assert!(!feature_properties.contains_key("enable_mcp_apps"));
+        assert!(!feature_properties.contains_key("experimental_use_unified_exec_tool"));
+        assert!(!feature_properties.contains_key("terminal_resize_reflow"));
+        assert!(!feature_properties.contains_key("chronicle"));
+
+        let notice_properties = schema["definitions"]["Notice"]["properties"]
+            .as_object()
+            .expect("notice schema properties");
+        assert!(!notice_properties.contains_key("hide_full_access_warning"));
+        assert!(!notice_properties.contains_key("external_config_migration_prompts"));
+
+        let rendered = serde_json::to_string(&schema).expect("schema should render");
+        assert!(!rendered.contains("\"ConfigProfile\""));
+        assert!(!rendered.contains("\"usage_hint_enabled\""));
+        assert!(!rendered.contains("\"ExternalConfigMigrationPrompts\""));
+    }
 }

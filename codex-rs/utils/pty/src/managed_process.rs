@@ -69,7 +69,7 @@ fn admission_reclaimers() -> &'static Mutex<Vec<(u64, AdmissionReclaimer)>> {
 /// Object also owns every descendant in the tree.
 pub struct ManagedRootProcess {
     id: u64,
-    #[cfg(windows)]
+
     job: crate::win::JobObject,
 }
 
@@ -101,7 +101,6 @@ impl ManagedRootProcess {
             );
         }
 
-        #[cfg(windows)]
         let job = match crate::win::JobObject::create() {
             Ok(job) => job,
             Err(error) => {
@@ -112,7 +111,7 @@ impl ManagedRootProcess {
 
         Ok(Self {
             id: NEXT_MANAGED_ROOT_ID.fetch_add(1, Ordering::Relaxed),
-            #[cfg(windows)]
+
             job,
         })
     }
@@ -192,7 +191,6 @@ impl ManagedRootProcess {
     ///
     /// Do not pair this with `CREATE_SUSPENDED`: Tokio does not retain the
     /// primary thread handle needed for a reliable `ResumeThread` call.
-    #[cfg(windows)]
     pub fn attach(&self, pid: u32) -> io::Result<()> {
         use std::os::windows::io::FromRawHandle;
         use std::os::windows::io::OwnedHandle;
@@ -208,12 +206,10 @@ impl ManagedRootProcess {
         self.job.assign_process(raw.cast())
     }
 
-    #[cfg(windows)]
     pub fn terminate(&self) -> io::Result<()> {
         self.job.terminate()
     }
 
-    #[cfg(windows)]
     pub fn preserve_descendants(&self) -> io::Result<()> {
         self.job.preserve_descendants()
     }

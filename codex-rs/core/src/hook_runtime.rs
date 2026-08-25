@@ -8,6 +8,7 @@ use codex_analytics::build_track_events_context;
 use codex_context_fragments::ModelContextBudget;
 use codex_context_fragments::RenderedContextFragment;
 use codex_features::Feature;
+use codex_hooks::ContextInjectingHookOutcome;
 use codex_hooks::PermissionRequestDecision;
 use codex_hooks::PermissionRequestOutcome;
 use codex_hooks::PermissionRequestRequest;
@@ -15,12 +16,10 @@ use codex_hooks::PostToolUseOutcome;
 use codex_hooks::PostToolUseRequest;
 use codex_hooks::PreToolUseOutcome;
 use codex_hooks::PreToolUseRequest;
-use codex_hooks::SessionStartOutcome;
 use codex_hooks::StartHookTarget;
 use codex_hooks::StopHookTarget;
 use codex_hooks::StopOutcome;
 use codex_hooks::SubagentHookContext;
-use codex_hooks::UserPromptSubmitOutcome;
 use codex_hooks::UserPromptSubmitRequest;
 use codex_otel::HOOK_RUN_DURATION_METRIC;
 use codex_otel::HOOK_RUN_METRIC;
@@ -31,10 +30,8 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HookCompletedEvent;
-use codex_protocol::protocol::HookEventName;
 use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::HookRunSummary;
-use codex_protocol::protocol::HookSource;
 use codex_protocol::protocol::HookStartedEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -78,49 +75,6 @@ pub(crate) struct TurnStopHookOutcome {
     pub(crate) observation_error: Option<String>,
 }
 
-struct ContextInjectingHookOutcome {
-    hook_events: Vec<HookCompletedEvent>,
-    outcome: HookRuntimeOutcome,
-}
-
-impl From<SessionStartOutcome> for ContextInjectingHookOutcome {
-    fn from(value: SessionStartOutcome) -> Self {
-        let SessionStartOutcome {
-            hook_events,
-            should_stop,
-            stop_reason,
-            additional_contexts,
-        } = value;
-        Self {
-            hook_events,
-            outcome: HookRuntimeOutcome {
-                should_stop,
-                stop_reason,
-                additional_contexts,
-            },
-        }
-    }
-}
-
-impl From<UserPromptSubmitOutcome> for ContextInjectingHookOutcome {
-    fn from(value: UserPromptSubmitOutcome) -> Self {
-        let UserPromptSubmitOutcome {
-            hook_events,
-            should_stop,
-            stop_reason,
-            additional_contexts,
-        } = value;
-        Self {
-            hook_events,
-            outcome: HookRuntimeOutcome {
-                should_stop,
-                stop_reason,
-                additional_contexts,
-            },
-        }
-    }
-}
-
 #[instrument(level = "trace", skip_all)]
 pub(crate) async fn run_pending_session_start_hooks(
     sess: &Arc<Session>,
@@ -151,8 +105,7 @@ pub(crate) async fn run_pending_session_start_hooks(
         };
         let request = codex_hooks::SessionStartRequest {
             session_id: sess.session_id().into(),
-            #[allow(deprecated)]
-            cwd: turn_context.cwd.clone(),
+            cwd: turn_context.cwd().clone(),
             transcript_path: sess.hook_transcript_path().await,
             model: turn_context.model_info.slug.clone(),
             permission_mode: hook_permission_mode(turn_context),
@@ -193,8 +146,7 @@ pub(crate) async fn run_pre_tool_use_hooks(
         session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
         subagent: thread_spawn_subagent_hook_context(sess, turn_context),
-        #[allow(deprecated)]
-        cwd: turn_context.cwd.clone(),
+        cwd: turn_context.cwd().clone(),
         transcript_path: sess.hook_transcript_path().await,
         model: turn_context.model_info.slug.clone(),
         permission_mode: hook_permission_mode(turn_context),
@@ -254,8 +206,7 @@ pub(crate) async fn run_permission_request_hooks(
         session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
         subagent: thread_spawn_subagent_hook_context(sess, turn_context),
-        #[allow(deprecated)]
-        cwd: turn_context.cwd.to_path_buf(),
+        cwd: turn_context.cwd().to_path_buf(),
         transcript_path: sess.hook_transcript_path().await,
         model: turn_context.model_info.slug.clone(),
         permission_mode: hook_permission_mode(turn_context),
@@ -296,8 +247,7 @@ pub(crate) async fn run_post_tool_use_hooks(
         session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
         subagent: thread_spawn_subagent_hook_context(sess, turn_context),
-        #[allow(deprecated)]
-        cwd: turn_context.cwd.clone(),
+        cwd: turn_context.cwd().clone(),
         transcript_path: sess.hook_transcript_path().await,
         model: turn_context.model_info.slug.clone(),
         permission_mode: hook_permission_mode(turn_context),
@@ -380,8 +330,7 @@ pub(crate) async fn run_turn_stop_hooks(
     let request = codex_hooks::StopRequest {
         session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
-        #[allow(deprecated)]
-        cwd: turn_context.cwd.clone(),
+        cwd: turn_context.cwd().clone(),
         transcript_path,
         model: turn_context.model_info.slug.clone(),
         permission_mode: hook_permission_mode(turn_context),
@@ -412,8 +361,7 @@ pub(crate) async fn run_pre_compact_hooks(
         session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
         subagent: thread_spawn_subagent_hook_context(sess, turn_context),
-        #[allow(deprecated)]
-        cwd: turn_context.cwd.clone(),
+        cwd: turn_context.cwd().clone(),
         transcript_path: sess.hook_transcript_path().await,
         model: turn_context.model_info.slug.clone(),
         trigger: compaction_trigger_label(trigger).to_string(),
@@ -452,8 +400,7 @@ pub(crate) async fn run_post_compact_hooks(
         session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
         subagent: thread_spawn_subagent_hook_context(sess, turn_context),
-        #[allow(deprecated)]
-        cwd: turn_context.cwd.clone(),
+        cwd: turn_context.cwd().clone(),
         transcript_path: sess.hook_transcript_path().await,
         model: turn_context.model_info.slug.clone(),
         trigger: compaction_trigger_label(trigger).to_string(),
@@ -494,8 +441,7 @@ pub(crate) async fn run_legacy_after_agent_hook(
     for hook_outcome in hooks
         .dispatch(codex_hooks::HookPayload {
             session_id: sess.session_id().into(),
-            #[allow(deprecated)]
-            cwd: turn_context.cwd.clone(),
+            cwd: turn_context.cwd().clone(),
             client: turn_context.app_server_client_name.clone(),
             triggered_at: chrono::Utc::now(),
             hook_event: codex_hooks::HookEvent::AfterAgent {
@@ -583,7 +529,7 @@ async fn begin_completion_hook_workspace_observation(
         .and_then(|repo_root| {
             sess.services
                 .git_workspace
-                .begin_workspace_change_observation(repo_root)
+                .begin_workspace_change_observation(&repo_root)
         });
     Some(CompletionHookWorkspaceObservationState {
         observation,
@@ -622,8 +568,7 @@ pub(crate) async fn inspect_pending_input(
                 session_id: sess.session_id().into(),
                 turn_id: turn_context.sub_id.clone(),
                 subagent: thread_spawn_subagent_hook_context(sess, turn_context),
-                #[allow(deprecated)]
-                cwd: turn_context.cwd.clone(),
+                cwd: turn_context.cwd().clone(),
                 transcript_path: sess.hook_transcript_path().await,
                 model: turn_context.model_info.slug.clone(),
                 permission_mode: hook_permission_mode(turn_context),
@@ -679,21 +624,29 @@ pub(crate) async fn record_pending_input(
     record_additional_contexts(sess, turn_context, additional_contexts).await;
 }
 
-async fn run_context_injecting_hook<Fut, Outcome>(
+async fn run_context_injecting_hook<Fut>(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     preview_runs: Vec<HookRunSummary>,
     outcome_future: Fut,
 ) -> HookRuntimeOutcome
 where
-    Fut: Future<Output = Outcome>,
-    Outcome: Into<ContextInjectingHookOutcome>,
+    Fut: Future<Output = ContextInjectingHookOutcome>,
 {
     emit_hook_started_events(sess, turn_context, preview_runs).await;
 
-    let outcome = outcome_future.await.into();
-    emit_hook_completed_events(sess, turn_context, outcome.hook_events).await;
-    outcome.outcome
+    let ContextInjectingHookOutcome {
+        hook_events,
+        should_stop,
+        stop_reason,
+        additional_contexts,
+    } = outcome_future.await;
+    emit_hook_completed_events(sess, turn_context, hook_events).await;
+    HookRuntimeOutcome {
+        should_stop,
+        stop_reason,
+        additional_contexts,
+    }
 }
 
 impl HookRuntimeOutcome {
@@ -858,31 +811,8 @@ fn hook_run_analytics_payload(
 }
 
 fn hook_run_metric_tags(run: &HookRunSummary) -> [(&'static str, &'static str); 3] {
-    let hook_name = match run.event_name {
-        HookEventName::PreToolUse => "PreToolUse",
-        HookEventName::PermissionRequest => "PermissionRequest",
-        HookEventName::PostToolUse => "PostToolUse",
-        HookEventName::PreCompact => "PreCompact",
-        HookEventName::PostCompact => "PostCompact",
-        HookEventName::SessionStart => "SessionStart",
-        HookEventName::UserPromptSubmit => "UserPromptSubmit",
-        HookEventName::SubagentStart => "SubagentStart",
-        HookEventName::SubagentStop => "SubagentStop",
-        HookEventName::Stop => "Stop",
-    };
-    let hook_source = match run.source {
-        HookSource::System => "system",
-        HookSource::User => "user",
-        HookSource::Project => "project",
-        HookSource::Mdm => "mdm",
-        HookSource::SessionFlags => "session_flags",
-        HookSource::Plugin => "plugin",
-        HookSource::CloudRequirements => "cloud_requirements",
-        HookSource::CloudManagedConfig => "cloud_managed_config",
-        HookSource::LegacyManagedConfigFile => "legacy_managed_config_file",
-        HookSource::LegacyManagedConfigMdm => "legacy_managed_config_mdm",
-        HookSource::Unknown => "unknown",
-    };
+    let hook_name = run.event_name.as_pascal_case_label();
+    let hook_source = run.source.as_snake_case_label();
     let status = match run.status {
         HookRunStatus::Running => "running",
         HookRunStatus::Completed => "completed",
@@ -951,7 +881,6 @@ mod tests {
     use tempfile::TempDir;
 
     use super::CompletionHookWorkspaceObservationState;
-    use super::ContextInjectingHookOutcome;
     use super::additional_context_messages;
     use super::finish_completion_hook_workspace_observation;
     use super::hook_run_analytics_payload;
@@ -964,28 +893,18 @@ mod tests {
     use codex_utils_absolute_path::test_support::test_path_buf;
 
     #[test]
-    fn context_injecting_hook_outcomes_preserve_stop_reasons() {
-        let session_start = ContextInjectingHookOutcome::from(codex_hooks::SessionStartOutcome {
-            hook_events: Vec::new(),
-            should_stop: true,
-            stop_reason: Some("session blocked".to_string()),
-            additional_contexts: Vec::new(),
-        });
-        assert_eq!(
-            session_start.outcome.stop_reason.as_deref(),
-            Some("session blocked")
-        );
-
-        let user_prompt = ContextInjectingHookOutcome::from(codex_hooks::UserPromptSubmitOutcome {
+    fn context_injecting_hook_outcome_preserves_runtime_fields() {
+        let outcome = codex_hooks::ContextInjectingHookOutcome {
             hook_events: Vec::new(),
             should_stop: true,
             stop_reason: Some("prompt blocked".to_string()),
-            additional_contexts: Vec::new(),
-        });
-        assert_eq!(
-            user_prompt.outcome.stop_reason.as_deref(),
-            Some("prompt blocked")
-        );
+            additional_contexts: vec!["injected".to_string()],
+        };
+
+        assert!(outcome.hook_events.is_empty());
+        assert!(outcome.should_stop);
+        assert_eq!(outcome.stop_reason.as_deref(), Some("prompt blocked"));
+        assert_eq!(outcome.additional_contexts, vec!["injected"]);
     }
 
     #[tokio::test]

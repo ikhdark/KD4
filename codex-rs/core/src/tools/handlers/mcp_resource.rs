@@ -24,6 +24,7 @@ use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::truncate_text;
 use rmcp::model::ListResourceTemplatesResult;
 use rmcp::model::ListResourcesResult;
+use rmcp::model::PaginatedRequestParams;
 use rmcp::model::ReadResourceResult;
 use rmcp::model::Resource;
 use rmcp::model::ResourceContents;
@@ -34,7 +35,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::function_tool::FunctionCallError;
+use crate::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::FunctionToolOutput;
@@ -236,6 +237,75 @@ fn ensure_model_can_access_mcp_server(
             "MCP server '{server}' is disabled by `orchestrator.mcp.enabled`"
         )))
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum McpListStrategy {
+    Exhaustive,
+    ExplicitPage,
+}
+
+fn mcp_list_strategy(cursor: Option<&str>) -> McpListStrategy {
+    if cursor.is_some() {
+        McpListStrategy::ExplicitPage
+    } else {
+        McpListStrategy::Exhaustive
+    }
+}
+
+fn ensure_cursor_has_server(
+    server: Option<&str>,
+    cursor: Option<&str>,
+) -> Result<(), FunctionCallError> {
+    if server.is_none() && cursor.is_some() {
+        Err(FunctionCallError::RespondToModel(
+            "cursor can only be used when a server is specified".to_string(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+async fn list_mcp_server_page<Page, Exhaustive, ExhaustiveFuture, Explicit, ExplicitFuture>(
+    cursor: Option<String>,
+    exhaustive: Exhaustive,
+    explicit: Explicit,
+) -> Result<Page, FunctionCallError>
+where
+    Exhaustive: FnOnce() -> ExhaustiveFuture,
+    ExhaustiveFuture: Future<Output = Result<Page, FunctionCallError>>,
+    Explicit: FnOnce(Option<PaginatedRequestParams>) -> ExplicitFuture,
+    ExplicitFuture: Future<Output = Result<Page, FunctionCallError>>,
+{
+    match mcp_list_strategy(cursor.as_deref()) {
+        McpListStrategy::Exhaustive => exhaustive().await,
+        McpListStrategy::ExplicitPage => {
+            let params =
+                cursor.map(|value| PaginatedRequestParams::default().with_cursor(Some(value)));
+            explicit(params).await
+        }
+    }
+}
+
+fn take_server_result<Page>(
+    mut collection: McpServerCollection<Page>,
+    server: &str,
+    operation: &str,
+) -> Result<Page, FunctionCallError> {
+    collection.results.remove(server).ok_or_else(|| {
+        collection
+            .errors
+            .into_iter()
+            .find(|error| error.server == server)
+            .map_or_else(
+                || {
+                    FunctionCallError::RespondToModel(format!(
+                        "{operation} failed: unknown MCP server '{server}'"
+                    ))
+                },
+                |error| FunctionCallError::RespondToModel(error.message),
+            )
+    })
 }
 
 #[derive(Debug, Deserialize, Default)]

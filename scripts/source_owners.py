@@ -174,6 +174,7 @@ def _schema_errors(manifest: object) -> list[str]:
         return ["owners must be an array of tables"]
     string_lists = (
         "concern_ids",
+        "feature_ids",
         "aliases",
         "phrases",
         "ambiguous_with",
@@ -303,6 +304,31 @@ def load_and_validate(
         )
     if root is None:
         root = manifest_path.resolve().parent
+    confined_paths: dict[str, tuple[Path | None, str | None]] = {}
+    path_existence: dict[Path, bool] = {}
+    directory_existence: dict[Path, bool] = {}
+
+    def resolve_confined(raw_path: str) -> tuple[Path | None, str | None]:
+        cached = confined_paths.get(raw_path)
+        if cached is not None:
+            return cached
+        try:
+            result = (confined_path(root, raw_path), None)
+        except ValueError as error:
+            result = (None, str(error))
+        confined_paths[raw_path] = result
+        return result
+
+    def path_exists(candidate: Path) -> bool:
+        if candidate not in path_existence:
+            path_existence[candidate] = candidate.exists()
+        return path_existence[candidate]
+
+    def path_is_dir(candidate: Path) -> bool:
+        if candidate not in directory_existence:
+            directory_existence[candidate] = candidate.is_dir()
+        return directory_existence[candidate]
+
     if manifest.get("schema_version") != SCHEMA_VERSION:
         errors.append(f"unsupported schema_version: {manifest.get('schema_version')!r}")
     owners = manifest.get("owners", [])
@@ -347,12 +373,15 @@ def load_and_validate(
             ),
         ]
         for raw_path in declared:
-            try:
-                candidate = confined_path(root, raw_path)
-                if not candidate.exists() and raw_path not in generated_mirrors:
-                    errors.append(f"{owner_id}: missing declared path: {raw_path}")
-            except ValueError as error:
-                errors.append(f"{owner_id}: {error}")
+            candidate, path_error = resolve_confined(raw_path)
+            if path_error is not None:
+                errors.append(f"{owner_id}: {path_error}")
+            elif (
+                candidate is not None
+                and not path_exists(candidate)
+                and raw_path not in generated_mirrors
+            ):
+                errors.append(f"{owner_id}: missing declared path: {raw_path}")
         validation_ids: set[str] = set()
         for validation in owner.get("validation", []):
             validation_id = validation.get("id", "")
@@ -364,12 +393,11 @@ def load_and_validate(
             argv = validation.get("argv", [])
             if not argv or not isinstance(argv[0], str) or not argv[0].strip():
                 errors.append(f"{owner_id}: {validation_id}: argv must be nonempty")
-            try:
-                cwd = confined_path(root, validation.get("cwd", ""))
-                if not cwd.is_dir():
-                    errors.append(f"{owner_id}: {validation_id}: invalid cwd")
-            except ValueError as error:
-                errors.append(f"{owner_id}: {validation_id}: {error}")
+            cwd, path_error = resolve_confined(validation.get("cwd", ""))
+            if path_error is not None:
+                errors.append(f"{owner_id}: {validation_id}: {path_error}")
+            elif cwd is not None and not path_is_dir(cwd):
+                errors.append(f"{owner_id}: {validation_id}: invalid cwd")
         invariant_ids: set[str] = set()
         for invariant in owner.get("invariants", []):
             invariant_id = invariant.get("id", "")
@@ -405,13 +433,13 @@ def load_and_validate(
                     f"{owner_id}: unknown relationship owner target: {target!r}"
                 )
             elif target.startswith("path:"):
-                try:
-                    if not confined_path(root, target[5:]).exists():
-                        errors.append(
-                            f"{owner_id}: missing relationship target: {target!r}"
-                        )
-                except ValueError as error:
-                    errors.append(f"{owner_id}: {error}")
+                candidate, path_error = resolve_confined(target[5:])
+                if path_error is not None:
+                    errors.append(f"{owner_id}: {path_error}")
+                elif candidate is not None and not path_exists(candidate):
+                    errors.append(
+                        f"{owner_id}: missing relationship target: {target!r}"
+                    )
     for phrase, candidates in phrases.items():
         if phrase and len(candidates) > 1:
             for owner in candidates:
@@ -492,6 +520,7 @@ def query_graph(
         selected_owners.append(
             {
                 "id": owner_id,
+                "feature_ids": owner.get("feature_ids", []),
                 "roots": owner.get("roots", []),
                 "primary_entries": owner.get("primary_entries", []),
                 "configuration": owner.get("contracts", []),
@@ -960,17 +989,15 @@ def main() -> int:
             )
             return 0
         manifest, digest = load_and_validate(args.manifest, root)
-        expected = replace_managed_block(
-            args.source_map.read_text(encoding="utf-8"), render_block(manifest, digest)
-        )
+        source_map = args.source_map.read_text(encoding="utf-8")
+        expected = replace_managed_block(source_map, render_block(manifest, digest))
         expected_index = expected_architecture_index(manifest, digest, root)
     except (OSError, ValueError, tomllib.TOMLDecodeError) as error:
         print(error, file=sys.stderr)
         return 1
-    actual = args.source_map.read_text(encoding="utf-8")
     if args.command == "check":
         stale = False
-        if actual != expected:
+        if source_map != expected:
             print(
                 "SOURCEMAP.md managed source-owner block is stale; run source_owners.py generate",
                 file=sys.stderr,

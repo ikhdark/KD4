@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
+use crate::PluginSkillRoot;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use codex_utils_plugins::PluginSkillRoot;
 
 use crate::AppConnectorId;
 use crate::AppDeclaration;
@@ -194,24 +194,6 @@ impl<M: Clone> PluginLoadOutcome<M> {
     }
 }
 
-/// Implemented by [`PluginLoadOutcome`] so callers (e.g. skills) can depend on `codex-plugin`
-/// without naming the MCP config type parameter.
-pub trait EffectiveSkillRoots {
-    fn effective_skill_roots(&self) -> Vec<AbsolutePathBuf>;
-
-    fn effective_plugin_skill_roots(&self) -> Vec<PluginSkillRoot>;
-}
-
-impl<M: Clone> EffectiveSkillRoots for PluginLoadOutcome<M> {
-    fn effective_skill_roots(&self) -> Vec<AbsolutePathBuf> {
-        PluginLoadOutcome::effective_skill_roots(self)
-    }
-
-    fn effective_plugin_skill_roots(&self) -> Vec<PluginSkillRoot> {
-        PluginLoadOutcome::effective_plugin_skill_roots(self)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,5 +245,13 @@ mod tests {
                 plugin_root: test_path("zeta@test"),
             }]
         );
+    }
+
+    #[test]
+    fn plugin_resolution_and_skill_roots_stay_concrete() {
+        let removed_skill_roots_trait = ["trait Effective", "SkillRoots"].concat();
+        let removed_provider_trait = ["trait Plugin", "Provider"].concat();
+        assert!(!include_str!("load_outcome.rs").contains(&removed_skill_roots_trait));
+        assert!(!include_str!("provider.rs").contains(&removed_provider_trait));
     }
 }

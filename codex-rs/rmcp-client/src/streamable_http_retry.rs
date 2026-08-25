@@ -5,7 +5,6 @@ use std::time::Instant;
 use anyhow::Result;
 use anyhow::anyhow;
 use codex_exec_server::ExecServerError;
-use reqwest::StatusCode;
 use rmcp::service::RoleClient;
 use rmcp::service::RunningService;
 use rmcp::transport::streamable_http_client::StreamableHttpError;
@@ -14,6 +13,7 @@ use tracing::warn;
 
 use crate::elicitation_client_service::ElicitationClientService;
 use crate::http_client_adapter::StreamableHttpClientAdapterError;
+use crate::http_client_adapter::is_retryable_http_status;
 use crate::oauth::OAuthPersistor;
 
 use super::PendingTransport;
@@ -33,7 +33,7 @@ impl RmcpClient {
         Option<OAuthPersistor>,
     )> {
         let should_retry = match &initial_transport {
-            PendingTransport::InProcess { .. } | PendingTransport::Stdio { .. } => false,
+            PendingTransport::Stdio { .. } => false,
             PendingTransport::StreamableHttp { .. }
             | PendingTransport::StreamableHttpWithOAuth { .. } => true,
         };
@@ -149,9 +149,9 @@ impl RmcpClient {
             StreamableHttpError::Client(StreamableHttpClientAdapterError::HttpRequest(
                 ExecServerError::Protocol(message),
             )) => message.starts_with("http response stream `") && message.contains("` failed:"),
-            StreamableHttpError::UnexpectedServerResponse(message) => {
-                is_retryable_unexpected_server_response(message.as_ref())
-            }
+            StreamableHttpError::Client(
+                StreamableHttpClientAdapterError::UnexpectedHttpStatus { status, .. },
+            ) => is_retryable_http_status(*status),
             StreamableHttpError::AuthRequired(_)
             | StreamableHttpError::InsufficientScope(_)
             | StreamableHttpError::SessionExpired
@@ -159,39 +159,11 @@ impl RmcpClient {
             | StreamableHttpError::ServerDoesNotSupportSse
             | StreamableHttpError::Deserialize(_)
             | StreamableHttpError::Client(StreamableHttpClientAdapterError::SessionExpired404)
-            | StreamableHttpError::Client(StreamableHttpClientAdapterError::Header(_)) => false,
+            | StreamableHttpError::Client(StreamableHttpClientAdapterError::Header(_))
+            | StreamableHttpError::UnexpectedServerResponse(_) => false,
             _ => false,
         }
     }
-}
-
-fn is_retryable_unexpected_server_response(message: &str) -> bool {
-    let Some(message) = message.strip_prefix("HTTP ") else {
-        return false;
-    };
-    let status_code = message
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect::<String>();
-    let Ok(status) = status_code.parse::<u16>() else {
-        return false;
-    };
-    let Ok(status) = StatusCode::from_u16(status) else {
-        return false;
-    };
-    is_retryable_http_status(status)
-}
-
-fn is_retryable_http_status(status: StatusCode) -> bool {
-    matches!(
-        status,
-        StatusCode::REQUEST_TIMEOUT
-            | StatusCode::TOO_MANY_REQUESTS
-            | StatusCode::INTERNAL_SERVER_ERROR
-            | StatusCode::BAD_GATEWAY
-            | StatusCode::SERVICE_UNAVAILABLE
-            | StatusCode::GATEWAY_TIMEOUT
-    )
 }
 
 fn remaining_initialize_timeout(

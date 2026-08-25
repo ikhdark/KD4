@@ -4,8 +4,6 @@ use codex_protocol::models::FunctionCallOutputContentItem;
 pub use codex_utils_string::approx_bytes_for_tokens;
 pub use codex_utils_string::approx_token_count;
 pub use codex_utils_string::approx_tokens_from_byte_count;
-use codex_utils_string::truncate_middle_chars;
-use codex_utils_string::truncate_middle_with_token_budget;
 
 pub use codex_protocol::protocol::TruncationPolicy;
 
@@ -265,10 +263,7 @@ pub fn formatted_truncate_text(content: &str, policy: TruncationPolicy) -> Strin
 }
 
 pub fn truncate_text(content: &str, policy: TruncationPolicy) -> String {
-    match policy {
-        TruncationPolicy::Bytes(bytes) => truncate_middle_chars(content, bytes),
-        TruncationPolicy::Tokens(tokens) => truncate_middle_with_token_budget(content, tokens).0,
-    }
+    policy.truncate_text(content)
 }
 
 pub fn formatted_truncate_text_content_items_with_policy(

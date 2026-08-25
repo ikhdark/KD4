@@ -127,14 +127,14 @@ impl EventSource for CrosstermEventSource {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<EventResult>> {
         // Crossterm's Windows backend expects Win32 input records. If VT input is inherited or
         // restored by another console client, navigation keys arrive as literal escape bytes.
-        #[cfg(windows)]
+
         let _ = super::windows_console::ensure_input_record_mode();
 
         let result = Pin::new(&mut self.get_mut().0).poll_next(cx);
 
         // EventStream starts its blocking reader before returning Pending, so reassert the mode
         // after that transition as well.
-        #[cfg(windows)]
+
         if result.is_pending() {
             let _ = super::windows_console::ensure_input_record_mode();
         }
@@ -156,10 +156,6 @@ pub struct TuiEventStream<S: EventSource + Default + Unpin = CrosstermEventSourc
     resume_stream: WatchStream<()>,
     terminal_focused: Arc<AtomicBool>,
     poll_draw_first: bool,
-    #[cfg(unix)]
-    suspend_context: crate::tui::job_control::SuspendContext,
-    #[cfg(unix)]
-    alt_screen_active: Arc<AtomicBool>,
 }
 
 impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
@@ -167,8 +163,6 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
         broker: Arc<EventBroker<S>>,
         draw_rx: broadcast::Receiver<()>,
         terminal_focused: Arc<AtomicBool>,
-        #[cfg(unix)] suspend_context: crate::tui::job_control::SuspendContext,
-        #[cfg(unix)] alt_screen_active: Arc<AtomicBool>,
     ) -> Self {
         let resume_stream = WatchStream::from_changes(broker.resume_events_rx());
         Self {
@@ -177,10 +171,6 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
             resume_stream,
             terminal_focused,
             poll_draw_first: false,
-            #[cfg(unix)]
-            suspend_context,
-            #[cfg(unix)]
-            alt_screen_active,
         }
     }
 
@@ -250,23 +240,7 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
     /// Map a crossterm event to a [`TuiEvent`], skipping events we don't use (mouse events, etc.).
     fn map_crossterm_event(&mut self, event: Event) -> Option<TuiEvent> {
         match event {
-            Event::Key(key_event) => {
-                #[cfg(unix)]
-                if crate::tui::job_control::SUSPEND_KEY.is_press(key_event) {
-                    self.broker.pause_events();
-                    let suspend_result = self.suspend_context.suspend(&self.alt_screen_active);
-                    self.broker.resume_events();
-                    if let Err(err) = suspend_result {
-                        tracing::warn!(
-                            event = "tui_suspend_failed",
-                            error = %err,
-                            "failed to suspend TUI process"
-                        );
-                    }
-                    return Some(TuiEvent::Draw);
-                }
-                Some(TuiEvent::Key(key_event))
-            }
+            Event::Key(key_event) => Some(TuiEvent::Key(key_event)),
             Event::Resize(_, _) => Some(TuiEvent::Resize),
             Event::Paste(pasted) => Some(TuiEvent::Paste(pasted)),
             Event::FocusGained => {
@@ -381,15 +355,7 @@ mod tests {
         draw_rx: broadcast::Receiver<()>,
         terminal_focused: Arc<AtomicBool>,
     ) -> TuiEventStream<FakeEventSource> {
-        TuiEventStream::new(
-            broker,
-            draw_rx,
-            terminal_focused,
-            #[cfg(unix)]
-            crate::tui::job_control::SuspendContext::new(),
-            #[cfg(unix)]
-            Arc::new(AtomicBool::new(false)),
-        )
+        TuiEventStream::new(broker, draw_rx, terminal_focused)
     }
 
     type SetupState = (

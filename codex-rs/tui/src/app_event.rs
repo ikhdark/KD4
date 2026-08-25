@@ -10,6 +10,7 @@
 
 use std::path::PathBuf;
 
+use crate::approval_presets::ApprovalPreset;
 use codex_app_server_protocol::AddCreditsNudgeCreditType;
 use codex_app_server_protocol::AddCreditsNudgeEmailStatus;
 use codex_app_server_protocol::ConsumeAccountRateLimitResetCreditResponse;
@@ -33,7 +34,6 @@ use codex_file_search::FileMatch;
 use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ModelPreset;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use codex_utils_approval_presets::ApprovalPreset;
 
 use crate::app_command::AppCommand;
 use crate::app_server_session::AppServerStartedThread;
@@ -77,14 +77,14 @@ pub(crate) enum ConsolidationScrollbackReflow {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+
 pub(crate) enum WindowsSandboxEnableMode {
     Elevated,
     Legacy,
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+
 pub(crate) struct ConnectorsSnapshot {
     pub(crate) connectors: Vec<AppInfo>,
 }
@@ -764,7 +764,6 @@ pub(crate) enum AppEvent {
     /// If `preset` is `Some`, the confirmation will apply the provided
     /// approval/sandbox configuration on Continue; if `None`, it performs no
     /// policy change and only acknowledges/dismisses the warning.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     OpenWorldWritableWarningConfirmation {
         preset: Option<ApprovalPreset>,
         profile_selection: Option<PermissionProfileSelection>,
@@ -777,35 +776,30 @@ pub(crate) enum AppEvent {
     },
 
     /// Prompt to enable the Windows sandbox feature before using Agent mode.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     OpenWindowsSandboxEnablePrompt {
         preset: ApprovalPreset,
         profile_selection: Option<PermissionProfileSelection>,
     },
 
     /// Open the Windows sandbox fallback prompt after declining or failing elevation.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     OpenWindowsSandboxFallbackPrompt {
         preset: ApprovalPreset,
         profile_selection: Option<PermissionProfileSelection>,
     },
 
     /// Begin the elevated Windows sandbox setup flow.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     BeginWindowsSandboxElevatedSetup {
         preset: ApprovalPreset,
         profile_selection: Option<PermissionProfileSelection>,
     },
 
     /// Begin the non-elevated Windows sandbox setup flow.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     BeginWindowsSandboxLegacySetup {
         preset: ApprovalPreset,
         profile_selection: Option<PermissionProfileSelection>,
     },
 
     /// Report that the non-elevated Windows sandbox failed its safety preflight.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     WindowsSandboxLegacySetupFailed {
         preset: ApprovalPreset,
         profile_selection: Option<PermissionProfileSelection>,
@@ -813,13 +807,11 @@ pub(crate) enum AppEvent {
     },
 
     /// Begin a non-elevated grant of read access for an additional directory.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     BeginWindowsSandboxGrantReadRoot {
         path: String,
     },
 
     /// Enable the Windows sandbox feature and switch to Agent mode.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     EnableWindowsSandboxForAgentMode {
         preset: ApprovalPreset,
         mode: WindowsSandboxEnableMode,
@@ -827,7 +819,6 @@ pub(crate) enum AppEvent {
     },
 
     /// Update the Windows sandbox feature mode without changing approval presets.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 
     /// Update the current approval policy in the running app and widget.
     UpdateAskForApprovalPolicy(AskForApproval),
@@ -856,7 +847,6 @@ pub(crate) enum AppEvent {
     ResetMemories,
 
     /// Update whether the world-writable directories warning has been acknowledged.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     UpdateWorldWritableWarningAcknowledged(bool),
 
     /// Update whether the rate limit switch prompt has been acknowledged for the session.
@@ -866,7 +856,6 @@ pub(crate) enum AppEvent {
     UpdatePlanModeReasoningEffort(Option<ReasoningEffort>),
 
     /// Persist the acknowledgement flag for the world-writable directories warning.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     PersistWorldWritableWarningAcknowledged,
 
     /// Persist the acknowledgement flag for the rate limit switch prompt.
@@ -882,7 +871,6 @@ pub(crate) enum AppEvent {
     },
 
     /// Skip the next world-writable scan (one-shot) after a user-confirmed continue.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     SkipNextWorldWritableScan,
 
     /// Re-open the approval presets popup.

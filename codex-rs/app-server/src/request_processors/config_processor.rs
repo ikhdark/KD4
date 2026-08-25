@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use super::config_errors::ConfigLoadResultExt;
 use crate::config_manager::ConfigManager;
 use crate::config_manager_service::ConfigManagerError;
 use crate::error_code::internal_error;
@@ -39,8 +40,9 @@ use codex_config::MatcherGroup as CoreMatcherGroup;
 use codex_config::ResidencyRequirement as CoreResidencyRequirement;
 use codex_config::SandboxModeRequirement as CoreSandboxModeRequirement;
 use codex_core::ThreadManager;
-use codex_features::canonical_feature_for_key;
+use codex_features::Feature;
 use codex_features::feature_for_key;
+use codex_features::user_settable_feature_for_key;
 use codex_model_provider::create_model_provider;
 use codex_plugin::PluginId;
 use codex_protocol::config_types::WebSearchMode;
@@ -50,8 +52,6 @@ use std::path::PathBuf;
 const SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT: &[&str] = &[
     "auth_elicitation",
     "memories",
-    "mentions_v2",
-    "remote_control",
     "remote_plugin",
     "tool_suggest",
 ];
@@ -186,11 +186,7 @@ impl ConfigRequestProcessor {
         self.config_manager
             .load_latest_config(fallback_cwd)
             .await
-            .map_err(|err| {
-                internal_error(format!(
-                    "failed to resolve feature override precedence: {err}"
-                ))
-            })
+            .map_config_load_error()
     }
 
     async fn write_value(
@@ -227,7 +223,7 @@ impl ConfigRequestProcessor {
             .map_err(map_error)?;
         self.emit_plugin_toggle_events(pending_changes).await;
         if reload_user_config {
-            self.reload_user_config().await;
+            self.reload_user_config(&[]).await;
         }
         Ok(response)
     }
@@ -239,7 +235,7 @@ impl ConfigRequestProcessor {
         let ExperimentalFeatureEnablementSetParams { mut enablement } = params;
         let mut invalid_keys = Vec::new();
         enablement.retain(|key, _| {
-            let valid = canonical_feature_for_key(key).is_some()
+            let valid = user_settable_feature_for_key(key).is_some()
                 && SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT.contains(&key.as_str());
             if !valid {
                 invalid_keys.push(key.clone());
@@ -254,6 +250,10 @@ impl ConfigRequestProcessor {
         if enablement.is_empty() {
             return Ok(ExperimentalFeatureEnablementSetResponse { enablement });
         }
+        let refreshed_features = enablement
+            .keys()
+            .filter_map(|name| user_settable_feature_for_key(name))
+            .collect::<Vec<_>>();
 
         self.config_manager
             .extend_runtime_feature_enablement(
@@ -264,28 +264,32 @@ impl ConfigRequestProcessor {
             .map_err(|_| internal_error("failed to update feature enablement"))?;
 
         self.load_latest_config(/*fallback_cwd*/ None).await?;
-        self.reload_user_config().await;
+        self.reload_user_config(&refreshed_features).await;
 
         Ok(ExperimentalFeatureEnablementSetResponse { enablement })
     }
 
-    async fn reload_user_config(&self) {
-        let next_config = match self.load_latest_config(/*fallback_cwd*/ None).await {
-            Ok(config) => config,
-            Err(err) => {
-                tracing::warn!(
-                    "failed to rebuild user config for runtime refresh: {}",
-                    err.message
-                );
-                return;
-            }
-        };
+    async fn reload_user_config(&self, refreshed_features: &[Feature]) {
         let thread_ids = self.thread_manager.list_thread_ids().await;
         for thread_id in thread_ids {
             let Ok(thread) = self.thread_manager.get_thread(thread_id).await else {
                 continue;
             };
-            thread.refresh_runtime_config(next_config.clone()).await;
+            let current_config = thread.config().await;
+            let next_config = match self
+                .config_manager
+                .load_latest_config_for_thread(current_config.as_ref())
+                .await
+            {
+                Ok(config) => config,
+                Err(err) => {
+                    tracing::warn!("failed to rebuild thread config for runtime refresh: {err}");
+                    continue;
+                }
+            };
+            thread
+                .refresh_runtime_config_features(next_config, refreshed_features)
+                .await;
         }
     }
 
@@ -569,6 +573,7 @@ fn config_write_error(code: ConfigWriteErrorCode, message: impl Into<String>) ->
 
 #[cfg(test)]
 mod tests {
+    use super::SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT;
     use super::map_requirements_toml_to_api;
     use codex_app_server_protocol::WindowsSandboxSetupMode;
     use codex_config::ComputerUseRequirementsToml;
@@ -576,9 +581,20 @@ mod tests {
     use codex_config::ModelsRequirementsToml;
     use codex_config::NewThreadModelDefaultsToml;
     use codex_config::WindowsRequirementsToml;
+    use codex_features::user_settable_feature_for_key;
     use codex_protocol::openai_models::ReasoningEffort;
     use pretty_assertions::assert_eq;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn experimental_feature_enablement_allowlist_only_contains_user_settable_features() {
+        for key in SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT {
+            assert!(
+                user_settable_feature_for_key(key).is_some(),
+                "experimental feature enablement key `{key}` is not user-settable"
+            );
+        }
+    }
 
     #[test]
     fn requirements_api_includes_allow_managed_hooks_only() {

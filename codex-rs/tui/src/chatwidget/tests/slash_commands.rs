@@ -164,10 +164,20 @@ async fn slash_compact_eagerly_queues_follow_up_before_turn_start() {
     chat.dispatch_command(SlashCommand::Compact);
 
     assert!(chat.bottom_pane.is_task_running());
+    assert!(chat.input_queue.user_turn_pending_start);
     match rx.try_recv() {
         Ok(AppEvent::CodexOp(Op::Compact)) => {}
         other => panic!("expected compact op to be submitted, got {other:?}"),
     }
+
+    let input_state = chat
+        .capture_thread_input_state()
+        .expect("thread input state");
+    chat.restore_thread_input_state(/*input_state*/ None);
+    assert!(!chat.bottom_pane.is_task_running());
+    chat.restore_thread_input_state(Some(input_state));
+    assert!(chat.bottom_pane.is_task_running());
+    assert!(chat.input_queue.user_turn_pending_start);
 
     chat.bottom_pane.set_composer_text(
         "queued before compact turn start".to_string(),
@@ -1213,6 +1223,18 @@ async fn slash_rename_without_existing_thread_name_starts_empty() {
 }
 
 #[tokio::test]
+async fn slash_rename_normalizes_inline_thread_name() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    submit_composer_text(&mut chat, "/rename   Current project title   ");
+
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::CodexOp(Op::SetThreadName { name })) if name == "Current project title"
+    );
+}
+
+#[tokio::test]
 async fn usage_error_slash_command_is_available_from_local_recall() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
 
@@ -1545,6 +1567,7 @@ async fn completed_token_activity_refresh_retries_after_plan_item_completion() {
     let mut controller = crate::streaming::controller::PlanStreamController::new(
         /*width*/ None,
         &chat.config.cwd,
+        chat.config.file_opener,
         chat.history_render_mode(),
     );
     controller.push("Plan details");

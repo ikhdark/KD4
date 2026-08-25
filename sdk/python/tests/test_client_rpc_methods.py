@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
 from openai_codex.api import TurnHandle
-from openai_codex.client import CodexClient, CodexConfig, _params_dict
+from openai_codex.client import (
+    CodexClient,
+    CodexConfig,
+    _installed_codex_path_dirs,
+    _params_dict,
+)
 from openai_codex.errors import CodexError, TransportClosedError
 from openai_codex.generated.notification_registry import notification_turn_id
 from openai_codex.generated.v2_all import (
@@ -82,6 +88,14 @@ def test_generated_params_models_are_snake_case_and_dump_by_alias() -> None:
     assert "search_term" in ThreadListParams.model_fields
     dumped = _params_dict(params)
     assert dumped == {"searchTerm": "needle", "limit": 5}
+
+
+def test_installed_path_dirs_requires_pinned_runtime_symbol(monkeypatch) -> None:
+    runtime_module = ModuleType("codex_cli_bin")
+    monkeypatch.setitem(sys.modules, "codex_cli_bin", runtime_module)
+
+    with pytest.raises(ImportError):
+        _installed_codex_path_dirs()
 
 
 def test_generated_v2_bundle_has_single_shared_plan_type_definition() -> None:

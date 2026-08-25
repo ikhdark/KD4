@@ -10,7 +10,7 @@ async fn approval_key_includes_environment_id() {
     let mut request = ShellRequest {
         command: vec!["echo".to_string(), "hello".to_string()],
         command_for_approval: vec!["echo".to_string(), "hello".to_string()],
-        #[cfg(windows)]
+
         approved_powershell_direct_argv: None,
         turn_environment: TurnEnvironment::new(
             "remote".to_string(),
@@ -29,8 +29,6 @@ async fn approval_key_includes_environment_id() {
         network: None,
         sandbox_permissions: SandboxPermissions::UseDefault,
         additional_permissions: None,
-        #[cfg(unix)]
-        additional_permissions_preapproved: false,
         justification: None,
         exec_approval_requirement: ExecApprovalRequirement::Skip {
             bypass_sandbox: false,
@@ -40,7 +38,7 @@ async fn approval_key_includes_environment_id() {
         validation_launch: None,
         workspace_operation_root: None,
     };
-    let runtime = ShellRuntime::for_shell_command(ShellRuntimeBackend::ShellCommandClassic);
+    let runtime = ShellRuntime::for_shell_command();
     let original_key = runtime.approval_keys(&request);
     request.turn_environment.environment_id = "other".to_string();
     let other_key = runtime.approval_keys(&request);
@@ -63,7 +61,7 @@ async fn approval_key_uses_inspectable_command_instead_of_encoded_payload() {
             "-Command".to_string(),
             "Get-ChildItem".to_string(),
         ],
-        #[cfg(windows)]
+
         approved_powershell_direct_argv: None,
         turn_environment: TurnEnvironment::new(
             "local".to_string(),
@@ -82,8 +80,6 @@ async fn approval_key_uses_inspectable_command_instead_of_encoded_payload() {
         network: None,
         sandbox_permissions: SandboxPermissions::UseDefault,
         additional_permissions: None,
-        #[cfg(unix)]
-        additional_permissions_preapproved: false,
         justification: None,
         exec_approval_requirement: ExecApprovalRequirement::Skip {
             bypass_sandbox: false,
@@ -93,7 +89,7 @@ async fn approval_key_uses_inspectable_command_instead_of_encoded_payload() {
         validation_launch: None,
         workspace_operation_root: None,
     };
-    let runtime = ShellRuntime::for_shell_command(ShellRuntimeBackend::ShellCommandClassic);
+    let runtime = ShellRuntime::for_shell_command();
 
     let keys = runtime.approval_keys(&request);
     assert_eq!(keys.len(), 1);

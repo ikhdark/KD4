@@ -669,10 +669,7 @@ struct FileSnapshotIdentity {
 
 #[derive(Debug, Eq, PartialEq)]
 enum StableSnapshotFileId {
-    #[cfg(windows)]
     Windows { volume: u64, index: [u8; 16] },
-    #[cfg(unix)]
-    Unix { device: u64, inode: u64 },
 }
 
 impl FileSnapshotIdentity {
@@ -687,7 +684,6 @@ impl FileSnapshotIdentity {
     }
 }
 
-#[cfg(windows)]
 fn stable_snapshot_file_id(file: &File) -> Option<StableSnapshotFileId> {
     use std::mem::MaybeUninit;
     use std::os::windows::io::AsRawHandle;
@@ -715,23 +711,6 @@ fn stable_snapshot_file_id(file: &File) -> Option<StableSnapshotFileId> {
         volume: info.VolumeSerialNumber,
         index: info.FileId.Identifier,
     })
-}
-
-#[cfg(unix)]
-fn stable_snapshot_file_id(file: &File) -> Option<StableSnapshotFileId> {
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = file.metadata().ok()?;
-
-    Some(StableSnapshotFileId::Unix {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
-}
-
-#[cfg(not(any(windows, unix)))]
-fn stable_snapshot_file_id(_file: &File) -> Option<StableSnapshotFileId> {
-    None
 }
 
 async fn reconcile_entries_tx(
@@ -852,11 +831,7 @@ fn observed_path_covers(observed: &str, path: &str) -> bool {
 }
 
 fn comparison_path(path: &str) -> String {
-    if cfg!(windows) {
-        path.to_lowercase()
-    } else {
-        path.to_string()
-    }
+    path.to_lowercase()
 }
 
 async fn update_workspace_entries_tx(
@@ -960,11 +935,7 @@ async fn query_assignment_ids(
 }
 
 fn paths_equal(left: &str, right: &str) -> bool {
-    if cfg!(windows) {
-        left.eq_ignore_ascii_case(right)
-    } else {
-        left == right
-    }
+    left.eq_ignore_ascii_case(right)
 }
 
 fn json<T: serde::Serialize + ?Sized>(value: &T) -> StoreResult<String> {

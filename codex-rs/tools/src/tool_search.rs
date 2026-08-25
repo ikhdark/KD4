@@ -68,20 +68,10 @@ impl ToolSearchInfo {
 }
 
 fn tool_names(spec: &ToolSpec) -> Vec<String> {
-    match spec {
-        ToolSpec::Function(tool) => vec![tool.name.clone()],
-        ToolSpec::Namespace(namespace) => namespace
-            .tools
-            .iter()
-            .map(|tool| {
-                let ResponsesApiNamespaceTool::Function(tool) = tool;
-                tool.name.clone()
-            })
-            .collect(),
-        ToolSpec::ToolSearch { .. } | ToolSpec::WebSearch { .. } | ToolSpec::Freeform(_) => {
-            Vec::new()
-        }
-    }
+    spec.callable_tool_names()
+        .into_iter()
+        .map(|tool_name| tool_name.name)
+        .collect()
 }
 
 fn default_tool_search_text(spec: &ToolSpec) -> String {

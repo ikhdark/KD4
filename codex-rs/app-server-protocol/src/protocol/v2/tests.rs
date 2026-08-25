@@ -1,7 +1,6 @@
 use super::*;
 use crate::ServerNotification;
 use codex_protocol::approvals::ElicitationRequest as CoreElicitationRequest;
-use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::AgentMessageItem;
 use codex_protocol::items::CollabAgentTool as CoreCollabAgentTool;
@@ -37,7 +36,6 @@ use codex_protocol::permissions::FileSystemSandboxEntry as CoreFileSystemSandbox
 use codex_protocol::permissions::FileSystemSpecialPath as CoreFileSystemSpecialPath;
 use codex_protocol::protocol::AgentStatus as CoreAgentStatus;
 use codex_protocol::protocol::AskForApproval as CoreAskForApproval;
-use codex_protocol::protocol::ConversationTextRole;
 use codex_protocol::protocol::ExecCommandSource as CoreExecCommandSource;
 use codex_protocol::protocol::GranularApprovalConfig as CoreGranularApprovalConfig;
 use codex_protocol::protocol::NetworkAccess as CoreNetworkAccess;
@@ -93,9 +91,6 @@ fn thread_sources_round_trip_as_scalar_labels() {
             serde_json::from_value::<ThreadSource>(value).expect("deserialize thread source"),
             source
         );
-
-        let core_source: codex_protocol::protocol::ThreadSource = source.clone().into();
-        assert_eq!(ThreadSource::from(core_source), source);
     }
 }
 
@@ -216,7 +211,6 @@ fn thread_resume_response_round_trips_initial_turns_page() {
         sandbox: SandboxPolicy::DangerFullAccess,
         active_permission_profile: None,
         reasoning_effort: None,
-        multi_agent_mode: Default::default(),
         initial_turns_page: Some(TurnsPage {
             data: Vec::new(),
             next_cursor: Some("cursor_next".to_string()),
@@ -578,16 +572,8 @@ fn command_execution_request_approval_localization_rejects_relative_additional_p
 
 #[test]
 fn permissions_request_approval_uses_request_permission_profile() {
-    let read_only_path = if cfg!(windows) {
-        r"C:\tmp\read-only"
-    } else {
-        "/tmp/read-only"
-    };
-    let read_write_path = if cfg!(windows) {
-        r"C:\tmp\read-write"
-    } else {
-        "/tmp/read-write"
-    };
+    let read_only_path = r"C:\tmp\read-only";
+    let read_write_path = r"C:\tmp\read-write";
     let params = serde_json::from_value::<PermissionsRequestApprovalParams>(json!({
         "threadId": "thr_123",
         "turnId": "turn_123",
@@ -808,16 +794,8 @@ fn legacy_current_working_directory_special_path_deserializes_as_project_roots()
 
 #[test]
 fn permissions_request_approval_response_uses_granted_permission_profile_without_macos() {
-    let read_only_path = if cfg!(windows) {
-        r"C:\tmp\read-only"
-    } else {
-        "/tmp/read-only"
-    };
-    let read_write_path = if cfg!(windows) {
-        r"C:\tmp\read-write"
-    } else {
-        "/tmp/read-write"
-    };
+    let read_only_path = r"C:\tmp\read-only";
+    let read_write_path = r"C:\tmp\read-write";
     let response = serde_json::from_value::<PermissionsRequestApprovalResponse>(json!({
         "permissions": {
             "network": {
@@ -1491,10 +1469,7 @@ fn command_exec_params_round_trip_with_size() {
         timeout_ms: None,
         cwd: None,
         env: None,
-        size: Some(CommandExecTerminalSize {
-            rows: 40,
-            cols: 120,
-        }),
+        size: Some(CommandExecTerminalSize::new(40, 120)),
         sandbox_policy: None,
         permission_profile: None,
     };
@@ -1525,13 +1500,27 @@ fn command_exec_params_round_trip_with_size() {
 }
 
 #[test]
+fn terminal_size_wrappers_share_the_canonical_payload() {
+    let canonical = PtyTerminalSize {
+        rows: 48,
+        cols: 132,
+    };
+    let command = CommandExecTerminalSize(canonical);
+    let process = ProcessTerminalSize(canonical);
+
+    assert_eq!(command.into_inner(), canonical);
+    assert_eq!(process.into_inner(), canonical);
+    assert_eq!(
+        serde_json::to_value(command).expect("serialize command terminal size"),
+        serde_json::to_value(process).expect("serialize process terminal size")
+    );
+}
+
+#[test]
 fn command_exec_resize_round_trips() {
     let params = CommandExecResizeParams {
         process_id: "proc-9".to_string(),
-        size: CommandExecTerminalSize {
-            rows: 50,
-            cols: 160,
-        },
+        size: CommandExecTerminalSize::new(50, 160),
     };
 
     let value = serde_json::to_value(&params).expect("serialize command/exec/resize params");
@@ -1599,10 +1588,7 @@ fn process_control_params_round_trip() {
 
     let resize = ProcessResizePtyParams {
         process_handle: "proc-7".to_string(),
-        size: ProcessTerminalSize {
-            rows: 50,
-            cols: 160,
-        },
+        size: ProcessTerminalSize::new(50, 160),
     };
     let value = serde_json::to_value(&resize).expect("serialize process/resizePty params");
     assert_eq!(
@@ -3260,11 +3246,7 @@ fn skills_extra_roots_set_params_rejects_relative_roots() {
 
 #[test]
 fn plugin_source_serializes_local_git_npm_and_remote_variants() {
-    let local_path = if cfg!(windows) {
-        r"C:\plugins\linear"
-    } else {
-        "/plugins/linear"
-    };
+    let local_path = r"C:\plugins\linear";
     let local_path = AbsolutePathBuf::try_from(PathBuf::from(local_path)).unwrap();
     let local_path_json = local_path.as_path().display().to_string();
 
@@ -3398,18 +3380,10 @@ fn plugin_marketplace_entry_serializes_remote_only_path_as_null() {
 
 #[test]
 fn plugin_interface_serializes_local_paths_and_remote_urls_separately() {
-    let composer_icon = if cfg!(windows) {
-        r"C:\plugins\linear\icon.png"
-    } else {
-        "/plugins/linear/icon.png"
-    };
+    let composer_icon = r"C:\plugins\linear\icon.png";
     let composer_icon = AbsolutePathBuf::try_from(PathBuf::from(composer_icon)).unwrap();
     let composer_icon_json = composer_icon.as_path().display().to_string();
-    let logo_dark = if cfg!(windows) {
-        r"C:\plugins\linear\logo-dark.png"
-    } else {
-        "/plugins/linear/logo-dark.png"
-    };
+    let logo_dark = r"C:\plugins\linear\logo-dark.png";
     let logo_dark = AbsolutePathBuf::try_from(PathBuf::from(logo_dark)).unwrap();
     let logo_dark_json = logo_dark.as_path().display().to_string();
 
@@ -3526,11 +3500,7 @@ fn plugin_installed_params_serializes_install_suggestion_names() {
 
 #[test]
 fn plugin_read_params_serialization_uses_install_source_fields() {
-    let marketplace_path = if cfg!(windows) {
-        r"C:\plugins\marketplace.json"
-    } else {
-        "/plugins/marketplace.json"
-    };
+    let marketplace_path = r"C:\plugins\marketplace.json";
     let marketplace_path = AbsolutePathBuf::try_from(PathBuf::from(marketplace_path)).unwrap();
     let marketplace_path_json = marketplace_path.as_path().display().to_string();
     assert_eq!(
@@ -3577,11 +3547,7 @@ fn plugin_read_params_serialization_uses_install_source_fields() {
 
 #[test]
 fn plugin_install_params_serialization_omits_force_remote_sync() {
-    let marketplace_path = if cfg!(windows) {
-        r"C:\plugins\marketplace.json"
-    } else {
-        "/plugins/marketplace.json"
-    };
+    let marketplace_path = r"C:\plugins\marketplace.json";
     let marketplace_path = AbsolutePathBuf::try_from(PathBuf::from(marketplace_path)).unwrap();
     let marketplace_path_json = marketplace_path.as_path().display().to_string();
     assert_eq!(
@@ -3646,11 +3612,7 @@ fn plugin_skill_read_params_serialization_uses_remote_plugin_id() {
 
 #[test]
 fn plugin_share_params_and_response_serialization_use_camel_case_fields() {
-    let plugin_path = if cfg!(windows) {
-        r"C:\plugins\gmail"
-    } else {
-        "/plugins/gmail"
-    };
+    let plugin_path = r"C:\plugins\gmail";
     let plugin_path = AbsolutePathBuf::try_from(PathBuf::from(plugin_path)).unwrap();
     let plugin_path_json = plugin_path.as_path().display().to_string();
 
@@ -3779,18 +3741,10 @@ fn plugin_share_params_and_response_serialization_use_camel_case_fields() {
         }),
     );
 
-    let plugin_path = if cfg!(windows) {
-        r"C:\Users\me\plugins\gmail"
-    } else {
-        "/Users/me/plugins/gmail"
-    };
+    let plugin_path = r"C:\Users\me\plugins\gmail";
     let plugin_path = AbsolutePathBuf::try_from(PathBuf::from(plugin_path)).unwrap();
     let plugin_path_json = plugin_path.as_path().display().to_string();
-    let marketplace_path = if cfg!(windows) {
-        r"C:\Users\me\.agents\plugins\marketplace.json"
-    } else {
-        "/Users/me/.agents/plugins/marketplace.json"
-    };
+    let marketplace_path = r"C:\Users\me\.agents\plugins\marketplace.json";
     let marketplace_path = AbsolutePathBuf::try_from(PathBuf::from(marketplace_path)).unwrap();
     let marketplace_path_json = marketplace_path.as_path().display().to_string();
     assert_eq!(
@@ -3956,11 +3910,7 @@ fn plugin_uninstall_params_serialization_omits_force_remote_sync() {
 
 #[test]
 fn marketplace_remove_response_serializes_nullable_installed_root() {
-    let installed_root = if cfg!(windows) {
-        r"C:\marketplaces\debug"
-    } else {
-        "/tmp/marketplaces/debug"
-    };
+    let installed_root = r"C:\marketplaces\debug";
     let installed_root = AbsolutePathBuf::try_from(PathBuf::from(installed_root)).unwrap();
     let installed_root_json = installed_root.as_path().display().to_string();
     assert_eq!(
@@ -3990,11 +3940,7 @@ fn marketplace_remove_response_serializes_nullable_installed_root() {
 
 #[test]
 fn marketplace_upgrade_response_serializes_camel_case_fields() {
-    let upgraded_root = if cfg!(windows) {
-        r"C:\marketplaces\debug"
-    } else {
-        "/tmp/marketplaces/debug"
-    };
+    let upgraded_root = r"C:\marketplaces\debug";
     let upgraded_root = AbsolutePathBuf::try_from(PathBuf::from(upgraded_root)).unwrap();
     let upgraded_root_json = upgraded_root.as_path().display().to_string();
 
@@ -4185,19 +4131,6 @@ fn thread_lifecycle_responses_default_missing_optional_fields() {
     assert_eq!(resume.active_permission_profile, None);
     assert_eq!(resume.initial_turns_page, None);
     assert_eq!(fork.active_permission_profile, None);
-    assert_eq!(
-        (
-            start.multi_agent_mode,
-            resume.multi_agent_mode,
-            fork.multi_agent_mode,
-        ),
-        (
-            MultiAgentMode::ExplicitRequestOnly,
-            MultiAgentMode::ExplicitRequestOnly,
-            MultiAgentMode::ExplicitRequestOnly,
-        )
-    );
-
     let foreign_source: LegacyAppPathString =
         serde_json::from_value(json!(r"C:\workspace\AGENTS.md")).expect("foreign source");
     let mut response_with_foreign_source = response;
@@ -4293,7 +4226,6 @@ fn turn_start_params_preserve_explicit_null_service_tier() {
         summary: None,
         output_schema: None,
         collaboration_mode: None,
-        multi_agent_mode: None,
         personality: None,
     };
     let serialized_without_override =
@@ -4318,47 +4250,31 @@ fn turn_start_params_round_trip_run_independently() {
 }
 
 #[test]
-fn turn_start_params_round_trip_multi_agent_mode() {
-    let params: TurnStartParams = serde_json::from_value(json!({
+fn retired_multi_agent_mode_request_fields_are_ignored() {
+    let turn_start: TurnStartParams = serde_json::from_value(json!({
         "threadId": "thread_123",
         "input": [],
         "multiAgentMode": "proactive"
     }))
     .expect("params should deserialize");
-
-    assert_eq!(
-        params.multi_agent_mode,
-        Some(codex_protocol::config_types::MultiAgentMode::Proactive)
-    );
-    assert_eq!(
-        crate::experimental_api::ExperimentalApi::experimental_reason(&params),
-        Some("turn/start.multiAgentMode")
-    );
-    assert_eq!(
-        serde_json::to_value(params).expect("params should serialize")["multiAgentMode"],
-        "proactive"
-    );
-}
-
-#[test]
-fn thread_start_params_round_trip_multi_agent_mode() {
-    let params: ThreadStartParams = serde_json::from_value(json!({
+    let thread_start: ThreadStartParams = serde_json::from_value(json!({
+        "multiAgentMode": "proactive"
+    }))
+    .expect("params should deserialize");
+    let settings_update: ThreadSettingsUpdateParams = serde_json::from_value(json!({
+        "threadId": "thread_123",
         "multiAgentMode": "proactive"
     }))
     .expect("params should deserialize");
 
-    assert_eq!(
-        params.multi_agent_mode,
-        Some(codex_protocol::config_types::MultiAgentMode::Proactive)
-    );
-    assert_eq!(
-        crate::experimental_api::ExperimentalApi::experimental_reason(&params),
-        Some("thread/start.multiAgentMode")
-    );
-    assert_eq!(
-        serde_json::to_value(params).expect("params should serialize")["multiAgentMode"],
-        "proactive"
-    );
+    for params in [
+        serde_json::to_value(turn_start).expect("turn/start params should serialize"),
+        serde_json::to_value(thread_start).expect("thread/start params should serialize"),
+        serde_json::to_value(settings_update)
+            .expect("thread/settings/update params should serialize"),
+    ] {
+        assert!(params.get("multiAgentMode").is_none());
+    }
 }
 
 #[test]
@@ -4436,10 +4352,9 @@ fn thread_settings_update_params_preserve_field_level_experimental_gates() {
 fn turn_start_params_round_trip_environments() {
     // Use a path foreign to the test host so this exercises syntax preservation instead of the
     // host-native conversion performed by test_absolute_path().
-    #[cfg(windows)]
+
     let raw_cwd = "/workspace";
-    #[cfg(not(windows))]
-    let raw_cwd = r"C:\workspace";
+
     let cwd: LegacyAppPathString =
         serde_json::from_value(json!(raw_cwd)).expect("API path should deserialize");
     let params: TurnStartParams = serde_json::from_value(json!({
@@ -4520,24 +4435,6 @@ fn turn_start_params_treat_null_or_omitted_environments_as_default() {
     assert_eq!(
         crate::experimental_api::ExperimentalApi::experimental_reason(&omitted_environments),
         None
-    );
-}
-
-#[test]
-fn realtime_append_text_defaults_role_to_user() {
-    let params = serde_json::from_value::<ThreadRealtimeAppendTextParams>(json!({
-        "threadId": "thread_123",
-        "text": "hello",
-    }))
-    .expect("params should deserialize");
-
-    assert_eq!(
-        params,
-        ThreadRealtimeAppendTextParams {
-            thread_id: "thread_123".to_string(),
-            text: "hello".to_string(),
-            role: ConversationTextRole::User,
-        }
     );
 }
 

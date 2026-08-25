@@ -31,18 +31,12 @@ impl ChatWidget {
         }
 
         if self.handle_reasoning_shortcut(key_event) {
-            self.bottom_pane.clear_quit_shortcut_hint();
-            self.quit_shortcut_expires_at = None;
-            self.quit_shortcut_key = None;
             return;
         }
 
         if key_event.kind == KeyEventKind::Press
             && self.copy_last_response_binding.is_pressed(key_event)
         {
-            self.bottom_pane.clear_quit_shortcut_hint();
-            self.quit_shortcut_expires_at = None;
-            self.quit_shortcut_key = None;
             self.copy_last_agent_markdown();
             return;
         }
@@ -62,13 +56,11 @@ impl ChatWidget {
                 modifiers,
                 kind: KeyEventKind::Press,
                 ..
-            } if modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'d') => {
-                if self.on_ctrl_d() {
-                    return;
-                }
-                self.bottom_pane.clear_quit_shortcut_hint();
-                self.quit_shortcut_expires_at = None;
-                self.quit_shortcut_key = None;
+            } if modifiers.contains(KeyModifiers::CONTROL)
+                && c.eq_ignore_ascii_case(&'d')
+                && self.on_ctrl_d() =>
+            {
+                return;
             }
             KeyEvent {
                 code: KeyCode::Char(c),
@@ -96,11 +88,6 @@ impl ChatWidget {
                     }
                 }
                 return;
-            }
-            other if other.kind == KeyEventKind::Press => {
-                self.bottom_pane.clear_quit_shortcut_hint();
-                self.quit_shortcut_expires_at = None;
-                self.quit_shortcut_key = None;
             }
             _ => {}
         }
@@ -376,14 +363,8 @@ impl ChatWidget {
 
     /// Handles a Ctrl+C press at the chat-widget layer.
     ///
-    /// The first press arms a time-bounded quit shortcut and shows a footer hint via the bottom
-    /// pane. If cancellable work is active, Ctrl+C also submits `Op::Interrupt` after the shortcut
-    /// is armed.
-    ///
-    /// When the double-press quit shortcut is enabled, pressing the same shortcut again before
-    /// expiry requests a shutdown-first quit.
+    /// If cancellable work is active, Ctrl+C submits `Op::Interrupt`; otherwise it requests quit.
     fn on_ctrl_c(&mut self) {
-        let key = key_hint::ctrl(KeyCode::Char('c'));
         let modal_or_popup_active = !self.bottom_pane.no_modal_or_popup_active();
         let should_pause_active_goal = self
             .bottom_pane
@@ -392,15 +373,6 @@ impl ChatWidget {
                 KeyModifiers::CONTROL,
             ));
         if self.bottom_pane.on_ctrl_c() == CancellationEvent::Handled {
-            if DOUBLE_PRESS_QUIT_SHORTCUT_ENABLED {
-                if modal_or_popup_active {
-                    self.quit_shortcut_expires_at = None;
-                    self.quit_shortcut_key = None;
-                    self.bottom_pane.clear_quit_shortcut_hint();
-                } else {
-                    self.arm_quit_shortcut(key);
-                }
-            }
             if should_pause_active_goal {
                 self.pause_active_goal_for_interrupt();
             }
@@ -410,33 +382,12 @@ impl ChatWidget {
             return;
         }
 
-        if !DOUBLE_PRESS_QUIT_SHORTCUT_ENABLED {
-            if self.is_cancellable_work_active() {
-                self.quit_shortcut_expires_at = None;
-                self.quit_shortcut_key = None;
-                self.bottom_pane.clear_quit_shortcut_hint();
-                if self.submit_op(AppCommand::interrupt_and_restore_prompt_if_no_output()) {
-                    self.pause_active_goal_for_interrupt();
-                }
-            } else {
-                self.request_quit_without_confirmation();
+        if self.is_cancellable_work_active() {
+            if self.submit_op(AppCommand::interrupt_and_restore_prompt_if_no_output()) {
+                self.pause_active_goal_for_interrupt();
             }
-            return;
-        }
-
-        if self.quit_shortcut_active_for(key) {
-            self.quit_shortcut_expires_at = None;
-            self.quit_shortcut_key = None;
+        } else {
             self.request_quit_without_confirmation();
-            return;
-        }
-
-        self.arm_quit_shortcut(key);
-
-        if self.is_cancellable_work_active()
-            && self.submit_op(AppCommand::interrupt_and_restore_prompt_if_no_output())
-        {
-            self.pause_active_goal_for_interrupt();
         }
     }
 
@@ -445,51 +396,12 @@ impl ChatWidget {
     /// Ctrl-D only participates in quit when the composer is empty and no modal/popup is active.
     /// Otherwise it should be routed to the active view and not attempt to quit.
     fn on_ctrl_d(&mut self) -> bool {
-        let key = key_hint::ctrl(KeyCode::Char('d'));
-        if !DOUBLE_PRESS_QUIT_SHORTCUT_ENABLED {
-            if !self.bottom_pane.composer_is_empty() || !self.bottom_pane.no_modal_or_popup_active()
-            {
-                return false;
-            }
-
-            self.request_quit_without_confirmation();
-            return true;
-        }
-
-        if self.quit_shortcut_active_for(key) {
-            self.quit_shortcut_expires_at = None;
-            self.quit_shortcut_key = None;
-            self.request_quit_without_confirmation();
-            return true;
-        }
-
         if !self.bottom_pane.composer_is_empty() || !self.bottom_pane.no_modal_or_popup_active() {
             return false;
         }
 
-        self.arm_quit_shortcut(key);
+        self.request_quit_without_confirmation();
         true
-    }
-
-    /// True if `key` matches the armed quit shortcut and the window has not expired.
-    fn quit_shortcut_active_for(&self, key: KeyBinding) -> bool {
-        self.quit_shortcut_key == Some(key)
-            && self
-                .quit_shortcut_expires_at
-                .is_some_and(|expires_at| Instant::now() < expires_at)
-    }
-
-    /// Arm the double-press quit shortcut and show the footer hint.
-    ///
-    /// This keeps the state machine (`quit_shortcut_*`) in `ChatWidget`, since
-    /// it is the component that interprets Ctrl+C vs Ctrl+D and decides whether
-    /// quitting is currently allowed, while delegating rendering to `BottomPane`.
-    pub(super) fn arm_quit_shortcut(&mut self, key: KeyBinding) {
-        self.quit_shortcut_expires_at = Instant::now()
-            .checked_add(QUIT_SHORTCUT_TIMEOUT)
-            .or_else(|| Some(Instant::now()));
-        self.quit_shortcut_key = Some(key);
-        self.bottom_pane.show_quit_shortcut_hint(key);
     }
 
     // Review mode counts as cancellable work so Ctrl+C interrupts instead of quitting.

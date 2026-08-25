@@ -35,11 +35,12 @@ async fn handle_resume_agent(
 ) -> Result<ResumeAgentResult, FunctionCallError> {
     let ToolInvocation {
         session,
-        turn,
+        step_context,
         payload,
         call_id,
         ..
     } = invocation;
+    let turn = Arc::clone(&step_context.turn);
     let arguments = function_arguments(payload)?;
     let args: ResumeAgentArgs = parse_arguments(&arguments)?;
     let receiver_thread_id = ThreadId::from_string(&args.id).map_err(|err| {

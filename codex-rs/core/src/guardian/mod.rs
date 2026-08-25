@@ -154,6 +154,8 @@ use prompt::build_guardian_prompt_items_with_parent_turn;
 #[cfg(test)]
 use prompt::collect_guardian_transcript_entries;
 #[cfg(test)]
+use prompt::collect_guardian_transcript_entries_after_for_test;
+#[cfg(test)]
 use prompt::guardian_output_schema;
 #[cfg(test)]
 pub(crate) use prompt::guardian_policy_prompt;

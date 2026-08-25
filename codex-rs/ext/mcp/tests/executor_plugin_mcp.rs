@@ -16,6 +16,14 @@ use std::sync::Arc;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+#[test]
+fn connector_loader_implementation_lives_at_its_crate_root() {
+    let source = include_str!("../../connectors/src/lib.rs");
+    let obsolete_module = ["mod executor_", "plugin;"].concat();
+
+    assert!(!source.contains(&obsolete_module));
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct ContributionSummary {
     name: String,

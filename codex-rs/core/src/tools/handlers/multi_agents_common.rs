@@ -1,8 +1,6 @@
+use crate::FunctionCallError;
 use crate::agent::role::AgentRoleLocks;
 use crate::config::Config;
-use crate::config::DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS;
-use crate::config::HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS;
-use crate::function_tool::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::FunctionToolOutput;
@@ -25,10 +23,6 @@ use codex_tools::ToolOutputProjectionMetadata;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 
-/// Minimum wait timeout to prevent tight polling loops from burning CPU.
-pub(crate) const MIN_WAIT_TIMEOUT_MS: i64 = DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS;
-pub(crate) const DEFAULT_WAIT_TIMEOUT_MS: i64 = MIN_WAIT_TIMEOUT_MS;
-pub(crate) const MAX_WAIT_TIMEOUT_MS: i64 = HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS;
 pub(crate) const DEFAULT_SPAWN_AGENT_MODEL: &str = "gpt-5.6-sol";
 pub(crate) const DEFAULT_SPAWN_AGENT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
 
@@ -248,8 +242,7 @@ pub(crate) fn apply_spawn_agent_runtime_overrides(
             FunctionCallError::RespondToModel(format!("approval_policy is invalid: {err}"))
         })?;
     config.approvals_reviewer = turn.config.approvals_reviewer;
-    #[allow(deprecated)]
-    let turn_cwd = turn.cwd.clone();
+    let turn_cwd = turn.cwd().clone();
     config.cwd = turn_cwd;
     Ok(())
 }
@@ -277,7 +270,7 @@ pub(crate) async fn apply_spawn_agent_model_defaults_and_overrides(
         })?
     } else {
         let available_models = models_manager
-            .list_models(RefreshStrategy::Offline, config.http_client_factory())
+            .list_models_shared(RefreshStrategy::Offline, config.http_client_factory())
             .await;
         match requested_model {
             Some(requested_model) => {

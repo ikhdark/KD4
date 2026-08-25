@@ -82,11 +82,6 @@ impl From<RemoteControlPairingStatusCode> for RemoteControlPairingStatusRequest 
     }
 }
 
-#[derive(Debug, Deserialize)]
-pub(super) struct RemoteControlPairingStatusResponse {
-    pub(super) claimed: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ClientId(pub String);
@@ -161,8 +156,6 @@ pub enum ServerEvent {
         message_size_bytes: usize,
         message_chunk_base64: String,
     },
-    #[allow(dead_code)]
-    Ack,
     Pong {
         status: PongStatus,
     },
@@ -172,7 +165,7 @@ impl ServerEvent {
     pub(crate) fn segment_id(&self) -> Option<usize> {
         match self {
             Self::ServerMessageChunk { segment_id, .. } => Some(*segment_id),
-            Self::ServerMessage { .. } | Self::Ack | Self::Pong { .. } => None,
+            Self::ServerMessage { .. } | Self::Pong { .. } => None,
         }
     }
 }
@@ -293,6 +286,23 @@ pub(super) fn normalize_remote_control_base_url(remote_control_url: &str) -> io:
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn server_event_has_only_supported_outbound_variants() {
+        fn event_kind(event: ServerEvent) -> &'static str {
+            match event {
+                ServerEvent::ServerMessage { .. } => "server_message",
+                ServerEvent::ServerMessageChunk { .. } => "server_message_chunk",
+                ServerEvent::Pong { .. } => "pong",
+            }
+        }
+
+        let event = ServerEvent::Pong {
+            status: PongStatus::Active,
+        };
+        assert_eq!(event.segment_id(), None);
+        assert_eq!(event_kind(event), "pong");
+    }
 
     #[test]
     fn normalize_remote_control_url_accepts_chatgpt_https_urls() {

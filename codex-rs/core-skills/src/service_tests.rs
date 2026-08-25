@@ -7,11 +7,13 @@ use codex_config::ConfigLayerEntry;
 use codex_config::ConfigLayerSource;
 use codex_config::ConfigLayerStack;
 use codex_config::ConfigRequirementsToml;
+use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::LOCAL_FS;
+use codex_exec_server::LocalFileSystem;
+use codex_plugin::PluginSkillRoot;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::test_support::PathBufExt;
 use codex_utils_absolute_path::test_support::PathExt;
-use codex_utils_plugins::PluginSkillRoot;
 use pretty_assertions::assert_eq;
 use std::collections::HashSet;
 use std::fs;
@@ -229,6 +231,70 @@ async fn skills_for_config_reuses_cache_for_same_effective_config() {
 }
 
 #[tokio::test]
+async fn skills_for_config_isolates_snapshots_by_executor_file_system() {
+    let codex_home = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let repo_dot_codex = cwd.path().join(".codex");
+    fs::create_dir_all(&repo_dot_codex).expect("create repo config dir");
+    let config_layer_stack = ConfigLayerStack::new(
+        vec![
+            user_config_layer(&codex_home, ""),
+            ConfigLayerEntry::new(
+                ConfigLayerSource::Project {
+                    dot_codex_folder: repo_dot_codex.abs(),
+                },
+                toml::Value::Table(toml::map::Map::new()),
+            ),
+        ],
+        Default::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .expect("valid config layer stack");
+    let skills_input = SkillsLoadInput::new(
+        cwd.path().abs(),
+        Vec::new(),
+        config_layer_stack,
+        /*bundled_skills_enabled*/ false,
+    );
+    let skills_service = SkillsService::new(
+        codex_home.path().abs(),
+        /*bundled_skills_enabled*/ false,
+    );
+    let first_fs: Arc<dyn ExecutorFileSystem> = Arc::new(LocalFileSystem::unsandboxed());
+    let first_snapshot = skills_service
+        .snapshot_for_config(&skills_input, Some(first_fs))
+        .await;
+    assert!(
+        first_snapshot
+            .outcome()
+            .skills
+            .iter()
+            .all(|skill| skill.name != "environment-skill")
+    );
+
+    let skill_dir = repo_dot_codex.join("skills/environment");
+    fs::create_dir_all(&skill_dir).expect("create environment skill dir");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: environment-skill\ndescription: from second environment\n---\n\n# Body\n",
+    )
+    .expect("write environment skill");
+
+    let second_fs: Arc<dyn ExecutorFileSystem> = Arc::new(LocalFileSystem::unsandboxed());
+    let second_snapshot = skills_service
+        .snapshot_for_config(&skills_input, Some(second_fs))
+        .await;
+    assert!(
+        second_snapshot
+            .outcome()
+            .skills
+            .iter()
+            .any(|skill| skill.name == "environment-skill"),
+        "a distinct executor filesystem must not reuse another environment's snapshot"
+    );
+}
+
+#[tokio::test]
 async fn set_extra_roots_replaces_runtime_roots_and_clears_cache() {
     let codex_home = tempfile::tempdir().expect("tempdir");
     let cwd = tempfile::tempdir().expect("tempdir");
@@ -350,6 +416,72 @@ async fn set_extra_roots_applies_to_config_loads_and_empty_clears() {
             .skills
             .iter()
             .all(|skill| skill.name != "runtime-skill")
+    );
+}
+
+#[tokio::test]
+async fn skills_for_config_does_not_reuse_cache_across_plugin_loads() {
+    let codex_home = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let skill_path = write_plugin_skill(
+        &codex_home,
+        "test",
+        "sample",
+        "sample-search",
+        "sample-search",
+        "description before plugin refresh",
+    );
+    let plugin_skill_root =
+        plugin_skill_root_for_skill_path(&skill_path, "test-plugin@test", "sample");
+    let config_layer_stack = config_stack(&codex_home, "");
+    let skills_service = SkillsService::new(
+        codex_home.path().abs(),
+        /*bundled_skills_enabled*/ true,
+    );
+    let first_input = SkillsLoadInput::new(
+        cwd.path().abs(),
+        vec![plugin_skill_root.clone()],
+        config_layer_stack.clone(),
+        bundled_skills_enabled_from_stack(&config_layer_stack),
+    )
+    .with_plugin_skill_snapshots(Some(PluginSkillSnapshots::for_plugin_load()));
+
+    let first_snapshot = skills_service
+        .snapshot_for_config(&first_input, Some(Arc::clone(&LOCAL_FS)))
+        .await;
+    let first_skill = first_snapshot
+        .outcome()
+        .skills
+        .iter()
+        .find(|skill| skill.name == "sample:sample-search")
+        .expect("plugin skill should load");
+    assert_eq!(first_skill.description, "description before plugin refresh");
+
+    fs::write(
+        &skill_path,
+        "---\nname: sample-search\ndescription: description after plugin refresh\n---\n\n# Body\n",
+    )
+    .expect("update plugin skill");
+    let refreshed_input = SkillsLoadInput::new(
+        cwd.path().abs(),
+        vec![plugin_skill_root],
+        config_layer_stack.clone(),
+        bundled_skills_enabled_from_stack(&config_layer_stack),
+    )
+    .with_plugin_skill_snapshots(Some(PluginSkillSnapshots::for_plugin_load()));
+
+    let refreshed_snapshot = skills_service
+        .snapshot_for_config(&refreshed_input, Some(Arc::clone(&LOCAL_FS)))
+        .await;
+    let refreshed_skill = refreshed_snapshot
+        .outcome()
+        .skills
+        .iter()
+        .find(|skill| skill.name == "sample:sample-search")
+        .expect("refreshed plugin skill should load");
+    assert_eq!(
+        refreshed_skill.description,
+        "description after plugin refresh"
     );
 }
 
@@ -585,11 +717,7 @@ async fn skills_for_cwd_uses_cached_result_until_force_reload() {
         bundled_skills_enabled_from_stack(&config_layer_stack),
     );
     let snapshot_a = skills_service
-        .snapshot_for_cwd(
-            &base_input,
-            /*force_reload*/ false,
-            Some(Arc::clone(&LOCAL_FS)),
-        )
+        .snapshot_for_cwd(&base_input, /*force_reload*/ false, /*fs*/ None)
         .await;
     let outcome_a = snapshot_a.outcome();
     assert!(
@@ -599,14 +727,15 @@ async fn skills_for_cwd_uses_cached_result_until_force_reload() {
             .all(|skill| skill.name != "late-skill")
     );
 
-    write_user_skill(&codex_home, "late", "late-skill", "added after cache");
+    write_user_skill(
+        &codex_home,
+        "late",
+        "late-skill",
+        "added after list snapshot",
+    );
 
     let snapshot_b = skills_service
-        .snapshot_for_cwd(
-            &base_input,
-            /*force_reload*/ false,
-            Some(Arc::clone(&LOCAL_FS)),
-        )
+        .snapshot_for_cwd(&base_input, /*force_reload*/ false, /*fs*/ None)
         .await;
     let outcome_b = snapshot_b.outcome();
     assert!(
@@ -617,11 +746,7 @@ async fn skills_for_cwd_uses_cached_result_until_force_reload() {
     );
 
     let snapshot_reloaded = skills_service
-        .snapshot_for_cwd(
-            &base_input,
-            /*force_reload*/ true,
-            Some(Arc::clone(&LOCAL_FS)),
-        )
+        .snapshot_for_cwd(&base_input, /*force_reload*/ true, /*fs*/ None)
         .await;
     let outcome_reloaded = snapshot_reloaded.outcome();
     assert!(
@@ -632,7 +757,55 @@ async fn skills_for_cwd_uses_cached_result_until_force_reload() {
     );
 }
 
-#[cfg_attr(windows, ignore)]
+#[tokio::test]
+async fn skills_snapshot_cache_evicts_entries_at_capacity() {
+    let codex_home = tempfile::tempdir().expect("tempdir");
+    let skills_service = SkillsService::new(
+        codex_home.path().abs(),
+        /*bundled_skills_enabled*/ true,
+    );
+
+    for index in 0..=MAX_CACHED_SKILL_SNAPSHOTS {
+        let cwd = codex_home.path().join(format!("workspace-{index}"));
+        let repo_dot_codex = cwd.join(".codex");
+        std::fs::create_dir_all(&repo_dot_codex).expect("create repo config dir");
+        let config_layer_stack = ConfigLayerStack::new(
+            vec![
+                user_config_layer(&codex_home, ""),
+                ConfigLayerEntry::new(
+                    ConfigLayerSource::Project {
+                        dot_codex_folder: repo_dot_codex.abs(),
+                    },
+                    toml::Value::Table(toml::map::Map::new()),
+                ),
+            ],
+            Default::default(),
+            ConfigRequirementsToml::default(),
+        )
+        .expect("valid config layer stack");
+        let input = SkillsLoadInput::new(
+            cwd.abs(),
+            Vec::new(),
+            config_layer_stack.clone(),
+            bundled_skills_enabled_from_stack(&config_layer_stack),
+        );
+        skills_service
+            .snapshot_for_cwd(
+                &input,
+                /*force_reload*/ false,
+                Some(Arc::clone(&LOCAL_FS)),
+            )
+            .await;
+    }
+
+    let cache = skills_service
+        .snapshot_cache
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(cache.len(), MAX_CACHED_SKILL_SNAPSHOTS);
+}
+
+#[ignore]
 #[test]
 fn disabled_paths_for_skills_allows_session_flags_to_override_user_layer() {
     let tempdir = tempfile::tempdir().expect("tempdir");
@@ -667,7 +840,7 @@ fn disabled_paths_for_skills_allows_session_flags_to_override_user_layer() {
     );
 }
 
-#[cfg_attr(windows, ignore)]
+#[ignore]
 #[test]
 fn disabled_paths_for_skills_allows_session_flags_to_disable_user_enabled_skill() {
     let tempdir = tempfile::tempdir().expect("tempdir");
@@ -705,7 +878,7 @@ fn disabled_paths_for_skills_allows_session_flags_to_disable_user_enabled_skill(
     );
 }
 
-#[cfg_attr(windows, ignore)]
+#[ignore]
 #[test]
 fn disabled_paths_for_skills_disables_matching_name_selectors() {
     let tempdir = tempfile::tempdir().expect("tempdir");
@@ -738,7 +911,7 @@ fn disabled_paths_for_skills_disables_matching_name_selectors() {
     );
 }
 
-#[cfg_attr(windows, ignore)]
+#[ignore]
 #[test]
 fn disabled_paths_for_skills_allows_name_selector_to_override_path_selector() {
     let tempdir = tempfile::tempdir().expect("tempdir");
@@ -773,7 +946,7 @@ fn disabled_paths_for_skills_allows_name_selector_to_override_path_selector() {
     );
 }
 
-#[cfg_attr(windows, ignore)]
+#[ignore]
 #[tokio::test]
 async fn skills_for_config_ignores_cwd_cache_when_session_flags_reenable_skill() {
     let codex_home = tempfile::tempdir().expect("tempdir");

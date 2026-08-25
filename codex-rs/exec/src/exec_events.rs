@@ -1,4 +1,4 @@
-use codex_protocol::models::WebSearchAction;
+pub use codex_protocol::items::WebSearchItem;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -302,14 +302,6 @@ pub struct McpToolCallItem {
     pub status: McpToolCallStatus,
 }
 
-/// A web search request.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
-pub struct WebSearchItem {
-    pub id: String,
-    pub query: String,
-    pub action: WebSearchAction,
-}
-
 /// An error notification.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 pub struct ErrorItem {
@@ -326,4 +318,19 @@ pub struct TodoItem {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 pub struct TodoListItem {
     pub items: Vec<TodoItem>,
+}
+
+#[cfg(test)]
+mod consolidated_type_tests {
+    use super::WebSearchItem;
+
+    fn into_protocol(item: WebSearchItem) -> codex_protocol::items::WebSearchItem {
+        item
+    }
+
+    #[test]
+    fn web_search_item_is_protocol_owned() {
+        let conversion: fn(WebSearchItem) -> codex_protocol::items::WebSearchItem = into_protocol;
+        let _ = conversion;
+    }
 }

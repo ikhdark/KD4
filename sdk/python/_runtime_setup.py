@@ -15,7 +15,7 @@ from pathlib import Path
 
 PACKAGE_NAME = "openai-codex-cli-bin"
 SDK_PACKAGE_NAME = "openai-codex"
-REPO_SLUG = "openai/codex"
+REPO_SLUG = "ikhdark/KD4"
 
 
 class RuntimeSetupError(RuntimeError):
@@ -88,29 +88,28 @@ def ensure_runtime_package_installed(
 
 
 def platform_asset_name() -> str:
-    system = platform.system().lower()
+    if platform.system() != "Windows":
+        raise RuntimeSetupError(
+            f"Unsupported runtime platform: system={platform.system()!r}; Windows is required."
+        )
+
     machine = platform.machine().lower()
 
-    if system == "darwin":
-        if machine in {"arm64", "aarch64"}:
-            return "codex-package-aarch64-apple-darwin.tar.gz"
-        if machine in {"x86_64", "amd64"}:
-            return "codex-package-x86_64-apple-darwin.tar.gz"
-    elif system == "linux":
-        if machine in {"aarch64", "arm64"}:
-            return "codex-package-aarch64-unknown-linux-musl.tar.gz"
-        if machine in {"x86_64", "amd64"}:
-            return "codex-package-x86_64-unknown-linux-musl.tar.gz"
-    elif system == "windows":
-        if machine in {"aarch64", "arm64"}:
-            return "codex-package-aarch64-pc-windows-msvc.tar.gz"
-        if machine in {"x86_64", "amd64"}:
-            return "codex-package-x86_64-pc-windows-msvc.tar.gz"
+    if machine in {"aarch64", "arm64"}:
+        return "codex-package-aarch64-pc-windows-msvc.tar.gz"
+    if machine in {"x86_64", "amd64"}:
+        return "codex-package-x86_64-pc-windows-msvc.tar.gz"
 
     raise RuntimeSetupError(
-        f"Unsupported runtime artifact platform: system={platform.system()!r}, "
-        f"machine={platform.machine()!r}"
+        f"Unsupported Windows runtime architecture: machine={platform.machine()!r}"
     )
+
+
+def platform_wheel_tag() -> str:
+    asset_name = platform_asset_name()
+    if "aarch64" in asset_name:
+        return "win_arm64"
+    return "win_amd64"
 
 
 def _installed_runtime_version(python_executable: str | Path) -> str | None:
@@ -262,6 +261,7 @@ def _stage_runtime_package(
         staging_dir,
         runtime_version,
         runtime_package_archive.resolve(),
+        platform_tag=platform_wheel_tag(),
     )
 
 

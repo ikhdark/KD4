@@ -1,7 +1,6 @@
-#![cfg(test)]
-
 use std::path::Path;
 
+use codex_app_server_protocol::ChatgptAuthTokensRefreshResponse;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_login::AuthKeyringBackendKind;
 use codex_login::load_auth_dot_json;
@@ -12,6 +11,16 @@ pub(crate) struct LocalChatgptAuth {
     pub(crate) access_token: String,
     pub(crate) chatgpt_account_id: String,
     pub(crate) chatgpt_plan_type: Option<String>,
+}
+
+impl LocalChatgptAuth {
+    pub(crate) fn to_refresh_response(&self) -> ChatgptAuthTokensRefreshResponse {
+        ChatgptAuthTokensRefreshResponse {
+            access_token: self.access_token.clone(),
+            chatgpt_account_id: self.chatgpt_account_id.clone(),
+            chatgpt_plan_type: self.chatgpt_plan_type.clone(),
+        }
+    }
 }
 
 pub(crate) fn load_local_chatgpt_auth(

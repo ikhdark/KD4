@@ -235,7 +235,6 @@ mod popup_state;
 mod slash_input;
 
 use self::attachment_state::AttachmentState;
-use self::draft_state::ComposerMentionBinding;
 use self::draft_state::DraftState;
 use self::footer_state::FooterState;
 use self::history_search::HistorySearchSession;
@@ -258,6 +257,8 @@ use crate::skills_helpers::skill_display_name;
 use crate::tui::FrameRequester;
 use crate::ui_consts::LIVE_PREFIX_COLS;
 use codex_connectors::AppInfo;
+use codex_core_skills::injection::is_mention_name_char;
+use codex_core_skills::injection::is_mention_name_char_char;
 #[cfg(test)]
 use codex_core_skills::model::SkillInterface;
 use codex_core_skills::model::SkillMetadata;
@@ -371,7 +372,6 @@ pub(crate) struct ChatComposer {
     app_event_tx: AppEventSender,
     history: ChatComposerHistory,
     footer: FooterState,
-    has_focus: bool,
     frame_requester: Option<FrameRequester>,
     attachments: AttachmentState,
     placeholder_text: String,
@@ -417,7 +417,7 @@ struct ComposerDraft {
     cursor: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub(crate) struct ComposerDraftSnapshot {
     pub(crate) text: String,
     pub(crate) text_elements: Vec<TextElement>,
@@ -425,6 +425,17 @@ pub(crate) struct ComposerDraftSnapshot {
     pub(crate) remote_image_urls: Vec<String>,
     pub(crate) mention_bindings: Vec<MentionBinding>,
     pub(crate) pending_pastes: Vec<(String, String)>,
+}
+
+impl ComposerDraftSnapshot {
+    pub(crate) fn has_content(&self) -> bool {
+        !self.text.is_empty()
+            || !self.local_images.is_empty()
+            || !self.remote_image_urls.is_empty()
+            || !self.text_elements.is_empty()
+            || !self.mention_bindings.is_empty()
+            || !self.pending_pastes.is_empty()
+    }
 }
 
 const FOOTER_SPACING_HEIGHT: u16 = 0;
@@ -488,7 +499,7 @@ impl ChatComposer {
     /// This enables reuse in contexts like request-user-input where we want
     /// the same visuals and editing behavior without slash commands or popups.
     pub(crate) fn new_with_config(
-        has_input_focus: bool,
+        _has_input_focus: bool,
         app_event_tx: AppEventSender,
         enhanced_keys_supported: bool,
         placeholder_text: String,
@@ -506,8 +517,6 @@ impl ChatComposer {
             app_event_tx,
             history: ChatComposerHistory::new(),
             footer: FooterState {
-                quit_shortcut_expires_at: None,
-                quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
                 esc_backtrack_hint: false,
                 use_shift_enter_hint,
                 mode: FooterMode::ComposerEmpty,
@@ -538,7 +547,6 @@ impl ChatComposer {
                 reasoning_down_key: primary_binding(&default_keymap.chat.decrease_reasoning_effort),
                 reasoning_up_key: primary_binding(&default_keymap.chat.increase_reasoning_effort),
             },
-            has_focus: has_input_focus,
             frame_requester: None,
             attachments: AttachmentState::default(),
             placeholder_text,
@@ -619,11 +627,7 @@ impl ChatComposer {
                 && binding.sigil == sigil
                 && binding.mention == mention
             {
-                ordered.push(MentionBinding {
-                    sigil: binding.sigil,
-                    mention: binding.mention,
-                    path: binding.path,
-                });
+                ordered.push(binding);
             }
         }
         self.draft.mention_bindings.clear();
@@ -702,9 +706,6 @@ impl ChatComposer {
         self.side_conversation_active = active;
     }
 
-    /// Compatibility shim for tests that still toggle the removed steer mode flag.
-    #[cfg(test)]
-    pub fn set_steer_enabled(&mut self, _enabled: bool) {}
     /// Centralized feature gating keeps config checks out of call sites.
     fn popups_enabled(&self) -> bool {
         self.config.popups_enabled
@@ -717,7 +718,7 @@ impl ChatComposer {
     fn image_paste_enabled(&self) -> bool {
         self.config.image_paste_enabled
     }
-    #[cfg(target_os = "windows")]
+
     pub fn set_windows_degraded_sandbox_active(&mut self, enabled: bool) {
         self.windows_degraded_sandbox_active = enabled;
     }
@@ -902,8 +903,7 @@ impl ChatComposer {
             return false;
         };
 
-        // normalize_pasted_path already handles Windows → WSL path conversion,
-        // so we can directly try to read the image dimensions.
+        // The pasted path is normalized before image dimensions are read.
         match image::image_dimensions(&path_buf) {
             Ok((width, height)) => {
                 tracing::info!("OK: {pasted}");
@@ -1548,44 +1548,9 @@ impl ChatComposer {
             return;
         }
 
-        match &mut self.popups.active {
-            ActivePopup::MentionV2(popup) => {
-                popup.set_file_matches(&query, matches);
-            }
-            _ => {}
+        if let ActivePopup::MentionV2(popup) = &mut self.popups.active {
+            popup.set_file_matches(&query, matches);
         }
-    }
-
-    /// Show the transient "press again to quit" hint for `key`.
-    ///
-    /// The owner (`BottomPane`/`ChatWidget`) is responsible for scheduling a
-    /// redraw after [`super::QUIT_SHORTCUT_TIMEOUT`] so the hint can disappear
-    /// even when the UI is otherwise idle.
-    pub fn show_quit_shortcut_hint(&mut self, key: KeyBinding, has_focus: bool) {
-        self.footer.quit_shortcut_expires_at = Instant::now()
-            .checked_add(super::QUIT_SHORTCUT_TIMEOUT)
-            .or_else(|| Some(Instant::now()));
-        self.footer.quit_shortcut_key = key;
-        self.footer.mode = FooterMode::QuitShortcutReminder;
-        self.set_has_focus(has_focus);
-    }
-
-    /// Clear the "press again to quit" hint immediately.
-    pub fn clear_quit_shortcut_hint(&mut self, has_focus: bool) {
-        self.footer.quit_shortcut_expires_at = None;
-        self.footer.mode = reset_mode_after_activity(self.footer.mode);
-        self.set_has_focus(has_focus);
-    }
-
-    /// Whether the quit shortcut hint should currently be shown.
-    ///
-    /// This is time-based rather than event-based: it may become false without
-    /// any additional user input, so the UI schedules a redraw when the hint
-    /// expires.
-    pub(crate) fn quit_shortcut_hint_visible(&self) -> bool {
-        self.footer
-            .quit_shortcut_expires_at
-            .is_some_and(|expires_at| Instant::now() < expires_at)
     }
 
     fn next_large_paste_placeholder(&self, char_count: usize) -> String {
@@ -2415,7 +2380,7 @@ impl ChatComposer {
         {
             self.draft.mention_bindings.insert(
                 id,
-                ComposerMentionBinding {
+                MentionBinding {
                     sigil,
                     mention,
                     path: path.to_string(),
@@ -2470,11 +2435,7 @@ impl ChatComposer {
                 && binding.sigil == sigil
                 && binding.mention == mention
             {
-                ordered.push(MentionBinding {
-                    sigil: binding.sigil,
-                    mention: binding.mention.clone(),
-                    path: binding.path.clone(),
-                });
+                ordered.push(binding.clone());
             }
         }
         ordered
@@ -2505,14 +2466,7 @@ impl ChatComposer {
             };
 
             if let Some(id) = id {
-                self.draft.mention_bindings.insert(
-                    id,
-                    ComposerMentionBinding {
-                        sigil: binding.sigil,
-                        mention: binding.mention,
-                        path: binding.path,
-                    },
-                );
+                self.draft.mention_bindings.insert(id, binding);
                 scan_from = range.end;
             }
         }
@@ -3080,12 +3034,6 @@ impl ChatComposer {
         self.current_text().trim_start().starts_with('!')
     }
 
-    fn shell_mode_footer_line(&self) -> Option<Line<'static>> {
-        self.is_bang_shell_command()
-            .then_some(())
-            .map(|_| Line::from(vec![Span::from("Shell mode").light_red()]))
-    }
-
     /// Applies any due `PasteBurst` flush at time `now`.
     ///
     /// Converts [`PasteBurst::flush_if_due`] results into concrete textarea mutations.
@@ -3318,11 +3266,7 @@ impl ChatComposer {
             return false;
         }
 
-        let next = toggle_shortcut_mode(
-            self.footer.mode,
-            self.quit_shortcut_hint_visible(),
-            self.is_empty(),
-        );
+        let next = toggle_shortcut_mode(self.footer.mode, self.is_empty());
         let changed = next != self.footer.mode;
         self.footer.mode = next;
         changed
@@ -3330,16 +3274,6 @@ impl ChatComposer {
 
     fn footer_props(&self) -> FooterProps {
         let mode = self.footer_mode();
-        let is_wsl = {
-            #[cfg(target_os = "linux")]
-            {
-                mode == FooterMode::ShortcutOverlay && crate::clipboard_paste::is_probably_wsl()
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                false
-            }
-        };
 
         FooterProps {
             mode,
@@ -3347,9 +3281,7 @@ impl ChatComposer {
             use_shift_enter_hint: self.footer.use_shift_enter_hint,
             is_task_running: self.is_task_running,
             queue_submissions: self.queue_submissions,
-            quit_shortcut_key: self.footer.quit_shortcut_key,
             collaboration_modes_enabled: self.collaboration_modes_enabled,
-            is_wsl,
             status_line_value: self.footer.status_line_value.clone(),
             status_line_enabled: self.footer.status_line_enabled,
             key_hints: FooterKeyHints {
@@ -3371,7 +3303,7 @@ impl ChatComposer {
     ///
     /// The base mode is derived solely from whether the composer is empty:
     /// `ComposerEmpty` iff empty, otherwise `ComposerHasDraft`. Transient
-    /// modes (Esc hint, overlay, quit reminder) can override that base when
+    /// modes (Esc hint and overlay) can override that base when
     /// their conditions are active.
     fn footer_mode(&self) -> FooterMode {
         if self.history_search.is_some() {
@@ -3388,15 +3320,6 @@ impl ChatComposer {
             FooterMode::HistorySearch => FooterMode::HistorySearch,
             FooterMode::EscHint => FooterMode::EscHint,
             FooterMode::ShortcutOverlay => FooterMode::ShortcutOverlay,
-            FooterMode::QuitShortcutReminder if self.quit_shortcut_hint_visible() => {
-                FooterMode::QuitShortcutReminder
-            }
-            FooterMode::ComposerEmpty | FooterMode::ComposerHasDraft
-                if self.quit_shortcut_hint_visible() =>
-            {
-                FooterMode::QuitShortcutReminder
-            }
-            FooterMode::QuitShortcutReminder => base_mode,
             FooterMode::ComposerEmpty | FooterMode::ComposerHasDraft => base_mode,
         }
     }
@@ -3722,10 +3645,6 @@ impl ChatComposer {
             .map(str::to_string)
     }
 
-    fn set_has_focus(&mut self, has_focus: bool) {
-        self.has_focus = has_focus;
-    }
-
     #[allow(dead_code)]
     pub(crate) fn set_input_enabled(&mut self, enabled: bool, placeholder: Option<String>) {
         self.draft.input_enabled = enabled;
@@ -3739,7 +3658,6 @@ impl ChatComposer {
 
     pub(crate) fn show_shutdown_in_progress(&mut self) {
         self.set_input_enabled(/*enabled*/ false, Some("Shutting down...".to_string()));
-        self.footer.quit_shortcut_expires_at = None;
         self.footer.mode = FooterMode::ComposerEmpty;
         self.footer.hint_override = Some(Vec::new());
         self.footer.plan_mode_nudge_visible = false;
@@ -3748,6 +3666,10 @@ impl ChatComposer {
 
     pub fn set_task_running(&mut self, running: bool) {
         self.is_task_running = running;
+    }
+
+    pub(crate) fn is_task_running(&self) -> bool {
+        self.is_task_running
     }
 
     pub(crate) fn set_queue_submissions(&mut self, queue_submissions: bool) {
@@ -3847,10 +3769,6 @@ fn skill_description(skill: &SkillMetadata) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-fn is_mention_name_char(byte: u8) -> bool {
-    matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-')
-}
-
 fn ends_plaintext_at_mention(bytes: &[u8], index: usize) -> bool {
     bytes.get(index).is_none_or(|byte| {
         byte.is_ascii_whitespace()
@@ -3874,10 +3792,6 @@ fn starts_plaintext_at_mention(text: &str, index: usize) -> bool {
     text.get(..index)
         .and_then(|prefix| prefix.chars().next_back())
         .is_some_and(|ch| ch.is_whitespace() || !is_mention_name_char_char(ch))
-}
-
-fn is_mention_name_char_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')
 }
 
 fn find_next_mention_token_range(text: &str, token: &str, from: usize) -> Option<Range<usize>> {
@@ -4022,14 +3936,12 @@ impl ChatComposer {
                     FooterMode::ComposerEmpty => !self.is_in_paste_burst(),
                     FooterMode::ComposerHasDraft => false,
                     FooterMode::HistorySearch
-                    | FooterMode::QuitShortcutReminder
                     | FooterMode::ShortcutOverlay
                     | FooterMode::EscHint => false,
                 };
                 let show_queue_hint = match footer_props.mode {
                     FooterMode::ComposerHasDraft => footer_props.is_task_running,
                     FooterMode::HistorySearch
-                    | FooterMode::QuitShortcutReminder
                     | FooterMode::ComposerEmpty
                     | FooterMode::ShortcutOverlay
                     | FooterMode::EscHint => false,
@@ -4108,8 +4020,8 @@ impl ChatComposer {
                     let right_line =
                         if let Some(label) = self.footer.side_conversation_context_label.as_ref() {
                             Some(side_conversation_context_line(label))
-                        } else if let Some(line) = self.shell_mode_footer_line() {
-                            Some(line)
+                        } else if self.is_bang_shell_command() {
+                            Some(Line::from(vec![Span::from("Shell mode").light_red()]))
                         } else if status_line_active {
                             let full = self.mode_indicator_line(show_cycle_hint);
                             let compact = self.mode_indicator_line(/*show_cycle_hint*/ false);
@@ -4158,7 +4070,6 @@ impl ChatComposer {
                             }
                             FooterMode::EscHint
                             | FooterMode::HistorySearch
-                            | FooterMode::QuitShortcutReminder
                             | FooterMode::ShortcutOverlay => None,
                         }
                     };
@@ -4166,7 +4077,6 @@ impl ChatComposer {
                         footer_props.mode,
                         FooterMode::EscHint
                             | FooterMode::HistorySearch
-                            | FooterMode::QuitShortcutReminder
                             | FooterMode::ShortcutOverlay
                     ) {
                         false
@@ -4558,41 +4468,6 @@ mod tests {
                 composer.set_queue_submissions(/*queue_submissions*/ true);
                 let _ = composer
                     .handle_key_event(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
-            },
-        );
-
-        snapshot_composer_state(
-            "footer_mode_ctrl_c_quit",
-            /*enhanced_keys_supported*/ true,
-            |composer| {
-                composer.show_quit_shortcut_hint(
-                    key_hint::ctrl(KeyCode::Char('c')),
-                    /*has_focus*/ true,
-                );
-            },
-        );
-
-        snapshot_composer_state(
-            "footer_mode_ctrl_c_interrupt",
-            /*enhanced_keys_supported*/ true,
-            |composer| {
-                composer.set_task_running(/*running*/ true);
-                composer.show_quit_shortcut_hint(
-                    key_hint::ctrl(KeyCode::Char('c')),
-                    /*has_focus*/ true,
-                );
-            },
-        );
-
-        snapshot_composer_state(
-            "footer_mode_ctrl_c_then_esc_hint",
-            /*enhanced_keys_supported*/ true,
-            |composer| {
-                composer.show_quit_shortcut_hint(
-                    key_hint::ctrl(KeyCode::Char('c')),
-                    /*has_focus*/ true,
-                );
-                let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
             },
         );
 
@@ -5431,32 +5306,6 @@ mod tests {
     }
 
     #[test]
-    fn base_footer_mode_tracks_empty_state_after_quit_hint_expires() {
-        use crossterm::event::KeyCode;
-
-        let (tx, _rx) = unbounded_channel::<AppEvent>();
-        let sender = AppEventSender::new(tx);
-        let mut composer = ChatComposer::new(
-            /*has_input_focus*/ true,
-            sender,
-            /*enhanced_keys_supported*/ false,
-            "Ask Codex to do anything".to_string(),
-            /*disable_paste_burst*/ false,
-        );
-
-        type_chars_humanlike(&mut composer, &['d']);
-        composer
-            .show_quit_shortcut_hint(key_hint::ctrl(KeyCode::Char('c')), /*has_focus*/ true);
-        composer.footer.quit_shortcut_expires_at =
-            Some(Instant::now() - std::time::Duration::from_secs(1));
-
-        assert_eq!(composer.footer_mode(), FooterMode::ComposerHasDraft);
-
-        composer.set_text_content(String::new(), Vec::new(), Vec::new());
-        assert_eq!(composer.footer_mode(), FooterMode::ComposerEmpty);
-    }
-
-    #[test]
     fn clear_for_ctrl_c_records_cleared_draft() {
         let (tx, _rx) = unbounded_channel::<AppEvent>();
         let sender = AppEventSender::new(tx);
@@ -5594,7 +5443,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             /*disable_paste_burst*/ false,
         );
-        composer.set_steer_enabled(/*enabled*/ true);
         composer.set_vim_enabled(/*enabled*/ true);
 
         assert!(composer.draft.textarea.is_vim_enabled());
@@ -5635,7 +5483,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             /*disable_paste_burst*/ false,
         );
-        composer.set_steer_enabled(/*enabled*/ true);
         composer.set_task_running(/*running*/ true);
         composer.set_vim_enabled(/*enabled*/ true);
 
@@ -5669,7 +5516,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             /*disable_paste_burst*/ false,
         );
-        composer.set_steer_enabled(/*enabled*/ true);
         composer.set_vim_enabled(/*enabled*/ true);
 
         composer.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
@@ -5944,7 +5790,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             /*disable_paste_burst*/ false,
         );
-        composer.set_steer_enabled(true);
 
         let (result, needs_redraw) =
             composer.handle_key_event(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT));
@@ -6207,6 +6052,10 @@ mod tests {
         }));
 
         let mentions = composer.mention_items();
+        assert_eq!(
+            ChatComposer::mention_token_from_insert_text(&mentions[0].insert_text),
+            Some(('$', "google-calendar:availability".to_string()))
+        );
         assert_eq!(mentions.len(), 3);
         assert_eq!(mentions[0].category_tag, Some("[Skill]".to_string()));
         assert_eq!(mentions[0].path, Some(skill_path.display().to_string()));
@@ -7415,7 +7264,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             /*disable_paste_burst*/ false,
         );
-        composer.set_steer_enabled(true);
         let input = "x".repeat(MAX_USER_INPUT_TEXT_CHARS);
         composer.draft.textarea.set_text_clearing_elements(&input);
 
@@ -7443,7 +7291,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             /*disable_paste_burst*/ false,
         );
-        composer.set_steer_enabled(true);
         let input = "x".repeat(MAX_USER_INPUT_TEXT_CHARS + 1);
         composer.draft.textarea.set_text_clearing_elements(&input);
 
@@ -7485,7 +7332,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             /*disable_paste_burst*/ false,
         );
-        composer.set_steer_enabled(false);
         let input = "x".repeat(MAX_USER_INPUT_TEXT_CHARS + 1);
         composer.draft.textarea.set_text_clearing_elements(&input);
 
@@ -8096,7 +7942,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             /*disable_paste_burst*/ false,
         );
-        composer.set_steer_enabled(true);
         composer.draft.textarea.insert_str("restore me");
         composer.draft.textarea.set_cursor(/*pos*/ 0);
 

@@ -2,7 +2,6 @@ mod auth_status;
 mod elicitation_client_service;
 mod executor_process_transport;
 mod http_client_adapter;
-mod in_process_transport;
 mod logging_client_handler;
 mod oauth;
 mod oauth_http_client;
@@ -22,7 +21,6 @@ pub use auth_status::discover_streamable_http_oauth;
 pub use auth_status::discover_streamable_http_oauth_with_http_client;
 pub use auth_status::supports_oauth_login;
 pub use codex_protocol::protocol::McpAuthStatus;
-pub use in_process_transport::InProcessTransportFactory;
 pub use oauth::StoredOAuthTokens;
 pub use oauth::WrappedOAuthTokenResponse;
 pub use oauth::delete_oauth_tokens;
@@ -40,8 +38,21 @@ pub use rmcp_client::ElicitationResponse;
 pub use rmcp_client::ListToolsWithConnectorIdResult;
 pub use rmcp_client::RmcpClient;
 pub use rmcp_client::SendElicitation;
+pub use rmcp_client::SendProgress;
 pub use rmcp_client::ToolWithConnectorId;
 pub use startup_error::is_authentication_required_error;
 pub use stdio_server_launcher::ExecutorStdioServerLauncher;
 pub use stdio_server_launcher::LocalStdioServerLauncher;
 pub use stdio_server_launcher::StdioServerLauncher;
+
+#[cfg(test)]
+mod abstraction_tests {
+    #[test]
+    fn transports_are_backed_by_runtime_consumers() {
+        let source = include_str!("rmcp_client.rs");
+        let removed_factory = ["InProcessTransport", "Factory"].concat();
+        let removed_constructor = ["new_in_process", "_client"].concat();
+        assert!(!source.contains(&removed_factory));
+        assert!(!source.contains(&removed_constructor));
+    }
+}

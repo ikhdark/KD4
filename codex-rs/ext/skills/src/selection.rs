@@ -1,14 +1,15 @@
 use std::collections::HashSet;
 
+use codex_core_skills::injection::ToolMentionKind;
 use codex_core_skills::injection::extract_tool_mentions;
+use codex_core_skills::injection::normalize_skill_path;
+use codex_core_skills::injection::tool_kind_for_path;
 use codex_protocol::user_input::UserInput;
 
 use crate::catalog::SkillAuthority;
 use crate::catalog::SkillCatalog;
 use crate::catalog::SkillCatalogEntry;
 use crate::catalog::SkillPackageId;
-
-const SKILL_PATH_PREFIX: &str = "skill://";
 
 #[tracing::instrument(
     level = "trace",
@@ -22,6 +23,7 @@ pub(crate) fn collect_explicit_skill_mentions(
     inputs: &[UserInput],
     catalog: &SkillCatalog,
 ) -> Vec<SkillCatalogEntry> {
+    let catalog = CanonicalSkillCatalog::new(catalog);
     let mut selected = Vec::new();
     let mut seen = HashSet::new();
     let mut blocked_plain_names = HashSet::new();
@@ -30,14 +32,21 @@ pub(crate) fn collect_explicit_skill_mentions(
         match input {
             UserInput::Skill { name, path } => {
                 blocked_plain_names.insert(name.clone());
-                select_by_path(catalog, &path.to_string_lossy(), &mut seen, &mut selected);
+                let path = path.to_string_lossy();
+                select_by_path(
+                    &catalog,
+                    CanonicalSkillPath::new(&path),
+                    &mut seen,
+                    &mut selected,
+                );
             }
-            UserInput::Mention { name, path } if path_is_skill(path) => {
-                blocked_plain_names.insert(name.clone());
-                select_by_path(catalog, path, &mut seen, &mut selected);
+            UserInput::Mention { name, path } => {
+                if let Some(path) = CanonicalSkillPath::from_mention(path) {
+                    blocked_plain_names.insert(name.clone());
+                    select_by_path(&catalog, path, &mut seen, &mut selected);
+                }
             }
             UserInput::Text { .. } | UserInput::Image { .. } | UserInput::LocalImage { .. } => {}
-            UserInput::Mention { .. } => {}
             _ => {}
         }
     }
@@ -49,13 +58,8 @@ pub(crate) fn collect_explicit_skill_mentions(
 
         let mentions = extract_tool_mentions(text);
         for path in mentions.paths() {
-            if path_is_skill(path) {
-                select_by_path(
-                    catalog,
-                    normalize_skill_path(path),
-                    &mut seen,
-                    &mut selected,
-                );
+            if let Some(path) = CanonicalSkillPath::from_mention(path) {
+                select_by_path(&catalog, path, &mut seen, &mut selected);
             }
         }
         for name in mentions.plain_names() {
@@ -66,9 +70,9 @@ pub(crate) fn collect_explicit_skill_mentions(
                 .entries
                 .iter()
                 .rev()
-                .find(|entry| entry.enabled && entry.name == name)
+                .find(|entry| entry.entry.name == name)
             {
-                push_selected(entry, &mut seen, &mut selected);
+                push_selected(entry.entry, &mut seen, &mut selected);
             }
         }
     }
@@ -77,15 +81,14 @@ pub(crate) fn collect_explicit_skill_mentions(
 }
 
 fn select_by_path(
-    catalog: &SkillCatalog,
-    path: &str,
+    catalog: &CanonicalSkillCatalog<'_>,
+    path: CanonicalSkillPath<'_>,
     seen: &mut HashSet<SkillCatalogEntryKey>,
     selected: &mut Vec<SkillCatalogEntry>,
 ) {
-    let normalized_path = normalize_skill_path(path);
-    for entry in catalog.entries.iter().filter(|entry| entry.enabled) {
-        if entry_matches_path(entry, normalized_path) {
-            push_selected(entry, seen, selected);
+    for entry in &catalog.entries {
+        if entry.matches(path) {
+            push_selected(entry.entry, seen, selected);
         }
     }
 }
@@ -101,25 +104,60 @@ fn push_selected(
     }
 }
 
-fn entry_matches_path(entry: &SkillCatalogEntry, path: &str) -> bool {
-    entry.main_prompt.as_str() == path
-        || entry.id.0 == path
-        || entry
-            .display_path
-            .as_deref()
-            .is_some_and(|display_path| normalize_skill_path(display_path) == path)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CanonicalSkillPath<'a>(&'a str);
+
+impl<'a> CanonicalSkillPath<'a> {
+    fn new(path: &'a str) -> Self {
+        Self(normalize_skill_path(path))
+    }
+
+    fn from_mention(path: &'a str) -> Option<Self> {
+        (tool_kind_for_path(path) == ToolMentionKind::Skill).then(|| Self::new(path))
+    }
 }
 
-fn path_is_skill(path: &str) -> bool {
-    path.starts_with(SKILL_PATH_PREFIX)
-        || path
-            .rsplit(['/', '\\'])
-            .next()
-            .is_some_and(|file_name| file_name.eq_ignore_ascii_case("SKILL.md"))
+struct CanonicalSkillCatalog<'a> {
+    entries: Vec<CanonicalSkillCatalogEntry<'a>>,
 }
 
-fn normalize_skill_path(path: &str) -> &str {
-    path.strip_prefix(SKILL_PATH_PREFIX).unwrap_or(path)
+impl<'a> CanonicalSkillCatalog<'a> {
+    fn new(catalog: &'a SkillCatalog) -> Self {
+        Self {
+            entries: catalog
+                .entries
+                .iter()
+                .filter(|entry| entry.enabled)
+                .map(CanonicalSkillCatalogEntry::new)
+                .collect(),
+        }
+    }
+}
+
+struct CanonicalSkillCatalogEntry<'a> {
+    entry: &'a SkillCatalogEntry,
+    main_prompt: CanonicalSkillPath<'a>,
+    id: CanonicalSkillPath<'a>,
+    display_path: Option<CanonicalSkillPath<'a>>,
+}
+
+impl<'a> CanonicalSkillCatalogEntry<'a> {
+    fn new(entry: &'a SkillCatalogEntry) -> Self {
+        Self {
+            entry,
+            main_prompt: CanonicalSkillPath::new(entry.main_prompt.as_str()),
+            id: CanonicalSkillPath::new(&entry.id.0),
+            display_path: entry.display_path.as_deref().map(CanonicalSkillPath::new),
+        }
+    }
+
+    fn matches(&self, path: CanonicalSkillPath<'_>) -> bool {
+        self.main_prompt.0 == path.0
+            || self.id.0 == path.0
+            || self
+                .display_path
+                .is_some_and(|candidate| candidate.0 == path.0)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -134,5 +172,23 @@ impl From<&SkillCatalogEntry> for SkillCatalogEntryKey {
             authority: entry.authority.clone(),
             package: entry.id.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_skill_path_classifies_and_normalizes_once_at_the_boundary() {
+        assert_eq!(
+            CanonicalSkillPath::from_mention("skill://root/demo/SKILL.md"),
+            Some(CanonicalSkillPath("root/demo/SKILL.md"))
+        );
+        assert_eq!(
+            CanonicalSkillPath::from_mention("C:\\skills\\demo\\skill.md"),
+            Some(CanonicalSkillPath("C:\\skills\\demo\\skill.md"))
+        );
+        assert_eq!(CanonicalSkillPath::from_mention("app://demo"), None);
     }
 }

@@ -1,24 +1,23 @@
-#[cfg(windows)]
 use std::collections::HashMap;
-#[cfg(windows)]
+
 use std::ffi::OsStr;
-#[cfg(windows)]
+
 use std::fs;
-#[cfg(windows)]
+
 use std::path::Component;
-#[cfg(windows)]
+
 use std::path::Path;
 use std::path::PathBuf;
-#[cfg(windows)]
+
 use std::path::Prefix;
 
 use codex_utils_absolute_path::AbsolutePathBuf;
 
 pub use crate::command_safety::PowershellDirectArgvCandidate;
-#[cfg(windows)]
+
 use crate::command_safety::PowershellResolutionState;
 use crate::command_safety::try_parse_powershell_ast_analysis;
-#[cfg(windows)]
+
 use crate::command_safety::try_parse_powershell_ast_analysis_with_resolution;
 use crate::command_safety::try_parse_powershell_ast_commands;
 use crate::shell_detect::ShellType;
@@ -174,7 +173,7 @@ pub fn parse_noprofile_powershell_command_into_direct_argv(
 
 /// A direct argv proven equivalent to a literal PowerShell native invocation in one final
 /// working-directory and child-environment state.
-#[cfg(windows)]
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct ProvenPowershellDirectArgv {
     command: Vec<String>,
@@ -183,7 +182,6 @@ pub struct ProvenPowershellDirectArgv {
     env: HashMap<String, String>,
 }
 
-#[cfg(windows)]
 impl ProvenPowershellDirectArgv {
     /// Borrow the proven canonical command for an internal policy compatibility check.
     ///
@@ -207,7 +205,6 @@ impl ProvenPowershellDirectArgv {
 /// Reclassify an exact-shape `-NoProfile -Command` invocation and prove that PowerShell and KD4's
 /// direct executable lookup select the same canonical `.exe` in the supplied final execution
 /// state. The returned command executes that canonical path and never performs another name lookup.
-#[cfg(windows)]
 pub fn prove_noprofile_powershell_command_as_direct_argv(
     command: &[String],
     cwd: &Path,
@@ -244,7 +241,6 @@ pub fn prove_noprofile_powershell_command_as_direct_argv(
     })
 }
 
-#[cfg(windows)]
 fn powershell_resolution_state(
     cwd: &Path,
     env: &HashMap<String, String>,
@@ -256,7 +252,6 @@ fn powershell_resolution_state(
     })
 }
 
-#[cfg(windows)]
 fn env_value_ignore_ascii_case<'a>(
     env: &'a HashMap<String, String>,
     name: &str,
@@ -265,7 +260,6 @@ fn env_value_ignore_ascii_case<'a>(
         .find_map(|(key, value)| key.eq_ignore_ascii_case(name).then_some(value.as_str()))
 }
 
-#[cfg(windows)]
 fn resolve_direct_exe(command_name: &str, path: &str) -> Option<PathBuf> {
     let command_path = Path::new(command_name);
     if command_path.is_absolute() {
@@ -308,7 +302,6 @@ fn resolve_direct_exe(command_name: &str, path: &str) -> Option<PathBuf> {
     None
 }
 
-#[cfg(windows)]
 fn canonical_exe(path: &Path) -> Option<PathBuf> {
     let canonical = fs::canonicalize(path).ok()?;
     (canonical.is_file()
@@ -319,14 +312,12 @@ fn canonical_exe(path: &Path) -> Option<PathBuf> {
     .then_some(canonical)
 }
 
-#[cfg(windows)]
 fn same_windows_path(left: &Path, right: &Path) -> bool {
     left.as_os_str()
         .to_string_lossy()
         .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
 }
 
-#[cfg(windows)]
 fn uses_legacy_windows_native_arguments(path: &Path) -> bool {
     path.file_name()
         .and_then(OsStr::to_str)
@@ -408,26 +399,25 @@ fn is_powershellish_executable_available(powershell_or_pwsh_exe: &std::path::Pat
 
 #[cfg(test)]
 mod tests {
-    #[cfg(windows)]
+
     use std::collections::HashMap;
-    #[cfg(windows)]
+
     use std::fs;
 
     use super::UTF8_OUTPUT_PREFIX;
     use super::extract_powershell_command;
-    #[cfg(windows)]
+
     use super::parse_noprofile_powershell_command_into_direct_argv;
-    #[cfg(windows)]
+
     use super::parse_powershell_command_into_plain_commands;
     use super::prefix_powershell_script_with_utf8;
-    #[cfg(windows)]
+
     use super::prove_noprofile_powershell_command_as_direct_argv;
-    #[cfg(windows)]
+
     use super::resolve_direct_exe;
-    #[cfg(windows)]
+
     use super::try_find_pwsh_executable_blocking;
 
-    #[cfg(windows)]
     #[test]
     fn direct_resolution_accepts_rooted_local_exe_but_rejects_relative_and_unc_paths() {
         let Some(pwsh) = try_find_pwsh_executable_blocking() else {
@@ -467,11 +457,7 @@ mod tests {
 
     #[test]
     fn extracts_full_path_powershell_command() {
-        let command = if cfg!(windows) {
-            "C:\\windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe".to_string()
-        } else {
-            "/usr/local/bin/powershell.exe".to_string()
-        };
+        let command = "C:\\windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe".to_string();
         let cmd = vec![command, "-Command".to_string(), "Write-Host hi".to_string()];
         let (_shell, script) = extract_powershell_command(&cmd).expect("extract");
         assert_eq!(script, "Write-Host hi");
@@ -533,7 +519,6 @@ mod tests {
         assert_eq!(prefix_powershell_script_with_utf8(&cmd), cmd);
     }
 
-    #[cfg(windows)]
     #[test]
     fn parses_plain_powershell_commands() {
         let commands = parse_powershell_command_into_plain_commands(&[
@@ -547,7 +532,6 @@ mod tests {
         assert_eq!(commands, vec![vec!["echo".to_string(), "hi".to_string()]]);
     }
 
-    #[cfg(windows)]
     #[test]
     fn parses_multiple_plain_powershell_commands() {
         let commands = parse_powershell_command_into_plain_commands(&[
@@ -567,7 +551,6 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
     #[test]
     fn parses_command_output_assignment_and_bare_read() {
         let commands = parse_powershell_command_into_plain_commands(&[
@@ -596,7 +579,6 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
     #[test]
     fn rejects_dynamic_uses_of_command_output_assignment() {
         for script in [
@@ -616,7 +598,6 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
     #[test]
     fn direct_candidate_contains_semantic_native_argument_values() {
         let Some(pwsh) = try_find_pwsh_executable_blocking() else {
@@ -650,7 +631,6 @@ mod tests {
         assert_eq!(candidate.powershell_version.split('.').next(), Some("7"));
     }
 
-    #[cfg(windows)]
     #[test]
     fn direct_candidate_rejects_dynamic_and_compound_forms() {
         let Some(pwsh) = try_find_pwsh_executable_blocking() else {
@@ -680,7 +660,6 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
     #[test]
     fn final_state_proof_executes_canonical_exe_and_is_state_bound() {
         let Some(pwsh) = try_find_pwsh_executable_blocking() else {
@@ -747,7 +726,6 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
     #[test]
     fn path_shadowing_and_powershell_commands_fail_closed() {
         let Some(pwsh) = try_find_pwsh_executable_blocking() else {

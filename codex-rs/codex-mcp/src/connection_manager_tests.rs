@@ -1,6 +1,7 @@
 use super::*;
 use crate::codex_apps_cache::CodexAppsToolsCache;
 use crate::codex_apps_cache::CodexAppsToolsCacheContext;
+use crate::codex_apps_cache::DEFAULT_CODEX_APPS_MCP_PRODUCT_SKU;
 use crate::declared_openai_file_input_param_names;
 use crate::elicitation::ElicitationLifecycle;
 use crate::elicitation::ElicitationRequestManager;
@@ -27,14 +28,13 @@ use codex_config::McpServerToolConfig;
 use codex_config::types::AuthKeyringBackendKind;
 use codex_config::types::OAuthCredentialsStoreMode;
 use codex_exec_server::EnvironmentManager;
+use codex_exec_server::ReqwestHttpClient;
 use codex_protocol::ToolName;
 use codex_protocol::mcp::McpServerInfo;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::GranularApprovalConfig;
-use codex_rmcp_client::InProcessTransportFactory;
 use codex_rmcp_client::RmcpClient;
 use futures::FutureExt;
-use futures::future::BoxFuture;
 use pretty_assertions::assert_eq;
 use rmcp::model::CreateElicitationRequestParams;
 use rmcp::model::ElicitationAction;
@@ -44,11 +44,9 @@ use rmcp::model::Meta;
 use rmcp::model::NumberOrString;
 use rmcp::model::Tool;
 use std::collections::HashSet;
-use std::io;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use tempfile::tempdir;
-use tokio::io::DuplexStream;
 
 fn create_test_tool(server_name: &str, tool_name: &str) -> ToolInfo {
     ToolInfo {
@@ -80,6 +78,8 @@ fn create_codex_apps_tools_cache_context(
             account_id: account_id.map(ToOwned::to_owned),
             chatgpt_user_id: chatgpt_user_id.map(ToOwned::to_owned),
             is_workspace_account: false,
+            chatgpt_base_url: "https://chatgpt.com".to_string(),
+            product_sku: DEFAULT_CODEX_APPS_MCP_PRODUCT_SKU.to_string(),
         },
     )
 }
@@ -95,24 +95,22 @@ fn create_test_server_info(title: &str) -> McpServerInfo {
     }
 }
 
-struct TestInProcessTransportFactory;
-
-impl InProcessTransportFactory for TestInProcessTransportFactory {
-    fn open(&self) -> BoxFuture<'static, io::Result<DuplexStream>> {
-        async {
-            let (client_stream, _server_stream) = tokio::io::duplex(1);
-            Ok(client_stream)
-        }
-        .boxed()
-    }
-}
-
 async fn create_test_managed_client(tools: Vec<ToolInfo>) -> ManagedClient {
     ManagedClient {
         client: Arc::new(
-            RmcpClient::new_in_process_client(Arc::new(TestInProcessTransportFactory))
-                .await
-                .expect("create in-process RMCP client"),
+            RmcpClient::new_streamable_http_client(
+                "test-uninitialized",
+                "http://127.0.0.1:1/mcp",
+                Some("test-bearer".to_string()),
+                None,
+                None,
+                OAuthCredentialsStoreMode::default(),
+                AuthKeyringBackendKind::default(),
+                Arc::new(ReqwestHttpClient),
+                None,
+            )
+            .await
+            .expect("create uninitialized RMCP client"),
         ),
         server_info: create_test_server_info("Ready"),
         tools,
@@ -1597,6 +1595,8 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
             account_id: None,
             chatgpt_user_id: None,
             is_workspace_account: false,
+            chatgpt_base_url: "https://chatgpt.com".to_string(),
+            product_sku: DEFAULT_CODEX_APPS_MCP_PRODUCT_SKU.to_string(),
         },
         /*prefix_mcp_tool_names*/ true,
         ElicitationCapability::default(),

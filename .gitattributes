@@ -2,5 +2,7 @@ AGENTS.md text eol=lf
 *.sh text eol=lf
 codex-rs/agent-task-store/migrations/*.sql text eol=lf
 codex-rs/config/src/thread_config/proto/codex.thread_config.v1.rs text eol=lf
+codex-rs/exec-server/src/proto/codex.exec_server.relay.v1.rs text eol=lf linguist-generated
+codex-rs/utils/sleep-inhibitor/src/iokit_bindings.rs text eol=lf linguist-generated
 codex-rs/app-server-protocol/schema/** linguist-generated
 codex-rs/hooks/schema/generated/** linguist-generated

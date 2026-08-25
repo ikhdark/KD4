@@ -69,12 +69,6 @@ fn init_login_file_logging(config: &Config) -> Option<WorkerGuard> {
     let mut log_file_opts = OpenOptions::new();
     log_file_opts.create(true).append(true);
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        log_file_opts.mode(0o600);
-    }
-
     let log_path = log_dir.join("codex-login.log");
     let log_file = match log_file_opts.open(&log_path) {
         Ok(log_file) => log_file,

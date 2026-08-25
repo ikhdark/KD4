@@ -686,38 +686,6 @@ fn log_preview_uses_content_items_when_plain_text_is_missing() {
 }
 
 #[test]
-fn telemetry_preview_returns_original_within_limits() {
-    let content = "short output";
-    assert_eq!(telemetry_preview(content), content);
-}
-
-#[test]
-fn telemetry_preview_truncates_by_bytes() {
-    let content = "x".repeat(TELEMETRY_PREVIEW_MAX_BYTES + 8);
-    let preview = telemetry_preview(&content);
-
-    assert!(preview.contains(TELEMETRY_PREVIEW_TRUNCATION_NOTICE));
-    assert!(
-        preview.len()
-            <= TELEMETRY_PREVIEW_MAX_BYTES + TELEMETRY_PREVIEW_TRUNCATION_NOTICE.len() + 1
-    );
-}
-
-#[test]
-fn telemetry_preview_truncates_by_lines() {
-    let content = (0..(TELEMETRY_PREVIEW_MAX_LINES + 5))
-        .map(|idx| format!("line {idx}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let preview = telemetry_preview(&content);
-    let lines: Vec<&str> = preview.lines().collect();
-
-    assert!(lines.len() <= TELEMETRY_PREVIEW_MAX_LINES + 1);
-    assert_eq!(lines.last(), Some(&TELEMETRY_PREVIEW_TRUNCATION_NOTICE));
-}
-
-#[test]
 fn command_semantic_evidence_normalizes_read_only_presentations() {
     let source_fact = "let stable = compute();";
     let presentations = [
@@ -1249,9 +1217,9 @@ fn artifact_recovery_notice_appears_when_model_output_is_reduced() {
     assert!(response.contains(&format!(
         "[command output reduced; full retained output is available as artifact {artifact_id}."
     )));
-    assert!(response.contains(
-        "Use read_tool_output with that id; search once for targets or batch exact ranges in one call.]"
-    ));
+    assert!(response.contains(&format!(
+        "Use the advertised read_tool_output schema with artifact {artifact_id}; search once or batch exact ranges in one call. Do not rerun the producer merely to recover omitted output.]"
+    )));
 }
 
 #[test]

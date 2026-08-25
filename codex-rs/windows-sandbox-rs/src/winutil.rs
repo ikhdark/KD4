@@ -22,50 +22,9 @@ pub fn to_wide<S: AsRef<OsStr>>(s: S) -> Vec<u16> {
     v
 }
 
-/// Quote a single Windows command-line argument following the rules used by
-/// CommandLineToArgvW/CRT so that spaces, quotes, and backslashes are preserved.
-/// Reference behavior matches Rust std::process::Command on Windows.
-#[cfg(target_os = "windows")]
-pub fn quote_windows_arg(arg: &str) -> String {
-    let needs_quotes = arg.is_empty()
-        || arg
-            .chars()
-            .any(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '"'));
-    if !needs_quotes {
-        return arg.to_string();
-    }
-
-    let mut quoted = String::with_capacity(arg.len() + 2);
-    quoted.push('"');
-    let mut backslashes = 0;
-    for ch in arg.chars() {
-        match ch {
-            '\\' => {
-                backslashes += 1;
-            }
-            '"' => {
-                quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
-                quoted.push('"');
-                backslashes = 0;
-            }
-            _ => {
-                if backslashes > 0 {
-                    quoted.push_str(&"\\".repeat(backslashes));
-                    backslashes = 0;
-                }
-                quoted.push(ch);
-            }
-        }
-    }
-    if backslashes > 0 {
-        quoted.push_str(&"\\".repeat(backslashes * 2));
-    }
-    quoted.push('"');
-    quoted
-}
+pub use codex_shell_command::quote_windows_arg;
 
 /// Build a Windows command line for CreateProcess-style APIs.
-#[cfg(target_os = "windows")]
 pub fn argv_to_command_line(argv: &[String]) -> String {
     argv.iter()
         .map(|arg| quote_windows_arg(arg))
@@ -124,7 +83,7 @@ pub fn string_from_sid_bytes(sid: &[u8]) -> Result<String, String> {
 }
 
 const SID_ADMINISTRATORS: &str = "S-1-5-32-544";
-const SID_USERS: &str = "S-1-5-32-545";
+pub const WELL_KNOWN_USERS_SID: &str = "S-1-5-32-545";
 const SID_AUTHENTICATED_USERS: &str = "S-1-5-11";
 const SID_EVERYONE: &str = "S-1-1-0";
 const SID_SYSTEM: &str = "S-1-5-18";
@@ -170,7 +129,7 @@ pub fn resolve_sid(name: &str) -> Result<Vec<u8>> {
 fn well_known_sid_str(name: &str) -> Option<&'static str> {
     match name {
         "Administrators" => Some(SID_ADMINISTRATORS),
-        "Users" => Some(SID_USERS),
+        "Users" => Some(WELL_KNOWN_USERS_SID),
         "Authenticated Users" => Some(SID_AUTHENTICATED_USERS),
         "Everyone" => Some(SID_EVERYONE),
         "SYSTEM" => Some(SID_SYSTEM),
@@ -208,6 +167,8 @@ fn sid_bytes_from_string(sid_str: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::argv_to_command_line;
+    use super::resolve_sid;
+    use super::string_from_sid_bytes;
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -236,6 +197,40 @@ mod tests {
         assert_eq!(
             argv_to_command_line(&argv),
             "pwsh.exe -Command \"Write-Output \\\"hello world\\\"\""
+        );
+    }
+
+    #[test]
+    fn well_known_accounts_resolve_through_the_canonical_sid_table() {
+        let cases = [
+            ("Administrators", "S-1-5-32-544"),
+            ("Users", "S-1-5-32-545"),
+            ("Authenticated Users", "S-1-5-11"),
+            ("Everyone", "S-1-1-0"),
+            ("SYSTEM", "S-1-5-18"),
+        ];
+
+        for (account, expected_sid) in cases {
+            let sid = resolve_sid(account).expect("resolve well-known SID");
+            assert_eq!(
+                string_from_sid_bytes(&sid).expect("format well-known SID"),
+                expected_sid
+            );
+        }
+    }
+
+    #[test]
+    fn current_user_resolves_through_the_canonical_lookup_fallback() {
+        let username = std::env::var("USERNAME").expect("USERNAME should identify current user");
+        let domain =
+            std::env::var("USERDOMAIN").expect("USERDOMAIN should identify current domain");
+        let account = format!(r"{domain}\{username}");
+
+        let sid = resolve_sid(&account).expect("resolve current user SID");
+        assert!(
+            string_from_sid_bytes(&sid)
+                .expect("format current user SID")
+                .starts_with("S-")
         );
     }
 }

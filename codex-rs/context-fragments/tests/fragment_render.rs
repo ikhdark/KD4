@@ -13,6 +13,13 @@ fn model_context_budget_enforces_aggregate_limit() {
     assert_eq!(budget.take("later"), None);
 }
 
+#[test]
+fn model_context_budget_truncates_at_utf8_boundary() {
+    let mut budget = ModelContextBudget::new(1);
+
+    assert_eq!(budget.take("a😀"), Some("a".to_string()));
+}
+
 struct TestFragment {
     body: String,
 }

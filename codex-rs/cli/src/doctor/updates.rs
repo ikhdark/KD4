@@ -11,6 +11,10 @@ use std::path::Path;
 use codex_core::config::Config;
 use codex_install_context::InstallContext;
 use codex_install_context::InstallMethod;
+use codex_install_context::UpdateAction;
+use codex_install_context::is_newer_version;
+use codex_install_context::is_source_build_version;
+use codex_install_context::version_from_release_tag;
 use serde::Deserialize;
 
 use super::CheckStatus;
@@ -23,7 +27,6 @@ use super::run_command;
 
 const VERSION_FILE_NAME: &str = "version.json";
 const GITHUB_LATEST_RELEASE_URL: &str = "https://api.github.com/repos/openai/codex/releases/latest";
-const HOMEBREW_CASK_API_URL: &str = "https://formulae.brew.sh/api/cask/codex.json";
 
 /// Builds the update-health row for the current installation.
 ///
@@ -33,12 +36,15 @@ const HOMEBREW_CASK_API_URL: &str = "https://formulae.brew.sh/api/cask/codex.jso
 pub(super) fn updates_check(config: &Config) -> DoctorCheck {
     let current_exe = std::env::current_exe().ok();
     let install_context = doctor_install_context(current_exe.as_deref());
+    let update_action = UpdateAction::from_install_context(&install_context)
+        .map(UpdateAction::command_str)
+        .unwrap_or_else(|| "manual or unknown".to_string());
     let mut details = vec![
         format!(
             "check for update on startup: {}",
             config.check_for_update_on_startup
         ),
-        format!("update action: {}", update_action_label(&install_context)),
+        format!("update action: {update_action}"),
     ];
     let version_file = config.codex_home.join(VERSION_FILE_NAME);
     push_cached_version_details(&mut details, &version_file);
@@ -85,18 +91,23 @@ pub(super) fn updates_check(config: &Config) -> DoctorCheck {
         }
     }
 
-    match fetch_latest_version(&install_context) {
-        Ok(latest_version) => {
-            details.push(format!("latest version: {latest_version}"));
-            if is_newer(&latest_version, env!("CARGO_PKG_VERSION")) == Some(true) {
-                details.push("latest version status: newer version is available".to_string());
-            } else {
-                details.push("latest version status: current version is not older".to_string());
+    let current_version = env!("CARGO_PKG_VERSION");
+    if is_source_build_version(current_version) {
+        details.push("latest version probe: skipped for source build".to_string());
+    } else {
+        match fetch_latest_version(&install_context) {
+            Ok(latest_version) => {
+                details.push(format!("latest version: {latest_version}"));
+                if is_newer_version(&latest_version, current_version) == Some(true) {
+                    details.push("latest version status: newer version is available".to_string());
+                } else {
+                    details.push("latest version status: current version is not older".to_string());
+                }
             }
-        }
-        Err(err) => {
-            status = status.max(CheckStatus::Warning);
-            details.push(format!("latest version probe: {err}"));
+            Err(err) => {
+                status = status.max(CheckStatus::Warning);
+                details.push(format!("latest version probe: {err}"));
+            }
         }
     }
 
@@ -129,20 +140,8 @@ fn push_cached_version_details(details: &mut Vec<String>, version_file: &Path) {
     }
 }
 
-fn update_action_label(context: &InstallContext) -> &'static str {
-    match &context.method {
-        InstallMethod::Npm => "npm install -g @openai/codex",
-        InstallMethod::Bun => "bun install -g @openai/codex",
-        InstallMethod::Pnpm => "pnpm add -g @openai/codex",
-        InstallMethod::Brew => "brew upgrade --cask codex",
-        InstallMethod::Standalone { .. } => "standalone installer",
-        InstallMethod::Other => "manual or unknown",
-    }
-}
-
 fn fetch_latest_version(context: &InstallContext) -> Result<String, String> {
     match &context.method {
-        InstallMethod::Brew => fetch_homebrew_cask_version(),
         InstallMethod::Npm
         | InstallMethod::Bun
         | InstallMethod::Pnpm
@@ -158,19 +157,9 @@ fn fetch_latest_github_release_version() -> Result<String, String> {
     }
 
     let info = http_get_json::<ReleaseInfo>(GITHUB_LATEST_RELEASE_URL)?;
-    info.tag_name
-        .strip_prefix("rust-v")
-        .map(str::to_string)
+    version_from_release_tag(&info.tag_name)
+        .map(str::to_owned)
         .ok_or_else(|| format!("failed to parse latest tag {}", info.tag_name))
-}
-
-fn fetch_homebrew_cask_version() -> Result<String, String> {
-    #[derive(Deserialize)]
-    struct HomebrewCaskInfo {
-        version: String,
-    }
-
-    http_get_json::<HomebrewCaskInfo>(HOMEBREW_CASK_API_URL).map(|info| info.version)
 }
 
 fn http_get_json<T>(url: &str) -> Result<T, String>
@@ -179,21 +168,6 @@ where
 {
     let body = run_command("curl", ["-fsSL", "--max-time", "5", url])?;
     serde_json::from_str::<T>(&body).map_err(|err| err.to_string())
-}
-
-fn is_newer(latest: &str, current: &str) -> Option<bool> {
-    match (parse_version(latest), parse_version(current)) {
-        (Some(latest), Some(current)) => Some(latest > current),
-        (Some(_), None) | (None, Some(_)) | (None, None) => None,
-    }
-}
-
-fn parse_version(value: &str) -> Option<(u64, u64, u64)> {
-    let mut parts = value.trim().split('.');
-    let major = parts.next()?.parse::<u64>().ok()?;
-    let minor = parts.next()?.parse::<u64>().ok()?;
-    let patch = parts.next()?.parse::<u64>().ok()?;
-    Some((major, minor, patch))
 }
 
 #[derive(Deserialize)]
@@ -207,37 +181,26 @@ struct VersionInfo {
 
 #[cfg(test)]
 mod tests {
+    use codex_core::config::ConfigBuilder;
+
     use super::*;
 
-    #[test]
-    fn is_newer_compares_plain_semver() {
-        assert_eq!(is_newer("1.2.4", "1.2.3"), Some(true));
-        assert_eq!(is_newer("1.2.3", "1.2.4"), Some(false));
-        assert_eq!(is_newer("1.2.3-beta.1", "1.2.2"), None);
-    }
+    #[tokio::test]
+    async fn updates_check_reports_inline_update_action() {
+        let codex_home = tempfile::tempdir().expect("tempdir");
+        let config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await
+            .expect("config");
 
-    #[test]
-    fn update_action_labels_install_contexts() {
-        assert_eq!(
-            update_action_label(&InstallContext {
-                method: InstallMethod::Npm,
-                package_layout: None,
-            }),
-            "npm install -g @openai/codex"
-        );
-        assert_eq!(
-            update_action_label(&InstallContext {
-                method: InstallMethod::Pnpm,
-                package_layout: None,
-            }),
-            "pnpm add -g @openai/codex"
-        );
-        assert_eq!(
-            update_action_label(&InstallContext {
-                method: InstallMethod::Other,
-                package_layout: None,
-            }),
-            "manual or unknown"
+        let check = updates_check(&config);
+
+        assert!(
+            check
+                .details
+                .iter()
+                .any(|detail| detail.starts_with("update action: "))
         );
     }
 }

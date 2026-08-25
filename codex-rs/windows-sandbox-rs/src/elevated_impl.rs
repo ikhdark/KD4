@@ -292,31 +292,4 @@ mod windows_impl {
     }
 }
 
-#[cfg(target_os = "windows")]
 pub use windows_impl::run_windows_sandbox_capture_for_permission_profile;
-
-#[cfg(not(target_os = "windows"))]
-mod stub {
-    use super::ElevatedSandboxProfileCaptureRequest;
-    use anyhow::Result;
-    use anyhow::bail;
-
-    #[derive(Debug, Default)]
-    pub struct CaptureResult {
-        pub exit_code: i32,
-        pub stdout: Vec<u8>,
-        pub stderr: Vec<u8>,
-        pub timed_out: bool,
-    }
-
-    /// Stub implementation for non-Windows targets; sandboxing only works on Windows.
-    #[allow(clippy::too_many_arguments)]
-    pub fn run_windows_sandbox_capture_for_permission_profile(
-        _request: ElevatedSandboxProfileCaptureRequest<'_>,
-    ) -> Result<CaptureResult> {
-        bail!("Windows sandbox is only available on Windows")
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-pub use stub::run_windows_sandbox_capture_for_permission_profile;

@@ -27,7 +27,6 @@ use anyhow::bail;
 use anyhow::ensure;
 use filedescriptor::FileDescriptor;
 use filedescriptor::OwnedHandle;
-use lazy_static::lazy_static;
 use portable_pty::cmdbuilder::CommandBuilder;
 use shared_library::shared_library;
 use std::env;
@@ -42,6 +41,7 @@ use std::os::windows::io::FromRawHandle;
 use std::path::Path;
 use std::ptr;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use winapi::shared::minwindef::DWORD;
 use winapi::shared::ntdef::NTSTATUS;
 use winapi::shared::ntstatus::STATUS_SUCCESS;
@@ -60,9 +60,6 @@ use winapi::um::winnt::OSVERSIONINFOW;
 pub type HPCON = HANDLE;
 
 pub const PSEUDOCONSOLE_RESIZE_QUIRK: DWORD = 0x2;
-#[allow(dead_code)]
-pub const PSEUDOCONSOLE_PASSTHROUGH_MODE: DWORD = 0x8;
-
 // https://learn.microsoft.com/en-gb/windows/console/createpseudoconsole
 // https://learn.microsoft.com/en-gb/windows/release-health/release-information
 const MIN_CONPTY_BUILD: u32 = 17_763;
@@ -97,9 +94,7 @@ fn load_conpty() -> ConPtyFuncs {
     }
 }
 
-lazy_static! {
-    static ref CONPTY: ConPtyFuncs = load_conpty();
-}
+static CONPTY: LazyLock<ConPtyFuncs> = LazyLock::new(load_conpty);
 
 pub fn conpty_supported() -> bool {
     windows_build_number().is_some_and(|build| build >= MIN_CONPTY_BUILD)
@@ -365,6 +360,7 @@ fn append_quoted(arg: &OsStr, cmdline: &mut Vec<u16>) {
 
 #[cfg(test)]
 mod tests {
+    use super::CONPTY;
     use super::MIN_CONPTY_BUILD;
     use super::windows_build_number;
 
@@ -374,5 +370,10 @@ mod tests {
         // at least check that this.
         let version = windows_build_number().unwrap();
         assert!(version > MIN_CONPTY_BUILD);
+    }
+
+    #[test]
+    fn conpty_functions_load() {
+        std::sync::LazyLock::force(&CONPTY);
     }
 }

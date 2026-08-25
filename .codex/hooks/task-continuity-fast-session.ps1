@@ -10,6 +10,7 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $emptyOutput = '{}'
+$script:RepositoryStateObservation = $null
 $stateDirectory = [System.IO.Path]::GetFullPath(
     (Join-Path $PSScriptRoot '..\harness\runs\task-continuity\v1')
 )
@@ -116,6 +117,12 @@ function Test-RepositoryStateMatchesCapsule {
                         $dirty += "`n..."
                     }
                     $dirty = Get-BoundedRedactedString $dirty 2000
+                }
+                $script:RepositoryStateObservation = [pscustomobject][ordered]@{
+                    working_directory = $WorkingDirectory
+                    root = $currentRoot
+                    revision = $revision
+                    dirty_summary = $dirty
                 }
                 $matches = (
                     -not [string]::IsNullOrWhiteSpace($revision) -and
@@ -280,9 +287,14 @@ catch {
 }
 
 try {
-    & (Join-Path $PSScriptRoot 'task-continuity.ps1') `
-        -TaskContinuityRawInput $TaskContinuityRawInput `
-        -TaskContinuitySkipFastPath
+    $slowArguments = @{
+        TaskContinuityRawInput = $TaskContinuityRawInput
+        TaskContinuitySkipFastPath = $true
+    }
+    if ($null -ne $script:RepositoryStateObservation) {
+        $slowArguments.TaskContinuityRepositoryState = $script:RepositoryStateObservation
+    }
+    & (Join-Path $PSScriptRoot 'task-continuity.ps1') @slowArguments
 }
 catch {
     try {

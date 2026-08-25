@@ -5,7 +5,6 @@ use bytes::Bytes;
 use codex_http_client::BuildRouteAwareHttpClientError;
 use codex_http_client::ClientRouteClass;
 use codex_http_client::HttpClientFactory;
-use codex_http_client::OutboundProxyPolicy;
 use futures::Stream;
 use reqwest::StatusCode;
 use reqwest::header::CONTENT_LENGTH;
@@ -328,31 +327,18 @@ fn build_reqwest_client(
     http_client_factory: &HttpClientFactory,
     url: &str,
 ) -> Result<reqwest::Client, OpenAiFileError> {
-    match http_client_factory.build_reqwest_client(
-        reqwest::Client::builder(),
-        url,
-        ClientRouteClass::Api,
-    ) {
-        Ok(client) => Ok(client),
-        Err(error)
-            if matches!(
-                http_client_factory.outbound_proxy_policy(),
-                OutboundProxyPolicy::ReqwestDefault
-            ) =>
-        {
-            tracing::warn!(%error, "failed to build OpenAI file upload client");
-            Ok(reqwest::Client::new())
-        }
-        Err(source) => Err(OpenAiFileError::ClientBuild {
+    http_client_factory
+        .build_reqwest_client(reqwest::Client::builder(), url, ClientRouteClass::Api)
+        .map_err(|source| OpenAiFileError::ClientBuild {
             url: url.to_string(),
             source,
-        }),
-    }
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_http_client::OutboundProxyPolicy;
     use pretty_assertions::assert_eq;
     use reqwest::header::HeaderValue;
     use std::sync::Arc;
@@ -390,6 +376,63 @@ mod tests {
 
     fn base_url_for(server: &MockServer) -> String {
         format!("{}/backend-api", server.uri())
+    }
+
+    #[test]
+    fn invalid_custom_ca_is_rejected_for_every_proxy_policy() {
+        const CHILD_POLICY_ENV: &str = "CODEX_API_FILES_INVALID_CA_TEST_POLICY";
+
+        let Ok(policy_name) = std::env::var(CHILD_POLICY_ENV) else {
+            let unique_suffix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after the Unix epoch")
+                .as_nanos();
+            let invalid_ca_path = std::env::temp_dir().join(format!(
+                "codex-api-invalid-ca-{}-{unique_suffix}.pem",
+                std::process::id()
+            ));
+            std::fs::write(&invalid_ca_path, "not a PEM certificate")
+                .expect("invalid CA fixture should be written");
+
+            for ca_env in ["CODEX_CA_CERTIFICATE", "SSL_CERT_FILE"] {
+                for policy_name in ["reqwest-default", "respect-system-proxy"] {
+                    let output = std::process::Command::new(
+                        std::env::current_exe().expect("test executable should be available"),
+                    )
+                    .arg("--exact")
+                    .arg("files::tests::invalid_custom_ca_is_rejected_for_every_proxy_policy")
+                    .arg("--nocapture")
+                    .env_remove("CODEX_CA_CERTIFICATE")
+                    .env_remove("SSL_CERT_FILE")
+                    .env(ca_env, &invalid_ca_path)
+                    .env(CHILD_POLICY_ENV, policy_name)
+                    .output()
+                    .expect("isolated CA subprocess should run");
+
+                    assert!(
+                        output.status.success(),
+                        "{policy_name} failed with invalid {ca_env}\nstdout:\n{}\nstderr:\n{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr),
+                    );
+                }
+            }
+            std::fs::remove_file(&invalid_ca_path).expect("invalid CA fixture should be removed");
+            return;
+        };
+
+        let outbound_proxy_policy = match policy_name.as_str() {
+            "reqwest-default" => OutboundProxyPolicy::ReqwestDefault,
+            "respect-system-proxy" => OutboundProxyPolicy::RespectSystemProxy,
+            _ => panic!("unexpected test proxy policy: {policy_name}"),
+        };
+        let error = build_reqwest_client(
+            &HttpClientFactory::new(outbound_proxy_policy),
+            "https://example.com/upload",
+        )
+        .expect_err("file uploads should reject invalid custom CAs");
+
+        assert!(matches!(error, OpenAiFileError::ClientBuild { .. }));
     }
 
     #[tokio::test]

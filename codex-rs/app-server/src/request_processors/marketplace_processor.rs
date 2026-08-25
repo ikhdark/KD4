@@ -134,6 +134,6 @@ impl MarketplaceRequestProcessor {
         self.config_manager
             .load_latest_config(fallback_cwd)
             .await
-            .map_err(|err| internal_error(format!("failed to reload config: {err}")))
+            .map_config_load_error()
     }
 }

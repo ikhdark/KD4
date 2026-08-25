@@ -26,7 +26,7 @@ use tokio::time::sleep;
 use tokio::time::timeout;
 
 use common::DELAYED_OUTPUT_AFTER_EXIT_PARENT_ARG;
-use common::current_test_binary_helper_paths;
+use common::current_test_binary_path;
 use common::exec_server::ExecServerHarness;
 use common::exec_server::exec_server;
 
@@ -342,7 +342,7 @@ async fn assert_exec_process_retains_output_after_exit_until_streams_close(
     use_remote: bool,
 ) -> Result<()> {
     let context = create_process_context(use_remote).await?;
-    let (helper_binary, _) = current_test_binary_helper_paths()?;
+    let helper_binary = current_test_binary_path()?;
     let release_dir = TempDir::new()?;
     let release_path = release_dir.path().join("release-delayed-output");
     let process_id = "proc-output-after-exit".to_string();
@@ -667,7 +667,7 @@ async fn assert_exec_process_preserves_queued_events_before_subscribe(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg_attr(not(unix), ignore = "Unix-only exec-server process test")]
+#[ignore = "Unix-only exec-server process test"]
 // Serialize tests that launch a real exec-server process through the full CLI.
 #[serial_test::serial(remote_exec_server)]
 async fn remote_exec_process_recovers_after_transport_disconnect() -> Result<()> {
@@ -819,7 +819,7 @@ async fn remote_exec_process_recovers_after_transport_disconnect() -> Result<()>
 
 #[test_case(false ; "local")]
 #[test_case(true ; "remote")]
-#[cfg_attr(not(unix), ignore = "Unix-only exec-server process test")]
+#[ignore = "Unix-only exec-server process test"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // Serialize tests that launch a real exec-server process through the full CLI.
 #[serial_test::serial(remote_exec_server)]
@@ -829,7 +829,7 @@ async fn exec_process_starts_and_exits(use_remote: bool) -> Result<()> {
 
 #[test_case(false ; "local")]
 #[test_case(true ; "remote")]
-#[cfg_attr(not(unix), ignore = "Unix-only exec-server process test")]
+#[ignore = "Unix-only exec-server process test"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // Serialize tests that launch a real exec-server process through the full CLI.
 #[serial_test::serial(remote_exec_server)]
@@ -839,7 +839,7 @@ async fn exec_process_streams_output(use_remote: bool) -> Result<()> {
 
 #[test_case(false ; "local")]
 #[test_case(true ; "remote")]
-#[cfg_attr(not(unix), ignore = "Unix-only exec-server process test")]
+#[ignore = "Unix-only exec-server process test"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // Serialize tests that launch a real exec-server process through the full CLI.
 #[serial_test::serial(remote_exec_server)]
@@ -849,7 +849,7 @@ async fn exec_process_pushes_events(use_remote: bool) -> Result<()> {
 
 #[test_case(false ; "local")]
 #[test_case(true ; "remote")]
-#[cfg_attr(not(unix), ignore = "Unix-only exec-server process test")]
+#[ignore = "Unix-only exec-server process test"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // Serialize tests that launch a real exec-server process through the full CLI.
 #[serial_test::serial(remote_exec_server)]
@@ -859,7 +859,7 @@ async fn exec_process_replays_events_after_close(use_remote: bool) -> Result<()>
 
 #[test_case(false ; "local")]
 #[test_case(true ; "remote")]
-#[cfg_attr(not(unix), ignore = "Unix-only exec-server process test")]
+#[ignore = "Unix-only exec-server process test"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // Serialize tests that launch a real exec-server process through the full CLI.
 #[serial_test::serial(remote_exec_server)]
@@ -871,7 +871,7 @@ async fn exec_process_retains_output_after_exit_until_streams_close(
 
 #[test_case(false ; "local")]
 #[test_case(true ; "remote")]
-#[cfg_attr(not(unix), ignore = "Unix-only exec-server process test")]
+#[ignore = "Unix-only exec-server process test"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // Serialize tests that launch a real exec-server process through the full CLI.
 #[serial_test::serial(remote_exec_server)]
@@ -881,7 +881,7 @@ async fn exec_process_write_then_read(use_remote: bool) -> Result<()> {
 
 #[test_case(false ; "local")]
 #[test_case(true ; "remote")]
-#[cfg_attr(not(unix), ignore = "Unix-only exec-server process test")]
+#[ignore = "Unix-only exec-server process test"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // Serialize tests that launch a real exec-server process through the full CLI.
 #[serial_test::serial(remote_exec_server)]
@@ -891,7 +891,7 @@ async fn exec_process_write_then_read_without_tty(use_remote: bool) -> Result<()
 
 #[test_case(false ; "local")]
 #[test_case(true ; "remote")]
-#[cfg_attr(not(unix), ignore = "Unix-only exec-server process test")]
+#[ignore = "Unix-only exec-server process test"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // Serialize tests that launch a real exec-server process through the full CLI.
 #[serial_test::serial(remote_exec_server)]
@@ -901,7 +901,7 @@ async fn exec_process_rejects_write_without_pipe_stdin(use_remote: bool) -> Resu
 
 #[test_case(false ; "local")]
 #[test_case(true ; "remote")]
-#[cfg_attr(not(unix), ignore = "Unix-only exec-server process test")]
+#[ignore = "Unix-only exec-server process test"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // Serialize tests that launch a real exec-server process through the full CLI.
 #[serial_test::serial(remote_exec_server)]
@@ -911,7 +911,6 @@ async fn exec_process_signal_interrupts_process(use_remote: bool) -> Result<()> 
 
 #[test_case(false ; "local")]
 #[test_case(true ; "remote")]
-#[cfg_attr(not(windows), ignore = "Windows-only exec-server process test")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // Serialize tests that launch a real exec-server process through the full CLI.
 #[serial_test::serial(remote_exec_server)]
@@ -921,7 +920,7 @@ async fn exec_process_signal_reports_unsupported_on_windows(use_remote: bool) ->
 
 #[test_case(false ; "local")]
 #[test_case(true ; "remote")]
-#[cfg_attr(not(unix), ignore = "Unix-only exec-server process test")]
+#[ignore = "Unix-only exec-server process test"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // Serialize tests that launch a real exec-server process through the full CLI.
 #[serial_test::serial(remote_exec_server)]

@@ -2,82 +2,30 @@
 
 import contextlib
 import io
-import importlib.util
+import json
 import os
-from pathlib import Path
-import shutil
 import subprocess
 import sys
 import tempfile
 import time
-import tomllib
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from scripts import rust_build_status
 from scripts import rust_build_status_support
 from scripts import tool_versions
+from scripts.build_tooling_test_support import REPO_ROOT
+from scripts.build_tooling_test_support import load_toml
+from scripts.build_tooling_test_support import powershell
+from scripts.build_tooling_test_support import ps_single_quote
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
-def powershell() -> str | None:
-    # Prefer Windows PowerShell 5.1: the justfile invokes these scripts via
-    # `powershell -NoProfile -File ...`, so tests should exercise the same
-    # host (5.1 has stricter native-stderr and StrictMode semantics).
-    return shutil.which("powershell") or shutil.which("pwsh")
-
-
-def pwsh_only() -> str | None:
-    # invoke-rust-perf-env.ps1 runs under pwsh 7.4+ in production (recipes
-    # invoke it inline in the just-shell pwsh session), and its -NoSccache
-    # proof depends on pwsh's empty-env-var semantics, so its tests must not
-    # fall back to Windows PowerShell 5.1.
-    return shutil.which("pwsh")
-
-
-def ps_single_quote(value: str | Path) -> str:
-    return "'" + str(value).replace("'", "''") + "'"
-
-
-def load_just_shell_module():
-    path = REPO_ROOT / "scripts" / "just-shell.py"
-    spec = importlib.util.spec_from_file_location("just_shell", path)
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def load_format_module():
-    path = REPO_ROOT / "scripts" / "format.py"
-    spec = importlib.util.spec_from_file_location("format_script", path)
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def load_root_maintenance_module():
-    path = REPO_ROOT / "scripts" / "root_maintenance.py"
-    spec = importlib.util.spec_from_file_location("root_maintenance", path)
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def load_toml(path: Path):
-    return tomllib.loads(path.read_text(encoding="utf-8"))
-
-
 class BuildToolingStorageTest(unittest.TestCase):
-    def test_run_lane_holds_reservation_and_passes_target_with_cargo_env(
+    def test_run_lane_holds_reservation_without_exporting_cargo_target_env(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -101,7 +49,7 @@ class BuildToolingStorageTest(unittest.TestCase):
             lines = output.read_text(encoding="utf-8").splitlines()
             self.assertEqual(result, 0)
             self.assertEqual(Path(lines[0]), (lanes_root / "unit").resolve())
-            self.assertEqual(lines[1], "True")
+            self.assertEqual(lines[1], "False")
             self.assertFalse(
                 rust_build_status.lane_active_lock_is_held(lanes_root / "unit")
             )
@@ -124,20 +72,6 @@ class BuildToolingStorageTest(unittest.TestCase):
                 ) as second:
                     self.assertEqual(first[0], "unit")
                     self.assertEqual(second[0], "unit-2")
-
-    @unittest.skipIf(os.name == "nt", "POSIX flock behavior")
-    def test_coordination_lock_honors_timeout_on_posix(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            lane_root = Path(temp_dir)
-            with rust_build_status.cargo_lane_coordination_lock(lane_root):
-                started = time.monotonic()
-                with self.assertRaises(TimeoutError):
-                    with rust_build_status.cargo_lane_coordination_lock(
-                        lane_root,
-                        timeout_seconds=0.05,
-                    ):
-                        self.fail("held coordination lock was acquired")
-                self.assertLess(time.monotonic() - started, 1.0)
 
     def test_cargo_command_target_dir_is_injected_once(self) -> None:
         target = Path("lane-target").resolve()
@@ -905,36 +839,103 @@ class BuildToolingStorageTest(unittest.TestCase):
                 rust_build_status.main(["prune", option, value])
 
     def test_lane_regexes_use_shared_tooling_patterns(self) -> None:
+        patterns = tool_versions.cargo_lane_patterns()
         self.assertEqual(
             rust_build_status.LANE_RE.pattern,
-            tool_versions.LANE_PATH_PATTERN,
+            patterns["lane_path_pattern"],
         )
         self.assertEqual(
             rust_build_status.JUST_LANE_RE.pattern,
-            tool_versions.JUST_LANE_PATTERN,
+            patterns["just_lane_pattern"],
+        )
+        self.assertEqual(
+            rust_build_status.SCRIPT_LANE_RE.pattern,
+            patterns["script_lane_pattern"],
+        )
+        self.assertEqual(
+            rust_build_status.JUST_FIXED_LANE_RE.pattern,
+            patterns["just_fixed_lane_pattern"],
+        )
+        self.assertEqual(
+            rust_build_status.JUST_FIXED_LANE_NAMES,
+            patterns["just_fixed_lane_names"],
         )
 
-    def test_new_local_lane_recipes_are_detected_from_just_commands(self) -> None:
+    def test_cargo_lane_main_uses_parameterized_recipe_not_fixed_alias(self) -> None:
+        patterns = tool_versions.cargo_lane_patterns()
+        process = rust_build_status.RustProcess(
+            pid=1,
+            name="just.exe",
+            command_line="just cargo-lane main cargo check",
+        )
+
+        self.assertEqual(rust_build_status.lane_name_for_process(process), "main")
+        self.assertNotIn("cargo-lane-main", patterns["just_fixed_lane_names"])
+        self.assertIsNone(
+            rust_build_status.JUST_FIXED_LANE_RE.search("just cargo-lane-main")
+        )
+
+    def test_lane_pattern_registry_drives_python_and_powershell(self) -> None:
+        shell = powershell()
+        if shell is None:
+            self.skipTest("PowerShell is not available")
+
+        command_lines = [
+            r"cargo check --target-dir C:\repo\target\lanes\path-lane",
+            "powershell -File scripts/cargo-lane.ps1 -Lane script-lane cargo check",
+            "just watch-lane recipe-lane",
+            "just test-lane-main",
+            "just release-lane",
+        ]
+        expected = {
+            rust_build_status.lane_name_for_process(
+                rust_build_status.RustProcess(
+                    pid=index,
+                    name="powershell.exe",
+                    command_line=command_line,
+                )
+            )
+            for index, command_line in enumerate(command_lines, start=1)
+        }
+        self.assertNotIn(None, expected)
+
+        pattern_script = REPO_ROOT / "scripts" / "cargo-lane-patterns.ps1"
+        command_lines_json = json.dumps(command_lines)
+        command = (
+            f". {ps_single_quote(pattern_script)}; "
+            f"$commandLines = ConvertFrom-Json {ps_single_quote(command_lines_json)}; "
+            "$names = @(Get-CargoLaneNamesFromCommandLines -CommandLines $commandLines); "
+            "ConvertTo-Json -Compress -InputObject $names"
+        )
+        result = subprocess.run(
+            [
+                shell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                command,
+            ],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+            creationflags=CREATE_NO_WINDOW,
+            timeout=30,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertEqual(set(json.loads(result.stdout)), expected)
+
         cargo_lane_text = (REPO_ROOT / "scripts" / "cargo-lane.ps1").read_text(
             encoding="utf-8"
         )
-        self.assertIn("watch-lane", cargo_lane_text)
-        self.assertIn("coverage-lane", cargo_lane_text)
-
-        for command in (
-            "just watch-lane codex-core",
-            "just coverage-lane codex-core",
-        ):
-            self.assertEqual(
-                rust_build_status.lane_name_for_process(
-                    rust_build_status.RustProcess(
-                        pid=99,
-                        name="just.exe",
-                        command_line=command,
-                    )
-                ),
-                "codex-core",
-            )
+        self.assertIn("Get-CargoLaneNamesFromCommandLines", cargo_lane_text)
+        self.assertNotIn("watch-lane", cargo_lane_text)
+        self.assertNotIn("release-lane", cargo_lane_text)
 
     def test_lane_report_marks_active_lanes_and_emits_safe_prune_suggestions(
         self,

@@ -11,10 +11,10 @@ use serde_json::json;
 use crate::DEFAULT_SEARCH_MAX_RESULTS;
 use crate::MAX_SEARCH_RESULTS;
 use crate::SEARCH_TOOL_NAME;
-use crate::backend::MemoriesBackend;
 use crate::backend::SearchMatchMode;
 use crate::backend::SearchMemoriesRequest;
 use crate::backend::SearchMemoriesResponse;
+use crate::local::LocalMemoriesBackend;
 use crate::metrics::record_tool_call;
 use crate::metrics::scope_from_optional_path;
 use crate::metrics::truncated_tag;
@@ -42,15 +42,12 @@ struct SearchArgs {
 }
 
 #[derive(Clone)]
-pub(super) struct SearchTool<B> {
-    pub(super) backend: B,
+pub(super) struct SearchTool {
+    pub(super) backend: LocalMemoriesBackend,
     pub(super) metrics_client: Option<MetricsClient>,
 }
 
-impl<B> ToolExecutor<ToolCall> for SearchTool<B>
-where
-    B: MemoriesBackend,
-{
+impl ToolExecutor<ToolCall> for SearchTool {
     fn tool_name(&self) -> ToolName {
         memory_tool_name(SEARCH_TOOL_NAME)
     }
@@ -67,19 +64,15 @@ where
     }
 }
 
-impl<B> SearchTool<B>
-where
-    B: MemoriesBackend,
-{
+impl SearchTool {
     async fn handle_call(
         &self,
         call: ToolCall,
     ) -> Result<Box<dyn codex_extension_api::ToolOutput>, codex_extension_api::FunctionCallError>
     {
-        let backend = self.backend.clone();
         let args: SearchArgs = parse_args(&call)?;
         let scope = scope_from_optional_path(args.path.as_deref(), "all");
-        let response = backend.search(args.into_request()).await;
+        let response = self.backend.search(args.into_request()).await;
         record_tool_call(
             self.metrics_client.as_ref(),
             SEARCH_TOOL_NAME,

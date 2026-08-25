@@ -35,11 +35,8 @@ use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
-use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use std::sync::LazyLock;
-use std::sync::Mutex as StdMutex;
 use toml::Value as TomlValue;
 use tracing::error;
 
@@ -58,23 +55,12 @@ const MAX_UTF8_BOUNDARY_LOOKAHEAD_BYTES: usize = 3;
 /// additional, finite allowance.
 const PROJECT_DOC_RENDERED_OVERHEAD_BYTES: usize = 4 * 1024;
 const PROJECT_DOC_AGGREGATE_NOTICE_RESERVE_BYTES: usize = 256;
-const STABLE_CONTEXT_RENDER_CACHE_CAPACITY: usize = 64;
 const PROJECT_DISCOVERY_REUSE_METRIC: &str = "codex.project_discovery_reuse";
 
 enum ProjectDiscoveryReuse {
     Hit(PathUri),
     Miss(&'static str),
 }
-
-#[derive(Default)]
-struct StableContextRenderCache {
-    renderings: HashMap<[u8; 32], Arc<str>>,
-    identity_by_structure: HashMap<[u8; 32], [u8; 32]>,
-    identity_by_content: HashMap<[u8; 32], [u8; 32]>,
-}
-
-static STABLE_CONTEXT_RENDER_CACHE: LazyLock<StdMutex<StableContextRenderCache>> =
-    LazyLock::new(|| StdMutex::new(StableContextRenderCache::default()));
 
 fn stable_context_identity_from_structure(
     structure: [u8; 32],
@@ -797,7 +783,7 @@ async fn agents_md_paths_with_metrics(
     } else {
         vec![dir]
     };
-    let candidate_filenames = candidate_filenames(config);
+    let candidate_filenames = project_doc_candidate_filenames(config);
     let directory_searches = search_dirs.into_iter().map(|directory| {
         let candidate_filenames = &candidate_filenames;
         async move {
@@ -876,7 +862,7 @@ pub(crate) fn effective_project_root_markers(config: &Config) -> Vec<String> {
     }
 }
 
-fn candidate_filenames(config: &Config) -> Vec<&str> {
+pub fn project_doc_candidate_filenames(config: &Config) -> Vec<&str> {
     let mut names: Vec<&str> = Vec::with_capacity(2 + config.project_doc_fallback_filenames.len());
     names.push(LOCAL_AGENTS_MD_FILENAME);
     names.push(DEFAULT_AGENTS_MD_FILENAME);
@@ -903,11 +889,27 @@ pub struct LoadedAgentsMd {
     entries: Vec<InstructionEntry>,
 }
 
+#[derive(Clone)]
 pub(crate) struct RepositoryStableContextBundle {
     pub(crate) identity: [u8; 32],
     pub(crate) rendered: Arc<str>,
     pub(crate) reused: bool,
     pub(crate) semantic_replacement: bool,
+}
+
+impl RepositoryStableContextBundle {
+    pub(crate) fn metadata(&self) -> ([u8; 32], bool, bool) {
+        (self.identity, self.reused, self.semantic_replacement)
+    }
+
+    pub(crate) fn as_cached(&self) -> Self {
+        Self {
+            identity: self.identity,
+            rendered: Arc::clone(&self.rendered),
+            reused: true,
+            semantic_replacement: false,
+        }
+    }
 }
 
 impl LoadedAgentsMd {
@@ -988,57 +990,16 @@ impl LoadedAgentsMd {
         active_cwd: &PathUri,
     ) -> RepositoryStableContextBundle {
         let structure = self.stable_context_structure_key(active_cwd);
-        let mut cache = STABLE_CONTEXT_RENDER_CACHE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(identity) = cache.identity_by_structure.get(&structure).copied()
-            && let Some(rendered) = cache.renderings.get(&identity)
-        {
-            return RepositoryStableContextBundle {
-                identity,
-                rendered: Arc::clone(rendered),
-                reused: true,
-                semantic_replacement: false,
-            };
-        }
-
         let rendered = self.text();
         let rendered_hash: [u8; 32] = Sha256::digest(rendered.as_bytes()).into();
         let identity = stable_context_identity_from_structure(structure, rendered_hash);
-        let semantic_replacement = cache
-            .identity_by_content
-            .get(&rendered_hash)
-            .is_some_and(|previous| *previous != identity);
-        cache.identity_by_structure.insert(structure, identity);
-        cache.identity_by_content.insert(rendered_hash, identity);
-        if let Some(cached) = cache.renderings.get(&identity) {
-            return RepositoryStableContextBundle {
-                identity,
-                rendered: Arc::clone(cached),
-                reused: true,
-                semantic_replacement,
-            };
-        }
-        if cache.renderings.len() >= STABLE_CONTEXT_RENDER_CACHE_CAPACITY {
-            cache.renderings.clear();
-            cache.identity_by_structure.clear();
-            cache.identity_by_content.clear();
-            cache.identity_by_structure.insert(structure, identity);
-            cache.identity_by_content.insert(rendered_hash, identity);
-        }
         let rendered: Arc<str> = rendered.into();
-        cache.renderings.insert(identity, Arc::clone(&rendered));
         RepositoryStableContextBundle {
             identity,
             rendered,
             reused: false,
-            semantic_replacement,
+            semantic_replacement: false,
         }
-    }
-
-    pub(crate) fn stable_context_metadata(&self, active_cwd: &PathUri) -> ([u8; 32], bool, bool) {
-        let bundle = self.stable_context_bundle(active_cwd);
-        (bundle.identity, bundle.reused, bundle.semantic_replacement)
     }
 
     #[cfg(test)]

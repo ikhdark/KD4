@@ -2,6 +2,7 @@ use std::any::TypeId;
 
 use codex_exec_server::ExecServerError;
 use pretty_assertions::assert_eq;
+use reqwest::StatusCode;
 use rmcp::transport::DynamicTransportError;
 use rmcp::transport::streamable_http_client::StreamableHttpError;
 
@@ -48,8 +49,14 @@ fn retryable_streamable_http_error_includes_remote_body_stream_failure() {
                 "http response stream `http-1` received seq 2, expected 1".to_string(),
             ),
         )),
-        StreamableHttpError::UnexpectedServerResponse("HTTP 502: upstream failure".into()),
-        StreamableHttpError::UnexpectedServerResponse("HTTP 400: bad request".into()),
+        StreamableHttpError::Client(StreamableHttpClientAdapterError::UnexpectedHttpStatus {
+            status: StatusCode::BAD_GATEWAY,
+            body_preview: "localized upstream failure".to_string(),
+        }),
+        StreamableHttpError::Client(StreamableHttpClientAdapterError::UnexpectedHttpStatus {
+            status: StatusCode::BAD_REQUEST,
+            body_preview: "localized bad request".to_string(),
+        }),
     ];
 
     assert_eq!(

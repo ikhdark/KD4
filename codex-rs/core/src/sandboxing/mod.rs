@@ -11,8 +11,6 @@ use crate::exec::ExecCapturePolicy;
 use crate::exec::ExecExpiration;
 use crate::exec::StdoutStream;
 use crate::exec::execute_exec_request;
-#[cfg(target_os = "macos")]
-use crate::spawn::CODEX_SANDBOX_ENV_VAR;
 use crate::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR;
 use codex_file_system::FileSystemSandboxContext;
 use codex_network_proxy::ManagedNetworkSandboxContext;
@@ -26,6 +24,9 @@ use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_sandboxing::SandboxExecRequest;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::WindowsSandboxFilesystemOverrides;
+use codex_sandboxing::resolve_windows_elevated_filesystem_overrides;
+use codex_sandboxing::resolve_windows_restricted_token_filesystem_overrides;
+use codex_sandboxing::windows_sandbox_uses_elevated_backend;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use std::collections::HashMap;
@@ -117,7 +118,7 @@ impl ExecRequest {
         request: SandboxExecRequest,
         options: ExecOptions,
         windows_sandbox_workspace_roots: Vec<AbsolutePathBuf>,
-    ) -> Self {
+    ) -> codex_protocol::error::Result<Self> {
         let SandboxExecRequest {
             command,
             cwd,
@@ -143,11 +144,7 @@ impl ExecRequest {
                 "1".to_string(),
             );
         }
-        #[cfg(target_os = "macos")]
-        if sandbox == SandboxType::MacosSeatbelt {
-            env.insert(CODEX_SANDBOX_ENV_VAR.to_string(), "seatbelt".to_string());
-        }
-        Self {
+        let mut request = Self {
             command,
             cwd,
             env,
@@ -169,7 +166,31 @@ impl ExecRequest {
             exec_server_sandbox: None,
             exec_server_enforce_managed_network: false,
             exec_server_managed_network: None,
+        };
+        if request.sandbox == SandboxType::WindowsRestrictedToken {
+            let sandbox_policy_cwd = request.windows_sandbox_policy_cwd.to_abs_path()?;
+            let use_elevated_backend = windows_sandbox_uses_elevated_backend(
+                request.windows_sandbox_level,
+                request.network.is_some(),
+            );
+            request.windows_sandbox_filesystem_overrides = if use_elevated_backend {
+                resolve_windows_elevated_filesystem_overrides(
+                    request.sandbox,
+                    &request.permission_profile,
+                    &sandbox_policy_cwd,
+                    use_elevated_backend,
+                )
+            } else {
+                resolve_windows_restricted_token_filesystem_overrides(
+                    request.sandbox,
+                    &request.permission_profile,
+                    &sandbox_policy_cwd,
+                    request.windows_sandbox_level,
+                )
+            }
+            .map_err(codex_protocol::error::CodexErr::UnsupportedOperation)?;
         }
+        Ok(request)
     }
 }
 

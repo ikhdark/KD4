@@ -1,14 +1,8 @@
-use crate::realtime_conversation::handle_audio as handle_realtime_conversation_audio;
-use crate::realtime_conversation::handle_close as handle_realtime_conversation_close;
-use crate::realtime_conversation::handle_speech as handle_realtime_conversation_speech;
-use crate::realtime_conversation::handle_start as handle_realtime_conversation_start;
-use crate::realtime_conversation::handle_text as handle_realtime_conversation_text;
 use async_channel::Receiver;
 use codex_otel::set_parent_from_w3c_trace_context;
 use codex_protocol::protocol::Submission;
 use std::time::Duration;
 use tracing::Instrument;
-use tracing::debug_span;
 use tracing::info_span;
 
 use crate::session::SteerInputError;
@@ -35,8 +29,6 @@ use codex_protocol::protocol::GuardianAssessmentStatus;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::McpServerRefreshConfig;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::RealtimeConversationListVoicesResponseEvent;
-use codex_protocol::protocol::RealtimeVoicesList;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::RolloutItem;
@@ -67,18 +59,6 @@ pub async fn clean_background_terminals(sess: &Arc<Session>) {
     sess.close_unified_exec_processes().await;
 }
 
-pub async fn realtime_conversation_list_voices(sess: &Session, sub_id: String) {
-    sess.send_event_raw(Event {
-        id: sub_id,
-        msg: EventMsg::RealtimeConversationListVoicesResponse(
-            RealtimeConversationListVoicesResponseEvent {
-                voices: RealtimeVoicesList::builtin(),
-            },
-        ),
-    })
-    .await;
-}
-
 pub async fn user_input_or_turn(
     sess: &Arc<Session>,
     sub_id: String,
@@ -93,10 +73,6 @@ pub async fn update_thread_settings(
     sub_id: String,
     thread_settings: ThreadSettingsOverrides,
 ) {
-    // A standalone model update must create resumable state: app-server clients
-    // can acknowledge it and immediately cold-resume the thread. Other runtime
-    // updates intentionally remain live-only until the first user turn.
-    let materialize_rollout = thread_settings.model.is_some();
     let updates = thread_settings_update(sess, thread_settings).await;
     match sess.update_settings(updates).await {
         Ok(()) => {
@@ -104,25 +80,20 @@ pub async fn update_thread_settings(
                 id: sub_id,
                 msg: sess.thread_settings_applied_event().await,
             };
-            if materialize_rollout {
-                let rollout_items = [RolloutItem::EventMsg(event.msg.clone())];
-                if let Err(err) = sess.persist_rollout_items_durable(&rollout_items).await {
-                    sess.send_event_raw_without_materializing_rollout(Event {
-                        id: event.id,
-                        msg: EventMsg::Error(ErrorEvent {
-                            message: format!("failed to persist thread settings override: {err}"),
-                            codex_error_info: Some(CodexErrorInfo::InternalServerError),
-                        }),
-                    })
-                    .await;
-                    return;
-                }
-                sess.send_event_raw_with_persistence(event, /*persist*/ false)
-                    .await;
-            } else {
-                sess.send_event_raw_without_materializing_rollout(event)
-                    .await;
+            let rollout_items = [RolloutItem::EventMsg(event.msg.clone())];
+            if let Err(err) = sess.persist_rollout_items_durable(&rollout_items).await {
+                sess.send_event_raw_without_materializing_rollout(Event {
+                    id: event.id,
+                    msg: EventMsg::Error(ErrorEvent {
+                        message: format!("failed to persist thread settings override: {err}"),
+                        codex_error_info: Some(CodexErrorInfo::InternalServerError),
+                    }),
+                })
+                .await;
+                return;
             }
+            sess.send_event_raw_with_persistence(event, /*persist*/ false)
+                .await;
         }
         Err(err) => {
             sess.send_event_raw(Event {
@@ -222,6 +193,20 @@ pub(super) async fn user_input_or_turn_inner(
             msg: sess.thread_settings_applied_event().await,
         })
         .await;
+    }
+    if let Err(err) = sess
+        .persist_thread_settings_snapshot_if_unmaterialized()
+        .await
+    {
+        sess.send_event_raw_without_materializing_rollout(Event {
+            id: sub_id,
+            msg: EventMsg::Error(ErrorEvent {
+                message: format!("failed to persist initial thread settings: {err}"),
+                codex_error_info: Some(CodexErrorInfo::InternalServerError),
+            }),
+        })
+        .await;
+        return;
     }
     match sess
         .steer_input(
@@ -560,6 +545,26 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
     sess.apply_rollout_reconstruction(turn_context.as_ref(), replay_items.as_slice())
         .await;
     sess.recompute_token_usage(turn_context.as_ref()).await;
+    let reconciled_history = sess.clone_history().await;
+    if !sess
+        .services
+        .task_evidence
+        .reconcile_rollback_history(reconciled_history.raw_items())
+        .await
+    {
+        sess.services
+            .task_evidence
+            .mark_user_source_capture_failed()
+            .await;
+        sess.send_event(
+            turn_context.as_ref(),
+            EventMsg::Warning(WarningEvent {
+                message: "Rolled the thread back, but failed to reconcile task evidence; completion will remain blocked until new evidence is recorded."
+                    .to_string(),
+            }),
+        )
+        .await;
+    }
 
     sess.persist_rollout_items(&[RolloutItem::EventMsg(rollback_msg.clone())])
         .await;
@@ -619,8 +624,8 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) {
     if let Some(startup_prewarm) = sess.take_session_startup_prewarm().await {
         startup_prewarm.abort().await;
     }
-    let _ = sess.conversation.shutdown().await;
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    sess.services.turn_environments.shutdown();
     sess.terminal_tasks.close();
     if tokio::time::timeout(Duration::from_secs(10), sess.terminal_tasks.wait())
         .await
@@ -712,8 +717,7 @@ pub async fn review(
         .await;
     sess.refresh_mcp_servers_if_requested(&turn_context, Some(sess.mcp_elicitation_reviewer()))
         .await;
-    #[allow(deprecated)]
-    match resolve_review_request(review_request, &turn_context.cwd) {
+    match resolve_review_request(review_request, turn_context.cwd()) {
         Ok(resolved) => {
             spawn_review_thread(
                 Arc::clone(sess),
@@ -763,41 +767,6 @@ pub(super) async fn submission_loop(
                 }
                 Op::CleanBackgroundTerminals => {
                     clean_background_terminals(&sess).await;
-                    false
-                }
-                Op::RealtimeConversationStart(params) => {
-                    if let Err(err) =
-                        handle_realtime_conversation_start(&sess, sub.id.clone(), params).await
-                    {
-                        sess.send_event_raw(Event {
-                            id: sub.id.clone(),
-                            msg: EventMsg::Error(ErrorEvent {
-                                message: err.to_string(),
-                                codex_error_info: Some(CodexErrorInfo::Other),
-                            }),
-                        })
-                        .await;
-                    }
-                    false
-                }
-                Op::RealtimeConversationAudio(params) => {
-                    handle_realtime_conversation_audio(&sess, sub.id.clone(), params).await;
-                    false
-                }
-                Op::RealtimeConversationText(params) => {
-                    handle_realtime_conversation_text(&sess, sub.id.clone(), params).await;
-                    false
-                }
-                Op::RealtimeConversationSpeech(params) => {
-                    handle_realtime_conversation_speech(&sess, sub.id.clone(), params).await;
-                    false
-                }
-                Op::RealtimeConversationClose => {
-                    handle_realtime_conversation_close(&sess, sub.id.clone()).await;
-                    false
-                }
-                Op::RealtimeConversationListVoices => {
-                    realtime_conversation_list_voices(&sess, sub.id.clone()).await;
                     false
                 }
                 Op::UserInput { .. } => {
@@ -948,22 +917,12 @@ Approved action:
 pub(super) fn submission_dispatch_span(sub: &Submission) -> tracing::Span {
     let op_name = sub.op.kind();
     let span_name = format!("op.dispatch.{op_name}");
-    let dispatch_span = match &sub.op {
-        Op::RealtimeConversationAudio(_) => {
-            debug_span!(
-                "submission_dispatch",
-                otel.name = span_name.as_str(),
-                submission.id = sub.id.as_str(),
-                codex.op = op_name
-            )
-        }
-        _ => info_span!(
-            "submission_dispatch",
-            otel.name = span_name.as_str(),
-            submission.id = sub.id.as_str(),
-            codex.op = op_name
-        ),
-    };
+    let dispatch_span = info_span!(
+        "submission_dispatch",
+        otel.name = span_name.as_str(),
+        submission.id = sub.id.as_str(),
+        codex.op = op_name
+    );
     if let Some(trace) = sub.trace.as_ref()
         && !set_parent_from_w3c_trace_context(&dispatch_span, trace)
     {

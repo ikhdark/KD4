@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use unicode_width::UnicodeWidthStr;
 use url::Url;
 
-use super::account::StatusAccountDisplay;
+use super::StatusAccountDisplay;
 use super::format::FieldFormatter;
 use super::format::line_display_width;
 use super::format::push_label;

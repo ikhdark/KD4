@@ -3,74 +3,21 @@
 import contextlib
 import io
 import json
-import importlib.util
-from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
-import tomllib
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from scripts import rust_packages
-
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-
-
-def powershell() -> str | None:
-    # Prefer Windows PowerShell 5.1: the justfile invokes these scripts via
-    # `powershell -NoProfile -File ...`, so tests should exercise the same
-    # host (5.1 has stricter native-stderr and StrictMode semantics).
-    return shutil.which("powershell") or shutil.which("pwsh")
-
-
-def pwsh_only() -> str | None:
-    # invoke-rust-perf-env.ps1 runs under pwsh 7.4+ in production (recipes
-    # invoke it inline in the just-shell pwsh session), and its -NoSccache
-    # proof depends on pwsh's empty-env-var semantics, so its tests must not
-    # fall back to Windows PowerShell 5.1.
-    return shutil.which("pwsh")
-
-
-def ps_single_quote(value: str | Path) -> str:
-    return "'" + str(value).replace("'", "''") + "'"
-
-
-def load_just_shell_module():
-    path = REPO_ROOT / "scripts" / "just-shell.py"
-    spec = importlib.util.spec_from_file_location("just_shell", path)
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def load_format_module():
-    path = REPO_ROOT / "scripts" / "format.py"
-    spec = importlib.util.spec_from_file_location("format_script", path)
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def load_root_maintenance_module():
-    path = REPO_ROOT / "scripts" / "root_maintenance.py"
-    spec = importlib.util.spec_from_file_location("root_maintenance", path)
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def load_toml(path: Path):
-    return tomllib.loads(path.read_text(encoding="utf-8"))
+from scripts.build_tooling_test_support import REPO_ROOT
+from scripts.build_tooling_test_support import load_format_module
+from scripts.build_tooling_test_support import load_root_maintenance_module
+from scripts.build_tooling_test_support import load_toml
+from scripts.build_tooling_test_support import powershell
+from scripts.build_tooling_test_support import ps_single_quote
 
 
 class BuildToolingPolicyTest(unittest.TestCase):
@@ -86,7 +33,7 @@ class BuildToolingPolicyTest(unittest.TestCase):
         self.assertNotIn("SystemTime::now", text)
         self.assertIn('workspace_root.join("build_info.rs").display()', text)
 
-    def test_build_info_scripts_emit_metadata_and_preserve_macos_linking(self) -> None:
+    def test_build_info_scripts_emit_metadata_without_non_windows_linking(self) -> None:
         app_server_build = (
             REPO_ROOT / "codex-rs" / "app-server" / "build.rs"
         ).read_text(encoding="utf-8")
@@ -98,17 +45,7 @@ class BuildToolingPolicyTest(unittest.TestCase):
         self.assertIn("build_info::emit();", app_server_build)
         self.assertIn('#[path = "../build_info.rs"]', cli_build)
         self.assertIn("build_info::emit();", cli_build)
-        self.assertIn("cargo:rustc-link-arg=-ObjC", cli_build)
-
-    def test_bwrap_build_script_tracks_resolved_source_dir(self) -> None:
-        text = (REPO_ROOT / "codex-rs" / "bwrap" / "build.rs").read_text(
-            encoding="utf-8"
-        )
-
-        self.assertIn(
-            'println!("cargo:rerun-if-env-changed=CODEX_BWRAP_SOURCE_DIR");', text
-        )
-        self.assertIn("vendor_dir.join(source).display()", text)
+        self.assertNotIn("cargo:rustc-link-arg=-ObjC", cli_build)
 
     def test_skills_build_script_requires_bundled_samples(self) -> None:
         text = (REPO_ROOT / "codex-rs" / "skills" / "build.rs").read_text(
@@ -187,7 +124,7 @@ class BuildToolingPolicyTest(unittest.TestCase):
         text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
         normalized = " ".join(text.split())
         slice_command = (
-            'python scripts/source_owners.py slice --owner <owner-id> '
+            "python scripts/source_owners.py slice --owner <owner-id> "
             '--focus "<task description>" --max-relationships 32'
         )
 
@@ -216,11 +153,15 @@ class BuildToolingPolicyTest(unittest.TestCase):
         text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
         normalized = " ".join(text.split())
 
-        self.assertIn("## Validation and local-build proof", text)
-        self.assertIn("Rust crates", text)
-        self.assertIn("Scripts", text)
-        self.assertIn("Do not publish unless the user explicitly asks", text)
-        self.assertIn("do not hand-edit generated locks", normalized)
+        self.assertIn("## Shared operating policy", text)
+        self.assertIn("### Implementation and validation", text)
+        self.assertIn("## Rust and script validation", text)
+        self.assertIn(
+            "Do not publish, deploy, or modify upstream state unless the user "
+            "explicitly requests that action",
+            normalized,
+        )
+        self.assertIn("do not hand-edit generated output", normalized)
 
     def test_agents_scripts_policy_is_nested_and_discoverable(self) -> None:
         root_text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
@@ -231,28 +172,10 @@ class BuildToolingPolicyTest(unittest.TestCase):
         self.assertIn("Root maintenance commands", scripts_text)
         self.assertIn("root_maintenance.py", scripts_text)
 
-    def test_installers_require_standalone_metadata(self) -> None:
-        shell_installer = (REPO_ROOT / "scripts" / "install" / "install.sh").read_text(
-            encoding="utf-8"
-        )
+    def test_windows_installer_requires_standalone_metadata(self) -> None:
         powershell_installer = (
             REPO_ROOT / "scripts" / "install" / "install.ps1"
         ).read_text(encoding="utf-8")
-
-        self.assertIn('INSTALL_METADATA_FILE="codex-install.env"', shell_installer)
-        self.assertIn(
-            '[ -f "$release_dir/$INSTALL_METADATA_FILE" ] ||', shell_installer
-        )
-        self.assertIn('"$BIN_PATH" --version >/dev/null', shell_installer)
-        self.assertNotIn('visible_command_preverified="true"', shell_installer)
-        self.assertIn(
-            '[ -x "$release_dir/bin/codex-code-mode-host" ] &&',
-            shell_installer,
-        )
-        self.assertIn(
-            '"$stage_release/bin/codex-code-mode-host"',
-            shell_installer,
-        )
 
         self.assertIn(
             '$InstallMetadataFile = "codex-install.env"', powershell_installer
@@ -268,127 +191,50 @@ class BuildToolingPolicyTest(unittest.TestCase):
         )
         self.assertIn('"bin\\codex-code-mode-host.exe"', powershell_installer)
 
-    def test_shell_installer_completeness_rejects_package_without_code_mode_host(
-        self,
-    ) -> None:
-        shell = shutil.which("sh")
-        if shell is None:
-            self.skipTest("shell is required for the Unix installer completeness test")
-
-        shell_installer_path = REPO_ROOT / "scripts" / "install" / "install.sh"
-        shell_installer = shell_installer_path.read_text(encoding="utf-8")
-        shell_helpers = (
-            REPO_ROOT / "scripts" / "install" / "install_release.sh"
+    def test_windows_installer_defaults_to_fork_release_artifacts(self) -> None:
+        powershell_installer = (
+            REPO_ROOT / "scripts" / "install" / "install.ps1"
         ).read_text(encoding="utf-8")
-        shell_sources = shell_helpers + "\n" + shell_installer
 
-        def shell_function(name: str) -> str:
-            start = shell_sources.index(f"{name}() {{")
-            end = shell_sources.index("\n}\n", start) + 3
-            return shell_sources[start:end]
+        self.assertIn(
+            "[string]$ReleaseRepository = $env:CODEX_RELEASE_REPOSITORY",
+            powershell_installer,
+        )
+        self.assertIn('$ReleaseRepository = "ikhdark/KD4"', powershell_installer)
+        self.assertIn(
+            '$ReleaseApiBase = "https://api.github.com/repos/$ReleaseRepository/releases"',
+            powershell_installer,
+        )
+        self.assertNotIn("api.github.com/repos/openai/codex", powershell_installer)
 
-        with tempfile.TemporaryDirectory(dir=REPO_ROOT) as temp_dir:
-            root = Path(temp_dir)
-            version = "1.2.3"
-            target = "test-target"
-            release_dir = root / f"{version}-{target}"
-            for relative in ("bin/codex", "codex", "codex-path/rg"):
-                path = release_dir / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("#!/bin/sh\n", encoding="utf-8", newline="\n")
-                path.chmod(0o755)
-            (release_dir / "bin" / "codex").write_text(
-                f"#!/bin/sh\nprintf 'codex-cli {version}\\n'\n",
-                encoding="utf-8",
-                newline="\n",
-            )
-            (release_dir / "codex-package.json").write_text(
-                json.dumps(
-                    {
-                        "layoutVersion": 1,
-                        "version": version,
-                        "target": target,
-                        "variant": "codex",
-                        "entrypoint": "bin/codex",
-                        "resourcesDir": "codex-resources",
-                        "pathDir": "codex-path",
-                    },
-                    indent=2,
-                )
-                + "\n",
-                encoding="utf-8",
-                newline="\n",
-            )
-            with (release_dir / "codex-install.env").open(
-                "w", encoding="utf-8", newline="\n"
-            ) as metadata:
-                metadata.write(
-                    f"version={version}\ntarget={target}\nlayout=package\n"
-                    "tree_sha256=placeholder\n"
-                )
-            shell_probe = root / "probe.sh"
-            shell_probe.write_text(
-                "\n".join(
-                    [
-                        "#!/bin/sh",
-                        'INSTALL_METADATA_FILE="codex-install.env"',
-                        shell_function("install_metadata_field"),
-                        shell_function("package_metadata_string_equals"),
-                        shell_function("package_metadata_number_equals"),
-                        shell_function("validate_package_metadata"),
-                        shell_function("version_from_binary"),
-                        shell_function("ensure_sha256"),
-                        shell_function("file_sha256"),
-                        shell_function("managed_release_digest"),
-                        shell_function("release_dir_is_complete"),
-                        'chmod 0755 "$1/bin/codex" "$1/codex" "$1/codex-path/rg"',
-                        'if [ -e "$1/bin/codex-code-mode-host" ]; then',
-                        '  chmod 0755 "$1/bin/codex-code-mode-host"',
-                        '  tree_sha256="$(managed_release_digest "$1" package "$3")"',
-                        '  printf "version=%s\\ntarget=%s\\nlayout=package\\ntree_sha256=%s\\n" "$2" "$3" "$tree_sha256" >"$1/$INSTALL_METADATA_FILE"',
-                        "fi",
-                        'release_dir_is_complete "$1" "$2" "$3" package',
-                        "",
-                    ]
-                ),
-                encoding="utf-8",
-            )
-
-            missing_shell = subprocess.run(
-                [
-                    shell,
-                    shell_probe.relative_to(REPO_ROOT).as_posix(),
-                    release_dir.relative_to(REPO_ROOT).as_posix(),
-                    version,
-                    target,
-                ],
-                cwd=REPO_ROOT,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            self.assertNotEqual(missing_shell.returncode, 0)
-            shell_host = release_dir / "bin" / "codex-code-mode-host"
-            shell_host.write_text("#!/bin/sh\n", encoding="utf-8", newline="\n")
-            shell_host.chmod(0o755)
-            complete_shell = subprocess.run(
-                [
-                    shell,
-                    shell_probe.relative_to(REPO_ROOT).as_posix(),
-                    release_dir.relative_to(REPO_ROOT).as_posix(),
-                    version,
-                    target,
-                ],
-                cwd=REPO_ROOT,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            self.assertEqual(
-                complete_shell.returncode,
-                0,
-                f"stdout:\n{complete_shell.stdout}\nstderr:\n{complete_shell.stderr}",
-            )
+        ps = powershell()
+        if ps is None:
+            self.skipTest("PowerShell is required for the Windows installer test")
+        installer_path = REPO_ROOT / "scripts" / "install" / "install.ps1"
+        command = (
+            "$tokens = $null; $errors = $null; "
+            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile("
+            f"{ps_single_quote(installer_path)}, [ref]$tokens, [ref]$errors); "
+            "$function = $ast.FindAll({ param($node) "
+            "$node -is [System.Management.Automation.Language.FunctionDefinitionAst] "
+            "-and $node.Name -eq 'Get-ReleaseApiUri' }, $true); "
+            "Invoke-Expression $function[0].Extent.Text; "
+            "$ReleaseApiBase = 'https://api.github.com/repos/ikhdark/KD4/releases'; "
+            "$actual = Get-ReleaseApiUri -RelativePath 'latest'; "
+            "if ($actual -cne 'https://api.github.com/repos/ikhdark/KD4/releases/latest') "
+            "{ exit 9 }"
+        )
+        completed = subprocess.run(
+            [ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+        )
 
     def test_powershell_installer_completeness_rejects_package_without_code_mode_host(
         self,
@@ -487,12 +333,18 @@ class BuildToolingPolicyTest(unittest.TestCase):
 
         expected_ruff_targets = sorted(
             path.relative_to(REPO_ROOT).as_posix()
-            for path in (REPO_ROOT / "scripts").rglob("*.py")
+            for root in root_maintenance.SCRIPT_AUDIT_ROOTS
+            for path in root.rglob("*.py")
             if "__pycache__" not in path.parts and ".venv" not in path.parts
         )
         expected_unittest_targets = sorted(
-            path.relative_to(REPO_ROOT).with_suffix("").as_posix().replace("/", ".")
-            for path in (REPO_ROOT / "scripts").rglob("test_*.py")
+            (
+                path.relative_to(REPO_ROOT).with_suffix("").as_posix().replace("/", ".")
+                if root_maintenance.SCRIPTS_ROOT in path.parents
+                else path.relative_to(REPO_ROOT).as_posix()
+            )
+            for root in root_maintenance.SCRIPT_AUDIT_ROOTS
+            for path in root.rglob("test_*.py")
             if "__pycache__" not in path.parts and ".venv" not in path.parts
         )
 
@@ -548,19 +400,6 @@ class BuildToolingPolicyTest(unittest.TestCase):
                 "scripts.test_publish_local_codex_freshness",
             ),
         )
-        self.assertEqual(
-            root_maintenance.test_modules_for_changed_path(
-                "scripts/publish-local-codex-wsl.sh"
-            ),
-            (
-                "scripts.test_dev_environment",
-                "scripts.test_publish_local_codex",
-                "scripts.test_publish_local_codex_apply",
-                "scripts.test_publish_local_codex_build",
-                "scripts.test_publish_local_codex_dry_run",
-                "scripts.test_publish_local_codex_freshness",
-            ),
-        )
         self.assertEqual(root_maintenance.python_lint_targets(["docs/example.md"]), [])
         self.assertEqual(
             root_maintenance.python_test_targets([], ["docs/example.md"]), []
@@ -572,12 +411,29 @@ class BuildToolingPolicyTest(unittest.TestCase):
             ("scripts.test_asciicheck",),
         )
 
+    def test_root_maintenance_routes_aggregate_python_script_tests(self) -> None:
+        root_maintenance = load_root_maintenance_module()
+
+        self.assertEqual(
+            root_maintenance.python_test_targets(
+                [],
+                [
+                    "scripts/investigation_eval/score_results.py",
+                    "scripts/investigation_eval/validate_cases.py",
+                    "scripts/kd4_model_attempt_analysis.py",
+                ],
+            ),
+            [
+                "scripts.investigation_eval.test_investigation_eval",
+                "scripts.test_kd4_perf_snapshot",
+            ],
+        )
+
     def test_root_maintenance_script_audit_plan_covers_every_script_type(self) -> None:
         root_maintenance = load_root_maintenance_module()
         tools = {
             "uv": "uv",
             "pwsh": "pwsh",
-            "bash": "bash",
             "node": "node",
         }
 
@@ -592,7 +448,6 @@ class BuildToolingPolicyTest(unittest.TestCase):
         self.assertIn("Python format", labels)
         self.assertIn("Python lint", labels)
         self.assertIn("PowerShell syntax", labels)
-        self.assertIn("shell syntax", labels)
         javascript_targets = [
             target
             for target, kind in root_maintenance.script_kind_map().items()
@@ -617,11 +472,6 @@ class BuildToolingPolicyTest(unittest.TestCase):
             ),
             ("scripts.test_build_tooling_storage",),
         )
-        shell_command = dict(commands)["shell syntax"]
-        self.assertIn("-c", shell_command)
-        self.assertNotIn("-lc", shell_command)
-        self.assertIn("$'s/\\r$//'", shell_command[-1])
-
         commands_without_tests, _missing = root_maintenance.script_audit_commands(
             include_tests=True,
             test_targets=[],
@@ -631,6 +481,175 @@ class BuildToolingPolicyTest(unittest.TestCase):
             "script unit tests",
             [label for label, _command in commands_without_tests],
         )
+
+    def test_root_maintenance_script_inventory_covers_owned_script_roots(
+        self,
+    ) -> None:
+        root_maintenance = load_root_maintenance_module()
+
+        expected_kinds = {
+            ".codex/environments/setup.py": "python",
+            ".codex/hooks/task-continuity.ps1": "powershell",
+            "codex-cli/scripts/build_npm_package.py": "python",
+            "codex-rs/app-server-test-client/scripts/live_elicitation_hold.ps1": "powershell",
+            "codex-rs/config/scripts/generate-proto.ps1": "powershell",
+            "codex-rs/scripts/nextest_windows_stack.py": "python",
+            "codex-rs/skills/src/assets/samples/imagegen/scripts/image_gen.py": "python",
+            "sdk/python/scripts/update_sdk_artifacts.py": "python",
+            "tools/argument-comment-lint/run.py": "python",
+        }
+        kind_by_target = root_maintenance.script_kind_map()
+
+        for target, expected_kind in expected_kinds.items():
+            with self.subTest(target=target):
+                self.assertEqual(kind_by_target.get(target), expected_kind)
+        self.assertIn(
+            "tools/argument-comment-lint/test_wrapper_common.py",
+            root_maintenance.python_unittest_targets(),
+        )
+
+    def test_obsolete_developer_tooling_residue_is_absent(self) -> None:
+        obsolete_paths = (
+            ".devcontainer",
+            "default.nix",
+            "flake.lock",
+            "flake.nix",
+            "codex-cli/scripts/init_firewall.sh",
+            "codex-cli/scripts/run_in_container.sh",
+            "codex-rs/bwrap",
+            "codex-rs/linux-sandbox",
+            "codex-rs/shell-escalation",
+            "codex-rs/vendor/bubblewrap",
+            "scripts/install/install.sh",
+            "scripts/test-remote-env.sh",
+            "codex-rs/vendor/BUILD.bazel",
+            "codex-rs/codex-backend-openapi-models/BUILD.bazel",
+            "codex-rs/backend-client/BUILD.bazel",
+            "codex-rs/login/BUILD.bazel",
+        )
+
+        for relative_path in obsolete_paths:
+            with self.subTest(path=relative_path):
+                self.assertFalse((REPO_ROOT / relative_path).exists())
+
+        extensions = (REPO_ROOT / ".vscode" / "extensions.json").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("BazelBuild.vscode-bazel", extensions)
+
+        deny_config = (REPO_ROOT / "codex-rs" / "deny.toml").read_text(encoding="utf-8")
+        self.assertNotIn('"webrtc-sys-build"', deny_config)
+
+    def test_windows_only_rust_policy_has_no_host_platform_branches(self) -> None:
+        cargo = load_toml(REPO_ROOT / "codex-rs" / "Cargo.toml")
+        self.assertEqual(cargo["workspace"]["dependencies"]["arboard"], "3")
+
+        deny = load_toml(REPO_ROOT / "codex-rs" / "deny.toml")
+        self.assertEqual(
+            set(deny["graph"]["targets"]),
+            {"x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"},
+        )
+
+        schema = (REPO_ROOT / "codex-rs" / "core" / "config.schema.json").read_text(
+            encoding="utf-8"
+        )
+        for retired_key in ("use_legacy_landlock", "use_linux_sandbox_bwrap"):
+            with self.subTest(schema_key=retired_key):
+                self.assertNotIn(retired_key, schema)
+
+        forbidden_cfg_fragments = (
+            "cfg!(windows)",
+            "cfg!(unix)",
+            'target_os = "',
+            'target_family = "',
+            "#[cfg(windows)]",
+            "#[cfg(unix)]",
+        )
+        violations: list[str] = []
+        for rust_path in (REPO_ROOT / "codex-rs").rglob("*.rs"):
+            if "target" in rust_path.parts:
+                continue
+            text = rust_path.read_text(encoding="utf-8")
+            for fragment in forbidden_cfg_fragments:
+                if fragment in text:
+                    violations.append(f"{rust_path.relative_to(REPO_ROOT)}: {fragment}")
+        self.assertEqual(violations, [])
+
+        conditional_dependencies: list[str] = []
+        for manifest_path in (REPO_ROOT / "codex-rs").rglob("Cargo.toml"):
+            if "target" in manifest_path.parts:
+                continue
+            manifest = manifest_path.read_text(encoding="utf-8")
+            if "[target.'cfg(" in manifest:
+                conditional_dependencies.append(
+                    str(manifest_path.relative_to(REPO_ROOT))
+                )
+        self.assertEqual(conditional_dependencies, [])
+
+        response_proxy_launcher = (
+            REPO_ROOT
+            / "codex-rs"
+            / "responses-api-proxy"
+            / "npm"
+            / "bin"
+            / "codex-responses-api-proxy.js"
+        ).read_text(encoding="utf-8")
+        for retired_platform in ("linux", "android", "darwin", "SIGHUP"):
+            with self.subTest(response_proxy_platform=retired_platform):
+                self.assertNotIn(retired_platform, response_proxy_launcher)
+
+        codex_launcher = (REPO_ROOT / "codex-cli" / "bin" / "codex.js").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("SIGHUP", codex_launcher)
+
+        dotslash_manifest = (
+            REPO_ROOT / "tools" / "argument-comment-lint" / "argument-comment-lint"
+        ).read_text(encoding="utf-8")
+        for retired_platform in ("macos-", "linux-", "apple-darwin", "unknown-linux"):
+            with self.subTest(dotslash_platform=retired_platform):
+                self.assertNotIn(retired_platform, dotslash_manifest)
+
+    def test_ignore_rules_have_single_owners_for_generated_artifacts(self) -> None:
+        root_ignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+        codex_ignore = (REPO_ROOT / ".codex" / ".gitignore").read_text(encoding="utf-8")
+        rust_ignore = (REPO_ROOT / "codex-rs" / ".gitignore").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertNotIn(".codex/evals/", root_ignore)
+        self.assertIn("/evals/", codex_ignore.splitlines())
+        self.assertIn("*.pdb", rust_ignore.splitlines())
+
+    def test_dependency_roles_match_published_consumers(self) -> None:
+        sdk_package = json.loads(
+            (REPO_ROOT / "sdk" / "typescript" / "package.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertIn("@modelcontextprotocol/sdk", sdk_package["dependencies"])
+        self.assertNotIn("@modelcontextprotocol/sdk", sdk_package["devDependencies"])
+
+    def test_sdk_build_owns_cleanup(self) -> None:
+        sdk_package = json.loads(
+            (REPO_ROOT / "sdk" / "typescript" / "package.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertNotIn("clean", sdk_package["scripts"])
+        tsup_config = (REPO_ROOT / "sdk" / "typescript" / "tsup.config.ts").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("clean: true", tsup_config)
+
+    def test_config_documentation_uses_current_public_destinations(self) -> None:
+        config_docs = (REPO_ROOT / "codex-rs" / "config.md").read_text(encoding="utf-8")
+
+        self.assertNotIn("../docs/config.md", config_docs)
+        self.assertIn(
+            "https://developers.openai.com/codex/config-reference", config_docs
+        )
+        self.assertIn("https://developers.openai.com/codex/mcp", config_docs)
 
     def test_root_maintenance_script_audit_current_tree_has_no_hard_findings(
         self,
@@ -648,66 +667,31 @@ class BuildToolingPolicyTest(unittest.TestCase):
 
         self.assertEqual(root_maintenance.script_audit_context_issues(), [])
 
-    def test_root_maintenance_script_audit_skips_native_sh_tests_on_windows(
-        self,
-    ) -> None:
+    def test_root_maintenance_script_audit_has_no_platform_skips(self) -> None:
         root_maintenance = load_root_maintenance_module()
 
-        targets, skipped = root_maintenance.script_audit_test_targets(
-            platform="nt",
-            native_sh_available=False,
-        )
+        targets = root_maintenance.script_audit_test_targets()
+
         self.assertNotIn("scripts.install.test_install_sh", targets)
-        self.assertEqual(len(skipped), 1)
-        self.assertIn("native /bin/sh is unavailable", skipped[0])
+        self.assertFalse(any(target.endswith("_sh") for target in targets))
 
-        native_targets, native_skipped = root_maintenance.script_audit_test_targets(
-            platform="nt",
-            native_sh_available=True,
-        )
-        self.assertIn("scripts.install.test_install_sh", native_targets)
-        self.assertEqual(native_skipped, [])
-
-    def test_root_maintenance_full_audit_fails_closed_on_platform_skips(
+    def test_root_maintenance_script_audit_success_has_no_stale_skip_summary(
         self,
     ) -> None:
         root_maintenance = load_root_maintenance_module()
-        common_patches = (
-            mock.patch.object(
-                root_maintenance, "script_source_targets", return_value=[]
-            ),
-            mock.patch.object(root_maintenance, "script_kind_map", return_value={}),
-            mock.patch.object(
-                root_maintenance, "script_audit_context_issues", return_value=[]
-            ),
-            mock.patch.object(
-                root_maintenance, "script_audit_findings", return_value=([], [])
-            ),
-            mock.patch.object(
-                root_maintenance,
-                "script_audit_test_targets",
-                return_value=([], ["native test unavailable"]),
-            ),
-            mock.patch.object(
-                root_maintenance, "script_audit_commands", return_value=([], [])
-            ),
-            mock.patch.object(
-                root_maintenance, "git_context_label", return_value="test"
-            ),
-        )
-        with contextlib.ExitStack() as stack:
-            for patcher in common_patches:
-                stack.enter_context(patcher)
-            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
-            self.assertEqual(
-                root_maintenance.run_script_audit(include_tests=True, strict=False),
-                1,
-            )
+        stdout = io.StringIO()
+
         with (
             mock.patch.object(
-                root_maintenance, "script_source_targets", return_value=[]
+                root_maintenance,
+                "script_source_targets",
+                return_value=["scripts/example.py"],
             ),
-            mock.patch.object(root_maintenance, "script_kind_map", return_value={}),
+            mock.patch.object(
+                root_maintenance,
+                "script_kind_map",
+                return_value={"scripts/example.py": "python"},
+            ),
             mock.patch.object(
                 root_maintenance, "script_audit_context_issues", return_value=[]
             ),
@@ -715,9 +699,7 @@ class BuildToolingPolicyTest(unittest.TestCase):
                 root_maintenance, "script_audit_findings", return_value=([], [])
             ),
             mock.patch.object(
-                root_maintenance,
-                "script_audit_test_targets",
-                return_value=([], ["native test unavailable"]),
+                root_maintenance, "script_audit_test_targets", return_value=[]
             ),
             mock.patch.object(
                 root_maintenance, "script_audit_commands", return_value=([], [])
@@ -725,16 +707,22 @@ class BuildToolingPolicyTest(unittest.TestCase):
             mock.patch.object(
                 root_maintenance, "git_context_label", return_value="test"
             ),
-            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stdout(stdout),
         ):
             self.assertEqual(
                 root_maintenance.run_script_audit(
                     include_tests=True,
                     strict=False,
-                    allow_platform_skips=True,
                 ),
                 0,
             )
+
+        self.assertIn(
+            "SCRIPT AUDIT PASSED: 1 script artifact(s), 0 command group(s), "
+            "0 advisory item(s).",
+            stdout.getvalue(),
+        )
+        self.assertNotIn("platform test skip", stdout.getvalue())
 
     def test_root_maintenance_git_paths_use_nul_delimiters(self) -> None:
         root_maintenance = load_root_maintenance_module()
@@ -764,34 +752,45 @@ class BuildToolingPolicyTest(unittest.TestCase):
         self.assertIn("-z", run.call_args_list[0].args[0])
         self.assertIn("--others", run.call_args_list[1].args[0])
 
-    def test_root_maintenance_empty_changed_selection_is_a_noop(self) -> None:
-        root_maintenance = load_root_maintenance_module()
+    def test_format_empty_changed_selection_is_a_noop(self) -> None:
+        format_script = load_format_module()
 
         with (
-            mock.patch.object(root_maintenance, "git_changed_paths", return_value=[]),
-            mock.patch.object(root_maintenance, "run") as run,
+            mock.patch.object(format_script, "resolved_changed_paths", return_value=[]),
+            mock.patch.object(format_script, "run_formatter_group") as run,
         ):
             self.assertEqual(
-                root_maintenance.main(["format-python", "--write", "--changed"]), 0
+                format_script.main(
+                    ["--write", "--only", "python-scripts", "--changed"]
+                ),
+                0,
             )
-            self.assertEqual(root_maintenance.main(["test-python", "--changed"]), 0)
 
         run.assert_not_called()
 
-    def test_root_maintenance_prettier_does_not_scan_script_inventory(self) -> None:
-        root_maintenance = load_root_maintenance_module()
+    def test_format_default_python_scope_stays_with_internal_scripts(self) -> None:
+        format_script = load_format_module()
+        group = format_script.FormatterGroup("Python scripts", ())
 
         with (
             mock.patch.object(
-                root_maintenance,
-                "script_inventory",
-                side_effect=AssertionError("unexpected script scan"),
+                format_script, "resolved_changed_paths"
+            ) as resolve_changed,
+            mock.patch.object(
+                format_script, "formatter_groups", return_value=(group,)
+            ) as groups,
+            mock.patch.object(
+                format_script,
+                "run_formatter_group",
+                return_value=format_script.FormatterResult("Python scripts", "", 0),
             ),
-            mock.patch.object(root_maintenance, "run", return_value=0) as run,
         ):
-            self.assertEqual(root_maintenance.main(["format-prettier"]), 0)
+            self.assertEqual(
+                format_script.main(["--check", "--only", "python-scripts"]), 0
+            )
 
-        run.assert_called_once()
+        resolve_changed.assert_not_called()
+        self.assertEqual(groups.call_args.kwargs["python_script_targets"], ("scripts",))
 
     def test_root_maintenance_missing_command_is_reported(self) -> None:
         root_maintenance = load_root_maintenance_module()
@@ -809,6 +808,13 @@ class BuildToolingPolicyTest(unittest.TestCase):
 
         self.assertIn("Could not run missing-tool", stderr.getvalue())
 
+    def test_root_maintenance_does_not_duplicate_formatter_commands(self) -> None:
+        root_maintenance = load_root_maintenance_module()
+        subcommands = root_maintenance.build_parser()._subparsers._group_actions[0]
+
+        self.assertNotIn("format-prettier", subcommands.choices)
+        self.assertNotIn("format-python", subcommands.choices)
+
     def test_root_maintenance_uv_commands_use_frozen_lock(self) -> None:
         root_maintenance = load_root_maintenance_module()
         calls: list[tuple[str, ...]] = []
@@ -818,12 +824,6 @@ class BuildToolingPolicyTest(unittest.TestCase):
             return 0
 
         with mock.patch.object(root_maintenance, "run", side_effect=fake_run):
-            self.assertEqual(
-                root_maintenance.main(
-                    ["format-python", "--changed", "scripts/root_maintenance.py"]
-                ),
-                0,
-            )
             self.assertEqual(
                 root_maintenance.main(
                     ["lint-python", "--changed", "scripts/root_maintenance.py"]
@@ -858,15 +858,23 @@ class BuildToolingPolicyTest(unittest.TestCase):
         self,
     ) -> None:
         package = json.loads((REPO_ROOT / "package.json").read_text(encoding="utf-8"))
-        root_maintenance = load_root_maintenance_module()
+        format_script = load_format_module()
 
         self.assertEqual(
             package["scripts"]["format"],
-            "prettier --check *.json *.md **/*.js",
+            "node scripts/run-python.js scripts/format.py --check --only prettier",
         )
         self.assertEqual(
             package["scripts"]["format:fix"],
-            "prettier --write *.json *.md **/*.js",
+            "node scripts/run-python.js scripts/format.py --write --only prettier",
+        )
+        self.assertEqual(
+            package["scripts"]["format:python"],
+            "node scripts/run-python.js scripts/format.py --check --only python-scripts",
+        )
+        self.assertEqual(
+            package["scripts"]["format:python:fix"],
+            "node scripts/run-python.js scripts/format.py --write --only python-scripts",
         )
         tracked_paths = set(
             subprocess.run(
@@ -879,7 +887,7 @@ class BuildToolingPolicyTest(unittest.TestCase):
                 check=True,
             ).stdout.splitlines()
         )
-        for target in root_maintenance.PRETTIER_TARGETS:
+        for target in format_script.PRETTIER_TARGETS:
             with self.subTest(target=target):
                 local_matches = {
                     path.relative_to(REPO_ROOT).as_posix()
@@ -891,13 +899,118 @@ class BuildToolingPolicyTest(unittest.TestCase):
                     f"Prettier target does not match repository files: {target}",
                 )
         self.assertEqual(
-            package["scripts"]["test:scripts:target"],
-            "node scripts/run-python.js scripts/root_maintenance.py test-python --changed",
-        )
-        self.assertEqual(
             package["scripts"]["test:scripts:changed"],
             "node scripts/run-python.js scripts/root_maintenance.py test-python --changed",
         )
+        self.assertNotIn("test:scripts:target", package["scripts"])
+
+    def test_justfile_only_exposes_canonical_developer_tooling_recipes(self) -> None:
+        justfile = "\n" + (REPO_ROOT / "justfile").read_text(encoding="utf-8")
+        package = json.loads((REPO_ROOT / "package.json").read_text(encoding="utf-8"))
+
+        self.assertIn("\ncargo-lane-isolated-home lane *args:", justfile)
+        self.assertIn("\nconfig-schema-check:", justfile)
+        self.assertIn("\nconfig-schema-regenerate owner:", justfile)
+        self.assertIn("\napp-server-schema-check:", justfile)
+        self.assertIn('\napp-server-schema-regenerate owner experimental="":', justfile)
+        self.assertIn("\nwrite-hooks-schema:", justfile)
+        self.assertNotIn("write-hooks-schema", package["scripts"])
+        for obsolete_recipe in (
+            "cargo-lane-home",
+            "cargo-lane-main",
+            "test-github-scripts",
+            "write-config-schema",
+            "config-schema-check-force",
+            "write-app-server-schema",
+            "app-server-schema-check-force",
+            "app-server-schema-runtime-check",
+            "app-server-schema-runtime-check-with-runtime",
+            "app-server-schema-runtime-check-force",
+            "source-owners-slice-focused",
+        ):
+            with self.subTest(recipe=obsolete_recipe):
+                self.assertNotIn(f"\n{obsolete_recipe}", justfile)
+        self.assertNotIn("\ndead-code *args:", justfile)
+        self.assertNotIn("\ntest-full *args:", justfile)
+        for obsolete_path in (
+            "scripts/run-powershell-script.ps1",
+            "scripts/test_run_powershell_script.py",
+        ):
+            with self.subTest(path=obsolete_path):
+                self.assertFalse((REPO_ROOT / obsolete_path).exists())
+
+        result = subprocess.run(
+            [
+                "just",
+                "--dry-run",
+                "app-server-schema-regenerate",
+                "policy-test",
+                "--experimental",
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rendered = result.stdout + result.stderr
+        self.assertIn('--owner "policy-test" -- --experimental', rendered)
+
+        result = subprocess.run(
+            [
+                "just",
+                "source-owners-slice",
+                "source-owner-index",
+                "--focus",
+                "canonical tooling command",
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        source_owner_slice = json.loads(result.stdout)
+        self.assertFalse(source_owner_slice["truncated"])
+        self.assertEqual(source_owner_slice["omitted_relationships"], 0)
+        self.assertEqual(source_owner_slice["material_unknowns"], [])
+        self.assertEqual(justfile.count("\nsource-owners-slice "), 1)
+
+        result = subprocess.run(
+            ["just", "--dry-run", "cargo-lane", "main", "cargo", "--version"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('run-lane --lane "main"', result.stdout + result.stderr)
+
+        canonical_command_sources = {
+            "codex-rs/app-server/README.md": "app-server-schema-regenerate <owner>",
+            "codex-rs/app-server-protocol/tests/schema_fixtures.rs": (
+                "app-server-schema-regenerate <owner>"
+            ),
+            "codex-rs/core/src/config/schema.md": "config-schema-regenerate <owner>",
+            "codex-rs/core/src/config/schema_tests.rs": (
+                "config-schema-regenerate <owner>"
+            ),
+            "codex-rs/core/src/tools/handlers/shell_tests.rs": (
+                '"config-schema-regenerate", "validation-test"'
+            ),
+        }
+        for relative_path, canonical_command in canonical_command_sources.items():
+            with self.subTest(path=relative_path):
+                source = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+                self.assertIn(canonical_command, source)
+                self.assertNotIn("just write-config-schema", source)
+                self.assertNotIn("just write-app-server-schema", source)
 
     def test_rust_package_search_start_keeps_existing_dotted_directories(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1000,10 +1113,15 @@ class BuildToolingPolicyTest(unittest.TestCase):
         normalized = " ".join(text.split())
 
         self.assertIn(
-            "Tooling success alone does not prove a",
-            text,
+            "A formatter, linter, build, applied patch, or successful command "
+            "selecting zero relevant tests is not runtime proof",
+            normalized,
         )
-        self.assertIn("focused failing test or approved final gate", normalized)
+        self.assertIn(
+            "Runtime proof requires a direct contract test or a user-approved "
+            "end-to-end gate",
+            normalized,
+        )
 
     def test_local_rust_loop_recipes_are_discoverable(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
@@ -1045,13 +1163,24 @@ class BuildToolingPolicyTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn(
-            "$ForwardedArgs | Where-Object "
-            "{ -not [string]::IsNullOrWhiteSpace($_) }",
+            "$ForwardedArgs | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }",
             analyzer,
         )
         self.assertIn('$lane = "rust-dead-code-matrix"', analyzer)
         self.assertIn('$env:RUSTFLAGS = "-Ddead_code"', analyzer)
-        self.assertIn('"--exclude", $v8SandboxPackages[0]', analyzer)
+
+    def test_windows_v8_fallback_tracks_remaining_forwarding_packages(self) -> None:
+        analyzer = (REPO_ROOT / "scripts/cargo-workspace-analyzer.ps1").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('$v8SandboxPackage = "codex-code-mode"', analyzer)
+        self.assertNotIn("codex-v8-poc", analyzer)
+        self.assertIn(
+            '$workspaceArgs = $cargoArgs + @("--exclude", $v8SandboxPackage)',
+            analyzer,
+        )
+        self.assertIn('$packageArgs += @("--package", $v8SandboxPackage)', analyzer)
 
     def test_package_validation_defaults_do_not_expand_to_workspace(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
@@ -1114,9 +1243,10 @@ class BuildToolingPolicyTest(unittest.TestCase):
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
 
         self.assertIn("cargo deny check bans sources licenses", justfile)
-        self.assertIn("cargo tree -d --workspace --target all", justfile)
+        self.assertIn("cargo tree -d --workspace", justfile)
+        self.assertNotIn("--target all", justfile)
 
-    def test_unix_lane_recipes_use_the_reserved_runner(self) -> None:
+    def test_lane_recipes_use_the_canonical_reserved_runner(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
 
         for snippet in (
@@ -1128,6 +1258,8 @@ class BuildToolingPolicyTest(unittest.TestCase):
         ):
             self.assertIn(snippet, justfile)
         self.assertNotIn("target/lanes/", justfile)
+        self.assertEqual(justfile.count("scripts\\cargo-lane.ps1"), 1)
+        self.assertIn('cargo-lane.ps1" -Lane "{{ lane }}" -IsolateCargoHome', justfile)
 
     def test_high_contention_just_recipes_use_cargo_lanes_on_windows(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
@@ -1140,7 +1272,7 @@ class BuildToolingPolicyTest(unittest.TestCase):
             "Pass a package/filter to 'just fix'",
             "Pass a package/filter to 'just clippy'",
             "cargo nextest run --no-run @forwarded_args",
-            'cargo watch -x "check -p {{ package }}" @($args | Select-Object -Skip 2)',
+            'cargo watch -x "check --target-dir $target_dir -p {{ package }}" @forwarded_args',
             'cargo llvm-cov -p "{{ package }}" @($args | Select-Object -Skip 2)',
             "_core-test-helpers-runtime target_dir:",
             "_core-test-helpers-mcp target_dir:",
@@ -1158,7 +1290,9 @@ class BuildToolingPolicyTest(unittest.TestCase):
             "test-lane-package package *args:\n    @$forwarded_args",
             justfile,
         )
-        self.assertGreaterEqual(justfile.count("scripts\\cargo-lane.ps1"), 3)
+        self.assertGreaterEqual(
+            justfile.count('scripts\\rust_build_status.py" run-lane'), 10
+        )
         self.assertNotIn('$target_dir = "target\\lanes\\', justfile)
 
     def test_perf_env_recipes_pass_structured_argv(self) -> None:
@@ -1190,16 +1324,6 @@ class BuildToolingPolicyTest(unittest.TestCase):
         self.assertNotIn('-CommandLine (("cargo', justfile)
         self.assertNotIn("[string]$CommandLine", perf_env)
         self.assertNotIn("cmd.exe /d /s /c", perf_env)
-
-    def test_remote_env_setup_quotes_container_paths_and_tracks_ownership(self) -> None:
-        remote_env = (REPO_ROOT / "scripts" / "test-remote-env.sh").read_text(
-            encoding="utf-8"
-        )
-
-        self.assertIn("cleanup_remote_env_setup_failure", remote_env)
-        self.assertIn("CODEX_TEST_REMOTE_EXEC_SERVER_MANAGED", remote_env)
-        self.assertIn('nohup "$remote_codex" exec-server', remote_env)
-        self.assertNotIn("nohup ${remote_codex_path} exec-server", remote_env)
 
 
 if __name__ == "__main__":

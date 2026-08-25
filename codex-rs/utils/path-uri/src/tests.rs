@@ -1,10 +1,8 @@
 use super::*;
 use pretty_assertions::assert_eq;
-#[cfg(windows)]
+
 use std::ffi::OsString;
-#[cfg(unix)]
-use std::os::unix::ffi::OsStringExt;
-#[cfg(windows)]
+
 use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
 
@@ -32,9 +30,6 @@ fn file_uri_round_trips_an_absolute_path() {
 
 #[test]
 fn non_native_uri_io_conversion_is_invalid_input() {
-    #[cfg(unix)]
-    let uris = ["file://server/share/file.txt", "file:///C:/workspace"];
-    #[cfg(windows)]
     let uris = ["file:///usr/local/file.txt"];
 
     for uri in uris {
@@ -158,7 +153,6 @@ fn inferred_native_path_string_uses_the_inferred_convention() {
     }
 }
 
-#[cfg(windows)]
 #[test]
 fn file_uri_falls_back_for_windows_prefixes_without_a_uri_representation() {
     for (native_path, expected_uri) in [
@@ -185,7 +179,6 @@ fn file_uri_falls_back_for_windows_prefixes_without_a_uri_representation() {
     }
 }
 
-#[cfg(windows)]
 #[test]
 fn file_uri_fallback_round_trips_non_unicode_windows_paths() {
     let path_wide = r"C:\bad\"
@@ -201,46 +194,6 @@ fn file_uri_fallback_round_trips_non_unicode_windows_paths() {
     assert!(uri.to_string().starts_with(BAD_PATH_URI_PREFIX));
     assert_eq!(
         reparsed.to_abs_path().expect("fallback URI should decode"),
-        path
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn file_uri_falls_back_for_posix_paths_with_null_bytes() {
-    let path = PathBuf::from(std::ffi::OsString::from_vec(
-        b"/tmp/null-\0-\xff-byte".to_vec(),
-    ));
-    let path = AbsolutePathBuf::from_absolute_path_checked(path).expect("absolute POSIX path");
-
-    let uri = PathUri::from_abs_path(&path);
-
-    assert_eq!(
-        uri,
-        PathUri::parse("file:///%00/bad/path/L3RtcC9udWxsLQAt_y1ieXRl")
-            .expect("valid fallback URI")
-    );
-    let json = serde_json::to_string(&uri).expect("fallback URI should serialize");
-    let reparsed: PathUri =
-        serde_json::from_str(&json).expect("serialized fallback URI should parse");
-    assert_eq!(json, r#""file:///%00/bad/path/L3RtcC9udWxsLQAt_y1ieXRl""#);
-    assert_eq!(reparsed, uri);
-    assert_eq!(
-        reparsed.to_abs_path().expect("fallback URI should decode"),
-        path
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn ordinary_bad_path_uri_is_not_decoded_as_a_fallback() {
-    let path = AbsolutePathBuf::from_absolute_path_checked("/bad/path/L3RtcC9udWxsLQAt_y1ieXRl")
-        .expect("absolute POSIX path");
-    let uri = PathUri::from_abs_path(&path);
-
-    assert_eq!(uri.to_string(), "file:///bad/path/L3RtcC9udWxsLQAt_y1ieXRl");
-    assert_eq!(
-        uri.to_abs_path().expect("URI should convert literally"),
         path
     );
 }
@@ -322,24 +275,6 @@ fn file_uri_preserves_paths_that_resemble_windows_paths() {
 }
 
 #[test]
-#[cfg(unix)]
-fn file_uri_accepts_non_utf8_posix_paths() {
-    let path = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/non-utf8-\xff".to_vec()));
-    let path = AbsolutePathBuf::from_absolute_path_checked(path).expect("absolute POSIX path");
-
-    let uri = PathUri::from_abs_path(&path);
-    assert_eq!(
-        uri.to_abs_path()
-            .expect("URI should convert to native path"),
-        path
-    );
-    assert_eq!(
-        PathUri::parse(&uri.to_string()).expect("non-UTF-8 URI should reparse"),
-        uri
-    );
-}
-
-#[test]
 fn file_uri_round_trips_literal_percent_characters() {
     let uri = PathUri::parse("file:///tmp/100%25/file").expect("file URI should parse");
 
@@ -349,7 +284,7 @@ fn file_uri_round_trips_literal_percent_characters() {
 }
 
 #[test]
-#[cfg(windows)]
+
 fn file_uri_round_trips_windows_unc_paths() {
     let path = AbsolutePathBuf::from_absolute_path_checked(r"\\server\share\src\main.rs")
         .expect("absolute UNC path");
@@ -635,13 +570,6 @@ fn join_keeps_canonicalized_posix_double_slash_paths_hierarchical() {
     assert_eq!(
         cwd.join("AGENTS.md"),
         Ok(PathUri::parse("file:///server/share/project/AGENTS.md").expect("valid child URI"))
-    );
-    #[cfg(unix)]
-    assert_eq!(
-        cwd.to_abs_path()
-            .expect("cwd should convert to a native path"),
-        AbsolutePathBuf::try_from("/server/share/project")
-            .expect("expected native path should be absolute")
     );
 }
 

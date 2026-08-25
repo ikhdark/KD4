@@ -5,9 +5,11 @@ use crate::analytics_utils::analytics_events_client_from_config;
 use crate::config_manager::ConfigManager;
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::OutgoingMessageSender;
+use crate::thread_state::ConnectionCapabilities;
 use crate::transport::AppServerTransport;
 use anyhow::Result;
 use app_test_support::create_mock_responses_server_repeating_assistant;
+use app_test_support::create_mock_responses_server_sequence_unchecked;
 use app_test_support::write_mock_responses_config_toml;
 use codex_analytics::AppServerRpcTransport;
 use codex_app_server_protocol::ClientInfo;
@@ -33,6 +35,7 @@ use codex_config::ThreadConfigSource;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_exec_server::EnvironmentManager;
+use codex_features::Feature;
 use codex_feedback::CodexFeedback;
 use codex_login::AuthManager;
 use codex_protocol::ThreadId;
@@ -48,6 +51,7 @@ use opentelemetry_sdk::trace::InMemorySpanExporter;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::trace::SpanData;
 use pretty_assertions::assert_eq;
+use serde_json::json;
 use serial_test::serial;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
@@ -132,8 +136,17 @@ impl TracingHarness {
         thread_config_loader: Arc<dyn ThreadConfigLoader>,
     ) -> Result<Self> {
         let server = create_mock_responses_server_repeating_assistant("Done").await;
+        Self::new_with_server_and_thread_config_loader(server, thread_config_loader, false).await
+    }
+
+    async fn new_with_server_and_thread_config_loader(
+        server: MockServer,
+        thread_config_loader: Arc<dyn ThreadConfigLoader>,
+        enable_collab: bool,
+    ) -> Result<Self> {
         let codex_home = TempDir::new()?;
-        let config = Arc::new(build_test_config(codex_home.path(), &server.uri()).await?);
+        let config =
+            Arc::new(build_test_config(codex_home.path(), &server.uri(), enable_collab).await?);
         let (processor, outgoing_rx) = build_test_processor(config, thread_config_loader).await;
         let tracing = init_test_tracing();
         tracing.exporter.reset();
@@ -176,7 +189,7 @@ impl TracingHarness {
     }
 
     async fn shutdown(self) {
-        self.processor.shutdown_threads().await;
+        self.processor.thread_processor.shutdown_threads().await;
         self.processor.drain_background_tasks().await;
     }
 
@@ -224,12 +237,21 @@ impl TracingHarness {
     }
 }
 
-async fn build_test_config(codex_home: &Path, server_uri: &str) -> Result<Config> {
+async fn build_test_config(
+    codex_home: &Path,
+    server_uri: &str,
+    enable_collab: bool,
+) -> Result<Config> {
+    let feature_flags = if enable_collab {
+        BTreeMap::from([(Feature::Collab, true)])
+    } else {
+        BTreeMap::new()
+    };
     write_mock_responses_config_toml(
         codex_home,
         server_uri,
-        &BTreeMap::new(),
-        /*auto_compact_limit*/ 8_192,
+        &feature_flags,
+        /*auto_compact_limit*/ if enable_collab { 1_000_000 } else { 8_192 },
         Some(false),
         "mock_provider",
         "compact",
@@ -424,23 +446,62 @@ fn thread_created_lag_resync_uses_only_missed_broadcast_instances() -> Result<()
     run_current_thread_test_with_stack(
         "thread_created_lag_resync_uses_only_missed_broadcast_instances",
         async {
-            let mut harness = TracingHarness::new().await?;
+            const CHILD_PROMPT: &str = "child: exercise thread-created lag recovery";
+            let spawn_args = serde_json::to_string(&json!({
+                "message": CHILD_PROMPT,
+                "task_name": "lag_child",
+            }))?;
+            let spawn_response = core_test_support::responses::sse(vec![
+                core_test_support::responses::ev_response_created("resp-spawn"),
+                core_test_support::responses::ev_function_call_with_namespace(
+                    "spawn-call",
+                    "agents",
+                    "spawn_agent",
+                    &spawn_args,
+                ),
+                core_test_support::responses::ev_completed("resp-spawn"),
+            ]);
+            let final_response = core_test_support::responses::sse(vec![
+                core_test_support::responses::ev_response_created("resp-final"),
+                core_test_support::responses::ev_assistant_message("msg-final", "Done"),
+                core_test_support::responses::ev_completed("resp-final"),
+            ]);
+            let server = create_mock_responses_server_sequence_unchecked(vec![
+                spawn_response,
+                final_response.clone(),
+                final_response,
+            ])
+            .await;
+            let mut harness = TracingHarness::new_with_server_and_thread_config_loader(
+                server,
+                Arc::new(codex_config::NoopThreadConfigLoader),
+                true,
+            )
+            .await?;
             // The tracing harness drives `process_request` directly and therefore does
             // not execute the transport loop's post-initialize connection registration.
             harness
                 .processor
+                .thread_processor
+                .thread_state_manager
                 .connection_initialized(
                     TEST_CONNECTION_ID,
-                    /*request_attestation*/ false,
-                    /*experimental_api*/ true,
+                    ConnectionCapabilities {
+                        request_attestation: false,
+                        experimental_api: true,
+                    },
                 )
                 .await;
             harness
                 .processor
+                .thread_processor
+                .thread_state_manager
                 .connection_initialized(
                     SECOND_TEST_CONNECTION_ID,
-                    /*request_attestation*/ false,
-                    /*experimental_api*/ false,
+                    ConnectionCapabilities {
+                        request_attestation: false,
+                        experimental_api: false,
+                    },
                 )
                 .await;
 
@@ -448,15 +509,20 @@ fn thread_created_lag_resync_uses_only_missed_broadcast_instances() -> Result<()
                 .start_thread(/*request_id*/ 30_001, /*trace*/ None)
                 .await;
             let top_level_thread_id = ThreadId::from_string(&top_level_thread.thread.id)?;
-            harness
-                .processor
-                .resync_thread_listeners(vec![TEST_CONNECTION_ID, SECOND_TEST_CONNECTION_ID])
-                .await;
+            assert!(
+                harness
+                    .processor
+                    .thread_processor
+                    .handle_thread_created_event(Ok(top_level_thread_id), vec![TEST_CONNECTION_ID])
+                    .await
+            );
 
             assert_eq!(
                 harness
                     .processor
-                    .subscribed_connection_ids_for_test(top_level_thread_id)
+                    .thread_processor
+                    .thread_state_manager
+                    .subscribed_connection_ids(top_level_thread_id)
                     .await
                     .into_iter()
                     .collect::<HashSet<_>>(),
@@ -464,22 +530,115 @@ fn thread_created_lag_resync_uses_only_missed_broadcast_instances() -> Result<()
                 "lag recovery must not attach unrelated top-level threads to other connections"
             );
 
-            let missed_thread = harness
-                .start_thread(/*request_id*/ 30_002, /*trace*/ None)
+            let _: TurnStartResponse = harness
+                .request(
+                    ClientRequest::TurnStart {
+                        request_id: RequestId::Integer(30_002),
+                        params: TurnStartParams {
+                            thread_id: top_level_thread.thread.id.clone(),
+                            input: vec![UserInput::Text {
+                                text: "spawn a child".to_string(),
+                                text_elements: Vec::new(),
+                            }],
+                            ..TurnStartParams::default()
+                        },
+                    },
+                    None,
+                )
                 .await;
-            let missed_thread_id = ThreadId::from_string(&missed_thread.thread.id)?;
-            harness
-                .processor
-                .set_thread_created_resync_override_for_test(missed_thread_id)
-                .await;
-            harness
-                .processor
-                .resync_thread_listeners(vec![TEST_CONNECTION_ID, SECOND_TEST_CONNECTION_ID])
-                .await;
+            let missed_thread_id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if let Some(thread_id) = harness
+                        .processor
+                        .thread_processor
+                        .thread_created_ids_for_test()
+                        .await
+                        .into_iter()
+                        .next()
+                    {
+                        break thread_id;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("spawned child should enter the thread-created recovery registry");
+            assert!(
+                harness
+                    .processor
+                    .thread_processor
+                    .handle_thread_created_event(Ok(missed_thread_id), vec![TEST_CONNECTION_ID])
+                    .await
+            );
             assert_eq!(
                 harness
                     .processor
-                    .subscribed_connection_ids_for_test(missed_thread_id)
+                    .thread_processor
+                    .thread_state_manager
+                    .subscribed_connection_ids(missed_thread_id)
+                    .await
+                    .into_iter()
+                    .collect::<HashSet<_>>(),
+                HashSet::from([TEST_CONNECTION_ID]),
+                "the initial child event should attach only its current connection"
+            );
+            let (thread_created_tx, mut thread_created_rx) = tokio::sync::broadcast::channel(1);
+            thread_created_tx.send(top_level_thread_id)?;
+            thread_created_tx.send(missed_thread_id)?;
+            let lagged = thread_created_rx.recv().await;
+            assert!(matches!(
+                &lagged,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(1))
+            ));
+            assert!(
+                harness
+                    .processor
+                    .thread_processor
+                    .handle_thread_created_event(
+                        lagged,
+                        vec![TEST_CONNECTION_ID, SECOND_TEST_CONNECTION_ID],
+                    )
+                    .await
+            );
+            assert_eq!(
+                harness
+                    .processor
+                    .thread_processor
+                    .thread_state_manager
+                    .subscribed_connection_ids(missed_thread_id)
+                    .await
+                    .into_iter()
+                    .collect::<HashSet<_>>(),
+                HashSet::from([TEST_CONNECTION_ID, SECOND_TEST_CONNECTION_ID]),
+                "lag recovery must retry an already-handled child for newly initialized connections"
+            );
+            let queued = thread_created_rx.recv().await;
+            assert_eq!(queued, Ok(missed_thread_id));
+            assert!(
+                harness
+                    .processor
+                    .thread_processor
+                    .thread_state_manager
+                    .is_connection_initialized(SECOND_TEST_CONNECTION_ID)
+                    .await,
+                "the synthetic second connection must remain initialized"
+            );
+            assert!(
+                harness
+                    .processor
+                    .thread_processor
+                    .handle_thread_created_event(
+                        queued,
+                        vec![TEST_CONNECTION_ID, SECOND_TEST_CONNECTION_ID],
+                    )
+                    .await
+            );
+            assert_eq!(
+                harness
+                    .processor
+                    .thread_processor
+                    .thread_state_manager
+                    .subscribed_connection_ids(missed_thread_id)
                     .await
                     .into_iter()
                     .collect::<HashSet<_>>(),
@@ -874,7 +1033,6 @@ async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
                     personality: None,
                     output_schema: None,
                     collaboration_mode: None,
-                    multi_agent_mode: None,
                 },
             },
             Some(remote_trace),
@@ -910,4 +1068,43 @@ async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
     harness.shutdown().await;
 
     Ok(())
+}
+
+#[test]
+fn message_processor_does_not_forward_lifecycle_owners() {
+    let source = include_str!("message_processor.rs");
+    for method_name in [
+        "thread_created_receiver",
+        "send_initialize_notifications_to_connection",
+        "connection_initialized",
+        "send_initialize_notifications",
+        "try_attach_thread_listener",
+        "resync_thread_listeners",
+        "subscribed_connection_ids_for_test",
+        "cancel_active_login",
+        "clear_all_thread_listeners",
+        "shutdown_threads",
+        "subscribe_running_assistant_turn_count",
+    ] {
+        let obsolete_forwarder = ["fn ", method_name, "("].concat();
+        assert!(
+            !source.contains(&obsolete_forwarder),
+            "MessageProcessor must not forward lifecycle owner method `{method_name}`"
+        );
+    }
+
+    let thread_processor_source = include_str!("request_processors/thread_processor.rs");
+    for method_name in [
+        "thread_created_receiver",
+        "connection_initialized",
+        "subscribe_running_assistant_turn_count",
+        "clear_all_thread_listeners",
+        "subscribed_connection_ids_for_test",
+    ] {
+        let obsolete_forwarder = ["fn ", method_name, "("].concat();
+        assert!(
+            !thread_processor_source.contains(&obsolete_forwarder),
+            "ThreadRequestProcessor must not forward owner method `{method_name}`"
+        );
+    }
 }

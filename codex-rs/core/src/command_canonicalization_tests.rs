@@ -53,7 +53,6 @@ fn canonicalizes_heredoc_scripts_to_stable_script_key() {
     );
 }
 
-#[cfg(windows)]
 #[test]
 fn canonicalizes_powershell_wrappers_without_crossing_profile_modes() {
     let script = "Write-Host hi";

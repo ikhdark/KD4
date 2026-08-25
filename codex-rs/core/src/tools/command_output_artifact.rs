@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::collections::VecDeque;
 use std::fmt;
 use std::fs::File;
 use std::io::Read;
@@ -64,46 +63,6 @@ pub(crate) const ARTIFACT_SEARCH_MAX_RESULTS: usize = 100;
 pub(crate) const ARTIFACT_SEARCH_MAX_CONTEXT_LINES: usize = 20;
 pub(crate) const ARTIFACT_SEARCH_MAX_QUERY_BYTES: usize = 1_024;
 const LOGICAL_ARTIFACT_METADATA_VERSION: u8 = 1;
-const MAX_DETERMINISTIC_RECOVERY_CACHE_ENTRIES: usize = 128;
-const MAX_VALIDATED_SNAPSHOT_CACHE_ENTRIES: usize = 16;
-const MAX_VALIDATED_SNAPSHOT_CACHE_BYTES: usize = 64 * 1024 * 1024;
-
-#[derive(Default)]
-struct DeterministicRecoveryCache {
-    entries: BTreeMap<String, ReadToolOutputResult>,
-    insertion_order: VecDeque<String>,
-}
-
-static DETERMINISTIC_RECOVERY_CACHE: OnceLock<StdMutex<DeterministicRecoveryCache>> =
-    OnceLock::new();
-
-#[derive(Default)]
-struct ValidatedSnapshotCache {
-    entries: BTreeMap<String, Arc<Vec<u8>>>,
-    insertion_order: VecDeque<String>,
-    retained_bytes: usize,
-}
-
-static VALIDATED_SNAPSHOT_CACHE: OnceLock<StdMutex<ValidatedSnapshotCache>> = OnceLock::new();
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct ValidatedSnapshotFileIdentity {
-    segment_index: u32,
-    bytes: u64,
-    modified: Option<(u64, u32)>,
-    created: Option<(u64, u32)>,
-    stable_id: StableArtifactFileIdentity,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum StableArtifactFileIdentity {
-    #[cfg(windows)]
-    Windows { volume: u64, index: [u8; 16] },
-    #[cfg(unix)]
-    Unix { device: u64, inode: u64 },
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ToolOutputSelector {
@@ -1369,6 +1328,15 @@ fn lock_artifact_handle(handle: &Arc<File>, position: SeekFrom) -> std::io::Resu
 }
 
 impl RawOutputArtifact {
+    #[cfg(test)]
+    pub(crate) fn artifact_id(&self) -> Option<ToolOutputArtifactId> {
+        match self {
+            Self::Pending { .. } => None,
+            Self::Stored { id, .. } => Some(*id),
+            Self::Failed { id, .. } => *id,
+        }
+    }
+
     pub(crate) fn pending(codex_home: &Path, thread_id: &str) -> Self {
         Self::Pending {
             codex_home: codex_home.to_path_buf(),
@@ -1467,7 +1435,7 @@ impl RawOutputArtifact {
             "full retained output"
         };
         Some(format!(
-            "[command output reduced; {scope} is available as artifact {id}.\nUse read_tool_output with that id; search once for targets or batch exact ranges in one call.]"
+            "[command output reduced; {scope} is available as artifact {id}.\nUse the advertised read_tool_output schema with artifact {id}; search once or batch exact ranges in one call. Do not rerun the producer merely to recover omitted output.]"
         ))
     }
 
@@ -3380,152 +3348,6 @@ fn load_validated_logical_snapshot(
     Ok(snapshot)
 }
 
-fn load_cached_validated_logical_snapshot(
-    path: &Path,
-    metadata: &LogicalArtifactMetadata,
-) -> Result<Arc<Vec<u8>>, ReadToolOutputError> {
-    let Some(file_identities) = validated_snapshot_file_identities(path, metadata)? else {
-        return load_validated_logical_snapshot(path, metadata).map(Arc::new);
-    };
-    let identity = serde_json::to_vec(&(path.to_string_lossy(), metadata, &file_identities))
-        .map_err(|err| {
-            ReadToolOutputError::Io(format!("failed to encode artifact cache identity: {err}"))
-        })?;
-    let key = format!("{:x}", Sha256::digest(identity));
-    if let Some(snapshot) = VALIDATED_SNAPSHOT_CACHE
-        .get_or_init(|| StdMutex::new(ValidatedSnapshotCache::default()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .entries
-        .get(&key)
-        .cloned()
-    {
-        return Ok(snapshot);
-    }
-
-    let snapshot = Arc::new(load_validated_logical_snapshot(path, metadata)?);
-    if validated_snapshot_file_identities(path, metadata)?.as_ref() != Some(&file_identities) {
-        return Err(ReadToolOutputError::Io(
-            "artifact files changed while validating the immutable snapshot".to_string(),
-        ));
-    }
-    let mut cache = VALIDATED_SNAPSHOT_CACHE
-        .get_or_init(|| StdMutex::new(ValidatedSnapshotCache::default()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    insert_validated_snapshot_cache_entry(
-        &mut cache,
-        key,
-        Arc::clone(&snapshot),
-        MAX_VALIDATED_SNAPSHOT_CACHE_ENTRIES,
-        MAX_VALIDATED_SNAPSHOT_CACHE_BYTES,
-    );
-    Ok(snapshot)
-}
-
-fn insert_validated_snapshot_cache_entry(
-    cache: &mut ValidatedSnapshotCache,
-    key: String,
-    snapshot: Arc<Vec<u8>>,
-    max_entries: usize,
-    max_bytes: usize,
-) {
-    let snapshot_bytes = snapshot.len();
-    if snapshot_bytes > max_bytes {
-        return;
-    }
-    if let Some(previous) = cache.entries.insert(key.clone(), snapshot) {
-        cache.retained_bytes = cache.retained_bytes.saturating_sub(previous.len());
-    } else {
-        cache.insertion_order.push_back(key);
-    }
-    cache.retained_bytes = cache.retained_bytes.saturating_add(snapshot_bytes);
-    while cache.entries.len() > max_entries || cache.retained_bytes > max_bytes {
-        let Some(expired) = cache.insertion_order.pop_front() else {
-            break;
-        };
-        if let Some(removed) = cache.entries.remove(&expired) {
-            cache.retained_bytes = cache.retained_bytes.saturating_sub(removed.len());
-        }
-    }
-}
-
-fn validated_snapshot_file_identities(
-    path: &Path,
-    metadata: &LogicalArtifactMetadata,
-) -> Result<Option<Vec<ValidatedSnapshotFileIdentity>>, ReadToolOutputError> {
-    let mut identities = Vec::with_capacity(metadata.segments.len());
-    for segment in &metadata.segments {
-        let segment_path = logical_segment_path(path, segment.index);
-        let (file, bytes) = open_regular_artifact(&segment_path)?;
-        let file_metadata = file.metadata().map_err(|err| {
-            ReadToolOutputError::Io(format!("failed to inspect artifact segment: {err}"))
-        })?;
-        let Some(stable_id) = stable_artifact_file_identity(&file) else {
-            return Ok(None);
-        };
-        identities.push(ValidatedSnapshotFileIdentity {
-            segment_index: segment.index,
-            bytes,
-            modified: file_metadata.modified().ok().and_then(system_time_identity),
-            created: file_metadata.created().ok().and_then(system_time_identity),
-            stable_id,
-        });
-    }
-    Ok(Some(identities))
-}
-
-fn system_time_identity(time: std::time::SystemTime) -> Option<(u64, u32)> {
-    let elapsed = time.duration_since(std::time::UNIX_EPOCH).ok()?;
-    Some((elapsed.as_secs(), elapsed.subsec_nanos()))
-}
-
-#[cfg(windows)]
-fn stable_artifact_file_identity(file: &File) -> Option<StableArtifactFileIdentity> {
-    use std::mem::MaybeUninit;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::FILE_ID_INFO;
-    use windows_sys::Win32::Storage::FileSystem::FileIdInfo;
-    use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandleEx;
-
-    let mut info = MaybeUninit::<FILE_ID_INFO>::zeroed();
-    let success = unsafe {
-        GetFileInformationByHandleEx(
-            file.as_raw_handle() as isize,
-            FileIdInfo,
-            info.as_mut_ptr().cast(),
-            std::mem::size_of::<FILE_ID_INFO>() as u32,
-        )
-    };
-    if success == 0 {
-        return None;
-    }
-    let info = unsafe { info.assume_init() };
-    let index = info.FileId.Identifier;
-    (info.VolumeSerialNumber != 0 || index.iter().any(|byte| *byte != 0)).then_some(
-        StableArtifactFileIdentity::Windows {
-            volume: info.VolumeSerialNumber,
-            index,
-        },
-    )
-}
-
-#[cfg(unix)]
-fn stable_artifact_file_identity(file: &File) -> Option<StableArtifactFileIdentity> {
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = file.metadata().ok()?;
-    Some(StableArtifactFileIdentity::Unix {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
-}
-
-#[cfg(not(any(windows, unix)))]
-fn stable_artifact_file_identity(_file: &File) -> Option<StableArtifactFileIdentity> {
-    None
-}
-
 fn validated_snapshot_range(
     snapshot: &[u8],
     range: CanonicalByteRange,
@@ -3684,16 +3506,7 @@ fn normalize_tool_output_selectors(
             _ => merged_bytes.push((start, end)),
         }
     }
-    line_ranges.sort_unstable();
-    let mut merged_lines = Vec::<(usize, usize)>::new();
-    for (start, end) in line_ranges {
-        match merged_lines.last_mut() {
-            Some((_, previous_end)) if start <= previous_end.saturating_add(1) => {
-                *previous_end = (*previous_end).max(end);
-            }
-            _ => merged_lines.push((start, end)),
-        }
-    }
+    let merged_lines = normalize_line_ranges(line_ranges);
 
     let mut normalized = merged_bytes
         .into_iter()
@@ -3709,6 +3522,20 @@ fn normalize_tool_output_selectors(
         normalized_selector_order_key(left, metadata)
             .cmp(&normalized_selector_order_key(right, metadata))
     });
+    normalized
+}
+
+pub(crate) fn normalize_line_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    ranges.sort_unstable();
+    let mut normalized: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match normalized.last_mut() {
+            Some((_, previous_end)) if start <= previous_end.saturating_add(1) => {
+                *previous_end = (*previous_end).max(end);
+            }
+            _ => normalized.push((start, end)),
+        }
+    }
     normalized
 }
 
@@ -4176,33 +4003,16 @@ pub(crate) async fn read_tool_output_selectors_with_ceiling_and_reuse(
     let metadata = tokio::task::spawn_blocking(move || load_logical_metadata(&metadata_path, id))
         .await
         .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))??;
-    let artifact_identity = format!(
-        "{}:{}:{}",
-        metadata.canonical_sha256,
-        metadata.retained_bytes,
-        metadata.retained_sha256.as_deref().unwrap_or_default()
-    );
-    let request_cache_key = deterministic_recovery_cache_key(
-        codex_home,
-        thread_id,
-        artifact_id,
-        &artifact_identity,
-        &selectors,
-        token_ceiling,
-    );
-    if let Some(result) = deterministic_recovery_cache_get(&request_cache_key) {
-        return Ok((result, true));
-    }
+    let selectors = normalize_tool_output_selectors(selectors, &metadata);
     let validation_path = path.clone();
     let metadata_for_snapshot = metadata.clone();
     let snapshot = tokio::task::spawn_blocking(move || {
         open_regular_artifact(&validation_path)?;
-        load_cached_validated_logical_snapshot(&validation_path, &metadata_for_snapshot)
+        load_validated_logical_snapshot(&validation_path, &metadata_for_snapshot)
     })
     .await
     .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))??;
-    let (result, normalized_selectors) = tokio::task::spawn_blocking(move || {
-        let selectors = normalize_tool_output_selectors(selectors, &metadata);
+    let result = tokio::task::spawn_blocking(move || {
         let mut response = ReadToolOutputResult {
             artifact_id: id.to_string(),
             canonical_sha256: metadata.canonical_sha256.clone(),
@@ -4215,14 +4025,14 @@ pub(crate) async fn read_tool_output_selectors_with_ceiling_and_reuse(
         for selector in &selectors {
             let mut selected = select_logical_artifact(
                 &metadata,
-                snapshot.as_ref(),
+                &snapshot,
                 selector.clone(),
                 token_ceiling.min(RECOVERY_FRAGMENT_TOKEN_CEILING),
                 token_ceiling,
             );
             if selected.status == ToolOutputSelectorStatus::SelectorTooLarge
                 && let Some(completed) =
-                    internally_drain_exact_subdivisions(&metadata, snapshot.as_ref(), &selected)
+                    internally_drain_exact_subdivisions(&metadata, &snapshot, &selected)
             {
                 let mut candidate = response.clone();
                 candidate.results.push(completed.clone());
@@ -4294,69 +4104,11 @@ pub(crate) async fn read_tool_output_selectors_with_ceiling_and_reuse(
         response.complete = response.results.iter().all(|result| {
             result.status == ToolOutputSelectorStatus::Ok && result.complete
         });
-        Ok((response, selectors))
+        Ok(response)
     })
     .await
     .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))??;
-    let normalized_cache_key = deterministic_recovery_cache_key(
-        codex_home,
-        thread_id,
-        artifact_id,
-        &artifact_identity,
-        &normalized_selectors,
-        token_ceiling,
-    );
-    deterministic_recovery_cache_insert(normalized_cache_key, result.clone());
-    deterministic_recovery_cache_insert(request_cache_key, result.clone());
     Ok((result, false))
-}
-
-fn deterministic_recovery_cache_key(
-    codex_home: &Path,
-    thread_id: &str,
-    artifact_id: &str,
-    artifact_identity: &str,
-    selectors: &[ToolOutputSelector],
-    token_ceiling: usize,
-) -> String {
-    let identity = serde_json::json!({
-        "codex_home": codex_home.to_string_lossy(),
-        "thread_id": thread_id,
-        "artifact_id": artifact_id,
-        "artifact_identity": artifact_identity,
-        "selectors": selectors,
-        "token_ceiling": token_ceiling,
-    });
-    format!(
-        "{:x}",
-        Sha256::digest(serde_json::to_vec(&identity).unwrap_or_default())
-    )
-}
-
-fn deterministic_recovery_cache_get(key: &str) -> Option<ReadToolOutputResult> {
-    DETERMINISTIC_RECOVERY_CACHE
-        .get_or_init(|| StdMutex::new(DeterministicRecoveryCache::default()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .entries
-        .get(key)
-        .cloned()
-}
-
-fn deterministic_recovery_cache_insert(key: String, result: ReadToolOutputResult) {
-    let mut cache = DETERMINISTIC_RECOVERY_CACHE
-        .get_or_init(|| StdMutex::new(DeterministicRecoveryCache::default()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if cache.entries.insert(key.clone(), result).is_none() {
-        cache.insertion_order.push_back(key);
-    }
-    while cache.entries.len() > MAX_DETERMINISTIC_RECOVERY_CACHE_ENTRIES {
-        let Some(expired) = cache.insertion_order.pop_front() else {
-            break;
-        };
-        cache.entries.remove(&expired);
-    }
 }
 
 #[cfg(test)]
@@ -4573,14 +4325,6 @@ fn map_artifact_open_error(error: std::io::Error) -> ReadToolOutputError {
     }
 }
 
-#[cfg(unix)]
-fn configure_no_follow_open(options: &mut std::fs::OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
-}
-
-#[cfg(windows)]
 fn configure_no_follow_open(options: &mut std::fs::OpenOptions) {
     use std::os::windows::fs::OpenOptionsExt;
 
@@ -4588,30 +4332,15 @@ fn configure_no_follow_open(options: &mut std::fs::OpenOptions) {
     options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
 }
 
-#[cfg(not(any(unix, windows)))]
-fn configure_no_follow_open(_options: &mut std::fs::OpenOptions) {}
-
-#[cfg(unix)]
-fn is_no_follow_error(raw_os_error: i32) -> bool {
-    raw_os_error == libc::ELOOP
-}
-
-#[cfg(not(unix))]
 fn is_no_follow_error(_raw_os_error: i32) -> bool {
     false
 }
 
-#[cfg(windows)]
 fn metadata_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(not(windows))]
-fn metadata_is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
-    false
 }
 
 #[cfg(test)]
@@ -4631,13 +4360,6 @@ fn active_tool_history_protection_path(artifact_path: &Path) -> PathBuf {
     artifact_path.with_extension(ACTIVE_TOOL_HISTORY_PROTECTION_EXTENSION)
 }
 
-#[cfg(unix)]
-fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    File::open(parent)?.sync_all()
-}
-
-#[cfg(not(unix))]
 fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
     // Portable Rust APIs cannot open directory handles on every supported platform. Individual
     // files are still synced; directory durability is requested where that operation is exposed.
@@ -5807,41 +5529,6 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn validated_snapshot_cache_enforces_entry_and_byte_limits() {
-        let mut cache = ValidatedSnapshotCache::default();
-        insert_validated_snapshot_cache_entry(
-            &mut cache,
-            "first".to_string(),
-            Arc::new(vec![0; 4]),
-            2,
-            6,
-        );
-        insert_validated_snapshot_cache_entry(
-            &mut cache,
-            "second".to_string(),
-            Arc::new(vec![0; 4]),
-            2,
-            6,
-        );
-
-        assert_eq!(
-            cache.entries.keys().cloned().collect::<Vec<_>>(),
-            vec!["second".to_string()]
-        );
-        assert_eq!(cache.retained_bytes, 4);
-
-        insert_validated_snapshot_cache_entry(
-            &mut cache,
-            "oversized".to_string(),
-            Arc::new(vec![0; 7]),
-            2,
-            6,
-        );
-        assert!(!cache.entries.contains_key("oversized"));
-        assert_eq!(cache.retained_bytes, 4);
-    }
-
     #[tokio::test]
     async fn artifact_retains_exact_bytes_across_chunks() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -6021,27 +5708,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn read_rejects_uuid_named_symlink_outside_thread_directory() {
-        use std::os::unix::fs::symlink;
-
-        let temp = tempfile::tempdir().expect("tempdir");
-        let thread_directory = temp.path().join("tool-output").join("thread");
-        std::fs::create_dir_all(&thread_directory).expect("create thread directory");
-        let outside = temp.path().join("outside.log");
-        std::fs::write(&outside, b"outside secret\n").expect("write outside artifact");
-        let id = ToolOutputArtifactId::new();
-        symlink(&outside, thread_directory.join(format!("{id}.log"))).expect("create symlink");
-
-        let error = read_tool_output_artifact(temp.path(), "thread", &id.to_string(), 1, 1, 16_384)
-            .await
-            .expect_err("symlink artifact should fail");
-
-        assert_eq!(error, ReadToolOutputError::Expired);
-    }
-
-    #[cfg(windows)]
     #[tokio::test]
     async fn read_rejects_uuid_named_reparse_point_outside_thread_directory() {
         use std::os::windows::fs::symlink_file;

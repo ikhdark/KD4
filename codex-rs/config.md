@@ -1,6 +1,9 @@
-# Configuration docs moved
+# Configuration documentation
 
-This file has moved. Please see the latest configuration documentation here:
+See the current Codex configuration documentation:
 
-- Full config docs: [docs/config.md](../docs/config.md)
-- MCP servers section: [docs/config.md#connecting-to-mcp-servers](../docs/config.md#connecting-to-mcp-servers)
+- [Configuration reference](https://developers.openai.com/codex/config-file/config-reference)
+- [Model Context Protocol (MCP)](https://developers.openai.com/codex/extend/mcp)
+
+For the exact keys supported by this checkout, see the generated
+[`core/config.schema.json`](core/config.schema.json).

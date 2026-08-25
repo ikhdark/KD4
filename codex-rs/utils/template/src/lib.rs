@@ -167,6 +167,15 @@ impl Template {
         })
     }
 
+    /// Parse a template embedded in the binary, panicking with its asset name if invalid.
+    #[track_caller]
+    pub fn parse_embedded(source: &str, template_name: &str) -> Self {
+        match Self::parse(source) {
+            Ok(template) => template,
+            Err(err) => panic!("embedded template {template_name} is invalid: {err}"),
+        }
+    }
+
     pub fn placeholders(&self) -> impl ExactSizeIterator<Item = &str> {
         self.placeholders.iter().map(String::as_str)
     }
@@ -314,6 +323,14 @@ mod tests {
             template.render([("greeting", "Hi"), ("name", "builder")]),
             Ok("Hi, builder!".to_string())
         );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "embedded template prompts/example.md is invalid: template placeholder at byte 0 is empty"
+    )]
+    fn embedded_template_parse_error_names_the_asset() {
+        Template::parse_embedded("{{ }}", "prompts/example.md");
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use codex_app_server_protocol::ServerNotification;
+use codex_app_server_protocol::ThreadItem;
 use codex_core::config::Config;
 use codex_protocol::protocol::SessionConfiguredEvent;
 
@@ -54,4 +55,55 @@ pub(crate) fn handle_last_message(
         );
     }
     Ok(())
+}
+
+pub(crate) fn final_message_from_turn_items(items: &[ThreadItem]) -> Option<String> {
+    items
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            ThreadItem::AgentMessage { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .or_else(|| {
+            items.iter().rev().find_map(|item| match item {
+                ThreadItem::Plan { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn final_message_prefers_latest_agent_message_and_falls_back_to_plan() {
+        let items = vec![
+            ThreadItem::Plan {
+                id: "plan".to_string(),
+                text: "latest plan".to_string(),
+            },
+            ThreadItem::AgentMessage {
+                id: "first".to_string(),
+                text: "first answer".to_string(),
+                phase: None,
+                memory_citation: None,
+            },
+            ThreadItem::AgentMessage {
+                id: "latest".to_string(),
+                text: "latest answer".to_string(),
+                phase: None,
+                memory_citation: None,
+            },
+        ];
+        assert_eq!(
+            final_message_from_turn_items(&items),
+            Some("latest answer".to_string())
+        );
+        assert_eq!(
+            final_message_from_turn_items(&items[..1]),
+            Some("latest plan".to_string())
+        );
+    }
 }

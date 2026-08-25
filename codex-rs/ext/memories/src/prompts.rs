@@ -10,18 +10,11 @@ use std::sync::LazyLock;
 use tokio::fs;
 
 static MEMORY_TOOL_DEVELOPER_INSTRUCTIONS_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
-    parse_embedded_template(
+    Template::parse_embedded(
         include_str!("../templates/memories/read_path.compact.md"),
         "memories/read_path.compact.md",
     )
 });
-
-fn parse_embedded_template(source: &'static str, template_name: &str) -> Template {
-    match Template::parse(source) {
-        Ok(template) => template,
-        Err(err) => panic!("embedded template {template_name} is invalid: {err}"),
-    }
-}
 
 /// Build the memory read-path prompt that is added to developer instructions.
 ///

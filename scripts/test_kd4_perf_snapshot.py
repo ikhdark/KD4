@@ -12,6 +12,12 @@ from scripts import kd4_model_attempt_analysis
 
 
 class Kd4PerfSnapshotTest(unittest.TestCase):
+    def test_rollout_analysis_is_owned_by_turn_latency_audit(self) -> None:
+        help_text = kd4_perf_snapshot.build_parser().format_help()
+
+        self.assertNotIn("--rollout-jsonl", help_text)
+        self.assertNotIn("--first-useful-action-report", help_text)
+
     def test_percentile_interpolates_sorted_values(self) -> None:
         self.assertEqual(kd4_perf_snapshot.percentile([4.0, 1.0, 3.0, 2.0], 0.5), 2.5)
         self.assertAlmostEqual(

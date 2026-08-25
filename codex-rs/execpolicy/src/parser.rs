@@ -183,7 +183,7 @@ fn parse_pattern<'v>(pattern: UnpackList<Value<'v>>) -> Result<Vec<PatternToken>
 
 fn parse_pattern_token<'v>(value: Value<'v>) -> Result<PatternToken> {
     if let Some(s) = value.unpack_str() {
-        Ok(PatternToken::Single(s.to_string()))
+        PatternToken::single(s)
     } else if let Some(list) = ListRef::from_value(value) {
         let tokens: Vec<String> = list
             .content()
@@ -201,13 +201,7 @@ fn parse_pattern_token<'v>(value: Value<'v>) -> Result<PatternToken> {
             })
             .collect::<Result<_>>()?;
 
-        match tokens.as_slice() {
-            [] => Err(Error::InvalidPattern(
-                "pattern alternatives cannot be empty".to_string(),
-            )),
-            [single] => Ok(PatternToken::Single(single.clone())),
-            _ => Ok(PatternToken::Alts(tokens)),
-        }
+        PatternToken::from_alternatives(tokens)
     } else {
         Err(Error::InvalidPattern(format!(
             "pattern element must be a string or list of strings (got {})",

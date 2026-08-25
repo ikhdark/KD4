@@ -79,12 +79,6 @@ impl PathUri {
             return uri;
         }
 
-        #[cfg(unix)]
-        let path_bytes = {
-            use std::os::unix::ffi::OsStrExt;
-            path.as_path().as_os_str().as_bytes().to_vec()
-        };
-        #[cfg(windows)]
         let path_bytes = {
             use std::os::windows::ffi::OsStrExt;
             path.as_path()
@@ -385,14 +379,6 @@ impl PathUri {
             ));
         }
         if let Some(path_bytes) = decode_bad_path_uri(&self.0) {
-            #[cfg(unix)]
-            let decoded_path = {
-                use std::os::unix::ffi::OsStringExt;
-                Some(std::path::PathBuf::from(std::ffi::OsString::from_vec(
-                    path_bytes,
-                )))
-            };
-            #[cfg(windows)]
             let decoded_path = {
                 use std::os::windows::ffi::OsStringExt;
                 path_bytes.len().is_multiple_of(2).then(|| {
@@ -720,15 +706,8 @@ pub enum PathConvention {
 
 impl PathConvention {
     /// Returns the path convention used by the current process.
-    #[cfg(windows)]
     pub const fn native() -> Self {
         Self::Windows
-    }
-
-    /// Returns the path convention used by the current process.
-    #[cfg(unix)]
-    pub const fn native() -> Self {
-        Self::Posix
     }
 
     /// Splits absolute or relative native path text into lexical segments.

@@ -129,6 +129,8 @@ fn tool_classification_separates_typed_authority() {
     for name in [
         "spawn_agent",
         "send_input",
+        "resume_agent",
+        "close_agent",
         "followup_task",
         "interrupt_agent",
         "amend_agent_task",

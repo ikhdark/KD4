@@ -318,31 +318,16 @@ fn summarize_oversized_line(line: &str, max_bytes: usize) -> String {
         return line.to_string();
     }
     if max_bytes <= MARKER.len() {
-        return take_prefix_at_char_boundary(line, max_bytes).to_string();
+        return line[..line.floor_char_boundary(max_bytes)].to_string();
     }
 
     let payload_bytes = max_bytes - MARKER.len();
     let head_bytes = payload_bytes / 2;
     let tail_bytes = payload_bytes - head_bytes;
-    let head = take_prefix_at_char_boundary(line, head_bytes);
-    let tail = take_suffix_at_char_boundary(line, tail_bytes);
+    let head = &line[..line.floor_char_boundary(head_bytes)];
+    let tail_start = line.ceil_char_boundary(line.len().saturating_sub(tail_bytes));
+    let tail = &line[tail_start..];
     format!("{head}{MARKER}{tail}")
-}
-
-fn take_prefix_at_char_boundary(value: &str, max_bytes: usize) -> &str {
-    let mut end = value.len().min(max_bytes);
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    &value[..end]
-}
-
-fn take_suffix_at_char_boundary(value: &str, max_bytes: usize) -> &str {
-    let mut start = value.len().saturating_sub(max_bytes);
-    while !value.is_char_boundary(start) {
-        start += 1;
-    }
-    &value[start..]
 }
 
 #[cfg(test)]

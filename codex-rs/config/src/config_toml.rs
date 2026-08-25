@@ -50,7 +50,7 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use codex_utils_path::normalize_for_path_comparison;
+use codex_utils_absolute_path::normalize_for_path_comparison;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Deserializer;
@@ -64,6 +64,38 @@ const RESERVED_MODEL_PROVIDER_IDS: [&str; 4] = [
     OLLAMA_OSS_PROVIDER_ID,
     LMSTUDIO_OSS_PROVIDER_ID,
 ];
+
+pub const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
+
+/// Converts a configured ChatGPT URL into the one internal backend base URL
+/// used by all runtime consumers.
+pub fn canonicalize_chatgpt_base_url(value: &str) -> String {
+    let value = value.trim();
+    let Ok(mut url) = url::Url::parse(value) else {
+        return value.trim_end_matches('/').to_string();
+    };
+
+    let path = url.path().trim_end_matches('/');
+    let is_known_chatgpt_alias = url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && matches!(
+            url.host_str(),
+            Some("chatgpt.com" | "chat.openai.com" | "chatgpt-staging.com")
+        )
+        && matches!(path, "" | "/backend-api" | "/codex" | "/backend-api/codex");
+
+    if is_known_chatgpt_alias {
+        url.set_path("/backend-api");
+    } else {
+        let path = path.to_string();
+        url.set_path(&path);
+    }
+
+    url.to_string().trim_end_matches('/').to_string()
+}
 
 /// Per-logical-request reasoning effort overrides. Omitted fields retain the
 /// compatibility defaults: high for orient, implement, and diagnose; low for
@@ -165,6 +197,18 @@ pub struct OrchestratorFeatureToml {
     pub enabled: Option<bool>,
 }
 
+pub const CURRENT_CONFIG_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
+#[serde(transparent)]
+pub struct ConfigVersion(pub u32);
+
+impl Default for ConfigVersion {
+    fn default() -> Self {
+        Self(CURRENT_CONFIG_VERSION)
+    }
+}
+
 /// Ordering policy for the AfterAgent hook at turn completion.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -178,6 +222,11 @@ pub enum AfterAgentPolicy {
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct ConfigToml {
+    /// Version of the persisted configuration shape. Unversioned files are
+    /// upgraded by the loader before this structure is deserialized.
+    #[serde(default)]
+    pub config_version: ConfigVersion,
+
     /// Optional override of model selection.
     pub model: Option<String>,
     /// Review model override used by the `/review` feature.
@@ -338,19 +387,15 @@ pub struct ConfigToml {
     /// Default: `300000` (5 minutes).
     pub background_terminal_max_timeout: Option<u64>,
 
-    /// Deprecated: ignored.
+    /// Legacy profile selector retained only so runtime can fail fast with a
+    /// migration message.
     #[schemars(skip)]
-    pub js_repl_node_path: Option<AbsolutePathBuf>,
-
-    /// Deprecated: ignored.
-    #[schemars(skip)]
-    pub js_repl_node_module_dirs: Option<Vec<AbsolutePathBuf>>,
-
-    /// Profile to use from the `profiles` map.
     pub profile: Option<String>,
 
-    /// Named profiles to facilitate switching between different configurations.
+    /// Legacy inline profile tables retained only so runtime can fail fast with
+    /// a migration message.
     #[serde(default)]
+    #[schemars(skip)]
     pub profiles: HashMap<String, ConfigProfile>,
 
     /// Settings that govern if and what will be written to `~/.codex/history.jsonl`.
@@ -369,7 +414,7 @@ pub struct ConfigToml {
     /// Debugging and reproducibility settings.
     pub debug: Option<DebugToml>,
 
-    /// Optional URI-based file opener. If set, citations to files in the model
+    /// Optional URI-based file opener. If set, local Markdown links in model
     /// output will be hyperlinked using the specified URI scheme.
     pub file_opener: Option<UriBasedFileOpener>,
 
@@ -391,9 +436,6 @@ pub struct ConfigToml {
     pub model_reasoning_summary: Option<ReasoningSummary>,
     /// Optional verbosity control for GPT-5 models (Responses API `text.verbosity`).
     pub model_verbosity: Option<Verbosity>,
-
-    /// Override to force-enable reasoning summaries for the configured model.
-    pub model_supports_reasoning_summaries: Option<bool>,
 
     /// Optional path to a JSON model catalog (applied on startup only).
     /// Per-thread `config` overrides are accepted but do not reapply this (no-ops).
@@ -417,39 +459,6 @@ pub struct ConfigToml {
 
     /// Base URL override for the built-in `openai` model provider.
     pub openai_base_url: Option<String>,
-
-    /// Machine-local realtime audio device preferences used by realtime voice.
-    #[serde(default)]
-    pub audio: Option<RealtimeAudioToml>,
-
-    /// Experimental / do not use. Overrides only the realtime conversation
-    /// websocket transport base URL (the `Op::RealtimeConversation`
-    /// `/v1/realtime`
-    /// connection) without changing normal provider HTTP requests.
-    pub experimental_realtime_ws_base_url: Option<String>,
-    /// Experimental / do not use. Overrides only the WebRTC realtime call
-    /// creation base URL. This is separate from `experimental_realtime_ws_base_url`
-    /// because WebRTC call creation is HTTP, while sideband control is websocket.
-    pub experimental_realtime_webrtc_call_base_url: Option<String>,
-    /// Experimental / do not use. Selects the realtime websocket model/snapshot
-    /// used for the `Op::RealtimeConversation` connection.
-    pub experimental_realtime_ws_model: Option<String>,
-    /// Experimental / do not use. Realtime websocket session selection.
-    /// `version` controls v1/v2 and `type` controls conversational/transcription.
-    #[serde(default)]
-    pub realtime: Option<RealtimeToml>,
-    /// Experimental / do not use. Overrides only the realtime conversation
-    /// websocket transport instructions (the `Op::RealtimeConversation`
-    /// `/ws` session.update instructions) without changing normal prompts.
-    pub experimental_realtime_ws_backend_prompt: Option<String>,
-    /// Experimental / do not use. Replaces the synthesized realtime startup
-    /// context appended to websocket session instructions. An empty string
-    /// disables startup context injection entirely.
-    pub experimental_realtime_ws_startup_context: Option<String>,
-    /// Experimental / do not use. Replaces the built-in realtime start
-    /// instructions inserted into developer messages when realtime becomes
-    /// active.
-    pub experimental_realtime_start_instructions: Option<String>,
 
     /// Experimental / do not use. When set, app-server fetches thread-scoped
     /// config from a remote service at this endpoint.
@@ -502,11 +511,6 @@ pub struct ConfigToml {
     /// Suppress warnings about unstable (under development) features.
     pub suppress_unstable_features_warning: Option<bool>,
 
-    /// Compatibility-only settings retained so legacy `ghost_snapshot`
-    /// config still loads.
-    #[serde(default)]
-    pub ghost_snapshot: Option<GhostSnapshotToml>,
-
     /// Markers used to detect the project root when searching parent
     /// directories for `.codex` folders. Defaults to [".git"] when unset.
     #[serde(default)]
@@ -550,7 +554,6 @@ pub struct ConfigToml {
     pub notice: Option<Notice>,
 
     pub experimental_compact_prompt_file: Option<AbsolutePathBuf>,
-    pub experimental_use_unified_exec_tool: Option<bool>,
     /// Preferred OSS provider for local models, e.g. "lmstudio" or "ollama".
     pub oss_provider: Option<String>,
 }
@@ -619,59 +622,6 @@ impl ProjectConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RealtimeAudioConfig {
-    pub microphone: Option<String>,
-    pub speaker: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum RealtimeWsMode {
-    #[default]
-    Conversational,
-    Transcription,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum RealtimeTransport {
-    #[default]
-    #[serde(rename = "webrtc")]
-    WebRtc,
-    Websocket,
-}
-
-pub use codex_protocol::protocol::RealtimeConversationVersion as RealtimeWsVersion;
-pub use codex_protocol::protocol::RealtimeVoice;
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-pub struct RealtimeConfig {
-    pub version: RealtimeWsVersion,
-    #[serde(rename = "type")]
-    pub session_type: RealtimeWsMode,
-    pub transport: RealtimeTransport,
-    pub voice: Option<RealtimeVoice>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-pub struct RealtimeToml {
-    pub version: Option<RealtimeWsVersion>,
-    #[serde(rename = "type")]
-    pub session_type: Option<RealtimeWsMode>,
-    pub transport: Option<RealtimeTransport>,
-    pub voice: Option<RealtimeVoice>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-pub struct RealtimeAudioToml {
-    pub microphone: Option<String>,
-    pub speaker: Option<String>,
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct ToolsToml {
@@ -705,14 +655,18 @@ where
 {
     let value = Option::<WebSearchToolConfigInput>::deserialize(deserializer)?;
 
-    Ok(match value {
-        None => None,
+    match value {
+        None => Ok(None),
         Some(WebSearchToolConfigInput::Enabled(enabled)) => {
             let _ = enabled;
-            None
+            Err(<D::Error as serde::de::Error>::custom(
+                "`tools.web_search` no longer accepts a boolean; set top-level \
+                     `web_search = \"live\"` or `web_search = \"disabled\"`, and use \
+                     `[tools.web_search]` only for search parameters",
+            ))
         }
-        Some(WebSearchToolConfigInput::Config(config)) => Some(config),
-    })
+        Some(WebSearchToolConfigInput::Config(config)) => Ok(Some(config)),
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
@@ -761,19 +715,6 @@ pub struct AgentRoleToml {
     pub nickname_candidates: Option<Vec<String>>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-pub struct GhostSnapshotToml {
-    /// Legacy no-op setting retained for compatibility.
-    #[serde(alias = "ignore_untracked_files_over_bytes")]
-    pub ignore_large_untracked_files: Option<i64>,
-    /// Legacy no-op setting retained for compatibility.
-    #[serde(alias = "large_untracked_dir_warning_threshold")]
-    pub ignore_large_untracked_dirs: Option<i64>,
-    /// Legacy no-op setting retained for compatibility.
-    pub disable_warnings: Option<bool>,
-}
-
 impl ConfigToml {
     /// Derive the effective permission profile from legacy sandbox config.
     ///
@@ -796,9 +737,7 @@ impl ConfigToml {
                 active_project
                     .filter(|project| project.is_trusted() || project.is_untrusted())
                     .map(|_| {
-                        if cfg!(target_os = "windows")
-                            && windows_sandbox_level == WindowsSandboxLevel::Disabled
-                        {
+                        if windows_sandbox_level == WindowsSandboxLevel::Disabled {
                             SandboxMode::ReadOnly
                         } else {
                             SandboxMode::WorkspaceWrite
@@ -806,9 +745,8 @@ impl ConfigToml {
                     })
             })
             .unwrap_or_default();
-        let effective_sandbox_mode = if cfg!(target_os = "windows")
+        let effective_sandbox_mode = if windows_sandbox_level == WindowsSandboxLevel::Disabled
             // If the experimental Windows sandbox is enabled, do not force a downgrade.
-            && windows_sandbox_level == WindowsSandboxLevel::Disabled
             && matches!(resolved_sandbox_mode, SandboxMode::WorkspaceWrite)
         {
             SandboxMode::ReadOnly
@@ -863,38 +801,34 @@ impl ConfigToml {
         resolved_cwd: &Path,
         repo_root: Option<&Path>,
     ) -> Option<ProjectConfig> {
-        let projects = self.projects.as_ref()?;
-
-        for normalized_cwd in normalized_project_lookup_keys(resolved_cwd) {
-            if let Some(project_config) = project_config_for_lookup_key(projects, &normalized_cwd) {
-                return Some(project_config);
-            }
-        }
-
+        let mut lookup_keys = normalized_project_lookup_keys(resolved_cwd);
         if let Some(repo_root) = repo_root {
-            for normalized_repo_root in normalized_project_lookup_keys(repo_root) {
-                if let Some(project_config_for_root) =
-                    project_config_for_lookup_key(projects, &normalized_repo_root)
-                {
-                    return Some(project_config_for_root);
-                }
-            }
+            lookup_keys.extend(normalized_project_lookup_keys(repo_root));
         }
+        self.get_active_project_for_lookup_keys(&lookup_keys)
+    }
 
-        None
+    /// Resolves an active project from path keys already normalized by config loading.
+    pub fn get_active_project_for_lookup_keys(
+        &self,
+        lookup_keys: &[String],
+    ) -> Option<ProjectConfig> {
+        let projects = ProjectLookup::new(self.projects.clone()?);
+        lookup_keys
+            .iter()
+            .find_map(|lookup_key| projects.get(lookup_key).map(|(_, project)| project.clone()))
     }
 }
 
 /// Canonicalize the path and convert it to a string to be used as a key in the
 /// projects trust map. On Windows, strips UNC, when possible, to try to ensure
 /// that different paths that point to the same location have the same key.
-fn normalized_project_lookup_keys(path: &Path) -> Vec<String> {
-    let normalized_path = normalize_project_lookup_key(path.to_string_lossy().to_string());
+pub(crate) fn normalized_project_lookup_keys(path: &Path) -> Vec<String> {
+    let normalized_path = normalize_project_lookup_key(&path.to_string_lossy());
     let normalized_canonical_path = normalize_project_lookup_key(
-        normalize_for_path_comparison(path)
+        &normalize_for_path_comparison(path)
             .unwrap_or_else(|_| path.to_path_buf())
-            .to_string_lossy()
-            .to_string(),
+            .to_string_lossy(),
     );
     if normalized_path == normalized_canonical_path {
         vec![normalized_canonical_path]
@@ -903,30 +837,37 @@ fn normalized_project_lookup_keys(path: &Path) -> Vec<String> {
     }
 }
 
-fn normalize_project_lookup_key(key: String) -> String {
-    if cfg!(windows) {
-        key.to_ascii_lowercase()
-    } else {
-        key
-    }
+pub(crate) fn normalize_project_lookup_key(key: &str) -> String {
+    key.to_ascii_lowercase()
 }
 
-fn project_config_for_lookup_key(
-    projects: &HashMap<String, ProjectConfig>,
-    lookup_key: &str,
-) -> Option<ProjectConfig> {
-    if let Some(project_config) = projects.get(lookup_key) {
-        return Some(project_config.clone());
+pub(crate) struct ProjectLookup<T> {
+    exact: HashMap<String, T>,
+    normalized: BTreeMap<String, String>,
+}
+
+impl<T> ProjectLookup<T> {
+    pub(crate) fn new(exact: HashMap<String, T>) -> Self {
+        let mut keys = exact.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        let mut normalized = BTreeMap::new();
+        for key in keys {
+            normalized
+                .entry(normalize_project_lookup_key(&key))
+                .or_insert(key);
+        }
+        Self { exact, normalized }
     }
 
-    let mut normalized_matches: Vec<_> = projects
-        .iter()
-        .filter(|(key, _)| normalize_project_lookup_key((*key).clone()) == lookup_key)
-        .collect();
-    normalized_matches.sort_by_key(|(key, _)| *key);
-    normalized_matches
-        .first()
-        .map(|(_, project_config)| (**project_config).clone())
+    pub(crate) fn get(&self, lookup_key: &str) -> Option<(&str, &T)> {
+        if let Some((key, value)) = self.exact.get_key_value(lookup_key) {
+            return Some((key.as_str(), value));
+        }
+        let key = self.normalized.get(lookup_key)?;
+        self.exact
+            .get_key_value(key)
+            .map(|(key, value)| (key.as_str(), value))
+    }
 }
 
 pub fn validate_reserved_model_provider_ids(
@@ -1011,6 +952,55 @@ mod tests {
 
     const WORKSPACE_ID_A: &str = "123e4567-e89b-42d3-a456-426614174000";
     const WORKSPACE_ID_B: &str = "123e4567-e89b-42d3-a456-426614174001";
+
+    #[test]
+    fn project_lookup_precomputes_deterministic_normalized_fallbacks() {
+        let lookup = ProjectLookup::new(HashMap::from([
+            ("C:\\Repo".to_string(), "mixed"),
+            ("C:\\REPO".to_string(), "upper"),
+            ("c:\\repo".to_string(), "exact"),
+        ]));
+
+        assert_eq!(lookup.get("c:\\repo"), Some(("c:\\repo", &"exact")));
+
+        let fallback = ProjectLookup::new(HashMap::from([
+            ("C:\\Repo".to_string(), "mixed"),
+            ("C:\\REPO".to_string(), "upper"),
+        ]));
+        assert_eq!(fallback.get("c:\\repo"), Some(("C:\\REPO", &"upper")));
+    }
+
+    #[test]
+    fn current_config_serializes_its_format_boundary() {
+        let serialized = toml::to_string(&ConfigToml::default()).expect("config should serialize");
+        assert!(serialized.contains("config_version = 1"));
+    }
+
+    #[test]
+    fn chatgpt_base_url_canonicalizes_known_aliases_to_the_backend_root() {
+        for (configured, expected) in [
+            (" HTTPS://CHATGPT.COM/ ", "https://chatgpt.com/backend-api"),
+            (
+                "https://chat.openai.com/codex/",
+                "https://chat.openai.com/backend-api",
+            ),
+            (
+                "https://chatgpt-staging.com/backend-api/codex/",
+                "https://chatgpt-staging.com/backend-api",
+            ),
+        ] {
+            assert_eq!(canonicalize_chatgpt_base_url(configured), expected);
+        }
+    }
+
+    #[test]
+    fn chatgpt_base_url_preserves_custom_hosts_and_paths() {
+        assert_eq!(
+            canonicalize_chatgpt_base_url(" http://LOCALHOST:8080/custom/// "),
+            "http://localhost:8080/custom"
+        );
+        assert_eq!(canonicalize_chatgpt_base_url("mock-base///"), "mock-base");
+    }
 
     #[test]
     fn reasoning_phase_efforts_distinguish_absent_empty_partial_and_full_tables() {

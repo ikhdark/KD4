@@ -13,6 +13,7 @@ use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
@@ -219,11 +220,13 @@ async fn submit_queue_only_agent_mail(codex: &CodexThread, text: &str) {
         .await
         .expect("submit queue-only agent mail");
     codex
-        .submit(Op::RealtimeConversationListVoices)
+        .submit(Op::ThreadSettings {
+            thread_settings: ThreadSettingsOverrides::default(),
+        })
         .await
-        .expect("submit list-voices barrier");
+        .expect("submit queue barrier");
     wait_for_event(codex, |event| {
-        matches!(event, EventMsg::RealtimeConversationListVoicesResponse(_))
+        matches!(event, EventMsg::ThreadSettingsApplied(_))
     })
     .await;
 }
@@ -520,7 +523,18 @@ async fn any_new_input_interrupts_sleep() {
     wait_for_sleep_item_completed(&codex, FIRST_SLEEP_CALL_ID, SLEEP_DURATION_MS).await;
     wait_for_sleep_item_started(&codex, SECOND_SLEEP_CALL_ID, SLEEP_DURATION_MS).await;
 
-    submit_queue_only_agent_mail(&codex, "new mailbox input").await;
+    codex
+        .submit(Op::InterAgentCommunication {
+            communication: InterAgentCommunication::new(
+                AgentPath::try_from("/root/worker").expect("worker path should parse"),
+                AgentPath::root(),
+                Vec::new(),
+                "new mailbox input".to_string(),
+                /*trigger_turn*/ false,
+            ),
+        })
+        .await
+        .expect("submit queue-only agent mail");
     wait_for_sleep_item_completed(&codex, SECOND_SLEEP_CALL_ID, SLEEP_DURATION_MS).await;
     wait_for_turn_complete(&codex).await;
 
@@ -1082,11 +1096,7 @@ async fn steered_user_input_follows_compact_when_only_the_steer_needs_follow_up(
 async fn steered_user_input_waits_when_tool_output_triggers_compact_before_next_request() {
     let (gate_first_completed_tx, gate_first_completed_rx) = oneshot::channel();
 
-    let large_output_command = if cfg!(windows) {
-        "[Console]::Out.Write([string]::new([char]'0', 40000))"
-    } else {
-        "printf '%040000d' 0"
-    };
+    let large_output_command = "[Console]::Out.Write([string]::new([char]'0', 40000))";
     let large_output_args = json!({
         "command": large_output_command,
         "login": false,

@@ -2,9 +2,9 @@ use super::PreviousSectionState;
 use super::WorldStateSection;
 use crate::agents_md::AgentsMdFreshness;
 use crate::agents_md::LoadedAgentsMd;
+use crate::agents_md::RepositoryStableContextBundle;
 use crate::context::ContextualUserFragment;
 use crate::context::UserInstructions;
-use codex_utils_path_uri::PathUri;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -39,13 +39,15 @@ impl AgentsMdState {
 
     pub(crate) fn new_cached(
         loaded: Option<&LoadedAgentsMd>,
-        active_cwd: &PathUri,
+        stable_context: Option<&RepositoryStableContextBundle>,
         freshness: AgentsMdFreshness,
     ) -> Self {
         Self::from_instructions(
             loaded.map(|loaded| {
-                let rendered = loaded.stable_context_bundle(active_cwd).rendered;
-                loaded.contextual_user_fragment_with_text(rendered.to_string())
+                let rendered = stable_context
+                    .map(|bundle| bundle.rendered.to_string())
+                    .unwrap_or_else(|| loaded.text());
+                loaded.contextual_user_fragment_with_text(rendered)
             }),
             freshness,
         )

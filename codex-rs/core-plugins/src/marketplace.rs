@@ -1,5 +1,7 @@
 use crate::manifest::PluginManifestInterface;
 use crate::manifest::load_plugin_manifest;
+use crate::marketplace_add::normalize_git_url;
+use crate::marketplace_add::normalize_github_shorthand_url;
 use codex_app_server_protocol::PluginAuthPolicy;
 use codex_app_server_protocol::PluginInstallPolicy;
 use codex_git_utils::get_git_repo_root;
@@ -88,7 +90,7 @@ impl MarketplacePluginManifestFallback {
     pub(crate) fn parse_for_listing(&self) -> Option<crate::manifest::PluginManifest> {
         // Materialized sources have no plugin root before install. Parse against a host-native
         // synthetic absolute root, then discard path-bearing fields so listings expose metadata only.
-        let plugin_root = Path::new(if cfg!(windows) { r"C:\" } else { "/" });
+        let plugin_root = Path::new(r"C:\");
         let mut manifest = crate::manifest::parse_plugin_manifest(
             plugin_root,
             &fallback_plugin_manifest_path(plugin_root),
@@ -522,7 +524,7 @@ fn resolve_marketplace_plugin_entry(
 
     let manifest = match &source {
         MarketplacePluginSource::Local { path } => {
-            if codex_utils_plugins::find_plugin_manifest_path(path.as_path()).is_some() {
+            if codex_plugin::find_plugin_manifest_path(path.as_path()).is_some() {
                 load_plugin_manifest(path.as_path())
             } else if manifest_fallback.has_metadata {
                 manifest_fallback.parse_for_plugin_root(path.as_path())
@@ -722,7 +724,7 @@ fn normalize_git_plugin_source_url(
         });
     }
     if url.starts_with("http://") || url.starts_with("https://") {
-        return Ok(normalize_github_git_url(url));
+        return Ok(normalize_git_url(url));
     }
     if url.starts_with("./")
         || url.starts_with("../")
@@ -888,45 +890,6 @@ fn normalize_optional_npm_source_field(
         });
     }
     Ok(Some(value.to_string()))
-}
-
-fn normalize_github_git_url(url: &str) -> String {
-    if url.starts_with("https://github.com/") && !url.ends_with(".git") {
-        format!("{url}.git")
-    } else {
-        url.to_string()
-    }
-}
-
-fn normalize_github_shorthand_url(source: &str) -> Option<String> {
-    if !looks_like_github_shorthand(source) {
-        return None;
-    }
-    let mut segments = source.split('/');
-    let owner = segments.next()?;
-    let repo = segments.next()?;
-    let repo = repo.strip_suffix(".git").unwrap_or(repo);
-    if repo.is_empty() {
-        return None;
-    }
-    Some(format!("https://github.com/{owner}/{repo}.git"))
-}
-
-fn looks_like_github_shorthand(source: &str) -> bool {
-    let mut segments = source.split('/');
-    let owner = segments.next();
-    let repo = segments.next();
-    let extra = segments.next();
-    owner.is_some_and(is_github_shorthand_segment)
-        && repo.is_some_and(is_github_shorthand_segment)
-        && extra.is_none()
-}
-
-fn is_github_shorthand_segment(segment: &str) -> bool {
-    !segment.is_empty()
-        && segment
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
 }
 
 pub fn plugin_interface_with_marketplace_category(

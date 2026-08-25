@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use codex_utils_absolute_path::is_windows_absolute_path;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppServerPath(String);
 
@@ -47,12 +49,15 @@ impl fmt::Display for AppServerPath {
     }
 }
 
-fn is_windows_absolute_path(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    (bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'\\' | b'/'))
-        || path.starts_with("\\\\")
-        || path.starts_with("//")
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn joins_forward_slash_unc_path_with_windows_separator() {
+        let path = AppServerPath::from_absolute_str("//server/share")
+            .expect("UNC path should be absolute");
+
+        assert_eq!(path.join("folder").as_str(), "//server/share\\folder");
+    }
 }

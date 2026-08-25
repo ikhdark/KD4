@@ -23,7 +23,7 @@ category = "callers_consumers"
 kind = "calls"
 target = "owner:core-agent-runtime"
 confidence = "compiler_resolved"
-evidence = [{ path = "codex-rs/app-server/src/lib.rs", symbol = "run_main_with_transport_options" }]
+evidence = [{ path = "codex-rs/app-server/src/lib.rs", symbol = "run_main" }]
 
 [[owners.relationships]]
 category = "runtime_registration"
@@ -43,7 +43,7 @@ evidence = [{ path = "codex-rs/app-server/tests", symbol = "integration suites" 
 id = "transport-dispatch-contract"
 kind = "compatibility"
 statement = "Every enabled app-server transport enters the shared runtime and preserves protocol-compatible request dispatch."
-evidence = [{ path = "codex-rs/app-server/src/lib.rs", symbol = "run_main_with_transport_options" }]
+evidence = [{ path = "codex-rs/app-server/src/lib.rs", symbol = "run_main" }]
 tests = ["codex-rs/app-server/tests"]
 
 [[owners.validation]]
@@ -102,7 +102,7 @@ id = "core-agent-runtime"
 concern_ids = ["agent-loop", "tool-runtime", "session"]
 aliases = ["agent runtime", "core session"]
 phrases = ["codex agent loop runtime"]
-roots = ["codex-rs/core/src"]
+roots = ["codex-rs/core/src", "codex-rs/core/tests", "codex-rs/core/benches"]
 primary_entries = [{ path = "codex-rs/core/src/session/mod.rs", symbol = "Codex" }]
 instructions = ["AGENTS.md", "codex-rs/AGENTS.md"]
 consumers = ["codex-rs/cli"]
@@ -157,20 +157,13 @@ roots = ["codex-rs/features"]
 primary_entries = [{ path = "codex-rs/features/src/lib.rs", symbol = "Feature" }]
 instructions = ["AGENTS.md", "codex-rs/AGENTS.md"]
 consumers = ["codex-rs/core/src/config/managed_features.rs"]
-contracts = ["kd4_features.toml"]
+contracts = []
 generated_mirrors = []
 tests = ["codex-rs/features/src/tests.rs"]
 
 [owners.facet_exclusions]
 control_and_data_flow = "This owner defines feature identity and defaults; runtime behavior is controlled by consuming owners."
 generated_artifacts = "The feature registry is source-backed and has no checked-in generated mirror."
-
-[[owners.relationships]]
-category = "configuration"
-kind = "reads_config"
-target = "config:kd4_features.toml"
-confidence = "manifest_derived"
-evidence = [{ path = "codex-rs/features/src/lib.rs", symbol = "Feature" }]
 
 [[owners.relationships]]
 category = "callers_consumers"
@@ -193,17 +186,311 @@ argv = ["just", "test-fast", "-p", "codex-features"]
 role = "focused_tests"
 
 [[owners]]
+id = "kd4-capability-manifest"
+concern_ids = ["kd4-capabilities", "implementation-lifecycle", "static-reachability"]
+aliases = ["KD4 feature manifest", "capability inventory"]
+phrases = ["declared KD4 capability ownership and implementation evidence"]
+roots = ["kd4_features.toml", "scripts/check_kd4_features.py"]
+primary_entries = [{ path = "scripts/check_kd4_features.py", symbol = "validate_manifest" }]
+instructions = ["AGENTS.md", "scripts/AGENTS.md"]
+consumers = ["scripts/kd4_perf_snapshot.py"]
+contracts = ["kd4_features.toml"]
+generated_mirrors = []
+tests = ["scripts/test_check_kd4_features.py"]
+
+[owners.facet_exclusions]
+control_and_data_flow = "The checker validates a declarative inventory; individual capability runtime flows remain with their implementation owners."
+generated_artifacts = "The capability inventory is authored source and has no checked-in generated mirror."
+
+[[owners.relationships]]
+category = "configuration"
+kind = "reads_config"
+target = "config:kd4_features.toml"
+confidence = "compiler_resolved"
+evidence = [{ path = "scripts/check_kd4_features.py", symbol = "DEFAULT_MANIFEST" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:scripts/kd4_perf_snapshot.py"
+confidence = "compiler_resolved"
+evidence = [{ path = "scripts/kd4_perf_snapshot.py", symbol = "check_kd4_features.py" }]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:justfile"
+confidence = "declared"
+evidence = [{ path = "justfile", symbol = "check-kd4-features" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:scripts/test_check_kd4_features.py"
+confidence = "declared"
+evidence = [{ path = "scripts/test_check_kd4_features.py", symbol = "FeatureManifestTest" }]
+
+[[owners.invariants]]
+id = "capability-evidence-reachability"
+kind = "semantic"
+statement = "Every declared KD4 capability has valid lifecycle metadata and repository-contained evidence, while optional runtime feature links resolve against the canonical Rust feature registry."
+evidence = [{ path = "scripts/check_kd4_features.py", symbol = "validate_manifest" }]
+tests = ["scripts/test_check_kd4_features.py"]
+
+[[owners.validation]]
+id = "kd4-capability-manifest-focused"
+cwd = "."
+argv = ["python", "-m", "unittest", "scripts.test_check_kd4_features"]
+role = "focused_tests"
+
+[[owners]]
+id = "code-mode-protocol-contracts"
+concern_ids = ["code-mode", "tool-description", "nested-tool-protocol"]
+aliases = ["code mode protocol", "code mode tool contract"]
+phrases = ["code mode nested tool description and host protocol"]
+roots = ["codex-rs/code-mode-protocol"]
+primary_entries = [{ path = "codex-rs/code-mode-protocol/src/lib.rs", symbol = "build_exec_tool_description" }]
+instructions = ["AGENTS.md", "codex-rs/AGENTS.md"]
+consumers = ["codex-rs/code-mode-host"]
+contracts = ["codex-rs/code-mode-protocol/src/description.rs"]
+generated_mirrors = []
+tests = ["codex-rs/code-mode-protocol/src/description.rs", "codex-rs/code-mode-protocol/src/host/host_tests.rs"]
+
+[owners.facet_exclusions]
+configuration_and_gates = "Code-mode protocol behavior is selected by its callers rather than repository configuration owned by this crate."
+generated_artifacts = "Tool declarations are rendered at runtime and have no checked-in generated mirror."
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:codex-rs/code-mode-host"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/code-mode-host/src/lib.rs", symbol = "codex_code_mode_protocol" }]
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:codex-rs/code-mode-protocol/src/description.rs"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/code-mode-protocol/src/lib.rs", symbol = "build_exec_tool_description" }]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:codex-rs/code-mode-protocol/src/lib.rs"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/code-mode-protocol/src/lib.rs", symbol = "build_exec_tool_description" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:codex-rs/code-mode-protocol/src/description.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/code-mode-protocol/src/description.rs", symbol = "tests" }]
+
+[[owners.invariants]]
+id = "code-mode-description-contract"
+kind = "compatibility"
+statement = "Rendered code-mode tool descriptions preserve callable names, schemas, runtime metadata, and bounded lazy-discovery guidance consumed by the host and core runtime."
+evidence = [{ path = "codex-rs/code-mode-protocol/src/description.rs", symbol = "build_exec_tool_description" }]
+tests = ["codex-rs/code-mode-protocol/src/description.rs"]
+
+[[owners.validation]]
+id = "code-mode-protocol-focused"
+cwd = "codex-rs"
+argv = ["cargo", "test", "-p", "codex-code-mode-protocol"]
+role = "focused_tests"
+
+[[owners]]
+id = "model-catalog-runtime"
+concern_ids = ["model-catalog", "model-instructions", "model-metadata"]
+aliases = ["models manager", "model prompt catalog"]
+phrases = ["resolved model metadata and base instructions"]
+roots = ["codex-rs/models-manager"]
+primary_entries = [{ path = "codex-rs/models-manager/src/manager.rs", symbol = "ModelsManager" }]
+instructions = ["AGENTS.md", "codex-rs/AGENTS.md"]
+consumers = ["codex-rs/core"]
+contracts = ["codex-rs/models-manager/src/prompt_resolver.rs", "codex-rs/models-manager/src/model_info.rs"]
+generated_mirrors = []
+tests = ["codex-rs/models-manager/src/prompt_contract_tests.rs", "codex-rs/models-manager/src/prompt_resolver.rs", "codex-rs/models-manager/src/model_info_tests.rs", "codex-rs/models-manager/src/manager_tests.rs"]
+
+[owners.facet_exclusions]
+configuration_and_gates = "Model metadata and local prompt overrides are resolved by the manager; remote model availability configuration is outside this owner."
+generated_artifacts = "Local prompt overrides are authored Rust inputs rather than generated artifacts."
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "owner:core-agent-runtime"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/core/src/config/mod.rs", symbol = "ModelsManagerConfig" }]
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:codex-rs/models-manager/src/model_info.rs"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/models-manager/src/manager.rs", symbol = "ModelsManager" }]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "constructs"
+target = "path:codex-rs/models-manager/src/manager.rs"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/core/src/session/mod.rs", symbol = "SharedModelsManager" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:codex-rs/models-manager/src/prompt_contract_tests.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/models-manager/src/prompt_contract_tests.rs", symbol = "resolved_prompts_satisfy_named_contract_registry" }]
+
+[[owners.invariants]]
+id = "model-instruction-resolution"
+kind = "semantic"
+statement = "Each resolved model receives the intended base instructions and metadata without duplicating or dropping prompt contracts across local and remote catalog paths."
+evidence = [{ path = "codex-rs/models-manager/src/model_info.rs", symbol = "model_info_from_slug" }, { path = "codex-rs/models-manager/src/prompt_resolver.rs" }]
+tests = ["codex-rs/models-manager/src/prompt_contract_tests.rs", "codex-rs/models-manager/src/prompt_resolver.rs", "codex-rs/models-manager/src/model_info_tests.rs", "codex-rs/models-manager/src/manager_tests.rs"]
+
+[[owners.validation]]
+id = "models-manager-focused"
+cwd = "codex-rs"
+argv = ["cargo", "test", "-p", "codex-models-manager"]
+role = "focused_tests"
+
+[[owners]]
+id = "shared-protocol-contracts"
+concern_ids = ["shared-protocol", "rollout-compatibility", "base-instructions"]
+aliases = ["codex protocol", "shared wire protocol"]
+phrases = ["shared protocol types and persisted session compatibility"]
+roots = ["codex-rs/protocol"]
+primary_entries = [{ path = "codex-rs/protocol/src/lib.rs", symbol = "protocol" }]
+instructions = ["AGENTS.md", "codex-rs/AGENTS.md", "codex-rs/protocol/AGENTS.md"]
+consumers = ["codex-rs/core", "codex-rs/cli", "codex-rs/app-server", "codex-rs/app-server-protocol"]
+contracts = ["codex-rs/protocol/src/protocol.rs", "codex-rs/protocol/src/models.rs"]
+generated_mirrors = []
+tests = ["codex-rs/protocol/src"]
+
+[owners.facet_exclusions]
+configuration_and_gates = "Shared protocol shape is a compatibility boundary and is not selected by a repository feature gate owned here."
+generated_artifacts = "App-server schema mirrors are owned separately by app-server-protocol-contracts."
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "owner:core-agent-runtime"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/core/src/lib.rs", symbol = "codex_protocol" }]
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "consumed_by"
+target = "owner:app-server-runtime"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/app-server/src", symbol = "codex_protocol" }]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:codex-rs/protocol/src/lib.rs"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/protocol/src/lib.rs" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:codex-rs/protocol/src"
+confidence = "declared"
+evidence = [{ path = "codex-rs/protocol/src", symbol = "crate tests" }]
+
+[[owners.invariants]]
+id = "shared-protocol-compatibility"
+kind = "compatibility"
+statement = "Shared wire types, base instructions, rollouts, and stored-session representations remain compatible across core, CLI, app-server, and protocol consumers."
+evidence = [{ path = "codex-rs/protocol/src/protocol.rs" }, { path = "codex-rs/protocol/src/models.rs", symbol = "BASE_INSTRUCTIONS_DEFAULT" }]
+tests = ["codex-rs/protocol/src"]
+
+[[owners.validation]]
+id = "protocol-focused"
+cwd = "codex-rs"
+argv = ["cargo", "nextest", "run", "-p", "codex-protocol"]
+role = "focused_tests"
+
+[[owners]]
+id = "shared-utility-crates"
+concern_ids = ["shared-utilities", "build-metadata", "certificate-parsing"]
+aliases = ["codex utility crates", "shared low-level helpers"]
+phrases = ["single-purpose utilities shared across runtime domains"]
+roots = ["codex-rs/utils"]
+primary_entries = [
+    { path = "codex-rs/utils/build-info/src/lib.rs", symbol = "BuildInfo" },
+    { path = "codex-rs/utils/der/src/lib.rs", symbol = "first_der_item" },
+]
+instructions = ["AGENTS.md", "codex-rs/AGENTS.md"]
+consumers = ["codex-rs/cli", "codex-rs/app-server", "codex-rs/http-client", "codex-rs/network-proxy", "codex-rs/core"]
+contracts = ["codex-rs/utils/build-info/src/lib.rs", "codex-rs/utils/der/src/lib.rs"]
+generated_mirrors = []
+tests = ["codex-rs/utils/build-info/src/lib.rs", "codex-rs/utils/der/src/lib.rs"]
+
+[owners.facet_exclusions]
+configuration_and_gates = "Utility behavior is selected through typed crate dependencies rather than repository feature gates."
+generated_artifacts = "These utility crates are authored source and do not own generated mirrors."
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "consumed_by"
+target = "owner:cli-entrypoints"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/cli/src/doctor/runtime.rs", symbol = "BuildInfo" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "owner:app-server-runtime"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/app-server/src/build_info.rs", symbol = "BuildInfo" }]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:codex-rs/Cargo.toml"
+confidence = "manifest_derived"
+evidence = [{ path = "codex-rs/Cargo.toml", symbol = "workspace.dependencies" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:codex-rs/utils"
+confidence = "declared"
+evidence = [{ path = "codex-rs/utils/build-info/src/lib.rs", symbol = "tests" }, { path = "codex-rs/utils/der/src/lib.rs", symbol = "tests" }]
+
+[[owners.invariants]]
+id = "shared-utility-single-source"
+kind = "semantic"
+statement = "Cross-domain build metadata and DER boundary parsing each have one typed implementation and one directly owned unit-test contract."
+evidence = [{ path = "codex-rs/utils/build-info/src/lib.rs", symbol = "BuildInfo" }, { path = "codex-rs/utils/der/src/lib.rs", symbol = "first_der_item" }]
+tests = ["codex-rs/utils/build-info/src/lib.rs", "codex-rs/utils/der/src/lib.rs"]
+
+[[owners.validation]]
+id = "shared-utilities-focused"
+cwd = "codex-rs"
+argv = ["cargo", "test", "-p", "codex-utils-build-info", "-p", "codex-utils-der"]
+role = "focused_tests"
+
+[[owners]]
 id = "planning-architecture-runtime"
-concern_ids = ["planning", "task-evidence", "validation-route"]
-aliases = ["update plan runtime", "task evidence planning"]
+concern_ids = ["planning", "plan-store", "validation-route"]
+aliases = ["update plan runtime", "durable plan store"]
 phrases = ["durable plan state and validation before implementation"]
-roots = ["codex-rs/core/src/tools/handlers", "codex-rs/core/src/session", "codex-rs/core/src/task_evidence.rs"]
+roots = ["codex-rs/core/src/plan_store.rs", "codex-rs/core/src/tools/handlers/plan.rs", "codex-rs/core/src/tools/handlers/plan_tests.rs", "codex-rs/core/src/tools/spec_plan.rs", "codex-rs/core/src/session/reasoning_governor.rs"]
 primary_entries = [
     { path = "codex-rs/core/src/tools/handlers/plan.rs", symbol = "PlanHandler" },
+    { path = "codex-rs/core/src/plan_store.rs", symbol = "PlanStore" },
 ]
 instructions = ["AGENTS.md", "codex-rs/AGENTS.md", "codex-rs/core/AGENTS.md"]
-consumers = ["codex-rs/core/src/session/reasoning_governor.rs"]
-contracts = ["codex-rs/core/src/task_evidence.rs"]
+consumers = ["codex-rs/core/src/task_evidence.rs", "codex-rs/core/src/session/reasoning_governor.rs"]
+contracts = ["codex-rs/core/src/plan_store.rs", "codex-rs/core/src/tools/handlers/plan.rs"]
 generated_mirrors = []
 tests = ["codex-rs/core/src/tools/handlers/plan_tests.rs"]
 
@@ -253,6 +540,65 @@ argv = ["cargo", "test", "-p", "codex-core", "tools::handlers::plan_tests"]
 role = "focused_tests"
 
 [[owners]]
+id = "task-evidence-runtime"
+concern_ids = ["task-evidence", "completion-gate", "validation-receipts"]
+feature_ids = ["task-evidence-completion-gate"]
+aliases = ["task evidence ledger", "completion evidence"]
+phrases = ["durable task evidence and completion admission"]
+roots = ["codex-rs/core/src/task_evidence.rs", "codex-rs/core/src/task_evidence"]
+primary_entries = [{ path = "codex-rs/core/src/task_evidence.rs", symbol = "TaskEvidenceLedger" }]
+instructions = ["AGENTS.md", "codex-rs/AGENTS.md", "codex-rs/core/AGENTS.md"]
+consumers = ["codex-rs/core/src/session", "codex-rs/core/src/tools/handlers/mcp.rs", "codex-rs/core/src/codex_thread.rs"]
+contracts = ["codex-rs/core/src/task_evidence/desktop_activation.rs", "codex-rs/core/src/task_evidence/external_evidence.rs", "codex-rs/core/src/task_evidence/source_owner_index.rs"]
+generated_mirrors = []
+tests = ["codex-rs/core/src/task_evidence_tests.rs"]
+
+[owners.facet_exclusions]
+configuration_and_gates = "KD4 completion evidence is activated by repository identity rather than a user-selectable feature gate."
+generated_artifacts = "Evidence documents and oversized payload artifacts are runtime state under CODEX_HOME, not checked-in generated mirrors."
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "owner:planning-architecture-runtime"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/core/src/task_evidence.rs", symbol = "TaskEvidenceLedger::record_planning_update" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:codex-rs/core/src/tools/handlers/mcp.rs"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/core/src/tools/handlers/mcp.rs", symbol = "McpHandler::handle_call" }]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "constructs"
+target = "path:codex-rs/core/src/session/session.rs"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/core/src/session/session.rs", symbol = "TaskEvidenceLedger::load_or_new" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:codex-rs/core/src/task_evidence_tests.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/core/src/task_evidence_tests.rs", symbol = "source_owner_is_derived_from_implementation_surfaces" }]
+
+[[owners.invariants]]
+id = "current-evidence-completion"
+kind = "semantic"
+statement = "Completion admission uses current, repository-contained evidence and reopens after relevant mutations or stale validation."
+evidence = [{ path = "codex-rs/core/src/task_evidence.rs", symbol = "TaskEvidenceLedger::completion_gate" }]
+tests = ["codex-rs/core/src/task_evidence_tests.rs"]
+
+[[owners.validation]]
+id = "task-evidence-focused"
+cwd = "codex-rs"
+argv = ["cargo", "test", "-p", "codex-core", "task_evidence_tests"]
+role = "focused_tests"
+
+[[owners]]
 id = "source-owner-index"
 concern_ids = ["repository-map", "relationship-index", "architecture-slice"]
 aliases = ["source owner registry", "architecture index"]
@@ -263,7 +609,7 @@ instructions = ["AGENTS.md", "scripts/AGENTS.md"]
 consumers = ["SOURCEMAP.md", "architecture_index.json"]
 contracts = ["source_owners.toml"]
 generated_mirrors = ["SOURCEMAP.md", "architecture_index.json"]
-tests = ["scripts/test_source_owners.py", "scripts/test_architecture_comprehension_eval.py"]
+tests = ["scripts/test_source_owners.py"]
 
 [[owners.relationships]]
 category = "control_flow"
@@ -317,7 +663,7 @@ tests = ["scripts/test_source_owners.py"]
 [[owners.validation]]
 id = "source-owner-focused"
 cwd = "."
-argv = ["python", "-m", "unittest", "scripts.test_source_owners", "scripts.test_architecture_comprehension_eval"]
+argv = ["python", "-m", "unittest", "scripts.test_source_owners"]
 role = "focused_tests"
 
 [[owners]]
@@ -433,7 +779,7 @@ tests = ["codex-rs/core/src/tools/command_output_artifact_tests.rs"]
 [[owners.validation]]
 id = "tool-output-focused"
 cwd = "codex-rs"
-argv = ["cargo", "test", "-p", "codex-core", "command_output_artifact_tests"]
+argv = ["cargo", "test", "-p", "codex-core", "tools::command_output_artifact::hardening_tests"]
 role = "focused_tests"
 
 [[owners]]
@@ -501,47 +847,59 @@ argv = ["python", "scripts/app_server_schema_runtime_check.py", "--mode", "check
 role = "generated_contract_check"
 
 [[owners]]
-id = "semantic-quality-gate"
-concern_ids = ["agent-quality-gate", "semantic-contracts", "validation-admission"]
-aliases = ["kda configuration", "agent semantic gate"]
-phrases = ["autonomous change semantic quality gate"]
-roots = ["codex-rs/kda.toml"]
-primary_entries = [{ path = "codex-rs/kda.toml", symbol = "version" }]
-instructions = ["AGENTS.md", "codex-rs/AGENTS.md"]
-consumers = []
-contracts = ["codex-rs/kda.toml"]
+id = "rust-turn-latency-benchmark"
+concern_ids = ["turn-latency", "code-mode-capture", "synthetic-non-inferiority"]
+aliases = ["Rust turn latency benchmark", "turn_latency bench"]
+phrases = ["single-build code-mode capture and synthetic latency comparison"]
+roots = ["codex-rs/core/benches/turn_latency.rs", "codex-rs/core/tests/turn_latency_bench.rs"]
+primary_entries = [{ path = "codex-rs/core/benches/turn_latency.rs", symbol = "main", ambiguous = true }]
+instructions = ["AGENTS.md", "codex-rs/AGENTS.md", "codex-rs/core/AGENTS.md"]
+consumers = ["codex-rs/core/Cargo.toml"]
+contracts = ["codex-rs/core/benches/turn_latency.rs"]
 generated_mirrors = []
-tests = []
+tests = ["codex-rs/core/tests/turn_latency_bench.rs"]
 
 [owners.facet_exclusions]
-control_and_data_flow = "This owner is declarative admission policy evaluated by the external cargo-kda analyzer rather than a KD4 runtime flow."
-callers_and_consumers = "The configuration is consumed by the external cargo-kda entrypoint, which is not source-owned in this repository."
-registration_and_entrypoints = "Cargo discovers the external cargo-kda subcommand; KD4 has no in-repository runtime registration point."
-generated_artifacts = "The quality-gate configuration is authored source and has no generated mirror."
+configuration_and_gates = "The benchmark command selects a workflow directly; no repository feature or configuration file owns that selection."
+generated_artifacts = "Serialized reports are local runtime outputs rather than checked-in generated mirrors."
 
 [[owners.relationships]]
-category = "configuration"
-kind = "gated_by"
-target = "config:codex-rs/kda.toml"
-confidence = "manifest_derived"
-evidence = [{ path = "codex-rs/kda.toml", symbol = "architecture-gate" }]
+category = "control_flow"
+kind = "calls"
+target = "owner:core-agent-runtime"
+confidence = "declared"
+evidence = [{ path = "codex-rs/core/benches/turn_latency.rs", symbol = "run_code_mode_capture" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:codex-rs/core/Cargo.toml"
+confidence = "declared"
+evidence = [{ path = "codex-rs/core/Cargo.toml", symbol = "[[bench]] turn_latency" }]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:codex-rs/core/Cargo.toml"
+confidence = "declared"
+evidence = [{ path = "codex-rs/core/Cargo.toml", symbol = "[[bench]] turn_latency" }]
 
 [[owners.relationships]]
 category = "tests_contracts"
 kind = "validated_by"
-target = "path:codex-rs/kda.toml"
+target = "path:codex-rs/core/benches/turn_latency.rs"
 confidence = "declared"
-evidence = [{ path = "codex-rs/kda.toml", symbol = "version" }]
+evidence = [{ path = "codex-rs/core/tests/turn_latency_bench.rs", symbol = "include" }]
 
 [[owners.invariants]]
-id = "source-bound-agent-admission"
+id = "separate-capture-and-comparison-verdicts"
 kind = "semantic"
-statement = "Autonomous changes cannot pass on unowned impact, incomplete consequence closure, or validation evidence from a different source, profile, architecture, dependency, command, target, or test selection."
-evidence = [{ path = "codex-rs/kda.toml", symbol = "architecture-gate" }]
-tests = []
+statement = "Code-mode capture emits one-build raw samples and a nested-dispatch quality verdict, while synthetic reports alone emit local baseline/candidate non-inferiority verdicts."
+evidence = [{ path = "codex-rs/core/benches/turn_latency.rs", symbol = "BenchmarkCommand" }]
+tests = ["codex-rs/core/tests/turn_latency_bench.rs"]
 
 [[owners.validation]]
-id = "kda-config-syntax"
-cwd = "."
-argv = ["python", "-c", "import pathlib,tomllib; tomllib.loads(pathlib.Path('codex-rs/kda.toml').read_text())"]
-role = "configuration_check"
+id = "rust-turn-latency-focused"
+cwd = "codex-rs"
+argv = ["cargo", "test", "-p", "codex-core", "--test", "turn_latency_bench", "code_mode_capture_report_has_no_local_ab_gate"]
+role = "focused_tests"

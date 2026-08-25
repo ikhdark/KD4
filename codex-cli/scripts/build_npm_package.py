@@ -13,56 +13,29 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 CODEX_CLI_ROOT = SCRIPT_DIR.parent
 REPO_ROOT = CODEX_CLI_ROOT.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.codex_package.targets import NPM_TARGETS  # noqa: E402
+
 RESPONSES_API_PROXY_NPM_ROOT = REPO_ROOT / "codex-rs" / "responses-api-proxy" / "npm"
 CODEX_SDK_ROOT = REPO_ROOT / "sdk" / "typescript"
 CODEX_NPM_NAME = "@openai/codex"
 CODEX_PACKAGE_COMPONENT = "codex-package"
 
-# `npm_name` is the local optional-dependency alias consumed by `bin/codex.js`.
-# The underlying package published to npm is always `@openai/codex`.
+# Derived adapter for the staging API. Canonical target metadata lives in
+# scripts/codex_package/targets.py.
 CODEX_PLATFORM_PACKAGES: dict[str, dict[str, str]] = {
-    "codex-linux-x64": {
-        "npm_name": "@openai/codex-linux-x64",
-        "npm_tag": "linux-x64",
-        "target_triple": "x86_64-unknown-linux-musl",
-        "os": "linux",
-        "cpu": "x64",
-    },
-    "codex-linux-arm64": {
-        "npm_name": "@openai/codex-linux-arm64",
-        "npm_tag": "linux-arm64",
-        "target_triple": "aarch64-unknown-linux-musl",
-        "os": "linux",
-        "cpu": "arm64",
-    },
-    "codex-darwin-x64": {
-        "npm_name": "@openai/codex-darwin-x64",
-        "npm_tag": "darwin-x64",
-        "target_triple": "x86_64-apple-darwin",
-        "os": "darwin",
-        "cpu": "x64",
-    },
-    "codex-darwin-arm64": {
-        "npm_name": "@openai/codex-darwin-arm64",
-        "npm_tag": "darwin-arm64",
-        "target_triple": "aarch64-apple-darwin",
-        "os": "darwin",
-        "cpu": "arm64",
-    },
-    "codex-win32-x64": {
-        "npm_name": "@openai/codex-win32-x64",
-        "npm_tag": "win32-x64",
-        "target_triple": "x86_64-pc-windows-msvc",
-        "os": "win32",
-        "cpu": "x64",
-    },
-    "codex-win32-arm64": {
-        "npm_name": "@openai/codex-win32-arm64",
-        "npm_tag": "win32-arm64",
-        "target_triple": "aarch64-pc-windows-msvc",
-        "os": "win32",
-        "cpu": "arm64",
-    },
+    target.package: {
+        "npm_name": target.npm_name,
+        "npm_tag": target.npm_tag,
+        "target_triple": target_triple,
+        "os": target.node_platform,
+        "cpu": target.node_arch,
+        "platform_key": target.node_platform_key,
+        "executable_name": target.executable_name,
+    }
+    for target_triple, target in NPM_TARGETS.items()
 }
 
 PACKAGE_EXPANSIONS: dict[str, list[str]] = {
@@ -71,12 +44,10 @@ PACKAGE_EXPANSIONS: dict[str, list[str]] = {
 
 PACKAGE_NATIVE_COMPONENTS: dict[str, list[str]] = {
     "codex": [],
-    "codex-linux-x64": [CODEX_PACKAGE_COMPONENT],
-    "codex-linux-arm64": [CODEX_PACKAGE_COMPONENT],
-    "codex-darwin-x64": [CODEX_PACKAGE_COMPONENT],
-    "codex-darwin-arm64": [CODEX_PACKAGE_COMPONENT],
-    "codex-win32-x64": [CODEX_PACKAGE_COMPONENT],
-    "codex-win32-arm64": [CODEX_PACKAGE_COMPONENT],
+    **{
+        package_name: [CODEX_PACKAGE_COMPONENT]
+        for package_name in CODEX_PLATFORM_PACKAGES
+    },
     "codex-responses-api-proxy": ["codex-responses-api-proxy"],
     "codex-sdk": [],
 }
@@ -276,6 +247,7 @@ def stage_sources(staging_dir: Path, version: str, package: str) -> None:
         with open(package_json_path, "r", encoding="utf-8") as fh:
             package_json = json.load(fh)
         package_json["version"] = version
+        package_json["os"] = ["win32"]
 
     if package == "codex-sdk":
         scripts = package_json.get("scripts")
@@ -304,6 +276,15 @@ def build_codex_package_json(version: str) -> dict:
         package_json = json.load(fh)
     package_json["version"] = version
     package_json["files"] = ["bin/codex.js"]
+    package_json["os"] = ["win32"]
+    package_json["codexNativeTargets"] = {
+        platform_package["platform_key"]: {
+            "targetTriple": platform_package["target_triple"],
+            "package": platform_package["npm_name"],
+            "binary": platform_package["executable_name"],
+        }
+        for platform_package in CODEX_PLATFORM_PACKAGES.values()
+    }
     package_json["optionalDependencies"] = {
         CODEX_PLATFORM_PACKAGES[platform_package]["npm_name"]: (
             f"npm:{CODEX_NPM_NAME}@"
@@ -319,15 +300,11 @@ def build_platform_package_json(version: str, platform_package: dict[str, str]) 
     with open(CODEX_CLI_ROOT / "package.json", "r", encoding="utf-8") as fh:
         codex_package_json = json.load(fh)
 
-    supported_os = [platform_package["os"]]
-    if platform_package["os"] == "linux":
-        supported_os.append("android")
-
-    package_json = {
+        package_json = {
         "name": CODEX_NPM_NAME,
         "version": version,
         "license": codex_package_json.get("license", "Apache-2.0"),
-        "os": supported_os,
+            "os": [platform_package["os"]],
         "cpu": [platform_package["cpu"]],
         "files": ["vendor"],
         "repository": codex_package_json.get("repository"),
@@ -389,6 +366,11 @@ def copy_native_binaries(
         if not target_dir.is_dir():
             continue
 
+        if "windows" not in target_dir.name:
+            raise RuntimeError(
+                f"Unsupported non-Windows native target in vendor source: {target_dir.name}"
+            )
+
         if target_filter is not None and target_dir.name not in target_filter:
             continue
 
@@ -397,8 +379,7 @@ def copy_native_binaries(
         dest_target_dir = vendor_dest / target_dir.name
 
         if CODEX_PACKAGE_COMPONENT in components_set:
-            codex_name = "codex.exe" if "windows" in target_dir.name else "codex"
-            codex_path = target_dir / "bin" / codex_name
+            codex_path = target_dir / "bin" / "codex.exe"
             if not codex_path.is_file():
                 raise RuntimeError(
                     f"Missing Codex executable for {target_dir.name}: {codex_path}"

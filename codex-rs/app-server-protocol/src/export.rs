@@ -17,6 +17,7 @@ use crate::protocol::common::EXPERIMENTAL_CLIENT_METHODS;
 use crate::protocol::common::EXPERIMENTAL_SERVER_METHOD_PARAM_TYPES;
 use crate::protocol::common::EXPERIMENTAL_SERVER_METHOD_RESPONSE_TYPES;
 use crate::protocol::common::EXPERIMENTAL_SERVER_METHODS;
+use crate::protocol::common::SERVER_NOTIFICATION_METADATA;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -55,13 +56,13 @@ const SPECIAL_DEFINITIONS: &[&str] = &[
     "ServerNotification",
     "ServerRequest",
 ];
-const FLAT_V2_SHARED_DEFINITIONS: &[&str] = &["ClientRequest", "ServerNotification"];
+const FLAT_V2_SHARED_DEFINITIONS: &[&str] =
+    &["ClientRequest", "OverloadErrorData", "ServerNotification"];
 const V1_CLIENT_REQUEST_METHODS: &[&str] =
     &["getConversationSummary", "gitDiffToRemote", "getAuthStatus"];
-const EXCLUDED_SERVER_NOTIFICATION_METHODS_FOR_JSON: &[&str] = &["rawResponseItem/completed"];
 
 #[derive(Clone)]
-pub struct GeneratedSchema {
+pub(crate) struct GeneratedSchema {
     namespace: Option<String>,
     logical_name: String,
     value: Value,
@@ -83,11 +84,6 @@ impl GeneratedSchema {
 }
 
 type JsonSchemaEmitter = fn(&Path) -> Result<GeneratedSchema>;
-pub fn generate_types(out_dir: &Path, prettier: Option<&Path>) -> Result<()> {
-    generate_ts(out_dir, prettier)?;
-    generate_json(out_dir)?;
-    Ok(())
-}
 
 #[derive(Clone, Copy, Debug)]
 pub struct GenerateTsOptions {
@@ -108,10 +104,6 @@ impl Default for GenerateTsOptions {
     }
 }
 
-pub fn generate_ts(out_dir: &Path, prettier: Option<&Path>) -> Result<()> {
-    generate_ts_with_options(out_dir, prettier, GenerateTsOptions::default())
-}
-
 pub fn generate_ts_with_options(
     out_dir: &Path,
     prettier: Option<&Path>,
@@ -128,6 +120,10 @@ pub fn generate_ts_with_options(
     ServerRequest::export_all_to(out_dir)?;
     export_server_responses(out_dir)?;
     ServerNotification::export_all_to(out_dir)?;
+
+    crate::OverloadErrorData::export_all_to(out_dir)?;
+    crate::PluginRemoteErrorData::export_all_to(out_dir)?;
+    crate::ThreadErrorData::export_all_to(out_dir)?;
 
     if !options.experimental_api {
         filter_experimental_ts(out_dir)?;
@@ -189,10 +185,6 @@ pub fn generate_ts_with_options(
     Ok(())
 }
 
-pub fn generate_json(out_dir: &Path) -> Result<()> {
-    generate_json_with_experimental(out_dir, /*experimental_api*/ false)
-}
-
 pub fn generate_internal_json_schema(out_dir: &Path) -> Result<()> {
     ensure_dir(out_dir)?;
     write_json_schema::<RolloutLine>(out_dir, "RolloutLine")?;
@@ -209,6 +201,14 @@ pub fn generate_json_with_experimental(out_dir: &Path, experimental_api: bool) -
         |d| write_json_schema_with_return::<crate::JSONRPCResponse>(d, "JSONRPCResponse"),
         |d| write_json_schema_with_return::<crate::JSONRPCError>(d, "JSONRPCError"),
         |d| write_json_schema_with_return::<crate::JSONRPCErrorError>(d, "JSONRPCErrorError"),
+        |d| write_json_schema_with_return::<crate::OverloadErrorData>(d, "OverloadErrorData"),
+        |d| {
+            write_json_schema_with_return::<crate::PluginRemoteErrorData>(
+                d,
+                "v2::PluginRemoteErrorData",
+            )
+        },
+        |d| write_json_schema_with_return::<crate::ThreadErrorData>(d, "v2::ThreadErrorData"),
         |d| write_json_schema_with_return::<crate::ClientRequest>(d, "ClientRequest"),
         |d| write_json_schema_with_return::<crate::ServerRequest>(d, "ServerRequest"),
         |d| write_json_schema_with_return::<crate::ClientNotification>(d, "ClientNotification"),
@@ -1386,9 +1386,10 @@ fn strip_v1_client_request_variants_from_json_schema(schema: &mut Value) {
 }
 
 fn strip_v1_server_notification_variants_from_json_schema(schema: &mut Value) {
-    let methods: HashSet<&str> = EXCLUDED_SERVER_NOTIFICATION_METHODS_FOR_JSON
+    let methods: HashSet<&str> = SERVER_NOTIFICATION_METADATA
         .iter()
-        .copied()
+        .filter(|metadata| metadata.json_export_excluded)
+        .map(|metadata| metadata.method)
         .collect();
     strip_method_variants_from_json_schema(schema, &methods);
 }
@@ -2950,6 +2951,10 @@ permissionProfile?: string | null};
         .map(str::to_string)
         .collect();
         assert_eq!(missing_server_notification_methods, Vec::<String>::new());
+        assert_eq!(
+            server_notification_methods.contains("rawResponseItem/completed"),
+            false
+        );
         assert_eq!(definitions.contains_key("EventMsg"), false);
         assert_eq!(
             output_dir

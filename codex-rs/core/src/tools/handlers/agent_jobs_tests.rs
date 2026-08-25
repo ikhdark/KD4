@@ -334,6 +334,22 @@ async fn wait_for_status_change_blocks_after_non_final_update_is_consumed() {
 }
 
 #[tokio::test]
+async fn atomic_csv_write_replaces_existing_destination() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let output_path = tempdir.path().join("output.csv");
+    std::fs::write(&output_path, "old contents").expect("seed destination");
+
+    write_job_csv_atomically(output_path.clone(), "header\nnew value\n".to_string())
+        .await
+        .expect("replace destination atomically");
+
+    assert_eq!(
+        std::fs::read_to_string(output_path).expect("read replaced destination"),
+        "header\nnew value\n"
+    );
+}
+
+#[tokio::test]
 async fn atomic_csv_write_failure_leaves_no_partial_destination() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
     let output_path = tempdir.path().join("x".repeat(300));

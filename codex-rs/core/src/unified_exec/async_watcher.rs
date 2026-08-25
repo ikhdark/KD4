@@ -1,8 +1,10 @@
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
 use tokio::time::Duration;
 use tokio::time::Instant;
 use tokio::time::Sleep;
@@ -249,6 +251,22 @@ pub(super) async fn wait_for_process_output_drain(signal: &CancellationToken) {
     wait_for_sticky_lifecycle_signal(signal).await;
 }
 
+pub(super) async fn wait_for_process_output_finalization(
+    output_drained: &CancellationToken,
+    output_closed: &AtomicBool,
+    output_closed_notify: &Notify,
+) {
+    wait_for_process_output_drain(output_drained).await;
+
+    let closed = output_closed_notify.notified();
+    tokio::pin!(closed);
+    closed.as_mut().enable();
+    if output_closed.load(Ordering::Acquire) {
+        return;
+    }
+    closed.await;
+}
+
 impl Drop for ProcessOutputWaiterGuard {
     fn drop(&mut self) {
         self.0.adjust_process_output_waiters(-1);
@@ -355,7 +373,13 @@ pub(crate) fn spawn_exit_watcher(
             codex_protocol::protocol::NextSampleBlockReason::WaitingForProcessCleanup,
         );
         let output_wait_started_at_ms = turn_ref.turn_timing_state.monotonic_offset_ms();
-        wait_for_process_output_drain(&output_drained).await;
+        let output_handles = process.output_handles();
+        wait_for_process_output_finalization(
+            &output_drained,
+            output_handles.output_closed.as_ref(),
+            output_handles.output_closed_notify.as_ref(),
+        )
+        .await;
         drop(output_waiter_guard);
         if let Some(timing) = tool_dispatch_timing.as_ref() {
             timing.record_timer_wait(ToolLifecycleTimerWait {

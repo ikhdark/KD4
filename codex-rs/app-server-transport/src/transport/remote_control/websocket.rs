@@ -1,4 +1,5 @@
 use super::CurrentRemoteControlEnrollment;
+use super::REMOTE_CONTROL_INSTALLATION_ID_HEADER;
 use super::RemoteControlEnrollmentSelection;
 use super::RemoteControlPairingPersistenceKey;
 use super::desired_state::RemoteControlDesiredState;
@@ -33,7 +34,8 @@ use axum::http::HeaderValue;
 use base64::Engine;
 use codex_app_server_protocol::RemoteControlConnectionStatus;
 use codex_app_server_protocol::RemoteControlStatusChangedNotification;
-use codex_core::util::backoff;
+use codex_core::retry::backoff;
+use codex_http_client::maybe_build_rustls_client_config_with_custom_ca;
 use codex_login::AuthManager;
 use codex_login::UnauthorizedRecovery;
 use codex_state::StateRuntime;
@@ -54,9 +56,10 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
+use tokio_tungstenite::Connector;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::connect_async_tls_with_config;
 use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_util::sync::CancellationToken;
@@ -68,7 +71,6 @@ use tracing::info;
 use tracing::warn;
 
 pub(super) const REMOTE_CONTROL_PROTOCOL_VERSION: &str = "3";
-pub(super) const REMOTE_CONTROL_INSTALLATION_ID_HEADER: &str = "x-codex-installation-id";
 const REMOTE_CONTROL_SUBSCRIBE_CURSOR_HEADER: &str = "x-codex-subscribe-cursor";
 const REMOTE_CONTROL_WEBSOCKET_PING_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(10);
@@ -1323,6 +1325,9 @@ pub(super) async fn connect_remote_control_websocket(
     tungstenite::http::Response<()>,
 )> {
     ensure_rustls_crypto_provider();
+    let connector = maybe_build_rustls_client_config_with_custom_ca()
+        .map_err(io::Error::from)?
+        .map(Connector::Rustls);
 
     let (auth, enrollment) = {
         let mut current_enrollment = current_enrollment.lock().await;
@@ -1349,7 +1354,9 @@ pub(super) async fn connect_remote_control_websocket(
 
     let websocket_connect_result = tokio::time::timeout(
         REMOTE_CONTROL_WEBSOCKET_CONNECT_TIMEOUT,
-        connect_async(request),
+        connect_async_tls_with_config(
+            request, /*config*/ None, /*disable_nagle*/ false, connector,
+        ),
     )
     .await
     .map_err(|_| {
@@ -1848,13 +1855,13 @@ mod tests {
     use tokio::time::Duration;
     use tokio::time::timeout;
     use tokio_tungstenite::accept_async;
+    use tokio_tungstenite::connect_async;
 
     // Windows CI can take longer than a few seconds for the websocket
     // client connection attempt to reach the local test listener.
-    #[cfg(windows)]
+
     pub(super) const TEST_HTTP_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
-    #[cfg(not(windows))]
-    pub(super) const TEST_HTTP_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
+
     pub(super) const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
     pub(super) const TEST_REMOTE_CONTROL_SERVER_TOKEN: &str = "Remote Control Token";
 

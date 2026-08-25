@@ -8,13 +8,11 @@ use crate::catalog::SkillPackageId;
 use crate::catalog::SkillProviderError;
 use crate::catalog::SkillReadResult;
 use crate::catalog::SkillResourceId;
-use crate::catalog::SkillSearchResult;
 use crate::catalog::SkillSourceKind;
 use crate::provider::SkillListQuery;
 use crate::provider::SkillProvider;
 use crate::provider::SkillProviderFuture;
 use crate::provider::SkillReadRequest;
-use crate::provider::SkillSearchRequest;
 
 const HOST_AUTHORITY_ID: &str = "host";
 
@@ -74,10 +72,6 @@ impl SkillProvider for HostSkillProvider {
                 contents,
             })
         })
-    }
-
-    fn search(&self, _request: SkillSearchRequest) -> SkillProviderFuture<'_, SkillSearchResult> {
-        Box::pin(async { Ok(SkillSearchResult::default()) })
     }
 }
 

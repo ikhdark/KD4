@@ -5,7 +5,7 @@ use super::plugin_analytics_capture::validate_mutation_events;
 use super::plugin_analytics_smoke::ANALYTICS_CAPTURE_ENV_VAR;
 use super::plugin_analytics_smoke::prepare_capture_file;
 use super::plugin_analytics_smoke::wait_until_capture_is_ready;
-use super::shell_quote;
+use super::powershell_quote;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -472,15 +472,15 @@ fn print_recovery_command(codex_bin: &Path, config_overrides: &[String], remote_
         .unwrap_or_else(|_| "codex-app-server-test-client".to_string());
     let mut command = format!(
         "{} --codex-bin {}",
-        shell_quote(&test_client),
-        shell_quote(&codex_bin.display().to_string())
+        powershell_quote(&test_client),
+        powershell_quote(&codex_bin.display().to_string())
     );
     for override_kv in config_overrides {
-        command.push_str(&format!(" --config {}", shell_quote(override_kv)));
+        command.push_str(&format!(" --config {}", powershell_quote(override_kv)));
     }
     command.push_str(&format!(
         " plugin-remote-uninstall --remote-plugin-id {} --confirm-account-mutation",
-        shell_quote(remote_plugin_id)
+        powershell_quote(remote_plugin_id)
     ));
     eprintln!("Recovery command:");
     eprintln!("  {command}");

@@ -717,7 +717,6 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
     assert_ne!(first.process_id, second.process_id);
 }
 
-#[cfg(windows)]
 #[test]
 fn initial_exec_yield_time_uses_windows_floor() {
     let above_max_yield_time_ms = crate::unified_exec::MAX_YIELD_TIME_MS + 1;
@@ -733,7 +732,6 @@ fn initial_exec_yield_time_uses_windows_floor() {
     );
 }
 
-#[cfg(windows)]
 #[test]
 fn warm_executor_yield_time_does_not_reapply_windows_cold_floor() {
     assert_eq!(
@@ -743,16 +741,6 @@ fn warm_executor_yield_time_does_not_reapply_windows_cold_floor() {
     assert_eq!(
         clamp_yield_time_for_readiness(/*yield_time_ms*/ 250, /*executor_ready*/ false),
         crate::unified_exec::WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS
-    );
-}
-
-#[cfg(not(windows))]
-#[test]
-fn initial_exec_yield_time_has_no_platform_floor() {
-    assert_eq!(clamp_yield_time(/*yield_time_ms*/ 1_000), 1_000);
-    assert_eq!(
-        clamp_yield_time(/*yield_time_ms*/ 1),
-        crate::unified_exec::MIN_YIELD_TIME_MS
     );
 }
 
@@ -814,18 +802,15 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         process_id: 123,
         yield_time_ms: 1000,
         max_output_tokens: None,
-        #[allow(deprecated)]
-        cwd: turn.cwd.clone().into(),
-        #[cfg(windows)]
+        cwd: turn.cwd().clone().into(),
+
         normalization_cwd: None,
-        #[allow(deprecated)]
-        sandbox_cwd: turn.cwd.clone().into(),
+        sandbox_cwd: turn.cwd().clone().into(),
         turn_environment: turn
             .environments
             .primary()
             .cloned()
             .expect("primary environment"),
-        shell_mode: codex_tools::UnifiedExecShellMode::Direct,
         network: None,
         tty: true,
         sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
@@ -850,8 +835,7 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         /*process_started_alive*/ false,
         &context,
         &request,
-        #[allow(deprecated)]
-        turn.cwd.clone().into(),
+        turn.cwd().clone().into(),
         transcript,
         "PRE_DENIAL_MARKER".to_string(),
         "Network access denied".to_string(),

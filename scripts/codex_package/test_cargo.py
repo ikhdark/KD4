@@ -33,36 +33,6 @@ class SourceBinariesForTargetTest(unittest.TestCase):
         command_identity.start()
         self.addCleanup(command_identity.stop)
 
-    def test_macos_package_with_prebuilt_entrypoint_builds_nothing(self) -> None:
-        self.assertEqual(
-            source_binaries_for_target(
-                TARGET_SPECS["aarch64-apple-darwin"],
-                PACKAGE_VARIANTS["codex"],
-                build_entrypoint=False,
-                build_code_mode_host=False,
-                build_bwrap=False,
-                build_codex_command_runner=False,
-                build_codex_windows_sandbox_setup=False,
-            ),
-            [],
-        )
-
-    def test_linux_package_with_prebuilt_entrypoint_and_bwrap_builds_nothing(
-        self,
-    ) -> None:
-        self.assertEqual(
-            source_binaries_for_target(
-                TARGET_SPECS["x86_64-unknown-linux-musl"],
-                PACKAGE_VARIANTS["codex"],
-                build_entrypoint=False,
-                build_code_mode_host=False,
-                build_bwrap=False,
-                build_codex_command_runner=False,
-                build_codex_windows_sandbox_setup=False,
-            ),
-            [],
-        )
-
     def test_windows_package_with_prebuilt_entrypoint_and_helpers_builds_nothing(
         self,
     ) -> None:
@@ -72,7 +42,6 @@ class SourceBinariesForTargetTest(unittest.TestCase):
                 PACKAGE_VARIANTS["codex"],
                 build_entrypoint=False,
                 build_code_mode_host=False,
-                build_bwrap=False,
                 build_codex_command_runner=False,
                 build_codex_windows_sandbox_setup=False,
             ),
@@ -86,7 +55,6 @@ class SourceBinariesForTargetTest(unittest.TestCase):
                 PACKAGE_VARIANTS["codex"],
                 build_entrypoint=False,
                 build_code_mode_host=False,
-                build_bwrap=False,
                 build_codex_command_runner=True,
                 build_codex_windows_sandbox_setup=True,
             ),
@@ -98,11 +66,10 @@ class SourceBinariesForTargetTest(unittest.TestCase):
             with self.subTest(variant=variant.name):
                 self.assertEqual(
                     source_binaries_for_target(
-                        TARGET_SPECS["aarch64-apple-darwin"],
+                        TARGET_SPECS["aarch64-pc-windows-msvc"],
                         variant,
                         build_entrypoint=False,
                         build_code_mode_host=True,
-                        build_bwrap=False,
                         build_codex_command_runner=False,
                         build_codex_windows_sandbox_setup=False,
                     ),
@@ -124,7 +91,6 @@ class SourceBinariesForTargetTest(unittest.TestCase):
                 profile="release",
                 entrypoint_bin=entrypoint,
                 code_mode_host_bin=code_mode_host,
-                bwrap_bin=None,
                 codex_command_runner_bin=command_runner,
                 codex_windows_sandbox_setup_bin=sandbox_setup,
             )
@@ -223,7 +189,6 @@ class SourceBinariesForTargetTest(unittest.TestCase):
                                 profile="release",
                                 entrypoint_bin=None,
                                 code_mode_host_bin=None,
-                                bwrap_bin=None,
                                 codex_command_runner_bin=None,
                                 codex_windows_sandbox_setup_bin=None,
                             )
@@ -350,7 +315,6 @@ class SourceBinariesForTargetTest(unittest.TestCase):
             outputs = cargo_module.SourceBuildOutputs(
                 entrypoint_bin=touch_file(output_dir / "codex.exe"),
                 code_mode_host_bin=touch_file(output_dir / "codex-code-mode-host.exe"),
-                bwrap_bin=None,
                 codex_command_runner_bin=touch_file(
                     output_dir / "codex-command-runner.exe"
                 ),
@@ -385,7 +349,6 @@ class SourceBinariesForTargetTest(unittest.TestCase):
                         profile="release",
                         entrypoint_bin=None,
                         code_mode_host_bin=None,
-                        bwrap_bin=None,
                         codex_command_runner_bin=None,
                         codex_windows_sandbox_setup_bin=None,
                         reuse_existing=True,
@@ -407,7 +370,6 @@ class SourceBinariesForTargetTest(unittest.TestCase):
             outputs = cargo_module.SourceBuildOutputs(
                 entrypoint_bin=touch_file(output_dir / "codex.exe"),
                 code_mode_host_bin=touch_file(output_dir / "codex-code-mode-host.exe"),
-                bwrap_bin=None,
                 codex_command_runner_bin=touch_file(
                     output_dir / "codex-command-runner.exe"
                 ),
@@ -459,7 +421,6 @@ class SourceBinariesForTargetTest(unittest.TestCase):
                                 profile="release",
                                 entrypoint_bin=None,
                                 code_mode_host_bin=None,
-                                bwrap_bin=None,
                                 codex_command_runner_bin=None,
                                 codex_windows_sandbox_setup_bin=None,
                                 reuse_existing=True,
@@ -494,7 +455,6 @@ class SourceBinariesForTargetTest(unittest.TestCase):
             outputs = cargo_module.SourceBuildOutputs(
                 entrypoint_bin=touch_file(output_dir / "codex.exe"),
                 code_mode_host_bin=touch_file(output_dir / "codex-code-mode-host.exe"),
-                bwrap_bin=None,
                 codex_command_runner_bin=touch_file(
                     output_dir / "codex-command-runner.exe"
                 ),
@@ -539,7 +499,6 @@ class SourceBinariesForTargetTest(unittest.TestCase):
                                 profile="release",
                                 entrypoint_bin=None,
                                 code_mode_host_bin=None,
-                                bwrap_bin=None,
                                 codex_command_runner_bin=None,
                                 codex_windows_sandbox_setup_bin=None,
                                 reuse_existing=True,
@@ -566,7 +525,6 @@ class SourceBinariesForTargetTest(unittest.TestCase):
             outputs = cargo_module.SourceBuildOutputs(
                 entrypoint_bin=touch_file(output_dir / "codex.exe"),
                 code_mode_host_bin=touch_file(output_dir / "codex-code-mode-host.exe"),
-                bwrap_bin=None,
                 codex_command_runner_bin=touch_file(
                     output_dir / "codex-command-runner.exe"
                 ),
@@ -628,7 +586,6 @@ class SourceBinariesForTargetTest(unittest.TestCase):
             outputs = cargo_module.SourceBuildOutputs(
                 entrypoint_bin=touch_file(output_dir / "codex.exe"),
                 code_mode_host_bin=touch_file(output_dir / "codex-code-mode-host.exe"),
-                bwrap_bin=None,
                 codex_command_runner_bin=touch_file(
                     output_dir / "codex-command-runner.exe"
                 ),
@@ -695,7 +652,6 @@ class SourceBinariesForTargetTest(unittest.TestCase):
                 code_mode_host_bin=touch_file(
                     Path(temp_dir) / "codex-code-mode-host.exe"
                 ),
-                bwrap_bin=None,
                 codex_command_runner_bin=None,
                 codex_windows_sandbox_setup_bin=None,
             )
@@ -768,7 +724,6 @@ class SourceBinariesForTargetTest(unittest.TestCase):
                             profile="release",
                             entrypoint_bin=None,
                             code_mode_host_bin=None,
-                            bwrap_bin=None,
                             codex_command_runner_bin=None,
                             codex_windows_sandbox_setup_bin=None,
                             reuse_existing=True,
@@ -798,28 +753,21 @@ class SourceBinariesForTargetTest(unittest.TestCase):
 
             with mock.patch.object(cargo_module, "CODEX_RS_ROOT", codex_rs):
                 with mock.patch.dict(os.environ, {}, clear=True):
-                    with mock.patch.object(
-                        cargo_module,
-                        "resolve_codex_v8_cargo_env",
-                        return_value={"CODEX_V8_ARCHIVE": "v8.tar.gz"},
-                    ):
-                        with mock.patch("subprocess.run", side_effect=fake_run):
-                            build_source_binaries(
-                                TARGET_SPECS["x86_64-pc-windows-msvc"],
-                                PACKAGE_VARIANTS["codex"],
-                                cargo="cargo",
-                                profile="release",
-                                entrypoint_bin=None,
-                                code_mode_host_bin=None,
-                                bwrap_bin=None,
-                                codex_command_runner_bin=None,
-                                codex_windows_sandbox_setup_bin=None,
-                            )
+                    with mock.patch("subprocess.run", side_effect=fake_run):
+                        build_source_binaries(
+                            TARGET_SPECS["x86_64-pc-windows-msvc"],
+                            PACKAGE_VARIANTS["codex"],
+                            cargo="cargo",
+                            profile="release",
+                            entrypoint_bin=None,
+                            code_mode_host_bin=None,
+                            codex_command_runner_bin=None,
+                            codex_windows_sandbox_setup_bin=None,
+                        )
 
             self.assertEqual(len(calls), 1)
             self.assertIn("codex", calls[0].cmd)
             self.assertIn("codex-code-mode-host", calls[0].cmd)
-            self.assertIn("CODEX_V8_ARCHIVE", calls[0].env)
             self.assertIn("codex-command-runner", calls[0].cmd)
             self.assertIn("codex-windows-sandbox-setup", calls[0].cmd)
             self.assertTrue(
@@ -828,7 +776,7 @@ class SourceBinariesForTargetTest(unittest.TestCase):
                 ).is_file()
             )
 
-    def test_reused_entrypoint_helpers_build_without_v8_env(self) -> None:
+    def test_reused_entrypoint_builds_only_missing_windows_helpers(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             codex_rs = root / "codex-rs"
@@ -849,27 +797,20 @@ class SourceBinariesForTargetTest(unittest.TestCase):
 
             with mock.patch.object(cargo_module, "CODEX_RS_ROOT", codex_rs):
                 with mock.patch.dict(os.environ, {}, clear=True):
-                    with mock.patch.object(
-                        cargo_module,
-                        "resolve_codex_v8_cargo_env",
-                        return_value={"CODEX_V8_ARCHIVE": "v8.tar.gz"},
-                    ):
-                        with mock.patch("subprocess.run", side_effect=fake_run):
-                            build_source_binaries(
-                                TARGET_SPECS["x86_64-pc-windows-msvc"],
-                                PACKAGE_VARIANTS["codex"],
-                                cargo="cargo",
-                                profile="release",
-                                entrypoint_bin=entrypoint,
-                                code_mode_host_bin=code_mode_host,
-                                bwrap_bin=None,
-                                codex_command_runner_bin=None,
-                                codex_windows_sandbox_setup_bin=None,
-                            )
+                    with mock.patch("subprocess.run", side_effect=fake_run):
+                        build_source_binaries(
+                            TARGET_SPECS["x86_64-pc-windows-msvc"],
+                            PACKAGE_VARIANTS["codex"],
+                            cargo="cargo",
+                            profile="release",
+                            entrypoint_bin=entrypoint,
+                            code_mode_host_bin=code_mode_host,
+                            codex_command_runner_bin=None,
+                            codex_windows_sandbox_setup_bin=None,
+                        )
 
         self.assertEqual(len(calls), 1)
         self.assertNotIn("codex", calls[0].cmd)
-        self.assertNotIn("CODEX_V8_ARCHIVE", calls[0].env)
         self.assertIn("codex-command-runner", calls[0].cmd)
         self.assertIn("codex-windows-sandbox-setup", calls[0].cmd)
 
@@ -891,7 +832,6 @@ class SourceBinariesForTargetTest(unittest.TestCase):
                                 profile="release",
                                 entrypoint_bin=None,
                                 code_mode_host_bin=None,
-                                bwrap_bin=None,
                                 codex_command_runner_bin=None,
                                 codex_windows_sandbox_setup_bin=None,
                             )
@@ -920,7 +860,6 @@ class SourceBinariesForTargetTest(unittest.TestCase):
                                 profile="release",
                                 entrypoint_bin=None,
                                 code_mode_host_bin=None,
-                                bwrap_bin=None,
                                 codex_command_runner_bin=None,
                                 codex_windows_sandbox_setup_bin=None,
                             )
@@ -938,7 +877,6 @@ class SourceBinariesForTargetTest(unittest.TestCase):
                         profile="release",
                         entrypoint_bin=missing,
                         code_mode_host_bin=None,
-                        bwrap_bin=None,
                         codex_command_runner_bin=None,
                         codex_windows_sandbox_setup_bin=None,
                     )

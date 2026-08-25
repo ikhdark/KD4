@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
-from pathlib import Path
 import re
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
-from typing import MutableMapping, Sequence
+from collections.abc import MutableMapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Never
 
 STRICT_LINTS = [
     "argument-comment-mismatch",
@@ -31,9 +32,7 @@ _TARGET_SELECTION_ARGS = {
 }
 _TARGET_SELECTION_PREFIXES = ("--bin=", "--test=", "--example=", "--bench=")
 _TARGET_SELECTION_WITH_VALUE = {"--bin", "--test", "--example", "--bench"}
-_NIGHTLY_LIBRARY_PATTERN = re.compile(
-    r"^(.+@nightly-[0-9]{4}-[0-9]{2}-[0-9]{2})-.+$"
-)
+_NIGHTLY_LIBRARY_PATTERN = re.compile(r"^(.+@nightly-[0-9]{4}-[0-9]{2}-[0-9]{2})-.+$")
 
 
 @dataclass
@@ -60,9 +59,11 @@ def parse_wrapper_args(argv: Sequence[str]) -> ParsedWrapperArgs:
     for arg in argv:
         if after_separator:
             parsed.cargo_args.append(arg)
-            if arg in _TARGET_SELECTION_ARGS or arg in _TARGET_SELECTION_WITH_VALUE:
-                parsed.has_cargo_target_selection = True
-            elif arg.startswith(_TARGET_SELECTION_PREFIXES):
+            if (
+                arg in _TARGET_SELECTION_ARGS
+                or arg in _TARGET_SELECTION_WITH_VALUE
+                or arg.startswith(_TARGET_SELECTION_PREFIXES)
+            ):
                 parsed.has_cargo_target_selection = True
             continue
 
@@ -139,7 +140,7 @@ def set_default_lint_env(env: MutableMapping[str, str]) -> None:
         env["CARGO_INCREMENTAL"] = "0"
 
 
-def die(message: str) -> "Never":
+def die(message: str) -> Never:
     print(message, file=sys.stderr)
     raise SystemExit(1)
 
@@ -153,7 +154,9 @@ def require_command(name: str, install_message: str | None = None) -> str:
     return executable
 
 
-def run_capture(args: Sequence[str], env: MutableMapping[str, str] | None = None) -> str:
+def run_capture(
+    args: Sequence[str], env: MutableMapping[str, str] | None = None
+) -> str:
     try:
         completed = subprocess.run(
             list(args),
@@ -230,14 +233,18 @@ def prefer_rustup_shims(env: MutableMapping[str, str]) -> None:
             env["RUSTUP_HOME"] = rustup_home
 
 
-def fetch_packaged_entrypoint(dotslash_manifest: Path, env: MutableMapping[str, str]) -> Path:
+def fetch_packaged_entrypoint(
+    dotslash_manifest: Path, env: MutableMapping[str, str]
+) -> Path:
     require_command(
         "dotslash",
         "argument-comment-lint prebuilt wrapper requires dotslash.\n"
         "Install dotslash, or use:\n"
         "  ./tools/argument-comment-lint/run.py ...",
     )
-    entrypoint = run_capture(["dotslash", "--", "fetch", str(dotslash_manifest)], env=env)
+    entrypoint = run_capture(
+        ["dotslash", "--", "fetch", str(dotslash_manifest)], env=env
+    )
     return Path(entrypoint).resolve()
 
 
@@ -270,7 +277,7 @@ def normalize_packaged_library(package_entrypoint: Path) -> Path:
     return normalized_library_path
 
 
-def exec_command(command: Sequence[str], env: MutableMapping[str, str]) -> "Never":
+def exec_command(command: Sequence[str], env: MutableMapping[str, str]) -> Never:
     try:
         completed = subprocess.run(list(command), env=dict(env), check=False)
     except FileNotFoundError:

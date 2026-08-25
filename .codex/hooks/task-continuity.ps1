@@ -1,7 +1,8 @@
 param(
     [AllowEmptyString()]
     [string]$TaskContinuityRawInput,
-    [switch]$TaskContinuitySkipFastPath
+    [switch]$TaskContinuitySkipFastPath,
+    [AllowNull()][object]$TaskContinuityRepositoryState
 )
 
 Set-StrictMode -Version 2.0
@@ -20,6 +21,7 @@ $script:StateDirectory = [System.IO.Path]::GetFullPath(
 )
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $script:EmptyOutput = '{}'
+$script:RepositoryStateObservation = $TaskContinuityRepositoryState
 
 # PowerShell executes every function declaration it reaches. Keep proven no-change
 # cases ahead of the full implementation so synchronous hooks pay only for the
@@ -411,6 +413,51 @@ function Get-RepositoryState {
     )
 
     $empty = New-RepositoryState
+    if ($null -ne $script:RepositoryStateObservation) {
+        $observation = $script:RepositoryStateObservation
+        $script:RepositoryStateObservation = $null
+        try {
+            if ($observation -isnot [pscustomobject] -or
+                -not (Test-HasProperty -Object $observation -Name 'working_directory') -or
+                -not (Test-HasProperty -Object $observation -Name 'root') -or
+                -not (Test-HasProperty -Object $observation -Name 'revision') -or
+                -not (Test-HasProperty -Object $observation -Name 'dirty_summary')) {
+                throw 'repository state observation was malformed'
+            }
+            if (-not [string]::Equals(
+                [string]$observation.working_directory,
+                $WorkingDirectory,
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+                throw 'repository state observation used a different working directory'
+            }
+            $root = [string]$observation.root
+            $revision = [string]$observation.revision
+            $dirty = [string]$observation.dirty_summary
+            if ([string]::IsNullOrWhiteSpace($root) -or
+                [string]::IsNullOrWhiteSpace($revision) -or
+                $revision -eq '(initial)' -or
+                [string]::IsNullOrWhiteSpace($dirty)) {
+                throw 'repository state observation was incomplete'
+            }
+            if (-not [string]::IsNullOrWhiteSpace($KnownRoot) -and
+                [string]::Equals(
+                    $root,
+                    $KnownRoot,
+                    [StringComparison]::OrdinalIgnoreCase
+                )) {
+                $root = $KnownRoot
+            }
+            return [pscustomobject][ordered]@{
+                root = Get-RedactedExcerpt -Value $root -MaximumCharacters 1000
+                revision = Get-RedactedExcerpt -Value $revision -MaximumCharacters 200
+                dirty_summary = Get-RedactedExcerpt -Value $dirty -MaximumCharacters 2000
+            }
+        }
+        catch {
+            Write-Diagnostic "Git state handoff unavailable: $($_.Exception.Message)"
+        }
+    }
     try {
         if (-not (Test-Path -LiteralPath $WorkingDirectory -PathType Container)) {
             throw 'working directory does not exist'

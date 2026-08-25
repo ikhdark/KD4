@@ -3,8 +3,9 @@ pub(crate) mod agent_jobs_spec;
 pub(crate) mod apply_patch;
 pub(crate) mod apply_patch_spec;
 pub(crate) mod command_preflight;
+pub(crate) mod command_search;
 pub(crate) mod command_shape;
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod command_windows_corpus_tests;
 mod current_time;
 mod dynamic;
@@ -41,6 +42,7 @@ mod view_image;
 pub(crate) mod view_image_spec;
 mod wait_for_environment;
 
+use codex_git_utils::get_git_repo_root;
 use codex_sandboxing::policy_transforms::intersect_permission_profiles;
 use codex_sandboxing::policy_transforms::merge_permission_profiles;
 use codex_sandboxing::policy_transforms::normalize_additional_permissions;
@@ -49,10 +51,13 @@ use codex_utils_absolute_path::AbsolutePathBufGuard;
 use serde::Deserialize;
 use serde_json::Map;
 use serde_json::Value;
+use std::future::Future;
 use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
 
+use crate::FunctionCallError;
 use crate::environment_selection::TurnEnvironmentSnapshot;
-use crate::function_tool::FunctionCallError;
 use crate::sandboxing::SandboxPermissions;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnEnvironment;
@@ -88,13 +93,114 @@ pub use unified_exec::WriteStdinHandler;
 pub use view_image::ViewImageHandler;
 pub(crate) use wait_for_environment::WaitForEnvironmentHandler;
 
+tokio::task_local! {
+    static PARSED_FUNCTION_ARGUMENTS: ParsedFunctionArguments;
+}
+
+/// One parsed representation of a function payload for the lifetime of a
+/// dispatch. Typed handlers deserialize from this value instead of reparsing
+/// the original JSON text.
+#[derive(Clone, Debug)]
+pub(crate) struct ParsedFunctionArguments {
+    raw: Arc<str>,
+    value: Result<Arc<Value>, Arc<str>>,
+}
+
+impl ParsedFunctionArguments {
+    pub(crate) fn from_payload(payload: &crate::tools::context::ToolPayload) -> Option<Self> {
+        let crate::tools::context::ToolPayload::Function { arguments } = payload else {
+            return None;
+        };
+        Some(Self::from_raw(arguments))
+    }
+
+    fn from_raw(arguments: &str) -> Self {
+        Self {
+            raw: Arc::from(arguments),
+            value: serde_json::from_str(arguments)
+                .map(Arc::new)
+                .map_err(|err| Arc::from(err.to_string())),
+        }
+    }
+
+    pub(crate) fn value(&self) -> Result<&Value, &str> {
+        self.value.as_deref().map_err(std::convert::AsRef::as_ref)
+    }
+
+    fn deserialize<T>(&self, arguments: &str) -> Option<Result<T, FunctionCallError>>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        if arguments != self.raw.as_ref() {
+            return None;
+        }
+        Some(match &self.value {
+            Ok(value) => serde_json::from_value(value.as_ref().clone()).map_err(|err| {
+                FunctionCallError::RespondToModel(format!(
+                    "failed to parse function arguments: {err}"
+                ))
+            }),
+            Err(message) => Err(FunctionCallError::RespondToModel(format!(
+                "failed to parse function arguments: {message}"
+            ))),
+        })
+    }
+
+    fn json_value(&self, arguments: &str) -> Option<Result<Value, String>> {
+        (arguments == self.raw.as_ref()).then(|| {
+            self.value
+                .as_ref()
+                .map(|value| value.as_ref().clone())
+                .map_err(std::string::ToString::to_string)
+        })
+    }
+}
+
+pub(crate) async fn with_parsed_function_arguments<F>(
+    parsed: Option<ParsedFunctionArguments>,
+    future: F,
+) -> F::Output
+where
+    F: Future,
+{
+    match parsed {
+        Some(parsed) => PARSED_FUNCTION_ARGUMENTS.scope(parsed, future).await,
+        None => future.await,
+    }
+}
+
+pub(crate) fn parsed_function_argument_value(arguments: &str) -> Option<Result<Value, String>> {
+    PARSED_FUNCTION_ARGUMENTS
+        .try_with(|parsed| parsed.json_value(arguments))
+        .ok()
+        .flatten()
+}
+
 pub(crate) fn parse_arguments<T>(arguments: &str) -> Result<T, FunctionCallError>
 where
     T: for<'de> Deserialize<'de>,
 {
+    if let Some(parsed) = PARSED_FUNCTION_ARGUMENTS
+        .try_with(|parsed| parsed.deserialize(arguments))
+        .ok()
+        .flatten()
+    {
+        return parsed;
+    }
     serde_json::from_str(arguments).map_err(|err| {
         FunctionCallError::RespondToModel(format!("failed to parse function arguments: {err}"))
     })
+}
+
+pub(crate) fn resolve_repository_root(cwd: &Path) -> PathBuf {
+    resolve_repository_root_with(cwd, get_git_repo_root)
+}
+
+fn resolve_repository_root_with(
+    cwd: &Path,
+    discover: impl FnOnce(&Path) -> Option<PathBuf>,
+) -> PathBuf {
+    discover(cwd).unwrap_or_else(|| cwd.to_path_buf())
 }
 
 fn updated_hook_command(updated_input: &Value) -> Result<&str, FunctionCallError> {
@@ -356,6 +462,7 @@ mod tests {
     use super::implicit_granted_permissions;
     use super::normalize_and_validate_additional_permissions;
     use super::permissions_are_preapproved;
+    use super::resolve_repository_root_with;
     use crate::sandboxing::SandboxPermissions;
     use codex_protocol::models::AdditionalPermissionProfile;
     use codex_protocol::models::FileSystemPermissions;
@@ -371,6 +478,22 @@ mod tests {
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
+
+    #[test]
+    fn repository_root_resolution_runs_discovery_once() {
+        let cwd = std::path::Path::new("workspace/nested");
+        let expected = std::path::PathBuf::from("workspace");
+        let mut discovery_count = 0;
+
+        let actual = resolve_repository_root_with(cwd, |observed_cwd| {
+            discovery_count += 1;
+            assert_eq!(observed_cwd, cwd);
+            Some(expected.clone())
+        });
+
+        assert_eq!(actual, expected);
+        assert_eq!(discovery_count, 1);
+    }
 
     fn network_permissions() -> AdditionalPermissionProfile {
         AdditionalPermissionProfile {

@@ -1,5 +1,6 @@
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::ThreadHistoryMode;
+use std::path::PathBuf;
 
 /// Result type returned by thread-store operations.
 pub type ThreadStoreResult<T> = Result<T, ThreadStoreError>;
@@ -23,6 +24,15 @@ pub enum ThreadStoreError {
     ThreadNotFound {
         /// Thread id requested by the caller.
         thread_id: ThreadId,
+    },
+
+    /// The thread is known, but its rollout file cannot currently be read.
+    #[error("failed to resolve rollout path `{}`: {reason}", path.display())]
+    RolloutNotMaterialized {
+        /// Rollout path requested by the caller.
+        path: PathBuf,
+        /// Diagnostic detail retained for logs and user-facing errors.
+        reason: String,
     },
 
     /// The caller supplied invalid request data.

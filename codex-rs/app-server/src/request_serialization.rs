@@ -17,8 +17,12 @@ type BoxFutureUnit = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 const MAX_TOTAL_QUEUED_REQUESTS: usize = 1024;
 const MAX_QUEUED_REQUESTS_PER_KEY: usize = 64;
-const MAX_TOTAL_QUEUED_BYTES: usize = 8 * 1024 * 1024;
-const MAX_QUEUED_BYTES_PER_KEY: usize = 1024 * 1024;
+// A valid turn can contain up to 1 MiB Unicode scalar values, which can occupy
+// four bytes each in the serialized request. Keep queue admission above that
+// protocol limit so turn validation, rather than overload handling, owns the
+// boundary response.
+const MAX_TOTAL_QUEUED_BYTES: usize = 32 * 1024 * 1024;
+const MAX_QUEUED_BYTES_PER_KEY: usize = 5 * 1024 * 1024;
 const MAX_CONCURRENT_SHARED_READS: usize = 16;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -116,6 +120,7 @@ pub(crate) struct QueuedInitializedRequest {
 }
 
 impl QueuedInitializedRequest {
+    #[cfg(test)]
     pub(crate) fn new(
         gate: Arc<ConnectionRpcGate>,
         future: impl Future<Output = ()> + Send + 'static,
@@ -190,10 +195,10 @@ struct RequestSerializationState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RequestAdmissionError {
-    TotalQueueFull,
-    PerKeyQueueFull,
-    TotalBytesFull,
-    PerKeyBytesFull,
+    TotalQueue,
+    PerKeyQueue,
+    TotalBytes,
+    PerKeyBytes,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -266,20 +271,20 @@ impl RequestSerializationQueues {
         let should_spawn = {
             let mut state = self.inner.lock().await;
             if state.total_queued >= self.limits.max_total_queued {
-                return RequestAdmission::Rejected(RequestAdmissionError::TotalQueueFull);
+                return RequestAdmission::Rejected(RequestAdmissionError::TotalQueue);
             }
             if state
                 .queues
                 .get(&key)
                 .is_some_and(|queue| queue.len() >= self.limits.max_queued_per_key)
             {
-                return RequestAdmission::Rejected(RequestAdmissionError::PerKeyQueueFull);
+                return RequestAdmission::Rejected(RequestAdmissionError::PerKeyQueue);
             }
             let request_bytes = request.estimated_bytes();
             if state.total_queued_bytes.saturating_add(request_bytes)
                 > self.limits.max_total_queued_bytes
             {
-                return RequestAdmission::Rejected(RequestAdmissionError::TotalBytesFull);
+                return RequestAdmission::Rejected(RequestAdmissionError::TotalBytes);
             }
             let key_bytes = state
                 .queues
@@ -292,7 +297,7 @@ impl RequestSerializationQueues {
                 })
                 .unwrap_or(0);
             if key_bytes.saturating_add(request_bytes) > self.limits.max_queued_bytes_per_key {
-                return RequestAdmission::Rejected(RequestAdmissionError::PerKeyBytesFull);
+                return RequestAdmission::Rejected(RequestAdmissionError::PerKeyBytes);
             }
             state.total_queued += 1;
             state.total_queued_bytes = state.total_queued_bytes.saturating_add(request_bytes);
@@ -506,7 +511,7 @@ mod tests {
                     QueuedInitializedRequest::new_with_estimated_bytes(gate(), 5, async {}),
                 )
                 .await,
-            RequestAdmission::Rejected(RequestAdmissionError::TotalBytesFull)
+            RequestAdmission::Rejected(RequestAdmissionError::TotalBytes)
         );
         let _ = release_tx.send(());
     }
@@ -735,7 +740,7 @@ mod tests {
                     }),
                 )
                 .await,
-            RequestAdmission::Rejected(RequestAdmissionError::PerKeyQueueFull)
+            RequestAdmission::Rejected(RequestAdmissionError::PerKeyQueue)
         );
         assert!(!rejected_polled.load(Ordering::SeqCst));
 
@@ -817,7 +822,7 @@ mod tests {
                     }),
                 )
                 .await,
-            RequestAdmission::Rejected(RequestAdmissionError::TotalQueueFull)
+            RequestAdmission::Rejected(RequestAdmissionError::TotalQueue)
         );
         assert!(!rejected_polled.load(Ordering::SeqCst));
 
@@ -873,7 +878,7 @@ mod tests {
                     QueuedInitializedRequest::new(gate(), async {}),
                 )
                 .await,
-            RequestAdmission::Rejected(RequestAdmissionError::TotalQueueFull)
+            RequestAdmission::Rejected(RequestAdmissionError::TotalQueue)
         );
 
         blocker_release_tx

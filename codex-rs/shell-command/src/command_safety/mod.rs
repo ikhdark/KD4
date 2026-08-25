@@ -2,7 +2,7 @@ mod powershell_parser;
 
 pub mod is_dangerous_command;
 pub mod is_safe_command;
-#[cfg(windows)]
+
 pub(crate) mod windows_safe_commands;
 pub use powershell_parser::PowershellDirectArgvCandidate;
 pub(crate) use powershell_parser::PowershellResolutionState;

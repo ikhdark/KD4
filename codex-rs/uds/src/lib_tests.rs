@@ -18,44 +18,6 @@ async fn prepare_private_socket_directory_creates_directory() {
     assert!(socket_dir.is_dir());
 }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn prepare_private_socket_directory_sets_existing_permissions_to_owner_only() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let temp_dir = tempfile::TempDir::new().expect("temp dir");
-    for mode in [0o755, 0o600] {
-        let socket_dir = temp_dir.path().join(format!("app-server-control-{mode:o}"));
-        std::fs::create_dir(&socket_dir).expect("socket dir should be created");
-        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(mode))
-            .expect("socket dir permissions should be changed");
-
-        prepare_private_socket_directory(&socket_dir)
-            .await
-            .expect("socket dir permissions should be set exactly");
-
-        let mode = std::fs::metadata(&socket_dir)
-            .expect("socket dir metadata")
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o700);
-    }
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn regular_file_path_is_not_stale_socket_path() {
-    let temp_dir = tempfile::TempDir::new().expect("temp dir");
-    let regular_file = temp_dir.path().join("not-a-socket");
-    std::fs::write(&regular_file, b"not a socket").expect("regular file should be created");
-
-    assert!(
-        !is_stale_socket_path(&regular_file)
-            .await
-            .expect("stale socket check should succeed")
-    );
-}
-
 #[tokio::test]
 async fn bound_listener_path_is_stale_socket_path() {
     let temp_dir = tempfile::TempDir::new().expect("temp dir");

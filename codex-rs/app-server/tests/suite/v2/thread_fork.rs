@@ -55,10 +55,7 @@ use super::analytics::mount_analytics_capture;
 use super::analytics::thread_initialized_event;
 use super::analytics::wait_for_analytics_payload;
 
-#[cfg(windows)]
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
-#[cfg(not(windows))]
-const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 async fn list_threads(mcp: &mut TestAppServer) -> Result<ThreadListResponse> {
     let list_id = mcp
@@ -795,6 +792,14 @@ async fn thread_fork_rejects_unmaterialized_thread() -> Result<()> {
             .contains("no rollout found for thread id"),
         "unexpected fork error: {}",
         fork_err.error.message
+    );
+    assert_eq!(
+        serde_json::from_value::<codex_app_server_protocol::ThreadErrorData>(
+            fork_err.error.data.expect("thread error data")
+        )?,
+        codex_app_server_protocol::ThreadErrorData {
+            reason: codex_app_server_protocol::ThreadErrorReason::NotMaterialized,
+        }
     );
 
     Ok(())

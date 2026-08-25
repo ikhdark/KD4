@@ -11,13 +11,6 @@ pub(crate) fn create_wait_tool() -> ToolSpec {
             JsonSchema::string(Some("Identifier of the running exec cell.".to_string())),
         ),
         (
-            "yield_time_ms".to_string(),
-            JsonSchema::number(Some(
-                "Compatibility field; owner-held waits wake directly on output or terminal state. Unchanged observations do not cause a model-visible yield or a new model generation, and this does not set a completion deadline."
-                    .to_string(),
-            )),
-        ),
-        (
             "max_tokens".to_string(),
             JsonSchema::number(Some(format!(
                 "Output token budget for this wait call. {}.",
@@ -92,13 +85,6 @@ mod tests {
                                     .to_string(),
                             )),
                         ),
-                        (
-                            "yield_time_ms".to_string(),
-                            JsonSchema::number(Some(
-                                "Compatibility field; owner-held waits wake directly on output or terminal state. Unchanged observations do not cause a model-visible yield or a new model generation, and this does not set a completion deadline."
-                                    .to_string(),
-                            )),
-                        ),
                     ]),
                     Some(vec!["cell_id".to_string()]),
                     Some(false.into()),
@@ -120,15 +106,7 @@ mod tests {
             .expect("code-mode wait properties");
         assert_eq!(
             code_properties.keys().cloned().collect::<Vec<_>>(),
-            vec!["cell_id", "max_tokens", "terminate", "yield_time_ms"]
-        );
-        assert!(
-            code_properties["yield_time_ms"]
-                .description
-                .as_deref()
-                .is_some_and(
-                    |description| description.contains("does not set a completion deadline")
-                )
+            vec!["cell_id", "max_tokens", "terminate"]
         );
 
         let ToolSpec::Function(agent_wait) = create_wait_agent_tool_v2(WaitAgentTimeoutOptions {

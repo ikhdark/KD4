@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -63,12 +64,13 @@ impl Handler {
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let ToolInvocation {
             session,
-            turn,
+            step_context,
             payload,
             call_id,
             cancellation_token,
             ..
         } = invocation;
+        let turn = Arc::clone(&step_context.turn);
         let arguments = function_arguments(payload)?;
         let args: WaitArgs = parse_arguments(&arguments)?;
         let min_timeout_ms = turn.config.multi_agent_v2.min_wait_timeout_ms;
@@ -364,8 +366,7 @@ impl Handler {
                     break;
                 }
 
-                let mut assignment_ids = drain.assignment_ids().clone();
-                assignment_ids.extend(wake_assignment_ids(&next_page));
+                let assignment_ids = wake_assignment_ids(&next_page);
                 let hydration = match hydrate_assignments(coordinator, &assignment_ids).await {
                     Ok(hydration) => hydration,
                     Err(error) => {
@@ -419,7 +420,8 @@ impl Handler {
                 {
                     drain_outcome = activity;
                 } else if drain.internally_drained_pages() > 0 {
-                    match hydrate_assignments(coordinator, drain.assignment_ids()).await {
+                    let assignment_ids = drain.assignment_ids();
+                    match hydrate_assignments(coordinator, &assignment_ids).await {
                         Ok(hydration) => {
                             if let Err(message) = drain.replace_if_same_revisions(hydration) {
                                 tracing::debug!(
@@ -672,7 +674,6 @@ enum WakePageAcceptance {
 struct WakeEventDrain {
     combined: WakeRead,
     hydrated_assignments: HydratedAssignments,
-    assignment_ids: BTreeSet<AssignmentId>,
     seen_event_ids: HashSet<WakeEventId>,
     page_count: usize,
 }
@@ -707,7 +708,6 @@ impl WakeEventDrain {
         Ok(Self {
             combined: first,
             hydrated_assignments,
-            assignment_ids,
             seen_event_ids,
             page_count: 1,
         })
@@ -751,9 +751,6 @@ impl WakeEventDrain {
                 "durable wake pagination repeated an accepted event".to_string(),
             );
         }
-        if let Err(message) = self.verify_same_revisions(&hydrated_assignments) {
-            return WakePageAcceptance::FailOpen(message);
-        }
         let page_assignment_ids = wake_assignment_ids(&page);
         if !page_assignment_ids
             .iter()
@@ -763,11 +760,25 @@ impl WakeEventDrain {
                 "durable wake pagination omitted a task revision".to_string(),
             );
         }
+        for (assignment_id, current) in &hydrated_assignments.revisions {
+            let Some(accepted) = self.hydrated_assignments.revisions.get(assignment_id) else {
+                continue;
+            };
+            if current != accepted {
+                return WakePageAcceptance::FailOpen(format!(
+                    "assignment {assignment_id} changed revision during durable wake pagination"
+                ));
+            }
+        }
 
         self.seen_event_ids
             .extend(page.updated_agents.iter().map(|event| event.event_id));
-        self.assignment_ids.extend(page_assignment_ids);
-        self.hydrated_assignments = hydrated_assignments;
+        self.hydrated_assignments
+            .revisions
+            .extend(hydrated_assignments.revisions);
+        self.hydrated_assignments
+            .tasks
+            .extend(hydrated_assignments.tasks);
         self.combined.reason = page.reason.or(self.combined.reason);
         self.combined.updated_agents.extend(page.updated_agents);
         self.combined.latest_event_id = page.latest_event_id;
@@ -796,8 +807,12 @@ impl WakeEventDrain {
         self.combined.latest_event_id
     }
 
-    fn assignment_ids(&self) -> &BTreeSet<AssignmentId> {
-        &self.assignment_ids
+    fn assignment_ids(&self) -> BTreeSet<AssignmentId> {
+        self.hydrated_assignments
+            .revisions
+            .keys()
+            .copied()
+            .collect()
     }
 
     fn verify_same_revisions(
@@ -899,7 +914,7 @@ fn agent_task_revision(task: &AgentTask) -> Result<String, serde_json::Error> {
 
 async fn hydrate_wait_owner_assignments(
     coordinator: &crate::agent::task_coordinator::AgentTaskCoordinator,
-    store: Option<&std::sync::Arc<dyn codex_agent_task_store::AgentTaskStore>>,
+    store: Option<&std::sync::Arc<codex_agent_task_store::LocalAgentTaskStore>>,
     root_session_id: Option<&str>,
     consuming_agent_path: &str,
 ) -> Result<HydratedAssignments, String> {
@@ -939,7 +954,7 @@ enum BacklogPageRead {
 }
 
 async fn read_next_wake_page(
-    store: &std::sync::Arc<dyn codex_agent_task_store::AgentTaskStore>,
+    store: &std::sync::Arc<codex_agent_task_store::LocalAgentTaskStore>,
     root_session_id: &str,
     cursor: WakeEventId,
     activity_rx: &mut tokio::sync::watch::Receiver<InputQueueActivity>,
@@ -1014,8 +1029,6 @@ mod tests {
     }
 
     fn test_authoritative_wait_state(
-        assignment_id: &str,
-        attempt_id: &str,
         state: AttemptState,
         epoch: u64,
         next_required_action: Option<&str>,
@@ -1024,8 +1037,8 @@ mod tests {
         task_revision: &str,
     ) -> AuthoritativeWaitState {
         AuthoritativeWaitState {
-            assignment_id: assignment_id.to_string(),
-            attempt_id: attempt_id.to_string(),
+            assignment_id: "assignment-1".to_string(),
+            attempt_id: "attempt-1".to_string(),
             state,
             epoch,
             next_required_action: next_required_action.map(str::to_string),
@@ -1038,8 +1051,6 @@ mod tests {
     #[test]
     fn authoritative_signal_requires_unambiguous_typed_blocked_or_terminal_state() {
         let blocked = vec![test_authoritative_wait_state(
-            "assignment-1",
-            "attempt-1",
             AttemptState::NeedsMain,
             7,
             Some("main agent action"),
@@ -1064,8 +1075,6 @@ mod tests {
         );
 
         let terminal = vec![test_authoritative_wait_state(
-            "assignment-1",
-            "attempt-1",
             AttemptState::Completed,
             8,
             None,
@@ -1089,8 +1098,6 @@ mod tests {
         );
 
         let active = vec![test_authoritative_wait_state(
-            "assignment-1",
-            "attempt-1",
             AttemptState::Active,
             9,
             None,
@@ -1103,8 +1110,6 @@ mod tests {
         );
 
         let pending_gate = vec![test_authoritative_wait_state(
-            "assignment-1",
-            "attempt-1",
             AttemptState::Completed,
             10,
             Some("review required"),
@@ -1182,8 +1187,9 @@ mod tests {
         };
         let before_state =
             authoritative_wait_state(&task, agent_task_revision(&task).expect("task serializes"));
-        let before = authoritative_wait_snapshot(Some("root"), "/root", &[before_state.clone()])
-            .expect("blocked snapshot");
+        let before =
+            authoritative_wait_snapshot(Some("root"), "/root", std::slice::from_ref(&before_state))
+                .expect("blocked snapshot");
 
         task.gates.push(codex_agent_task_store::AgentGate {
             assignment_id,
@@ -1199,8 +1205,9 @@ mod tests {
             &task,
             agent_task_revision(&task).expect("changed task serializes"),
         );
-        let after = authoritative_wait_snapshot(Some("root"), "/root", &[after_state.clone()])
-            .expect("changed blocked snapshot");
+        let after =
+            authoritative_wait_snapshot(Some("root"), "/root", std::slice::from_ref(&after_state))
+                .expect("changed blocked snapshot");
 
         assert_eq!(after_state.state, before_state.state);
         assert_eq!(after_state.epoch, before_state.epoch);
@@ -1277,11 +1284,18 @@ mod tests {
         }
     }
 
-    fn test_hydration(assignment_id: AssignmentId, revision: &str) -> HydratedAssignments {
+    fn test_hydrations(assignments: &[(AssignmentId, &str)]) -> HydratedAssignments {
         HydratedAssignments {
-            revisions: BTreeMap::from([(assignment_id, revision.to_string())]),
+            revisions: assignments
+                .iter()
+                .map(|(assignment_id, revision)| (*assignment_id, (*revision).to_string()))
+                .collect(),
             tasks: BTreeMap::new(),
         }
+    }
+
+    fn test_hydration(assignment_id: AssignmentId, revision: &str) -> HydratedAssignments {
+        test_hydrations(&[(assignment_id, revision)])
     }
 
     #[test]
@@ -1375,6 +1389,128 @@ mod tests {
             WakePageAcceptance::FailOpen(_)
         ));
         assert_eq!(changed_event.finish().0, first);
+    }
+
+    #[test]
+    fn later_page_merges_new_assignment_without_rehydrating_prior_assignment() {
+        let first_assignment_id = AssignmentId::new();
+        let second_assignment_id = AssignmentId::new();
+        let first = test_wake_page(
+            test_wake_events(
+                first_assignment_id,
+                codex_agent_task_store::AttemptId::new(),
+                1,
+            ),
+            0,
+            1,
+        );
+        let second = test_wake_page(
+            test_wake_events(
+                second_assignment_id,
+                codex_agent_task_store::AttemptId::new(),
+                1,
+            ),
+            0,
+            0,
+        );
+        let mut drain = WakeEventDrain::new(
+            None,
+            first,
+            test_hydration(first_assignment_id, "revision-1"),
+        )
+        .expect("first page is valid");
+
+        assert_eq!(
+            drain.push(second, test_hydration(second_assignment_id, "revision-2")),
+            WakePageAcceptance::Accepted
+        );
+        let (_, hydration) = drain.finish();
+        assert_eq!(
+            hydration.revisions,
+            BTreeMap::from([
+                (first_assignment_id, "revision-1".to_string()),
+                (second_assignment_id, "revision-2".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn final_revision_fence_scope_is_derived_from_accepted_revisions() {
+        let assignment_id = AssignmentId::new();
+        let derived_assignment_id = AssignmentId::new();
+        let first = test_wake_page(
+            test_wake_events(assignment_id, codex_agent_task_store::AttemptId::new(), 1),
+            0,
+            0,
+        );
+        let mut drain =
+            WakeEventDrain::new(None, first, test_hydration(assignment_id, "revision-1"))
+                .expect("first page is valid");
+        drain
+            .hydrated_assignments
+            .revisions
+            .insert(derived_assignment_id, "revision-2".to_string());
+
+        assert!(drain.assignment_ids().contains(&derived_assignment_id));
+    }
+
+    #[test]
+    fn later_page_rejects_changed_repeated_assignment() {
+        let assignment_id = AssignmentId::new();
+        let attempt_id = codex_agent_task_store::AttemptId::new();
+        let first = test_wake_page(test_wake_events(assignment_id, attempt_id, 1), 0, 1);
+        let second = test_wake_page(test_wake_events(assignment_id, attempt_id, 1), 0, 0);
+        let mut drain =
+            WakeEventDrain::new(None, first, test_hydration(assignment_id, "revision-1"))
+                .expect("first page is valid");
+
+        assert!(matches!(
+            drain.push(second, test_hydration(assignment_id, "revision-2")),
+            WakePageAcceptance::FailOpen(_)
+        ));
+    }
+
+    #[test]
+    fn final_revision_fence_rejects_prior_assignment_changed_after_disjoint_page() {
+        let first_assignment_id = AssignmentId::new();
+        let second_assignment_id = AssignmentId::new();
+        let first = test_wake_page(
+            test_wake_events(
+                first_assignment_id,
+                codex_agent_task_store::AttemptId::new(),
+                1,
+            ),
+            0,
+            1,
+        );
+        let second = test_wake_page(
+            test_wake_events(
+                second_assignment_id,
+                codex_agent_task_store::AttemptId::new(),
+                1,
+            ),
+            0,
+            0,
+        );
+        let mut drain = WakeEventDrain::new(
+            None,
+            first,
+            test_hydration(first_assignment_id, "revision-1"),
+        )
+        .expect("first page is valid");
+        assert_eq!(
+            drain.push(second, test_hydration(second_assignment_id, "revision-2")),
+            WakePageAcceptance::Accepted
+        );
+
+        assert!(
+            drain
+                .replace_if_same_revisions(test_hydrations(&[
+                    (first_assignment_id, "revision-3"),
+                    (second_assignment_id, "revision-2"),
+                ]))
+                .is_err()
+        );
     }
 
     #[test]
@@ -1711,7 +1847,7 @@ pub(crate) async fn inspect_authoritative_wait_snapshot(
 async fn nudge_stalled_assignments(
     session: &crate::session::session::Session,
     turn: &crate::session::turn_context::TurnContext,
-    store: Option<&std::sync::Arc<dyn codex_agent_task_store::AgentTaskStore>>,
+    store: Option<&std::sync::Arc<codex_agent_task_store::LocalAgentTaskStore>>,
     root_session_id: Option<&str>,
 ) -> Vec<String> {
     let (Some(store), Some(root_session_id)) = (store, root_session_id) else {
@@ -1890,7 +2026,7 @@ fn earliest_deadline(first: Option<Instant>, second: Option<Instant>) -> Option<
 }
 
 async fn read_wake_events(
-    store: Option<&std::sync::Arc<dyn codex_agent_task_store::AgentTaskStore>>,
+    store: Option<&std::sync::Arc<codex_agent_task_store::LocalAgentTaskStore>>,
     root_session_id: Option<&str>,
     cursor: Option<WakeEventId>,
 ) -> codex_agent_task_store::StoreResult<WakeRead> {
@@ -1913,7 +2049,7 @@ async fn read_wake_events(
 }
 
 async fn wait_wake_events(
-    store: Option<&std::sync::Arc<dyn codex_agent_task_store::AgentTaskStore>>,
+    store: Option<&std::sync::Arc<codex_agent_task_store::LocalAgentTaskStore>>,
     root_session_id: Option<&str>,
     cursor: Option<WakeEventId>,
 ) -> codex_agent_task_store::StoreResult<WakeRead> {
@@ -1935,7 +2071,7 @@ async fn wait_for_activity(
     activity_open: &mut bool,
     pending_activity: Option<InputQueueActivity>,
     boundary_deadline: Option<Instant>,
-    store: Option<&std::sync::Arc<dyn codex_agent_task_store::AgentTaskStore>>,
+    store: Option<&std::sync::Arc<codex_agent_task_store::LocalAgentTaskStore>>,
     root_session_id: Option<&str>,
     cursor: Option<WakeEventId>,
 ) -> codex_agent_task_store::StoreResult<(WaitOutcome, WakeRead)> {

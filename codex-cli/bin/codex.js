@@ -12,69 +12,21 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const require = createRequire(import.meta.url);
 const codexPackageRoot = realpathSync(path.join(__dirname, ".."));
-
-const PLATFORM_PACKAGE_BY_TARGET = {
-  "x86_64-unknown-linux-musl": "@openai/codex-linux-x64",
-  "aarch64-unknown-linux-musl": "@openai/codex-linux-arm64",
-  "x86_64-apple-darwin": "@openai/codex-darwin-x64",
-  "aarch64-apple-darwin": "@openai/codex-darwin-arm64",
-  "x86_64-pc-windows-msvc": "@openai/codex-win32-x64",
-  "aarch64-pc-windows-msvc": "@openai/codex-win32-arm64",
-};
-
 const { platform, arch } = process;
+const packageJson = require(path.join(codexPackageRoot, "package.json"));
+const nativeTarget = packageJson.codexNativeTargets?.[`${platform}-${arch}`];
 
-let targetTriple = null;
-switch (platform) {
-  case "linux":
-  case "android":
-    switch (arch) {
-      case "x64":
-        targetTriple = "x86_64-unknown-linux-musl";
-        break;
-      case "arm64":
-        targetTriple = "aarch64-unknown-linux-musl";
-        break;
-      default:
-        break;
-    }
-    break;
-  case "darwin":
-    switch (arch) {
-      case "x64":
-        targetTriple = "x86_64-apple-darwin";
-        break;
-      case "arm64":
-        targetTriple = "aarch64-apple-darwin";
-        break;
-      default:
-        break;
-    }
-    break;
-  case "win32":
-    switch (arch) {
-      case "x64":
-        targetTriple = "x86_64-pc-windows-msvc";
-        break;
-      case "arm64":
-        targetTriple = "aarch64-pc-windows-msvc";
-        break;
-      default:
-        break;
-    }
-    break;
-  default:
-    break;
-}
-
-if (!targetTriple) {
+if (
+  !nativeTarget ||
+  typeof nativeTarget.targetTriple !== "string" ||
+  typeof nativeTarget.package !== "string" ||
+  typeof nativeTarget.binary !== "string"
+) {
   throw new Error(`Unsupported platform: ${platform} (${arch})`);
 }
 
-const platformPackage = PLATFORM_PACKAGE_BY_TARGET[targetTriple];
-if (!platformPackage) {
-  throw new Error(`Unsupported target triple: ${targetTriple}`);
-}
+const targetTriple = nativeTarget.targetTriple;
+const platformPackage = nativeTarget.package;
 
 function findCodexExecutable() {
   let vendorRoot;
@@ -89,21 +41,14 @@ function findCodexExecutable() {
     vendorRoot,
     targetTriple,
     "bin",
-    process.platform === "win32" ? "codex.exe" : "codex",
+    nativeTarget.binary,
   );
   if (existsSync(codexExecutable)) {
     return codexExecutable;
   }
 
-  const packageManager = detectPackageManager();
-  const updateCommand =
-    packageManager === "bun"
-      ? "bun install -g @openai/codex@latest"
-      : packageManager === "pnpm"
-        ? "pnpm add -g @openai/codex@latest"
-        : "npm install -g @openai/codex@latest";
   throw new Error(
-    `Missing optional dependency ${platformPackage}. Reinstall Codex: ${updateCommand}`,
+    `Missing optional dependency ${platformPackage}. Reinstall this KD4 package from the same fork release artifact.`,
   );
 }
 
@@ -218,7 +163,7 @@ const forwardSignal = (signal) => {
   }
 };
 
-const forwardedSignals = ["SIGINT", "SIGTERM", "SIGHUP"];
+const forwardedSignals = ["SIGINT", "SIGTERM"];
 const signalHandlers = new Map(
   forwardedSignals.map((signal) => [signal, () => forwardSignal(signal)]),
 );

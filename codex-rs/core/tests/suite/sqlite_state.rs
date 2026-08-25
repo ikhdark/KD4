@@ -55,12 +55,7 @@ use wiremock::matchers::path;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn new_thread_is_recorded_in_state_db() -> Result<()> {
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_config(|config| {
-        config
-            .features
-            .enable(Feature::Sqlite)
-            .expect("test config should allow feature update");
-    });
+    let mut builder = test_codex();
     let test = builder.build(&server).await?;
 
     let thread_id = test.session_configured.thread_id;
@@ -142,16 +137,15 @@ async fn resume_restores_dynamic_tools_from_rollout_with_sqlite_enabled() -> Res
             },
         )],
     });
-    let mut builder = test_codex().with_config(|config| {
-        config
-            .features
-            .enable(Feature::Sqlite)
-            .expect("test config should allow feature update");
-    });
+    let mut builder = test_codex();
     let base_test = builder.build(&server).await?;
+    let options = base_test
+        .thread_manager
+        .start_thread_options(base_test.config.clone())
+        .with_dynamic_tools(vec![dynamic_tool]);
     let started = base_test
         .thread_manager
-        .start_thread_with_tools(base_test.config.clone(), vec![dynamic_tool])
+        .start_thread_with_options(options)
         .await?;
     let rollout_path = started
         .session_configured
@@ -177,12 +171,7 @@ async fn resume_restores_dynamic_tools_from_rollout_with_sqlite_enabled() -> Res
     })
     .await;
 
-    let mut resume_builder = test_codex().with_config(|config| {
-        config
-            .features
-            .enable(Feature::Sqlite)
-            .expect("test config should allow feature update");
-    });
+    let mut resume_builder = test_codex();
     let resumed = resume_builder
         .resume(&server, base_test.home.clone(), rollout_path)
         .await?;
@@ -239,16 +228,14 @@ async fn resume_restores_legacy_dynamic_tools_from_rollout_with_sqlite_enabled()
         "required": ["query"],
         "additionalProperties": false,
     });
-    let mut builder = test_codex().with_config(|config| {
-        config
-            .features
-            .enable(Feature::Sqlite)
-            .expect("test config should allow feature update");
-    });
+    let mut builder = test_codex();
     let base_test = builder.build(&server).await?;
+    let options = base_test
+        .thread_manager
+        .start_thread_options(base_test.config.clone());
     let started = base_test
         .thread_manager
-        .start_thread_with_tools(base_test.config.clone(), Vec::new())
+        .start_thread_with_options(options)
         .await?;
     let rollout_path = started
         .session_configured
@@ -297,12 +284,7 @@ async fn resume_restores_legacy_dynamic_tools_from_rollout_with_sqlite_enabled()
         .join("\n");
     fs::write(&rollout_path, format!("{rollout}\n"))?;
 
-    let mut resume_builder = test_codex().with_config(|config| {
-        config
-            .features
-            .enable(Feature::Sqlite)
-            .expect("test config should allow feature update");
-    });
+    let mut resume_builder = test_codex();
     let resumed = resume_builder
         .resume(&server, base_test.home.clone(), rollout_path)
         .await?;
@@ -339,6 +321,69 @@ async fn resume_restores_legacy_dynamic_tools_from_rollout_with_sqlite_enabled()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_rejects_invalid_dynamic_tools_from_rollout() -> Result<()> {
+    let server = start_mock_server().await;
+    mount_sse_once(
+        &server,
+        responses::sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+
+    let mut builder = test_codex();
+    let base_test = builder.build(&server).await?;
+    let rollout_path = base_test
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+
+    base_test.submit_turn("persist this thread").await?;
+    base_test.codex.submit(Op::Shutdown).await?;
+    wait_for_event(&base_test.codex, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
+
+    let mut rollout_lines = fs::read_to_string(&rollout_path)?
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<serde_json::Result<Vec<_>>>()?;
+    rollout_lines.first_mut().expect("session metadata line")["payload"]["dynamic_tools"] = json!([{
+        "type": "function",
+        "name": "invalid tool name",
+        "description": "Invalid restored tool fixture.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }
+    }]);
+    let rollout = rollout_lines
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<serde_json::Result<Vec<_>>>()?
+        .join("\n");
+    fs::write(&rollout_path, format!("{rollout}\n"))?;
+
+    let mut resume_builder = test_codex();
+    let error = match resume_builder
+        .resume(&server, base_test.home.clone(), rollout_path)
+        .await
+    {
+        Ok(_) => panic!("invalid restored dynamic tools should reject resume"),
+        Err(error) => error,
+    };
+    assert!(
+        format!("{error:#}").contains(
+            "dynamic tool name must match ^[a-zA-Z0-9_-]+$ to match Responses API: invalid tool name"
+        ),
+        "unexpected resume error: {error:#}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backfill_scans_existing_rollouts() -> Result<()> {
     let server = start_mock_server().await;
 
@@ -347,71 +392,64 @@ async fn backfill_scans_existing_rollouts() -> Result<()> {
     let rollout_rel_path = format!("sessions/2026/01/27/rollout-2026-01-27T12-00-00-{uuid}.jsonl");
     let rollout_rel_path_for_hook = rollout_rel_path.clone();
 
-    let mut builder = test_codex()
-        .with_pre_build_hook(move |codex_home| {
-            let rollout_path = codex_home.join(&rollout_rel_path_for_hook);
-            let parent = rollout_path
-                .parent()
-                .expect("rollout path should have parent");
-            fs::create_dir_all(parent).expect("should create rollout directory");
-            let session_meta_line = SessionMetaLine {
-                meta: SessionMeta {
-                    session_id: thread_id.into(),
-                    id: thread_id,
-                    forked_from_id: None,
-                    parent_thread_id: None,
-                    timestamp: "2026-01-27T12:00:00Z".to_string(),
-                    cwd: codex_home.to_path_buf(),
-                    originator: "test".to_string(),
-                    cli_version: "test".to_string(),
-                    source: SessionSource::default(),
-                    thread_source: None,
-                    agent_path: None,
-                    agent_nickname: None,
-                    agent_role: None,
-                    model_provider: None,
-                    base_instructions: None,
-                    dynamic_tools: None,
-                    selected_capability_roots: Vec::new(),
-                    memory_mode: None,
-                    history_mode: Default::default(),
-                    multi_agent_version: None,
-                    context_window: None,
-                },
-                git: None,
-            };
+    let mut builder = test_codex().with_pre_build_hook(move |codex_home| {
+        let rollout_path = codex_home.join(&rollout_rel_path_for_hook);
+        let parent = rollout_path
+            .parent()
+            .expect("rollout path should have parent");
+        fs::create_dir_all(parent).expect("should create rollout directory");
+        let session_meta_line = SessionMetaLine {
+            meta: SessionMeta {
+                session_id: thread_id.into(),
+                id: thread_id,
+                forked_from_id: None,
+                parent_thread_id: None,
+                timestamp: "2026-01-27T12:00:00Z".to_string(),
+                cwd: codex_home.to_path_buf(),
+                originator: "test".to_string(),
+                cli_version: "test".to_string(),
+                source: SessionSource::default(),
+                thread_source: None,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+                model_provider: None,
+                base_instructions: None,
+                dynamic_tools: None,
+                selected_capability_roots: Vec::new(),
+                memory_mode: None,
+                history_mode: Default::default(),
+                multi_agent_version: None,
+                context_window: None,
+            },
+            git: None,
+        };
 
-            let lines = [
-                RolloutLine {
-                    timestamp: "2026-01-27T12:00:00Z".to_string(),
-                    item: RolloutItem::SessionMeta(session_meta_line),
-                },
-                RolloutLine {
-                    timestamp: "2026-01-27T12:00:01Z".to_string(),
-                    item: RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
-                        client_id: None,
-                        message: "hello from backfill".to_string(),
-                        images: None,
-                        local_images: Vec::new(),
-                        text_elements: Vec::new(),
-                        ..Default::default()
-                    })),
-                },
-            ];
+        let lines = [
+            RolloutLine {
+                timestamp: "2026-01-27T12:00:00Z".to_string(),
+                item: RolloutItem::SessionMeta(session_meta_line),
+            },
+            RolloutLine {
+                timestamp: "2026-01-27T12:00:01Z".to_string(),
+                item: RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                    client_id: None,
+                    message: "hello from backfill".to_string(),
+                    images: None,
+                    local_images: Vec::new(),
+                    text_elements: Vec::new(),
+                    ..Default::default()
+                })),
+            },
+        ];
 
-            let jsonl = lines
-                .iter()
-                .map(|line| serde_json::to_string(line).expect("rollout line should serialize"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            fs::write(&rollout_path, format!("{jsonl}\n")).expect("should write rollout file");
-        })
-        .with_config(|config| {
-            config
-                .features
-                .enable(Feature::Sqlite)
-                .expect("test config should allow feature update");
-        });
+        let jsonl = lines
+            .iter()
+            .map(|line| serde_json::to_string(line).expect("rollout line should serialize"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&rollout_path, format!("{jsonl}\n")).expect("should write rollout file");
+    });
 
     let test = builder.build(&server).await?;
 
@@ -458,12 +496,7 @@ async fn user_messages_persist_in_state_db() -> Result<()> {
     )
     .await;
 
-    let mut builder = test_codex().with_config(|config| {
-        config
-            .features
-            .enable(Feature::Sqlite)
-            .expect("test config should allow feature update");
-    });
+    let mut builder = test_codex();
     let test = builder.build(&server).await?;
 
     let db_path = codex_state::state_db_path(test.config.sqlite_home.as_path());
@@ -513,10 +546,6 @@ async fn web_search_marks_thread_memory_mode_polluted_when_configured() -> Resul
     .await;
 
     let mut builder = test_codex().with_config(|config| {
-        config
-            .features
-            .enable(Feature::Sqlite)
-            .expect("test config should allow feature update");
         config.memories.disable_on_external_context = true;
     });
     let test = builder.build(&server).await?;
@@ -585,10 +614,6 @@ async fn standalone_web_search_marks_thread_memory_mode_polluted_when_configured
         .with_config(|config| {
             config
                 .features
-                .enable(Feature::Sqlite)
-                .expect("test config should allow feature update");
-            config
-                .features
                 .enable(Feature::StandaloneWebSearch)
                 .expect("standalone web search should be enabled");
             config.memories.disable_on_external_context = true;
@@ -649,10 +674,6 @@ async fn mcp_call_marks_thread_memory_mode_polluted_when_configured() -> Result<
 
     let rmcp_test_server_bin = stdio_server_bin()?;
     let mut builder = test_codex().with_config(move |config| {
-        config
-            .features
-            .enable(Feature::Sqlite)
-            .expect("test config should allow feature update");
         config.memories.disable_on_external_context = true;
 
         let mut servers = config.mcp_servers.get().clone();
@@ -772,12 +793,7 @@ async fn tool_call_logs_include_thread_id() -> Result<()> {
     )
     .await;
 
-    let mut builder = test_codex().with_config(|config| {
-        config
-            .features
-            .enable(Feature::Sqlite)
-            .expect("test config should allow feature update");
-    });
+    let mut builder = test_codex();
     let test = builder.build(&server).await?;
     let db = test.codex.state_db().expect("state db enabled");
     let expected_thread_id = test.session_configured.thread_id.to_string();

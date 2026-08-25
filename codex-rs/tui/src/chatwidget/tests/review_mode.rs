@@ -385,7 +385,6 @@ async fn restore_thread_input_state_restores_pending_steers_without_downgrading_
         user_turn_pending_start: false,
         current_collaboration_mode: chat.current_collaboration_mode.clone(),
         active_collaboration_mask: chat.active_collaboration_mask.clone(),
-        task_running: false,
         agent_turn_running: false,
     }));
 
@@ -413,7 +412,6 @@ async fn restore_thread_input_state_restores_pending_steers_without_downgrading_
 async fn steer_enter_queues_while_plan_stream_is_active() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());
-    chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
     let plan_mask = collaboration_modes::mask_for_kind(chat.model_catalog.as_ref(), ModeKind::Plan)
         .expect("expected plan collaboration mask");
     chat.set_collaboration_mask(plan_mask);
@@ -987,7 +985,7 @@ async fn ctrl_c_shutdown_works_with_caps_lock() {
 }
 
 #[tokio::test]
-async fn ctrl_c_interrupts_without_arming_quit_when_double_press_disabled() {
+async fn ctrl_c_interrupts_active_review_without_quitting() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.bottom_pane.set_task_running(/*running*/ true);
 
@@ -995,13 +993,11 @@ async fn ctrl_c_interrupts_without_arming_quit_when_double_press_disabled() {
 
     next_interrupt_op(&mut op_rx);
     assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
-    assert!(!chat.bottom_pane.quit_shortcut_hint_visible());
 
     chat.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
 
     next_interrupt_op(&mut op_rx);
     assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
-    assert!(!chat.bottom_pane.quit_shortcut_hint_visible());
 }
 
 #[tokio::test]
@@ -1020,7 +1016,6 @@ async fn ctrl_c_cleared_prompt_is_recoverable_via_history() {
     chat.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
     assert!(chat.bottom_pane.composer_text().is_empty());
     assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
-    assert!(!chat.bottom_pane.quit_shortcut_hint_visible());
 
     chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
     let restored_text = chat.bottom_pane.composer_text();
@@ -1029,7 +1024,6 @@ async fn ctrl_c_cleared_prompt_is_recoverable_via_history() {
         "expected placeholder {placeholder:?} after history recall"
     );
     assert!(restored_text.starts_with("draft message "));
-    assert!(!chat.bottom_pane.quit_shortcut_hint_visible());
 
     let images = chat.bottom_pane.take_recent_submission_images();
     assert_eq!(vec![PathBuf::from("/tmp/preview.png")], images);

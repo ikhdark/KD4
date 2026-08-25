@@ -6,14 +6,12 @@
 //!
 //! `rate_limits` is the main integration point for status-line usage-limit items: it converts raw
 //! window snapshots into local-time labels and classifies data as available, stale, or missing.
-mod account;
 mod card;
 mod format;
 mod helpers;
 mod rate_limits;
 pub(crate) mod remote_connection;
 
-pub(crate) use account::StatusAccountDisplay;
 pub(crate) use card::StatusHistoryHandle;
 #[cfg(test)]
 pub(crate) use card::new_status_output;
@@ -29,6 +27,15 @@ pub(crate) use rate_limits::RateLimitWindowDisplay;
 #[cfg(test)]
 pub(crate) use rate_limits::rate_limit_snapshot_display;
 pub(crate) use rate_limits::rate_limit_snapshot_display_for_limit;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StatusAccountDisplay {
+    ChatGpt {
+        email: Option<String>,
+        plan: Option<String>,
+    },
+    ApiKey,
+}
 
 #[cfg(test)]
 mod tests;

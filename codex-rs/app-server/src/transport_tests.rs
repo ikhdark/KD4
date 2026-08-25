@@ -71,6 +71,78 @@ fn response_with_reasoning_policy_history() -> OutgoingMessage {
 }
 
 #[tokio::test]
+async fn envelope_target_selection_preserves_the_only_delivery_path_difference() {
+    let initialized_connection_id = ConnectionId(1);
+    let uninitialized_connection_id = ConnectionId(2);
+    let missing_connection_id = ConnectionId(3);
+    let (initialized_writer_tx, mut initialized_writer_rx) = mpsc::channel(1);
+    let (uninitialized_writer_tx, mut uninitialized_writer_rx) = mpsc::channel(1);
+    let mut connections = HashMap::new();
+    connections.insert(
+        initialized_connection_id,
+        OutboundConnectionState::new(
+            initialized_writer_tx,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(RwLock::new(HashSet::new())),
+            /*disconnect_sender*/ None,
+        ),
+    );
+    connections.insert(
+        uninitialized_connection_id,
+        OutboundConnectionState::new(
+            uninitialized_writer_tx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(RwLock::new(HashSet::new())),
+            /*disconnect_sender*/ None,
+        ),
+    );
+
+    let notification = OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+        ConfigWarningNotification {
+            summary: "target-selection".to_string(),
+            details: None,
+            path: None,
+            range: None,
+        },
+    ));
+    let broadcast = OutgoingEnvelope::Broadcast {
+        message: notification.clone(),
+    };
+    assert_eq!(
+        target_connection_ids(&connections, &broadcast),
+        vec![initialized_connection_id]
+    );
+    route_outgoing_envelope(&mut connections, broadcast).await;
+    assert!(initialized_writer_rx.try_recv().is_ok());
+    assert!(uninitialized_writer_rx.try_recv().is_err());
+
+    for connection_id in [uninitialized_connection_id, missing_connection_id] {
+        let direct = OutgoingEnvelope::ToConnection {
+            connection_id,
+            message: notification.clone(),
+            write_complete_tx: None,
+        };
+        assert_eq!(
+            target_connection_ids(&connections, &direct),
+            vec![connection_id]
+        );
+    }
+
+    route_outgoing_envelope(
+        &mut connections,
+        OutgoingEnvelope::ToConnection {
+            connection_id: uninitialized_connection_id,
+            message: notification,
+            write_complete_tx: None,
+        },
+    )
+    .await;
+    assert!(uninitialized_writer_rx.try_recv().is_ok());
+}
+
+#[tokio::test]
 async fn to_connection_notification_respects_opt_out_filters() {
     let connection_id = ConnectionId(7);
     let (writer_tx, mut writer_rx) = mpsc::channel(1);

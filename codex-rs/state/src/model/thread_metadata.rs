@@ -6,39 +6,15 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
+pub use codex_protocol::protocol::SortDirection;
 use codex_protocol::protocol::ThreadHistoryMode;
+pub use codex_protocol::protocol::ThreadRelationFilter;
+pub use codex_protocol::protocol::ThreadSortKey as SortKey;
 use codex_protocol::protocol::ThreadSource;
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 use std::collections::HashMap;
 use std::path::PathBuf;
-
-/// The sort key to use when listing threads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SortKey {
-    /// Sort by the thread's creation timestamp.
-    CreatedAt,
-    /// Sort by the thread's last update timestamp.
-    UpdatedAt,
-    /// Sort by the thread's product recency timestamp.
-    RecencyAt,
-}
-
-/// Sort direction to use when listing threads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SortDirection {
-    Asc,
-    Desc,
-}
-
-/// Spawn-graph relationship used to filter thread listings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThreadRelationFilter {
-    /// Return only threads whose immediate parent is the given thread.
-    DirectChildrenOf(ThreadId),
-    /// Return every thread transitively descended from the given thread.
-    DescendantsOf(ThreadId),
-}
 
 /// A pagination anchor used for keyset pagination.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -555,7 +531,10 @@ pub struct BackfillStats {
 
 #[cfg(test)]
 mod tests {
+    use super::SortDirection;
+    use super::SortKey;
     use super::ThreadMetadata;
+    use super::ThreadRelationFilter;
     use super::ThreadRow;
     use chrono::DateTime;
     use chrono::Utc;
@@ -564,6 +543,22 @@ mod tests {
     use codex_protocol::protocol::ThreadHistoryMode;
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
+
+    #[test]
+    fn listing_value_types_are_protocol_owned() {
+        let sort_key: codex_protocol::protocol::ThreadSortKey = SortKey::CreatedAt;
+        let direction: codex_protocol::protocol::SortDirection = SortDirection::Asc;
+        fn relation_is_shared(
+            relation: ThreadRelationFilter,
+        ) -> codex_protocol::protocol::ThreadRelationFilter {
+            relation
+        }
+
+        assert_eq!(sort_key, SortKey::CreatedAt);
+        assert_eq!(direction, SortDirection::Asc);
+        let _: fn(ThreadRelationFilter) -> codex_protocol::protocol::ThreadRelationFilter =
+            relation_is_shared;
+    }
 
     fn thread_row(reasoning_effort: Option<&str>) -> ThreadRow {
         ThreadRow {

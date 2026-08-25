@@ -8,7 +8,10 @@
 //! for them.
 
 use super::*;
+use crate::app_server_session::server_error_data_from_report;
 use crate::chatwidget::InterruptedTurnNoticeMode;
+use codex_app_server_protocol::ThreadErrorData;
+use codex_app_server_protocol::ThreadErrorReason;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 
@@ -134,9 +137,7 @@ mod tests {
 
     #[test]
     fn side_start_error_message_explains_missing_first_prompt() {
-        let err = color_eyre::eyre::eyre!(
-            "thread/fork failed during TUI bootstrap: thread/fork failed: no rollout found for thread id 019da1a1-bed9-7a43-88a2-b49d43915021"
-        );
+        let err = thread_error_report(ThreadErrorReason::NotMaterialized, "localized message");
 
         assert_eq!(
             App::side_start_error_message(&err),
@@ -152,6 +153,20 @@ mod tests {
             App::side_start_error_message(&err),
             "Failed to start side conversation: transport disconnected"
         );
+    }
+
+    fn thread_error_report(reason: ThreadErrorReason, message: &str) -> color_eyre::Report {
+        let source = codex_app_server_protocol::JSONRPCErrorError {
+            code: -32600,
+            message: message.to_string(),
+            data: Some(
+                serde_json::to_value(ThreadErrorData { reason }).expect("thread error data"),
+            ),
+        };
+        color_eyre::Report::new(codex_app_server_client::TypedRequestError::Server {
+            method: "thread/fork".to_string(),
+            source,
+        })
     }
 
     #[test]
@@ -492,11 +507,11 @@ impl App {
     }
 
     pub(super) fn side_start_error_message(err: &color_eyre::Report) -> String {
-        if err.chain().any(|cause| {
-            let message = cause.to_string();
-            message.contains("no rollout found for thread id")
-                || message.contains("includeTurns is unavailable before first user message")
-        }) {
+        let reason = server_error_data_from_report::<ThreadErrorData>(err).map(|data| data.reason);
+        if matches!(
+            reason,
+            Some(ThreadErrorReason::NotMaterialized | ThreadErrorReason::NotFound)
+        ) {
             SIDE_NO_STARTED_CONVERSATION_MESSAGE.to_string()
         } else {
             format!("Failed to start side conversation: {err}")

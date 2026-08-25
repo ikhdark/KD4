@@ -4,10 +4,6 @@ Runtime: shell
 Executes shell requests under the orchestrator: asks for approval when needed,
 builds sandbox transform inputs, and runs them under the current SandboxAttempt.
 */
-#[cfg(unix)]
-pub(crate) mod unix_escalation;
-pub(crate) mod zsh_fork_backend;
-
 use crate::command_canonicalization::canonicalize_command_for_approval;
 use crate::exec::CommandProgress;
 use crate::exec::ExecCapturePolicy;
@@ -23,12 +19,10 @@ use crate::tools::known_delta_store::PreparedKnownDelta;
 use crate::tools::network_approval::NetworkApprovalMode;
 use crate::tools::network_approval::NetworkApprovalSpec;
 use crate::tools::runtimes::RuntimePathPrepends;
-#[cfg(unix)]
-use crate::tools::runtimes::apply_zsh_fork_path_prepend;
 use crate::tools::runtimes::build_sandbox_command;
 use crate::tools::runtimes::disable_powershell_profile_for_elevated_windows_sandbox;
 use crate::tools::runtimes::exec_env_for_sandbox_permissions;
-use crate::tools::runtimes::maybe_wrap_shell_lc_with_snapshot;
+use crate::tools::runtimes::maybe_wrap_shell_lc_with_snapshot_file;
 use crate::tools::sandboxing::Approvable;
 use crate::tools::sandboxing::ApprovalAction;
 use crate::tools::sandboxing::ApprovalCtx;
@@ -50,7 +44,7 @@ use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::ReviewDecision;
 use codex_sandboxing::SandboxablePreference;
 use codex_shell_command::powershell::prefix_powershell_script_with_utf8;
-#[cfg(windows)]
+
 use codex_shell_command::powershell::prove_noprofile_powershell_command_as_direct_argv;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use futures::future::BoxFuture;
@@ -65,7 +59,7 @@ pub struct ShellRequest {
     /// Semantically equivalent, inspectable command used for approvals and
     /// approval caching when `command` contains an encoded runtime payload.
     pub command_for_approval: Vec<String>,
-    #[cfg(windows)]
+
     pub approved_powershell_direct_argv: Option<Vec<String>>,
     pub turn_environment: TurnEnvironment,
     pub shell_type: Option<ShellType>,
@@ -79,8 +73,6 @@ pub struct ShellRequest {
     pub network: Option<NetworkProxy>,
     pub sandbox_permissions: SandboxPermissions,
     pub additional_permissions: Option<AdditionalPermissionProfile>,
-    #[cfg(unix)]
-    pub additional_permissions_preapproved: bool,
     pub justification: Option<String>,
     pub exec_approval_requirement: ExecApprovalRequirement,
     pub(crate) known_delta: Option<PreparedKnownDelta>,
@@ -88,25 +80,7 @@ pub struct ShellRequest {
     pub(crate) workspace_operation_root: Option<PathBuf>,
 }
 
-/// Selects `ShellRuntime` behavior for different callers.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ShellRuntimeBackend {
-    /// Legacy backend for the `shell_command` tool.
-    ///
-    /// Keeps `shell_command` on the standard shell runtime flow without the
-    /// zsh-fork shell-escalation adapter.
-    ShellCommandClassic,
-    /// zsh-fork backend for the `shell_command` tool.
-    ///
-    /// On Unix, attempts to run via the zsh-fork + `codex-shell-escalation`
-    /// adapter, with fallback to the standard shell runtime flow if
-    /// prerequisites are not met.
-    ShellCommandZshFork,
-}
-
-pub struct ShellRuntime {
-    backend: ShellRuntimeBackend,
-}
+pub struct ShellRuntime;
 
 #[derive(serde::Serialize, Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct ApprovalKey {
@@ -118,8 +92,8 @@ pub(crate) struct ApprovalKey {
 }
 
 impl ShellRuntime {
-    pub(crate) fn for_shell_command(backend: ShellRuntimeBackend) -> Self {
-        Self { backend }
+    pub(crate) fn for_shell_command() -> Self {
+        Self
     }
 
     fn stdout_stream(
@@ -320,13 +294,31 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             }
             None => None,
         };
+        let mutation = crate::turn_diff_tracker::command_mutation(
+            &req.command_for_approval,
+            Some(req.cwd.as_path()),
+        );
+        crate::tools::events::begin_exec_mutation_evidence(
+            crate::tools::events::ToolEventCtx::new(
+                ctx.session.as_ref(),
+                ctx.turn.as_ref(),
+                &ctx.call_id,
+                None,
+            ),
+            Some(&req.cwd),
+            &mutation,
+        )
+        .await;
         let session_shell = ctx.session.user_shell();
         let shell = req
             .turn_environment
             .shell
             .as_ref()
             .unwrap_or(session_shell.as_ref());
-        let shell_snapshot_location = req.turn_environment.shell_snapshot(&req.cwd).await;
+        let shell_snapshot_location = req
+            .turn_environment
+            .shell_snapshot(&codex_utils_path_uri::PathUri::from_abs_path(&req.cwd))
+            .await;
         let (file_system_sandbox_policy, _) = attempt.permissions.to_runtime_permissions();
         let sandbox_permissions = sandbox_permissions_preserving_denied_reads(
             req.sandbox_permissions,
@@ -334,31 +326,15 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
         );
         let managed_network =
             managed_network_for_sandbox_permissions(req.network.as_ref(), sandbox_permissions);
-        let env = exec_env_for_sandbox_permissions(&req.env, sandbox_permissions);
+        let mut env = exec_env_for_sandbox_permissions(&req.env, sandbox_permissions);
         let explicit_env_overrides = req.explicit_env_overrides.clone();
-        #[cfg(unix)]
-        let (env, runtime_path_prepends) = {
-            let mut env = env;
-            let mut runtime_path_prepends = RuntimePathPrepends::default();
-            crate::tools::runtimes::apply_package_path_prepend(
-                &mut env,
-                &mut runtime_path_prepends,
-            );
-            if self.backend == ShellRuntimeBackend::ShellCommandZshFork
-                && let Some(shell_zsh_path) = ctx.session.services.shell_zsh_path.as_deref()
-            {
-                apply_zsh_fork_path_prepend(&mut env, &mut runtime_path_prepends, shell_zsh_path);
-            }
-            (env, runtime_path_prepends)
-        };
-        #[cfg(not(unix))]
-        let runtime_path_prepends = RuntimePathPrepends::default();
-        let command = maybe_wrap_shell_lc_with_snapshot(
+        let runtime_path_prepends = RuntimePathPrepends;
+        let command = maybe_wrap_shell_lc_with_snapshot_file(
             &req.command,
             shell,
-            shell_snapshot_location.as_ref(),
+            shell_snapshot_location.as_deref(),
             &explicit_env_overrides,
-            &env,
+            &mut env,
             &runtime_path_prepends,
         );
         let command = disable_powershell_profile_for_elevated_windows_sandbox(
@@ -368,7 +344,6 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             attempt.windows_sandbox_level,
         );
         let command = if matches!(shell.shell_type, ShellType::PowerShell) {
-            #[cfg(windows)]
             {
                 if let Some(approved_command) = req.approved_powershell_direct_argv.as_ref()
                     && let Some(proof) = prove_noprofile_powershell_command_as_direct_argv(
@@ -385,26 +360,9 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
                     prefix_powershell_script_with_utf8(&command)
                 }
             }
-            #[cfg(not(windows))]
-            {
-                prefix_powershell_script_with_utf8(&command)
-            }
         } else {
             command
         };
-
-        if self.backend == ShellRuntimeBackend::ShellCommandZshFork
-            && req.stall_timeout_ms.is_none()
-        {
-            match zsh_fork_backend::maybe_run_shell_command(req, attempt, ctx, &command).await? {
-                Some(out) => return Ok(out),
-                None => {
-                    tracing::warn!(
-                        "ZshFork backend specified, but conditions for using it were not met, falling back to normal execution",
-                    );
-                }
-            }
-        }
 
         let command =
             build_sandbox_command(&command, &req.cwd, &env, req.additional_permissions.clone())?;

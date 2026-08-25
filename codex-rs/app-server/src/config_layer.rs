@@ -11,7 +11,7 @@ use codex_config::ConfigLayerSource;
 /// The types stay separate so app-server protocol ownership does not leak into the config domain
 /// crate. Because this crate owns neither type, Rust's orphan rules require an explicit conversion
 /// function instead of a `From` implementation.
-pub(crate) fn config_layer_source_to_api(source: ConfigLayerSource) -> ApiConfigLayerSource {
+fn config_layer_source_to_api(source: ConfigLayerSource) -> ApiConfigLayerSource {
     match source {
         ConfigLayerSource::Mdm { domain, key } => ApiConfigLayerSource::Mdm { domain, key },
         ConfigLayerSource::System { file } => ApiConfigLayerSource::System { file },
@@ -59,5 +59,19 @@ pub(crate) fn config_layer_to_api(layer: ConfigLayer) -> ApiConfigLayer {
         version: layer.version,
         config: layer.config,
         disabled_reason: layer.disabled_reason,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn internal_api_visibility_is_minimal() {
+        let source = include_str!("config_layer.rs");
+        let crate_visible_declaration = ["pub(crate)", " fn config_layer_source_to_api"].concat();
+
+        assert!(
+            !source.contains(&crate_visible_declaration),
+            "module-local config conversion helper must remain private"
+        );
     }
 }

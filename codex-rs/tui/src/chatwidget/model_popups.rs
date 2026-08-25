@@ -396,9 +396,8 @@ impl ChatWidget {
             let effort_label = Self::reasoning_effort_label(effort);
             format!("⚠ {effort_label} reasoning effort can quickly consume Plus plan rate limits.")
         });
-        let warn_for_model = preset.model.starts_with("gpt-5.1-codex")
-            || preset.model.starts_with("gpt-5.1-codex-max")
-            || preset.model.starts_with("gpt-5.2");
+        let warn_for_account =
+            self.config.model_provider.requires_openai_auth && self.has_chatgpt_account;
 
         let mut choices: Vec<ReasoningEffortConfig> = supported
             .iter()
@@ -464,7 +463,7 @@ impl ChatWidget {
                 .map(|option| option.description.to_string())
                 .filter(|text| !text.is_empty());
 
-            let show_warning = warn_for_model && warn_effort.as_ref() == Some(&effort);
+            let show_warning = warn_for_account && warn_effort.as_ref() == Some(&effort);
             let selected_description = if show_warning {
                 warning_text.as_ref().map(|warning_message| {
                     description.as_ref().map_or_else(

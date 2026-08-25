@@ -1,4 +1,4 @@
-use crate::function_tool::FunctionCallError;
+use crate::FunctionCallError;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::handlers::mcp_resource_spec::create_list_mcp_resource_templates_tool;
@@ -9,7 +9,6 @@ use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 
 use rmcp::model::ListResourceTemplatesResult;
-use rmcp::model::PaginatedRequestParams;
 use rmcp::model::ResourceTemplate;
 
 use super::ListResourceTemplatesArgs;
@@ -17,28 +16,17 @@ use super::ListResourceTemplatesPayload;
 use super::McpServerCollection;
 use super::canonical_all_list_resource_templates;
 use super::canonical_single_list_resource_templates;
+use super::ensure_cursor_has_server;
 use super::ensure_model_can_access_mcp_server;
 use super::execute_resource_call;
+use super::list_mcp_server_page;
 use super::model_can_access_mcp_server;
 use super::parse_args_with_default;
 use super::parse_arguments;
 use super::serialize_function_output;
+use super::take_server_result;
 
 pub struct ListMcpResourceTemplatesHandler;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ListResourceTemplatesStrategy {
-    Exhaustive,
-    ExplicitPage,
-}
-
-fn list_resource_templates_strategy(cursor: Option<&str>) -> ListResourceTemplatesStrategy {
-    if cursor.is_some() {
-        ListResourceTemplatesStrategy::ExplicitPage
-    } else {
-        ListResourceTemplatesStrategy::Exhaustive
-    }
-}
 
 fn exhaustive_resource_template_pages(
     collection: McpServerCollection<Vec<ResourceTemplate>>,
@@ -109,6 +97,7 @@ impl ListMcpResourceTemplatesHandler {
         let args: ListResourceTemplatesArgs = parse_args_with_default(arguments.clone())?;
         let args = args.normalize()?;
         let ListResourceTemplatesArgs { server, cursor } = args;
+        ensure_cursor_has_server(server.as_deref(), cursor.as_deref())?;
 
         let invocation = McpInvocation {
             server: server.clone().unwrap_or_else(|| "codex".to_string()),
@@ -126,33 +115,19 @@ impl ListMcpResourceTemplatesHandler {
             async {
                 let (payload, canonical) = if let Some(server_name) = server.clone() {
                     ensure_model_can_access_mcp_server(turn.as_ref(), &server_name)?;
-                    let result = match list_resource_templates_strategy(cursor.as_deref()) {
-                        ListResourceTemplatesStrategy::Exhaustive => {
+                    let result = list_mcp_server_page(
+                        cursor.clone(),
+                        || async {
                             let collection = manager
                                 .list_all_resource_templates(|candidate| candidate == server_name)
                                 .await;
-                            let mut pages = exhaustive_resource_template_pages(collection);
-                            pages.results.remove(&server_name).ok_or_else(|| {
-                                pages
-                                    .errors
-                                    .into_iter()
-                                    .find(|error| error.server == server_name)
-                                    .map_or_else(
-                                        || {
-                                            FunctionCallError::RespondToModel(format!(
-                                                "resources/templates/list failed: unknown MCP server '{server_name}'"
-                                            ))
-                                        },
-                                        |error| {
-                                            FunctionCallError::RespondToModel(error.message)
-                                        },
-                                    )
-                            })?
-                        }
-                        ListResourceTemplatesStrategy::ExplicitPage => {
-                            let params = cursor.clone().map(|value| {
-                                PaginatedRequestParams::default().with_cursor(Some(value))
-                            });
+                            take_server_result(
+                                exhaustive_resource_template_pages(collection),
+                                &server_name,
+                                "resources/templates/list",
+                            )
+                        },
+                        |params| async {
                             manager
                                 .list_resource_templates(&server_name, params)
                                 .await
@@ -160,9 +135,10 @@ impl ListMcpResourceTemplatesHandler {
                                     FunctionCallError::RespondToModel(format!(
                                         "resources/templates/list failed: {err:#}"
                                     ))
-                                })?
-                        }
-                    };
+                                })
+                        },
+                    )
+                    .await?;
                     let canonical =
                         canonical_single_list_resource_templates(&server_name, &result)?;
                     let payload = ListResourceTemplatesPayload::from_single_server(
@@ -172,12 +148,6 @@ impl ListMcpResourceTemplatesHandler {
                     )?;
                     (payload, canonical)
                 } else {
-                    if cursor.is_some() {
-                        return Err(FunctionCallError::RespondToModel(
-                            "cursor can only be used when a server is specified".to_string(),
-                        ));
-                    }
-
                     let collection = manager
                         .list_all_resource_templates(|server_name| {
                             model_can_access_mcp_server(turn.as_ref(), server_name)
@@ -199,22 +169,5 @@ impl ListMcpResourceTemplatesHandler {
 impl CoreToolRuntime for ListMcpResourceTemplatesHandler {
     fn waits_for_runtime_cancellation(&self) -> bool {
         true
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn omitted_cursor_uses_exhaustive_owner_collection() {
-        assert_eq!(
-            list_resource_templates_strategy(None),
-            ListResourceTemplatesStrategy::Exhaustive
-        );
-        assert_eq!(
-            list_resource_templates_strategy(Some("opaque-cursor")),
-            ListResourceTemplatesStrategy::ExplicitPage
-        );
     }
 }

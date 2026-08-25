@@ -859,7 +859,7 @@ impl DomainListKind {
 }
 
 pub(crate) fn unix_socket_permissions_supported() -> bool {
-    cfg!(target_os = "macos")
+    false
 }
 
 async fn host_resolves_to_non_public_ip<F, Fut>(
@@ -1962,68 +1962,6 @@ mod tests {
         assert!(build_config_state(config, NetworkProxyConstraints::default()).is_err());
     }
 
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn unix_socket_allowlist_is_respected_on_macos() {
-        let socket_path = "/tmp/example.sock".to_string();
-        let state = network_proxy_state_for_policy(network_settings_with_unix_sockets(
-            &["example.com"],
-            &[],
-            std::slice::from_ref(&socket_path),
-        ));
-
-        assert!(state.is_unix_socket_allowed(&socket_path).await.unwrap());
-        assert!(
-            !state
-                .is_unix_socket_allowed("/tmp/not-allowed.sock")
-                .await
-                .unwrap()
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn unix_socket_allowlist_resolves_symlinks() {
-        use std::os::unix::fs::symlink;
-        use tempfile::tempdir;
-
-        let temp_dir = tempdir().unwrap();
-        let dir = temp_dir.path();
-
-        let real = dir.join("real.sock");
-        let link = dir.join("link.sock");
-
-        // The allowlist mechanism is path-based; for test purposes we don't need an actual unix
-        // domain socket. Any filesystem entry works for canonicalization.
-        std::fs::write(&real, b"not a socket").unwrap();
-        symlink(&real, &link).unwrap();
-
-        let real_s = real.to_str().unwrap().to_string();
-        let link_s = link.to_str().unwrap().to_string();
-
-        let state = network_proxy_state_for_policy(network_settings_with_unix_sockets(
-            &["example.com"],
-            &[],
-            std::slice::from_ref(&real_s),
-        ));
-
-        assert!(state.is_unix_socket_allowed(&link_s).await.unwrap());
-    }
-
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn unix_socket_allow_all_flag_bypasses_allowlist() {
-        let state = network_proxy_state_for_policy({
-            let mut network = network_settings(&["example.com"], &[]);
-            network.dangerously_allow_all_unix_sockets = true;
-            network
-        });
-
-        assert!(state.is_unix_socket_allowed("/tmp/any.sock").await.unwrap());
-        assert!(!state.is_unix_socket_allowed("relative.sock").await.unwrap());
-    }
-
-    #[cfg(not(target_os = "macos"))]
     #[tokio::test]
     async fn unix_socket_allowlist_is_rejected_on_non_macos() {
         let socket_path = "/tmp/example.sock".to_string();

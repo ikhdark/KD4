@@ -15,6 +15,28 @@ use serde::Serialize;
 use std::path::PathBuf;
 use ts_rs::TS;
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub enum PluginRemoteErrorReason {
+    AuthenticationRequired,
+    UnsupportedAuthMode,
+    AccessDenied,
+    NotFound,
+    Transient,
+    InvalidRequest,
+    InvalidResponse,
+    Internal,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub struct PluginRemoteErrorData {
+    pub reason: PluginRemoteErrorReason,
+    pub retryable: bool,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -632,6 +654,19 @@ pub struct PluginSummary {
     pub interface: Option<PluginInterface>,
     #[serde(default)]
     pub keywords: Vec<String>,
+}
+
+impl PluginSummary {
+    /// Returns the user-facing plugin name, falling back to the manifest name.
+    pub fn display_name(&self) -> String {
+        self.interface
+            .as_ref()
+            .and_then(|interface| interface.display_name.as_deref())
+            .map(str::trim)
+            .filter(|display_name| !display_name.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| self.name.clone())
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]

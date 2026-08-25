@@ -34,8 +34,7 @@ use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
 use codex_utils_path_uri::LegacyAppPathString;
 use codex_utils_path_uri::PathUri;
 use codex_utils_pty::ManagedRootProcess;
-#[cfg(unix)]
-use codex_utils_pty::process_group::kill_process_group;
+
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use rmcp::service::RoleClient;
@@ -193,8 +192,6 @@ impl StdioServerLauncher for LocalStdioServerLauncher {
 
 struct LocalProcessTerminator {
     managed: Mutex<Option<Arc<ManagedRootProcess>>>,
-    #[cfg(unix)]
-    process_group_id: u32,
 }
 
 #[derive(Clone)]
@@ -246,8 +243,7 @@ impl LocalStdioServerLauncher {
             .env_clear()
             .envs(envs)
             .args(args);
-        #[cfg(unix)]
-        command.process_group(0);
+
         let managed = Arc::new(ManagedRootProcess::reserve_with_reclaim().await?);
 
         let (transport, stderr) = TokioChildProcess::builder(command)
@@ -256,7 +252,7 @@ impl LocalStdioServerLauncher {
         let process_id = transport
             .id()
             .ok_or_else(|| io::Error::other("spawned MCP server has no process id"))?;
-        #[cfg(windows)]
+
         managed.attach(process_id)?;
         let process = StdioServerProcessHandle::local(
             program_name.clone(),
@@ -290,21 +286,6 @@ impl LocalStdioServerLauncher {
 
 impl LocalProcessTerminator {
     fn new(process_group_id: u32, managed: Arc<ManagedRootProcess>) -> Self {
-        #[cfg(unix)]
-        {
-            Self {
-                managed: Mutex::new(Some(managed)),
-                process_group_id,
-            }
-        }
-        #[cfg(windows)]
-        {
-            let _ = process_group_id;
-            Self {
-                managed: Mutex::new(Some(managed)),
-            }
-        }
-        #[cfg(not(any(unix, windows)))]
         {
             let _ = process_group_id;
             Self {
@@ -313,20 +294,6 @@ impl LocalProcessTerminator {
         }
     }
 
-    #[cfg(unix)]
-    fn terminate(&self) {
-        let Some(_managed) = self.take_managed() else {
-            return;
-        };
-        if let Err(error) = kill_process_group(self.process_group_id) {
-            warn!(
-                "Failed to kill MCP process group {}: {error}",
-                self.process_group_id
-            );
-        }
-    }
-
-    #[cfg(windows)]
     fn terminate(&self) {
         let Some(managed) = self.take_managed() else {
             return;
@@ -337,11 +304,6 @@ impl LocalProcessTerminator {
                 managed.id()
             );
         }
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    fn terminate(&self) {
-        let _ = self.take_managed();
     }
 
     fn reaped(&self) {

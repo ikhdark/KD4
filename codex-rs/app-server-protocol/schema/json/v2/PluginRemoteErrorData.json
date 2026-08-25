@@ -1,0 +1,32 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "PluginRemoteErrorReason": {
+      "enum": [
+        "authenticationRequired",
+        "unsupportedAuthMode",
+        "accessDenied",
+        "notFound",
+        "transient",
+        "invalidRequest",
+        "invalidResponse",
+        "internal"
+      ],
+      "type": "string"
+    }
+  },
+  "properties": {
+    "reason": {
+      "$ref": "#/definitions/PluginRemoteErrorReason"
+    },
+    "retryable": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "reason",
+    "retryable"
+  ],
+  "title": "PluginRemoteErrorData",
+  "type": "object"
+}

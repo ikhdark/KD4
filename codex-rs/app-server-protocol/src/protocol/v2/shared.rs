@@ -1,6 +1,7 @@
 use codex_experimental_api_macros::ExperimentalApi;
 use codex_protocol::config_types::ApprovalsReviewer as CoreApprovalsReviewer;
 use codex_protocol::config_types::SandboxMode as CoreSandboxMode;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval as CoreAskForApproval;
 use codex_protocol::protocol::CodexErrorInfo as CoreCodexErrorInfo;
 use codex_protocol::protocol::GranularApprovalConfig as CoreGranularApprovalConfig;
@@ -14,11 +15,47 @@ use schemars::schema::SchemaObject;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
+use std::path::Path;
 use ts_rs::TS;
 
 // Macro to declare a camelCased API v2 enum mirroring a core enum which
 // tends to use either snake_case or kebab-case.
 macro_rules! v2_enum_from_core {
+    (
+        rename_all = $rename_all:literal;
+        $(export_to = $export_to:literal;)?
+        $(#[$enum_meta:meta])*
+        pub enum $Name:ident from $Src:path {
+            $( $(#[$variant_meta:meta])* $Variant:ident ),+ $(,)?
+        }
+    ) => {
+        #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+        $(#[$enum_meta])*
+        #[serde(rename_all = $rename_all)]
+        #[ts(rename_all = $rename_all)]
+        $(#[ts(export_to = $export_to)])?
+        pub enum $Name {
+            $( $(#[$variant_meta])* $Variant ),+
+        }
+
+        impl $Name {
+            pub fn to_core(self) -> $Src {
+                match self { $( $Name::$Variant => <$Src>::$Variant ),+ }
+            }
+        }
+
+        impl From<$Src> for $Name {
+            fn from(value: $Src) -> Self {
+                match value { $( <$Src>::$Variant => $Name::$Variant ),+ }
+            }
+        }
+
+        impl From<$Name> for $Src {
+            fn from(value: $Name) -> Self {
+                value.to_core()
+            }
+        }
+    };
     (
         $(#[$enum_meta:meta])*
         pub enum $Name:ident from $Src:path {
@@ -51,6 +88,17 @@ pub(super) use v2_enum_from_core;
 
 pub(super) const fn default_enabled() -> bool {
     true
+}
+
+/// Canonical PTY size payload shared by app-server process APIs.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct PtyTerminalSize {
+    /// Terminal height in character cells.
+    pub rows: u16,
+    /// Terminal width in character cells.
+    pub cols: u16,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
@@ -300,6 +348,33 @@ impl SandboxMode {
             SandboxMode::DangerFullAccess => CoreSandboxMode::DangerFullAccess,
         }
     }
+
+    /// Projects the canonical permission profile onto the legacy app-server sandbox field.
+    ///
+    /// `None` means the profile cannot be represented by the legacy field. Callers should send
+    /// the richer permissions selection when one is available.
+    pub fn from_permission_profile(
+        permission_profile: &PermissionProfile,
+        cwd: &Path,
+    ) -> Option<Self> {
+        match permission_profile {
+            PermissionProfile::Disabled => Some(Self::DangerFullAccess),
+            PermissionProfile::External { .. } => None,
+            PermissionProfile::Managed { .. } => {
+                let file_system_policy = permission_profile.file_system_sandbox_policy();
+                if file_system_policy.has_full_disk_write_access() {
+                    permission_profile
+                        .network_sandbox_policy()
+                        .is_enabled()
+                        .then_some(Self::DangerFullAccess)
+                } else if file_system_policy.can_write_path_with_cwd(cwd, cwd) {
+                    Some(Self::WorkspaceWrite)
+                } else {
+                    Some(Self::ReadOnly)
+                }
+            }
+        }
+    }
 }
 
 impl From<CoreSandboxMode> for SandboxMode {
@@ -308,6 +383,57 @@ impl From<CoreSandboxMode> for SandboxMode {
             CoreSandboxMode::ReadOnly => SandboxMode::ReadOnly,
             CoreSandboxMode::WorkspaceWrite => SandboxMode::WorkspaceWrite,
             CoreSandboxMode::DangerFullAccess => SandboxMode::DangerFullAccess,
+        }
+    }
+}
+
+#[cfg(test)]
+mod sandbox_mode_tests {
+    use super::SandboxMode;
+    use codex_protocol::models::ManagedFileSystemPermissions;
+    use codex_protocol::models::PermissionProfile;
+    use codex_protocol::permissions::NetworkSandboxPolicy;
+
+    #[test]
+    fn permission_profile_projection_preserves_legacy_sandbox_semantics() {
+        let cwd = std::env::current_dir().expect("current directory");
+        let cases = [
+            (
+                PermissionProfile::Disabled,
+                Some(SandboxMode::DangerFullAccess),
+            ),
+            (
+                PermissionProfile::External {
+                    network: NetworkSandboxPolicy::Restricted,
+                },
+                None,
+            ),
+            (
+                PermissionProfile::Managed {
+                    file_system: ManagedFileSystemPermissions::Unrestricted,
+                    network: NetworkSandboxPolicy::Enabled,
+                },
+                Some(SandboxMode::DangerFullAccess),
+            ),
+            (
+                PermissionProfile::Managed {
+                    file_system: ManagedFileSystemPermissions::Unrestricted,
+                    network: NetworkSandboxPolicy::Restricted,
+                },
+                None,
+            ),
+            (
+                PermissionProfile::workspace_write(),
+                Some(SandboxMode::WorkspaceWrite),
+            ),
+            (PermissionProfile::read_only(), Some(SandboxMode::ReadOnly)),
+        ];
+
+        for (profile, expected) in cases {
+            assert_eq!(
+                SandboxMode::from_permission_profile(&profile, &cwd),
+                expected
+            );
         }
     }
 }

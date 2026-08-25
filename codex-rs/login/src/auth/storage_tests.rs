@@ -2,10 +2,9 @@ use super::*;
 use crate::token_data::IdTokenInfo;
 use anyhow::Context;
 use base64::Engine;
+use codex_secrets::LocalSecretsBackend;
 use codex_secrets::LocalSecretsNamespace;
 use codex_secrets::SecretScope;
-use codex_secrets::SecretsBackendKind;
-use codex_secrets::SecretsManager;
 use codex_secrets::compute_keyring_account;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -307,6 +306,10 @@ fn ephemeral_storage_save_load_delete_is_in_memory_only() -> anyhow::Result<()> 
     assert!(removed);
     let loaded = storage.load()?;
     assert_eq!(None, loaded);
+    assert!(
+        !storage.delete()?,
+        "deleted in-memory auth must stay absent"
+    );
     assert!(!get_auth_file(dir.path()).exists());
     Ok(())
 }
@@ -316,13 +319,12 @@ fn seed_secrets_backend_and_fallback_auth_file_for_delete(
     codex_home: &Path,
     auth: &AuthDotJson,
 ) -> anyhow::Result<PathBuf> {
-    let manager = SecretsManager::new_with_keyring_store_and_namespace(
+    let backend = LocalSecretsBackend::new_with_namespace(
         codex_home.to_path_buf(),
-        SecretsBackendKind::Local,
         Arc::new(mock_keyring.clone()),
         LocalSecretsNamespace::CodexAuth,
     );
-    manager.set(
+    backend.set(
         &SecretScope::Global,
         &CODEX_AUTH_SECRET_NAME,
         &serde_json::to_string(auth)?,
@@ -337,13 +339,12 @@ fn seed_secrets_backend_with_auth(
     codex_home: &Path,
     auth: &AuthDotJson,
 ) -> anyhow::Result<()> {
-    let manager = SecretsManager::new_with_keyring_store_and_namespace(
+    let backend = LocalSecretsBackend::new_with_namespace(
         codex_home.to_path_buf(),
-        SecretsBackendKind::Local,
         Arc::new(mock_keyring.clone()),
         LocalSecretsNamespace::CodexAuth,
     );
-    manager.set(
+    backend.set(
         &SecretScope::Global,
         &CODEX_AUTH_SECRET_NAME,
         &serde_json::to_string(auth)?,
@@ -356,13 +357,12 @@ fn assert_keyring_saved_auth_and_removed_fallback(
     codex_home: &Path,
     expected: &AuthDotJson,
 ) -> anyhow::Result<()> {
-    let manager = SecretsManager::new_with_keyring_store_and_namespace(
+    let backend = LocalSecretsBackend::new_with_namespace(
         codex_home.to_path_buf(),
-        SecretsBackendKind::Local,
         Arc::new(mock_keyring.clone()),
         LocalSecretsNamespace::CodexAuth,
     );
-    let saved_value = manager
+    let saved_value = backend
         .get(&SecretScope::Global, &CODEX_AUTH_SECRET_NAME)?
         .context("encrypted auth entry should exist")?;
     let expected_serialized = serde_json::to_string(expected)?;

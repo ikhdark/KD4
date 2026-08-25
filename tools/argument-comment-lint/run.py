@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from typing import Never
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -18,7 +19,7 @@ from wrapper_common import (
 )
 
 
-def main() -> "Never":
+def main() -> Never:
     root = repo_root()
     parsed = parse_wrapper_args(sys.argv[1:])
     final_args = build_final_args(parsed, root / "codex-rs" / "Cargo.toml")
@@ -27,7 +28,12 @@ def main() -> "Never":
     ensure_source_prerequisites(env)
     set_default_lint_env(env)
 
-    command = ["cargo", "dylint", "--path", str(root / "tools" / "argument-comment-lint")]
+    command = [
+        "cargo",
+        "dylint",
+        "--path",
+        str(root / "tools" / "argument-comment-lint"),
+    ]
     if not parsed.has_library_selection:
         command.append("--all")
     command.extend(final_args)

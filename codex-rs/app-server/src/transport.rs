@@ -224,40 +224,42 @@ pub(crate) async fn route_outgoing_envelope(
     connections: &mut HashMap<ConnectionId, OutboundConnectionState>,
     envelope: OutgoingEnvelope,
 ) {
-    match envelope {
+    let target_connection_ids = target_connection_ids(connections, &envelope);
+    let (message, mut write_complete_tx) = match envelope {
         OutgoingEnvelope::ToConnection {
-            connection_id,
             message,
             write_complete_tx,
-        } => {
-            let _ =
-                send_message_to_connection(connections, connection_id, message, write_complete_tx)
-                    .await;
-        }
-        OutgoingEnvelope::Broadcast { message } => {
-            let target_connections: Vec<ConnectionId> = connections
-                .iter()
-                .filter_map(|(connection_id, connection_state)| {
-                    if connection_state.initialized.load(Ordering::Acquire)
-                        && !should_skip_notification_for_connection(connection_state, &message)
-                    {
-                        Some(*connection_id)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            ..
+        } => (message, write_complete_tx),
+        OutgoingEnvelope::Broadcast { message } => (message, None),
+    };
 
-            for connection_id in target_connections {
-                let _ = send_message_to_connection(
-                    connections,
-                    connection_id,
-                    message.clone(),
-                    /*write_complete_tx*/ None,
-                )
-                .await;
-            }
-        }
+    for connection_id in target_connection_ids {
+        let _ = send_message_to_connection(
+            connections,
+            connection_id,
+            message.clone(),
+            write_complete_tx.take(),
+        )
+        .await;
+    }
+}
+
+fn target_connection_ids(
+    connections: &HashMap<ConnectionId, OutboundConnectionState>,
+    envelope: &OutgoingEnvelope,
+) -> Vec<ConnectionId> {
+    match envelope {
+        OutgoingEnvelope::ToConnection { connection_id, .. } => vec![*connection_id],
+        OutgoingEnvelope::Broadcast { .. } => connections
+            .iter()
+            .filter_map(|(connection_id, connection_state)| {
+                connection_state
+                    .initialized
+                    .load(Ordering::Acquire)
+                    .then_some(*connection_id)
+            })
+            .collect(),
     }
 }
 

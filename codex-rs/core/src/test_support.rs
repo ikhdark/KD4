@@ -6,7 +6,17 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::LazyLock;
 
+use crate::CodexThread;
+use crate::ThreadManager;
+use crate::config::Config;
+use crate::responses_metadata::CodexResponsesMetadata;
+use crate::responses_metadata::CodexResponsesRequestKind;
+use crate::responses_metadata::subagent_header_value;
+use crate::responses_metadata::subagent_metadata_kind;
+use crate::thread_manager;
+use crate::unified_exec;
 use codex_exec_server::EnvironmentManager;
 use codex_extension_api::LoadUserInstructionsFuture;
 use codex_extension_api::LoadedUserInstructions;
@@ -27,19 +37,8 @@ use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::SessionSource;
-use once_cell::sync::Lazy;
 
-use crate::CodexThread;
-use crate::ThreadManager;
-use crate::config::Config;
-use crate::responses_metadata::CodexResponsesMetadata;
-use crate::responses_metadata::CodexResponsesRequestKind;
-use crate::responses_metadata::subagent_header_value;
-use crate::responses_metadata::subagent_metadata_kind;
-use crate::thread_manager;
-use crate::unified_exec;
-
-static TEST_MODEL_PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
+static TEST_MODEL_PRESETS: LazyLock<Vec<ModelPreset>> = LazyLock::new(|| {
     let mut response = bundled_models_response()
         .unwrap_or_else(|err| panic!("bundled models.json should parse: {err}"));
     response.models.sort_by_key(|model| model.priority);
@@ -233,4 +232,18 @@ pub fn all_model_presets() -> &'static Vec<ModelPreset> {
 
 pub fn builtin_collaboration_mode_presets() -> Vec<CollaborationModeMask> {
     collaboration_mode_presets::builtin_collaboration_mode_presets()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::all_model_presets;
+
+    #[test]
+    fn test_model_presets_are_initialized_with_one_default() {
+        let presets = all_model_presets();
+
+        assert!(!presets.is_empty());
+        assert_eq!(presets.iter().filter(|preset| preset.is_default).count(), 1);
+        assert!(std::ptr::eq(presets, all_model_presets()));
+    }
 }

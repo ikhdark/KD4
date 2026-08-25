@@ -6,6 +6,9 @@
     "codex-responses-api-proxy": "bin/codex-responses-api-proxy.js"
   },
   "type": "module",
+  "os": [
+    "win32"
+  ],
   "engines": {
     "node": ">=16"
   },

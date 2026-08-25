@@ -29,6 +29,8 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::Barrier;
@@ -75,6 +77,106 @@ fn write_session_file(root: &Path, ts: &str, uuid: Uuid) -> std::io::Result<Path
     });
     writeln!(file, "{user_event}")?;
     Ok(path)
+}
+
+#[test]
+fn db_hits_already_reconciled_from_filesystem_are_not_reconciled_again() {
+    let overlapping_id = ThreadId::new();
+    let db_only_id = ThreadId::new();
+    let filesystem_ids = HashSet::from([overlapping_id]);
+
+    assert!(!RolloutRecorder::db_hit_needs_reconciliation(
+        &filesystem_ids,
+        overlapping_id
+    ));
+    assert!(RolloutRecorder::db_hit_needs_reconciliation(
+        &filesystem_ids,
+        db_only_id
+    ));
+}
+
+struct EventCountingSubscriber(Arc<AtomicUsize>);
+
+impl tracing::Subscriber for EventCountingSubscriber {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, _event: &tracing::Event<'_>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+#[test]
+fn thread_list_db_fallback_emits_one_diagnostic() {
+    let events = Arc::new(AtomicUsize::new(0));
+    tracing::subscriber::with_default(EventCountingSubscriber(Arc::clone(&events)), || {
+        warn_thread_list_db_fallback();
+    });
+
+    assert_eq!(events.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn ascending_thread_listing_scans_each_rollout_once_per_page() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    const ROLLOUT_COUNT: usize = 260;
+    for index in 0..ROLLOUT_COUNT {
+        let timestamp = format!("2025-01-{:02}T12-00-{:02}", index / 60 + 1, index % 60);
+        write_session_file(
+            home.path(),
+            &timestamp,
+            Uuid::from_u128(10_000 + index as u128),
+        )?;
+    }
+
+    let first = RolloutRecorder::list_threads(
+        /*state_db_ctx*/ None,
+        &config,
+        /*page_size*/ 1,
+        /*cursor*/ None,
+        ThreadSortKey::CreatedAt,
+        SortDirection::Asc,
+        &[],
+        /*model_providers*/ None,
+        /*cwd_filters*/ None,
+        config.model_provider_id.as_str(),
+        /*search_term*/ None,
+    )
+    .await?;
+    assert_eq!(first.num_scanned_files, ROLLOUT_COUNT);
+    let cursor = first.next_cursor.as_ref().expect("second page cursor");
+
+    let second = RolloutRecorder::list_threads(
+        /*state_db_ctx*/ None,
+        &config,
+        /*page_size*/ 1,
+        Some(cursor),
+        ThreadSortKey::CreatedAt,
+        SortDirection::Asc,
+        &[],
+        /*model_providers*/ None,
+        /*cwd_filters*/ None,
+        config.model_provider_id.as_str(),
+        /*search_term*/ None,
+    )
+    .await?;
+    assert_eq!(second.num_scanned_files, ROLLOUT_COUNT);
+    assert_ne!(first.items[0].thread_id, second.items[0].thread_id);
+    Ok(())
 }
 
 #[test]
@@ -152,7 +254,7 @@ async fn state_db_init_backfills_before_returning() -> anyhow::Result<()> {
         .join("\n");
     fs::write(&rollout_path, format!("{jsonl}\n"))?;
 
-    let runtime = crate::state_db::init(&test_config(home.path()))
+    let runtime = crate::state_integration::init(&test_config(home.path()))
         .await
         .expect("state db should initialize");
 
@@ -182,6 +284,7 @@ async fn load_rollout_items_defaults_legacy_session_id() -> std::io::Result<()> 
         "{}",
         serde_json::json!({
             "timestamp": ts,
+            "format_version": 0,
             "type": "session_meta",
             "payload": {
                 "id": thread_id,
@@ -325,7 +428,7 @@ async fn load_rollout_items_preserves_legacy_guardian_assessment_lines() -> std:
                     "type": "command",
                     "source": "shell",
                     "command": "rm -rf /tmp/guardian",
-                    "cwd": if cfg!(windows) { r"C:\tmp" } else { "/tmp" },
+                    "cwd": r"C:\tmp",
                 },
             },
         })
@@ -379,6 +482,7 @@ async fn load_rollout_items_filters_legacy_ghost_snapshots_from_compaction_histo
         "{}",
         serde_json::json!({
             "timestamp": ts,
+            "format_version": 0,
             "type": "compacted",
             "payload": {
                 "message": "summary",
@@ -495,6 +599,11 @@ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<
 
     let text = std::fs::read_to_string(&rollout_path)?;
     let first_line = text.lines().next().expect("session metadata line");
+    let first_value: serde_json::Value = serde_json::from_str(first_line)?;
+    assert_eq!(
+        first_value["format_version"],
+        serde_json::json!(codex_protocol::protocol::CURRENT_ROLLOUT_FORMAT_VERSION)
+    );
     let session_meta: RolloutLine = serde_json::from_str(first_line)?;
     let RolloutItem::SessionMeta(session_meta) = session_meta.item else {
         panic!("expected session metadata in rollout");
@@ -1380,13 +1489,13 @@ async fn list_threads_metadata_filter_overlays_state_db_list_metadata() -> std::
 }
 
 #[test]
-fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fields() {
+fn overlay_thread_item_metadata_preserves_thread_id_and_uses_authoritative_state_fields() {
     let filesystem_thread_id = ThreadId::new();
     let state_thread_id = ThreadId::new();
     let filesystem_path = PathBuf::from("/tmp/filesystem-rollout.jsonl");
     let state_path = PathBuf::from("/tmp/state-rollout.jsonl");
     let mut item = ThreadItem {
-        path: filesystem_path.clone(),
+        path: filesystem_path,
         thread_id: Some(filesystem_thread_id),
         first_user_message: Some("filesystem message".to_string()),
         title: None,
@@ -1428,16 +1537,13 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
         updated_at: Some("2025-01-03T16:01:02.003Z".to_string()),
     };
 
-    fill_missing_thread_item_metadata(&mut item, state_item);
+    overlay_thread_item_metadata(&mut item, state_item);
 
-    assert_eq!(item.path, filesystem_path);
+    assert_eq!(item.path, PathBuf::from("/tmp/state-rollout.jsonl"));
     assert_eq!(item.thread_id, Some(filesystem_thread_id));
-    assert_eq!(
-        item.first_user_message.as_deref(),
-        Some("filesystem message")
-    );
+    assert_eq!(item.first_user_message.as_deref(), Some("state message"));
     assert_eq!(item.title.as_deref(), Some("state title"));
-    assert_eq!(item.preview.as_deref(), Some("filesystem preview"));
+    assert_eq!(item.preview.as_deref(), Some("state preview"));
     assert_eq!(item.cwd.as_deref(), Some(Path::new("/tmp/state-cwd")));
     assert_eq!(item.git_branch.as_deref(), Some("state-branch"));
     assert_eq!(item.git_sha.as_deref(), Some("state-sha"));
@@ -1576,10 +1682,8 @@ async fn resume_candidate_matches_cwd_reads_latest_turn_context() -> std::io::Re
             collaboration_mode: None,
             multi_agent_version: None,
             multi_agent_mode: None,
-            realtime_active: None,
             effort: None,
             context_provenance: None,
-            summary: codex_protocol::config_types::ReasoningSummary::Auto,
         }),
     };
     writeln!(file, "{}", serde_json::to_string(&turn_context)?)?;
@@ -1602,6 +1706,62 @@ async fn resume_candidate_matches_cwd_reads_latest_turn_context() -> std::io::Re
         )
         .await
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_threads_filters_and_projects_latest_persisted_cwd() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let latest_cwd = home.path().join("latest-list-cwd");
+    fs::create_dir_all(&latest_cwd)?;
+    let path = write_session_file(home.path(), "2025-01-03T13-30-00", Uuid::from_u128(9016))?;
+    let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
+    let turn_context = RolloutLine {
+        timestamp: "2025-01-03T13:30:01Z".to_string(),
+        item: RolloutItem::TurnContext(TurnContextItem {
+            turn_id: Some("turn-1".to_string()),
+            cwd: serde_json::from_value(serde_json::json!(&latest_cwd))
+                .expect("absolute latest cwd"),
+            workspace_roots: None,
+            current_date: None,
+            timezone: None,
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
+            network: None,
+            file_system_sandbox_policy: None,
+            model: "test-model".to_string(),
+            comp_hash: None,
+            personality: None,
+            collaboration_mode: None,
+            multi_agent_version: None,
+            multi_agent_mode: None,
+            effort: None,
+            context_provenance: None,
+        }),
+    };
+    writeln!(file, "{}", serde_json::to_string(&turn_context)?)?;
+
+    let cwd_filters = [latest_cwd.clone()];
+    let page = RolloutRecorder::list_threads(
+        /*state_db_ctx*/ None,
+        &test_config(home.path()),
+        /*page_size*/ 10,
+        /*cursor*/ None,
+        ThreadSortKey::CreatedAt,
+        SortDirection::Desc,
+        &[SessionSource::Cli],
+        /*model_providers*/ None,
+        Some(cwd_filters.as_slice()),
+        "test-provider",
+        /*search_term*/ None,
+    )
+    .await?;
+
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].path, path);
+    assert_eq!(page.items[0].cwd.as_deref(), Some(latest_cwd.as_path()));
     Ok(())
 }
 
@@ -1634,10 +1794,8 @@ async fn find_latest_thread_path_filters_on_latest_turn_context_cwd() -> std::io
             collaboration_mode: None,
             multi_agent_version: None,
             multi_agent_mode: None,
-            realtime_active: None,
             effort: None,
             context_provenance: None,
-            summary: codex_protocol::config_types::ReasoningSummary::Auto,
         }),
     };
     writeln!(file, "{}", serde_json::to_string(&turn_context)?)?;

@@ -8,18 +8,18 @@ use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
-use codex_rollout::ARCHIVED_SESSIONS_SUBDIR;
 use codex_rollout::append_rollout_item_to_path;
 use codex_rollout::append_thread_name;
-use codex_rollout::find_archived_thread_path_by_id_str;
-use codex_rollout::find_thread_path_by_id_str;
 use codex_rollout::read_session_meta_line;
 use codex_state::ThreadMetadataBuilder;
 use tracing::warn;
 
 use super::LocalThreadStore;
+use super::helpers::ResolvedRolloutPath;
 use super::helpers::git_info_from_parts;
 use super::helpers::permission_profile_to_metadata_value;
+use super::helpers::resolve_rollout_path;
+use super::helpers::rollout_path_is_archived;
 use super::live_writer;
 use crate::GitInfoPatch;
 use crate::ReadThreadParams;
@@ -30,11 +30,6 @@ use crate::ThreadStoreResult;
 use crate::UpdateThreadMetadataParams;
 use crate::error::reject_paginated_history_mode;
 use crate::local::read_thread;
-
-struct ResolvedRolloutPath {
-    path: PathBuf,
-    archived: bool,
-}
 
 pub(super) async fn update_thread_metadata(
     store: &LocalThreadStore,
@@ -85,8 +80,14 @@ pub(super) async fn update_thread_metadata(
     if live_writer::rollout_path(store, thread_id).await.is_ok() {
         live_writer::persist_thread(store, thread_id).await?;
     }
-    let mut resolved_rollout_path =
-        resolve_rollout_path(store, thread_id, params.include_archived).await?;
+    let mut resolved_rollout_path = resolve_rollout_path(
+        store,
+        thread_id,
+        params.include_archived,
+        /*require_materialized*/ false,
+    )
+    .await?
+    .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
     let name = patch.name;
     let git_info = patch.git_info;
     if let Some(memory_mode) = patch.memory_mode {
@@ -96,7 +97,7 @@ pub(super) async fn update_thread_metadata(
     }
 
     let state_db_ctx = store.state_db().await;
-    codex_rollout::state_db::reconcile_rollout(
+    codex_rollout::state_integration::reconcile_rollout(
         state_db_ctx.as_deref(),
         resolved_rollout_path.path.as_path(),
         store.config.default_model_provider_id.as_str(),
@@ -208,7 +209,7 @@ async fn apply_metadata_update(
     let mut rollout_path = patch.rollout_path.clone().or(live_rollout_path);
     let mut rollout_path_archived = rollout_path
         .as_deref()
-        .is_some_and(|path| rollout_path_is_archived(store, path));
+        .is_some_and(|path| rollout_path_is_archived(store.config.codex_home.as_path(), path));
     let state_db = store.state_db().await;
     let sqlite_write_result: ThreadStoreResult<()> = if let Some(state_db) = state_db.as_ref() {
         let patch = patch.clone();
@@ -222,7 +223,14 @@ async fn apply_metadata_update(
                     })?;
             let advance_recency_at = patch.advance_recency_at;
             if existing.is_none() && rollout_path.is_none() {
-                let resolved = resolve_rollout_path(store, thread_id, include_archived).await?;
+                let resolved = resolve_rollout_path(
+                    store,
+                    thread_id,
+                    include_archived,
+                    /*require_materialized*/ false,
+                )
+                .await?
+                .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
                 rollout_path_archived = resolved.archived;
                 rollout_path = Some(resolved.path);
             }
@@ -508,7 +516,7 @@ fn enum_to_string<T: serde::Serialize>(value: &T) -> String {
 }
 
 fn normalize_cwd(cwd: PathBuf) -> PathBuf {
-    codex_utils_path::normalize_for_path_comparison(cwd.as_path()).unwrap_or(cwd)
+    codex_utils_absolute_path::normalize_for_path_comparison(cwd.as_path()).unwrap_or(cwd)
 }
 
 async fn apply_thread_git_info(
@@ -659,59 +667,6 @@ fn memory_mode_as_str(mode: ThreadMemoryMode) -> &'static str {
         ThreadMemoryMode::Enabled => "enabled",
         ThreadMemoryMode::Disabled => "disabled",
     }
-}
-
-async fn resolve_rollout_path(
-    store: &LocalThreadStore,
-    thread_id: ThreadId,
-    include_archived: bool,
-) -> ThreadStoreResult<ResolvedRolloutPath> {
-    if let Ok(path) = live_writer::rollout_path(store, thread_id).await {
-        let archived = rollout_path_is_archived(store, path.as_path());
-        return Ok(ResolvedRolloutPath { path, archived });
-    }
-
-    let state_db_ctx = store.state_db().await;
-    let active_path = find_thread_path_by_id_str(
-        store.config.codex_home.as_path(),
-        &thread_id.to_string(),
-        state_db_ctx.as_deref(),
-    )
-    .await
-    .map_err(|err| ThreadStoreError::InvalidRequest {
-        message: format!("failed to locate thread id {thread_id}: {err}"),
-    })?;
-    if let Some(path) = active_path {
-        return Ok(ResolvedRolloutPath {
-            path,
-            archived: false,
-        });
-    }
-    if !include_archived {
-        return Err(ThreadStoreError::InvalidRequest {
-            message: format!("thread not found: {thread_id}"),
-        });
-    }
-    find_archived_thread_path_by_id_str(
-        store.config.codex_home.as_path(),
-        &thread_id.to_string(),
-        state_db_ctx.as_deref(),
-    )
-    .await
-    .map_err(|err| ThreadStoreError::InvalidRequest {
-        message: format!("failed to locate archived thread id {thread_id}: {err}"),
-    })?
-    .map(|path| ResolvedRolloutPath {
-        path,
-        archived: true,
-    })
-    .ok_or_else(|| ThreadStoreError::InvalidRequest {
-        message: format!("thread not found: {thread_id}"),
-    })
-}
-
-fn rollout_path_is_archived(store: &LocalThreadStore, path: &Path) -> bool {
-    path.starts_with(store.config.codex_home.join(ARCHIVED_SESSIONS_SUBDIR))
 }
 
 #[cfg(test)]
@@ -1013,7 +968,7 @@ mod tests {
         assert_eq!(appended["payload"]["memory_mode"], "disabled");
         assert_eq!(appended["payload"]["git"]["branch"], "feature");
 
-        codex_rollout::state_db::reconcile_rollout(
+        codex_rollout::state_integration::reconcile_rollout(
             Some(runtime.as_ref()),
             path.as_path(),
             config.default_model_provider_id.as_str(),
@@ -1068,6 +1023,63 @@ mod tests {
         let appended = last_rollout_item(path.as_path());
         assert_eq!(appended["type"], "session_meta");
         assert_eq!(appended["payload"]["memory_mode"], "disabled");
+    }
+
+    #[tokio::test]
+    async fn update_thread_metadata_keeps_external_archived_thread_archived_in_sqlite() {
+        let home = TempDir::new().expect("temp dir");
+        let external_home = TempDir::new().expect("external temp dir");
+        let config = test_config(home.path());
+        let runtime = codex_state::StateRuntime::init(
+            home.path().to_path_buf(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("state db should initialize");
+        runtime
+            .mark_backfill_complete(/*last_watermark*/ None)
+            .await
+            .expect("backfill should be complete");
+        let store = LocalThreadStore::new(config, Some(runtime.clone()));
+        let uuid = Uuid::from_u128(311);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+        let archived_path =
+            write_archived_session_file(external_home.path(), "2025-01-03T14-50-00", uuid)
+                .expect("external archived session file");
+
+        store
+            .resume_thread(ResumeThreadParams {
+                thread_id,
+                rollout_path: Some(archived_path),
+                history: None,
+                include_archived: true,
+                metadata: test_thread_metadata(),
+            })
+            .await
+            .expect("resume external archived thread");
+
+        let thread = store
+            .update_thread_metadata(UpdateThreadMetadataParams {
+                thread_id,
+                patch: ThreadMetadataPatch {
+                    name: Some(Some("External archived title".to_string())),
+                    ..Default::default()
+                },
+                include_archived: true,
+            })
+            .await
+            .expect("set external archived thread name");
+
+        assert!(thread.archived_at.is_some());
+        assert!(
+            runtime
+                .get_thread(thread_id)
+                .await
+                .expect("get metadata")
+                .expect("metadata")
+                .archived_at
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -1264,7 +1276,7 @@ mod tests {
         assert_eq!(appended["type"], "session_meta");
         assert_eq!(appended["payload"]["git"], json!({}));
 
-        codex_rollout::state_db::reconcile_rollout(
+        codex_rollout::state_integration::reconcile_rollout(
             Some(runtime.as_ref()),
             path.as_path(),
             config.default_model_provider_id.as_str(),
@@ -1298,7 +1310,7 @@ mod tests {
         let appended = last_rollout_item(path.as_path());
         assert_eq!(appended["type"], "session_meta");
         assert_eq!(appended["payload"].get("git"), None);
-        codex_rollout::state_db::reconcile_rollout(
+        codex_rollout::state_integration::reconcile_rollout(
             Some(runtime.as_ref()),
             path.as_path(),
             config.default_model_provider_id.as_str(),
@@ -1358,7 +1370,7 @@ mod tests {
         let appended = last_rollout_item(path.as_path());
         assert_eq!(appended["type"], "session_meta");
         assert_eq!(appended["payload"].get("git"), None);
-        codex_rollout::state_db::reconcile_rollout(
+        codex_rollout::state_integration::reconcile_rollout(
             Some(runtime.as_ref()),
             path.as_path(),
             config.default_model_provider_id.as_str(),
@@ -1594,7 +1606,7 @@ mod tests {
         assert_eq!(thread.preview, "Hello from user");
         assert_eq!(
             thread.first_user_message.as_deref(),
-            Some("Hello from user")
+            Some("Later first message")
         );
         let metadata = runtime
             .get_thread(thread_id)
@@ -1636,8 +1648,9 @@ mod tests {
 
         assert!(matches!(
             err,
-            ThreadStoreError::InvalidRequest { message }
-                if message == format!("thread not found: {thread_id}")
+            ThreadStoreError::ThreadNotFound {
+                thread_id: missing_thread_id
+            } if missing_thread_id == thread_id
         ));
         let metadata = runtime
             .get_thread(thread_id)
@@ -1749,8 +1762,9 @@ mod tests {
         let child = workspace.join("child");
         std::fs::create_dir_all(child.as_path()).expect("create workspace");
         let unnormalized_cwd = child.join("..");
-        let normalized_cwd = codex_utils_path::normalize_for_path_comparison(workspace.as_path())
-            .expect("normalize cwd");
+        let normalized_cwd =
+            codex_utils_absolute_path::normalize_for_path_comparison(workspace.as_path())
+                .expect("normalize cwd");
 
         store
             .update_thread_metadata(UpdateThreadMetadataParams {
@@ -1815,7 +1829,7 @@ mod tests {
             .mark_backfill_complete(/*last_watermark*/ None)
             .await
             .expect("backfill should be complete");
-        codex_rollout::state_db::reconcile_rollout(
+        codex_rollout::state_integration::reconcile_rollout(
             Some(runtime.as_ref()),
             archived_path.as_path(),
             config.default_model_provider_id.as_str(),
@@ -1878,7 +1892,7 @@ mod tests {
             .mark_backfill_complete(/*last_watermark*/ None)
             .await
             .expect("backfill should be complete");
-        codex_rollout::state_db::reconcile_rollout(
+        codex_rollout::state_integration::reconcile_rollout(
             Some(runtime.as_ref()),
             archived_path.as_path(),
             config.default_model_provider_id.as_str(),

@@ -3,6 +3,7 @@ use crate::agent::control::ListedAgent;
 use crate::tools::handlers::multi_agents_spec::create_list_agents_tool;
 use codex_tools::ToolSpec;
 use serde_json::json;
+use std::sync::Arc;
 
 pub(crate) struct Handler;
 
@@ -27,10 +28,11 @@ impl Handler {
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let ToolInvocation {
             session,
-            turn,
+            step_context,
             payload,
             ..
         } = invocation;
+        let turn = Arc::clone(&step_context.turn);
         let arguments = function_arguments(payload)?;
         let args: ListAgentsArgs = parse_arguments(&arguments)?;
         session

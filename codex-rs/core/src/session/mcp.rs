@@ -201,7 +201,9 @@ impl Session {
                 )
                 .await;
             let expected_runtime = {
-                let _guard = self.services.mcp_projection_lock.lock().await;
+                let Ok(_guard) = self.services.mcp_projection_lock.acquire().await else {
+                    unreachable!("MCP projection semaphore is never closed");
+                };
                 let current = self.services.latest_mcp_runtime();
                 if current.available_environment_ids() == available_environment_ids {
                     return current;
@@ -433,10 +435,7 @@ impl Session {
             .primary()
             .and_then(|turn_environment| turn_environment.cwd().to_abs_path().ok())
             .map(|cwd| cwd.to_path_buf())
-            .unwrap_or_else(|| {
-                #[allow(deprecated)]
-                turn_context.cwd.to_path_buf()
-            });
+            .unwrap_or_else(|| turn_context.cwd().to_path_buf());
         let mcp_runtime_context = McpRuntimeContext::new(environment_manager, cwd);
         let auth_statuses = compute_auth_statuses(
             mcp_servers.iter(),
@@ -468,7 +467,7 @@ impl Session {
             }
         });
         #[cfg(test)]
-        if let Ok(pause) = TEST_MCP_STARTUP_PAUSE.try_with(|pause| Arc::clone(pause))
+        if let Ok(pause) = TEST_MCP_STARTUP_PAUSE.try_with(Arc::clone)
             && pause.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
         {
             *pause.token.lock().await = Some(mcp_startup_cancellation_token.clone());
@@ -493,7 +492,11 @@ impl Session {
             mcp_runtime_context.clone(),
             mcp_config.codex_home.clone(),
             self.services.mcp_manager.codex_apps_tools_cache(),
-            codex_apps_tools_cache_key(auth.as_ref()),
+            codex_apps_tools_cache_key(
+                auth.as_ref(),
+                &mcp_config.chatgpt_base_url,
+                mcp_config.apps_mcp_product_sku.as_deref(),
+            ),
             mcp_config.prefix_mcp_tool_names,
             mcp_config.client_elicitation_capability.clone(),
             self.services
@@ -510,7 +513,9 @@ impl Session {
         refreshed_manager
             .set_elicitations_auto_deny(expected_runtime.manager().elicitations_auto_deny());
 
-        let projection_guard = self.services.mcp_projection_lock.lock().await;
+        let Ok(projection_guard) = self.services.mcp_projection_lock.acquire().await else {
+            unreachable!("MCP projection semaphore is never closed");
+        };
         let current_runtime = self.services.latest_mcp_runtime();
         if !Arc::ptr_eq(&current_runtime, &expected_runtime) {
             drop(projection_guard);
@@ -619,7 +624,9 @@ impl Session {
                 .mcp_server_catalog
                 .with_materialized_servers(mcp_servers.clone());
             let expected_runtime = {
-                let _guard = self.services.mcp_projection_lock.lock().await;
+                let Ok(_guard) = self.services.mcp_projection_lock.acquire().await else {
+                    unreachable!("MCP projection semaphore is never closed");
+                };
                 let current = self.services.latest_mcp_runtime();
                 if !Arc::ptr_eq(&current, &expected_runtime) {
                     continue;
@@ -688,7 +695,9 @@ impl Session {
                 )
                 .await;
             let expected_runtime = {
-                let _guard = self.services.mcp_projection_lock.lock().await;
+                let Ok(_guard) = self.services.mcp_projection_lock.acquire().await else {
+                    unreachable!("MCP projection semaphore is never closed");
+                };
                 let current = self.services.latest_mcp_runtime();
                 if !Arc::ptr_eq(&current, &expected_runtime) {
                     continue;

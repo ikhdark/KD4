@@ -1,15 +1,8 @@
 use std::fmt;
 use std::path::Path;
-use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::Result;
 use codex_git_utils::get_git_repo_root;
-use codex_keyring_store::DefaultKeyringStore;
-use codex_keyring_store::KeyringStore;
-use schemars::JsonSchema;
-use serde::Deserialize;
-use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
 
@@ -80,82 +73,6 @@ pub struct SecretListEntry {
     pub name: SecretName,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum SecretsBackendKind {
-    #[default]
-    Local,
-}
-
-pub trait SecretsBackend: Send + Sync {
-    fn set(&self, scope: &SecretScope, name: &SecretName, value: &str) -> Result<()>;
-    fn get(&self, scope: &SecretScope, name: &SecretName) -> Result<Option<String>>;
-    fn delete(&self, scope: &SecretScope, name: &SecretName) -> Result<bool>;
-    fn list(&self, scope_filter: Option<&SecretScope>) -> Result<Vec<SecretListEntry>>;
-}
-
-#[derive(Clone)]
-pub struct SecretsManager {
-    backend: Arc<dyn SecretsBackend>,
-}
-
-impl SecretsManager {
-    pub fn new(codex_home: PathBuf, backend_kind: SecretsBackendKind) -> Self {
-        let backend: Arc<dyn SecretsBackend> = match backend_kind {
-            SecretsBackendKind::Local => {
-                let keyring_store: Arc<dyn KeyringStore> = Arc::new(DefaultKeyringStore);
-                Arc::new(LocalSecretsBackend::new(codex_home, keyring_store))
-            }
-        };
-        Self { backend }
-    }
-
-    pub fn new_with_keyring_store(
-        codex_home: PathBuf,
-        backend_kind: SecretsBackendKind,
-        keyring_store: Arc<dyn KeyringStore>,
-    ) -> Self {
-        let backend: Arc<dyn SecretsBackend> = match backend_kind {
-            SecretsBackendKind::Local => {
-                Arc::new(LocalSecretsBackend::new(codex_home, keyring_store))
-            }
-        };
-        Self { backend }
-    }
-
-    pub fn new_with_keyring_store_and_namespace(
-        codex_home: PathBuf,
-        backend_kind: SecretsBackendKind,
-        keyring_store: Arc<dyn KeyringStore>,
-        namespace: LocalSecretsNamespace,
-    ) -> Self {
-        let backend: Arc<dyn SecretsBackend> = match backend_kind {
-            SecretsBackendKind::Local => Arc::new(LocalSecretsBackend::new_with_namespace(
-                codex_home,
-                keyring_store,
-                namespace,
-            )),
-        };
-        Self { backend }
-    }
-
-    pub fn set(&self, scope: &SecretScope, name: &SecretName, value: &str) -> Result<()> {
-        self.backend.set(scope, name, value)
-    }
-
-    pub fn get(&self, scope: &SecretScope, name: &SecretName) -> Result<Option<String>> {
-        self.backend.get(scope, name)
-    }
-
-    pub fn delete(&self, scope: &SecretScope, name: &SecretName) -> Result<bool> {
-        self.backend.delete(scope, name)
-    }
-
-    pub fn list(&self, scope_filter: Option<&SecretScope>) -> Result<Vec<SecretListEntry>> {
-        self.backend.list(scope_filter)
-    }
-}
-
 pub fn environment_id_from_cwd(cwd: &Path) -> String {
     if let Some(repo_root) = get_git_repo_root(cwd)
         && let Some(name) = repo_root.file_name()
@@ -203,6 +120,7 @@ mod tests {
     use super::*;
     use codex_keyring_store::tests::MockKeyringStore;
     use pretty_assertions::assert_eq;
+    use std::sync::Arc;
 
     #[test]
     fn environment_id_fallback_has_cwd_prefix() {
@@ -223,26 +141,28 @@ mod tests {
     }
 
     #[test]
-    fn manager_round_trips_local_backend() -> Result<()> {
+    fn local_backend_round_trips_secrets() -> Result<()> {
         let codex_home = tempfile::tempdir().expect("tempdir");
         let keyring = Arc::new(MockKeyringStore::default());
-        let manager = SecretsManager::new_with_keyring_store(
-            codex_home.path().to_path_buf(),
-            SecretsBackendKind::Local,
-            keyring,
-        );
+        let backend = LocalSecretsBackend::new(codex_home.path().to_path_buf(), keyring);
         let scope = SecretScope::Global;
         let name = SecretName::new("GITHUB_TOKEN")?;
 
-        manager.set(&scope, &name, "token-1")?;
-        assert_eq!(manager.get(&scope, &name)?, Some("token-1".to_string()));
+        backend.set(&scope, &name, "token-1")?;
+        assert_eq!(backend.get(&scope, &name)?, Some("token-1".to_string()));
 
-        let listed = manager.list(/*scope_filter*/ None)?;
+        let listed = backend.list(/*scope_filter*/ None)?;
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].name, name);
 
-        assert!(manager.delete(&scope, &name)?);
-        assert_eq!(manager.get(&scope, &name)?, None);
+        assert!(backend.delete(&scope, &name)?);
+        assert_eq!(backend.get(&scope, &name)?, None);
         Ok(())
+    }
+
+    #[test]
+    fn local_backend_is_the_only_secrets_behavior_owner() {
+        let obsolete_facade = ["struct Secrets", "Manager"].concat();
+        assert!(!include_str!("lib.rs").contains(&obsolete_facade));
     }
 }

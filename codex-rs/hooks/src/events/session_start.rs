@@ -10,6 +10,7 @@ use codex_protocol::protocol::HookRunSummary;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
 use super::common;
+use super::common::ContextInjectingHookOutcome;
 use crate::engine::CommandShell;
 use crate::engine::ConfiguredHandler;
 use crate::engine::command_runner::CommandRunResult;
@@ -76,14 +77,6 @@ impl StartHookTarget {
     }
 }
 
-#[derive(Debug)]
-pub struct SessionStartOutcome {
-    pub hook_events: Vec<HookCompletedEvent>,
-    pub should_stop: bool,
-    pub stop_reason: Option<String>,
-    pub additional_contexts: Vec<String>,
-}
-
 #[derive(Debug, PartialEq, Eq)]
 struct SessionStartHandlerData {
     should_stop: bool,
@@ -110,19 +103,14 @@ pub(crate) async fn run(
     shell: &CommandShell,
     request: SessionStartRequest,
     turn_id: Option<String>,
-) -> SessionStartOutcome {
+) -> ContextInjectingHookOutcome {
     let matched = dispatcher::select_handlers(
         handlers,
         request.target.event_name(),
         Some(request.target.matcher_input()),
     );
     if matched.is_empty() {
-        return SessionStartOutcome {
-            hook_events: Vec::new(),
-            should_stop: false,
-            stop_reason: None,
-            additional_contexts: Vec::new(),
-        };
+        return ContextInjectingHookOutcome::default();
     }
 
     let (input_json, turn_id) = match request.target {
@@ -137,7 +125,7 @@ pub(crate) async fn run(
             )) {
                 Ok(input_json) => input_json,
                 Err(error) => {
-                    return serialization_failure_outcome(
+                    return ContextInjectingHookOutcome::from_serialization_failure(
                         common::serialization_failure_hook_events(
                             matched,
                             turn_id,
@@ -167,7 +155,7 @@ pub(crate) async fn run(
             let input_json = match serde_json::to_string(&input) {
                 Ok(input_json) => input_json,
                 Err(error) => {
-                    return serialization_failure_outcome(
+                    return ContextInjectingHookOutcome::from_serialization_failure(
                         common::serialization_failure_hook_events(
                             matched,
                             Some(subagent_turn_id),
@@ -200,7 +188,7 @@ pub(crate) async fn run(
             .map(|result| result.data.additional_contexts_for_model.as_slice()),
     );
 
-    SessionStartOutcome {
+    ContextInjectingHookOutcome {
         hook_events: results.into_iter().map(|result| result.completed).collect(),
         should_stop,
         stop_reason,
@@ -331,15 +319,6 @@ fn parse_completed(
             additional_contexts_for_model,
         },
         completion_order: 0,
-    }
-}
-
-fn serialization_failure_outcome(hook_events: Vec<HookCompletedEvent>) -> SessionStartOutcome {
-    SessionStartOutcome {
-        hook_events,
-        should_stop: false,
-        stop_reason: None,
-        additional_contexts: Vec::new(),
     }
 }
 

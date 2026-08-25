@@ -58,7 +58,7 @@ impl ToolExecutor<ToolInvocation> for ExtensionToolAdapter {
         Box::pin(async move {
             let call = tokio::select! {
                 _ = invocation.cancellation_token.cancelled() => {
-                    return Err(crate::function_tool::FunctionCallError::RespondToModel(
+                    return Err(crate::FunctionCallError::RespondToModel(
                         "extension tool call cancelled".to_string(),
                     ));
                 }
@@ -164,6 +164,7 @@ async fn to_extension_call(
         .await
         .additional_permissions;
         let file_system_sandbox_context = invocation
+            .step_context
             .turn
             .file_system_sandbox_context(additional_permissions, environment.cwd());
         environments.push(ToolEnvironment {
@@ -174,15 +175,20 @@ async fn to_extension_call(
         });
     }
     ExtensionToolCall {
-        turn_id: invocation.turn.sub_id.clone(),
+        turn_id: invocation.step_context.turn.sub_id.clone(),
         call_id: invocation.call_id.clone(),
         tool_name: invocation.tool_name.clone(),
-        model: invocation.turn.model_info.slug.clone(),
-        truncation_policy: invocation.turn.model_info.truncation_policy.into(),
+        model: invocation.step_context.turn.model_info.slug.clone(),
+        truncation_policy: invocation
+            .step_context
+            .turn
+            .model_info
+            .truncation_policy
+            .into(),
         conversation_history,
         turn_item_emitter: Arc::new(CoreTurnItemEmitter {
             session: Arc::downgrade(&invocation.session),
-            turn: Arc::downgrade(&invocation.turn),
+            turn: Arc::downgrade(&invocation.step_context.turn),
         }),
         cancellation_token: invocation.cancellation_token.clone(),
         primary_environment_id,
@@ -407,7 +413,6 @@ mod tests {
         let invocation = ToolInvocation {
             session: session.into(),
             step_context: StepContext::for_test(Arc::clone(&turn)),
-            turn,
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
             call_id: "call-extension".to_string(),
@@ -478,14 +483,21 @@ mod tests {
         let EventMsg::RawResponseItem(raw_history_item) = raw_history_event.msg else {
             panic!("expected raw response item event");
         };
-        assert_eq!(raw_history_item.item, expected_history_item);
+        assert!(raw_history_item.item.id().is_some());
+        assert_eq!(
+            core_test_support::responses::strip_response_item_ids(std::slice::from_ref(
+                &raw_history_item.item
+            )),
+            core_test_support::responses::strip_response_item_ids(std::slice::from_ref(
+                &expected_history_item
+            ))
+        );
         let step_context = StepContext::for_test(Arc::clone(&turn));
         let cancellation_token = tokio_util::sync::CancellationToken::new();
         let forwarded_cancellation_token = cancellation_token.clone();
         let invocation = ToolInvocation {
             session,
             step_context,
-            turn,
             cancellation_token,
             tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
             call_id: "call-extension".to_string(),
@@ -495,6 +507,7 @@ mod tests {
                 arguments: json!({ "message": "hello" }).to_string(),
             },
         };
+        drop(turn);
 
         crate::tools::registry::ToolExecutor::handle(&handler, invocation)
             .await
@@ -526,8 +539,12 @@ mod tests {
             expected_sandbox_cwds
         );
         assert_eq!(
-            captured_call.conversation_history.items(),
-            std::slice::from_ref(&expected_history_item)
+            core_test_support::responses::strip_response_item_ids(
+                captured_call.conversation_history.items()
+            ),
+            core_test_support::responses::strip_response_item_ids(std::slice::from_ref(
+                &expected_history_item
+            ))
         );
         match captured_call.payload {
             ToolPayload::Function { arguments } => {
@@ -579,7 +596,6 @@ mod tests {
         let invocation = ToolInvocation {
             session: session.into(),
             step_context: StepContext::for_test(Arc::clone(&turn)),
-            turn,
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
             call_id: "call-no-history".to_string(),
@@ -611,7 +627,6 @@ mod tests {
         let invocation = ToolInvocation {
             session,
             step_context: StepContext::for_test(Arc::clone(&turn)),
-            turn,
             cancellation_token: cancellation_token.clone(),
             tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
             call_id: "call-extension-cancel".to_string(),
@@ -664,12 +679,8 @@ mod tests {
         let (session, mut turn) = crate::session::tests::make_session_and_context().await;
         let native_secondary = turn.environments.turn_environments[0].clone();
         let native_secondary_id = native_secondary.environment_id.clone();
-        let foreign_cwd = if cfg!(windows) {
-            PathUri::parse("file:///tmp/foreign-primary")
-        } else {
-            PathUri::parse("file:///C:/foreign-primary")
-        }
-        .expect("foreign cwd should be a valid file URI");
+        let foreign_cwd = PathUri::parse("file:///tmp/foreign-primary")
+            .expect("foreign cwd should be a valid file URI");
         let foreign_primary = TurnEnvironment::new(
             "foreign-primary".to_string(),
             Arc::clone(&native_secondary.environment),
@@ -681,7 +692,6 @@ mod tests {
         let invocation = ToolInvocation {
             session: session.into(),
             step_context: StepContext::for_test(Arc::clone(&turn)),
-            turn,
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
             call_id: "call-extension".to_string(),

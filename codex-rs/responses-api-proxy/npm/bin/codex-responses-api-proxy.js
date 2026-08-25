@@ -9,34 +9,14 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 function determineTargetTriple(platform, arch) {
-  switch (platform) {
-    case "linux":
-    case "android":
-      if (arch === "x64") {
-        return "x86_64-unknown-linux-musl";
-      }
-      if (arch === "arm64") {
-        return "aarch64-unknown-linux-musl";
-      }
-      break;
-    case "darwin":
-      if (arch === "x64") {
-        return "x86_64-apple-darwin";
-      }
-      if (arch === "arm64") {
-        return "aarch64-apple-darwin";
-      }
-      break;
-    case "win32":
-      if (arch === "x64") {
-        return "x86_64-pc-windows-msvc";
-      }
-      if (arch === "arm64") {
-        return "aarch64-pc-windows-msvc";
-      }
-      break;
-    default:
-      break;
+  if (platform !== "win32") {
+    return null;
+  }
+  if (arch === "x64") {
+    return "x86_64-pc-windows-msvc";
+  }
+  if (arch === "arm64") {
+    return "aarch64-pc-windows-msvc";
   }
   return null;
 }
@@ -54,7 +34,7 @@ const binaryBaseName = "codex-responses-api-proxy";
 const binaryPath = path.join(
   archRoot,
   binaryBaseName,
-  process.platform === "win32" ? `${binaryBaseName}.exe` : binaryBaseName,
+  `${binaryBaseName}.exe`,
 );
 
 const child = spawn(binaryPath, process.argv.slice(2), {
@@ -74,7 +54,7 @@ const forwardSignal = (signal) => {
   }
 };
 
-const forwardedSignals = ["SIGINT", "SIGTERM", "SIGHUP"];
+const forwardedSignals = ["SIGINT", "SIGTERM"];
 const signalHandlers = new Map(
   forwardedSignals.map((signal) => [signal, () => forwardSignal(signal)]),
 );

@@ -1,9 +1,13 @@
-use crate::function_tool::FunctionCallError;
+use crate::FunctionCallError;
+use crate::agent::task_capabilities::normalize_absolute_repo_path;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::sandboxing::ToolError;
+use codex_agent_task_store::AttemptState;
+use codex_agent_task_store::AttributionConfidence;
 use codex_apply_patch::AppliedPatchDelta;
+use codex_git_utils::get_git_repo_root;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::SandboxErr;
 use codex_protocol::exec_output::ExecToolCallOutput;
@@ -600,16 +604,20 @@ async fn emit_exec_stage(
     match stage {
         ToolEventStage::Begin => {
             let native_cwd = exec_input.cwd.to_abs_path().ok();
+            let mutation = crate::turn_diff_tracker::command_mutation(
+                exec_input.command,
+                native_cwd.as_ref().map(AbsolutePathBuf::as_path),
+            );
             if matches!(
-                crate::turn_diff_tracker::command_mutation(
-                    exec_input.command,
-                    native_cwd.as_ref().map(AbsolutePathBuf::as_path),
-                ),
+                mutation,
                 crate::turn_diff_tracker::CommandMutation::Uncertain
             ) {
                 let baseline = match native_cwd.as_ref() {
                     Some(cwd) => {
-                        crate::git_workspace::capture_workspace_evidence_identity(cwd.as_path())
+                        ctx.session
+                            .services
+                            .git_workspace
+                            .workspace_evidence_identity(cwd.as_path())
                             .await
                     }
                     None => None,
@@ -617,7 +625,7 @@ async fn emit_exec_stage(
                 ctx.session
                     .services
                     .command_execution
-                    .record_uncertain_command_baseline(ctx.call_id, baseline)
+                    .record_uncertain_command_baseline(ctx.call_id, &ctx.turn.sub_id, baseline)
                     .await;
             }
             emit_exec_command_begin(
@@ -686,6 +694,130 @@ async fn emit_exec_stage(
     }
 }
 
+pub(crate) async fn begin_exec_mutation_evidence(
+    ctx: ToolEventCtx<'_>,
+    native_cwd: Option<&AbsolutePathBuf>,
+    mutation: &crate::turn_diff_tracker::CommandMutation,
+) {
+    if ctx
+        .session
+        .services
+        .command_execution
+        .has_typed_mutation_baseline(ctx.call_id)
+        .await
+    {
+        return;
+    }
+    let Some(cwd) = native_cwd else {
+        return;
+    };
+    let Some(paths) = mutation.paths() else {
+        return;
+    };
+    let coordinator = ctx.session.services.agent_control.task_coordinator();
+    let Some(binding) = coordinator.binding_for_source(&ctx.turn.session_source) else {
+        return;
+    };
+    let Some(store) = coordinator.store() else {
+        return;
+    };
+    let Ok(task) = coordinator
+        .get_agent_task(binding.assignment_id, Some(0))
+        .await
+    else {
+        tracing::warn!(
+            attempt_id = %binding.attempt_id,
+            "command mutation evidence could not verify the typed assignment"
+        );
+        return;
+    };
+    if task.current_attempt.attempt_id != binding.attempt_id
+        || task.current_attempt.state != AttemptState::Active
+    {
+        tracing::warn!(
+            attempt_id = %binding.attempt_id,
+            "command mutation evidence skipped an inactive typed assignment"
+        );
+        return;
+    }
+
+    let repo_root = get_git_repo_root(cwd.as_path()).unwrap_or_else(|| cwd.as_path().to_path_buf());
+    let repo_paths = paths
+        .iter()
+        .filter_map(|path| normalize_absolute_repo_path(&repo_root, path).ok())
+        .collect::<Vec<_>>();
+    let mut begun_paths = Vec::new();
+    for path in repo_paths {
+        match store
+            .begin_mutation(
+                binding.attempt_id,
+                &repo_root,
+                path.clone(),
+                AttributionConfidence::Definitive,
+            )
+            .await
+        {
+            Ok(_) => begun_paths.push(path),
+            Err(error) => tracing::warn!(
+                %error,
+                path,
+                "command mutation evidence was unavailable; continuing with the command"
+            ),
+        }
+    }
+    if !begun_paths.is_empty() {
+        ctx.session
+            .services
+            .command_execution
+            .record_typed_mutation_baseline(
+                ctx.call_id,
+                &ctx.turn.sub_id,
+                crate::tools::command_execution::TypedMutationBaseline {
+                    attempt_id: binding.attempt_id,
+                    repo_root,
+                    paths: begun_paths,
+                },
+            )
+            .await;
+    }
+}
+
+async fn finish_exec_mutation_evidence(ctx: ToolEventCtx<'_>, declined: bool) {
+    let baseline = ctx
+        .session
+        .services
+        .command_execution
+        .take_typed_mutation_baseline(ctx.call_id)
+        .await;
+    let Some(baseline) = baseline else {
+        return;
+    };
+    if declined {
+        return;
+    }
+    let Some(store) = ctx
+        .session
+        .services
+        .agent_control
+        .task_coordinator()
+        .store()
+    else {
+        return;
+    };
+    for path in baseline.paths {
+        if let Err(error) = store
+            .finalize_mutation(baseline.attempt_id, &baseline.repo_root, path.clone())
+            .await
+        {
+            tracing::warn!(
+                %error,
+                path,
+                "command mutation evidence finalization was unavailable; the command remains complete"
+            );
+        }
+    }
+}
+
 async fn emit_exec_end(
     ctx: ToolEventCtx<'_>,
     exec_input: ExecCommandInput<'_>,
@@ -696,6 +828,7 @@ async fn emit_exec_end(
         exec_input.command,
         native_cwd.as_ref().map(AbsolutePathBuf::as_path),
     );
+    let mut observed_workspace_identity = None;
     if matches!(
         mutation,
         crate::turn_diff_tracker::CommandMutation::Uncertain
@@ -711,41 +844,57 @@ async fn emit_exec_end(
         } else {
             let current = match native_cwd.as_ref() {
                 Some(cwd) => {
-                    crate::git_workspace::capture_workspace_evidence_identity(cwd.as_path()).await
+                    ctx.session
+                        .services
+                        .git_workspace
+                        .workspace_evidence_identity(cwd.as_path())
+                        .await
                 }
                 None => None,
             };
-            let workspace_changed = match (baseline, current) {
+            let workspace_changed = match (baseline.as_ref(), current.as_ref()) {
                 (Some(Some(before)), Some(after)) => Some(before != after),
                 _ => None,
             };
+            observed_workspace_identity = current;
             crate::turn_diff_tracker::resolve_uncertain_command_observation(workspace_changed)
         };
     }
+    finish_exec_mutation_evidence(ctx, exec_result.status == ExecCommandStatus::Declined).await;
     let possible_mutation = mutation.may_have_mutated();
     let mutation_paths = mutation.paths();
-    let validation_result = ctx
+    let (validation_result, bound_plan_step) = ctx
         .session
         .services
         .command_execution
-        .validation_result_for_call(ctx.call_id)
-        .await;
+        .validation_result_with_plan_step_for_call(ctx.call_id)
+        .await
+        .map_or((None, None), |(result, bound_plan_step)| {
+            (Some(result), bound_plan_step)
+        });
     let successful_validation_identity = validation_result
         .as_ref()
         .filter(|result| result.status.is_success())
         .and_then(|result| serde_json::to_string(&result.proof_key).ok());
-    let current_workspace_identity = if (possible_mutation
+    let workspace_identity_required = (possible_mutation
         && exec_result.status != ExecCommandStatus::Declined)
-        || successful_validation_identity.is_some()
-    {
+        || successful_validation_identity.is_some();
+    let current_workspace_identity = if workspace_identity_capture_required(
+        workspace_identity_required,
+        observed_workspace_identity.as_ref(),
+    ) {
         match native_cwd.as_ref() {
             Some(cwd) => {
-                crate::git_workspace::capture_workspace_evidence_identity(cwd.as_path()).await
+                ctx.session
+                    .services
+                    .git_workspace
+                    .workspace_evidence_identity(cwd.as_path())
+                    .await
             }
             None => None,
         }
     } else {
-        None
+        observed_workspace_identity
     };
     if possible_mutation && exec_result.status != ExecCommandStatus::Declined {
         if let Some(paths) = mutation_paths {
@@ -776,7 +925,7 @@ async fn emit_exec_end(
             )
             .await;
     }
-    if exec_result.status != ExecCommandStatus::Declined
+    let observed_mutation_revision = if exec_result.status != ExecCommandStatus::Declined
         && let Some(tracker) = ctx.turn_diff_tracker
     {
         let mut tracker = tracker.lock().await;
@@ -792,6 +941,20 @@ async fn emit_exec_end(
             successful_validation_identity,
             current_workspace_identity.clone(),
         );
+        Some(tracker.current_mutation_revision())
+    } else {
+        None
+    };
+    if let Some(observed_mutation_revision) = observed_mutation_revision {
+        ctx.session
+            .services
+            .command_execution
+            .observe_repository_revision_with_identity(
+                &ctx.turn.sub_id,
+                observed_mutation_revision,
+                current_workspace_identity.clone(),
+            )
+            .await;
     }
     let (ledger, provenance) = ctx
         .session
@@ -811,24 +974,11 @@ async fn emit_exec_end(
         crate::tasks::completion_review::implementation_identity_for_evidence(ctx.session, &ledger)
             .await
     };
-    let bound_plan_step = if let Some(validation_result) = validation_result.as_ref()
-        && validation_result.status.is_success()
-    {
-        ledger
-            .auto_validation_candidate()
-            .await
-            .and_then(|candidate| {
-                let proof_identity = &validation_result.proof_key.implementation_identity;
-                (candidate.implementation_identity == *proof_identity
-                    || candidate
-                        .leaf_implementation_identities
-                        .iter()
-                        .any(|identity| identity == proof_identity))
-                .then_some((candidate.step_id, candidate.step_revision))
-            })
-    } else {
-        None
-    };
+    let bound_plan_step = validation_result
+        .as_ref()
+        .is_some_and(|result| result.status.is_success())
+        .then_some(bound_plan_step)
+        .flatten();
     ledger
         .record_command_bound_with_validation_result(
             exec_input.command,
@@ -867,6 +1017,13 @@ async fn emit_exec_end(
             }),
         )
         .await;
+}
+
+fn workspace_identity_capture_required(
+    required: bool,
+    observed: Option<&crate::git_workspace::WorkspaceEvidenceIdentity>,
+) -> bool {
+    required && observed.is_none()
 }
 
 async fn emit_patch_end(
@@ -988,14 +1145,18 @@ mod tests {
     use crate::task_evidence::TaskEvidenceLedger;
     use crate::turn_diff_tracker::TurnDiffTracker;
     use codex_exec_server::LOCAL_FS;
+    use codex_protocol::AgentPath;
     use codex_protocol::ThreadId;
     use codex_protocol::error::CodexErr;
     use codex_protocol::error::SandboxErr;
     use codex_protocol::exec_output::ExecToolCallOutput;
     use codex_protocol::items::TurnItem;
     use codex_protocol::protocol::PatchApplyStatus;
+    use codex_protocol::protocol::SessionSource;
+    use codex_protocol::protocol::SubAgentSource;
     use codex_utils_path_uri::PathUri;
     use std::path::Path;
+    use std::process::Command;
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::sync::Mutex;
@@ -1020,6 +1181,92 @@ mod tests {
         evidence_path
     }
 
+    async fn enable_typed_task_for_repo(
+        session: &mut Arc<Session>,
+        turn: &mut Arc<TurnContext>,
+        repo: &Path,
+        write_paths: &[&str],
+    ) -> (
+        codex_agent_task_store::AttemptId,
+        Arc<codex_agent_task_store::LocalAgentTaskStore>,
+    ) {
+        let root_session_id = "events-root".to_string();
+        let state_runtime = codex_state::StateRuntime::init(
+            repo.join(".typed-task-home"),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("typed task state initializes");
+        let agent_control = &Arc::get_mut(session)
+            .expect("single session reference")
+            .services
+            .agent_control;
+        let coordinator = agent_control.task_coordinator();
+        coordinator
+            .initialize(state_runtime, root_session_id.clone())
+            .await
+            .expect("typed task coordinator initializes");
+        let (assignment, attempt) = coordinator
+            .create_assignment(
+                repo,
+                codex_agent_task_store::AssignmentDraft {
+                    root_session_id: root_session_id.clone(),
+                    admission_origin: codex_agent_task_store::AssignmentAdmissionOrigin::Typed,
+                    role: codex_agent_task_store::AgentRole::Worker,
+                    capability_profile:
+                        codex_agent_task_store::CapabilityProfile::ScopedSourceWrite,
+                    objective: "exercise command mutation evidence".to_string(),
+                    acceptance_criteria: vec![codex_agent_task_store::AcceptanceCriterion {
+                        id: "mutation-evidence".to_string(),
+                        text: "command mutation evidence is finalized".to_string(),
+                    }],
+                    read_scope: Vec::new(),
+                    write_scope: write_paths
+                        .iter()
+                        .map(|path| codex_agent_task_store::RepoScope {
+                            path: (*path).to_string(),
+                            recursive: false,
+                        })
+                        .collect(),
+                    stop_condition: "evidence finalized".to_string(),
+                    dependencies: Vec::new(),
+                    risk_hints: Vec::new(),
+                    required_evidence: vec!["focused mutation test".to_string()],
+                    prohibited_changes: Vec::new(),
+                    contract_claims: Vec::new(),
+                    workspace_strategy: codex_agent_task_store::WorkspaceStrategy::Auto,
+                    relation: None,
+                    architecture_contract_ref: None,
+                },
+            )
+            .await
+            .expect("typed assignment is created");
+        let agent_path = AgentPath::try_from("/root/events_worker").expect("valid agent path");
+        coordinator
+            .bind_agent_task(codex_agent_task_store::AgentTaskBindingDraft {
+                assignment_id: assignment.assignment_id,
+                attempt_id: attempt.attempt_id,
+                agent_path: agent_path.to_string(),
+                task_name: "events_worker".to_string(),
+                thread_id: None,
+            })
+            .await
+            .expect("typed assignment is bound");
+        Arc::get_mut(turn)
+            .expect("single turn reference")
+            .session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: ThreadId::new(),
+            depth: 1,
+            agent_path: Some(agent_path),
+            agent_nickname: None,
+            agent_role: Some("worker".to_string()),
+        });
+        (
+            attempt.attempt_id,
+            coordinator.store().expect("typed task store is available"),
+        )
+    }
+
     async fn latest_evidence_file_paths(evidence_path: &Path) -> Vec<String> {
         let bytes = tokio::fs::read(evidence_path)
             .await
@@ -1032,6 +1279,16 @@ mod tests {
             .keys()
             .cloned()
             .collect()
+    }
+
+    fn initialize_git_repository(path: &Path) {
+        std::fs::create_dir_all(path).expect("create repository");
+        let status = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(path)
+            .status()
+            .expect("launch git init");
+        assert!(status.success(), "git init failed");
     }
 
     fn set_turn_environments(turn: &mut Arc<TurnContext>, environments: &[(&str, &Path)]) {
@@ -1228,6 +1485,214 @@ mod tests {
         assert_eq!(item.formatted_output.as_deref(), Some(model_text.as_str()));
         assert_eq!(tracker.lock().await.current_mutation_revision(), 0);
         assert!(!tracker.lock().await.has_unvalidated_mutation());
+    }
+
+    #[tokio::test]
+    async fn duplicate_repository_reads_uncertain_command_reuses_post_command_identity() {
+        let temp = tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        initialize_git_repository(&repo);
+        let (mut session, mut turn, _rx_event) =
+            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
+        set_turn_environments(
+            &mut turn,
+            &[(codex_exec_server::LOCAL_ENVIRONMENT_ID, repo.as_path())],
+        );
+        Arc::get_mut(&mut session)
+            .expect("single session reference")
+            .services
+            .command_execution =
+            crate::tools::command_execution::CommandExecutionLedger::load_or_new(
+                temp.path().join("codex-home"),
+                "workspace-reuse".to_string(),
+                &repo,
+            )
+            .await;
+        let before_hash = session
+            .services
+            .command_execution
+            .current_workspace_identity_hash(codex_exec_server::LOCAL_ENVIRONMENT_ID, &repo)
+            .await
+            .expect("initial workspace identity");
+        let cwd = AbsolutePathBuf::from_absolute_path(&repo).expect("absolute cwd");
+        let emitter = ToolEmitter::shell(
+            vec!["custom-mutator".to_string()],
+            cwd,
+            ExecCommandSource::Agent,
+            String::new(),
+        );
+        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+        let capture_count_before = session
+            .services
+            .git_workspace
+            .workspace_evidence_capture_count();
+
+        emitter
+            .begin(ToolEventCtx::new(
+                session.as_ref(),
+                turn.as_ref(),
+                "uncertain-call",
+                Some(&tracker),
+            ))
+            .await;
+        tokio::fs::write(repo.join("changed.txt"), b"changed")
+            .await
+            .expect("mutate repository");
+        emitter
+            .finish(
+                ToolEventCtx::new(
+                    session.as_ref(),
+                    turn.as_ref(),
+                    "uncertain-call",
+                    Some(&tracker),
+                ),
+                Ok(ExecToolCallOutput::default()),
+                None,
+            )
+            .await
+            .expect("successful uncertain command");
+
+        assert_eq!(
+            session
+                .services
+                .git_workspace
+                .workspace_evidence_capture_count()
+                - capture_count_before,
+            2,
+            "baseline and one post-command capture should serve all consumers"
+        );
+        let after_hash = session
+            .services
+            .command_execution
+            .current_workspace_identity_hash(codex_exec_server::LOCAL_ENVIRONMENT_ID, &repo)
+            .await
+            .expect("refreshed workspace identity");
+        assert_ne!(before_hash, after_hash);
+    }
+
+    #[tokio::test]
+    async fn shell_and_unified_exec_finalize_typed_mutation_evidence() {
+        let temp = tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        initialize_git_repository(&repo);
+        tokio::fs::write(repo.join("shell.txt"), "before shell")
+            .await
+            .expect("shell fixture");
+        tokio::fs::write(repo.join("unified.txt"), "before unified")
+            .await
+            .expect("unified fixture");
+        let (mut session, mut turn, _rx_event) =
+            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
+        set_turn_environments(
+            &mut turn,
+            &[(codex_exec_server::LOCAL_ENVIRONMENT_ID, repo.as_path())],
+        );
+        let (attempt_id, store) = enable_typed_task_for_repo(
+            &mut session,
+            &mut turn,
+            &repo,
+            &["shell.txt", "unified.txt"],
+        )
+        .await;
+        let cwd = AbsolutePathBuf::from_absolute_path(&repo).expect("absolute cwd");
+
+        let shell = ToolEmitter::shell(
+            vec!["touch".to_string(), "shell.txt".to_string()],
+            cwd.clone(),
+            ExecCommandSource::Agent,
+            codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
+        );
+        let shell_mutation = crate::turn_diff_tracker::command_mutation(
+            &["touch".to_string(), "shell.txt".to_string()],
+            Some(&repo),
+        );
+        begin_exec_mutation_evidence(
+            ToolEventCtx::new(session.as_ref(), turn.as_ref(), "shell-mutation", None),
+            Some(&cwd),
+            &shell_mutation,
+        )
+        .await;
+        shell
+            .begin(ToolEventCtx::new(
+                session.as_ref(),
+                turn.as_ref(),
+                "shell-mutation",
+                None,
+            ))
+            .await;
+        tokio::fs::write(repo.join("shell.txt"), "after shell")
+            .await
+            .expect("shell mutation");
+        shell
+            .finish(
+                ToolEventCtx::new(session.as_ref(), turn.as_ref(), "shell-mutation", None),
+                Ok(ExecToolCallOutput::default()),
+                None,
+            )
+            .await
+            .expect("shell mutation completes");
+
+        let unified_command = vec!["touch".to_string(), "unified.txt".to_string()];
+        let unified_mutation =
+            crate::turn_diff_tracker::command_mutation(&unified_command, Some(&repo));
+        begin_exec_mutation_evidence(
+            ToolEventCtx::new(session.as_ref(), turn.as_ref(), "unified-mutation", None),
+            Some(&cwd),
+            &unified_mutation,
+        )
+        .await;
+        ToolEmitter::unified_exec(
+            &unified_command,
+            PathUri::from_abs_path(&cwd),
+            ExecCommandSource::Agent,
+            Some("process".to_string()),
+            codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
+        )
+        .begin(ToolEventCtx::new(
+            session.as_ref(),
+            turn.as_ref(),
+            "unified-mutation",
+            None,
+        ))
+        .await;
+        tokio::fs::write(repo.join("unified.txt"), "after unified")
+            .await
+            .expect("unified mutation");
+        ToolEmitter::unified_exec(
+            &unified_command,
+            PathUri::from_abs_path(&cwd),
+            ExecCommandSource::Agent,
+            Some("process".to_string()),
+            codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
+        )
+        .finish(
+            ToolEventCtx::new(session.as_ref(), turn.as_ref(), "unified-mutation", None),
+            Ok(ExecToolCallOutput::default()),
+            None,
+        )
+        .await
+        .expect("unified mutation completes");
+
+        let evidence = store
+            .list_mutation_evidence(
+                attempt_id,
+                Some(codex_agent_task_store::MAX_MUTATION_EVIDENCE_LIMIT),
+            )
+            .await
+            .expect("mutation evidence remains queryable");
+        assert_eq!(
+            evidence
+                .iter()
+                .map(|item| item.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["shell.txt", "unified.txt"]
+        );
+        assert!(evidence.iter().all(|item| item.final_hash.is_some()));
+        assert!(
+            evidence
+                .iter()
+                .all(|item| item.pre_write_hash != item.final_hash)
+        );
     }
 
     #[tokio::test]

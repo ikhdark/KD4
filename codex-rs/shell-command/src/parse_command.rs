@@ -72,7 +72,6 @@ mod tests {
         args.iter().map(ToString::to_string).collect()
     }
 
-    #[cfg(windows)]
     fn windows_powershell_path() -> String {
         PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"))
             .join("System32")
@@ -1266,7 +1265,6 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
     #[test]
     fn profile_enabled_powershell_wrapper_remains_visible() {
         let powershell = windows_powershell_path();
@@ -1279,7 +1277,6 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
     #[test]
     fn powershell_with_noprofile_and_c_alias_is_stripped() {
         let powershell = windows_powershell_path();
@@ -1291,7 +1288,6 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
     #[test]
     fn powershell_with_path_is_stripped() {
         let command = windows_powershell_path();
@@ -1444,7 +1440,7 @@ fn simplify_once(commands: &[ParsedCommand]) -> Option<Vec<ParsedCommand>> {
 }
 
 /// Validates that this is a `sed -n 123,123p` command.
-fn is_valid_sed_n_arg(arg: Option<&str>) -> bool {
+pub(crate) fn is_valid_sed_n_arg(arg: Option<&str>) -> bool {
     let s = match arg {
         Some(s) => s,
         None => return false,

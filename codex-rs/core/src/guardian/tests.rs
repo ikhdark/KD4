@@ -52,6 +52,8 @@ use codex_protocol::protocol::GuardianUserAuthorization;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::TurnCompleteEvent;
+use codex_utils_path_uri::LegacyAppPathString;
+use codex_utils_path_uri::PathUri;
 use core_test_support::PathBufExt;
 use core_test_support::TempDirExt;
 use core_test_support::context_snapshot;
@@ -449,7 +451,7 @@ async fn build_guardian_prompt_full_mode_preserves_initial_review_format() -> an
     let prompt = build_guardian_prompt_items(
         session.as_ref(),
         Some("Sandbox denied outbound git push to github.com.".to_string()),
-        GuardianApprovalRequest::Shell {
+        &GuardianApprovalRequest::Shell {
             id: "shell-1".to_string(),
             command: vec!["git".to_string(), "push".to_string()],
             cwd: test_path_buf("/repo/codex-rs/core").abs(),
@@ -509,7 +511,7 @@ async fn build_guardian_prompt_includes_parent_turn_denied_reads() -> anyhow::Re
         session.as_ref(),
         Some(turn.as_ref()),
         Some("Sandbox denied reading /repo/private/secret.txt.".to_string()),
-        GuardianApprovalRequest::Shell {
+        &GuardianApprovalRequest::Shell {
             id: "shell-1".to_string(),
             command: vec!["cat".to_string(), "/repo/private/secret.txt".to_string()],
             cwd: test_path_buf("/repo").abs(),
@@ -563,7 +565,7 @@ async fn build_guardian_prompt_delta_mode_preserves_original_numbering() -> anyh
     let prompt = build_guardian_prompt_items(
         session.as_ref(),
         /*retry_reason*/ None,
-        GuardianApprovalRequest::Shell {
+        &GuardianApprovalRequest::Shell {
             id: "shell-2".to_string(),
             command: vec!["git".to_string(), "push".to_string()],
             cwd: test_path_buf("/repo/codex-rs/core").abs(),
@@ -601,7 +603,7 @@ async fn build_guardian_prompt_delta_mode_handles_empty_delta() -> anyhow::Resul
     let prompt = build_guardian_prompt_items(
         session.as_ref(),
         /*retry_reason*/ None,
-        GuardianApprovalRequest::Shell {
+        &GuardianApprovalRequest::Shell {
             id: "shell-2".to_string(),
             command: vec!["git".to_string(), "push".to_string()],
             cwd: test_path_buf("/repo/codex-rs/core").abs(),
@@ -636,7 +638,7 @@ async fn build_guardian_prompt_stale_delta_cursor_falls_back_to_full_prompt() ->
     let prompt = build_guardian_prompt_items(
         session.as_ref(),
         /*retry_reason*/ None,
-        GuardianApprovalRequest::Shell {
+        &GuardianApprovalRequest::Shell {
             id: "shell-3".to_string(),
             command: vec!["git".to_string(), "push".to_string()],
             cwd: test_path_buf("/repo/codex-rs/core").abs(),
@@ -721,7 +723,7 @@ async fn build_guardian_prompt_stale_delta_version_falls_back_to_full_prompt() -
     let prompt = build_guardian_prompt_items(
         session.as_ref(),
         /*retry_reason*/ None,
-        GuardianApprovalRequest::Shell {
+        &GuardianApprovalRequest::Shell {
             id: "shell-4".to_string(),
             command: vec!["git".to_string(), "push".to_string()],
             cwd: test_path_buf("/repo/codex-rs/core").abs(),
@@ -880,6 +882,87 @@ fn collect_guardian_transcript_entries_includes_recent_tool_calls_and_output() {
 }
 
 #[test]
+fn collect_guardian_transcript_delta_materializes_only_unseen_entries() {
+    let items = vec![
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "old user context ".repeat(20_000),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::FunctionCall {
+            id: None,
+            call_id: "call-1".to_string(),
+            name: "shell".to_string(),
+            arguments: "old tool arguments ".repeat(20_000),
+            namespace: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: "call-1".to_string(),
+            output: codex_protocol::models::FunctionCallOutputPayload::from_text(
+                "new result".to_string(),
+            ),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "new assistant context".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ];
+
+    let (entries, transcript_entry_count) =
+        collect_guardian_transcript_entries_after_for_test(&items, 2);
+
+    assert_eq!(transcript_entry_count, 4);
+    assert_eq!(entries.len(), 2);
+    assert_eq!(
+        entries[0],
+        GuardianTranscriptEntry {
+            kind: GuardianTranscriptEntryKind::Tool("tool shell result".to_string()),
+            text: "new result".to_string(),
+        }
+    );
+    assert_eq!(
+        entries[1],
+        GuardianTranscriptEntry {
+            kind: GuardianTranscriptEntryKind::Assistant,
+            text: "new assistant context".to_string(),
+        }
+    );
+}
+
+#[test]
+fn collect_guardian_transcript_bounds_retained_entry_text() {
+    let original = "large tool output ".repeat(100_000);
+    let items = vec![ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "call-1".to_string(),
+        output: codex_protocol::models::FunctionCallOutputPayload::from_text(original.clone()),
+        internal_chat_message_metadata_passthrough: None,
+    }];
+
+    let entries = collect_guardian_transcript_entries(&items);
+
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].text.len() < original.len());
+    assert!(
+        entries[0]
+            .text
+            .contains("<truncated omitted_approx_tokens=")
+    );
+}
+
+#[test]
 fn guardian_truncate_text_keeps_prefix_suffix_and_xml_marker() {
     let content = "prefix ".repeat(200) + &" suffix".repeat(200);
 
@@ -896,7 +979,7 @@ fn format_guardian_action_pretty_truncates_large_string_fields() -> serde_json::
     let patch = "line\n".repeat(100_000);
     let action = GuardianApprovalRequest::ApplyPatch {
         id: "patch-1".to_string(),
-        cwd: test_path_buf("/tmp").abs(),
+        cwd: PathUri::from_abs_path(&test_path_buf("/tmp").abs()),
         files: Vec::new(),
         patch: patch.clone(),
     };
@@ -915,7 +998,7 @@ fn format_guardian_action_pretty_reports_no_truncation_for_small_payload() -> se
 {
     let action = GuardianApprovalRequest::ApplyPatch {
         id: "patch-1".to_string(),
-        cwd: test_path_buf("/tmp").abs(),
+        cwd: PathUri::from_abs_path(&test_path_buf("/tmp").abs()),
         files: Vec::new(),
         patch: "line\n".to_string(),
     };
@@ -924,6 +1007,30 @@ fn format_guardian_action_pretty_reports_no_truncation_for_small_payload() -> se
 
     assert!(rendered.text.contains("\"tool\": \"apply_patch\""));
     assert!(!rendered.truncated);
+    Ok(())
+}
+
+#[test]
+fn format_guardian_action_pretty_bounds_nested_mcp_arguments() -> serde_json::Result<()> {
+    let large_argument = "argument ".repeat(100_000);
+    let action = GuardianApprovalRequest::McpToolCall {
+        id: "call-1".to_string(),
+        server: "mcp_server".to_string(),
+        tool_name: "large_argument_tool".to_string(),
+        arguments: Some(serde_json::json!({ "payload": large_argument })),
+        connector_id: None,
+        connector_name: None,
+        connector_description: None,
+        connected_account_email: None,
+        tool_title: None,
+        tool_description: None,
+        annotations: None,
+    };
+
+    let rendered = format_guardian_action_pretty(&action)?;
+
+    assert!(rendered.text.contains("<truncated omitted_approx_tokens="));
+    assert!(rendered.truncated);
     Ok(())
 }
 
@@ -1023,7 +1130,7 @@ async fn build_guardian_prompt_items_explains_network_access_review_scope() -> a
     let prompt = build_guardian_prompt_items(
         session.as_ref(),
         Some("Network access to \"example.com\" is blocked by policy.".to_string()),
-        GuardianApprovalRequest::NetworkAccess {
+        &GuardianApprovalRequest::NetworkAccess {
             id: "network-1".to_string(),
             turn_id: "turn-1".to_string(),
             target: "https://example.com:443".to_string(),
@@ -1085,12 +1192,14 @@ async fn build_guardian_prompt_items_explains_network_access_review_scope() -> a
 
 #[test]
 fn guardian_assessment_action_redacts_apply_patch_patch_text() {
-    let cwd = test_path_buf("/tmp").abs();
-    let file = test_path_buf("/tmp/guardian.txt").abs();
+    let cwd = PathUri::from_abs_path(&test_path_buf("/tmp").abs());
+    let file = PathUri::from_abs_path(&test_path_buf("/tmp/guardian.txt").abs());
+    let expected_cwd = LegacyAppPathString::from(cwd.clone());
+    let expected_file = LegacyAppPathString::from(file.clone());
     let action = GuardianApprovalRequest::ApplyPatch {
         id: "patch-1".to_string(),
-        cwd: cwd.clone(),
-        files: vec![file.clone()],
+        cwd,
+        files: vec![file],
         patch: "*** Begin Patch\n*** Update File: guardian.txt\n@@\n+secret\n*** End Patch"
             .to_string(),
     };
@@ -1099,8 +1208,8 @@ fn guardian_assessment_action_redacts_apply_patch_patch_text() {
         serde_json::to_value(guardian_assessment_action(&action)).expect("serialize action"),
         serde_json::json!({
             "type": "apply_patch",
-            "cwd": cwd,
-            "files": [file],
+            "cwd": expected_cwd,
+            "files": [expected_file],
         }),
     );
 }
@@ -1118,8 +1227,10 @@ fn guardian_request_turn_id_prefers_network_access_owner_turn() {
     };
     let apply_patch = GuardianApprovalRequest::ApplyPatch {
         id: "patch-1".to_string(),
-        cwd: test_path_buf("/tmp").abs(),
-        files: vec![test_path_buf("/tmp/guardian.txt").abs()],
+        cwd: PathUri::from_abs_path(&test_path_buf("/tmp").abs()),
+        files: vec![PathUri::from_abs_path(
+            &test_path_buf("/tmp/guardian.txt").abs(),
+        )],
         patch: "*** Begin Patch\n*** Update File: guardian.txt\n@@\n+hello\n*** End Patch"
             .to_string(),
     };
@@ -1170,8 +1281,10 @@ async fn cancelled_guardian_review_emits_terminal_abort_without_warning() {
         "review-cancelled-guardian".to_string(),
         GuardianApprovalRequest::ApplyPatch {
             id: "patch-1".to_string(),
-            cwd: test_path_buf("/tmp").abs(),
-            files: vec![test_path_buf("/tmp/guardian.txt").abs()],
+            cwd: PathUri::from_abs_path(&test_path_buf("/tmp").abs()),
+            files: vec![PathUri::from_abs_path(
+                &test_path_buf("/tmp/guardian.txt").abs(),
+            )],
             patch: "*** Begin Patch\n*** Update File: guardian.txt\n@@\n+hello\n*** End Patch"
                 .to_string(),
         },
@@ -1867,7 +1980,7 @@ async fn build_guardian_prompt_items_includes_parent_session_id() -> anyhow::Res
     let prompt = build_guardian_prompt_items(
         &session,
         /*retry_reason*/ None,
-        GuardianApprovalRequest::Shell {
+        &GuardianApprovalRequest::Shell {
             id: "shell-1".to_string(),
             command: vec!["git".to_string(), "status".to_string()],
             cwd: test_path_buf("/repo").abs(),

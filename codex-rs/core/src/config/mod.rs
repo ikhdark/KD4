@@ -1,6 +1,5 @@
 use crate::config::edit::ConfigEdit;
 use crate::config::edit::ConfigEditsBuilder;
-use crate::path_utils::normalize_for_native_workdir;
 use crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS;
 use crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS;
 use crate::windows_sandbox::WindowsSandboxLevelExt;
@@ -13,6 +12,7 @@ use codex_config::ConfigLayerStackOrdering;
 use codex_config::ConfigRequirements;
 use codex_config::ConfigRequirementsToml;
 use codex_config::ConstrainedWithSource;
+use codex_config::DEFAULT_CHATGPT_BASE_URL;
 use codex_config::FeatureRequirementsToml;
 use codex_config::ManagedAuthPolicy;
 use codex_config::McpServerRequirement;
@@ -22,13 +22,12 @@ use codex_config::ResidencyRequirement;
 use codex_config::SandboxModeRequirement;
 use codex_config::Sourced;
 use codex_config::ThreadConfigLoader;
+use codex_config::canonicalize_chatgpt_base_url;
 use codex_config::config_toml::AfterAgentPolicy;
 use codex_config::config_toml::ConfigLockfileToml;
 use codex_config::config_toml::ConfigToml;
 use codex_config::config_toml::DEFAULT_PROJECT_DOC_MAX_BYTES;
 use codex_config::config_toml::ProjectConfig;
-use codex_config::config_toml::RealtimeAudioConfig;
-use codex_config::config_toml::RealtimeConfig;
 use codex_config::config_toml::ReasoningPhaseEfforts;
 use codex_config::config_toml::ThreadStoreToml;
 use codex_config::config_toml::validate_model_providers;
@@ -69,12 +68,16 @@ use codex_features::FeatureOverrides;
 use codex_features::FeatureToml;
 use codex_features::Features;
 use codex_features::FeaturesToml;
+use codex_features::MULTI_AGENT_DEFAULT_WAIT_TIMEOUT_MS;
+use codex_features::MULTI_AGENT_MAX_WAIT_TIMEOUT_MS;
+use codex_features::MULTI_AGENT_MIN_WAIT_TIMEOUT_MS;
+use codex_features::MULTI_AGENT_V2_DEFAULT_MAX_CONCURRENT_THREADS_PER_SESSION;
+use codex_features::MULTI_AGENT_V2_MIN_CONCURRENT_THREADS_PER_SESSION;
 use codex_features::MultiAgentV2ConfigToml;
 use codex_features::NetworkProxyConfigToml;
 use codex_git_utils::resolve_root_git_project_for_trust;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
-use codex_install_context::InstallContext;
 use codex_login::AuthManagerConfig;
 use codex_login::AuthRouteConfig;
 use codex_mcp::McpConfig;
@@ -115,6 +118,7 @@ use codex_protocol::protocol::SandboxPolicy;
 pub use codex_thread_store::ExtraConfig;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
+use codex_utils_absolute_path::normalize_for_native_workdir;
 use codex_utils_path_uri::PathUri;
 use rmcp::model::ElicitationCapability;
 use rmcp::model::FormElicitationCapability;
@@ -136,7 +140,6 @@ use crate::config::permissions::builtin_permission_profile;
 use crate::config::permissions::compile_permission_profile_selection;
 use crate::config::permissions::compile_permission_profile_workspace_roots;
 use crate::config::permissions::default_builtin_permission_profile_name;
-use crate::config::permissions::get_readable_roots_required_for_codex_runtime;
 use crate::config::permissions::network_proxy_config_for_profile_selection;
 use crate::config::permissions::validate_user_permission_profile_names;
 use crate::config_lock::config_without_lock_controls;
@@ -165,7 +168,6 @@ pub use codex_config::ConstraintResult;
 pub use codex_config::LoaderOverrides;
 pub use codex_network_proxy::NetworkProxyAuditMetadata;
 use codex_sandboxing::compatibility_sandbox_policy_for_permission_profile;
-pub use codex_sandboxing::system_bwrap_warning;
 pub use managed_features::ManagedFeatures;
 pub use network_proxy_spec::NetworkProxySpec;
 pub use network_proxy_spec::StartedNetworkProxy;
@@ -197,28 +199,6 @@ fn effective_reasoning_phase_efforts(
     }
 }
 
-const DEFAULT_IGNORE_LARGE_UNTRACKED_DIRS: i64 = 200;
-const DEFAULT_IGNORE_LARGE_UNTRACKED_FILES: i64 = 10 * 1024 * 1024;
-
-/// Compatibility-only config retained so legacy `ghost_snapshot` settings
-/// continue to load even though snapshots are no longer produced.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GhostSnapshotConfig {
-    pub ignore_large_untracked_files: Option<i64>,
-    pub ignore_large_untracked_dirs: Option<i64>,
-    pub disable_warnings: bool,
-}
-
-impl Default for GhostSnapshotConfig {
-    fn default() -> Self {
-        Self {
-            ignore_large_untracked_files: Some(DEFAULT_IGNORE_LARGE_UNTRACKED_FILES),
-            ignore_large_untracked_dirs: Some(DEFAULT_IGNORE_LARGE_UNTRACKED_DIRS),
-            disable_warnings: false,
-        }
-    }
-}
-
 /// Maximum number of source bytes retained across project documentation files.
 /// Model-visible separators, provenance labels, and notices receive a separate
 /// fixed 4 KiB allowance, so the rendered project-doc payload is bounded by
@@ -243,11 +223,6 @@ pub(crate) const DEFAULT_AGENT_MAX_THREADS: Option<usize> = Some(6);
 ///
 /// The runtime subtracts `/root` before sizing child residency, so the default
 /// permits up to two concurrently resident child agents.
-pub(crate) const DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION: usize = 3;
-
-pub(crate) const DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS: i64 = 60_000;
-pub(crate) const DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS: i64 = 60 * 60 * 1000;
-pub(crate) const DEFAULT_MULTI_AGENT_V2_DEFAULT_WAIT_TIMEOUT_MS: i64 = 60_000;
 const DEFAULT_MULTI_AGENT_V2_ROOT_AGENT_USAGE_HINT_TEXT: &str = r#"You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals.
 
 At the start of your turn, you are the active agent.
@@ -357,10 +332,6 @@ fn default_multi_agent_v2_usage_hint_text(usage_hint_text: &str, max_concurrency
     )
 }
 
-pub(crate) const HARD_MIN_MULTI_AGENT_V2_TIMEOUT_MS: i64 =
-    DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS;
-pub(crate) const HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS: i64 =
-    DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS;
 pub(crate) const DEFAULT_AGENT_MAX_DEPTH: i32 = 1;
 pub(crate) const DEFAULT_AGENT_JOB_MAX_RUNTIME_SECONDS: Option<u64> = None;
 const LOCAL_DEV_BUILD_VERSION: &str = "0.0.0";
@@ -452,8 +423,7 @@ pub struct Permissions {
     pub allow_login_shell: bool,
     /// Policy used to build process environments for shell/unified exec.
     pub shell_environment_policy: ShellEnvironmentPolicy,
-    /// Effective Windows sandbox mode derived from `[windows].sandbox` or
-    /// legacy feature keys.
+    /// Effective Windows sandbox mode derived from `[windows].sandbox`.
     pub windows_sandbox_mode: Option<WindowsSandboxModeToml>,
     /// Whether the final Windows sandboxed child should run on a private desktop.
     pub windows_sandbox_private_desktop: bool,
@@ -1021,29 +991,12 @@ pub struct Config {
     /// This is a runtime-only knob populated from invocation overrides, not from config files.
     pub bypass_hook_trust: bool,
 
-    /// Optional URI-based file opener. If set, citations to files in the model
-    /// output will be hyperlinked using the specified URI scheme.
+    /// URI-based opener used for local Markdown links rendered by the TUI.
     pub file_opener: UriBasedFileOpener,
 
     /// Path to the current Codex executable. This cannot be set in the config
     /// file: it must be set in code via [`ConfigOverrides`].
     pub codex_self_exe: Option<PathBuf>,
-
-    /// Path to the `codex-linux-sandbox` executable. This must be set if
-    /// [`codex_sandboxing::SandboxType::LinuxSeccomp`] is used. Note that this
-    /// cannot be set in the config file: it must be set in code via
-    /// [`ConfigOverrides`].
-    ///
-    /// When this program is invoked, arg0 will be set to `codex-linux-sandbox`.
-    pub codex_linux_sandbox_exe: Option<PathBuf>,
-
-    /// Path to the `codex-execve-wrapper` executable used for shell
-    /// escalation. This cannot be set in the config file: it must be set in
-    /// code via [`ConfigOverrides`].
-    pub main_execve_wrapper_exe: Option<PathBuf>,
-
-    /// Optional absolute path to patched zsh used by zsh-exec-bridge-backed shell execution.
-    pub zsh_path: Option<PathBuf>,
 
     /// Value to use for `reasoning.effort` when making a request using the
     /// Responses API.
@@ -1067,9 +1020,6 @@ pub struct Config {
     /// using the Responses API. When unset, the model catalog default is used.
     pub model_reasoning_summary: Option<ReasoningSummary>,
 
-    /// Optional override to force-enable reasoning summaries for the configured model.
-    pub model_supports_reasoning_summaries: Option<bool>,
-
     /// Optional full model catalog loaded from `model_catalog_json`.
     /// When set, this replaces the bundled catalog for the current process.
     pub model_catalog: Option<ModelsResponse>,
@@ -1086,35 +1036,6 @@ pub struct Config {
     /// Optional product SKU forwarded to the host-owned apps MCP server.
     pub apps_mcp_product_sku: Option<String>,
 
-    /// Machine-local realtime audio device preferences used by realtime voice.
-    pub realtime_audio: RealtimeAudioConfig,
-
-    /// Experimental / do not use. Overrides only the realtime conversation
-    /// websocket transport base URL (the `Op::RealtimeConversation`
-    /// `/v1/realtime`
-    /// connection) without changing normal provider HTTP requests.
-    pub experimental_realtime_ws_base_url: Option<String>,
-    /// Experimental / do not use. Overrides only the WebRTC realtime call
-    /// creation base URL.
-    pub experimental_realtime_webrtc_call_base_url: Option<String>,
-    /// Experimental / do not use. Selects the realtime websocket model/snapshot
-    /// used for the `Op::RealtimeConversation` connection.
-    pub experimental_realtime_ws_model: Option<String>,
-    /// Experimental / do not use. Realtime websocket session selection.
-    /// `version` controls v1/v2 and `type` controls conversational/transcription.
-    pub realtime: RealtimeConfig,
-    /// Experimental / do not use. Overrides only the realtime conversation
-    /// websocket transport instructions (the `Op::RealtimeConversation`
-    /// `/ws` session.update instructions) without changing normal prompts.
-    pub experimental_realtime_ws_backend_prompt: Option<String>,
-    /// Experimental / do not use. Replaces the synthesized realtime startup
-    /// context appended to websocket session instructions. An empty string
-    /// disables startup context injection entirely.
-    pub experimental_realtime_ws_startup_context: Option<String>,
-    /// Experimental / do not use. Replaces the built-in realtime start
-    /// instructions inserted into developer messages when realtime becomes
-    /// active.
-    pub experimental_realtime_start_instructions: Option<String>,
     /// Experimental / do not use. When set, app-server fetches thread-scoped
     /// config from a remote service at this endpoint.
     pub experimental_thread_config_endpoint: Option<String>,
@@ -1145,10 +1066,6 @@ pub struct Config {
     /// Maximum poll window for background terminal output (`write_stdin`), in milliseconds.
     /// Default: `300000` (5 minutes).
     pub background_terminal_max_timeout: u64,
-
-    /// Compatibility-only settings retained for legacy `ghost_snapshot`
-    /// config loading.
-    pub ghost_snapshot: GhostSnapshotConfig,
 
     /// Settings specific to the task-path-based multi-agent tool surface.
     pub multi_agent_v2: MultiAgentV2Config,
@@ -1240,9 +1157,9 @@ impl MultiAgentV2Config {
     fn defaults_for_max_concurrency(max_concurrent_threads_per_session: usize) -> Self {
         Self {
             max_concurrent_threads_per_session,
-            min_wait_timeout_ms: DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS,
-            max_wait_timeout_ms: DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS,
-            default_wait_timeout_ms: DEFAULT_MULTI_AGENT_V2_DEFAULT_WAIT_TIMEOUT_MS,
+            min_wait_timeout_ms: MULTI_AGENT_MIN_WAIT_TIMEOUT_MS,
+            max_wait_timeout_ms: MULTI_AGENT_MAX_WAIT_TIMEOUT_MS,
+            default_wait_timeout_ms: MULTI_AGENT_DEFAULT_WAIT_TIMEOUT_MS,
             usage_hint_text: None,
             root_agent_usage_hint_text: Some(default_multi_agent_v2_usage_hint_text(
                 DEFAULT_MULTI_AGENT_V2_ROOT_AGENT_USAGE_HINT_TEXT,
@@ -1264,7 +1181,7 @@ impl MultiAgentV2Config {
 impl Default for MultiAgentV2Config {
     fn default() -> Self {
         Self::defaults_for_max_concurrency(
-            DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION,
+            MULTI_AGENT_V2_DEFAULT_MAX_CONCURRENT_THREADS_PER_SESSION,
         )
     }
 }
@@ -1564,7 +1481,6 @@ impl Config {
             tool_output_token_limit: self.tool_output_token_limit,
             base_instructions: self.base_instructions.clone(),
             personality_enabled: self.features.enabled(Feature::Personality),
-            model_supports_reasoning_summaries: self.model_supports_reasoning_summaries,
             model_catalog: self.model_catalog.clone(),
         }
     }
@@ -1684,8 +1600,6 @@ impl Config {
                 .features
                 .enabled(Feature::SkillMcpDependencyInstall),
             approval_policy: self.permissions.approval_policy.clone(),
-            codex_linux_sandbox_exe: self.codex_linux_sandbox_exe.clone(),
-            use_legacy_landlock: self.features.use_legacy_landlock(),
             apps_enabled: self.features.enabled(Feature::Apps),
             prefix_mcp_tool_names: self.prefix_mcp_tool_names(),
             client_elicitation_capability: if self.features.enabled(Feature::AuthElicitation) {
@@ -1754,18 +1668,11 @@ impl Config {
             .effective_config()
             .try_into()
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-        let default_zsh_path = refreshed_config
-            .zsh_path
-            .clone()
-            .map(AbsolutePathBuf::try_from)
-            .transpose()?;
-
         Self::load_config_with_layer_stack(
             LOCAL_FS.as_ref(),
             cfg,
             ConfigOverrides {
                 cwd: Some(self.cwd.to_path_buf()),
-                default_zsh_path,
                 ..Default::default()
             },
             refreshed_config.codex_home.clone(),
@@ -1827,8 +1734,7 @@ impl Config {
     /// designed to use [AskForApproval::Never] exclusively.
     ///
     /// Further, [ConfigOverrides] contains some options that are not supported
-    /// in [ConfigToml], such as `cwd`, `codex_self_exe`, `codex_linux_sandbox_exe`, and
-    /// `main_execve_wrapper_exe`.
+    /// in [ConfigToml], such as `cwd` and `codex_self_exe`.
     pub async fn load_with_cli_overrides_and_harness_overrides(
         cli_overrides: Vec<(String, TomlValue)>,
         harness_overrides: ConfigOverrides,
@@ -1849,53 +1755,6 @@ pub fn resolve_profile_v2_config_path(
         format!("{profile_name}{CONFIG_PROFILE_V2_SUFFIX}"),
         codex_home,
     )
-}
-
-/// DEPRECATED: Use [Config::load_with_cli_overrides()] instead because working
-/// with [ConfigToml] directly means that [ConfigRequirements] have not been
-/// applied yet, which risks failing to enforce required constraints.
-pub async fn load_config_as_toml_with_cli_overrides(
-    codex_home: &Path,
-    cwd: Option<&AbsolutePathBuf>,
-    cli_overrides: Vec<(String, TomlValue)>,
-    loader_overrides: LoaderOverrides,
-) -> std::io::Result<ConfigToml> {
-    load_config_as_toml_with_cli_and_loader_overrides(
-        codex_home,
-        cwd,
-        cli_overrides,
-        loader_overrides,
-    )
-    .await
-}
-
-/// DEPRECATED for most callers: prefer [Config::load_with_cli_overrides()] or
-/// [ConfigBuilder] because working with [ConfigToml] directly means
-/// [ConfigRequirements] have not been applied yet, which risks skipping
-/// required constraints.
-pub async fn load_config_as_toml_with_cli_and_loader_overrides(
-    codex_home: &Path,
-    cwd: Option<&AbsolutePathBuf>,
-    cli_overrides: Vec<(String, TomlValue)>,
-    loader_overrides: LoaderOverrides,
-) -> std::io::Result<ConfigToml> {
-    load_config_as_toml_with_cli_and_load_options(codex_home, cwd, cli_overrides, loader_overrides)
-        .await
-}
-
-/// DEPRECATED for most callers: prefer [Config::load_with_cli_overrides()] or
-/// [ConfigBuilder] because working with [ConfigToml] directly means
-/// [ConfigRequirements] have not been applied yet, which risks skipping
-/// required constraints.
-pub async fn load_config_as_toml_with_cli_and_load_options(
-    codex_home: &Path,
-    cwd: Option<&AbsolutePathBuf>,
-    cli_overrides: Vec<(String, TomlValue)>,
-    options: impl Into<ConfigLoadOptions>,
-) -> std::io::Result<ConfigToml> {
-    load_config_toml_with_layer_stack(codex_home, cwd, cli_overrides, options)
-        .await
-        .map(|result| result.config_toml)
 }
 
 /// Partially loaded config plus the layer stack used to derive it.
@@ -2123,33 +1982,10 @@ pub async fn load_global_mcp_servers(
         return Ok(BTreeMap::new());
     };
 
-    ensure_no_inline_bearer_tokens(servers_value)?;
-
     servers_value
         .clone()
         .try_into()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-}
-
-/// We briefly allowed plain text bearer_token fields in MCP server configs.
-/// We want to warn people who recently added these fields but can remove this after a few months.
-fn ensure_no_inline_bearer_tokens(value: &TomlValue) -> std::io::Result<()> {
-    let Some(servers_table) = value.as_table() else {
-        return Ok(());
-    };
-
-    for (server_name, server_value) in servers_table {
-        if let Some(server_table) = server_value.as_table()
-            && server_table.contains_key("bearer_token")
-        {
-            let message = format!(
-                "mcp_servers.{server_name} uses unsupported `bearer_token`; set `bearer_token_env_var`."
-            );
-            return Err(std::io::Error::new(ErrorKind::InvalidData, message));
-        }
-    }
-
-    Ok(())
 }
 
 pub(crate) fn set_project_trust_level_inner(
@@ -2492,6 +2328,11 @@ pub struct ConfigOverrides {
     pub review_model: Option<String>,
     pub cwd: Option<PathBuf>,
     pub approval_policy: Option<AskForApproval>,
+    /// A lower-priority runtime approval policy that is ignored when the
+    /// resolved approvals reviewer is automatic. Headless clients use this to
+    /// default to `Never` without rebuilding configuration after discovering
+    /// an automatic reviewer.
+    pub headless_approval_policy: Option<AskForApproval>,
     pub approvals_reviewer: Option<ApprovalsReviewer>,
     pub sandbox_mode: Option<SandboxMode>,
     pub permission_profile: Option<PermissionProfile>,
@@ -2499,9 +2340,6 @@ pub struct ConfigOverrides {
     pub model_provider: Option<String>,
     pub service_tier: Option<Option<String>>,
     pub codex_self_exe: Option<PathBuf>,
-    pub codex_linux_sandbox_exe: Option<PathBuf>,
-    pub main_execve_wrapper_exe: Option<PathBuf>,
-    pub default_zsh_path: Option<AbsolutePathBuf>,
     pub base_instructions: Option<String>,
     pub developer_instructions: Option<String>,
     pub personality: Option<Personality>,
@@ -2573,18 +2411,8 @@ fn resolve_orchestrator_feature_enabled(
     feature.and_then(|feature| feature.enabled).unwrap_or(true)
 }
 
-fn resolve_code_mode_config(
-    config_toml: &ConfigToml,
-    startup_warnings: &mut Vec<String>,
-) -> CodeModeConfig {
+fn resolve_code_mode_config(config_toml: &ConfigToml) -> CodeModeConfig {
     let base = code_mode_toml_config(config_toml.features.as_ref());
-    if base.and_then(|config| config.waiting_policy).is_some() {
-        startup_warnings.push(
-            "`features.code_mode.waiting_policy` is deprecated and ignored; remove this setting."
-                .to_string(),
-        );
-    }
-
     CodeModeConfig {
         excluded_tool_namespaces: base
             .and_then(|config| config.excluded_tool_namespaces.as_ref())
@@ -2601,7 +2429,7 @@ fn resolve_multi_agent_v2_config(config_toml: &ConfigToml) -> MultiAgentV2Config
     let base = multi_agent_v2_toml_config(config_toml.features.as_ref());
     let max_concurrent_threads_per_session = base
         .and_then(|config| config.max_concurrent_threads_per_session)
-        .unwrap_or(DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION);
+        .unwrap_or(MULTI_AGENT_V2_DEFAULT_MAX_CONCURRENT_THREADS_PER_SESSION);
     let default =
         MultiAgentV2Config::defaults_for_max_concurrency(max_concurrent_threads_per_session);
     let min_wait_timeout_ms = base
@@ -2759,7 +2587,6 @@ pub fn resolve_configured_features(
     let configured_features = Features::from_sources(
         FeatureConfigSource {
             features: cfg.features.as_ref(),
-            experimental_use_unified_exec_tool: cfg.experimental_use_unified_exec_tool,
         },
         FeatureConfigSource::default(),
         FeatureOverrides::default(),
@@ -2842,16 +2669,16 @@ pub(crate) fn resolve_web_search_mode_for_turn(
 }
 
 fn validate_multi_agent_v2_wait_timeout(label: &str, value: i64) -> std::io::Result<()> {
-    if value < HARD_MIN_MULTI_AGENT_V2_TIMEOUT_MS {
+    if value < MULTI_AGENT_MIN_WAIT_TIMEOUT_MS {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("{label} must be at least {HARD_MIN_MULTI_AGENT_V2_TIMEOUT_MS}"),
+            format!("{label} must be at least {MULTI_AGENT_MIN_WAIT_TIMEOUT_MS}"),
         ));
     }
-    if value > HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS {
+    if value > MULTI_AGENT_MAX_WAIT_TIMEOUT_MS {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("{label} must be at most {HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS}"),
+            format!("{label} must be at most {MULTI_AGENT_MAX_WAIT_TIMEOUT_MS}"),
         ));
     }
     Ok(())
@@ -2998,6 +2825,7 @@ impl Config {
             review_model: override_review_model,
             cwd,
             approval_policy: approval_policy_override,
+            headless_approval_policy,
             approvals_reviewer: approvals_reviewer_override,
             sandbox_mode,
             permission_profile,
@@ -3005,9 +2833,6 @@ impl Config {
             model_provider,
             service_tier: service_tier_override,
             codex_self_exe,
-            codex_linux_sandbox_exe,
-            main_execve_wrapper_exe,
-            default_zsh_path,
             base_instructions,
             developer_instructions,
             personality,
@@ -3054,6 +2879,12 @@ impl Config {
                 ),
             ));
         }
+        if !cfg.profiles.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "legacy `profiles` config tables are no longer supported; use `--profile <name>` with `<name>.config.toml` instead",
+            ));
+        }
 
         let tool_suggest = resolve_tool_suggest_config(&cfg, &config_layer_stack);
         let feature_overrides = FeatureOverrides {
@@ -3063,7 +2894,6 @@ impl Config {
         let configured_features = Features::from_sources(
             FeatureConfigSource {
                 features: cfg.features.as_ref(),
-                experimental_use_unified_exec_tool: cfg.experimental_use_unified_exec_tool,
             },
             FeatureConfigSource {
                 ..Default::default()
@@ -3122,20 +2952,26 @@ impl Config {
             .into_iter()
             .map(|path| AbsolutePathBuf::resolve_path_against_base(path, resolved_cwd.as_path()))
             .collect();
-        let repo_root = if let Some(discovery) = config_layer_stack
+        let project_discovery = config_layer_stack
             .project_discovery()
-            .filter(|discovery| discovery.matches(&resolved_cwd, fs))
-        {
+            .filter(|discovery| discovery.matches(&resolved_cwd, fs));
+        let repo_root = if let Some(discovery) = project_discovery {
             discovery.git_trust_root().cloned()
         } else {
             resolve_root_git_project_for_trust(fs, &resolved_cwd).await
         };
-        let active_project = cfg
-            .get_active_project(
+        let active_project = if let Some(lookup_keys) =
+            project_discovery.and_then(|discovery| discovery.active_project_lookup_keys())
+        {
+            cfg.get_active_project_for_lookup_keys(lookup_keys)
+                .unwrap_or(ProjectConfig { trust_level: None })
+        } else {
+            cfg.get_active_project(
                 resolved_cwd.as_path(),
                 repo_root.as_ref().map(AbsolutePathBuf::as_path),
             )
-            .unwrap_or(ProjectConfig { trust_level: None });
+            .unwrap_or(ProjectConfig { trust_level: None })
+        };
         let permission_config_syntax = resolve_permission_config_syntax(
             &config_layer_stack,
             &cfg,
@@ -3379,9 +3215,28 @@ impl Config {
             }
             configured_network_proxy_config.enabled = true;
         }
+        let approvals_reviewer_was_explicit =
+            approvals_reviewer_override.is_some() || cfg.approvals_reviewer.is_some();
+        let mut approvals_reviewer = approvals_reviewer_override
+            .or(cfg.approvals_reviewer)
+            .unwrap_or(ApprovalsReviewer::User);
+        if !approvals_reviewer_was_explicit
+            && let Err(err) = constrained_approvals_reviewer.can_set(&approvals_reviewer)
+        {
+            tracing::warn!(
+                error = %err,
+                "default approvals reviewer is disallowed by requirements; falling back to required default"
+            );
+            approvals_reviewer = constrained_approvals_reviewer.value();
+        }
+        let effective_approval_policy_override = approval_policy_override.or_else(|| {
+            (approvals_reviewer != ApprovalsReviewer::AutoReview)
+                .then_some(headless_approval_policy)
+                .flatten()
+        });
         let approval_policy_was_explicit =
-            approval_policy_override.is_some() || cfg.approval_policy.is_some();
-        let mut approval_policy = approval_policy_override
+            effective_approval_policy_override.is_some() || cfg.approval_policy.is_some();
+        let mut approval_policy = effective_approval_policy_override
             .or(cfg.approval_policy)
             .unwrap_or_else(|| {
                 if active_project.is_trusted() {
@@ -3401,26 +3256,12 @@ impl Config {
             );
             approval_policy = constrained_approval_policy.value();
         }
-        let approvals_reviewer_was_explicit =
-            approvals_reviewer_override.is_some() || cfg.approvals_reviewer.is_some();
-        let mut approvals_reviewer = approvals_reviewer_override
-            .or(cfg.approvals_reviewer)
-            .unwrap_or(ApprovalsReviewer::User);
-        if !approvals_reviewer_was_explicit
-            && let Err(err) = constrained_approvals_reviewer.can_set(&approvals_reviewer)
-        {
-            tracing::warn!(
-                error = %err,
-                "default approvals reviewer is disallowed by requirements; falling back to required default"
-            );
-            approvals_reviewer = constrained_approvals_reviewer.value();
-        }
         let web_search_mode =
             resolve_web_search_mode(&cfg, &features).unwrap_or(WebSearchMode::Cached);
         let web_search_config = resolve_web_search_config(&cfg);
         let experimental_request_user_input_enabled =
             resolve_experimental_request_user_input_enabled(&cfg);
-        let code_mode = resolve_code_mode_config(&cfg, &mut startup_warnings);
+        let code_mode = resolve_code_mode_config(&cfg);
         let multi_agent_v2 = resolve_multi_agent_v2_config(&cfg);
         let current_time_reminder = resolve_current_time_reminder_config(&cfg, &features)?;
         let terminal_resize_reflow = resolve_terminal_resize_reflow_config(&cfg);
@@ -3458,10 +3299,14 @@ impl Config {
 
         let history = cfg.history.unwrap_or_default();
 
-        if multi_agent_v2.max_concurrent_threads_per_session == 0 {
+        if multi_agent_v2.max_concurrent_threads_per_session
+            < MULTI_AGENT_V2_MIN_CONCURRENT_THREADS_PER_SESSION
+        {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "features.multi_agent_v2.max_concurrent_threads_per_session must be at least 1",
+                format!(
+                    "features.multi_agent_v2.max_concurrent_threads_per_session must be at least {MULTI_AGENT_V2_MIN_CONCURRENT_THREADS_PER_SESSION}"
+                ),
             ));
         }
         validate_multi_agent_v2_wait_timeout(
@@ -3541,31 +3386,6 @@ impl Config {
             .background_terminal_max_timeout
             .unwrap_or(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS)
             .max(MIN_EMPTY_YIELD_TIME_MS);
-
-        let ghost_snapshot = {
-            let mut config = GhostSnapshotConfig::default();
-            if let Some(ghost_snapshot) = cfg.ghost_snapshot.as_ref()
-                && let Some(ignore_over_bytes) = ghost_snapshot.ignore_large_untracked_files
-            {
-                config.ignore_large_untracked_files = if ignore_over_bytes > 0 {
-                    Some(ignore_over_bytes)
-                } else {
-                    None
-                };
-            }
-            if let Some(ghost_snapshot) = cfg.ghost_snapshot.as_ref()
-                && let Some(threshold) = ghost_snapshot.ignore_large_untracked_dirs
-            {
-                config.ignore_large_untracked_dirs =
-                    if threshold > 0 { Some(threshold) } else { None };
-            }
-            if let Some(ghost_snapshot) = cfg.ghost_snapshot.as_ref()
-                && let Some(disable_warnings) = ghost_snapshot.disable_warnings
-            {
-                config.disable_warnings = disable_warnings;
-            }
-            config
-        };
 
         let use_experimental_unified_exec_tool = features.enabled(Feature::UnifiedExec);
 
@@ -3659,10 +3479,6 @@ impl Config {
         )
         .await?;
         let compact_prompt = compact_prompt.or(file_compact_prompt);
-        let zsh_path = default_zsh_path
-            .or_else(|| InstallContext::current().bundled_zsh_path())
-            .map(AbsolutePathBuf::into_path_buf);
-
         let review_model = override_review_model.or(cfg.review_model);
 
         let check_for_update_on_startup = cfg.check_for_update_on_startup.unwrap_or(true);
@@ -3748,11 +3564,7 @@ impl Config {
             network_requirements,
             &network_permission_profile,
         )?;
-        let mut helper_readable_roots = get_readable_roots_required_for_codex_runtime(
-            &codex_home,
-            zsh_path.as_ref(),
-            main_execve_wrapper_exe.as_ref(),
-        );
+        let mut helper_readable_roots = Vec::new();
         if features.enabled(Feature::MemoryTool) && memories_config.use_memories {
             helper_readable_roots.push(memories_root);
         }
@@ -3901,9 +3713,6 @@ impl Config {
             bypass_hook_trust,
             file_opener: cfg.file_opener.unwrap_or(UriBasedFileOpener::VsCode),
             codex_self_exe,
-            codex_linux_sandbox_exe,
-            main_execve_wrapper_exe,
-            zsh_path,
 
             hide_agent_reasoning: cfg.hide_agent_reasoning.unwrap_or(false),
             show_raw_agent_reasoning: cfg
@@ -3917,38 +3726,15 @@ impl Config {
                 cfg.reasoning_phase_efforts,
             )),
             model_reasoning_summary: cfg.model_reasoning_summary,
-            model_supports_reasoning_summaries: cfg.model_supports_reasoning_summaries,
             model_catalog,
             model_verbosity: cfg.model_verbosity,
-            chatgpt_base_url: cfg
-                .chatgpt_base_url
-                .unwrap_or("https://chatgpt.com/backend-api/".to_string()),
+            chatgpt_base_url: canonicalize_chatgpt_base_url(
+                cfg.chatgpt_base_url
+                    .as_deref()
+                    .unwrap_or(DEFAULT_CHATGPT_BASE_URL),
+            ),
             respect_system_proxy,
             apps_mcp_product_sku: cfg.apps_mcp_product_sku.clone(),
-            realtime_audio: cfg
-                .audio
-                .map_or_else(RealtimeAudioConfig::default, |audio| RealtimeAudioConfig {
-                    microphone: audio.microphone,
-                    speaker: audio.speaker,
-                }),
-            experimental_realtime_ws_base_url: cfg.experimental_realtime_ws_base_url,
-            experimental_realtime_webrtc_call_base_url: cfg
-                .experimental_realtime_webrtc_call_base_url,
-            experimental_realtime_ws_model: cfg.experimental_realtime_ws_model,
-            realtime: cfg
-                .realtime
-                .map_or_else(RealtimeConfig::default, |realtime| {
-                    let defaults = RealtimeConfig::default();
-                    RealtimeConfig {
-                        version: realtime.version.unwrap_or(defaults.version),
-                        session_type: realtime.session_type.unwrap_or(defaults.session_type),
-                        transport: realtime.transport.unwrap_or(defaults.transport),
-                        voice: realtime.voice,
-                    }
-                }),
-            experimental_realtime_ws_backend_prompt: cfg.experimental_realtime_ws_backend_prompt,
-            experimental_realtime_ws_startup_context: cfg.experimental_realtime_ws_startup_context,
-            experimental_realtime_start_instructions: cfg.experimental_realtime_start_instructions,
             experimental_thread_config_endpoint: cfg.experimental_thread_config_endpoint,
             experimental_thread_store: thread_store_config(cfg.experimental_thread_store),
             forced_chatgpt_workspace_id,
@@ -3959,7 +3745,6 @@ impl Config {
             code_mode,
             use_experimental_unified_exec_tool,
             background_terminal_max_timeout,
-            ghost_snapshot,
             multi_agent_v2,
             current_time_reminder,
             features,

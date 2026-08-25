@@ -22,11 +22,6 @@
 //! and environment variables that the test chose for itself. That matters here because the normal
 //! reqwest client-construction path is not hermetic enough for environment-sensitive tests:
 //!
-//! - on macOS seatbelt runs, `reqwest::Client::builder().build()` can panic inside
-//!   `system-configuration` while probing platform proxy settings, which means the process can die
-//!   before the custom-CA code reports success or a structured error. That matters in practice
-//!   because Codex itself commonly runs spawned test processes under seatbelt, so this is not just
-//!   a hypothetical CI edge case.
 //! - child processes inherit CA-related environment variables by default, which lets developer
 //!   shell state or CI configuration affect a test unless the test scrubs those variables first
 //!
@@ -47,6 +42,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use codex_utils_der::first_der_item;
 use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
 use rustls::ClientConfig;
 use rustls::RootCertStore;
@@ -180,6 +176,17 @@ pub fn build_reqwest_client_with_custom_ca(
     builder: reqwest::ClientBuilder,
 ) -> Result<reqwest::Client, BuildCustomCaTransportError> {
     build_reqwest_client_with_env(&ProcessEnv, builder)
+}
+
+/// Builds a blocking reqwest client that honors Codex custom CA environment variables.
+///
+/// This is the blocking sibling of [`build_reqwest_client_with_custom_ca`]. Callers supply their
+/// baseline builder configuration, and this helper preserves it while applying the same custom CA
+/// selection, parsing, and error policy as asynchronous HTTP clients.
+pub fn build_blocking_reqwest_client_with_custom_ca(
+    builder: reqwest::blocking::ClientBuilder,
+) -> Result<reqwest::blocking::Client, BuildCustomCaTransportError> {
+    build_blocking_reqwest_client_with_env(&ProcessEnv, builder)
 }
 
 /// Builds a rustls client config when a Codex custom CA bundle is configured.
@@ -365,6 +372,71 @@ fn build_reqwest_client_with_env(
             ))
         }
     }
+}
+
+fn build_blocking_reqwest_client_with_env(
+    env_source: &dyn EnvSource,
+    mut builder: reqwest::blocking::ClientBuilder,
+) -> Result<reqwest::blocking::Client, BuildCustomCaTransportError> {
+    if let Some(bundle) = env_source.configured_ca_bundle() {
+        ensure_rustls_crypto_provider();
+        info!(
+            source_env = bundle.source_env,
+            ca_path = %bundle.path.display(),
+            "building blocking HTTP client with rustls backend for custom CA bundle"
+        );
+        builder = builder.use_rustls_tls();
+
+        let certificates = bundle.load_certificates()?;
+        for (idx, cert) in certificates.iter().enumerate() {
+            let certificate = match reqwest::Certificate::from_der(cert.as_ref()) {
+                Ok(certificate) => certificate,
+                Err(source) => {
+                    warn!(
+                        source_env = bundle.source_env,
+                        ca_path = %bundle.path.display(),
+                        certificate_index = idx + 1,
+                        error = %source,
+                        "failed to register CA certificate"
+                    );
+                    return Err(BuildCustomCaTransportError::RegisterCertificate {
+                        source_env: bundle.source_env,
+                        path: bundle.path.clone(),
+                        certificate_index: idx + 1,
+                        source,
+                    });
+                }
+            };
+            builder = builder.add_root_certificate(certificate);
+        }
+
+        return builder.build().map_err(|source| {
+            warn!(
+                source_env = bundle.source_env,
+                ca_path = %bundle.path.display(),
+                error = %source,
+                "failed to build blocking client after loading custom CA bundle"
+            );
+            BuildCustomCaTransportError::BuildClientWithCustomCa {
+                source_env: bundle.source_env,
+                path: bundle.path,
+                source,
+            }
+        });
+    }
+
+    info!(
+        codex_ca_certificate_configured = false,
+        ssl_cert_file_configured = false,
+        "using system root certificates because no CA override environment variable was selected"
+    );
+    builder.build().map_err(|source| {
+        warn!(
+            error = %source,
+            "failed to build blocking client while using system root certificates"
+        );
+        BuildCustomCaTransportError::BuildClientWithSystemRoots(source)
+    })
 }
 
 /// Abstracts environment access so tests can cover precedence rules without mutating process-wide
@@ -645,72 +717,6 @@ impl NormalizedPem {
     }
 }
 
-/// Returns the first DER-encoded ASN.1 object in `der`, ignoring any trailing OpenSSL metadata.
-///
-/// A PEM `CERTIFICATE` block usually decodes to exactly one DER blob: the certificate itself.
-/// OpenSSL's `TRUSTED CERTIFICATE` variant is different. It starts with that same certificate
-/// blob, but may append extra `X509_AUX` bytes after it to describe OpenSSL-specific trust
-/// settings. `reqwest::Certificate::from_der` only understands the certificate object, not those
-/// trailing OpenSSL extensions.
-///
-/// This helper therefore asks a narrower question than "is this a valid certificate?": where does
-/// the first top-level DER object end? If that boundary can be found, the caller keeps only that
-/// prefix and discards the trailing trust metadata. If it cannot be found, the input is treated as
-/// malformed CA data.
-fn first_der_item(der: &[u8]) -> Option<&[u8]> {
-    der_item_length(der).map(|length| &der[..length])
-}
-
-/// Returns the byte length of the first DER item in `der`.
-///
-/// DER is a binary encoding for ASN.1 objects. Each object begins with:
-///
-/// - a tag byte describing what kind of object follows
-/// - one or more length bytes describing how many content bytes belong to that object
-/// - the content bytes themselves
-///
-/// For this module, the important fact is that a certificate is stored as one complete top-level
-/// DER object. Once we know that object's declared length, we know exactly where the certificate
-/// ends and where any trailing OpenSSL `X509_AUX` data begins.
-///
-/// This helper intentionally parses only that outer length field. It does not validate the inner
-/// certificate structure, the meaning of the tag, or every nested ASN.1 value. That narrower scope
-/// is deliberate: the caller only needs a safe slice boundary for the leading certificate object
-/// before handing those bytes to `reqwest`, which performs the real certificate parsing.
-///
-/// The implementation supports the DER length forms needed here:
-///
-/// - short form, where the length is stored directly in the second byte
-/// - long form, where the second byte says how many following bytes make up the length value
-///
-/// Indefinite lengths are rejected because DER does not permit them, and any declared length that
-/// would run past the end of the input is treated as malformed.
-fn der_item_length(der: &[u8]) -> Option<usize> {
-    let &length_octet = der.get(1)?;
-    if length_octet & 0x80 == 0 {
-        return Some(2 + usize::from(length_octet)).filter(|length| *length <= der.len());
-    }
-
-    let length_octets = usize::from(length_octet & 0x7f);
-    if length_octets == 0 {
-        return None;
-    }
-
-    let length_start = 2usize;
-    let length_end = length_start.checked_add(length_octets)?;
-    let length_bytes = der.get(length_start..length_end)?;
-    let mut content_length = 0usize;
-    for &byte in length_bytes {
-        content_length = content_length
-            .checked_mul(256)?
-            .checked_add(usize::from(byte))?;
-    }
-
-    length_end
-        .checked_add(content_length)
-        .filter(|length| *length <= der.len())
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -724,6 +730,7 @@ mod tests {
     use super::CODEX_CA_CERT_ENV;
     use super::EnvSource;
     use super::SSL_CERT_FILE_ENV;
+    use super::build_blocking_reqwest_client_with_env;
     use super::maybe_build_rustls_client_config_with_env;
 
     const TEST_CERT: &str = include_str!("../tests/fixtures/test-ca.pem");
@@ -811,6 +818,24 @@ mod tests {
         let env = map_env(&[(CODEX_CA_CERT_ENV, cert_path.to_string_lossy().as_ref())]);
 
         let error = maybe_build_rustls_client_config_with_env(&env).expect_err("invalid CA");
+
+        assert!(matches!(
+            error,
+            BuildCustomCaTransportError::InvalidCaFile { .. }
+        ));
+    }
+
+    #[test]
+    fn blocking_client_reports_invalid_ca_file() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let cert_path = write_cert_file(&temp_dir, "empty.pem", "");
+        let env = map_env(&[(CODEX_CA_CERT_ENV, cert_path.to_string_lossy().as_ref())]);
+
+        let error = build_blocking_reqwest_client_with_env(
+            &env,
+            reqwest::blocking::Client::builder().no_proxy(),
+        )
+        .expect_err("invalid CA");
 
         assert!(matches!(
             error,

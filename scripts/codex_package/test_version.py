@@ -3,6 +3,7 @@
 from pathlib import Path
 import sys
 import tempfile
+import tomllib
 import unittest
 from unittest import mock
 
@@ -39,6 +40,9 @@ class VersionDiscoveryTest(unittest.TestCase):
                 version.read_workspace_version(cargo_toml),
                 "1.2.3-alpha.4",
             )
+
+    def test_uses_required_stdlib_tomllib(self) -> None:
+        self.assertIs(version.tomllib, tomllib)
 
     def test_reads_workspace_package_version_with_toml_comments(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -120,17 +124,6 @@ class VersionDiscoveryTest(unittest.TestCase):
             version.read_workspace_version()
 
         read_uncached.assert_called_once_with(expected)
-
-    def test_parse_version_assignment_requires_exact_key_and_quoted_value(self) -> None:
-        self.assertEqual(version.parse_version_assignment('version = "1.2.3"'), "1.2.3")
-        self.assertEqual(
-            version.parse_version_assignment('version = "1.2.3" # comment'),
-            "1.2.3",
-        )
-        self.assertIsNone(version.parse_version_assignment('package.version = "1.2.3"'))
-        self.assertIsNone(version.parse_version_assignment("version = 1.2.3"))
-        self.assertIsNone(version.parse_version_assignment('version = "1.2.3" extra'))
-
 
 if __name__ == "__main__":
     unittest.main()

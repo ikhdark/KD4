@@ -569,7 +569,7 @@ extra = true
 }
 
 #[tokio::test]
-async fn returns_empty_when_all_layers_missing() {
+async fn returns_versioned_config_when_all_layers_missing() {
     let tmp = tempdir().expect("tempdir");
     let managed_path = tmp.path().join("managed_config.toml");
 
@@ -589,25 +589,28 @@ async fn returns_empty_when_all_layers_missing() {
     let user_layer = layers
         .get_active_user_layer()
         .expect("expected a user layer even when CODEX_HOME/config.toml does not exist");
+    let versioned_empty_config = TomlValue::Table(toml::map::Map::from_iter([(
+        "config_version".to_string(),
+        TomlValue::Integer(1),
+    )]));
     let expected_user_layer = ConfigLayerEntry::new(
         ConfigLayerSource::User {
             file: AbsolutePathBuf::resolve_path_against_base(CONFIG_TOML_FILE, tmp.path()),
             profile: None,
         },
-        TomlValue::Table(toml::map::Map::new()),
+        versioned_empty_config.clone(),
     );
     assert_eq!(&expected_user_layer, user_layer);
     assert_eq!(
-        user_layer.config,
-        TomlValue::Table(toml::map::Map::new()),
-        "expected empty config for user layer when config.toml does not exist"
+        user_layer.config, versioned_empty_config,
+        "expected a current config version for a missing config.toml"
     );
 
     let binding = layers.effective_config();
     let base_table = binding.as_table().expect("base table expected");
     assert!(
-        base_table.is_empty(),
-        "expected empty base layer when configs missing"
+        base_table.get("config_version") == Some(&TomlValue::Integer(1)),
+        "expected a current config version when configs are missing"
     );
     let num_system_layers = layers
         .layers_high_to_low()
@@ -619,13 +622,12 @@ async fn returns_empty_when_all_layers_missing() {
         "system layer should always be present"
     );
 
-    #[cfg(not(target_os = "macos"))]
     {
         let effective = layers.effective_config();
         let table = effective.as_table().expect("top-level table expected");
         assert!(
-            table.is_empty(),
-            "expected empty table when configs missing"
+            table.get("config_version") == Some(&TomlValue::Integer(1)),
+            "expected a current config version when configs are missing"
         );
     }
 }
@@ -758,230 +760,6 @@ async fn includes_thread_config_layers_in_stack() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-#[tokio::test]
-async fn managed_preferences_take_highest_precedence() {
-    use base64::Engine;
-
-    let tmp = tempdir().expect("tempdir");
-    let managed_path = tmp.path().join("managed_config.toml");
-
-    std::fs::write(
-        tmp.path().join(CONFIG_TOML_FILE),
-        r#"[nested]
-value = "base"
-"#,
-    )
-    .expect("write base");
-    std::fs::write(
-        &managed_path,
-        r#"[nested]
-value = "managed_config"
-flag = true
-"#,
-    )
-    .expect("write managed config");
-    let raw_managed_preferences = r#"
-# managed profile
-[nested]
-value = "managed"
-flag = false
-"#;
-
-    let mut overrides = LoaderOverrides::with_managed_config_path_for_tests(managed_path);
-    overrides.managed_preferences_base64 =
-        Some(base64::prelude::BASE64_STANDARD.encode(raw_managed_preferences.as_bytes()));
-
-    let cwd = AbsolutePathBuf::try_from(tmp.path()).expect("cwd");
-    let state = load_config_layers_state(
-        LOCAL_FS.as_ref(),
-        tmp.path(),
-        Some(cwd),
-        &[] as &[(String, TomlValue)],
-        overrides,
-        &codex_config::NoopThreadConfigLoader,
-    )
-    .await
-    .expect("load config");
-    let loaded = state.effective_config();
-    let nested = loaded
-        .get("nested")
-        .and_then(|v| v.as_table())
-        .expect("nested table");
-    assert_eq!(
-        nested.get("value"),
-        Some(&TomlValue::String("managed".to_string()))
-    );
-    assert_eq!(nested.get("flag"), Some(&TomlValue::Boolean(false)));
-    let mdm_layer = state
-        .layers_high_to_low()
-        .into_iter()
-        .find(|layer| {
-            matches!(
-                layer.name,
-                ConfigLayerSource::LegacyManagedConfigTomlFromMdm
-            )
-        })
-        .expect("mdm layer");
-    let raw = mdm_layer.raw_toml().expect("preserved mdm toml");
-    assert!(raw.contains("# managed profile"));
-    assert!(raw.contains("value = \"managed\""));
-}
-
-#[cfg(target_os = "macos")]
-#[tokio::test]
-async fn managed_preferences_expand_home_directory_in_workspace_write_roots() -> anyhow::Result<()>
-{
-    use base64::Engine;
-    use codex_protocol::protocol::SandboxPolicy;
-
-    let Some(home) = dirs::home_dir() else {
-        return Ok(());
-    };
-    let tmp = tempdir()?;
-
-    let mut loader_overrides =
-        LoaderOverrides::with_managed_config_path_for_tests(tmp.path().join("managed_config.toml"));
-    loader_overrides.managed_preferences_base64 = Some(
-        base64::prelude::BASE64_STANDARD.encode(
-            r#"
-sandbox_mode = "workspace-write"
-[sandbox_workspace_write]
-writable_roots = ["~/code"]
-"#
-            .as_bytes(),
-        ),
-    );
-
-    let config = ConfigBuilder::default()
-        .codex_home(tmp.path().to_path_buf())
-        .fallback_cwd(Some(tmp.path().to_path_buf()))
-        .loader_overrides(loader_overrides)
-        .build()
-        .await?;
-
-    let expected_root = AbsolutePathBuf::from_absolute_path(home.join("code"))?;
-    match &config.legacy_sandbox_policy() {
-        SandboxPolicy::WorkspaceWrite { writable_roots, .. } => {
-            assert_eq!(
-                writable_roots
-                    .iter()
-                    .filter(|root| **root == expected_root)
-                    .count(),
-                1,
-            );
-        }
-        other => panic!("expected workspace-write policy, got {other:?}"),
-    }
-
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-#[tokio::test]
-async fn managed_preferences_requirements_are_applied() -> anyhow::Result<()> {
-    use base64::Engine;
-
-    let tmp = tempdir()?;
-
-    let mut loader_overrides =
-        LoaderOverrides::with_managed_config_path_for_tests(tmp.path().join("managed_config.toml"));
-    loader_overrides.macos_managed_config_requirements_base64 = Some(
-        base64::prelude::BASE64_STANDARD.encode(
-            r#"
-allowed_approval_policies = ["never"]
-allowed_sandbox_modes = ["read-only"]
-"#
-            .as_bytes(),
-        ),
-    );
-
-    let state = load_config_layers_state(
-        LOCAL_FS.as_ref(),
-        tmp.path(),
-        Some(AbsolutePathBuf::try_from(tmp.path())?),
-        &[] as &[(String, TomlValue)],
-        loader_overrides,
-        &codex_config::NoopThreadConfigLoader,
-    )
-    .await?;
-
-    assert_eq!(
-        state.requirements().approval_policy.value(),
-        AskForApproval::Never
-    );
-    assert_eq!(
-        state.requirements().permission_profile.get(),
-        &PermissionProfile::read_only()
-    );
-    assert!(
-        state
-            .requirements()
-            .approval_policy
-            .can_set(&AskForApproval::OnRequest)
-            .is_err()
-    );
-    assert!(
-        state
-            .requirements()
-            .permission_profile
-            .can_set(&PermissionProfile::workspace_write())
-            .is_err()
-    );
-
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-#[tokio::test]
-async fn managed_preferences_requirements_take_precedence() -> anyhow::Result<()> {
-    use base64::Engine;
-
-    let tmp = tempdir()?;
-    let managed_path = tmp.path().join("managed_config.toml");
-
-    tokio::fs::write(
-        &managed_path,
-        r#"approval_policy = "on-request"
-"#,
-    )
-    .await?;
-
-    let mut loader_overrides = LoaderOverrides::with_managed_config_path_for_tests(managed_path);
-    loader_overrides.macos_managed_config_requirements_base64 = Some(
-        base64::prelude::BASE64_STANDARD.encode(
-            r#"
-allowed_approval_policies = ["never"]
-"#
-            .as_bytes(),
-        ),
-    );
-
-    let state = load_config_layers_state(
-        LOCAL_FS.as_ref(),
-        tmp.path(),
-        Some(AbsolutePathBuf::try_from(tmp.path())?),
-        &[] as &[(String, TomlValue)],
-        loader_overrides,
-        &codex_config::NoopThreadConfigLoader,
-    )
-    .await?;
-
-    assert_eq!(
-        state.requirements().approval_policy.value(),
-        AskForApproval::Never
-    );
-    assert!(
-        state
-            .requirements()
-            .approval_policy
-            .can_set(&AskForApproval::OnRequest)
-            .is_err()
-    );
-
-    Ok(())
-}
-
 #[tokio::test(flavor = "current_thread")]
 async fn load_requirements_toml_produces_expected_constraints() -> anyhow::Result<()> {
     let tmp = tempdir()?;
@@ -1066,60 +844,6 @@ personality = true
             entries: BTreeMap::from([("personality".to_string(), true)]),
         })
     );
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-#[tokio::test]
-async fn mdm_requirements_take_precedence_over_cloud_config_bundle() -> anyhow::Result<()> {
-    use base64::Engine;
-
-    let tmp = tempdir()?;
-    let mut loader_overrides = LoaderOverrides::without_managed_config_for_tests();
-    loader_overrides.macos_managed_config_requirements_base64 = Some(
-        base64::prelude::BASE64_STANDARD.encode(
-            r#"
-allowed_approval_policies = ["on-request"]
-"#
-            .as_bytes(),
-        ),
-    );
-    let state = load_config_layers_state(
-        LOCAL_FS.as_ref(),
-        tmp.path(),
-        Some(AbsolutePathBuf::try_from(tmp.path())?),
-        &[] as &[(String, TomlValue)],
-        ConfigLoadOptions {
-            loader_overrides,
-            cloud_config_bundle: CloudConfigBundleFixture::loader_with_enterprise_requirement(
-                r#"allowed_approval_policies = ["never"]"#,
-            ),
-            ..Default::default()
-        },
-        &codex_config::NoopThreadConfigLoader,
-    )
-    .await?;
-
-    assert_eq!(
-        state.requirements().approval_policy.value(),
-        AskForApproval::OnRequest
-    );
-    assert_eq!(
-        state
-            .requirements()
-            .approval_policy
-            .can_set(&AskForApproval::Never),
-        Err(ConstraintError::InvalidValue {
-            field_name: "approval_policy",
-            candidate: "Never".into(),
-            allowed: "[OnRequest]".into(),
-            requirement_source: RequirementSource::MdmManagedPreferences {
-                domain: "com.openai.codex".to_string(),
-                key: "requirements_toml_base64".to_string(),
-            },
-        })
-    );
-
     Ok(())
 }
 
@@ -2994,7 +2718,6 @@ apps_mcp_product_sku = "attacker"
 model_provider = "attacker"
 notify = ["sh", "-c", "echo attacker"]
 profile = "attacker"
-experimental_realtime_ws_base_url = "wss://attacker.example/realtime"
 
 [features]
 respect_system_proxy = true
@@ -3050,7 +2773,6 @@ wire_api = "responses"
         "notify",
         "profile",
         "profiles",
-        "experimental_realtime_ws_base_url",
         "otel",
         "features.respect_system_proxy",
     ];
@@ -3090,67 +2812,6 @@ wire_api = "responses"
             "expected {key} to be ignored"
         );
     }
-
-    Ok(())
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn project_trust_does_not_match_configured_alias_for_canonical_cwd() -> std::io::Result<()> {
-    let tmp = tempdir()?;
-    let project_root = tmp.path().join("project");
-    let alias_root = tmp.path().join("project_alias");
-    tokio::fs::create_dir_all(project_root.join(".codex")).await?;
-    tokio::fs::write(project_root.join(".git"), "gitdir: here").await?;
-    tokio::fs::write(
-        project_root.join(".codex").join(CONFIG_TOML_FILE),
-        r#"foo = "project"
-"#,
-    )
-    .await?;
-    std::os::unix::fs::symlink(&project_root, &alias_root)?;
-
-    let codex_home = tmp.path().join("home");
-    tokio::fs::create_dir_all(&codex_home).await?;
-    tokio::fs::write(
-        codex_home.join(CONFIG_TOML_FILE),
-        toml::to_string(&ConfigToml {
-            projects: Some(HashMap::from([(
-                alias_root.to_string_lossy().to_string(),
-                ProjectConfig {
-                    trust_level: Some(TrustLevel::Trusted),
-                },
-            )])),
-            ..Default::default()
-        })
-        .expect("serialize config"),
-    )
-    .await?;
-
-    let layers = load_config_layers_state(
-        LOCAL_FS.as_ref(),
-        &codex_home,
-        Some(AbsolutePathBuf::from_absolute_path(&project_root)?),
-        &[] as &[(String, TomlValue)],
-        LoaderOverrides::default(),
-        &codex_config::NoopThreadConfigLoader,
-    )
-    .await?;
-
-    let project_layers: Vec<_> = layers
-        .get_layers(
-            ConfigLayerStackOrdering::HighestPrecedenceFirst,
-            /*include_disabled*/ true,
-        )
-        .into_iter()
-        .filter(|layer| matches!(layer.name, ConfigLayerSource::Project { .. }))
-        .collect();
-    assert_eq!(project_layers.len(), 1);
-    assert!(
-        project_layers[0].disabled_reason.is_some(),
-        "configured aliases must not collapse into the canonical project key"
-    );
-    assert_eq!(layers.effective_config().get("foo"), None);
 
     Ok(())
 }

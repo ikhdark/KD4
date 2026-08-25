@@ -7,7 +7,10 @@ use std::sync::Arc;
 use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::LOCAL_FS;
 use codex_protocol::protocol::Product;
+pub use codex_protocol::protocol::SkillDependencies;
+pub use codex_protocol::protocol::SkillInterface;
 use codex_protocol::protocol::SkillScope;
+pub use codex_protocol::protocol::SkillToolDependency;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use sha2::Digest;
@@ -34,23 +37,16 @@ impl SkillMetadata {
     pub fn allows_implicit_invocation(&self) -> bool {
         self.policy
             .as_ref()
-            .and_then(|policy| policy.allow_implicit_invocation)
-            .unwrap_or(true)
+            .is_none_or(SkillPolicy::allows_implicit_invocation)
     }
 
     pub fn matches_product_restriction_for_product(
         &self,
         restriction_product: Option<Product>,
     ) -> bool {
-        match &self.policy {
-            Some(policy) => {
-                policy.products.is_empty()
-                    || restriction_product.is_some_and(|product| {
-                        product.matches_product_restriction(&policy.products)
-                    })
-            }
-            None => true,
-        }
+        self.policy
+            .as_ref()
+            .is_none_or(|policy| policy.matches_product_restriction(restriction_product))
     }
 }
 
@@ -62,29 +58,16 @@ pub struct SkillPolicy {
     pub products: Vec<Product>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SkillInterface {
-    pub display_name: Option<String>,
-    pub short_description: Option<String>,
-    pub icon_small: Option<AbsolutePathBuf>,
-    pub icon_large: Option<AbsolutePathBuf>,
-    pub brand_color: Option<String>,
-    pub default_prompt: Option<String>,
-}
+impl SkillPolicy {
+    pub fn allows_implicit_invocation(&self) -> bool {
+        self.allow_implicit_invocation.unwrap_or(true)
+    }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SkillDependencies {
-    pub tools: Vec<SkillToolDependency>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SkillToolDependency {
-    pub r#type: String,
-    pub value: String,
-    pub description: Option<String>,
-    pub transport: Option<String>,
-    pub command: Option<String>,
-    pub url: Option<String>,
+    pub fn matches_product_restriction(&self, restriction_product: Option<Product>) -> bool {
+        self.products.is_empty()
+            || restriction_product
+                .is_some_and(|product| product.matches_product_restriction(&self.products))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,6 +208,59 @@ mod catalog_id_tests {
     use super::*;
     use codex_utils_absolute_path::test_support::PathBufExt;
     use codex_utils_absolute_path::test_support::test_path_buf;
+
+    #[test]
+    fn skill_policy_owns_invocation_and_product_defaults() {
+        let unrestricted = SkillPolicy::default();
+        assert!(unrestricted.allows_implicit_invocation());
+        assert!(unrestricted.matches_product_restriction(None));
+
+        let restricted = SkillPolicy {
+            allow_implicit_invocation: Some(false),
+            products: vec![Product::Codex],
+        };
+        assert!(!restricted.allows_implicit_invocation());
+        assert!(restricted.matches_product_restriction(Some(Product::Codex)));
+        assert!(!restricted.matches_product_restriction(Some(Product::Chatgpt)));
+        assert!(!restricted.matches_product_restriction(None));
+    }
+
+    #[test]
+    fn skill_metadata_uses_shared_protocol_types() {
+        fn accept_shared(
+            interface: codex_protocol::protocol::SkillInterface,
+            dependencies: codex_protocol::protocol::SkillDependencies,
+        ) -> (
+            codex_protocol::protocol::SkillInterface,
+            codex_protocol::protocol::SkillDependencies,
+        ) {
+            (interface, dependencies)
+        }
+
+        let interface = SkillInterface {
+            display_name: Some("Example".to_string()),
+            short_description: None,
+            icon_small: None,
+            icon_large: None,
+            brand_color: None,
+            default_prompt: None,
+        };
+        let dependencies = SkillDependencies {
+            tools: vec![SkillToolDependency {
+                r#type: "mcp".to_string(),
+                value: "example".to_string(),
+                description: None,
+                transport: None,
+                command: None,
+                url: None,
+            }],
+        };
+
+        let (shared_interface, shared_dependencies) =
+            accept_shared(interface.clone(), dependencies.clone());
+        assert_eq!(shared_interface, interface);
+        assert_eq!(shared_dependencies, dependencies);
+    }
 
     fn skill(name: &str, path: &str, scope: SkillScope, plugin_id: Option<&str>) -> SkillMetadata {
         SkillMetadata {

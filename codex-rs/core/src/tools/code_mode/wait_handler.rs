@@ -2,11 +2,12 @@ use serde::Deserialize;
 use sha2::Digest;
 use sha2::Sha256;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use tracing::warn;
 
-use crate::function_tool::FunctionCallError;
+use crate::FunctionCallError;
 use crate::session::InputQueueActivity;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
@@ -23,7 +24,6 @@ use codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 
-use super::DEFAULT_WAIT_YIELD_TIME_MS;
 use super::ExecContext;
 use super::WAIT_TOOL_NAME;
 use super::handle_runtime_response;
@@ -36,16 +36,12 @@ pub struct CodeModeWaitHandler;
 #[derive(Debug, Deserialize)]
 struct ExecWaitArgs {
     cell_id: String,
-    #[serde(default = "default_wait_yield_time_ms")]
-    yield_time_ms: u64,
+    #[serde(default, rename = "yield_time_ms")]
+    _compatibility_yield_time_ms: Option<u64>,
     #[serde(default)]
     max_tokens: Option<usize>,
     #[serde(default)]
     terminate: bool,
-}
-
-fn default_wait_yield_time_ms() -> u64 {
-    DEFAULT_WAIT_YIELD_TIME_MS
 }
 
 #[derive(Debug)]
@@ -96,12 +92,13 @@ impl CodeModeWaitHandler {
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let ToolInvocation {
             session,
-            turn,
+            step_context,
             cancellation_token,
             tool_name,
             payload,
             ..
         } = invocation;
+        let turn = Arc::clone(&step_context.turn);
 
         match payload {
             ToolPayload::Function { arguments }
@@ -129,11 +126,9 @@ impl CodeModeWaitHandler {
                         .input_queue
                         .subscribe_activity(turn_state.as_deref())
                         .await;
-                    // Periodic empty observations are host-owned and no longer
-                    // wake the model. The compatibility cadence argument stays
-                    // accepted, while the runtime now wakes this owner on
-                    // output, explicit `yield_control()`, or terminal completion.
-                    let _requested_yield_time_ms = args.yield_time_ms;
+                    // Periodic empty observations are host-owned and do not
+                    // wake the model. The runtime wakes this owner on output,
+                    // explicit `yield_control()`, or terminal completion.
                     let held = hold_until_state_change(
                         || {
                             exec.session

@@ -1,10 +1,8 @@
-use std::fs;
-use std::io::ErrorKind;
 use std::path::Path;
 
-use codex_utils_path::acquire_atomic_write_lock;
-use codex_utils_path::resolve_symlink_write_paths;
-use codex_utils_path::write_atomically;
+use codex_file_system::acquire_atomic_write_lock;
+use codex_file_system::resolve_symlink_write_paths;
+use codex_file_system::write_atomically;
 use tokio::task;
 use toml_edit::DocumentMut;
 use toml_edit::Item as TomlItem;
@@ -12,6 +10,7 @@ use toml_edit::Table as TomlTable;
 use toml_edit::value;
 
 use crate::CONFIG_TOML_FILE;
+use crate::read_or_create_config_document;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginConfigEdit {
@@ -59,7 +58,7 @@ fn apply_user_plugin_config_edits_blocking(
     let config_path = codex_home.join(CONFIG_TOML_FILE);
     let _lock = acquire_atomic_write_lock(&config_path)?;
     let write_paths = resolve_symlink_write_paths(&config_path)?;
-    let mut doc = read_or_create_document(write_paths.read_path.as_deref())?;
+    let mut doc = read_or_create_config_document(write_paths.read_path.as_deref())?;
     let mut mutated = false;
     for edit in edits {
         mutated |= match edit {
@@ -74,19 +73,6 @@ fn apply_user_plugin_config_edits_blocking(
         return Ok(());
     }
     write_atomically(&write_paths.write_path, &doc.to_string())
-}
-
-fn read_or_create_document(config_path: Option<&Path>) -> std::io::Result<DocumentMut> {
-    let Some(config_path) = config_path else {
-        return Ok(DocumentMut::new());
-    };
-    match fs::read_to_string(config_path) {
-        Ok(raw) => raw
-            .parse::<DocumentMut>()
-            .map_err(|err| std::io::Error::new(ErrorKind::InvalidData, err)),
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(DocumentMut::new()),
-        Err(err) => Err(err),
-    }
 }
 
 fn set_plugin_enabled(doc: &mut DocumentMut, plugin_key: &str, enabled: bool) -> bool {
@@ -183,6 +169,7 @@ fn preserve_decor(existing: &TomlItem, replacement: &mut TomlItem) {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use std::fs;
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -272,35 +259,6 @@ enabled = true
             .unwrap();
 
         assert!(!codex_home.path().join(CONFIG_TOML_FILE).exists());
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn set_user_plugin_enabled_follows_config_symlink() {
-        use std::os::unix::fs::symlink;
-
-        let codex_home = TempDir::new().unwrap();
-        let target_path = codex_home.path().join("target_config.toml");
-        symlink(&target_path, codex_home.path().join(CONFIG_TOML_FILE)).unwrap();
-
-        set_user_plugin_enabled(
-            codex_home.path(),
-            "demo@market".to_string(),
-            /*enabled*/ true,
-        )
-        .await
-        .unwrap();
-
-        let config =
-            toml::from_str::<toml::Value>(&fs::read_to_string(target_path).unwrap()).unwrap();
-        let expected: toml::Value = toml::from_str(
-            r#"
-[plugins."demo@market"]
-enabled = true
-        "#,
-        )
-        .unwrap();
-        assert_eq!(config, expected);
     }
 
     fn read_config(codex_home: &Path) -> toml::Value {

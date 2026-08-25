@@ -139,6 +139,39 @@ fn ignores_regular_user_text() {
 }
 
 #[test]
+fn legacy_warning_recognizers_are_owned_by_contextual_user_message() {
+    let owner_source = include_str!("contextual_user_message.rs");
+    let module_source = include_str!("mod.rs");
+
+    for name in [
+        "LegacyApplyPatchExecCommandWarning",
+        "LegacyModelMismatchWarning",
+        "LegacyUnifiedExecProcessLimitWarning",
+    ] {
+        assert!(owner_source.contains(&format!("pub(crate) struct {name};")));
+    }
+    for module in [
+        "legacy_apply_patch_exec_command_warning",
+        "legacy_model_mismatch_warning",
+        "legacy_unified_exec_process_limit_warning",
+    ] {
+        assert!(!module_source.contains(&format!("mod {module};")));
+    }
+
+    for text in [
+        "Warning: apply_patch was requested via exec_command. Use the apply_patch tool instead of exec_command.",
+        "Warning: Your account was flagged for potentially high-risk cyber activity.",
+        "Warning: The maximum number of unified exec processes you can keep open is 64.",
+    ] {
+        assert!(is_legacy_compaction_warning_fragment(
+            &ContentItem::InputText {
+                text: text.to_string(),
+            }
+        ));
+    }
+}
+
+#[test]
 fn detects_hook_prompt_fragment_and_roundtrips_escaping() {
     let message = build_hook_prompt_message(&[HookPromptFragment::from_single_hook(
         r#"Retry with "waves" & <tides>"#,

@@ -1,6 +1,7 @@
 use super::MarketplaceAddError;
 use crate::marketplace::validate_marketplace_root;
 use codex_plugin::validate_plugin_segment;
+use codex_utils_absolute_path::is_windows_absolute_path;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -51,17 +52,38 @@ pub(crate) fn parse_marketplace_source(
         });
     }
 
-    if looks_like_github_shorthand(&base_source) {
-        return Ok(MarketplaceSource::Git {
-            url: format!("https://github.com/{base_source}.git"),
-            ref_name,
-        });
+    if let Some(url) = normalize_github_shorthand_url(&base_source) {
+        return Ok(MarketplaceSource::Git { url, ref_name });
     }
 
     Err(MarketplaceAddError::InvalidRequest(
         "invalid marketplace source format; expected owner/repo, a git URL, or a local marketplace path"
             .to_string(),
     ))
+}
+
+pub(crate) fn canonicalize_configured_git_source(
+    source: &str,
+    explicit_ref: Option<String>,
+) -> Result<MarketplaceSource, MarketplaceAddError> {
+    let source = source.trim();
+    if source.is_empty() {
+        return Err(MarketplaceAddError::InvalidRequest(
+            "marketplace source must not be empty".to_string(),
+        ));
+    }
+
+    let (base_source, parsed_ref) = split_source_ref(source);
+    let ref_name = explicit_ref.or(parsed_ref);
+    let url = if !looks_like_local_path(&base_source)
+        && let Some(url) = normalize_github_shorthand_url(&base_source)
+    {
+        url
+    } else {
+        normalize_git_url(&base_source)
+    };
+
+    Ok(MarketplaceSource::Git { url, ref_name })
 }
 
 pub(super) fn stage_marketplace_source<F>(
@@ -115,7 +137,7 @@ fn non_empty_ref(ref_name: &str) -> Option<String> {
     (!ref_name.is_empty()).then(|| ref_name.to_string())
 }
 
-fn normalize_git_url(url: &str) -> String {
+pub(crate) fn normalize_git_url(url: &str) -> String {
     let url = url.trim_end_matches('/');
     if url.starts_with("https://github.com/") && !url.ends_with(".git") {
         format!("{url}.git")
@@ -126,7 +148,7 @@ fn normalize_git_url(url: &str) -> String {
 
 fn looks_like_local_path(source: &str) -> bool {
     Path::new(source).is_absolute()
-        || looks_like_windows_absolute_path(source)
+        || is_windows_absolute_path(source)
         || source.starts_with("./")
         || source.starts_with(".\\")
         || source.starts_with("../")
@@ -134,15 +156,6 @@ fn looks_like_local_path(source: &str) -> bool {
         || source.starts_with("~/")
         || source == "."
         || source == ".."
-}
-
-fn looks_like_windows_absolute_path(source: &str) -> bool {
-    let bytes = source.as_bytes();
-    bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'\\' | b'/')
-        || source.starts_with(r"\\")
 }
 
 fn resolve_local_source_path(source: &str) -> Result<PathBuf, MarketplaceAddError> {
@@ -194,6 +207,20 @@ fn looks_like_github_shorthand(source: &str) -> bool {
         && extra.is_none()
 }
 
+pub(crate) fn normalize_github_shorthand_url(source: &str) -> Option<String> {
+    if !looks_like_github_shorthand(source) {
+        return None;
+    }
+    let mut segments = source.split('/');
+    let owner = segments.next()?;
+    let repo = segments.next()?;
+    let repo = repo.strip_suffix(".git").unwrap_or(repo);
+    if repo.is_empty() {
+        return None;
+    }
+    Some(format!("https://github.com/{owner}/{repo}.git"))
+}
+
 fn is_github_shorthand_segment(segment: &str) -> bool {
     !segment.is_empty()
         && segment
@@ -226,6 +253,32 @@ mod tests {
             MarketplaceSource::Git {
                 url: "https://github.com/owner/repo.git".to_string(),
                 ref_name: Some("main".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_marketplace_source("owner/repo.git", /*explicit_ref*/ None).unwrap(),
+            MarketplaceSource::Git {
+                url: "https://github.com/owner/repo.git".to_string(),
+                ref_name: None,
+            }
+        );
+    }
+
+    #[test]
+    fn configured_git_source_canonicalizes_shorthand_without_rejecting_git_path_syntax() {
+        assert_eq!(
+            canonicalize_configured_git_source(" owner/repo@main ", None).unwrap(),
+            MarketplaceSource::Git {
+                url: "https://github.com/owner/repo.git".to_string(),
+                ref_name: Some("main".to_string()),
+            }
+        );
+        assert_eq!(
+            canonicalize_configured_git_source("../marketplace.git", Some("HEAD".to_string()))
+                .unwrap(),
+            MarketplaceSource::Git {
+                url: "../marketplace.git".to_string(),
+                ref_name: Some("HEAD".to_string()),
             }
         );
     }
@@ -327,6 +380,7 @@ mod tests {
         assert!(looks_like_local_path(r"C:\Users\alice\marketplace"));
         assert!(looks_like_local_path("C:/Users/alice/marketplace"));
         assert!(looks_like_local_path(r"\\server\share\marketplace"));
+        assert!(looks_like_local_path("//server/share/marketplace"));
         assert!(!looks_like_local_path(r"C:relative\path"));
     }
 

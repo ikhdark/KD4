@@ -39,10 +39,10 @@ fn model_preset(id: &str, show_in_picker: bool) -> ModelPreset {
 #[test]
 fn spawn_agent_tool_v2_exposes_typed_assignments_and_lists_visible_models() {
     let tool = create_spawn_agent_tool_v2(SpawnAgentToolOptions {
-        available_models: vec![
+        available_models: Arc::new(vec![
             model_preset("visible", /*show_in_picker*/ true),
             model_preset("hidden", /*show_in_picker*/ false),
-        ],
+        ]),
         agent_type_description: "role help".to_string(),
         hide_agent_type_model_reasoning: false,
         usage_hint_text: None,
@@ -166,7 +166,7 @@ fn spawn_agent_tool_v2_exposes_typed_assignments_and_lists_visible_models() {
 #[test]
 fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
     let tool = create_spawn_agent_tool_v1(SpawnAgentToolOptions {
-        available_models: Vec::new(),
+        available_models: Arc::new(Vec::new()),
         agent_type_description: "role help".to_string(),
         hide_agent_type_model_reasoning: false,
         usage_hint_text: None,
@@ -229,14 +229,14 @@ fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
 #[test]
 fn spawn_agent_tool_caps_visible_model_summaries() {
     let tool = create_spawn_agent_tool_v2(SpawnAgentToolOptions {
-        available_models: vec![
+        available_models: Arc::new(vec![
             model_preset("first", /*show_in_picker*/ true),
             model_preset("second", /*show_in_picker*/ true),
             model_preset("third", /*show_in_picker*/ true),
             model_preset("fourth", /*show_in_picker*/ true),
             model_preset("fifth", /*show_in_picker*/ true),
             model_preset("sixth", /*show_in_picker*/ true),
-        ],
+        ]),
         agent_type_description: "role help".to_string(),
         hide_agent_type_model_reasoning: false,
         usage_hint_text: None,
@@ -279,7 +279,7 @@ fn spawn_agent_tool_caps_reasoning_effort_value_length() {
 #[test]
 fn spawn_agent_tool_hides_service_tier_with_spawn_metadata() {
     let tool = create_spawn_agent_tool_v2(SpawnAgentToolOptions {
-        available_models: vec![model_preset("visible", /*show_in_picker*/ true)],
+        available_models: Arc::new(vec![model_preset("visible", /*show_in_picker*/ true)]),
         agent_type_description: "role help".to_string(),
         hide_agent_type_model_reasoning: true,
         usage_hint_text: None,

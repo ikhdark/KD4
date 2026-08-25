@@ -37,11 +37,6 @@ use tokio::io::AsyncReadExt;
 use codex_config::types::History;
 use codex_config::types::HistoryPersistence;
 
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-
 /// Filename that stores the message history inside `~/.codex`.
 const HISTORY_FILENAME: &str = "history.jsonl";
 const HISTORY_READ_BUFFER_SIZE: usize = 8192;
@@ -137,11 +132,6 @@ pub async fn append_entry(
     // Open the history file for read/write access (append-only on Unix).
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true);
-    #[cfg(unix)]
-    {
-        options.append(true);
-        options.mode(0o600);
-    }
 
     let mut history_file = options.open(&path)?;
 
@@ -296,23 +286,6 @@ pub fn lookup(log_id: u64, offset: usize, config: &HistoryConfig) -> Option<Hist
     lookup_history_entry(&path, log_id, offset)
 }
 
-/// On Unix systems, ensure the file permissions are `0o600` (rw-------). If the
-/// permissions cannot be changed the error is propagated to the caller.
-#[cfg(unix)]
-async fn ensure_owner_only_permissions(file: &File) -> Result<()> {
-    let metadata = file.metadata()?;
-    let current_mode = metadata.permissions().mode() & 0o777;
-    if current_mode != 0o600 {
-        let mut perms = metadata.permissions();
-        perms.set_mode(0o600);
-        let perms_clone = perms.clone();
-        let file_clone = file.try_clone()?;
-        tokio::task::spawn_blocking(move || file_clone.set_permissions(perms_clone)).await??;
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
 // On Windows, simply succeed.
 async fn ensure_owner_only_permissions(_file: &File) -> Result<()> {
     Ok(())
@@ -416,21 +389,9 @@ fn lookup_history_entry(path: &Path, log_id: u64, offset: usize) -> Option<Histo
     None
 }
 
-#[cfg(unix)]
-fn log_identity(metadata: &std::fs::Metadata) -> Option<u64> {
-    use std::os::unix::fs::MetadataExt;
-    Some(metadata.ino())
-}
-
-#[cfg(windows)]
 fn log_identity(metadata: &std::fs::Metadata) -> Option<u64> {
     use std::os::windows::fs::MetadataExt;
     Some(metadata.creation_time())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn log_identity(_metadata: &std::fs::Metadata) -> Option<u64> {
-    None
 }
 
 #[cfg(test)]

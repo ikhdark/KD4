@@ -1,3 +1,6 @@
+use codex_features::MULTI_AGENT_DEFAULT_WAIT_TIMEOUT_MS;
+use codex_features::MULTI_AGENT_MAX_WAIT_TIMEOUT_MS;
+use codex_features::MULTI_AGENT_MIN_WAIT_TIMEOUT_MS;
 use codex_protocol::openai_models::ModelPreset;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiNamespace;
@@ -7,6 +10,7 @@ use codex_tools::ToolSpec;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use super::multi_agents_common::DEFAULT_SPAWN_AGENT_MODEL;
 use super::multi_agents_common::DEFAULT_SPAWN_AGENT_REASONING_EFFORT;
@@ -23,7 +27,7 @@ const MAX_REASONING_EFFORT_CHARS_IN_SPAWN_AGENT_DESCRIPTION: usize = 64;
 
 #[derive(Debug, Clone, Default)]
 pub struct SpawnAgentToolOptions {
-    pub available_models: Vec<ModelPreset>,
+    pub available_models: Arc<Vec<ModelPreset>>,
     pub agent_type_description: String,
     pub hide_agent_type_model_reasoning: bool,
     pub usage_hint_text: Option<String>,
@@ -57,9 +61,9 @@ pub struct WaitAgentTimeoutOptions {
 impl Default for WaitAgentTimeoutOptions {
     fn default() -> Self {
         Self {
-            default_timeout_ms: super::multi_agents_common::DEFAULT_WAIT_TIMEOUT_MS,
-            min_timeout_ms: super::multi_agents_common::MIN_WAIT_TIMEOUT_MS,
-            max_timeout_ms: super::multi_agents_common::MAX_WAIT_TIMEOUT_MS,
+            default_timeout_ms: MULTI_AGENT_DEFAULT_WAIT_TIMEOUT_MS,
+            min_timeout_ms: MULTI_AGENT_MIN_WAIT_TIMEOUT_MS,
+            max_timeout_ms: MULTI_AGENT_MAX_WAIT_TIMEOUT_MS,
         }
     }
 }

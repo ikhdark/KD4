@@ -3,7 +3,7 @@
 ## Ownership
 
 This crate owns reusable model-visible prompt text and template rendering for
-review, permissions, goals, compaction, realtime, and apply_patch instructions.
+review, permissions, goals, compaction, and apply_patch instructions.
 Treat wording changes as behavior changes.
 
 ## Editing Rules

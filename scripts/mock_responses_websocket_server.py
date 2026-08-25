@@ -213,19 +213,12 @@ async def _handle_connection(
     quiet: bool = False,
     log_json: str = "pretty",
 ) -> bool:
-    # Modern websockets releases expose the request path here.
-    path = getattr(getattr(websocket, "request", None), "path", None)
-    if path is None:
-        # Legacy releases expose the path directly on the protocol.
-        path = getattr(websocket, "path", None)
-    if path is None:
-        # Accept if the handler API doesn't expose a path at all.
-        path = "(unknown)"
+    path = websocket.request.path
 
     _log_conn(f"connected path={path}", quiet=quiet)
 
-    path_no_qs = path.split("?", 1)[0] if path != "(unknown)" else path
-    if path_no_qs != "(unknown)" and path_no_qs != expected_path:
+    path_no_qs = path.split("?", 1)[0]
+    if path_no_qs != expected_path:
         _log_conn(f"rejecting unexpected path (expected {expected_path})", quiet=quiet)
         await websocket.close(code=1008, reason="unexpected websocket path")
         return False

@@ -62,10 +62,7 @@ async fn reconnect_reuses_registration_until_url_is_rejected() -> Result<()> {
     )?;
     let environment_task = tokio::spawn(run_remote_environment(
         config,
-        ExecServerRuntimePaths::new(
-            std::env::current_exe()?,
-            /*codex_linux_sandbox_exe*/ None,
-        )?,
+        ExecServerRuntimePaths::new(std::env::current_exe()?)?,
     ));
 
     let (first_socket, _peer_addr) = timeout(Duration::from_secs(5), listener.accept()).await??;

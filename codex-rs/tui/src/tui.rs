@@ -19,12 +19,11 @@ use crossterm::cursor::SetCursorStyle;
 use crossterm::event::DisableBracketedPaste;
 use crossterm::event::DisableFocusChange;
 use crossterm::event::EnableBracketedPaste;
-#[cfg(not(windows))]
-use crossterm::event::EnableFocusChange;
+
 use crossterm::event::KeyEvent;
 use crossterm::terminal::EnterAlternateScreen;
 use crossterm::terminal::LeaveAlternateScreen;
-#[cfg(not(unix))]
+
 use crossterm::terminal::supports_keyboard_enhancement;
 use ratatui::backend::Backend;
 use ratatui::backend::CrosstermBackend;
@@ -49,21 +48,19 @@ use crate::terminal_hyperlinks::HyperlinkLine;
 use crate::terminal_hyperlinks::plain_hyperlink_lines;
 use crate::tui::event_stream::EventBroker;
 use crate::tui::event_stream::TuiEventStream;
-#[cfg(unix)]
-use crate::tui::job_control::SuspendContext;
+
 use codex_config::types::NotificationCondition;
 use codex_config::types::NotificationMethod;
 
 mod event_stream;
 mod frame_rate_limiter;
 mod frame_requester;
-#[cfg(unix)]
-mod job_control;
+
 mod keyboard_modes;
 mod terminal_stderr;
 #[cfg(test)]
 pub(crate) mod test_support;
-#[cfg(windows)]
+
 mod windows_console;
 
 /// Target frame interval for UI redraw scheduling.
@@ -108,6 +105,7 @@ mod tests {
     use codex_config::types::NotificationCondition;
     use ratatui::layout::Position;
     use ratatui::layout::Rect;
+    use serial_test::serial;
 
     #[test]
     fn unfocused_notification_condition_is_suppressed_when_focused() {
@@ -131,6 +129,18 @@ mod tests {
             NotificationCondition::Unfocused,
             /*terminal_focused*/ false
         ));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn with_restored_runs_callback_with_fixed_keep_raw_policy() -> std::io::Result<()> {
+        let mut tui = super::test_support::make_test_tui()?;
+
+        let output = tui.with_restored(|| async { "completed" }).await;
+        let _ = super::restore_after_exit();
+
+        assert_eq!(output, "completed");
+        Ok(())
     }
 
     #[test]
@@ -181,7 +191,7 @@ pub fn set_modes() -> Result<()> {
     execute!(stdout(), EnableBracketedPaste)?;
 
     enable_raw_mode()?;
-    #[cfg(windows)]
+
     if let Err(err) = windows_console::set_input_record_mode() {
         let _ = disable_raw_mode();
         let _ = execute!(stdout(), DisableBracketedPaste);
@@ -195,9 +205,6 @@ pub fn set_modes() -> Result<()> {
     // gracefully if unsupported.
     keyboard_modes::enable_keyboard_enhancement();
 
-    #[cfg(not(windows))]
-    let _ = execute!(stdout(), EnableFocusChange);
-    #[cfg(windows)]
     let _ = execute!(stdout(), DisableFocusChange);
     Ok(())
 }
@@ -210,14 +217,12 @@ impl Command for EnableAlternateScroll {
         write!(f, "\x1b[?1007h")
     }
 
-    #[cfg(windows)]
     fn execute_winapi(&self) -> Result<()> {
         Err(std::io::Error::other(
             "tried to execute EnableAlternateScroll using WinAPI; use ANSI instead",
         ))
     }
 
-    #[cfg(windows)]
     fn is_ansi_code_supported(&self) -> bool {
         true
     }
@@ -231,14 +236,12 @@ impl Command for DisableAlternateScroll {
         write!(f, "\x1b[?1007l")
     }
 
-    #[cfg(windows)]
     fn execute_winapi(&self) -> Result<()> {
         Err(std::io::Error::other(
             "tried to execute DisableAlternateScroll using WinAPI; use ANSI instead",
         ))
     }
 
-    #[cfg(windows)]
     fn is_ansi_code_supported(&self) -> bool {
         true
     }
@@ -276,7 +279,7 @@ fn restore_common(
     {
         first_error.get_or_insert(err);
     }
-    #[cfg(windows)]
+
     if let Err(err) = windows_console::restore_input_mode() {
         first_error.get_or_insert(err);
     }
@@ -293,27 +296,9 @@ fn restore_common(
     }
 }
 
-/// Restore the terminal to its original state.
-/// Inverse of `set_modes`.
-pub fn restore() -> Result<()> {
-    restore_common(RawModeRestore::Disable, KeyboardRestore::PopStack)
-}
-
-/// Force crossterm's cached raw-mode state back in sync with the terminal after `fg`.
-///
-/// A shell may restore the job's saved termios after the process receives `SIGCONT`. When that
-/// races with [`set_modes`], crossterm still believes raw mode is enabled even though the terminal
-/// has returned to canonical, echoing mode. Clearing crossterm's saved state before enabling raw
-/// mode again makes the kernel state authoritative once the shell has completed its handoff.
-#[cfg(unix)]
-pub(super) fn reapply_raw_mode_after_resume() -> Result<()> {
-    disable_raw_mode()?;
-    enable_raw_mode()
-}
-
 /// Restore the terminal after Codex is exiting.
 ///
-/// Uses a stronger keyboard reset than [`restore`] so the parent shell recovers even if a
+/// Uses a strong keyboard reset so the parent shell recovers even if a
 /// terminal missed the stack pop that normally pairs with [`set_modes`].
 pub fn restore_after_exit() -> Result<()> {
     let mut first_error =
@@ -333,37 +318,8 @@ pub fn restore_keep_raw() -> Result<()> {
     restore_common(RawModeRestore::Keep, KeyboardRestore::PopStack)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RestoreMode {
-    #[allow(dead_code)]
-    Full, // Fully restore the terminal (disables raw mode).
-    KeepRaw, // Restore the terminal but keep raw mode enabled.
-}
-
-impl RestoreMode {
-    fn restore(self) -> Result<()> {
-        match self {
-            RestoreMode::Full => restore(),
-            RestoreMode::KeepRaw => restore_keep_raw(),
-        }
-    }
-}
-
 /// Flush the underlying stdin buffer to clear any input that may be buffered at the terminal level.
 /// For example, clears any user input that occurred while the crossterm EventStream was dropped.
-#[cfg(unix)]
-fn flush_terminal_input_buffer() {
-    // Safety: flushing the stdin queue is safe and does not move ownership.
-    let result = unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) };
-    if result != 0 {
-        let err = std::io::Error::last_os_error();
-        tracing::warn!("failed to tcflush stdin: {err}");
-    }
-}
-
-/// Flush the underlying stdin buffer to clear any input that may be buffered at the terminal level.
-/// For example, clears any user input that occurred while the crossterm EventStream was dropped.
-#[cfg(windows)]
 fn flush_terminal_input_buffer() {
     use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
@@ -372,7 +328,7 @@ fn flush_terminal_input_buffer() {
     use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
 
     let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    if handle == INVALID_HANDLE_VALUE || handle == 0 {
+    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
         let err = unsafe { GetLastError() };
         tracing::warn!("failed to get stdin handle for flush: error {err}");
         return;
@@ -384,9 +340,6 @@ fn flush_terminal_input_buffer() {
         tracing::warn!("failed to flush stdin buffer: error {err}");
     }
 }
-
-#[cfg(not(any(unix, windows)))]
-pub(crate) fn flush_terminal_input_buffer() {}
 
 /// Initialize the terminal (inline viewport; history stays in normal scrollback)
 pub(crate) fn init() -> Result<InitializedTerminal> {
@@ -402,73 +355,13 @@ pub(crate) fn init() -> Result<InitializedTerminal> {
 
     set_panic_hook();
 
-    #[cfg(unix)]
-    let backend = CrosstermBackend::new(stdout());
-
-    #[cfg(unix)]
-    let startup_probe = {
-        use crate::terminal_probe::StartupKeyboardEnhancementProbe;
-
-        let started_at = std::time::Instant::now();
-        let keyboard_probe = if keyboard_modes::keyboard_enhancement_disabled() {
-            StartupKeyboardEnhancementProbe::Skip
-        } else {
-            StartupKeyboardEnhancementProbe::Query
-        };
-        match crate::terminal_probe::startup(crate::terminal_probe::DEFAULT_TIMEOUT, keyboard_probe)
-        {
-            Ok(probe) => {
-                tracing::info!(
-                    duration_ms = %started_at.elapsed().as_millis(),
-                    cursor_position = probe.cursor_position.is_some(),
-                    default_colors = probe.default_colors.is_some(),
-                    keyboard_enhancement_supported = ?probe.keyboard_enhancement_supported,
-                    "terminal startup probes completed"
-                );
-                probe
-            }
-            Err(err) => {
-                tracing::warn!(
-                    duration_ms = %started_at.elapsed().as_millis(),
-                    "terminal startup probes failed: {err}"
-                );
-                crate::terminal_probe::StartupProbe {
-                    cursor_position: None,
-                    default_colors: None,
-                    keyboard_enhancement_supported: None,
-                }
-            }
-        }
-    };
-
-    #[cfg(unix)]
-    crate::terminal_palette::set_default_colors_from_startup_probe(startup_probe.default_colors);
-
-    #[cfg(unix)]
-    let cursor_pos = match startup_probe.cursor_position {
-        Some(pos) => pos,
-        None => {
-            tracing::warn!("initial cursor position probe timed out; defaulting to origin");
-            Position { x: 0, y: 0 }
-        }
-    };
-
-    #[cfg(unix)]
-    let enhanced_keys_supported = startup_probe
-        .keyboard_enhancement_supported
-        .unwrap_or(/*default*/ false);
-
-    #[cfg(not(unix))]
     let mut backend = CrosstermBackend::new(stdout());
 
-    #[cfg(not(unix))]
     let cursor_pos = cursor_position_with_crossterm(&mut backend);
 
-    #[cfg(not(unix))]
     let enhanced_keys_supported =
         !keyboard_modes::keyboard_enhancement_disabled() && detect_keyboard_enhancement_supported();
 
-    #[cfg(windows)]
     probe_windows_default_colors();
 
     let tui = CustomTerminal::with_options_and_cursor_position(backend, cursor_pos)?;
@@ -480,7 +373,6 @@ pub(crate) fn init() -> Result<InitializedTerminal> {
     })
 }
 
-#[cfg(not(unix))]
 fn cursor_position_with_crossterm(backend: &mut CrosstermBackend<Stdout>) -> Position {
     backend.get_cursor_position().unwrap_or_else(|err| {
         tracing::warn!("failed to read initial cursor position; defaulting to origin: {err}");
@@ -488,14 +380,12 @@ fn cursor_position_with_crossterm(backend: &mut CrosstermBackend<Stdout>) -> Pos
     })
 }
 
-#[cfg(not(unix))]
 fn detect_keyboard_enhancement_supported() -> bool {
     // Non-Unix startup keeps the existing crossterm keyboard probe path because it already knows
     // how to interpret platform-specific event sources.
     supports_keyboard_enhancement().unwrap_or(/*default*/ false)
 }
 
-#[cfg(windows)]
 fn probe_windows_default_colors() {
     let started_at = std::time::Instant::now();
     match crate::terminal_probe::default_colors(crate::terminal_probe::DEFAULT_TIMEOUT) {
@@ -549,8 +439,6 @@ pub struct Tui {
     ambient_pet_image_state: crate::pets::PetImageRenderState,
     pet_picker_preview_image_state: crate::pets::PetImageRenderState,
     alt_saved_viewport: Option<ratatui::layout::Rect>,
-    #[cfg(unix)]
-    suspend_context: SuspendContext,
     // True when overlay alt-screen UI is active
     alt_screen_active: Arc<AtomicBool>,
     // True when terminal/tab is focused; updated internally from crossterm events
@@ -606,8 +494,6 @@ impl Tui {
             ambient_pet_image_state: crate::pets::PetImageRenderState::default(),
             pet_picker_preview_image_state: crate::pets::PetImageRenderState::default(),
             alt_saved_viewport: None,
-            #[cfg(unix)]
-            suspend_context: SuspendContext::new(),
             alt_screen_active: Arc::new(AtomicBool::new(false)),
             terminal_focused: Arc::new(AtomicBool::new(true)),
             enhanced_keys_supported,
@@ -659,9 +545,9 @@ impl Tui {
     /// Temporarily restore terminal state to run an external interactive program `f`.
     ///
     /// This pauses crossterm's stdin polling by dropping the underlying event stream, restores
-    /// terminal modes and stderr (optionally keeping raw mode enabled), then re-applies Codex TUI
-    /// modes and stderr suppression before resuming events.
-    pub async fn with_restored<R, F, Fut>(&mut self, mode: RestoreMode, f: F) -> R
+    /// terminal modes and stderr while keeping raw mode enabled, then re-applies Codex TUI modes
+    /// and stderr suppression before resuming events.
+    pub async fn with_restored<R, F, Fut>(&mut self, f: F) -> R
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = R>,
@@ -675,7 +561,7 @@ impl Tui {
             let _ = self.leave_alt_screen();
         }
 
-        if let Err(err) = mode.restore() {
+        if let Err(err) = restore_keep_raw() {
             tracing::warn!("failed to restore terminal modes before external program: {err}");
         }
         if let Err(err) = terminal_stderr::pause() {
@@ -730,15 +616,6 @@ impl Tui {
     }
 
     pub fn event_stream(&self) -> Pin<Box<dyn Stream<Item = TuiEvent> + Send + 'static>> {
-        #[cfg(unix)]
-        let stream = TuiEventStream::new(
-            self.event_broker.clone(),
-            self.draw_tx.subscribe(),
-            self.terminal_focused.clone(),
-            self.suspend_context.clone(),
-            self.alt_screen_active.clone(),
-        );
-        #[cfg(not(unix))]
         let stream = TuiEventStream::new(
             self.event_broker.clone(),
             self.draw_tx.subscribe(),
@@ -900,10 +777,6 @@ impl Tui {
     ) -> Result<()> {
         // If we are resuming from ^Z, we need to prepare the resume action now so we can apply it
         // in the synchronized update.
-        #[cfg(unix)]
-        let mut prepared_resume = self
-            .suspend_context
-            .prepare_resume_action(&mut self.alt_saved_viewport);
 
         // Precompute any viewport updates that need a cursor-position query before entering
         // the synchronized update, to avoid racing with the event reader.
@@ -912,11 +785,6 @@ impl Tui {
         ensure_virtual_terminal_processing()?;
 
         stdout().sync_update(|_| {
-            #[cfg(unix)]
-            if let Some(prepared) = prepared_resume.take() {
-                prepared.apply(&mut self.terminal)?;
-            }
-
             let terminal = &mut self.terminal;
             if let Some(new_area) = pending_viewport_area.take() {
                 terminal.set_viewport_area(new_area);
@@ -949,18 +817,6 @@ impl Tui {
             )?;
 
             // Update the y position for suspending so Ctrl-Z can place the cursor correctly.
-            #[cfg(unix)]
-            {
-                let area = terminal.viewport_area;
-                let inline_area_bottom = if self.alt_screen_active.load(Ordering::Relaxed) {
-                    self.alt_saved_viewport
-                        .map(|r| r.bottom().saturating_sub(1))
-                        .unwrap_or_else(|| area.bottom().saturating_sub(1))
-                } else {
-                    area.bottom().saturating_sub(1)
-                };
-                self.suspend_context.set_cursor_y(inline_area_bottom);
-            }
 
             terminal.draw(|frame| {
                 draw_fn(frame);
@@ -1036,19 +892,10 @@ impl Tui {
     ) -> Result<()> {
         // If we are resuming from ^Z, we need to prepare the resume action now so we can apply it
         // in the synchronized update.
-        #[cfg(unix)]
-        let mut prepared_resume = self
-            .suspend_context
-            .prepare_resume_action(&mut self.alt_saved_viewport);
 
         ensure_virtual_terminal_processing()?;
 
         stdout().sync_update(|_| {
-            #[cfg(unix)]
-            if let Some(prepared) = prepared_resume.take() {
-                prepared.apply(&mut self.terminal)?;
-            }
-
             let terminal = &mut self.terminal;
             let needs_full_repaint =
                 Self::update_inline_viewport_for_resize_reflow(terminal, height)?;
@@ -1063,18 +910,6 @@ impl Tui {
             }
 
             // Update the y position for suspending so Ctrl-Z can place the cursor correctly.
-            #[cfg(unix)]
-            {
-                let area = terminal.viewport_area;
-                let inline_area_bottom = if self.alt_screen_active.load(Ordering::Relaxed) {
-                    self.alt_saved_viewport
-                        .map(|r| r.bottom().saturating_sub(1))
-                        .unwrap_or_else(|| area.bottom().saturating_sub(1))
-                } else {
-                    area.bottom().saturating_sub(1)
-                };
-                self.suspend_context.set_cursor_y(inline_area_bottom);
-            }
 
             terminal.draw(|frame| {
                 draw_fn(frame);
@@ -1105,7 +940,6 @@ impl Tui {
     }
 }
 
-#[cfg(windows)]
 fn ensure_virtual_terminal_processing() -> Result<()> {
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
@@ -1118,7 +952,7 @@ fn ensure_virtual_terminal_processing() -> Result<()> {
     use windows_sys::Win32::System::Console::SetConsoleMode;
 
     fn enable_for_handle(handle: HANDLE) -> Result<()> {
-        if handle == INVALID_HANDLE_VALUE || handle == 0 {
+        if handle == INVALID_HANDLE_VALUE || handle.is_null() {
             return Ok(());
         }
 
@@ -1145,10 +979,5 @@ fn ensure_virtual_terminal_processing() -> Result<()> {
     let stderr_handle = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
     enable_for_handle(stderr_handle)?;
 
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn ensure_virtual_terminal_processing() -> Result<()> {
     Ok(())
 }

@@ -28,11 +28,15 @@ use codex_tools::ToolExposure;
 use codex_tools::ToolName;
 use codex_tools::ToolOutput;
 use codex_tools::ToolSpec;
+use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use tempfile::tempdir;
 
-use super::code_mode_namespace_descriptions;
+use super::active_collaboration_namespace;
 use super::merge_into_namespaces;
+use crate::agent::task_capabilities::TypedToolClass;
+use crate::agent::task_capabilities::classify_typed_tool;
 use crate::config::CurrentTimeReminderConfig;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
@@ -49,7 +53,7 @@ use crate::tools::router::ToolSuggestPresentation;
 const MULTI_AGENT_V2_NAMESPACE: &str = "agents";
 
 #[test]
-fn namespace_descriptions_share_one_hard_budget_in_stable_spec_order() {
+fn merged_namespace_descriptions_share_one_hard_budget_in_stable_spec_order() {
     let specs = [("zeta", 'z'), ("alpha", 'a')]
         .into_iter()
         .map(|(name, fill)| {
@@ -60,20 +64,6 @@ fn namespace_descriptions_share_one_hard_budget_in_stable_spec_order() {
             })
         })
         .collect::<Vec<_>>();
-
-    let code_mode_descriptions = code_mode_namespace_descriptions(&specs);
-    assert_eq!(
-        code_mode_descriptions["zeta"].description,
-        "z".repeat(30_000)
-    );
-    assert!(code_mode_descriptions["alpha"].description.len() < 30_000);
-    assert!(
-        code_mode_descriptions
-            .values()
-            .map(|namespace| namespace.description.len())
-            .sum::<usize>()
-            <= 40_000
-    );
 
     let merged = merge_into_namespaces(specs);
     let ToolSpec::Namespace(first_namespace) = &merged[0] else {
@@ -273,6 +263,35 @@ async fn update_plan_is_not_exposed_or_registered_in_plan_mode() {
     plan_mode.assert_registered_lacks(&["update_plan"]);
 }
 
+#[tokio::test]
+async fn read_turn_timing_is_registered_only_for_kd4_repositories() {
+    let temp = tempdir().expect("create temp directory");
+    let ordinary_cwd = temp.path().join("ordinary");
+    let kd4_cwd = temp.path().join("kd4");
+    std::fs::create_dir_all(&ordinary_cwd).expect("create ordinary repository fixture");
+    std::fs::create_dir_all(&kd4_cwd).expect("create KD4 repository fixture");
+    std::fs::write(kd4_cwd.join("kd4_features.toml"), "# test marker\n")
+        .expect("write KD4 repository marker");
+
+    let ordinary_cwd = codex_utils_absolute_path::AbsolutePathBuf::try_from(ordinary_cwd)
+        .expect("ordinary fixture path should be absolute");
+    let ordinary_plan = probe(move |turn| {
+        update_config(turn, |config| config.cwd = ordinary_cwd);
+    })
+    .await;
+    ordinary_plan.assert_visible_lacks(&["read_turn_timing"]);
+    ordinary_plan.assert_registered_lacks(&["read_turn_timing"]);
+
+    let kd4_cwd = codex_utils_absolute_path::AbsolutePathBuf::try_from(kd4_cwd)
+        .expect("KD4 fixture path should be absolute");
+    let kd4_plan = probe(move |turn| {
+        update_config(turn, |config| config.cwd = kd4_cwd);
+    })
+    .await;
+    kd4_plan.assert_visible_contains(&["read_turn_timing"]);
+    kd4_plan.assert_registered_contains(&["read_turn_timing"]);
+}
+
 fn set_feature(turn: &mut TurnContext, feature: Feature, enabled: bool) {
     let mut config = (*turn.config).clone();
     if enabled {
@@ -293,21 +312,6 @@ fn set_feature(turn: &mut TurnContext, feature: Feature, enabled: bool) {
 fn set_features(turn: &mut TurnContext, features: &[Feature]) {
     for feature in features {
         set_feature(turn, *feature, /*enabled*/ true);
-    }
-}
-
-fn zsh_fork_config_for_spec_plan_tests() -> codex_tools::ZshForkConfig {
-    let placeholder_exe = codex_utils_absolute_path::AbsolutePathBuf::try_from(
-        std::env::current_exe().expect("current exe path"),
-    )
-    .expect("current exe should be absolute");
-
-    // Spec planning only checks whether the shell mode is ZshFork. These paths
-    // are never executed, so use a stable absolute placeholder instead of
-    // depending on packaged zsh-fork artifacts in schema tests.
-    codex_tools::ZshForkConfig {
-        shell_zsh_path: placeholder_exe.clone(),
-        main_execve_wrapper_exe: placeholder_exe,
     }
 }
 
@@ -638,7 +642,6 @@ async fn request_user_input_stays_direct_in_code_mode_only() {
 async fn shell_family_registers_visible_unified_exec_and_hidden_legacy_shell() {
     let plan = probe(|turn| {
         set_features(turn, &[Feature::ShellTool, Feature::UnifiedExec]);
-        set_feature(turn, Feature::ShellZshFork, /*enabled*/ false);
         turn.model_info.shell_type = ConfigShellToolType::ShellCommand;
     })
     .await;
@@ -666,119 +669,6 @@ async fn shell_family_follows_default_unified_exec_policy() {
         plan.assert_visible_contains(&["shell_command"]);
         plan.assert_visible_lacks(&["exec_command", "write_stdin"]);
     }
-}
-
-#[tokio::test]
-async fn shell_zsh_fork_stays_standalone_until_unified_exec_composition_is_enabled() {
-    let standalone = probe(|turn| {
-        set_features(turn, &[Feature::ShellTool, Feature::UnifiedExec]);
-        set_feature(turn, Feature::ShellZshFork, /*enabled*/ true);
-        set_feature(turn, Feature::UnifiedExecZshFork, /*enabled*/ false);
-        turn.model_info.shell_type = ConfigShellToolType::ShellCommand;
-    })
-    .await;
-
-    standalone.assert_visible_contains(&["shell_command"]);
-    standalone.assert_visible_lacks(&["exec_command", "write_stdin"]);
-    standalone.assert_registered_contains(&["shell_command"]);
-    standalone.assert_registered_lacks(&["exec_command", "write_stdin"]);
-
-    let composed = probe(|turn| {
-        set_features(
-            turn,
-            &[
-                Feature::ShellTool,
-                Feature::UnifiedExec,
-                Feature::ShellZshFork,
-                Feature::UnifiedExecZshFork,
-            ],
-        );
-        turn.model_info.shell_type = ConfigShellToolType::ShellCommand;
-    })
-    .await;
-
-    if codex_utils_pty::conpty_supported() {
-        composed.assert_visible_contains(&["exec_command", "write_stdin"]);
-        composed.assert_visible_lacks(&["shell_command"]);
-        composed.assert_registered_contains(&["exec_command", "write_stdin", "shell_command"]);
-        assert_eq!(composed.exposure("shell_command"), ToolExposure::Hidden);
-    } else {
-        composed.assert_visible_contains(&["shell_command"]);
-        composed.assert_visible_lacks(&["exec_command", "write_stdin"]);
-    }
-}
-
-#[tokio::test]
-async fn zsh_fork_unified_exec_hides_shell_parameter() {
-    if !codex_utils_pty::conpty_supported() {
-        return;
-    }
-
-    let plan = probe(|turn| {
-        set_features(
-            turn,
-            &[
-                Feature::ShellTool,
-                Feature::UnifiedExec,
-                Feature::ShellZshFork,
-                Feature::UnifiedExecZshFork,
-            ],
-        );
-        turn.unified_exec_shell_mode =
-            codex_tools::UnifiedExecShellMode::ZshFork(zsh_fork_config_for_spec_plan_tests());
-    })
-    .await;
-
-    plan.assert_visible_contains(&["exec_command", "write_stdin"]);
-    assert!(!has_parameter(plan.visible_spec("exec_command"), "shell"));
-}
-
-#[tokio::test]
-async fn zsh_fork_unified_exec_keeps_shell_parameter_when_remote_environment_available() {
-    if !codex_utils_pty::conpty_supported() {
-        return;
-    }
-
-    let plan = probe(|turn| {
-        set_features(
-            turn,
-            &[
-                Feature::ShellTool,
-                Feature::UnifiedExec,
-                Feature::ShellZshFork,
-                Feature::UnifiedExecZshFork,
-            ],
-        );
-        turn.unified_exec_shell_mode =
-            codex_tools::UnifiedExecShellMode::ZshFork(zsh_fork_config_for_spec_plan_tests());
-        let remote_cwd = turn
-            .environments
-            .primary()
-            .expect("primary environment")
-            .cwd()
-            .clone();
-        turn.environments.turn_environments.push(
-            crate::session::turn_context::TurnEnvironment::new(
-                "remote".to_string(),
-                Arc::new(
-                    codex_exec_server::Environment::create_for_tests(Some(
-                        "ws://127.0.0.1:1/remote-exec-server".to_string(),
-                    ))
-                    .expect("remote test environment"),
-                ),
-                remote_cwd,
-                /*shell*/ None,
-            ),
-        );
-    })
-    .await;
-
-    plan.assert_visible_contains(&["exec_command", "write_stdin"]);
-    assert!(has_parameter(plan.visible_spec("exec_command"), "shell"));
-    assert!(has_parameter(
-        plan.visible_spec("exec_command"),
-        "environment_id"
-    ));
 }
 
 #[tokio::test]
@@ -928,6 +818,28 @@ async fn host_context_gates_agent_job_tools() {
     })
     .await;
     worker_agent_job.assert_visible_contains(&["spawn_agents_on_csv", "report_agent_job_result"]);
+
+    let remote_agent_job = probe(|turn| {
+        set_feature(turn, Feature::SpawnCsv, /*enabled*/ true);
+        let remote_environment = Arc::new(
+            codex_exec_server::Environment::create_for_tests(Some(
+                "ws://127.0.0.1:1/agent-job-routing".to_string(),
+            ))
+            .expect("remote test environment"),
+        );
+        let foreign_cwd =
+            PathUri::parse("file:///tmp/codex-agent-job-remote").expect("POSIX cwd URI");
+        let shell = turn.environments.turn_environments[0].shell.clone();
+        turn.environments.turn_environments[0] = crate::session::turn_context::TurnEnvironment::new(
+            "remote-primary".to_string(),
+            remote_environment,
+            foreign_cwd,
+            shell,
+        );
+    })
+    .await;
+    remote_agent_job.assert_visible_lacks(&["spawn_agents_on_csv", "report_agent_job_result"]);
+    remote_agent_job.assert_registered_lacks(&["spawn_agents_on_csv", "report_agent_job_result"]);
 }
 
 #[tokio::test]
@@ -1134,6 +1046,42 @@ async fn duplicate_extension_tool_names_surface_an_actionable_warning() {
     };
     assert!(warning.contains("extension_echo"));
     assert!(warning.contains("Rename or disable"));
+}
+
+#[tokio::test]
+async fn dynamic_tool_name_collisions_use_the_shared_first_registration_policy() {
+    let plan = probe_with(
+        |_| {},
+        ToolPlanInputs {
+            dynamic_tools: vec![
+                dynamic_tool(None, "update_plan", /*defer_loading*/ false),
+                dynamic_tool(None, "duplicate_dynamic", /*defer_loading*/ false),
+                dynamic_tool(None, "duplicate_dynamic", /*defer_loading*/ false),
+            ],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    for name in ["update_plan", "duplicate_dynamic"] {
+        assert_eq!(
+            plan.registered_names
+                .iter()
+                .filter(|registered| registered.as_str() == name)
+                .count(),
+            1,
+            "the first registration should be the only reachable `{name}` tool"
+        );
+    }
+    assert_eq!(plan.warnings.len(), 2);
+    for name in ["update_plan", "duplicate_dynamic"] {
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|warning| { warning.contains(name) && warning.contains("Rename or disable") }),
+            "expected an actionable collision warning for `{name}`"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1513,6 +1461,35 @@ async fn code_mode_only_exposes_configured_dynamic_namespace_directly() {
 }
 
 #[tokio::test]
+async fn deferred_tools_enable_nested_tool_guidance_without_prompt_inventory() {
+    let plan = probe_with(
+        |turn| {
+            set_feature(turn, Feature::CodeMode, /*enabled*/ true);
+            set_feature(turn, Feature::Collab, /*enabled*/ false);
+            turn.model_info.supports_search_tool = true;
+        },
+        ToolPlanInputs {
+            dynamic_tools: vec![dynamic_tool(
+                Some("deferred"),
+                "lookup",
+                /*defer_loading*/ true,
+            )],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    let ToolSpec::Freeform(exec) = plan.visible_spec(codex_code_mode::PUBLIC_TOOL_NAME) else {
+        panic!("expected code mode exec tool");
+    };
+    assert!(
+        exec.description
+            .contains("Some deferred nested tools may be omitted")
+    );
+    assert!(!exec.description.contains("deferred_lookup(args:"));
+}
+
+#[tokio::test]
 async fn excluded_deferred_namespaces_do_not_enable_nested_tool_guidance() {
     let plan = probe_with(
         |turn| {
@@ -1716,6 +1693,30 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
         direct_model_only
             .exposure(&ToolName::namespaced(MULTI_AGENT_V2_NAMESPACE, "spawn_agent").to_string()),
         ToolExposure::DirectModelOnly
+    );
+}
+
+#[tokio::test]
+async fn collaboration_namespace_selection_tracks_the_active_agent_version_and_surface() {
+    let (_session, mut turn) = make_session_and_context().await;
+    set_feature(&mut turn, Feature::Collab, /*enabled*/ true);
+    set_feature(&mut turn, Feature::MultiAgentV2, /*enabled*/ false);
+
+    let namespace = active_collaboration_namespace(&turn, AgentSurfaceStage::TypedAdministration);
+    assert_eq!(namespace, Some(MULTI_AGENT_V1_NAMESPACE));
+    for name in ["spawn_agent", "resume_agent", "close_agent"] {
+        assert_eq!(
+            classify_typed_tool(Some(MULTI_AGENT_V1_NAMESPACE), name, namespace),
+            TypedToolClass::RootTaskControl
+        );
+    }
+
+    set_feature(&mut turn, Feature::MultiAgentV2, /*enabled*/ true);
+    let namespace = active_collaboration_namespace(&turn, AgentSurfaceStage::TypedAdministration);
+    assert_eq!(namespace, Some(MULTI_AGENT_V2_NAMESPACE));
+    assert_eq!(
+        active_collaboration_namespace(&turn, AgentSurfaceStage::Prohibited),
+        None
     );
 }
 

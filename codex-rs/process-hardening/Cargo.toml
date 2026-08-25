@@ -9,11 +9,11 @@ name = "codex_process_hardening"
 path = "src/lib.rs"
 doctest = false
 
+[dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
+
 [lints]
 workspace = true
-
-[dependencies]
-libc = { workspace = true }
-
-[dev-dependencies]
-pretty_assertions = { workspace = true }

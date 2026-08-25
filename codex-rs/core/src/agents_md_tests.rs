@@ -415,7 +415,7 @@ fn repository_stable_context_identity_covers_sources_order_scope_and_content() {
 }
 
 #[test]
-fn unchanged_repository_stable_context_bundle_reuses_cached_rendering() {
+fn repository_stable_context_bundle_is_a_pure_derived_value() {
     let cwd = PathUri::parse("file:///stable-context-cache-test").expect("cwd URI");
     let loaded = LoadedAgentsMd {
         user_instructions: None,
@@ -432,16 +432,15 @@ fn unchanged_repository_stable_context_bundle_reuses_cached_rendering() {
     let first = loaded.stable_context_bundle(&cwd);
     let second = loaded.stable_context_bundle(&cwd);
 
-    assert!(!first.reused);
-    assert!(!first.semantic_replacement);
-    assert!(second.reused);
-    assert!(!second.semantic_replacement);
+    assert!(!first.reused && !second.reused);
+    assert!(!first.semantic_replacement && !second.semantic_replacement);
     assert_eq!(first.identity, second.identity);
-    assert!(Arc::ptr_eq(&first.rendered, &second.rendered));
+    assert_eq!(first.rendered, second.rendered);
+    assert!(!Arc::ptr_eq(&first.rendered, &second.rendered));
 }
 
 #[test]
-fn byte_identical_repository_from_a_different_source_is_a_semantic_replacement() {
+fn repository_stable_context_does_not_infer_replacement_without_session_history() {
     let cwd = PathUri::parse("file:///stable-context-semantic-replacement").expect("cwd URI");
     let original = stable_context_loaded(&[(
         "semantic-original/AGENTS.md",
@@ -457,22 +456,16 @@ fn byte_identical_repository_from_a_different_source_is_a_semantic_replacement()
 
     assert_ne!(first.identity, second.identity);
     assert_eq!(first.rendered, second.rendered);
-    assert!(second.semantic_replacement);
+    assert!(!first.semantic_replacement);
+    assert!(!second.semantic_replacement);
 }
 
 #[test]
 fn foreign_agents_md_uses_environment_native_paths() {
-    let (cwd, rendered_cwd) = if cfg!(windows) {
-        (
-            PathUri::parse("file:///codex%20runtime").expect("POSIX cwd URI"),
-            "/codex runtime",
-        )
-    } else {
-        (
-            PathUri::parse("file:///C:/codex%20runtime").expect("Windows cwd URI"),
-            r"C:\codex runtime",
-        )
-    };
+    let (cwd, rendered_cwd) = (
+        PathUri::parse("file:///codex%20runtime").expect("POSIX cwd URI"),
+        "/codex runtime",
+    );
     let source_path = cwd.join("AGENTS.md").expect("AGENTS.md URI");
     let loaded = LoadedAgentsMd {
         user_instructions: None,
@@ -2092,29 +2085,6 @@ async fn agents_md_preferred_over_fallbacks() {
 async fn agents_md_directory_is_ignored() {
     let tmp = tempfile::tempdir().expect("tempdir");
     fs::create_dir(tmp.path().join("AGENTS.md")).unwrap();
-
-    let cfg = make_config(&tmp, /*limit*/ 4096, /*instructions*/ None).await;
-
-    let res = get_user_instructions(&cfg).await;
-    assert_eq!(res, None);
-
-    let discovery = agents_md_paths(&cfg).await.expect("discover paths");
-    assert_eq!(discovery, Vec::<PathUri>::new());
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn agents_md_special_file_is_ignored() {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let path = tmp.path().join("AGENTS.md");
-    let c_path = CString::new(path.as_os_str().as_bytes()).expect("path without nul");
-    // SAFETY: `c_path` is a valid, nul-terminated path and `mkfifo` does not
-    // retain the pointer after the call.
-    let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
-    assert_eq!(rc, 0);
 
     let cfg = make_config(&tmp, /*limit*/ 4096, /*instructions*/ None).await;
 

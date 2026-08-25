@@ -8,6 +8,76 @@ use serde::Deserialize;
 use serde::Serialize;
 use ts_rs::TS;
 
+const TOOL_CALL_THREAD_ID_META_KEY: &str = "threadId";
+const TOOL_CALL_PROGRESS_TOKEN_META_KEY: &str = "progressToken";
+const TOOL_CALL_PROGRESS_TOKEN_PREFIX: &str = "codex-mcp-progress:";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolCallProgressToken {
+    turn_id: String,
+    item_id: String,
+}
+
+/// Adds the Codex thread identifier to object-valued MCP tool metadata.
+///
+/// Non-object metadata is preserved because MCP permits provider-specific
+/// values that Codex must not rewrite.
+pub fn with_tool_call_thread_id_meta(
+    meta: Option<serde_json::Value>,
+    thread_id: &str,
+) -> Option<serde_json::Value> {
+    match meta {
+        Some(serde_json::Value::Object(mut map)) => {
+            map.insert(
+                TOOL_CALL_THREAD_ID_META_KEY.to_string(),
+                serde_json::Value::String(thread_id.to_string()),
+            );
+            Some(serde_json::Value::Object(map))
+        }
+        None => Some(serde_json::json!({"threadId": thread_id})),
+        other => other,
+    }
+}
+
+/// Adds an opaque MCP progress token that can be correlated back to one Codex
+/// turn item when a server echoes it in `notifications/progress`.
+pub fn with_tool_call_progress_token_meta(
+    meta: Option<serde_json::Value>,
+    turn_id: &str,
+    item_id: &str,
+) -> Option<serde_json::Value> {
+    let token = ToolCallProgressToken {
+        turn_id: turn_id.to_string(),
+        item_id: item_id.to_string(),
+    };
+    let Ok(token) = serde_json::to_string(&token) else {
+        return meta;
+    };
+    match meta {
+        Some(serde_json::Value::Object(mut map)) => {
+            map.insert(
+                TOOL_CALL_PROGRESS_TOKEN_META_KEY.to_string(),
+                serde_json::Value::String(format!("{TOOL_CALL_PROGRESS_TOKEN_PREFIX}{token}")),
+            );
+            Some(serde_json::Value::Object(map))
+        }
+        None => Some(serde_json::json!({
+            (TOOL_CALL_PROGRESS_TOKEN_META_KEY):
+                format!("{TOOL_CALL_PROGRESS_TOKEN_PREFIX}{token}")
+        })),
+        other => other,
+    }
+}
+
+/// Decodes a progress token previously created by
+/// [`with_tool_call_progress_token_meta`]. Provider-owned tokens are ignored.
+pub fn decode_tool_call_progress_token(token: &str) -> Option<(String, String)> {
+    let encoded = token.strip_prefix(TOOL_CALL_PROGRESS_TOKEN_PREFIX)?;
+    let token: ToolCallProgressToken = serde_json::from_str(encoded).ok()?;
+    Some((token.turn_id, token.item_id))
+}
+
 /// ID of a request, which can be either a string or an integer.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(untagged)]
@@ -339,6 +409,48 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn tool_call_thread_id_meta_is_added_without_rewriting_non_objects() {
+        assert_eq!(
+            with_tool_call_thread_id_meta(
+                Some(serde_json::json!({
+                    "source": "test-client",
+                    "threadId": "stale-thread",
+                })),
+                "thread-live",
+            ),
+            Some(serde_json::json!({
+                "source": "test-client",
+                "threadId": "thread-live",
+            }))
+        );
+        assert_eq!(
+            with_tool_call_thread_id_meta(/*meta*/ None, "thread-live"),
+            Some(serde_json::json!({"threadId": "thread-live"}))
+        );
+        assert_eq!(
+            with_tool_call_thread_id_meta(Some(serde_json::json!("invalid-meta")), "thread-live"),
+            Some(serde_json::json!("invalid-meta"))
+        );
+    }
+
+    #[test]
+    fn tool_call_progress_token_round_trips_turn_and_item_ids() {
+        let meta = with_tool_call_progress_token_meta(
+            Some(serde_json::json!({"source": "test-client"})),
+            "turn-1",
+            "item-1",
+        )
+        .expect("object metadata");
+        let token = meta["progressToken"].as_str().expect("progress token");
+
+        assert_eq!(
+            decode_tool_call_progress_token(token),
+            Some(("turn-1".to_string(), "item-1".to_string()))
+        );
+        assert!(decode_tool_call_progress_token("provider-token").is_none());
+    }
 
     #[test]
     fn resource_size_deserializes_without_narrowing() {

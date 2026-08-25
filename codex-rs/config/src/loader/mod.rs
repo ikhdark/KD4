@@ -1,6 +1,4 @@
 mod layer_io;
-#[cfg(target_os = "macos")]
-mod macos;
 #[cfg(test)]
 mod tests;
 
@@ -15,6 +13,9 @@ use crate::config_requirements::RequirementSource;
 use crate::config_requirements::SandboxModeRequirement;
 use crate::config_toml::ConfigToml;
 use crate::config_toml::ProjectConfig;
+use crate::config_toml::ProjectLookup;
+use crate::config_toml::normalize_project_lookup_key;
+use crate::config_toml::normalized_project_lookup_keys;
 use crate::diagnostics::ConfigError;
 use crate::diagnostics::config_error_from_toml;
 use crate::diagnostics::first_layer_config_error_from_entries as typed_first_layer_config_error_from_entries;
@@ -46,14 +47,9 @@ use dunce::canonicalize as normalize_path;
 use serde::Deserialize;
 use std::io;
 use std::path::Path;
-#[cfg(windows)]
 use std::path::PathBuf;
 use toml::Value as TomlValue;
 
-#[cfg(unix)]
-const SYSTEM_CONFIG_TOML_FILE_UNIX: &str = "/etc/codex/config.toml";
-
-#[cfg(windows)]
 const DEFAULT_PROGRAM_DATA_DIR_WINDOWS: &str = r"C:\ProgramData";
 
 // Project-local config comes from repository contents, so it should not get to
@@ -69,8 +65,6 @@ const PROJECT_LOCAL_CONFIG_DENYLIST: &[&str] = &[
     "notify",
     "profile",
     "profiles",
-    "experimental_realtime_webrtc_call_base_url",
-    "experimental_realtime_ws_base_url",
     "otel",
 ];
 
@@ -94,9 +88,7 @@ async fn first_layer_config_error_from_entries(layers: &[ConfigLayerEntry]) -> O
 ///
 /// Configuration is built up from multiple layers in the following order:
 ///
-/// - admin:    managed preferences (*)
-/// - system    `/etc/codex/config.toml` (Unix) or
-///   `%ProgramData%\OpenAI\Codex\config.toml` (Windows)
+/// - system    `%ProgramData%\OpenAI\Codex\config.toml`
 /// - cloud     enterprise-managed cloud config bundle fragments
 /// - user      `${CODEX_HOME}/config.toml`
 /// - profile   `${CODEX_HOME}/<name>.config.toml`, when selected
@@ -104,8 +96,6 @@ async fn first_layer_config_error_from_entries(layers: &[ConfigLayerEntry]) -> O
 /// - tree      parent directories up to root looking for `./.codex/config.toml` (loaded but disabled when untrusted)
 /// - repo      `$(git rev-parse --show-toplevel)/.codex/config.toml` (loaded but disabled when untrusted)
 /// - runtime   e.g., --config flags, model selector in UI
-///
-/// (*) Only available on macOS via managed device profiles.
 ///
 /// See https://developers.openai.com/codex/security for details.
 ///
@@ -154,19 +144,7 @@ pub async fn load_config_layers_state(
             cloud_config_layers = enterprise_managed_config;
         }
 
-        #[cfg(target_os = "macos")]
-        {
-            managed_preferences_requirements_layer = macos::load_managed_admin_requirements_layer(
-                overrides
-                    .macos_managed_config_requirements_base64
-                    .as_deref(),
-            )
-            .await?;
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            managed_preferences_requirements_layer = None;
-        }
+        managed_preferences_requirements_layer = None;
 
         // Honor the system requirements.toml location.
         let requirements_toml_file = system_requirements_toml_file_with_overrides(&overrides)?;
@@ -348,14 +326,19 @@ pub async fn load_config_layers_state(
             strict_config,
         )
         .await?;
-        project_discovery = Some(ProjectDiscoveryContext::new(
-            cwd.clone(),
-            project_trust_context.project_root.clone(),
-            project_root_markers,
-            project_trust_context.checkout_root.clone(),
-            project_trust_context.repo_root.clone(),
-            fs,
-        ));
+        let active_project_lookup_keys =
+            project_trust_context.active_project_lookup_keys_for_cwd(&cwd);
+        project_discovery = Some(
+            ProjectDiscoveryContext::new(
+                cwd.clone(),
+                project_trust_context.project_root.clone(),
+                project_root_markers,
+                project_trust_context.checkout_root.clone(),
+                project_trust_context.repo_root.clone(),
+                fs,
+            )
+            .with_active_project_lookup_keys(active_project_lookup_keys),
+        );
         layers.extend(project_layers.layers);
         startup_warnings = Some(project_layers.startup_warnings);
     }
@@ -503,6 +486,7 @@ async fn load_config_toml_for_required_layer(
                     config_error_from_toml(toml_file.as_path(), &contents, err.clone());
                 io_error_from_config_error(io::ErrorKind::InvalidData, config_error, Some(err))
             })?;
+            let config = migrate_config_toml(config, toml_file.as_path())?;
             if strict_config {
                 validate_config_toml_strictly(
                     toml_file.as_path(),
@@ -528,7 +512,215 @@ async fn load_config_toml_for_required_layer(
         }
     }?;
 
+    let toml_value = migrate_config_toml(toml_value, toml_file.as_path())?;
     Ok(create_entry(toml_value))
+}
+
+const LEGACY_FEATURE_ALIASES: &[(&str, &str)] = &[
+    ("connectors", "apps"),
+    ("experimental_use_unified_exec_tool", "unified_exec"),
+    ("request_permissions", "exec_permission_approvals"),
+    ("web_search", "web_search_request"),
+    ("imagegenext", "image_generation"),
+    ("collab", "multi_agent"),
+    ("memory_tool", "memory_tool"),
+    ("codex_hooks", "hooks"),
+];
+
+const LEGACY_WINDOWS_SANDBOX_FEATURE_KEYS: &[&str] = &[
+    "experimental_windows_sandbox",
+    "elevated_windows_sandbox",
+    "enable_experimental_windows_sandbox",
+];
+
+const REMOVED_FEATURE_KEYS: &[&str] = &[
+    "undo",
+    "js_repl",
+    "js_repl_tools_only",
+    "terminal_resize_reflow",
+    "search_tool",
+    "codex_git_commit",
+    "sqlite",
+    "apply_patch_freeform",
+    "request_rule",
+    "remote_models",
+    "multi_agent_mode",
+    "apps_mcp_path_override",
+    "tool_search",
+    "tool_search_always_defer_mcp_tools",
+    "unavailable_dummy_tools",
+    "plugin_hooks",
+    "external_migration",
+    "resize_all_images",
+    "skill_env_var_dependency_prompt",
+    "mentions_v2",
+    "steer",
+    "collaboration_modes",
+    "remote_control",
+    "image_detail_original",
+    "tui_app_server",
+    "workspace_owner_usage_nudge",
+    "responses_websockets",
+    "responses_websockets_v2",
+    "remote_compaction_v2",
+    "chronicle",
+    "telepathy",
+];
+
+fn migrate_config_toml(mut value: TomlValue, path: &Path) -> io::Result<TomlValue> {
+    let table = value.as_table_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("config file {} must contain a TOML table", path.display()),
+        )
+    })?;
+    let version = match table.get("config_version") {
+        None => 0,
+        Some(TomlValue::Integer(version)) => *version,
+        Some(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("config_version in {} must be an integer", path.display()),
+            ));
+        }
+    };
+    if version == i64::from(crate::config_toml::CURRENT_CONFIG_VERSION) {
+        remove_obsolete_config_entries(table);
+        return Ok(value);
+    }
+    if version != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported config_version {version} in {}; this build supports version {}",
+                path.display(),
+                crate::config_toml::CURRENT_CONFIG_VERSION
+            ),
+        ));
+    }
+
+    migrate_legacy_config_table(table);
+    table.insert(
+        "config_version".to_string(),
+        TomlValue::Integer(i64::from(crate::config_toml::CURRENT_CONFIG_VERSION)),
+    );
+    Ok(value)
+}
+
+fn migrate_legacy_config_table(table: &mut toml::map::Map<String, TomlValue>) {
+    if let Some(alias_value) = table.remove("experimental_use_unified_exec_tool") {
+        let features = table
+            .entry("features".to_string())
+            .or_insert_with(|| TomlValue::Table(toml::map::Map::new()));
+        if let Some(features) = features.as_table_mut() {
+            features
+                .entry("unified_exec".to_string())
+                .or_insert(alias_value);
+        }
+    }
+
+    remove_obsolete_config_entries(table);
+    migrate_legacy_windows_sandbox_mode(table);
+    if let Some(features) = table.get_mut("features").and_then(TomlValue::as_table_mut) {
+        migrate_legacy_feature_table(features);
+    }
+    if let Some(profiles) = table.get_mut("profiles").and_then(TomlValue::as_table_mut) {
+        for profile in profiles
+            .iter_mut()
+            .filter_map(|(_, value)| TomlValue::as_table_mut(value))
+        {
+            migrate_legacy_config_table(profile);
+            profile.remove("config_version");
+        }
+    }
+}
+
+fn remove_obsolete_config_entries(table: &mut toml::map::Map<String, TomlValue>) {
+    for ignored in [
+        "model_supports_reasoning_summaries",
+        "ghost_snapshot",
+        "js_repl_node_path",
+        "js_repl_node_module_dirs",
+    ] {
+        table.remove(ignored);
+    }
+    if let Some(notice) = table.get_mut("notice").and_then(TomlValue::as_table_mut) {
+        notice.remove("hide_full_access_warning");
+        notice.remove("external_config_migration_prompts");
+    }
+    if let Some(features) = table.get_mut("features").and_then(TomlValue::as_table_mut) {
+        for key in REMOVED_FEATURE_KEYS {
+            features.remove(*key);
+        }
+    }
+    if let Some(profiles) = table.get_mut("profiles").and_then(TomlValue::as_table_mut) {
+        for profile in profiles
+            .iter_mut()
+            .filter_map(|(_, value)| TomlValue::as_table_mut(value))
+        {
+            remove_obsolete_config_entries(profile);
+        }
+    }
+}
+
+fn migrate_legacy_windows_sandbox_mode(table: &mut toml::map::Map<String, TomlValue>) {
+    let legacy_mode = table
+        .get("features")
+        .and_then(TomlValue::as_table)
+        .and_then(|features| {
+            if features
+                .get("elevated_windows_sandbox")
+                .and_then(TomlValue::as_bool)
+                == Some(true)
+            {
+                Some("elevated")
+            } else if [
+                "experimental_windows_sandbox",
+                "enable_experimental_windows_sandbox",
+            ]
+            .iter()
+            .any(|key| features.get(*key).and_then(TomlValue::as_bool) == Some(true))
+            {
+                Some("unelevated")
+            } else {
+                None
+            }
+        });
+
+    let Some(legacy_mode) = legacy_mode else {
+        return;
+    };
+    let windows = table
+        .entry("windows".to_string())
+        .or_insert_with(|| TomlValue::Table(toml::map::Map::new()));
+    if let Some(windows) = windows.as_table_mut() {
+        windows
+            .entry("sandbox".to_string())
+            .or_insert_with(|| TomlValue::String(legacy_mode.to_string()));
+    }
+}
+
+fn migrate_legacy_feature_table(features: &mut toml::map::Map<String, TomlValue>) {
+    for (legacy, canonical) in LEGACY_FEATURE_ALIASES {
+        if legacy == canonical {
+            continue;
+        }
+        if let Some(value) = features.remove(*legacy) {
+            features.entry((*canonical).to_string()).or_insert(value);
+        }
+    }
+    for key in REMOVED_FEATURE_KEYS {
+        features.remove(*key);
+    }
+    for key in LEGACY_WINDOWS_SANDBOX_FEATURE_KEYS {
+        features.remove(*key);
+    }
+    if let Some(multi_agent_v2) = features
+        .get_mut("multi_agent_v2")
+        .and_then(TomlValue::as_table_mut)
+    {
+        multi_agent_v2.remove("usage_hint_enabled");
+    }
 }
 
 fn validate_config_toml_strictly(
@@ -624,12 +816,6 @@ pub async fn load_requirements_toml(
     }
 }
 
-#[cfg(unix)]
-fn system_requirements_toml_file() -> io::Result<AbsolutePathBuf> {
-    AbsolutePathBuf::from_absolute_path(Path::new("/etc/codex/requirements.toml"))
-}
-
-#[cfg(windows)]
 fn system_requirements_toml_file() -> io::Result<AbsolutePathBuf> {
     windows_system_requirements_toml_file()
 }
@@ -643,12 +829,6 @@ fn system_requirements_toml_file_with_overrides(
     }
 }
 
-#[cfg(unix)]
-pub fn system_config_toml_file() -> io::Result<AbsolutePathBuf> {
-    AbsolutePathBuf::from_absolute_path(Path::new(SYSTEM_CONFIG_TOML_FILE_UNIX))
-}
-
-#[cfg(windows)]
 pub fn system_config_toml_file() -> io::Result<AbsolutePathBuf> {
     windows_system_config_toml_file()
 }
@@ -662,7 +842,6 @@ fn system_config_toml_file_with_overrides(
     }
 }
 
-#[cfg(windows)]
 fn windows_codex_system_dir() -> PathBuf {
     let program_data = windows_program_data_dir_from_known_folder().unwrap_or_else(|err| {
         tracing::warn!(
@@ -674,19 +853,16 @@ fn windows_codex_system_dir() -> PathBuf {
     program_data.join("OpenAI").join("Codex")
 }
 
-#[cfg(windows)]
 fn windows_system_requirements_toml_file() -> io::Result<AbsolutePathBuf> {
     let requirements_toml_file = windows_codex_system_dir().join("requirements.toml");
     AbsolutePathBuf::try_from(requirements_toml_file)
 }
 
-#[cfg(windows)]
 fn windows_system_config_toml_file() -> io::Result<AbsolutePathBuf> {
     let config_toml_file = windows_codex_system_dir().join("config.toml");
     AbsolutePathBuf::try_from(config_toml_file)
 }
 
-#[cfg(windows)]
 fn windows_program_data_dir_from_known_folder() -> io::Result<PathBuf> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
@@ -706,7 +882,12 @@ fn windows_program_data_dir_from_known_folder() -> io::Result<PathBuf> {
     // SAFETY: SHGetKnownFolderPath initializes path_ptr with a CoTaskMem-allocated,
     // null-terminated UTF-16 string on success.
     let hr = unsafe {
-        SHGetKnownFolderPath(&FOLDERID_ProgramData, known_folder_flags, 0, &mut path_ptr)
+        SHGetKnownFolderPath(
+            &FOLDERID_ProgramData,
+            known_folder_flags,
+            std::ptr::null_mut(),
+            &mut path_ptr,
+        )
     };
     if hr != 0 {
         return Err(io::Error::other(format!(
@@ -832,7 +1013,7 @@ struct ProjectTrustContext {
     repo_root: Option<AbsolutePathBuf>,
     repo_root_key: Option<String>,
     repo_root_lookup_keys: Option<Vec<String>>,
-    projects_trust: std::collections::HashMap<String, TrustLevel>,
+    projects_trust: ProjectLookup<TrustLevel>,
     user_config_file: AbsolutePathBuf,
 }
 
@@ -853,40 +1034,48 @@ impl ProjectTrustDecision {
 }
 
 impl ProjectTrustContext {
-    fn decision_for_dir(&self, dir: &AbsolutePathBuf) -> ProjectTrustDecision {
-        for dir_key in normalized_project_trust_keys(dir.as_path()) {
-            if let Some((trust_key, trust_level)) =
-                project_trust_for_lookup_key(&self.projects_trust, &dir_key)
-            {
-                return ProjectTrustDecision {
-                    trust_level: Some(trust_level),
-                    trust_key,
-                };
-            }
-        }
+    fn decision_for_lookup_keys(
+        &self,
+        lookup_keys: impl IntoIterator<Item = String>,
+    ) -> Option<ProjectTrustDecision> {
+        lookup_keys.into_iter().find_map(|lookup_key| {
+            self.projects_trust
+                .get(&lookup_key)
+                .map(|(trust_key, trust_level)| ProjectTrustDecision {
+                    trust_level: Some(*trust_level),
+                    trust_key: trust_key.to_string(),
+                })
+        })
+    }
 
-        for project_root_key in &self.project_root_lookup_keys {
-            if let Some((trust_key, trust_level)) =
-                project_trust_for_lookup_key(&self.projects_trust, project_root_key)
-            {
-                return ProjectTrustDecision {
-                    trust_level: Some(trust_level),
-                    trust_key,
-                };
-            }
-        }
-
+    fn active_project_lookup_keys_for_cwd(&self, cwd: &AbsolutePathBuf) -> Vec<String> {
+        let mut lookup_keys = normalized_project_lookup_keys(cwd.as_path());
         if let Some(repo_root_lookup_keys) = self.repo_root_lookup_keys.as_ref() {
-            for repo_root_key in repo_root_lookup_keys {
-                if let Some((trust_key, trust_level)) =
-                    project_trust_for_lookup_key(&self.projects_trust, repo_root_key)
-                {
-                    return ProjectTrustDecision {
-                        trust_level: Some(trust_level),
-                        trust_key,
-                    };
+            for key in repo_root_lookup_keys {
+                if !lookup_keys.contains(key) {
+                    lookup_keys.push(key.clone());
                 }
             }
+        }
+        lookup_keys
+    }
+
+    fn decision_for_dir(&self, dir: &AbsolutePathBuf) -> ProjectTrustDecision {
+        if let Some(decision) =
+            self.decision_for_lookup_keys(normalized_project_lookup_keys(dir.as_path()))
+        {
+            return decision;
+        }
+
+        if let Some(decision) = self.decision_for_lookup_keys(self.project_root_lookup_keys.clone())
+        {
+            return decision;
+        }
+
+        if let Some(repo_root_lookup_keys) = self.repo_root_lookup_keys.clone()
+            && let Some(decision) = self.decision_for_lookup_keys(repo_root_lookup_keys)
+        {
+            return decision;
         }
 
         ProjectTrustDecision {
@@ -1003,7 +1192,7 @@ async fn project_trust_context(
     let project_root = find_project_root(fs, cwd, project_root_markers).await?;
     let projects = project_trust_config.projects.unwrap_or_default();
 
-    let project_root_lookup_keys = normalized_project_trust_keys(project_root.as_path());
+    let project_root_lookup_keys = normalized_project_lookup_keys(project_root.as_path());
     let project_root_key = project_root_lookup_keys
         .first()
         .cloned()
@@ -1012,15 +1201,17 @@ async fn project_trust_context(
     let repo_root = resolve_root_git_project_for_trust(fs, cwd).await;
     let repo_root_lookup_keys = repo_root
         .as_ref()
-        .map(|root| normalized_project_trust_keys(root.as_path()));
+        .map(|root| normalized_project_lookup_keys(root.as_path()));
     let repo_root_key = repo_root_lookup_keys
         .as_ref()
         .and_then(|keys| keys.first().cloned());
 
-    let projects_trust = projects
-        .into_iter()
-        .filter_map(|(key, project)| project.trust_level.map(|trust_level| (key, trust_level)))
-        .collect();
+    let projects_trust = ProjectLookup::new(
+        projects
+            .into_iter()
+            .filter_map(|(key, project)| project.trust_level.map(|trust_level| (key, trust_level)))
+            .collect(),
+    );
 
     Ok(ProjectTrustContext {
         project_root,
@@ -1039,51 +1230,12 @@ async fn project_trust_context(
 /// projects trust map. On Windows, strips UNC, when possible, to try to ensure
 /// that different paths that point to the same location have the same key.
 pub fn project_trust_key(path: &Path) -> String {
-    normalized_project_trust_keys(path)
+    normalized_project_lookup_keys(path)
         .into_iter()
         .next()
-        .unwrap_or_else(|| normalize_project_trust_lookup_key(path.to_string_lossy().to_string()))
+        .unwrap_or_else(|| normalize_project_lookup_key(&path.to_string_lossy()))
 }
 
-fn normalized_project_trust_keys(path: &Path) -> Vec<String> {
-    let normalized_path = normalize_project_trust_lookup_key(path.to_string_lossy().to_string());
-    let normalized_canonical_path = normalize_project_trust_lookup_key(
-        normalize_path(path)
-            .unwrap_or_else(|_| path.to_path_buf())
-            .to_string_lossy()
-            .to_string(),
-    );
-    if normalized_path == normalized_canonical_path {
-        vec![normalized_canonical_path]
-    } else {
-        vec![normalized_canonical_path, normalized_path]
-    }
-}
-
-fn normalize_project_trust_lookup_key(key: String) -> String {
-    if cfg!(windows) {
-        key.to_ascii_lowercase()
-    } else {
-        key
-    }
-}
-fn project_trust_for_lookup_key(
-    projects_trust: &std::collections::HashMap<String, TrustLevel>,
-    lookup_key: &str,
-) -> Option<(String, TrustLevel)> {
-    if let Some(trust_level) = projects_trust.get(lookup_key).copied() {
-        return Some((lookup_key.to_string(), trust_level));
-    }
-
-    let mut normalized_matches: Vec<_> = projects_trust
-        .iter()
-        .filter(|(key, _)| normalize_project_trust_lookup_key((*key).clone()) == lookup_key)
-        .collect();
-    normalized_matches.sort_by_key(|(key, _)| *key);
-    normalized_matches
-        .first()
-        .map(|(key, trust_level)| ((**key).clone(), **trust_level))
-}
 /// Takes a `toml::Value` parsed from a config.toml file and walks through it,
 /// resolving any `AbsolutePathBuf` fields against `base_dir`, returning a new
 /// `toml::Value` with the same shape but with paths resolved.
@@ -1424,7 +1576,7 @@ struct LegacyManagedConfigToml {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
-    #[cfg(windows)]
+
     use std::path::Path;
     use tempfile::tempdir;
 
@@ -1525,7 +1677,6 @@ foo = "xyzzy"
         Ok(())
     }
 
-    #[cfg(windows)]
     #[test]
     fn windows_system_requirements_toml_file_uses_expected_suffix() {
         let expected = windows_program_data_dir_from_known_folder()
@@ -1547,7 +1698,6 @@ foo = "xyzzy"
         );
     }
 
-    #[cfg(windows)]
     #[test]
     fn windows_system_config_toml_file_uses_expected_suffix() {
         let expected = windows_program_data_dir_from_known_folder()

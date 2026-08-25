@@ -5,8 +5,7 @@ use std::io::Read;
 use std::time::Duration;
 use std::time::Instant;
 
-pub(crate) const DESKTOP_ACTIVATION_EVIDENCE_HANDLE_ENV: &str =
-    "CODEX_DESKTOP_ACTIVATION_EVIDENCE_HANDLE";
+const DESKTOP_ACTIVATION_EVIDENCE_HANDLE_ENV: &str = "CODEX_DESKTOP_ACTIVATION_EVIDENCE_HANDLE";
 const MAX_BOOTSTRAP_EVIDENCE_BYTES: u64 = 64 * 1024;
 const BOOTSTRAP_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const BOOTSTRAP_READ_POLL_INTERVAL: Duration = Duration::from_millis(5);
@@ -63,61 +62,6 @@ fn evidence_is_complete(bytes: &[u8]) -> bool {
     serde_json::from_slice::<DesktopPublishInstallEvidenceV1>(bytes).is_ok()
 }
 
-#[cfg(unix)]
-fn read_inherited_pipe_until_complete(
-    pipe: &mut std::fs::File,
-    raw_handle: usize,
-) -> std::io::Result<Vec<u8>> {
-    const F_GETFL: i32 = 3;
-    const F_SETFL: i32 = 4;
-    #[cfg(any(target_os = "android", target_os = "linux"))]
-    const O_NONBLOCK: i32 = 0x800;
-    #[cfg(any(
-        target_os = "dragonfly",
-        target_os = "freebsd",
-        target_os = "ios",
-        target_os = "macos",
-        target_os = "netbsd",
-        target_os = "openbsd"
-    ))]
-    const O_NONBLOCK: i32 = 0x4;
-    #[cfg(any(target_os = "illumos", target_os = "solaris"))]
-    const O_NONBLOCK: i32 = 0x80;
-    #[cfg(not(any(
-        target_os = "android",
-        target_os = "dragonfly",
-        target_os = "freebsd",
-        target_os = "illumos",
-        target_os = "ios",
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "solaris"
-    )))]
-    const O_NONBLOCK: i32 = 0x4;
-
-    unsafe extern "C" {
-        fn fcntl(fd: i32, command: i32, ...) -> i32;
-    }
-
-    let fd = i32::try_from(raw_handle)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid pipe fd"))?;
-    // SAFETY: `fd` is the inherited descriptor now owned by `pipe`; F_GETFL does not
-    // access memory and returns its current status flags.
-    let flags = unsafe { fcntl(fd, F_GETFL) };
-    if flags == -1 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: `fd` remains owned by `pipe`; F_SETFL changes only its status flags.
-    if unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) } == -1 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    read_nonblocking_pipe_until_complete(pipe)
-}
-
-#[cfg(windows)]
 fn read_inherited_pipe_until_complete(
     pipe: &mut std::fs::File,
     raw_handle: usize,
@@ -180,54 +124,11 @@ fn read_inherited_pipe_until_complete(
     }
 }
 
-#[cfg(not(any(windows, unix)))]
-fn read_inherited_pipe_until_complete(
-    _pipe: &mut std::fs::File,
-    _raw_handle: usize,
-) -> std::io::Result<Vec<u8>> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "Desktop activation bootstrap handles are unsupported",
-    ))
-}
-
-#[cfg(unix)]
-fn read_nonblocking_pipe_until_complete(pipe: &mut std::fs::File) -> std::io::Result<Vec<u8>> {
-    let deadline = Instant::now() + BOOTSTRAP_READ_TIMEOUT;
-    let mut bytes = Vec::new();
-    let mut chunk = [0_u8; 8 * 1024];
-    loop {
-        if evidence_is_complete(&bytes) || bytes.len() as u64 > MAX_BOOTSTRAP_EVIDENCE_BYTES {
-            return Ok(bytes);
-        }
-        if Instant::now() >= deadline {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "timed out reading Desktop activation bootstrap",
-            ));
-        }
-
-        let remaining =
-            (MAX_BOOTSTRAP_EVIDENCE_BYTES + 1).saturating_sub(bytes.len() as u64) as usize;
-        match pipe.read(&mut chunk[..remaining.min(chunk.len())]) {
-            Ok(0) => return Ok(bytes),
-            Ok(count) => bytes.extend_from_slice(&chunk[..count]),
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                sleep_until_next_poll(deadline);
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(err) => return Err(err),
-        }
-    }
-}
-
-#[cfg(any(windows, unix))]
 fn sleep_until_next_poll(deadline: Instant) {
     let remaining = deadline.saturating_duration_since(Instant::now());
     std::thread::sleep(remaining.min(BOOTSTRAP_READ_POLL_INTERVAL));
 }
 
-#[cfg(windows)]
 fn inherited_pipe_file(raw_handle: usize) -> std::io::Result<std::fs::File> {
     use std::os::windows::io::FromRawHandle;
     use windows_sys::Win32::Foundation::HANDLE_FLAG_INHERIT;
@@ -242,24 +143,6 @@ fn inherited_pipe_file(raw_handle: usize) -> std::io::Result<std::fs::File> {
     Ok(unsafe { std::fs::File::from_raw_handle(raw_handle as *mut std::ffi::c_void) })
 }
 
-#[cfg(unix)]
-fn inherited_pipe_file(raw_handle: usize) -> std::io::Result<std::fs::File> {
-    use std::os::fd::FromRawFd;
-
-    let fd = i32::try_from(raw_handle)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid pipe fd"))?;
-    // SAFETY: the native parent supplied this inherited one-shot read descriptor.
-    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
-}
-
-#[cfg(not(any(windows, unix)))]
-fn inherited_pipe_file(_raw_handle: usize) -> std::io::Result<std::fs::File> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "Desktop activation bootstrap handles are unsupported",
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::BOOTSTRAP_READ_TIMEOUT;
@@ -268,7 +151,21 @@ mod tests {
     use std::time::Duration;
     use std::time::Instant;
 
-    #[cfg(any(windows, unix))]
+    #[test]
+    fn internal_api_visibility_is_minimal() {
+        let source = include_str!("desktop_activation.rs");
+        let crate_visible_declaration = [
+            "pub(crate)",
+            " const DESKTOP_ACTIVATION_EVIDENCE_HANDLE_ENV",
+        ]
+        .concat();
+
+        assert!(
+            !source.contains(&crate_visible_declaration),
+            "module-local Desktop activation environment key must remain private"
+        );
+    }
+
     #[test]
     fn desktop_activation_stalled_inherited_handle_is_deadline_bounded() {
         let (raw_handle, _writer) = stalled_pipe();
@@ -283,16 +180,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    fn stalled_pipe() -> (usize, std::os::unix::net::UnixStream) {
-        use std::os::fd::IntoRawFd;
-
-        let (reader, writer) =
-            std::os::unix::net::UnixStream::pair().expect("create stalled pipe pair");
-        (reader.into_raw_fd() as usize, writer)
-    }
-
-    #[cfg(windows)]
     fn stalled_pipe() -> (usize, std::fs::File) {
         use std::os::windows::io::FromRawHandle;
 

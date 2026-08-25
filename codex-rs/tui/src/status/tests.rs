@@ -314,7 +314,7 @@ async fn status_snapshot_includes_reasoning_details() {
         reasoning_effort_override,
     );
     let mut rendered_lines = render_lines(&composite.display_lines(/*width*/ 80));
-    if cfg!(windows) {
+    {
         for line in &mut rendered_lines {
             *line = line.replace('\\', "/");
         }
@@ -690,7 +690,7 @@ async fn status_snapshot_shows_active_user_defined_profile() {
         /*reasoning_effort_override*/ None,
     );
     let mut rendered_lines = render_lines(&composite.display_lines(/*width*/ 80));
-    if cfg!(windows) {
+    {
         for line in &mut rendered_lines {
             *line = line.replace('\\', "/");
         }
@@ -845,7 +845,7 @@ async fn status_snapshot_shows_auto_review_permissions() {
         /*reasoning_effort_override*/ None,
     );
     let mut rendered_lines = render_lines(&composite.display_lines(/*width*/ 80));
-    if cfg!(windows) {
+    {
         for line in &mut rendered_lines {
             *line = line.replace('\\', "/");
         }
@@ -945,7 +945,7 @@ async fn status_snapshot_includes_forked_from() {
         /*reasoning_effort_override*/ None,
     );
     let mut rendered_lines = render_lines(&composite.display_lines(/*width*/ 80));
-    if cfg!(windows) {
+    {
         for line in &mut rendered_lines {
             *line = line.replace('\\', "/");
         }
@@ -1010,7 +1010,7 @@ async fn status_snapshot_includes_monthly_limit() {
         /*reasoning_effort_override*/ None,
     );
     let mut rendered_lines = render_lines(&composite.display_lines(/*width*/ 80));
-    if cfg!(windows) {
+    {
         for line in &mut rendered_lines {
             *line = line.replace('\\', "/");
         }
@@ -1075,7 +1075,7 @@ async fn status_snapshot_includes_enterprise_monthly_credit_limit() {
         /*reasoning_effort_override*/ None,
     );
     let mut rendered_lines = render_lines(&composite.display_lines(/*width*/ 92));
-    if cfg!(windows) {
+    {
         for line in &mut rendered_lines {
             *line = line.replace('\\', "/");
         }
@@ -1084,7 +1084,7 @@ async fn status_snapshot_includes_enterprise_monthly_credit_limit() {
     assert_snapshot!(sanitized);
 
     let mut rendered_lines = render_lines(&composite.display_lines(/*width*/ 46));
-    if cfg!(windows) {
+    {
         for line in &mut rendered_lines {
             *line = line.replace('\\', "/");
         }
@@ -1156,7 +1156,7 @@ async fn status_snapshot_uses_generic_limit_labels_for_unsupported_windows() {
         /*reasoning_effort_override*/ None,
     );
     let mut rendered_lines = render_lines(&composite.display_lines(/*width*/ 80));
-    if cfg!(windows) {
+    {
         for line in &mut rendered_lines {
             *line = line.replace('\\', "/");
         }
@@ -1473,7 +1473,7 @@ async fn status_snapshot_truncates_in_narrow_terminal() {
         reasoning_effort_override,
     );
     let mut rendered_lines = render_lines(&composite.display_lines(/*width*/ 70));
-    if cfg!(windows) {
+    {
         for line in &mut rendered_lines {
             *line = line.replace('\\', "/");
         }
@@ -1522,7 +1522,7 @@ async fn status_snapshot_shows_missing_limits_message() {
         /*reasoning_effort_override*/ None,
     );
     let mut rendered_lines = render_lines(&composite.display_lines(/*width*/ 80));
-    if cfg!(windows) {
+    {
         for line in &mut rendered_lines {
             *line = line.replace('\\', "/");
         }
@@ -1578,7 +1578,7 @@ async fn status_snapshot_uses_default_reasoning_when_config_empty() {
         /*refreshing_rate_limits*/ false,
     );
     let mut rendered_lines = render_lines(&composite.display_lines(/*width*/ 80));
-    if cfg!(windows) {
+    {
         for line in &mut rendered_lines {
             *line = line.replace('\\', "/");
         }
@@ -1645,7 +1645,7 @@ async fn status_snapshot_shows_refreshing_limits_notice() {
         /*refreshing_rate_limits*/ true,
     );
     let mut rendered_lines = render_lines(&composite.display_lines(/*width*/ 80));
-    if cfg!(windows) {
+    {
         for line in &mut rendered_lines {
             *line = line.replace('\\', "/");
         }
@@ -1717,7 +1717,7 @@ async fn status_snapshot_includes_credits_and_limits() {
         /*reasoning_effort_override*/ None,
     );
     let mut rendered_lines = render_lines(&composite.display_lines(/*width*/ 80));
-    if cfg!(windows) {
+    {
         for line in &mut rendered_lines {
             *line = line.replace('\\', "/");
         }
@@ -1777,7 +1777,7 @@ async fn status_snapshot_shows_unavailable_limits_message() {
         /*reasoning_effort_override*/ None,
     );
     let mut rendered_lines = render_lines(&composite.display_lines(/*width*/ 80));
-    if cfg!(windows) {
+    {
         for line in &mut rendered_lines {
             *line = line.replace('\\', "/");
         }
@@ -1837,7 +1837,7 @@ async fn status_snapshot_treats_refreshing_empty_limits_as_unavailable() {
         /*refreshing_rate_limits*/ true,
     );
     let mut rendered_lines = render_lines(&composite.display_lines(/*width*/ 80));
-    if cfg!(windows) {
+    {
         for line in &mut rendered_lines {
             *line = line.replace('\\', "/");
         }
@@ -1906,7 +1906,7 @@ async fn status_snapshot_shows_stale_limits_message() {
         /*reasoning_effort_override*/ None,
     );
     let mut rendered_lines = render_lines(&composite.display_lines(/*width*/ 80));
-    if cfg!(windows) {
+    {
         for line in &mut rendered_lines {
             *line = line.replace('\\', "/");
         }
@@ -1979,7 +1979,7 @@ async fn status_snapshot_cached_limits_hide_credits_without_flag() {
         /*reasoning_effort_override*/ None,
     );
     let mut rendered_lines = render_lines(&composite.display_lines(/*width*/ 80));
-    if cfg!(windows) {
+    {
         for line in &mut rendered_lines {
             *line = line.replace('\\', "/");
         }

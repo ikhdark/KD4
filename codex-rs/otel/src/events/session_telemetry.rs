@@ -49,7 +49,6 @@ use eventsource_stream::EventStreamError as StreamError;
 use opentelemetry_sdk::metrics::data::ResourceMetrics;
 use reqwest::Error;
 use reqwest::Response;
-use std::borrow::Cow;
 use std::future::Future;
 use std::time::Duration;
 use std::time::Instant;
@@ -1391,7 +1390,7 @@ impl SessionTelemetry {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn log_tool_result_with_tags<F, Fut, E>(
+    pub async fn log_tool_result_with_tags<F, Fut, T, E, Describe>(
         &self,
         tool_name: &str,
         call_id: &str,
@@ -1399,10 +1398,12 @@ impl SessionTelemetry {
         extra_tags: &[(&str, &str)],
         extra_trace_fields: &[(&str, &str)],
         f: F,
-    ) -> Result<(String, bool), E>
+        describe: Describe,
+    ) -> Result<T, E>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<(String, bool), E>>,
+        Fut: Future<Output = Result<T, E>>,
+        Describe: FnOnce(&T) -> (String, bool),
         E: std::fmt::Display,
     {
         let start = Instant::now();
@@ -1410,8 +1411,8 @@ impl SessionTelemetry {
         let duration = start.elapsed();
 
         let (output, success) = match &result {
-            Ok((preview, success)) => (Cow::Borrowed(preview.as_str()), *success),
-            Err(error) => (Cow::Owned(error.to_string()), false),
+            Ok(value) => describe(value),
+            Err(error) => (error.to_string(), false),
         };
 
         self.tool_result_with_tags(
@@ -1420,7 +1421,7 @@ impl SessionTelemetry {
             arguments,
             duration,
             success,
-            output.as_ref(),
+            &output,
             extra_tags,
             extra_trace_fields,
         );
@@ -1655,6 +1656,59 @@ mod model_attempt_privacy_tests {
         assert_eq!(
             normalized_context_component_hash("prompt text or a filesystem path"),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod tool_result_passthrough_tests {
+    use super::*;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct TypedToolResult {
+        preview: String,
+        value: u64,
+    }
+
+    #[tokio::test]
+    async fn timed_tool_result_returns_the_typed_result_without_projection() {
+        let telemetry = SessionTelemetry::new(
+            ThreadId::new(),
+            "test-model",
+            "test-model",
+            None,
+            None,
+            None,
+            "test".to_string(),
+            false,
+            "test".to_string(),
+            SessionSource::Cli,
+        );
+
+        let result = telemetry
+            .log_tool_result_with_tags(
+                "test_tool",
+                "call-1",
+                "{}",
+                &[],
+                &[],
+                || async {
+                    Ok::<TypedToolResult, &'static str>(TypedToolResult {
+                        preview: "preview".to_string(),
+                        value: 42,
+                    })
+                },
+                |result| (result.preview.clone(), true),
+            )
+            .await
+            .expect("typed tool result should pass through telemetry");
+
+        assert_eq!(
+            result,
+            TypedToolResult {
+                preview: "preview".to_string(),
+                value: 42,
+            }
         );
     }
 }

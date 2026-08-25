@@ -22,7 +22,6 @@ use codex_app_server_protocol::ThreadStartResponse;
 use codex_config::LoaderOverrides;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_core::config::ConfigBuilder;
-use codex_features::FEATURES;
 use codex_features::Stage;
 use pretty_assertions::assert_eq;
 use serde::de::DeserializeOwned;
@@ -63,8 +62,7 @@ async fn experimental_feature_list_returns_feature_metadata_with_stage() -> Resu
         .await?;
 
     let actual = read_response::<ExperimentalFeatureListResponse>(&mut mcp, request_id).await?;
-    let expected_data = FEATURES
-        .iter()
+    let expected_data = codex_features::user_settable_features()
         .map(|spec| {
             let (stage, display_name, description, announcement) = match spec.stage {
                 Stage::Experimental {
@@ -82,7 +80,7 @@ async fn experimental_feature_list_returns_feature_metadata_with_stage() -> Resu
                 }
                 Stage::Stable => (ExperimentalFeatureStage::Stable, None, None, None),
                 Stage::Deprecated => (ExperimentalFeatureStage::Deprecated, None, None, None),
-                Stage::Removed => (ExperimentalFeatureStage::Removed, None, None, None),
+                Stage::Internal => (ExperimentalFeatureStage::Removed, None, None, None),
             };
 
             ExperimentalFeature {
@@ -364,11 +362,6 @@ async fn experimental_feature_enablement_set_only_updates_named_features() -> Re
         .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
-    set_experimental_feature_enablement(
-        &mut mcp,
-        BTreeMap::from([("mentions_v2".to_string(), true)]),
-    )
-    .await?;
     let actual = set_experimental_feature_enablement(
         &mut mcp,
         BTreeMap::from([
@@ -394,13 +387,6 @@ async fn experimental_feature_enablement_set_only_updates_named_features() -> Re
 
     let ConfigReadResponse { config, .. } = read_config(&mut mcp, /*cwd*/ None).await?;
 
-    assert_eq!(
-        config
-            .additional
-            .get("features")
-            .and_then(|features| features.get("mentions_v2")),
-        Some(&json!(true))
-    );
     assert_eq!(
         config
             .additional
@@ -434,7 +420,7 @@ async fn experimental_feature_enablement_set_only_updates_named_features() -> Re
 }
 
 #[tokio::test]
-async fn experimental_feature_enablement_set_allows_remote_control() -> Result<()> {
+async fn experimental_feature_enablement_set_ignores_removed_features() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -442,14 +428,18 @@ async fn experimental_feature_enablement_set_allows_remote_control() -> Result<(
         .build()
         .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-    let remote_control_enabled = false;
-    let enablement = BTreeMap::from([("remote_control".to_string(), remote_control_enabled)]);
+    let enablement = BTreeMap::from([
+        ("mentions_v2".to_string(), true),
+        ("remote_control".to_string(), false),
+    ]);
 
-    let actual = set_experimental_feature_enablement(&mut mcp, enablement.clone()).await?;
+    let actual = set_experimental_feature_enablement(&mut mcp, enablement).await?;
 
     assert_eq!(
         actual,
-        ExperimentalFeatureEnablementSetResponse { enablement }
+        ExperimentalFeatureEnablementSetResponse {
+            enablement: BTreeMap::new(),
+        }
     );
 
     Ok(())
@@ -465,11 +455,8 @@ async fn experimental_feature_enablement_set_empty_map_is_no_op() -> Result<()> 
         .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
-    set_experimental_feature_enablement(
-        &mut mcp,
-        BTreeMap::from([("mentions_v2".to_string(), true)]),
-    )
-    .await?;
+    set_experimental_feature_enablement(&mut mcp, BTreeMap::from([("memories".to_string(), true)]))
+        .await?;
     let actual = set_experimental_feature_enablement(&mut mcp, BTreeMap::new()).await?;
 
     assert_eq!(
@@ -485,7 +472,7 @@ async fn experimental_feature_enablement_set_empty_map_is_no_op() -> Result<()> 
         config
             .additional
             .get("features")
-            .and_then(|features| features.get("mentions_v2")),
+            .and_then(|features| features.get("memories")),
         Some(&json!(true))
     );
 

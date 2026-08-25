@@ -3,9 +3,7 @@
 //! This module provides a [`CliConfigOverrides`] struct that can be embedded
 //! into a `clap`-derived CLI struct using `#[clap(flatten)]`. Each occurrence
 //! of `-c key=value` (or `--config key=value`) will be collected as a raw
-//! string. Helper methods are provided to convert the raw strings into
-//! key/value pairs as well as to apply them onto a mutable
-//! `serde_json::Value` representing the configuration tree.
+//! string. A helper method converts the raw strings into key/value pairs.
 
 use clap::ArgAction;
 use clap::Parser;
@@ -82,69 +80,10 @@ impl CliConfigOverrides {
             })
             .collect()
     }
-
-    /// Apply all parsed overrides onto `target`. Intermediate objects will be
-    /// created as necessary. Values located at the destination path will be
-    /// replaced.
-    pub fn apply_on_value(&self, target: &mut Value) -> Result<(), String> {
-        let overrides = self.parse_overrides()?;
-        for (path, value) in overrides {
-            apply_single_override(target, &path, value);
-        }
-        Ok(())
-    }
 }
 
 fn canonicalize_override_key(key: &str) -> String {
-    if key == "use_legacy_landlock" {
-        "features.use_legacy_landlock".to_string()
-    } else {
-        key.to_string()
-    }
-}
-
-/// Apply a single override onto `root`, creating intermediate objects as
-/// necessary.
-fn apply_single_override(root: &mut Value, path: &str, value: Value) {
-    use toml::value::Table;
-
-    let parts: Vec<&str> = path.split('.').collect();
-    let mut current = root;
-
-    for (i, part) in parts.iter().enumerate() {
-        let is_last = i == parts.len() - 1;
-
-        if is_last {
-            match current {
-                Value::Table(tbl) => {
-                    tbl.insert((*part).to_string(), value);
-                }
-                _ => {
-                    let mut tbl = Table::new();
-                    tbl.insert((*part).to_string(), value);
-                    *current = Value::Table(tbl);
-                }
-            }
-            return;
-        }
-
-        // Traverse or create intermediate table.
-        match current {
-            Value::Table(tbl) => {
-                current = tbl
-                    .entry((*part).to_string())
-                    .or_insert_with(|| Value::Table(Table::new()));
-            }
-            _ => {
-                *current = Value::Table(Table::new());
-                if let Value::Table(tbl) = current {
-                    current = tbl
-                        .entry((*part).to_string())
-                        .or_insert_with(|| Value::Table(Table::new()));
-                }
-            }
-        }
-    }
+    key.to_string()
 }
 
 fn parse_toml_value(raw: &str) -> Result<Value, toml::de::Error> {
@@ -185,16 +124,6 @@ mod tests {
         let v = parse_toml_value("[1, 2, 3]").expect("parse");
         let arr = v.as_array().expect("array");
         assert_eq!(arr.len(), 3);
-    }
-
-    #[test]
-    fn canonicalizes_use_legacy_landlock_alias() {
-        let overrides = CliConfigOverrides {
-            raw_overrides: vec!["use_legacy_landlock=true".to_string()],
-        };
-        let parsed = overrides.parse_overrides().expect("parse_overrides");
-        assert_eq!(parsed[0].0.as_str(), "features.use_legacy_landlock");
-        assert_eq!(parsed[0].1.as_bool(), Some(true));
     }
 
     #[test]

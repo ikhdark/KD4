@@ -105,116 +105,12 @@ pub fn default_bg() -> Option<(u8, u8, u8)> {
     default_colors().map(|c| c.bg)
 }
 
-#[cfg(any(unix, windows))]
 pub(crate) fn set_default_colors_from_startup_probe(
     colors: Option<crate::terminal_probe::DefaultColors>,
 ) {
     imp::set_default_colors_from_startup_probe(colors);
 }
 
-#[cfg(all(unix, not(test)))]
-mod imp {
-    use super::DefaultColors;
-    use crossterm::style::Color as CrosstermColor;
-    use crossterm::style::query_background_color;
-    use crossterm::style::query_foreground_color;
-    use std::sync::Mutex;
-    use std::sync::OnceLock;
-
-    struct Cache<T> {
-        attempted: bool,
-        value: Option<T>,
-    }
-
-    impl<T> Default for Cache<T> {
-        fn default() -> Self {
-            Self {
-                attempted: false,
-                value: None,
-            }
-        }
-    }
-
-    impl<T: Copy> Cache<T> {
-        fn get_or_init_with(&mut self, mut init: impl FnMut() -> Option<T>) -> Option<T> {
-            if !self.attempted {
-                self.value = init();
-                self.attempted = true;
-            }
-            self.value
-        }
-    }
-
-    fn default_colors_cache() -> &'static Mutex<Cache<DefaultColors>> {
-        static CACHE: OnceLock<Mutex<Cache<DefaultColors>>> = OnceLock::new();
-        CACHE.get_or_init(|| Mutex::new(Cache::default()))
-    }
-
-    pub(super) fn default_colors() -> Option<DefaultColors> {
-        let cache = default_colors_cache();
-        let mut cache = cache.lock().ok()?;
-        cache.get_or_init_with(query_default_colors)
-    }
-
-    pub(super) fn set_default_colors_from_startup_probe(
-        colors: Option<crate::terminal_probe::DefaultColors>,
-    ) {
-        if let Ok(mut cache) = default_colors_cache().lock() {
-            cache.value = colors.map(|colors| DefaultColors {
-                fg: colors.fg,
-                bg: colors.bg,
-            });
-            cache.attempted = true;
-        }
-    }
-
-    pub(super) fn requery_default_colors() {
-        if let Ok(mut cache) = default_colors_cache().lock() {
-            // Don't try to refresh if the cache is already attempted and failed.
-            if cache.attempted && cache.value.is_none() {
-                return;
-            }
-
-            // Focus events arrive after crossterm's event stream is active. Requery through
-            // crossterm here so unrelated input stays in crossterm's skipped-event queue instead
-            // of being consumed by the bounded startup probe's direct tty reads.
-            let fg = query_foreground_color()
-                .ok()
-                .flatten()
-                .and_then(color_to_tuple);
-            let bg = query_background_color()
-                .ok()
-                .flatten()
-                .and_then(color_to_tuple);
-            cache.value = fg.zip(bg).map(|(fg, bg)| DefaultColors { fg, bg });
-            cache.attempted = true;
-        }
-    }
-
-    /// Queries terminal default colors through the bounded startup probe path.
-    ///
-    /// The palette cache treats `None` as an attempted-but-unavailable result, so this function
-    /// collapses I/O errors and missing responses into the same fallback path used for terminals
-    /// that simply do not support OSC 10/11 queries.
-    fn query_default_colors() -> Option<DefaultColors> {
-        crate::terminal_probe::default_colors(crate::terminal_probe::DEFAULT_TIMEOUT)
-            .ok()
-            .flatten()
-            .map(|colors| DefaultColors {
-                fg: colors.fg,
-                bg: colors.bg,
-            })
-    }
-
-    fn color_to_tuple(color: CrosstermColor) -> Option<(u8, u8, u8)> {
-        match color {
-            CrosstermColor::Rgb { r, g, b } => Some((r, g, b)),
-            _ => None,
-        }
-    }
-}
-
-#[cfg(windows)]
 mod imp {
     use super::DefaultColors;
     use std::sync::Mutex;
@@ -278,23 +174,6 @@ mod imp {
                 bg: colors.bg,
             })
     }
-}
-
-#[cfg(not(any(all(unix, not(test)), windows)))]
-mod imp {
-    use super::DefaultColors;
-
-    pub(super) fn default_colors() -> Option<DefaultColors> {
-        None
-    }
-
-    #[cfg(any(unix, windows))]
-    pub(super) fn set_default_colors_from_startup_probe(
-        _colors: Option<crate::terminal_probe::DefaultColors>,
-    ) {
-    }
-
-    pub(super) fn requery_default_colors() {}
 }
 
 /// The subset of Xterm colors that are usually consistent across terminals.

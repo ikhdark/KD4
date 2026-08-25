@@ -748,14 +748,8 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
     fn sample_project_root() -> PathBuf {
         PathBuf::from(r"C:\workspace\project")
-    }
-
-    #[cfg(not(windows))]
-    fn sample_project_root() -> PathBuf {
-        PathBuf::from("/workspace/project")
     }
 
     fn sample_project_path(path: &str) -> String {
@@ -841,10 +835,8 @@ mod tests {
         );
 
         let rendered = render_screen(&screen, /*width*/ 80, /*height*/ 24);
-        #[cfg(windows)]
+
         assert_snapshot!("external_agent_config_migration_prompt_windows", rendered);
-        #[cfg(not(windows))]
-        assert_snapshot!("external_agent_config_migration_prompt", rendered);
     }
 
     #[test]
@@ -859,13 +851,11 @@ mod tests {
         screen.customize();
 
         let rendered = render_screen(&screen, /*width*/ 80, /*height*/ 30);
-        #[cfg(windows)]
+
         assert_snapshot!(
             "external_agent_config_migration_customize_windows",
             rendered
         );
-        #[cfg(not(windows))]
-        assert_snapshot!("external_agent_config_migration_customize", rendered);
     }
 
     #[test]
@@ -881,13 +871,11 @@ mod tests {
         screen.move_up();
 
         let rendered = render_screen(&screen, /*width*/ 80, /*height*/ 30);
-        #[cfg(windows)]
+
         assert_snapshot!(
             "external_agent_config_migration_customize_action_windows",
             rendered
         );
-        #[cfg(not(windows))]
-        assert_snapshot!("external_agent_config_migration_customize_action", rendered);
     }
 
     #[test]

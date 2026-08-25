@@ -303,7 +303,7 @@ impl ThreadGoalRequestProcessor {
             let command = crate::thread_state::ThreadListenerCommand::EmitThreadGoalSnapshot {
                 state_db: state_db.clone(),
             };
-            if listener_command_tx.send(command).await.is_ok() {
+            if listener_command_tx.send(command).is_ok() {
                 return;
             }
             warn!(
@@ -317,14 +317,14 @@ impl ThreadGoalRequestProcessor {
         &self,
         thread_id: ThreadId,
         goal: ThreadGoal,
-        listener_command_tx: Option<tokio::sync::mpsc::Sender<ThreadListenerCommand>>,
+        listener_command_tx: Option<tokio::sync::mpsc::UnboundedSender<ThreadListenerCommand>>,
     ) {
         if let Some(listener_command_tx) = listener_command_tx {
             let command = crate::thread_state::ThreadListenerCommand::EmitThreadGoalUpdated {
                 turn_id: None,
                 goal: goal.clone(),
             };
-            if listener_command_tx.send(command).await.is_ok() {
+            if listener_command_tx.send(command).is_ok() {
                 return;
             }
             warn!(
@@ -345,11 +345,11 @@ impl ThreadGoalRequestProcessor {
     async fn emit_thread_goal_cleared_ordered(
         &self,
         thread_id: ThreadId,
-        listener_command_tx: Option<tokio::sync::mpsc::Sender<ThreadListenerCommand>>,
+        listener_command_tx: Option<tokio::sync::mpsc::UnboundedSender<ThreadListenerCommand>>,
     ) {
         if let Some(listener_command_tx) = listener_command_tx {
             let command = crate::thread_state::ThreadListenerCommand::EmitThreadGoalCleared;
-            if listener_command_tx.send(command).await.is_ok() {
+            if listener_command_tx.send(command).is_ok() {
                 return;
             }
             warn!(
@@ -380,14 +380,7 @@ pub(super) fn api_thread_goal_from_state(goal: codex_state::ThreadGoal) -> Threa
 }
 
 fn api_thread_goal_status_from_state(status: codex_state::ThreadGoalStatus) -> ThreadGoalStatus {
-    match status {
-        codex_state::ThreadGoalStatus::Active => ThreadGoalStatus::Active,
-        codex_state::ThreadGoalStatus::Paused => ThreadGoalStatus::Paused,
-        codex_state::ThreadGoalStatus::Blocked => ThreadGoalStatus::Blocked,
-        codex_state::ThreadGoalStatus::UsageLimited => ThreadGoalStatus::UsageLimited,
-        codex_state::ThreadGoalStatus::BudgetLimited => ThreadGoalStatus::BudgetLimited,
-        codex_state::ThreadGoalStatus::Complete => ThreadGoalStatus::Complete,
-    }
+    status.into()
 }
 
 fn goal_service_error(err: GoalServiceError) -> JSONRPCErrorError {

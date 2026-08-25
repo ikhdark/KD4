@@ -74,6 +74,7 @@ async fn thread_delete_with_non_local_thread_store_does_not_create_local_persist
     let mut client = start_in_process_server(codex_home.path()).await?;
 
     let response = client
+        .sender()
         .request(ClientRequest::ThreadStart {
             request_id: RequestId::Integer(1),
             params: ThreadStartParams::default(),
@@ -86,6 +87,7 @@ async fn thread_delete_with_non_local_thread_store_does_not_create_local_persist
     assert_eq!(thread.path, None);
 
     client
+        .sender()
         .request(ClientRequest::TurnStart {
             request_id: RequestId::Integer(2),
             params: TurnStartParams {
@@ -118,6 +120,7 @@ async fn thread_delete_with_non_local_thread_store_does_not_create_local_persist
     .await??;
 
     let response = client
+        .sender()
         .request(ClientRequest::ThreadList {
             request_id: RequestId::Integer(3),
             params: ThreadListParams {
@@ -217,6 +220,7 @@ async fn cold_thread_resume_reuses_non_local_history_probe() -> Result<()> {
 
     let mut client = start_in_process_client(config.clone(), loader_overrides.clone()).await?;
     let response = client
+        .sender()
         .request(ClientRequest::ThreadStart {
             request_id: RequestId::Integer(1),
             params: ThreadStartParams::default(),
@@ -226,6 +230,7 @@ async fn cold_thread_resume_reuses_non_local_history_probe() -> Result<()> {
     let ThreadStartResponse { thread, .. } = serde_json::from_value(response)?;
 
     client
+        .sender()
         .request(ClientRequest::TurnStart {
             request_id: RequestId::Integer(2),
             params: TurnStartParams {
@@ -262,6 +267,7 @@ async fn cold_thread_resume_reuses_non_local_history_probe() -> Result<()> {
     // The in-memory store is pathless, so resume currently fails later while
     // assembling the response. The history-bearing probe must still be reused.
     let _resume_result = client
+        .sender()
         .request(ClientRequest::ThreadResume {
             request_id: RequestId::Integer(3),
             params: ThreadResumeParams {
@@ -332,6 +338,7 @@ async fn delete_thread(
     thread_id: String,
 ) -> Result<()> {
     let response = client
+        .sender()
         .request(ClientRequest::ThreadDelete {
             request_id: RequestId::Integer(request_id),
             params: ThreadDeleteParams { thread_id },

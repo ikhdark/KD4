@@ -2,10 +2,11 @@ use chrono::DateTime;
 use chrono::Duration as ChronoDuration;
 use chrono::Utc;
 use codex_agent_task_store::WorkspaceManifestEntry;
+use codex_config::schema::canonicalize as canonicalize_json;
 use codex_git_utils::collect_git_info;
-use codex_git_utils::get_git_repo_root;
 use codex_protocol::ThreadId;
 use codex_protocol::mcp::CallToolResult;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::plan_tool::PlanItemArg;
 use codex_protocol::plan_tool::StepStatus;
@@ -22,6 +23,7 @@ use codex_protocol::user_input::UserInput;
 use codex_protocol::validation::ValidationResult;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_path_uri::PathUri;
+use codex_utils_string::sha1_hex;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
@@ -30,11 +32,14 @@ use sha1::Sha1;
 use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::io;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -46,10 +51,32 @@ use tokio::sync::Semaphore;
 use tracing::debug;
 use tracing::warn;
 
+use crate::plan_store::PlanUpdateEffect;
 use crate::terminal_event_fingerprint;
 use crate::turn_diff_tracker::CommandMutation;
 
-const TASK_EVIDENCE_SCHEMA_VERSION: u32 = 12;
+mod desktop_activation;
+mod external_evidence;
+mod source_owner_index;
+
+pub use desktop_activation::DesktopActivationChallenge;
+pub use desktop_activation::DesktopActivationObligation;
+pub use desktop_activation::DesktopActivationRecordObservation;
+pub use desktop_activation::DesktopActivationRecordResult;
+pub use desktop_activation::DesktopActivationVerificationError;
+pub use desktop_activation::DesktopPublishInstallEvidenceV1;
+use external_evidence::EvidenceCompleteness;
+use external_evidence::canonical_mcp_result_payload;
+use external_evidence::encode_external_evidence_artifact;
+use external_evidence::evidence_completeness_name;
+use external_evidence::extract_external_evidence_metadata;
+use source_owner_index::SourceOwnerIndex;
+use source_owner_index::SourceOwnerIndexSnapshot;
+#[cfg(test)]
+use source_owner_index::load_source_owner_index;
+
+const TASK_EVIDENCE_SCHEMA_VERSION: u32 = 13;
+const FROZEN_TASK_EVIDENCE_V12_SCHEMA_VERSION: u32 = 12;
 const FROZEN_TASK_EVIDENCE_V11_SCHEMA_VERSION: u32 = 11;
 const FROZEN_TASK_EVIDENCE_V10_SCHEMA_VERSION: u32 = 10;
 const FROZEN_TASK_EVIDENCE_V9_SCHEMA_VERSION: u32 = 9;
@@ -108,7 +135,6 @@ pub(crate) const COMPLETION_REVIEW_LENSES: [&str; 8] = [
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TaskEvidenceMode {
     Disabled,
-    EvidenceOnly,
     Kd4Completion,
 }
 
@@ -204,6 +230,14 @@ pub(crate) struct PlanStepEvidenceInput {
     pub(crate) source_owner: Option<String>,
     #[serde(default)]
     pub(crate) implementation_surfaces: Vec<String>,
+    /// Semantic runtime roles used to select completion-review lenses when a
+    /// path alone does not reveal the affected contract.
+    #[serde(default)]
+    pub(crate) surface_roles: Vec<String>,
+    /// Repository-relative validation assets whose changes require the
+    /// validation completion-review lens.
+    #[serde(default)]
+    pub(crate) validation_asset_paths: Vec<String>,
     #[serde(default)]
     pub(crate) mutation_obligations: Vec<MutationObligationInput>,
     #[serde(default)]
@@ -244,29 +278,6 @@ pub(crate) struct PlanningUpdateInput {
     pub(crate) step_evidence: Vec<PlanStepEvidenceInput>,
     #[serde(default)]
     pub(crate) plan: Vec<PlanItemArg>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PlanUpdateEffect {
-    Initial,
-    StructuralRevision,
-    StatusOnly,
-    NoOp,
-}
-
-impl PlanUpdateEffect {
-    pub(crate) fn requests_generation(self) -> bool {
-        matches!(self, Self::Initial | Self::StructuralRevision)
-    }
-
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Initial => "initial",
-            Self::StructuralRevision => "structural_revision",
-            Self::StatusOnly => "status_only",
-            Self::NoOp => "no_op",
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -652,11 +663,13 @@ pub(crate) enum ExternalEvidenceCapture {
 
 #[derive(Clone)]
 pub(crate) struct TaskEvidenceLedger {
-    mode: TaskEvidenceMode,
+    enabled: Arc<AtomicBool>,
     codex_home: Option<PathBuf>,
     thread_id: Option<String>,
-    evidence_path: Option<PathBuf>,
-    repo_root: Option<PathBuf>,
+    evidence_path: Arc<RwLock<Option<PathBuf>>>,
+    repo_root: Arc<RwLock<Option<PathBuf>>>,
+    source_owner_index: Arc<RwLock<Option<Arc<Mutex<SourceOwnerIndexSnapshot>>>>>,
+    binding_paths: Arc<StdMutex<BTreeMap<PathBuf, PathBuf>>>,
     document: Arc<Mutex<Option<TaskEvidenceDocument>>>,
     persistence_gate: Arc<Semaphore>,
     external_evidence_gate: Arc<Semaphore>,
@@ -664,65 +677,18 @@ pub(crate) struct TaskEvidenceLedger {
     freshness_state: Arc<std::sync::Mutex<FreshnessState>>,
     last_persisted_revision: Arc<AtomicU64>,
     source_capture_failed: Arc<AtomicBool>,
-    desktop_activation_gate: Arc<Semaphore>,
-    desktop_activation_runtime: Arc<std::sync::Mutex<DesktopActivationRuntimeState>>,
+    desktop_activation: DesktopActivationAttestationService,
     #[cfg(test)]
     persistence_test_control: Arc<std::sync::Mutex<Option<PersistenceTestControl>>>,
-}
-
-const SOURCE_OWNER_MANIFEST_SCHEMA_VERSION: u32 = 2;
-
-#[derive(Debug, Deserialize)]
-struct SourceOwnerManifest {
-    schema_version: u32,
-    #[serde(default)]
-    owners: Vec<SourceOwnerDeclaration>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SourceOwnerDeclaration {
-    id: String,
-    #[serde(default)]
-    roots: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-struct SourceOwnerIndex {
-    roots: Vec<SourceOwnerRoot>,
-}
-
-#[derive(Debug, Clone)]
-struct SourceOwnerRoot {
-    owner_id: String,
-    root: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TrustedFileToken {
     len: u64,
-    #[cfg(unix)]
-    dev: u64,
-    #[cfg(unix)]
-    ino: u64,
-    #[cfg(unix)]
-    mode: u32,
-    #[cfg(unix)]
-    mtime: i64,
-    #[cfg(unix)]
-    mtime_nsec: i64,
-    #[cfg(unix)]
-    ctime: i64,
-    #[cfg(unix)]
-    ctime_nsec: i64,
-    #[cfg(windows)]
     volume_serial_number: u64,
-    #[cfg(windows)]
     file_id: [u8; 16],
-    #[cfg(windows)]
     file_attributes: u32,
-    #[cfg(windows)]
     last_write_time: i64,
-    #[cfg(windows)]
     change_time: i64,
 }
 
@@ -799,6 +765,7 @@ pub(crate) struct ChildEvidenceProvenance {
     pub(crate) source_agent_path: String,
 }
 
+#[cfg(test)]
 type PersistenceWriteBarrierPair = (Arc<std::sync::Barrier>, Arc<std::sync::Barrier>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -808,8 +775,8 @@ enum PersistOutcome {
     Failed,
 }
 
+#[cfg(test)]
 #[derive(Clone)]
-#[cfg_attr(not(test), allow(dead_code))]
 struct PersistenceTestControl {
     before_next_write: Arc<std::sync::Mutex<Option<PersistenceWriteBarrierPair>>>,
     fail_writes: Arc<std::sync::atomic::AtomicBool>,
@@ -842,7 +809,6 @@ struct TaskEvidenceDocument {
     external_evidence: Vec<ExternalEvidenceReceipt>,
     #[serde(default)]
     completion_review_receipts: Vec<CompletionReviewAuditReceipt>,
-    generated_artifact_requirements: Vec<GeneratedArtifactRequirement>,
     #[serde(default)]
     latest_generated_artifact_hashes: BTreeMap<String, FileHashSnapshot>,
     latest_file_hashes: BTreeMap<String, FileHashSnapshot>,
@@ -935,6 +901,7 @@ pub(crate) struct TerminalRolloutRepairV1 {
     pub(crate) repair_missing_call_outputs: bool,
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn bool_is_false(value: &bool) -> bool {
     !*value
 }
@@ -1067,15 +1034,12 @@ struct CompletionReviewLedgerV2 {
     root_task_id: String,
     completion_epoch: u64,
     manifest_revision: u64,
-    next_source_ordinal: u64,
     source_records: BTreeMap<String, UserSourceRecord>,
     mapping_revisions: Vec<SourceMappingRevision>,
     manifest_snapshots: Vec<RequirementManifestSnapshot>,
     active_review_cycle: Option<CompletionReviewCycle>,
     review_risk: CompletionReviewRisk,
     receipts: Vec<CompletionReviewReceiptV2>,
-    next_review_sequence: u64,
-    last_terminal_closure: Option<String>,
     #[serde(default)]
     last_workspace_event_epoch: u64,
     #[serde(default)]
@@ -1491,7 +1455,6 @@ struct CompletionReviewCycle {
     #[serde(default)]
     manifest_gap_reconstructed: bool,
     accepted_review_id: Option<String>,
-    accepted_dossier_snapshot_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1727,7 +1690,6 @@ struct CompletionReviewReceiptV2 {
     parent_review_id: Option<String>,
     superseded_review_id: Option<String>,
     candidate_mutation_revision: u64,
-    candidate_hash: String,
     implementation_identity_hash: String,
     dossier_snapshot_id: String,
     user_source_ledger_hash: String,
@@ -2018,6 +1980,10 @@ struct EvidencePlanStep {
     #[serde(default)]
     implementation_surfaces: Vec<String>,
     #[serde(default)]
+    surface_roles: Vec<String>,
+    #[serde(default)]
+    validation_asset_paths: Vec<String>,
+    #[serde(default)]
     mutation_obligations: Vec<MutationObligationState>,
     #[serde(default)]
     validation_receipt_id: Option<String>,
@@ -2041,8 +2007,6 @@ struct PlanningEvidenceState {
     audit_history: Vec<PlanningAuditEntry>,
     #[serde(default)]
     outside_plan_actions: Vec<OutsidePlanAction>,
-    #[serde(default)]
-    counters: PlanningEvidenceCounters,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2099,18 +2063,6 @@ struct OutsidePlanAction {
     kind: String,
     action_id: String,
     recorded_at: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-struct PlanningEvidenceCounters {
-    initial_updates: u64,
-    structural_revisions: u64,
-    status_only_updates: u64,
-    no_op_updates: u64,
-    step_revisions: u64,
-    step_removals: u64,
-    fact_removals: u64,
-    outside_plan_actions: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2242,14 +2194,6 @@ struct CommandReceipt {
     source_thread_id: Option<String>,
     #[serde(default)]
     source_agent_path: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum EvidenceCompleteness {
-    Complete,
-    Partial,
-    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2409,30 +2353,6 @@ struct DesktopActivationReceipt {
     running_executable_observed_timestamp: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct DesktopPublishInstallEvidenceV1 {
-    pub schema_version: u32,
-    pub trusted_producer_version: u32,
-    pub publisher_evidence_id: String,
-    pub thread_id: String,
-    pub evidence_epoch: u64,
-    #[serde(rename = "implementationIdentity")]
-    pub implementation_identity_hash: String,
-    pub activation_obligation_identity: String,
-    #[serde(rename = "publishId")]
-    pub publish_identity: String,
-    #[serde(default)]
-    pub install_generation: u64,
-    pub expected_installed_executable_path: String,
-    #[serde(rename = "installedFileSha256")]
-    pub installed_executable_sha256: String,
-    #[serde(rename = "installationTimestamp")]
-    pub issued_at: String,
-    #[serde(default)]
-    pub expires_at: String,
-}
-
 type AuthoritativeDesktopInstallEvidence = DesktopPublishInstallEvidenceV1;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2536,6 +2456,52 @@ struct DesktopActivationRuntimeState {
     recorded_challenges: BTreeMap<String, RecordedDesktopActivationChallenge>,
 }
 
+#[derive(Debug, Clone)]
+struct DesktopActivationAttestationService {
+    gate: Arc<Semaphore>,
+    runtime: Arc<std::sync::Mutex<DesktopActivationRuntimeState>>,
+}
+
+impl Default for DesktopActivationAttestationService {
+    fn default() -> Self {
+        Self {
+            gate: Arc::new(Semaphore::new(1)),
+            runtime: Arc::new(std::sync::Mutex::new(
+                DesktopActivationRuntimeState::default(),
+            )),
+        }
+    }
+}
+
+impl DesktopActivationAttestationService {
+    async fn acquire(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, DesktopActivationVerificationError> {
+        Arc::clone(&self.gate)
+            .acquire_owned()
+            .await
+            .map_err(|_| DesktopActivationVerificationError::PersistenceFailed)
+    }
+
+    fn lock_runtime(&self) -> std::sync::MutexGuard<'_, DesktopActivationRuntimeState> {
+        self.runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn runtime_handle(&self) -> Arc<std::sync::Mutex<DesktopActivationRuntimeState>> {
+        Arc::clone(&self.runtime)
+    }
+
+    fn snapshot(&self) -> DesktopActivationRuntimeSnapshot {
+        self.lock_runtime().snapshot()
+    }
+
+    fn reset(&self) {
+        *self.lock_runtime() = DesktopActivationRuntimeState::default();
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RecordedDesktopActivationChallenge {
     request_hash: String,
@@ -2548,68 +2514,6 @@ struct DesktopActivationRuntimeSnapshot {
     availability: DesktopInstallEvidenceAvailability,
     current_install_evidence_hash: Option<String>,
     live_proof: Option<LiveDesktopActivationProof>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DesktopActivationVerificationError {
-    NoAuthenticatedHostTransport,
-    InvalidAuthoritativeEvidence,
-    AuthoritativeEvidenceStale,
-    ImplementationIdentityMismatch,
-    RunningExecutableMismatch,
-    RunningProcessIdentityMissing,
-    ChallengeMissingOrConsumed,
-    ChallengeExpired,
-    ChallengeIdentityMismatch,
-    AuthenticatedChannelMismatch,
-    InitializedProcessMismatch,
-    InvalidDesktopObservation,
-    ActivationObligationChanged,
-    ChallengeAlreadyRecordedWithDifferentPayload,
-    PersistenceFailed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DesktopActivationObligation {
-    pub thread_id: String,
-    pub evidence_epoch: u64,
-    pub implementation_identity: String,
-    pub activation_obligation_identity: String,
-    pub requiring_plan_step_ids: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DesktopActivationChallenge {
-    pub challenge_id: String,
-    pub thread_id: String,
-    pub evidence_epoch: u64,
-    pub implementation_identity: String,
-    pub activation_obligation_identity: String,
-    pub publisher_evidence_id: String,
-    pub expected_installed_executable_path: String,
-    pub expected_installed_executable_sha256: String,
-    pub publish_id: String,
-    pub issued_at: String,
-    pub expires_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct DesktopActivationRecordObservation {
-    pub challenge_id: String,
-    pub desktop_process_id: u32,
-    pub desktop_executable_path: String,
-    pub observation_timestamp: String,
-    pub initialization_observation_identity: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DesktopActivationRecordResult {
-    pub challenge_id: String,
-    pub recorded_at: String,
-    pub already_recorded: bool,
 }
 
 impl DesktopActivationRuntimeState {
@@ -2857,7 +2761,6 @@ fn new_completion_review_ledger(root_task_id: &str) -> CompletionReviewLedgerV2 
         root_task_id: root_task_id.to_string(),
         completion_epoch: 1,
         manifest_revision: 0,
-        next_source_ordinal: 1,
         source_records: BTreeMap::new(),
         mapping_revisions: Vec::new(),
         manifest_snapshots: Vec::new(),
@@ -2869,8 +2772,6 @@ fn new_completion_review_ledger(root_task_id: &str) -> CompletionReviewLedgerV2 
             resolved_at: None,
         },
         receipts: Vec::new(),
-        next_review_sequence: 1,
-        last_terminal_closure: None,
         last_workspace_event_epoch: 0,
         workspace_event_baseline_epoch: 0,
         typed_assignment_baseline: BTreeSet::new(),
@@ -3020,15 +2921,11 @@ fn render_compaction_task_state(document: &TaskEvidenceDocument) -> String {
         }));
     }
     unresolved_work.extend(
-        document
-            .risks
-            .iter()
+        effective_risks(document)
             .filter(|risk| !risk.resolved && risk.blocking)
             .map(|risk| format!("- blocking risk {}: {}", risk.id, risk.description)),
     );
-    let warnings = document
-        .risks
-        .iter()
+    let warnings = effective_risks(document)
         .filter(|risk| !risk.resolved && !risk.blocking)
         .map(|risk| format!("- risk {}: {}", risk.id, risk.description))
         .collect::<Vec<_>>();
@@ -3221,114 +3118,6 @@ fn step_status_name(status: &StepStatus) -> &'static str {
     }
 }
 
-async fn load_source_owner_index(repo_root: &Path) -> Option<SourceOwnerIndex> {
-    let path = repo_root.join("source_owners.toml");
-    let contents = match tokio::fs::read_to_string(&path).await {
-        Ok(contents) => contents,
-        Err(err) => {
-            warn!(
-                "source-owner derivation is unavailable because {} could not be read: {err}",
-                path.display()
-            );
-            return None;
-        }
-    };
-    let manifest = match toml::from_str::<SourceOwnerManifest>(&contents) {
-        Ok(manifest) => manifest,
-        Err(err) => {
-            warn!(
-                "source-owner derivation is unavailable because {} is invalid: {err}",
-                path.display()
-            );
-            return None;
-        }
-    };
-    if manifest.schema_version != SOURCE_OWNER_MANIFEST_SCHEMA_VERSION {
-        warn!(
-            "source-owner derivation is unavailable because {} uses unsupported schema version {}",
-            path.display(),
-            manifest.schema_version
-        );
-        return None;
-    }
-
-    let mut owner_ids = BTreeSet::new();
-    let mut roots = Vec::new();
-    for owner in manifest.owners {
-        if owner.id.trim().is_empty() || !owner_ids.insert(owner.id.clone()) {
-            warn!(
-                "source-owner derivation is unavailable because {} contains an empty or duplicate owner id",
-                path.display()
-            );
-            return None;
-        }
-        for root in owner.roots {
-            let Ok(root) = canonical_repair_path(&root, false) else {
-                warn!(
-                    "source-owner derivation is unavailable because {} contains an unsafe owner root",
-                    path.display()
-                );
-                return None;
-            };
-            roots.push(SourceOwnerRoot {
-                owner_id: owner.id.clone(),
-                root,
-            });
-        }
-    }
-    Some(SourceOwnerIndex { roots })
-}
-
-impl SourceOwnerIndex {
-    fn derive(&self, implementation_surfaces: &[String]) -> Option<String> {
-        if implementation_surfaces.is_empty() {
-            return None;
-        }
-        let mut derived_owner = None;
-        for surface in implementation_surfaces {
-            let surface = canonical_repair_path(surface, false).ok()?;
-            let mut best_specificity = None;
-            let mut best_owners = BTreeSet::new();
-            for candidate in &self.roots {
-                if surface == candidate.root
-                    || surface
-                        .strip_prefix(&candidate.root)
-                        .is_some_and(|suffix| suffix.starts_with('/'))
-                {
-                    let specificity = candidate.root.len();
-                    match best_specificity {
-                        None => {
-                            best_specificity = Some(specificity);
-                            best_owners.insert(candidate.owner_id.as_str());
-                        }
-                        Some(best) if specificity > best => {
-                            best_specificity = Some(specificity);
-                            best_owners.clear();
-                            best_owners.insert(candidate.owner_id.as_str());
-                        }
-                        Some(best) if specificity == best => {
-                            best_owners.insert(candidate.owner_id.as_str());
-                        }
-                        Some(_) => {}
-                    }
-                }
-            }
-            if best_owners.len() != 1 {
-                return None;
-            }
-            let owner = (*best_owners.first()?).to_string();
-            if derived_owner
-                .as_ref()
-                .is_some_and(|derived: &String| derived != &owner)
-            {
-                return None;
-            }
-            derived_owner = Some(owner);
-        }
-        derived_owner
-    }
-}
-
 fn normalize_implementation_surfaces(repo_root: &Path, surfaces: &[String]) -> Vec<String> {
     let mut seen = BTreeSet::new();
     surfaces
@@ -3374,22 +3163,25 @@ fn rederive_document_source_owners(
 
 impl TaskEvidenceLedger {
     pub(crate) async fn load_or_new(codex_home: PathBuf, thread_id: ThreadId, cwd: &Path) -> Self {
-        let (mode, repo_root) = if let Some(repo_root) = find_kd4_repo_root(cwd) {
-            (TaskEvidenceMode::Kd4Completion, repo_root)
-        } else if let Some(repo_root) = get_git_repo_root(cwd) {
-            (TaskEvidenceMode::EvidenceOnly, repo_root)
-        } else {
-            return Self::disabled();
+        let Some(repo_root) = find_kd4_repo_root(cwd) else {
+            return Self::unbound(codex_home, thread_id);
         };
         let repo_root = canonical_repository_root(&repo_root);
-        let source_owner_index = if mode == TaskEvidenceMode::Kd4Completion {
-            load_source_owner_index(&repo_root).await
-        } else {
-            None
-        };
         let evidence_path = codex_home
             .join("task-evidence")
             .join(format!("{thread_id}.json"));
+        Self::load_bound(codex_home, thread_id, cwd, repo_root, evidence_path).await
+    }
+
+    async fn load_bound(
+        codex_home: PathBuf,
+        thread_id: ThreadId,
+        cwd: &Path,
+        repo_root: PathBuf,
+        evidence_path: PathBuf,
+    ) -> Self {
+        let mode = TaskEvidenceMode::Kd4Completion;
+        let source_owner_index = SourceOwnerIndexSnapshot::load(&repo_root).await;
         let now = timestamp();
         let thread_id_text = thread_id.to_string();
         let repository_root = repo_root.to_string_lossy().into_owned();
@@ -3439,16 +3231,11 @@ impl TaskEvidenceLedger {
             if rederive_document_source_owners(
                 &mut document,
                 &repo_root,
-                source_owner_index.as_ref(),
+                source_owner_index.index(),
             ) {
                 invalidate_for_plan_change(&mut document);
                 document.planning.material_revision =
                     document.planning.material_revision.saturating_add(1);
-                document.planning.counters.structural_revisions = document
-                    .planning
-                    .counters
-                    .structural_revisions
-                    .saturating_add(1);
             }
             for receipt in &mut document.terminalization_receipts {
                 if receipt.delivery_state.is_authoritative_claim()
@@ -3507,7 +3294,6 @@ impl TaskEvidenceLedger {
                 command_receipts: Vec::new(),
                 external_evidence: Vec::new(),
                 completion_review_receipts: Vec::new(),
-                generated_artifact_requirements: Vec::new(),
                 latest_generated_artifact_hashes: BTreeMap::new(),
                 latest_file_hashes: BTreeMap::new(),
                 risks,
@@ -3524,23 +3310,23 @@ impl TaskEvidenceLedger {
                 completion: None,
             }
         };
-        if mode == TaskEvidenceMode::EvidenceOnly && storage_failure_reason.is_some() {
-            warn!(
-                "disabling evidence-only task ledger because rejected evidence could not be safely replaced"
-            );
-            return Self::disabled();
-        }
         let writable_evidence_path = storage_failure_reason.is_none().then_some(evidence_path);
         let source_capture_failed = document
             .completion_review_v2
             .as_ref()
             .is_some_and(|ledger| ledger.source_capture_failed);
         let ledger = Self {
-            mode,
+            enabled: Arc::new(AtomicBool::new(true)),
             codex_home: Some(codex_home.clone()),
             thread_id: Some(thread_id_text.clone()),
-            evidence_path: writable_evidence_path,
-            repo_root: Some(repo_root),
+            evidence_path: Arc::new(RwLock::new(writable_evidence_path.clone())),
+            repo_root: Arc::new(RwLock::new(Some(repo_root.clone()))),
+            source_owner_index: Arc::new(RwLock::new(Some(Arc::new(Mutex::new(
+                source_owner_index,
+            ))))),
+            binding_paths: Arc::new(StdMutex::new(BTreeMap::from_iter(
+                writable_evidence_path.map(|path| (repo_root, path)),
+            ))),
             document: Arc::new(Mutex::new(Some(document.clone()))),
             persistence_gate: Arc::new(Semaphore::new(1)),
             external_evidence_gate: Arc::new(Semaphore::new(1)),
@@ -3548,21 +3334,12 @@ impl TaskEvidenceLedger {
             freshness_state: Arc::new(std::sync::Mutex::new(FreshnessState::default())),
             last_persisted_revision: Arc::new(AtomicU64::new(0)),
             source_capture_failed: Arc::new(AtomicBool::new(source_capture_failed)),
-            desktop_activation_gate: Arc::new(Semaphore::new(1)),
-            desktop_activation_runtime: Arc::new(std::sync::Mutex::new(
-                DesktopActivationRuntimeState::default(),
-            )),
+            desktop_activation: DesktopActivationAttestationService::default(),
             #[cfg(test)]
             persistence_test_control: Arc::new(std::sync::Mutex::new(None)),
         };
         if storage_failure_reason.is_none() {
             let persisted = ledger.persist_document(&document).await;
-            if mode == TaskEvidenceMode::EvidenceOnly && persisted != PersistOutcome::Persisted {
-                warn!(
-                    "disabling evidence-only task ledger because initial persistence could not be established"
-                );
-                return Self::disabled();
-            }
             if mode == TaskEvidenceMode::Kd4Completion && persisted == PersistOutcome::Failed {
                 let mut guard = ledger.document.lock().await;
                 if let Some(document) = guard.as_mut() {
@@ -3625,11 +3402,13 @@ impl TaskEvidenceLedger {
 
     pub(crate) fn disabled() -> Self {
         Self {
-            mode: TaskEvidenceMode::Disabled,
+            enabled: Arc::new(AtomicBool::new(false)),
             codex_home: None,
             thread_id: None,
-            evidence_path: None,
-            repo_root: None,
+            evidence_path: Arc::new(RwLock::new(None)),
+            repo_root: Arc::new(RwLock::new(None)),
+            source_owner_index: Arc::new(RwLock::new(None)),
+            binding_paths: Arc::new(StdMutex::new(BTreeMap::new())),
             document: Arc::new(Mutex::new(None)),
             persistence_gate: Arc::new(Semaphore::new(1)),
             external_evidence_gate: Arc::new(Semaphore::new(1)),
@@ -3637,20 +3416,159 @@ impl TaskEvidenceLedger {
             freshness_state: Arc::new(std::sync::Mutex::new(FreshnessState::default())),
             last_persisted_revision: Arc::new(AtomicU64::new(0)),
             source_capture_failed: Arc::new(AtomicBool::new(false)),
-            desktop_activation_gate: Arc::new(Semaphore::new(1)),
-            desktop_activation_runtime: Arc::new(std::sync::Mutex::new(
-                DesktopActivationRuntimeState::default(),
-            )),
+            desktop_activation: DesktopActivationAttestationService::default(),
             #[cfg(test)]
             persistence_test_control: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
-    fn desktop_activation_runtime_snapshot(&self) -> DesktopActivationRuntimeSnapshot {
-        self.desktop_activation_runtime
+    fn unbound(codex_home: PathBuf, thread_id: ThreadId) -> Self {
+        let mut ledger = Self::disabled();
+        ledger.codex_home = Some(codex_home);
+        ledger.thread_id = Some(thread_id.to_string());
+        ledger
+    }
+
+    fn evidence_path(&self) -> Option<PathBuf> {
+        self.evidence_path
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn bound_repo_root(&self) -> Option<PathBuf> {
+        self.repo_root
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn bound_source_owner_index(&self) -> Option<Arc<Mutex<SourceOwnerIndexSnapshot>>> {
+        self.source_owner_index
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) async fn rebind_to_cwd(&self, cwd: &Path) {
+        let Some(repo_root) = find_kd4_repo_root(cwd).map(|root| canonical_repository_root(&root))
+        else {
+            self.enabled.store(false, Ordering::Release);
+            *self.document.lock().await = None;
+            *self
+                .evidence_path
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            *self
+                .repo_root
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            *self
+                .source_owner_index
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            self.source_capture_failed.store(false, Ordering::Release);
+            *self
+                .freshness_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = FreshnessState::default();
+            self.desktop_activation.reset();
+            return;
+        };
+        if self.allows_kd4_completion() && self.matches_repo_root(&repo_root) {
+            return;
+        }
+        let (Some(codex_home), Some(thread_id_text)) =
+            (self.codex_home.clone(), self.thread_id.clone())
+        else {
+            return;
+        };
+        let Ok(thread_id) = ThreadId::from_string(&thread_id_text) else {
+            return;
+        };
+        self.enabled.store(false, Ordering::Release);
+        let evidence_path = self
+            .binding_paths
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .snapshot()
+            .get(&repo_root)
+            .cloned()
+            .unwrap_or_else(|| {
+                let repository_hash = format!(
+                    "{:x}",
+                    Sha256::digest(repo_root.to_string_lossy().as_bytes())
+                );
+                codex_home
+                    .join("task-evidence")
+                    .join(format!("{thread_id_text}-{}.json", &repository_hash[..16]))
+            });
+        let rebound = Self::load_bound(
+            codex_home,
+            thread_id,
+            cwd,
+            repo_root.clone(),
+            evidence_path.clone(),
+        )
+        .await;
+        if !rebound.allows_kd4_completion() {
+            *self.document.lock().await = None;
+            *self
+                .evidence_path
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            *self
+                .repo_root
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            *self
+                .source_owner_index
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            self.source_capture_failed.store(false, Ordering::Release);
+            *self
+                .freshness_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = FreshnessState::default();
+            self.desktop_activation.reset();
+            return;
+        }
+        let rebound_document = rebound.document.lock().await.clone();
+        *self.document.lock().await = rebound_document;
+        *self
+            .evidence_path
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = rebound.evidence_path();
+        *self
+            .repo_root
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(repo_root.clone());
+        *self
+            .source_owner_index
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            rebound.bound_source_owner_index();
+        self.binding_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(repo_root, evidence_path);
+        self.last_persisted_revision.store(
+            rebound.last_persisted_revision.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        self.source_capture_failed.store(
+            rebound.source_capture_failed.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        *self
+            .freshness_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = FreshnessState::default();
+        self.desktop_activation.reset();
+        self.enabled.store(true, Ordering::Release);
+    }
+
+    fn desktop_activation_runtime_snapshot(&self) -> DesktopActivationRuntimeSnapshot {
+        self.desktop_activation.snapshot()
     }
 
     pub(crate) async fn desktop_activation_obligation(
@@ -3677,10 +3595,7 @@ impl TaskEvidenceLedger {
         evidence: AuthoritativeDesktopInstallEvidence,
         bootstrap_consumed_at: String,
     ) -> Result<DesktopActivationChallenge, DesktopActivationVerificationError> {
-        let _activation_permit = Arc::clone(&self.desktop_activation_gate)
-            .acquire_owned()
-            .await
-            .map_err(|_| DesktopActivationVerificationError::PersistenceFailed)?;
+        let _activation_permit = self.desktop_activation.acquire().await?;
         let runtime_snapshot = self.desktop_activation_runtime_snapshot();
         let (obligation, last_mutation_at) = {
             let document = self.document.lock().await;
@@ -3732,10 +3647,7 @@ impl TaskEvidenceLedger {
                 return Err(DesktopActivationVerificationError::ActivationObligationChanged);
             }
         }
-        let mut runtime = self
-            .desktop_activation_runtime
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut runtime = self.desktop_activation.lock_runtime();
         runtime.install_evidence_source =
             DesktopInstallEvidenceSource::AuthenticatedHostBootstrap {
                 channel_identity: "inherited-bootstrap-handle-v1".to_string(),
@@ -3756,10 +3668,7 @@ impl TaskEvidenceLedger {
         &self,
         observation: DesktopActivationRecordObservation,
     ) -> Result<DesktopActivationRecordResult, DesktopActivationVerificationError> {
-        let _activation_permit = Arc::clone(&self.desktop_activation_gate)
-            .acquire_owned()
-            .await
-            .map_err(|_| DesktopActivationVerificationError::PersistenceFailed)?;
+        let _activation_permit = self.desktop_activation.acquire().await?;
         let request_hash = canonical_hash(
             "KD4_DESKTOP_ACTIVATION_RECORD_REQUEST_V1",
             &serde_json::to_value(&observation).unwrap_or(Value::Null),
@@ -3770,10 +3679,7 @@ impl TaskEvidenceLedger {
             return Ok(result);
         }
         let pending = {
-            let runtime = self
-                .desktop_activation_runtime
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let runtime = self.desktop_activation.lock_runtime();
             runtime
                 .pending_challenge
                 .as_ref()
@@ -3814,11 +3720,7 @@ impl TaskEvidenceLedger {
                 }
                 document.revision
             };
-            let mut runtime_candidate = self
-                .desktop_activation_runtime
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
+            let mut runtime_candidate = self.desktop_activation.lock_runtime().clone();
             if let Some(recorded) = runtime_candidate
                 .recorded_challenges
                 .get(&observation.challenge_id)
@@ -3876,7 +3778,7 @@ impl TaskEvidenceLedger {
                 };
                 runtime_candidate.recorded_challenges.remove(&first);
             }
-            let committed_runtime = Arc::clone(&self.desktop_activation_runtime);
+            let committed_runtime = self.desktop_activation.runtime_handle();
             let receipt_for_document = receipt.clone();
             let pending_for_document = pending.clone();
             let transition = self
@@ -3929,10 +3831,7 @@ impl TaskEvidenceLedger {
         challenge_id: &str,
         request_hash: &str,
     ) -> Result<Option<DesktopActivationRecordResult>, DesktopActivationVerificationError> {
-        let runtime = self
-            .desktop_activation_runtime
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let runtime = self.desktop_activation.lock_runtime();
         let Some(recorded) = runtime.recorded_challenges.get(challenge_id) else {
             return Ok(None);
         };
@@ -3950,11 +3849,15 @@ impl TaskEvidenceLedger {
 
     #[cfg(test)]
     pub(crate) fn mode(&self) -> TaskEvidenceMode {
-        self.mode
+        if self.enabled.load(Ordering::Acquire) {
+            TaskEvidenceMode::Kd4Completion
+        } else {
+            TaskEvidenceMode::Disabled
+        }
     }
 
     pub(crate) fn allows_kd4_completion(&self) -> bool {
-        self.mode == TaskEvidenceMode::Kd4Completion
+        self.enabled.load(Ordering::Acquire)
     }
 
     /// Atomically establishes the immutable terminal event and coordinates at-least-once live
@@ -4068,8 +3971,8 @@ impl TaskEvidenceLedger {
         &self,
         candidate: &AuthoritativeTerminalEventV1,
     ) -> Option<TerminalClaimResult> {
-        let path = self.evidence_path.as_ref()?;
-        let bytes = tokio::fs::read(path).await.ok()?;
+        let path = self.evidence_path()?;
+        let bytes = tokio::fs::read(&path).await.ok()?;
         let document = serde_json::from_slice::<TaskEvidenceDocument>(&bytes).ok()?;
         let receipt = document.terminalization_receipts.iter().find(|receipt| {
             receipt.terminal_identity == candidate.terminal_identity
@@ -4355,14 +4258,19 @@ impl TaskEvidenceLedger {
     }
 
     pub(crate) fn matches_repo_root(&self, candidate: &Path) -> bool {
-        let Some(repo_root) = self.repo_root.as_ref() else {
+        if !self.allows_kd4_completion() {
+            return false;
+        }
+        let Some(repo_root) = self.bound_repo_root() else {
             return false;
         };
-        repository_roots_match(repo_root, candidate)
+        repository_roots_match(&repo_root, candidate)
     }
 
-    pub(crate) fn repository_root(&self) -> Option<&Path> {
-        self.repo_root.as_deref()
+    pub(crate) fn repository_root(&self) -> Option<PathBuf> {
+        self.allows_kd4_completion()
+            .then(|| self.bound_repo_root())
+            .flatten()
     }
 
     pub(crate) async fn last_workspace_event_epoch(&self) -> u64 {
@@ -4533,8 +4441,7 @@ impl TaskEvidenceLedger {
                         if ledger.source_records.contains_key(&source_id) {
                             continue;
                         }
-                        let source_ordinal = ledger.next_source_ordinal;
-                        ledger.next_source_ordinal = ledger.next_source_ordinal.saturating_add(1);
+                        let source_ordinal = next_source_ordinal(ledger);
                         ledger.source_records.insert(
                             source_id.clone(),
                             UserSourceRecord {
@@ -4618,7 +4525,6 @@ impl TaskEvidenceLedger {
                         correction_consumed: false,
                         manifest_gap_reconstructed: false,
                         accepted_review_id: None,
-                        accepted_dossier_snapshot_id: None,
                     });
                     document.evidence_epoch = document.evidence_epoch.saturating_add(1);
                     document.desktop_activation_receipt = None;
@@ -4645,6 +4551,162 @@ impl TaskEvidenceLedger {
             }
         }
         false
+    }
+
+    pub(crate) async fn reconcile_rollback_history(&self, history: &[ResponseItem]) -> bool {
+        if !self.allows_kd4_completion() {
+            return true;
+        }
+        let sources = {
+            let guard = self.document.lock().await;
+            let Some(ledger) = guard
+                .as_ref()
+                .and_then(|document| document.completion_review_v2.as_ref())
+            else {
+                return false;
+            };
+            surviving_sources_for_history(ledger, history)
+        };
+        self.reset_after_history_rewrite(sources).await
+    }
+
+    pub(crate) async fn inherit_forked_history(
+        &self,
+        source_thread_id: ThreadId,
+        history: &[ResponseItem],
+    ) -> bool {
+        if !self.allows_kd4_completion() {
+            return true;
+        }
+        let (Some(codex_home), Some(repo_root)) =
+            (self.codex_home.as_ref(), self.bound_repo_root())
+        else {
+            return false;
+        };
+        let source_thread_id_text = source_thread_id.to_string();
+        let legacy_path = codex_home
+            .join("task-evidence")
+            .join(format!("{source_thread_id}.json"));
+        let repository_hash = format!(
+            "{:x}",
+            Sha256::digest(repo_root.to_string_lossy().as_bytes())
+        );
+        let rebound_path = codex_home.join("task-evidence").join(format!(
+            "{source_thread_id}-{}.json",
+            &repository_hash[..16]
+        ));
+        let mut inherited_sources = None;
+        for path in [legacy_path, rebound_path] {
+            match load_existing_document(&path, &source_thread_id_text, &repo_root).await {
+                ExistingDocument::Loaded { document, .. } => {
+                    inherited_sources = document
+                        .completion_review_v2
+                        .as_ref()
+                        .map(|ledger| surviving_sources_for_history(ledger, history));
+                    break;
+                }
+                ExistingDocument::Missing => {}
+                ExistingDocument::NewerSchema { .. } | ExistingDocument::Rejected { .. } => {}
+            }
+        }
+        let sources = inherited_sources
+            .unwrap_or_else(|| source_records_from_history(history, self.thread_id.as_deref()));
+        self.reset_after_history_rewrite(sources).await
+    }
+
+    async fn reset_after_history_rewrite(&self, sources: Vec<UserSourceRecord>) -> bool {
+        let Some((_, snapshot)) = self
+            .update_document(|document| {
+                let root_task_id = document.thread_id.clone();
+                let next_epoch = document
+                    .completion_review_v2
+                    .as_ref()
+                    .map(|ledger| ledger.completion_epoch.saturating_add(1))
+                    .unwrap_or(1);
+                let mut ledger = new_completion_review_ledger(&root_task_id);
+                ledger.completion_epoch = next_epoch;
+                for source in sources {
+                    let source_id = deterministic_source_id(
+                        &root_task_id,
+                        next_epoch,
+                        &source.message_id,
+                        source.content_ordinal,
+                        &source.content_hash,
+                    );
+                    let source_ordinal = next_source_ordinal(&ledger);
+                    ledger.source_records.insert(
+                        source_id.clone(),
+                        UserSourceRecord {
+                            source_id,
+                            source_ordinal,
+                            completion_epoch: next_epoch,
+                            introduced_manifest_revision: 1,
+                            ..source
+                        },
+                    );
+                }
+                if !ledger.source_records.is_empty() {
+                    ledger.manifest_revision = 1;
+                    ledger.mapping_revisions = ledger
+                        .source_records
+                        .keys()
+                        .cloned()
+                        .map(|source_id| SourceMappingRevision {
+                            completion_epoch: next_epoch,
+                            manifest_revision: 1,
+                            source_id,
+                            source_classification_contract_version: None,
+                            relationship_resolver_contract_version: None,
+                            mapping: SourceMapping::PendingClassification,
+                        })
+                        .collect();
+                    ledger.manifest_snapshots.push(RequirementManifestSnapshot {
+                        completion_epoch: next_epoch,
+                        manifest_revision: 1,
+                        manifest_hash: requirement_manifest_hash(1, &[]),
+                        requirements: Vec::new(),
+                    });
+                    ledger.active_review_cycle = Some(CompletionReviewCycle {
+                        cycle_id: format!("cycle-{next_epoch}-1"),
+                        manifest_revision: 1,
+                        parent_terminal_review_id: None,
+                        superseded_review_id: None,
+                        phase: CompletionReviewCyclePhase::ClassificationPending,
+                        correction_consumed: false,
+                        manifest_gap_reconstructed: false,
+                        accepted_review_id: None,
+                    });
+                }
+                document.evidence_epoch = document.evidence_epoch.saturating_add(1);
+                document.last_mutation_at = None;
+                document.planning = PlanningEvidenceState::default();
+                document.plan.clear();
+                document.active_step_id = None;
+                document.batch_acknowledgement = None;
+                document.edit_intents.clear();
+                document.edit_receipts.clear();
+                document.command_receipts.clear();
+                document.external_evidence.clear();
+                document.completion_review_receipts.clear();
+                document.latest_generated_artifact_hashes.clear();
+                document.latest_file_hashes.clear();
+                document.risks.clear();
+                document.desktop_activation_receipt = None;
+                document.host_mutation_revision = 0;
+                document.completion_review_v2 = Some(ledger);
+                document.source_classification_cache.clear();
+                document.terminalization_receipts.clear();
+                document.locked_user_decisions.clear();
+                document.final_proof = FinalProofStateV1::default();
+                document.completion = None;
+                document.updated_at = timestamp();
+            })
+            .await
+        else {
+            return false;
+        };
+        self.source_capture_failed.store(false, Ordering::Release);
+        self.persist_document(&snapshot).await == PersistOutcome::Persisted
     }
 
     #[cfg(test)]
@@ -4674,17 +4736,25 @@ impl TaskEvidenceLedger {
                 unfinished_mutation_obligation: None,
             };
         }
-        let source_owner_index = match self.repo_root.as_deref() {
-            Some(repo_root) => load_source_owner_index(repo_root).await,
-            None => None,
+        let repo_root = self.bound_repo_root();
+        let source_owner_snapshot = self.bound_source_owner_index();
+        let source_owner_index = match (repo_root.as_deref(), source_owner_snapshot.as_ref()) {
+            (Some(repo_root), Some(snapshot)) => {
+                let cached = snapshot.lock().await.clone();
+                let refreshed = cached.refreshed(repo_root).await;
+                snapshot
+                    .lock()
+                    .await
+                    .install_if_unchanged(&cached, refreshed)
+            }
+            _ => None,
         };
-        let repo_root = self.repo_root.clone();
         for fact in &mut update.facts {
             let normalized = fact
                 .depends_on_paths
                 .iter()
                 .map(|path| {
-                    self.repo_root.as_ref().map_or_else(
+                    repo_root.as_ref().map_or_else(
                         || normalize_slashes(path),
                         |repo_root| normalize_input_path(repo_root, None, Path::new(path)),
                     )
@@ -4725,7 +4795,7 @@ impl TaskEvidenceLedger {
             if let Some((step_id, implementation_revision, route)) = acknowledgement_candidate {
                 let covered_paths = validation_route_covered_paths(&route);
                 let mut covered_manifest = Vec::with_capacity(covered_paths.len());
-                if let Some(repo_root) = self.repo_root.as_ref() {
+                if let Some(repo_root) = repo_root.as_ref() {
                     for path in covered_paths {
                         covered_manifest.push(snapshot_file(repo_root, &path).await);
                     }
@@ -4779,8 +4849,6 @@ impl TaskEvidenceLedger {
                             revision: document.planning.material_revision.saturating_add(1),
                             recorded_at: timestamp(),
                         });
-                        document.planning.counters.fact_removals =
-                            document.planning.counters.fact_removals.saturating_add(1);
                         material_plan_change = true;
                     }
                 }
@@ -4795,8 +4863,6 @@ impl TaskEvidenceLedger {
                             revision: retired.revision,
                             recorded_at: timestamp(),
                         });
-                        document.planning.counters.step_removals =
-                            document.planning.counters.step_removals.saturating_add(1);
                         material_plan_change = true;
                     }
                 }
@@ -4839,6 +4905,14 @@ impl TaskEvidenceLedger {
                     let source_owner = source_owner_index
                         .as_ref()
                         .and_then(|index| index.derive(&implementation_surfaces));
+                    let surface_roles = evidence
+                        .map(|evidence| evidence.surface_roles.clone())
+                        .or_else(|| old.as_ref().map(|step| step.surface_roles.clone()))
+                        .unwrap_or_default();
+                    let validation_asset_paths = evidence
+                        .map(|evidence| evidence.validation_asset_paths.clone())
+                        .or_else(|| old.as_ref().map(|step| step.validation_asset_paths.clone()))
+                        .unwrap_or_default();
                     let mut candidate = EvidencePlanStep {
                         id: id.clone(),
                         revision: old.as_ref().map_or(1, |step| step.revision),
@@ -4862,6 +4936,8 @@ impl TaskEvidenceLedger {
                         validation_disposition: ValidationDisposition::UnresolvedDiscoverable,
                         source_owner,
                         implementation_surfaces,
+                        surface_roles,
+                        validation_asset_paths,
                         mutation_obligations: requested_obligations
                             .or_else(|| old.as_ref().map(|step| step.mutation_obligations.clone()))
                             .unwrap_or_default(),
@@ -4887,8 +4963,6 @@ impl TaskEvidenceLedger {
                     if material_step_change {
                         if let Some(old) = old.as_ref() {
                             candidate.revision = old.revision.saturating_add(1);
-                            document.planning.counters.step_revisions =
-                                document.planning.counters.step_revisions.saturating_add(1);
                         }
                         candidate.edit_paths.clear();
                         candidate.validation_receipt_id = None;
@@ -4976,7 +5050,7 @@ impl TaskEvidenceLedger {
                         document.planning.material_revision.saturating_add(1);
                 }
                 sync_plan_structure_state(document, &duplicate_explicit_ids);
-                rebuild_declared_requirements_and_risks(document);
+                refresh_derived_plan_state(document);
                 sync_plan_structure_state(document, &duplicate_explicit_ids);
                 if plan_is_terminally_acknowledged(document) {
                     resolve_recoverable_runtime_risks(document);
@@ -4995,27 +5069,13 @@ impl TaskEvidenceLedger {
                 document.completion = None;
                 let effect = if material_plan_change {
                     if was_unplanned {
-                        document.planning.counters.initial_updates =
-                            document.planning.counters.initial_updates.saturating_add(1);
                         PlanUpdateEffect::Initial
                     } else {
-                        document.planning.counters.structural_revisions = document
-                            .planning
-                            .counters
-                            .structural_revisions
-                            .saturating_add(1);
                         PlanUpdateEffect::StructuralRevision
                     }
                 } else if status_change {
-                    document.planning.counters.status_only_updates = document
-                        .planning
-                        .counters
-                        .status_only_updates
-                        .saturating_add(1);
                     PlanUpdateEffect::StatusOnly
                 } else {
-                    document.planning.counters.no_op_updates =
-                        document.planning.counters.no_op_updates.saturating_add(1);
                     PlanUpdateEffect::NoOp
                 };
                 trim_to_last(
@@ -5135,12 +5195,12 @@ impl TaskEvidenceLedger {
             )
         };
         if !candidate.repository_wide {
-            let repo_root = self.repo_root.as_ref()?;
+            let repo_root = self.bound_repo_root()?;
             for expected in &covered_manifest {
                 if expected.read_error.is_some() {
                     return None;
                 }
-                if snapshot_file(repo_root, &expected.path).await != *expected {
+                if snapshot_file(&repo_root, &expected.path).await != *expected {
                     return None;
                 }
             }
@@ -5156,8 +5216,7 @@ impl TaskEvidenceLedger {
             return Err("direct validation must declare non-empty covered_paths".to_string());
         }
         let repo_root = self
-            .repo_root
-            .as_ref()
+            .bound_repo_root()
             .ok_or_else(|| "direct validation requires a repository root".to_string())?;
         let mut normalized = covered_paths
             .iter()
@@ -5167,7 +5226,7 @@ impl TaskEvidenceLedger {
         normalized.dedup();
         let mut covered_manifest = Vec::with_capacity(normalized.len());
         for path in normalized {
-            let snapshot = snapshot_file(repo_root, &path).await;
+            let snapshot = snapshot_file(&repo_root, &path).await;
             if let Some(read_error) = snapshot.read_error.as_deref() {
                 return Err(format!(
                     "direct validation could not snapshot covered path `{path}`: {read_error}"
@@ -5182,10 +5241,10 @@ impl TaskEvidenceLedger {
         ))
     }
 
-    pub(crate) async fn direct_validation_implementation_identity_for_leaf(
+    pub(crate) async fn direct_validation_implementation_binding_for_leaf(
         &self,
         executed_leaf: &codex_protocol::plan_tool::ValidationRouteLeaf,
-    ) -> Result<String, String> {
+    ) -> Result<(String, Option<(String, u64)>), String> {
         if let Some(candidate) = self.auto_validation_candidate().await
             && let Some((_, identity)) = candidate
                 .route
@@ -5209,10 +5268,14 @@ impl TaskEvidenceLedger {
                                 .collect::<BTreeSet<_>>()
                 })
         {
-            return Ok(identity.clone());
+            return Ok((
+                identity.clone(),
+                Some((candidate.step_id, candidate.step_revision)),
+            ));
         }
         self.direct_validation_implementation_identity(&executed_leaf.covered_paths)
             .await
+            .map(|identity| (identity, None))
     }
 
     #[cfg(test)]
@@ -5297,19 +5360,19 @@ impl TaskEvidenceLedger {
         paths: &[PathBuf],
         provenance: Option<&ChildEvidenceProvenance>,
     ) {
-        if self.mode != TaskEvidenceMode::Kd4Completion {
+        if !self.allows_kd4_completion() {
             return;
         }
-        let Some(repo_root) = self.repo_root.as_ref() else {
+        let Some(repo_root) = self.bound_repo_root() else {
             return;
         };
         let normalized_paths = paths
             .iter()
-            .map(|path| normalize_input_path(repo_root, Some(cwd), path))
+            .map(|path| normalize_input_path(&repo_root, Some(cwd), path))
             .collect::<BTreeSet<_>>();
         let mut files = Vec::with_capacity(normalized_paths.len());
         for normalized in normalized_paths {
-            files.push(snapshot_file(repo_root, &normalized).await);
+            files.push(snapshot_file(&repo_root, &normalized).await);
         }
         let evidence_call_id = provenance
             .map(|value| format!("{}:{call_id}", value.source_thread_id))
@@ -5357,16 +5420,10 @@ impl TaskEvidenceLedger {
         outcome: &str,
         provenance: Option<&ChildEvidenceProvenance>,
     ) {
-        if self.mode == TaskEvidenceMode::EvidenceOnly {
-            if outcome == "completed" {
-                self.record_host_mutation().await;
-            }
+        if !self.allows_kd4_completion() {
             return;
         }
-        if self.mode != TaskEvidenceMode::Kd4Completion {
-            return;
-        }
-        let Some(repo_root) = self.repo_root.as_ref() else {
+        let Some(repo_root) = self.bound_repo_root() else {
             return;
         };
         let evidence_call_id = provenance
@@ -5390,7 +5447,7 @@ impl TaskEvidenceLedger {
         let mut transitions = Vec::with_capacity(intent.files.len());
         let mut after_snapshots = Vec::with_capacity(intent.files.len());
         for before in &intent.files {
-            let after = snapshot_file(repo_root, &before.path).await;
+            let after = snapshot_file(&repo_root, &before.path).await;
             if before != &after || before.read_error.is_some() || after.read_error.is_some() {
                 transitions.push(FileHashTransition {
                     path: before.path.clone(),
@@ -5627,28 +5684,33 @@ impl TaskEvidenceLedger {
         let possible_mutation = mutation.may_have_mutated();
         let observed_mutation = matches!(&mutation, CommandMutation::KnownMutation { .. });
         let mutation_paths = mutation.paths().or(mutation_paths);
-        if self.mode == TaskEvidenceMode::EvidenceOnly {
-            if observed_mutation {
-                self.record_host_mutation().await;
-            }
-            return;
-        }
-        if self.mode != TaskEvidenceMode::Kd4Completion {
+        if !self.allows_kd4_completion() {
             return;
         }
         let command_succeeded = exit_code == 0 && !timed_out;
         let Some((_, snapshot)) = self
             .update_document(|document| {
                 let action_id = command.join("\u{1f}");
-                let (step_id, step_revision, work_unit_id, attribution) = bound_plan_step
+                let resolved_plan_step = bound_plan_step
                     .filter(|(step_id, step_revision)| {
                         document.plan.iter().any(|step| {
                             step.id == *step_id && step.revision == *step_revision
                         })
                     })
+                    .map(|(step_id, step_revision)| (step_id.to_string(), step_revision))
+                    .or_else(|| {
+                        infer_validation_plan_binding(
+                            document,
+                            command,
+                            cwd,
+                            implementation_identity_hash,
+                            validation_result.as_ref(),
+                        )
+                    });
+                let (step_id, step_revision, work_unit_id, attribution) = resolved_plan_step
                     .map(|(step_id, step_revision)| {
                         (
-                            Some(step_id.to_string()),
+                            Some(step_id),
                             Some(step_revision),
                             None,
                             ActionAttributionKind::PlannedStep,
@@ -5790,15 +5852,13 @@ impl TaskEvidenceLedger {
             return None;
         }
         let desktop_activation = self.desktop_activation_runtime_snapshot();
+        let evidence_path = self.evidence_path();
         let (gate, latest_review_audit) = {
             let guard = self.document.lock().await;
             let document = guard.as_ref()?;
             task_is_tracked(document).then(|| {
-                let gate = derive_completion_gate(
-                    document,
-                    self.evidence_path.as_deref(),
-                    &desktop_activation,
-                );
+                let gate =
+                    derive_completion_gate(document, evidence_path.as_deref(), &desktop_activation);
                 let latest_review_audit = document
                     .completion_review_receipts
                     .iter()
@@ -5867,16 +5927,20 @@ impl TaskEvidenceLedger {
         typed_quiescent: bool,
         default_children_quiescent: bool,
     ) -> Option<CompletionReviewDossier> {
+        debug_assert_canonical_authoritative_inputs(
+            typed_mutation_identities,
+            typed_evidence,
+            authoritative_input_errors,
+        );
         if !self.allows_kd4_completion() {
             return None;
         }
         self.refresh_external_file_freshness().await;
         let source_capture_failed = self.user_source_capture_failed();
         let candidate_completion = candidate_completion.map(str::to_string);
-        let mut authoritative_input_errors = authoritative_input_errors.to_vec();
-        authoritative_input_errors.sort();
-        authoritative_input_errors.dedup();
+        let authoritative_input_errors = authoritative_input_errors.to_vec();
         let desktop_activation_runtime = self.desktop_activation_runtime_snapshot();
+        let evidence_path = self.evidence_path();
         let (
             document_revision,
             root_task_id,
@@ -6001,17 +6065,23 @@ impl TaskEvidenceLedger {
                     .iter()
                     .flat_map(|step| step.risks.iter().cloned()),
             );
+            review_lens_selection_facts.surface_roles.extend(
+                document
+                    .plan
+                    .iter()
+                    .flat_map(|step| step.surface_roles.iter().cloned()),
+            );
+            review_lens_selection_facts.validation_asset_paths.extend(
+                document
+                    .plan
+                    .iter()
+                    .flat_map(|step| step.validation_asset_paths.iter().cloned()),
+            );
             review_lens_selection_facts.generated_artifacts.extend(
                 document
                     .plan
                     .iter()
                     .flat_map(|step| step.generated_artifacts.iter().cloned()),
-            );
-            review_lens_selection_facts.generated_artifacts.extend(
-                document
-                    .generated_artifact_requirements
-                    .iter()
-                    .filter_map(|artifact| artifact.path.clone()),
             );
             for values in [
                 &mut review_lens_selection_facts.risk_hints,
@@ -6026,9 +6096,6 @@ impl TaskEvidenceLedger {
                 values.sort();
                 values.dedup();
             }
-            let mut typed_mutation_identities = typed_mutation_identities.to_vec();
-            typed_mutation_identities.sort();
-            typed_mutation_identities.dedup();
             let mut path_hashes = document
                 .latest_file_hashes
                 .values()
@@ -6143,12 +6210,9 @@ impl TaskEvidenceLedger {
                 })
                 .collect::<Vec<_>>();
             external_evidence.sort_by_key(std::string::ToString::to_string);
-            let mut typed_evidence = typed_evidence.to_vec();
-            typed_evidence.sort();
-            typed_evidence.dedup();
             let evidence_gate = derive_completion_gate(
                 document,
-                self.evidence_path.as_deref(),
+                evidence_path.as_deref(),
                 &desktop_activation_runtime,
             );
             let locally_obtainable_proof_routes =
@@ -6173,7 +6237,7 @@ impl TaskEvidenceLedger {
                 "externalEvidence": external_evidence,
                 "desktopActivation": desktop_activation,
                 "plan": document.plan,
-                "risks": document.risks,
+                "risks": effective_risks(document).collect::<Vec<_>>(),
                 "evidenceGate": evidence_gate,
                 "locallyObtainableProofRoutes": locally_obtainable_proof_routes,
                 "typedEvidence": typed_evidence,
@@ -6188,7 +6252,7 @@ impl TaskEvidenceLedger {
             );
             let cycle = ledger.active_review_cycle.as_ref();
             let current_repair_snapshot =
-                current_repair_snapshot(document, &typed_mutation_identities);
+                current_repair_snapshot(document, typed_mutation_identities);
             let initial_receipt = cycle.and_then(|cycle| {
                 if matches!(
                     cycle.phase,
@@ -6318,6 +6382,8 @@ impl TaskEvidenceLedger {
             let Some(ledger) = document.completion_review_v2.as_mut() else {
                 unreachable!("V2 dossier requires a V2 ledger");
             };
+            let parent_terminal_review_id =
+                latest_terminal_closure(ledger).map(|receipt| receipt.review_id.clone());
             let cycle = ledger
                 .active_review_cycle
                 .get_or_insert_with(|| CompletionReviewCycle {
@@ -6326,7 +6392,7 @@ impl TaskEvidenceLedger {
                         ledger.completion_epoch, ledger.manifest_revision
                     ),
                     manifest_revision: ledger.manifest_revision,
-                    parent_terminal_review_id: ledger.last_terminal_closure.clone(),
+                    parent_terminal_review_id,
                     superseded_review_id: None,
                     phase: if dossier.mappings_classified {
                         CompletionReviewCyclePhase::InitialReviewPending
@@ -6336,7 +6402,6 @@ impl TaskEvidenceLedger {
                     correction_consumed: false,
                     manifest_gap_reconstructed: false,
                     accepted_review_id: None,
-                    accepted_dossier_snapshot_id: None,
                 });
             if cycle.manifest_revision != dossier.manifest_revision {
                 cycle.manifest_revision = dossier.manifest_revision;
@@ -6346,7 +6411,6 @@ impl TaskEvidenceLedger {
                     CompletionReviewCyclePhase::ClassificationPending
                 };
                 cycle.accepted_review_id = None;
-                cycle.accepted_dossier_snapshot_id = None;
                 cycle.manifest_gap_reconstructed = false;
                 cycle.superseded_review_id = None;
             }
@@ -6373,10 +6437,7 @@ impl TaskEvidenceLedger {
             return None;
         }
         let ledger = document.completion_review_v2.as_ref()?;
-        Some(format!(
-            "review-{}-{}-{}",
-            ledger.completion_epoch, ledger.manifest_revision, ledger.next_review_sequence
-        ))
+        Some(next_review_id(ledger))
     }
 
     pub(crate) async fn record_completion_review_attempt_v2(
@@ -6690,8 +6751,7 @@ impl TaskEvidenceLedger {
         let attempt_identity = input.attempt_identity.clone();
         let reviewer_contract_hash = input.reviewer_contract_hash.clone();
         let evidence_path = self
-            .evidence_path
-            .as_ref()
+            .evidence_path()
             .map(|path| path.to_string_lossy().into_owned());
         {
             let guard = self.document.lock().await;
@@ -6756,11 +6816,7 @@ impl TaskEvidenceLedger {
             let Some(ledger) = document.completion_review_v2.as_mut() else {
                 unreachable!("V2 dossier requires a V2 ledger");
             };
-            let review_id = format!(
-                "review-{}-{}-{}",
-                ledger.completion_epoch, ledger.manifest_revision, ledger.next_review_sequence
-            );
-            ledger.next_review_sequence = ledger.next_review_sequence.saturating_add(1);
+            let review_id = next_review_id(ledger);
             let findings = input
                 .findings
                 .into_iter()
@@ -6797,7 +6853,6 @@ impl TaskEvidenceLedger {
                 parent_review_id: parent_review_id.clone(),
                 superseded_review_id,
                 candidate_mutation_revision: dossier.host_mutation_revision,
-                candidate_hash: dossier.implementation_identity_hash.clone(),
                 implementation_identity_hash: dossier.implementation_identity_hash.clone(),
                 dossier_snapshot_id: dossier.dossier_snapshot_id.clone(),
                 user_source_ledger_hash: dossier.user_source_ledger_hash.clone(),
@@ -6826,18 +6881,13 @@ impl TaskEvidenceLedger {
                 recorded_at: timestamp(),
             });
             let terminal_closure_id = terminal_outcome.as_deref().map(|outcome| {
-                let terminal_review_id = format!(
-                    "review-{}-{}-{}",
-                    ledger.completion_epoch, ledger.manifest_revision, ledger.next_review_sequence
-                );
-                ledger.next_review_sequence = ledger.next_review_sequence.saturating_add(1);
+                let terminal_review_id = next_review_id(ledger);
                 ledger.receipts.push(CompletionReviewReceiptV2 {
                     review_id: terminal_review_id.clone(),
                     attempt_kind: CompletionReviewAttemptKind::TerminalClosure,
                     parent_review_id: Some(review_id.clone()),
                     superseded_review_id: None,
                     candidate_mutation_revision: dossier.host_mutation_revision,
-                    candidate_hash: dossier.implementation_identity_hash.clone(),
                     implementation_identity_hash: dossier.implementation_identity_hash.clone(),
                     dossier_snapshot_id: dossier.dossier_snapshot_id.clone(),
                     user_source_ledger_hash: dossier.user_source_ledger_hash.clone(),
@@ -6911,7 +6961,6 @@ impl TaskEvidenceLedger {
                     correction_consumed,
                     manifest_gap_reconstructed: true,
                     accepted_review_id: None,
-                    accepted_dossier_snapshot_id: None,
                 });
                 ledger.review_risk.unresolved = true;
                 ledger.review_risk.cycle_id = ledger
@@ -6961,7 +7010,6 @@ impl TaskEvidenceLedger {
                 }
                 if review_clean && !needs_correction && terminal_outcome.is_none() {
                     cycle.accepted_review_id = Some(review_id.clone());
-                    cycle.accepted_dossier_snapshot_id = Some(dossier.dossier_snapshot_id.clone());
                     if ledger.obligation.mode == "mandatory"
                         && ledger.obligation.required_attempt_identity.as_deref()
                             == Some(attempt_identity.as_str())
@@ -6978,8 +7026,7 @@ impl TaskEvidenceLedger {
                 ledger.review_risk.cycle_id = Some(cycle.cycle_id.clone());
                 ledger.review_risk.resolved_at = None;
             }
-            if let Some(terminal_closure_id) = terminal_closure_id {
-                ledger.last_terminal_closure = Some(terminal_closure_id);
+            if terminal_closure_id.is_some() {
                 let status = if terminal_outcome.as_deref() == Some("blocked") {
                     TaskCompletionStatus::Blocked
                 } else {
@@ -7018,10 +7065,8 @@ impl TaskEvidenceLedger {
                 findings,
             }
         };
-        let transition = self
-            .atomic_review_update(dossier.document_revision, None, None, update)
-            .await;
-        transition
+        self.atomic_review_update(dossier.document_revision, None, None, update)
+            .await
     }
 
     pub(crate) async fn finalize_completion_review(
@@ -7072,8 +7117,6 @@ impl TaskEvidenceLedger {
                 || !ledger.review_risk.unresolved
                 || cycle.phase != CompletionReviewCyclePhase::ProvisionalClean
                 || cycle.accepted_review_id.as_deref() != Some(accepted_review_id.as_str())
-                || cycle.accepted_dossier_snapshot_id.as_deref()
-                    != Some(accepted.dossier_snapshot_id.as_str())
                 || !accepted.review_clean
                 || accepted.terminal_outcome.is_some()
                 || accepted.implementation_identity_hash != dossier.implementation_identity_hash
@@ -7101,20 +7144,13 @@ impl TaskEvidenceLedger {
                     let Some(ledger) = document.completion_review_v2.as_mut() else {
                         unreachable!("V2 dossier requires a V2 ledger");
                     };
-                    let review_id = format!(
-                        "review-{}-{}-{}",
-                        ledger.completion_epoch,
-                        ledger.manifest_revision,
-                        ledger.next_review_sequence
-                    );
-                    ledger.next_review_sequence = ledger.next_review_sequence.saturating_add(1);
+                    let review_id = next_review_id(ledger);
                     ledger.receipts.push(CompletionReviewReceiptV2 {
-                        review_id: review_id.clone(),
+                        review_id,
                         attempt_kind: CompletionReviewAttemptKind::TerminalClosure,
                         parent_review_id: Some(accepted_parent),
                         superseded_review_id: None,
                         candidate_mutation_revision: dossier.host_mutation_revision,
-                        candidate_hash: dossier.implementation_identity_hash.clone(),
                         implementation_identity_hash: dossier.implementation_identity_hash.clone(),
                         dossier_snapshot_id: accepted_dossier_snapshot_id.clone(),
                         user_source_ledger_hash: dossier.user_source_ledger_hash.clone(),
@@ -7149,7 +7185,6 @@ impl TaskEvidenceLedger {
                     }
                     ledger.review_risk.unresolved = false;
                     ledger.review_risk.resolved_at = Some(timestamp());
-                    ledger.last_terminal_closure = Some(review_id);
                     document.completion = Some(completion.clone());
                     document.updated_at = timestamp();
                     completion.clone()
@@ -7186,14 +7221,7 @@ impl TaskEvidenceLedger {
         let Some(accepted_review_id) = cycle.accepted_review_id.as_deref() else {
             return false;
         };
-        let Some(terminal_id) = ledger.last_terminal_closure.as_deref() else {
-            return false;
-        };
-        let Some(terminal) = ledger
-            .receipts
-            .iter()
-            .find(|receipt| receipt.review_id == terminal_id)
-        else {
+        let Some(terminal) = latest_terminal_closure(ledger) else {
             return false;
         };
         let Some(accepted) = ledger
@@ -7210,8 +7238,6 @@ impl TaskEvidenceLedger {
                 .is_some_and(|gate| gate.status == TaskCompletionStatus::Passed)
             && cycle.phase == CompletionReviewCyclePhase::Closed
             && !ledger.review_risk.unresolved
-            && cycle.accepted_dossier_snapshot_id.as_deref()
-                == Some(accepted.dossier_snapshot_id.as_str())
             && accepted.review_clean
             && accepted.implementation_identity_hash == dossier.implementation_identity_hash
             && accepted.user_source_ledger_hash == dossier.user_source_ledger_hash
@@ -7238,7 +7264,6 @@ impl TaskEvidenceLedger {
             {
                 cycle.phase = CompletionReviewCyclePhase::InitialReviewPending;
                 cycle.accepted_review_id = None;
-                cycle.accepted_dossier_snapshot_id = None;
                 ledger.review_risk.unresolved = true;
                 ledger.review_risk.cycle_id = Some(cycle.cycle_id.clone());
                 ledger.review_risk.opened_at = Some(timestamp());
@@ -7265,7 +7290,6 @@ impl TaskEvidenceLedger {
             {
                 cycle.phase = CompletionReviewCyclePhase::InitialReviewPending;
                 cycle.accepted_review_id = None;
-                cycle.accepted_dossier_snapshot_id = None;
                 ledger.review_risk.unresolved = true;
                 ledger.review_risk.cycle_id = Some(cycle.cycle_id.clone());
                 ledger.review_risk.opened_at = Some(timestamp());
@@ -7338,7 +7362,6 @@ impl TaskEvidenceLedger {
                 correction_consumed,
                 manifest_gap_reconstructed,
                 accepted_review_id: None,
-                accepted_dossier_snapshot_id: None,
             });
             ledger.review_risk.unresolved = true;
             ledger.review_risk.cycle_id = Some(cycle_id);
@@ -7369,29 +7392,17 @@ impl TaskEvidenceLedger {
             if !persisted_passed {
                 return;
             }
-            let Some(superseded_review_id) = ledger.last_terminal_closure.clone() else {
+            let Some(superseded) = latest_terminal_closure(ledger).cloned() else {
                 return;
             };
-            let Some(superseded) = ledger
-                .receipts
-                .iter()
-                .find(|receipt| receipt.review_id == superseded_review_id)
-                .cloned()
-            else {
-                return;
-            };
-            let review_id = format!(
-                "review-{}-{}-{}",
-                ledger.completion_epoch, ledger.manifest_revision, ledger.next_review_sequence
-            );
-            ledger.next_review_sequence = ledger.next_review_sequence.saturating_add(1);
+            let superseded_review_id = superseded.review_id.clone();
+            let review_id = next_review_id(ledger);
             ledger.receipts.push(CompletionReviewReceiptV2 {
-                review_id: review_id.clone(),
+                review_id,
                 attempt_kind: CompletionReviewAttemptKind::TerminalClosure,
                 parent_review_id: superseded.parent_review_id.clone(),
                 superseded_review_id: Some(superseded_review_id),
                 candidate_mutation_revision: superseded.candidate_mutation_revision,
-                candidate_hash: superseded.candidate_hash.clone(),
                 implementation_identity_hash: superseded.implementation_identity_hash.clone(),
                 dossier_snapshot_id: superseded.dossier_snapshot_id.clone(),
                 user_source_ledger_hash: superseded.user_source_ledger_hash.clone(),
@@ -7424,16 +7435,13 @@ impl TaskEvidenceLedger {
             }
             ledger.review_risk.unresolved = true;
             ledger.review_risk.resolved_at = None;
-            ledger.last_terminal_closure = Some(review_id);
             let mut completion = document.completion.clone().unwrap_or(TaskCompletionGate {
                 status: TaskCompletionStatus::Partial,
                 reasons: Vec::new(),
                 evidence_path: None,
             });
             completion.status = TaskCompletionStatus::Partial;
-            completion.reasons.push(reason);
-            completion.reasons.sort();
-            completion.reasons.dedup();
+            insert_completion_gate_reason(&mut completion.reasons, reason);
             document.completion = Some(completion);
             document.updated_at = timestamp();
         })
@@ -7853,7 +7861,6 @@ impl TaskEvidenceLedger {
             if let Some(cycle) = ledger.active_review_cycle.as_mut() {
                 cycle.phase = CompletionReviewCyclePhase::Closed;
                 cycle.accepted_review_id = None;
-                cycle.accepted_dossier_snapshot_id = None;
             }
             ledger.review_risk.unresolved = false;
             ledger.review_risk.resolved_at = Some(timestamp());
@@ -7942,16 +7949,18 @@ impl TaskEvidenceLedger {
         if !self.allows_kd4_completion() {
             return None;
         }
+        let repo_root = self.bound_repo_root();
         input.typed_validation_proofs = current_typed_validation_proofs(
-            self.repo_root.as_deref(),
+            repo_root.as_deref(),
             &input.workspace_manifest_identity,
             input.typed_validation_proofs,
         )
         .await;
         let evidence_path = self
-            .evidence_path
+            .evidence_path()
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned());
+        let completion_evidence_path = self.evidence_path();
         let desktop_activation_runtime = self.desktop_activation_runtime_snapshot();
         let ((result, changed), snapshot) = self
             .update_document(move |document| {
@@ -7986,7 +7995,7 @@ impl TaskEvidenceLedger {
                 };
                 let mut gate = derive_completion_gate(
                     document,
-                    self.evidence_path.as_deref(),
+                    completion_evidence_path.as_deref(),
                     &desktop_activation_runtime,
                 );
                 let missing_or_failed = missing_or_failed_obligations(
@@ -8000,7 +8009,7 @@ impl TaskEvidenceLedger {
                     let occurrence = format!(
                         "final proof obligation {obligation_id} is missing, failed, or stale"
                     );
-                    gate.reasons.push(occurrence.clone());
+                    insert_completion_gate_reason(&mut gate.reasons, occurrence.clone());
                     merge_completion_reason(
                         &mut structured_reasons,
                         "missing_failed_or_stale_proof",
@@ -8015,7 +8024,7 @@ impl TaskEvidenceLedger {
                 if validation_plan.ambiguous_or_unmappable {
                     let occurrence =
                         "the sealed validation plan is ambiguous or unmappable".to_string();
-                    gate.reasons.push(occurrence.clone());
+                    insert_completion_gate_reason(&mut gate.reasons, occurrence.clone());
                     merge_completion_reason(
                         &mut structured_reasons,
                         "invalid_validation_plan",
@@ -8030,7 +8039,7 @@ impl TaskEvidenceLedger {
                 if !basis.child_gate_state.is_empty() {
                     for state in &basis.child_gate_state {
                         let occurrence = format!("child or typed gate is not clear: {state}");
-                        gate.reasons.push(occurrence.clone());
+                        insert_completion_gate_reason(&mut gate.reasons, occurrence.clone());
                         merge_completion_reason(
                             &mut structured_reasons,
                             "child_or_typed_gate_blocked",
@@ -8043,8 +8052,6 @@ impl TaskEvidenceLedger {
                         );
                     }
                 }
-                gate.reasons.sort();
-                gate.reasons.dedup();
                 if !gate.reasons.is_empty() && gate.status == TaskCompletionStatus::Passed {
                     gate.status = TaskCompletionStatus::Partial;
                 }
@@ -8088,9 +8095,7 @@ impl TaskEvidenceLedger {
                     Ok(checkpoint) => checkpoint,
                     Err(reason) => {
                         gate.status = TaskCompletionStatus::Partial;
-                        gate.reasons.push(reason.clone());
-                        gate.reasons.sort();
-                        gate.reasons.dedup();
+                        insert_completion_gate_reason(&mut gate.reasons, reason.clone());
                         merge_completion_reason(
                             &mut structured_reasons,
                             "checkpoint_preflight_failed",
@@ -8311,6 +8316,7 @@ impl TaskEvidenceLedger {
         }
         let source_capture_failed = self.user_source_capture_failed();
         let mut latest_gate = None;
+        let evidence_path = self.evidence_path();
         for persistence_retry in 0..8 {
             if persistence_retry > 0 {
                 let mut state = self.lock_freshness_state();
@@ -8343,12 +8349,12 @@ impl TaskEvidenceLedger {
                         freshness_state_changed = true;
                         return None;
                     }
-                    if self.evidence_path.is_some() {
+                    if evidence_path.is_some() {
                         resolve_risk(document, "task-evidence-storage-failure");
                     }
                     let mut gate = derive_completion_gate(
                         document,
-                        self.evidence_path.as_deref(),
+                        evidence_path.as_deref(),
                         &desktop_activation_runtime,
                     );
                     overlay_completion_review_gate(document, &mut gate, source_capture_failed);
@@ -8397,13 +8403,12 @@ impl TaskEvidenceLedger {
         reason: &str,
         record_storage_risk: bool,
     ) -> TaskCompletionGate {
-        gate.reasons.push(reason.to_string());
-        gate.reasons.sort();
-        gate.reasons.dedup();
+        insert_completion_gate_reason(&mut gate.reasons, reason.to_string());
         if gate.status != TaskCompletionStatus::Blocked {
             gate.status = TaskCompletionStatus::Partial;
         }
         let desktop_activation_runtime = self.desktop_activation_runtime_snapshot();
+        let evidence_path = self.evidence_path();
         let snapshot = {
             let mut guard = self.document.lock().await;
             guard.as_mut().map(|document| {
@@ -8416,15 +8421,13 @@ impl TaskEvidenceLedger {
                 if snapshot_revision.is_some() && snapshot_revision != Some(document.revision) {
                     let current_gate = derive_completion_gate(
                         document,
-                        self.evidence_path.as_deref(),
+                        evidence_path.as_deref(),
                         &desktop_activation_runtime,
                     );
                     if current_gate.status == TaskCompletionStatus::Blocked {
                         gate.status = TaskCompletionStatus::Blocked;
                     }
-                    gate.reasons.extend(current_gate.reasons);
-                    gate.reasons.sort();
-                    gate.reasons.dedup();
+                    extend_completion_gate_reasons(&mut gate.reasons, current_gate.reasons);
                 }
                 document.completion = Some(gate.clone());
                 document.updated_at = timestamp();
@@ -8466,7 +8469,7 @@ impl TaskEvidenceLedger {
         if !self.allows_kd4_completion() {
             return true;
         }
-        let Some(repo_root) = self.repo_root.as_deref() else {
+        let Some(repo_root) = self.bound_repo_root() else {
             return true;
         };
         let manifest = {
@@ -8501,7 +8504,7 @@ impl TaskEvidenceLedger {
         }
         self.lock_freshness_state().diagnostics.scan_invocations += 1;
         let scan = self
-            .scan_freshness_manifest(repo_root, &manifest, purpose == FreshnessPurpose::Ordinary)
+            .scan_freshness_manifest(&repo_root, &manifest, purpose == FreshnessPurpose::Ordinary)
             .await;
         let manifest_after_scan = {
             let guard = self.document.lock().await;
@@ -8880,10 +8883,10 @@ impl TaskEvidenceLedger {
         root_session_id: &str,
         same_root_typed_actor_ids: &BTreeSet<String>,
     ) -> bool {
-        if self.mode != TaskEvidenceMode::Kd4Completion {
+        if !self.allows_kd4_completion() {
             return true;
         }
-        let Some(repo_root) = self.repo_root.as_ref() else {
+        let Some(repo_root) = self.bound_repo_root() else {
             return false;
         };
         let (cursor, stored_scope_identity) = {
@@ -8943,7 +8946,7 @@ impl TaskEvidenceLedger {
                 }
                 snapshots
                     .entry(path.clone())
-                    .or_insert(snapshot_file(repo_root, path).await);
+                    .or_insert(snapshot_file(&repo_root, path).await);
             }
         }
 
@@ -9112,24 +9115,6 @@ impl TaskEvidenceLedger {
         self.persist_document(&snapshot).await == PersistOutcome::Persisted
     }
 
-    async fn record_host_mutation(&self) {
-        if self.mode == TaskEvidenceMode::Disabled {
-            return;
-        }
-        let Some((_, snapshot)) = self
-            .update_document(|document| {
-                invalidate_for_mutation(document, None);
-                document.updated_at = timestamp();
-            })
-            .await
-        else {
-            return;
-        };
-        if self.persist_document(&snapshot).await == PersistOutcome::Failed {
-            warn!("failed to persist task-evidence host mutation revision");
-        }
-    }
-
     #[cfg(test)]
     pub(crate) async fn record_external_mcp_evidence(
         &self,
@@ -9182,7 +9167,7 @@ impl TaskEvidenceLedger {
         implementation_identity_hash: Option<&str>,
         max_receipts: usize,
     ) -> ExternalEvidenceCapture {
-        if self.mode == TaskEvidenceMode::Disabled {
+        if !self.allows_kd4_completion() {
             return ExternalEvidenceCapture::Ignored;
         }
         let metadata = match extract_external_evidence_metadata(result) {
@@ -9190,7 +9175,7 @@ impl TaskEvidenceLedger {
             Ok(None) => return ExternalEvidenceCapture::Ignored,
             Err(message) => return ExternalEvidenceCapture::Warning(message),
         };
-        let Some(evidence_path) = self.evidence_path.clone() else {
+        let Some(evidence_path) = self.evidence_path() else {
             return ExternalEvidenceCapture::Warning(
                 "external evidence persistence is unavailable for this task",
             );
@@ -9310,10 +9295,15 @@ impl TaskEvidenceLedger {
         let document = Arc::clone(&self.document);
         let persistence_gate = Arc::clone(&self.persistence_gate);
         let last_persisted_revision = Arc::clone(&self.last_persisted_revision);
+        #[cfg(test)]
         let persistence_test_control = self.persistence_test_control();
         let codex_home = self.codex_home.clone();
         let thread_id = self.thread_id.clone();
-        let mode = self.mode;
+        let mode = if self.allows_kd4_completion() {
+            TaskEvidenceMode::Kd4Completion
+        } else {
+            TaskEvidenceMode::Disabled
+        };
         let server_name = server_name.to_string();
         let tool_name = tool_name.to_string();
         let call_id = call_id.to_string();
@@ -9386,7 +9376,8 @@ impl TaskEvidenceLedger {
                 document.revision = document.revision.saturating_add(1);
                 document.clone()
             };
-            let (outcome, returned_permit) = persist_document_with_permit(
+            #[cfg(test)]
+            let persistence_result = persist_document_with_permit(
                 evidence_path.clone(),
                 snapshot,
                 persistence_permit,
@@ -9394,6 +9385,15 @@ impl TaskEvidenceLedger {
                 persistence_test_control.clone(),
             )
             .await;
+            #[cfg(not(test))]
+            let persistence_result = persist_document_with_permit(
+                evidence_path.clone(),
+                snapshot,
+                persistence_permit,
+                Arc::clone(&last_persisted_revision),
+            )
+            .await;
+            let (outcome, returned_permit) = persistence_result;
             persistence_permit = match returned_permit {
                 Some(permit) => permit,
                 None => match Arc::clone(&persistence_gate).acquire_owned().await {
@@ -9451,7 +9451,8 @@ impl TaskEvidenceLedger {
                     };
                     drop(pending_artifact.take());
                     let rollback_revision = failure_snapshot.revision;
-                    let (rollback_outcome, _) = persist_document_with_permit(
+                    #[cfg(test)]
+                    let rollback_result = persist_document_with_permit(
                         evidence_path,
                         failure_snapshot,
                         persistence_permit,
@@ -9459,6 +9460,15 @@ impl TaskEvidenceLedger {
                         persistence_test_control,
                     )
                     .await;
+                    #[cfg(not(test))]
+                    let rollback_result = persist_document_with_permit(
+                        evidence_path,
+                        failure_snapshot,
+                        persistence_permit,
+                        Arc::clone(&last_persisted_revision),
+                    )
+                    .await;
+                    let (rollback_outcome, _) = rollback_result;
                     if rollback_outcome == PersistOutcome::Failed {
                         last_persisted_revision.fetch_max(rollback_revision, Ordering::AcqRel);
                     }
@@ -9512,7 +9522,7 @@ impl TaskEvidenceLedger {
         update: impl FnOnce(&mut TaskEvidenceDocument) -> T + Send,
         commit: impl FnOnce() + Send,
     ) -> AtomicReviewTransition<T> {
-        let Some(path) = self.evidence_path.clone() else {
+        let Some(path) = self.evidence_path() else {
             return AtomicReviewTransition::Failed;
         };
         let _permit = match Arc::clone(&self.persistence_gate).acquire_owned().await {
@@ -9550,8 +9560,10 @@ impl TaskEvidenceLedger {
                 return AtomicReviewTransition::Failed;
             }
         };
+        #[cfg(test)]
         let test_control = self.persistence_test_control();
         let write_result = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
             if let Some(control) = test_control.as_ref()
                 && let Some((started, release)) = control
                     .before_next_write
@@ -9562,16 +9574,16 @@ impl TaskEvidenceLedger {
                 started.wait();
                 release.wait();
             }
+            #[cfg(test)]
             if test_control
                 .as_ref()
                 .is_some_and(|control| control.fail_writes.load(Ordering::Acquire))
             {
-                Err(io::Error::other(
+                return Err(io::Error::other(
                     "injected task-evidence persistence failure",
-                ))
-            } else {
-                atomic_write_evidence(&path, &bytes)
+                ));
             }
+            atomic_write_evidence(&path, &bytes)
         })
         .await;
         match write_result {
@@ -9605,7 +9617,7 @@ impl TaskEvidenceLedger {
     }
 
     async fn persist_document(&self, document: &TaskEvidenceDocument) -> PersistOutcome {
-        let Some(path) = self.evidence_path.as_ref() else {
+        let Some(path) = self.evidence_path() else {
             return PersistOutcome::Persisted;
         };
         let permit = match Arc::clone(&self.persistence_gate).acquire_owned().await {
@@ -9615,28 +9627,32 @@ impl TaskEvidenceLedger {
                 return PersistOutcome::Failed;
             }
         };
-        persist_document_with_permit(
+        #[cfg(test)]
+        let result = persist_document_with_permit(
             path.clone(),
             document.clone(),
             permit,
             Arc::clone(&self.last_persisted_revision),
             self.persistence_test_control(),
         )
-        .await
-        .0
+        .await;
+        #[cfg(not(test))]
+        let result = persist_document_with_permit(
+            path.clone(),
+            document.clone(),
+            permit,
+            Arc::clone(&self.last_persisted_revision),
+        )
+        .await;
+        result.0
     }
 
+    #[cfg(test)]
     fn persistence_test_control(&self) -> Option<PersistenceTestControl> {
-        #[cfg(test)]
-        {
-            return self
-                .persistence_test_control
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-        }
-        #[cfg(not(test))]
-        None
+        self.persistence_test_control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     #[cfg(test)]
@@ -10017,10 +10033,28 @@ async fn current_typed_validation_proofs(
     workspace_manifest_identity: &str,
     proofs: Vec<TypedValidationProofInputV1>,
 ) -> Vec<TypedValidationProofInputV1> {
+    current_typed_validation_proofs_with_observation_counts(
+        repo_root,
+        workspace_manifest_identity,
+        proofs,
+    )
+    .await
+    .0
+}
+
+async fn current_typed_validation_proofs_with_observation_counts(
+    repo_root: Option<&Path>,
+    workspace_manifest_identity: &str,
+    proofs: Vec<TypedValidationProofInputV1>,
+) -> (Vec<TypedValidationProofInputV1>, usize, usize) {
     let Some(repo_root) = repo_root else {
-        return Vec::new();
+        return (Vec::new(), 0, 0);
     };
     let mut current = Vec::new();
+    let mut observed_head: Option<Option<String>> = None;
+    let mut observed_files = HashMap::<String, Option<WorkspaceManifestEntry>>::new();
+    let mut head_observation_count = 0;
+    let mut file_observation_count = 0;
     for mut proof in proofs {
         if proof.covered_manifest.is_empty() {
             continue;
@@ -10028,9 +10062,17 @@ async fn current_typed_validation_proofs(
         let mut manifest_is_current = true;
         for expected in &proof.covered_manifest {
             if expected.path == codex_agent_task_store::REPOSITORY_WIDE_PATH {
-                let head = crate::git_workspace::capture_candidate_diff(repo_root)
-                    .await
-                    .and_then(|capture| capture.head_identity);
+                let head = match observed_head.as_ref() {
+                    Some(head) => head.clone(),
+                    None => {
+                        head_observation_count += 1;
+                        let head = codex_git_utils::get_head_commit_hash(repo_root)
+                            .await
+                            .map(|head| head.0);
+                        observed_head = Some(head.clone());
+                        head
+                    }
+                };
                 if expected.content_hash != head
                     || expected.existed != expected.content_hash.is_some()
                 {
@@ -10039,25 +10081,36 @@ async fn current_typed_validation_proofs(
                 }
                 continue;
             }
-            let Ok(absolute) = validated_generated_artifact_path(repo_root, &expected.path) else {
+            let observed = match observed_files.get(&expected.path) {
+                Some(observed) => observed.clone(),
+                None => {
+                    file_observation_count += 1;
+                    let observed =
+                        match validated_generated_artifact_path(repo_root, &expected.path) {
+                            Ok(absolute) => match sha256_file(&absolute).await {
+                                Ok(hash) => Some(WorkspaceManifestEntry {
+                                    path: expected.path.clone(),
+                                    content_hash: Some(hash),
+                                    existed: true,
+                                }),
+                                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                                    Some(WorkspaceManifestEntry {
+                                        path: expected.path.clone(),
+                                        content_hash: None,
+                                        existed: false,
+                                    })
+                                }
+                                Err(_) => None,
+                            },
+                            Err(_) => None,
+                        };
+                    observed_files.insert(expected.path.clone(), observed.clone());
+                    observed
+                }
+            };
+            let Some(observed) = observed else {
                 manifest_is_current = false;
                 break;
-            };
-            let observed = match sha256_file(&absolute).await {
-                Ok(hash) => WorkspaceManifestEntry {
-                    path: expected.path.clone(),
-                    content_hash: Some(hash),
-                    existed: true,
-                },
-                Err(error) if error.kind() == io::ErrorKind::NotFound => WorkspaceManifestEntry {
-                    path: expected.path.clone(),
-                    content_hash: None,
-                    existed: false,
-                },
-                Err(_) => {
-                    manifest_is_current = false;
-                    break;
-                }
             };
             if observed != *expected {
                 manifest_is_current = false;
@@ -10070,7 +10123,7 @@ async fn current_typed_validation_proofs(
             current.push(proof);
         }
     }
-    current
+    (current, file_observation_count, head_observation_count)
 }
 
 fn missing_or_failed_obligations(
@@ -10211,6 +10264,7 @@ fn completion_checkpoint_for(
             step.runtime_paths
                 .iter()
                 .chain(step.implementation_surfaces.iter())
+                .chain(step.validation_asset_paths.iter())
                 .chain(step.edit_paths.iter())
         })
         .cloned()
@@ -10249,9 +10303,7 @@ fn completion_checkpoint_for(
     let evidence_gate =
         derive_completion_gate(document, None, &DesktopActivationRuntimeSnapshot::default());
     let unresolved_blockers = evidence_gate.reasons;
-    let unresolved_risks = document
-        .risks
-        .iter()
+    let unresolved_risks = effective_risks(document)
         .filter(|risk| !risk.resolved)
         .map(|risk| format!("{}: {}", risk.id, risk.description))
         .collect::<Vec<_>>();
@@ -10355,6 +10407,154 @@ fn review_identity_is_current(
     expected_implementation_identity
         .is_none_or(|expected| receipt.implementation_identity_hash == expected)
         && expected_dossier_snapshot.is_none_or(|expected| receipt.dossier_snapshot_id == expected)
+}
+
+#[derive(Debug)]
+struct HistoryUserSources {
+    message_id: Option<String>,
+    materials: Vec<(UserSourceKind, String)>,
+}
+
+fn history_user_sources(history: &[ResponseItem]) -> Vec<HistoryUserSources> {
+    history
+        .iter()
+        .filter_map(|item| {
+            let ResponseItem::Message {
+                id, role, content, ..
+            } = item
+            else {
+                return None;
+            };
+            if role != "user" {
+                return None;
+            }
+            let materials = content
+                .iter()
+                .filter_map(|content| match content {
+                    ContentItem::InputText { text } if !text.is_empty() => {
+                        Some((UserSourceKind::Text, text.clone()))
+                    }
+                    ContentItem::InputImage { image_url, .. } => {
+                        Some((UserSourceKind::Image, image_url.clone()))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (!materials.is_empty()).then(|| HistoryUserSources {
+                message_id: id.as_ref().map(ToString::to_string),
+                materials,
+            })
+        })
+        .collect()
+}
+
+fn surviving_sources_for_history(
+    ledger: &CompletionReviewLedgerV2,
+    history: &[ResponseItem],
+) -> Vec<UserSourceRecord> {
+    let history_sources = history_user_sources(history);
+    let mut groups = BTreeMap::<String, Vec<UserSourceRecord>>::new();
+    for source in ledger
+        .source_records
+        .values()
+        .filter(|source| source.completion_epoch == ledger.completion_epoch)
+    {
+        groups
+            .entry(source.message_id.clone())
+            .or_default()
+            .push(source.clone());
+    }
+    let mut groups = groups.into_values().collect::<Vec<_>>();
+    groups.sort_by_key(|sources| {
+        sources
+            .iter()
+            .map(|source| source.source_ordinal)
+            .min()
+            .unwrap_or(u64::MAX)
+    });
+    let mut consumed_history = BTreeSet::new();
+    let mut surviving = Vec::new();
+    for mut sources in groups {
+        sources.sort_by_key(|source| source.content_ordinal);
+        let message_id = sources
+            .first()
+            .map(|source| source.message_id.as_str())
+            .unwrap_or_default();
+        let exact_match = history_sources.iter().enumerate().find(|(index, message)| {
+            !consumed_history.contains(index) && message.message_id.as_deref() == Some(message_id)
+        });
+        let legacy_signature = sources
+            .iter()
+            .filter(|source| {
+                matches!(
+                    source.source_kind,
+                    UserSourceKind::Text | UserSourceKind::Image
+                )
+            })
+            .map(|source| (source.source_kind, source.exact_material.clone()))
+            .collect::<Vec<_>>();
+        let matched_index = exact_match.map(|(index, _)| index).or_else(|| {
+            (!legacy_signature.is_empty()).then(|| {
+                history_sources
+                    .iter()
+                    .enumerate()
+                    .find(|(index, message)| {
+                        !consumed_history.contains(index) && message.materials == legacy_signature
+                    })
+                    .map(|(index, _)| index)
+            })?
+        });
+        if let Some(index) = matched_index {
+            consumed_history.insert(index);
+            surviving.extend(sources);
+        }
+    }
+    surviving
+}
+
+fn source_records_from_history(
+    history: &[ResponseItem],
+    root_task_id: Option<&str>,
+) -> Vec<UserSourceRecord> {
+    let root_task_id = root_task_id.unwrap_or("history-rewrite");
+    let mut records = Vec::new();
+    for (message_ordinal, message) in history_user_sources(history).into_iter().enumerate() {
+        let message_id = message.message_id.unwrap_or_else(|| {
+            let signature = serde_json::to_vec(&message.materials).unwrap_or_default();
+            format!(
+                "legacy-history-{message_ordinal}-{:x}",
+                Sha256::digest(signature)
+            )
+        });
+        for (content_ordinal, (kind, exact_material)) in message.materials.into_iter().enumerate() {
+            let availability = if exact_material.is_empty() {
+                UserSourceAvailability::Unavailable
+            } else {
+                UserSourceAvailability::Available
+            };
+            let content_hash = user_source_content_hash(kind, &exact_material, availability);
+            let content_ordinal = u64::try_from(content_ordinal).unwrap_or(u64::MAX);
+            records.push(UserSourceRecord {
+                source_id: deterministic_source_id(
+                    root_task_id,
+                    0,
+                    &message_id,
+                    content_ordinal,
+                    &content_hash,
+                ),
+                message_id: message_id.clone(),
+                source_kind: kind,
+                content_hash,
+                source_ordinal: u64::try_from(records.len()).unwrap_or(u64::MAX),
+                content_ordinal,
+                exact_material,
+                availability,
+                completion_epoch: 0,
+                introduced_manifest_revision: 0,
+            });
+        }
+    }
+    records
 }
 
 async fn user_source_material(
@@ -11003,7 +11203,7 @@ fn completion_contract_hashes(
 }
 
 fn canonical_hash(format_name: &str, value: &Value) -> String {
-    let canonical = canonicalize_json_value(value.clone());
+    let canonical = canonicalize_json(value);
     let mut bytes = Vec::new();
     bytes.extend_from_slice(format_name.as_bytes());
     bytes.push(b'\n');
@@ -11149,16 +11349,7 @@ fn is_sha256_hex(value: &str) -> bool {
 }
 
 fn desktop_paths_match(expected: &str, observed: &str) -> bool {
-    let expected = normalize_path_for_identity(Path::new(expected));
-    let observed = normalize_path_for_identity(Path::new(observed));
-    #[cfg(windows)]
-    {
-        expected.eq_ignore_ascii_case(&observed)
-    }
-    #[cfg(not(windows))]
-    {
-        expected == observed
-    }
+    codex_utils_absolute_path::paths_match_after_normalization(expected, observed)
 }
 
 fn desktop_install_evidence_hash(
@@ -11402,14 +11593,10 @@ fn canonical_repair_path(
         return Err(RereviewFallbackReason::InvalidPath);
     }
     let canonical = segments.join("/");
-    if cfg!(windows) {
-        if !canonical.is_ascii() {
-            return Err(RereviewFallbackReason::AmbiguousWindowsCase);
-        }
-        Ok(canonical.to_ascii_lowercase())
-    } else {
-        Ok(canonical)
+    if !canonical.is_ascii() {
+        return Err(RereviewFallbackReason::AmbiguousWindowsCase);
     }
+    Ok(canonical.to_ascii_lowercase())
 }
 
 fn generated_pattern_is_supported(pattern: &str, grammar_version: u32) -> bool {
@@ -11506,6 +11693,8 @@ fn plan_structure_hash(plan: &[EvidencePlanStep]) -> String {
                 "step": step.step,
                 "sourceOwner": step.source_owner,
                 "implementationSurfaces": step.implementation_surfaces,
+                "surfaceRoles": step.surface_roles,
+                "validationAssetPaths": step.validation_asset_paths,
                 "mutationObligations": step.mutation_obligations.iter().map(|obligation| serde_json::json!({
                     "id": obligation.id,
                     "description": obligation.description,
@@ -11552,6 +11741,7 @@ fn declared_repair_scopes(
             .iter()
             .chain(step.runtime_paths.iter())
             .chain(step.generated_artifacts.iter())
+            .chain(step.validation_asset_paths.iter())
             .cloned()
     }));
     for candidate in candidates {
@@ -11601,6 +11791,23 @@ fn declared_repair_scopes(
 
 fn receipt_sequence(id: &str, prefix: &str) -> Option<u64> {
     id.strip_prefix(prefix)?.parse().ok()
+}
+
+fn debug_assert_canonical_authoritative_inputs(
+    typed_mutation_identities: &[String],
+    typed_evidence: &[String],
+    authoritative_input_errors: &[String],
+) {
+    for values in [
+        typed_mutation_identities,
+        typed_evidence,
+        authoritative_input_errors,
+    ] {
+        debug_assert!(
+            values.windows(2).all(|pair| pair[0] < pair[1]),
+            "authoritative completion-review inputs must be sorted and deduplicated by the producer"
+        );
+    }
 }
 
 fn current_repair_snapshot(
@@ -11684,9 +11891,7 @@ fn current_repair_snapshot(
     default_child_mutation_identities.sort();
     default_child_mutation_identities.dedup();
 
-    let mut typed_mutation_identities = typed_mutation_identities.to_vec();
-    typed_mutation_identities.sort();
-    typed_mutation_identities.dedup();
+    let typed_mutation_identities = typed_mutation_identities.to_vec();
     let mut external_evidence_ids = document
         .external_evidence
         .iter()
@@ -12161,7 +12366,7 @@ async fn persist_document_with_permit(
     document: TaskEvidenceDocument,
     permit: tokio::sync::OwnedSemaphorePermit,
     last_persisted_revision: Arc<AtomicU64>,
-    test_control: Option<PersistenceTestControl>,
+    #[cfg(test)] test_control: Option<PersistenceTestControl>,
 ) -> (PersistOutcome, Option<tokio::sync::OwnedSemaphorePermit>) {
     let bytes = match serde_json::to_vec_pretty(&document) {
         Ok(bytes) => bytes,
@@ -12171,6 +12376,7 @@ async fn persist_document_with_permit(
         }
     };
     match tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
         if let Some(control) = test_control.as_ref()
             && let Some((started, release)) = control
                 .before_next_write
@@ -12182,6 +12388,7 @@ async fn persist_document_with_permit(
             release.wait();
         }
         let last_revision = last_persisted_revision.load(Ordering::Acquire);
+        #[cfg(test)]
         let force_superseded = test_control.as_ref().is_some_and(|control| {
             control
                 .supersede_writes
@@ -12190,11 +12397,15 @@ async fn persist_document_with_permit(
                 })
                 .is_ok()
         });
-        let outcome = if force_superseded || last_revision > document.revision {
+        let superseded = last_revision > document.revision;
+        #[cfg(test)]
+        let superseded = superseded || force_superseded;
+        let outcome = if superseded {
             PersistOutcome::Superseded
         } else if last_revision == document.revision && last_revision != 0 {
             PersistOutcome::Persisted
         } else {
+            #[cfg(test)]
             let write_result = if test_control
                 .as_ref()
                 .is_some_and(|control| control.fail_writes.load(Ordering::Acquire))
@@ -12205,6 +12416,8 @@ async fn persist_document_with_permit(
             } else {
                 atomic_write_evidence(&path, &bytes)
             };
+            #[cfg(not(test))]
+            let write_result = atomic_write_evidence(&path, &bytes);
             match write_result {
                 Ok(()) => {
                     last_persisted_revision.store(document.revision, Ordering::Release);
@@ -12249,150 +12462,8 @@ async fn delete_external_artifact_owned(
     }
 }
 
-struct ExternalEvidenceMetadata {
-    producer: String,
-    producer_schema_version: u32,
-    provider_snapshot: Option<String>,
-    payload_completeness: EvidenceCompleteness,
-    truncated: bool,
-    approximate: bool,
-    limitations: Vec<String>,
-}
-
-fn extract_external_evidence_metadata(
-    result: &CallToolResult,
-) -> Result<Option<ExternalEvidenceMetadata>, &'static str> {
-    let Some(structured) = result.structured_content.as_ref() else {
-        return Ok(None);
-    };
-    let Some(evidence_meta) = structured.get("evidenceMeta") else {
-        return Ok(None);
-    };
-    let Some(meta) = evidence_meta.as_object() else {
-        return Err("MCP evidenceMeta is malformed and was ignored");
-    };
-    let Some(schema_version) = meta.get("schemaVersion").and_then(Value::as_u64) else {
-        return Err("MCP evidenceMeta schemaVersion is malformed and was ignored");
-    };
-    if schema_version != 1 {
-        return Err("MCP evidenceMeta schemaVersion is unsupported and was ignored");
-    }
-    let Some(producer) = meta.get("producer").and_then(Value::as_str) else {
-        return Err("MCP evidenceMeta producer is malformed and was ignored");
-    };
-    if producer.trim().is_empty() {
-        return Err("MCP evidenceMeta producer is malformed and was ignored");
-    }
-    let Some(evidence_bearing) = meta.get("evidenceBearing").and_then(Value::as_bool) else {
-        return Err("MCP evidenceMeta evidenceBearing is malformed and was ignored");
-    };
-    if !evidence_bearing {
-        return Ok(None);
-    }
-    if meta
-        .get("operation")
-        .and_then(Value::as_str)
-        .is_none_or(str::is_empty)
-    {
-        return Err("MCP evidenceMeta operation is malformed and was ignored");
-    }
-    let payload_completeness = match meta.get("payloadCompleteness").and_then(Value::as_str) {
-        Some("complete") => EvidenceCompleteness::Complete,
-        Some("partial") => EvidenceCompleteness::Partial,
-        Some("unknown") => EvidenceCompleteness::Unknown,
-        _ => {
-            return Err("MCP evidenceMeta payloadCompleteness is malformed and was ignored");
-        }
-    };
-    let Some(truncated) = meta.get("truncated").and_then(Value::as_bool) else {
-        return Err("MCP evidenceMeta truncated flag is malformed and was ignored");
-    };
-    if payload_completeness == EvidenceCompleteness::Complete && truncated {
-        return Err("MCP evidenceMeta complete payload cannot be truncated and was ignored");
-    }
-    let Some(approximate) = meta.get("approximate").and_then(Value::as_bool) else {
-        return Err("MCP evidenceMeta approximate flag is malformed and was ignored");
-    };
-    let Some(limitations) = meta.get("limitations").and_then(Value::as_array) else {
-        return Err("MCP evidenceMeta limitations are malformed and were ignored");
-    };
-    let Some(limitations) = limitations
-        .iter()
-        .map(|value| value.as_str().map(str::to_string))
-        .collect::<Option<Vec<_>>>()
-    else {
-        return Err("MCP evidenceMeta limitations are malformed and were ignored");
-    };
-    let provider_snapshot = match meta.get("snapshot") {
-        // Keep ingress tolerant for providers deployed before snapshot became
-        // explicitly required by the producer contract.
-        None | Some(Value::Null) => None,
-        Some(Value::String(snapshot)) => Some(snapshot.clone()),
-        Some(_) => return Err("MCP evidenceMeta snapshot is malformed and was ignored"),
-    };
-    Ok(Some(ExternalEvidenceMetadata {
-        producer: producer.to_string(),
-        producer_schema_version: schema_version as u32,
-        provider_snapshot,
-        payload_completeness,
-        truncated,
-        approximate,
-        limitations,
-    }))
-}
-
-fn canonical_mcp_result_payload(result: &CallToolResult) -> Value {
-    canonicalize_json_value(serde_json::json!({
-        "content": result.content,
-        "structuredContent": result.structured_content,
-        "isError": result.is_error,
-    }))
-}
-
-fn canonicalize_json_value(value: Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let sorted = map
-                .into_iter()
-                .map(|(key, value)| (key, canonicalize_json_value(value)))
-                .collect::<BTreeMap<_, _>>();
-            Value::Object(sorted.into_iter().collect())
-        }
-        Value::Array(values) => {
-            Value::Array(values.into_iter().map(canonicalize_json_value).collect())
-        }
-        other => other,
-    }
-}
-
-const fn evidence_completeness_name(completeness: EvidenceCompleteness) -> &'static str {
-    match completeness {
-        EvidenceCompleteness::Complete => "complete",
-        EvidenceCompleteness::Partial => "partial",
-        EvidenceCompleteness::Unknown => "unknown",
-    }
-}
-
-fn encode_external_evidence_artifact(canonical_bytes: &[u8]) -> Option<Vec<u8>> {
-    let canonical = std::str::from_utf8(canonical_bytes).ok()?;
-    let mut encoded = Vec::with_capacity(canonical_bytes.len() + 256);
-    encoded.extend_from_slice(EXTERNAL_EVIDENCE_ARTIFACT_HEADER.as_bytes());
-    let mut start = 0;
-    while start < canonical.len() {
-        let mut end = (start + EXTERNAL_EVIDENCE_ARTIFACT_CHUNK_BYTES).min(canonical.len());
-        while !canonical.is_char_boundary(end) {
-            end -= 1;
-        }
-        let line = Value::String(canonical[start..end].to_string()).to_string();
-        encoded.extend_from_slice(line.as_bytes());
-        encoded.push(b'\n');
-        start = end;
-    }
-    Some(encoded)
-}
-
 fn workspace_root_fingerprint(start: &TaskStartState) -> String {
-    let identity = canonicalize_json_value(serde_json::json!({
+    let identity = canonicalize_json(&serde_json::json!({
         "repositoryRoot": start.repository_root,
         "repositoryUrl": start.repository_url,
     }));
@@ -12516,6 +12587,7 @@ async fn load_existing_document_with_supported_version(
             | FROZEN_TASK_EVIDENCE_V9_SCHEMA_VERSION
             | FROZEN_TASK_EVIDENCE_V10_SCHEMA_VERSION
             | FROZEN_TASK_EVIDENCE_V11_SCHEMA_VERSION
+            | FROZEN_TASK_EVIDENCE_V12_SCHEMA_VERSION
             | TASK_EVIDENCE_SCHEMA_VERSION
     ) && let Err(reason) = validate_v5_completion_review(&document)
     {
@@ -12843,15 +12915,6 @@ fn validate_v5_revision_snapshots(ledger: &CompletionReviewLedgerV2) -> Result<(
             return Err("source introduction revision is missing or invalid".to_string());
         }
     }
-    let max_source_ordinal = ledger
-        .source_records
-        .values()
-        .map(|source| source.source_ordinal)
-        .max()
-        .unwrap_or_default();
-    if ledger.next_source_ordinal <= max_source_ordinal {
-        return Err("next source ordinal can reuse a persisted source identity".to_string());
-    }
     Ok(())
 }
 
@@ -12866,12 +12929,55 @@ fn parse_review_coordinates(review_id: &str) -> Option<(u64, u64, u64)> {
         .then_some((epoch, revision, sequence))
 }
 
+fn next_source_ordinal(ledger: &CompletionReviewLedgerV2) -> u64 {
+    ledger
+        .source_records
+        .values()
+        .map(|source| source.source_ordinal)
+        .max()
+        .unwrap_or_default()
+        .saturating_add(1)
+        .max(1)
+}
+
+fn next_review_sequence(ledger: &CompletionReviewLedgerV2) -> u64 {
+    let highest_canonical_sequence = ledger
+        .receipts
+        .iter()
+        .filter_map(|receipt| parse_review_coordinates(&receipt.review_id))
+        .map(|(_, _, sequence)| sequence)
+        .max()
+        .unwrap_or_default();
+    highest_canonical_sequence
+        .max(u64::try_from(ledger.receipts.len()).unwrap_or(u64::MAX))
+        .saturating_add(1)
+        .max(1)
+}
+
+fn next_review_id(ledger: &CompletionReviewLedgerV2) -> String {
+    format!(
+        "review-{}-{}-{}",
+        ledger.completion_epoch,
+        ledger.manifest_revision,
+        next_review_sequence(ledger)
+    )
+}
+
+fn latest_terminal_closure(
+    ledger: &CompletionReviewLedgerV2,
+) -> Option<&CompletionReviewReceiptV2> {
+    ledger
+        .receipts
+        .iter()
+        .rev()
+        .find(|receipt| receipt.attempt_kind == CompletionReviewAttemptKind::TerminalClosure)
+}
+
 fn receipt_identity_matches(
     left: &CompletionReviewReceiptV2,
     right: &CompletionReviewReceiptV2,
 ) -> bool {
     left.candidate_mutation_revision == right.candidate_mutation_revision
-        && left.candidate_hash == right.candidate_hash
         && left.implementation_identity_hash == right.implementation_identity_hash
         && left.dossier_snapshot_id == right.dossier_snapshot_id
         && left.user_source_ledger_hash == right.user_source_ledger_hash
@@ -13293,7 +13399,6 @@ fn validate_v5_review_receipts(
         })
         .collect::<BTreeMap<_, _>>();
     let mut seen = BTreeMap::<String, &CompletionReviewReceiptV2>::new();
-    let mut max_sequence = 0;
     for (receipt_index, receipt) in ledger.receipts.iter().enumerate() {
         if receipt.review_id.trim().is_empty() || seen.contains_key(&receipt.review_id) {
             return Err("review receipt ID is blank or duplicated".to_string());
@@ -13303,9 +13408,8 @@ fn validate_v5_review_receipts(
         let manifest = if migrated_v4 {
             None
         } else {
-            let (epoch, revision, sequence) =
+            let (epoch, revision, _) =
                 coordinates.ok_or_else(|| "review receipt ID is not host-canonical".to_string())?;
-            max_sequence = max_sequence.max(sequence);
             let manifest = manifest_by_key
                 .get(&(epoch, revision))
                 .copied()
@@ -13327,8 +13431,7 @@ fn validate_v5_review_receipts(
             }
             Some(manifest)
         };
-        if receipt.candidate_hash != receipt.implementation_identity_hash
-            || receipt.implementation_identity_hash.trim().is_empty()
+        if receipt.implementation_identity_hash.trim().is_empty()
             || receipt.dossier_snapshot_id.trim().is_empty()
             || receipt.infrastructure_outcome.trim().is_empty()
         {
@@ -13584,9 +13687,6 @@ fn validate_v5_review_receipts(
         }
         seen.insert(receipt.review_id.clone(), receipt);
     }
-    if ledger.next_review_sequence <= max_sequence {
-        return Err("next review sequence can reuse a persisted review identity".to_string());
-    }
     if let Some(cycle) = ledger.active_review_cycle.as_ref() {
         if cycle.manifest_revision != ledger.manifest_revision {
             return Err("active review cycle targets the wrong manifest revision".to_string());
@@ -13631,31 +13731,21 @@ fn validate_v5_review_receipts(
                 );
             }
         }
-        match cycle.accepted_review_id.as_ref() {
-            Some(accepted_id) => {
-                let accepted = seen
-                    .get(accepted_id)
-                    .copied()
-                    .ok_or_else(|| "active cycle accepted review is missing".to_string())?;
-                if !accepted.review_clean
-                    || accepted.terminal_outcome.is_some()
-                    || !matches!(
-                        accepted.attempt_kind,
-                        CompletionReviewAttemptKind::InitialReview
-                            | CompletionReviewAttemptKind::Rereview
-                    )
-                    || cycle.accepted_dossier_snapshot_id.as_deref()
-                        != Some(accepted.dossier_snapshot_id.as_str())
-                {
-                    return Err("active cycle accepted review pointer is inconsistent".to_string());
-                }
+        if let Some(accepted_id) = cycle.accepted_review_id.as_ref() {
+            let accepted = seen
+                .get(accepted_id)
+                .copied()
+                .ok_or_else(|| "active cycle accepted review is missing".to_string())?;
+            if !accepted.review_clean
+                || accepted.terminal_outcome.is_some()
+                || !matches!(
+                    accepted.attempt_kind,
+                    CompletionReviewAttemptKind::InitialReview
+                        | CompletionReviewAttemptKind::Rereview
+                )
+            {
+                return Err("active cycle accepted review pointer is inconsistent".to_string());
             }
-            None if cycle.accepted_dossier_snapshot_id.is_some() => {
-                return Err(
-                    "active cycle has a dossier pointer without an accepted review".to_string(),
-                );
-            }
-            None => {}
         }
         if matches!(
             cycle.phase,
@@ -13678,14 +13768,8 @@ fn validate_v5_review_receipts(
             .accepted_review_id
             .as_ref()
             .ok_or_else(|| "Passed completion lacks an accepted review".to_string())?;
-        let terminal_id = ledger
-            .last_terminal_closure
-            .as_ref()
+        let terminal = latest_terminal_closure(ledger)
             .ok_or_else(|| "Passed completion lacks terminal closure".to_string())?;
-        let terminal = seen
-            .get(terminal_id)
-            .copied()
-            .ok_or_else(|| "Passed terminal closure is missing".to_string())?;
         if cycle.phase != CompletionReviewCyclePhase::Closed
             || ledger.review_risk.unresolved
             || ledger.review_risk.resolved_at.is_none()
@@ -13701,7 +13785,7 @@ fn validate_v5_review_receipts(
     }
     if !ledger.review_risk.unresolved
         && ledger.review_risk.resolved_at.is_some()
-        && ledger.last_terminal_closure.is_none()
+        && latest_terminal_closure(ledger).is_none()
     {
         return Err("resolved completion-review risk lacks terminal closure".to_string());
     }
@@ -13779,12 +13863,6 @@ fn recorded_or_native_path_within_repository(recorded: &str, repository_root: &P
         .any(|ancestor| repository_root_paths_equal(ancestor, &repository_root))
 }
 
-#[cfg(not(windows))]
-fn repository_root_paths_equal(left: &Path, right: &Path) -> bool {
-    left == right
-}
-
-#[cfg(windows)]
 fn repository_root_paths_equal(left: &Path, right: &Path) -> bool {
     use std::path::Component;
     use std::path::Prefix;
@@ -13925,17 +14003,12 @@ fn migrate_document_with_completion_model(
         document.risks.retain(|risk| {
             matches!(
                 risk.source.as_str(),
-                "edit"
-                    | "command"
-                    | "freshness"
-                    | "plan"
-                    | "plan_structure"
-                    | "task_evidence_storage"
+                "edit" | "command" | "freshness" | "plan_structure" | "task_evidence_storage"
             )
         });
         document.latest_generated_artifact_hashes.clear();
     }
-    rebuild_declared_requirements_and_risks(document);
+    refresh_derived_plan_state(document);
     sync_plan_structure_state(document, &duplicate_step_ids);
     if document.completion_review_v2.is_none() {
         document.completion_review_v2 = Some(new_completion_review_ledger(&document.thread_id));
@@ -14028,7 +14101,6 @@ fn seed_migrated_v4_terminal_lineage(document: &mut TaskEvidenceDocument) {
         parent_review_id,
         superseded_review_id: None,
         candidate_mutation_revision: document.host_mutation_revision,
-        candidate_hash: implementation_identity_hash.clone(),
         implementation_identity_hash: implementation_identity_hash.clone(),
         dossier_snapshot_id: dossier_snapshot_id.clone(),
         user_source_ledger_hash: source_ledger_hash.clone(),
@@ -14068,7 +14140,7 @@ fn seed_migrated_v4_terminal_lineage(document: &mut TaskEvidenceDocument) {
         None,
     ));
     ledger.receipts.push(receipt(
-        terminal_review_id.clone(),
+        terminal_review_id,
         CompletionReviewAttemptKind::TerminalClosure,
         Some(initial_review_id.clone()),
         Some("passed".to_string()),
@@ -14082,7 +14154,6 @@ fn seed_migrated_v4_terminal_lineage(document: &mut TaskEvidenceDocument) {
         correction_consumed: false,
         manifest_gap_reconstructed: false,
         accepted_review_id: Some(initial_review_id),
-        accepted_dossier_snapshot_id: Some(dossier_snapshot_id),
     });
     ledger.review_risk = CompletionReviewRisk {
         unresolved: false,
@@ -14090,8 +14161,6 @@ fn seed_migrated_v4_terminal_lineage(document: &mut TaskEvidenceDocument) {
         opened_at: Some(recorded_at.clone()),
         resolved_at: Some(recorded_at),
     };
-    ledger.last_terminal_closure = Some(terminal_review_id);
-    ledger.next_review_sequence = 3;
     document.completion_review_v2 = Some(ledger);
 }
 
@@ -14141,9 +14210,12 @@ fn atomic_write_evidence(path: &Path, bytes: &[u8]) -> io::Result<()> {
     temp.as_file_mut().sync_all()?;
     let persisted = temp.persist(path).map_err(|err| err.error)?;
     persisted.sync_all()?;
-    #[cfg(unix)]
-    std::fs::File::open(parent)?.sync_all()?;
+
     Ok(())
+}
+
+pub(crate) fn is_kd4_repository(cwd: &Path) -> bool {
+    find_kd4_repo_root(cwd).is_some()
 }
 
 fn find_kd4_repo_root(cwd: &Path) -> Option<PathBuf> {
@@ -14202,6 +14274,8 @@ fn normalize_requested_status(requested: &StepStatus) -> StepStatus {
 fn step_internal_structure_matches(left: &EvidencePlanStep, right: &EvidencePlanStep) -> bool {
     left.source_owner == right.source_owner
         && left.implementation_surfaces == right.implementation_surfaces
+        && left.surface_roles == right.surface_roles
+        && left.validation_asset_paths == right.validation_asset_paths
         && left
             .mutation_obligations
             .iter()
@@ -14339,6 +14413,7 @@ fn step_requires_validation(step: &EvidencePlanStep) -> bool {
         || step.external_validation_route.is_some()
         || !step.runtime_paths.is_empty()
         || !step.generated_artifacts.is_empty()
+        || !step.validation_asset_paths.is_empty()
         || step.requires_desktop_activation
         || !step.implementation_surfaces.is_empty()
         || !step.mutation_obligations.is_empty()
@@ -14410,11 +14485,6 @@ fn current_action_attribution(
         &mut document.planning.outside_plan_actions,
         MAX_OUTSIDE_PLAN_ACTIONS,
     );
-    document.planning.counters.outside_plan_actions = document
-        .planning
-        .counters
-        .outside_plan_actions
-        .saturating_add(1);
     (None, None, None, ActionAttributionKind::OutsidePlan)
 }
 
@@ -14593,6 +14663,73 @@ fn validation_receipt_matches_leaf_proof(
                     == leaf.covered_contracts.iter().collect::<BTreeSet<_>>()
                 && validation.duration_ms <= leaf.timeout_ms
         })
+}
+
+fn infer_validation_plan_binding(
+    document: &TaskEvidenceDocument,
+    command: &[String],
+    cwd: &PathUri,
+    implementation_identity_hash: Option<&str>,
+    validation_result: Option<&ValidationResult>,
+) -> Option<(String, u64)> {
+    let implementation_identity = implementation_identity_hash?;
+    let validation = validation_result?;
+    if !validation.status.is_success()
+        || validation.proof_key.validation_contract_version
+            != codex_protocol::validation::VALIDATION_CONTRACT_VERSION
+        || validation.proof_key.implementation_identity != implementation_identity
+        || !repository_roots_match(
+            Path::new(&validation.proof_key.repository),
+            Path::new(&document.start.repository_root),
+        )
+        || !recorded_or_native_locations_match(&cwd.to_string(), &validation.proof_key.cwd)
+        || !recorded_path_uri_matches(&cwd.to_string(), Path::new(&document.start.repository_root))
+    {
+        return None;
+    }
+    let acknowledgement = document.batch_acknowledgement.as_ref()?;
+    if acknowledgement.implementation_revision != document.host_mutation_revision {
+        return None;
+    }
+    let step = document
+        .plan
+        .iter()
+        .find(|step| step.id == acknowledgement.step_id)?;
+    if step.status != StepStatus::Implemented
+        || !implementation_dependencies_satisfied(document, step)
+        || step.validation_disposition != ValidationDisposition::Executable
+    {
+        return None;
+    }
+    let route = step.validation_route.as_ref()?;
+    route
+        .leaves
+        .iter()
+        .any(|leaf| {
+            validation_leaf_implementation_identity(
+                acknowledgement.implementation_revision,
+                leaf,
+                &acknowledgement.covered_manifest,
+            ) == implementation_identity
+                && crate::validation_admission::validation_argv_semantically_covers(
+                    command, &leaf.argv,
+                )
+                && validation.route.leaves.iter().any(|executed_leaf| {
+                    crate::validation_admission::validation_argv_semantically_covers(
+                        &executed_leaf.argv,
+                        &leaf.argv,
+                    ) && executed_leaf.uncertainty == leaf.uncertainty
+                        && executed_leaf.covered_paths.iter().collect::<BTreeSet<_>>()
+                            == leaf.covered_paths.iter().collect::<BTreeSet<_>>()
+                        && executed_leaf
+                            .covered_contracts
+                            .iter()
+                            .collect::<BTreeSet<_>>()
+                            == leaf.covered_contracts.iter().collect::<BTreeSet<_>>()
+                        && validation.duration_ms <= leaf.timeout_ms
+                })
+        })
+        .then(|| (step.id.clone(), step.revision))
 }
 
 fn accept_matching_command_proof(document: &mut TaskEvidenceDocument, receipt: &CommandReceipt) {
@@ -14865,6 +15002,11 @@ fn workspace_proof_scope(document: &TaskEvidenceDocument) -> WorkspaceProofScope
                 .map(|path| normalize_slashes(path)),
         );
         paths.extend(
+            step.validation_asset_paths
+                .iter()
+                .map(|path| normalize_slashes(path)),
+        );
+        paths.extend(
             step.implementation_surfaces
                 .iter()
                 .map(|path| normalize_slashes(path)),
@@ -15060,11 +15202,10 @@ fn sync_plan_structure_state(
     }
 }
 
-fn rebuild_declared_requirements_and_risks(document: &mut TaskEvidenceDocument) {
-    document.generated_artifact_requirements.clear();
-    document.risks.retain(|risk| risk.source != "plan");
+fn declared_generated_artifact_requirements(
+    document: &TaskEvidenceDocument,
+) -> Vec<GeneratedArtifactRequirement> {
     let mut requirements = Vec::new();
-    let mut risks = Vec::new();
     for step in &document.plan {
         if step.status != StepStatus::Skipped {
             for (index, path) in step.generated_artifacts.iter().enumerate() {
@@ -15075,29 +15216,50 @@ fn rebuild_declared_requirements_and_risks(document: &mut TaskEvidenceDocument) 
                 });
             }
         }
-        for (index, description) in step.risks.iter().enumerate() {
-            risks.push(EvidenceRisk {
-                id: format!("plan:{}:risk:{index}", step.id),
-                description: description.clone(),
-                source: "plan".to_string(),
-                blocking: false,
-                resolved: step.status == StepStatus::Passed,
-                epoch: document.evidence_epoch,
-            });
-        }
     }
+    requirements
+}
+
+fn declared_plan_risks(document: &TaskEvidenceDocument) -> Vec<EvidenceRisk> {
     document
-        .generated_artifact_requirements
-        .extend(requirements);
-    let required_artifact_paths = document
-        .generated_artifact_requirements
+        .plan
+        .iter()
+        .flat_map(|step| {
+            step.risks
+                .iter()
+                .enumerate()
+                .map(move |(index, description)| EvidenceRisk {
+                    id: format!("plan:{}:risk:{index}", step.id),
+                    description: description.clone(),
+                    source: "plan".to_string(),
+                    blocking: false,
+                    resolved: step.status == StepStatus::Passed,
+                    epoch: document.evidence_epoch,
+                })
+        })
+        .collect()
+}
+
+fn effective_risks(document: &TaskEvidenceDocument) -> impl Iterator<Item = EvidenceRisk> + '_ {
+    document
+        .risks
+        .iter()
+        .cloned()
+        .chain(declared_plan_risks(document))
+}
+
+fn refresh_derived_plan_state(document: &mut TaskEvidenceDocument) {
+    // Schema versions through V12 persisted plan-derived risks. Drop those legacy
+    // mirrors and derive them from the plan wherever they are consumed.
+    document.risks.retain(|risk| risk.source != "plan");
+    let requirements = declared_generated_artifact_requirements(document);
+    let required_artifact_paths = requirements
         .iter()
         .filter_map(|requirement| requirement.path.as_deref())
         .collect::<BTreeSet<_>>();
     document
         .latest_generated_artifact_hashes
         .retain(|path, _| required_artifact_paths.contains(path.as_str()));
-    document.risks.extend(risks);
 }
 
 fn plan_is_terminally_acknowledged(document: &TaskEvidenceDocument) -> bool {
@@ -15216,13 +15378,32 @@ fn completion_review_locally_obtainable_proof_routes(gate: &TaskCompletionGate) 
     routes
 }
 
+fn insert_completion_gate_reason(reasons: &mut Vec<String>, reason: String) {
+    if !reasons.windows(2).all(|pair| pair[0] < pair[1]) {
+        reasons.sort();
+        reasons.dedup();
+    }
+    if let Err(index) = reasons.binary_search(&reason) {
+        reasons.insert(index, reason);
+    }
+}
+
+fn extend_completion_gate_reasons(
+    reasons: &mut Vec<String>,
+    additional: impl IntoIterator<Item = String>,
+) {
+    for reason in additional {
+        insert_completion_gate_reason(reasons, reason);
+    }
+}
+
 fn derive_completion_gate(
     document: &TaskEvidenceDocument,
     evidence_path: Option<&Path>,
     desktop_activation_runtime: &DesktopActivationRuntimeSnapshot,
 ) -> TaskCompletionGate {
-    let mut blocked = Vec::new();
-    let mut partial = Vec::new();
+    let mut blocked = BTreeSet::new();
+    let mut partial = BTreeSet::new();
     let blocked_steps = document
         .plan
         .iter()
@@ -15230,7 +15411,7 @@ fn derive_completion_gate(
         .map(|step| step.id.clone())
         .collect::<Vec<_>>();
     if !blocked_steps.is_empty() {
-        blocked.push(format!("blocked plan steps: {}", blocked_steps.join(", ")));
+        blocked.insert(format!("blocked plan steps: {}", blocked_steps.join(", ")));
     }
     let unacknowledged_steps = document
         .plan
@@ -15239,7 +15420,7 @@ fn derive_completion_gate(
         .map(|step| format!("{} ({:?})", step.id, step.status))
         .collect::<Vec<_>>();
     if !unacknowledged_steps.is_empty() {
-        partial.push(format!(
+        partial.insert(format!(
             "plan steps are not acknowledged as passed: {}",
             unacknowledged_steps.join(", ")
         ));
@@ -15248,10 +15429,12 @@ fn derive_completion_gate(
         && let Some(work_unit) = document.planning.work_unit.as_ref()
     {
         match work_unit.validation_disposition {
-            ValidationDisposition::UnavailableBlocked => blocked.push(format!(
-                "focused work unit `{}` has no available validation route",
-                work_unit.id
-            )),
+            ValidationDisposition::UnavailableBlocked => {
+                blocked.insert(format!(
+                    "focused work unit `{}` has no available validation route",
+                    work_unit.id
+                ));
+            }
             ValidationDisposition::NotRequired
                 if !focused_work_unit_requires_validation(work_unit) => {}
             ValidationDisposition::Executable
@@ -15259,7 +15442,7 @@ fn derive_completion_gate(
             | ValidationDisposition::NotRequired
                 if work_unit.validation_receipt_id.is_none() =>
             {
-                partial.push(format!(
+                partial.insert(format!(
                     "focused work unit `{}` lacks current validation proof",
                     work_unit.id
                 ));
@@ -15279,11 +15462,11 @@ fn derive_completion_gate(
     {
         for dependency in &step.depends_on {
             if dependency == &step.id {
-                blocked.push(format!("plan step `{}` cannot depend on itself", step.id));
+                blocked.insert(format!("plan step `{}` cannot depend on itself", step.id));
                 continue;
             }
             let Some(dependency_step) = steps_by_id.get(dependency.as_str()) else {
-                blocked.push(format!(
+                blocked.insert(format!(
                     "plan step `{}` depends on missing step `{dependency}`",
                     step.id
                 ));
@@ -15293,7 +15476,7 @@ fn derive_completion_gate(
                 dependency_step.status,
                 StepStatus::Passed | StepStatus::Skipped
             ) {
-                partial.push(format!(
+                partial.insert(format!(
                     "plan step `{}` depends on unfinished step `{dependency}` ({:?})",
                     step.id, dependency_step.status
                 ));
@@ -15302,7 +15485,7 @@ fn derive_completion_gate(
     }
     let cycle_members = dependency_cycle_members(document);
     if !cycle_members.is_empty() {
-        blocked.push(format!(
+        blocked.insert(format!(
             "plan dependency cycle includes: {}",
             cycle_members.into_iter().collect::<Vec<_>>().join(", ")
         ));
@@ -15323,7 +15506,7 @@ fn derive_completion_gate(
                     )
             })
     {
-        partial.push(match desktop_activation_runtime.availability {
+        partial.insert(match desktop_activation_runtime.availability {
             DesktopInstallEvidenceAvailability::NoAuthenticatedHostTransport => {
                 "required Desktop activation receipt is missing or stale: no authenticated host transport"
                     .to_string()
@@ -15333,11 +15516,11 @@ fn derive_completion_gate(
             }
         });
     }
-    for requirement in &document.generated_artifact_requirements {
+    for requirement in declared_generated_artifact_requirements(document) {
         if let Some(path) = requirement.path.as_ref()
             && !generated_artifact_is_currently_available(document, path)
         {
-            partial.push(format!(
+            partial.insert(format!(
                 "required generated artifact is missing, unreadable, or unhashable: {path}"
             ));
         }
@@ -15347,34 +15530,26 @@ fn derive_completion_gate(
         .values()
         .filter(|snapshot| snapshot.read_error.is_some())
     {
-        partial.push(format!(
+        partial.insert(format!(
             "task-controlled file is unreadable and cannot be freshness-checked: {}",
             snapshot.path
         ));
     }
     blocked.extend(
-        document
-            .risks
-            .iter()
+        effective_risks(document)
             .filter(|risk| !risk.resolved && risk.blocking)
-            .map(|risk| risk.description.clone()),
+            .map(|risk| risk.description),
     );
     partial.extend(
-        document
-            .risks
-            .iter()
+        effective_risks(document)
             .filter(|risk| !risk.resolved && !risk.blocking)
-            .map(|risk| risk.description.clone()),
+            .map(|risk| risk.description),
     );
-    blocked.sort();
-    blocked.dedup();
-    partial.sort();
-    partial.dedup();
     let (status, reasons) = if !blocked.is_empty() {
         blocked.extend(partial);
-        (TaskCompletionStatus::Blocked, blocked)
+        (TaskCompletionStatus::Blocked, blocked.into_iter().collect())
     } else if !partial.is_empty() {
-        (TaskCompletionStatus::Partial, partial)
+        (TaskCompletionStatus::Partial, partial.into_iter().collect())
     } else {
         (TaskCompletionStatus::Passed, Vec::new())
     };
@@ -15434,29 +15609,32 @@ fn overlay_completion_review_gate(
         return;
     }
     if source_capture_failed {
-        gate.reasons.push(
+        insert_completion_gate_reason(
+            &mut gate.reasons,
             "a user source could not be durably captured before completion review".to_string(),
         );
     }
     if blocked {
-        gate.reasons
-            .push("completion review is blocked by an external impediment".to_string());
+        insert_completion_gate_reason(
+            &mut gate.reasons,
+            "completion review is blocked by an external impediment".to_string(),
+        );
         gate.status = TaskCompletionStatus::Blocked;
     } else if gate.status != TaskCompletionStatus::Blocked {
         if mandatory_proof_missing {
-            gate.reasons.push(
+            insert_completion_gate_reason(
+                &mut gate.reasons,
                 "mandatory completion-review proof is missing for the current candidate"
                     .to_string(),
             );
         } else {
-            gate.reasons.push(
+            insert_completion_gate_reason(
+                &mut gate.reasons,
                 "completion review risk remains unresolved for the current candidate".to_string(),
             );
         }
         gate.status = TaskCompletionStatus::Partial;
     }
-    gate.reasons.sort();
-    gate.reasons.dedup();
 }
 
 fn invalidate_for_mutation(
@@ -15520,12 +15698,10 @@ fn invalidate_for_mutation(
         match cycle.phase {
             CompletionReviewCyclePhase::RereviewPending if cycle.correction_consumed => {
                 cycle.accepted_review_id = None;
-                cycle.accepted_dossier_snapshot_id = None;
             }
             CompletionReviewCyclePhase::ProvisionalClean => {
                 cycle.phase = CompletionReviewCyclePhase::InitialReviewPending;
                 cycle.accepted_review_id = None;
-                cycle.accepted_dossier_snapshot_id = None;
                 ledger.review_risk.unresolved = true;
                 ledger.review_risk.resolved_at = None;
             }
@@ -15553,7 +15729,6 @@ fn invalidate_for_mutation(
                     correction_consumed: false,
                     manifest_gap_reconstructed: false,
                     accepted_review_id: None,
-                    accepted_dossier_snapshot_id: None,
                 };
                 ledger.review_risk.unresolved = true;
                 ledger.review_risk.cycle_id = Some(cycle.cycle_id.clone());
@@ -15603,6 +15778,11 @@ fn mutation_can_affect_step(
             step.mutation_obligations
                 .iter()
                 .flat_map(|obligation| obligation.paths.iter().map(|path| normalize_slashes(path))),
+        )
+        .chain(
+            step.validation_asset_paths
+                .iter()
+                .map(|path| normalize_slashes(path)),
         )
         .chain(step.edit_paths.iter().cloned())
         .collect::<BTreeSet<_>>();
@@ -15791,18 +15971,19 @@ fn lexical_clean_path(path: PathBuf) -> PathBuf {
 }
 
 fn freshness_manifest(document: &TaskEvidenceDocument) -> FreshnessManifest {
+    let requirements = declared_generated_artifact_requirements(document);
+    let artifact_paths = requirements
+        .iter()
+        .filter_map(|requirement| requirement.path.clone())
+        .map(|path| normalize_slashes(&path))
+        .collect();
     FreshnessManifest {
         state_signature: completion_freshness_state_signature(document),
         evidence_epoch: document.evidence_epoch,
-        requirements: document.generated_artifact_requirements.clone(),
+        requirements,
         tracked: document.latest_file_hashes.clone(),
         artifacts: document.latest_generated_artifact_hashes.clone(),
-        artifact_paths: document
-            .generated_artifact_requirements
-            .iter()
-            .filter_map(|requirement| requirement.path.clone())
-            .map(|path| normalize_slashes(&path))
-            .collect(),
+        artifact_paths,
     }
 }
 
@@ -15931,26 +16112,6 @@ async fn trusted_file_token(file: &tokio::fs::File) -> Option<TrustedFileToken> 
     trusted_file_token_from_handle(file, &metadata)
 }
 
-#[cfg(unix)]
-fn trusted_file_token_from_handle(
-    _file: &tokio::fs::File,
-    metadata: &std::fs::Metadata,
-) -> Option<TrustedFileToken> {
-    use std::os::unix::fs::MetadataExt;
-
-    Some(TrustedFileToken {
-        len: metadata.len(),
-        dev: metadata.dev(),
-        ino: metadata.ino(),
-        mode: metadata.mode(),
-        mtime: metadata.mtime(),
-        mtime_nsec: metadata.mtime_nsec(),
-        ctime: metadata.ctime(),
-        ctime_nsec: metadata.ctime_nsec(),
-    })
-}
-
-#[cfg(windows)]
 fn trusted_file_token_from_handle(
     file: &tokio::fs::File,
     metadata: &std::fs::Metadata,
@@ -16008,14 +16169,6 @@ fn trusted_file_token_from_handle(
         last_write_time: basic.LastWriteTime,
         change_time: basic.ChangeTime,
     })
-}
-
-#[cfg(not(any(unix, windows)))]
-fn trusted_file_token_from_handle(
-    _file: &tokio::fs::File,
-    _metadata: &std::fs::Metadata,
-) -> Option<TrustedFileToken> {
-    None
 }
 
 async fn sha1_file(path: &Path) -> io::Result<String> {
@@ -16100,10 +16253,6 @@ fn collect_directory_entries(directory: &Path, entries: &mut Vec<PathBuf>) -> io
     Ok(())
 }
 
-fn sha1_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha1::digest(bytes))
-}
-
 fn timestamp() -> String {
     Utc::now().to_rfc3339()
 }
@@ -16128,6 +16277,33 @@ mod tests {
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(
+        expected = "authoritative completion-review inputs must be sorted and deduplicated by the producer"
+    )]
+    fn authoritative_review_input_boundary_rejects_reordering() {
+        debug_assert_canonical_authoritative_inputs(
+            &["zeta".to_string(), "alpha".to_string()],
+            &[],
+            &[],
+        );
+    }
+
+    #[test]
+    fn completion_gate_reason_insertion_canonicalizes_once_and_stays_ordered() {
+        let mut reasons = vec!["zeta".to_string(), "alpha".to_string(), "zeta".to_string()];
+
+        insert_completion_gate_reason(&mut reasons, "middle".to_string());
+        insert_completion_gate_reason(&mut reasons, "alpha".to_string());
+        extend_completion_gate_reasons(
+            &mut reasons,
+            ["omega".to_string(), "beta".to_string(), "omega".to_string()],
+        );
+
+        assert_eq!(reasons, ["alpha", "beta", "middle", "omega", "zeta"]);
+    }
 
     async fn ledger_fixture() -> (TempDir, TaskEvidenceLedger) {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -16481,7 +16657,7 @@ mod tests {
         }
 
         let persisted: TaskEvidenceDocument = serde_json::from_slice(
-            &tokio::fs::read(ledger.evidence_path.as_ref().expect("evidence path"))
+            &tokio::fs::read(ledger.evidence_path().expect("evidence path"))
                 .await
                 .expect("persisted evidence"),
         )
@@ -16727,7 +16903,6 @@ mod tests {
             );
         }
 
-        #[cfg(windows)]
         {
             assert_eq!(
                 canonical_repair_path("SRC/Lib.rs", false),
@@ -16758,6 +16933,8 @@ mod tests {
             validation_disposition: ValidationDisposition::NotRequired,
             source_owner: None,
             implementation_surfaces: Vec::new(),
+            surface_roles: Vec::new(),
+            validation_asset_paths: Vec::new(),
             mutation_obligations: Vec::new(),
             validation_receipt_id: None,
             edit_paths: BTreeSet::from(["src/lib.rs".to_string()]),
@@ -16780,6 +16957,13 @@ mod tests {
         assert_ne!(
             plan_structure_hash(std::slice::from_ref(&original)),
             plan_structure_hash(std::slice::from_ref(&changed_paths))
+        );
+        let mut changed_review_metadata = original.clone();
+        changed_review_metadata.surface_roles = vec!["pipeline".to_string()];
+        changed_review_metadata.validation_asset_paths = vec!["tests/golden.snap".to_string()];
+        assert_ne!(
+            plan_structure_hash(std::slice::from_ref(&original)),
+            plan_structure_hash(std::slice::from_ref(&changed_review_metadata))
         );
     }
 
@@ -17230,9 +17414,6 @@ mod tests {
         std::fs::write(outside.join("file.rs"), "outside").expect("outside file");
         let link = repo.join("link");
 
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&outside, &link).expect("directory symlink");
-        #[cfg(windows)]
         if let Err(err) = std::os::windows::fs::symlink_dir(&outside, &link) {
             if err.kind() == std::io::ErrorKind::PermissionDenied {
                 return;

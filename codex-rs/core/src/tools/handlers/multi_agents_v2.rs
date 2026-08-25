@@ -1,8 +1,8 @@
 //! Implements the MultiAgentV2 collaboration tool surface.
 
+use crate::FunctionCallError;
 use crate::agent::AgentStatus;
 use crate::agent::agent_resolver::resolve_agent_target;
-use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
@@ -26,10 +26,10 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 
-pub(crate) use followup_task::Handler as FollowupTaskHandler;
 pub(crate) use interrupt_agent::Handler as InterruptAgentHandler;
 pub(crate) use list_agents::Handler as ListAgentsHandler;
-pub(crate) use send_message::Handler as SendMessageHandler;
+pub(crate) use message_tool::FollowupTaskHandler;
+pub(crate) use message_tool::SendMessageHandler;
 pub(crate) use spawn::Handler as SpawnAgentHandler;
 pub(crate) use task::AbandonAgentTaskHandler;
 pub(crate) use task::AmendAgentTaskHandler;
@@ -39,11 +39,9 @@ pub(crate) use task::SubmitAgentReceiptHandler;
 pub(crate) use task::WaiveAgentGateHandler;
 pub(crate) use wait::Handler as WaitAgentHandler;
 
-mod followup_task;
 mod interrupt_agent;
 mod list_agents;
 mod message_tool;
-mod send_message;
 mod spawn;
 mod task;
 pub(crate) mod wait;

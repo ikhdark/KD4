@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [string]$Release = $env:CODEX_RELEASE
+    [string]$Release = $env:CODEX_RELEASE,
+    [string]$ReleaseRepository = $env:CODEX_RELEASE_REPOSITORY
 )
 
 Set-StrictMode -Version Latest
@@ -10,9 +11,26 @@ $ProgressPreference = "SilentlyContinue"
 if ([string]::IsNullOrWhiteSpace($Release)) {
     $Release = "latest"
 }
+if ([string]::IsNullOrWhiteSpace($ReleaseRepository)) {
+    $ReleaseRepository = "ikhdark/KD4"
+}
+$ReleaseRepository = $ReleaseRepository.Trim()
+if ($ReleaseRepository -cnotmatch "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$") {
+    throw "Invalid Codex release repository: $ReleaseRepository. Expected owner/name."
+}
+$ReleaseApiBase = "https://api.github.com/repos/$ReleaseRepository/releases"
 
 $NonInteractive = $env:CODEX_NON_INTERACTIVE -match "^(?i:1|true|yes)$"
 $InstallMetadataFile = "codex-install.env"
+$MinimumSupportedVersion = [version]"0.133.0"
+
+function Get-ReleaseApiUri {
+    param(
+        [string]$RelativePath
+    )
+
+    return "$ReleaseApiBase/$RelativePath"
+}
 
 function Write-Step {
     param(
@@ -101,13 +119,26 @@ function Assert-ValidReleaseVersion {
     }
 }
 
+function Assert-SupportedReleaseVersion {
+    param(
+        [string]$Version
+    )
+
+    $parts = $Version.Split("-", 2)
+    $coreVersion = [version]$parts[0]
+    $isPrereleaseAtMinimum = $coreVersion -eq $MinimumSupportedVersion -and $parts.Length -gt 1
+    if ($coreVersion -lt $MinimumSupportedVersion -or $isPrereleaseAtMinimum) {
+        throw "Unsupported Codex release version: $Version. The standalone installer supports $MinimumSupportedVersion and newer."
+    }
+}
+
 function Find-ReleaseAssetMetadata {
     param(
         [string]$AssetName,
         [string]$ResolvedVersion
     )
 
-    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/openai/codex/releases/tags/rust-v$ResolvedVersion"
+    $release = Invoke-RestMethod -Uri (Get-ReleaseApiUri -RelativePath "tags/rust-v$ResolvedVersion")
     $asset = $release.assets | Where-Object { $_.name -eq $AssetName } | Select-Object -First 1
     if ($null -eq $asset) {
         return $null
@@ -250,10 +281,11 @@ function Resolve-Version {
     $normalizedVersion = Normalize-Version -RawVersion $Release
     Assert-ValidReleaseVersion -Version $normalizedVersion
     if ($normalizedVersion -ne "latest") {
+        Assert-SupportedReleaseVersion -Version $normalizedVersion
         return $normalizedVersion
     }
 
-    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/openai/codex/releases/latest"
+    $release = Invoke-RestMethod -Uri (Get-ReleaseApiUri -RelativePath "latest")
     if (-not $release.tag_name) {
         Write-Error "Failed to resolve the latest Codex release version."
         exit 1
@@ -261,6 +293,7 @@ function Resolve-Version {
 
     $resolvedVersion = Normalize-Version -RawVersion $release.tag_name
     Assert-ValidReleaseVersion -Version $resolvedVersion
+    Assert-SupportedReleaseVersion -Version $resolvedVersion
     return $resolvedVersion
 }
 
@@ -667,30 +700,6 @@ function Test-PackageContentsAreComplete {
     return $true
 }
 
-function Test-LegacyPlatformNpmContentsAreComplete {
-    param(
-        [string]$PackageDir
-    )
-
-    if (-not (Test-Path -LiteralPath $PackageDir -PathType Container)) {
-        return $false
-    }
-
-    $expectedFiles = @(
-        "codex.exe",
-        "codex-resources\codex-command-runner.exe",
-        "codex-resources\codex-windows-sandbox-setup.exe",
-        "codex-resources\rg.exe"
-    )
-    foreach ($name in $expectedFiles) {
-        if (-not (Test-Path -LiteralPath (Join-Path $PackageDir $name) -PathType Leaf)) {
-            return $false
-        }
-    }
-
-    return $true
-}
-
 function Write-InstallMetadata {
     param(
         [string]$ReleaseDir,
@@ -743,11 +752,6 @@ function Test-ReleaseIsComplete {
                 return $false
             }
         }
-        "LegacyPlatformNpm" {
-            if (-not (Test-LegacyPlatformNpmContentsAreComplete -PackageDir $ReleaseDir)) {
-                return $false
-            }
-        }
         default {
             throw "Unknown Codex installer layout: $Layout"
         }
@@ -764,11 +768,7 @@ function Test-ReleaseIsComplete {
         return $false
     }
 
-    $codexPath = if ($Layout -eq "Package") {
-        Join-Path $ReleaseDir "bin\codex.exe"
-    } else {
-        Join-Path $ReleaseDir "codex.exe"
-    }
+    $codexPath = Join-Path $ReleaseDir "bin\codex.exe"
     return (Get-VersionFromBinary -CodexPath $codexPath) -ceq $ExpectedVersion
 }
 
@@ -869,7 +869,7 @@ function Test-VisibleCodexCommand {
 }
 
 if ($env:OS -ne "Windows_NT") {
-    Write-Error "install.ps1 supports Windows only. Use install.sh on macOS or Linux."
+    Write-Error "install.ps1 supports Windows only."
     exit 1
 }
 
@@ -881,17 +881,14 @@ if (-not [Environment]::Is64BitOperatingSystem) {
 $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
 $target = $null
 $platformLabel = $null
-$npmTag = $null
 switch ($architecture) {
     "Arm64" {
         $target = "aarch64-pc-windows-msvc"
         $platformLabel = "Windows (ARM64)"
-        $npmTag = "win32-arm64"
     }
     "X64" {
         $target = "x86_64-pc-windows-msvc"
         $platformLabel = "Windows (x64)"
-        $npmTag = "win32-x64"
     }
     default {
         Write-Error "Unsupported architecture: $architecture"
@@ -940,14 +937,7 @@ $packageMetadata = Find-ReleaseAssetMetadata -AssetName $packageAsset -ResolvedV
 $checksumMetadata = Find-ReleaseAssetMetadata -AssetName $checksumAsset -ResolvedVersion $resolvedVersion
 $installLayout = "Package"
 if ($null -eq $packageMetadata -or $null -eq $checksumMetadata) {
-    $packageAsset = "codex-npm-$npmTag-$resolvedVersion.tgz"
-    $packageMetadata = Find-ReleaseAssetMetadata -AssetName $packageAsset -ResolvedVersion $resolvedVersion
-    if ($null -ne $packageMetadata) {
-        $installLayout = "LegacyPlatformNpm"
-    } else {
-        throw "Could not find Codex package or platform npm release assets for Codex $resolvedVersion."
-    }
-    $checksumMetadata = $null
+    throw "Could not find Codex standalone package release assets for Codex $resolvedVersion."
 }
 $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("codex-install-" + [System.Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
@@ -966,13 +956,9 @@ try {
             $stagingDir = Join-Path $releasesDir ".staging.$releaseName.$PID"
 
             Write-Step "Downloading Codex CLI"
-            if ($installLayout -eq "Package") {
-                Invoke-WebRequest -Uri $checksumMetadata.Url -OutFile $checksumPath
-                Test-ArchiveDigest -ArchivePath $checksumPath -ExpectedDigest $checksumMetadata.Sha256
-                $expectedPackageDigest = Get-PackageArchiveDigest -ManifestPath $checksumPath -AssetName $packageAsset
-            } else {
-                $expectedPackageDigest = $packageMetadata.Sha256
-            }
+            Invoke-WebRequest -Uri $checksumMetadata.Url -OutFile $checksumPath
+            Test-ArchiveDigest -ArchivePath $checksumPath -ExpectedDigest $checksumMetadata.Sha256
+            $expectedPackageDigest = Get-PackageArchiveDigest -ManifestPath $checksumPath -AssetName $packageAsset
             Invoke-WebRequest -Uri $packageMetadata.Url -OutFile $archivePath
             Test-ArchiveDigest -ArchivePath $archivePath -ExpectedDigest $expectedPackageDigest
 
@@ -981,40 +967,12 @@ try {
                 Remove-Item -LiteralPath $stagingDir -Recurse -Force
             }
             New-Item -ItemType Directory -Force -Path $stagingDir | Out-Null
-            if ($installLayout -eq "Package") {
-                tar -xzf $archivePath -C $stagingDir
-                if (-not (Test-PackageContentsAreComplete -PackageDir $stagingDir -ExpectedVersion $resolvedVersion -ExpectedTarget $target)) {
-                    throw "Downloaded Codex package archive did not contain the expected package layout."
-                }
-            } else {
-                $extractDir = Join-Path $tempDir "extract"
-                New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
-                tar -xzf $archivePath -C $extractDir
-
-                $vendorRoot = Join-Path $extractDir "package/vendor/$target"
-                $resourcesDir = Join-Path $stagingDir "codex-resources"
-                New-Item -ItemType Directory -Force -Path $resourcesDir | Out-Null
-                $copyMap = @{
-                    "codex/codex.exe" = "codex.exe"
-                    "codex/codex-command-runner.exe" = "codex-resources\codex-command-runner.exe"
-                    "codex/codex-windows-sandbox-setup.exe" = "codex-resources\codex-windows-sandbox-setup.exe"
-                    "path/rg.exe" = "codex-resources\rg.exe"
-                }
-
-                foreach ($relativeSource in $copyMap.Keys) {
-                    Copy-Item -LiteralPath (Join-Path $vendorRoot $relativeSource) -Destination (Join-Path $stagingDir $copyMap[$relativeSource])
-                }
-
-                if (-not (Test-LegacyPlatformNpmContentsAreComplete -PackageDir $stagingDir)) {
-                    throw "Downloaded Codex npm archive did not contain the expected legacy platform package layout."
-                }
+            tar -xzf $archivePath -C $stagingDir
+            if (-not (Test-PackageContentsAreComplete -PackageDir $stagingDir -ExpectedVersion $resolvedVersion -ExpectedTarget $target)) {
+                throw "Downloaded Codex package archive did not contain the expected package layout."
             }
 
-            $stagedCodexPath = if ($installLayout -eq "Package") {
-                Join-Path $stagingDir "bin\codex.exe"
-            } else {
-                Join-Path $stagingDir "codex.exe"
-            }
+            $stagedCodexPath = Join-Path $stagingDir "bin\codex.exe"
             $stagedVersion = Get-VersionFromBinary -CodexPath $stagedCodexPath
             if ($stagedVersion -cne $resolvedVersion) {
                 throw "Downloaded Codex binary version did not match release metadata. Expected $resolvedVersion but got $stagedVersion."
@@ -1036,11 +994,7 @@ try {
             Ensure-Junction -LinkPath $currentDir -TargetPath $releaseDir -InstallerOwnedTargetPrefix $releasesDir
 
             $visibleParent = Split-Path -Parent $visibleBinDir
-            $currentBinDir = if ($installLayout -eq "Package") {
-                Join-Path $currentDir "bin"
-            } else {
-                $currentDir
-            }
+            $currentBinDir = Join-Path $currentDir "bin"
             New-Item -ItemType Directory -Force -Path $visibleParent | Out-Null
             $oldStandaloneBackup = Move-OldStandaloneBinIfApproved -VisibleBinDir $visibleBinDir -DefaultVisibleBinDir $defaultVisibleBinDir
             Ensure-Junction -LinkPath $visibleBinDir -TargetPath $currentBinDir -InstallerOwnedTargetPrefix $standaloneRoot

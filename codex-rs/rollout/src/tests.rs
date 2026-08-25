@@ -7,6 +7,7 @@ use std::fs::File;
 use std::fs::FileTimes;
 use std::io::Write;
 use std::path::Path;
+use std::path::PathBuf;
 
 use chrono::TimeZone;
 use pretty_assertions::assert_eq;
@@ -46,6 +47,18 @@ use codex_protocol::protocol::UserMessageEvent;
 const NO_SOURCE_FILTER: &[SessionSource] = &[];
 const TEST_PROVIDER: &str = "test-provider";
 
+#[test]
+fn deprecated_find_conversation_path_alias_is_removed() {
+    let crate_root = include_str!("lib.rs");
+    assert!(!crate_root.contains("find_conversation_path_by_id_str"));
+}
+
+#[test]
+fn deprecated_state_db_module_alias_is_removed() {
+    let crate_root = include_str!("lib.rs");
+    assert!(!crate_root.contains("pub use state_integration as state_db"));
+}
+
 fn provider_vec(providers: &[&str]) -> Vec<String> {
     providers
         .iter()
@@ -57,12 +70,16 @@ fn thread_id_from_uuid(uuid: Uuid) -> ThreadId {
     ThreadId::from_string(&uuid.to_string()).expect("valid thread id")
 }
 
+fn expected_fixture_cwd() -> PathBuf {
+    std::env::current_dir().expect("current directory should resolve")
+}
+
 async fn insert_state_db_thread(
     home: &Path,
     thread_id: ThreadId,
     rollout_path: &Path,
     archived: bool,
-) -> crate::state_db::StateDbHandle {
+) -> crate::state_integration::StateDbHandle {
     let runtime = codex_state::StateRuntime::init(home.to_path_buf(), TEST_PROVIDER.to_string())
         .await
         .expect("state db should initialize");
@@ -642,7 +659,7 @@ async fn test_list_conversations_latest_first() {
                 first_user_message: Some("Hello from user".to_string()),
                 title: None,
                 preview: Some("Hello from user".to_string()),
-                cwd: Some(Path::new(".").to_path_buf()),
+                cwd: Some(expected_fixture_cwd()),
                 git_branch: None,
                 git_sha: None,
                 git_origin_url: None,
@@ -663,7 +680,7 @@ async fn test_list_conversations_latest_first() {
                 first_user_message: Some("Hello from user".to_string()),
                 title: None,
                 preview: Some("Hello from user".to_string()),
-                cwd: Some(Path::new(".").to_path_buf()),
+                cwd: Some(expected_fixture_cwd()),
                 git_branch: None,
                 git_sha: None,
                 git_origin_url: None,
@@ -684,7 +701,7 @@ async fn test_list_conversations_latest_first() {
                 first_user_message: Some("Hello from user".to_string()),
                 title: None,
                 preview: Some("Hello from user".to_string()),
-                cwd: Some(Path::new(".").to_path_buf()),
+                cwd: Some(expected_fixture_cwd()),
                 git_branch: None,
                 git_sha: None,
                 git_origin_url: None,
@@ -798,7 +815,7 @@ async fn test_pagination_cursor() {
                 first_user_message: Some("Hello from user".to_string()),
                 title: None,
                 preview: Some("Hello from user".to_string()),
-                cwd: Some(Path::new(".").to_path_buf()),
+                cwd: Some(expected_fixture_cwd()),
                 git_branch: None,
                 git_sha: None,
                 git_origin_url: None,
@@ -819,7 +836,7 @@ async fn test_pagination_cursor() {
                 first_user_message: Some("Hello from user".to_string()),
                 title: None,
                 preview: Some("Hello from user".to_string()),
-                cwd: Some(Path::new(".").to_path_buf()),
+                cwd: Some(expected_fixture_cwd()),
                 git_branch: None,
                 git_sha: None,
                 git_origin_url: None,
@@ -876,7 +893,7 @@ async fn test_pagination_cursor() {
                 first_user_message: Some("Hello from user".to_string()),
                 title: None,
                 preview: Some("Hello from user".to_string()),
-                cwd: Some(Path::new(".").to_path_buf()),
+                cwd: Some(expected_fixture_cwd()),
                 git_branch: None,
                 git_sha: None,
                 git_origin_url: None,
@@ -897,7 +914,7 @@ async fn test_pagination_cursor() {
                 first_user_message: Some("Hello from user".to_string()),
                 title: None,
                 preview: Some("Hello from user".to_string()),
-                cwd: Some(Path::new(".").to_path_buf()),
+                cwd: Some(expected_fixture_cwd()),
                 git_branch: None,
                 git_sha: None,
                 git_origin_url: None,
@@ -946,7 +963,7 @@ async fn test_pagination_cursor() {
             first_user_message: Some("Hello from user".to_string()),
             title: None,
             preview: Some("Hello from user".to_string()),
-            cwd: Some(Path::new(".").to_path_buf()),
+            cwd: Some(expected_fixture_cwd()),
             git_branch: None,
             git_sha: None,
             git_origin_url: None,
@@ -1120,7 +1137,7 @@ async fn test_get_thread_contents() {
             first_user_message: Some("Hello from user".to_string()),
             title: None,
             preview: Some("Hello from user".to_string()),
-            cwd: Some(Path::new(".").to_path_buf()),
+            cwd: Some(expected_fixture_cwd()),
             git_branch: None,
             git_sha: None,
             git_origin_url: None,
@@ -1489,7 +1506,7 @@ async fn test_cursor_preserves_same_second_filesystem_ties() {
                 first_user_message: Some("Hello from user".to_string()),
                 title: None,
                 preview: Some("Hello from user".to_string()),
-                cwd: Some(Path::new(".").to_path_buf()),
+                cwd: Some(expected_fixture_cwd()),
                 git_branch: None,
                 git_sha: None,
                 git_origin_url: None,
@@ -1510,7 +1527,7 @@ async fn test_cursor_preserves_same_second_filesystem_ties() {
                 first_user_message: Some("Hello from user".to_string()),
                 title: None,
                 preview: Some("Hello from user".to_string()),
-                cwd: Some(Path::new(".").to_path_buf()),
+                cwd: Some(expected_fixture_cwd()),
                 git_branch: None,
                 git_sha: None,
                 git_origin_url: None,
@@ -1552,7 +1569,7 @@ async fn test_cursor_preserves_same_second_filesystem_ties() {
             first_user_message: Some("Hello from user".to_string()),
             title: None,
             preview: Some("Hello from user".to_string()),
-            cwd: Some(Path::new(".").to_path_buf()),
+            cwd: Some(expected_fixture_cwd()),
             git_branch: None,
             git_sha: None,
             git_origin_url: None,

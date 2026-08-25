@@ -75,11 +75,8 @@ fn parses_config_isolation_flags() {
 }
 
 #[test]
-fn removed_full_auto_flag_reports_migration_path() {
-    let cli = Cli::parse_from(["codex-exec", "--full-auto", "summarize"]);
+fn removed_full_auto_flag_is_rejected() {
+    let result = Cli::try_parse_from(["codex-exec", "--full-auto", "summarize"]);
 
-    assert_eq!(
-        cli.removed_full_auto_warning(),
-        Some("warning: `--full-auto` is deprecated; use `--sandbox workspace-write` instead.")
-    );
+    assert!(result.is_err());
 }

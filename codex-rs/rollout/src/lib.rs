@@ -14,7 +14,7 @@ pub(crate) mod recorder;
 pub(crate) mod search;
 pub(crate) mod session_index;
 mod sqlite_metrics;
-pub mod state_db;
+pub mod state_integration;
 mod tool_manifest;
 
 pub(crate) use codex_protocol::protocol;
@@ -48,8 +48,6 @@ pub use list::ThreadSortKey;
 pub use list::ThreadsPage;
 pub use list::find_archived_thread_path_by_id_str;
 pub use list::find_thread_path_by_id_str;
-#[deprecated(note = "use find_thread_path_by_id_str")]
-pub use list::find_thread_path_by_id_str as find_conversation_path_by_id_str;
 pub use list::get_threads;
 pub use list::get_threads_in_root;
 pub use list::parse_cursor;
@@ -75,8 +73,8 @@ pub use session_index::find_thread_meta_by_name_str;
 pub use session_index::find_thread_name_by_id;
 pub use session_index::find_thread_names_by_ids;
 pub use session_index::remove_thread_name_entries;
-pub use state_db::StateDbHandle;
-pub use state_db::sqlite_telemetry_recorder;
+pub use state_integration::StateDbHandle;
+pub use state_integration::sqlite_telemetry_recorder;
 pub use tool_manifest::ToolManifestDictionary;
 
 #[cfg(test)]

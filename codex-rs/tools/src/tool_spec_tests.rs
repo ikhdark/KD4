@@ -85,6 +85,49 @@ fn tool_spec_name_covers_all_variants() {
 }
 
 #[test]
+fn callable_tool_names_are_derived_from_the_complete_spec_shape() {
+    let namespace = ToolSpec::Namespace(ResponsesApiNamespace {
+        name: "calendar".to_string(),
+        description: "Calendar tools".to_string(),
+        tools: ["create", "delete"]
+            .into_iter()
+            .map(|name| {
+                ResponsesApiNamespaceTool::Function(ResponsesApiTool {
+                    name: name.to_string(),
+                    description: String::new(),
+                    strict: false,
+                    defer_loading: None,
+                    parameters: JsonSchema::default(),
+                    output_schema: None,
+                })
+            })
+            .collect(),
+    });
+
+    assert_eq!(
+        namespace.callable_tool_names(),
+        vec![
+            crate::ToolName::namespaced("calendar", "create"),
+            crate::ToolName::namespaced("calendar", "delete"),
+        ]
+    );
+    assert_eq!(namespace.sole_callable_tool_name(), None);
+    assert_eq!(
+        ToolSpec::Freeform(FreeformTool {
+            name: "exec".to_string(),
+            description: String::new(),
+            format: FreeformToolFormat {
+                r#type: "grammar".to_string(),
+                syntax: "lark".to_string(),
+                definition: String::new(),
+            },
+        })
+        .sole_callable_tool_name(),
+        Some(crate::ToolName::plain("exec"))
+    );
+}
+
+#[test]
 fn web_search_config_converts_to_responses_api_types() {
     assert_eq!(
         ResponsesApiWebSearchFilters::from(ConfigWebSearchFilters {

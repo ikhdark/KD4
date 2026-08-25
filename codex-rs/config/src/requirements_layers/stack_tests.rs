@@ -155,24 +155,12 @@ fn composition_strategy_applies_to_non_cloud_layers() {
         domain: "com.openai.codex".to_string(),
         key: "requirements_toml_base64".to_string(),
     };
-    let system_file = if cfg!(windows) {
-        "C:\\requirements.toml"
-    } else {
-        "/etc/codex/requirements.toml"
-    };
+    let system_file = "C:\\requirements.toml";
     let system_source = RequirementSource::SystemRequirementsToml {
         file: AbsolutePathBuf::from_absolute_path(system_file).expect("absolute path"),
     };
-    let high_path = if cfg!(windows) {
-        "C:\\secret"
-    } else {
-        "/secret"
-    };
-    let low_path = if cfg!(windows) {
-        "C:\\other-secret"
-    } else {
-        "/other-secret"
-    };
+    let high_path = "C:\\secret";
+    let low_path = "C:\\other-secret";
 
     let composed = compose_requirements_for_hostname(
         vec![
@@ -967,16 +955,8 @@ command = "low"
 
 #[test]
 fn permissions_deny_read_unions_while_profiles_use_regular_toml_merge() {
-    let high_path = if cfg!(windows) {
-        "C:\\secret"
-    } else {
-        "/secret"
-    };
-    let low_path = if cfg!(windows) {
-        "C:\\other-secret"
-    } else {
-        "/other-secret"
-    };
+    let high_path = "C:\\secret";
+    let low_path = "C:\\other-secret";
     let composed = compose(vec![
         layer(
             "req_low",
@@ -1026,11 +1006,7 @@ extends = ":workspace"
 
 #[test]
 fn deny_read_only_layers_do_not_leave_empty_permissions_tables() {
-    let path = if cfg!(windows) {
-        "C:\\secret"
-    } else {
-        "/secret"
-    };
+    let path = "C:\\secret";
     let composed = compose(vec![layer(
         "req_high",
         "High",

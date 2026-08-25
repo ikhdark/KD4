@@ -35,7 +35,6 @@ use tempfile::TempDir;
 use tempfile::tempdir;
 use toml::Value as TomlValue;
 
-#[cfg(windows)]
 #[path = "exec_policy_windows_tests.rs"]
 mod windows_tests;
 
@@ -55,11 +54,7 @@ fn config_stack_for_dot_codex_folder(dot_codex_folder: &Path) -> ConfigLayerStac
 }
 
 fn host_absolute_path(segments: &[&str]) -> String {
-    let mut path = if cfg!(windows) {
-        PathBuf::from(r"C:\")
-    } else {
-        PathBuf::from("/")
-    };
+    let mut path = PathBuf::from(r"C:\");
     for segment in segments {
         path.push(segment);
     }
@@ -67,11 +62,7 @@ fn host_absolute_path(segments: &[&str]) -> String {
 }
 
 fn host_program_path(name: &str) -> String {
-    let executable_name = if cfg!(windows) {
-        format!("{name}.exe")
-    } else {
-        name.to_string()
-    };
+    let executable_name = format!("{name}.exe");
     host_absolute_path(&["usr", "bin", &executable_name])
 }
 
@@ -858,34 +849,6 @@ async fn drops_requested_amendment_for_heredoc_fallback_prompts_when_it_matches(
 }
 
 #[tokio::test]
-#[cfg(not(windows))]
-async fn heredoc_with_variable_assignment_is_not_reduced_to_allowed_prefix() {
-    assert_exec_approval_requirement_for_command(
-        ExecApprovalRequirementScenario {
-            policy_src: Some(r#"prefix_rule(pattern=["cat"], decision="allow")"#.to_string()),
-            command: vec![
-                "bash".to_string(),
-                "-lc".to_string(),
-                "PATH=/tmp/evil:$PATH cat <<'EOF'\nhello\nEOF".to_string(),
-            ],
-            approval_policy: AskForApproval::OnRequest,
-            permission_profile: PermissionProfile::read_only(),
-            sandbox_permissions: SandboxPermissions::UseDefault,
-            prefix_rule: None,
-        },
-        ExecApprovalRequirement::Skip {
-            bypass_sandbox: false,
-            proposed_execpolicy_amendment: Some(ExecPolicyAmendment::new(vec![
-                "bash".to_string(),
-                "-lc".to_string(),
-                "PATH=/tmp/evil:$PATH cat <<'EOF'\nhello\nEOF".to_string(),
-            ])),
-        },
-    )
-    .await;
-}
-
-#[tokio::test]
 async fn heredoc_redirect_without_escalation_runs_inside_sandbox() {
     assert_exec_approval_requirement_for_command(
         ExecApprovalRequirementScenario {
@@ -983,7 +946,7 @@ prefix_rule(
 }
 
 #[tokio::test]
-async fn exec_approval_requirement_prefers_execpolicy_match() {
+async fn execpolicy_prompt_takes_precedence_without_proposed_amendment() {
     assert_exec_approval_requirement_for_command(
         ExecApprovalRequirementScenario {
             policy_src: Some(r#"prefix_rule(pattern=["rm"], decision="prompt")"#.to_string()),
@@ -1031,12 +994,7 @@ prefix_rule(pattern=["git"], decision="allow")
 #[tokio::test]
 async fn absolute_path_exec_approval_requirement_ignores_disallowed_host_executable_paths() {
     let allowed_git_path = host_program_path("git");
-    let disallowed_git_path = host_absolute_path(&[
-        "opt",
-        "homebrew",
-        "bin",
-        if cfg!(windows) { "git.exe" } else { "git" },
-    ]);
+    let disallowed_git_path = host_absolute_path(&["opt", "homebrew", "bin", "git.exe"]);
     let allowed_git_path_literal = starlark_string(&allowed_git_path);
     let policy_src = format!(
         r#"
@@ -1728,25 +1686,6 @@ async fn proposed_execpolicy_amendment_is_present_for_single_command_without_pol
 }
 
 #[tokio::test]
-async fn proposed_execpolicy_amendment_is_omitted_when_policy_prompts() {
-    assert_exec_approval_requirement_for_command(
-        ExecApprovalRequirementScenario {
-            policy_src: Some(r#"prefix_rule(pattern=["rm"], decision="prompt")"#.to_string()),
-            command: vec!["rm".to_string()],
-            approval_policy: AskForApproval::OnRequest,
-            permission_profile: PermissionProfile::Disabled,
-            sandbox_permissions: SandboxPermissions::UseDefault,
-            prefix_rule: None,
-        },
-        ExecApprovalRequirement::NeedsApproval {
-            reason: Some("`rm` requires approval by policy".to_string()),
-            proposed_execpolicy_amendment: None,
-        },
-    )
-    .await;
-}
-
-#[tokio::test]
 async fn proposed_execpolicy_amendment_is_present_for_multi_command_scripts() {
     assert_exec_approval_requirement_for_command(
         ExecApprovalRequirementScenario {
@@ -2074,8 +2013,7 @@ fn vec_str(items: &[&str]) -> Vec<String> {
     items.iter().map(std::string::ToString::to_string).collect()
 }
 
-/// Note this test behaves differently on Windows because it exercises an
-/// `if cfg!(windows)` code path in render_decision_for_unmatched_command().
+/// Exercises the Windows-specific unmatched-command rendering path.
 #[tokio::test]
 async fn verify_approval_requirement_for_unsafe_powershell_command() {
     // `brew install powershell` to run this test on a Mac!
@@ -2096,25 +2034,15 @@ async fn verify_approval_requirement_for_unsafe_powershell_command() {
         "-Command",
         "echo hi @(calc)",
     ])));
-    let (pwsh_approval_reason, expected_req) = if cfg!(windows) {
-        (
-            r#"On Windows, SandboxPolicy::ReadOnly should be assumed to mean
+    let (pwsh_approval_reason, expected_req) = (
+        r#"On Windows, SandboxPolicy::ReadOnly should be assumed to mean
                 that no sandbox is present, so anything that is not "provably
                 safe" should require approval."#,
-            ExecApprovalRequirement::NeedsApproval {
-                reason: None,
-                proposed_execpolicy_amendment: expected_amendment.clone(),
-            },
-        )
-    } else {
-        (
-            "On non-Windows, rely on the read-only sandbox to prevent harm.",
-            ExecApprovalRequirement::Skip {
-                bypass_sandbox: false,
-                proposed_execpolicy_amendment: expected_amendment.clone(),
-            },
-        )
-    };
+        ExecApprovalRequirement::NeedsApproval {
+            reason: None,
+            proposed_execpolicy_amendment: expected_amendment.clone(),
+        },
+    );
     assert_eq!(
         expected_req,
         policy

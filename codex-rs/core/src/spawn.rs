@@ -19,9 +19,7 @@ use codex_protocol::permissions::NetworkSandboxPolicy;
 /// attributes, so this may change in the future.
 pub const CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR: &str = "CODEX_SANDBOX_NETWORK_DISABLED";
 
-/// Should be set when the process is spawned under a sandbox. Currently, the
-/// value is "seatbelt" for macOS, but it may change in the future to
-/// accommodate sandboxing configuration and other sandboxing mechanisms.
+/// Set when the process is spawned under the Windows restricted-token sandbox.
 pub const CODEX_SANDBOX_ENV_VAR: &str = "CODEX_SANDBOX";
 
 #[derive(Debug, Clone, Copy)]
@@ -46,7 +44,7 @@ pub(crate) struct SpawnChildRequest<'a> {
     pub network: Option<&'a NetworkProxy>,
     pub stdio_policy: StdioPolicy,
     pub env: HashMap<String, String>,
-    #[cfg(windows)]
+
     pub creation_flags: u32,
 }
 
@@ -60,7 +58,6 @@ pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io
         network,
         stdio_policy,
         mut env,
-        #[cfg(windows)]
         creation_flags,
     } = request;
 
@@ -80,48 +77,21 @@ pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io
     );
 
     let mut cmd = Command::new(&program);
-    #[cfg(unix)]
-    cmd.arg0(arg0.map_or_else(|| program.to_string_lossy().to_string(), String::from));
+    let _ = arg0;
     cmd.args(args);
     cmd.current_dir(cwd);
     cmd.env_clear();
     cmd.envs(env);
-    #[cfg(windows)]
-    {
-        cmd.creation_flags(creation_flags);
-    }
+    cmd.creation_flags(creation_flags);
 
     // If this Codex process dies (including being killed via SIGKILL), we want
     // any child processes that were spawned as part of a `"shell"` tool call
     // to also be terminated.
 
-    #[cfg(unix)]
-    unsafe {
-        let detach_from_tty = matches!(stdio_policy, StdioPolicy::RedirectForShellTool);
-        #[cfg(target_os = "linux")]
-        let parent_pid = libc::getpid();
-        cmd.pre_exec(move || {
-            if detach_from_tty {
-                codex_utils_pty::process_group::detach_from_tty()?;
-            }
-
-            // This relies on prctl(2), so it only works on Linux.
-            #[cfg(target_os = "linux")]
-            {
-                // This prctl call effectively requests, "deliver SIGTERM when my
-                // current parent dies."
-                codex_utils_pty::process_group::set_parent_death_signal(parent_pid)?;
-            }
-            Ok(())
-        });
-    }
-
     match stdio_policy {
         StdioPolicy::RedirectForShellTool => {
-            // Do not create a file descriptor for stdin because otherwise some
-            // commands may hang forever waiting for input. For example, ripgrep has
-            // a heuristic where it may try to read from stdin as explained here:
-            // https://github.com/BurntSushi/ripgrep/blob/e2362d4d5185d02fa857bf381e7bd52e66fafc73/crates/core/flags/hiargs.rs#L1101-L1103
+            // Do not create a handle for stdin because otherwise some commands may hang waiting
+            // for input.
             cmd.stdin(Stdio::null());
 
             cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -141,11 +111,7 @@ fn apply_network_sandbox_policy_to_env(
     env: &mut HashMap<String, String>,
     network_sandbox_policy: NetworkSandboxPolicy,
 ) {
-    if cfg!(windows) {
-        env.retain(|key, _| !key.eq_ignore_ascii_case(CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR));
-    } else {
-        env.remove(CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR);
-    }
+    env.retain(|key, _| !key.eq_ignore_ascii_case(CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR));
     if !network_sandbox_policy.is_enabled() {
         env.insert(
             CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR.to_string(),

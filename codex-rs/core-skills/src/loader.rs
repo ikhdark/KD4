@@ -22,12 +22,12 @@ use codex_config::merge_toml_values;
 use codex_config::project_root_markers_from_config;
 use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::LOCAL_FS;
+use codex_plugin::PluginSkillRoot;
 use codex_protocol::protocol::Product;
 use codex_protocol::protocol::SkillScope;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
 use codex_utils_path_uri::PathUri;
-use codex_utils_plugins::PluginSkillRoot;
 use dirs::home_dir;
 use discovery::DirectorySymlinkPolicy;
 use discovery::DiscoveredSkill;
@@ -40,6 +40,7 @@ use discovery::discover_skills;
 use futures::FutureExt;
 use futures::StreamExt;
 use namespace::SkillNamespaceResolver;
+use noyalib::compat::serde_yaml;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::error::Error;
@@ -383,8 +384,13 @@ async fn repo_agents_skill_roots(
     let Some(fs) = fs else {
         return Vec::new();
     };
-    let project_root_markers = project_root_markers_from_stack(config_layer_stack);
-    let project_root = find_project_root(fs.as_ref(), cwd, &project_root_markers).await;
+    let project_root = match config_layer_stack.project_discovery() {
+        Some(discovery) if discovery.matches(cwd, fs.as_ref()) => discovery.project_root().clone(),
+        _ => {
+            let project_root_markers = project_root_markers_from_stack(config_layer_stack);
+            find_project_root(fs.as_ref(), cwd, &project_root_markers).await
+        }
+    };
     let dirs = dirs_between_project_root_and_cwd(cwd, &project_root);
     let mut roots = Vec::new();
     for dir in dirs {

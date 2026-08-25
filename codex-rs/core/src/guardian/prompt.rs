@@ -1,5 +1,9 @@
 use std::collections::HashMap;
 
+use codex_protocol::models::AgentMessageInputContent;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::plaintext_agent_message_content;
 use codex_protocol::protocol::GuardianRiskLevel;
@@ -92,7 +96,7 @@ pub(crate) enum GuardianPromptMode {
 pub(crate) async fn build_guardian_prompt_items(
     session: &Session,
     retry_reason: Option<String>,
-    request: GuardianApprovalRequest,
+    request: &GuardianApprovalRequest,
     mode: GuardianPromptMode,
 ) -> serde_json::Result<GuardianPromptItems> {
     build_guardian_prompt_items_with_parent_turn(
@@ -109,16 +113,25 @@ pub(crate) async fn build_guardian_prompt_items_with_parent_turn(
     session: &Session,
     parent_turn: Option<&TurnContext>,
     retry_reason: Option<String>,
-    request: GuardianApprovalRequest,
+    request: &GuardianApprovalRequest,
     mode: GuardianPromptMode,
 ) -> serde_json::Result<GuardianPromptItems> {
     let history = session.clone_history().await;
-    let transcript_entries = collect_guardian_transcript_entries(history.raw_items());
+    let requested_entry_offset = match &mode {
+        GuardianPromptMode::Delta { cursor }
+            if cursor.parent_history_version == history.history_version() =>
+        {
+            cursor.transcript_entry_count
+        }
+        GuardianPromptMode::Full | GuardianPromptMode::Delta { .. } => 0,
+    };
+    let mut transcript_collection =
+        collect_guardian_transcript_entries_after(history.raw_items(), requested_entry_offset);
     let transcript_cursor = GuardianTranscriptCursor {
         parent_history_version: history.history_version(),
-        transcript_entry_count: transcript_entries.len(),
+        transcript_entry_count: transcript_collection.transcript_entry_count,
     };
-    let planned_action_json = format_guardian_action_pretty(&request)?;
+    let planned_action_json = format_guardian_action_pretty(request)?;
 
     let prompt_shape = match mode {
         GuardianPromptMode::Full => GuardianPromptShape::Full,
@@ -130,10 +143,15 @@ pub(crate) async fn build_guardian_prompt_items_with_parent_turn(
                     already_seen_entry_count: cursor.transcript_entry_count,
                 }
             } else {
+                if requested_entry_offset != 0 {
+                    transcript_collection =
+                        collect_guardian_transcript_entries_after(history.raw_items(), 0);
+                }
                 GuardianPromptShape::Full
             }
         }
     };
+    let transcript_entries = transcript_collection.entries;
     let (transcript_entries, omission_note, headings) = match prompt_shape {
         GuardianPromptShape::Full => {
             let (transcript_entries, omission_note) =
@@ -154,7 +172,7 @@ pub(crate) async fn build_guardian_prompt_items_with_parent_turn(
         } => {
             let (transcript_entries, omission_note) =
                 render_guardian_transcript_entries_with_offset(
-                    &transcript_entries[already_seen_entry_count..],
+                    &transcript_entries,
                     already_seen_entry_count,
                     "<no retained transcript delta entries>",
                 );
@@ -197,7 +215,7 @@ pub(crate) async fn build_guardian_prompt_items_with_parent_turn(
         push_text(denied_reads_context);
         push_text(">>> PARENT TURN PERMISSION CONTEXT END\n".to_string());
     }
-    match &request {
+    match request {
         GuardianApprovalRequest::NetworkAccess { trigger, .. } => {
             push_text(">>> APPROVAL REQUEST START\n".to_string());
             push_text("Below is a proposed network access request under review.\n".to_string());
@@ -242,8 +260,7 @@ pub(crate) async fn build_guardian_prompt_items_with_parent_turn(
 }
 
 fn parent_turn_denied_reads_context(turn: &TurnContext) -> Option<String> {
-    #[allow(deprecated)]
-    let cwd = &turn.cwd;
+    let cwd = turn.cwd();
     let file_system_policy = turn.permission_profile.file_system_sandbox_policy();
     let mut entries = file_system_policy
         .get_unreadable_roots_with_cwd(cwd)
@@ -313,24 +330,13 @@ fn render_guardian_transcript_entries_with_offset(
         return (vec![empty_placeholder.to_string()], None);
     }
 
-    let rendered_entries = entries
+    let rendered_entry_token_counts = entries
         .iter()
         .enumerate()
         .map(|(index, entry)| {
-            let token_cap = if entry.kind.is_tool() {
-                GUARDIAN_MAX_TOOL_ENTRY_TOKENS
-            } else {
-                GUARDIAN_MAX_MESSAGE_ENTRY_TOKENS
-            };
-            let (text, _) = guardian_truncate_text(&entry.text, token_cap);
-            let rendered = format!(
-                "[{}] {}: {}",
-                index + entry_number_offset + 1,
-                entry.kind.role(),
-                text
-            );
-            let token_count = approx_token_count(&rendered);
-            (rendered, token_count)
+            let (_, token_count) =
+                render_guardian_transcript_entry(entry, index + entry_number_offset + 1);
+            token_count
         })
         .collect::<Vec<_>>();
 
@@ -345,16 +351,16 @@ fn render_guardian_transcript_entries_with_offset(
 
     if let Some(&first_user_index) = user_indices.first() {
         included[first_user_index] = true;
-        message_tokens += rendered_entries[first_user_index].1;
+        message_tokens += rendered_entry_token_counts[first_user_index];
     }
 
     if let Some(&last_user_index) = user_indices.last()
         && !included[last_user_index]
-        && message_tokens + rendered_entries[last_user_index].1
+        && message_tokens + rendered_entry_token_counts[last_user_index]
             <= GUARDIAN_MAX_MESSAGE_TRANSCRIPT_TOKENS
     {
         included[last_user_index] = true;
-        message_tokens += rendered_entries[last_user_index].1;
+        message_tokens += rendered_entry_token_counts[last_user_index];
     }
 
     for &index in user_indices.iter().rev() {
@@ -362,7 +368,7 @@ fn render_guardian_transcript_entries_with_offset(
             continue;
         }
 
-        let token_count = rendered_entries[index].1;
+        let token_count = rendered_entry_token_counts[index];
         if message_tokens + token_count > GUARDIAN_MAX_MESSAGE_TRANSCRIPT_TOKENS {
             continue;
         }
@@ -378,7 +384,7 @@ fn render_guardian_transcript_entries_with_offset(
             continue;
         }
 
-        let token_count = rendered_entries[index].1;
+        let token_count = rendered_entry_token_counts[index];
         let within_budget = if entry.kind.is_tool() {
             tool_tokens + token_count <= GUARDIAN_MAX_TOOL_TRANSCRIPT_TOKENS
         } else {
@@ -401,11 +407,28 @@ fn render_guardian_transcript_entries_with_offset(
         .iter()
         .enumerate()
         .filter(|(index, _)| included[*index])
-        .map(|(index, _)| rendered_entries[index].0.clone())
+        .map(|(index, entry)| {
+            render_guardian_transcript_entry(entry, index + entry_number_offset + 1).0
+        })
         .collect::<Vec<_>>();
     let omitted_any = included.iter().any(|included_entry| !included_entry);
     let omission_note = omitted_any.then(|| "Some conversation entries were omitted.".to_string());
     (transcript, omission_note)
+}
+
+fn render_guardian_transcript_entry(
+    entry: &GuardianTranscriptEntry,
+    entry_number: usize,
+) -> (String, usize) {
+    let token_cap = if entry.kind.is_tool() {
+        GUARDIAN_MAX_TOOL_ENTRY_TOKENS
+    } else {
+        GUARDIAN_MAX_MESSAGE_ENTRY_TOKENS
+    };
+    let (text, _) = guardian_truncate_text(&entry.text, token_cap);
+    let rendered = format!("[{entry_number}] {}: {text}", entry.kind.role());
+    let token_count = approx_token_count(&rendered);
+    (rendered, token_count)
 }
 
 /// Retains the human-readable conversation plus recent tool call / result
@@ -416,64 +439,129 @@ fn render_guardian_transcript_entries_with_offset(
 /// Keep both tool calls and tool results here. The reviewer often needs the
 /// agent's exact queried path / arguments as well as the returned evidence to
 /// decide whether the pending approval is justified.
+#[cfg(test)]
 pub(crate) fn collect_guardian_transcript_entries(
     items: &[ResponseItem],
 ) -> Vec<GuardianTranscriptEntry> {
+    collect_guardian_transcript_entries_after(items, 0).entries
+}
+
+struct GuardianTranscriptCollection {
+    entries: Vec<GuardianTranscriptEntry>,
+    transcript_entry_count: usize,
+}
+
+fn collect_guardian_transcript_entries_after(
+    items: &[ResponseItem],
+    already_seen_entry_count: usize,
+) -> GuardianTranscriptCollection {
     let mut entries = Vec::new();
-    let mut tool_names_by_call_id = HashMap::new();
-    let non_empty_entry = |kind, text: String| {
-        (!text.trim().is_empty()).then_some(GuardianTranscriptEntry { kind, text })
-    };
-    let content_entry =
-        |kind, content| content_items_to_text(content).and_then(|text| non_empty_entry(kind, text));
-    let serialized_entry =
-        |kind, serialized: Option<String>| serialized.and_then(|text| non_empty_entry(kind, text));
+    let mut transcript_entry_count = 0usize;
+    let mut tool_names_by_call_id: HashMap<&str, &str> = HashMap::new();
 
     for item in items {
-        let entry = match item {
-            ResponseItem::Message { role, content, .. } if role == "user" => {
-                if is_contextual_user_message_content(content) {
-                    None
-                } else {
-                    content_entry(GuardianTranscriptEntryKind::User, content)
-                }
+        match item {
+            ResponseItem::Message { role, content, .. }
+                if role == "user"
+                    && !is_contextual_user_message_content(content)
+                    && content_has_non_empty_text(content) =>
+            {
+                let Some(text) = content_items_to_text(content) else {
+                    continue;
+                };
+                retain_guardian_transcript_entry(
+                    &mut entries,
+                    &mut transcript_entry_count,
+                    already_seen_entry_count,
+                    || GuardianTranscriptEntry {
+                        kind: GuardianTranscriptEntryKind::User,
+                        text,
+                    },
+                );
             }
-            ResponseItem::Message { role, content, .. } if role == "developer" => {
-                content_items_to_text(content).and_then(|text| {
-                    // Preserve only the explicit auto-review approval marker for
-                    // Guardian context; other developer messages are intentionally
-                    // excluded from the review transcript.
-                    text.starts_with(AUTO_REVIEW_DENIED_ACTION_APPROVAL_DEVELOPER_PREFIX)
-                        .then_some(GuardianTranscriptEntry {
-                            kind: GuardianTranscriptEntryKind::Developer,
-                            text,
-                        })
-                })
+            ResponseItem::Message { role, content, .. }
+                if role == "developer"
+                    && content_starts_with(
+                        content,
+                        AUTO_REVIEW_DENIED_ACTION_APPROVAL_DEVELOPER_PREFIX,
+                    ) =>
+            {
+                let Some(text) = content_items_to_text(content) else {
+                    continue;
+                };
+                retain_guardian_transcript_entry(
+                    &mut entries,
+                    &mut transcript_entry_count,
+                    already_seen_entry_count,
+                    || GuardianTranscriptEntry {
+                        kind: GuardianTranscriptEntryKind::Developer,
+                        text,
+                    },
+                );
             }
-            ResponseItem::Message { role, content, .. } if role == "assistant" => {
-                content_entry(GuardianTranscriptEntryKind::Assistant, content)
+            ResponseItem::Message { role, content, .. }
+                if role == "assistant" && content_has_non_empty_text(content) =>
+            {
+                let Some(text) = content_items_to_text(content) else {
+                    continue;
+                };
+                retain_guardian_transcript_entry(
+                    &mut entries,
+                    &mut transcript_entry_count,
+                    already_seen_entry_count,
+                    || GuardianTranscriptEntry {
+                        kind: GuardianTranscriptEntryKind::Assistant,
+                        text,
+                    },
+                );
             }
             ResponseItem::AgentMessage {
                 author, content, ..
-            } => plaintext_agent_message_content(content).map(|text| GuardianTranscriptEntry {
-                kind: GuardianTranscriptEntryKind::Assistant,
-                text: format!("Agent message from {author}:\n{text}"),
-            }),
-            ResponseItem::LocalShellCall { action, .. } => serialized_entry(
-                GuardianTranscriptEntryKind::Tool("tool shell call".to_string()),
-                serde_json::to_string(action).ok(),
-            ),
+            } if agent_message_has_non_empty_plaintext(content) => {
+                let Some(text) = plaintext_agent_message_content(content) else {
+                    continue;
+                };
+                retain_guardian_transcript_entry(
+                    &mut entries,
+                    &mut transcript_entry_count,
+                    already_seen_entry_count,
+                    || GuardianTranscriptEntry {
+                        kind: GuardianTranscriptEntryKind::Assistant,
+                        text: format!("Agent message from {author}:\n{text}"),
+                    },
+                );
+            }
+            ResponseItem::LocalShellCall { action, .. } => {
+                if let Ok(text) = serde_json::to_string(action) {
+                    retain_guardian_transcript_entry(
+                        &mut entries,
+                        &mut transcript_entry_count,
+                        already_seen_entry_count,
+                        || GuardianTranscriptEntry {
+                            kind: GuardianTranscriptEntryKind::Tool("tool shell call".to_string()),
+                            text,
+                        },
+                    );
+                }
+            }
             ResponseItem::FunctionCall {
                 call_id,
                 name,
                 arguments,
                 ..
             } => {
-                tool_names_by_call_id.insert(call_id.clone(), name.clone());
-                (!arguments.trim().is_empty()).then(|| GuardianTranscriptEntry {
-                    kind: GuardianTranscriptEntryKind::Tool(format!("tool {name} call")),
-                    text: arguments.clone(),
-                })
+                tool_names_by_call_id.insert(call_id, name);
+                if !arguments.trim().is_empty() {
+                    retain_guardian_transcript_entry(
+                        &mut entries,
+                        &mut transcript_entry_count,
+                        already_seen_entry_count,
+                        || GuardianTranscriptEntry {
+                            kind: GuardianTranscriptEntryKind::Tool(format!("tool {name} call")),
+                            text: arguments.clone(),
+                        },
+                    );
+                }
             }
             ResponseItem::CustomToolCall {
                 call_id,
@@ -481,43 +569,142 @@ pub(crate) fn collect_guardian_transcript_entries(
                 input,
                 ..
             } => {
-                tool_names_by_call_id.insert(call_id.clone(), name.clone());
-                (!input.trim().is_empty()).then(|| GuardianTranscriptEntry {
-                    kind: GuardianTranscriptEntryKind::Tool(format!("tool {name} call")),
-                    text: input.clone(),
-                })
+                tool_names_by_call_id.insert(call_id, name);
+                if !input.trim().is_empty() {
+                    retain_guardian_transcript_entry(
+                        &mut entries,
+                        &mut transcript_entry_count,
+                        already_seen_entry_count,
+                        || GuardianTranscriptEntry {
+                            kind: GuardianTranscriptEntryKind::Tool(format!("tool {name} call")),
+                            text: input.clone(),
+                        },
+                    );
+                }
             }
-            ResponseItem::WebSearchCall { action, .. } => action.as_ref().and_then(|action| {
-                serialized_entry(
-                    GuardianTranscriptEntryKind::Tool("tool web_search call".to_string()),
-                    serde_json::to_string(action).ok(),
-                )
-            }),
+            ResponseItem::WebSearchCall {
+                action: Some(action),
+                ..
+            } => {
+                if let Ok(text) = serde_json::to_string(action) {
+                    retain_guardian_transcript_entry(
+                        &mut entries,
+                        &mut transcript_entry_count,
+                        already_seen_entry_count,
+                        || GuardianTranscriptEntry {
+                            kind: GuardianTranscriptEntryKind::Tool(
+                                "tool web_search call".to_string(),
+                            ),
+                            text,
+                        },
+                    );
+                }
+            }
             ResponseItem::FunctionCallOutput {
                 call_id, output, ..
             }
             | ResponseItem::CustomToolCallOutput {
                 call_id, output, ..
-            } => output.body.to_text().and_then(|text| {
-                non_empty_entry(
-                    GuardianTranscriptEntryKind::Tool(
-                        tool_names_by_call_id.get(call_id).map_or_else(
+            } if function_output_has_non_empty_text(&output.body) => {
+                let Some(text) = output.body.to_text() else {
+                    continue;
+                };
+                let tool_name = tool_names_by_call_id.get(call_id.as_str()).copied();
+                retain_guardian_transcript_entry(
+                    &mut entries,
+                    &mut transcript_entry_count,
+                    already_seen_entry_count,
+                    || GuardianTranscriptEntry {
+                        kind: GuardianTranscriptEntryKind::Tool(tool_name.map_or_else(
                             || "tool result".to_string(),
                             |name| format!("tool {name} result"),
-                        ),
-                    ),
-                    text,
-                )
-            }),
-            _ => None,
-        };
-
-        if let Some(entry) = entry {
-            entries.push(entry);
+                        )),
+                        text,
+                    },
+                );
+            }
+            _ => {}
         }
     }
 
-    entries
+    GuardianTranscriptCollection {
+        entries,
+        transcript_entry_count,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn collect_guardian_transcript_entries_after_for_test(
+    items: &[ResponseItem],
+    already_seen_entry_count: usize,
+) -> (Vec<GuardianTranscriptEntry>, usize) {
+    let collection = collect_guardian_transcript_entries_after(items, already_seen_entry_count);
+    (collection.entries, collection.transcript_entry_count)
+}
+
+fn retain_guardian_transcript_entry(
+    entries: &mut Vec<GuardianTranscriptEntry>,
+    transcript_entry_count: &mut usize,
+    already_seen_entry_count: usize,
+    build_entry: impl FnOnce() -> GuardianTranscriptEntry,
+) {
+    let entry_index = *transcript_entry_count;
+    *transcript_entry_count = (*transcript_entry_count).saturating_add(1);
+    if entry_index >= already_seen_entry_count {
+        let mut entry = build_entry();
+        let token_cap = if entry.kind.is_tool() {
+            GUARDIAN_MAX_TOOL_ENTRY_TOKENS
+        } else {
+            GUARDIAN_MAX_MESSAGE_ENTRY_TOKENS
+        };
+        entry.text = guardian_truncate_text(&entry.text, token_cap).0;
+        entries.push(entry);
+    }
+}
+
+fn content_has_non_empty_text(content: &[ContentItem]) -> bool {
+    content.iter().any(|item| match item {
+        ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+            !text.trim().is_empty()
+        }
+        ContentItem::InputImage { .. } => false,
+    })
+}
+
+fn content_starts_with(content: &[ContentItem], prefix: &str) -> bool {
+    content.iter().find_map(|item| match item {
+        ContentItem::InputText { text } | ContentItem::OutputText { text } if !text.is_empty() => {
+            Some(text.starts_with(prefix))
+        }
+        ContentItem::InputText { .. }
+        | ContentItem::OutputText { .. }
+        | ContentItem::InputImage { .. } => None,
+    }) == Some(true)
+}
+
+fn agent_message_has_non_empty_plaintext(content: &[AgentMessageInputContent]) -> bool {
+    let mut has_non_empty_text = false;
+    for item in content {
+        match item {
+            AgentMessageInputContent::InputText { text } => {
+                has_non_empty_text |= !text.trim().is_empty();
+            }
+            AgentMessageInputContent::EncryptedContent { .. } => return false,
+        }
+    }
+    has_non_empty_text
+}
+
+fn function_output_has_non_empty_text(body: &FunctionCallOutputBody) -> bool {
+    match body {
+        FunctionCallOutputBody::Text(text) => !text.trim().is_empty(),
+        FunctionCallOutputBody::ContentItems(items) => items.iter().any(|item| {
+            matches!(
+                item,
+                FunctionCallOutputContentItem::InputText { text } if !text.trim().is_empty()
+            )
+        }),
+    }
 }
 
 pub(crate) fn guardian_truncate_text(content: &str, token_cap: usize) -> (String, bool) {

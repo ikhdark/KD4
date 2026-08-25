@@ -59,7 +59,7 @@ def exclusive_file_lock(
     acquired = False
     deadline = time.monotonic() + timeout_seconds
     try:
-        if os.name == "nt" and os.fstat(fd).st_size == 0:
+        if os.fstat(fd).st_size == 0:
             os.write(fd, b"\0")
             os.fsync(fd)
         while not acquired:
@@ -96,25 +96,15 @@ def exclusive_file_lock(
 
 
 def _acquire_file_lock(fd: int) -> None:
-    if os.name == "nt":
-        import msvcrt
+    import msvcrt
 
-        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-    else:
-        import fcntl
-
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
 
 
 def _release_file_lock(fd: int) -> None:
-    if os.name == "nt":
-        import msvcrt
+    import msvcrt
 
-        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-    else:
-        import fcntl
-
-        fcntl.flock(fd, fcntl.LOCK_UN)
+    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
 
 
 def _lock_error_is_contention(error: OSError) -> bool:
@@ -140,20 +130,10 @@ def lock_owner_pid(lock_path: Path) -> int | None:
 def process_is_running(pid: int) -> bool:
     if pid <= 0:
         return False
-    if os.name == "nt":
-        # Python's Windows os.kill implementation does not offer a harmless
-        # signal-0 probe. The open lock handle denies deletion on Windows, so
-        # let the unlink attempt itself distinguish a live owner.
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return True
-    return True
+    # Python's Windows os.kill implementation does not offer a harmless
+    # signal-0 probe. The open lock handle denies deletion on Windows, so
+    # let the unlink attempt itself distinguish a live owner.
+    return False
 
 
 def worker_count_for(item_count: int, requested: int | None = None) -> int:
@@ -488,6 +468,9 @@ def install_single_binary(
     target: str,
     component: BinaryComponent,
 ) -> Path:
+    if "windows" not in target:
+        raise RuntimeError(f"Unsupported non-Windows native target: {target}")
+
     expected_names = [archive_name_for_target(component.artifact_prefix, target)]
     fallback_expected_names = [
         *expected_names,
@@ -506,15 +489,9 @@ def install_single_binary(
     dest_dir = vendor_dir / target / component.dest_dir
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    binary_name = (
-        f"{component.binary_basename}.exe"
-        if "windows" in target
-        else component.binary_basename
-    )
+    binary_name = f"{component.binary_basename}.exe"
     dest = dest_dir / binary_name
     _runtime().extract_zstd_archive(archive_path, dest)
-    if "windows" not in target:
-        dest.chmod(0o755)
     return dest
 
 

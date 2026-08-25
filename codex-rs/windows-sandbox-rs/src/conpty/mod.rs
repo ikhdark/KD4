@@ -38,20 +38,25 @@ use crate::process::make_env_block;
 /// Owns a ConPTY handle and its backing pipe handles.
 pub struct ConptyInstance {
     pseudoconsole: Option<PsuedoCon>,
-    input_write: HANDLE,
-    output_read: HANDLE,
+    // windows-sys 0.61 models HANDLE as a raw pointer, which is not Send.
+    // These owned opaque values may be released on the process-wait thread,
+    // so retain their addresses and reconstruct HANDLE only at Win32 calls.
+    input_write: usize,
+    output_read: usize,
     job: Option<Arc<JobObject>>,
     _desktop: Option<LaunchDesktop>,
 }
 
 impl Drop for ConptyInstance {
     fn drop(&mut self) {
+        let input_write = self.input_write as HANDLE;
+        let output_read = self.output_read as HANDLE;
         unsafe {
-            if self.input_write != 0 && self.input_write != INVALID_HANDLE_VALUE {
-                CloseHandle(self.input_write);
+            if !input_write.is_null() && input_write != INVALID_HANDLE_VALUE {
+                CloseHandle(input_write);
             }
-            if self.output_read != 0 && self.output_read != INVALID_HANDLE_VALUE {
-                CloseHandle(self.output_read);
+            if !output_read.is_null() && output_read != INVALID_HANDLE_VALUE {
+                CloseHandle(output_read);
             }
         }
         let _ = self.pseudoconsole.take();
@@ -59,18 +64,18 @@ impl Drop for ConptyInstance {
 }
 
 impl ConptyInstance {
-    pub fn raw_handle(&self) -> Option<HANDLE> {
+    pub fn raw_handle(&self) -> Option<isize> {
         self.pseudoconsole
             .as_ref()
-            .map(|pseudoconsole| pseudoconsole.raw_handle() as HANDLE)
+            .map(|pseudoconsole| pseudoconsole.raw_handle() as isize)
     }
 
     pub fn take_input_write(&mut self) -> HANDLE {
-        std::mem::replace(&mut self.input_write, 0)
+        std::mem::replace(&mut self.input_write, 0) as HANDLE
     }
 
     pub fn take_output_read(&mut self) -> HANDLE {
-        std::mem::replace(&mut self.output_read, 0)
+        std::mem::replace(&mut self.output_read, 0) as HANDLE
     }
 
     /// Returns the Job Object containing the spawned process, if this instance owns one.
@@ -79,29 +84,16 @@ impl ConptyInstance {
     }
 }
 
-/// Create a ConPTY with backing pipes.
-///
-/// This is public so callers that need lower-level PTY setup can build on the same
-/// primitive, although the common entry point is `spawn_conpty_process_as_user`.
-#[allow(dead_code)]
-pub fn create_conpty(cols: i16, rows: i16) -> Result<ConptyInstance> {
-    let raw = RawConPty::new(cols, rows)?;
-    let (pseudoconsole, input_write, output_read) = raw.into_handles();
-
-    Ok(ConptyInstance {
-        pseudoconsole: Some(pseudoconsole),
-        input_write: input_write.into_raw_handle() as HANDLE,
-        output_read: output_read.into_raw_handle() as HANDLE,
-        job: None,
-        _desktop: None,
-    })
-}
-
 /// Spawn a process under `h_token` with ConPTY attached.
 ///
 /// This is the main shared ConPTY entry point and is used by both the legacy/direct path
 /// and the elevated runner path whenever a PTY-backed sandboxed process is needed.
-pub fn spawn_conpty_process_as_user(
+///
+/// # Safety
+///
+/// `h_token` must be a valid primary token handle with the access rights required by
+/// `CreateProcessAsUserW`, and it must remain valid for the duration of this call.
+pub unsafe fn spawn_conpty_process_as_user(
     h_token: HANDLE,
     argv: &[String],
     cwd: &Path,
@@ -128,11 +120,11 @@ pub fn spawn_conpty_process_as_user(
 
     let raw = RawConPty::new(/*cols*/ 80, /*rows*/ 24)?;
     let (pseudoconsole, input_write, output_read) = raw.into_handles();
-    let hpc = pseudoconsole.raw_handle() as HANDLE;
+    let hpc = pseudoconsole.raw_handle() as isize;
     let conpty = ConptyInstance {
         pseudoconsole: Some(pseudoconsole),
-        input_write: input_write.into_raw_handle() as HANDLE,
-        output_read: output_read.into_raw_handle() as HANDLE,
+        input_write: input_write.into_raw_handle() as usize,
+        output_read: output_read.into_raw_handle() as usize,
         job: Some(Arc::clone(&job)),
         _desktop: Some(desktop),
     };

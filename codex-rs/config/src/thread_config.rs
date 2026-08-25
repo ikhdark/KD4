@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use crate::ConfigLayerSource;
 use codex_model_provider_info::ModelProviderInfo;
@@ -14,6 +15,14 @@ use crate::ConfigLayerEntry;
 mod remote;
 
 pub use remote::RemoteThreadConfigLoader;
+
+/// Selects the configured thread loader for an optional remote endpoint.
+pub fn thread_config_loader_for_endpoint(endpoint: Option<&str>) -> Arc<dyn ThreadConfigLoader> {
+    match endpoint {
+        Some(endpoint) => Arc::new(RemoteThreadConfigLoader::new(endpoint)),
+        None => Arc::new(NoopThreadConfigLoader),
+    }
+}
 
 /// Context available to implementations when loading thread-scoped config.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -219,6 +228,18 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[tokio::test]
+    async fn loader_factory_uses_noop_when_endpoint_is_absent() {
+        let loader = thread_config_loader_for_endpoint(None);
+        assert_eq!(
+            loader
+                .load(ThreadConfigContext::default())
+                .await
+                .expect("noop loader succeeds"),
+            Vec::new()
+        );
+    }
 
     #[tokio::test]
     async fn loader_returns_session_and_user_sources() {

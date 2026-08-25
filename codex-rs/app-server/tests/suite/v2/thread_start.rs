@@ -58,10 +58,9 @@ use super::analytics::wait_for_analytics_payload;
 
 // Thread startup can spend more than ten seconds discovering the shell and
 // workspace state on Windows test hosts.
-#[cfg(windows)]
+
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-#[cfg(not(windows))]
-const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
 const EXEC_POLICY_PARSE_WARNING_SUMMARY: &str = "Error parsing rules; custom rules not applied.";
 
@@ -866,16 +865,10 @@ async fn thread_start_without_selected_environment_includes_only_global_instruct
     Ok(())
 }
 
-#[cfg(windows)]
 fn normalize_path_for_comparison(path: impl AsRef<Path>) -> PathBuf {
     let path = path.as_ref();
     let path = path.display().to_string();
     PathBuf::from(path.strip_prefix(r"\\?\").unwrap_or(&path))
-}
-
-#[cfg(not(windows))]
-fn normalize_path_for_comparison(path: impl AsRef<Path>) -> PathBuf {
-    path.as_ref().to_path_buf()
 }
 
 #[tokio::test]
@@ -1740,14 +1733,7 @@ stream_max_retries = 0
     )
 }
 
-#[cfg(target_os = "windows")]
 fn broken_mcp_transport_toml() -> &'static str {
     r#"command = "cmd"
 args = ["/C", "exit 1"]"#
-}
-
-#[cfg(not(target_os = "windows"))]
-fn broken_mcp_transport_toml() -> &'static str {
-    r#"command = "/bin/sh"
-args = ["-c", "exit 1"]"#
 }

@@ -2,8 +2,9 @@
 
 use codex_hooks::HOOK_EVENT_NAMES;
 use codex_hooks::HOOK_EVENT_NAMES_WITH_MATCHERS;
+use noyalib::compat::serde_yaml;
+use noyalib::compat::serde_yaml::Value as YamlValue;
 use serde_json::Value as JsonValue;
-use serde_yaml::Value as YamlValue;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
@@ -1023,9 +1024,10 @@ fn parse_frontmatter(
 
     let mut frontmatter = BTreeMap::new();
     for (key, value) in mapping {
-        let Some(key) = key.as_str().map(str::trim).filter(|key| !key.is_empty()) else {
+        let key = key.trim();
+        if key.is_empty() {
             continue;
-        };
+        }
         frontmatter.insert(key.to_string(), frontmatter_value_from_yaml(value));
     }
 
@@ -1291,7 +1293,11 @@ fn is_missing_or_empty_text_file(path: &Path) -> io::Result<bool> {
     Ok(fs::read_to_string(path)?.trim().is_empty())
 }
 
-fn rewrite_external_agent_terms(content: &str) -> String {
+/// Rewrites external-agent product and instruction-file names in imported user-authored text.
+///
+/// Matching intentionally remains ASCII case-insensitive with ASCII word boundaries so migration
+/// behavior stays compatible with existing imported documents.
+pub fn rewrite_external_agent_terms(content: &str) -> String {
     let mut rewritten = replace_case_insensitive_with_boundaries(
         content,
         &external_agent_doc_file_name(),
@@ -1390,6 +1396,17 @@ mod tests {
         Path::new("/repo")
             .join(external_agent_config_dir())
             .join(relative_path)
+    }
+
+    #[test]
+    fn external_agent_term_rewrite_preserves_case_and_boundary_contract() {
+        assert_eq!(
+            rewrite_external_agent_terms(
+                "CLAUDE, claude-code, claude_code, claudecode, claude code; xclaude claude2 _claude; CLAUDE.md"
+            ),
+            "Codex, Codex, Codex, Codex, Codex; xclaude claude2 _claude; AGENTS.md"
+        );
+        assert_eq!(rewrite_external_agent_terms(""), "");
     }
 
     fn source_hook_command(script_name: &str) -> String {
@@ -1797,7 +1814,9 @@ command = "enabled-server"
             "---\nname: cloud-incident\ndescription: Debug incidents\nskills:\n  - runbook-reader\ntools:\n  - Read\n  - Bash\ndisallowedTools:\n  - Write\n---\nInvestigate carefully.\n",
         );
 
-        assert!(agent_metadata(&document).is_some());
+        let metadata = agent_metadata(&document).expect("valid subagent metadata");
+        assert_eq!(metadata.name, "cloud-incident");
+        assert_eq!(metadata.description, "Debug incidents");
     }
 
     #[test]

@@ -97,9 +97,9 @@ mod request_user_input;
 use process::add_codex_parent_to_path;
 use process::build_serve_command;
 use process::listener_pids_on_port;
+use process::powershell_quote;
 use process::preflight_serve_restart;
 use process::runtime_dir;
-use process::shell_quote;
 use process::start_prepared_serve;
 use process::terminate_process;
 
@@ -108,7 +108,6 @@ const NOTIFICATIONS_TO_OPT_OUT: &[&str] = &[
     "command/exec/outputDelta",
     "item/agentMessage/delta",
     "item/plan/delta",
-    "item/fileChange/outputDelta",
     "item/reasoning/summaryTextDelta",
     "item/reasoning/textDelta",
 ];
@@ -227,18 +226,6 @@ enum CliCommand {
         first_message: String,
         /// Follow-up user message for the second turn.
         follow_up_message: String,
-    },
-    /// Trigger zsh-fork multi-subcommand approvals and assert expected approval behavior.
-    #[command(name = "trigger-zsh-fork-multi-cmd-approval")]
-    TriggerZshForkMultiCmdApproval {
-        /// Optional prompt; defaults to an explicit `/usr/bin/true && /usr/bin/true` command.
-        user_message: Option<String>,
-        /// Minimum number of command-approval callbacks expected in the turn.
-        #[arg(long, default_value_t = 2)]
-        min_approvals: usize,
-        /// One-based approval index to abort (e.g. --abort-on 2 aborts the second approval).
-        #[arg(long)]
-        abort_on: Option<usize>,
     },
     /// Trigger the ChatGPT login flow and wait for completion.
     TestLogin {
@@ -416,22 +403,6 @@ pub async fn run() -> Result<()> {
                 &config_overrides,
                 first_message,
                 follow_up_message,
-                &dynamic_tools,
-            )
-            .await
-        }
-        CliCommand::TriggerZshForkMultiCmdApproval {
-            user_message,
-            min_approvals,
-            abort_on,
-        } => {
-            let endpoint = resolve_endpoint(codex_bin, url)?;
-            trigger_zsh_fork_multi_cmd_approval(
-                &endpoint,
-                &config_overrides,
-                user_message,
-                min_approvals,
-                abort_on,
                 &dynamic_tools,
             )
             .await
@@ -661,14 +632,7 @@ fn serve(codex_bin: &Path, config_overrides: &[String], listen: &str, kill: bool
 
     println!("started codex app-server");
     println!("listen: {listen}");
-    println!(
-        "pid: {pid} ({})",
-        if cfg!(windows) {
-            "app-server process"
-        } else {
-            "launcher process"
-        }
-    );
+    println!("pid: {pid} (app-server process)");
     println!("log: {}", log_path.display());
 
     Ok(())
@@ -770,112 +734,6 @@ async fn send_message_v2_endpoint(
             approval_policy: None,
             sandbox_policy: None,
             dynamic_tools,
-        },
-    )
-    .await
-}
-
-async fn trigger_zsh_fork_multi_cmd_approval(
-    endpoint: &Endpoint,
-    config_overrides: &[String],
-    user_message: Option<String>,
-    min_approvals: usize,
-    abort_on: Option<usize>,
-    dynamic_tools: &Option<Vec<DynamicToolSpec>>,
-) -> Result<()> {
-    if let Some(abort_on) = abort_on
-        && abort_on == 0
-    {
-        bail!("--abort-on must be >= 1 when provided");
-    }
-
-    let default_prompt = "Run this exact command using shell command execution without rewriting or splitting it: /usr/bin/true && /usr/bin/true";
-    let message = user_message.unwrap_or_else(|| default_prompt.to_string());
-
-    with_client(
-        "trigger-zsh-fork-multi-cmd-approval",
-        endpoint,
-        config_overrides,
-        |client| {
-            let initialize = client.initialize()?;
-            println!("< initialize response: {initialize:?}");
-
-            let thread_response = client.thread_start(ThreadStartParams {
-                dynamic_tools: dynamic_tools.clone(),
-                ..Default::default()
-            })?;
-            println!("< thread/start response: {thread_response:?}");
-
-            client.command_approval_behavior = match abort_on {
-                Some(index) => CommandApprovalBehavior::AbortOn(index),
-                None => CommandApprovalBehavior::AlwaysAccept,
-            };
-            client.command_approval_count = 0;
-            client.command_approval_item_ids.clear();
-            client.command_execution_statuses.clear();
-            client.last_turn_status = None;
-
-            let mut turn_params = TurnStartParams {
-                thread_id: thread_response.thread.id.clone(),
-                client_user_message_id: None,
-                input: vec![V2UserInput::Text {
-                    text: message,
-                    text_elements: Vec::new(),
-                }],
-                ..Default::default()
-            };
-            turn_params.approval_policy = Some(AskForApproval::OnRequest);
-            turn_params.sandbox_policy = Some(SandboxPolicy::ReadOnly {
-                network_access: false,
-            });
-
-            let turn_response = client.turn_start(turn_params)?;
-            println!("< turn/start response: {turn_response:?}");
-            client.stream_turn(&thread_response.thread.id, &turn_response.turn.id)?;
-
-            if client.command_approval_count < min_approvals {
-                bail!(
-                    "expected at least {min_approvals} command approvals, got {}",
-                    client.command_approval_count
-                );
-            }
-            let mut approvals_per_item = std::collections::BTreeMap::new();
-            for item_id in &client.command_approval_item_ids {
-                *approvals_per_item.entry(item_id.clone()).or_insert(0usize) += 1;
-            }
-            let max_approvals_for_one_item =
-                approvals_per_item.values().copied().max().unwrap_or(0);
-            if max_approvals_for_one_item < min_approvals {
-                bail!(
-                    "expected at least {min_approvals} approvals for one command item, got max {max_approvals_for_one_item} with map {approvals_per_item:?}"
-                );
-            }
-
-            let last_command_status = client.command_execution_statuses.last();
-            if abort_on.is_none() {
-                if last_command_status != Some(&CommandExecutionStatus::Completed) {
-                    bail!("expected completed command execution, got {last_command_status:?}");
-                }
-                if client.last_turn_status != Some(TurnStatus::Completed) {
-                    bail!(
-                        "expected completed turn in all-accept flow, got {:?}",
-                        client.last_turn_status
-                    );
-                }
-            } else if last_command_status == Some(&CommandExecutionStatus::Completed) {
-                bail!(
-                    "expected non-completed command execution in mixed approval/decline flow, got {last_command_status:?}"
-                );
-            }
-
-            println!(
-                "[zsh-fork multi-approval summary] approvals={}, approvals_per_item={approvals_per_item:?}, command_statuses={:?}, turn_status={:?}",
-                client.command_approval_count,
-                client.command_execution_statuses,
-                client.last_turn_status
-            );
-
-            Ok(())
         },
     )
     .await
@@ -1256,7 +1114,7 @@ fn thread_increment_elicitation(url: &str, thread_id: String) -> Result<()> {
 
     let response =
         client.thread_increment_elicitation(ThreadIncrementElicitationParams { thread_id })?;
-    println!("< thread/increment_elicitation response: {response:?}");
+    println!("< thread/incrementElicitation response: {response:?}");
 
     Ok(())
 }
@@ -1272,7 +1130,7 @@ fn thread_decrement_elicitation(url: &str, thread_id: String, lease_id: String) 
         thread_id,
         lease_id,
     })?;
-    println!("< thread/decrement_elicitation response: {response:?}");
+    println!("< thread/decrementElicitation response: {response:?}");
 
     Ok(())
 }
@@ -1286,13 +1144,13 @@ fn thread_hold_elicitation(url: &str, thread_id: String, hold_seconds: u64) -> R
     let response = client.thread_increment_elicitation(ThreadIncrementElicitationParams {
         thread_id: thread_id.clone(),
     })?;
-    println!("< thread/increment_elicitation response: {response:?}");
+    println!("< thread/incrementElicitation response: {response:?}");
     std::thread::sleep(Duration::from_secs(hold_seconds));
     let response = client.thread_decrement_elicitation(ThreadDecrementElicitationParams {
         thread_id,
         lease_id: response.lease_id,
     })?;
-    println!("< thread/decrement_elicitation response: {response:?}");
+    println!("< thread/decrementElicitation response: {response:?}");
     Ok(())
 }
 
@@ -1305,9 +1163,6 @@ fn live_elicitation_timeout_pause(
     script: Option<PathBuf>,
     hold_seconds: u64,
 ) -> Result<()> {
-    if cfg!(windows) {
-        bail!("live-elicitation-timeout-pause currently requires a POSIX shell");
-    }
     if hold_seconds <= 10 {
         bail!("--hold-seconds must be greater than 10 to exceed the unified exec timeout");
     }
@@ -1328,7 +1183,7 @@ fn live_elicitation_timeout_pause(
     let script_path = script.unwrap_or_else(|| {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("scripts")
-            .join("live_elicitation_hold.sh")
+            .join("live_elicitation_hold.ps1")
     });
     if !script_path.is_file() {
         bail!("helper script not found: {}", script_path.display());
@@ -1353,11 +1208,13 @@ fn live_elicitation_timeout_pause(
 
     let thread_id = thread_response.thread.id;
     let command = format!(
-        "APP_SERVER_URL={} APP_SERVER_TEST_CLIENT_BIN={} ELICITATION_HOLD_SECONDS={} sh {}",
-        shell_quote(&websocket_url),
-        shell_quote(&app_server_test_client_bin.display().to_string()),
-        hold_seconds,
-        shell_quote(&script_path.display().to_string()),
+        "$env:APP_SERVER_URL={}; $env:APP_SERVER_TEST_CLIENT_BIN={}; \
+         $env:ELICITATION_HOLD_SECONDS={}; \
+         powershell -NoProfile -ExecutionPolicy Bypass -File {}",
+        powershell_quote(&websocket_url),
+        powershell_quote(&app_server_test_client_bin.display().to_string()),
+        powershell_quote(&hold_seconds.to_string()),
+        powershell_quote(&script_path.display().to_string()),
     );
     let prompt = format!(
         "Use the `exec_command` tool exactly once. Set its `cmd` field to the exact shell command below. Do not rewrite it, do not split it, do not call any other tool, do not set `yield_time_ms`, and wait for the command to finish before replying.\n\n{command}\n\nAfter the command finishes, reply with exactly `DONE`."
@@ -1509,7 +1366,6 @@ struct CodexClient {
 #[derive(Debug, Clone, Copy)]
 enum CommandApprovalBehavior {
     AlwaysAccept,
-    AbortOn(usize),
 }
 
 fn item_started_before_helper_done_is_unexpected(
@@ -1776,7 +1632,7 @@ impl CodexClient {
             params,
         };
 
-        self.send_request(request, request_id, "thread/increment_elicitation")
+        self.send_request(request, request_id, "thread/incrementElicitation")
     }
 
     fn thread_decrement_elicitation(
@@ -1789,7 +1645,7 @@ impl CodexClient {
             params,
         };
 
-        self.send_request(request, request_id, "thread/decrement_elicitation")
+        self.send_request(request, request_id, "thread/decrementElicitation")
     }
 
     fn wait_for_account_login_completion(
@@ -2115,10 +1971,6 @@ impl CodexClient {
 
         let decision = match self.command_approval_behavior {
             CommandApprovalBehavior::AlwaysAccept => CommandExecutionApprovalDecision::Accept,
-            CommandApprovalBehavior::AbortOn(index) if self.command_approval_count == index => {
-                CommandExecutionApprovalDecision::Cancel
-            }
-            CommandApprovalBehavior::AbortOn(_) => CommandExecutionApprovalDecision::Accept,
         };
         let response = CommandExecutionRequestApprovalResponse {
             decision: decision.clone(),
@@ -2345,5 +2197,15 @@ impl Drop for CodexClient {
 
         let _ = child.kill();
         let _ = child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NOTIFICATIONS_TO_OPT_OUT;
+
+    #[test]
+    fn retired_file_change_output_delta_is_not_requested() {
+        assert!(!NOTIFICATIONS_TO_OPT_OUT.contains(&"item/fileChange/outputDelta"));
     }
 }

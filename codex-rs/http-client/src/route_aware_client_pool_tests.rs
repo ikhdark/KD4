@@ -65,8 +65,16 @@ async fn streams_request_bodies_without_exposing_reqwest_body() {
     assert!(requests[0].ends_with("\r\n\r\nhello"));
 }
 
+#[test]
+fn route_aware_pool_source_has_no_legacy_custom_ca_escape_hatch() {
+    let source = include_str!("route_aware_client_pool.rs");
+
+    assert!(!source.contains("with_legacy_custom_ca_fallback"));
+    assert!(!source.contains("build_with_transport_default_proxy_and_custom_ca_fallback"));
+}
+
 #[tokio::test]
-async fn legacy_custom_ca_fallback_is_limited_to_reqwest_default() {
+async fn invalid_custom_ca_is_rejected_for_every_proxy_policy() {
     const CHILD_POLICY_ENV: &str = "CODEX_HTTP_CLIENT_POOL_INVALID_CA_TEST_POLICY";
 
     let Ok(policy_name) = std::env::var(CHILD_POLICY_ENV) else {
@@ -81,7 +89,7 @@ async fn legacy_custom_ca_fallback_is_limited_to_reqwest_default() {
                     std::env::current_exe().expect("test executable should be available"),
                 )
                 .arg("--exact")
-                .arg("route_aware_client_pool::tests::legacy_custom_ca_fallback_is_limited_to_reqwest_default")
+                .arg("route_aware_client_pool::tests::invalid_custom_ca_is_rejected_for_every_proxy_policy")
                 .arg("--nocapture")
                 .env_remove("CODEX_CA_CERTIFICATE")
                 .env_remove("SSL_CERT_FILE")
@@ -109,35 +117,15 @@ async fn legacy_custom_ca_fallback_is_limited_to_reqwest_default() {
     let pool = RouteAwareClientPool::with_chatgpt_cloudflare_cookies(
         HttpClientFactory::new(outbound_proxy_policy),
         ClientRouteClass::Other,
-    )
-    .with_legacy_custom_ca_fallback();
+    );
+    let error = pool
+        .client_for_url_with_resolver("http://127.0.0.1/update", |_| async {
+            Ok(OutboundProxyRoute::Direct)
+        })
+        .await
+        .expect_err("route-aware pools should reject invalid custom CAs");
 
-    match outbound_proxy_policy {
-        OutboundProxyPolicy::ReqwestDefault => {
-            let (address, server) = spawn_response_server(vec![
-                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
-            ]);
-            let response = pool
-                .get(format!("http://{address}/update"))
-                .send()
-                .await
-                .expect("default-routed request should fall back to system roots");
-
-            assert_eq!(response.status(), StatusCode::OK);
-            let requests = server.join().expect("response server should finish");
-            assert_eq!(requests.len(), 1);
-        }
-        OutboundProxyPolicy::RespectSystemProxy => {
-            let error = pool
-                .client_for_url_with_resolver("http://127.0.0.1/update", |_| async {
-                    Ok(OutboundProxyRoute::Direct)
-                })
-                .await
-                .expect_err("system-proxy routes should reject invalid custom CAs");
-
-            assert!(matches!(error, RouteAwareClientPoolError::Build(_)));
-        }
-    }
+    assert!(matches!(error, RouteAwareClientPoolError::Build(_)));
 }
 
 #[tokio::test]

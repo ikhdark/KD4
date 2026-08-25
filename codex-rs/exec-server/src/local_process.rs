@@ -1031,9 +1031,6 @@ mod tests {
 
     #[tokio::test]
     async fn start_process_rejects_non_native_cwd_before_launch() {
-        #[cfg(unix)]
-        let uri = "file://server/share/checkout";
-        #[cfg(windows)]
         let uri = "file:///usr/local/checkout";
         let cwd = PathUri::parse(uri).expect("non-native cwd URI");
         let source = cwd
@@ -1081,7 +1078,7 @@ mod tests {
             ("OVERLAY".to_string(), "overlay".to_string()),
             ("POLICY_SET".to_string(), "overlay-wins".to_string()),
         ]);
-        if cfg!(target_os = "windows") {
+        {
             expected.insert("PATHEXT".to_string(), ".COM;.EXE;.BAT;.CMD".to_string());
         }
 

@@ -12,7 +12,7 @@ It provides:
 
 This crate owns the transport, protocol, and filesystem/process handlers. The
 top-level `codex` binary owns hidden helper dispatch for sandboxed
-filesystem operations and `codex-linux-sandbox`.
+filesystem operations and the Windows sandbox helpers.
 
 ## Transport
 

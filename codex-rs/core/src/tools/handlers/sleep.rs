@@ -1,4 +1,4 @@
-use crate::function_tool::FunctionCallError;
+use crate::FunctionCallError;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
@@ -16,6 +16,7 @@ use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -71,11 +72,12 @@ impl ToolExecutor<ToolInvocation> for SleepHandler {
         Box::pin(async move {
             let ToolInvocation {
                 session,
-                turn,
+                step_context,
                 call_id,
                 payload,
                 ..
             } = invocation;
+            let turn = Arc::clone(&step_context.turn);
             let ToolPayload::Function { arguments } = payload else {
                 return Err(FunctionCallError::RespondToModel(format!(
                     "{TOOL_NAME} handler received unsupported payload"

@@ -4,7 +4,7 @@ use serde_json::Map;
 use serde_json::Value;
 use serde_json::json;
 
-use crate::function_tool::FunctionCallError;
+use crate::FunctionCallError;
 use crate::shell::Shell;
 use crate::shell::ShellType;
 

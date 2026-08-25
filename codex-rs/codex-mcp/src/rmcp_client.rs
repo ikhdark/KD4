@@ -48,13 +48,16 @@ use codex_config::types::OAuthCredentialsStoreMode;
 use codex_exec_server::HttpClient;
 use codex_exec_server::ReqwestHttpClient;
 use codex_protocol::mcp::McpServerInfo;
+use codex_protocol::mcp::decode_tool_call_progress_token;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::McpStartupStatus;
 use codex_protocol::protocol::McpStartupUpdateEvent;
+use codex_protocol::protocol::McpToolCallProgressEvent;
 use codex_rmcp_client::ExecutorStdioServerLauncher;
 use codex_rmcp_client::LocalStdioServerLauncher;
 use codex_rmcp_client::RmcpClient;
+use codex_rmcp_client::SendProgress;
 use codex_rmcp_client::StdioServerLauncher;
 use codex_rmcp_client::ToolWithConnectorId;
 use codex_rmcp_client::is_authentication_required_error;
@@ -66,6 +69,8 @@ use rmcp::model::ElicitationCapability;
 use rmcp::model::Implementation;
 use rmcp::model::InitializeRequestParams;
 use rmcp::model::JsonObject;
+use rmcp::model::NumberOrString;
+use rmcp::model::ProgressNotificationParam;
 use rmcp::model::ProtocolVersion;
 use rmcp::model::Tool as RmcpTool;
 use tokio::time::Instant as TokioInstant;
@@ -96,6 +101,37 @@ const UNTRUSTED_CONNECTOR_META_KEYS: &[&str] = &[
     "connector_description",
     "connectorDescription",
 ];
+
+fn make_progress_sender(tx_event: Sender<Event>) -> SendProgress {
+    Box::new(move |params: ProgressNotificationParam| {
+        let tx_event = tx_event.clone();
+        async move {
+            let NumberOrString::String(token) = &params.progress_token.0 else {
+                return;
+            };
+            let Some((turn_id, item_id)) = decode_tool_call_progress_token(token) else {
+                return;
+            };
+            let message = params.message.unwrap_or_else(|| match params.total {
+                Some(total) => format!("MCP tool progress: {}/{total}", params.progress),
+                None => format!("MCP tool progress: {}", params.progress),
+            });
+            if let Err(err) = tx_event
+                .send(Event {
+                    id: turn_id,
+                    msg: EventMsg::McpToolCallProgress(McpToolCallProgressEvent {
+                        call_id: item_id,
+                        message,
+                    }),
+                })
+                .await
+            {
+                warn!("failed to forward MCP tool progress event: {err}");
+            }
+        }
+        .boxed()
+    })
+}
 
 #[derive(Clone)]
 pub(crate) struct ManagedClient {
@@ -844,10 +880,11 @@ async fn start_server_task(
         supports_openai_form_elicitation,
     );
 
-    let send_elicitation = elicitation_requests.make_sender(server_name.clone(), tx_event);
+    let send_elicitation = elicitation_requests.make_sender(server_name.clone(), tx_event.clone());
+    let send_progress = make_progress_sender(tx_event);
 
     let initialize_result = client
-        .initialize(params, startup_timeout, send_elicitation)
+        .initialize(params, startup_timeout, send_elicitation, send_progress)
         .await
         .map_err(StartupOutcomeError::from)?;
 
@@ -1042,9 +1079,11 @@ async fn make_rmcp_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_protocol::mcp::with_tool_call_progress_token_meta;
     use pretty_assertions::assert_eq;
     use rmcp::model::JsonObject;
     use rmcp::model::Meta;
+    use rmcp::model::ProgressToken;
     use rmcp::transport::auth::AuthError;
 
     #[test]
@@ -1055,6 +1094,36 @@ mod tests {
         let error = StartupOutcomeError::from(error);
 
         assert!(error.is_authentication_required());
+    }
+
+    #[tokio::test]
+    async fn progress_sender_emits_correlated_core_event() {
+        let meta = with_tool_call_progress_token_meta(None, "turn-1", "item-1")
+            .expect("progress metadata");
+        let token = meta["progressToken"]
+            .as_str()
+            .expect("string progress token")
+            .to_string();
+        let (tx_event, rx_event) = async_channel::unbounded();
+        let send_progress = make_progress_sender(tx_event);
+
+        send_progress(ProgressNotificationParam {
+            progress_token: ProgressToken(NumberOrString::String(token.into())),
+            progress: 2.0,
+            total: Some(5.0),
+            message: Some("working".to_string()),
+        })
+        .await;
+
+        let event = rx_event.recv().await.expect("forwarded progress event");
+        assert_eq!(event.id, "turn-1");
+        match event.msg {
+            EventMsg::McpToolCallProgress(event) => {
+                assert_eq!(event.call_id, "item-1");
+                assert_eq!(event.message, "working");
+            }
+            other => panic!("expected MCP tool progress event, got {other:?}"),
+        }
     }
 
     #[test]

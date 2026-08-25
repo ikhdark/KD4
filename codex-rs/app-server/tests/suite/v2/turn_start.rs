@@ -63,20 +63,17 @@ use codex_app_server_protocol::TurnSteerParams;
 use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_app_server_protocol::WarningNotification;
 use codex_config::config_toml::ConfigToml;
-use codex_core::personality_migration::PERSONALITY_MIGRATION_FILENAME;
 use codex_core::test_support::all_model_presets;
 use codex_features::FEATURES;
 use codex_features::Feature;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
-use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::Settings;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::openai_models::ReasoningEffort;
-use codex_protocol::protocol::MULTI_AGENT_MODE_OPEN_TAG;
 use codex_protocol::user_input::MAX_USER_INPUT_TEXT_CHARS;
 use codex_utils_absolute_path::test_support::PathExt;
 use core_test_support::responses;
@@ -97,12 +94,9 @@ use wiremock::ResponseTemplate;
 use super::analytics::mount_analytics_capture;
 use super::analytics::wait_for_analytics_event;
 
-#[cfg(windows)]
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
-#[cfg(not(windows))]
-const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 const TEST_ORIGINATOR: &str = "codex_vscode";
-const LOCAL_PRAGMATIC_TEMPLATE: &str = "You are a deeply pragmatic, effective software engineer.";
 const MULTI_AGENT_V2_NAMESPACE: &str = "agents";
 const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
 const TEST_MODEL_CATALOG_FILENAME: &str = "models_test_catalog.json";
@@ -1850,172 +1844,6 @@ async fn turn_start_accepts_personality_override_v2() -> Result<()> {
 }
 
 #[tokio::test]
-async fn turn_start_ignores_deprecated_multi_agent_mode() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = responses::start_mock_server().await;
-    let body = responses::sse(vec![
-        responses::ev_response_created("resp-1"),
-        responses::ev_assistant_message("msg-1", "Done"),
-        responses::ev_completed("resp-1"),
-    ]);
-    let response_mock = responses::mount_sse_once(&server, body).await;
-
-    let codex_home = TempDir::new()?;
-    create_config_toml(
-        codex_home.path(),
-        &server.uri(),
-        "never",
-        &BTreeMap::from([(Feature::MultiAgentV2, true)]),
-    )?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let thread_req = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
-            model: Some("mock-model".to_string()),
-            ..Default::default()
-        })
-        .await?;
-    let thread_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
-    )
-    .await??;
-    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
-
-    let turn_req = mcp
-        .send_turn_start_request(TurnStartParams {
-            thread_id: thread.id,
-            input: vec![V2UserInput::Text {
-                text: "Hello".to_string(),
-                text_elements: Vec::new(),
-            }],
-            multi_agent_mode: Some(MultiAgentMode::Proactive),
-            ..Default::default()
-        })
-        .await?;
-    let turn_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
-    )
-    .await??;
-    let _: TurnStartResponse = to_response(turn_resp)?;
-
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("turn/completed"),
-    )
-    .await??;
-
-    let developer_texts = response_mock
-        .single_request()
-        .message_input_texts("developer");
-    assert!(developer_texts.iter().any(|text| {
-        text.contains(
-            "Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents",
-        )
-    }));
-    assert!(
-        !developer_texts
-            .iter()
-            .any(|text| text.contains("Proactive multi-agent delegation is active."))
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn thread_start_ignores_deprecated_multi_agent_mode() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = responses::start_mock_server().await;
-    let body = responses::sse(vec![
-        responses::ev_response_created("resp-1"),
-        responses::ev_assistant_message("msg-1", "Done"),
-        responses::ev_completed("resp-1"),
-    ]);
-    let response_mock = responses::mount_sse_once(&server, body).await;
-
-    let codex_home = TempDir::new()?;
-    create_config_toml(
-        codex_home.path(),
-        &server.uri(),
-        "never",
-        &BTreeMap::from([(Feature::MultiAgentV2, true)]),
-    )?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let thread_req = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
-            model: Some("mock-model".to_string()),
-            multi_agent_mode: Some(MultiAgentMode::Proactive),
-            ..Default::default()
-        })
-        .await?;
-    let thread_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
-    )
-    .await??;
-    let ThreadStartResponse {
-        thread,
-        multi_agent_mode,
-        ..
-    } = to_response::<ThreadStartResponse>(thread_resp)?;
-    assert_eq!(multi_agent_mode, MultiAgentMode::ExplicitRequestOnly);
-
-    let turn_req = mcp
-        .send_turn_start_request(TurnStartParams {
-            thread_id: thread.id,
-            input: vec![V2UserInput::Text {
-                text: "Hello".to_string(),
-                text_elements: Vec::new(),
-            }],
-            ..Default::default()
-        })
-        .await?;
-    let turn_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
-    )
-    .await??;
-    let _: TurnStartResponse = to_response(turn_resp)?;
-
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("turn/completed"),
-    )
-    .await??;
-
-    let developer_texts = response_mock
-        .single_request()
-        .message_input_texts("developer");
-    assert!(developer_texts.iter().any(|text| {
-        text.contains(MULTI_AGENT_MODE_OPEN_TAG)
-            && text.contains(
-                "Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents",
-            )
-    }));
-    assert!(
-        !developer_texts
-            .iter()
-            .any(|text| text.contains("Proactive multi-agent delegation is active."))
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn turn_start_change_personality_mid_thread_v2() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -2132,17 +1960,10 @@ async fn turn_start_change_personality_mid_thread_v2() -> Result<()> {
 }
 
 #[tokio::test]
-async fn turn_start_uses_migrated_pragmatic_personality_without_override_v2() -> Result<()> {
+async fn app_server_startup_does_not_run_retired_personality_migration_v2() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
-    let body = responses::sse(vec![
-        responses::ev_response_created("resp-1"),
-        responses::ev_assistant_message("msg-1", "Done"),
-        responses::ev_completed("resp-1"),
-    ]);
-    let response_mock = responses::mount_sse_once(&server, body).await;
-
     let codex_home = TempDir::new()?;
     create_config_toml(
         codex_home.path(),
@@ -2168,58 +1989,10 @@ async fn turn_start_uses_migrated_pragmatic_personality_without_override_v2() ->
     let persisted_toml: ConfigToml = toml::from_str(&std::fs::read_to_string(
         codex_home.path().join("config.toml"),
     )?)?;
-    assert_eq!(persisted_toml.personality, Some(Personality::Pragmatic));
+    assert_eq!(persisted_toml.personality, None);
     assert!(
-        codex_home
-            .path()
-            .join(PERSONALITY_MIGRATION_FILENAME)
-            .exists(),
-        "expected personality migration marker to be written on startup"
-    );
-
-    let thread_req = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
-            model: Some("gpt-5.4".to_string()),
-            ..Default::default()
-        })
-        .await?;
-    let thread_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
-    )
-    .await??;
-    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
-
-    let turn_req = mcp
-        .send_turn_start_request(TurnStartParams {
-            thread_id: thread.id,
-            client_user_message_id: None,
-            input: vec![V2UserInput::Text {
-                text: "Hello".to_string(),
-                text_elements: Vec::new(),
-            }],
-            personality: None,
-            ..Default::default()
-        })
-        .await?;
-    let turn_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
-    )
-    .await??;
-    let _turn: TurnStartResponse = to_response::<TurnStartResponse>(turn_resp)?;
-
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("turn/completed"),
-    )
-    .await??;
-
-    let request = response_mock.single_request();
-    let instructions_text = request.instructions_text();
-    assert!(
-        instructions_text.contains(LOCAL_PRAGMATIC_TEMPLATE),
-        "expected startup-migrated pragmatic personality in model instructions, got: {instructions_text:?}"
+        !codex_home.path().join(".personality_migration").exists(),
+        "retired personality migration must not write its marker on startup"
     );
 
     Ok(())
@@ -2662,7 +2435,6 @@ async fn turn_start_updates_sandbox_and_cwd_between_turns_v2() -> Result<()> {
             personality: None,
             output_schema: None,
             collaboration_mode: None,
-            multi_agent_mode: None,
         })
         .await?;
     timeout(
@@ -2703,7 +2475,6 @@ async fn turn_start_updates_sandbox_and_cwd_between_turns_v2() -> Result<()> {
             personality: None,
             output_schema: None,
             collaboration_mode: None,
-            multi_agent_mode: None,
         })
         .await?;
     timeout(
@@ -2748,159 +2519,6 @@ async fn turn_start_updates_sandbox_and_cwd_between_turns_v2() -> Result<()> {
         mcp.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
-
-    Ok(())
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn turn_start_permission_profile_rebinds_runtime_workspace_roots_between_turns() -> Result<()>
-{
-    skip_if_no_network!(Ok(()));
-
-    let tmp = TempDir::new()?;
-    let codex_home = tmp.path().join("codex_home");
-    std::fs::create_dir(&codex_home)?;
-    let old_root = tmp.path().join("old-root");
-    let new_root = tmp.path().join("new-root");
-    std::fs::create_dir(&old_root)?;
-    std::fs::create_dir(&new_root)?;
-    let old_root_text = old_root.to_string_lossy().into_owned();
-    let new_root_text = new_root.to_string_lossy().into_owned();
-    let old_root = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(old_root)?;
-    let new_root = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(new_root)?;
-
-    let server = responses::start_mock_server().await;
-    let response_mock = responses::mount_sse_sequence(
-        &server,
-        vec![
-            responses::sse(vec![
-                responses::ev_response_created("resp-1"),
-                responses::ev_assistant_message("msg-1", "done first"),
-                responses::ev_completed("resp-1"),
-            ]),
-            responses::sse(vec![
-                responses::ev_response_created("resp-2"),
-                responses::ev_assistant_message("msg-2", "done second"),
-                responses::ev_completed("resp-2"),
-            ]),
-        ],
-    )
-    .await;
-    let server_uri = server.uri();
-    std::fs::write(
-        codex_home.join("config.toml"),
-        format!(
-            r#"
-model = "mock-model"
-approval_policy = "never"
-default_permissions = "dev"
-model_provider = "mock_provider"
-
-[model_providers.mock_provider]
-name = "Mock provider for test"
-base_url = "{server_uri}/v1"
-wire_api = "responses"
-request_max_retries = 0
-stream_max_retries = 0
-
-[permissions.dev.filesystem.":workspace_roots"]
-"." = "write"
-"#
-        ),
-    )?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(&codex_home)
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let start_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
-            model: Some("mock-model".to_string()),
-            ..Default::default()
-        })
-        .await?;
-    let start_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
-    )
-    .await??;
-    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
-
-    let first_turn_id = mcp
-        .send_turn_start_request(TurnStartParams {
-            thread_id: thread.id.clone(),
-            client_user_message_id: None,
-            input: vec![V2UserInput::Text {
-                text: "select dev profile".to_string(),
-                text_elements: Vec::new(),
-            }],
-            runtime_workspace_roots: Some(vec![old_root]),
-            permissions: Some("dev".to_string()),
-            ..Default::default()
-        })
-        .await?;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(first_turn_id)),
-    )
-    .await??;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("turn/completed"),
-    )
-    .await??;
-
-    let second_turn_id = mcp
-        .send_turn_start_request(TurnStartParams {
-            thread_id: thread.id.clone(),
-            client_user_message_id: None,
-            input: vec![V2UserInput::Text {
-                text: "write in new root".to_string(),
-                text_elements: Vec::new(),
-            }],
-            runtime_workspace_roots: Some(vec![new_root]),
-            ..Default::default()
-        })
-        .await?;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(second_turn_id)),
-    )
-    .await??;
-
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("turn/completed"),
-    )
-    .await??;
-
-    let requests = response_mock.requests();
-    assert_eq!(requests.len(), 2, "expected two Responses API requests");
-    let latest_permissions_instructions =
-        |request: &core_test_support::responses::ResponsesRequest| {
-            request
-                .message_input_texts("developer")
-                .into_iter()
-                .rev()
-                .find(|text| text.contains("<permissions instructions>"))
-                .expect("permissions instructions")
-        };
-    let first_permissions = latest_permissions_instructions(&requests[0]);
-    assert!(first_permissions.contains(&old_root_text));
-    assert!(
-        !first_permissions.contains(&new_root_text),
-        "first turn should materialize the initial runtime workspace root"
-    );
-
-    let second_permissions = latest_permissions_instructions(&requests[1]);
-    assert!(second_permissions.contains(&new_root_text));
-    assert!(
-        !second_permissions.contains(&old_root_text),
-        "second turn should rebind :workspace_roots to the updated runtime workspace root"
-    );
 
     Ok(())
 }
@@ -3416,7 +3034,6 @@ async fn turn_start_streams_apply_patch_change_updates_v2() -> Result<()> {
         &BTreeMap::from([
             (Feature::ApplyPatchStreamingEvents, true),
             (Feature::Plugins, false),
-            (Feature::RemoteModels, false),
             (Feature::ShellSnapshot, false),
         ]),
     )?;
@@ -4439,7 +4056,7 @@ async fn turn_start_file_change_approval_decline_v2() -> Result<()> {
 }
 
 #[tokio::test]
-#[cfg_attr(windows, ignore = "process id reporting differs on Windows")]
+#[ignore = "process id reporting differs on Windows"]
 async fn command_execution_notifications_include_process_id() -> Result<()> {
     // TODO(anp): Add target-Windows process-id expectations for remote executors.
     skip_if_wine_exec!(

@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use super::SessionTask;
-use super::SessionTaskContext;
 use super::SessionTaskResult;
 use super::emit_compact_metric;
 use crate::session::TurnInput;
@@ -9,6 +8,7 @@ use crate::session::turn_context::TurnContext;
 use crate::state::TaskKind;
 use codex_protocol::error::CodexErr;
 use codex_protocol::user_input::UserInput;
+use futures::future::BoxFuture;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Default)]
@@ -23,20 +23,15 @@ impl SessionTask for CompactTask {
         "session_task.compact"
     }
 
-    async fn run(
+    fn run(
         self: Arc<Self>,
-        session: Arc<SessionTaskContext>,
+        session: Arc<crate::session::session::Session>,
         ctx: Arc<TurnContext>,
         _input: Vec<TurnInput>,
         _cancellation_token: CancellationToken,
-    ) -> SessionTaskResult {
-        let session = session.clone_session();
-        let result = if crate::compact::should_use_remote_compact_task(ctx.provider.info()) {
-            if ctx
-                .config
-                .features
-                .enabled(codex_features::Feature::RemoteCompactionV2)
-            {
+    ) -> BoxFuture<'static, SessionTaskResult> {
+        Box::pin(async move {
+            let result = if crate::compact::should_use_remote_compact_task(ctx.provider.info()) {
                 emit_compact_metric(
                     &session.services.session_telemetry,
                     "remote_v2",
@@ -46,32 +41,25 @@ impl SessionTask for CompactTask {
             } else {
                 emit_compact_metric(
                     &session.services.session_telemetry,
-                    "remote",
+                    "local",
                     /*manual*/ true,
                 );
-                crate::compact_remote::run_remote_compact_task(session.clone(), ctx).await
+                let input = vec![UserInput::Text {
+                    text: ctx
+                        .config
+                        .compact_prompt
+                        .as_deref()
+                        .unwrap_or(crate::compact::SUMMARIZATION_PROMPT)
+                        .to_string(),
+                    // Compaction prompt is synthesized; no UI element ranges to preserve.
+                    text_elements: Vec::new(),
+                }];
+                crate::compact::run_compact_task(session.clone(), ctx, input).await
+            };
+            if let Err(err @ CodexErr::TurnAborted) = result {
+                return Err(err);
             }
-        } else {
-            emit_compact_metric(
-                &session.services.session_telemetry,
-                "local",
-                /*manual*/ true,
-            );
-            let input = vec![UserInput::Text {
-                text: ctx
-                    .config
-                    .compact_prompt
-                    .as_deref()
-                    .unwrap_or(crate::compact::SUMMARIZATION_PROMPT)
-                    .to_string(),
-                // Compaction prompt is synthesized; no UI element ranges to preserve.
-                text_elements: Vec::new(),
-            }];
-            crate::compact::run_compact_task(session.clone(), ctx, input).await
-        };
-        if let Err(err @ CodexErr::TurnAborted) = result {
-            return Err(err);
-        }
-        Ok(super::TurnTaskResult::default())
+            Ok(super::TurnTaskResult::default())
+        })
     }
 }

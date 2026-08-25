@@ -1,6 +1,8 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -63,6 +65,8 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
+use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -167,6 +171,104 @@ url = "{mcp_server_url}/mcp"
             "calledBy": "mcp-app",
         }))
     );
+
+    mcp_server_handle.abort();
+    let _ = mcp_server_handle.await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_server_tool_call_holds_thread_serialization_until_completion() -> Result<()> {
+    let responses_server = responses::start_mock_server().await;
+    let (mcp_server_url, mcp_server_handle, mut started_calls, call_releases) =
+        start_blocking_mcp_server().await?;
+    let codex_home = TempDir::new()?;
+    write_mock_responses_config_toml(
+        codex_home.path(),
+        &responses_server.uri(),
+        &BTreeMap::new(),
+        /*auto_compact_limit*/ 1024,
+        /*requires_openai_auth*/ None,
+        "mock_provider",
+        "compact",
+    )?;
+
+    let config_path = codex_home.path().join("config.toml");
+    let mut config_toml = std::fs::read_to_string(&config_path)?;
+    config_toml.push_str(&format!(
+        r#"
+[mcp_servers.{TEST_SERVER_NAME}]
+url = "{mcp_server_url}/mcp"
+"#
+    ));
+    std::fs::write(config_path, config_toml)?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_start_id = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let thread_start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response(thread_start_resp)?;
+
+    let first_request_id = mcp
+        .send_mcp_server_tool_call_request(McpServerToolCallParams {
+            thread_id: thread.id.clone(),
+            server: TEST_SERVER_NAME.to_string(),
+            tool: TEST_TOOL_NAME.to_string(),
+            arguments: Some(json!({ "message": "first" })),
+            meta: None,
+        })
+        .await?;
+    assert_eq!(
+        timeout(DEFAULT_READ_TIMEOUT, started_calls.recv()).await?,
+        Some(1)
+    );
+
+    let second_request_id = mcp
+        .send_mcp_server_tool_call_request(McpServerToolCallParams {
+            thread_id: thread.id,
+            server: TEST_SERVER_NAME.to_string(),
+            tool: TEST_TOOL_NAME.to_string(),
+            arguments: Some(json!({ "message": "second" })),
+            meta: None,
+        })
+        .await?;
+    assert!(
+        timeout(Duration::from_millis(250), started_calls.recv())
+            .await
+            .is_err(),
+        "a second serialized request started while the first tool call was still pending"
+    );
+
+    call_releases.add_permits(1);
+    let _: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(first_request_id)),
+    )
+    .await??;
+    assert_eq!(
+        timeout(DEFAULT_READ_TIMEOUT, started_calls.recv()).await?,
+        Some(2)
+    );
+    call_releases.add_permits(1);
+    let _: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(second_request_id)),
+    )
+    .await??;
 
     mcp_server_handle.abort();
     let _ = mcp_server_handle.await;
@@ -855,6 +957,100 @@ async fn start_mcp_server() -> Result<(String, JoinHandle<()>)> {
     });
 
     Ok((format!("http://{addr}"), handle))
+}
+
+#[derive(Clone)]
+struct BlockingToolAppsMcpServer {
+    call_count: Arc<AtomicUsize>,
+    started_calls: mpsc::UnboundedSender<usize>,
+    call_releases: Arc<Semaphore>,
+}
+
+impl ServerHandler for BlockingToolAppsMcpServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, rmcp::ErrorData> {
+        let input_schema: JsonObject = serde_json::from_value(json!({
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string"
+                }
+            },
+            "additionalProperties": false
+        }))
+        .map_err(|err| rmcp::ErrorData::internal_error(err.to_string(), None))?;
+
+        Ok(ListToolsResult {
+            tools: vec![Tool::new(
+                Cow::Borrowed(TEST_TOOL_NAME),
+                Cow::Borrowed("Block until the test releases this call."),
+                Arc::new(input_schema),
+            )],
+            next_cursor: None,
+            meta: None,
+        })
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        assert_eq!(request.name.as_ref(), TEST_TOOL_NAME);
+        let call_number = self.call_count.fetch_add(1, Ordering::SeqCst) + 1;
+        self.started_calls.send(call_number).map_err(|err| {
+            rmcp::ErrorData::internal_error(format!("failed to report tool call: {err}"), None)
+        })?;
+        self.call_releases
+            .acquire()
+            .await
+            .map_err(|err| rmcp::ErrorData::internal_error(err.to_string(), None))?
+            .forget();
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "call {call_number}"
+        ))]))
+    }
+}
+
+async fn start_blocking_mcp_server() -> Result<(
+    String,
+    JoinHandle<()>,
+    mpsc::UnboundedReceiver<usize>,
+    Arc<Semaphore>,
+)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let (started_calls_tx, started_calls_rx) = mpsc::unbounded_channel();
+    let call_releases = Arc::new(Semaphore::new(0));
+    let server = BlockingToolAppsMcpServer {
+        call_count: Arc::new(AtomicUsize::new(0)),
+        started_calls: started_calls_tx,
+        call_releases: Arc::clone(&call_releases),
+    };
+    let mcp_service = StreamableHttpService::new(
+        move || Ok(server.clone()),
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+    let router = Router::new().nest_service("/mcp", mcp_service);
+
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    Ok((
+        format!("http://{addr}"),
+        handle,
+        started_calls_rx,
+        call_releases,
+    ))
 }
 
 async fn serve_environment_until_shutdown(

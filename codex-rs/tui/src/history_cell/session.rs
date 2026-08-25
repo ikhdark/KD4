@@ -156,7 +156,7 @@ pub(crate) fn new_session_info(
         config.cwd.to_path_buf(),
         CODEX_CLI_VERSION,
     )
-    .with_yolo_mode(has_yolo_permissions(
+    .with_full_access_mode(has_full_access_permissions(
         session.approval_policy,
         &session.permission_profile,
     ));
@@ -218,14 +218,14 @@ pub(crate) fn new_session_info(
     SessionInfoCell(CompositeHistoryCell { parts })
 }
 
-pub(crate) fn is_yolo_mode(config: &Config) -> bool {
-    has_yolo_permissions(
+pub(crate) fn is_full_access_mode(config: &Config) -> bool {
+    has_full_access_permissions(
         AskForApproval::from(config.permissions.approval_policy.value()),
         &config.permissions.effective_permission_profile(),
     )
 }
 
-pub(crate) fn has_yolo_permissions(
+pub(crate) fn has_full_access_permissions(
     approval_policy: AskForApproval,
     permission_profile: &PermissionProfile,
 ) -> bool {
@@ -247,7 +247,7 @@ pub(crate) struct SessionHeaderHistoryCell {
     reasoning_effort: Option<ReasoningEffortConfig>,
     show_fast_status: bool,
     directory: PathBuf,
-    yolo_mode: bool,
+    full_access_mode: bool,
 }
 
 impl SessionHeaderHistoryCell {
@@ -283,12 +283,12 @@ impl SessionHeaderHistoryCell {
             reasoning_effort,
             show_fast_status,
             directory,
-            yolo_mode: false,
+            full_access_mode: false,
         }
     }
 
-    pub(crate) fn with_yolo_mode(mut self, yolo_mode: bool) -> Self {
-        self.yolo_mode = yolo_mode;
+    pub(crate) fn with_full_access_mode(mut self, full_access_mode: bool) -> Self {
+        self.full_access_mode = full_access_mode;
         self
     }
 
@@ -346,7 +346,7 @@ impl HistoryCell for SessionHeaderHistoryCell {
         const CHANGE_MODEL_HINT_EXPLANATION: &str = " to change";
         const DIR_LABEL: &str = "directory:";
         const PERMISSIONS_LABEL: &str = "permissions:";
-        let label_width = if self.yolo_mode {
+        let label_width = if self.full_access_mode {
             DIR_LABEL.len().max(PERMISSIONS_LABEL.len())
         } else {
             DIR_LABEL.len()
@@ -391,11 +391,11 @@ impl HistoryCell for SessionHeaderHistoryCell {
             make_row(dir_spans),
         ];
 
-        if self.yolo_mode {
+        if self.full_access_mode {
             let permissions_label = format!("{PERMISSIONS_LABEL:<label_width$}");
             lines.push(make_row(vec![
                 Span::from(format!("{permissions_label} ")).dim(),
-                "YOLO mode".magenta().bold(),
+                "Full Access".magenta().bold(),
             ]));
         }
 
@@ -421,8 +421,8 @@ impl HistoryCell for SessionHeaderHistoryCell {
                 self.format_directory(/*max_width*/ None)
             )),
         ];
-        if self.yolo_mode {
-            lines.push(Line::from("permissions: YOLO mode"));
+        if self.full_access_mode {
+            lines.push(Line::from("permissions: Full Access"));
         }
         lines
     }

@@ -15,6 +15,30 @@ pub struct SubagentHookContext {
     pub agent_type: String,
 }
 
+#[derive(Debug, Default)]
+pub struct ContextInjectingHookOutcome {
+    pub hook_events: Vec<HookCompletedEvent>,
+    pub should_stop: bool,
+    pub stop_reason: Option<String>,
+    pub additional_contexts: Vec<String>,
+}
+
+impl ContextInjectingHookOutcome {
+    pub(crate) fn from_serialization_failure(hook_events: Vec<HookCompletedEvent>) -> Self {
+        Self {
+            hook_events,
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct StatelessHookOutcome {
+    pub hook_events: Vec<HookCompletedEvent>,
+    pub should_stop: bool,
+    pub stop_reason: Option<String>,
+}
+
 pub(crate) fn join_text_chunks(chunks: Vec<String>) -> Option<String> {
     if chunks.is_empty() {
         None
@@ -169,9 +193,41 @@ mod tests {
     use codex_protocol::protocol::HookEventName;
     use pretty_assertions::assert_eq;
 
+    use super::ContextInjectingHookOutcome;
+    use super::StatelessHookOutcome;
     use super::matcher_pattern_for_event;
     use super::matches_matcher;
     use super::validate_matcher_pattern;
+
+    #[test]
+    fn shared_hook_outcomes_preserve_their_payload_shapes() {
+        let empty_context_injecting =
+            ContextInjectingHookOutcome::from_serialization_failure(Vec::new());
+        assert!(empty_context_injecting.hook_events.is_empty());
+        assert!(!empty_context_injecting.should_stop);
+        assert_eq!(empty_context_injecting.stop_reason, None);
+        assert!(empty_context_injecting.additional_contexts.is_empty());
+
+        let context_injecting = ContextInjectingHookOutcome {
+            hook_events: Vec::new(),
+            should_stop: true,
+            stop_reason: Some("blocked".to_string()),
+            additional_contexts: vec!["context".to_string()],
+        };
+        assert!(context_injecting.hook_events.is_empty());
+        assert!(context_injecting.should_stop);
+        assert_eq!(context_injecting.stop_reason.as_deref(), Some("blocked"));
+        assert_eq!(context_injecting.additional_contexts, vec!["context"]);
+
+        let stateless = StatelessHookOutcome {
+            hook_events: Vec::new(),
+            should_stop: false,
+            stop_reason: None,
+        };
+        assert!(stateless.hook_events.is_empty());
+        assert!(!stateless.should_stop);
+        assert_eq!(stateless.stop_reason, None);
+    }
 
     #[test]
     fn matcher_omitted_matches_all_occurrences() {

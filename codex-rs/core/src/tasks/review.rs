@@ -19,6 +19,7 @@ use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::review_format::format_review_findings_block;
 use codex_protocol::review_format::render_review_output_text;
+use futures::future::BoxFuture;
 use tokio_util::sync::CancellationToken;
 
 use crate::codex_delegate::run_codex_thread_one_shot;
@@ -31,7 +32,6 @@ use codex_features::Feature;
 use codex_protocol::user_input::UserInput;
 
 use super::SessionTask;
-use super::SessionTaskContext;
 use super::SessionTaskResult;
 
 #[derive(Clone)]
@@ -56,68 +56,73 @@ impl SessionTask for ReviewTask {
         "session_task.review"
     }
 
-    async fn run(
+    fn run(
         self: Arc<Self>,
-        session: Arc<SessionTaskContext>,
+        session: Arc<Session>,
         ctx: Arc<TurnContext>,
         input: Vec<TurnInput>,
         cancellation_token: CancellationToken,
-    ) -> SessionTaskResult {
-        let sess = session.clone_session();
-        let start_event = EventMsg::TurnStarted(TurnStartedEvent {
-            turn_id: ctx.sub_id.clone(),
-            trace_id: ctx.trace_id.clone(),
-            started_at: ctx.turn_timing_state.started_at_unix_secs().await,
-            model_context_window: ctx.model_context_window(),
-            collaboration_mode_kind: ctx.collaboration_mode.mode,
-        });
-        sess.send_event(ctx.as_ref(), start_event).await;
+    ) -> BoxFuture<'static, SessionTaskResult> {
+        Box::pin(async move {
+            let sess = Arc::clone(&session);
+            let start_event = EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: ctx.sub_id.clone(),
+                trace_id: ctx.trace_id.clone(),
+                started_at: ctx.turn_timing_state.started_at_unix_secs().await,
+                model_context_window: ctx.model_context_window(),
+                collaboration_mode_kind: ctx.collaboration_mode.mode,
+            });
+            sess.send_event(ctx.as_ref(), start_event).await;
 
-        let item = TurnItem::EnteredReviewMode(self.entered_review_mode.clone());
-        sess.emit_turn_item_started(ctx.as_ref(), &item).await;
-        sess.emit_turn_item_completed(ctx.as_ref(), item).await;
+            let item = TurnItem::EnteredReviewMode(self.entered_review_mode.clone());
+            sess.emit_turn_item_started(ctx.as_ref(), &item).await;
+            sess.emit_turn_item_completed(ctx.as_ref(), item).await;
 
-        session.session.services.session_telemetry.counter(
-            "codex.task.review",
-            /*inc*/ 1,
-            &[],
-        );
+            session
+                .services
+                .session_telemetry
+                .counter("codex.task.review", /*inc*/ 1, &[]);
 
-        let mut user_input = Vec::new();
-        for item in input {
-            match item {
-                TurnInput::UserInput { mut content, .. } => user_input.append(&mut content),
-                TurnInput::ResponseItem(_) | TurnInput::InterAgentCommunication(_) => {}
+            let mut user_input = Vec::new();
+            for item in input {
+                match item {
+                    TurnInput::UserInput { mut content, .. } => user_input.append(&mut content),
+                    TurnInput::ResponseItem(_) | TurnInput::InterAgentCommunication(_) => {}
+                }
             }
-        }
 
-        // Start sub-codex conversation and get the receiver for events.
-        let standalone_work_guard = ctx.turn_timing_state.begin_standalone_work();
-        let output = match start_review_conversation(
-            session.clone(),
-            ctx.clone(),
-            user_input,
-            cancellation_token.clone(),
-        )
-        .await
-        {
-            Some(receiver) => process_review_events(session.clone(), ctx.clone(), receiver).await,
-            None => None,
-        };
-        drop(standalone_work_guard);
-        if !cancellation_token.is_cancelled() {
-            exit_review_mode(session.clone_session(), output.clone(), ctx.clone()).await;
-        }
-        Ok(super::TurnTaskResult::default())
+            // Start sub-codex conversation and get the receiver for events.
+            let standalone_work_guard = ctx.turn_timing_state.begin_standalone_work();
+            let output = match start_review_conversation(
+                session.clone(),
+                ctx.clone(),
+                user_input,
+                cancellation_token.clone(),
+            )
+            .await
+            {
+                Some(receiver) => {
+                    process_review_events(session.clone(), ctx.clone(), receiver).await
+                }
+                None => None,
+            };
+            drop(standalone_work_guard);
+            if !cancellation_token.is_cancelled() {
+                exit_review_mode(Arc::clone(&session), output.clone(), ctx.clone()).await;
+            }
+            Ok(super::TurnTaskResult::default())
+        })
     }
 
-    async fn abort(&self, session: Arc<SessionTaskContext>, ctx: Arc<TurnContext>) {
-        exit_review_mode(session.clone_session(), /*review_output*/ None, ctx).await;
+    fn abort<'a>(&'a self, session: Arc<Session>, ctx: Arc<TurnContext>) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            exit_review_mode(session, /*review_output*/ None, ctx).await;
+        })
     }
 }
 
 async fn start_review_conversation(
-    session: Arc<SessionTaskContext>,
+    session: Arc<Session>,
     ctx: Arc<TurnContext>,
     input: Vec<UserInput>,
     cancellation_token: CancellationToken,
@@ -147,10 +152,10 @@ async fn start_review_conversation(
     sub_agent_config.model = Some(model);
     (run_codex_thread_one_shot(
         sub_agent_config,
-        session.auth_manager(),
-        session.models_manager(),
+        Arc::clone(&session.services.auth_manager),
+        Arc::clone(&session.services.models_manager),
         input,
-        session.clone_session(),
+        Arc::clone(&session),
         ctx.clone(),
         cancellation_token,
         SubAgentSource::Review,
@@ -163,7 +168,7 @@ async fn start_review_conversation(
 }
 
 async fn process_review_events(
-    session: Arc<SessionTaskContext>,
+    session: Arc<Session>,
     ctx: Arc<TurnContext>,
     receiver: async_channel::Receiver<Event>,
 ) -> Option<ReviewOutputEvent> {
@@ -172,10 +177,7 @@ async fn process_review_events(
         match event.clone().msg {
             EventMsg::AgentMessage(_) => {
                 if let Some(prev) = prev_agent_message.take() {
-                    session
-                        .clone_session()
-                        .send_event(ctx.as_ref(), prev.msg)
-                        .await;
+                    session.send_event(ctx.as_ref(), prev.msg).await;
                 }
                 prev_agent_message = Some(event);
             }
@@ -203,10 +205,7 @@ async fn process_review_events(
                 return None;
             }
             other => {
-                session
-                    .clone_session()
-                    .send_event(ctx.as_ref(), other)
-                    .await;
+                session.send_event(ctx.as_ref(), other).await;
             }
         }
     }

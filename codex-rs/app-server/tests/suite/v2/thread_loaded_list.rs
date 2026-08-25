@@ -2,6 +2,7 @@ use anyhow::Result;
 use app_test_support::TestAppServer;
 use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::to_response;
+use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadLoadedListParams;
@@ -101,6 +102,31 @@ async fn thread_loaded_list_paginates() -> Result<()> {
     } = to_response::<ThreadLoadedListResponse>(resp)?;
     assert_eq!(second_page, vec![expected[1].clone()]);
     assert_eq!(next_cursor, None);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_loaded_list_rejects_invalid_cursor_when_empty() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let list_id = mcp
+        .send_thread_loaded_list_request(ThreadLoadedListParams {
+            cursor: Some("not-a-cursor".to_string()),
+            limit: None,
+        })
+        .await?;
+    let error: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(list_id)),
+    )
+    .await??;
+    assert_eq!(error.error.message, "invalid cursor: not-a-cursor");
 
     Ok(())
 }

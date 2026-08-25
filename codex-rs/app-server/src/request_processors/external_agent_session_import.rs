@@ -30,9 +30,9 @@ use codex_thread_store::UpdateThreadMetadataParams;
 use futures::StreamExt;
 use tokio::sync::Semaphore;
 
-use crate::config::external_agent_config::ExternalAgentConfigImportItemResult;
-use crate::config::external_agent_config::record_import_error;
 use crate::config_manager::ConfigManager;
+use crate::external_agent_config::ExternalAgentConfigImportItemResult;
+use crate::external_agent_config::record_import_error;
 
 const SESSION_IMPORT_CONCURRENCY: usize = 5;
 
@@ -44,7 +44,7 @@ pub(super) struct ExternalAgentSessionImporter {
     thread_store: Arc<dyn ThreadStore>,
     state_db: Option<StateDbHandle>,
     config_manager: ConfigManager,
-    arg0_paths: Arg0DispatchPaths,
+    _arg0_paths: Arg0DispatchPaths,
 }
 
 impl ExternalAgentSessionImporter {
@@ -63,7 +63,7 @@ impl ExternalAgentSessionImporter {
             thread_store,
             state_db,
             config_manager,
-            arg0_paths,
+            _arg0_paths: arg0_paths,
         }
     }
 
@@ -222,8 +222,6 @@ impl ExternalAgentSessionImporter {
                 /*request_overrides*/ None,
                 ConfigOverrides {
                     cwd: Some(cwd),
-                    codex_linux_sandbox_exe: self.arg0_paths.codex_linux_sandbox_exe.clone(),
-                    main_execve_wrapper_exe: self.arg0_paths.main_execve_wrapper_exe.clone(),
                     ..Default::default()
                 },
             )
@@ -280,7 +278,7 @@ impl ExternalAgentSessionImporter {
         rollout_items.retain(|item| is_persisted_rollout_item(item, ThreadHistoryMode::Legacy));
         let title = title
             .as_deref()
-            .and_then(codex_core::util::normalize_thread_name);
+            .and_then(codex_thread_store::normalize_thread_name);
         let metadata = ThreadMetadataPatch {
             title,
             preview: first_user_message.clone(),

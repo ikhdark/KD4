@@ -1,7 +1,5 @@
 use super::*;
 
-const MCP_TOOL_THREAD_ID_META_KEY: &str = "threadId";
-
 #[derive(Clone)]
 pub(crate) struct McpRequestProcessor {
     auth_manager: Arc<AuthManager>,
@@ -65,12 +63,11 @@ impl McpRequestProcessor {
 
     pub(crate) async fn mcp_server_tool_call(
         &self,
-        request_id: &ConnectionRequestId,
         params: McpServerToolCallParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.call_mcp_server_tool(request_id, params)
+        self.call_mcp_server_tool(params)
             .await
-            .map(|()| None)
+            .map(|response| Some(response.into()))
     }
 
     async fn mcp_server_refresh_response(
@@ -90,7 +87,7 @@ impl McpRequestProcessor {
         self.config_manager
             .load_latest_config(fallback_cwd)
             .await
-            .map_err(|err| internal_error(format!("failed to reload config: {err}")))
+            .map_config_load_error()
     }
 
     async fn load_thread(
@@ -238,7 +235,7 @@ impl McpRequestProcessor {
                     .config_manager
                     .load_latest_config_for_thread(thread_config.as_ref())
                     .await
-                    .map_err(|err| internal_error(format!("failed to reload config: {err}")))?;
+                    .map_config_load_error()?;
                 (config, Some(thread))
             }
             None => (self.load_latest_config(/*fallback_cwd*/ None).await?, None),
@@ -454,47 +451,16 @@ impl McpRequestProcessor {
 
     async fn call_mcp_server_tool(
         &self,
-        request_id: &ConnectionRequestId,
         params: McpServerToolCallParams,
-    ) -> Result<(), JSONRPCErrorError> {
-        let outgoing = Arc::clone(&self.outgoing);
+    ) -> Result<McpServerToolCallResponse, JSONRPCErrorError> {
         let thread_id = params.thread_id.clone();
         let (_, thread) = self.load_thread(&thread_id).await?;
-        let meta = with_mcp_tool_call_thread_id_meta(params.meta, &thread_id);
-        let request_id = request_id.clone();
+        let meta = codex_protocol::mcp::with_tool_call_thread_id_meta(params.meta, &thread_id);
 
-        tokio::spawn(async move {
-            let result = thread
-                .call_mcp_tool(&params.server, &params.tool, params.arguments, meta)
-                .await
-                .map(McpServerToolCallResponse::from)
-                .map_err(|error| internal_error(format!("{error:#}")));
-            outgoing.send_result(request_id, result).await;
-        });
-        Ok(())
-    }
-}
-
-fn with_mcp_tool_call_thread_id_meta(
-    meta: Option<serde_json::Value>,
-    thread_id: &str,
-) -> Option<serde_json::Value> {
-    match meta {
-        Some(serde_json::Value::Object(mut map)) => {
-            map.insert(
-                MCP_TOOL_THREAD_ID_META_KEY.to_string(),
-                serde_json::Value::String(thread_id.to_string()),
-            );
-            Some(serde_json::Value::Object(map))
-        }
-        None => {
-            let mut map = serde_json::Map::new();
-            map.insert(
-                MCP_TOOL_THREAD_ID_META_KEY.to_string(),
-                serde_json::Value::String(thread_id.to_string()),
-            );
-            Some(serde_json::Value::Object(map))
-        }
-        other => other,
+        thread
+            .call_mcp_tool(&params.server, &params.tool, params.arguments, meta)
+            .await
+            .map(McpServerToolCallResponse::from)
+            .map_err(|error| internal_error(format!("{error:#}")))
     }
 }

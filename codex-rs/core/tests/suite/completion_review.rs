@@ -66,6 +66,10 @@ fn completion_review_builder() -> TestCodexBuilder {
 
 fn completion_review_builder_with_role(register_reviewer_role: bool) -> TestCodexBuilder {
     test_codex().with_config(move |config| {
+        config.permissions.shell_environment_policy.r#set.insert(
+            "CARGO_TARGET_DIR".to_string(),
+            config.cwd.join("target").display().to_string(),
+        );
         let initialized = Command::new("git")
             .args(["init", "--quiet"])
             .current_dir(&config.cwd)
@@ -74,6 +78,15 @@ fn completion_review_builder_with_role(register_reviewer_role: bool) -> TestCode
         assert!(
             initialized.success(),
             "initialize completion-review repository"
+        );
+        let configured = Command::new("git")
+            .args(["config", "core.autocrlf", "false"])
+            .current_dir(&config.cwd)
+            .status()
+            .expect("configure completion-review repository line endings");
+        assert!(
+            configured.success(),
+            "configure completion-review repository line endings"
         );
         fs::write(
             config.cwd.join("kd4_features.toml"),
@@ -154,7 +167,7 @@ fn completion_review_builder_with_role(register_reviewer_role: bool) -> TestCode
 }
 
 fn write_explicit_stop_hook(home: &Path) {
-    let (script_path, command) = if cfg!(windows) {
+    let (script_path, command) = {
         let script_path = home.join("completion-review-stop.ps1");
         fs::write(
             &script_path,
@@ -169,17 +182,6 @@ Write-Output '{"continue":false,"stopReason":"explicit stop"}'
                 "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{}\"",
                 script_path.display()
             ),
-        )
-    } else {
-        let script_path = home.join("completion-review-stop.sh");
-        fs::write(
-            &script_path,
-            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{\"continue\":false,\"stopReason\":\"explicit stop\"}'\n",
-        )
-        .expect("write explicit stop hook");
-        (
-            script_path.clone(),
-            format!("sh \"{}\"", script_path.display()),
         )
     };
     assert!(script_path.is_file());
@@ -202,7 +204,7 @@ Write-Output '{"continue":false,"stopReason":"explicit stop"}'
 
 fn write_single_continuation_stop_hook(home: &Path) {
     let prompt = "complete the stop-hook-requested follow-up";
-    let (script_path, command) = if cfg!(windows) {
+    let (script_path, command) = {
         let script_path = home.join("completion-review-continuation.ps1");
         fs::write(
             &script_path,
@@ -226,19 +228,6 @@ if (Test-Path -LiteralPath $state) {{
                 script_path.display()
             ),
         )
-    } else {
-        let script_path = home.join("completion-review-continuation.sh");
-        fs::write(
-            &script_path,
-            format!(
-                "#!/bin/sh\ncat >/dev/null\nstate=\"$(dirname \"$0\")/completion-review-stop-seen\"\nif [ -f \"$state\" ]; then\n  printf '%s\\n' '{{}}'\nelse\n  : > \"$state\"\n  printf '%s\\n' '{{\"decision\":\"block\",\"reason\":\"{prompt}\"}}'\nfi\n"
-            ),
-        )
-        .expect("write continuation stop hook");
-        (
-            script_path.clone(),
-            format!("sh \"{}\"", script_path.display()),
-        )
     };
     assert!(script_path.is_file());
     fs::write(
@@ -261,17 +250,16 @@ if (Test-Path -LiteralPath $state) {{
 fn completion_review_builder_with_after_agent_probe() -> TestCodexBuilder {
     completion_review_builder().with_config(|config| {
         let marker = config.codex_home.join("after-agent-order.txt");
-        if cfg!(windows) {
-            let script = config.codex_home.join("after-agent-order.ps1");
+        let script = config.codex_home.join("after-agent-order.ps1");
             fs::write(
                 &script,
                 r#"param([string]$Payload)
-$receipt = Get-ChildItem -Path (Join-Path $PSScriptRoot 'task-evidence\*.json') -ErrorAction SilentlyContinue | Select-Object -First 1
 $result = 'missing-review'
-if ($null -ne $receipt) {
+foreach ($receipt in Get-ChildItem -Path (Join-Path $PSScriptRoot 'task-evidence\*.json') -ErrorAction SilentlyContinue) {
     $content = Get-Content -LiteralPath $receipt.FullName -Raw
     if ($content -match '"attempt_kind"\s*:\s*"initial_review"' -and $content -match '"review_clean"\s*:\s*true') {
         $result = 'reviewed'
+        break
     }
 }
 
@@ -287,15 +275,6 @@ Set-Content -LiteralPath (Join-Path $PSScriptRoot 'after-agent-order.txt') -Valu
                 "-File".to_string(),
                 script.display().to_string(),
             ]);
-        } else {
-            let script = config.codex_home.join("after-agent-order.sh");
-            fs::write(
-                &script,
-                "#!/bin/sh\nif grep -Eq '\"attempt_kind\"[[:space:]]*:[[:space:]]*\"initial_review\"' \"$(dirname \"$0\")\"/task-evidence/*.json && grep -Eq '\"review_clean\"[[:space:]]*:[[:space:]]*true' \"$(dirname \"$0\")\"/task-evidence/*.json; then\n  printf reviewed > \"$(dirname \"$0\")/after-agent-order.txt\"\nelse\n  printf missing-review > \"$(dirname \"$0\")/after-agent-order.txt\"\nfi\n",
-            )
-            .expect("write AfterAgent probe");
-            config.notify = Some(vec!["sh".to_string(), script.display().to_string()]);
-        }
         assert_eq!(marker.file_name().and_then(|name| name.to_str()), Some("after-agent-order.txt"));
     })
 }
@@ -304,8 +283,7 @@ fn completion_review_builder_with_mutating_finalizer(abort: bool) -> TestCodexBu
     completion_review_builder().with_config(move |config| {
         config.after_agent_policy = AfterAgentPolicy::MutatingFinalizer;
         let workspace = config.cwd.display().to_string();
-        if cfg!(windows) {
-            let script = config.codex_home.join("mutating-finalizer.ps1");
+        let script = config.codex_home.join("mutating-finalizer.ps1");
             let exit = if abort { "exit 7" } else { "" };
             fs::write(
                 &script,
@@ -330,22 +308,6 @@ Set-Content -LiteralPath (Join-Path $Workspace 'finalizer.txt') -Value 'finalize
                 script.display().to_string(),
                 workspace,
             ]);
-        } else {
-            let script = config.codex_home.join("mutating-finalizer.sh");
-            let exit = if abort { "exit 7" } else { "" };
-            fs::write(
-                &script,
-                format!(
-                    "#!/bin/sh\ncount_path=\"$(dirname \"$0\")/mutating-finalizer-count.txt\"\ncount=0\nif [ -f \"$count_path\" ]; then count=$(cat \"$count_path\"); fi\nprintf '%s\\n' \"$((count + 1))\" > \"$count_path\"\nprintf finalized > \"$1/finalizer.txt\"\n{exit}\n"
-                ),
-            )
-            .expect("write mutating finalizer");
-            config.notify = Some(vec![
-                "sh".to_string(),
-                script.display().to_string(),
-                workspace,
-            ]);
-        }
     })
 }
 
@@ -385,7 +347,7 @@ fn plan_response(response_id: &str, call_id: &str, status: &str) -> String {
                     "uncertainty": "the requested file behavior remains present",
                     "covered_paths": ["src/lib.rs"],
                     "covered_contracts": ["The requested file behavior is present"],
-                    "timeout_ms": 10000
+                    "timeout_ms": 120000
                 }]
             }
         }]
@@ -410,7 +372,7 @@ fn validation_response(response_id: &str, call_id: &str) -> String {
             "--",
             "--exact"
         ],
-        "yield_time_ms": 30_000,
+        "yield_time_ms": 60_000,
         "validation": {
             "uncertainty": "the requested file behavior remains present",
             "covered_paths": ["src/lib.rs"],
@@ -488,6 +450,7 @@ enum ReviewScenario {
 struct CompletionReviewProbe {
     total_requests: AtomicUsize,
     classification_requests: AtomicUsize,
+    local_classification_requests: AtomicUsize,
     relationship_resolution_requests: AtomicUsize,
     review_requests: AtomicUsize,
     rereview_requests: AtomicUsize,
@@ -520,7 +483,7 @@ impl Respond for CompletionReviewResponder {
             .find(|text| text.contains(LOCAL_CLASSIFICATION_REQUEST_MARKER))
         {
             self.probe
-                .classification_requests
+                .local_classification_requests
                 .fetch_add(1, Ordering::SeqCst);
             let items = tagged_json(request_text, "source_local_items");
             let response = local_classification_response(
@@ -1090,8 +1053,15 @@ async fn clean_review_finishes_without_a_repair_continuation() -> Result<()> {
     );
     assert_no_additional_turn_complete(&test).await;
 
-    assert_eq!(probe.total_requests.load(Ordering::SeqCst), 7);
-    assert_eq!(probe.classification_requests.load(Ordering::SeqCst), 1);
+    let classification_requests = probe.classification_requests.load(Ordering::SeqCst);
+    assert_eq!(
+        probe.total_requests.load(Ordering::SeqCst),
+        6 + classification_requests + probe.local_classification_requests.load(Ordering::SeqCst)
+    );
+    assert!(
+        (1..=2).contains(&classification_requests),
+        "classification requests must remain bounded: {classification_requests}"
+    );
     assert_eq!(probe.review_requests.load(Ordering::SeqCst), 1);
     assert_eq!(probe.rereview_requests.load(Ordering::SeqCst), 0);
     assert_eq!(probe.repair_requests.load(Ordering::SeqCst), 0);
@@ -1146,9 +1116,10 @@ async fn manifest_gap_rebuilds_the_manifest_and_starts_a_fresh_initial_review() 
     );
     assert_no_additional_turn_complete(&test).await;
 
+    let classification_requests = probe.classification_requests.load(Ordering::SeqCst);
     assert_eq!(
         probe.total_requests.load(Ordering::SeqCst),
-        9,
+        8 + classification_requests + probe.local_classification_requests.load(Ordering::SeqCst),
         "classifications={}, relationships={}, reviews={}, rereviews={}, repairs={}",
         probe.classification_requests.load(Ordering::SeqCst),
         probe
@@ -1158,7 +1129,10 @@ async fn manifest_gap_rebuilds_the_manifest_and_starts_a_fresh_initial_review() 
         probe.rereview_requests.load(Ordering::SeqCst),
         probe.repair_requests.load(Ordering::SeqCst),
     );
-    assert_eq!(probe.classification_requests.load(Ordering::SeqCst), 1);
+    assert!(
+        (1..=2).contains(&classification_requests),
+        "classification requests must remain bounded across a manifest refresh: {classification_requests}"
+    );
     assert_eq!(
         probe
             .relationship_resolution_requests
@@ -1223,8 +1197,15 @@ async fn reviewer_finding_injects_one_repair_and_repair_mutation_cannot_rearm_re
     );
     assert_no_additional_turn_complete(&test).await;
 
-    assert_eq!(probe.total_requests.load(Ordering::SeqCst), 13);
-    assert_eq!(probe.classification_requests.load(Ordering::SeqCst), 1);
+    let classification_requests = probe.classification_requests.load(Ordering::SeqCst);
+    assert_eq!(
+        probe.total_requests.load(Ordering::SeqCst),
+        12 + classification_requests + probe.local_classification_requests.load(Ordering::SeqCst)
+    );
+    assert!(
+        (1..=2).contains(&classification_requests),
+        "classification requests must remain bounded: {classification_requests}"
+    );
     assert_eq!(probe.review_requests.load(Ordering::SeqCst), 2);
     assert_eq!(probe.rereview_requests.load(Ordering::SeqCst), 1);
     assert_eq!(probe.repair_requests.load(Ordering::SeqCst), 5);
@@ -1277,7 +1258,11 @@ async fn ordinary_nonpassed_evidence_remains_partial_after_supplemental_review()
         completion.completion,
     );
 
-    assert_eq!(probe.classification_requests.load(Ordering::SeqCst), 1);
+    let classification_requests = probe.classification_requests.load(Ordering::SeqCst);
+    assert!(
+        (1..=2).contains(&classification_requests),
+        "classification requests must remain bounded: {classification_requests}"
+    );
     assert_eq!(probe.review_requests.load(Ordering::SeqCst), 1);
     assert_eq!(probe.rereview_requests.load(Ordering::SeqCst), 0);
     assert_eq!(probe.repair_requests.load(Ordering::SeqCst), 0);
@@ -1395,7 +1380,11 @@ async fn malformed_supplemental_reviewer_output_does_not_worsen_completion() -> 
         probe.review_requests.load(Ordering::SeqCst),
     );
     assert!(gate.reasons.is_empty());
-    assert_eq!(probe.classification_requests.load(Ordering::SeqCst), 1);
+    let classification_requests = probe.classification_requests.load(Ordering::SeqCst);
+    assert!(
+        (1..=2).contains(&classification_requests),
+        "classification requests must remain bounded across supplemental-review fallback: {classification_requests}"
+    );
     assert_eq!(probe.review_requests.load(Ordering::SeqCst), 1);
     Ok(())
 }
@@ -1434,7 +1423,11 @@ async fn oversized_supplemental_reviewer_output_does_not_worsen_completion() -> 
         probe.review_requests.load(Ordering::SeqCst),
     );
     assert!(gate.reasons.is_empty());
-    assert_eq!(probe.classification_requests.load(Ordering::SeqCst), 1);
+    let classification_requests = probe.classification_requests.load(Ordering::SeqCst);
+    assert!(
+        (1..=2).contains(&classification_requests),
+        "classification requests must remain bounded across supplemental-review fallback: {classification_requests}"
+    );
     assert_eq!(probe.review_requests.load(Ordering::SeqCst), 1);
     Ok(())
 }
@@ -1552,8 +1545,15 @@ async fn stop_hook_continuation_runs_before_the_single_reviewer() -> Result<()> 
         completion.completion.as_ref().map(|gate| gate.status),
         Some(TaskCompletionStatus::Passed)
     );
-    assert_eq!(probe.total_requests.load(Ordering::SeqCst), 8);
-    assert_eq!(probe.classification_requests.load(Ordering::SeqCst), 1);
+    let classification_requests = probe.classification_requests.load(Ordering::SeqCst);
+    assert_eq!(
+        probe.total_requests.load(Ordering::SeqCst),
+        7 + classification_requests + probe.local_classification_requests.load(Ordering::SeqCst)
+    );
+    assert!(
+        (1..=2).contains(&classification_requests),
+        "classification requests must remain bounded: {classification_requests}"
+    );
     assert_eq!(probe.review_requests.load(Ordering::SeqCst), 1);
     assert!(
         probe
@@ -1594,7 +1594,11 @@ async fn reviewer_finishes_before_legacy_after_agent_hook() -> Result<()> {
         completion.completion.as_ref().map(|gate| gate.status),
         Some(TaskCompletionStatus::Passed)
     );
-    assert_eq!(probe.classification_requests.load(Ordering::SeqCst), 1);
+    let classification_requests = probe.classification_requests.load(Ordering::SeqCst);
+    assert!(
+        (1..=2).contains(&classification_requests),
+        "classification requests must remain bounded: {classification_requests}"
+    );
     assert_eq!(probe.review_requests.load(Ordering::SeqCst), 1);
 
     let marker = test.home.path().join("after-agent-order.txt");

@@ -17,7 +17,6 @@ use codex_agent_task_store::AcceptanceCriterion;
 use codex_agent_task_store::AdmissionRejectionReason;
 use codex_agent_task_store::AgentRole;
 use codex_agent_task_store::AgentTaskBindingDraft;
-use codex_agent_task_store::AgentTaskStore;
 use codex_agent_task_store::ArchitectureContractRef;
 use codex_agent_task_store::Assignment;
 use codex_agent_task_store::AssignmentAdmissionOrigin;
@@ -27,6 +26,7 @@ use codex_agent_task_store::AssignmentRelation;
 use codex_agent_task_store::Attempt;
 use codex_agent_task_store::AttemptState;
 use codex_agent_task_store::IntegrationPlan;
+use codex_agent_task_store::LocalAgentTaskStore;
 use codex_agent_task_store::RelevantHandle;
 use codex_agent_task_store::RepoScope;
 use codex_agent_task_store::StoreError;
@@ -49,6 +49,7 @@ use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -87,11 +88,12 @@ async fn handle_spawn_agent(
 ) -> Result<SpawnAgentResult, FunctionCallError> {
     let ToolInvocation {
         session,
-        turn,
+        step_context,
         payload,
         call_id,
         ..
     } = invocation;
+    let turn = Arc::clone(&step_context.turn);
     let arguments = function_arguments(payload)?;
     let mut args: SpawnAgentArgs = parse_arguments(&arguments)?;
     if turn.session_source.is_non_root_agent() && args.assignment.is_some() {
@@ -1284,7 +1286,7 @@ fn legacy_message_draft(
 }
 
 async fn construct_and_attach_task_capsule(
-    store: &dyn AgentTaskStore,
+    store: &LocalAgentTaskStore,
     repo_root: &Path,
     assignment: &Assignment,
     attempt: &Attempt,
@@ -1323,11 +1325,7 @@ async fn construct_and_attach_task_capsule(
             Err(error) => return Err(StoreError::Io(error)),
         }
 
-        let path_key = if cfg!(windows) {
-            path.to_ascii_lowercase()
-        } else {
-            path.clone()
-        };
+        let path_key = path.to_ascii_lowercase();
         distinct_paths
             .entry(path_key.clone())
             .or_insert_with(|| path.clone());
@@ -1364,22 +1362,14 @@ async fn construct_and_attach_task_capsule(
         .files
         .iter()
         .map(|entry| {
-            let key = if cfg!(windows) {
-                entry.path.to_ascii_lowercase()
-            } else {
-                entry.path.clone()
-            };
+            let key = entry.path.to_ascii_lowercase();
             (key, entry)
         })
         .collect::<BTreeMap<_, _>>();
     let relevant_handles = normalized_handles
         .into_iter()
         .map(|handle| {
-            let key = if cfg!(windows) {
-                handle.path().to_ascii_lowercase()
-            } else {
-                handle.path().to_string()
-            };
+            let key = handle.path().to_ascii_lowercase();
             let entry = entries.get(&key).ok_or_else(|| {
                 StoreError::InvalidTaskCapsule(format!(
                     "workspace revision omitted relevant handle {:?}",

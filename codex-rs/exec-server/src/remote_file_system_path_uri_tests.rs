@@ -134,9 +134,6 @@ async fn record_read_file_params(
 }
 
 fn non_native_cwd() -> PathUri {
-    #[cfg(unix)]
-    let uri = "file://server/share/checkout";
-    #[cfg(windows)]
     let uri = "file:///usr/local/checkout";
 
     PathUri::parse(uri).expect("non-native cwd URI")

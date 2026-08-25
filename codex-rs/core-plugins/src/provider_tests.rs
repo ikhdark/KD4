@@ -14,7 +14,6 @@ use codex_exec_server::FileSystemSandboxContext;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_exec_server::ReadDirectoryEntry;
 use codex_exec_server::RemoveOptions;
-use codex_plugin::PluginProvider;
 use codex_plugin::ResolvedPlugin;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
@@ -301,7 +300,7 @@ async fn standalone_capability_root_is_not_a_plugin() {
     let provider = ExecutorPluginProvider::new(Arc::new(EnvironmentManager::default_for_tests()));
 
     let resolved = provider
-        .resolve(&selected_root(
+        .resolve_bound(&selected_root(
             "standalone",
             LOCAL_ENVIRONMENT_ID,
             &standalone_root,
@@ -309,7 +308,7 @@ async fn standalone_capability_root_is_not_a_plugin() {
         .await
         .expect("resolve standalone root");
 
-    assert_eq!(resolved, None);
+    assert!(resolved.is_none());
 }
 
 #[tokio::test]
@@ -320,10 +319,13 @@ async fn unavailable_environment_does_not_fall_back_to_host_filesystem() {
     let provider =
         ExecutorPluginProvider::new(Arc::new(EnvironmentManager::without_environments()));
 
-    let err = provider
-        .resolve(&selected_root("host-plugin", "missing", &plugin_root))
+    let err = match provider
+        .resolve_bound(&selected_root("host-plugin", "missing", &plugin_root))
         .await
-        .expect_err("missing environment should fail");
+    {
+        Ok(_) => panic!("missing environment should fail"),
+        Err(err) => err,
+    };
 
     assert_eq!(
         err.to_string(),
@@ -346,14 +348,17 @@ async fn malformed_preferred_manifest_does_not_fall_through_to_alternate() {
             .expect("manifest URI");
     let provider = ExecutorPluginProvider::new(Arc::new(EnvironmentManager::default_for_tests()));
 
-    let err = provider
-        .resolve(&selected_root(
+    let err = match provider
+        .resolve_bound(&selected_root(
             "selected-demo",
             LOCAL_ENVIRONMENT_ID,
             &plugin_root,
         ))
         .await
-        .expect_err("malformed preferred manifest should fail");
+    {
+        Ok(_) => panic!("malformed preferred manifest should fail"),
+        Err(err) => err,
+    };
 
     let ExecutorPluginProviderError::ParseManifest {
         root_id,

@@ -16,11 +16,8 @@ use windows_sys::Win32::Foundation::GlobalFree;
 use windows_sys::Win32::Foundation::TRUE;
 use windows_sys::Win32::Networking::WinHttp::ERROR_WINHTTP_AUTODETECTION_FAILED;
 use windows_sys::Win32::Networking::WinHttp::ERROR_WINHTTP_BAD_AUTO_PROXY_SCRIPT;
-use windows_sys::Win32::Networking::WinHttp::ERROR_WINHTTP_CANNOT_CONNECT;
-use windows_sys::Win32::Networking::WinHttp::ERROR_WINHTTP_CONNECTION_ERROR;
 use windows_sys::Win32::Networking::WinHttp::ERROR_WINHTTP_INVALID_URL;
 use windows_sys::Win32::Networking::WinHttp::ERROR_WINHTTP_LOGIN_FAILURE;
-use windows_sys::Win32::Networking::WinHttp::ERROR_WINHTTP_NAME_NOT_RESOLVED;
 use windows_sys::Win32::Networking::WinHttp::ERROR_WINHTTP_SCRIPT_EXECUTION_ERROR;
 use windows_sys::Win32::Networking::WinHttp::ERROR_WINHTTP_SECURE_CERT_CN_INVALID;
 use windows_sys::Win32::Networking::WinHttp::ERROR_WINHTTP_SECURE_CERT_DATE_INVALID;
@@ -356,9 +353,6 @@ fn classify_winhttp_error(code: u32) -> RouteFailureClass {
         ERROR_WINHTTP_INVALID_URL | ERROR_WINHTTP_UNRECOGNIZED_SCHEME => {
             RouteFailureClass::InvalidProxyConfig
         }
-        ERROR_WINHTTP_CANNOT_CONNECT
-        | ERROR_WINHTTP_CONNECTION_ERROR
-        | ERROR_WINHTTP_NAME_NOT_RESOLVED => RouteFailureClass::ResolverError,
         _ => RouteFailureClass::ResolverError,
     }
 }

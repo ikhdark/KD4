@@ -1,3 +1,4 @@
+use super::REMOTE_CONTROL_INSTALLATION_ID_HEADER;
 use super::auth::REMOTE_CONTROL_ACCOUNT_ID_HEADER;
 use super::enroll::RemoteControlEnrollment;
 use super::enroll::load_persisted_remote_control_enrollment;
@@ -7,7 +8,6 @@ use super::protocol::ClientEvent;
 use super::protocol::ClientId;
 use super::protocol::StreamId;
 use super::protocol::normalize_remote_control_url;
-use super::server_api::REMOTE_CONTROL_INSTALLATION_ID_HEADER;
 use super::websocket::REMOTE_CONTROL_PROTOCOL_VERSION;
 use super::websocket::RemoteControlWebsocket;
 use super::websocket::RemoteControlWebsocketConfig;

@@ -620,6 +620,7 @@ async fn mcp_resource_read_returns_error_for_unknown_thread() -> Result<()> {
     .await?;
 
     let response = client
+        .sender()
         .request(ClientRequest::McpResourceRead {
             request_id: RequestId::Integer(1),
             params: McpResourceReadParams {

@@ -208,20 +208,6 @@ pub struct SkillReadResult {
     pub contents: String,
 }
 
-/// Search results for a package whose files are not readable through ordinary
-/// executor filesystem access.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SkillSearchResult {
-    pub matches: Vec<SkillSearchMatch>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SkillSearchMatch {
-    pub resource: SkillResourceId,
-    pub title: String,
-    pub snippet: String,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SkillProviderError {
     pub message: String,

@@ -2063,7 +2063,7 @@ async fn thread_list_backwards_cursor_can_seed_forward_delta_sync() -> Result<()
         "mock_provider".to_string(),
     )
     .await?;
-    codex_rollout::state_db::reconcile_rollout(
+    codex_rollout::state_integration::reconcile_rollout(
         Some(state.as_ref()),
         new_rollout_path.as_path(),
         "mock_provider",

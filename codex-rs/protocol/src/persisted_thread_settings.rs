@@ -34,6 +34,7 @@ pub struct PersistedThreadSettings {
     pub model: Option<String>,
     pub model_provider_id: Option<String>,
     pub service_tier: Option<Option<String>>,
+    pub developer_instructions: Option<Option<String>>,
     pub approval_policy: Option<AskForApproval>,
     pub approvals_reviewer: Option<ApprovalsReviewer>,
     pub permission_profile: Option<PermissionProfile>,
@@ -61,6 +62,9 @@ impl PersistedThreadSettings {
         }
         if mask.service_tier {
             self.service_tier = None;
+        }
+        if mask.developer_instructions {
+            self.developer_instructions = None;
         }
         if mask.approval_policy {
             self.approval_policy = None;
@@ -110,6 +114,7 @@ pub struct PersistedThreadSettingsOverrideMask {
     pub model: bool,
     pub model_provider_id: bool,
     pub service_tier: bool,
+    pub developer_instructions: bool,
     pub approval_policy: bool,
     pub approvals_reviewer: bool,
     pub permission_profile: bool,
@@ -227,6 +232,9 @@ impl PersistedThreadSettingsReducer {
         if let Some(service_tier) = snapshot.service_tier.as_ref() {
             self.settings.service_tier = Some(service_tier.clone());
         }
+        if let Some(developer_instructions) = snapshot.developer_instructions.as_ref() {
+            self.settings.developer_instructions = Some(developer_instructions.clone());
+        }
         self.settings.approval_policy = Some(snapshot.approval_policy);
         self.settings.approvals_reviewer = Some(snapshot.approvals_reviewer);
         self.settings.permission_profile = Some(snapshot.permission_profile.clone());
@@ -319,6 +327,7 @@ mod tests {
             model: model.to_string(),
             model_provider_id: format!("provider-{model}"),
             service_tier: Some(Some("flex".to_string())),
+            developer_instructions: Some(Some("persisted developer instructions".to_string())),
             approval_policy: AskForApproval::Never,
             approvals_reviewer: ApprovalsReviewer::AutoReview,
             permission_profile: PermissionProfile::workspace_write(),
@@ -365,10 +374,8 @@ mod tests {
             collaboration_mode: None,
             multi_agent_version: None,
             multi_agent_mode: None,
-            realtime_active: None,
             effort: None,
             context_provenance: None,
-            summary: ReasoningSummary::Auto,
         };
         let mut history = vec![
             RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(
@@ -386,6 +393,10 @@ mod tests {
             reduce_persisted_thread_settings(&history, PersistedThreadSettings::default());
         assert_eq!(snapshot_settings.model.as_deref(), Some("second"));
         assert_eq!(&snapshot_settings.service_tier, &second.service_tier);
+        assert_eq!(
+            &snapshot_settings.developer_instructions,
+            &second.developer_instructions
+        );
         assert_eq!(
             snapshot_settings.permission_profile,
             Some(second.permission_profile.clone())
@@ -481,6 +492,7 @@ mod tests {
             ))],
             PersistedThreadSettings {
                 service_tier: Some(Some("metadata-tier".to_string())),
+                developer_instructions: Some(Some("metadata instructions".to_string())),
                 active_permission_profile: Some(Some(fallback_profile.clone())),
                 reasoning_effort: Some(Some(ReasoningEffort::Medium)),
                 reasoning_summary: Some(Some(ReasoningSummary::Concise)),
@@ -505,6 +517,10 @@ mod tests {
             Some(Some("metadata-tier".to_string()))
         );
         assert_eq!(
+            settings.developer_instructions,
+            Some(Some("metadata instructions".to_string()))
+        );
+        assert_eq!(
             settings.active_permission_profile,
             Some(Some(fallback_profile))
         );
@@ -526,6 +542,7 @@ mod tests {
             "model": "null-model",
             "model_provider_id": "null-provider",
             "service_tier": null,
+            "developer_instructions": null,
             "approval_policy": "never",
             "approvals_reviewer": "user",
             "permission_profile": PermissionProfile::read_only(),
@@ -546,6 +563,7 @@ mod tests {
             ))],
             PersistedThreadSettings {
                 service_tier: Some(Some("metadata-tier".to_string())),
+                developer_instructions: Some(Some("metadata instructions".to_string())),
                 active_permission_profile: Some(Some(ActivePermissionProfile::new(
                     "metadata-profile",
                 ))),
@@ -557,6 +575,7 @@ mod tests {
         );
 
         assert_eq!(settings.service_tier, Some(None));
+        assert_eq!(settings.developer_instructions, Some(None));
         assert_eq!(settings.active_permission_profile, Some(None));
         assert_eq!(settings.reasoning_effort, Some(None));
         assert_eq!(settings.reasoning_summary, Some(None));

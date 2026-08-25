@@ -16,6 +16,7 @@ path = "src/bin/config_schema.rs"
 workspace = true
 
 [dependencies]
+codex-client = { workspace = true }
 anyhow = { workspace = true }
 arc-swap = { workspace = true }
 async-channel = { workspace = true }
@@ -52,7 +53,6 @@ codex-execpolicy = { workspace = true }
 codex-git-utils = { workspace = true }
 codex-hooks = { workspace = true }
 codex-http-client = { workspace = true }
-codex-install-context = { workspace = true }
 codex-network-proxy = { workspace = true }
 codex-otel = { workspace = true }
 codex-plugin = { workspace = true }
@@ -73,15 +73,12 @@ codex-utils-cache = { workspace = true }
 codex-utils-image = { workspace = true }
 codex-utils-home-dir = { workspace = true }
 codex-utils-output-truncation = { workspace = true }
-codex-utils-path = { workspace = true }
 codex-utils-path-uri = { workspace = true }
-codex-utils-plugins = { workspace = true }
 codex-utils-pty = { workspace = true }
 codex-utils-string = { workspace = true }
 codex-utils-stream-parser = { workspace = true }
-codex-windows-sandbox = { package = "codex-windows-sandbox", path = "../windows-sandbox-rs" }
+codex-windows-sandbox = { workspace = true }
 csv = { workspace = true }
-dirs = { workspace = true }
 dunce = { workspace = true }
 eventsource-stream = { workspace = true }
 futures = { workspace = true }
@@ -90,11 +87,10 @@ iana-time-zone = { workspace = true }
 image = { workspace = true, features = ["jpeg", "png", "webp"] }
 indexmap = { workspace = true }
 jsonschema = { workspace = true }
-libc = { workspace = true }
-once_cell = { workspace = true }
+lru = { workspace = true }
 rand = { workspace = true }
 regex-lite = { workspace = true }
-reqwest = { workspace = true, features = ["json", "stream"] }
+reqwest = { workspace = true, features = ["json", "rustls", "stream"] }
 rmcp = { workspace = true, default-features = false, features = [
     "base64",
     "macros",
@@ -121,30 +117,18 @@ tokio-tungstenite = { workspace = true }
 toml = { workspace = true }
 toml_edit = { workspace = true }
 tracing = { workspace = true, features = ["log"] }
+unicode-segmentation = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true, features = ["serde", "v4", "v5", "v7"] }
 which = { workspace = true }
 
-# Build OpenSSL from source for musl builds.
-[target.x86_64-unknown-linux-musl.dependencies]
-openssl-sys = { workspace = true, features = ["vendored"] }
-
-# Build OpenSSL from source for musl builds.
-[target.aarch64-unknown-linux-musl.dependencies]
-openssl-sys = { workspace = true, features = ["vendored"] }
-
-[target.'cfg(unix)'.dependencies]
-codex-shell-escalation = { workspace = true }
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.52", features = [
+windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
 ] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-whoami = { workspace = true }
 codex-extension-items = { workspace = true }
 assert_cmd = { workspace = true }
 assert_matches = { workspace = true }
@@ -175,9 +159,6 @@ tracing-test = { workspace = true, features = ["no-env-filter"] }
 walkdir = { workspace = true }
 wiremock = { workspace = true }
 zstd = { workspace = true }
-
-[package.metadata.cargo-shear]
-ignored = ["openssl-sys"]
 
 [[bench]]
 name = "turn_latency"

@@ -91,7 +91,6 @@ pub(crate) enum AppCommand {
     SetThreadName {
         name: String,
     },
-    Shutdown,
     ThreadRollback {
         num_turns: u32,
     },
@@ -248,11 +247,6 @@ impl AppCommand {
 
     pub(crate) fn set_thread_name(name: String) -> Self {
         Self::SetThreadName { name }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn shutdown() -> Self {
-        Self::Shutdown
     }
 
     pub(crate) fn thread_rollback(num_turns: u32) -> Self {

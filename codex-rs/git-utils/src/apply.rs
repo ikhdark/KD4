@@ -6,14 +6,14 @@
 //! mode via [`ApplyGitRequest::preflight`] and inspect the resulting paths to
 //! learn what would change before applying for real.
 
-use once_cell::sync::Lazy;
 use regex::Regex;
 use std::ffi::OsString;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 
-const DISABLED_HOOKS_PATH: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
+use crate::DISABLED_HOOKS_PATH;
 
 /// Parameters for invoking [`apply_git_patch`].
 #[derive(Debug, Clone)]
@@ -356,7 +356,7 @@ fn materialize_worktree_in_temporary_index(
     }
 
     let canonical_git_root = std::fs::canonicalize(git_root)?;
-    let null_device = OsString::from(if cfg!(windows) { "NUL" } else { "/dev/null" });
+    let null_device = OsString::from("NUL");
     for path in paths
         .iter()
         .filter(|path| !tracked_paths.contains(*path))
@@ -506,16 +506,7 @@ fn trim_line_ending(mut bytes: &[u8]) -> &[u8] {
 }
 
 fn path_buf_from_git_bytes(bytes: &[u8]) -> PathBuf {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStringExt;
-
-        PathBuf::from(OsString::from_vec(bytes.to_vec()))
-    }
-    #[cfg(not(unix))]
-    {
-        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
-    }
+    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
 fn quote_shell(s: &str) -> String {
@@ -681,16 +672,7 @@ fn unescape_c_bytes(input: &str) -> Vec<u8> {
 }
 
 fn os_string_from_git_path_bytes(bytes: Vec<u8>) -> OsString {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStringExt;
-
-        OsString::from_vec(bytes)
-    }
-    #[cfg(not(unix))]
-    {
-        OsString::from(String::from_utf8_lossy(&bytes).into_owned())
-    }
+    OsString::from(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Stage only the files that actually exist on disk for the given diff.
@@ -773,62 +755,64 @@ pub fn parse_git_apply_output(
         Some(path)
     }
 
-    static APPLIED_CLEAN: Lazy<Regex> =
-        Lazy::new(|| regex_ci("^Applied patch(?: to)?\\s+(?P<path>.+?)\\s+cleanly\\.?$"));
-    static APPLIED_CONFLICTS: Lazy<Regex> =
-        Lazy::new(|| regex_ci("^Applied patch(?: to)?\\s+(?P<path>.+?)\\s+with conflicts\\.?$"));
-    static APPLYING_WITH_REJECTS: Lazy<Regex> = Lazy::new(|| {
+    static APPLIED_CLEAN: LazyLock<Regex> =
+        LazyLock::new(|| regex_ci("^Applied patch(?: to)?\\s+(?P<path>.+?)\\s+cleanly\\.?$"));
+    static APPLIED_CONFLICTS: LazyLock<Regex> = LazyLock::new(|| {
+        regex_ci("^Applied patch(?: to)?\\s+(?P<path>.+?)\\s+with conflicts\\.?$")
+    });
+    static APPLYING_WITH_REJECTS: LazyLock<Regex> = LazyLock::new(|| {
         regex_ci("^Applying patch\\s+(?P<path>.+?)\\s+with\\s+\\d+\\s+rejects?\\.{0,3}$")
     });
-    static CHECKING_PATCH: Lazy<Regex> =
-        Lazy::new(|| regex_ci("^Checking patch\\s+(?P<path>.+?)\\.\\.\\.$"));
-    static UNMERGED_LINE: Lazy<Regex> = Lazy::new(|| regex_ci("^U\\s+(?P<path>.+)$"));
-    static PATCH_FAILED: Lazy<Regex> =
-        Lazy::new(|| regex_ci("^error:\\s+patch failed:\\s+(?P<path>.+?)(?::\\d+)?(?:\\s|$)"));
-    static DOES_NOT_APPLY: Lazy<Regex> =
-        Lazy::new(|| regex_ci("^error:\\s+(?P<path>.+?):\\s+patch does not apply$"));
-    static THREE_WAY_START: Lazy<Regex> = Lazy::new(|| {
+    static CHECKING_PATCH: LazyLock<Regex> =
+        LazyLock::new(|| regex_ci("^Checking patch\\s+(?P<path>.+?)\\.\\.\\.$"));
+    static UNMERGED_LINE: LazyLock<Regex> = LazyLock::new(|| regex_ci("^U\\s+(?P<path>.+)$"));
+    static PATCH_FAILED: LazyLock<Regex> =
+        LazyLock::new(|| regex_ci("^error:\\s+patch failed:\\s+(?P<path>.+?)(?::\\d+)?(?:\\s|$)"));
+    static DOES_NOT_APPLY: LazyLock<Regex> =
+        LazyLock::new(|| regex_ci("^error:\\s+(?P<path>.+?):\\s+patch does not apply$"));
+    static THREE_WAY_START: LazyLock<Regex> = LazyLock::new(|| {
         regex_ci("^(?:Performing three-way merge|Falling back to three-way merge)\\.\\.\\.$")
     });
-    static THREE_WAY_FAILED: Lazy<Regex> =
-        Lazy::new(|| regex_ci("^Failed to perform three-way merge\\.\\.\\.$"));
-    static FALLBACK_DIRECT: Lazy<Regex> =
-        Lazy::new(|| regex_ci("^Falling back to direct application\\.\\.\\.$"));
-    static LACKS_BLOB: Lazy<Regex> = Lazy::new(|| {
+    static THREE_WAY_FAILED: LazyLock<Regex> =
+        LazyLock::new(|| regex_ci("^Failed to perform three-way merge\\.\\.\\.$"));
+    static FALLBACK_DIRECT: LazyLock<Regex> =
+        LazyLock::new(|| regex_ci("^Falling back to direct application\\.\\.\\.$"));
+    static LACKS_BLOB: LazyLock<Regex> = LazyLock::new(|| {
         regex_ci(
             "^(?:error: )?repository lacks the necessary blob to (?:perform|fall back on) 3-?way merge\\.?$",
         )
     });
-    static INDEX_MISMATCH: Lazy<Regex> =
-        Lazy::new(|| regex_ci("^error:\\s+(?P<path>.+?):\\s+does not match index\\b"));
-    static NOT_IN_INDEX: Lazy<Regex> =
-        Lazy::new(|| regex_ci("^error:\\s+(?P<path>.+?):\\s+does not exist in index\\b"));
-    static ALREADY_EXISTS_WT: Lazy<Regex> = Lazy::new(|| {
+    static INDEX_MISMATCH: LazyLock<Regex> =
+        LazyLock::new(|| regex_ci("^error:\\s+(?P<path>.+?):\\s+does not match index\\b"));
+    static NOT_IN_INDEX: LazyLock<Regex> =
+        LazyLock::new(|| regex_ci("^error:\\s+(?P<path>.+?):\\s+does not exist in index\\b"));
+    static ALREADY_EXISTS_WT: LazyLock<Regex> = LazyLock::new(|| {
         regex_ci("^error:\\s+(?P<path>.+?)\\s+already exists in (?:the )?working directory\\b")
     });
-    static FILE_EXISTS: Lazy<Regex> =
-        Lazy::new(|| regex_ci("^error:\\s+patch failed:\\s+(?P<path>.+?)\\s+File exists"));
-    static RENAMED_DELETED: Lazy<Regex> =
-        Lazy::new(|| regex_ci("^error:\\s+path\\s+(?P<path>.+?)\\s+has been renamed\\/deleted"));
-    static CANNOT_APPLY_BINARY: Lazy<Regex> = Lazy::new(|| {
+    static FILE_EXISTS: LazyLock<Regex> =
+        LazyLock::new(|| regex_ci("^error:\\s+patch failed:\\s+(?P<path>.+?)\\s+File exists"));
+    static RENAMED_DELETED: LazyLock<Regex> = LazyLock::new(|| {
+        regex_ci("^error:\\s+path\\s+(?P<path>.+?)\\s+has been renamed\\/deleted")
+    });
+    static CANNOT_APPLY_BINARY: LazyLock<Regex> = LazyLock::new(|| {
         regex_ci(
             "^error:\\s+cannot apply binary patch to\\s+['\\\"]?(?P<path>.+?)['\\\"]?\\s+without full index line$",
         )
     });
-    static BINARY_DOES_NOT_APPLY: Lazy<Regex> = Lazy::new(|| {
+    static BINARY_DOES_NOT_APPLY: LazyLock<Regex> = LazyLock::new(|| {
         regex_ci("^error:\\s+binary patch does not apply to\\s+['\\\"]?(?P<path>.+?)['\\\"]?$")
     });
-    static BINARY_INCORRECT_RESULT: Lazy<Regex> = Lazy::new(|| {
+    static BINARY_INCORRECT_RESULT: LazyLock<Regex> = LazyLock::new(|| {
         regex_ci(
             "^error:\\s+binary patch to\\s+['\\\"]?(?P<path>.+?)['\\\"]?\\s+creates incorrect result\\b",
         )
     });
-    static CANNOT_READ_CURRENT: Lazy<Regex> = Lazy::new(|| {
+    static CANNOT_READ_CURRENT: LazyLock<Regex> = LazyLock::new(|| {
         regex_ci("^error:\\s+cannot read the current contents of\\s+['\\\"]?(?P<path>.+?)['\\\"]?$")
     });
-    static SKIPPED_PATCH: Lazy<Regex> =
-        Lazy::new(|| regex_ci("^Skipped patch\\s+['\\\"]?(?P<path>.+?)['\\\"]\\.$"));
-    static CANNOT_MERGE_BINARY_WARN: Lazy<Regex> = Lazy::new(|| {
+    static SKIPPED_PATCH: LazyLock<Regex> =
+        LazyLock::new(|| regex_ci("^Skipped patch\\s+['\\\"]?(?P<path>.+?)['\\\"]\\.$"));
+    static CANNOT_MERGE_BINARY_WARN: LazyLock<Regex> = LazyLock::new(|| {
         regex_ci(
             "^warning:\\s*Cannot merge binary files:\\s+(?P<path>.+?)\\s+\\(ours\\s+vs\\.\\s+theirs\\)",
         )

@@ -80,8 +80,7 @@ __all__ = [
 
 
 BUILD_SCRIPT = REPO_ROOT / "codex-cli" / "scripts" / "build_npm_package.py"
-WORKFLOW_NAME = ".github/workflows/rust-release.yml"
-DEFAULT_GITHUB_REPO = "openai/codex"
+DEFAULT_GITHUB_REPO = "ikhdark/KD4"
 COMPLETE_MARKER = ".complete"
 LOCK_POLL_SECONDS = 0.1
 LOCK_STALE_SECONDS = 60 * 60
@@ -176,13 +175,16 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("CODEX_STAGE_GITHUB_REPO"),
         help=(
             "GitHub repository to query for release artifacts, in owner/name form. "
-            "Defaults to CODEX_STAGE_GITHUB_REPO, then the current gh repo, then openai/codex."
+            "Defaults to CODEX_STAGE_GITHUB_REPO, then the current gh repo, then ikhdark/KD4."
         ),
     )
     parser.add_argument(
         "--workflow-name",
-        default=os.environ.get("CODEX_STAGE_WORKFLOW_NAME", WORKFLOW_NAME),
-        help="GitHub Actions workflow name/path to query when --workflow-url is not provided.",
+        default=os.environ.get("CODEX_STAGE_WORKFLOW_NAME"),
+        help=(
+            "Explicit GitHub Actions workflow name/path to query when "
+            "--workflow-url is not provided. There is no implicit workflow default."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -393,7 +395,7 @@ def resolve_release_workflow(
 
 
 def resolve_workflow_url(
-    version: str, override: str | None, github_repo: str, workflow_name: str
+    version: str, override: str | None, github_repo: str, workflow_name: str | None
 ) -> tuple[str, str | None]:
     if override:
         reference = parse_workflow_run_url(override)
@@ -413,8 +415,13 @@ def resolve_workflow_url(
         )
         workflow = json.loads(stdout)
         workflow["url"] = override
-    else:
+    elif workflow_name:
         workflow = resolve_release_workflow(version, github_repo, workflow_name)
+    else:
+        raise ValueError(
+            "--workflow-url is required unless an explicit --workflow-name or "
+            "CODEX_STAGE_WORKFLOW_NAME is provided"
+        )
 
     if workflow.get("status") != "completed" or workflow.get("conclusion") != "success":
         raise RuntimeError(

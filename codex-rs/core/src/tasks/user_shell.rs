@@ -10,7 +10,7 @@ use codex_exec_server::ExecOutputStream as ServerExecOutputStream;
 use codex_exec_server::ExecParams;
 use codex_exec_server::ExecProcess;
 use codex_network_proxy::PROXY_ACTIVE_ENV_KEY;
-use codex_utils_absolute_path::AbsolutePathBuf;
+use futures::future::BoxFuture;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
 use tracing::warn;
@@ -29,9 +29,8 @@ use crate::shell::Shell;
 use crate::state::TaskKind;
 use crate::tools::format_exec_output_str;
 use crate::tools::runtimes::RuntimePathPrepends;
-#[cfg(unix)]
-use crate::tools::runtimes::apply_package_path_prepend;
-use crate::tools::runtimes::maybe_wrap_shell_lc_with_snapshot;
+
+use crate::tools::runtimes::maybe_wrap_shell_lc_with_snapshot_file;
 use crate::tools::runtimes::strip_managed_proxy_env;
 use crate::user_shell_command::user_shell_command_record_item_from_formatted_output;
 use codex_protocol::exec_output::ExecToolCallOutput;
@@ -49,7 +48,6 @@ use codex_sandboxing::SandboxType;
 use codex_shell_command::parse_command::parse_command;
 
 use super::SessionTask;
-use super::SessionTaskContext;
 use super::SessionTaskResult;
 use crate::session::session::Session;
 use codex_protocol::models::PermissionProfile;
@@ -86,22 +84,24 @@ impl SessionTask for UserShellCommandTask {
         "session_task.user_shell"
     }
 
-    async fn run(
+    fn run(
         self: Arc<Self>,
-        session: Arc<SessionTaskContext>,
+        session: Arc<Session>,
         turn_context: Arc<TurnContext>,
         _input: Vec<TurnInput>,
         cancellation_token: CancellationToken,
-    ) -> SessionTaskResult {
-        execute_user_shell_command(
-            session.clone_session(),
-            turn_context,
-            self.command.clone(),
-            cancellation_token,
-            UserShellCommandMode::StandaloneTurn,
-        )
-        .await;
-        Ok(super::TurnTaskResult::default())
+    ) -> BoxFuture<'static, SessionTaskResult> {
+        Box::pin(async move {
+            execute_user_shell_command(
+                session,
+                turn_context,
+                self.command.clone(),
+                cancellation_token,
+                UserShellCommandMode::StandaloneTurn,
+            )
+            .await;
+            Ok(super::TurnTaskResult::default())
+        })
     }
 }
 
@@ -197,6 +197,7 @@ pub(crate) async fn execute_user_shell_command(
             &session,
             turn_context.as_ref(),
             turn_environment,
+            environment_shell,
             display_command.clone(),
             &call_id,
             &cancellation_token,
@@ -361,7 +362,9 @@ async fn execute_local_user_shell_command(
             "shell working directory is not native to the Codex host".to_string(),
         )
     })?;
-    let shell_snapshot_location = turn_environment.shell_snapshot(&cwd).await;
+    let shell_snapshot_location = turn_environment
+        .shell_snapshot(turn_environment.cwd())
+        .await;
     let mut exec_env_map = create_env(
         &turn_context.config.permissions.shell_environment_policy,
         Some(session.thread_id),
@@ -372,7 +375,7 @@ async fn execute_local_user_shell_command(
     let exec_command = prepare_user_shell_exec_command(
         display_command,
         environment_shell,
-        shell_snapshot_location.as_ref(),
+        shell_snapshot_location.as_deref(),
         &turn_context
             .config
             .permissions
@@ -430,6 +433,7 @@ async fn execute_remote_user_shell_command(
     session: &Session,
     turn_context: &TurnContext,
     turn_environment: &crate::session::turn_context::TurnEnvironment,
+    environment_shell: &Shell,
     display_command: Vec<String>,
     call_id: &str,
     cancellation_token: &CancellationToken,
@@ -454,10 +458,22 @@ async fn execute_remote_user_shell_command(
             .map(std::string::ToString::to_string)
             .collect(),
     };
-    let env = HashMap::from([(
+    let shell_snapshot = turn_environment
+        .shell_snapshot(turn_environment.cwd())
+        .await;
+    let mut env = policy.r#set.clone();
+    env.insert(
         CODEX_THREAD_ID_ENV_VAR.to_string(),
         session.thread_id.to_string(),
-    )]);
+    );
+    let display_command = maybe_wrap_shell_lc_with_snapshot_file(
+        &display_command,
+        environment_shell,
+        shell_snapshot.as_deref(),
+        &policy.r#set,
+        &mut env,
+        &RuntimePathPrepends,
+    );
     let process_id = call_id.into();
     let exec_backend = turn_environment.environment.get_exec_backend();
     let start = exec_backend.start(ExecParams {
@@ -605,25 +621,12 @@ async fn send_user_shell_error(session: &Session, turn_context: &TurnContext, me
 fn prepare_user_shell_exec_command(
     display_command: &[String],
     shell: &Shell,
-    shell_snapshot: Option<&AbsolutePathBuf>,
+    shell_snapshot: Option<&crate::shell_snapshot::ShellSnapshotFile>,
     shell_environment_set: &HashMap<String, String>,
     exec_env_map: &mut HashMap<String, String>,
 ) -> Vec<String> {
-    #[cfg(unix)]
     {
-        prepare_user_shell_exec_command_with_path_prepend(
-            display_command,
-            shell,
-            shell_snapshot,
-            shell_environment_set,
-            exec_env_map,
-            apply_package_path_prepend,
-        )
-    }
-
-    #[cfg(not(unix))]
-    {
-        maybe_wrap_shell_lc_with_snapshot(
+        maybe_wrap_shell_lc_with_snapshot_file(
             display_command,
             shell,
             shell_snapshot,
@@ -632,36 +635,9 @@ fn prepare_user_shell_exec_command(
             // On non-Unix targets, arg0 has already prepended the package path
             // to the process PATH before create_env() builds exec_env_map.
             // RuntimePathPrepends is only needed for Unix shell snapshot replay.
-            &RuntimePathPrepends::default(),
+            &RuntimePathPrepends,
         )
     }
-}
-
-/// Prepares a user-shell command after adding runtime-owned PATH entries.
-///
-/// The callback mutates the live exec environment for commands that are not
-/// wrapped with a shell snapshot and records only the runtime-owned entries so
-/// snapshot wrapping can reapply them after restoring the user's snapshot PATH.
-#[cfg(unix)]
-fn prepare_user_shell_exec_command_with_path_prepend(
-    display_command: &[String],
-    shell: &Shell,
-    shell_snapshot: Option<&AbsolutePathBuf>,
-    shell_environment_set: &HashMap<String, String>,
-    exec_env_map: &mut HashMap<String, String>,
-    prepend_runtime_path: impl FnOnce(&mut HashMap<String, String>, &mut RuntimePathPrepends),
-) -> Vec<String> {
-    let explicit_env_overrides = shell_environment_set.clone();
-    let mut runtime_path_prepends = RuntimePathPrepends::default();
-    prepend_runtime_path(exec_env_map, &mut runtime_path_prepends);
-    maybe_wrap_shell_lc_with_snapshot(
-        display_command,
-        shell,
-        shell_snapshot,
-        &explicit_env_overrides,
-        exec_env_map,
-        &runtime_path_prepends,
-    )
 }
 
 async fn persist_user_shell_output(

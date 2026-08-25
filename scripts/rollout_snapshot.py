@@ -34,9 +34,6 @@ class RolloutSnapshot:
 
 
 def _open_shared_binary(path: Path) -> BinaryIO:
-    if os.name != "nt":
-        return path.open("rb")
-
     import ctypes
     import msvcrt
     from ctypes import wintypes

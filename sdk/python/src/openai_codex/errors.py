@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+_OVERLOADED_ERROR_CODE = -32001
+
 
 class CodexError(Exception):
     """Base exception for SDK errors."""
@@ -58,6 +60,15 @@ def _contains_retry_limit_text(message: str) -> bool:
     return "retry limit" in lowered or "too many failed attempts" in lowered
 
 
+def _is_structured_overload(code: int, data: Any) -> bool:
+    return (
+        code == _OVERLOADED_ERROR_CODE
+        and isinstance(data, dict)
+        and isinstance(data.get("reason"), str)
+        and data.get("retryable") is True
+    )
+
+
 def _is_server_overloaded(data: Any) -> bool:
     if data is None:
         return False
@@ -98,7 +109,7 @@ def map_jsonrpc_error(code: int, message: str, data: Any = None) -> JsonRpcError
         return InternalRpcError(code, message, data)
 
     if -32099 <= code <= -32000:
-        if _is_server_overloaded(data):
+        if _is_structured_overload(code, data) or _is_server_overloaded(data):
             if _contains_retry_limit_text(message):
                 return RetryLimitExceededError(code, message, data)
             return ServerBusyError(code, message, data)
@@ -116,6 +127,6 @@ def is_retryable_error(exc: BaseException) -> bool:
         return True
 
     if isinstance(exc, JsonRpcError):
-        return _is_server_overloaded(exc.data)
+        return _is_structured_overload(exc.code, exc.data) or _is_server_overloaded(exc.data)
 
     return False

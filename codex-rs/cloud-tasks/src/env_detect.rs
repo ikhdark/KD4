@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use tracing::info;
 use tracing::warn;
 
+use crate::urls::CloudBaseUrl;
+
 #[derive(Debug, Clone, serde::Deserialize)]
 struct CodeEnvironment {
     id: String,
@@ -23,7 +25,7 @@ pub struct AutodetectSelection {
 }
 
 pub async fn autodetect_environment_id(
-    base_url: &str,
+    base_url: &CloudBaseUrl,
     headers: &HeaderMap,
     desired_label: Option<String>,
 ) -> anyhow::Result<AutodetectSelection> {
@@ -33,7 +35,7 @@ pub async fn autodetect_environment_id(
     let mut by_repo_envs: Vec<CodeEnvironment> = Vec::new();
     for origin in &origins {
         if let Some((owner, repo)) = parse_owner_repo(origin) {
-            let url = if base_url.contains("/backend-api") {
+            let url = if base_url.as_str().contains("/backend-api") {
                 format!(
                     "{}/wham/environments/by-repo/{}/{}/{}",
                     base_url, "github", owner, repo
@@ -67,7 +69,7 @@ pub async fn autodetect_environment_id(
     }
 
     // 2) Fallback to the full list
-    let list_url = if base_url.contains("/backend-api") {
+    let list_url = if base_url.as_str().contains("/backend-api") {
         format!("{base_url}/wham/environments")
     } else {
         format!("{base_url}/api/codex/environments")
@@ -254,7 +256,7 @@ fn parse_owner_repo(url: &str) -> Option<(String, String)> {
 /// List environments for the current repo(s) with a fallback to the global list.
 /// Returns a de-duplicated, sorted set suitable for the TUI modal.
 pub async fn list_environments(
-    base_url: &str,
+    base_url: &CloudBaseUrl,
     headers: &HeaderMap,
 ) -> anyhow::Result<Vec<crate::app::EnvironmentRow>> {
     let mut map: HashMap<String, crate::app::EnvironmentRow> = HashMap::new();
@@ -263,7 +265,7 @@ pub async fn list_environments(
     let origins = get_git_origins();
     for origin in &origins {
         if let Some((owner, repo)) = parse_owner_repo(origin) {
-            let url = if base_url.contains("/backend-api") {
+            let url = if base_url.as_str().contains("/backend-api") {
                 format!(
                     "{}/wham/environments/by-repo/{}/{}/{}",
                     base_url, "github", owner, repo
@@ -307,7 +309,7 @@ pub async fn list_environments(
     }
 
     // 2) Fallback to the full list; on error return what we have if any.
-    let list_url = if base_url.contains("/backend-api") {
+    let list_url = if base_url.as_str().contains("/backend-api") {
         format!("{base_url}/wham/environments")
     } else {
         format!("{base_url}/api/codex/environments")

@@ -10,6 +10,7 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $emptyOutput = '{}'
+$script:RepositoryStateObservation = $null
 $stateDirectory = [System.IO.Path]::GetFullPath(
     (Join-Path $PSScriptRoot '..\harness\runs\task-continuity\v1')
 )
@@ -90,10 +91,24 @@ try {
             )
         }
         else {
-            $statusLines = @(
-                & git.exe -C $storedRoot status --porcelain=v2 --branch 2>$null
+            $rootLines = @(
+                & git.exe -C ([string]$inputObject.cwd) rev-parse --show-toplevel 2>$null
             )
-            if ($LASTEXITCODE -eq 0) {
+            $rootExitCode = $LASTEXITCODE
+            $currentRoot = ($rootLines -join "`n").Trim()
+            $statusExitCode = 1
+            if ($rootExitCode -eq 0 -and
+                [string]::Equals(
+                    $currentRoot,
+                    $storedRoot,
+                    [StringComparison]::OrdinalIgnoreCase
+                )) {
+                $statusLines = @(
+                    & git.exe -C $storedRoot status --porcelain=v2 --branch 2>$null
+                )
+                $statusExitCode = $LASTEXITCODE
+            }
+            if ($rootExitCode -eq 0 -and $statusExitCode -eq 0) {
                 $revision = $null
                 $dirtyLines = @()
                 foreach ($statusLine in $statusLines) {
@@ -134,6 +149,12 @@ try {
                         $dirty = $dirty.Substring(0, 1997) + '...'
                     }
                 }
+                $script:RepositoryStateObservation = [pscustomobject][ordered]@{
+                    working_directory = [string]$inputObject.cwd
+                    root = $currentRoot
+                    revision = $revision
+                    dirty_summary = $dirty
+                }
                 $repositoryMatches = (
                     -not [string]::IsNullOrWhiteSpace($revision) -and
                     [string]$capsule.repository.revision -eq $revision -and
@@ -155,9 +176,14 @@ catch {
 }
 
 try {
-    & (Join-Path $PSScriptRoot 'task-continuity.ps1') `
-        -TaskContinuityRawInput $TaskContinuityRawInput `
-        -TaskContinuitySkipFastPath
+    $slowArguments = @{
+        TaskContinuityRawInput = $TaskContinuityRawInput
+        TaskContinuitySkipFastPath = $true
+    }
+    if ($null -ne $script:RepositoryStateObservation) {
+        $slowArguments.TaskContinuityRepositoryState = $script:RepositoryStateObservation
+    }
+    & (Join-Path $PSScriptRoot 'task-continuity.ps1') @slowArguments
 }
 catch {
     try {

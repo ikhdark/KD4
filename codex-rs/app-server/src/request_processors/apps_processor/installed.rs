@@ -46,16 +46,23 @@ impl AppsRequestProcessor {
                 .apps_enabled_for_auth(auth.as_ref().is_some_and(CodexAuth::uses_codex_backend));
 
             let workspace_enabled = apps_enabled
-                && self
-                    .workspace_codex_plugins_enabled(&config, auth.as_ref())
-                    .await;
+                && workspace_codex_plugins_enabled(
+                    &config,
+                    auth.as_ref(),
+                    Some(&self.workspace_settings_cache),
+                )
+                .await;
             let runtime_enabled = apps_enabled && workspace_enabled;
 
             let mcp_manager = self.thread_manager.mcp_manager();
             let mcp_config = mcp_manager.runtime_config(&config).await;
             let mut mcp_servers = effective_mcp_servers(&mcp_config, auth.as_ref());
             mcp_servers.retain(|name, _| name == CODEX_APPS_MCP_SERVER_NAME);
-            let cache_key = codex_apps_tools_cache_key(auth.as_ref());
+            let cache_key = codex_apps_tools_cache_key(
+                auth.as_ref(),
+                &mcp_config.chatgpt_base_url,
+                mcp_config.apps_mcp_product_sku.as_deref(),
+            );
             let previous_tools = mcp_manager
                 .codex_apps_tools_cache()
                 .current_tools(config.codex_home.to_path_buf(), cache_key.clone());
@@ -205,7 +212,7 @@ impl AppsRequestProcessor {
         self.config_manager
             .load_latest_config_for_thread(thread_config.as_ref())
             .await
-            .map_err(|err| internal_error(format!("failed to reload config: {err}")))
+            .map_config_load_error()
     }
 }
 

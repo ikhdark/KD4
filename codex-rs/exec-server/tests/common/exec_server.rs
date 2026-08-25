@@ -50,7 +50,6 @@ impl Drop for ExecServerHarness {
 
 pub(crate) struct TestCodexHelperPaths {
     pub(crate) codex_exe: PathBuf,
-    pub(crate) codex_linux_sandbox_exe: Option<PathBuf>,
 }
 
 pub(crate) struct DisconnectableWebSocketProxy {
@@ -68,10 +67,9 @@ impl Drop for DisconnectableWebSocketProxy {
 }
 
 pub(crate) fn test_codex_helper_paths() -> anyhow::Result<TestCodexHelperPaths> {
-    let (helper_binary, codex_linux_sandbox_exe) = super::current_test_binary_helper_paths()?;
+    let helper_binary = super::current_test_binary_path()?;
     Ok(TestCodexHelperPaths {
         codex_exe: helper_binary,
-        codex_linux_sandbox_exe,
     })
 }
 

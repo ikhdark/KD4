@@ -14,6 +14,12 @@ use toml::Value;
 pub(crate) const TEST_CURATED_PLUGIN_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 pub(crate) const TEST_CURATED_PLUGIN_CACHE_VERSION: &str = "01234567";
 
+#[derive(Clone, Copy)]
+enum CuratedPluginFixture {
+    Complete,
+    ManifestOnly,
+}
+
 pub(crate) fn write_file(path: &Path, contents: &str) {
     fs::create_dir_all(path.parent().expect("file should have a parent")).unwrap();
     fs::write(path, contents).unwrap();
@@ -57,6 +63,14 @@ pub(crate) fn write_curated_plugin(root: &Path, plugin_name: &str) {
     );
 }
 
+fn write_manifest_only_curated_plugin(root: &Path, plugin_name: &str) {
+    let plugin_root = root.join("plugins").join(plugin_name);
+    write_file(
+        &plugin_root.join(".codex-plugin/plugin.json"),
+        &format!(r#"{{"name":"{plugin_name}"}}"#),
+    );
+}
+
 pub(crate) fn write_openai_curated_marketplace(root: &Path, plugin_names: &[&str]) {
     write_curated_marketplace(
         root,
@@ -64,6 +78,18 @@ pub(crate) fn write_openai_curated_marketplace(root: &Path, plugin_names: &[&str
         OPENAI_CURATED_MARKETPLACE_NAME,
         /*display_name*/ None,
         plugin_names,
+        CuratedPluginFixture::Complete,
+    );
+}
+
+pub(crate) fn write_manifest_only_openai_curated_marketplace(root: &Path, plugin_names: &[&str]) {
+    write_curated_marketplace(
+        root,
+        "marketplace.json",
+        OPENAI_CURATED_MARKETPLACE_NAME,
+        /*display_name*/ None,
+        plugin_names,
+        CuratedPluginFixture::ManifestOnly,
     );
 }
 
@@ -74,6 +100,7 @@ pub(crate) fn write_openai_api_curated_marketplace(root: &Path, plugin_names: &[
         OPENAI_API_CURATED_MARKETPLACE_NAME,
         Some("OpenAI Curated"),
         plugin_names,
+        CuratedPluginFixture::Complete,
     );
 }
 
@@ -83,6 +110,7 @@ fn write_curated_marketplace(
     marketplace_name: &str,
     display_name: Option<&str>,
     plugin_names: &[&str],
+    plugin_fixture: CuratedPluginFixture,
 ) {
     let plugins = plugin_names
         .iter()
@@ -121,8 +149,17 @@ fn write_curated_marketplace(
         ),
     );
     for plugin_name in plugin_names {
-        write_curated_plugin(root, plugin_name);
+        match plugin_fixture {
+            CuratedPluginFixture::Complete => write_curated_plugin(root, plugin_name),
+            CuratedPluginFixture::ManifestOnly => {
+                write_manifest_only_curated_plugin(root, plugin_name)
+            }
+        }
     }
+}
+
+pub(crate) fn write_curated_plugin_sha(codex_home: &Path) {
+    write_curated_plugin_sha_with(codex_home, TEST_CURATED_PLUGIN_SHA);
 }
 
 pub(crate) fn write_curated_plugin_sha_with(codex_home: &Path, sha: &str) {
@@ -162,4 +199,39 @@ fn feature_enabled(config: &Value, key: &str, default_enabled: bool) -> bool {
         .and_then(|features| features.get(key))
         .and_then(Value::as_bool)
         .unwrap_or(default_enabled)
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::write_manifest_only_openai_curated_marketplace;
+    use super::write_openai_curated_marketplace;
+
+    #[test]
+    fn curated_marketplace_fixture_controls_plugin_payload() {
+        let complete = tempdir().unwrap();
+        write_openai_curated_marketplace(complete.path(), &["sample"]);
+        assert!(
+            complete
+                .path()
+                .join("plugins/sample/skills/SKILL.md")
+                .exists()
+        );
+
+        let manifest_only = tempdir().unwrap();
+        write_manifest_only_openai_curated_marketplace(manifest_only.path(), &["sample"]);
+        assert!(
+            manifest_only
+                .path()
+                .join("plugins/sample/.codex-plugin/plugin.json")
+                .exists()
+        );
+        assert!(
+            !manifest_only
+                .path()
+                .join("plugins/sample/skills/SKILL.md")
+                .exists()
+        );
+    }
 }

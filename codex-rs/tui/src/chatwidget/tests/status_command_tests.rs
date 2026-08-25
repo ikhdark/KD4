@@ -98,17 +98,10 @@ async fn status_command_uses_catalog_default_reasoning_when_config_empty() {
 #[tokio::test]
 async fn status_command_renders_native_and_foreign_instruction_sources() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    let (foreign_source, foreign_display) = if cfg!(windows) {
-        (
-            PathUri::parse("file:///remote/AGENTS.md").expect("POSIX instruction source"),
-            "/remote/AGENTS.md",
-        )
-    } else {
-        (
-            PathUri::parse("file:///C:/remote/AGENTS.md").expect("Windows instruction source"),
-            r"C:\remote\AGENTS.md",
-        )
-    };
+    let (foreign_source, foreign_display) = (
+        PathUri::parse("file:///remote/AGENTS.md").expect("POSIX instruction source"),
+        "/remote/AGENTS.md",
+    );
     chat.instruction_source_paths = vec![
         PathUri::from_abs_path(&chat.config.cwd.join("AGENTS.md")),
         foreign_source,

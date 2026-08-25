@@ -36,8 +36,6 @@ from .targets import PackageVariant
 from .targets import TargetSpec
 from .targets import default_target
 from .targets import resolve_input_path
-from .zsh import resolve_zsh_bin
-from .zsh import supports_zsh
 from .version import read_workspace_version
 
 
@@ -113,14 +111,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--bwrap-bin",
-        type=Path,
-        help=(
-            "Optional prebuilt Linux bwrap executable. If omitted for Linux "
-            "targets, bwrap is built with Cargo."
-        ),
-    )
-    parser.add_argument(
         "--codex-command-runner-bin",
         type=Path,
         help=(
@@ -144,22 +134,6 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Optional local ripgrep executable override instead of fetching from "
             "scripts/codex_package/rg."
-        ),
-    )
-    parser.add_argument(
-        "--zsh-bin",
-        type=Path,
-        help=(
-            "Optional local patched zsh executable override instead of fetching from "
-            "scripts/codex_package/codex-zsh."
-        ),
-    )
-    parser.add_argument(
-        "--zsh-manifest",
-        type=Path,
-        help=(
-            "Optional DotSlash manifest for the patched zsh fork instead of "
-            "scripts/codex_package/codex-zsh."
         ),
     )
     parser.add_argument(
@@ -246,7 +220,6 @@ def main() -> int:
                     variant,
                     spec,
                     expected_version=version,
-                    include_zsh=inputs.zsh_bin is not None,
                     fast=getattr(args, "fast_validate", False),
                 )
 
@@ -392,39 +365,21 @@ def resolve_package_inputs(
     spec: TargetSpec,
     variant: PackageVariant,
 ) -> tuple[str, PackageInputs]:
-    zsh_bin = None
-    zsh_bin_arg = getattr(args, "zsh_bin", None)
-    zsh_manifest_arg = getattr(args, "zsh_manifest", None)
-    resolve_zsh = supports_zsh(spec)
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    with ThreadPoolExecutor(max_workers=3) as executor:
         source_outputs_future = executor.submit(
             resolve_source_outputs, args, spec, variant
         )
         version_future = executor.submit(read_workspace_version)
         rg_future = executor.submit(resolve_rg_bin, spec, args.rg_bin)
-        zsh_future = (
-            executor.submit(
-                resolve_zsh_bin,
-                spec,
-                zsh_bin_arg,
-                manifest_path=zsh_manifest_arg,
-            )
-            if resolve_zsh
-            else None
-        )
         source_outputs = source_outputs_future.result()
         version = version_future.result()
         rg_bin = rg_future.result()
-        if zsh_future is not None:
-            zsh_bin = zsh_future.result()
     return (
         version,
         PackageInputs(
             entrypoint_bin=source_outputs.entrypoint_bin,
             code_mode_host_bin=source_outputs.code_mode_host_bin,
             rg_bin=rg_bin,
-            zsh_bin=zsh_bin,
-            bwrap_bin=source_outputs.bwrap_bin,
             codex_command_runner_bin=source_outputs.codex_command_runner_bin,
             codex_windows_sandbox_setup_bin=source_outputs.codex_windows_sandbox_setup_bin,
         ),
@@ -436,26 +391,8 @@ def validate_cli_request(
     spec: TargetSpec,
     package_dir: Path,
 ) -> None:
-    zsh_bin = getattr(args, "zsh_bin", None)
-    zsh_manifest = getattr(args, "zsh_manifest", None)
-    if zsh_bin is not None and zsh_manifest is not None:
-        raise RuntimeError("--zsh-bin and --zsh-manifest cannot be used together.")
-    if not supports_zsh(spec) and (zsh_bin is not None or zsh_manifest is not None):
-        raise RuntimeError("zsh overrides are only supported for Unix package targets.")
-
-    bwrap_bin = getattr(args, "bwrap_bin", None)
     command_runner_bin = getattr(args, "codex_command_runner_bin", None)
     sandbox_setup_bin = getattr(args, "codex_windows_sandbox_setup_bin", None)
-    if bwrap_bin is not None and not spec.is_linux:
-        raise RuntimeError("--bwrap-bin is only supported for Linux targets.")
-    if command_runner_bin is not None and not spec.is_windows:
-        raise RuntimeError(
-            "--codex-command-runner-bin is only supported for Windows targets."
-        )
-    if sandbox_setup_bin is not None and not spec.is_windows:
-        raise RuntimeError(
-            "--codex-windows-sandbox-setup-bin is only supported for Windows targets."
-        )
 
     if getattr(args, "skip_build_if_present", False):
         ignored_source_flags = [
@@ -466,7 +403,6 @@ def validate_cli_request(
                     "--code-mode-host-bin",
                     getattr(args, "code_mode_host_bin", None),
                 ),
-                ("--bwrap-bin", bwrap_bin),
                 ("--codex-command-runner-bin", command_runner_bin),
                 ("--codex-windows-sandbox-setup-bin", sandbox_setup_bin),
             ]
@@ -549,11 +485,6 @@ def resolve_source_outputs(
             "prebuilt code-mode host executable",
             "--code-mode-host-bin",
         ),
-        bwrap_bin=resolve_optional_input_path(
-            args.bwrap_bin,
-            "prebuilt Linux bwrap executable",
-            "--bwrap-bin",
-        ),
         codex_command_runner_bin=resolve_optional_input_path(
             args.codex_command_runner_bin,
             "prebuilt Windows codex-command-runner.exe executable",
@@ -583,13 +514,9 @@ def source_outputs_from_existing(
     return SourceBuildOutputs(
         entrypoint_bin=output_dir / variant.entrypoint_name(spec),
         code_mode_host_bin=output_dir / spec.code_mode_host_name,
-        bwrap_bin=output_dir / "bwrap" if spec.is_linux else None,
-        codex_command_runner_bin=(
-            output_dir / "codex-command-runner.exe" if spec.is_windows else None
-        ),
-        codex_windows_sandbox_setup_bin=(
-            output_dir / "codex-windows-sandbox-setup.exe" if spec.is_windows else None
-        ),
+        codex_command_runner_bin=output_dir / "codex-command-runner.exe",
+        codex_windows_sandbox_setup_bin=output_dir
+        / "codex-windows-sandbox-setup.exe",
     )
 
 

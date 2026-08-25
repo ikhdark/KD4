@@ -476,6 +476,10 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         self.assertEqual(intervals[1]["tokens"]["inputTokens"], 110)
         summary = kd4_turn_latency_audit.bounded_summary(report)
         self.assertEqual(len(summary["perTurn"][0]["tokenIntervals"]), 2)
+        self.assertEqual(report["firstUsefulActionAnalysis"]["canonicalTurnCount"], 1)
+        self.assertIn("firstUsefulActionAnalysis", summary)
+        self.assertNotIn("measurementContract", summary["firstUsefulActionAnalysis"])
+        self.assertNotIn("sourceSnapshots", summary["firstUsefulActionAnalysis"])
         self.assertIn(
             "boundary=2026-08-17", kd4_turn_latency_audit.render_report(report)
         )
@@ -903,12 +907,8 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         self.assertEqual(orchestration["evidenceSource"], "toolCalls")
         self.assertEqual(orchestration["roundTripNs"], 3_000_000_000)
         self.assertEqual(orchestration["reportedChildWorkNs"], 45_000_000)
-        self.assertEqual(
-            orchestration["orchestrationGapLowerBoundNs"], 2_955_000_000
-        )
-        self.assertEqual(
-            orchestration["orchestrationGapUpperBoundNs"], 2_955_000_000
-        )
+        self.assertEqual(orchestration["orchestrationGapLowerBoundNs"], 2_955_000_000)
+        self.assertEqual(orchestration["orchestrationGapUpperBoundNs"], 2_955_000_000)
 
     def test_reports_coverage_and_segments_eval_from_repository_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -1,7 +1,7 @@
 //! Internal `codex.exe --run-as-windows-sandbox` wrapper.
 //!
 //! This gives direct-spawn callers an argv-shaped Windows sandbox launcher,
-//! analogous to the macOS seatbelt and Linux sandbox wrapper paths. The wrapper
+//! used by the Windows restricted-token sandbox. The wrapper
 //! parses sandbox metadata from argv, launches the requested inner command in a
 //! Windows sandbox session, and forwards stdio to that inner command.
 

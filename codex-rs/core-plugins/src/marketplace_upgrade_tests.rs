@@ -33,11 +33,36 @@ last_revision = "abc123"
             .expect("read configured marketplace"),
         Some(ConfiguredGitMarketplace {
             name: "good".to_string(),
-            source: "https://github.com/example/good.git".to_string(),
-            ref_name: Some("main".to_string()),
+            source: MarketplaceSource::Git {
+                url: "https://github.com/example/good.git".to_string(),
+                ref_name: Some("main".to_string()),
+            },
             sparse_paths: vec!["plugins".to_string()],
             last_revision: Some("abc123".to_string()),
         })
+    );
+}
+
+#[test]
+fn configured_git_marketplace_canonicalizes_source_at_load_boundary() {
+    let marketplace: toml::Value = toml::from_str(
+        r#"
+source_type = "git"
+source = " example/plugins@main "
+"#,
+    )
+    .expect("parse marketplace config");
+
+    let marketplace = parse_configured_git_marketplace("example", &marketplace)
+        .expect("parse configured marketplace")
+        .expect("Git marketplace");
+
+    assert_eq!(
+        marketplace.source,
+        MarketplaceSource::Git {
+            url: "https://github.com/example/plugins.git".to_string(),
+            ref_name: Some("main".to_string()),
+        }
     );
 }
 
@@ -88,53 +113,6 @@ source = {good_url:?}
 }
 
 #[test]
-fn upgrade_uses_validated_source_for_git_operations() {
-    let codex_home = TempDir::new().expect("create Codex home");
-    let remote_repo = TempDir::new().expect("create remote repository");
-    init_marketplace_repo(remote_repo.path(), "good");
-    let normalized_url = url::Url::from_directory_path(remote_repo.path())
-        .expect("remote repository URL")
-        .to_string();
-    let raw_source = codex_home.path().join("missing-raw-source");
-    let raw_source = raw_source.to_string_lossy().into_owned();
-    let config = format!(
-        r#"
-[marketplaces.good]
-source_type = "git"
-source = {raw_source:?}
-ref = "missing-ref"
-"#
-    );
-    std::fs::write(codex_home.path().join(CONFIG_TOML_FILE), config).expect("write config");
-    let marketplace = ConfiguredGitMarketplace {
-        name: "good".to_string(),
-        source: raw_source,
-        ref_name: Some("missing-ref".to_string()),
-        sparse_paths: Vec::new(),
-        last_revision: None,
-    };
-    let normalized_source = MarketplaceSource::Git {
-        url: normalized_url,
-        ref_name: Some("HEAD".to_string()),
-    };
-    let install_root = marketplace_install_root(codex_home.path());
-
-    let upgraded_root = upgrade_configured_git_marketplace(
-        codex_home.path(),
-        &install_root,
-        &marketplace,
-        Some(&normalized_source),
-    )
-    .expect("upgrade should use the validated source")
-    .expect("marketplace should be upgraded");
-
-    assert_eq!(
-        upgraded_root,
-        AbsolutePathBuf::try_from(install_root.join("good")).expect("installed marketplace root")
-    );
-}
-
-#[test]
 fn up_to_date_fast_path_validates_marketplace_name() {
     const REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
     let codex_home = TempDir::new().expect("create Codex home");
@@ -151,25 +129,17 @@ fn up_to_date_fast_path_validates_marketplace_name() {
     let missing_source = missing_source.to_string_lossy().into_owned();
     let marketplace = ConfiguredGitMarketplace {
         name: "good".to_string(),
-        source: missing_source.clone(),
-        ref_name: Some(REVISION.to_string()),
+        source: MarketplaceSource::Git {
+            url: missing_source,
+            ref_name: Some(REVISION.to_string()),
+        },
         sparse_paths: Vec::new(),
         last_revision: Some(REVISION.to_string()),
     };
     super::activation::write_installed_marketplace_metadata(&destination, &marketplace, REVISION)
         .expect("write installed marketplace metadata");
-    let normalized_source = MarketplaceSource::Git {
-        url: missing_source,
-        ref_name: Some(REVISION.to_string()),
-    };
-
-    let err = upgrade_configured_git_marketplace(
-        codex_home.path(),
-        &install_root,
-        &marketplace,
-        Some(&normalized_source),
-    )
-    .expect_err("mismatched marketplace name must not use the up-to-date fast path");
+    let err = upgrade_configured_git_marketplace(codex_home.path(), &install_root, &marketplace)
+        .expect_err("mismatched marketplace name must not use the up-to-date fast path");
 
     assert!(err.contains("git clone marketplace source failed"));
 }

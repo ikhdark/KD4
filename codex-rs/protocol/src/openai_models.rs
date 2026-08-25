@@ -599,6 +599,39 @@ impl From<ModelInfo> for ModelPreset {
     }
 }
 
+impl From<&ModelInfo> for ModelPreset {
+    fn from(info: &ModelInfo) -> Self {
+        let supports_personality = info.supports_personality();
+        ModelPreset {
+            id: info.slug.clone(),
+            model: info.slug.clone(),
+            display_name: info.display_name.clone(),
+            description: info.description.clone().unwrap_or_default(),
+            default_reasoning_effort: info
+                .default_reasoning_level
+                .clone()
+                .unwrap_or(ReasoningEffort::None),
+            supported_reasoning_efforts: info.supported_reasoning_levels.clone(),
+            supports_personality,
+            additional_speed_tiers: info.additional_speed_tiers.clone(),
+            service_tiers: info.service_tiers.clone(),
+            default_service_tier: info.default_service_tier.clone(),
+            is_default: false,
+            upgrade: info.upgrade.as_ref().map(|upgrade| ModelUpgrade {
+                id: upgrade.model.clone(),
+                migration_config_key: info.slug.clone(),
+                model_link: None,
+                upgrade_copy: None,
+                migration_markdown: Some(upgrade.migration_markdown.clone()),
+            }),
+            show_in_picker: info.visibility == ModelVisibility::List,
+            availability_nux: info.availability_nux.clone(),
+            supported_in_api: info.supported_in_api,
+            input_modalities: info.input_modalities.clone(),
+        }
+    }
+}
+
 impl ModelPreset {
     pub fn supports_fast_mode(&self) -> bool {
         self.service_tiers
@@ -1110,6 +1143,20 @@ mod tests {
             preset.default_service_tier,
             Some(ServiceTier::Fast.request_value().to_string())
         );
+    }
+
+    #[test]
+    fn borrowed_model_preset_matches_owned_conversion() {
+        let model = ModelInfo {
+            availability_nux: Some(ModelAvailabilityNux {
+                message: "Try Spark.".to_string(),
+            }),
+            additional_speed_tiers: vec![SPEED_TIER_FAST.to_string()],
+            default_service_tier: Some(ServiceTier::Fast.request_value().to_string()),
+            ..test_model(/*spec*/ None)
+        };
+
+        assert_eq!(ModelPreset::from(&model), ModelPreset::from(model));
     }
 
     #[test]

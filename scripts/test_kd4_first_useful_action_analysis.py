@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from scripts import kd4_first_useful_action_analysis as analysis
+from scripts.rollout_snapshot import read_rollout_snapshot
 
 
 def record(timestamp: str, record_type: str, payload: dict[str, object]) -> str:
@@ -13,6 +14,9 @@ def record(timestamp: str, record_type: str, payload: dict[str, object]) -> str:
 
 
 class FirstUsefulActionAnalysisTest(unittest.TestCase):
+    def test_module_has_no_standalone_rollout_lookup_cli(self) -> None:
+        self.assertFalse(hasattr(analysis, "main"))
+
     def test_legacy_reconstruction_excludes_control_only_tools(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "rollout.jsonl"
@@ -49,7 +53,7 @@ class FirstUsefulActionAnalysisTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            result = analysis.analyze([Path(temp_dir)])
+            result = analysis.analyze_snapshots([read_rollout_snapshot(path)])
 
         self.assertEqual(result["legacyReconstructedTurnCount"], 1)
         self.assertEqual(
@@ -94,7 +98,7 @@ class FirstUsefulActionAnalysisTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            result = analysis.analyze([path])
+            result = analysis.analyze_snapshots([read_rollout_snapshot(path)])
 
         self.assertEqual(result["canonicalTurnCount"], 1)
         self.assertEqual(result["legacyReconstructedTurnCount"], 0)

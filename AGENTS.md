@@ -15,10 +15,66 @@
   replacing or updating the local binary, then restarting Desktop. Perform
   those activation steps only when the request includes them.
 
-## Routing and task scope
+<!-- SHARED-OPERATING-POLICY: START -->
+## Shared operating policy
+
+### Scope and workspace
 
 - Read every applicable `AGENTS.md` from the repository root through each path
-  touched. Read every user-provided or user-named file in full.
+  touched, and read every user-provided or user-named file in full.
+- Work only within the requested scope. Do not broaden a directed fix or add
+  unrelated cleanup, refactoring, dependency changes, or activation work.
+- Do not publish, deploy, or modify upstream state unless the user explicitly
+  requests that action.
+- Preserve concurrent work and every unrelated hunk. Compare an overlapping
+  target and its diff once, then keep or merge the version that satisfies every
+  affected contract and direct test.
+- Ask only when unresolved intent, incompatible user-visible outcomes, a
+  required compatibility break, an unrequested destructive or external action,
+  or conflicting validation criteria would materially change the solution.
+  State the conflict and consequences; otherwise make the narrowest reasonable
+  assumption, preserve existing behavior, and avoid over-engineering.
+
+### Bug checks
+
+- Report only defects supported by evidence. Do not report a design preference
+  as a defect or change functional code merely because another design seems
+  preferable.
+- Each finding must identify the violated contract or invariant, responsible
+  producer, reachable consumer or user-visible effect, and exact source
+  locations. For a requested finding count, stop only after that many distinct
+  findings meet all requirements; otherwise continue until every candidate in
+  the requested scope is resolved.
+
+### Implementation and validation
+
+- For a code edit, add or update the direct test in the same change. The test
+  must fail without the implementation change and pass with it.
+- Produce schemas, snapshots, locks, vendored content, and other generated
+  artifacts through their owner commands; do not hand-edit generated output.
+- Run only the narrow tests that exercise the active implementation. Do not run
+  broad test suites, repository-wide validation, or workspace analyzers unless
+  the user requests that exact scope.
+- A formatter, linter, build, applied patch, or successful command selecting
+  zero relevant tests is not runtime proof. Runtime proof requires a direct
+  contract test or a user-approved end-to-end gate that executes the changed
+  path.
+
+### Validation failure handling
+
+- Run each scoped validation once initially. Retry transient infrastructure at
+  most twice in the existing warmed build lane; do not create a cold lane
+  solely to retry.
+- Stop on unrelated or pre-existing compilation or test failures. Do not repair
+  them without expanded scope; report passed direct checks, the blocker, and
+  checks that could not run.
+- Do not rerun validation while concurrent edits continue. After the same
+  blocker occurs twice, finish and report it.
+- Preserve narrower passing results despite broader failures.
+<!-- SHARED-OPERATING-POLICY: END -->
+
+## Routing and task scope
+
 - Before reading `SOURCEMAP.md` broadly, query the smallest named owner slice:
   `python scripts/source_owners.py slice --owner <owner-id> --focus "<task
   description>" --max-relationships 32`. Require an untruncated result with no
@@ -37,29 +93,10 @@
   maintenance scripts; `.codex/config.toml` and `.codex/skills` own local
   configuration, fork-local skills, and validation workflows.
 - Modify the requested behavior and the contract relationships identified
-  above. Do not add unrelated cleanup, refactoring, dependency changes,
-  publication, or activation.
+  above.
 - After adding, deleting, moving, or renaming a repository file or directory,
   run `just source-map-check`. Run it even when ownership prose is unchanged;
   the command also rewrites the tracked-path snapshot.
-- Ask only when repository or tool output proves incompatible user-visible
-  outcomes, a required compatibility break, an unrequested destructive or
-  external action, or conflicting validation criteria. State the conflict and
-  consequences. Otherwise preserve existing behavior.
-- A bug finding must identify the violated contract or invariant, responsible
-  producer, reachable consumer or user-visible effect, and exact source
-  locations. For a requested finding count, stop when that many distinct
-  findings meet all four requirements. For an exhaustive check, resolve every
-  candidate in the mapped owner paths.
-
-## Shared workspace and authorization
-
-- Preserve concurrent work and every unrelated hunk. Compare overlapping
-  versions once. Keep the version that satisfies every affected contract and
-  direct test; merge non-conflicting required behavior. Ask under the conflict
-  rule above only when the versions require incompatible user-visible behavior.
-- Publish, deploy, or modify upstream state only when the request explicitly
-  includes that action.
 
 ## Delegated workflows
 
@@ -69,30 +106,18 @@
   to start, returns a tool error, or omits its assigned output, continue in the
   primary agent.
 
-## Implementation and validation
+## Rust and script validation
 
-- For a code edit, add or update the direct test in the same change. The test
-  must fail without the implementation change and pass with it.
 - For a Rust edit, run the repository-named package or test filter that executes
   the changed contract. Validation passes only when at least one direct test is
   selected and the command exits successfully. Run workspace analyzers only
   when repository instructions or the user require them. If no direct route is
   named, report the missing route before editing.
+- Do not run the full `codex-rs/core` test suite unless the user requests that
+  exact scope.
 - For a script edit, follow `scripts/AGENTS.md`. Run its named test; if none is
   named, run the sibling unit test. If none exists, run the interpreter syntax
   check and configured formatter or linter.
-- Produce schemas, snapshots, locks, vendored content, and other generated
-  artifacts through their owner commands; do not hand-edit generated files.
-- A formatter, linter, build, or applied patch is not runtime proof. Runtime
-  proof requires the direct contract test or a user-approved end-to-end gate
-  that executes the changed path.
-- Do not run broad tests.
-- Whenever a full Cargo test or workspace test run is explicitly required or
-  otherwise performed, use Cargo's `--no-fail-fast` mode and let the run finish
-  before making fixes. Apply the same inventory-first rule to full-workspace
-  Clippy, `cargo shear`, and other lint, analyzer, or quality-gate runs: complete
-  the requested run and inventory every failing target, test, assertion, and
-  diagnostic before implementation fixes begin.
 
 ## Sessions and rollout audits
 
@@ -109,32 +134,3 @@
   parsers before or after it.
 - `audit decision: finalize` or `auditDecision.readyToFinalize=true` ends the
   audit. Answer from that report; continue only for blocker codes it lists.
-
-## Benchmarking
-
-- Before editing an explicit optimization or documented hot path, record the
-  exact workload command, quality-gate command, latency statistic and threshold,
-  and token metric and budget. If the request and repository provide no value
-  for any field, ask for it and do not edit.
-- Use the repository-named subprocess or end-to-end benchmark. If none is
-  named, request the workload command, inputs, build profile, environment,
-  sample count, and statistic. Hold them constant for baseline and candidate
-  release builds.
-- Unit-test duration, test-binary startup, build duration, analytical action
-  counts, and source estimates are not runtime benchmarks.
-- For an A/B comparison with a previous fork version, use binaries in
-  `C:\Users\kuh\Desktop\LOCAL-KD\backups` as the baseline.
-- Run the quality gate before each comparison. Do not benchmark a failing
-  candidate. Reject a candidate that exceeds a recorded threshold or regresses
-  against the passing baseline.
-- Do not weaken an established workload, sample count, percentile, latency
-  threshold, or token budget unless the user explicitly changes the contract.
-- After changing the workload implementation, inputs, build, or measured path,
-  rerun the quality gate and then the unchanged workload. This is a new proof,
-  not an unchanged-command retry.
-- Finish only when the quality gate passes and measured latency and token use
-  stay within their recorded limits. If code changed and a limit still fails,
-  report `partial`. Report `blocked` only when a required input, permission, or
-  external failure prevents another authorized change. Report the workload,
-  build identity, sample count, statistic and measured value, latency threshold,
-  token measurement, and token budget. Limit claims to that workload.

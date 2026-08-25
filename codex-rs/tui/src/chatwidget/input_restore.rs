@@ -2,6 +2,8 @@
 
 use std::collections::HashSet;
 
+use crate::bottom_pane::ComposerDraftSnapshot;
+
 use super::user_messages::remap_colliding_paste_placeholders;
 use super::*;
 
@@ -46,7 +48,7 @@ impl ChatWidget {
         if self.suppress_initial_user_message_submit {
             return;
         }
-        #[cfg(any(target_os = "windows", test))]
+
         if self.elevated_windows_sandbox_setup_required() {
             return;
         }
@@ -95,7 +97,7 @@ impl ChatWidget {
         }
     }
 
-    pub(super) fn pop_latest_queued_composer_state(&mut self) -> Option<ThreadComposerState> {
+    pub(super) fn pop_latest_queued_composer_state(&mut self) -> Option<ComposerDraftSnapshot> {
         if let Some(user_message) = self.input_queue.queued_user_messages.pop_back() {
             let history_record = self
                 .input_queue
@@ -204,7 +206,7 @@ impl ChatWidget {
     /// placeholders in a stable order and rebase text element byte ranges so the restored composer
     /// state stays aligned with the merged attachment list. Returns `None` when there is nothing to
     /// restore.
-    fn drain_pending_messages_for_restore(&mut self) -> Option<ThreadComposerState> {
+    fn drain_pending_messages_for_restore(&mut self) -> Option<ComposerDraftSnapshot> {
         if self.input_queue.pending_steers.is_empty() && !self.has_queued_follow_up_messages() {
             return None;
         }
@@ -298,8 +300,8 @@ impl ChatWidget {
         ));
     }
 
-    pub(super) fn restore_composer_state(&mut self, composer: ThreadComposerState) {
-        let ThreadComposerState {
+    pub(super) fn restore_composer_state(&mut self, composer: ComposerDraftSnapshot) {
+        let ComposerDraftSnapshot {
             text,
             local_images,
             remote_image_urls,
@@ -321,7 +323,7 @@ impl ChatWidget {
     fn composer_state_from_user_message(
         user_message: UserMessage,
         pending_pastes: Vec<(String, String)>,
-    ) -> ThreadComposerState {
+    ) -> ComposerDraftSnapshot {
         let UserMessage {
             text,
             local_images,
@@ -329,7 +331,7 @@ impl ChatWidget {
             text_elements,
             mention_bindings,
         } = user_message;
-        ThreadComposerState {
+        ComposerDraftSnapshot {
             text,
             local_images,
             remote_image_urls,
@@ -341,14 +343,7 @@ impl ChatWidget {
 
     pub(crate) fn capture_thread_input_state(&self) -> Option<ThreadInputState> {
         let draft = self.bottom_pane.composer_draft_snapshot();
-        let composer = ThreadComposerState {
-            text: draft.text,
-            text_elements: draft.text_elements,
-            local_images: draft.local_images,
-            remote_image_urls: draft.remote_image_urls,
-            mention_bindings: draft.mention_bindings,
-            pending_pastes: draft.pending_pastes,
-        };
+        let composer = draft;
         Some(ThreadInputState {
             composer: composer.has_content().then_some(composer),
             pending_steers: self
@@ -379,13 +374,11 @@ impl ChatWidget {
             user_turn_pending_start: self.input_queue.user_turn_pending_start,
             current_collaboration_mode: self.current_collaboration_mode.clone(),
             active_collaboration_mask: self.active_collaboration_mask.clone(),
-            task_running: self.bottom_pane.is_task_running(),
             agent_turn_running: self.turn_lifecycle.agent_turn_running,
         })
     }
 
     pub(crate) fn restore_thread_input_state(&mut self, input_state: Option<ThreadInputState>) {
-        let restored_task_running = input_state.as_ref().is_some_and(|state| state.task_running);
         if let Some(input_state) = input_state {
             self.current_collaboration_mode = input_state.current_collaboration_mode;
             self.active_collaboration_mask = input_state.active_collaboration_mask;
@@ -437,13 +430,7 @@ impl ChatWidget {
             self.input_queue.clear();
             self.restore_composer_state(Default::default());
         }
-        self.turn_lifecycle
-            .restore_running(self.turn_lifecycle.agent_turn_running, Instant::now());
         self.update_task_running_state();
-        if restored_task_running && !self.bottom_pane.is_task_running() {
-            self.bottom_pane.set_task_running(/*running*/ true);
-            self.refresh_status_surfaces();
-        }
         self.refresh_pending_input_preview();
         self.request_redraw();
     }

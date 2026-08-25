@@ -31,35 +31,21 @@ async fn process_spawn_returns_before_exit_and_emits_exit_notification() -> Resu
     // Use a probe/release handshake instead of asserting on wall-clock timing:
     // the child proves it started by writing the probe file, then waits for the
     // test to create the release file before it can emit output and exit.
-    let command = if cfg!(windows) {
-        vec![
-            "powershell.exe".to_string(),
-            "-NoProfile".to_string(),
-            "-NonInteractive".to_string(),
-            "-Command".to_string(),
-            concat!(
-                "[IO.File]::WriteAllText($env:CODEX_PROCESS_EXEC_PROBE_FILE, 'process'); ",
-                "while (!(Test-Path -LiteralPath $env:CODEX_PROCESS_EXEC_RELEASE_FILE)) { ",
-                "Start-Sleep -Milliseconds 20 ",
-                "}; ",
-                "[Console]::Out.Write('process-out'); ",
-                "[Console]::Error.Write('process-err')",
-            )
-            .to_string(),
-        ]
-    } else {
-        vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            concat!(
-                "printf process > \"$CODEX_PROCESS_EXEC_PROBE_FILE\"; ",
-                "while [ ! -e \"$CODEX_PROCESS_EXEC_RELEASE_FILE\" ]; do sleep 0.05; done; ",
-                "printf process-out; ",
-                "printf process-err >&2",
-            )
-            .to_string(),
-        ]
-    };
+    let command = vec![
+        "powershell.exe".to_string(),
+        "-NoProfile".to_string(),
+        "-NonInteractive".to_string(),
+        "-Command".to_string(),
+        concat!(
+            "[IO.File]::WriteAllText($env:CODEX_PROCESS_EXEC_PROBE_FILE, 'process'); ",
+            "while (!(Test-Path -LiteralPath $env:CODEX_PROCESS_EXEC_RELEASE_FILE)) { ",
+            "Start-Sleep -Milliseconds 20 ",
+            "}; ",
+            "[Console]::Out.Write('process-out'); ",
+            "[Console]::Error.Write('process-err')",
+        )
+        .to_string(),
+    ];
     let env = HashMap::from([
         (
             "CODEX_PROCESS_EXEC_PROBE_FILE".to_string(),
@@ -137,21 +123,13 @@ async fn process_spawn_reports_buffered_output_cap_reached() -> Result<()> {
     let (_server, mut mcp) = initialized_mcp(codex_home.path()).await?;
 
     let process_handle = "capped-one-shot-1".to_string();
-    let command = if cfg!(windows) {
-        vec![
-            "powershell.exe".to_string(),
-            "-NoProfile".to_string(),
-            "-NonInteractive".to_string(),
-            "-Command".to_string(),
-            "[Console]::Out.Write('abcde'); [Console]::Error.Write('12345')".to_string(),
-        ]
-    } else {
-        vec![
-            "sh".to_string(),
-            "-lc".to_string(),
-            "printf abcde; printf 12345 >&2".to_string(),
-        ]
-    };
+    let command = vec![
+        "powershell.exe".to_string(),
+        "-NoProfile".to_string(),
+        "-NonInteractive".to_string(),
+        "-Command".to_string(),
+        "[Console]::Out.Write('abcde'); [Console]::Error.Write('12345')".to_string(),
+    ];
     let spawn_request_id = mcp
         .send_process_spawn_request(ProcessSpawnParams {
             output_bytes_cap: Some(Some(3)),
@@ -186,17 +164,13 @@ async fn process_kill_terminates_running_process() -> Result<()> {
     let (_server, mut mcp) = initialized_mcp(codex_home.path()).await?;
 
     let process_handle = "sleep-process-1".to_string();
-    let command = if cfg!(windows) {
-        vec![
-            "powershell.exe".to_string(),
-            "-NoProfile".to_string(),
-            "-NonInteractive".to_string(),
-            "-Command".to_string(),
-            "Start-Sleep -Seconds 30".to_string(),
-        ]
-    } else {
-        vec!["sh".to_string(), "-lc".to_string(), "sleep 30".to_string()]
-    };
+    let command = vec![
+        "powershell.exe".to_string(),
+        "-NoProfile".to_string(),
+        "-NonInteractive".to_string(),
+        "-Command".to_string(),
+        "Start-Sleep -Seconds 30".to_string(),
+    ];
     let spawn_request_id = mcp
         .send_process_spawn_request(process_spawn_params(
             process_handle.clone(),

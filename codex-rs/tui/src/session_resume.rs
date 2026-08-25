@@ -16,7 +16,7 @@ use crate::tui::Tui;
 use codex_protocol::ThreadId;
 use codex_rollout::open_rollout_line_reader;
 use codex_state::StateRuntime;
-use codex_utils_path as path_utils;
+use codex_utils_absolute_path as path_utils;
 use serde::Deserialize;
 use serde_json::Value;
 

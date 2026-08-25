@@ -2,13 +2,26 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+import importlib.util
 import sys
 import unittest
+from pathlib import Path
+from typing import Never, get_type_hints
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import wrapper_common
+
+
+def load_entrypoint(filename: str):
+    path = Path(__file__).resolve().parent / filename
+    module_name = filename.removesuffix(".py").replace("-", "_")
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class WrapperCommonTest(unittest.TestCase):
@@ -127,6 +140,14 @@ class WrapperCommonTest(unittest.TestCase):
             "-A unknown_lints",
         )
         self.assertEqual(env["CARGO_INCREMENTAL"], "0")
+
+    def test_nonreturning_annotations_resolve(self) -> None:
+        self.assertIs(get_type_hints(wrapper_common.die)["return"], Never)
+        self.assertIs(get_type_hints(wrapper_common.exec_command)["return"], Never)
+        for filename in ("run.py", "run-prebuilt-linter.py"):
+            with self.subTest(filename=filename):
+                module = load_entrypoint(filename)
+                self.assertIs(get_type_hints(module.main)["return"], Never)
 
 
 if __name__ == "__main__":

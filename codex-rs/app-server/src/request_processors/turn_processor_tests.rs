@@ -2,14 +2,40 @@ use super::*;
 
 #[test]
 fn turn_clients_use_normal_mcp_elicitation_handling() {
-    assert!(!MCP_ELICITATIONS_AUTO_DENY);
+    const { assert!(!MCP_ELICITATIONS_AUTO_DENY) };
 }
 
 #[test]
-fn flush_transcript_tail_defaults_enabled_and_honors_explicit_opt_out() {
-    assert!(flush_transcript_tail_on_session_end(None));
-    assert!(flush_transcript_tail_on_session_end(Some(true)));
-    assert!(!flush_transcript_tail_on_session_end(Some(false)));
+fn typed_turn_responses_reach_the_dispatch_boundary_without_inner_wrappers() {
+    let source = include_str!("turn_processor.rs");
+    for removed_wrapper in [
+        "thread_inject_items_response_inner",
+        "thread_settings_update_inner",
+        "turn_interrupt_inner",
+    ] {
+        assert!(
+            !source.contains(removed_wrapper),
+            "{removed_wrapper} must not reintroduce a pass-through call hop"
+        );
+    }
+}
+
+#[test]
+fn turn_interrupt_rejects_retained_interrupted_snapshot() {
+    let error = validate_turn_interrupt_target(
+        Some(("turn-1", &TurnStatus::Interrupted)),
+        /*is_running*/ true,
+        "turn-1",
+    )
+    .expect_err("an interrupted presentation snapshot must not be treated as active");
+
+    assert_eq!(error.message, "no active turn to interrupt");
+}
+
+#[test]
+fn turn_interrupt_allows_running_startup_race_without_snapshot() {
+    validate_turn_interrupt_target(None, /*is_running*/ true, "turn-1")
+        .expect("core may report running before TurnStarted is projected");
 }
 
 #[test]
@@ -43,6 +69,33 @@ fn in_flight_task_coalescing_fingerprint_normalizes_identity() {
 }
 
 #[test]
+fn task_workspace_identity_uses_one_snapshot_projection_for_defaults_and_overrides() {
+    let fallback_cwd =
+        AbsolutePathBuf::from_absolute_path(r"C:\repo").expect("absolute fallback cwd");
+    let fallback_roots = vec![fallback_cwd.clone()];
+    let params = TurnStartParams::default();
+
+    assert_eq!(
+        task_workspace_identity(&params, &fallback_cwd, &fallback_roots),
+        format!("cwd={fallback_cwd:?};roots={fallback_roots:?}")
+    );
+
+    let override_cwd =
+        AbsolutePathBuf::from_absolute_path(r"D:\other").expect("absolute override cwd");
+    let override_roots = vec![override_cwd.clone()];
+    let params = TurnStartParams {
+        cwd: Some(override_cwd.to_path_buf()),
+        runtime_workspace_roots: Some(override_roots.clone()),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        task_workspace_identity(&params, &fallback_cwd, &fallback_roots),
+        format!("cwd={override_cwd:?};roots={override_roots:?}")
+    );
+}
+
+#[test]
 fn in_flight_task_coalescing_returns_reuse_coordinates() {
     let thread_id = codex_protocol::ThreadId::new();
     let existing = crate::thread_state::InFlightTaskReference {
@@ -67,12 +120,76 @@ fn in_flight_task_coalescing_returns_reuse_coordinates() {
 fn in_flight_task_capacity_error_is_retryable() {
     let error = in_flight_task_capacity_error();
 
+    assert_eq!(error.code, codex_app_server_protocol::OVERLOADED_ERROR_CODE);
     assert_eq!(
-        error.data,
-        Some(serde_json::json!({
-            "reason": "inFlightTaskCapacityExceeded",
-            "retryable": true,
-        }))
+        serde_json::from_value::<codex_app_server_protocol::OverloadErrorData>(
+            error.data.expect("overload error data")
+        )
+        .expect("valid overload error data"),
+        codex_app_server_protocol::OverloadErrorData {
+            reason: codex_app_server_protocol::OverloadReason::InFlightTaskCapacity,
+            retryable: true,
+        }
+    );
+}
+
+#[tokio::test]
+async fn missing_error_path_rejected_task_does_not_apply_connection_updates() {
+    let manager = ThreadStateManager::new();
+    let existing_thread_id = ThreadId::new();
+    let fingerprint = "same-task".to_string();
+    manager
+        .claim_in_flight_task(
+            fingerprint.clone(),
+            existing_thread_id,
+            "turn-existing".to_string(),
+        )
+        .await;
+    let updates_applied = std::cell::Cell::new(false);
+
+    let error = claim_in_flight_task_before_connection_updates(
+        &manager,
+        Some(&fingerprint),
+        ThreadId::new(),
+        "turn-rejected",
+        || async {
+            updates_applied.set(true);
+            Ok(())
+        },
+    )
+    .await
+    .expect_err("duplicate task must be rejected");
+
+    assert!(!updates_applied.get());
+    assert_eq!(
+        error
+            .data
+            .and_then(|data| data["reason"].as_str().map(str::to_owned)),
+        Some("identicalTaskInFlight".to_string())
+    );
+}
+
+#[tokio::test]
+async fn missing_error_path_failed_connection_update_releases_task_claim() {
+    let manager = ThreadStateManager::new();
+    let thread_id = ThreadId::new();
+    let fingerprint = "retryable-task".to_string();
+
+    claim_in_flight_task_before_connection_updates(
+        &manager,
+        Some(&fingerprint),
+        thread_id,
+        "turn-failed",
+        || async { Err(internal_error("injected connection update failure")) },
+    )
+    .await
+    .expect_err("connection update should fail");
+
+    assert_eq!(
+        manager
+            .claim_in_flight_task(fingerprint, thread_id, "turn-retry".to_string())
+            .await,
+        crate::thread_state::InFlightTaskClaim::Claimed
     );
 }
 
