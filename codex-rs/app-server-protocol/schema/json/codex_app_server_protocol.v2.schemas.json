@@ -1480,78 +1480,6 @@
             },
             "method": {
               "enum": [
-                "thread/desktopActivation/obligation"
-              ],
-              "title": "Thread/desktopActivation/obligationRequestMethod",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/definitions/ThreadDesktopActivationObligationParams"
-            }
-          },
-          "required": [
-            "id",
-            "method",
-            "params"
-          ],
-          "title": "Thread/desktopActivation/obligationRequest",
-          "type": "object"
-        },
-        {
-          "properties": {
-            "id": {
-              "$ref": "#/definitions/RequestId"
-            },
-            "method": {
-              "enum": [
-                "thread/desktopActivation/challenge"
-              ],
-              "title": "Thread/desktopActivation/challengeRequestMethod",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/definitions/ThreadDesktopActivationChallengeParams"
-            }
-          },
-          "required": [
-            "id",
-            "method",
-            "params"
-          ],
-          "title": "Thread/desktopActivation/challengeRequest",
-          "type": "object"
-        },
-        {
-          "properties": {
-            "id": {
-              "$ref": "#/definitions/RequestId"
-            },
-            "method": {
-              "enum": [
-                "thread/desktopActivation/record"
-              ],
-              "title": "Thread/desktopActivation/recordRequestMethod",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/definitions/ThreadDesktopActivationRecordParams"
-            }
-          },
-          "required": [
-            "id",
-            "method",
-            "params"
-          ],
-          "title": "Thread/desktopActivation/recordRequest",
-          "type": "object"
-        },
-        {
-          "properties": {
-            "id": {
-              "$ref": "#/definitions/RequestId"
-            },
-            "method": {
-              "enum": [
                 "thread/fork"
               ],
               "title": "Thread/forkRequestMethod",
@@ -4725,7 +4653,7 @@
               "description": "This is the path to the user's config.toml file, though it is not guaranteed to exist."
             },
             "profile": {
-              "description": "Name of the selected profile-v2 config layered on top of the base user config, when this layer represents one.",
+              "description": "Name of the selected profile config layered on top of the base user config, when this layer represents one.",
               "type": [
                 "string",
                 "null"
@@ -5450,108 +5378,6 @@
       ],
       "title": "DeprecationNoticeNotification",
       "type": "object"
-    },
-    "DesktopActivationChallenge": {
-      "properties": {
-        "activationObligationIdentity": {
-          "type": "string"
-        },
-        "challengeId": {
-          "type": "string"
-        },
-        "evidenceEpoch": {
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "expectedInstalledExecutablePath": {
-          "type": "string"
-        },
-        "expectedInstalledExecutableSha256": {
-          "type": "string"
-        },
-        "expiresAt": {
-          "type": "string"
-        },
-        "implementationIdentity": {
-          "type": "string"
-        },
-        "issuedAt": {
-          "type": "string"
-        },
-        "publishId": {
-          "type": "string"
-        },
-        "publisherEvidenceId": {
-          "type": "string"
-        },
-        "threadId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "activationObligationIdentity",
-        "challengeId",
-        "evidenceEpoch",
-        "expectedInstalledExecutablePath",
-        "expectedInstalledExecutableSha256",
-        "expiresAt",
-        "implementationIdentity",
-        "issuedAt",
-        "publishId",
-        "publisherEvidenceId",
-        "threadId"
-      ],
-      "type": "object"
-    },
-    "DesktopActivationObligation": {
-      "properties": {
-        "activationObligationIdentity": {
-          "type": "string"
-        },
-        "evidenceEpoch": {
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "implementationIdentity": {
-          "type": "string"
-        },
-        "requiringPlanStepIds": {
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "threadId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "activationObligationIdentity",
-        "evidenceEpoch",
-        "implementationIdentity",
-        "requiringPlanStepIds",
-        "threadId"
-      ],
-      "type": "object"
-    },
-    "DesktopActivationUnavailableReason": {
-      "enum": [
-        "noCurrentActivationObligation",
-        "noAuthoritativeBootstrapEvidence",
-        "bootstrapEvidenceMalformed",
-        "bootstrapEvidenceMismatch",
-        "bootstrapEvidenceStale",
-        "runningExecutableMismatch",
-        "challengeExpired",
-        "challengeMissingOrConsumed",
-        "activationObligationChanged",
-        "invalidDesktopObservation",
-        "replayPayloadMismatch",
-        "persistenceFailed"
-      ],
-      "type": "string"
     },
     "DeterministicContinuationClass": {
       "enum": [
@@ -7610,7 +7436,8 @@
         "userPromptSubmit",
         "subagentStart",
         "subagentStop",
-        "stop"
+        "stop",
+        "interrupt"
       ],
       "type": "string"
     },
@@ -7977,10 +7804,6 @@
     "InitializeCapabilities": {
       "description": "Client-declared capabilities negotiated during initialize.",
       "properties": {
-        "desktopActivationReceipts": {
-          "description": "Opt into the trusted Desktop activation obligation/challenge/receipt API.",
-          "type": "boolean"
-        },
         "experimentalApi": {
           "default": false,
           "description": "Opt into receiving experimental API methods and fields.",
@@ -8643,6 +8466,13 @@
     },
     "ManagedHooksRequirements": {
       "properties": {
+        "Interrupt": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/ConfiguredHookMatcherGroup"
+          },
+          "type": "array"
+        },
         "PermissionRequest": {
           "items": {
             "$ref": "#/definitions/ConfiguredHookMatcherGroup"
@@ -15686,129 +15516,6 @@
       "title": "ThreadDeletedNotification",
       "type": "object"
     },
-    "ThreadDesktopActivationChallengeParams": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "properties": {
-        "threadId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "threadId"
-      ],
-      "title": "ThreadDesktopActivationChallengeParams",
-      "type": "object"
-    },
-    "ThreadDesktopActivationChallengeResponse": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "properties": {
-        "challenge": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/DesktopActivationChallenge"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "unavailableReason": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/DesktopActivationUnavailableReason"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      },
-      "title": "ThreadDesktopActivationChallengeResponse",
-      "type": "object"
-    },
-    "ThreadDesktopActivationObligationParams": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "properties": {
-        "threadId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "threadId"
-      ],
-      "title": "ThreadDesktopActivationObligationParams",
-      "type": "object"
-    },
-    "ThreadDesktopActivationObligationResponse": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "properties": {
-        "obligation": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/DesktopActivationObligation"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      },
-      "title": "ThreadDesktopActivationObligationResponse",
-      "type": "object"
-    },
-    "ThreadDesktopActivationRecordParams": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "additionalProperties": false,
-      "properties": {
-        "challengeId": {
-          "type": "string"
-        },
-        "desktopExecutablePath": {
-          "type": "string"
-        },
-        "desktopProcessId": {
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "initializationObservationIdentity": {
-          "type": "string"
-        },
-        "observationTimestamp": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "challengeId",
-        "desktopExecutablePath",
-        "desktopProcessId",
-        "initializationObservationIdentity",
-        "observationTimestamp"
-      ],
-      "title": "ThreadDesktopActivationRecordParams",
-      "type": "object"
-    },
-    "ThreadDesktopActivationRecordResponse": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "properties": {
-        "alreadyRecorded": {
-          "type": "boolean"
-        },
-        "challengeId": {
-          "type": "string"
-        },
-        "recordedAt": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "alreadyRecorded",
-        "challengeId",
-        "recordedAt"
-      ],
-      "title": "ThreadDesktopActivationRecordResponse",
-      "type": "object"
-    },
     "ThreadErrorData": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -18676,10 +18383,6 @@
             "string",
             "null"
           ]
-        },
-        "requiresDesktopActivation": {
-          "default": false,
-          "type": "boolean"
         },
         "risks": {
           "items": {

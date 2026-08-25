@@ -1616,7 +1616,14 @@ async fn on_request_user_input_response(
     user_input_guard: ThreadWatchActiveGuard,
 ) {
     let response = receiver.await;
-    resolve_server_request_on_thread_listener(&thread_state, pending_request_id).await;
+    if let Err(error) =
+        resolve_server_request_on_thread_listener(&thread_state, pending_request_id).await
+    {
+        error!(
+            ?error,
+            "failed to resolve server request on thread listener"
+        );
+    }
     drop(user_input_guard);
     let value = match response {
         Ok(Ok(value)) => value,
@@ -1702,7 +1709,14 @@ async fn on_mcp_server_elicitation_response(
     permission_guard: ThreadWatchActiveGuard,
 ) {
     let response = receiver.await;
-    resolve_server_request_on_thread_listener(&thread_state, pending_request_id).await;
+    if let Err(error) =
+        resolve_server_request_on_thread_listener(&thread_state, pending_request_id).await
+    {
+        error!(
+            ?error,
+            "failed to resolve server request on thread listener"
+        );
+    }
     drop(permission_guard);
     let response = mcp_server_elicitation_response_from_client_result(response);
 
@@ -1776,7 +1790,14 @@ async fn on_request_permissions_response(
         request_permissions_guard,
     } = pending_response;
     let response = receiver.await;
-    resolve_server_request_on_thread_listener(&thread_state, pending_request_id.clone()).await;
+    if let Err(error) =
+        resolve_server_request_on_thread_listener(&thread_state, pending_request_id.clone()).await
+    {
+        error!(
+            ?error,
+            "failed to resolve server request on thread listener"
+        );
+    }
     drop(request_permissions_guard);
     let response = match request_permissions_response_from_client_result(
         requested_permissions,
@@ -1913,7 +1934,14 @@ async fn on_file_change_request_approval_response(
     permission_guard: ThreadWatchActiveGuard,
 ) {
     let response = receiver.await;
-    resolve_server_request_on_thread_listener(&thread_state, pending_request_id).await;
+    if let Err(error) =
+        resolve_server_request_on_thread_listener(&thread_state, pending_request_id).await
+    {
+        error!(
+            ?error,
+            "failed to resolve server request on thread listener"
+        );
+    }
     drop(permission_guard);
     let decision = match response {
         Ok(Ok(value)) => {
@@ -1964,7 +1992,14 @@ async fn on_command_execution_request_approval_response(
     permission_guard: ThreadWatchActiveGuard,
 ) {
     let response = receiver.await;
-    resolve_server_request_on_thread_listener(&thread_state, pending_request_id).await;
+    if let Err(error) =
+        resolve_server_request_on_thread_listener(&thread_state, pending_request_id).await
+    {
+        error!(
+            ?error,
+            "failed to resolve server request on thread listener"
+        );
+    }
     drop(permission_guard);
     let (decision, completion_status) = match response {
         Ok(Ok(value)) => {
@@ -3790,7 +3825,6 @@ mod tests {
                     runtime_paths: vec!["src/first.rs".to_string()],
                     generated_artifacts: Vec::new(),
                     risks: Vec::new(),
-                    requires_desktop_activation: false,
                     validation_route: None,
                 },
                 PlanItemArg {
@@ -3802,7 +3836,6 @@ mod tests {
                     runtime_paths: Vec::new(),
                     generated_artifacts: Vec::new(),
                     risks: Vec::new(),
-                    requires_desktop_activation: false,
                     validation_route: None,
                 },
             ],

@@ -1,37 +1,10 @@
 use codex_config::Constrained;
 use codex_config::ConstraintResult;
 use codex_protocol::models::ActivePermissionProfile;
-use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
-use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY;
-use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
 use codex_protocol::models::PermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BuiltInPermissionProfileId {
-    ReadOnly,
-    Workspace,
-    DangerFullAccess,
-}
-
-impl BuiltInPermissionProfileId {
-    fn from_str(id: &str) -> Option<Self> {
-        match id {
-            BUILT_IN_PERMISSION_PROFILE_READ_ONLY => Some(Self::ReadOnly),
-            BUILT_IN_PERMISSION_PROFILE_WORKSPACE => Some(Self::Workspace),
-            BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS => Some(Self::DangerFullAccess),
-            _ => None,
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::ReadOnly => BUILT_IN_PERMISSION_PROFILE_READ_ONLY,
-            Self::Workspace => BUILT_IN_PERMISSION_PROFILE_WORKSPACE,
-            Self::DangerFullAccess => BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS,
-        }
-    }
-}
+use super::permissions::BuiltInPermissionProfileId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ResolvedPermissionProfile {

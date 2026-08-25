@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 from pathlib import Path
+import json
 import os
 import re
 import subprocess
@@ -19,6 +20,35 @@ FRESH_SOURCE_TIME = FIXTURE_TIME + 10_000
 
 
 class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
+    def test_skip_build_rejects_tampered_source_bundle_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manifest = self.write_source_bundle_manifest(
+                self.source_exe,
+                self.source_code_mode_host,
+                self.source_windows_sandbox_setup,
+                self.source_command_runner,
+            )
+            metadata = json.loads(manifest.read_text(encoding="utf-8"))
+            metadata["bundleId"] = "f" * 64
+            manifest.write_text(json.dumps(metadata), encoding="utf-8")
+
+            result = self.run_script(
+                "-DryRun",
+                "-SkipBuild",
+                "-SourceExe",
+                str(self.source_exe),
+                "-SourceBundleManifest",
+                str(manifest),
+                "-InstallDir",
+                str(Path(temp_dir) / "install"),
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "Source bundle identity does not match its canonical file inventory",
+                result.stdout + result.stderr,
+            )
+
     def test_dry_run_reports_proof_without_writing_target(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             install_dir = Path(temp_dir) / "install"
@@ -368,7 +398,7 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
         with tempfile.TemporaryDirectory() as temp_dir:
             user_profile = Path(temp_dir) / "profile"
             expected_home = user_profile / "Desktop" / "LOCAL-KD"
-            expected_target = expected_home / "codex.exe"
+            expected_target = expected_home / "bin" / "codex.exe"
             stale_codex_home = user_profile / ".codex-test-home"
             env = clean_env()
             env["USERPROFILE"] = str(user_profile)

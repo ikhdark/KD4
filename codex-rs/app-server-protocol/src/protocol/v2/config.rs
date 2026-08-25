@@ -67,7 +67,7 @@ pub enum ConfigLayerSource {
         /// guaranteed to exist.
         file: AbsolutePathBuf,
 
-        /// Name of the selected profile-v2 config layered on top of the base
+        /// Name of the selected profile config layered on top of the base
         /// user config, when this layer represents one.
         profile: Option<String>,
     },
@@ -453,6 +453,9 @@ pub struct ManagedHooksRequirements {
     #[serde(rename = "Stop")]
     #[ts(rename = "Stop")]
     pub stop: Vec<ConfiguredHookMatcherGroup>,
+    #[serde(rename = "Interrupt", default)]
+    #[ts(rename = "Interrupt")]
+    pub interrupt: Vec<ConfiguredHookMatcherGroup>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]

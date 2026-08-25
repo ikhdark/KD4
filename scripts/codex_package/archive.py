@@ -1,20 +1,19 @@
 """Archive writers for canonical Codex package directories."""
 
 import os
+import gzip
+import hashlib
 import shutil
 import subprocess
 import tarfile
 import tempfile
 import zipfile
-from collections.abc import Callable
 from pathlib import Path
 from typing import BinaryIO
 
 from .layout import MANAGED_PACKAGE_PATHS
-from .targets import REPO_ROOT
-
-
-ZSTD_DOTSLASH = REPO_ROOT / ".github" / "workflows" / "zstd"
+ZSTD_PATH_ENV = "CODEX_ZSTD"
+ZSTD_SHA256_ENV = "CODEX_ZSTD_SHA256"
 
 
 def write_archive(
@@ -142,10 +141,10 @@ def write_tar_archive(
     entries: list[Path] | None = None,
     compression: str = "default",
 ) -> None:
-    kwargs = {}
     if mode.endswith(":gz"):
+        compresslevel = 9
         if compression == "fast":
-            kwargs["compresslevel"] = 1
+            compresslevel = 1
         elif compression == "none":
             # Silently dropping ":gz" would produce an uncompressed tar under
             # a gzip filename that gzip-expecting consumers reject.
@@ -154,7 +153,15 @@ def write_tar_archive(
                 "use a .tar.zst or .zip output, or a gzip compression level."
             )
 
-    with tarfile.open(archive_path, mode, **kwargs) as archive:
+        with archive_path.open("wb") as raw:
+            with gzip.GzipFile(
+                filename="", fileobj=raw, mode="wb", compresslevel=compresslevel, mtime=0
+            ) as compressed:
+                with tarfile.open(fileobj=compressed, mode="w") as archive:
+                    write_tar_entries(archive, package_dir, entries=entries)
+        return
+
+    with tarfile.open(archive_path, mode) as archive:
         write_tar_entries(archive, package_dir, entries=entries)
 
 
@@ -190,27 +197,25 @@ def write_tar_zst_archive(
 
 def resolve_zstd_command(
     *,
-    dotslash_manifest: Path = ZSTD_DOTSLASH,
-    which: Callable[[str], str | None] = shutil.which,
+    environ: dict[str, str] | None = None,
 ) -> list[str]:
-    zstd = which("zstd")
-    if zstd is not None:
-        return [zstd]
-
-    dotslash = which("dotslash")
-    if dotslash is not None and dotslash_manifest.is_file():
-        return [dotslash, str(dotslash_manifest)]
-
-    # The DotSlash wrapper referenced by ZSTD_DOTSLASH does not exist in this
-    # fork, so only suggest it when the manifest is actually present.
-    hint = (
-        f", or install DotSlash so the repository wrapper can run: {dotslash_manifest}"
-        if dotslash_manifest.is_file()
-        else " (e.g. `scoop install zstd` or `winget install Facebook.Zstandard`)"
-    )
-    raise RuntimeError(
-        f"zstd is required to write .tar.zst archives. Install zstd{hint}"
-    )
+    values = os.environ if environ is None else environ
+    path_value = values.get(ZSTD_PATH_ENV)
+    expected_digest = values.get(ZSTD_SHA256_ENV, "").lower()
+    if not path_value or not expected_digest:
+        raise RuntimeError(
+            ".tar.zst requires a pinned compressor: set CODEX_ZSTD to the "
+            "executable and CODEX_ZSTD_SHA256 to its SHA-256 digest"
+        )
+    path = Path(path_value).resolve()
+    if not path.is_file():
+        raise RuntimeError(f"Pinned zstd executable does not exist: {path}")
+    actual_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if actual_digest != expected_digest:
+        raise RuntimeError(
+            f"Pinned zstd digest mismatch: expected {expected_digest}, got {actual_digest}"
+        )
+    return [str(path)]
 
 
 def write_zip_archive(
@@ -230,10 +235,15 @@ def write_zip_archive(
     with zipfile.ZipFile(archive_path, "w", **kwargs) as archive:
         for path in entries if entries is not None else package_entries(package_dir):
             relative_path = archive_member_name(path, package_dir)
-            if path.is_dir():
-                archive.write(path, f"{relative_path}/")
-            else:
-                archive.write(path, relative_path)
+            member_name = f"{relative_path}/" if path.is_dir() else relative_path
+            info = zipfile.ZipInfo(member_name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.create_system = 3
+            info.external_attr = ((0o755 if path.is_dir() else 0o644) << 16)
+            archive.writestr(
+                info,
+                b"" if path.is_dir() else path.read_bytes(),
+                compress_type=zip_compression,
+            )
 
 
 def write_tar_stream(
@@ -253,11 +263,18 @@ def write_tar_entries(
     entries: list[Path] | None = None,
 ) -> None:
     for path in entries if entries is not None else package_entries(package_dir):
-        archive.add(
-            path,
-            arcname=archive_member_name(path, package_dir),
-            recursive=False,
-        )
+        info = archive.gettarinfo(path, arcname=archive_member_name(path, package_dir))
+        info.mtime = 0
+        info.uid = 0
+        info.gid = 0
+        info.uname = ""
+        info.gname = ""
+        info.mode = 0o755 if path.is_dir() else 0o644
+        if path.is_dir():
+            archive.addfile(info)
+        else:
+            with path.open("rb") as file:
+                archive.addfile(info, file)
 
 
 def archive_member_name(path: Path, package_dir: Path) -> str:

@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 const CONNECTION_RPC_SHUTDOWN_GRACE: Duration = Duration::from_secs(/*secs*/ 30);
+const CONNECTION_RPC_ABORT_JOIN_GRACE: Duration = Duration::from_secs(/*secs*/ 1);
 
 #[derive(Debug)]
 struct ConnectionRpcGateState {
@@ -69,7 +70,7 @@ impl ConnectionRpcGate {
         }
     }
 
-    pub(crate) async fn run<F>(&self, future: F)
+    pub(crate) async fn run<F>(&self, future: F) -> Result<bool, tokio::task::JoinError>
     where
         F: Future<Output = ()> + Send + 'static,
     {
@@ -79,7 +80,7 @@ impl ConnectionRpcGate {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !state.accepting {
-                return;
+                return Ok(false);
             }
 
             let task_id = state.next_task_id;
@@ -102,7 +103,8 @@ impl ConnectionRpcGate {
             join_handle
         };
 
-        let _ = join_handle.await;
+        join_handle.await?;
+        Ok(true)
     }
 
     pub(crate) fn cancellation_token(&self) -> CancellationToken {
@@ -156,7 +158,7 @@ impl ConnectionRpcGate {
         for abort_handle in abort_handles {
             abort_handle.abort();
         }
-        self.tasks.wait().await;
+        let _ = timeout(CONNECTION_RPC_ABORT_JOIN_GRACE, self.tasks.wait()).await;
         aborted_tasks
     }
 
@@ -200,7 +202,8 @@ mod tests {
         gate.run(async move {
             ran_clone.store(/*val*/ true, Ordering::Release);
         })
-        .await;
+        .await
+        .expect("handler should complete");
 
         assert!(ran.load(Ordering::Acquire));
     }
@@ -212,13 +215,28 @@ mod tests {
         let polled = Arc::new(AtomicBool::new(/*v*/ false));
         let polled_clone = Arc::clone(&polled);
 
-        gate.run(async move {
-            polled_clone.store(/*val*/ true, Ordering::Release);
-        })
-        .await;
+        let accepted = gate
+            .run(async move {
+                polled_clone.store(/*val*/ true, Ordering::Release);
+            })
+            .await
+            .expect("closed gate should not join a task");
 
+        assert!(!accepted);
         assert!(!polled.load(Ordering::Acquire));
         assert!(!gate.is_accepting());
+    }
+
+    #[tokio::test]
+    async fn run_reports_handler_panics() {
+        let gate = ConnectionRpcGate::new();
+
+        let error = gate
+            .run(async { panic!("handler panic") })
+            .await
+            .expect_err("handler panic must be observable");
+
+        assert!(error.is_panic());
     }
 
     #[tokio::test]
@@ -230,7 +248,7 @@ mod tests {
         let (started_tx, started_rx) = oneshot::channel();
         let gate_for_run = Arc::clone(&gate);
         let run_task = tokio::spawn(async move {
-            gate_for_run
+            let _ = gate_for_run
                 .run(async move {
                     started_tx.send(()).expect("receiver should be open");
                     cancellation.cancelled().await;
@@ -254,7 +272,7 @@ mod tests {
         let (started_tx, started_rx) = oneshot::channel();
         let gate_for_run = Arc::clone(&gate);
         let run_task = tokio::spawn(async move {
-            gate_for_run
+            let _ = gate_for_run
                 .run(async move {
                     started_tx.send(()).expect("receiver should be open");
                     pending::<()>().await;
@@ -279,7 +297,7 @@ mod tests {
         let (started_tx, started_rx) = oneshot::channel();
         let gate_for_run = Arc::clone(&gate);
         let run_task = tokio::spawn(async move {
-            gate_for_run
+            let _ = gate_for_run
                 .run(async move {
                     started_tx.send(()).expect("receiver should be open");
                     cancellation.cancelled().await;
@@ -293,10 +311,11 @@ mod tests {
 
         let late_polled = Arc::new(AtomicBool::new(/*v*/ false));
         let late_polled_clone = Arc::clone(&late_polled);
-        gate.run(async move {
-            late_polled_clone.store(/*val*/ true, Ordering::Release);
-        })
-        .await;
+        let _ = gate
+            .run(async move {
+                late_polled_clone.store(/*val*/ true, Ordering::Release);
+            })
+            .await;
 
         assert!(!late_polled.load(Ordering::Acquire));
         assert_eq!(gate.inflight_count(), 0);
@@ -342,7 +361,7 @@ mod tests {
         let (continue_tx, continue_rx) = oneshot::channel();
         let gate_for_run = Arc::clone(&gate);
         let run_task = tokio::spawn(async move {
-            gate_for_run
+            let _ = gate_for_run
                 .run(async move {
                     entered_tx.send(()).expect("receiver should be open");
                     let _ = continue_rx.await;

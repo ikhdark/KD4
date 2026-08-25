@@ -1783,7 +1783,7 @@ mod tests {
                 [models.new_thread]
                 model = "managed-model"
                 model_reasoning_effort = "medium"
-                service_tier = "fast"
+                service_tier = "priority"
             "#,
         )?;
 
@@ -1793,7 +1793,7 @@ mod tests {
                 new_thread: Some(NewThreadModelDefaultsToml {
                     model: Some("managed-model".to_string()),
                     model_reasoning_effort: Some(ReasoningEffort::Medium),
-                    service_tier: Some("fast".to_string()),
+                    service_tier: Some("priority".to_string()),
                 }),
             })
         );
@@ -1827,7 +1827,7 @@ mod tests {
             new_thread: Some(NewThreadModelDefaultsToml {
                 model: Some("managed-model".to_string()),
                 model_reasoning_effort: Some(ReasoningEffort::Medium),
-                service_tier: Some("fast".to_string()),
+                service_tier: Some("priority".to_string()),
             }),
         };
         let enforce_residency = ResidencyRequirement::Us;
@@ -2701,19 +2701,12 @@ allowed_approvals_reviewers = ["user"]
     }
 
     #[test]
-    fn deserialize_legacy_allowed_approvals_reviewer() -> Result<()> {
+    fn retired_allowed_approvals_reviewer_is_rejected() {
         let toml_str = r#"
             allowed_approvals_reviewers = ["guardian_subagent", "user"]
         "#;
-        let config: ConfigRequirementsToml = from_str(toml_str)?;
-        let requirements: ConfigRequirements = with_unknown_source(config).try_into()?;
-
-        assert_eq!(
-            requirements.approvals_reviewer.value(),
-            ApprovalsReviewer::AutoReview
-        );
-
-        Ok(())
+        from_str::<ConfigRequirementsToml>(toml_str)
+            .expect_err("retired approvals reviewer must be rejected");
     }
 
     #[test]

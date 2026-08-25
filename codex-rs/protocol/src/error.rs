@@ -15,7 +15,7 @@ use chrono::Datelike;
 use chrono::Local;
 use chrono::Utc;
 use codex_async_utils::CancelErr;
-use reqwest::StatusCode;
+use http::StatusCode;
 use serde_json;
 use std::io;
 use std::time::Duration;
@@ -235,8 +235,8 @@ impl CodexErr {
         let http_status_code = match self {
             CodexErr::RetryLimit(err) => Some(err.status),
             CodexErr::UnexpectedStatus(err) => Some(err.status),
-            CodexErr::ConnectionFailed(err) => err.source.status(),
-            CodexErr::ResponseStreamFailed(err) => err.source.status(),
+            CodexErr::ConnectionFailed(err) => err.status,
+            CodexErr::ResponseStreamFailed(err) => err.status,
             _ => None,
         };
         http_status_code.as_ref().map(StatusCode::as_u16)
@@ -245,18 +245,20 @@ impl CodexErr {
 
 #[derive(Debug)]
 pub struct ConnectionFailedError {
-    pub source: reqwest::Error,
+    pub message: String,
+    pub status: Option<StatusCode>,
 }
 
 impl std::fmt::Display for ConnectionFailedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Connection failed: {}", self.source)
+        write!(f, "Connection failed: {}", self.message)
     }
 }
 
 #[derive(Debug)]
 pub struct ResponseStreamFailed {
-    pub source: reqwest::Error,
+    pub message: String,
+    pub status: Option<StatusCode>,
     pub request_id: Option<String>,
 }
 
@@ -265,7 +267,7 @@ impl std::fmt::Display for ResponseStreamFailed {
         write!(
             f,
             "Error while reading the server response: {}{}",
-            self.source,
+            self.message,
             self.request_id
                 .as_ref()
                 .map(|id| format!(", request id: {id}"))

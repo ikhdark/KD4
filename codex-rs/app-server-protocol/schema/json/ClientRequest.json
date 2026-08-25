@@ -1506,10 +1506,6 @@
     "InitializeCapabilities": {
       "description": "Client-declared capabilities negotiated during initialize.",
       "properties": {
-        "desktopActivationReceipts": {
-          "description": "Opt into the trusted Desktop activation obligation/challenge/receipt API.",
-          "type": "boolean"
-        },
         "experimentalApi": {
           "default": false,
           "description": "Opt into receiving experimental API methods and fields.",
@@ -3814,58 +3810,6 @@
       ],
       "type": "object"
     },
-    "ThreadDesktopActivationChallengeParams": {
-      "properties": {
-        "threadId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "threadId"
-      ],
-      "type": "object"
-    },
-    "ThreadDesktopActivationObligationParams": {
-      "properties": {
-        "threadId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "threadId"
-      ],
-      "type": "object"
-    },
-    "ThreadDesktopActivationRecordParams": {
-      "additionalProperties": false,
-      "properties": {
-        "challengeId": {
-          "type": "string"
-        },
-        "desktopExecutablePath": {
-          "type": "string"
-        },
-        "desktopProcessId": {
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "initializationObservationIdentity": {
-          "type": "string"
-        },
-        "observationTimestamp": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "challengeId",
-        "desktopExecutablePath",
-        "desktopProcessId",
-        "initializationObservationIdentity",
-        "observationTimestamp"
-      ],
-      "type": "object"
-    },
     "ThreadForkParams": {
       "description": "There are two ways to fork a thread: 1. By thread_id: load the thread from disk by thread_id and fork it into a new thread. 2. By path: load the thread from disk by path and fork it into a new thread.\n\nIf using a non-empty path, the thread_id param will be ignored. Empty string path values are treated as absent.\n\nPrefer using thread_id whenever possible.",
       "properties": {
@@ -5158,78 +5102,6 @@
         "params"
       ],
       "title": "Thread/resumeRequest",
-      "type": "object"
-    },
-    {
-      "properties": {
-        "id": {
-          "$ref": "#/definitions/RequestId"
-        },
-        "method": {
-          "enum": [
-            "thread/desktopActivation/obligation"
-          ],
-          "title": "Thread/desktopActivation/obligationRequestMethod",
-          "type": "string"
-        },
-        "params": {
-          "$ref": "#/definitions/ThreadDesktopActivationObligationParams"
-        }
-      },
-      "required": [
-        "id",
-        "method",
-        "params"
-      ],
-      "title": "Thread/desktopActivation/obligationRequest",
-      "type": "object"
-    },
-    {
-      "properties": {
-        "id": {
-          "$ref": "#/definitions/RequestId"
-        },
-        "method": {
-          "enum": [
-            "thread/desktopActivation/challenge"
-          ],
-          "title": "Thread/desktopActivation/challengeRequestMethod",
-          "type": "string"
-        },
-        "params": {
-          "$ref": "#/definitions/ThreadDesktopActivationChallengeParams"
-        }
-      },
-      "required": [
-        "id",
-        "method",
-        "params"
-      ],
-      "title": "Thread/desktopActivation/challengeRequest",
-      "type": "object"
-    },
-    {
-      "properties": {
-        "id": {
-          "$ref": "#/definitions/RequestId"
-        },
-        "method": {
-          "enum": [
-            "thread/desktopActivation/record"
-          ],
-          "title": "Thread/desktopActivation/recordRequestMethod",
-          "type": "string"
-        },
-        "params": {
-          "$ref": "#/definitions/ThreadDesktopActivationRecordParams"
-        }
-      },
-      "required": [
-        "id",
-        "method",
-        "params"
-      ],
-      "title": "Thread/desktopActivation/recordRequest",
       "type": "object"
     },
     {

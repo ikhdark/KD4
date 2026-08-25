@@ -329,8 +329,18 @@ async fn gpt_5_tools_without_apply_patch_append_apply_patch_instructions() -> an
         .as_str()
         .expect("instructions should be a string");
     assert!(
-        instructions0.contains("You are"),
-        "expected non-empty instructions"
+        normalize_newlines(instructions0)
+            .contains(&normalize_newlines(APPLY_PATCH_TOOL_INSTRUCTIONS)),
+        "instructions should include the apply-patch guidance when the tool is absent"
+    );
+    assert!(
+        !body0["tools"]
+            .as_array()
+            .expect("tools should be an array")
+            .iter()
+            .any(|tool| tool.get("name").and_then(serde_json::Value::as_str)
+                == Some("apply_patch")),
+        "fixture must not register the apply_patch tool"
     );
 
     let body1 = req2.single_request().body_json();

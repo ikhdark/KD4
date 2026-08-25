@@ -1,8 +1,8 @@
 use std::any::TypeId;
 
 use codex_exec_server::ExecServerError;
+use http::StatusCode;
 use pretty_assertions::assert_eq;
-use reqwest::StatusCode;
 use rmcp::transport::DynamicTransportError;
 use rmcp::transport::streamable_http_client::StreamableHttpError;
 

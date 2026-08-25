@@ -17,6 +17,53 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::collections::HashMap;
 
+#[derive(serde::Serialize)]
+struct ShellApprovalKey {
+    command: String,
+}
+
+#[derive(serde::Serialize)]
+struct PatchApprovalKey {
+    command: String,
+}
+
+#[test]
+fn approval_cache_is_namespaced_by_tool_and_key_schema() {
+    let mut store = ApprovalStore::default();
+    let shell_key = ShellApprovalKey {
+        command: "same-json".to_string(),
+    };
+    store.put("shell", shell_key, ReviewDecision::ApprovedForSession);
+
+    assert_eq!(
+        store.get(
+            "shell",
+            &ShellApprovalKey {
+                command: "same-json".to_string(),
+            }
+        ),
+        Some(ReviewDecision::ApprovedForSession)
+    );
+    assert_eq!(
+        store.get(
+            "apply_patch",
+            &ShellApprovalKey {
+                command: "same-json".to_string(),
+            }
+        ),
+        None
+    );
+    assert_eq!(
+        store.get(
+            "shell",
+            &PatchApprovalKey {
+                command: "same-json".to_string(),
+            }
+        ),
+        None
+    );
+}
+
 #[test]
 fn bash_permission_request_payload_omits_missing_description() {
     assert_eq!(

@@ -3,7 +3,7 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::error::RetryLimitReachedError;
 use codex_protocol::error::UnexpectedResponseError;
 use codex_protocol::error::UsageLimitReachedError;
-use reqwest::StatusCode;
+use http::StatusCode;
 
 #[test]
 fn current_model_fallback_matches_model_specific_failures() {

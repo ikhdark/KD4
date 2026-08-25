@@ -2,8 +2,10 @@
 """Stage and optionally package the @openai/codex npm module."""
 
 import argparse
+import hashlib
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -144,6 +146,7 @@ def main() -> int:
                 staging_dir,
                 native_components,
                 target_filter={target_filter} if target_filter else None,
+                expected_version=version,
             )
 
         if release_version:
@@ -260,6 +263,14 @@ def stage_sources(staging_dir: Path, version: str, package: str) -> None:
         dependencies[CODEX_NPM_NAME] = version
         package_json["dependencies"] = dependencies
 
+    for notice_name in ("LICENSE", "NOTICE"):
+        shutil.copy2(REPO_ROOT / notice_name, staging_dir / notice_name)
+    files = package_json.get("files")
+    if isinstance(files, list):
+        for notice_name in ("LICENSE", "NOTICE"):
+            if notice_name not in files:
+                files.append(notice_name)
+
     with open(staging_dir / "package.json", "w", encoding="utf-8") as out:
         json.dump(package_json, out, indent=2)
         out.write("\n")
@@ -274,8 +285,9 @@ def compute_platform_package_version(version: str, platform_tag: str) -> str:
 def build_codex_package_json(version: str) -> dict:
     with open(CODEX_CLI_ROOT / "package.json", "r", encoding="utf-8") as fh:
         package_json = json.load(fh)
+    package_json.pop("private", None)
     package_json["version"] = version
-    package_json["files"] = ["bin/codex.js"]
+    package_json["files"] = ["bin/codex.js", "LICENSE", "NOTICE"]
     package_json["os"] = ["win32"]
     package_json["codexNativeTargets"] = {
         platform_package["platform_key"]: {
@@ -300,13 +312,13 @@ def build_platform_package_json(version: str, platform_package: dict[str, str]) 
     with open(CODEX_CLI_ROOT / "package.json", "r", encoding="utf-8") as fh:
         codex_package_json = json.load(fh)
 
-        package_json = {
+    package_json = {
         "name": CODEX_NPM_NAME,
         "version": version,
         "license": codex_package_json.get("license", "Apache-2.0"),
-            "os": [platform_package["os"]],
+        "os": [platform_package["os"]],
         "cpu": [platform_package["cpu"]],
-        "files": ["vendor"],
+        "files": ["vendor", "LICENSE", "NOTICE"],
         "repository": codex_package_json.get("repository"),
     }
     engines = codex_package_json.get("engines")
@@ -346,6 +358,7 @@ def copy_native_binaries(
     staging_dir: Path,
     components: list[str],
     target_filter: set[str] | None = None,
+    expected_version: str | None = None,
 ) -> None:
     vendor_src = vendor_src.resolve()
     if not vendor_src.exists():
@@ -384,9 +397,82 @@ def copy_native_binaries(
                 raise RuntimeError(
                     f"Missing Codex executable for {target_dir.name}: {codex_path}"
                 )
-            if dest_target_dir.exists():
-                shutil.rmtree(dest_target_dir)
-            shutil.copytree(target_dir, dest_target_dir)
+            metadata_path = target_dir / "codex-package.json"
+            if not metadata_path.is_file():
+                raise RuntimeError(f"Missing canonical package metadata: {metadata_path}")
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if metadata.get("target") != target_dir.name:
+                raise RuntimeError(
+                    f"Canonical package target mismatch for {target_dir.name}"
+                )
+            if expected_version is not None and metadata.get("version") != expected_version:
+                raise RuntimeError(
+                    f"Canonical package version mismatch for {target_dir.name}: "
+                    f"expected {expected_version}, got {metadata.get('version')!r}"
+                )
+            inventory = metadata.get("files")
+            if not isinstance(inventory, list) or not inventory:
+                raise RuntimeError(f"Canonical package has no file inventory: {metadata_path}")
+            declared = {"codex-package.json"}
+            for item in inventory:
+                if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+                    raise RuntimeError(f"Invalid canonical package inventory: {metadata_path}")
+                relative = item["path"]
+                relative_path = Path(relative)
+                if relative_path.is_absolute() or ".." in relative_path.parts:
+                    raise RuntimeError(
+                        f"Unsafe canonical package inventory path: {relative!r}"
+                    )
+                source = target_dir / relative_path
+                if not source.is_file():
+                    raise RuntimeError(f"Missing canonical package file: {source}")
+                actual_size = source.stat().st_size
+                actual_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+                if item.get("size") != actual_size or item.get("sha256") != actual_digest:
+                    raise RuntimeError(
+                        f"Canonical package digest mismatch: {target_dir.name}/{relative}"
+                    )
+                declared.add(relative)
+            expected_bundle_id = hashlib.sha256(
+                json.dumps(
+                    inventory, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest()
+            if metadata.get("bundleId") != expected_bundle_id:
+                raise RuntimeError(
+                    f"Canonical package bundle identity mismatch: {metadata_path}"
+                )
+            actual = {
+                path.relative_to(target_dir).as_posix()
+                for path in target_dir.rglob("*")
+                if path.is_file()
+            }
+            if actual != declared:
+                raise RuntimeError(
+                    f"Canonical package inventory mismatch for {target_dir.name}: "
+                    f"unexpected={sorted(actual - declared)}, missing={sorted(declared - actual)}"
+                )
+            for relative in sorted(declared):
+                source = target_dir / relative
+                destination = dest_target_dir / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+
+            host_target = {
+                "AMD64": "x86_64-pc-windows-msvc",
+                "X86_64": "x86_64-pc-windows-msvc",
+                "ARM64": "aarch64-pc-windows-msvc",
+                "AARCH64": "aarch64-pc-windows-msvc",
+            }.get(platform.machine().upper())
+            if expected_version is not None and os.name == "nt" and host_target == target_dir.name:
+                reported = subprocess.check_output(
+                    [str(codex_path), "--version"], text=True
+                ).strip().split()[-1]
+                if reported != expected_version:
+                    raise RuntimeError(
+                        f"Native Codex version mismatch for {target_dir.name}: "
+                        f"expected {expected_version}, got {reported}"
+                    )
         else:
             dest_target_dir.mkdir(parents=True, exist_ok=True)
 
@@ -448,7 +534,36 @@ def run_npm_pack(staging_dir: Path, output_path: Path) -> Path:
 
         shutil.move(str(tarball_path), output_path)
 
+    smoke_test_npm_tarball(output_path)
     return output_path
+
+
+def smoke_test_npm_tarball(tarball_path: Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="codex-npm-smoke-") as smoke_dir_str:
+        smoke_dir = Path(smoke_dir_str)
+        subprocess.run(
+            [
+                "npm",
+                "install",
+                "--force",
+                "--ignore-scripts",
+                "--omit=optional",
+                "--no-package-lock",
+                str(tarball_path),
+            ],
+            cwd=smoke_dir,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        installed = smoke_dir / "node_modules" / "@openai" / "codex"
+        package_json = installed / "package.json"
+        if not package_json.is_file():
+            raise RuntimeError("npm smoke install did not produce @openai/codex/package.json")
+        launcher = installed / "bin" / "codex.js"
+        if launcher.is_file():
+            subprocess.run(["node", "--check", str(launcher)], check=True)
 
 
 if __name__ == "__main__":

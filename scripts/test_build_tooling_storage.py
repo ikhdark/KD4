@@ -96,6 +96,151 @@ class BuildToolingStorageTest(unittest.TestCase):
             explicit,
         )
 
+    def test_run_lane_directly_launches_known_nextest_recipe_with_argv(self) -> None:
+        target = Path("C:/target path/lane")
+        command = [
+            "just",
+            "_test-lane-local-reserved",
+            "-p",
+            "codex-app-server",
+            "test(filter with spaces)",
+        ]
+        completed = subprocess.CompletedProcess(command, 9)
+        with (
+            mock.patch.object(
+                rust_build_status,
+                "reserve_cargo_lane",
+                return_value=contextlib.nullcontext(("unit", target)),
+            ),
+            mock.patch.object(
+                rust_build_status.shutil,
+                "which",
+                return_value=None,
+            ),
+            mock.patch.object(
+                rust_build_status.subprocess,
+                "run",
+                return_value=completed,
+            ) as run,
+        ):
+            result = rust_build_status.run_in_cargo_lane(
+                repo_root=Path.cwd(),
+                requested_lane="unit",
+                command=command,
+            )
+
+        self.assertEqual(result, 9)
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "cargo",
+                "nextest",
+                "run",
+                "--target-dir",
+                str(target),
+                "--no-fail-fast",
+                "-p",
+                "codex-app-server",
+                "test(filter with spaces)",
+            ],
+        )
+        child_env = run.call_args.kwargs["env"]
+        self.assertEqual(child_env["NEXTEST_PROFILE"], "local")
+        self.assertNotIn("CODEX_CARGO_LANE_TARGET_DIR", child_env)
+        self.assertEqual(
+            child_env["RUST_MIN_STACK"], rust_build_status.RUST_MIN_STACK_BYTES
+        )
+
+    def test_run_lane_keeps_shell_fallback_when_core_helpers_are_required(
+        self,
+    ) -> None:
+        target = Path("C:/target/lane")
+        command = [
+            "just",
+            "_test-lane-fast-reserved",
+            "-p",
+            "codex-core",
+            "test(core_filter)",
+        ]
+        with (
+            mock.patch.dict(rust_build_status.os.environ, {}, clear=True),
+            mock.patch.object(
+                rust_build_status,
+                "reserve_cargo_lane",
+                return_value=contextlib.nullcontext(("unit", target)),
+            ),
+            mock.patch.object(rust_build_status.shutil, "which", return_value=None),
+            mock.patch.object(
+                rust_build_status.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(command, 0),
+            ) as run,
+        ):
+            result = rust_build_status.run_in_cargo_lane(
+                repo_root=Path.cwd(),
+                requested_lane="unit",
+                command=command,
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(run.call_args.args[0], command)
+        child_env = run.call_args.kwargs["env"]
+        self.assertNotIn("NEXTEST_PROFILE", child_env)
+        self.assertEqual(child_env["CODEX_CARGO_LANE_TARGET_DIR"], str(target))
+
+    def test_direct_reserved_lane_commands_cover_fast_and_package_recipes(
+        self,
+    ) -> None:
+        cases = (
+            (
+                [
+                    "just",
+                    "_test-lane-fast-reserved",
+                    "-p",
+                    "codex-app-server",
+                    "filter with spaces",
+                ],
+                [
+                    "cargo",
+                    "nextest",
+                    "run",
+                    "-p",
+                    "codex-app-server",
+                    "filter with spaces",
+                ],
+            ),
+            (
+                [
+                    "just",
+                    "_test-lane-package-reserved",
+                    "codex-cli",
+                    "filter with spaces",
+                ],
+                [
+                    "cargo",
+                    "nextest",
+                    "run",
+                    "-p",
+                    "codex-cli",
+                    "filter with spaces",
+                ],
+            ),
+        )
+        for command, expected in cases:
+            with self.subTest(command=command):
+                child_env: dict[str, str] = {}
+                actual = rust_build_status._direct_reserved_lane_command(
+                    command,
+                    child_env,
+                )
+
+                self.assertEqual(actual, expected)
+                self.assertEqual(child_env["NEXTEST_PROFILE"], "fast")
+                self.assertEqual(
+                    child_env["RUST_MIN_STACK"],
+                    rust_build_status.RUST_MIN_STACK_BYTES,
+                )
+
     def test_cargo_command_parses_toolchain_and_value_taking_global_options(
         self,
     ) -> None:
@@ -252,6 +397,93 @@ class BuildToolingStorageTest(unittest.TestCase):
                 )
             )
         )
+
+    def test_process_classification_is_observed_once_for_snapshot_consumers(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(
+            rust_build_status,
+            "_classify_rust_process",
+            wraps=rust_build_status._classify_rust_process,
+        ) as classify:
+            process = rust_build_status.RustProcess(
+                pid=7,
+                name="pwsh.exe",
+                command_line="pwsh just cargo-lane ui cargo check",
+            )
+            snapshot = rust_build_status.BuildStatusSnapshot.collect(
+                repo_root=Path(temp_dir),
+                processes=[process],
+            )
+            self.assertEqual(snapshot.lane_name_for(snapshot.processes[0]), "ui")
+            self.assertEqual(
+                rust_build_status.shared_target_rust_processes(
+                    snapshot.processes,
+                    snapshot.lane_names_by_process,
+                ),
+                [],
+            )
+            self.assertEqual(
+                rust_build_status.active_lane_names(snapshot.processes),
+                {"ui"},
+            )
+
+        self.assertEqual(classify.call_count, 1)
+
+    def test_shared_process_filter_reuses_one_process_classification(self) -> None:
+        with mock.patch.object(
+            rust_build_status,
+            "_classify_rust_process",
+            wraps=rust_build_status._classify_rust_process,
+        ) as classify:
+            process = rust_build_status.RustProcess(
+                pid=8,
+                name="pwsh.exe",
+                command_line="pwsh cargo check",
+            )
+            shared = rust_build_status.shared_target_rust_processes([process])
+
+        self.assertEqual(len(shared), 1)
+        self.assertEqual(classify.call_count, 1)
+
+    def test_lane_candidates_reuse_one_directory_observation(self) -> None:
+        class FakeEntry:
+            def __init__(self, root: Path, name: str, mtime: float) -> None:
+                self.name = name
+                self.path = str(root / name)
+                self._observation = os.stat_result(
+                    (0o040755, 0, 0, 1, 0, 0, 0, mtime, mtime, mtime)
+                )
+                self.stat_calls = 0
+
+            def stat(self, *, follow_symlinks: bool) -> os.stat_result:
+                self.assert_follow_symlinks = follow_symlinks
+                self.stat_calls += 1
+                return self._observation
+
+        root = Path("C:/lanes")
+        older = FakeEntry(root, "unit", 1.0)
+        newer = FakeEntry(root, "unit-2", 2.0)
+        unrelated = FakeEntry(root, "other", 3.0)
+        with mock.patch.object(
+            rust_build_status.os,
+            "scandir",
+            return_value=contextlib.nullcontext([older, newer, unrelated]),
+        ):
+            candidates = rust_build_status._lane_reservation_candidates(
+                root,
+                "unit",
+                prefer_warm=True,
+            )
+
+        self.assertEqual(
+            [candidate.name for candidate in candidates[:2]],
+            ["unit-2", "unit"],
+        )
+        self.assertEqual(older.stat_calls, 1)
+        self.assertEqual(newer.stat_calls, 1)
+        self.assertEqual(unrelated.stat_calls, 0)
+        self.assertFalse(older.assert_follow_symlinks)
 
     def test_target_disk_report_warns_when_target_exceeds_budget(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

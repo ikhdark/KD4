@@ -24,12 +24,18 @@ impl Session {
         let mut active = self.active_turn.lock().await;
         match active.as_mut() {
             Some(active_turn) => {
+                let pending_input = input
+                    .iter()
+                    .cloned()
+                    .map(TurnInput::ResponseItem)
+                    .collect::<Vec<_>>();
                 self.input_queue
                     .extend_pending_input_for_turn_state(
                         active_turn.turn_state.as_ref(),
-                        input.into_iter().map(TurnInput::ResponseItem).collect(),
+                        &pending_input,
                     )
-                    .await;
+                    .await
+                    .map_err(|_| input)?;
                 Ok(())
             }
             None => Err(input),
@@ -120,12 +126,23 @@ impl Session {
             ));
         }
 
-        self.input_queue
-            .extend_pending_input_for_turn_state(
-                turn_state.as_ref(),
-                input.into_iter().map(TurnInput::ResponseItem).collect(),
-            )
-            .await;
+        let pending_input = input
+            .iter()
+            .cloned()
+            .map(TurnInput::ResponseItem)
+            .collect::<Vec<_>>();
+        if self
+            .input_queue
+            .extend_pending_input_for_turn_state(turn_state.as_ref(), &pending_input)
+            .await
+            .is_err()
+        {
+            self.clear_reserved_idle_turn(&turn_state).await;
+            return Err(TryStartTurnIfIdleError::new(
+                TryStartTurnIfIdleRejectionReason::PendingInputLimitExceeded,
+                input,
+            ));
+        }
         self.start_task(turn_context, Vec::new(), RegularTask::new())
             .await;
         startup_guard.disarm();

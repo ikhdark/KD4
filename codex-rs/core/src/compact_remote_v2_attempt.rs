@@ -5,7 +5,7 @@ use super::run_remote_compaction_request_v2;
 use crate::Prompt;
 use crate::client::ModelClientSession;
 use crate::compact::CompactionAnalyticsDetails;
-use crate::compact_remote::trim_function_call_history_to_fit_context_window;
+use crate::compact_remote::trim_function_call_history_to_fit_context_window_for_prompt;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
 use crate::session::session::Session;
@@ -37,15 +37,36 @@ pub(super) async fn run_remote_compact_v2_attempt(
     compaction_trace: &CompactionTraceContext,
     compaction_metadata: CompactionTurnMetadata,
     analytics_details: &mut CompactionAnalyticsDetails,
+    cancellation_token: &CancellationToken,
 ) -> CodexResult<RemoteCompactV2Attempt> {
     let turn_context = &step_context.turn;
     let mut history = sess.clone_history().await;
     let base_instructions = sess.get_base_instructions().await;
+    let tool_router = built_tools(
+        sess.as_ref(),
+        step_context.as_ref(),
+        &[],
+        cancellation_token,
+    )
+    .await?;
+    let mut owned_client_session = None;
+    let client_session = match client_session {
+        Some(client_session) => client_session,
+        None => owned_client_session.insert(sess.services.model_client.new_session()),
+    };
+    let mut prepared = prepare_sampling_prompt_for_client(
+        history.clone(),
+        turn_context,
+        client_session,
+        sess.services.git_workspace.as_ref(),
+    )
+    .await;
     let (rewritten_outputs, estimated_deleted_tokens) =
-        trim_function_call_history_to_fit_context_window(
+        trim_function_call_history_to_fit_context_window_for_prompt(
             &mut history,
             turn_context.as_ref(),
             &base_instructions,
+            Some(prepared.items()),
         );
     if rewritten_outputs > 0 {
         info!(
@@ -53,6 +74,13 @@ pub(super) async fn run_remote_compact_v2_attempt(
             rewritten_outputs,
             "rewrote history outputs before remote compaction v2"
         );
+        prepared = prepare_sampling_prompt_for_client(
+            history.clone(),
+            turn_context,
+            client_session,
+            sess.services.git_workspace.as_ref(),
+        )
+        .await;
     }
     if estimated_deleted_tokens > 0 {
         let max_local_deleted_tokens = sess
@@ -69,25 +97,6 @@ pub(super) async fn run_remote_compact_v2_attempt(
     let trace_input_history = compaction_trace
         .is_enabled()
         .then(|| history.raw_items().to_vec());
-    let tool_router = built_tools(
-        sess.as_ref(),
-        step_context.as_ref(),
-        &[],
-        &CancellationToken::new(),
-    )
-    .await?;
-    let mut owned_client_session = None;
-    let client_session = match client_session {
-        Some(client_session) => client_session,
-        None => owned_client_session.insert(sess.services.model_client.new_session()),
-    };
-    let prepared = prepare_sampling_prompt_for_client(
-        history,
-        turn_context,
-        client_session,
-        sess.services.git_workspace.as_ref(),
-    )
-    .await;
     let mut prompt = build_projected_prompt(
         sess.as_ref(),
         &prepared,
@@ -113,6 +122,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
         &prompt,
         &responses_metadata,
         compaction_trace,
+        cancellation_token,
     )
     .await;
     let RemoteCompactionV2Output {

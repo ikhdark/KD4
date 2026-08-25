@@ -230,6 +230,26 @@ class VscodeRuntimeProofTest(unittest.TestCase):
 
 
 class ConfigSchemaCheckTest(unittest.TestCase):
+    def test_logged_command_quotes_arguments_with_spaces(self) -> None:
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(
+                config_schema_check.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0),
+            ),
+            contextlib.redirect_stdout(stdout),
+        ):
+            self.assertEqual(
+                config_schema_check.run(
+                    ["cargo", "--manifest-path", "C:/repo with spaces/Cargo.toml"],
+                    cwd=Path("/repo"),
+                ),
+                0,
+            )
+
+        self.assertIn("'C:/repo with spaces/Cargo.toml'", stdout.getvalue())
+
     def test_changed_outputs_detects_added_removed_and_modified_paths(self) -> None:
         before = {"a": "1", "b": "2"}
         after = {"b": "3", "c": "4"}
@@ -441,6 +461,16 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
             ),
             mock.patch.object(
                 app_server_schema_runtime_check,
+                "run_stable_compatibility_check",
+                return_value=0,
+            ),
+            mock.patch.object(
+                app_server_schema_runtime_check,
+                "run_python_sdk_contract_check",
+                return_value=0,
+            ),
+            mock.patch.object(
+                app_server_schema_runtime_check,
                 "generated_output_lock",
                 return_value=contextlib.nullcontext(),
             ),
@@ -468,6 +498,11 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
             ),
             mock.patch.object(
                 app_server_schema_runtime_check,
+                "run_python_sdk_contract_check",
+                return_value=0,
+            ),
+            mock.patch.object(
+                app_server_schema_runtime_check,
                 "generated_output_lock",
                 return_value=contextlib.nullcontext(),
             ),
@@ -490,6 +525,130 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
             "assignment:app-server-owner",
             ["--experimental"],
         )
+
+    def test_stable_schema_compatibility_rejects_breaks_and_allows_additions(
+        self,
+    ) -> None:
+        baseline = {
+            "definitions": {
+                "Request": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"],
+                }
+            }
+        }
+        additive = {
+            "definitions": {
+                **baseline["definitions"],
+                "Response": {"type": "object"},
+            }
+        }
+        additive["definitions"]["Request"] = {
+            **baseline["definitions"]["Request"],
+            "properties": {
+                **baseline["definitions"]["Request"]["properties"],
+                "tag": {"type": "string"},
+            },
+        }
+        breaking = {
+            "definitions": {
+                "Request": {
+                    "type": "object",
+                    "properties": {},
+                    "required": ["name", "tag"],
+                }
+            }
+        }
+
+        self.assertEqual(
+            app_server_schema_runtime_check.stable_schema_compatibility_issues(
+                baseline, additive
+            ),
+            [],
+        )
+        issues = app_server_schema_runtime_check.stable_schema_compatibility_issues(
+            baseline, breaking
+        )
+        self.assertIn("$/definitions/Request/properties/name:removed", issues)
+        self.assertIn("$/definitions/Request/required:changed", issues)
+
+    def test_schema_gate_composes_protocol_compatibility_and_python_consumer(
+        self,
+    ) -> None:
+        calls: list[str] = []
+        with (
+            mock.patch.object(
+                app_server_schema_runtime_check, "repo_root", return_value=Path("/repo")
+            ),
+            mock.patch.object(
+                app_server_schema_runtime_check,
+                "schema_inputs_changed",
+                return_value=False,
+            ),
+            mock.patch.object(
+                app_server_schema_runtime_check,
+                "run_protocol_check",
+                side_effect=lambda _root: calls.append("protocol") or 0,
+            ),
+            mock.patch.object(
+                app_server_schema_runtime_check,
+                "run_stable_compatibility_check",
+                side_effect=lambda _root, baseline, _allowed: (
+                    calls.append(f"compatibility:{baseline}") or 0
+                ),
+            ),
+            mock.patch.object(
+                app_server_schema_runtime_check,
+                "run_python_sdk_contract_check",
+                side_effect=lambda _root: calls.append("python-sdk") or 0,
+            ),
+            mock.patch.object(
+                app_server_schema_runtime_check,
+                "generated_output_lock",
+                return_value=contextlib.nullcontext(),
+            ),
+        ):
+            self.assertEqual(
+                app_server_schema_runtime_check.main(["--mode", "check"]),
+                0,
+            )
+
+        self.assertEqual(calls, ["protocol", "compatibility:HEAD^", "python-sdk"])
+
+    def test_schema_gate_stops_before_consumer_on_compatibility_failure(self) -> None:
+        with (
+            mock.patch.object(
+                app_server_schema_runtime_check, "repo_root", return_value=Path("/repo")
+            ),
+            mock.patch.object(
+                app_server_schema_runtime_check,
+                "schema_inputs_changed",
+                return_value=False,
+            ),
+            mock.patch.object(
+                app_server_schema_runtime_check, "run_protocol_check", return_value=0
+            ),
+            mock.patch.object(
+                app_server_schema_runtime_check,
+                "run_stable_compatibility_check",
+                return_value=1,
+            ),
+            mock.patch.object(
+                app_server_schema_runtime_check, "run_python_sdk_contract_check"
+            ) as consumer,
+            mock.patch.object(
+                app_server_schema_runtime_check,
+                "generated_output_lock",
+                return_value=contextlib.nullcontext(),
+            ),
+        ):
+            self.assertEqual(
+                app_server_schema_runtime_check.main(["--mode", "check"]),
+                1,
+            )
+
+        consumer.assert_not_called()
 
     def test_app_server_schema_rejects_removed_auto_mode(self) -> None:
         with self.assertRaises(SystemExit) as raised:

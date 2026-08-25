@@ -503,7 +503,6 @@ fn update_plan_schema_exposes_task_evidence_contract() {
             "depends_on",
             "generated_artifacts",
             "id",
-            "requires_desktop_activation",
             "risks",
             "runtime_paths",
             "status",

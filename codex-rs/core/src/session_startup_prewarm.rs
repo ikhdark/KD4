@@ -31,11 +31,6 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::BaseInstructions;
 
-/// Gives an already-running startup prewarm a brief chance to hand its prepared
-/// websocket and response prefix to the first real turn. This is deliberately
-/// bounded so a stalled speculative request cannot stall ordinary dispatch.
-pub(crate) const FIRST_TURN_PREWARM_HANDOFF_TIMEOUT: Duration = Duration::from_millis(500);
-
 pub(crate) struct SessionStartupPrewarmHandle {
     task: AbortOnDropHandle<CodexResult<ModelClientSession>>,
     started_at: Instant,
@@ -129,31 +124,24 @@ impl SessionStartupPrewarmHandle {
     ) -> SessionStartupPrewarmResolution {
         let _startup_wait = startup_timing.begin_phase(StartupPhase::FirstTurnPrewarmWait);
         let resolve_started_at = Instant::now();
-        let Self {
-            mut task,
-            started_at,
-        } = self;
+        let Self { task, started_at } = self;
         let age_at_first_turn = started_at.elapsed();
 
-        let resolution = tokio::select! {
-            biased;
-            _ = cancellation_token.cancelled() => {
-                task.abort();
-                let _ = task.await;
-                SessionStartupPrewarmResolution::Cancelled
-            }
-            result = &mut task => Self::resolution_from_join_result(result, started_at),
-            _ = tokio::time::sleep(FIRST_TURN_PREWARM_HANDOFF_TIMEOUT) => {
-                // The regular turn owns the transport after this bounded handoff window.
-                // Startup sessions are non-publishing by construction, so aborting the loser
-                // also prevents its transport from entering the shared cache.
-                task.abort();
-                drop(task);
-                info!("startup websocket prewarm missed the first-turn handoff window");
-                SessionStartupPrewarmResolution::Unavailable {
-                    status: "handoff_timeout",
-                    prewarm_duration: Some(started_at.elapsed()),
-                }
+        let resolution = if cancellation_token.is_cancelled() {
+            task.abort();
+            let _ = task.await;
+            SessionStartupPrewarmResolution::Cancelled
+        } else if task.is_finished() {
+            Self::resolution_from_join_result(task.await, started_at)
+        } else {
+            // A speculative startup request must never delay ordinary dispatch. Reuse it only
+            // when it has already completed; otherwise the regular turn owns the transport.
+            task.abort();
+            drop(task);
+            info!("startup websocket prewarm was not ready at first-turn handoff");
+            SessionStartupPrewarmResolution::Unavailable {
+                status: "not_ready",
+                prewarm_duration: Some(started_at.elapsed()),
             }
         };
         let status = match &resolution {
@@ -247,6 +235,11 @@ impl SessionStartupTransportHandle {
         }
     }
 
+    pub(crate) async fn abort(self) {
+        self.task.abort();
+        let _ = self.task.await;
+    }
+
     async fn resolve(self) -> SessionStartupTransportResolution {
         match self.task.await {
             Ok(Ok(client_session)) => {
@@ -278,11 +271,14 @@ impl Session {
         }
         if !self.services.model_client.startup_websocket_enabled() {
             let model_client = self.services.model_client.clone();
-            tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 if let Err(err) = model_client.prewarm_auth().await {
                     warn!("startup auth prewarm failed: {err:#}");
                 }
+                Ok(model_client.new_speculative_session())
             });
+            self.set_session_startup_transport(SessionStartupTransportHandle::new(task))
+                .await;
             return;
         }
 
@@ -387,6 +383,37 @@ impl Session {
                 cancellation_token,
             )
             .await
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
+    struct DropSignal(Arc<AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn aborting_startup_transport_drops_retained_work() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_dropped = Arc::clone(&dropped);
+        let task = tokio::spawn(async move {
+            let _drop_signal = DropSignal(task_dropped);
+            std::future::pending::<CodexResult<ModelClientSession>>().await
+        });
+        tokio::task::yield_now().await;
+
+        SessionStartupTransportHandle::new(task).abort().await;
+
+        assert!(dropped.load(Ordering::SeqCst));
     }
 }
 

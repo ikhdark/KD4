@@ -1121,13 +1121,6 @@ fn feature_flag_details(config: &Config, details: &mut Vec<String>) {
         "feature flag overrides: {}",
         display_list(&overrides)
     ));
-    for usage in features.legacy_feature_usages() {
-        details.push(format!(
-            "legacy feature flag: {} -> {}",
-            usage.alias,
-            usage.feature.key()
-        ));
-    }
 }
 
 fn config_toml_details(config: &Config, details: &mut Vec<String>) {

@@ -79,6 +79,37 @@ path = "scripts/test_kd4_perf_snapshot.py"
 contains = "test_phase0_profile_covers_required_baseline_categories"
 
 [[features]]
+id = "task-continuity-hooks"
+version = 1
+status = "enabled"
+capability_kind = "workflow"
+owner = ".codex/hooks"
+summary = "Repository-local lifecycle hooks that persist, compact, restore, and retain bounded task-continuity capsules while failing open."
+upstream_equivalent = "none"
+config_keys = []
+runtime_verification = { kind = "contract_test", path = "scripts/test_task_continuity_hook.py", symbol = "test_manifest_command_fails_open_before_helper_in_non_git_directory", command = ["python", "-m", "unittest", "scripts.test_task_continuity_hook.TaskContinuityHookTest.test_manifest_command_fails_open_before_helper_in_non_git_directory"] }
+
+[[features.evidence]]
+kind = "entrypoint"
+path = ".codex/hooks/task-continuity-entry.ps1"
+contains = "param("
+
+[[features.evidence]]
+kind = "registration"
+path = ".codex/hooks.json"
+contains = "task-continuity-entry.ps1"
+
+[[features.evidence]]
+kind = "workflow"
+path = ".codex/hooks/task-continuity.ps1"
+contains = "param("
+
+[[features.evidence]]
+kind = "test"
+path = "scripts/test_task_continuity_hook.py"
+contains = "class TaskContinuityHookTest"
+
+[[features]]
 id = "extension-boundary-core"
 version = 1
 status = "enabled"
@@ -87,6 +118,7 @@ owner = "codex-rs/ext/extension-api"
 summary = "Reuse ToolContributor, ToolLifecycleContributor, and ContextContributor before adding KD4-only hooks."
 upstream_equivalent = "codex extension-api contributor registry"
 config_keys = []
+runtime_verification = { kind = "contract_test", path = "codex-rs/ext/extension-api/tests/registry.rs", symbol = "build_round_trips_every_contributor_category", command = ["cargo", "test", "-p", "codex-extension-api", "build_round_trips_every_contributor_category"] }
 
 [[features.evidence]]
 kind = "entrypoint"
@@ -132,6 +164,7 @@ owner = "codex-rs/core"
 summary = "Explicit legacy, script, argv, and internally encoded PowerShell command shapes."
 upstream_equivalent = "partial"
 config_keys = []
+runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/handlers/command_shape_tests.rs", symbol = "tagged_script_and_legacy_shapes_are_explicit", command = ["cargo", "test", "-p", "codex-core", "tagged_script_and_legacy_shapes_are_explicit"] }
 
 [[features.evidence]]
 kind = "entrypoint"
@@ -167,6 +200,7 @@ owner = "codex-rs/core"
 summary = "Active preflight with one bounded read-only equivalent repair and rejection-only mutating commands."
 upstream_equivalent = "none"
 config_keys = []
+runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/handlers/command_preflight_tests.rs", symbol = "never_repairs_mutating_command_flag_typos", command = ["cargo", "test", "-p", "codex-core", "never_repairs_mutating_command_flag_typos"] }
 
 [[features.evidence]]
 kind = "entrypoint"
@@ -197,6 +231,7 @@ owner = "codex-rs/core"
 summary = "Bounded failure-focused output on classic and unified execution paths."
 upstream_equivalent = "partial"
 config_keys = []
+runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/shell_output_summary_tests.rs", symbol = "failed_output_keeps_exact_error_lines", command = ["cargo", "test", "-p", "codex-core", "failed_output_keeps_exact_error_lines"] }
 
 [[features.evidence]]
 kind = "entrypoint"
@@ -227,6 +262,7 @@ owner = "codex-rs/core"
 summary = "Session-bounded command fingerprints with repair accounting and third-identical-failure prevention."
 upstream_equivalent = "none"
 config_keys = []
+runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/command_execution.rs", symbol = "input_state_determined_failure_blocks_exact_retry_but_freshness_bypasses", command = ["cargo", "test", "-p", "codex-core", "input_state_determined_failure_blocks_exact_retry_but_freshness_bypasses"] }
 
 [[features.evidence]]
 kind = "entrypoint"
@@ -262,6 +298,7 @@ owner = "codex-rs/core"
 summary = "Addressable full raw command output streamed before bounded transcript retention or model summarization, including background completion."
 upstream_equivalent = "none"
 config_keys = []
+runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/handlers/unified_exec_tests.rs", symbol = "foreground_output_artifact_retains_bytes_beyond_transcript_cap", command = ["cargo", "test", "-p", "codex-core", "foreground_output_artifact_retains_bytes_beyond_transcript_cap"] }
 
 [[features.evidence]]
 kind = "entrypoint"
@@ -302,6 +339,7 @@ owner = "codex-rs/shell-command"
 summary = "Explicit PowerShell paths win, otherwise pwsh is preferred with Windows PowerShell compatibility fallback."
 upstream_equivalent = "partial"
 config_keys = []
+runtime_verification = { kind = "contract_test", path = "codex-rs/shell-command/src/shell_detect.rs", symbol = "powershell_resolver_prefers_pwsh_then_compatibility_host", command = ["cargo", "test", "-p", "codex-shell-command", "powershell_resolver_prefers_pwsh_then_compatibility_host"] }
 
 [[features.evidence]]
 kind = "entrypoint"
@@ -352,6 +390,7 @@ owner = "codex-rs/app-server"
 summary = "Build, install, runtime, and KD4 watermark metadata at initialization."
 upstream_equivalent = "partial"
 config_keys = []
+runtime_verification = { kind = "integration_test", path = "codex-rs/app-server/tests/suite/v2/initialize.rs", symbol = "initialize_response_includes_local_runtime_metadata", command = ["cargo", "test", "-p", "codex-app-server", "initialize_response_includes_local_runtime_metadata"] }
 generated_artifacts = [
   "codex-rs/app-server-protocol/schema/json/v1/InitializeResponse.json",
   "codex-rs/app-server-protocol/schema/typescript/ServerRuntimeInfo.ts",
@@ -411,6 +450,7 @@ owner = "codex-rs/core"
 summary = "Cached and diversified discovery of deferred core and extension tools."
 upstream_equivalent = "partial"
 config_keys = []
+runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/spec_plan_tests.rs", symbol = "tool_search_cache_rebuilds_when_deferred_sources_change", command = ["cargo", "test", "-p", "codex-core", "tool_search_cache_rebuilds_when_deferred_sources_change"] }
 
 [[features.evidence]]
 kind = "entrypoint"
@@ -441,6 +481,7 @@ owner = "codex-rs/config"
 summary = "Human-readable configuration reference exposed through codex config explain."
 upstream_equivalent = "none"
 config_keys = []
+runtime_verification = { kind = "contract_test", path = "codex-rs/cli/src/main.rs", symbol = "config_explain_parses_optional_filter", command = ["cargo", "test", "-p", "codex-cli", "config_explain_parses_optional_filter"] }
 
 [[features.evidence]]
 kind = "entrypoint"
@@ -475,13 +516,17 @@ retired_paths = ["codex-rs/config/src/coding_budgets.rs"]
 
 [[features]]
 id = "task-evidence-completion-gate"
-version = 12
+version = 13
 status = "enabled"
 capability_kind = "runtime"
 owner = "codex-rs/core"
-summary = "Persisted schema-v12 task evidence, including explicit plan acknowledgement, versioned manifests, candidate-bound proof identity, atomic completion-review and terminal-delivery lineage, authenticated Desktop activation receipts, and migration from older schemas."
+summary = "Persisted versioned task evidence, including explicit plan acknowledgement, versioned manifests, candidate-bound proof identity, atomic completion-review and terminal-delivery lineage, and migration from older schemas."
 upstream_equivalent = "none"
 config_keys = []
+runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/task_evidence_tests.rs", symbol = "current_schema_reload_removes_stale_skipped_step_requirements", command = ["cargo", "test", "-p", "codex-core", "current_schema_reload_removes_stale_skipped_step_requirements"] }
+contract_schema_version = 13
+contract_schema_source = "codex-rs/core/src/task_evidence.rs"
+contract_schema_symbol = "TASK_EVIDENCE_SCHEMA_VERSION"
 source_owner = "task-evidence-runtime"
 
 [[features]]
@@ -496,6 +541,7 @@ owner = "codex-rs/core"
 summary = "Host-enforced KD4 completion review with sparse exception-only reviewer output, deterministic host-selected lenses, candidate-bound evidence, host-validated freshness, host-computed cleanliness, one automatic correction phase, and one independent rereview."
 upstream_equivalent = "none"
 config_keys = ["features.task_completion_reviewer"]
+runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tasks/completion_review_v2.rs", symbol = "sparse_wire_contract_requires_all_five_arrays_and_rejects_legacy_fields", command = ["cargo", "test", "-p", "codex-core", "sparse_wire_contract_requires_all_five_arrays_and_rejects_legacy_fields"] }
 
 [[features.evidence]]
 kind = "entrypoint"
@@ -523,24 +569,19 @@ path = "codex-rs/core/src/tasks/completion_review_v2.rs"
 contains = "sparse_wire_contract_requires_all_five_arrays_and_rejects_legacy_fields"
 
 [[features]]
-id = "desktop-runtime-receipt"
-version = 1
-status = "planned"
-capability_kind = "runtime"
-owner = "codex-rs/app-server"
-summary = "Authenticated, publish-ID-bound proof that Codex Desktop initialized the intended installed binary and live process."
-upstream_equivalent = "none"
-config_keys = []
-
-[[features]]
 id = "repository-intelligence"
-version = 1
-status = "planned"
-capability_kind = "runtime"
-owner = "codex-rs"
-summary = "Incremental ownership, reachability, impact, test, and generated-output graph."
+version = 2
+status = "enabled"
+capability_kind = "workflow"
+owner = "scripts"
+summary = "Deterministic source-owner relationship graph with bounded architecture slices and generated map/index mirrors."
 upstream_equivalent = "none"
 config_keys = []
+source_owner = "source-owner-index"
+generated_artifacts = [
+  "SOURCEMAP.md",
+  "architecture_index.json",
+]
 
 [[features]]
 id = "shared-worktree-reliability"
@@ -551,6 +592,7 @@ owner = "codex-rs/agent-task-store"
 summary = "Nonblocking workspace revision and path-event tracking, advisory claims, best-effort mutation evidence, validation singleflight, lifecycle quiescence, and versioned isolated-worktree handoffs."
 upstream_equivalent = "none"
 config_keys = []
+runtime_verification = { kind = "contract_test", path = "codex-rs/agent-task-store/src/tests.rs", symbol = "focused_validation_dependency_receipt_freshness_is_scoped", command = ["cargo", "test", "-p", "codex-agent-task-store", "focused_validation_dependency_receipt_freshness_is_scoped"] }
 
 [[features.evidence]]
 kind = "module"

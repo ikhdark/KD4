@@ -42,7 +42,8 @@ async fn exit_before_watcher_registration_is_observed_once() {
             None,
             tokio::time::Instant::now(),
         )
-        .await;
+        .await
+        .expect("track running process");
     let exit = CancellationToken::new();
     let output_drained = CancellationToken::new();
     exit.cancel();

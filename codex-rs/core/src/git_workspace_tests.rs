@@ -54,6 +54,33 @@ async fn local_snapshot(cwd: AbsolutePathBuf, generation: u64) -> TurnEnvironmen
 }
 
 #[tokio::test]
+async fn root_discovery_starts_independent_resolutions_concurrently_and_preserves_order() {
+    async fn wait_and_return(
+        barrier: Arc<tokio::sync::Barrier>,
+        value: &'static str,
+    ) -> &'static str {
+        barrier.wait().await;
+        value
+    }
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let first_barrier = Arc::clone(&barrier);
+    let second_barrier = Arc::clone(&barrier);
+
+    let roots = tokio::time::timeout(
+        Duration::from_millis(200),
+        resolve_roots_in_order([
+            wait_and_return(first_barrier, "first"),
+            wait_and_return(second_barrier, "second"),
+        ]),
+    )
+    .await
+    .expect("independent root probes should start concurrently");
+
+    assert_eq!(roots, vec!["first", "second"]);
+}
+
+#[tokio::test]
 async fn snapshot_preserves_native_environment_pairing_when_foreign_cwds_are_skipped() {
     let manager = local_environment_manager().await;
     let environment = manager
@@ -130,13 +157,67 @@ fn duplicate_repository_reads_combined_diff_preserves_only_the_patch() {
 :100644 100644 aaaaaaa bbbbbbb R100\0old name.rs\0new name.rs\0\0\
 diff --git a/src/lib.rs b/src/lib.rs\npatch body\n";
 
-    let (paths, patch) = candidate_diff_and_paths(capture).expect("combined diff capture");
+    let (paths, patch) = candidate_diff_and_paths(capture.to_vec()).expect("combined diff capture");
 
     assert_eq!(
         paths,
-        vec!["src/lib.rs".to_string(), "new name.rs".to_string()]
+        vec![
+            "src/lib.rs".to_string(),
+            "old name.rs".to_string(),
+            "new name.rs".to_string(),
+        ]
     );
     assert_eq!(patch, b"diff --git a/src/lib.rs b/src/lib.rs\npatch body\n");
+}
+
+#[test]
+fn duplicate_repository_reads_untracked_paths_are_owned_in_one_parse() {
+    assert_eq!(
+        candidate_untracked_paths(b"z.txt\0a file.txt\0\0"),
+        Some(vec!["z.txt".to_string(), "a file.txt".to_string()])
+    );
+    assert_eq!(candidate_untracked_paths(b"valid\0\xff\0"), None);
+}
+
+#[tokio::test]
+async fn duplicate_repository_reads_require_two_matching_captures() {
+    let mut observations = [Some(1), Some(2), Some(2)].into_iter();
+    assert_eq!(
+        stable_workspace_capture(|| std::future::ready(observations.next().flatten())).await,
+        Some(2)
+    );
+
+    let mut changing = [Some(1), Some(2), Some(3)].into_iter();
+    assert_eq!(
+        stable_workspace_capture(|| std::future::ready(changing.next().flatten())).await,
+        None
+    );
+}
+
+#[tokio::test]
+async fn failed_workspace_refresh_invalidates_the_latest_identity() {
+    let (_temp, repo) = create_clean_git_repo().await;
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+
+    let identity = cache
+        .workspace_evidence_identity(repo.as_path())
+        .await
+        .expect("initial identity");
+    assert_eq!(
+        cache.latest_workspace_evidence_identity(repo.as_path()),
+        Some(identity)
+    );
+
+    std::fs::rename(repo.join(".git"), repo.join(".git-disabled"))
+        .expect("disable repository metadata");
+    assert_eq!(
+        cache.workspace_evidence_identity(repo.as_path()).await,
+        None
+    );
+    assert_eq!(
+        cache.latest_workspace_evidence_identity(repo.as_path()),
+        None
+    );
 }
 
 #[tokio::test]
@@ -151,6 +232,9 @@ async fn duplicate_repository_reads_candidate_diff_uses_combined_layer_observati
         .await
         .expect("candidate diff capture");
     let identity = capture.workspace_evidence_identity();
+    let identity_only = capture_workspace_evidence_identity(repo.as_path())
+        .await
+        .expect("identity-only capture");
 
     assert_eq!(
         capture.changed_paths,
@@ -167,6 +251,7 @@ async fn duplicate_repository_reads_candidate_diff_uses_combined_layer_observati
     assert_eq!(identity.head_identity, capture.head_identity);
     assert_eq!(identity.index_identity, capture.index_identity);
     assert_eq!(identity.worktree_identity, capture.worktree_identity);
+    assert_eq!(identity_only, identity);
     assert_eq!(
         identity.repository_root,
         Some(
@@ -736,4 +821,18 @@ fn recursive_source_path_observation_detects_descendant_changes() {
     cache.note_host_workspace_mutation_paths(root.path(), &["src/nested/lib.rs".to_string()]);
 
     assert!(!cache.source_path_change_observation_is_current(&observation));
+}
+
+#[test]
+fn path_relationships_preserve_case_on_case_sensitive_filesystems() {
+    assert!(!path_is_same_or_descendant_with_case_sensitivity(
+        Path::new("repo/src/Owner.rs"),
+        Path::new("repo/src/owner.rs"),
+        true,
+    ));
+    assert!(path_is_same_or_descendant_with_case_sensitivity(
+        Path::new("repo/src/Owner.rs"),
+        Path::new("repo/src/owner.rs"),
+        false,
+    ));
 }

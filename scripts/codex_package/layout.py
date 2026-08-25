@@ -1,19 +1,25 @@
 """Canonical Codex package directory layout."""
 
-import json
+import hashlib
 import inspect
+import json
 import os
+import platform
+import re
 import shutil
 import stat
+import struct
+import subprocess
 from pathlib import Path
 from pathlib import PureWindowsPath
 
+from .targets import REPO_ROOT
 from .targets import PackageInputs
 from .targets import PackageVariant
 from .targets import TargetSpec
 
 
-LAYOUT_VERSION = 1
+LAYOUT_VERSION = 2
 APPLY_PATCH_ALIASES = ("apply_patch", "applypatch")
 CODEX_CORE_APPLY_PATCH_ARG1 = "--codex-run-as-apply-patch"
 MANAGED_PACKAGE_PATHS = (
@@ -21,6 +27,8 @@ MANAGED_PACKAGE_PATHS = (
     Path("codex-resources"),
     Path("codex-path"),
     Path("codex-package.json"),
+    Path("LICENSE"),
+    Path("NOTICE"),
 )
 
 
@@ -28,7 +36,7 @@ def prepare_package_dir(package_dir: Path, *, force: bool, reuse: bool = False) 
     validate_package_dir_destination(package_dir, force=force, reuse=reuse)
     if package_dir.exists():
         if reuse:
-            clean_managed_package_paths(package_dir)
+            clean_package_dir(package_dir)
         elif any(package_dir.iterdir()):
             remove_tree_allow_readonly(package_dir)
 
@@ -54,9 +62,8 @@ def validate_package_dir_destination(
         )
 
 
-def clean_managed_package_paths(package_dir: Path) -> None:
-    for relative_path in MANAGED_PACKAGE_PATHS:
-        path = package_dir / relative_path
+def clean_package_dir(package_dir: Path) -> None:
+    for path in package_dir.iterdir():
         if path.is_dir():
             remove_tree_allow_readonly(path)
         else:
@@ -115,6 +122,8 @@ def build_package_dir(
     variant: PackageVariant,
     spec: TargetSpec,
     inputs: PackageInputs,
+    *,
+    build_identity: dict[str, object] | None = None,
 ) -> None:
     validate_package_input_roles(inputs)
     bin_dir = package_dir / "bin"
@@ -156,6 +165,14 @@ def build_package_dir(
             resources_dir / "codex-windows-sandbox-setup.exe",
         )
 
+    shutil.copyfile(REPO_ROOT / "LICENSE", package_dir / "LICENSE")
+    shutil.copyfile(REPO_ROOT / "NOTICE", package_dir / "NOTICE")
+
+    files = package_file_inventory(package_dir, variant=variant, spec=spec)
+    bundle_id = hashlib.sha256(
+        json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
     metadata = {
         "layoutVersion": LAYOUT_VERSION,
         "version": version,
@@ -164,6 +181,9 @@ def build_package_dir(
         "entrypoint": f"bin/{entrypoint_name}",
         "resourcesDir": "codex-resources",
         "pathDir": "codex-path",
+        "bundleId": bundle_id,
+        "buildIdentity": build_identity or {"status": "unavailable"},
+        "files": files,
     }
     write_json(package_dir / "codex-package.json", metadata)
 
@@ -174,7 +194,6 @@ def validate_package_dir(
     spec: TargetSpec,
     *,
     expected_version: str | None = None,
-    fast: bool = False,
 ) -> None:
     required_dirs = [
         Path("bin"),
@@ -216,25 +235,54 @@ def validate_package_dir(
                 f"Invalid package metadata field {key!r}: expected {expected!r}, got {actual!r}"
             )
 
-    required_files = [
-        Path("bin") / variant.entrypoint_name(spec),
-        Path("bin") / spec.code_mode_host_name,
-        Path("codex-path") / spec.rg_name,
-    ]
-    executable_files = list(required_files)
-
-    required_files.extend(
-        [
-            Path("codex-resources") / "codex-command-runner.exe",
-            Path("codex-resources") / "codex-windows-sandbox-setup.exe",
-            *[Path("codex-path") / f"{alias}.bat" for alias in APPLY_PATCH_ALIASES],
-        ]
-    )
-
-    for relative_file in required_files:
-        path = package_dir / relative_file
+    files = metadata.get("files")
+    if not isinstance(files, list) or not files:
+        raise RuntimeError("Invalid package metadata field 'files'")
+    declared_paths: set[str] = set()
+    for entry in files:
+        if not isinstance(entry, dict):
+            raise RuntimeError("Invalid package file inventory entry")
+        relative = entry.get("path")
+        if not isinstance(relative, str) or not relative or relative in declared_paths:
+            raise RuntimeError(f"Invalid package file inventory path: {relative!r}")
+        relative_path = Path(relative)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise RuntimeError(f"Unsafe package file inventory path: {relative}")
+        declared_paths.add(relative)
+        path = package_dir / relative_path
         if not path.is_file():
-            raise RuntimeError(f"Missing package file: {relative_file}")
+            raise RuntimeError(f"Missing package file: {relative}")
+        actual_size = path.stat().st_size
+        actual_sha256 = sha256_file(path)
+        if entry.get("size") != actual_size or entry.get("sha256") != actual_sha256:
+            raise RuntimeError(f"Package file digest mismatch: {relative}")
+
+    actual_paths = {
+        path.relative_to(package_dir).as_posix()
+        for path in package_dir.rglob("*")
+        if path.is_file() and path.name != "codex-package.json"
+    }
+    if actual_paths != declared_paths:
+        unexpected = sorted(actual_paths - declared_paths)
+        missing = sorted(declared_paths - actual_paths)
+        raise RuntimeError(
+            f"Package inventory mismatch: unexpected={unexpected}, missing={missing}"
+        )
+
+    expected_bundle_id = hashlib.sha256(
+        json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    if metadata.get("bundleId") != expected_bundle_id:
+        raise RuntimeError("Invalid package metadata field 'bundleId'")
+    if not isinstance(metadata.get("buildIdentity"), dict) or not metadata[
+        "buildIdentity"
+    ]:
+        raise RuntimeError("Invalid package metadata field 'buildIdentity'")
+
+    validate_pe_targets(package_dir, files, spec)
+    validate_host_entrypoint_version(
+        package_dir / str(metadata["entrypoint"]), spec, version
+    )
 
     expected_alias_text = windows_apply_patch_alias_text(
         PureWindowsPath("..") / "bin" / variant.entrypoint_name(spec)
@@ -256,7 +304,7 @@ def copy_executable(
     copy_file_for_staging(
         src,
         dest,
-        prefer_hardlink=True if prefer_hardlink is None else prefer_hardlink,
+        prefer_hardlink=False,
     )
 
 
@@ -280,13 +328,8 @@ def windows_apply_patch_alias_text(entrypoint_relative_path: PureWindowsPath) ->
 
 
 def copy_file_for_staging(src: Path, dest: Path, *, prefer_hardlink: bool) -> None:
+    _ = prefer_hardlink
     dest.unlink(missing_ok=True)
-    if prefer_hardlink:
-        try:
-            os.link(src, dest)
-            return
-        except OSError:
-            pass
     shutil.copyfile(src, dest)
 
 
@@ -296,5 +339,107 @@ def write_json(path: Path, value: object) -> None:
         out.write("\n")
 
 
-def is_executable(path: Path) -> bool:
-    return path.is_file()
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def package_file_inventory(
+    package_dir: Path, *, variant: PackageVariant, spec: TargetSpec
+) -> list[dict[str, object]]:
+    roles = {
+        f"bin/{variant.entrypoint_name(spec)}": "entrypoint",
+        f"bin/{spec.code_mode_host_name}": "code-mode-host",
+        "codex-resources/codex-command-runner.exe": "command-runner",
+        "codex-resources/codex-windows-sandbox-setup.exe": "sandbox-setup",
+        f"codex-path/{spec.rg_name}": "ripgrep",
+        "codex-path/apply_patch.bat": "apply-patch-alias",
+        "codex-path/applypatch.bat": "apply-patch-alias",
+        "LICENSE": "license",
+        "NOTICE": "notice",
+    }
+    inventory = []
+    for path in sorted(package_dir.rglob("*")):
+        if not path.is_file() or path.name == "codex-package.json":
+            continue
+        relative = path.relative_to(package_dir).as_posix()
+        inventory.append(
+            {
+                "path": relative,
+                "role": roles.get(relative, "resource"),
+                "size": path.stat().st_size,
+                "sha256": sha256_file(path),
+            }
+        )
+    return inventory
+
+
+def pe_machine(path: Path) -> int | None:
+    with path.open("rb") as file:
+        if file.read(2) != b"MZ":
+            return None
+        file.seek(0x3C)
+        offset_bytes = file.read(4)
+        if len(offset_bytes) != 4:
+            raise RuntimeError(f"Invalid PE executable: {path}")
+        file.seek(struct.unpack("<I", offset_bytes)[0])
+        if file.read(4) != b"PE\0\0":
+            raise RuntimeError(f"Invalid PE executable: {path}")
+        machine = file.read(2)
+        if len(machine) != 2:
+            raise RuntimeError(f"Invalid PE executable: {path}")
+        return struct.unpack("<H", machine)[0]
+
+
+def validate_pe_targets(
+    package_dir: Path, files: list[dict[str, object]], spec: TargetSpec
+) -> None:
+    expected_machine = {
+        "x86_64-pc-windows-msvc": 0x8664,
+        "aarch64-pc-windows-msvc": 0xAA64,
+    }.get(spec.target)
+    if expected_machine is None:
+        return
+    for entry in files:
+        relative = str(entry["path"])
+        if not relative.lower().endswith(".exe"):
+            continue
+        machine = pe_machine(package_dir / relative)
+        if machine is not None and machine != expected_machine:
+            raise RuntimeError(
+                f"Package executable target mismatch: {relative} has PE machine "
+                f"0x{machine:04x}, expected 0x{expected_machine:04x}"
+            )
+
+
+def validate_host_entrypoint_version(
+    entrypoint: Path, spec: TargetSpec, expected_version: str
+) -> None:
+    host_target = {
+        "amd64": "x86_64-pc-windows-msvc",
+        "x86_64": "x86_64-pc-windows-msvc",
+        "arm64": "aarch64-pc-windows-msvc",
+        "aarch64": "aarch64-pc-windows-msvc",
+    }.get(platform.machine().lower())
+    if os.name != "nt" or host_target != spec.target or pe_machine(entrypoint) is None:
+        return
+    try:
+        completed = subprocess.run(
+            [entrypoint, "--version"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(f"Packaged entrypoint failed --version: {entrypoint}") from error
+    version_match = re.search(r"([0-9][0-9A-Za-z.+-]*)\s*$", completed.stdout.strip())
+    actual_version = version_match.group(1) if version_match else None
+    if actual_version != expected_version:
+        raise RuntimeError(
+            "Packaged entrypoint version mismatch: "
+            f"expected {expected_version}, got {actual_version!r}"
+        )

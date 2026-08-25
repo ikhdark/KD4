@@ -2,22 +2,1354 @@ use chrono::Duration;
 use chrono::Utc;
 use codex_state::StateRuntime;
 use pretty_assertions::assert_eq;
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use tempfile::TempDir;
 use uuid::Uuid;
 
+static TEST_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+fn task_store_migrator_through(version: i64) -> sqlx::migrate::Migrator {
+    sqlx::migrate::Migrator {
+        migrations: Cow::Owned(
+            TEST_MIGRATOR
+                .migrations
+                .iter()
+                .filter(|migration| migration.version <= version)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: TEST_MIGRATOR.ignore_missing,
+        locking: TEST_MIGRATOR.locking,
+        table_name: TEST_MIGRATOR.table_name.clone(),
+        create_schemas: TEST_MIGRATOR.create_schemas.clone(),
+        no_tx: TEST_MIGRATOR.no_tx,
+    }
+}
+
 use super::*;
+use crate::local::TestReceiptRefreshPause;
 use crate::local::TestSnapshotCapturePause;
+use crate::local::with_test_receipt_refresh_pause;
 use crate::local::with_test_snapshot_capture_pause;
+use crate::workspace::TestWorkspaceCapturePause;
+use crate::workspace::with_test_workspace_capture_pause;
 
 #[test]
 fn editing_and_tool_calls_are_meaningful_progress() {
     assert!(ObservationKind::Editing.is_meaningful_progress());
     assert!(ObservationKind::ToolCall.is_meaningful_progress());
     assert!(!ObservationKind::Starting.is_meaningful_progress());
+}
+
+#[tokio::test]
+async fn audit_mutation_recovery_f060_page_reports_completeness_and_rejects_zero() {
+    let fixture = Fixture::new().await;
+    std::fs::create_dir_all(fixture.repo.path().join("src")).expect("src creates");
+    let (_, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), worker_draft("audit-page", "src"))
+        .await
+        .expect("assignment creates");
+    for path in ["src/a.rs", "src/b.rs"] {
+        std::fs::write(fixture.repo.path().join(path), "before").expect("file writes");
+        fixture
+            .store
+            .begin_mutation(
+                attempt.attempt_id,
+                fixture.repo.path(),
+                path.to_string(),
+                AttributionConfidence::Definitive,
+            )
+            .await
+            .expect("mutation begins");
+    }
+    let page = fixture
+        .store
+        .list_mutation_evidence_page(attempt.attempt_id, Some(1))
+        .await
+        .expect("page reads");
+    assert_eq!(page.evidence.len(), 1);
+    assert_eq!(page.total_count, 2);
+    assert!(page.truncated);
+    assert_eq!(page.next_cursor, Some(1));
+    assert!(matches!(
+        fixture
+            .store
+            .list_mutation_evidence(attempt.attempt_id, Some(0))
+            .await,
+        Err(StoreError::InvalidMutationEvidenceLimit(0))
+    ));
+}
+
+#[tokio::test]
+async fn audit_mutation_recovery_f061_finalize_pending_is_atomic() {
+    let fixture = Fixture::new().await;
+    std::fs::create_dir_all(fixture.repo.path().join("src")).expect("src creates");
+    let (_, attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            worker_draft("audit-finalize-all", "src"),
+        )
+        .await
+        .expect("assignment creates");
+    for path in ["src/a.rs", "src/b.rs"] {
+        std::fs::write(fixture.repo.path().join(path), "before").expect("file writes");
+        fixture
+            .store
+            .begin_mutation(
+                attempt.attempt_id,
+                fixture.repo.path(),
+                path.into(),
+                AttributionConfidence::Definitive,
+            )
+            .await
+            .expect("mutation begins");
+    }
+    std::fs::remove_file(fixture.repo.path().join("src/b.rs")).expect("file removes");
+    std::fs::create_dir(fixture.repo.path().join("src/b.rs")).expect("directory replaces file");
+    assert!(
+        fixture
+            .store
+            .finalize_pending_mutations(attempt.attempt_id)
+            .await
+            .is_err()
+    );
+    let page = fixture
+        .store
+        .list_mutation_evidence_page(attempt.attempt_id, None)
+        .await
+        .expect("page reads");
+    assert!(page.evidence.iter().all(|item| item.finalized_at.is_none()));
+}
+
+#[tokio::test]
+async fn audit_mutation_recovery_f062_prewrite_capture_holds_coordination_lock() {
+    let fixture = Fixture::new().await;
+    std::fs::create_dir_all(fixture.repo.path().join("src")).expect("src creates");
+    std::fs::write(fixture.repo.path().join("src/a.rs"), "before").expect("file writes");
+    let (_, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), worker_draft("audit-pre", "src"))
+        .await
+        .expect("assignment creates");
+    let pause = Arc::new(TestSnapshotCapturePause::new());
+    let task_pause = Arc::clone(&pause);
+    let store = fixture.store.clone();
+    let repo = fixture.repo.path().to_path_buf();
+    let task = tokio::spawn(async move {
+        with_test_snapshot_capture_pause(
+            task_pause,
+            store.begin_mutation(
+                attempt.attempt_id,
+                &repo,
+                "src/a.rs".into(),
+                AttributionConfidence::Definitive,
+            ),
+        )
+        .await
+    });
+    let permit = pause.started.acquire().await.expect("capture pauses");
+    permit.forget();
+    let pool = coordination_pool(&fixture).await;
+    let mut connection = pool.acquire().await.expect("connection opens");
+    let writer = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection),
+    )
+    .await;
+    assert!(
+        !matches!(writer, Ok(Ok(_))),
+        "writer must remain excluded during prewrite capture"
+    );
+    pause.release.add_permits(1);
+    task.await.expect("task joins").expect("mutation begins");
+}
+
+#[tokio::test]
+async fn audit_mutation_recovery_f063_final_snapshot_matches_commit_evidence() {
+    let fixture = Fixture::new().await;
+    std::fs::create_dir_all(fixture.repo.path().join("src")).expect("src creates");
+    std::fs::write(fixture.repo.path().join("src/a.rs"), "before").expect("file writes");
+    let (_, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), worker_draft("audit-final", "src"))
+        .await
+        .expect("assignment creates");
+    fixture
+        .store
+        .begin_mutation(
+            attempt.attempt_id,
+            fixture.repo.path(),
+            "src/a.rs".into(),
+            AttributionConfidence::Definitive,
+        )
+        .await
+        .expect("mutation begins");
+    std::fs::write(fixture.repo.path().join("src/a.rs"), "committed").expect("file mutates");
+    let pause = Arc::new(TestSnapshotCapturePause::new());
+    let task_pause = Arc::clone(&pause);
+    let store = fixture.store.clone();
+    let repo = fixture.repo.path().to_path_buf();
+    let task = tokio::spawn(async move {
+        with_test_snapshot_capture_pause(
+            task_pause,
+            store.finalize_mutation(attempt.attempt_id, &repo, "src/a.rs".into()),
+        )
+        .await
+    });
+    let permit = pause.started.acquire().await.expect("capture pauses");
+    permit.forget();
+    let pool = coordination_pool(&fixture).await;
+    let mut connection = pool.acquire().await.expect("connection opens");
+    let writer = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection),
+    )
+    .await;
+    assert!(
+        !matches!(writer, Ok(Ok(_))),
+        "writer must remain excluded until final evidence commits"
+    );
+    pause.release.add_permits(1);
+    let evidence = task.await.expect("task joins").expect("mutation finalizes");
+    let snapshot = fixture
+        .store
+        .read_mutation_snapshot(
+            attempt.attempt_id,
+            "src/a.rs".into(),
+            MutationSnapshotVersion::Final,
+            0,
+            None,
+        )
+        .await
+        .expect("snapshot reads");
+    assert_eq!(snapshot.bytes, b"committed");
+    assert!(evidence.end_epoch.is_some());
+}
+
+#[tokio::test]
+async fn audit_mutation_recovery_f064_summary_records_configured_policy() {
+    let fixture = Fixture::new().await;
+    let (assignment, _) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), worker_draft("audit-policy", "src"))
+        .await
+        .expect("assignment creates");
+    let now = Utc::now() + Duration::seconds(300);
+    let recovery = crate::local::with_test_comparison_now(
+        now,
+        fixture.store.recover_nonproductive_assignment(
+            assignment.assignment_id,
+            now - Duration::seconds(37),
+        ),
+    )
+    .await
+    .expect("recovery evaluates");
+    let NonproductiveRecovery::Recovered {
+        receipt,
+        productivity,
+    } = recovery
+    else {
+        panic!("recovery should complete")
+    };
+    assert!(receipt.summary.contains("37 seconds"));
+    assert_eq!(productivity.recovery_threshold_seconds, 37);
+    assert_eq!(
+        productivity.recovery_policy_version,
+        NONPRODUCTIVE_RECOVERY_POLICY_VERSION
+    );
+}
+
+#[tokio::test]
+async fn audit_mutation_recovery_f065_validation_leases_are_server_bounded() {
+    let fixture = Fixture::new().await;
+    initialize_validation_repository(fixture.repo.path());
+    let command = "cargo test audit lease";
+    let (_, attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            validation_worker_draft("audit-lease", "src", command),
+        )
+        .await
+        .expect("assignment creates");
+    let now = fixed_time("2030-01-01T00:00:00Z");
+    let call = crate::local::with_test_comparison_now(
+        now,
+        start_focused_validation_with_evidence(
+            &fixture.store,
+            attempt.attempt_id,
+            "audit-lease-call",
+            command,
+            ValidationEvidence {
+                lease_expires_at: Some(fixed_time("2099-01-01T00:00:00Z")),
+                ..ValidationEvidence::default()
+            },
+        ),
+    )
+    .await;
+    assert_eq!(
+        call.evidence.lease_expires_at,
+        Some(now + Duration::seconds(MAX_VALIDATION_LEASE_SECONDS))
+    );
+    crate::local::with_test_comparison_now(
+        now + Duration::seconds(10),
+        fixture
+            .store
+            .heartbeat_validation_call(call.call_id.clone(), fixed_time("2099-01-01T00:00:00Z")),
+    )
+    .await
+    .expect("heartbeat succeeds");
+    let refreshed = fixture
+        .store
+        .get_validation_call(call.call_id)
+        .await
+        .expect("call reads")
+        .expect("call exists");
+    assert_eq!(
+        refreshed.evidence.lease_expires_at,
+        Some(now + Duration::seconds(10 + MAX_VALIDATION_LEASE_SECONDS))
+    );
+}
+
+#[tokio::test]
+async fn audit_mutation_recovery_f066_distinct_stale_causes_are_not_deduplicated() {
+    let fixture = Fixture::new().await;
+    let (_, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), worker_draft("audit-stale", "src"))
+        .await
+        .expect("assignment creates");
+    let pool = coordination_pool(&fixture).await;
+    let mut transaction = pool.begin().await.expect("transaction begins");
+    crate::local::record_stale_event_tx(&mut transaction, &attempt, 7, "manifest changed")
+        .await
+        .expect("first stale event");
+    crate::local::record_stale_event_tx(&mut transaction, &attempt, 7, "toolchain changed")
+        .await
+        .expect("second stale event");
+    transaction.commit().await.expect("transaction commits");
+    let count = sqlx::query_scalar::<_, i64>(
+        "SELECT stale_events FROM stale_recovery WHERE attempt_id = ?",
+    )
+    .bind(attempt.attempt_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("count reads");
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
+async fn audit_mutation_recovery_f067_epoch_overflow_is_rejected() {
+    let fixture = Fixture::new().await;
+    assert!(matches!(
+        fixture.store.read_workspace_events(fixture.repo.path(), u64::MAX).await,
+        Err(StoreError::CorruptData(message)) if message.contains("SQLite integer range")
+    ));
+}
+
+#[tokio::test]
+async fn audit_mutation_recovery_f068_failed_reconciliation_does_not_commit_hidden_call() {
+    let fixture = Fixture::new().await;
+    initialize_validation_repository(fixture.repo.path());
+    let command = "cargo test audit reconciliation";
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            validation_worker_draft("audit-reconcile", "src", command),
+        )
+        .await
+        .expect("assignment creates");
+    let pool = coordination_pool(&fixture).await;
+    sqlx::query("INSERT INTO stale_recovery (attempt_id, stale_events, reconciliation_call_id, last_stale_epoch, last_reason, updated_at) VALUES (?, 1, 'existing', 1, 'stale', ?)").bind(attempt.attempt_id.to_string()).bind(serde_json::to_string(&Utc::now()).expect("time serializes")).execute(&pool).await.expect("recovery state seeds");
+    let result = fixture
+        .store
+        .record_validation_call(ValidationCall {
+            call_id: "rejected-reconciliation".into(),
+            attempt_id: attempt.attempt_id,
+            command_summary: command.into(),
+            resolved_executable: resolved_test_executable(),
+            proof_kind: ValidationProofKind::Focused,
+            evidence: ValidationEvidence::default(),
+            status: ValidationCallStatus::Running,
+            recorded_at: Utc::now(),
+        })
+        .await;
+    assert!(matches!(result, Err(StoreError::StaleRecoveryExhausted(_))));
+    assert!(
+        fixture
+            .store
+            .get_validation_call("rejected-reconciliation".into())
+            .await
+            .expect("lookup succeeds")
+            .is_none()
+    );
+    assert_eq!(
+        fixture
+            .store
+            .get_agent_task(assignment.assignment_id, Some(0))
+            .await
+            .expect("task reads")
+            .current_attempt
+            .state,
+        AttemptState::Active
+    );
+}
+
+fn audit_capsule(assignment: &Assignment, attempt: &Attempt) -> TaskCapsuleV1 {
+    TaskCapsuleV1 {
+        schema_version: 1,
+        assignment_id: assignment.assignment_id,
+        attempt_id: attempt.attempt_id,
+        role: assignment.role,
+        capability_profile: assignment.capability_profile,
+        requirements: assignment.acceptance_criteria.clone(),
+        objective: assignment.objective.clone(),
+        read_scope: assignment.read_scope.clone(),
+        write_scope: assignment.write_scope.clone(),
+        stop_condition: assignment.stop_condition.clone(),
+        dependencies: assignment.dependencies.clone(),
+        risk_hints: assignment.risk_hints.clone(),
+        contract_claims: assignment.contract_claims.clone(),
+        workspace_strategy: Some(assignment.workspace_strategy),
+        relation: assignment.relation.clone(),
+        architecture_contract_ref: assignment.architecture_contract_ref.clone(),
+        integration_plan: assignment.integration_plan,
+        relevant_handles: Vec::new(),
+        workspace_epoch: assignment.start_epoch,
+        workspace_manifest_hash: "audit-manifest".into(),
+        prohibited_changes: assignment.prohibited_changes.clone(),
+        required_evidence: assignment.required_evidence.clone(),
+    }
+}
+
+#[tokio::test]
+async fn audit_mutation_recovery_f070_capsule_publication_reconciles_committed_stage() {
+    let fixture = Fixture::new().await;
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), worker_draft("audit-capsule", "src"))
+        .await
+        .expect("assignment creates");
+    let canonical =
+        serde_json::to_string(&audit_capsule(&assignment, &attempt)).expect("capsule serializes");
+    fixture
+        .store
+        .attach_task_capsule(assignment.assignment_id, attempt.attempt_id, canonical)
+        .await
+        .expect("capsule attaches");
+    let dir = fixture
+        .state
+        .codex_home()
+        .join("agent-task-coordination")
+        .join("task_capsules");
+    let final_path = dir.join(format!("{}.json", assignment.assignment_id));
+    let stage_path = dir.join(format!(".{}.staged.json", assignment.assignment_id));
+    fixture.store.close().await;
+    std::fs::rename(&final_path, &stage_path).expect("crash stage simulates");
+    let restarted = LocalAgentTaskStore::initialize(&fixture.state)
+        .await
+        .expect("store restarts");
+    assert!(final_path.exists());
+    assert!(!stage_path.exists());
+    assert!(
+        restarted
+            .get_agent_task(assignment.assignment_id, None)
+            .await
+            .expect("task reads")
+            .assignment
+            .task_capsule
+            .is_some()
+    );
+    restarted.close().await;
+}
+
+fn run_git(repo: &std::path::Path, args: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .expect("Git command starts");
+    assert!(
+        output.status.success(),
+        "Git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn initialize_validation_repository(repo: &std::path::Path) {
+    std::fs::create_dir_all(repo.join("src")).expect("source directory creates");
+    std::fs::write(repo.join("src/lib.rs"), "pub fn initial() {}\n")
+        .expect("source fixture writes");
+    std::fs::write(repo.join("README.md"), "initial documentation\n")
+        .expect("documentation fixture writes");
+    run_git(repo, &["init", "--quiet"]);
+    run_git(repo, &["config", "user.email", "audit@example.invalid"]);
+    run_git(repo, &["config", "user.name", "Audit Test"]);
+    run_git(repo, &["add", "src/lib.rs", "README.md"]);
+    run_git(repo, &["commit", "--quiet", "-m", "initial"]);
+}
+
+#[tokio::test]
+async fn audit_validation_receipt_retained_digest_authenticates_raw_artifact_bytes() {
+    let fixture = Fixture::new().await;
+    initialize_validation_repository(fixture.repo.path());
+    let command = "focused proof";
+    let (_, attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            validation_worker_draft("digest-root", "src", command),
+        )
+        .await
+        .expect("assignment creates");
+    let mut call = start_focused_validation_with_evidence(
+        &fixture.store,
+        attempt.attempt_id,
+        "audit-validation-digest",
+        command,
+        ValidationEvidence {
+            cwd: Some(fixture.repo.path().to_string_lossy().into_owned()),
+            ..ValidationEvidence::default()
+        },
+    )
+    .await;
+    let raw_digest = "A".repeat(64);
+    call.evidence.retained_output_ref = Some("tool-call:audit-validation-digest".to_string());
+    call.evidence.validation_result = Some(serde_json::json!({
+        "raw_artifact_ref": "artifact://audit-validation-digest",
+        "raw_artifact_sha256": raw_digest,
+    }));
+    let finished = finish_focused_validation(&fixture.store, call).await;
+    assert_eq!(finished.evidence.retained_output_digest, "a".repeat(64));
+}
+
+#[tokio::test]
+async fn audit_validation_receipt_completion_rejects_incomplete_exact_snapshot() {
+    let fixture = Fixture::new().await;
+    initialize_validation_repository(fixture.repo.path());
+    let command = "focused proof";
+    let (_, attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            validation_worker_draft("incomplete-root", "src", command),
+        )
+        .await
+        .expect("assignment creates");
+    let running = start_focused_validation_with_evidence(
+        &fixture.store,
+        attempt.attempt_id,
+        "audit-validation-incomplete",
+        command,
+        ValidationEvidence {
+            cwd: Some(fixture.repo.path().to_string_lossy().into_owned()),
+            ..ValidationEvidence::default()
+        },
+    )
+    .await;
+    let pool = coordination_pool(&fixture).await;
+    let body =
+        sqlx::query_scalar::<_, String>("SELECT body_json FROM validation_calls WHERE call_id = ?")
+            .bind("audit-validation-incomplete")
+            .fetch_one(&pool)
+            .await
+            .expect("validation body reads");
+    let mut call: ValidationCall = serde_json::from_str(&body).expect("validation body decodes");
+    call.evidence
+        .execution_snapshot
+        .as_mut()
+        .expect("snapshot exists")
+        .complete = false;
+    sqlx::query("UPDATE validation_calls SET body_json = ? WHERE call_id = ?")
+        .bind(serde_json::to_string(&call).expect("validation body encodes"))
+        .bind("audit-validation-incomplete")
+        .execute(&pool)
+        .await
+        .expect("incomplete snapshot persists");
+    finish_focused_validation(&fixture.store, running).await;
+
+    let error = fixture
+        .store
+        .submit_agent_receipt(
+            attempt.attempt_id,
+            completed_receipt(vec!["audit-validation-incomplete".to_string()]),
+        )
+        .await
+        .expect_err("incomplete snapshot cannot complete an assignment");
+    assert!(matches!(
+        error,
+        StoreError::ValidationCallStatusInvalid { .. }
+    ));
+}
+
+#[tokio::test]
+async fn audit_validation_receipt_markdown_change_invalidates_cargo_evidence() {
+    let fixture = Fixture::new().await;
+    initialize_validation_repository(fixture.repo.path());
+    let command = "cargo test -p example";
+    let evidence = || ValidationEvidence {
+        cwd: Some(fixture.repo.path().to_string_lossy().into_owned()),
+        environment_hash: Some("audit-environment".to_string()),
+        toolchain: Some("audit-toolchain".to_string()),
+        retained_output_ref: Some("tool-call:audit-cargo".to_string()),
+        validation_result: Some(serde_json::json!({
+            "raw_artifact_ref": "artifact://audit-cargo",
+            "raw_artifact_sha256": "b".repeat(64),
+        })),
+        ..ValidationEvidence::default()
+    };
+    let (_, first_attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            validation_worker_draft("markdown-root", "src", command),
+        )
+        .await
+        .expect("first assignment creates");
+    let first = start_focused_validation_with_evidence(
+        &fixture.store,
+        first_attempt.attempt_id,
+        "audit-validation-markdown-first",
+        command,
+        evidence(),
+    )
+    .await;
+    finish_focused_validation(&fixture.store, first).await;
+
+    std::fs::write(
+        fixture.repo.path().join("README.md"),
+        "changed documentation\n",
+    )
+    .expect("documentation changes");
+    let (_, second_attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            validation_worker_draft("markdown-root", "src", command),
+        )
+        .await
+        .expect("second assignment creates");
+    let second = start_focused_validation_with_evidence(
+        &fixture.store,
+        second_attempt.attempt_id,
+        "audit-validation-markdown-second",
+        command,
+        evidence(),
+    )
+    .await;
+    assert_eq!(second.evidence.shared_from_call_id, None);
+}
+
+#[tokio::test]
+async fn audit_validation_receipt_covered_and_execution_views_share_one_capture() {
+    let fixture = Fixture::new().await;
+    initialize_validation_repository(fixture.repo.path());
+    std::fs::write(
+        fixture.repo.path().join("src/lib.rs"),
+        "pub fn before_pause() {}\n",
+    )
+    .expect("source changes before capture");
+    let command = "focused proof";
+    let (_, attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            validation_worker_draft("coherent-root", "src", command),
+        )
+        .await
+        .expect("assignment creates");
+    let pause = Arc::new(TestWorkspaceCapturePause::new());
+    let store = fixture.store.clone();
+    let scoped_pause = Arc::clone(&pause);
+    let task = tokio::spawn(async move {
+        with_test_workspace_capture_pause(scoped_pause, async move {
+            start_focused_validation(
+                &store,
+                attempt.attempt_id,
+                "audit-validation-coherent",
+                command,
+            )
+            .await
+        })
+        .await
+    });
+    let started = tokio::time::timeout(std::time::Duration::from_secs(2), pause.started.acquire())
+        .await
+        .expect("workspace capture reaches pause")
+        .expect("pause remains open");
+    started.forget();
+    std::fs::write(
+        fixture.repo.path().join("src/lib.rs"),
+        "pub fn after_pause() {}\n",
+    )
+    .expect("source changes between possible captures");
+    pause.release.add_permits(2);
+    let call = task.await.expect("validation task joins");
+    let covered = call
+        .evidence
+        .covered_manifest
+        .iter()
+        .find(|entry| entry.path == "src/lib.rs")
+        .expect("covered source exists");
+    let executed = call
+        .evidence
+        .execution_snapshot
+        .as_deref()
+        .expect("execution snapshot exists")
+        .manifest
+        .iter()
+        .find(|entry| entry.path == "src/lib.rs")
+        .expect("executed source exists");
+    assert_eq!(covered, executed);
+}
+
+#[tokio::test]
+async fn audit_validation_receipt_commit_rejects_change_after_refresh() {
+    let fixture = Fixture::new().await;
+    initialize_validation_repository(fixture.repo.path());
+    let command = "focused proof";
+    let (_, attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            validation_worker_draft("receipt-race-root", "src", command),
+        )
+        .await
+        .expect("assignment creates");
+    finish_focused_validation(
+        &fixture.store,
+        start_focused_validation_with_evidence(
+            &fixture.store,
+            attempt.attempt_id,
+            "audit-validation-receipt-race",
+            command,
+            ValidationEvidence {
+                cwd: Some(fixture.repo.path().to_string_lossy().into_owned()),
+                ..ValidationEvidence::default()
+            },
+        )
+        .await,
+    )
+    .await;
+    let pause = Arc::new(TestReceiptRefreshPause::new());
+    let store = fixture.store.clone();
+    let scoped_pause = Arc::clone(&pause);
+    let receipt = tokio::spawn(async move {
+        with_test_receipt_refresh_pause(scoped_pause, async move {
+            store
+                .submit_agent_receipt(
+                    attempt.attempt_id,
+                    completed_receipt(vec!["audit-validation-receipt-race".to_string()]),
+                )
+                .await
+        })
+        .await
+    });
+    let started = tokio::time::timeout(std::time::Duration::from_secs(2), pause.started.acquire())
+        .await
+        .expect("receipt reaches post-refresh pause")
+        .expect("pause remains open");
+    started.forget();
+    std::fs::write(
+        fixture.repo.path().join("receipt-race-window.txt"),
+        "created after validation refresh\n",
+    )
+    .expect("untracked source changes after refresh");
+    pause.release.add_permits(1);
+    let error = receipt
+        .await
+        .expect("receipt task joins")
+        .expect_err("post-refresh change supersedes evidence");
+    assert!(
+        matches!(error, StoreError::EvidenceSuperseded { .. }),
+        "unexpected receipt race error: {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn audit_validation_receipt_failed_and_cancelled_do_not_refresh_progress() {
+    let fixture = Fixture::new().await;
+    initialize_validation_repository(fixture.repo.path());
+    let pool = coordination_pool(&fixture).await;
+    let command = "focused proof";
+    for (ordinal, status) in [
+        ValidationCallStatus::Failed,
+        ValidationCallStatus::Cancelled,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (_, attempt) = fixture
+            .store
+            .create_assignment(
+                fixture.repo.path(),
+                validation_worker_draft(&format!("terminal-root-{ordinal}"), "src", command),
+            )
+            .await
+            .expect("assignment creates");
+        let mut call = start_focused_validation_with_evidence(
+            &fixture.store,
+            attempt.attempt_id,
+            &format!("audit-validation-terminal-{ordinal}"),
+            command,
+            ValidationEvidence {
+                cwd: Some(fixture.repo.path().to_string_lossy().into_owned()),
+                ..ValidationEvidence::default()
+            },
+        )
+        .await;
+        let prior = fixed_time("2020-01-01T00:00:00Z") + Duration::seconds(ordinal as i64);
+        let prior_json = serde_json::to_string(&prior).expect("progress timestamp serializes");
+        sqlx::query("UPDATE workspace_actors SET last_progress_at = ? WHERE attempt_id = ?")
+            .bind(&prior_json)
+            .bind(attempt.attempt_id.to_string())
+            .execute(&pool)
+            .await
+            .expect("prior progress persists");
+        call.status = status;
+        call.recorded_at += Duration::milliseconds(1);
+        fixture
+            .store
+            .record_validation_call(call)
+            .await
+            .expect("terminal validation records");
+        let progress = sqlx::query_scalar::<_, String>(
+            "SELECT last_progress_at FROM workspace_actors WHERE attempt_id = ?",
+        )
+        .bind(attempt.attempt_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("progress reads");
+        assert_eq!(progress, prior_json);
+    }
+}
+
+#[tokio::test]
+async fn audit_workspace_actor_reset_clears_binding_and_lease() {
+    let fixture = Fixture::new().await;
+    std::fs::create_dir_all(fixture.repo.path().join("src")).expect("scope directory");
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), worker_draft("reset-root", "src"))
+        .await
+        .expect("assignment creates");
+    let registration = WorkspaceActorRegistration {
+        root_session_id: "reset-root".to_string(),
+        actor_id: "reset-actor".to_string(),
+        kind: WorkspaceActorKind::Typed,
+        assignment_id: Some(assignment.assignment_id),
+        attempt_id: Some(attempt.attempt_id),
+        strategy: WorkspaceStrategy::Shared,
+    };
+    fixture
+        .store
+        .register_workspace_actor(fixture.repo.path(), registration)
+        .await
+        .expect("bound actor registers");
+    let pool = coordination_pool(&fixture).await;
+    sqlx::query(
+        "UPDATE workspace_actors SET state = 'active', lease_expires_at = ? WHERE actor_id = ?",
+    )
+    .bind(serde_json::to_string(&(Utc::now() + Duration::hours(1))).expect("lease serializes"))
+    .bind("reset-actor")
+    .execute(&pool)
+    .await
+    .expect("actor simulates active lease");
+
+    fixture
+        .store
+        .register_workspace_actor(
+            fixture.repo.path(),
+            WorkspaceActorRegistration {
+                root_session_id: "reset-root".to_string(),
+                actor_id: "reset-actor".to_string(),
+                kind: WorkspaceActorKind::Typed,
+                assignment_id: None,
+                attempt_id: None,
+                strategy: WorkspaceStrategy::Shared,
+            },
+        )
+        .await
+        .expect("actor resets");
+    let row = sqlx::query_as::<_, (Option<String>, Option<String>, String, Option<String>)>(
+        "SELECT assignment_id, attempt_id, state, lease_expires_at FROM workspace_actors WHERE actor_id = ?",
+    )
+    .bind("reset-actor")
+    .fetch_one(&pool)
+    .await
+    .expect("reset actor reads");
+    assert_eq!(row, (None, None, "idle".to_string(), None));
+}
+
+#[tokio::test]
+async fn audit_workspace_capture_publish_order_matches_scan_order() {
+    let fixture = Fixture::new().await;
+    let path = fixture.repo.path().join("ordered.txt");
+    std::fs::write(&path, "old").expect("initial file");
+    fixture
+        .store
+        .capture_workspace_revision(fixture.repo.path(), vec!["ordered.txt".to_string()])
+        .await
+        .expect("baseline captures");
+
+    let pause = Arc::new(TestWorkspaceCapturePause::new());
+    let first_store = fixture.store.clone();
+    let first_root = fixture.repo.path().to_path_buf();
+    let first_pause = Arc::clone(&pause);
+    let first = tokio::spawn(async move {
+        with_test_workspace_capture_pause(first_pause, async move {
+            first_store
+                .capture_workspace_revision(&first_root, vec!["ordered.txt".to_string()])
+                .await
+        })
+        .await
+    });
+    let started = tokio::time::timeout(std::time::Duration::from_secs(1), pause.started.acquire())
+        .await
+        .expect("first scan reaches pause")
+        .expect("pause remains open");
+    started.forget();
+    std::fs::write(&path, "new").expect("file changes between captures");
+    let second_store = fixture.store.clone();
+    let second_root = fixture.repo.path().to_path_buf();
+    let second = tokio::spawn(async move {
+        second_store
+            .capture_workspace_revision(&second_root, vec!["ordered.txt".to_string()])
+            .await
+    });
+    pause.release.add_permits(1);
+    let first = first
+        .await
+        .expect("first task joins")
+        .expect("first capture");
+    let second = second
+        .await
+        .expect("second task joins")
+        .expect("second capture");
+    assert!(second.epoch > first.epoch);
+    assert_ne!(second.manifest_hash, first.manifest_hash);
+}
+
+#[tokio::test]
+async fn audit_workspace_git_capture_includes_tracked_generated_named_paths() {
+    let fixture = Fixture::new().await;
+    run_git(fixture.repo.path(), &["init", "--quiet"]);
+    std::fs::create_dir_all(fixture.repo.path().join("build")).expect("build directory");
+    std::fs::write(fixture.repo.path().join("build/source.rs"), "old").expect("tracked file");
+    run_git(fixture.repo.path(), &["add", "build/source.rs"]);
+    run_git(
+        fixture.repo.path(),
+        &[
+            "-c",
+            "user.name=KD4 Audit",
+            "-c",
+            "user.email=kd4-audit@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture",
+        ],
+    );
+    std::fs::write(fixture.repo.path().join("build/source.rs"), "new").expect("tracked change");
+    let revision = fixture
+        .store
+        .capture_workspace_revision(fixture.repo.path(), vec![REPOSITORY_WIDE_PATH.to_string()])
+        .await
+        .expect("Git overlay captures");
+    assert_eq!(revision.capture_mode, WorkspaceCaptureMode::GitOverlay);
+    assert!(revision.complete);
+    assert!(revision.discovery_errors.is_empty());
+    assert!(
+        revision
+            .files
+            .iter()
+            .any(|entry| entry.path == "build/source.rs")
+    );
+}
+
+#[tokio::test]
+async fn audit_workspace_fallback_is_incomplete_and_rejected_for_validation() {
+    let fixture = Fixture::new().await;
+    std::fs::write(fixture.repo.path().join("input.txt"), "input").expect("fallback input");
+    let revision = fixture
+        .store
+        .capture_workspace_revision(fixture.repo.path(), vec![REPOSITORY_WIDE_PATH.to_string()])
+        .await
+        .expect("fallback captures diagnostically");
+    assert_eq!(
+        revision.capture_mode,
+        WorkspaceCaptureMode::FilesystemFallback
+    );
+    assert!(!revision.complete);
+    assert!(!revision.discovery_errors.is_empty());
+    assert!(crate::local::require_complete_workspace_capture(&revision).is_err());
+}
+
+#[tokio::test]
+async fn audit_workspace_validation_inputs_do_not_skip_generated_named_directories() {
+    let repo = TempDir::new().expect("repository tempdir");
+    std::fs::create_dir_all(repo.path().join("target-crate")).expect("target directory");
+    std::fs::write(repo.path().join("target-crate/Cargo.toml"), "[package]\n")
+        .expect("validation input");
+    let scopes = crate::local::repository_global_validation_scopes(repo.path())
+        .await
+        .expect("global validation scopes collect");
+    assert!(
+        scopes
+            .iter()
+            .any(|scope| scope.path == "target-crate/Cargo.toml")
+    );
+}
+
+#[tokio::test]
+async fn repository_global_validation_discovery_respects_git_ignores() {
+    let repo = TempDir::new().expect("repository tempdir");
+    run_git(repo.path(), &["init", "--quiet"]);
+    std::fs::write(repo.path().join(".gitignore"), "generated/\n").expect("ignore file");
+    std::fs::write(repo.path().join("Cargo.toml"), "[workspace]\n").expect("tracked input");
+    std::fs::create_dir_all(repo.path().join("generated/deep")).expect("ignored directory");
+    std::fs::write(repo.path().join("generated/deep/Cargo.toml"), "[package]\n")
+        .expect("ignored validation-looking input");
+    run_git(repo.path(), &["add", ".gitignore", "Cargo.toml"]);
+
+    let scopes = crate::local::repository_global_validation_scopes(repo.path())
+        .await
+        .expect("Git-backed global validation scopes collect");
+
+    assert!(scopes.iter().any(|scope| scope.path == "Cargo.toml"));
+    assert!(
+        scopes
+            .iter()
+            .all(|scope| scope.path != "generated/deep/Cargo.toml")
+    );
+}
+
+#[cfg(any(unix, windows))]
+fn create_audit_symlink(target: &std::path::Path, link: &std::path::Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).expect("file symlink creates");
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(target, link).expect("file symlink creates");
+}
+
+#[tokio::test]
+async fn audit_workspace_symlink_target_identity_affects_manifest() {
+    let fixture = Fixture::new().await;
+    std::fs::write(fixture.repo.path().join("left.txt"), "same").expect("left target");
+    std::fs::write(fixture.repo.path().join("right.txt"), "same").expect("right target");
+    let link = fixture.repo.path().join("link.txt");
+    create_audit_symlink(std::path::Path::new("left.txt"), &link);
+    let left = fixture
+        .store
+        .capture_workspace_revision(fixture.repo.path(), vec!["link.txt".to_string()])
+        .await
+        .expect("left link captures");
+    std::fs::remove_file(&link).expect("left link removes");
+    create_audit_symlink(std::path::Path::new("right.txt"), &link);
+    let right = fixture
+        .store
+        .capture_workspace_revision(fixture.repo.path(), vec!["link.txt".to_string()])
+        .await
+        .expect("right link captures");
+    assert_ne!(left.files, right.files);
+    assert_ne!(left.manifest_hash, right.manifest_hash);
+}
+
+#[tokio::test]
+async fn audit_workspace_broken_symlink_differs_from_absent_path() {
+    let fixture = Fixture::new().await;
+    let link = fixture.repo.path().join("link.txt");
+    create_audit_symlink(std::path::Path::new("missing.txt"), &link);
+    let broken = fixture
+        .store
+        .capture_workspace_revision(fixture.repo.path(), vec!["link.txt".to_string()])
+        .await
+        .expect("broken link captures");
+    std::fs::remove_file(&link).expect("broken link removes");
+    let absent = fixture
+        .store
+        .capture_workspace_revision(fixture.repo.path(), vec!["link.txt".to_string()])
+        .await
+        .expect("absent path captures");
+    assert!(broken.files[0].existed);
+    assert!(!absent.files[0].existed);
+    assert_ne!(broken.manifest_hash, absent.manifest_hash);
+}
+
+#[tokio::test]
+async fn audit_task_view_terminal_actor_with_future_expiry_is_released() {
+    let fixture = Fixture::new().await;
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            worker_draft("task-view-lease-root", "src"),
+        )
+        .await
+        .expect("assignment creates");
+    let pool = coordination_pool(&fixture).await;
+    let future = Utc::now() + Duration::hours(1);
+    sqlx::query(
+        "UPDATE workspace_actors SET state = 'terminal', lease_expires_at = ? WHERE attempt_id = ?",
+    )
+    .bind(serde_json::to_string(&future).expect("future expiry serializes"))
+    .bind(attempt.attempt_id.to_string())
+    .execute(&pool)
+    .await
+    .expect("persisted actor state changes");
+
+    let task = fixture
+        .store
+        .get_agent_task(assignment.assignment_id, Some(0))
+        .await
+        .expect("task view reads");
+    assert_eq!(
+        task.workspace_status.lease_state,
+        Some(LeaseState::Released)
+    );
+}
+
+#[tokio::test]
+async fn audit_task_view_validation_history_and_receipt_references_are_complete() {
+    let fixture = Fixture::new().await;
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            worker_draft("task-view-validation-root", "src"),
+        )
+        .await
+        .expect("assignment creates");
+    let pool = coordination_pool(&fixture).await;
+    let recorded_at = Utc::now();
+    let mut transaction = pool.begin().await.expect("validation transaction begins");
+    for index in 0..=MAX_VALIDATION_CALLS_PER_TASK {
+        let call = ValidationCall {
+            call_id: format!("audit-call-{index:03}"),
+            attempt_id: attempt.attempt_id,
+            command_summary: format!("audit validation {index}"),
+            resolved_executable: None,
+            proof_kind: ValidationProofKind::Focused,
+            evidence: ValidationEvidence::default(),
+            status: ValidationCallStatus::Succeeded,
+            recorded_at,
+        };
+        sqlx::query(
+            "INSERT INTO validation_calls (call_id, attempt_id, body_json, status, recorded_at)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&call.call_id)
+        .bind(attempt.attempt_id.to_string())
+        .bind(serde_json::to_string(&call).expect("validation call serializes"))
+        .bind(serde_json::to_string(&call.status).expect("validation status serializes"))
+        .bind(serde_json::to_string(&call.recorded_at).expect("validation time serializes"))
+        .execute(&mut *transaction)
+        .await
+        .expect("validation call inserts");
+    }
+    let receipt = AgentReceipt {
+        assignment_id: assignment.assignment_id,
+        attempt_id: attempt.attempt_id,
+        status: AgentStatusClaim::NeedsMain,
+        summary: "receipt references the oldest retained call".to_string(),
+        criterion_results: vec![CriterionResult {
+            criterion_id: criterion().id,
+            status: CriterionStatus::NotRun,
+            evidence: None,
+        }],
+        declared_changes: Vec::new(),
+        validation_call_ids: vec!["audit-call-000".to_string()],
+        blockers: vec!["task view completeness fixture".to_string()],
+        risks: Vec::new(),
+        next_action: Some("inspect complete task view".to_string()),
+        architecture_contract: None,
+        evidence_epoch: 0,
+        evidence_manifest_hash: String::new(),
+        sealed_at: recorded_at,
+    };
+    sqlx::query(
+        "INSERT INTO receipts (attempt_id, assignment_id, status, body_json, sealed_at)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(attempt.attempt_id.to_string())
+    .bind(assignment.assignment_id.to_string())
+    .bind(serde_json::to_string(&receipt.status).expect("receipt status serializes"))
+    .bind(serde_json::to_string(&receipt).expect("receipt serializes"))
+    .bind(serde_json::to_string(&receipt.sealed_at).expect("receipt time serializes"))
+    .execute(&mut *transaction)
+    .await
+    .expect("receipt inserts");
+    transaction.commit().await.expect("task fixture commits");
+
+    let task = fixture
+        .store
+        .get_agent_task(assignment.assignment_id, Some(0))
+        .await
+        .expect("task view reads");
+    assert_eq!(
+        task.validation_calls.len(),
+        MAX_VALIDATION_CALLS_PER_TASK + 1
+    );
+    let receipt = task.receipt.expect("receipt is present");
+    assert!(receipt.validation_call_ids.iter().all(|receipt_id| {
+        task.validation_calls
+            .iter()
+            .any(|call| &call.call_id == receipt_id)
+    }));
+}
+
+#[tokio::test]
+async fn audit_task_view_wake_read_distinguishes_no_stream_from_empty() {
+    let fixture = Fixture::new().await;
+    let no_stream = fixture
+        .store
+        .read_wake_events("missing-wake-root".to_string(), None)
+        .await
+        .expect("missing stream reads");
+    assert_eq!(no_stream.status, WakeReadStatus::NoStream);
+    assert!(!no_stream.timed_out);
+
+    fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            worker_draft("healthy-wake-root", "src"),
+        )
+        .await
+        .expect("wake-producing assignment creates");
+    let available = fixture
+        .store
+        .read_wake_events("healthy-wake-root".to_string(), None)
+        .await
+        .expect("wake events read");
+    assert_eq!(available.status, WakeReadStatus::EventsAvailable);
+    let cursor = available.latest_event_id.expect("wake cursor exists");
+    let empty = fixture
+        .store
+        .read_wake_events("healthy-wake-root".to_string(), Some(cursor))
+        .await
+        .expect("empty stream read succeeds");
+    assert_eq!(empty.status, WakeReadStatus::Empty);
+    assert!(!empty.timed_out);
+}
+
+#[tokio::test]
+async fn audit_task_view_wake_checkpoint_rejects_foreign_event() {
+    let fixture = Fixture::new().await;
+    fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            worker_draft("checkpoint-owner-root", "src/owner"),
+        )
+        .await
+        .expect("owner assignment creates");
+    fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            worker_draft("checkpoint-foreign-root", "src/foreign"),
+        )
+        .await
+        .expect("foreign assignment creates");
+    let foreign = fixture
+        .store
+        .read_wake_events("checkpoint-foreign-root".to_string(), None)
+        .await
+        .expect("foreign wake reads")
+        .latest_event_id
+        .expect("foreign wake exists");
+    let expected = fixture
+        .store
+        .automatic_wake_cursor(
+            "checkpoint-owner-root".to_string(),
+            "/root/consumer".to_string(),
+        )
+        .await
+        .expect("owner cursor initializes");
+    let error = fixture
+        .store
+        .compare_and_swap_automatic_wake_cursor(
+            "checkpoint-owner-root".to_string(),
+            "/root/consumer".to_string(),
+            expected,
+            foreign,
+        )
+        .await
+        .expect_err("foreign event is rejected");
+    assert!(matches!(error, StoreError::InvalidWakeWatermark(_)));
+}
+
+#[tokio::test]
+async fn audit_task_view_wake_checkpoint_cannot_move_backward() {
+    let fixture = Fixture::new().await;
+    let (_, attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            worker_draft("checkpoint-order-root", "src"),
+        )
+        .await
+        .expect("assignment creates");
+    fixture
+        .store
+        .append_observation(
+            attempt.attempt_id,
+            ObservationKind::Reading,
+            "newer event".to_string(),
+            None,
+        )
+        .await
+        .expect("newer event appends");
+    let events = fixture
+        .store
+        .read_wake_events("checkpoint-order-root".to_string(), None)
+        .await
+        .expect("wake events read")
+        .updated_agents;
+    let older = events.first().expect("older wake exists").event_id;
+    let newer = events.last().expect("newer wake exists").event_id;
+    let expected = fixture
+        .store
+        .automatic_wake_cursor(
+            "checkpoint-order-root".to_string(),
+            "/root/consumer".to_string(),
+        )
+        .await
+        .expect("cursor initializes");
+    assert!(
+        fixture
+            .store
+            .compare_and_swap_automatic_wake_cursor(
+                "checkpoint-order-root".to_string(),
+                "/root/consumer".to_string(),
+                expected,
+                newer,
+            )
+            .await
+            .expect("cursor advances")
+    );
+    let error = fixture
+        .store
+        .compare_and_swap_automatic_wake_cursor(
+            "checkpoint-order-root".to_string(),
+            "/root/consumer".to_string(),
+            Some(newer),
+            older,
+        )
+        .await
+        .expect_err("cursor regression is rejected");
+    assert!(matches!(error, StoreError::WakeWatermarkRegression { .. }));
 }
 
 struct Fixture {
@@ -73,7 +1405,7 @@ async fn coordination_pool(fixture: &Fixture) -> sqlx::SqlitePool {
         .expect("coordination database opens")
 }
 
-async fn admit_writer_while_snapshot_capture_is_paused(
+async fn assert_writer_blocked_while_snapshot_capture_is_paused(
     pause: &TestSnapshotCapturePause,
     blocker_pool: &sqlx::SqlitePool,
 ) {
@@ -101,8 +1433,8 @@ async fn admit_writer_while_snapshot_capture_is_paused(
     }
     pause.release.add_permits(1);
     assert!(
-        writer_acquired,
-        "snapshot capture must not retain a SQLite writer transaction"
+        !writer_acquired,
+        "snapshot capture must retain the SQLite writer transaction"
     );
 }
 
@@ -171,12 +1503,139 @@ async fn workspace_actor_registration_waits_for_transient_writer_contention() {
 
 #[tokio::test]
 async fn migration_removes_workspace_mutation_blocking_schema() {
-    let fixture = Fixture::new().await;
+    let codex_home = TempDir::new().expect("codex home tempdir");
+    let repo = TempDir::new().expect("repository tempdir");
+    let state = StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string())
+        .await
+        .expect("state runtime initializes");
+    let coordination_root = state.codex_home().join("agent-task-coordination");
+    tokio::fs::create_dir_all(&coordination_root)
+        .await
+        .expect("coordination directory creates");
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(coordination_root.join("agent_tasks.sqlite"))
+        .create_if_missing(true)
+        .foreign_keys(true);
+    let predecessor_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("predecessor database opens");
+    task_store_migrator_through(15)
+        .run(&predecessor_pool)
+        .await
+        .expect("migrations through 0015 apply");
+
+    let repository =
+        crate::scope::repository_identity(repo.path()).expect("repository identity resolves");
+    let created_at = json_time("2026-08-24T12:00:00Z");
+    sqlx::query(
+        "INSERT INTO workspace_repositories (
+            workspace_id, repository_id, canonical_root, epoch, updated_at
+         ) VALUES (?, ?, ?, 1, ?)",
+    )
+    .bind(&repository.workspace_id)
+    .bind(&repository.id)
+    .bind(&repository.canonical_path)
+    .bind(&created_at)
+    .execute(&predecessor_pool)
+    .await
+    .expect("retained repository row seeds");
+    sqlx::query(
+        "INSERT INTO workspace_events (
+            workspace_id, epoch, actor_id, actor_kind, attribution_confidence,
+            paths_json, contracts_json, created_at
+         ) VALUES (?, 1, 'legacy-root', ?, ?, ?, ?, ?)",
+    )
+    .bind(&repository.workspace_id)
+    .bind(serde_json::to_string(&WorkspaceActorKind::Root).expect("actor kind serializes"))
+    .bind(
+        serde_json::to_string(&AttributionConfidence::Definitive).expect("attribution serializes"),
+    )
+    .bind(r#"["src/lib.rs"]"#)
+    .bind(r#"["stable-contract"]"#)
+    .bind(&created_at)
+    .execute(&predecessor_pool)
+    .await
+    .expect("retained event seeds");
+    sqlx::query(
+        "INSERT INTO actor_supporting_reads (
+            workspace_id, actor_id, path, manifest_entry_json, read_epoch, read_at
+         ) VALUES (?, 'legacy-root', 'src/lib.rs', '{}', 1, ?)",
+    )
+    .bind(&repository.workspace_id)
+    .bind(&created_at)
+    .execute(&predecessor_pool)
+    .await
+    .expect("retired supporting read seeds");
+    sqlx::query(
+        "INSERT INTO workspace_manifest_payloads (
+            workspace_id, manifest_id, payload_format_version,
+            canonical_manifest_bytes, entry_count, payload_byte_count, created_at
+         ) VALUES (?, 'legacy-manifest', 1, X'00', 0, 1, ?)",
+    )
+    .bind(&repository.workspace_id)
+    .bind(&created_at)
+    .execute(&predecessor_pool)
+    .await
+    .expect("retired manifest payload seeds");
+    sqlx::query(
+        "INSERT INTO workspace_mutation_leases (
+            lease_id, workspace_id, root_session_id, actor_id, attempt_id,
+            start_epoch, paths_json, contracts_json, expected_manifest_json,
+            state, created_at, heartbeat_at, expires_at, released_at, actor_kind
+         ) VALUES (
+            'legacy-lease', ?, 'legacy-root', 'legacy-root', NULL,
+            1, '[]', '[]', '[]', 'released', ?, ?, ?, ?, ?
+         )",
+    )
+    .bind(&repository.workspace_id)
+    .bind(&created_at)
+    .bind(&created_at)
+    .bind(&created_at)
+    .bind(&created_at)
+    .bind(serde_json::to_string(&WorkspaceActorKind::Root).expect("actor kind serializes"))
+    .execute(&predecessor_pool)
+    .await
+    .expect("retired mutation lease seeds");
+    sqlx::query(
+        "INSERT INTO workspace_finalization_fences (
+            fence_id, workspace_id, root_session_id, state, created_at,
+            expires_at, released_at
+         ) VALUES ('legacy-fence', ?, 'legacy-root', 'released', ?, ?, ?)",
+    )
+    .bind(&repository.workspace_id)
+    .bind(&created_at)
+    .bind(&created_at)
+    .bind(&created_at)
+    .execute(&predecessor_pool)
+    .await
+    .expect("retired finalization fence seeds");
+    predecessor_pool.close().await;
+
+    let store = LocalAgentTaskStore::initialize(&state)
+        .await
+        .expect("production initializer upgrades predecessor database");
+    let events = store
+        .read_workspace_events(repo.path(), 0)
+        .await
+        .expect("retained workspace events read through production API");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].paths, vec!["src/lib.rs".to_string()]);
+    assert_eq!(events[0].contracts, vec!["stable-contract".to_string()]);
+
+    let fixture = Fixture {
+        _codex_home: codex_home,
+        repo,
+        state,
+        store,
+    };
     let pool = coordination_pool(&fixture).await;
     let remaining = sqlx::query_as::<_, (String, String)>(
         "SELECT type, name
          FROM sqlite_master
          WHERE (type = 'table' AND name IN (
+                    'actor_supporting_reads',
                     'workspace_manifest_payloads',
                     'workspace_mutation_leases',
                     'workspace_finalization_fences'
@@ -189,9 +1648,17 @@ async fn migration_removes_workspace_mutation_blocking_schema() {
     .expect("post-migration schema reads");
     assert_eq!(remaining, Vec::<(String, String)>::new());
     pool.close().await;
+    fixture.store.close().await;
 }
 
-async fn expire_workspace_actor_leases(fixture: &Fixture, attempt_ids: &[AttemptId]) {
+async fn expire_workspace_actor_leases(
+    fixture: &Fixture,
+    attempt_ids: &[AttemptId],
+) -> chrono::DateTime<Utc> {
+    assert!(
+        !attempt_ids.is_empty(),
+        "at least one actor lease is required"
+    );
     let database_path = fixture
         .state
         .codex_home()
@@ -205,7 +1672,16 @@ async fn expire_workspace_actor_leases(fixture: &Fixture, attempt_ids: &[Attempt
         .connect_with(options)
         .await
         .expect("coordination database opens");
-    let stale_at = Utc::now() - Duration::seconds(DEFAULT_WORKSPACE_LEASE_SECONDS + 1);
+    let encoded_comparison_now = sqlx::query_scalar::<_, String>(
+        "SELECT last_progress_at FROM workspace_actors WHERE attempt_id = ?",
+    )
+    .bind(attempt_ids[0].to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("workspace actor comparison time reads");
+    let comparison_now: chrono::DateTime<Utc> = serde_json::from_str(&encoded_comparison_now)
+        .expect("workspace actor comparison time decodes");
+    let stale_at = comparison_now - Duration::seconds(DEFAULT_WORKSPACE_LEASE_SECONDS + 1);
     let encoded_stale_at = serde_json::to_string(&stale_at).expect("stale time serializes");
     for attempt_id in attempt_ids {
         let updated = sqlx::query(
@@ -222,6 +1698,7 @@ async fn expire_workspace_actor_leases(fixture: &Fixture, attempt_ids: &[Attempt
         assert_eq!(updated.rows_affected(), 1);
     }
     pool.close().await;
+    comparison_now
 }
 
 async fn remove_workspace_actor(fixture: &Fixture, attempt_id: AttemptId) {
@@ -582,12 +2059,31 @@ async fn start_focused_validation_with_evidence(
     command: &str,
     evidence: ValidationEvidence,
 ) -> ValidationCall {
+    start_focused_validation_with_executable_and_evidence(
+        store,
+        attempt_id,
+        call_id,
+        command,
+        resolved_test_executable(),
+        evidence,
+    )
+    .await
+}
+
+async fn start_focused_validation_with_executable_and_evidence(
+    store: &LocalAgentTaskStore,
+    attempt_id: AttemptId,
+    call_id: &str,
+    command: &str,
+    resolved_executable: Option<String>,
+    evidence: ValidationEvidence,
+) -> ValidationCall {
     store
         .record_validation_call(ValidationCall {
             call_id: call_id.to_string(),
             attempt_id,
             command_summary: command.to_string(),
-            resolved_executable: resolved_test_executable(),
+            resolved_executable,
             proof_kind: ValidationProofKind::Focused,
             evidence,
             status: ValidationCallStatus::Running,
@@ -2186,23 +3682,27 @@ async fn exact_typed_actor_heartbeat_renews_only_the_current_bound_attempt() {
         "heartbeat-root",
     )
     .await;
-    expire_workspace_actor_leases(&fixture, &[attempt.attempt_id]).await;
+    let comparison_now = expire_workspace_actor_leases(&fixture, &[attempt.attempt_id]).await;
 
     assert!(
-        fixture
-            .store
-            .heartbeat_typed_workspace_actor(binding.clone())
-            .await
-            .expect("typed heartbeat")
+        crate::local::with_test_comparison_now(
+            comparison_now,
+            fixture
+                .store
+                .heartbeat_typed_workspace_actor(binding.clone()),
+        )
+        .await
+        .expect("typed heartbeat")
     );
     let mut mismatched = binding.clone();
     mismatched.thread_id = Some("wrong-thread".to_string());
     assert!(
-        !fixture
-            .store
-            .heartbeat_typed_workspace_actor(mismatched)
-            .await
-            .expect("mismatched heartbeat is rejected")
+        !crate::local::with_test_comparison_now(
+            comparison_now,
+            fixture.store.heartbeat_typed_workspace_actor(mismatched),
+        )
+        .await
+        .expect("mismatched heartbeat is rejected")
     );
 
     fixture
@@ -2215,11 +3715,12 @@ async fn exact_typed_actor_heartbeat_renews_only_the_current_bound_attempt() {
         .await
         .expect("attempt is sealed");
     assert!(
-        !fixture
-            .store
-            .heartbeat_typed_workspace_actor(binding)
-            .await
-            .expect("sealed heartbeat is rejected")
+        !crate::local::with_test_comparison_now(
+            comparison_now,
+            fixture.store.heartbeat_typed_workspace_actor(binding),
+        )
+        .await
+        .expect("sealed heartbeat is rejected")
     );
 }
 
@@ -2234,12 +3735,16 @@ async fn orphaned_owner_claims_release_after_the_liveness_window() {
         )
         .await
         .expect("expired-owner assignment");
-    expire_workspace_actor_leases(&expired_fixture, &[expired_attempt.attempt_id]).await;
-    expired_fixture
-        .store
-        .check_quiescence("expired-owner-root".to_string())
-        .await
-        .expect("quiescence scavenges the expired owner");
+    let comparison_now =
+        expire_workspace_actor_leases(&expired_fixture, &[expired_attempt.attempt_id]).await;
+    crate::local::with_test_comparison_now(
+        comparison_now,
+        expired_fixture
+            .store
+            .check_quiescence("expired-owner-root".to_string()),
+    )
+    .await
+    .expect("quiescence scavenges the expired owner");
     let expired_task = expired_fixture
         .store
         .get_agent_task(expired_assignment.assignment_id, Some(10))
@@ -2304,24 +3809,28 @@ async fn live_reviewer_preserves_a_gated_claim_after_the_worker_lease_expires() 
         .await
         .expect("reviewer assignment");
 
-    expire_workspace_actor_leases(&fixture, &[worker_attempt.attempt_id]).await;
-    let live_relation = fixture
-        .store
-        .check_quiescence("review-root".to_string())
-        .await
-        .expect("live related reviewer is considered");
+    let worker_comparison_now =
+        expire_workspace_actor_leases(&fixture, &[worker_attempt.attempt_id]).await;
+    let live_relation = crate::local::with_test_comparison_now(
+        worker_comparison_now,
+        fixture.store.check_quiescence("review-root".to_string()),
+    )
+    .await
+    .expect("live related reviewer is considered");
     assert!(
         live_relation
             .active_claim_assignment_ids
             .contains(&worker.assignment_id)
     );
 
-    expire_workspace_actor_leases(&fixture, &[reviewer_attempt.attempt_id]).await;
-    let released = fixture
-        .store
-        .check_quiescence("review-root".to_string())
-        .await
-        .expect("stale related actors are scavenged");
+    let reviewer_comparison_now =
+        expire_workspace_actor_leases(&fixture, &[reviewer_attempt.attempt_id]).await;
+    let released = crate::local::with_test_comparison_now(
+        reviewer_comparison_now,
+        fixture.store.check_quiescence("review-root".to_string()),
+    )
+    .await
+    .expect("stale related actors are scavenged");
     assert!(
         !released
             .active_claim_assignment_ids
@@ -2680,6 +4189,13 @@ async fn wake_stream_is_bounded_non_draining_and_rebuilt() {
     assert_eq!(first.updated_agents, repeated.updated_agents);
 
     fixture.store.close().await;
+    let pool = coordination_pool(&fixture).await;
+    sqlx::query("DELETE FROM wake_events WHERE event_id = ?")
+        .bind(watermark.to_string())
+        .execute(&pool)
+        .await
+        .expect("derived wake event is removed to require repair");
+    pool.close().await;
     let restarted = LocalAgentTaskStore::initialize(&fixture.state)
         .await
         .expect("restart reconstruction");
@@ -2699,7 +4215,8 @@ async fn wake_stream_is_bounded_non_draining_and_rebuilt() {
             .await
             .expect("retained page reads");
         if page.updated_agents.is_empty() {
-            assert!(page.timed_out);
+            assert_eq!(page.status, WakeReadStatus::Empty);
+            assert!(!page.timed_out);
             break;
         }
         if cursor.is_none() {
@@ -2728,6 +4245,58 @@ async fn wake_stream_is_bounded_non_draining_and_rebuilt() {
     }
     assert_eq!(retained_events, MAX_WAKE_EVENTS_PER_ROOT);
     assert_eq!(retained_ids.len(), MAX_WAKE_EVENTS_PER_ROOT);
+}
+
+#[tokio::test]
+async fn clean_restart_does_not_rebuild_current_wake_streams() {
+    let fixture = Fixture::new().await;
+    let (_, attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            worker_draft("clean-restart-root", "src"),
+        )
+        .await
+        .expect("assignment");
+    fixture
+        .store
+        .append_observation(
+            attempt.attempt_id,
+            ObservationKind::Reading,
+            "durable progress".to_string(),
+            None,
+        )
+        .await
+        .expect("observation appends");
+    fixture.store.close().await;
+
+    let pool = coordination_pool(&fixture).await;
+    sqlx::query(
+        "CREATE TRIGGER reject_clean_wake_event_rebuild
+         BEFORE DELETE ON wake_events
+         BEGIN SELECT RAISE(ABORT, 'clean wake events must not rebuild'); END",
+    )
+    .execute(&pool)
+    .await
+    .expect("wake event rebuild guard installs");
+    sqlx::query(
+        "CREATE TRIGGER reject_clean_wake_stream_rebuild
+         BEFORE DELETE ON wake_streams
+         BEGIN SELECT RAISE(ABORT, 'clean wake streams must not rebuild'); END",
+    )
+    .execute(&pool)
+    .await
+    .expect("wake stream rebuild guard installs");
+    pool.close().await;
+
+    let restarted = LocalAgentTaskStore::initialize(&fixture.state)
+        .await
+        .expect("clean restart skips derived wake rewrite");
+    let wake = restarted
+        .read_wake_events("clean-restart-root".to_string(), None)
+        .await
+        .expect("wake stream remains readable");
+    assert_eq!(wake.updated_agents.len(), 2);
 }
 
 #[tokio::test]
@@ -2997,7 +4566,7 @@ async fn mutation_evidence_keeps_private_prewrite_snapshot() {
         })
         .await
     });
-    admit_writer_while_snapshot_capture_is_paused(&begin_pause, &blocker_pool).await;
+    assert_writer_blocked_while_snapshot_capture_is_paused(&begin_pause, &blocker_pool).await;
     let event_id = begin
         .await
         .expect("begin mutation task joins")
@@ -3017,7 +4586,7 @@ async fn mutation_evidence_keeps_private_prewrite_snapshot() {
         })
         .await
     });
-    admit_writer_while_snapshot_capture_is_paused(&finalize_pause, &blocker_pool).await;
+    assert_writer_blocked_while_snapshot_capture_is_paused(&finalize_pause, &blocker_pool).await;
     let evidence = finalize
         .await
         .expect("finalize mutation task joins")
@@ -5022,6 +6591,242 @@ async fn focused_validation_dependency_completed_reuse_is_manifest_bound() {
     assert_eq!(changed_generated.evidence.shared_from_call_id, None);
 }
 
+#[tokio::test]
+async fn focused_validation_dependency_transitive_and_executable_identity_changes_supersede() {
+    fn reusable_evidence() -> ValidationEvidence {
+        ValidationEvidence {
+            cwd: Some(".".to_string()),
+            environment_hash: Some("closure-environment".to_string()),
+            toolchain: Some("closure-toolchain".to_string()),
+            retained_output_ref: Some("tool-call:closure-output".to_string()),
+            ..ValidationEvidence::default()
+        }
+    }
+
+    async fn attempt_for(fixture: &Fixture, call_id: &str, command: &str) -> Attempt {
+        fixture
+            .store
+            .create_assignment(
+                fixture.repo.path(),
+                validation_worker_draft("closure-root", "owner", command),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{call_id} assignment creates: {error}"))
+            .1
+    }
+
+    async fn start(
+        fixture: &Fixture,
+        attempt: &Attempt,
+        call_id: &str,
+        command: &str,
+        executable: &std::path::Path,
+    ) -> ValidationCall {
+        start_focused_validation_with_executable_and_evidence(
+            &fixture.store,
+            attempt.attempt_id,
+            call_id,
+            command,
+            Some(executable.to_string_lossy().into_owned()),
+            reusable_evidence(),
+        )
+        .await
+    }
+
+    fn cargo_executable() -> PathBuf {
+        let executable = std::env::var_os("CARGO")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let mut locator = if cfg!(windows) {
+                    Command::new("where.exe")
+                } else {
+                    Command::new("which")
+                };
+                let output = locator
+                    .arg("cargo")
+                    .output()
+                    .expect("Cargo executable locator starts");
+                assert!(output.status.success(), "Cargo executable is discoverable");
+                let path =
+                    String::from_utf8(output.stdout).expect("Cargo executable path is UTF-8");
+                PathBuf::from(
+                    path.lines()
+                        .next()
+                        .expect("Cargo executable path is present"),
+                )
+            });
+        std::fs::canonicalize(&executable).unwrap_or_else(|error| {
+            panic!(
+                "resolved Cargo executable {} canonicalizes: {error}",
+                executable.display()
+            )
+        })
+    }
+
+    let fixture = Fixture::new().await;
+    run_git(fixture.repo.path(), &["init", "-q"]);
+    run_git(
+        fixture.repo.path(),
+        &["config", "user.email", "closure@example.invalid"],
+    );
+    run_git(
+        fixture.repo.path(),
+        &["config", "user.name", "Validation Closure"],
+    );
+    std::fs::write(
+        fixture.repo.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"owner\", \"dep\", \"leaf\", \"unrelated\"]\nresolver = \"2\"\n",
+    )
+    .expect("workspace manifest");
+    std::fs::write(
+        fixture.repo.path().join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"dep\"\nversion = \"0.1.0\"\ndependencies = [\n \"leaf\",\n]\n\n[[package]]\nname = \"leaf\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"owner\"\nversion = \"0.1.0\"\ndependencies = [\n \"dep\",\n]\n\n[[package]]\nname = \"unrelated\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("workspace lock");
+    for package in ["owner", "dep", "leaf", "unrelated"] {
+        let source = fixture.repo.path().join(package).join("src/lib.rs");
+        std::fs::create_dir_all(source.parent().expect("package source parent"))
+            .expect("package source directory");
+        let dependencies = match package {
+            "owner" => "[dependencies]\ndep = { path = \"../dep\" }\n",
+            "dep" => "[dependencies]\nleaf = { path = \"../leaf\" }\n",
+            _ => "",
+        };
+        std::fs::write(
+            fixture.repo.path().join(package).join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{package}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n{dependencies}"
+            ),
+        )
+        .expect("package manifest");
+        std::fs::write(source, format!("pub fn {package}() {{}}\n")).expect("package source");
+    }
+    run_git(fixture.repo.path(), &["add", "."]);
+    run_git(
+        fixture.repo.path(),
+        &["commit", "-qm", "validation closure"],
+    );
+
+    let executable = cargo_executable();
+    let command = "cargo test -p owner closure";
+
+    let baseline_attempt = attempt_for(&fixture, "closure-baseline", command).await;
+    let baseline = start(
+        &fixture,
+        &baseline_attempt,
+        "closure-baseline",
+        command,
+        &executable,
+    )
+    .await;
+    finish_focused_validation(&fixture.store, baseline).await;
+    fixture
+        .store
+        .submit_agent_receipt(
+            baseline_attempt.attempt_id,
+            completed_receipt(vec!["closure-baseline".to_string()]),
+        )
+        .await
+        .expect("baseline receipt");
+
+    std::fs::write(
+        fixture.repo.path().join("unrelated/src/lib.rs"),
+        "pub fn unrelated_changed() {}\n",
+    )
+    .expect("unrelated source changes");
+    let unrelated_attempt = attempt_for(&fixture, "closure-unrelated", command).await;
+    let unrelated = start(
+        &fixture,
+        &unrelated_attempt,
+        "closure-unrelated",
+        command,
+        &executable,
+    )
+    .await;
+    assert_eq!(
+        unrelated.evidence.shared_from_call_id.as_deref(),
+        Some("closure-baseline"),
+        "an unrelated workspace package retains the reusable focused result"
+    );
+    finish_focused_validation(&fixture.store, unrelated).await;
+    fixture
+        .store
+        .submit_agent_receipt(
+            unrelated_attempt.attempt_id,
+            completed_receipt(vec!["closure-unrelated".to_string()]),
+        )
+        .await
+        .expect("unrelated receipt");
+
+    std::fs::write(
+        fixture.repo.path().join("leaf/src/lib.rs"),
+        "pub fn leaf_changed() {}\n",
+    )
+    .expect("transitive dependency changes");
+    let dependency_attempt = attempt_for(&fixture, "closure-dependency", command).await;
+    let dependency = start(
+        &fixture,
+        &dependency_attempt,
+        "closure-dependency",
+        command,
+        &executable,
+    )
+    .await;
+    assert_eq!(
+        dependency.evidence.shared_from_call_id, None,
+        "a transitive local dependency change invalidates reusable validation"
+    );
+    finish_focused_validation(&fixture.store, dependency).await;
+    fixture
+        .store
+        .submit_agent_receipt(
+            dependency_attempt.attempt_id,
+            completed_receipt(vec!["closure-dependency".to_string()]),
+        )
+        .await
+        .expect("dependency receipt");
+
+    let fake_executable = fixture._codex_home.path().join("focused-validator");
+    std::fs::write(&fake_executable, "validator-v1\n").expect("validation executable v1");
+    let fake_executable =
+        std::fs::canonicalize(fake_executable).expect("validation executable path");
+    let fake_command = "focused-validator closure";
+    let executable_baseline_attempt =
+        attempt_for(&fixture, "closure-executable-baseline", fake_command).await;
+    let executable_baseline = start(
+        &fixture,
+        &executable_baseline_attempt,
+        "closure-executable-baseline",
+        fake_command,
+        &fake_executable,
+    )
+    .await;
+    finish_focused_validation(&fixture.store, executable_baseline).await;
+    fixture
+        .store
+        .submit_agent_receipt(
+            executable_baseline_attempt.attempt_id,
+            completed_receipt(vec!["closure-executable-baseline".to_string()]),
+        )
+        .await
+        .expect("executable baseline receipt");
+
+    std::fs::write(&fake_executable, "validator-v2\n").expect("validation executable v2");
+    let executable_attempt = attempt_for(&fixture, "closure-executable", fake_command).await;
+    let executable_changed = start(
+        &fixture,
+        &executable_attempt,
+        "closure-executable",
+        fake_command,
+        &fake_executable,
+    )
+    .await;
+    assert_eq!(
+        executable_changed.evidence.shared_from_call_id, None,
+        "resolved executable content changes invalidate reusable validation"
+    );
+}
+
 #[test]
 fn validation_reuse_rejects_every_incomplete_or_legacy_identity() {
     let complete = ValidationEvidence {
@@ -5187,6 +6992,8 @@ async fn bounded_validation_operation_suspends_only_until_its_hard_deadline() {
         NonproductiveRecovery::Suspended(ProductivitySummary {
             active_owned_operation_count: 1,
             cancelled_expired_operation_count: 0,
+            recovery_threshold_seconds: 120,
+            recovery_policy_version: NONPRODUCTIVE_RECOVERY_POLICY_VERSION,
         })
     );
 

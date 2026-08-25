@@ -18,8 +18,10 @@ Keep background and usage examples in READMEs/help. Read nested policies in
 Read [`../SOURCEMAP.md`](../SOURCEMAP.md) only for ambiguous or cross-boundary
 ownership.
 
-- Local Codex binary publish/replacement proof: `publish-local-codex.ps1`,
-  `test_publish_local_codex.py`.
+- Local Codex binary publish/replacement proof: `publish-local-codex.ps1`;
+  resolve its complete maintained test route with `python
+  scripts/root_maintenance.py test-python --changed
+  scripts/publish-local-codex.ps1`.
 - Rust lanes, target cleanup, and build diagnostics: `rust_build_status.py` is
   canonical; `cargo-lane.ps1` remains the direct no-Python and isolated-home
   adapter. Shared Python Rust environment policy lives in `rust_tool_env.py`;

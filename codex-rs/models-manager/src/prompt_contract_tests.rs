@@ -283,6 +283,28 @@ fn gpt_5_6_family_uses_one_canonical_prompt_within_size_limit() {
 }
 
 #[test]
+fn bundled_gpt_5_6_catalog_defers_prompt_to_local_policy() {
+    let catalog: serde_json::Value = serde_json::from_str(include_str!("../models.json"))
+        .expect("bundled models.json should parse");
+    let models = catalog["models"]
+        .as_array()
+        .expect("bundled models.json should contain a models array");
+
+    for slug in GPT_5_6_PROMPT_POLICY_SLUGS {
+        let model = models
+            .iter()
+            .find(|model| model["slug"].as_str() == Some(slug))
+            .unwrap_or_else(|| panic!("bundled models.json should contain {slug}"));
+
+        assert_eq!(
+            model["base_instructions"].as_str(),
+            Some(""),
+            "{slug} should defer prompt content to its registered local policy"
+        );
+    }
+}
+
+#[test]
 fn bundled_gpt_5_6_models_match_prompt_policy_registration() {
     let response = crate::bundled_models_response().expect("bundled models.json should parse");
     let bundled_slugs = response

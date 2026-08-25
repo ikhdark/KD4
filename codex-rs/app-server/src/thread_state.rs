@@ -21,7 +21,6 @@ use codex_rollout::state_integration::StateDbHandle;
 use codex_utils_path_uri::LegacyAppPathString;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::Weak;
@@ -29,12 +28,10 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
-use tracing::error;
 
 type PendingInterruptQueue = Vec<ConnectionRequestId>;
-const MAX_TRACKED_TURN_ORIGINS: usize = 256;
 const MAX_TRACKED_IN_FLIGHT_TASKS: usize = 1_024;
-const MAX_ACKNOWLEDGED_TERMINAL_LEDGER_ENTRIES: usize = 1_024;
+pub(crate) const THREAD_LISTENER_COMMAND_CAPACITY: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct InFlightTaskReference {
@@ -52,7 +49,6 @@ pub(crate) enum InFlightTaskClaim {
 #[derive(Default)]
 struct TurnOriginState {
     by_turn_id: HashMap<String, ConnectionId>,
-    insertion_order: VecDeque<String>,
 }
 
 #[derive(Clone, Default)]
@@ -77,18 +73,7 @@ impl TurnOriginTracker {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state
-            .by_turn_id
-            .insert(turn_id.clone(), connection_id)
-            .is_none()
-        {
-            state.insertion_order.push_back(turn_id.clone());
-        }
-        while state.insertion_order.len() > MAX_TRACKED_TURN_ORIGINS {
-            if let Some(expired_turn_id) = state.insertion_order.pop_front() {
-                state.by_turn_id.remove(&expired_turn_id);
-            }
-        }
+        state.by_turn_id.insert(turn_id.clone(), connection_id);
         drop(state);
         TurnOriginReservation {
             tracker: self.clone(),
@@ -103,13 +88,7 @@ impl TurnOriginTracker {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let connection_id = state.by_turn_id.remove(turn_id);
-        if connection_id.is_some() {
-            state
-                .insertion_order
-                .retain(|candidate| candidate != turn_id);
-        }
-        connection_id
+        state.by_turn_id.remove(turn_id)
     }
 
     fn remove_if_matches(&self, turn_id: &str, connection_id: ConnectionId) {
@@ -119,9 +98,6 @@ impl TurnOriginTracker {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.by_turn_id.get(turn_id) == Some(&connection_id) {
             state.by_turn_id.remove(turn_id);
-            state
-                .insertion_order
-                .retain(|candidate| candidate != turn_id);
         }
     }
 }
@@ -178,11 +154,24 @@ pub(crate) enum ThreadListenerCommand {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResolveServerRequestFailure {
+    ListenerNotRunning,
+    ListenerClosed,
+    CompletionDropped,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ResolveServerRequestError {
+    pub(crate) request_id: RequestId,
+    pub(crate) failure: ResolveServerRequestFailure,
+}
+
 pub(crate) fn thread_listener_command_channel() -> (
-    mpsc::UnboundedSender<ThreadListenerCommand>,
-    mpsc::UnboundedReceiver<ThreadListenerCommand>,
+    mpsc::Sender<ThreadListenerCommand>,
+    mpsc::Receiver<ThreadListenerCommand>,
 ) {
-    mpsc::unbounded_channel()
+    mpsc::channel(THREAD_LISTENER_COMMAND_CAPACITY)
 }
 
 /// Per-conversation accumulation of the latest states e.g. error message while a turn runs.
@@ -229,12 +218,12 @@ pub(crate) struct ThreadState {
     pub(crate) pending_rollbacks: Option<ConnectionRequestId>,
     pub(crate) turn_summary: TurnSummary,
     terminal_ledger: HashMap<String, TerminalLedgerEntry>,
-    acknowledged_terminal_order: VecDeque<String>,
     pub(crate) cancel_tx: Option<oneshot::Sender<()>>,
     pub(crate) experimental_raw_events: bool,
     pub(crate) listener_generation: u64,
     last_thread_settings: Option<ThreadSettings>,
-    listener_command_tx: Option<mpsc::UnboundedSender<ThreadListenerCommand>>,
+    listener_command_tx: Option<mpsc::Sender<ThreadListenerCommand>>,
+    unresolved_server_request_resolutions: Vec<ResolveServerRequestError>,
     current_turn_history: ThreadHistoryBuilder,
     turn_origin_tracker: TurnOriginTracker,
     listener_thread: Option<Weak<CodexThread>>,
@@ -242,6 +231,38 @@ pub(crate) struct ThreadState {
 }
 
 impl ThreadState {
+    fn mark_server_request_resolution_unresolved(
+        &mut self,
+        request_id: RequestId,
+        failure: ResolveServerRequestFailure,
+    ) -> ResolveServerRequestError {
+        self.unresolved_server_request_resolutions
+            .retain(|unresolved| unresolved.request_id != request_id);
+        let error = ResolveServerRequestError {
+            request_id,
+            failure,
+        };
+        self.unresolved_server_request_resolutions
+            .push(error.clone());
+        error
+    }
+
+    fn clear_unresolved_server_request_resolution(&mut self, request_id: &RequestId) {
+        self.unresolved_server_request_resolutions
+            .retain(|unresolved| &unresolved.request_id != request_id);
+    }
+
+    #[cfg(test)]
+    fn unresolved_server_request_resolution(
+        &self,
+        request_id: &RequestId,
+    ) -> Option<ResolveServerRequestFailure> {
+        self.unresolved_server_request_resolutions
+            .iter()
+            .find(|unresolved| &unresolved.request_id == request_id)
+            .map(|unresolved| unresolved.failure)
+    }
+
     pub(crate) fn listener_matches(&self, conversation: &Arc<CodexThread>) -> bool {
         self.listener_thread
             .as_ref()
@@ -255,7 +276,7 @@ impl ThreadState {
         conversation: &Arc<CodexThread>,
         watch_registration: WatchRegistration,
         thread_settings_baseline: ThreadSettings,
-    ) -> (mpsc::UnboundedReceiver<ThreadListenerCommand>, u64) {
+    ) -> (mpsc::Receiver<ThreadListenerCommand>, u64) {
         if let Some(previous) = self.cancel_tx.replace(cancel_tx) {
             let _ = previous.send(());
         }
@@ -278,9 +299,7 @@ impl ThreadState {
         self.watch_registration = WatchRegistration::default();
     }
 
-    pub(crate) fn listener_command_tx(
-        &self,
-    ) -> Option<mpsc::UnboundedSender<ThreadListenerCommand>> {
+    pub(crate) fn listener_command_tx(&self) -> Option<mpsc::Sender<ThreadListenerCommand>> {
         self.listener_command_tx.clone()
     }
 
@@ -480,29 +499,6 @@ impl ThreadState {
             return;
         }
         entry.acknowledged_queued = true;
-        self.acknowledged_terminal_order
-            .push_back(turn_id.to_string());
-        self.prune_acknowledged_terminal_ledger();
-    }
-
-    fn prune_acknowledged_terminal_ledger(&mut self) {
-        while self.acknowledged_terminal_order.len() > MAX_ACKNOWLEDGED_TERMINAL_LEDGER_ENTRIES {
-            let Some(expired_turn_id) = self.acknowledged_terminal_order.pop_front() else {
-                break;
-            };
-            let is_acknowledged_tombstone =
-                self.terminal_ledger
-                    .get(&expired_turn_id)
-                    .is_some_and(|entry| {
-                        entry.state_reduced
-                            && entry.notification_accepted
-                            && entry.notification.is_none()
-                            && entry.acknowledged_queued
-                    });
-            if is_acknowledged_tombstone {
-                self.terminal_ledger.remove(&expired_turn_id);
-            }
-        }
     }
 
     pub(crate) fn turn_origin_tracker(&self) -> TurnOriginTracker {
@@ -527,33 +523,63 @@ fn terminal_turn_id(event: &EventMsg) -> Option<&str> {
 pub(crate) async fn resolve_server_request_on_thread_listener(
     thread_state: &Arc<Mutex<ThreadState>>,
     request_id: RequestId,
-) {
+) -> Result<(), ResolveServerRequestError> {
+    async fn unresolved(
+        thread_state: &Arc<Mutex<ThreadState>>,
+        request_id: RequestId,
+        failure: ResolveServerRequestFailure,
+    ) -> ResolveServerRequestError {
+        thread_state
+            .lock()
+            .await
+            .mark_server_request_resolution_unresolved(request_id, failure)
+    }
+
     let (completion_tx, completion_rx) = oneshot::channel();
     let listener_command_tx = {
         let state = thread_state.lock().await;
         state.listener_command_tx()
     };
     let Some(listener_command_tx) = listener_command_tx else {
-        error!("failed to remove pending client request: thread listener is not running");
-        return;
+        return Err(unresolved(
+            thread_state,
+            request_id,
+            ResolveServerRequestFailure::ListenerNotRunning,
+        )
+        .await);
     };
 
+    let unresolved_request_id = request_id.clone();
     if listener_command_tx
         .send(ThreadListenerCommand::ResolveServerRequest {
             request_id,
             completion_tx,
         })
+        .await
         .is_err()
     {
-        error!(
-            "failed to remove pending client request: thread listener command channel is closed"
-        );
-        return;
+        return Err(unresolved(
+            thread_state,
+            unresolved_request_id,
+            ResolveServerRequestFailure::ListenerClosed,
+        )
+        .await);
     }
 
-    if let Err(err) = completion_rx.await {
-        error!("failed to remove pending client request: {err}");
+    if completion_rx.await.is_err() {
+        return Err(unresolved(
+            thread_state,
+            unresolved_request_id,
+            ResolveServerRequestFailure::CompletionDropped,
+        )
+        .await);
     }
+
+    thread_state
+        .lock()
+        .await
+        .clear_unresolved_server_request_resolution(&unresolved_request_id);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -655,6 +681,98 @@ mod tests {
         drop(reservation);
 
         assert_eq!(tracker.take("turn-1"), None);
+    }
+
+    #[test]
+    fn live_turn_origins_are_not_evicted_by_unrelated_reservations() {
+        let tracker = TurnOriginTracker::default();
+        tracker
+            .reserve("turn-0".to_string(), ConnectionId(7))
+            .commit();
+        for index in 1..300 {
+            tracker
+                .reserve(format!("turn-{index}"), ConnectionId(index))
+                .commit();
+        }
+
+        assert_eq!(tracker.take("turn-0"), Some(ConnectionId(7)));
+    }
+
+    #[tokio::test]
+    async fn resolving_without_a_listener_returns_a_typed_error() {
+        let state = Arc::new(Mutex::new(ThreadState::default()));
+        let request_id = RequestId::Integer(1);
+
+        assert_eq!(
+            resolve_server_request_on_thread_listener(&state, request_id.clone()).await,
+            Err(ResolveServerRequestError {
+                request_id: request_id.clone(),
+                failure: ResolveServerRequestFailure::ListenerNotRunning,
+            })
+        );
+        assert_eq!(
+            state
+                .lock()
+                .await
+                .unresolved_server_request_resolution(&request_id),
+            Some(ResolveServerRequestFailure::ListenerNotRunning)
+        );
+    }
+
+    #[tokio::test]
+    async fn resolving_on_a_closed_listener_returns_a_typed_error() {
+        let state = Arc::new(Mutex::new(ThreadState::default()));
+        let (listener_command_tx, listener_command_rx) = thread_listener_command_channel();
+        drop(listener_command_rx);
+        state.lock().await.listener_command_tx = Some(listener_command_tx);
+        let request_id = RequestId::Integer(2);
+
+        assert_eq!(
+            resolve_server_request_on_thread_listener(&state, request_id.clone()).await,
+            Err(ResolveServerRequestError {
+                request_id: request_id.clone(),
+                failure: ResolveServerRequestFailure::ListenerClosed,
+            })
+        );
+        assert_eq!(
+            state
+                .lock()
+                .await
+                .unresolved_server_request_resolution(&request_id),
+            Some(ResolveServerRequestFailure::ListenerClosed)
+        );
+    }
+
+    #[tokio::test]
+    async fn resolving_with_dropped_completion_returns_a_typed_error() {
+        let state = Arc::new(Mutex::new(ThreadState::default()));
+        let (listener_command_tx, mut listener_command_rx) = thread_listener_command_channel();
+        state.lock().await.listener_command_tx = Some(listener_command_tx);
+        let listener = tokio::spawn(async move {
+            let Some(ThreadListenerCommand::ResolveServerRequest { completion_tx, .. }) =
+                listener_command_rx.recv().await
+            else {
+                panic!("expected a server-request resolution command");
+            };
+            drop(completion_tx);
+        });
+        let request_id = RequestId::Integer(3);
+
+        assert_eq!(
+            resolve_server_request_on_thread_listener(&state, request_id.clone()).await,
+            Err(ResolveServerRequestError {
+                request_id: request_id.clone(),
+                failure: ResolveServerRequestFailure::CompletionDropped,
+            })
+        );
+        listener.await.expect("listener task should complete");
+        assert_eq!(
+            state
+                .lock()
+                .await
+                .unresolved_server_request_resolution(&request_id),
+            Some(ResolveServerRequestFailure::CompletionDropped)
+        );
     }
 
     #[tokio::test]
@@ -819,7 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_ledger_bounds_acknowledged_tombstones_without_evicting_pending_delivery() {
+    fn terminal_ledger_retains_acknowledged_tombstones_for_exactly_once_replay() {
         let mut state = ThreadState::default();
 
         let unreduced_event = terminal_event("unreduced", "done");
@@ -848,7 +966,8 @@ mod tests {
             &[],
         ));
 
-        for index in 0..=MAX_ACKNOWLEDGED_TERMINAL_LEDGER_ENTRIES {
+        const TOMBSTONES_BEYOND_FORMER_CAP: usize = 1_025;
+        for index in 0..TOMBSTONES_BEYOND_FORMER_CAP {
             let turn_id = format!("acknowledged-{index}");
             let event = terminal_event(&turn_id, "done");
             let fingerprint = terminal_event_fingerprint(&event).expect("terminal fingerprint");
@@ -860,7 +979,7 @@ mod tests {
             state.mark_terminal_acknowledged(&turn_id, &fingerprint);
         }
 
-        let newest_turn_id = format!("acknowledged-{MAX_ACKNOWLEDGED_TERMINAL_LEDGER_ENTRIES}");
+        let newest_turn_id = format!("acknowledged-{}", TOMBSTONES_BEYOND_FORMER_CAP - 1);
         let newest_fingerprint = state
             .terminal_ledger
             .get(&newest_turn_id)
@@ -869,15 +988,11 @@ mod tests {
             .clone();
         state.mark_terminal_acknowledged(&newest_turn_id, &newest_fingerprint);
 
-        assert!(!state.terminal_ledger.contains_key("acknowledged-0"));
+        assert!(state.terminal_ledger.contains_key("acknowledged-0"));
         assert!(state.terminal_ledger.contains_key(&newest_turn_id));
         assert_eq!(
-            state.acknowledged_terminal_order.len(),
-            MAX_ACKNOWLEDGED_TERMINAL_LEDGER_ENTRIES
-        );
-        assert_eq!(
             state.terminal_ledger.len(),
-            MAX_ACKNOWLEDGED_TERMINAL_LEDGER_ENTRIES + 2
+            TOMBSTONES_BEYOND_FORMER_CAP + 2
         );
 
         let unreduced = state
@@ -894,7 +1009,7 @@ mod tests {
             .expect("newest acknowledged tombstone must remain");
         assert!(reduced_tombstone.state_reduced);
         assert!(reduced_tombstone.acknowledged_queued);
-        assert!(!state.terminal_ledger.contains_key("acknowledged-1"));
+        assert!(state.terminal_ledger.contains_key("acknowledged-1"));
 
         let pending = state
             .terminal_ledger
@@ -1069,8 +1184,7 @@ pub(crate) struct ThreadStateManager {
     state: Arc<Mutex<ThreadStateManagerInner>>,
     // Extension event sinks are synchronous, so they need an await-free way to
     // enqueue work on the active per-thread listener.
-    listener_commands:
-        Arc<StdMutex<HashMap<ThreadId, mpsc::UnboundedSender<ThreadListenerCommand>>>>,
+    listener_commands: Arc<StdMutex<HashMap<ThreadId, mpsc::Sender<ThreadListenerCommand>>>>,
 }
 
 fn core_lease_id(lease: &OutOfBandElicitationLeaseKey) -> OutOfBandElicitationLeaseId {
@@ -1356,7 +1470,7 @@ impl ThreadStateManager {
     pub(crate) fn current_listener_command_tx(
         &self,
         thread_id: ThreadId,
-    ) -> Option<mpsc::UnboundedSender<ThreadListenerCommand>> {
+    ) -> Option<mpsc::Sender<ThreadListenerCommand>> {
         self.listener_commands
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1367,7 +1481,7 @@ impl ThreadStateManager {
     pub(crate) fn register_listener_command_tx(
         &self,
         thread_id: ThreadId,
-        tx: mpsc::UnboundedSender<ThreadListenerCommand>,
+        tx: mpsc::Sender<ThreadListenerCommand>,
     ) {
         self.listener_commands
             .lock()

@@ -98,6 +98,8 @@ pub enum TryStartTurnIfIdleRejectionReason {
     /// Another turn or task is active, or the idle reservation was lost before
     /// the automatic turn could start.
     Busy,
+    /// The session already holds the maximum pending input item or byte budget.
+    PendingInputLimitExceeded,
 }
 
 /// Rejection returned when an extension asks to start automatic idle work but
@@ -205,43 +207,6 @@ impl CodexThread {
     /// Returns the session telemetry handle for thread-scoped production instrumentation.
     pub fn session_telemetry(&self) -> SessionTelemetry {
         self.codex.session.services.session_telemetry.clone()
-    }
-
-    pub async fn desktop_activation_obligation(
-        &self,
-    ) -> Option<crate::DesktopActivationObligation> {
-        self.codex
-            .session
-            .services
-            .task_evidence
-            .desktop_activation_obligation()
-            .await
-    }
-
-    pub async fn issue_desktop_activation_challenge(
-        &self,
-        evidence: crate::DesktopPublishInstallEvidenceV1,
-        bootstrap_consumed_at: String,
-    ) -> Result<crate::DesktopActivationChallenge, crate::DesktopActivationVerificationError> {
-        self.codex
-            .session
-            .services
-            .task_evidence
-            .issue_desktop_activation_challenge(evidence, bootstrap_consumed_at)
-            .await
-    }
-
-    pub async fn record_desktop_activation(
-        &self,
-        observation: crate::DesktopActivationRecordObservation,
-    ) -> Result<crate::DesktopActivationRecordResult, crate::DesktopActivationVerificationError>
-    {
-        self.codex
-            .session
-            .services
-            .task_evidence
-            .record_desktop_activation(observation)
-            .await
     }
 
     pub async fn shutdown_and_wait(&self) -> CodexResult<()> {

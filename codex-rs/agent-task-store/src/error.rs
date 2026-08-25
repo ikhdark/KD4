@@ -79,13 +79,15 @@ pub enum StoreError {
     InvalidObservationLimit(usize),
     #[error("wake watermark {0} does not belong to this root session")]
     InvalidWakeWatermark(String),
+    #[error("wake watermark cannot move backward from sequence {current} to {next}")]
+    WakeWatermarkRegression { current: i64, next: i64 },
     #[error("assignment {0} has no durable repository identity")]
     RepositoryBindingMissing(AssignmentId),
     #[error("repository root does not match assignment {0}")]
     RepositoryMismatch(AssignmentId),
     #[error("binding limit must be between 0 and 256, got {0}")]
     InvalidBindingLimit(usize),
-    #[error("mutation evidence limit must be between 0 and 100, got {0}")]
+    #[error("mutation evidence limit must be between 1 and 100, got {0}")]
     InvalidMutationEvidenceLimit(usize),
     #[error("snapshot chunk size must be between 1 and 262144 bytes, got {0}")]
     InvalidSnapshotChunkSize(usize),

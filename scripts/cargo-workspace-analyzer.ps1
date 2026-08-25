@@ -57,7 +57,10 @@ $hasAllFeatures = $forwarded -contains "--all-features"
 $hasExplicitPackage =
     ($forwarded -contains "-p") -or
     ($forwarded -contains "--package") -or
-    ($forwarded -contains "--manifest-path")
+    ($forwarded -contains "--manifest-path") -or
+    @($forwarded | Where-Object {
+        $_.StartsWith("--package=") -or $_.StartsWith("--manifest-path=")
+    }).Count -gt 0
 
 if ($Analyzer -eq "clippy") {
     $lane = "auto"
@@ -65,7 +68,12 @@ if ($Analyzer -eq "clippy") {
     $isWorkspace = $forwarded -contains "--workspace"
 } else {
     $lane = "rust-dead-code-matrix"
-    $env:RUSTFLAGS = "-Ddead_code"
+    if ([string]::IsNullOrWhiteSpace($env:RUSTFLAGS)) {
+        $env:RUSTFLAGS = "-Ddead_code"
+    }
+    else {
+        $env:RUSTFLAGS = "$($env:RUSTFLAGS) -Ddead_code"
+    }
     $cargoArgs = @("check")
     if (-not $hasExplicitPackage) {
         $cargoArgs += "--workspace"

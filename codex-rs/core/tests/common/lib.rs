@@ -17,7 +17,6 @@ use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
 pub use codex_core::test_support::TestCodexResponsesRequestKind;
 pub use codex_core::test_support::responses_metadata;
-use codex_features::Feature;
 use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::NetworkSandboxPolicy;
@@ -92,9 +91,10 @@ pub fn assert_regex_match<'s>(pattern: &str, actual: &'s str) -> regex_lite::Cap
 }
 
 pub fn test_path_buf_with_windows(unix_path: &str, windows_path: Option<&str>) -> PathBuf {
-    if let Some(windows) = windows_path {
-        PathBuf::from(windows)
-    } else {
+    if cfg!(target_os = "windows") {
+        if let Some(windows) = windows_path {
+            return PathBuf::from(windows);
+        }
         let mut path = PathBuf::from(r"C:\");
         path.extend(
             unix_path
@@ -102,8 +102,10 @@ pub fn test_path_buf_with_windows(unix_path: &str, windows_path: Option<&str>) -
                 .split('/')
                 .filter(|segment| !segment.is_empty()),
         );
-        path
+        return path;
     }
+
+    PathBuf::from(unix_path)
 }
 
 pub fn test_path_buf(unix_path: &str) -> PathBuf {
@@ -244,9 +246,6 @@ pub async fn load_default_config_for_test_with_cloud_config_bundle(
     // Do not let a developer-level CODEX_SQLITE_HOME override make otherwise
     // hermetic integration tests share one state database.
     config.sqlite_home = codex_home.path().join("sqlite");
-    // Preserve the integration harness's legacy baseline now that V2 is a
-    // stable default. Tests that cover V2 enable it explicitly.
-    let _ = config.features.disable(Feature::MultiAgentV2);
     config
 }
 
@@ -363,11 +362,8 @@ pub async fn wait_for_event_with_timeout<F>(
 where
     F: FnMut(&codex_protocol::protocol::EventMsg) -> bool,
 {
-    use tokio::time::Duration;
-    use tokio::time::timeout;
     loop {
-        // Allow a bit more time to accommodate async startup work (e.g. config IO, tool discovery)
-        let ev = timeout(wait_time.max(Duration::from_secs(10)), codex.next_event())
+        let ev = event_before_deadline(wait_time, codex.next_event())
             .await
             .expect("timeout waiting for event")
             .expect("stream ended unexpectedly");
@@ -375,6 +371,13 @@ where
             return ev.msg;
         }
     }
+}
+
+async fn event_before_deadline<T>(
+    wait_time: tokio::time::Duration,
+    event: impl std::future::Future<Output = T>,
+) -> Result<T, tokio::time::error::Elapsed> {
+    tokio::time::timeout(wait_time, event).await
 }
 
 pub fn sandbox_env_var() -> &'static str {
@@ -641,4 +644,49 @@ macro_rules! skip_if_wine_exec {
             $reason,
         );
     }};
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::pending;
+    use std::time::Instant;
+
+    #[test]
+    fn host_path_fixture_uses_host_convention() {
+        let path = test_path_buf_with_windows("/tmp/kd4-test", Some(r"C:\tmp\kd4-test"));
+
+        if cfg!(target_os = "windows") {
+            assert_eq!(path, PathBuf::from(r"C:\tmp\kd4-test"));
+        } else {
+            assert_eq!(path, PathBuf::from("/tmp/kd4-test"));
+        }
+    }
+
+    #[tokio::test]
+    async fn default_config_keeps_multi_agent_v2_enabled() {
+        let codex_home = tempfile::tempdir().expect("create test Codex home");
+        let config = load_default_config_for_test(&codex_home).await;
+
+        assert!(
+            config
+                .features
+                .enabled(codex_features::Feature::MultiAgentV2)
+        );
+    }
+
+    #[tokio::test]
+    async fn event_waiter_honors_requested_deadline() {
+        let wait_time = tokio::time::Duration::from_millis(10);
+        let started = Instant::now();
+
+        let result = event_before_deadline(wait_time, pending::<()>()).await;
+
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "requested short deadline was widened: {:?}",
+            started.elapsed()
+        );
+    }
 }

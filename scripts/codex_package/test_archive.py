@@ -16,33 +16,36 @@ from codex_package.archive import resolve_zstd_command
 
 
 class ResolveZstdCommandTest(unittest.TestCase):
-    def test_prefers_zstd_from_path(self) -> None:
-        def which(name: str) -> str | None:
-            return {"zstd": "/usr/bin/zstd", "dotslash": "/usr/bin/dotslash"}.get(name)
-
-        self.assertEqual(resolve_zstd_command(which=which), ["/usr/bin/zstd"])
-
-    def test_falls_back_to_dotslash_manifest(self) -> None:
+    def test_accepts_explicit_zstd_with_matching_digest(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            manifest = Path(temp_dir) / "zstd"
-            manifest.write_text("#!/usr/bin/env dotslash\n{}\n", encoding="utf-8")
-
-            def which(name: str) -> str | None:
-                return {"dotslash": "/usr/bin/dotslash"}.get(name)
+            executable = Path(temp_dir) / "zstd"
+            executable.write_bytes(b"pinned zstd")
+            digest = __import__("hashlib").sha256(executable.read_bytes()).hexdigest()
 
             self.assertEqual(
-                resolve_zstd_command(dotslash_manifest=manifest, which=which),
-                ["/usr/bin/dotslash", str(manifest)],
+                resolve_zstd_command(
+                    environ={
+                        archive.ZSTD_PATH_ENV: str(executable),
+                        archive.ZSTD_SHA256_ENV: digest,
+                    }
+                ),
+                [str(executable.resolve())],
             )
 
-    def test_errors_when_no_zstd_or_dotslash_manifest_is_available(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            missing_manifest = Path(temp_dir) / "zstd"
+    def test_rejects_unpinned_zstd(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "pinned compressor"):
+            resolve_zstd_command(environ={})
 
-            with self.assertRaisesRegex(RuntimeError, "zstd is required"):
+    def test_rejects_zstd_digest_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            executable = Path(temp_dir) / "zstd"
+            executable.write_bytes(b"unexpected")
+            with self.assertRaisesRegex(RuntimeError, "digest mismatch"):
                 resolve_zstd_command(
-                    dotslash_manifest=missing_manifest,
-                    which=lambda _name: None,
+                    environ={
+                        archive.ZSTD_PATH_ENV: str(executable),
+                        archive.ZSTD_SHA256_ENV: "0" * 64,
+                    }
                 )
 
     def test_tar_zst_streams_tar_to_zstd_stdin(self) -> None:
@@ -216,6 +219,31 @@ class WriteArchiveSafetyTest(unittest.TestCase):
 
 
 class ArchiveMemberNameTest(unittest.TestCase):
+    def test_tar_gz_and_zip_are_byte_reproducible(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            package_dir = root / "package"
+            package_dir.mkdir()
+            payload = package_dir / "payload.bin"
+            payload.write_bytes(b"stable")
+            entries = [payload]
+            first_tgz = root / "first.tar.gz"
+            second_tgz = root / "second.tar.gz"
+            first_zip = root / "first.zip"
+            second_zip = root / "second.zip"
+
+            archive.write_tar_archive(
+                package_dir, first_tgz, mode="w:gz", entries=entries
+            )
+            archive.write_tar_archive(
+                package_dir, second_tgz, mode="w:gz", entries=entries
+            )
+            archive.write_zip_archive(package_dir, first_zip, entries=entries)
+            archive.write_zip_archive(package_dir, second_zip, entries=entries)
+
+            self.assertEqual(first_tgz.read_bytes(), second_tgz.read_bytes())
+            self.assertEqual(first_zip.read_bytes(), second_zip.read_bytes())
+
     def test_package_entries_exclude_unmanaged_reuse_contents(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             package_dir = Path(temp_dir) / "package"

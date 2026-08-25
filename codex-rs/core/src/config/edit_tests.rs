@@ -90,7 +90,7 @@ fn set_service_tier_saves_default_as_default() {
 }
 
 #[test]
-fn set_service_tier_saves_priority_as_fast() {
+fn set_service_tier_saves_priority() {
     let tmp = tempdir().expect("tmpdir");
     let codex_home = tmp.path();
 
@@ -100,7 +100,7 @@ fn set_service_tier_saves_priority_as_fast() {
         .expect("persist");
 
     let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
-    assert_eq!(contents, "service_tier = \"fast\"\n");
+    assert_eq!(contents, "service_tier = \"priority\"\n");
 }
 
 #[test]

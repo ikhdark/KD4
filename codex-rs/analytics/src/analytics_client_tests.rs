@@ -803,7 +803,6 @@ fn sample_initialize_fact(connection_id: u64) -> AnalyticsFact {
             capabilities: Some(InitializeCapabilities {
                 experimental_api: false,
                 request_attestation: false,
-                desktop_activation_receipts: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
             }),
@@ -1716,7 +1715,6 @@ async fn initialize_caches_client_and_thread_lifecycle_publishes_once_initialize
                     capabilities: Some(InitializeCapabilities {
                         experimental_api: false,
                         request_attestation: false,
-                        desktop_activation_receipts: false,
                         opt_out_notification_methods: None,
                         mcp_server_openai_form_elicitation: false,
                     }),
@@ -2021,7 +2019,6 @@ async fn compaction_event_ingests_custom_fact() {
                     capabilities: Some(InitializeCapabilities {
                         experimental_api: false,
                         request_attestation: false,
-                        desktop_activation_receipts: false,
                         opt_out_notification_methods: None,
                         mcp_server_openai_form_elicitation: false,
                     }),
@@ -2152,7 +2149,6 @@ async fn guardian_review_event_ingests_custom_fact_with_optional_target_item() {
                     capabilities: Some(InitializeCapabilities {
                         experimental_api: false,
                         request_attestation: false,
-                        desktop_activation_receipts: false,
                         opt_out_notification_methods: None,
                         mcp_server_openai_form_elicitation: false,
                     }),

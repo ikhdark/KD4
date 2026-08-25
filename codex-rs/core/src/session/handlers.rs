@@ -624,6 +624,9 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) {
     if let Some(startup_prewarm) = sess.take_session_startup_prewarm().await {
         startup_prewarm.abort().await;
     }
+    if let Some(startup_transport) = sess.take_session_startup_transport().await {
+        startup_transport.abort().await;
+    }
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
     sess.services.turn_environments.shutdown();
     sess.terminal_tasks.close();

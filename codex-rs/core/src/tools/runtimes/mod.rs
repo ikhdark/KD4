@@ -319,7 +319,7 @@ fn maybe_wrap_powershell_with_snapshot(
 
     let snapshot_path = powershell_single_quote(snapshot_path);
     let rewritten_script = format!(
-        "try {{ . '{snapshot_path}' *> $null }} catch {{}}\n{override_restores}\n{proxy_restore}\n& {{\n{original_script}\n}}"
+        "try {{ . '{snapshot_path}' *> $null }} catch {{ [Console]::Error.WriteLine('codex: shell snapshot replay failed: ' + $_.Exception.Message) }}\n{override_restores}\n{proxy_restore}\n& {{\n{original_script}\n}}"
     );
 
     let rewritten = vec![
@@ -761,6 +761,45 @@ mod shell_snapshot_replay_tests {
             String::from_utf8_lossy(&output.stdout).trim(),
             "from-snapshot|current|False"
         );
+    }
+
+    #[test]
+    fn powershell_snapshot_source_failure_is_visible_while_the_command_continues() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let snapshot_path = AbsolutePathBuf::from_absolute_path(dir.path().join("broken.ps1"))
+            .expect("absolute snapshot path");
+        std::fs::write(
+            &snapshot_path,
+            format!("{POWERSHELL_SNAPSHOT_FORMAT_HEADER}\nthrow 'broken snapshot'\n"),
+        )
+        .expect("write broken PowerShell snapshot");
+        let shell = crate::shell::get_shell(ShellType::PowerShell, /*path*/ None)
+            .expect("PowerShell is required on Windows");
+        let original = shell.derive_exec_args(
+            "Microsoft.PowerShell.Utility\\Write-Output 'command-ran'",
+            /*use_login_shell*/ true,
+        );
+
+        let rewritten = maybe_wrap_shell_lc_with_snapshot(
+            &original,
+            &shell,
+            Some(&snapshot_path),
+            &HashMap::new(),
+            &std::env::vars().collect(),
+            &RuntimePathPrepends,
+        );
+        let output = std::process::Command::new(&rewritten[0])
+            .args(&rewritten[1..])
+            .output()
+            .expect("run wrapped PowerShell command");
+
+        assert!(output.status.success(), "command failed: {output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "command-ran"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("codex: shell snapshot replay failed: broken snapshot"));
     }
 
     #[test]

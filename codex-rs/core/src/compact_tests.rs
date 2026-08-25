@@ -99,6 +99,7 @@ fn agent_message(text: &str) -> ResponseItem {
 
 fn compacted_user_message(text: &str) -> CompactedUserMessage {
     CompactedUserMessage {
+        source_item_id: None,
         content: vec![UserInput::Text {
             text: text.to_string(),
             text_elements: Vec::new(),
@@ -448,6 +449,45 @@ fn semantic_summary_truncation_preserves_conversation_state() {
 }
 
 #[test]
+fn final_bounded_compaction_preserves_all_required_sections() {
+    let generated = COMPACTION_SECTIONS
+        .iter()
+        .map(|(heading, _)| format!("{heading}\n{}", "section evidence ".repeat(2_000)))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let summary = bounded_task_state_summary(None, &generated);
+
+    assert!(approx_token_count(&summary) <= COMPACT_TASK_STATE_MAX_TOKENS);
+    for (heading, _) in COMPACTION_SECTIONS {
+        assert!(
+            section_has_nonempty_body(&summary, heading),
+            "bounded checkpoint lost {heading}: {summary}"
+        );
+    }
+    assert!(validate_generated_compaction_summary(None, &summary).is_ok());
+}
+
+#[test]
+fn compaction_section_allocations_fit_without_final_blind_cut() {
+    let generated = format!(
+        "{}\n{}",
+        "preamble ".repeat(1_000),
+        COMPACTION_SECTIONS
+            .iter()
+            .map(|(heading, _)| format!("{heading}\n{}", "bounded content ".repeat(1_000)))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    );
+
+    let summary = truncate_compaction_summary(&generated, COMPACT_TASK_STATE_MAX_TOKENS);
+
+    assert!(approx_token_count(&summary) <= COMPACT_TASK_STATE_MAX_TOKENS);
+    assert!(summary.contains(NEXT_ACTION_HEADING));
+    assert!(section_has_nonempty_body(&summary, NEXT_ACTION_HEADING));
+}
+
+#[test]
 fn semantic_summary_truncation_prefers_newest_updates() {
     let previous = format!(
         "{SUMMARY_PREFIX}\n{CURRENT_STATE_HEADING}\n{}",
@@ -570,6 +610,136 @@ fn unresolved_user_and_agent_messages_keep_their_original_order() {
 }
 
 #[test]
+fn summary_reuse_is_disabled_when_post_summary_user_tail_is_truncated() {
+    let items = vec![
+        user_message(&format!("{SUMMARY_PREFIX}\nprior checkpoint")),
+        user_message(&"unresolved constraint ".repeat(COMPACT_USER_MESSAGE_MAX_TOKENS * 3)),
+    ];
+
+    let (_, _, _, omitted_user_text) = build_bounded_unresolved_input_history(&items);
+
+    assert!(omitted_user_text);
+    assert!(!can_reuse_previous_summary(&items, omitted_user_text));
+}
+
+#[test]
+fn bounded_user_history_emits_text_omission_receipt() {
+    let items = vec![
+        ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "previous response".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+        user_message(&"exact constraint ".repeat(COMPACT_USER_MESSAGE_MAX_TOKENS * 3)),
+    ];
+
+    let (history, _, _, omitted_user_text) = build_bounded_unresolved_input_history(&items);
+    let rendered = serde_json::to_string(&history).expect("history serializes");
+
+    assert!(omitted_user_text);
+    assert!(rendered.contains(COMPACT_TEXT_OMISSION_MARKER));
+    assert!(rendered.contains("\"role\":\"user\""));
+}
+
+#[test]
+fn unresolved_text_omission_reports_stable_provenance_and_exact_counts() {
+    let text = "exact constraint ".repeat(COMPACT_USER_MESSAGE_MAX_TOKENS * 3);
+    let original_tokens = approx_token_count(&text);
+    let items = vec![ResponseItem::Message {
+        id: Some(ResponseItemId::from_server("user-message-7".to_string())),
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText { text }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: Some(InternalChatMessageMetadataPassthrough {
+            turn_id: Some("turn-7".to_string()),
+        }),
+    }];
+
+    let (history, _, _, omitted_user_text) = build_bounded_unresolved_input_history(&items);
+    let receipt = history
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::Message { content, .. } => {
+                content.iter().find_map(|content| match content {
+                    ContentItem::InputText { text }
+                        if text.contains(COMPACT_TEXT_OMISSION_MARKER) =>
+                    {
+                        serde_json::from_str::<serde_json::Value>(text).ok()
+                    }
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .next()
+        .expect("typed omission receipt");
+
+    assert!(omitted_user_text);
+    assert_eq!(receipt["source_item_id"], "user-message-7");
+    assert_eq!(receipt["turn_id"], "turn-7");
+    assert_eq!(receipt["original_tokens"], original_tokens);
+    let retained = receipt["retained_tokens"]
+        .as_u64()
+        .expect("retained tokens") as usize;
+    assert_eq!(
+        receipt["omitted_tokens"],
+        original_tokens.saturating_sub(retained)
+    );
+    assert_eq!(receipt["unresolved"], true);
+}
+
+#[test]
+fn bounded_agent_history_emits_text_omission_receipt() {
+    let items = vec![
+        ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "previous response".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+        agent_message(&"worker evidence ".repeat(COMPACT_AGENT_MESSAGE_MAX_TOKENS * 3)),
+    ];
+
+    let (history, _, _, _) = build_bounded_unresolved_input_history(&items);
+    let rendered = serde_json::to_string(&history).expect("history serializes");
+
+    assert!(rendered.contains(COMPACT_TEXT_OMISSION_MARKER));
+    assert!(rendered.contains("\"role\":\"agent\""));
+}
+
+#[test]
+fn unresolved_tool_output_survives_local_compaction_as_typed_receipt() {
+    let call = ResponseItem::FunctionCall {
+        id: None,
+        name: "inspect".to_string(),
+        namespace: None,
+        arguments: "{}".to_string(),
+        call_id: "pending-call".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "pending-call".to_string(),
+        output: codex_protocol::models::FunctionCallOutputPayload::from_text(
+            "exact pending evidence".to_string(),
+        ),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let items = vec![user_message("request"), call.clone(), output.clone()];
+
+    let (history, _, _, _) = build_bounded_unresolved_input_history(&items);
+
+    assert_eq!(history, vec![call, output]);
+}
+
+#[test]
 fn newest_section_updates_include_separator_cost_in_their_budget() {
     let updates = (0..200)
         .map(|index| vec![format!("update-{index}")])
@@ -622,6 +792,7 @@ fn at_start_injection_preserves_cacheable_prefix_order() {
 #[test]
 fn text_truncation_keeps_images_in_their_original_order() {
     let message = CompactedUserMessage {
+        source_item_id: None,
         content: vec![
             UserInput::Text {
                 text: "word ".repeat(200),
@@ -663,6 +834,7 @@ fn image_limits_emit_a_stable_compaction_omission_marker() {
         })
         .collect();
     let message = CompactedUserMessage {
+        source_item_id: None,
         content: images,
         internal_chat_message_metadata_passthrough: None,
     };
@@ -714,6 +886,7 @@ fn build_compacted_history_preserves_user_message_passthrough_metadata() {
     let history = build_compacted_history(
         Vec::new(),
         &[CompactedUserMessage {
+            source_item_id: None,
             content: vec![UserInput::Text {
                 text: "first user message".to_string(),
                 text_elements: Vec::new(),
@@ -729,6 +902,19 @@ fn build_compacted_history_preserves_user_message_passthrough_metadata() {
 
     assert_eq!(history[0].turn_id(), Some("turn-1"));
     assert_eq!(history[1].turn_id(), None);
+}
+
+#[test]
+fn local_compaction_attempt_buffers_output_until_completed() {
+    let partial = user_message("partial summary");
+    let mut accumulator = LocalCompactionAccumulator::default();
+
+    accumulator.record_output(partial.clone());
+    assert_eq!(accumulator.items, vec![partial.clone()]);
+
+    let output = accumulator.complete(None);
+    assert_eq!(output.items, vec![partial]);
+    assert_eq!(output.token_usage, None);
 }
 
 #[test]

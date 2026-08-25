@@ -13,7 +13,7 @@ fn remote_catalog_jsonrpc_error_preserves_typed_recovery_data() {
     let error = remote_plugin_catalog_error_to_jsonrpc(
         codex_core_plugins::remote::RemotePluginCatalogError::UnexpectedStatus {
             url: "https://example.test/plugins".to_string(),
-            status: reqwest::StatusCode::FORBIDDEN,
+            status: http::StatusCode::FORBIDDEN,
             body: "localized body".to_string(),
         },
         "list remote plugins",

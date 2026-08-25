@@ -1,5 +1,10 @@
 //! Shared runtime build metadata for executable surfaces.
 
+pub const CODEX_VERSION: &str = match option_env!("CODEX_RELEASE_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BuildInfo {
     pub version: &'static str,
@@ -12,7 +17,7 @@ pub struct BuildInfo {
 impl BuildInfo {
     pub fn current() -> Self {
         Self {
-            version: env!("CARGO_PKG_VERSION"),
+            version: CODEX_VERSION,
             commit: option_env!("CODEX_BUILD_COMMIT")
                 .or(option_env!("GIT_COMMIT"))
                 .unwrap_or("unknown"),
@@ -69,6 +74,12 @@ const fn default_build_profile() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::BuildInfo;
+    use super::CODEX_VERSION;
+
+    #[test]
+    fn current_uses_the_authoritative_embedded_version() {
+        assert_eq!(BuildInfo::current().version, CODEX_VERSION);
+    }
 
     #[test]
     fn commit_precedence_and_fallbacks_are_shared() {

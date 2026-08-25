@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +23,7 @@ use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TaskCompletionStatus;
 use codex_protocol::user_input::UserInput;
 use codex_utils_output_truncation::approx_token_count;
+use futures::StreamExt;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
@@ -94,6 +96,7 @@ const MAX_REVIEW_OUTPUT_TOKENS: usize = 6_000;
 const MAX_REVIEW_FINDINGS: usize = 32;
 const MAX_REVIEW_REQUIREMENTS: usize = 256;
 const AUTHORITATIVE_MUTATION_EVIDENCE_LIMIT: usize = 100;
+const AUTHORITATIVE_BINDING_READ_CONCURRENCY: usize = 8;
 
 const SOURCE_CLASSIFICATION_MARKER: &str = "KD4_SOURCE_CLASSIFICATION_REQUEST_V1";
 const SOURCE_LOCAL_CLASSIFICATION_MARKER: &str = "KD4_SOURCE_LOCAL_CLASSIFICATION_REQUEST_V4";
@@ -1494,7 +1497,6 @@ fn bounded_review_dossier_json(
         "last_successful_validation_revision": turn_evidence.last_successful_validation_revision,
         "focused_receipts": dossier.reviewer_visible_evidence.get("proofReceipts"),
         "external_evidence": dossier.reviewer_visible_evidence.get("externalEvidence"),
-        "desktop_activation": dossier.reviewer_visible_evidence.get("desktopActivation"),
     });
     let task_attributed_paths = dossier
         .reviewer_visible_evidence
@@ -3633,14 +3635,24 @@ async fn collect_authoritative_review_inputs(
     match bindings_result {
         Ok(mut bindings) => {
             bindings.sort_by_key(|binding| binding.assignment_id);
-            for binding in bindings {
-                let task = store.get_agent_task(binding.assignment_id, Some(0)).await;
-                let mutations = store
-                    .list_mutation_evidence(
-                        binding.attempt_id,
-                        Some(AUTHORITATIVE_MUTATION_EVIDENCE_LIMIT),
-                    )
-                    .await;
+            let binding_evidence = collect_bounded_in_order(
+                bindings.into_iter().map(|binding| {
+                    let store = Arc::clone(&store);
+                    async move {
+                        let (task, mutations) = tokio::join!(
+                            store.get_agent_task(binding.assignment_id, Some(0)),
+                            store.list_mutation_evidence(
+                                binding.attempt_id,
+                                Some(AUTHORITATIVE_MUTATION_EVIDENCE_LIMIT),
+                            )
+                        );
+                        (binding, task, mutations)
+                    }
+                }),
+                AUTHORITATIVE_BINDING_READ_CONCURRENCY,
+            )
+            .await;
+            for (binding, task, mutations) in binding_evidence {
                 match (task, mutations) {
                     (Ok(task), Ok(mut mutations)) => {
                         if let Some(reason) = authoritative_mutation_page_saturation_reason(
@@ -3726,6 +3738,19 @@ async fn collect_authoritative_review_inputs(
     result.review_lens_selection_facts.risk_hints.sort();
     result.review_lens_selection_facts.risk_hints.dedup();
     result
+}
+
+async fn collect_bounded_in_order<T>(
+    futures: impl IntoIterator<Item = impl Future<Output = T> + Send>,
+    concurrency: usize,
+) -> Vec<T> {
+    async move {
+        futures::stream::iter(futures)
+            .buffered(concurrency)
+            .collect()
+            .await
+    }
+    .await
 }
 
 fn authoritative_typed_validation_proofs(task: &AgentTask) -> Vec<TypedValidationProofInputV1> {
@@ -5013,6 +5038,36 @@ mod tests {
     use sha2::Digest;
     use sha2::Sha256;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn authoritative_binding_reads_are_concurrent_and_ordered() {
+        async fn wait_and_return(
+            barrier: Arc<tokio::sync::Barrier>,
+            value: &'static str,
+        ) -> &'static str {
+            barrier.wait().await;
+            value
+        }
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let first_barrier = Arc::clone(&barrier);
+        let second_barrier = Arc::clone(&barrier);
+
+        let values = tokio::time::timeout(
+            Duration::from_millis(200),
+            collect_bounded_in_order(
+                [
+                    wait_and_return(first_barrier, "first"),
+                    wait_and_return(second_barrier, "second"),
+                ],
+                AUTHORITATIVE_BINDING_READ_CONCURRENCY,
+            ),
+        )
+        .await
+        .expect("independent binding reads should overlap");
+
+        assert_eq!(values, vec!["first", "second"]);
+    }
 
     fn completed_typed_task_with_structured_validation() -> AgentTask {
         let assignment_id = AssignmentId::new();

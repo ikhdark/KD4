@@ -1,5 +1,7 @@
 //! Reusable HTTP client and request-builder wrappers.
 
+use bytes::Bytes;
+use futures::TryStream;
 use http::Error as HttpRequestBuildError;
 use http::HeaderMap;
 use http::HeaderName;
@@ -241,6 +243,16 @@ impl RequestBuilder {
         B: Into<reqwest::Body>,
     {
         self.map(|builder| builder.body(body))
+    }
+
+    /// Sets a streaming request body without exposing the underlying HTTP implementation.
+    pub fn body_stream<S>(self, stream: S) -> Self
+    where
+        S: TryStream + Send + 'static,
+        S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+        Bytes: From<S::Ok>,
+    {
+        self.map(|builder| builder.body(reqwest::Body::wrap_stream(stream)))
     }
 
     pub async fn send(self) -> Result<HttpResponse, HttpError> {

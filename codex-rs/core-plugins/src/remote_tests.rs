@@ -24,12 +24,12 @@ fn remote_catalog_http_client_error_is_classified() {
 fn remote_catalog_error_data_owns_http_recovery_classification() {
     let forbidden = RemotePluginCatalogError::UnexpectedStatus {
         url: "https://example.test/plugins".to_string(),
-        status: reqwest::StatusCode::FORBIDDEN,
+        status: http::StatusCode::FORBIDDEN,
         body: "localized body".to_string(),
     };
     let unavailable = RemotePluginCatalogError::UnexpectedStatus {
         url: "https://example.test/plugins".to_string(),
-        status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        status: http::StatusCode::SERVICE_UNAVAILABLE,
         body: "localized body".to_string(),
     };
 

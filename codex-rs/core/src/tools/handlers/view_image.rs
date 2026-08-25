@@ -80,9 +80,12 @@ impl ToolExecutor<ToolInvocation> for ViewImageHandler {
         true
     }
 
-    fn search_info(&self) -> Option<ToolSearchInfo> {
+    fn search_info_for_registered_spec(
+        &self,
+        registered_spec: &ToolSpec,
+    ) -> Option<ToolSearchInfo> {
         ToolSearchInfo::from_tool_spec(
-            self.spec(),
+            registered_spec.clone(),
             Some(ToolSearchSourceInfo {
                 name: "Images".to_string(),
                 description: Some(

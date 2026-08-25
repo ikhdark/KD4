@@ -267,13 +267,7 @@ impl ModelProviderInfo {
             .unwrap_or_else(|| default_base_url.to_string());
 
         let headers = self.build_header_map()?;
-        let retry = ApiRetryConfig {
-            max_retries: self.request_max_retries(),
-            base_delay: Duration::from_millis(200),
-            retry_429: false,
-            retry_5xx: true,
-            retry_transport: true,
-        };
+        let retry = self.request_retry_config();
 
         Ok(ApiProvider {
             name: self.name.clone(),
@@ -283,6 +277,17 @@ impl ModelProviderInfo {
             retry,
             stream_idle_timeout: self.stream_idle_timeout(),
         })
+    }
+
+    /// Returns the complete effective retry policy used by the API transport.
+    pub fn request_retry_config(&self) -> ApiRetryConfig {
+        ApiRetryConfig {
+            max_retries: self.request_max_retries(),
+            base_delay: Duration::from_millis(200),
+            retry_429: false,
+            retry_5xx: true,
+            retry_transport: true,
+        }
     }
 
     /// If `env_key` is Some, returns the API key for this provider if present

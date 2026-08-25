@@ -782,7 +782,7 @@ pub(crate) async fn begin_exec_mutation_evidence(
     }
 }
 
-async fn finish_exec_mutation_evidence(ctx: ToolEventCtx<'_>, declined: bool) {
+async fn finish_exec_mutation_evidence(ctx: ToolEventCtx<'_>) {
     let baseline = ctx
         .session
         .services
@@ -792,9 +792,6 @@ async fn finish_exec_mutation_evidence(ctx: ToolEventCtx<'_>, declined: bool) {
     let Some(baseline) = baseline else {
         return;
     };
-    if declined {
-        return;
-    }
     let Some(store) = ctx
         .session
         .services
@@ -812,7 +809,7 @@ async fn finish_exec_mutation_evidence(ctx: ToolEventCtx<'_>, declined: bool) {
             tracing::warn!(
                 %error,
                 path,
-                "command mutation evidence finalization was unavailable; the command remains complete"
+                "command mutation evidence finalization was unavailable; the command outcome remains terminal"
             );
         }
     }
@@ -860,7 +857,7 @@ async fn emit_exec_end(
             crate::turn_diff_tracker::resolve_uncertain_command_observation(workspace_changed)
         };
     }
-    finish_exec_mutation_evidence(ctx, exec_result.status == ExecCommandStatus::Declined).await;
+    finish_exec_mutation_evidence(ctx).await;
     let possible_mutation = mutation.may_have_mutated();
     let mutation_paths = mutation.paths();
     let (validation_result, bound_plan_step) = ctx
@@ -1485,6 +1482,61 @@ mod tests {
         assert_eq!(item.formatted_output.as_deref(), Some(model_text.as_str()));
         assert_eq!(tracker.lock().await.current_mutation_revision(), 0);
         assert!(!tracker.lock().await.has_unvalidated_mutation());
+    }
+
+    #[tokio::test]
+    async fn post_begin_declined_command_finalizes_typed_mutation_evidence() {
+        let temp = tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        initialize_git_repository(&repo);
+        tokio::fs::write(repo.join("protected.txt"), "unchanged")
+            .await
+            .expect("mutation fixture");
+        let (mut session, mut turn, _rx_event) =
+            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
+        set_turn_environments(
+            &mut turn,
+            &[(codex_exec_server::LOCAL_ENVIRONMENT_ID, repo.as_path())],
+        );
+        let (attempt_id, store) =
+            enable_typed_task_for_repo(&mut session, &mut turn, &repo, &["protected.txt"]).await;
+        let cwd = AbsolutePathBuf::from_absolute_path(&repo).expect("absolute cwd");
+        let command = vec!["rm".to_string(), "protected.txt".to_string()];
+        let mutation = crate::turn_diff_tracker::command_mutation(&command, Some(&repo));
+        let call_id = "post-begin-declined-mutation";
+
+        begin_exec_mutation_evidence(
+            ToolEventCtx::new(session.as_ref(), turn.as_ref(), call_id, None),
+            Some(&cwd),
+            &mutation,
+        )
+        .await;
+        ToolEmitter::shell(
+            command,
+            cwd,
+            ExecCommandSource::Agent,
+            codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
+        )
+        .finish(
+            ToolEventCtx::new(session.as_ref(), turn.as_ref(), call_id, None),
+            Err(ToolError::Denied("declined after begin".to_string())),
+            None,
+        )
+        .await
+        .expect_err("declined command is returned to the model");
+
+        let evidence = store
+            .list_mutation_evidence(
+                attempt_id,
+                Some(codex_agent_task_store::MAX_MUTATION_EVIDENCE_LIMIT),
+            )
+            .await
+            .expect("mutation evidence remains queryable");
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].path, "protected.txt");
+        assert_eq!(evidence[0].pre_write_hash, evidence[0].final_hash);
+        assert!(evidence[0].finalized_at.is_some());
+        assert!(evidence[0].end_epoch.is_some());
     }
 
     #[tokio::test]

@@ -16,7 +16,7 @@ from codex_package.targets import TARGET_SPECS
 
 
 class CopyFileForStagingTest(unittest.TestCase):
-    def test_prefers_hardlink_when_requested(self) -> None:
+    def test_requested_hardlink_still_copies_to_isolate_staging(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             src = root / "src.exe"
@@ -29,22 +29,23 @@ class CopyFileForStagingTest(unittest.TestCase):
             ):
                 layout.copy_file_for_staging(src, dest, prefer_hardlink=True)
 
-            link.assert_called_once_with(src, dest)
-            copyfile.assert_not_called()
+            link.assert_not_called()
+            copyfile.assert_called_once_with(src, dest)
 
-    def test_falls_back_to_copy_when_hardlink_fails(self) -> None:
+    def test_copy_does_not_attempt_hardlink(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             src = root / "src.exe"
             dest = root / "dest.exe"
             src.write_text("binary", encoding="utf-8")
 
-            with mock.patch.object(layout.os, "link", side_effect=OSError):
+            with mock.patch.object(layout.os, "link", side_effect=OSError) as link:
                 layout.copy_file_for_staging(src, dest, prefer_hardlink=True)
 
             self.assertEqual(dest.read_text(encoding="utf-8"), "binary")
+            link.assert_not_called()
 
-    def test_reuse_package_dir_removes_managed_paths_only(self) -> None:
+    def test_reuse_package_dir_removes_all_residue(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             package_dir = Path(temp_dir) / "package"
             package_dir.mkdir()
@@ -67,7 +68,7 @@ class CopyFileForStagingTest(unittest.TestCase):
             self.assertFalse((package_dir / "codex-resources").exists())
             self.assertFalse((package_dir / "codex-path").exists())
             self.assertFalse((package_dir / "codex-package.json").exists())
-            self.assertTrue(keep.is_file())
+            self.assertFalse(keep.exists())
 
     def test_destination_preflight_does_not_remove_existing_output(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -106,7 +107,7 @@ class CopyFileForStagingTest(unittest.TestCase):
             chmod.assert_called_once_with(failed_path, layout.stat.S_IWRITE)
             retry.assert_called_once_with(failed_path)
 
-    def test_package_layout_prefers_hardlink_for_ripgrep(self) -> None:
+    def test_package_layout_copies_ripgrep(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             package_dir = root / "package"
@@ -307,7 +308,7 @@ class CopyFileForStagingTest(unittest.TestCase):
                     PACKAGE_VARIANTS["codex"],
                     spec,
                 )
-            self.assertIn("Invalid package file contents", str(cm.exception))
+            self.assertIn("Package file digest mismatch", str(cm.exception))
 
 
 if __name__ == "__main__":

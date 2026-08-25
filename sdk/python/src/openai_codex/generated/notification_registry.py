@@ -67,6 +67,7 @@ from .v2_all import TurnStartedNotification
 from .v2_all import TurnTerminalizationCompletedNotification
 from .v2_all import WarningNotification
 from .v2_all import WindowsSandboxSetupCompletedNotification
+from .v2_all import WindowsWorldWritableWarningNotification
 
 GeneratedNotificationPayload: TypeAlias = (
     AccountLoginCompletedNotification
@@ -129,6 +130,7 @@ GeneratedNotificationPayload: TypeAlias = (
     | TurnTerminalizationCompletedNotification
     | WarningNotification
     | WindowsSandboxSetupCompletedNotification
+    | WindowsWorldWritableWarningNotification
 )
 
 NOTIFICATION_MODELS: dict[str, type[BaseModel]] = {
@@ -191,6 +193,7 @@ NOTIFICATION_MODELS: dict[str, type[BaseModel]] = {
     "turn/started": TurnStartedNotification,
     "turn/terminalizationCompleted": TurnTerminalizationCompletedNotification,
     "warning": WarningNotification,
+    "windows/worldWritableWarning": WindowsWorldWritableWarningNotification,
     "windowsSandbox/setupCompleted": WindowsSandboxSetupCompletedNotification,
 }
 

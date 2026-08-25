@@ -6,7 +6,6 @@ use std::path::Path;
 
 use crate::HooksToml;
 use crate::permissions_toml::PermissionsToml;
-use crate::profile_toml::ConfigProfile;
 use crate::types::AnalyticsConfigToml;
 use crate::types::ApprovalsReviewer;
 use crate::types::AppsConfigToml;
@@ -384,19 +383,8 @@ pub struct ConfigToml {
     pub completed_tool_history_projection: Option<bool>,
 
     /// Maximum poll window for background terminal output (`write_stdin`), in milliseconds.
-    /// Default: `300000` (5 minutes).
+    /// Default: `60000` (1 minute).
     pub background_terminal_max_timeout: Option<u64>,
-
-    /// Legacy profile selector retained only so runtime can fail fast with a
-    /// migration message.
-    #[schemars(skip)]
-    pub profile: Option<String>,
-
-    /// Legacy inline profile tables retained only so runtime can fail fast with
-    /// a migration message.
-    #[serde(default)]
-    #[schemars(skip)]
-    pub profiles: HashMap<String, ConfigProfile>,
 
     /// Settings that govern if and what will be written to `~/.codex/history.jsonl`.
     #[serde(default = "default_history")]
@@ -445,7 +433,7 @@ pub struct ConfigToml {
     pub personality: Option<Personality>,
 
     /// Optional explicit service tier request id for new turns (for example
-    /// `default`, `priority`, or `flex`; legacy `fast` also works).
+    /// `default`, `priority`, or `flex`).
     pub service_tier: Option<String>,
 
     /// Base URL for requests to ChatGPT (as opposed to the OpenAI API).

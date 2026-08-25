@@ -45,10 +45,13 @@ MANIFEST_EVENTS = [
 PRODUCTION_COMMANDS = {
     event: (
         "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass "
-        '-Command "$repoRoot = git rev-parse --show-toplevel; '
-        "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; "
-        "& (Join-Path $repoRoot '.codex/hooks/task-continuity-entry.ps1') "
-        f'-ExpectedEvent {event}"'
+        "-Command \"$ErrorActionPreference = 'Stop'; try { "
+        "$root = Get-Item -LiteralPath (Get-Location); "
+        "while ($null -ne $root -and -not [IO.File]::Exists((Join-Path $root.FullName "
+        "'.codex/hooks/task-continuity-entry.ps1'))) { $root = $root.Parent }; "
+        "if ($null -eq $root) { throw 'repository root discovery failed' }; "
+        "& (Join-Path $root.FullName '.codex/hooks/task-continuity-entry.ps1') "
+        f"-ExpectedEvent {event} }} catch {{ [Console]::Out.Write('{{}}'); exit 0 }}\""
     )
     for event in MANIFEST_EVENTS
 }
@@ -929,15 +932,15 @@ class TaskContinuityHookTest(unittest.TestCase):
             self.assertEqual(handler["type"], "command")
             self.assertEqual(handler["command"], PRODUCTION_COMMANDS[event])
             self.assertEqual(handler["commandWindows"], PRODUCTION_COMMANDS[event])
-            self.assertEqual(handler["timeout"], 5)
+            self.assertEqual(handler["timeout"], 30)
             self.assertNotIn("async", handler)
             self.assertIn(
                 "-NoLogo -NoProfile -NonInteractive", handler["commandWindows"]
             )
             self.assertNotIn(str(REPO_ROOT), handler["commandWindows"])
-            self.assertIn("git rev-parse --show-toplevel", handler["commandWindows"])
+            self.assertNotIn("git rev-parse", handler["commandWindows"])
             self.assertIn(
-                "Join-Path $repoRoot '.codex/hooks/task-continuity-entry.ps1'",
+                "Join-Path $root.FullName '.codex/hooks/task-continuity-entry.ps1'",
                 handler["commandWindows"],
             )
         self.assertTrue(HELPER.is_file())
@@ -960,7 +963,27 @@ class TaskContinuityHookTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "{}")
 
+    def test_manifest_command_fails_open_before_helper_outside_checkout(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = subprocess.run(
+                PRODUCTION_COMMANDS["UserPromptSubmit"],
+                cwd=temp_dir,
+                input="{}",
+                text=True,
+                capture_output=True,
+                shell=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "{}")
+
     def test_helper_parses_as_windows_powershell(self) -> None:
+        slow_source = SLOW_HELPER.read_text(encoding="utf-8")
+        self.assertNotIn("[ScriptBlock]::Create", slow_source)
+        self.assertNotIn("$script:SlowImplementation = @'", slow_source)
         command = """
 $tokens = $null
 $errors = $null
@@ -989,6 +1012,26 @@ if ($errors.Count -ne 0) {
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "")
+
+    def test_fast_helpers_delegate_without_duplicate_parsing_or_policy(self) -> None:
+        entry_source = HELPER.read_text(encoding="utf-8")
+        self.assertNotIn("git.exe", entry_source)
+        self.assertIn("-TaskContinuityExpectedEvent $ExpectedEvent", entry_source)
+        for helper in FAST_HELPERS:
+            source = helper.read_text(encoding="utf-8")
+            self.assertIn("task-continuity.ps1", source)
+            self.assertIn("-TaskContinuityExpectedEvent $ExpectedEvent", source)
+            self.assertNotIn("DeserializeObject", source)
+            self.assertNotIn("ConvertFrom-Json", source)
+            self.assertNotIn("git.exe", source)
+
+        source = SLOW_HELPER.read_text(encoding="utf-8")
+        self.assertIn(
+            "$script:ParsedInput = $script:FastInput",
+            source,
+        )
+        self.assertIn("Get-CapsulePath -NormalizedSessionId", source)
+        self.assertNotIn("$dirtyLines +=", source)
 
     def test_every_event_uses_exact_stdout(self) -> None:
         session_id = self.sandbox.session_id()
@@ -1094,6 +1137,25 @@ if ($errors.Count -ne 0) {
         after = self.sandbox.capsule(session_id)
 
         self.assertEqual(after["last_turn_id"], "turn-2")
+        self.assertNotEqual(after["material_digest"], before["material_digest"])
+
+    def test_same_text_receipts_without_turn_id_are_not_collapsed(self) -> None:
+        session_id = self.sandbox.session_id()
+        payload = self.sandbox.payload(
+            "UserPromptSubmit",
+            session_id,
+            prompt="same request",
+        )
+        del payload["turn_id"]
+        self.invoke_empty(payload)
+        before = self.sandbox.capsule(session_id)
+
+        self.invoke_empty(payload)
+        after = self.sandbox.capsule(session_id)
+
+        self.assertTrue(before["last_turn_id"].startswith("receipt:"))
+        self.assertTrue(after["last_turn_id"].startswith("receipt:"))
+        self.assertNotEqual(after["last_turn_id"], before["last_turn_id"])
         self.assertNotEqual(after["material_digest"], before["material_digest"])
 
     def test_all_handled_error_fixtures_emit_exact_empty_object(self) -> None:
@@ -1403,6 +1465,13 @@ if ($errors.Count -ne 0) {
         self.assertEqual(predecessor_path.read_bytes(), predecessor_bytes)
         self.assertEqual(predecessor_path.stat().st_mtime_ns, predecessor_mtime)
 
+        self.invoke_empty(
+            self.sandbox.payload("SessionStart", child, source="startup")
+        )
+        duplicate = self.sandbox.capsule(child)
+        self.assertEqual(duplicate["last_user_request"], "Preserve predecessor context")
+        self.assertEqual(duplicate["last_assistant_result"], "Predecessor result")
+
         new_session = self.sandbox.session_id()
         self.sandbox.transcript.write_text("", encoding="utf-8")
         self.invoke_empty(
@@ -1511,10 +1580,22 @@ if ($errors.Count -ne 0) {
         )
         stopped = self.sandbox.capsule(session_id)["task_state"]
         self.assertEqual(stopped["current_state"], "Distinct task complete")
-        self.assertEqual(stopped["completed_work"], "Distinct task complete")
+        self.assertIsNone(stopped["completed_work"])
         self.assertIsNone(stopped["unresolved_work"])
         self.assertEqual(stopped["evidence"], "Distinct task complete")
-        self.assertEqual(stopped["next_action"], "Await the next user request.")
+        self.assertIsNone(stopped["next_action"])
+
+    def test_material_digest_includes_event_and_transcript_identity(self) -> None:
+        session_id = self.sandbox.session_id()
+        first = self.sandbox.payload("UserPromptSubmit", session_id)
+        self.invoke_empty(first)
+        alternate = self.sandbox.root / "alternate.jsonl"
+        alternate.write_text("", encoding="utf-8")
+        self.invoke_empty({**first, "transcript_path": str(alternate)})
+
+        capsule = self.sandbox.capsule(session_id)
+        self.assertEqual(capsule["transcript_path"], str(alternate))
+        self.assertEqual(capsule["last_event"], "UserPromptSubmit")
 
     def test_unchanged_stop_preserves_bytes_and_modification_time(self) -> None:
         session_id = self.sandbox.session_id()
@@ -1529,6 +1610,88 @@ if ($errors.Count -ne 0) {
         self.invoke_empty(stop)
         self.assertEqual(capsule_path.read_bytes(), before_bytes)
         self.assertEqual(capsule_path.stat().st_mtime_ns, before_mtime)
+
+    def test_stop_refreshes_repository_before_unchanged_short_circuit(self) -> None:
+        git = shutil.which("git.exe") or shutil.which("git")
+        if git is None:
+            self.skipTest("Git is not available")
+        for args in (
+            ["init"],
+            ["config", "user.email", "continuity@example.invalid"],
+            ["config", "user.name", "Continuity Test"],
+        ):
+            subprocess.run(
+                [git, *args],
+                cwd=self.sandbox.root,
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+        tracked = self.sandbox.root / "tracked.txt"
+        tracked.write_text("clean\n", encoding="utf-8")
+        subprocess.run([git, "add", "tracked.txt"], cwd=self.sandbox.root, check=True)
+        subprocess.run(
+            [git, "commit", "-m", "fixture"],
+            cwd=self.sandbox.root,
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        session_id = self.sandbox.session_id()
+        self.invoke_empty(self.sandbox.payload("UserPromptSubmit", session_id))
+        stop = self.sandbox.payload(
+            "Stop", session_id, last_assistant_message="Stable result"
+        )
+        self.invoke_empty(stop)
+        before = self.sandbox.capsule_path(session_id).read_bytes()
+
+        tracked.write_text("dirty\n", encoding="utf-8")
+        self.invoke_empty(stop)
+        capsule = self.sandbox.capsule(session_id)
+        self.assertNotEqual(self.sandbox.capsule_path(session_id).read_bytes(), before)
+        self.assertIn("tracked.txt", capsule["repository"]["dirty_summary"])
+
+    def test_dirty_repository_identity_changes_when_status_lines_do_not(self) -> None:
+        git = shutil.which("git.exe") or shutil.which("git")
+        if git is None:
+            self.skipTest("Git is not available")
+        for args in (
+            ["init"],
+            ["config", "user.email", "continuity@example.invalid"],
+            ["config", "user.name", "Continuity Test"],
+        ):
+            subprocess.run(
+                [git, *args],
+                cwd=self.sandbox.root,
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+        tracked = self.sandbox.root / "tracked.txt"
+        tracked.write_text("clean\n", encoding="utf-8")
+        subprocess.run([git, "add", "tracked.txt"], cwd=self.sandbox.root, check=True)
+        subprocess.run(
+            [git, "commit", "-m", "fixture"],
+            cwd=self.sandbox.root,
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        session_id = self.sandbox.session_id()
+        stop = self.sandbox.payload(
+            "Stop", session_id, last_assistant_message="Stable result"
+        )
+
+        tracked.write_text("dirty one\n", encoding="utf-8")
+        self.invoke_empty(stop)
+        first = self.sandbox.capsule(session_id)["repository"]["dirty_summary"]
+        tracked.write_text("dirty two\n", encoding="utf-8")
+        self.invoke_empty(stop)
+        second = self.sandbox.capsule(session_id)["repository"]["dirty_summary"]
+
+        self.assertIn("tracked.txt", first)
+        self.assertIn("tracked.txt", second)
+        self.assertNotEqual(second, first)
 
     def test_concurrent_sessions_use_atomic_replacement_without_temp_files(
         self,
@@ -1564,7 +1727,56 @@ if ($errors.Count -ne 0) {
         ]
         self.assertEqual(leftovers, [])
 
-    def test_retention_runs_only_on_session_start_and_enforces_age_and_count(
+    def test_concurrent_updates_for_one_session_are_serialized(self) -> None:
+        session_id = self.sandbox.session_id()
+        self.invoke_empty(
+            self.sandbox.payload("SessionStart", session_id, source="startup")
+        )
+
+        def clear(_: int) -> subprocess.CompletedProcess[str]:
+            result, _ = self.sandbox.invoke(
+                self.sandbox.payload("SessionStart", session_id, source="clear")
+            )
+            return result
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(clear, range(8)))
+        for result in results:
+            self.assert_empty(result)
+        self.assertEqual(self.sandbox.capsule(session_id)["continuity_epoch"], 8)
+
+    def test_startup_retention_protects_the_fork_predecessor(self) -> None:
+        predecessor = self.sandbox.session_id()
+        self.invoke_empty(
+            self.sandbox.payload(
+                "UserPromptSubmit", predecessor, prompt="Retain this predecessor"
+            )
+        )
+        predecessor_path = self.sandbox.capsule_path(predecessor)
+        old = time.time() - (31 * 24 * 60 * 60)
+        os.utime(predecessor_path, (old, old))
+        child = self.sandbox.session_id()
+        self.sandbox.transcript.write_text(
+            compact_json(
+                {
+                    "type": "session_meta",
+                    "payload": {"id": child, "forked_from_id": predecessor},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        self.invoke_injection(
+            self.sandbox.payload("SessionStart", child, source="startup"), child
+        )
+        self.assertTrue(predecessor_path.exists())
+        self.assertEqual(
+            self.sandbox.capsule(child)["last_user_request"],
+            "Retain this predecessor",
+        )
+
+    def test_retention_preserves_capsules_without_terminal_or_lease_proof(
         self,
     ) -> None:
         self.sandbox.state.mkdir(parents=True)
@@ -1588,14 +1800,14 @@ if ($errors.Count -ne 0) {
             self.sandbox.payload("SessionStart", current, source="startup")
         )
         self.assertTrue(
-            all(not self.sandbox.capsule_path(value).exists() for value in old_ids)
+            all(self.sandbox.capsule_path(value).exists() for value in old_ids)
         )
         inactive = [
             path
             for path in self.sandbox.state.glob("*.json")
             if path.name != f"{current}.json"
         ]
-        self.assertLessEqual(len(inactive), 100)
+        self.assertGreater(len(inactive), 100)
         self.assertTrue(self.sandbox.capsule_path(current).exists())
 
     def test_hooks_list_diagnoses_states_without_using_order(self) -> None:

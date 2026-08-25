@@ -19,7 +19,7 @@ use std::time::Duration;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
-use codex_http_client::build_blocking_reqwest_client_with_custom_ca;
+use codex_http_client::BlockingHttpClientBuilder;
 use url::Url;
 use uuid::Uuid;
 
@@ -95,17 +95,17 @@ fn pack_dir(codex_home: &Path) -> PathBuf {
 
 fn download_bytes_with_limit(url: &str, max_bytes: u64) -> Result<Vec<u8>> {
     validate_download_url(url)?;
-    let client = build_blocking_reqwest_client_with_custom_ca(
-        reqwest::blocking::Client::builder().timeout(PET_DOWNLOAD_TIMEOUT),
-    )
-    .context("build pet asset download client")?;
+    let client = BlockingHttpClientBuilder::new()
+        .request_timeout(Some(PET_DOWNLOAD_TIMEOUT))
+        .build_with_transport_default_proxy()
+        .context("build pet asset download client")?;
     let response = client
         .get(url)
         .send()
         .with_context(|| format!("download pet asset from {url}"))?
         .error_for_status()
         .with_context(|| format!("download pet asset from {url}"))?;
-    validate_download_url(response.url().as_str())?;
+    validate_download_url(response.url())?;
 
     if response.content_length().is_some_and(|len| len > max_bytes) {
         bail!("pet asset download from {url} exceeded {max_bytes} bytes");

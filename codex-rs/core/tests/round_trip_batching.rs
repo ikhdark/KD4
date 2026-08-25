@@ -2,10 +2,12 @@
 
 use codex_features::Feature;
 use codex_protocol::protocol::TurnTiming;
+use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
+use core_test_support::responses::mount_sse_once_match;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
@@ -13,6 +15,7 @@ use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
+use wiremock::MockServer;
 
 const EDIT_ARGS: &str = r#"{"sleep_before_ms":1}"#;
 const VALIDATE_TEST_ARGS: &str = r#"{"sleep_before_ms":2}"#;
@@ -28,6 +31,84 @@ fn function_call_output_ids(input: &[Value]) -> Vec<&str> {
         .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
         .filter_map(|item| item.get("call_id").and_then(Value::as_str))
         .collect()
+}
+
+type FunctionCall = (String, String, String);
+type FunctionCallOutput = (String, String);
+
+fn request_tool_transcript(
+    request: &wiremock::Request,
+) -> Option<(Vec<FunctionCall>, Vec<FunctionCallOutput>)> {
+    let body: Value = serde_json::from_slice(&request.body).ok()?;
+    let input = body.get("input")?.as_array()?;
+    let calls = input
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+        .map(|item| {
+            Some((
+                item.get("call_id")?.as_str()?.to_string(),
+                item.get("name")?.as_str()?.to_string(),
+                item.get("arguments")?.as_str()?.to_string(),
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let outputs = input
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
+        .map(|item| {
+            Some((
+                item.get("call_id")?.as_str()?.to_string(),
+                item.get("output")?.as_str()?.to_string(),
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some((calls, outputs))
+}
+
+async fn mount_semantically_gated_sequence(
+    server: &MockServer,
+    steps: Vec<(Vec<(&'static str, &'static str)>, String)>,
+) -> Vec<ResponseMock> {
+    let mut mocks = Vec::with_capacity(steps.len());
+    for (expected_calls, response) in steps {
+        let expected_transcript = (
+            expected_calls
+                .iter()
+                .map(|(call_id, arguments)| {
+                    (
+                        (*call_id).to_string(),
+                        "test_sync_tool".to_string(),
+                        (*arguments).to_string(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            expected_calls
+                .into_iter()
+                .map(|(call_id, _)| (call_id.to_string(), "ok".to_string()))
+                .collect::<Vec<_>>(),
+        );
+        mocks.push(
+            mount_sse_once_match(
+                server,
+                move |request: &wiremock::Request| {
+                    request_tool_transcript(request).as_ref() == Some(&expected_transcript)
+                },
+                response,
+            )
+            .await,
+        );
+    }
+    mocks
+}
+
+fn calls(entries: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'static str)> {
+    entries.to_vec()
+}
+
+fn requests_for_sequence(
+    mocks: &[ResponseMock],
+) -> Vec<core_test_support::responses::ResponsesRequest> {
+    mocks.iter().flat_map(ResponseMock::requests).collect()
 }
 
 fn assert_timing_reconciles(timing: &TurnTiming) {
@@ -81,33 +162,57 @@ async fn post_edit_batches_validation_and_git_into_three_model_requests() -> any
     skip_if_no_network!(Ok(()));
 
     let baseline_server = start_mock_server().await;
-    let baseline_responses = mount_sse_sequence(
+    let baseline_responses = mount_semantically_gated_sequence(
         &baseline_server,
         vec![
-            sse(vec![
-                ev_response_created("edit"),
-                ev_function_call("edit", "test_sync_tool", EDIT_ARGS),
-                ev_completed("edit"),
-            ]),
-            sse(vec![
-                ev_response_created("validate-test"),
-                ev_function_call("validate-test", "test_sync_tool", VALIDATE_TEST_ARGS),
-                ev_completed("validate-test"),
-            ]),
-            sse(vec![
-                ev_response_created("validate-format"),
-                ev_function_call("validate-format", "test_sync_tool", VALIDATE_FORMAT_ARGS),
-                ev_completed("validate-format"),
-            ]),
-            sse(vec![
-                ev_response_created("git-diff"),
-                ev_function_call("git-diff", "test_sync_tool", GIT_DIFF_ARGS),
-                ev_completed("git-diff"),
-            ]),
-            sse(vec![
-                ev_assistant_message("done", "done"),
-                ev_completed("complete"),
-            ]),
+            (
+                vec![],
+                sse(vec![
+                    ev_response_created("edit"),
+                    ev_function_call("edit", "test_sync_tool", EDIT_ARGS),
+                    ev_completed("edit"),
+                ]),
+            ),
+            (
+                calls(&[("edit", EDIT_ARGS)]),
+                sse(vec![
+                    ev_response_created("validate-test"),
+                    ev_function_call("validate-test", "test_sync_tool", VALIDATE_TEST_ARGS),
+                    ev_completed("validate-test"),
+                ]),
+            ),
+            (
+                calls(&[("edit", EDIT_ARGS), ("validate-test", VALIDATE_TEST_ARGS)]),
+                sse(vec![
+                    ev_response_created("validate-format"),
+                    ev_function_call("validate-format", "test_sync_tool", VALIDATE_FORMAT_ARGS),
+                    ev_completed("validate-format"),
+                ]),
+            ),
+            (
+                calls(&[
+                    ("edit", EDIT_ARGS),
+                    ("validate-test", VALIDATE_TEST_ARGS),
+                    ("validate-format", VALIDATE_FORMAT_ARGS),
+                ]),
+                sse(vec![
+                    ev_response_created("git-diff"),
+                    ev_function_call("git-diff", "test_sync_tool", GIT_DIFF_ARGS),
+                    ev_completed("git-diff"),
+                ]),
+            ),
+            (
+                calls(&[
+                    ("edit", EDIT_ARGS),
+                    ("validate-test", VALIDATE_TEST_ARGS),
+                    ("validate-format", VALIDATE_FORMAT_ARGS),
+                    ("git-diff", GIT_DIFF_ARGS),
+                ]),
+                sse(vec![
+                    ev_assistant_message("done", "done"),
+                    ev_completed("complete"),
+                ]),
+            ),
         ],
     )
     .await;
@@ -126,25 +231,39 @@ async fn post_edit_batches_validation_and_git_into_three_model_requests() -> any
         .await?;
 
     let server = start_mock_server().await;
-    let responses = mount_sse_sequence(
+    let responses = mount_semantically_gated_sequence(
         &server,
         vec![
-            sse(vec![
-                ev_response_created("edit"),
-                ev_function_call("edit", "test_sync_tool", EDIT_ARGS),
-                ev_completed("edit"),
-            ]),
-            sse(vec![
-                ev_response_created("post-edit"),
-                ev_function_call("validate-test", "test_sync_tool", VALIDATE_TEST_ARGS),
-                ev_function_call("validate-format", "test_sync_tool", VALIDATE_FORMAT_ARGS),
-                ev_function_call("git-diff", "test_sync_tool", GIT_DIFF_ARGS),
-                ev_completed("post-edit"),
-            ]),
-            sse(vec![
-                ev_assistant_message("done", "done"),
-                ev_completed("complete"),
-            ]),
+            (
+                vec![],
+                sse(vec![
+                    ev_response_created("edit"),
+                    ev_function_call("edit", "test_sync_tool", EDIT_ARGS),
+                    ev_completed("edit"),
+                ]),
+            ),
+            (
+                calls(&[("edit", EDIT_ARGS)]),
+                sse(vec![
+                    ev_response_created("post-edit"),
+                    ev_function_call("validate-test", "test_sync_tool", VALIDATE_TEST_ARGS),
+                    ev_function_call("validate-format", "test_sync_tool", VALIDATE_FORMAT_ARGS),
+                    ev_function_call("git-diff", "test_sync_tool", GIT_DIFF_ARGS),
+                    ev_completed("post-edit"),
+                ]),
+            ),
+            (
+                calls(&[
+                    ("edit", EDIT_ARGS),
+                    ("validate-test", VALIDATE_TEST_ARGS),
+                    ("validate-format", VALIDATE_FORMAT_ARGS),
+                    ("git-diff", GIT_DIFF_ARGS),
+                ]),
+                sse(vec![
+                    ev_assistant_message("done", "done"),
+                    ev_completed("complete"),
+                ]),
+            ),
         ],
     )
     .await;
@@ -162,8 +281,8 @@ async fn post_edit_batches_validation_and_git_into_three_model_requests() -> any
         )
         .await?;
 
-    let baseline_requests = baseline_responses.requests();
-    let requests = responses.requests();
+    let baseline_requests = requests_for_sequence(&baseline_responses);
+    let requests = requests_for_sequence(&responses);
     assert_eq!(
         baseline_completion.last_agent_message.as_deref(),
         completion.last_agent_message.as_deref()
@@ -211,32 +330,51 @@ async fn diagnosis_and_dynamic_validation_keep_model_boundaries() -> anyhow::Res
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let responses = mount_sse_sequence(
+    let responses = mount_semantically_gated_sequence(
         &server,
         vec![
-            sse(vec![
-                ev_response_created("1"),
-                ev_function_call("failing-check", "test_sync_tool", FAILING_CHECK_ARGS),
-                ev_completed("failed"),
-            ]),
-            sse(vec![
-                ev_response_created("2"),
-                ev_function_call("diagnose", "test_sync_tool", DIAGNOSE_ARGS),
-                ev_completed("diagnosed"),
-            ]),
-            sse(vec![
-                ev_response_created("3"),
-                ev_function_call(
-                    "targeted-validation",
-                    "test_sync_tool",
-                    TARGETED_VALIDATION_ARGS,
-                ),
-                ev_completed("validated"),
-            ]),
-            sse(vec![
-                ev_assistant_message("done", "done"),
-                ev_completed("complete"),
-            ]),
+            (
+                vec![],
+                sse(vec![
+                    ev_response_created("1"),
+                    ev_function_call("failing-check", "test_sync_tool", FAILING_CHECK_ARGS),
+                    ev_completed("failed"),
+                ]),
+            ),
+            (
+                calls(&[("failing-check", FAILING_CHECK_ARGS)]),
+                sse(vec![
+                    ev_response_created("2"),
+                    ev_function_call("diagnose", "test_sync_tool", DIAGNOSE_ARGS),
+                    ev_completed("diagnosed"),
+                ]),
+            ),
+            (
+                calls(&[
+                    ("failing-check", FAILING_CHECK_ARGS),
+                    ("diagnose", DIAGNOSE_ARGS),
+                ]),
+                sse(vec![
+                    ev_response_created("3"),
+                    ev_function_call(
+                        "targeted-validation",
+                        "test_sync_tool",
+                        TARGETED_VALIDATION_ARGS,
+                    ),
+                    ev_completed("validated"),
+                ]),
+            ),
+            (
+                calls(&[
+                    ("failing-check", FAILING_CHECK_ARGS),
+                    ("diagnose", DIAGNOSE_ARGS),
+                    ("targeted-validation", TARGETED_VALIDATION_ARGS),
+                ]),
+                sse(vec![
+                    ev_assistant_message("done", "done"),
+                    ev_completed("complete"),
+                ]),
+            ),
         ],
     )
     .await;
@@ -252,7 +390,7 @@ async fn diagnosis_and_dynamic_validation_keep_model_boundaries() -> anyhow::Res
         .submit_turn_and_capture_completion("diagnose the failure, then select validation")
         .await?;
 
-    let requests = responses.requests();
+    let requests = requests_for_sequence(&responses);
     let timing = completion.timing.expect("turn timing");
     assert_timing_reconciles(&timing);
     let counters = &timing.counters;

@@ -5,7 +5,7 @@ set shell := ["python", "-c", 'import os, runpy; runpy.run_path(os.environ["JUST
 set windows-shell := ["python", "-c", 'import os, runpy; runpy.run_path(os.environ["JUST_SHELL"], run_name="__main__")']
 
 rust_min_stack := "8388608" # 8 MiB
-rust_parallelism := "16" # Keep local builds and tests responsive; standard env/CLI overrides still win.
+rust_parallelism := "8" # Match codex-rs/.cargo/config.toml; standard env/CLI overrides still win.
 cargo_build_jobs := env_var_or_default("CARGO_BUILD_JOBS", rust_parallelism)
 export CARGO_BUILD_JOBS := cargo_build_jobs
 rust_test_threads := env_var_or_default("RUST_TEST_THREADS", rust_parallelism)
@@ -38,7 +38,6 @@ codex-stale-ok *args:
 exec *args:
     cargo run --bin codex -- exec {args}
 
-# Start `codex exec-server` and run codex-tui.
 # Run the CLI version of the file-search crate.
 file-search *args:
     cargo run --bin codex-file-search -- {args}
@@ -53,24 +52,61 @@ _app-server-test-client-reserved *args:
     $forwarded_args = @($args | Select-Object -Skip 1); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; Remove-Item Env:CODEX_CARGO_LANE_TARGET_DIR -ErrorAction SilentlyContinue; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; cargo build --target-dir $target_dir -p codex-cli; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cargo run --target-dir $target_dir -p codex-app-server-test-client -- --codex-bin (Join-Path $target_dir "debug\codex.exe") @forwarded_args
 
 # Format the justfile and Rust code for the high-frequency local edit path.
+[script("python")]
 fmt:
-    {{ python }} ../scripts/format.py --fast-local
+    import runpy
+    import sys
+    script = r"{{ justfile_directory() }}/scripts/format.py"
+    sys.argv = [script, "--fast-local"]
+    runpy.run_path(script, run_name="__main__")
 
 # Check the high-frequency local formatter set without modifying files.
+[script("python")]
 fmt-check-fast:
-    {{ python }} "{{ justfile_directory() }}/scripts/format.py" --check --fast-local
+    import runpy
+    import sys
+    script = r"{{ justfile_directory() }}/scripts/format.py"
+    sys.argv = [script, "--check", "--fast-local"]
+    runpy.run_path(script, run_name="__main__")
 
 # Format the justfile, Rust, Prettier targets, Python SDK code, and Python scripts.
+[script("python")]
 fmt-full:
-    {{ python }} ../scripts/format.py
+    import runpy
+    import sys
+    script = r"{{ justfile_directory() }}/scripts/format.py"
+    sys.argv = [script]
+    runpy.run_path(script, run_name="__main__")
 
 # Check formatting without modifying files.
+[script("python")]
 fmt-check:
-    {{ python }} ../scripts/format.py --check
+    import runpy
+    import sys
+    script = r"{{ justfile_directory() }}/scripts/format.py"
+    sys.argv = [script, "--check"]
+    runpy.run_path(script, run_name="__main__")
 
 [no-cd]
+[script("python")]
 check-kd4-features *args:
-    @{{ python }} "{{ justfile_directory() }}/scripts/check_kd4_features.py" {args}
+    import json
+    import os
+    import runpy
+    import sys
+    script = r"{{ justfile_directory() }}/scripts/check_kd4_features.py"
+    forwarded = sys.argv[1:]
+    if os.name == "nt":
+        # just's Windows script-recipe boundary applies two JSON-style escape
+        # layers to positional arguments. Remove both before handing argv to
+        # the underlying Python entrypoint.
+        def decode_argument(argument):
+            for _ in range(2):
+                argument = json.loads('"' + argument + '"')
+            return argument
+        forwarded = [decode_argument(argument) for argument in forwarded]
+    sys.argv = [script, *forwarded]
+    runpy.run_path(script, run_name="__main__")
 
 [no-cd]
 kd4-sync-audit *args:
@@ -110,7 +146,7 @@ clippy *args:
 
 [windows]
 clippy-workspace *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); & "{{ justfile_directory() }}\scripts\cargo-workspace-analyzer.ps1" -Analyzer clippy @forwarded_args; exit $LASTEXITCODE
+    $forwarded_args = @($args | Select-Object -Skip 1); & "{{ justfile_directory() }}\scripts\cargo-workspace-analyzer.ps1" -Analyzer clippy --workspace @forwarded_args; exit $LASTEXITCODE
 
 [windows]
 cargo-shear *args:
@@ -123,10 +159,16 @@ rust-dead-code-matrix *args:
 [windows]
 install:
     #!powershell.exe -File
+    $requiredPwshVersion = [version]"7.5.2"
     $pwsh = Get-Command pwsh.exe -ErrorAction SilentlyContinue
     if (-not $pwsh) {
-        winget install --exact --id Microsoft.PowerShell --source winget --accept-package-agreements --accept-source-agreements
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        Write-Error "PowerShell $requiredPwshVersion is required. Install that exact version before running setup."
+        exit 2
+    }
+    $actualPwshVersion = & $pwsh.Source -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+    if ([version]$actualPwshVersion -ne $requiredPwshVersion) {
+        Write-Error "PowerShell $requiredPwshVersion is required; found $actualPwshVersion."
+        exit 2
     }
     rustup show active-toolchain
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -136,7 +178,24 @@ install:
 [no-cd]
 [windows]
 publish-local-codex-final *args:
-    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\publish-local-codex.ps1" -AutoSkipBuild -Profile release -RunDoctor -CloseRunningTargetTimeoutSeconds 30 -ConfigureDesktopLocalCli -DesktopCliEnvironmentTarget User {args}
+    @just test-release-tooling
+    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\publish-local-codex.ps1" -AutoSkipBuild -Profile release -RunDoctor -DoctorOnNoop -CloseRunningTargetTimeoutSeconds 30 -ConfigureDesktopLocalCli -DesktopCliEnvironmentTarget User -RestartDesktop {args}
+
+[no-cd]
+[windows]
+prepare-codex-release version:
+    @{{ python }} "{{ justfile_directory() }}\scripts\build_codex_package.py" --target x86_64-pc-windows-msvc --cargo-profile release --release-version "{{ version }}" --package-dir "{{ justfile_directory() }}\_build\packages\{{ version }}-x64" --release-dir "{{ justfile_directory() }}\_build\release\{{ version }}" --force
+    @{{ python }} "{{ justfile_directory() }}\scripts\build_codex_package.py" --target aarch64-pc-windows-msvc --cargo-profile release --release-version "{{ version }}" --package-dir "{{ justfile_directory() }}\_build\packages\{{ version }}-arm64" --release-dir "{{ justfile_directory() }}\_build\release\{{ version }}" --force
+
+[no-cd]
+[windows]
+sign-codex-release version: (prepare-codex-release version)
+    $releaseDir = "{{ justfile_directory() }}\_build\release\{{ version }}"; if (-not (Get-Command cosign -ErrorAction SilentlyContinue)) { throw "cosign is required" }; foreach ($asset in @(Get-ChildItem -LiteralPath $releaseDir -File | Where-Object { $_.Name -notlike '*.sigstore.json' })) { cosign sign-blob --yes --bundle "$($asset.FullName).sigstore.json" $asset.FullName; if ($LASTEXITCODE -ne 0) { throw "cosign failed for $($asset.Name)" } }
+
+[no-cd]
+[windows]
+publish-codex-release version: (sign-codex-release version)
+    $releaseDir = "{{ justfile_directory() }}\_build\release\{{ version }}"; $tag = "rust-v{{ version }}"; if ([string]::IsNullOrWhiteSpace($env:CODEX_RELEASE_CERTIFICATE_IDENTITY) -or [string]::IsNullOrWhiteSpace($env:CODEX_RELEASE_OIDC_ISSUER)) { throw "Set CODEX_RELEASE_CERTIFICATE_IDENTITY and CODEX_RELEASE_OIDC_ISSUER to the authorized Sigstore identity" }; foreach ($asset in @(Get-ChildItem -LiteralPath $releaseDir -File | Where-Object { $_.Name -notlike '*.sigstore.json' })) { cosign verify-blob --bundle "$($asset.FullName).sigstore.json" --certificate-identity $env:CODEX_RELEASE_CERTIFICATE_IDENTITY --certificate-oidc-issuer $env:CODEX_RELEASE_OIDC_ISSUER $asset.FullName; if ($LASTEXITCODE -ne 0) { throw "Sigstore verification failed for $($asset.Name)" } }; $assets = @(Get-ChildItem -LiteralPath $releaseDir -File | Select-Object -ExpandProperty FullName); if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { throw "gh is required" }; gh release create $tag @assets --repo ikhdark/KD4 --verify-tag --title $tag; if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }; $expected = @($assets | ForEach-Object { Split-Path -Leaf $_ } | Sort-Object); $actual = @(gh release view $tag --repo ikhdark/KD4 --json assets --jq '.assets[].name' | Sort-Object); if (Compare-Object $expected $actual) { throw "Published release inventory does not match the prepared assets" }
 
 [no-cd]
 [windows]
@@ -183,8 +242,7 @@ _core-test-helpers target_dir:
 
 [windows]
 _core-test-helpers-runtime target_dir:
-    cargo build --target-dir "{{ target_dir }}" -p codex-cli --bin codex
-    cargo build --target-dir "{{ target_dir }}" -p codex-code-mode-host --bin codex-code-mode-host
+    cargo build --target-dir "{{ target_dir }}" -p codex-cli --bin codex -p codex-code-mode-host --bin codex-code-mode-host
 
 [windows]
 _core-test-helpers-mcp target_dir:
@@ -192,8 +250,7 @@ _core-test-helpers-mcp target_dir:
 
 [windows]
 _core-test-helpers-windows-sandbox target_dir:
-    cargo build --target-dir "{{ target_dir }}" -p codex-windows-sandbox --bin codex-windows-sandbox-setup
-    cargo build --target-dir "{{ target_dir }}" -p codex-windows-sandbox --bin codex-command-runner
+    cargo build --target-dir "{{ target_dir }}" -p codex-windows-sandbox --bin codex-windows-sandbox-setup --bin codex-command-runner
 
 [windows]
 test-fast-nosccache *args:
@@ -467,9 +524,10 @@ sdk-ts-check:
     pnpm --dir "{{ justfile_directory() }}" --filter @openai/codex-sdk run typecheck
     pnpm --dir "{{ justfile_directory() }}" --filter @openai/codex-sdk run test
 
-# Run the Python SDK test suite (default marker exclusions apply).
+# Lint and run the Python SDK test suite (default marker exclusions apply).
 [no-cd]
 sdk-python-check:
+    uv run --directory "{{ justfile_directory() }}/sdk/python" --group dev ruff check .
     uv run --directory "{{ justfile_directory() }}/sdk/python" --group dev pytest
 
 # Lint the codex-cli npm wrapper entrypoint.

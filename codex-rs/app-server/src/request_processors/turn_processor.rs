@@ -1140,6 +1140,16 @@ impl TurnRequestProcessor {
                         None,
                         Some(AnalyticsJsonRpcError::Input(InputError::Empty)),
                     ),
+                    SteerInputError::PendingInputLimitExceeded {
+                        max_items,
+                        max_bytes,
+                    } => (
+                        format!(
+                            "pending input limit exceeded (maximum {max_items} items or {max_bytes} bytes)"
+                        ),
+                        None,
+                        None,
+                    ),
                 };
                 let mut error = invalid_request(message);
                 error.data = data;

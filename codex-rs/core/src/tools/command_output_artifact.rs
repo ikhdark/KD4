@@ -21,6 +21,9 @@ use std::time::SystemTime;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use codex_file_system::AtomicWriteLock;
+use codex_file_system::acquire_atomic_write_lock;
+use codex_file_system::write_bytes_atomically;
 use codex_tools::CanonicalByteRange;
 use codex_tools::CanonicalJsonPointer;
 use codex_tools::CanonicalToolResult;
@@ -63,6 +66,11 @@ pub(crate) const ARTIFACT_SEARCH_MAX_RESULTS: usize = 100;
 pub(crate) const ARTIFACT_SEARCH_MAX_CONTEXT_LINES: usize = 20;
 pub(crate) const ARTIFACT_SEARCH_MAX_QUERY_BYTES: usize = 1_024;
 const LOGICAL_ARTIFACT_METADATA_VERSION: u8 = 1;
+const LOGICAL_ARTIFACT_TRANSACTION_EXTENSION: &str = "transaction";
+const LOGICAL_ARTIFACT_CREATE_TRANSACTION_BYTES: &[u8] =
+    b"KD4_LOGICAL_ARTIFACT_CREATE_TRANSACTION_V1\n";
+const LOGICAL_ARTIFACT_ATTACH_TRANSACTION_BYTES: &[u8] =
+    b"KD4_LOGICAL_ARTIFACT_ATTACH_TRANSACTION_V1\n";
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ToolOutputSelector {
@@ -1613,6 +1621,200 @@ fn logical_segment_path(path: &Path, index: u32) -> PathBuf {
     }
 }
 
+fn logical_transaction_path(path: &Path) -> PathBuf {
+    path.with_extension(LOGICAL_ARTIFACT_TRANSACTION_EXTENSION)
+}
+
+fn begin_logical_artifact_transaction(
+    path: &Path,
+    preserve_base_segment: bool,
+) -> std::io::Result<()> {
+    reconcile_logical_artifact_transaction(path)?;
+    let transaction_path = logical_transaction_path(path);
+    let mut transaction = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&transaction_path)?;
+    let write = transaction
+        .write_all(if preserve_base_segment {
+            LOGICAL_ARTIFACT_ATTACH_TRANSACTION_BYTES
+        } else {
+            LOGICAL_ARTIFACT_CREATE_TRANSACTION_BYTES
+        })
+        .and_then(|()| transaction.sync_all())
+        .and_then(|()| sync_parent_directory(&transaction_path));
+    if let Err(err) = write {
+        drop(transaction);
+        let _ = std::fs::remove_file(&transaction_path);
+        let _ = sync_parent_directory(&transaction_path);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn finish_logical_artifact_transaction(path: &Path) -> std::io::Result<()> {
+    let transaction_path = logical_transaction_path(path);
+    match std::fs::remove_file(&transaction_path) {
+        Ok(()) => sync_parent_directory(&transaction_path),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn reconcile_logical_artifact_transaction(path: &Path) -> std::io::Result<()> {
+    let transaction_path = logical_transaction_path(path);
+    match std::fs::symlink_metadata(&transaction_path) {
+        Ok(metadata) if metadata.is_file() && !metadata_is_reparse_point(&metadata) => {}
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "invalid logical artifact transaction marker `{}`",
+                    transaction_path.display()
+                ),
+            ));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    }
+    let transaction_bytes = std::fs::read(&transaction_path)?;
+    let preserve_base_segment = transaction_bytes == LOGICAL_ARTIFACT_ATTACH_TRANSACTION_BYTES;
+    if !preserve_base_segment && transaction_bytes != LOGICAL_ARTIFACT_CREATE_TRANSACTION_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "invalid logical artifact transaction marker `{}`",
+                transaction_path.display()
+            ),
+        ));
+    }
+
+    let metadata = std::fs::read(logical_metadata_path(path))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<LogicalArtifactMetadata>(&bytes).ok())
+        .filter(|metadata| metadata.version == LOGICAL_ARTIFACT_METADATA_VERSION);
+    if let Some(metadata) = metadata {
+        let retained = metadata
+            .segments
+            .iter()
+            .map(|segment| logical_segment_path(path, segment.index))
+            .collect::<BTreeSet<_>>();
+        if let Some(directory) = path.parent() {
+            let stem = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            for entry in std::fs::read_dir(directory)? {
+                let entry = entry?;
+                let candidate = entry.path();
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                let is_segment =
+                    name == format!("{stem}.log") || name.starts_with(&format!("{stem}.segment-"));
+                if is_segment && !retained.contains(&candidate) {
+                    match std::fs::remove_file(candidate) {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => return Err(err),
+                    }
+                }
+            }
+        }
+        finish_logical_artifact_transaction(path)
+    } else if preserve_base_segment {
+        if let Some(directory) = path.parent() {
+            let stem = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            for entry in std::fs::read_dir(directory)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(&format!("{stem}.segment-")) {
+                    match std::fs::remove_file(entry.path()) {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => return Err(err),
+                    }
+                }
+            }
+        }
+        finish_logical_artifact_transaction(path)
+    } else {
+        remove_logical_artifact_files(path)
+    }
+}
+
+fn reconcile_logical_artifact_transactions(directory: &Path) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|value| value.to_str())
+            != Some(LOGICAL_ARTIFACT_TRANSACTION_EXTENSION)
+        {
+            continue;
+        }
+        let Some(stem) = path.file_stem() else {
+            continue;
+        };
+        reconcile_logical_artifact_transaction(&path.with_file_name(stem).with_extension("log"))?;
+    }
+    Ok(())
+}
+
+fn reconcile_logical_artifact_transactions_in_root(root: &Path) -> std::io::Result<()> {
+    let directories = match std::fs::read_dir(root) {
+        Ok(directories) => directories,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    for directory in directories {
+        let directory = directory?;
+        let metadata = directory.metadata()?;
+        if metadata.is_dir() && !metadata_is_reparse_point(&metadata) {
+            reconcile_logical_artifact_transactions(&directory.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn normalized_unavailable_ranges(
+    canonical_bytes: u64,
+    canonical_ranges: &[CanonicalByteRange],
+    retained_bytes: u64,
+) -> Vec<CanonicalByteRange> {
+    let mut ranges = canonical_ranges
+        .iter()
+        .map(|range| {
+            CanonicalByteRange::new(
+                range.start.min(canonical_bytes),
+                range.end.min(canonical_bytes),
+            )
+        })
+        .filter(|range| !range.is_empty())
+        .collect::<Vec<_>>();
+    if retained_bytes < canonical_bytes {
+        ranges.push(CanonicalByteRange::new(retained_bytes, canonical_bytes));
+    }
+    ranges.sort_unstable_by_key(|range| (range.start, range.end));
+    let mut normalized: Vec<CanonicalByteRange> = Vec::new();
+    for range in ranges {
+        if let Some(previous) = normalized.last_mut()
+            && range.start <= previous.end
+        {
+            previous.end = previous.end.max(range.end);
+            continue;
+        }
+        normalized.push(range);
+    }
+    normalized
+}
+
 struct StagedLogicalSegment {
     index: u32,
     range: CanonicalByteRange,
@@ -1650,6 +1852,16 @@ async fn remove_staged_logical_segments(segments: &[StagedLogicalSegment]) {
     }
 }
 
+async fn write_staged_logical_segment(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = tokio::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .await?;
+    file.write_all(bytes).await?;
+    file.sync_all().await
+}
+
 async fn stage_logical_segments(
     directory: &Path,
     id: ToolOutputArtifactId,
@@ -1662,7 +1874,8 @@ async fn stage_logical_segments(
         let index = first_index + offset as u32;
         let start = canonical_start + offset as u64 * MAX_RAW_OUTPUT_ARTIFACT_BYTES as u64;
         let path = staged_logical_segment_path(directory, id, index);
-        if let Err(err) = tokio::fs::write(&path, chunk).await {
+        if let Err(err) = write_staged_logical_segment(&path, chunk).await {
+            let _ = tokio::fs::remove_file(&path).await;
             remove_staged_logical_segments(&staged).await;
             return Err((start, path, err));
         }
@@ -1674,7 +1887,8 @@ async fn stage_logical_segments(
     }
     if bytes.is_empty() && first_index == 0 {
         let path = staged_logical_segment_path(directory, id, 0);
-        if let Err(err) = tokio::fs::write(&path, []).await {
+        if let Err(err) = write_staged_logical_segment(&path, &[]).await {
+            let _ = tokio::fs::remove_file(&path).await;
             return Err((canonical_start, path, err));
         }
         staged.push(StagedLogicalSegment {
@@ -1691,7 +1905,7 @@ async fn install_staged_logical_segments(
     staged: Vec<StagedLogicalSegment>,
     retained_bytes: u64,
 ) -> Result<Vec<LogicalArtifactSegment>, (u64, PathBuf, std::io::Error)> {
-    let mut installed = Vec::new();
+    let mut installed: Vec<LogicalArtifactSegment> = Vec::new();
     for segment in staged {
         if segment.range.start >= retained_bytes && !segment.range.is_empty() {
             let _ = tokio::fs::remove_file(&segment.path).await;
@@ -1706,20 +1920,61 @@ async fn install_staged_logical_segments(
             {
                 Ok(file) => {
                     if let Err(err) = file.set_len(end.saturating_sub(segment.range.start)).await {
+                        for installed_segment in &installed {
+                            let _ = tokio::fs::remove_file(logical_segment_path(
+                                final_path,
+                                installed_segment.index,
+                            ))
+                            .await;
+                        }
+                        return Err((segment.range.start, segment.path, err));
+                    }
+                    if let Err(err) = file.sync_all().await {
+                        for installed_segment in &installed {
+                            let _ = tokio::fs::remove_file(logical_segment_path(
+                                final_path,
+                                installed_segment.index,
+                            ))
+                            .await;
+                        }
                         return Err((segment.range.start, segment.path, err));
                     }
                 }
-                Err(err) => return Err((segment.range.start, segment.path, err)),
+                Err(err) => {
+                    for installed_segment in &installed {
+                        let _ = tokio::fs::remove_file(logical_segment_path(
+                            final_path,
+                            installed_segment.index,
+                        ))
+                        .await;
+                    }
+                    return Err((segment.range.start, segment.path, err));
+                }
             }
         }
         let destination = logical_segment_path(final_path, segment.index);
         if let Err(err) = tokio::fs::rename(&segment.path, &destination).await {
+            for installed_segment in &installed {
+                let _ = tokio::fs::remove_file(logical_segment_path(
+                    final_path,
+                    installed_segment.index,
+                ))
+                .await;
+            }
             return Err((segment.range.start, segment.path, err));
         }
         installed.push(LogicalArtifactSegment {
             index: segment.index,
             range: CanonicalByteRange::new(segment.range.start, end),
         });
+    }
+    if let Err(err) = sync_parent_directory(final_path) {
+        for installed_segment in &installed {
+            let _ =
+                tokio::fs::remove_file(logical_segment_path(final_path, installed_segment.index))
+                    .await;
+        }
+        return Err((retained_bytes, final_path.to_path_buf(), err));
     }
     Ok(installed)
 }
@@ -1929,6 +2184,15 @@ async fn create_canonical_output_artifact_with_id(
     // parallel without racing retention accounting.
     let _retention_permit = retention_sweep_permit().await;
     let path = directory.join(format!("{id}.log"));
+    if let Err(err) = reconcile_logical_artifact_transactions(&directory) {
+        return CanonicalOutputArtifact {
+            id: Some(id),
+            retained_bytes: 0,
+            complete: false,
+            unavailable_ranges: vec![CanonicalByteRange::new(0, canonical.exact_bytes)],
+            error: Some(format!("failed to reconcile artifact transactions: {err}")),
+        };
+    }
     enforce_retention_locked(&directory, &path, canonical.exact_bytes, 1).await;
     let usage = retention_usage_locked(&directory).await;
     let available = MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD
@@ -1940,15 +2204,22 @@ async fn create_canonical_output_artifact_with_id(
         .min(staged_bytes.len() as u64);
     let retention_token = capture_retention_token(&directory);
     let complete = canonical.complete && retained_bytes == canonical.exact_bytes;
-    let unavailable_ranges = if retained_bytes < canonical.exact_bytes {
-        vec![CanonicalByteRange::new(
-            retained_bytes,
-            canonical.exact_bytes,
-        )]
-    } else {
-        canonical.unavailable_ranges.clone()
-    };
+    let unavailable_ranges = normalized_unavailable_ranges(
+        canonical.exact_bytes,
+        &canonical.unavailable_ranges,
+        retained_bytes,
+    );
     let retained = &canonical.bytes[..retained_bytes as usize];
+    if let Err(err) = begin_logical_artifact_transaction(&path, false) {
+        reject_stale_delta(&retention_token);
+        return CanonicalOutputArtifact {
+            id: Some(id),
+            retained_bytes: 0,
+            complete: false,
+            unavailable_ranges: vec![CanonicalByteRange::new(0, canonical.exact_bytes)],
+            error: Some(format!("failed to begin artifact transaction: {err}")),
+        };
+    }
     let segments =
         match install_staged_logical_segments(&path, staged_segments, retained_bytes).await {
             Ok(segments) => segments,
@@ -1996,7 +2267,7 @@ async fn create_canonical_output_artifact_with_id(
             };
         }
     };
-    if let Err(err) = tokio::fs::write(logical_metadata_path(&path), metadata_bytes).await {
+    if let Err(err) = write_bytes_atomically(&logical_metadata_path(&path), &metadata_bytes) {
         rollback_logical_artifact_creation(&retention_token, &path);
         return CanonicalOutputArtifact {
             id: Some(id),
@@ -2004,6 +2275,16 @@ async fn create_canonical_output_artifact_with_id(
             complete: false,
             unavailable_ranges,
             error: Some(format!("failed to write artifact metadata: {err}")),
+        };
+    }
+    if let Err(err) = finish_logical_artifact_transaction(&path) {
+        reject_stale_delta(&retention_token);
+        return CanonicalOutputArtifact {
+            id: Some(id),
+            retained_bytes,
+            complete: false,
+            unavailable_ranges,
+            error: Some(format!("failed to commit artifact transaction: {err}")),
         };
     }
     match artifact_retention_record(&path).await {
@@ -2104,6 +2385,19 @@ pub(crate) async fn attach_canonical_output_artifact(
         };
     let _staged_cleanup = StagedLogicalSegmentCleanup::new(&staged_segments);
     let _retention_permit = retention_sweep_permit().await;
+    if let Err(err) = reconcile_logical_artifact_transactions(&directory) {
+        return CanonicalOutputArtifact {
+            id: Some(id),
+            retained_bytes: existing.len() as u64,
+            complete: false,
+            unavailable_ranges: normalized_unavailable_ranges(
+                canonical.exact_bytes,
+                &canonical.unavailable_ranges,
+                existing.len() as u64,
+            ),
+            error: Some(format!("failed to reconcile artifact transactions: {err}")),
+        };
+    }
     enforce_retention_locked(
         &directory,
         &path,
@@ -2125,31 +2419,45 @@ pub(crate) async fn attach_canonical_output_artifact(
         index: 0,
         range: CanonicalByteRange::new(0, existing.len() as u64),
     }];
-    match install_staged_logical_segments(&path, staged_segments, retained_bytes).await {
-        Ok(additional_segments) => segments.extend(additional_segments),
-        Err((start, staged_path, err)) => {
-            reject_stale_delta(&retention_token);
-            return CanonicalOutputArtifact {
-                id: Some(id),
-                retained_bytes: start,
-                complete: false,
-                unavailable_ranges: vec![CanonicalByteRange::new(start, canonical.exact_bytes)],
-                error: Some(format!(
-                    "failed to install staged artifact segment `{}`: {err}",
-                    staged_path.display()
-                )),
-            };
-        }
+    if let Err(err) = begin_logical_artifact_transaction(&path, true) {
+        reject_stale_delta(&retention_token);
+        return CanonicalOutputArtifact {
+            id: Some(id),
+            retained_bytes: existing.len() as u64,
+            complete: false,
+            unavailable_ranges: normalized_unavailable_ranges(
+                canonical.exact_bytes,
+                &canonical.unavailable_ranges,
+                existing.len() as u64,
+            ),
+            error: Some(format!("failed to begin artifact transaction: {err}")),
+        };
     }
+    let additional_segments =
+        match install_staged_logical_segments(&path, staged_segments, retained_bytes).await {
+            Ok(additional_segments) => additional_segments,
+            Err((start, staged_path, err)) => {
+                reject_stale_delta(&retention_token);
+                let _ = reconcile_logical_artifact_transaction(&path);
+                return CanonicalOutputArtifact {
+                    id: Some(id),
+                    retained_bytes: start,
+                    complete: false,
+                    unavailable_ranges: vec![CanonicalByteRange::new(start, canonical.exact_bytes)],
+                    error: Some(format!(
+                        "failed to install staged artifact segment `{}`: {err}",
+                        staged_path.display()
+                    )),
+                };
+            }
+        };
+    segments.extend(additional_segments.iter().cloned());
     let complete = canonical.complete && retained_bytes == canonical.exact_bytes;
-    let unavailable_ranges = if complete {
-        canonical.unavailable_ranges.clone()
-    } else {
-        vec![CanonicalByteRange::new(
-            retained_bytes,
-            canonical.exact_bytes,
-        )]
-    };
+    let unavailable_ranges = normalized_unavailable_ranges(
+        canonical.exact_bytes,
+        &canonical.unavailable_ranges,
+        retained_bytes,
+    );
     let mut metadata = LogicalArtifactMetadata {
         version: LOGICAL_ARTIFACT_METADATA_VERSION,
         artifact_id: id.to_string(),
@@ -2171,8 +2479,9 @@ pub(crate) async fn attach_canonical_output_artifact(
     populate_recovery_subdivisions(&mut metadata);
     let write = serde_json::to_vec(&metadata)
         .map_err(std::io::Error::other)
-        .and_then(|bytes| std::fs::write(logical_metadata_path(&path), bytes));
+        .and_then(|bytes| write_bytes_atomically(&logical_metadata_path(&path), &bytes));
     if let Err(err) = write {
+        let _ = reconcile_logical_artifact_transaction(&path);
         reject_stale_delta(&retention_token);
         return CanonicalOutputArtifact {
             id: Some(id),
@@ -2180,6 +2489,16 @@ pub(crate) async fn attach_canonical_output_artifact(
             complete: false,
             unavailable_ranges,
             error: Some(format!("failed to write artifact metadata: {err}")),
+        };
+    }
+    if let Err(err) = finish_logical_artifact_transaction(&path) {
+        reject_stale_delta(&retention_token);
+        return CanonicalOutputArtifact {
+            id: Some(id),
+            retained_bytes,
+            complete: false,
+            unavailable_ranges,
+            error: Some(format!("failed to commit artifact transaction: {err}")),
         };
     }
     match artifact_retention_record(&path).await {
@@ -2370,6 +2689,7 @@ fn remove_logical_artifact_files(path: &Path) -> std::io::Result<()> {
             .file_stem()
             .and_then(|value| value.to_str())
             .unwrap_or_default();
+        let transaction_path = logical_transaction_path(path);
         for entry in std::fs::read_dir(directory)? {
             let entry = entry?;
             let name = entry.file_name();
@@ -2384,6 +2704,11 @@ fn remove_logical_artifact_files(path: &Path) -> std::io::Result<()> {
                     Err(err) => return Err(err),
                 }
             }
+        }
+        match std::fs::remove_file(&transaction_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
         }
     }
     Ok(())
@@ -2501,7 +2826,7 @@ pub(crate) struct PendingEvidenceArtifact {
     bytes: u64,
     handle: Arc<File>,
     cleanup: PendingEvidenceArtifactCleanup,
-    retention_permit: Option<SemaphorePermit<'static>>,
+    retention_permit: Option<RetentionSweepPermit>,
 }
 
 impl PendingEvidenceArtifact {
@@ -3198,6 +3523,15 @@ fn load_logical_metadata(
     path: &Path,
     id: ToolOutputArtifactId,
 ) -> Result<LogicalArtifactMetadata, ReadToolOutputError> {
+    match std::fs::symlink_metadata(logical_transaction_path(path)) {
+        Ok(_) => return Err(ReadToolOutputError::StillWriting),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(ReadToolOutputError::Io(format!(
+                "failed to inspect artifact transaction: {err}"
+            )));
+        }
+    }
     let metadata_path = logical_metadata_path(path);
     match std::fs::read(&metadata_path) {
         Ok(bytes) => {
@@ -3289,12 +3623,24 @@ fn load_validated_logical_snapshot(
     path: &Path,
     metadata: &LogicalArtifactMetadata,
 ) -> Result<Vec<u8>, ReadToolOutputError> {
+    let unavailable_ranges_are_invalid =
+        metadata
+            .unavailable_ranges
+            .iter()
+            .enumerate()
+            .any(|(index, range)| {
+                range.start >= range.end
+                    || range.end > metadata.canonical_bytes
+                    || index.checked_sub(1).is_some_and(|previous| {
+                        metadata.unavailable_ranges[previous].end >= range.start
+                    })
+            });
     if metadata.retained_bytes > metadata.canonical_bytes
-        || metadata.unavailable_ranges.iter().any(|range| {
-            range.start > range.end
-                || range.end > metadata.canonical_bytes
-                || range.start < metadata.retained_bytes
-        })
+        || unavailable_ranges_are_invalid
+        || (metadata.complete
+            && (metadata.retained_bytes != metadata.canonical_bytes
+                || !metadata.unavailable_ranges.is_empty()))
+        || (!metadata.complete && metadata.unavailable_ranges.is_empty())
     {
         return Err(ReadToolOutputError::Io(
             "artifact retained and unavailable ranges do not match metadata".to_string(),
@@ -4360,10 +4706,35 @@ fn active_tool_history_protection_path(artifact_path: &Path) -> PathBuf {
     artifact_path.with_extension(ACTIVE_TOOL_HISTORY_PROTECTION_EXTENSION)
 }
 
-fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
-    // Portable Rust APIs cannot open directory handles on every supported platform. Individual
-    // files are still synced; directory durability is requested where that operation is exposed.
-    Ok(())
+fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    #[cfg(windows)]
+    let result = {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(parent)
+            .and_then(|directory| directory.sync_all())
+    };
+    #[cfg(not(windows))]
+    let result = std::fs::File::open(parent).and_then(|directory| directory.sync_all());
+    match result {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::Unsupported
+                    | std::io::ErrorKind::InvalidInput
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn artifact_is_protected(artifact_path: &Path) -> std::io::Result<bool> {
@@ -5061,7 +5432,21 @@ async fn enforce_retention_locked(
     reserved_artifacts: usize,
 ) {
     let root = tool_output_root_for_directory(directory);
-    match prepare_retention_mode(&root, false).await {
+    if reconcile_logical_artifact_transactions(directory).is_err() {
+        let mut registry = lock_retention_registry();
+        transition_current_root_to_dirty(&mut registry, &root);
+        return;
+    }
+    let external_generation_changed =
+        retention_interprocess_index_stale().swap(false, Ordering::AcqRel);
+    if external_generation_changed
+        && reconcile_logical_artifact_transactions_in_root(&root).is_err()
+    {
+        let mut registry = lock_retention_registry();
+        transition_current_root_to_dirty(&mut registry, &root);
+        return;
+    }
+    match prepare_retention_mode(&root, external_generation_changed).await {
         RetentionModeKind::Indexed => {
             if !enforce_indexed_thread_retention(
                 &root,
@@ -5367,10 +5752,73 @@ async fn log_bytes_in_tool_output_root(root: &Path) -> std::io::Result<u64> {
     Ok(bytes)
 }
 
-async fn retention_sweep_permit() -> SemaphorePermit<'static> {
-    match retention_sweep_semaphore().acquire().await {
+struct RetentionSweepPermit {
+    _process_permit: SemaphorePermit<'static>,
+    _interprocess_lock: AtomicWriteLock,
+}
+
+fn retention_interprocess_lock_target() -> PathBuf {
+    std::env::temp_dir().join("openai-codex-tool-output-retention-v1")
+}
+
+fn retention_interprocess_index_stale() -> &'static AtomicBool {
+    static STALE: AtomicBool = AtomicBool::new(true);
+    &STALE
+}
+
+fn retention_interprocess_generation() -> &'static StdMutex<Option<u64>> {
+    static GENERATION: OnceLock<StdMutex<Option<u64>>> = OnceLock::new();
+    GENERATION.get_or_init(|| StdMutex::new(None))
+}
+
+fn advance_retention_interprocess_generation(lock_target: &Path) -> std::io::Result<()> {
+    let previous = match std::fs::read_to_string(lock_target) {
+        Ok(value) => value.trim().parse::<u64>().map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid artifact retention generation: {err}"),
+            )
+        })?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(err) => return Err(err),
+    };
+    let next = previous.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "artifact retention generation overflowed",
+        )
+    })?;
+    write_bytes_atomically(lock_target, next.to_string().as_bytes())?;
+    let mut observed = retention_interprocess_generation()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if observed.is_none_or(|observed| observed != previous) {
+        retention_interprocess_index_stale().store(true, Ordering::Release);
+    }
+    *observed = Some(next);
+    Ok(())
+}
+
+async fn retention_sweep_permit() -> RetentionSweepPermit {
+    let process_permit = match retention_sweep_semaphore().acquire().await {
         Ok(permit) => permit,
         Err(_) => unreachable!("the process-wide retention sweep semaphore is never closed"),
+    };
+    let lock_target = retention_interprocess_lock_target();
+    let interprocess_lock = match tokio::task::spawn_blocking(move || {
+        let lock = acquire_atomic_write_lock(&lock_target)?;
+        advance_retention_interprocess_generation(&lock_target)?;
+        Ok::<_, std::io::Error>(lock)
+    })
+    .await
+    {
+        Ok(Ok(lock)) => lock,
+        Ok(Err(error)) => panic!("shared artifact retention lock must be available: {error}"),
+        Err(error) => panic!("retention lock task must complete: {error}"),
+    };
+    RetentionSweepPermit {
+        _process_permit: process_permit,
+        _interprocess_lock: interprocess_lock,
     }
 }
 

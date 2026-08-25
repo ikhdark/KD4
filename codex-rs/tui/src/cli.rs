@@ -6,7 +6,7 @@ use codex_utils_cli::CliConfigOverrides;
 use codex_utils_cli::SharedCliOptions;
 
 #[derive(Parser, Clone, Debug)]
-#[command(version)]
+#[command(version = crate::version::CODEX_CLI_VERSION)]
 pub struct Cli {
     /// Optional user prompt to start the session.
     #[arg(value_name = "PROMPT", value_hint = clap::ValueHint::Other)]
@@ -86,6 +86,18 @@ impl std::ops::Deref for Cli {
 impl std::ops::DerefMut for Cli {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.shared.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use crate::version::CODEX_CLI_VERSION;
+    use clap::CommandFactory;
+
+    #[test]
+    fn clap_version_uses_the_shared_embedded_version() {
+        assert_eq!(Cli::command().get_version(), Some(CODEX_CLI_VERSION));
     }
 }
 

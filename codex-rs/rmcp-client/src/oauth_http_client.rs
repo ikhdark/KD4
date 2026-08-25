@@ -7,9 +7,9 @@ use codex_exec_server::HttpClient;
 use codex_exec_server::HttpHeader;
 use codex_exec_server::HttpRedirectPolicy;
 use codex_exec_server::HttpRequestParams;
+use http::HeaderMap;
 use oauth2::HttpRequest;
 use oauth2::HttpResponse;
-use reqwest::header::HeaderMap;
 use rmcp::transport::auth::OAuthHttpClient;
 use rmcp::transport::auth::OAuthHttpClientError;
 use rmcp::transport::auth::OAuthHttpClientFuture;
@@ -23,6 +23,7 @@ static NEXT_OAUTH_REQUEST_ID: AtomicU64 = AtomicU64::new(0);
 pub(crate) struct OAuthHttpClientAdapter {
     http_client: Arc<dyn HttpClient>,
     default_headers: HeaderMap,
+    buffered_responses: bool,
 }
 
 impl OAuthHttpClientAdapter {
@@ -30,7 +31,13 @@ impl OAuthHttpClientAdapter {
         Self {
             http_client,
             default_headers,
+            buffered_responses: false,
         }
+    }
+
+    pub(crate) fn with_buffered_responses(mut self) -> Self {
+        self.buffered_responses = true;
+        self
     }
 
     async fn execute_request(
@@ -72,32 +79,49 @@ impl OAuthHttpClientAdapter {
                 .max(1)
         });
         let request_id = NEXT_OAUTH_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-        let (response, mut body_stream) = self
-            .http_client
-            .http_request_stream(HttpRequestParams {
-                method: parts.method.to_string(),
-                url: parts.uri.to_string(),
-                headers,
-                body: (!body.is_empty()).then_some(body.into()),
-                timeout_ms,
-                redirect_policy,
-                request_id: format!("oauth-request-{request_id}"),
-                stream_response: true,
-            })
-            .await
-            .map_err(|error| OAuthHttpClientError::new(error.to_string()))?;
-        let mut body = Vec::new();
-        while let Some(chunk) = body_stream
-            .recv()
-            .await
-            .map_err(|error| OAuthHttpClientError::new(error.to_string()))?
-        {
-            if chunk.len() > MAX_OAUTH_HTTP_RESPONSE_BODY_BYTES - body.len() {
-                return Err(OAuthHttpClientError::new(format!(
-                    "OAuth HTTP response body exceeds {MAX_OAUTH_HTTP_RESPONSE_BODY_BYTES} bytes"
-                )));
+        let params = HttpRequestParams {
+            method: parts.method.to_string(),
+            url: parts.uri.to_string(),
+            headers,
+            body: (!body.is_empty()).then_some(body.into()),
+            timeout_ms,
+            redirect_policy,
+            request_id: format!("oauth-request-{request_id}"),
+            stream_response: !self.buffered_responses,
+        };
+        let (response, body) = if self.buffered_responses {
+            let response = self
+                .http_client
+                .http_request(params)
+                .await
+                .map_err(|error| OAuthHttpClientError::new(error.to_string()))?;
+            let body = response.body.clone().into_inner();
+            (response, body)
+        } else {
+            let (response, mut body_stream) = self
+                .http_client
+                .http_request_stream(params)
+                .await
+                .map_err(|error| OAuthHttpClientError::new(error.to_string()))?;
+            let mut body = Vec::new();
+            while let Some(chunk) = body_stream
+                .recv()
+                .await
+                .map_err(|error| OAuthHttpClientError::new(error.to_string()))?
+            {
+                if chunk.len() > MAX_OAUTH_HTTP_RESPONSE_BODY_BYTES - body.len() {
+                    return Err(OAuthHttpClientError::new(format!(
+                        "OAuth HTTP response body exceeds {MAX_OAUTH_HTTP_RESPONSE_BODY_BYTES} bytes"
+                    )));
+                }
+                body.extend_from_slice(&chunk);
             }
-            body.extend_from_slice(&chunk);
+            (response, body)
+        };
+        if body.len() > MAX_OAUTH_HTTP_RESPONSE_BODY_BYTES {
+            return Err(OAuthHttpClientError::new(format!(
+                "OAuth HTTP response body exceeds {MAX_OAUTH_HTTP_RESPONSE_BODY_BYTES} bytes"
+            )));
         }
         let mut builder = oauth2::http::Response::builder().status(response.status);
         for header in response.headers {

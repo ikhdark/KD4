@@ -177,18 +177,44 @@ fn request_user_input_event_remains_forward_compatible() {
             "id": "q1",
             "header": "Mode",
             "question": "Pick one",
+            "isOther": true,
+            "isSecret": true,
             "futureQuestionField": true,
             "options": [
                 {"label": "A", "description": "Alpha", "futureOptionField": true},
                 {"label": "B", "description": "Beta"}
             ]
         }],
+        "autoResolutionMs": 321,
         "futureEventField": true
     }))
     .expect("shared events should continue ignoring future fields");
 
-    assert_eq!(event.questions.len(), 1);
-    assert_eq!(event.questions[0].options.as_ref().map(Vec::len), Some(2));
+    assert_eq!(
+        event,
+        RequestUserInputEvent {
+            call_id: "call-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            questions: vec![RequestUserInputQuestion {
+                id: "q1".to_string(),
+                header: "Mode".to_string(),
+                question: "Pick one".to_string(),
+                is_other: true,
+                is_secret: true,
+                options: Some(vec![
+                    RequestUserInputQuestionOption {
+                        label: "A".to_string(),
+                        description: "Alpha".to_string(),
+                    },
+                    RequestUserInputQuestionOption {
+                        label: "B".to_string(),
+                        description: "Beta".to_string(),
+                    },
+                ]),
+            }],
+            auto_resolution_ms: Some(321),
+        }
+    );
 }
 
 fn question_json(id: &str, header: &str, option_count: usize) -> Value {

@@ -386,14 +386,18 @@ async fn check_ollama_status() -> ProviderStatus {
 }
 
 async fn check_port_status(port: u16) -> io::Result<bool> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
+    let client = codex_http_client::HttpClientBuilder::new()
+        .build_direct()
         .map_err(io::Error::other)?;
 
     let url = format!("http://localhost:{port}");
 
-    match client.get(&url).send().await {
+    match client
+        .get(&url)
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+    {
         Ok(response) => Ok(response.status().is_success()),
         Err(_) => Ok(false), // Connection failed = not running
     }
@@ -402,6 +406,10 @@ async fn check_port_status(port: u16) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
 
     #[test]
     fn ctrl_h_l_move_provider_selection() {
@@ -413,5 +421,16 @@ mod tests {
         assert_eq!(widget.selected_option, 1);
         widget.handle_key_event(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
         assert_eq!(widget.selected_option, 0);
+    }
+
+    #[tokio::test]
+    async fn check_port_status_uses_shared_http_client_for_loopback_probe() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        assert!(check_port_status(server.address().port()).await.unwrap());
     }
 }

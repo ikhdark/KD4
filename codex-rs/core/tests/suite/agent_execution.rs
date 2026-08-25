@@ -5,6 +5,7 @@ use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call_with_namespace;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once_match;
+use core_test_support::responses::request_has_last_message_input_text;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::test_codex::test_codex;
@@ -16,11 +17,6 @@ const FIRST_PROMPT: &str = "spawn the first agent";
 const FIRST_TASK: &str = "spawn the second agent";
 const SECOND_TASK: &str = "second worker task";
 const MULTI_AGENT_V2_NAMESPACE: &str = "agents";
-
-fn body_contains(request: &wiremock::Request, text: &str) -> bool {
-    serde_json::from_slice::<serde_json::Value>(&request.body)
-        .is_ok_and(|body| body.to_string().contains(text))
-}
 
 fn has_function_call_output(request: &wiremock::Request, call_id: &str) -> bool {
     serde_json::from_slice::<serde_json::Value>(&request.body).is_ok_and(|body| {
@@ -45,7 +41,9 @@ async fn v2_nested_spawn_checks_shared_active_execution_capacity() -> Result<()>
     }))?;
     mount_sse_once_match(
         &server,
-        |request: &wiremock::Request| body_contains(request, FIRST_PROMPT),
+        |request: &wiremock::Request| {
+            request_has_last_message_input_text(request, "user", FIRST_PROMPT)
+        },
         sse(vec![
             ev_response_created("first-response"),
             ev_function_call_with_namespace(
@@ -65,7 +63,8 @@ async fn v2_nested_spawn_checks_shared_active_execution_capacity() -> Result<()>
     mount_sse_once_match(
         &server,
         |request: &wiremock::Request| {
-            body_contains(request, FIRST_TASK) && !has_function_call_output(request, "first-call")
+            request_has_last_message_input_text(request, "user", FIRST_TASK)
+                && !has_function_call_output(request, "first-call")
         },
         sse(vec![
             ev_response_created("first-worker-response"),

@@ -513,6 +513,40 @@ fn validation_execution_outcome_distinguishes_success_from_not_executed() {
 }
 
 #[test]
+fn legacy_validation_status_requires_an_explicit_boolean_success() {
+    use super::ValidationExecutionOutcome;
+
+    assert_eq!(
+        ValidationExecutionOutcome::from_value_or_legacy_success(&serde_json::json!({})),
+        ValidationExecutionOutcome::NotExecuted
+    );
+    assert_eq!(
+        ValidationExecutionOutcome::from_value_or_legacy_success(&serde_json::json!({
+            "success": null
+        })),
+        ValidationExecutionOutcome::NotExecuted
+    );
+    assert_eq!(
+        ValidationExecutionOutcome::from_value_or_legacy_success(&serde_json::json!({
+            "success": "true"
+        })),
+        ValidationExecutionOutcome::NotExecuted
+    );
+    assert_eq!(
+        ValidationExecutionOutcome::from_value_or_legacy_success(&serde_json::json!({
+            "success": true
+        })),
+        ValidationExecutionOutcome::ExecutedSuccess
+    );
+    assert_eq!(
+        ValidationExecutionOutcome::from_value_or_legacy_success(&serde_json::json!({
+            "success": false
+        })),
+        ValidationExecutionOutcome::ExecutedFailure
+    );
+}
+
+#[test]
 fn legacy_shell_projection_metadata_keeps_exact_bytes_status_and_context() {
     let raw = vec![b'o', b'k', b'\n', 0xff];
     let output = super::LegacyShellToolOutput {
@@ -612,6 +646,7 @@ async fn command_surfaces_share_validation_proof_singleflight_preparation() {
         force_fresh: false,
     };
     let environment = std::collections::HashMap::new();
+    let environment_hash = super::validation_environment_hash(&environment);
     let shell_cancellation = tokio_util::sync::CancellationToken::new();
     let mut shell_launch = Some(launch.clone());
     let shell_preparation =
@@ -624,6 +659,7 @@ async fn command_surfaces_share_validation_proof_singleflight_preparation() {
             cwd: "codex-rs",
             command_invocation: &invocation,
             environment: &environment,
+            environment_hash: &environment_hash,
             execution_context: "shell=None;login=false;tty=false",
             repository_epoch: 7,
             call_id: "shell-call",
@@ -650,6 +686,7 @@ async fn command_surfaces_share_validation_proof_singleflight_preparation() {
         cwd: "codex-rs",
         command_invocation: &invocation,
         environment: &environment,
+        environment_hash: &environment_hash,
         execution_context: "shell=None;login=false;tty=false",
         repository_epoch: 7,
         call_id: "exec-call",
@@ -691,6 +728,7 @@ async fn validation_proof_preparation_isolated_by_execution_context() {
         force_fresh: false,
     };
     let environment = std::collections::HashMap::new();
+    let environment_hash = super::validation_environment_hash(&environment);
 
     let first_cancellation = tokio_util::sync::CancellationToken::new();
     let mut first_launch = Some(launch.clone());
@@ -703,6 +741,7 @@ async fn validation_proof_preparation_isolated_by_execution_context() {
         cwd: "codex-rs",
         command_invocation: &invocation,
         environment: &environment,
+        environment_hash: &environment_hash,
         execution_context: "shell=Bash;login=false;tty=false",
         repository_epoch: 7,
         call_id: "bash-call",
@@ -729,6 +768,7 @@ async fn validation_proof_preparation_isolated_by_execution_context() {
         cwd: "codex-rs",
         command_invocation: &invocation,
         environment: &environment,
+        environment_hash: &environment_hash,
         execution_context: "shell=PowerShell;login=true;tty=true",
         repository_epoch: 7,
         call_id: "powershell-call",
@@ -1636,6 +1676,57 @@ async fn shell_command_handler_defaults_to_non_login_when_disallowed() {
         session
             .user_shell()
             .derive_exec_args("echo hello", /*use_login_shell*/ false)
+    );
+}
+
+#[tokio::test]
+async fn shell_command_exec_params_reuse_the_resolved_shell() {
+    let (session, turn_context) = make_session_and_context().await;
+    let turn_environment = turn_context
+        .environments
+        .primary()
+        .expect("primary environment");
+    let cwd = turn_environment
+        .cwd()
+        .to_abs_path()
+        .expect("native environment cwd");
+    let params = ShellCommandToolCallParams {
+        command: Some("echo hello".to_string()),
+        kind: None,
+        program: None,
+        args: None,
+        script_body: None,
+        workdir: None,
+        login: Some(false),
+        timeout_ms: None,
+        stall_timeout_ms: None,
+        sandbox_permissions: None,
+        additional_permissions: None,
+        prefix_rule: None,
+        justification: None,
+        validation: None,
+        force_fresh: None,
+    };
+    let resolved_shell = Shell {
+        shell_type: ShellType::Bash,
+        shell_path: PathBuf::from("/already/resolved/bash"),
+    };
+
+    let exec_params = ShellCommandHandler::to_exec_params_with_shell(
+        &params,
+        &CommandInvocation::Script("echo hello".to_string()),
+        &session,
+        &turn_context,
+        turn_environment,
+        cwd,
+        /*allow_login_shell*/ false,
+        &resolved_shell,
+    )
+    .expect("resolved shell should be accepted without another lookup");
+
+    assert_eq!(
+        exec_params.command,
+        resolved_shell.derive_exec_args("echo hello", /*use_login_shell*/ false)
     );
 }
 

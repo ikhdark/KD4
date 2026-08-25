@@ -1002,7 +1002,10 @@ class CargoLaneTest(unittest.TestCase):
         user_profile = self.temp_root / "user"
         cargo_config = user_profile / ".cargo" / "config.toml"
         cargo_config.parent.mkdir(parents=True)
-        cargo_config.write_text("[net]\nretry = 3\n", encoding="utf-8")
+        source_config = (
+            'build.rustc-wrapper = "custom-wrapper"\n[net]\nretry = 3\n'
+        )
+        cargo_config.write_text(source_config, encoding="utf-8")
         local_app_data = self.temp_root / "local-app-data"
         fake_bin = self.temp_root / "bin"
         fake_bin.mkdir()
@@ -1015,7 +1018,7 @@ class CargoLaneTest(unittest.TestCase):
             "cmd.exe",
             "/d",
             "/c",
-            "echo incremental=%CARGO_INCREMENTAL% %CARGO_HOME% %SCCACHE_BASEDIR% %SCCACHE_CACHE_SIZE%",
+            "echo wrapper=%RUSTC_WRAPPER% incremental=%CARGO_INCREMENTAL% %CARGO_HOME% %SCCACHE_BASEDIR% %SCCACHE_CACHE_SIZE%",
             extra_env={
                 "CARGO_INCREMENTAL": "",
                 "LOCALAPPDATA": str(local_app_data),
@@ -1034,9 +1037,8 @@ class CargoLaneTest(unittest.TestCase):
             0,
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
-        self.assertIn("[net]", config_text)
-        self.assertIn("retry = 3", config_text)
-        self.assertIn('rustc-wrapper = "sccache"', config_text)
+        self.assertEqual(config_text, source_config)
+        self.assertIn("wrapper=sccache", result.stdout)
         self.assertIn(str(REPO_ROOT), result.stdout)
         self.assertIn("80G", result.stdout)
         self.assertIn("incremental=0", result.stdout)

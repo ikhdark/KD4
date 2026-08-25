@@ -163,40 +163,6 @@ mod thread_list_cwd_filter_tests {
     }
 }
 
-mod desktop_activation_owner_tests {
-    use super::super::remove_desktop_activation_challenge_owners_for_connection;
-    use crate::outgoing_message::ConnectionId;
-    use std::collections::HashMap;
-
-    #[test]
-    fn connection_close_removes_only_its_desktop_activation_challenges() {
-        let mut owners = HashMap::from([
-            (
-                "challenge-a".to_string(),
-                ("thread-a".to_string(), ConnectionId(1)),
-            ),
-            (
-                "challenge-b".to_string(),
-                ("thread-b".to_string(), ConnectionId(2)),
-            ),
-            (
-                "challenge-c".to_string(),
-                ("thread-c".to_string(), ConnectionId(1)),
-            ),
-        ]);
-
-        remove_desktop_activation_challenge_owners_for_connection(&mut owners, ConnectionId(1));
-
-        assert_eq!(
-            owners,
-            HashMap::from([(
-                "challenge-b".to_string(),
-                ("thread-b".to_string(), ConnectionId(2)),
-            )])
-        );
-    }
-}
-
 mod background_terminal_pagination_tests {
     use super::super::paginate_background_terminals;
     use codex_app_server_protocol::ThreadBackgroundTerminal;

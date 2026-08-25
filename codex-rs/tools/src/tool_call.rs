@@ -92,6 +92,20 @@ impl TurnItemEmitter for NoopTurnItemEmitter {
     }
 }
 
+/// Host-visible source for a model tool call.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ToolCallSource {
+    /// The model invoked the tool directly.
+    Direct,
+    /// Code mode invoked the tool while executing a runtime cell.
+    CodeMode {
+        /// Runtime cell that issued the nested tool request.
+        cell_id: String,
+        /// Code-mode's per-cell tool invocation id.
+        runtime_tool_call_id: String,
+    },
+}
+
 #[derive(Clone)]
 pub struct ToolCall {
     pub turn_id: String,
@@ -99,6 +113,7 @@ pub struct ToolCall {
     pub tool_name: ToolName,
     pub model: String,
     pub truncation_policy: TruncationPolicy,
+    pub source: ToolCallSource,
     pub conversation_history: ConversationHistory,
     pub turn_item_emitter: Arc<dyn TurnItemEmitter>,
     pub cancellation_token: CancellationToken,
@@ -115,6 +130,7 @@ impl std::fmt::Debug for ToolCall {
             .field("tool_name", &self.tool_name)
             .field("model", &self.model)
             .field("truncation_policy", &self.truncation_policy)
+            .field("source", &self.source)
             .field("conversation_history", &self.conversation_history)
             .field("turn_item_emitter", &"<host turn item emitter>")
             .field("cancelled", &self.cancellation_token.is_cancelled())
@@ -126,6 +142,23 @@ impl std::fmt::Debug for ToolCall {
 }
 
 impl ToolCall {
+    /// Returns the response-content budget, bounded by the tool's own size limit.
+    ///
+    /// Direct calls use the host's effective text-output allowance. Code Mode receives
+    /// typed results without that truncation, so only the tool's limit applies.
+    /// Callers must include serialization overhead when fitting a response to this budget.
+    pub fn response_byte_budget(&self, max_response_bytes: usize) -> usize {
+        match &self.source {
+            ToolCallSource::Direct => {
+                max_response_bytes.min((self.truncation_policy * 1.2).byte_budget())
+            }
+            ToolCallSource::CodeMode {
+                cell_id: _,
+                runtime_tool_call_id: _,
+            } => max_response_bytes,
+        }
+    }
+
     pub fn function_arguments(&self) -> Result<&str, FunctionCallError> {
         match &self.payload {
             ToolPayload::Function { arguments } => Ok(arguments),

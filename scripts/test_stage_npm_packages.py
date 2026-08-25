@@ -142,6 +142,27 @@ class StageNpmPackagesTests(unittest.TestCase):
         self.assertNotIn("@openai/codex@latest", cli_launcher)
         self.assertIn("same fork release artifact", cli_launcher)
 
+    def test_npm_pack_smoke_tests_the_moved_tarball(self) -> None:
+        build = stage.load_build_module()
+        staging_dir = self.root / "staging"
+        staging_dir.mkdir()
+        output_path = self.root / "out" / "codex.tgz"
+
+        def fake_pack(command: list[str], **_: object) -> str:
+            pack_dir = Path(command[command.index("--pack-destination") + 1])
+            (pack_dir / "packed.tgz").write_bytes(b"fixture")
+            return json.dumps([{"filename": "packed.tgz"}])
+
+        with (
+            mock.patch.object(build.subprocess, "check_output", side_effect=fake_pack),
+            mock.patch.object(build, "smoke_test_npm_tarball") as smoke,
+        ):
+            actual = build.run_npm_pack(staging_dir, output_path)
+
+        self.assertEqual(actual, output_path.resolve())
+        self.assertEqual(output_path.read_bytes(), b"fixture")
+        smoke.assert_called_once_with(output_path.resolve())
+
     def test_platform_package_manifest_is_minimal(self) -> None:
         build = stage.load_build_module()
 
@@ -154,7 +175,7 @@ class StageNpmPackagesTests(unittest.TestCase):
         self.assertEqual(package_json["version"], "1.2.3-win32-x64")
         self.assertEqual(package_json["os"], ["win32"])
         self.assertEqual(package_json["cpu"], ["x64"])
-        self.assertEqual(package_json["files"], ["vendor"])
+        self.assertEqual(package_json["files"], ["vendor", "LICENSE", "NOTICE"])
         self.assertNotIn("packageManager", package_json)
 
     def test_codex_staging_copies_user_facing_package_readme(self) -> None:
@@ -200,11 +221,13 @@ class StageNpmPackagesTests(unittest.TestCase):
         selected_bin = selected_target / "bin"
         selected_bin.mkdir(parents=True)
         (selected_bin / "codex.exe").write_text("native", encoding="utf-8")
+        self.write_package_metadata(selected_target)
 
         skipped_target = vendor_src / "aarch64-pc-windows-msvc"
         skipped_bin = skipped_target / "bin"
         skipped_bin.mkdir(parents=True)
         (skipped_bin / "codex.exe").write_text("native", encoding="utf-8")
+        self.write_package_metadata(skipped_target)
 
         staging_dir = self.root / "staging"
         staging_dir.mkdir()
@@ -232,6 +255,22 @@ class StageNpmPackagesTests(unittest.TestCase):
                 {"x86_64-pc-windows-msvc"},
             )
 
+    def test_copy_native_binaries_rejects_changed_declared_file(self) -> None:
+        build = stage.load_build_module()
+        target_dir = self.root / "vendor-src" / "x86_64-pc-windows-msvc"
+        binary = target_dir / "bin" / "codex.exe"
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes(b"original")
+        self.write_package_metadata(target_dir)
+        binary.write_bytes(b"tampered")
+
+        with self.assertRaisesRegex(RuntimeError, "digest mismatch"):
+            build.copy_native_binaries(
+                self.root / "vendor-src",
+                self.root / "staging",
+                [build.CODEX_PACKAGE_COMPONENT],
+            )
+
     def test_copy_native_binaries_rejects_non_windows_targets(self) -> None:
         build = stage.load_build_module()
         vendor_src = self.root / "vendor-src"
@@ -243,6 +282,36 @@ class StageNpmPackagesTests(unittest.TestCase):
                 self.root / "staging",
                 [build.CODEX_PACKAGE_COMPONENT],
             )
+
+    def write_package_metadata(self, target_dir: Path, version: str = "1.2.3") -> None:
+        files = []
+        for path in sorted(target_dir.rglob("*")):
+            if not path.is_file() or path.name == "codex-package.json":
+                continue
+            contents = path.read_bytes()
+            files.append(
+                {
+                    "path": path.relative_to(target_dir).as_posix(),
+                    "role": "entrypoint",
+                    "size": len(contents),
+                    "sha256": hashlib.sha256(contents).hexdigest(),
+                }
+            )
+        bundle_id = hashlib.sha256(
+            json.dumps(files, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        (target_dir / "codex-package.json").write_text(
+            json.dumps(
+                {
+                    "layoutVersion": 2,
+                    "version": version,
+                    "target": target_dir.name,
+                    "bundleId": bundle_id,
+                    "files": files,
+                }
+            ),
+            encoding="utf-8",
+        )
 
     def test_parse_args_accepts_max_download_workers(self) -> None:
         argv = [

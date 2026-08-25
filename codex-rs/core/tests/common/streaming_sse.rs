@@ -284,8 +284,8 @@ fn unix_ms_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::StatusCode;
     use pretty_assertions::assert_eq;
-    use reqwest::StatusCode;
     use tokio::net::TcpStream;
     use tokio::time::Duration;
     use tokio::time::timeout;
@@ -607,7 +607,10 @@ data: {"type":"response.completed","response":{"id":"resp-1"}}
             "stream": true
         });
 
-        let resp = reqwest::Client::new()
+        let client = codex_http_client::HttpClientBuilder::new()
+            .build_direct()
+            .expect("build HTTP client");
+        let resp = client
             .post(url)
             .json(&payload)
             .send()

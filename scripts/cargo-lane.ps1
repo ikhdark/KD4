@@ -807,63 +807,19 @@ function Copy-UserCargoConfig {
     return $configPath
 }
 
-function Set-CargoConfigRustcWrapper {
-    param(
-        [string]$ConfigPath
-    )
-
-    $lines = @()
-    if (Test-Path -LiteralPath $ConfigPath -PathType Leaf) {
-        $lines = @([IO.File]::ReadAllLines($ConfigPath))
-    }
-
-    if (@($lines | Where-Object { $_ -match "^\s*rustc-wrapper\s*=" }).Count -gt 0) {
-        return
-    }
-
-    $buildIndex = -1
-    for ($i = 0; $i -lt $lines.Count; $i++) {
-        if ($lines[$i] -match "^\s*\[build\]\s*$") {
-            $buildIndex = $i
-            break
-        }
-    }
-
-    if ($buildIndex -ge 0) {
-        $updated = [System.Collections.Generic.List[string]]::new()
-        foreach ($line in $lines) {
-            [void]$updated.Add($line)
-            if ($updated.Count -eq ($buildIndex + 1)) {
-                [void]$updated.Add('rustc-wrapper = "sccache"')
-            }
-        }
-        [IO.File]::WriteAllLines($ConfigPath, [string[]]$updated)
-        return
-    }
-
-    $updatedLines = @($lines)
-    if ($updatedLines.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($updatedLines[-1])) {
-        $updatedLines += ""
-    }
-    $updatedLines += "[build]"
-    $updatedLines += 'rustc-wrapper = "sccache"'
-    [IO.File]::WriteAllLines($ConfigPath, [string[]]$updatedLines)
-}
-
 function Enable-SccacheForCargoHome {
     param(
         [string]$CargoHome,
         [string]$RepoRoot
     )
 
-    $configPath = Copy-UserCargoConfig -CargoHome $CargoHome
+    $null = Copy-UserCargoConfig -CargoHome $CargoHome
 
     if (-not (Get-Command sccache -ErrorAction SilentlyContinue)) {
         return
     }
 
     Enable-SccacheEnvironment -RepoRoot $RepoRoot
-    Set-CargoConfigRustcWrapper -ConfigPath $configPath
 }
 
 function Enable-SccacheForLane {

@@ -20,6 +20,95 @@ FRESH_SOURCE_TIME = FIXTURE_TIME + 10_000
 
 
 class PublishLocalCodexApplyTest(PublishLocalCodexTestBase):
+    def test_audit_publish_stages_complete_bundle_before_visibility(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            install_dir = temp_path / "install"
+            install_dir.mkdir()
+            target = install_dir / "codex.exe"
+            target.write_bytes(b"old")
+            source = temp_path / "source.exe"
+            source.write_bytes(b"new")
+            missing = temp_path / "missing.exe"
+            journal = temp_path / ".install.codex-local-publish.transaction.json"
+            command = rf"""
+. {ps_single_quote(SCRIPT)} -ImportOnly
+$entries = @(
+    [pscustomobject]@{{ Name = 'codex'; SourcePath = {ps_single_quote(source)}; TargetPath = {ps_single_quote(target)}; BackupPath = {ps_single_quote(temp_path / 'codex.bak')}; HadPreviousTarget = $true; Changed = $true }}
+    [pscustomobject]@{{ Name = 'host'; SourcePath = {ps_single_quote(missing)}; TargetPath = {ps_single_quote(install_dir / 'host.exe')}; BackupPath = {ps_single_quote(temp_path / 'host.bak')}; HadPreviousTarget = $false; Changed = $true }}
+)
+try {{
+    New-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(journal)} -InstallDir {ps_single_quote(install_dir)} -Entries $entries
+    throw 'expected staging failure'
+}}
+catch {{
+    if ($_.Exception.Message -eq 'expected staging failure') {{ throw }}
+    exit 0
+}}
+"""
+            result = subprocess.run(
+                [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(target.read_bytes(), b"old")
+            self.assertFalse(journal.exists())
+            self.assertEqual(list(temp_path.glob(".install.bundle.*")), [])
+
+    def test_audit_publish_recovers_journaled_bundle_as_one_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            install_dir = temp_path / "install"
+            install_dir.mkdir()
+            target = install_dir / "codex.exe"
+            backup = temp_path / "codex.bak"
+            target.write_bytes(b"new")
+            backup.write_bytes(b"old")
+            stage = temp_path / ".install.bundle.fixture"
+            stage.mkdir()
+            rollback = temp_path / ".install.rollback.fixture"
+            rollback.mkdir()
+            (rollback / "codex.exe").write_bytes(b"old")
+            journal = temp_path / ".install.codex-local-publish.transaction.json"
+            command = rf"""
+. {ps_single_quote(SCRIPT)} -ImportOnly
+$transaction = [pscustomobject]@{{
+    SchemaVersion = 1
+    TransactionId = 'fixture'
+    Phase = 'Applying'
+    JournalPath = {ps_single_quote(journal)}
+    InstallDir = {ps_single_quote(install_dir)}
+    StageRoot = {ps_single_quote(stage)}
+    RollbackRoot = {ps_single_quote(rollback)}
+    HadPreviousInstall = $true
+    Entries = @([pscustomobject]@{{
+        Name = 'codex'
+        StagedPath = {ps_single_quote(stage / 'codex.exe')}
+        TargetPath = {ps_single_quote(target)}
+        BackupPath = {ps_single_quote(backup)}
+        HadPreviousTarget = $true
+        Changed = $true
+        State = 'Applying'
+    }})
+}}
+Write-CodexPublishTransactionJournal -Transaction $transaction
+if (-not (Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(journal)})) {{ throw 'recovery did not run' }}
+"""
+            result = subprocess.run(
+                [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(target.read_bytes(), b"old")
+            self.assertFalse(journal.exists())
+            self.assertFalse(stage.exists())
+
     def test_apply_replaces_target_and_writes_backup(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -65,11 +154,12 @@ class PublishLocalCodexApplyTest(PublishLocalCodexTestBase):
             self.assertEqual(
                 command_runner_target.read_bytes(), self.source_command_runner_bytes
             )
-            backups = sorted((install_dir / "backups").glob("codex-2*.exe"))
+            backup_dir = install_dir.parent / "publisher-backups"
+            backups = sorted(backup_dir.glob("codex-2*.exe"))
             self.assertEqual(len(backups), 1)
             self.assertEqual(backups[0].read_bytes(), b"previous-codex")
             code_mode_host_backups = sorted(
-                (install_dir / "backups").glob("codex-code-mode-host-*.exe")
+                backup_dir.glob("codex-code-mode-host-*.exe")
             )
             self.assertEqual(len(code_mode_host_backups), 1)
             self.assertEqual(
@@ -105,7 +195,8 @@ class PublishLocalCodexApplyTest(PublishLocalCodexTestBase):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             install_dir = temp_path / "install"
-            backup_dir = install_dir / "backups"
+            install_dir.mkdir()
+            backup_dir = install_dir.parent / "publisher-backups"
             backup_dir.mkdir(parents=True)
             for index in range(12):
                 backup = backup_dir / f"codex-20000101T0000{index:02d}000Z.exe"
@@ -142,7 +233,8 @@ class PublishLocalCodexApplyTest(PublishLocalCodexTestBase):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             install_dir = temp_path / "install"
-            backup_dir = install_dir / "backups"
+            install_dir.mkdir()
+            backup_dir = install_dir.parent / "publisher-backups"
             backup_dir.mkdir(parents=True)
             for index in range(10):
                 (backup_dir / f"codex-20000101T0000{index:02d}000Z.exe").write_bytes(
@@ -204,19 +296,19 @@ class PublishLocalCodexApplyTest(PublishLocalCodexTestBase):
             self.assertEqual(
                 code_mode_host_target.read_bytes(), previous_code_mode_host
             )
-            backups = sorted((install_dir / "backups").glob("codex-2*.exe"))
+            backup_dir = install_dir.parent / "publisher-backups"
+            backups = sorted(backup_dir.glob("codex-2*.exe"))
             self.assertEqual(len(backups), 1)
             self.assertEqual(backups[0].read_bytes(), previous)
             code_mode_host_backups = sorted(
-                (install_dir / "backups").glob("codex-code-mode-host-*.exe")
+                backup_dir.glob("codex-code-mode-host-*.exe")
             )
             self.assertEqual(len(code_mode_host_backups), 1)
             self.assertEqual(
                 code_mode_host_backups[0].read_bytes(), previous_code_mode_host
             )
             self.assertIn("rollback: requested:", result.stdout)
-            self.assertIn("rollbackResult: restored backup", result.stdout)
-            self.assertIn("codeModeHostRollbackResult: restored backup", result.stdout)
+            self.assertIn("bundleTransactionRecovery: rolled back:", result.stdout)
             self.assertIn(
                 "Published Codex binary failed --version verification",
                 result.stderr,
@@ -251,6 +343,8 @@ class PublishLocalCodexApplyTest(PublishLocalCodexTestBase):
                 str(self.source_windows_sandbox_setup),
                 "-SourceCommandRunnerExe",
                 str(self.source_command_runner),
+                "-SourceBundleManifest",
+                str(self.write_source_bundle_manifest(fake_codex)),
                 "-InstallDir",
                 str(install_dir),
                 "-ConfigureDesktopLocalCli",
@@ -336,7 +430,8 @@ class PublishLocalCodexApplyTest(PublishLocalCodexTestBase):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             install_dir = temp_path / "install"
-            backup_dir = install_dir / "backups"
+            install_dir.mkdir()
+            backup_dir = install_dir.parent / "publisher-backups"
             backup_dir.mkdir(parents=True)
             for index in range(12):
                 backup = backup_dir / f"codex-20990101T0000{index:02d}000Z.exe"
@@ -369,7 +464,7 @@ class PublishLocalCodexApplyTest(PublishLocalCodexTestBase):
                 f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
             self.assertIn("rollback: requested:", result.stdout)
-            self.assertIn("rollbackResult: restored backup", result.stdout)
+            self.assertIn("bundleTransactionRecovery: rolled back:", result.stdout)
             self.assertNotIn("backupPruned:", result.stdout)
             self.assertFalse((install_dir / "codex-code-mode-host.exe").exists())
             self.assert_no_publish_temps(install_dir)
@@ -399,11 +494,7 @@ class PublishLocalCodexApplyTest(PublishLocalCodexTestBase):
             self.assertIn("backupPath: <none: target missing>", result.stdout)
             self.assertIn("rollback: requested:", result.stdout)
             self.assertIn(
-                "rollbackResult: removed newly published target", result.stdout
-            )
-            self.assertIn(
-                "codeModeHostRollbackResult: removed newly published target",
-                result.stdout,
+                "bundleTransactionRecovery: rolled back:", result.stdout
             )
             self.assert_no_publish_temps(install_dir)
 

@@ -346,6 +346,44 @@ fn mixed_registered_message_is_split_into_canonical_prefix_and_dynamic_history()
 }
 
 #[test]
+fn mixed_stable_and_ordinary_user_message_sets_latest_real_user_boundary() {
+    let catalog = "<skills_instructions>\nfull catalog\n</skills_instructions>";
+    let usage = "<skills_usage_instructions>\nusage\n</skills_usage_instructions>";
+    let selected = skill("a");
+    let mixed = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![
+            ContentItem::InputText {
+                text: repository("current"),
+            },
+            ContentItem::InputText {
+                text: "new ordinary task".to_string(),
+            },
+        ],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let projection = project_stable_context(
+        vec![
+            text_message("developer", usage),
+            text_message("developer", catalog),
+            text_message("user", "use a"),
+            text_message("user", &selected),
+            mixed,
+        ]
+        .into(),
+        StableContextTarget::Sampling,
+    );
+
+    let text = visible_text(&projection.items);
+    assert!(text.contains(&usage));
+    assert!(text.contains(&catalog));
+    assert!(!text.contains(&selected.as_str()));
+    assert!(text.contains(&"new ordinary task"));
+}
+
+#[test]
 fn canonical_projection_places_volatile_context_after_reusable_history_prefix() {
     let repository = repository("stable repository");
     let collaboration = collaboration("stable collaboration");

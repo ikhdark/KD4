@@ -5,11 +5,17 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import re
 import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
+
+try:
+    from scripts.generated_output_lock import GenerationLockError, source_map_lock
+except ModuleNotFoundError:
+    from generated_output_lock import GenerationLockError, source_map_lock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TOP_LEVEL_OWNERS_HEADING = "## Top-level ownership"
@@ -294,7 +300,12 @@ def sync_tracked_path_snapshot(
         )
     if updated == raw_markdown:
         return False
-    source_map.write_bytes(updated.encode("utf-8"))
+    temporary = source_map.with_name(f".{source_map.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_bytes(updated.encode("utf-8"))
+        os.replace(temporary, source_map)
+    finally:
+        temporary.unlink(missing_ok=True)
     return True
 
 
@@ -391,7 +402,7 @@ def check_source_map(
 
     failed = False
     for line_number, owner in owners:
-        if owner_has_source(owner, sources):
+        if owner_has_source(owner, tracked_sources):
             continue
         print(
             f"{source_map}:{line_number}: declared owner has no repository source: "
@@ -457,21 +468,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         else args.source_map.resolve().parent
     )
     try:
-        source_paths, tracked_source_paths = repository_source_inventory(root)
-        sync_tracked_path_snapshot(
-            args.source_map,
-            repo_root=root,
-            source_paths=tracked_source_paths,
-        )
-    except (OSError, UnicodeError, ValueError) as exc:
+        with source_map_lock(root, f"source-map-check:{os.getpid()}"):
+            source_paths, tracked_source_paths = repository_source_inventory(root)
+            sync_tracked_path_snapshot(
+                args.source_map,
+                repo_root=root,
+                source_paths=tracked_source_paths,
+            )
+            return check_source_map(
+                args.source_map,
+                repo_root=root,
+                source_paths=source_paths,
+                tracked_source_paths=tracked_source_paths,
+            )
+    except (GenerationLockError, OSError, UnicodeError, ValueError) as exc:
         print(f"{args.source_map}: {exc}", file=sys.stderr)
         return 1
-    return check_source_map(
-        args.source_map,
-        repo_root=root,
-        source_paths=source_paths,
-        tracked_source_paths=tracked_source_paths,
-    )
 
 
 if __name__ == "__main__":

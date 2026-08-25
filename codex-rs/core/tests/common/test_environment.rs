@@ -18,7 +18,15 @@ pub enum TestTargetOs {
 
 impl TestTargetOs {
     const fn host() -> Self {
-        Self::Windows
+        if cfg!(target_os = "windows") {
+            Self::Windows
+        } else if cfg!(target_os = "macos") {
+            Self::MacOs
+        } else if cfg!(target_os = "linux") {
+            Self::Linux
+        } else {
+            panic!("unsupported test host operating system")
+        }
     }
 
     const fn path_convention(self) -> PathConvention {
@@ -80,18 +88,13 @@ impl TestEnvironment {
 }
 
 pub(crate) fn test_environment() -> TestEnvironment {
-    let environment = parse_test_environment(
+    load_test_environment(
         std::env::var_os(TEST_ENVIRONMENT_ENV_VAR).as_deref(),
         std::env::var_os(LEGACY_REMOTE_ENV_ENV_VAR).as_deref(),
         std::env::var_os(DOCKER_CONTAINER_ENV_VAR).as_deref(),
+        TestTargetOs::host(),
     )
-    .expect("invalid test environment configuration");
-
-    if matches!(environment, TestEnvironment::WineExec) {
-        panic!("{TEST_ENVIRONMENT_ENV_VAR}=wine-exec is only supported on Linux");
-    }
-
-    environment
+    .expect("invalid test environment configuration")
 }
 
 /// Returns the operating system used by the selected test execution environment.
@@ -161,6 +164,25 @@ fn parse_test_environment(
             "{TEST_ENVIRONMENT_ENV_VAR} must be one of local, docker, or wine-exec; got {value:?}"
         )),
     }
+}
+
+fn load_test_environment(
+    configured_environment: Option<&OsStr>,
+    legacy_remote_environment: Option<&OsStr>,
+    docker_container: Option<&OsStr>,
+    host_os: TestTargetOs,
+) -> Result<TestEnvironment, String> {
+    let environment = parse_test_environment(
+        configured_environment,
+        legacy_remote_environment,
+        docker_container,
+    )?;
+    if matches!(environment, TestEnvironment::WineExec) && host_os != TestTargetOs::Linux {
+        return Err(format!(
+            "{TEST_ENVIRONMENT_ENV_VAR}=wine-exec is only supported on Linux"
+        ));
+    }
+    Ok(environment)
 }
 
 fn non_empty_utf8(name: &str, value: &OsStr) -> Result<String, String> {

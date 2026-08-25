@@ -271,7 +271,12 @@ pub(crate) async fn apply_spawn_agent_model_defaults_and_overrides(
     } else {
         let available_models = models_manager
             .list_models_shared(RefreshStrategy::Offline, config.http_client_factory())
-            .await;
+            .await
+            .map_err(|error| {
+                FunctionCallError::RespondToModel(format!(
+                    "could not resolve the child model catalog: {error}"
+                ))
+            })?;
         match requested_model {
             Some(requested_model) => {
                 find_spawn_agent_model_name(&available_models, requested_model)?

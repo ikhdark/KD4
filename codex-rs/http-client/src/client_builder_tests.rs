@@ -31,3 +31,17 @@ fn transport_default_client_propagates_custom_ca_failure() {
         }
     ));
 }
+
+#[test]
+fn async_builder_accepts_transport_neutral_tls_material() {
+    let ca_pem = include_bytes!("../tests/fixtures/test-ca.pem");
+
+    let client = HttpClientBuilder::new()
+        .timeout(std::time::Duration::from_secs(1))
+        .tls_certs_only_pem(ca_pem)
+        .expect("valid CA certificate")
+        .https_only(true)
+        .build_direct();
+
+    assert!(client.is_ok());
+}

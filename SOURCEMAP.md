@@ -49,7 +49,7 @@ an SDK, schema, package, installed binary, or Codex Desktop.
 Update it in the same change whenever the repository materially changes.
 
 <!-- BEGIN TRACKED PATH SNAPSHOT -->
-Tracked repository path snapshot: `count=4964 sha256=9141878c8cfaae819b100d0d145a102201b7e0b2b0d6d78bc976e1df88e78934`.
+Tracked repository path snapshot: `count=5015 sha256=2a29b1d953a5916358c258355f876cc86da0839a25e2be15ad540a57e4d427ac`.
 <!-- END TRACKED PATH SNAPSHOT -->
 
 Every repository file or directory add, delete, move, or rename also requires
@@ -174,6 +174,7 @@ below.
 | Path | Applies to |
 | --- | --- |
 | `AGENTS.md` | Entire repository; canonical shared policy plus KD4 project context |
+| `.codex/AGENTS.md` | Repo-local Codex configuration, environment setup, durable harness material, fork-local skills, and workspace policy |
 | `codex-rs/AGENTS.md` | Compact Rust-wide invariants; detailed ownership, workflow, and validation routing live in this map |
 | `codex-rs/core/AGENTS.md` | Core-only session, context, diagnostics, compatibility, and validation deltas |
 | `codex-rs/prompts/AGENTS.md` | Model-visible prompt text, templates, and snapshot expectations |
@@ -193,7 +194,7 @@ below.
 | CLI library support | `codex-rs/cli/src/lib.rs` | `codex-rs/utils/build-info`, exit-status helpers |
 | Interactive TUI | `codex-rs/tui/src/main.rs` | `codex-rs/tui/src/lib.rs`, app/session routing, chat widget, bottom pane, core/protocol |
 | Headless execution | `codex-rs/exec/src/main.rs` | `codex-rs/exec`, core, protocol, JSONL/event output |
-| App server | `codex-rs/app-server/src/main.rs` | app-server library, protocol, transport, daemon, core |
+| App server | `codex-rs/app-server/src/main.rs` | app-server library, protocol, transport, core |
 | App-server exec transport | `codex-rs/app-server/src/bin/exec_server.rs` | app-server transport and process execution wiring |
 | App-server test client | `codex-rs/app-server-test-client/src/main.rs` | app-server protocol/transport smoke paths |
 | MCP server | `codex-rs/mcp-server/src/main.rs` | MCP server library, core, RMCP client, protocol |
@@ -229,7 +230,7 @@ below.
 | Cloud and external agents | `codex-rs/agent-graph-store`, `codex-rs/agent-identity`, `codex-rs/cloud-config`, `codex-rs/cloud-tasks`, `codex-rs/cloud-tasks-client`, `codex-rs/cloud-tasks-mock-client`, `codex-rs/external-agent-migration`, `codex-rs/external-agent-sessions` |
 | Telemetry, feedback, and diagnostics | `codex-rs/analytics`, `codex-rs/feedback`, `codex-rs/otel`, `codex-rs/response-debug-context` |
 | Support crates and narrow binaries | `codex-rs/async-utils`, `codex-rs/codex-experimental-api-macros`, `codex-rs/git-utils`, `codex-rs/stdio-to-uds`, `codex-rs/test-binary-support`, `codex-rs/uds` |
-| Shared utility crates | `codex-rs/utils/absolute-path`, `codex-rs/utils/cache`, `codex-rs/utils/cargo-bin`, `codex-rs/utils/cli`, `codex-rs/utils/home-dir`, `codex-rs/utils/image`, `codex-rs/utils/oss`, `codex-rs/utils/output-truncation`, `codex-rs/utils/path-uri`, `codex-rs/utils/pty`, `codex-rs/utils/rustls-provider`, `codex-rs/utils/sandbox-summary`, `codex-rs/utils/stream-parser`, `codex-rs/utils/string`, `codex-rs/utils/template` |
+| Shared utility crates | `codex-rs/utils/absolute-path`, `codex-rs/utils/build-info`, `codex-rs/utils/cache`, `codex-rs/utils/cargo-bin`, `codex-rs/utils/cli`, `codex-rs/utils/der`, `codex-rs/utils/home-dir`, `codex-rs/utils/image`, `codex-rs/utils/oss`, `codex-rs/utils/output-truncation`, `codex-rs/utils/path-uri`, `codex-rs/utils/pty`, `codex-rs/utils/rustls-provider`, `codex-rs/utils/sandbox-summary`, `codex-rs/utils/stream-parser`, `codex-rs/utils/string`, `codex-rs/utils/template` |
 
 ## Rust edit and upstream synchronization boundaries
 
@@ -312,7 +313,6 @@ revalidate tree equality, generated outputs, and affected callers on every sync.
 | Retained command output | `codex-rs/core/src/tools/command_output_artifact.rs` | unified exec and shell producers, `ExecCommandToolOutput` model/code-mode projection, opaque current-thread `read_tool_output` handler/spec, generic retention and receipt-scoped protected evidence-artifact lifecycle |
 | Command retry and validation reuse | `codex-rs/core/src/tools/command_execution.rs` | session initialization, content-identified `CODEX_HOME/command-execution-cache` persistence, retained validation artifacts, shell/unified-exec producers, repository mutation epochs |
 | Task evidence ledger | `codex-rs/core/src/task_evidence.rs` | session initialization, completion admission, plan acknowledgement, mutation reopening, generated-artifact checks |
-| Desktop activation evidence protocol | `codex-rs/core/src/task_evidence/desktop_activation.rs` | `codex-rs/core/src/codex_thread.rs`, app-server Desktop activation callers, task-evidence persistence |
 | External MCP evidence protocol | `codex-rs/core/src/task_evidence/external_evidence.rs` | MCP handler receipt capture, canonical oversized-payload artifacts, task-evidence persistence |
 | Runtime source-owner projection | `codex-rs/core/src/task_evidence/source_owner_index.rs` | `source_owners.toml`, task-evidence plan and validation ownership derivation |
 | Shell execution and approvals | `codex-rs/core/src/exec.rs`, `codex-rs/core/src/exec_policy.rs` | shell-command, execpolicy, sandboxing, Windows sandbox |
@@ -491,7 +491,7 @@ This map owns cross-cutting navigation and structural inventory.
 | Dependency or build-system change | owning manifest -> lock state -> workspace/recipe consumers -> focused build/test/package proof |
 | New top-level area, package, or instruction scope | add the owner and policy boundary -> update the machine-checked inventory in this file -> add routing/validation -> run `just source-map-check` |
 
-<!-- BEGIN KD4 SOURCE OWNERS schema=2 manifest_sha256=0261a42e2585112e5ea6091da977aa85a2a2befcce4254fa7cc1c352f0c30e98 -->
+<!-- BEGIN KD4 SOURCE OWNERS schema=2 manifest_sha256=9f7b8e0c349816d9b113680fc9ce20d5815d5af841db704722872787a1997576 -->
 ### Managed KD4 source-owner index
 
 This table is generated by `scripts/source_owners.py`; edit `source_owners.toml`, not this block.
@@ -512,6 +512,7 @@ This table is generated by `scripts/source_owners.py`; edit `source_owners.toml`
 | `shared-protocol-contracts` | `codex-rs/protocol` | `codex-rs/protocol/src/lib.rs::protocol` | `callers_consumers:consumed_by` -> `owner:core-agent-runtime`<br>`control_flow:consumed_by` -> `owner:app-server-runtime`<br>`runtime_registration:registers` -> `path:codex-rs/protocol/src/lib.rs`<br>+1 more | `compatibility:shared-protocol-compatibility` | `protocol-focused` |
 | `shared-utility-crates` | `codex-rs/utils` | `codex-rs/utils/build-info/src/lib.rs::BuildInfo`<br>`codex-rs/utils/der/src/lib.rs::first_der_item` | `control_flow:consumed_by` -> `owner:cli-entrypoints`<br>`callers_consumers:consumed_by` -> `owner:app-server-runtime`<br>`runtime_registration:registers` -> `path:codex-rs/Cargo.toml`<br>+1 more | `semantic:shared-utility-single-source` | `shared-utilities-focused` |
 | `source-owner-index` | `scripts/source_owners.py`<br>`source_owners.toml` | `scripts/source_owners.py::main` | `control_flow:generates` -> `generated:architecture_index.json`<br>`callers_consumers:consumed_by` -> `path:SOURCEMAP.md`<br>`configuration:reads_config` -> `config:source_owners.toml`<br>+3 more | `compatibility:fresh-index` | `source-owner-focused` |
+| `task-continuity-hooks` | `.codex/hooks.json`<br>`.codex/hooks/task-continuity-entry.ps1`<br>`.codex/hooks/task-continuity-fast-basic.ps1`<br>`.codex/hooks/task-continuity-fast-compact.ps1`<br>`.codex/hooks/task-continuity-fast-session.ps1`<br>`.codex/hooks/task-continuity.ps1`<br>`scripts/test_task_continuity_hook.py` | `.codex/hooks/task-continuity-entry.ps1::param(` | `runtime_registration:registers` -> `path:.codex/hooks/task-continuity-entry.ps1`<br>`control_flow:calls` -> `path:.codex/hooks/task-continuity.ps1`<br>`tests_contracts:validated_by` -> `path:scripts/test_task_continuity_hook.py` | `semantic:hook-fail-open` | `task-continuity-hooks-focused` |
 | `task-evidence-runtime` | `codex-rs/core/src/task_evidence.rs`<br>`codex-rs/core/src/task_evidence` | `codex-rs/core/src/task_evidence.rs::TaskEvidenceLedger` | `control_flow:calls` -> `owner:planning-architecture-runtime`<br>`callers_consumers:consumed_by` -> `path:codex-rs/core/src/tools/handlers/mcp.rs`<br>`runtime_registration:constructs` -> `path:codex-rs/core/src/session/session.rs`<br>+1 more | `semantic:current-evidence-completion` | `task-evidence-focused` |
 | `tool-output-recovery` | `codex-rs/core/src/tools/command_output_artifact.rs`<br>`codex-rs/core/src/tools/handlers/read_tool_output.rs` | `codex-rs/core/src/tools/handlers/read_tool_output.rs::ReadToolOutputHandler` | `control_flow:calls` -> `path:codex-rs/core/src/tools/command_output_artifact.rs`<br>`callers_consumers:consumed_by` -> `path:codex-rs/core/src/context_manager/history.rs`<br>`runtime_registration:registers` -> `path:codex-rs/core/src/tools/spec_plan.rs`<br>+1 more | `compatibility:exact-bounded-recovery` | `tool-output-focused` |
 <!-- END KD4 SOURCE OWNERS -->

@@ -13,6 +13,7 @@ use codex_features::Feature;
 use codex_features::FeatureConfigSource;
 use codex_features::FeatureOverrides;
 use codex_features::Features;
+use codex_features::feature_requirement_for_key;
 use codex_features::user_settable_feature_for_key;
 
 /// Wrapper around [`Features`] which enforces constraints defined in
@@ -29,7 +30,7 @@ impl Default for ManagedFeatures {
     fn default() -> Self {
         Self {
             value: ConstrainedWithSource::new(
-                Constrained::allow_any(Features::default()),
+                Constrained::allow_any(Features::with_defaults()),
                 /*source*/ None,
             ),
             pinned_features: BTreeMap::new(),
@@ -209,12 +210,7 @@ fn parse_feature_requirements(
 ) -> BTreeMap<Feature, bool> {
     let mut pinned_features = BTreeMap::new();
     for (key, enabled) in feature_requirements.entries {
-        if key == "auto_review" {
-            pinned_features.insert(Feature::GuardianApproval, enabled);
-            continue;
-        }
-
-        if let Some(feature) = user_settable_feature_for_key(&key) {
+        if let Some(feature) = feature_requirement_for_key(&key) {
             pinned_features.insert(feature, enabled);
             continue;
         }
@@ -305,4 +301,14 @@ pub(crate) fn validate_feature_requirements_in_config_toml(
         FeatureOverrides::default(),
     );
     ManagedFeatures::from_configured(configured_features, feature_requirements.cloned()).map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_uses_authoritative_feature_defaults() {
+        assert_eq!(ManagedFeatures::default().get(), &Features::with_defaults());
+    }
 }

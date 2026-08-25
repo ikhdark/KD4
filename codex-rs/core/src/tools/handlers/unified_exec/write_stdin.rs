@@ -81,10 +81,6 @@ impl WriteStdinHandler {
         validate_independent_review_stdin(&turn.session_source, &args.chars)
             .map_err(|message| FunctionCallError::RespondToModel(message.to_string()))?;
         let yield_time_ms = owner_wait_yield_time_ms(&args.chars, args.yield_time_ms);
-        if args.chars.is_empty() {
-            let _ = tool_dispatch_trace::increment_retry_count();
-            let _ = tool_dispatch_trace::increment_reentry_count();
-        }
         let deadline_at_ms = tool_dispatch_trace::lifecycle_deadline_after_ms(yield_time_ms);
         let response = session
             .services

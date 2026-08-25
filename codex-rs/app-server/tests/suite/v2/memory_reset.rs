@@ -72,6 +72,48 @@ async fn memory_reset_clears_memory_files_and_rows_preserves_threads() -> Result
     Ok(())
 }
 
+#[tokio::test]
+async fn memory_reset_filesystem_failure_preserves_memory_rows() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path())?;
+    let state_db = init_state_db(codex_home.path()).await?;
+    let memory_root = codex_home.path().join("memories_extensions");
+    tokio::fs::write(&memory_root, "not a directory\n").await?;
+    let thread_id = seed_stage1_output(&state_db, codex_home.path()).await?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let request_id = mcp
+        .send_raw_request("memory/reset", /*params*/ None)
+        .await?;
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let error = to_response::<MemoryResetResponse>(response).expect_err("reset should fail");
+    assert!(
+        error
+            .to_string()
+            .contains("failed to stage memory directories"),
+        "unexpected reset error: {error}"
+    );
+
+    let stage1_outputs = state_db
+        .memories()
+        .list_stage1_outputs_for_global(/*n*/ 10)
+        .await?;
+    assert_eq!(stage1_outputs.len(), 1);
+    assert_eq!(stage1_outputs[0].thread_id, thread_id);
+
+    Ok(())
+}
+
 async fn seed_stage1_output(state_db: &Arc<StateRuntime>, codex_home: &Path) -> Result<ThreadId> {
     let now = Utc::now();
     let thread_id = ThreadId::from_string(&Uuid::new_v4().to_string())?;

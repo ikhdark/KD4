@@ -31,7 +31,11 @@ pub(super) async fn spawn_review_thread(
             RefreshStrategy::OnlineIfUncached,
             config.http_client_factory(),
         )
-        .await;
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "review model refresh failed; using the parent turn catalog");
+            Arc::clone(&parent_turn_context.available_models)
+        });
     let review_prompt = resolved.prompt.clone();
     let provider = parent_turn_context.provider.clone();
     let auth_manager = parent_turn_context.auth_manager.clone();

@@ -9,6 +9,7 @@ use codex_context_fragments::ModelContextBudget;
 use codex_context_fragments::RenderedContextFragment;
 use codex_features::Feature;
 use codex_hooks::ContextInjectingHookOutcome;
+use codex_hooks::InterruptRequest;
 use codex_hooks::PermissionRequestDecision;
 use codex_hooks::PermissionRequestOutcome;
 use codex_hooks::PermissionRequestRequest;
@@ -350,6 +351,45 @@ pub(crate) async fn run_turn_stop_hooks(
         workspace_changed,
         observation_error,
     }
+}
+
+#[instrument(level = "trace", skip_all)]
+pub(crate) async fn run_turn_interrupt_hooks(sess: &Arc<Session>, turn_context: &Arc<TurnContext>) {
+    // User-configured Interrupt hooks describe the root turn lifecycle. Internal
+    // and thread-spawned subagent sessions have their own parent-owned terminal
+    // lifecycle and must not dispatch a second Interrupt notification.
+    if matches!(&turn_context.session_source, SessionSource::SubAgent(_)) {
+        return;
+    }
+
+    let hooks = sess.hooks();
+    let preview_runs = hooks.preview_interrupt();
+    if preview_runs.is_empty() {
+        return;
+    }
+
+    let request = InterruptRequest {
+        session_id: sess.session_id().into(),
+        turn_id: turn_context.sub_id.clone(),
+        cwd: turn_context.cwd().clone(),
+        transcript_path: sess.hook_transcript_path().await,
+        model: turn_context.model_info.slug.clone(),
+        permission_mode: hook_permission_mode(turn_context),
+    };
+
+    // Interrupt hooks may inspect the transcript, so make the durable history
+    // written by terminal preparation visible before the process starts.
+    if let Err(error) = sess.flush_rollout().await {
+        tracing::warn!(
+            turn_id = %turn_context.sub_id,
+            %error,
+            "failed to flush rollout before Interrupt hooks"
+        );
+    }
+
+    emit_hook_started_events(sess, turn_context, preview_runs).await;
+    let outcome = hooks.run_interrupt(request).await;
+    emit_hook_completed_events(sess, turn_context, outcome.hook_events).await;
 }
 
 pub(crate) async fn run_pre_compact_hooks(

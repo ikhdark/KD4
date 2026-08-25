@@ -477,7 +477,6 @@ fn initialize_params(
         capabilities: Some(InitializeCapabilities {
             experimental_api,
             request_attestation: false,
-            desktop_activation_receipts: false,
             opt_out_notification_methods: (!opt_out_notification_methods.is_empty())
                 .then(|| opt_out_notification_methods.to_vec()),
             mcp_server_openai_form_elicitation,
@@ -1117,7 +1116,7 @@ mod tests {
     async fn lifecycle_builders_share_config_mapping_and_preserve_resume_reviewer() {
         let mut config = build_test_config().await;
         config.bypass_hook_trust = true;
-        config.service_tier = Some("fast".to_string());
+        config.service_tier = Some("priority".to_string());
         let overrides = ThreadLifecycleOverrides {
             model_provider: Some(config.model_provider_id.clone()),
             cwd: Some(config.cwd.to_string_lossy().to_string()),
@@ -1144,7 +1143,7 @@ mod tests {
                 .and_then(|overrides| overrides.get("bypass_hook_trust")),
             Some(&serde_json::Value::Bool(true))
         );
-        assert_eq!(start.service_tier, Some(Some("fast".to_string())));
+        assert_eq!(start.service_tier, Some(Some("priority".to_string())));
         assert_eq!(start.service_tier, resume.service_tier);
         assert_eq!(resume.service_tier, fork.service_tier);
         assert_eq!(

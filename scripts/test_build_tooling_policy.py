@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 
 import contextlib
+import hashlib
 import io
 import json
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -21,6 +24,66 @@ from scripts.build_tooling_test_support import ps_single_quote
 
 
 class BuildToolingPolicyTest(unittest.TestCase):
+    def run_workspace_analyzer(
+        self,
+        analyzer: str,
+        *forwarded_args: str,
+        rustflags: str = "",
+        os_name: str | None = None,
+    ) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]]]:
+        shell = powershell()
+        if shell is None:
+            self.skipTest("PowerShell is required for workspace analyzer tests")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            analyzer_path = temp_root / "cargo-workspace-analyzer.ps1"
+            shutil.copyfile(
+                REPO_ROOT / "scripts" / "cargo-workspace-analyzer.ps1",
+                analyzer_path,
+            )
+            (temp_root / "cargo-lane.ps1").write_text(
+                "param(\n"
+                "    [string]$Lane,\n"
+                "    [Parameter(ValueFromRemainingArguments = $true)]\n"
+                "    [string[]]$Command\n"
+                ")\n"
+                "[ordered]@{ lane = $Lane; args = @($Command); rustflags = $env:RUSTFLAGS } "
+                "| ConvertTo-Json -Compress | Add-Content -LiteralPath "
+                "$env:CODEX_ANALYZER_TEST_OUTPUT\n",
+                encoding="utf-8",
+            )
+            output_path = temp_root / "calls.jsonl"
+            env = {
+                **os.environ,
+                "RUSTFLAGS": rustflags,
+                "CODEX_ANALYZER_TEST_OUTPUT": str(output_path),
+            }
+            if os_name is not None:
+                env["OS"] = os_name
+            result = subprocess.run(
+                [
+                    shell,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(analyzer_path),
+                    "-Analyzer",
+                    analyzer,
+                    *forwarded_args,
+                ],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            output = (
+                output_path.read_text(encoding="utf-8") if output_path.exists() else ""
+            )
+        payloads = [json.loads(line) for line in output.splitlines() if line.strip()]
+        return result, payloads
+
     def test_build_info_script_uses_upstream_git_metadata_fallbacks(
         self,
     ) -> None:
@@ -69,6 +132,37 @@ class BuildToolingPolicyTest(unittest.TestCase):
         self.assertFalse((REPO_ROOT / ".codex" / "skills" / "kd4-harness").exists())
         self.assertNotIn("skills/kd4-harness", workspace_policy)
         self.assertNotIn("kd4-harness", harness_workflow)
+
+    def test_harness_workflow_orchestrator_reference_resolves(self) -> None:
+        harness_dir = REPO_ROOT / ".codex" / "harness"
+        workflow = (harness_dir / "workflow.md").read_text(encoding="utf-8")
+        relative_path = "templates/ORCHESTRATOR.md"
+
+        self.assertIn(
+            f"[`{relative_path}`]({relative_path})",
+            workflow,
+        )
+        self.assertTrue((harness_dir / relative_path).is_file())
+
+    def test_harness_local_markdown_links_resolve(self) -> None:
+        harness_dir = REPO_ROOT / ".codex" / "harness"
+
+        durable_markdown = (
+            path
+            for path in harness_dir.rglob("*.md")
+            if "runs" not in path.relative_to(harness_dir).parts
+        )
+        for markdown_path in sorted(durable_markdown):
+            markdown = markdown_path.read_text(encoding="utf-8")
+            for target in re.findall(r"\[[^]]*\]\(([^)]+)\)", markdown):
+                relative_path = target.split("#", 1)[0]
+                if not relative_path or "://" in relative_path:
+                    continue
+                with self.subTest(source=markdown_path, target=target):
+                    self.assertTrue(
+                        (markdown_path.parent / relative_path).is_file(),
+                        f"broken local Markdown link in {markdown_path}: {target}",
+                    )
 
     def test_repo_local_skill_frontmatter_names_match_folders(self) -> None:
         skills_dir = REPO_ROOT / ".codex" / "skills"
@@ -191,6 +285,51 @@ class BuildToolingPolicyTest(unittest.TestCase):
         )
         self.assertIn('"bin\\codex-code-mode-host.exe"', powershell_installer)
 
+    def test_windows_installer_cleans_failed_metadata_temporary_file(self) -> None:
+        ps = powershell()
+        if ps is None:
+            self.skipTest("PowerShell is required for the Windows installer test")
+        installer = REPO_ROOT / "scripts" / "install" / "install.ps1"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            command = (
+                "$tokens=$null; $errors=$null; "
+                f"$ast=[Management.Automation.Language.Parser]::ParseFile({ps_single_quote(installer)},[ref]$tokens,[ref]$errors); "
+                "$fn=$ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Write-InstallMetadata'},$true)[0]; "
+                "Invoke-Expression $fn.Extent.Text; $InstallMetadataFile='codex-install.env'; "
+                "function Move-Item { throw 'injected move failure' }; "
+                f"try {{ Write-InstallMetadata -ReleaseDir {ps_single_quote(Path(temp_dir))} -ResolvedVersion '1' -Target 't' -Layout 'Package' }} catch {{ }}; "
+                f"if (@(Get-ChildItem -LiteralPath {ps_single_quote(Path(temp_dir))} -Filter 'codex-install.env.*').Count -ne 0) {{ exit 9 }}"
+            )
+            completed = subprocess.run(
+                [ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_windows_installer_detects_unknown_external_codex_conflict(self) -> None:
+        ps = powershell()
+        if ps is None:
+            self.skipTest("PowerShell is required for the Windows installer test")
+        installer = REPO_ROOT / "scripts" / "install" / "install.ps1"
+        command = (
+            "$tokens=$null; $errors=$null; "
+            f"$ast=[Management.Automation.Language.Parser]::ParseFile({ps_single_quote(installer)},[ref]$tokens,[ref]$errors); "
+            "$names=@('Get-ExistingCodexManager','Get-ConflictingInstall'); "
+            "$ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $names -contains $n.Name},$true) | ForEach-Object { Invoke-Expression $_.Extent.Text }; "
+            "function Test-PathIsEqualOrDescendant { return $false }; function Get-ExistingCodexCommand { 'C:\\Tools\\codex.exe' }; function Write-Step {}; function Write-WarningStep {}; "
+            "$conflict=Get-ConflictingInstall -VisibleBinDir 'C:\\KD4\\bin'; "
+            "if ($null -eq $conflict -or $null -ne $conflict.Manager -or $conflict.Path -cne 'C:\\Tools\\codex.exe') { exit 9 }"
+        )
+        completed = subprocess.run(
+            [ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_windows_installer_defaults_to_fork_release_artifacts(self) -> None:
         powershell_installer = (
             REPO_ROOT / "scripts" / "install" / "install.ps1"
@@ -253,20 +392,41 @@ class BuildToolingPolicyTest(unittest.TestCase):
                 "codex-path/rg.exe",
                 "codex-resources/codex-command-runner.exe",
                 "codex-resources/codex-windows-sandbox-setup.exe",
+                "LICENSE",
+                "NOTICE",
             ):
                 path = windows_package / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.touch()
+            package_files = [
+                {
+                    "path": path.relative_to(windows_package).as_posix(),
+                    "role": "test",
+                    "size": path.stat().st_size,
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                }
+                for path in sorted(windows_package.rglob("*"))
+                if path.is_file() and path.name != "codex-package.json"
+            ]
             (windows_package / "codex-package.json").write_text(
                 json.dumps(
                     {
-                        "layoutVersion": 1,
+                        "layoutVersion": 2,
                         "version": "1.2.3",
                         "target": "x86_64-pc-windows-msvc",
                         "variant": "codex",
                         "entrypoint": "bin/codex.exe",
                         "resourcesDir": "codex-resources",
                         "pathDir": "codex-path",
+                        "bundleId": hashlib.sha256(
+                            json.dumps(
+                                package_files,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ).encode()
+                        ).hexdigest(),
+                        "buildIdentity": {"status": "test-fixture"},
+                        "files": package_files,
                     }
                 ),
                 encoding="utf-8",
@@ -282,10 +442,12 @@ class BuildToolingPolicyTest(unittest.TestCase):
                     f"$ast = [System.Management.Automation.Language.Parser]::ParseFile("
                     f"{ps_single_quote(powershell_installer)}, "
                     "[ref]$tokens, [ref]$errors); "
-                    "$function = $ast.FindAll({ param($node) "
+                    "$names = @('Get-FileSha256', 'Get-PeMachine', "
+                    "'Test-PackageContentsAreComplete'); "
+                    "$functions = $ast.FindAll({ param($node) "
                     "$node -is [System.Management.Automation.Language.FunctionDefinitionAst] "
-                    "-and $node.Name -eq 'Test-PackageContentsAreComplete' }, $true); "
-                    "Invoke-Expression $function[0].Extent.Text; "
+                    "-and $names -contains $node.Name }, $true); "
+                    "$functions | ForEach-Object { Invoke-Expression $_.Extent.Text }; "
                     f"$actual = Test-PackageContentsAreComplete -PackageDir "
                     f"{ps_single_quote(windows_package)} -ExpectedVersion '1.2.3' "
                     "-ExpectedTarget 'x86_64-pc-windows-msvc'; "
@@ -312,11 +474,51 @@ class BuildToolingPolicyTest(unittest.TestCase):
                 f"stdout:\n{missing_windows.stdout}\nstderr:\n{missing_windows.stderr}",
             )
             (windows_package / "bin" / "codex-code-mode-host.exe").touch()
+            metadata_path = windows_package / "codex-package.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            code_mode_host = windows_package / "bin" / "codex-code-mode-host.exe"
+            metadata["files"].append(
+                {
+                    "path": "bin/codex-code-mode-host.exe",
+                    "role": "code-mode-host",
+                    "size": code_mode_host.stat().st_size,
+                    "sha256": hashlib.sha256(code_mode_host.read_bytes()).hexdigest(),
+                }
+            )
+            metadata["bundleId"] = hashlib.sha256(
+                json.dumps(
+                    metadata["files"], sort_keys=True, separators=(",", ":")
+                ).encode()
+            ).hexdigest()
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
             complete_windows = run_powershell_probe(True)
             self.assertEqual(
                 complete_windows.returncode,
                 0,
                 f"stdout:\n{complete_windows.stdout}\nstderr:\n{complete_windows.stderr}",
+            )
+
+            metadata["bundleId"] = "f" * 64
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            mismatched_bundle = run_powershell_probe(False)
+            self.assertEqual(
+                mismatched_bundle.returncode,
+                0,
+                f"stdout:\n{mismatched_bundle.stdout}\nstderr:\n{mismatched_bundle.stderr}",
+            )
+
+            metadata["bundleId"] = hashlib.sha256(
+                json.dumps(
+                    metadata["files"], sort_keys=True, separators=(",", ":")
+                ).encode()
+            ).hexdigest()
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            (windows_package / "unexpected.dll").touch()
+            extra_file = run_powershell_probe(False)
+            self.assertEqual(
+                extra_file.returncode,
+                0,
+                f"stdout:\n{extra_file.stdout}\nstderr:\n{extra_file.stderr}",
             )
 
     def test_windows_installer_parses_the_first_nonempty_version_line(self) -> None:
@@ -327,6 +529,65 @@ class BuildToolingPolicyTest(unittest.TestCase):
         self.assertIn("$versionLine = @($versionOutput)", powershell_installer)
         self.assertIn("[regex]::Match($versionLine", powershell_installer)
         self.assertNotIn("$versionOutput -match", powershell_installer)
+
+    def test_windows_installer_uninstall_removes_only_its_path_entry(self) -> None:
+        ps = powershell()
+        if ps is None:
+            self.skipTest("PowerShell is required for the Windows installer test")
+        installer = REPO_ROOT / "scripts" / "install" / "install.ps1"
+        command = (
+            "$tokens=$null; $errors=$null; "
+            f"$ast=[Management.Automation.Language.Parser]::ParseFile({ps_single_quote(installer)},[ref]$tokens,[ref]$errors); "
+            "$fn=$ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Remove-PathEntry'},$true)[0]; "
+            "Invoke-Expression $fn.Extent.Text; "
+            "$actual=Remove-PathEntry -PathValue 'C:\\Tools;C:\\KD4\\bin\\;C:\\Other' -Entry 'c:\\kd4\\BIN'; "
+            "if ($actual -cne 'C:\\Tools;C:\\Other') { Write-Error $actual; exit 9 }"
+        )
+        completed = subprocess.run(
+            [ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_windows_installer_retains_active_and_two_previous_releases(self) -> None:
+        ps = powershell()
+        if ps is None:
+            self.skipTest("PowerShell is required for the Windows installer test")
+        installer = REPO_ROOT / "scripts" / "install" / "install.ps1"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            releases = Path(temp_dir) / "releases"
+            active = releases / "active"
+            incomplete = releases / "incomplete"
+            completed_releases = [releases / f"previous-{index}" for index in range(3)]
+            for release in (active, incomplete, *completed_releases):
+                release.mkdir(parents=True)
+            for index, release in enumerate(completed_releases):
+                (release / "codex-install.env").write_text(
+                    "version=1\n", encoding="utf-8"
+                )
+                os.utime(release, (index + 1, index + 1))
+
+            command = (
+                "$tokens=$null; $errors=$null; "
+                f"$ast=[Management.Automation.Language.Parser]::ParseFile({ps_single_quote(installer)},[ref]$tokens,[ref]$errors); "
+                "$fn=$ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Remove-OldCompletedReleases'},$true)[0]; "
+                "Invoke-Expression $fn.Extent.Text; $InstallMetadataFile='codex-install.env'; "
+                f"Remove-OldCompletedReleases -ReleasesDir {ps_single_quote(releases)} -ActiveReleaseDir {ps_single_quote(active)} -RetainPrevious 2"
+            )
+            completed = subprocess.run(
+                [ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertTrue(active.is_dir())
+            self.assertTrue(incomplete.is_dir())
+            self.assertFalse(completed_releases[0].exists())
+            self.assertTrue(completed_releases[1].is_dir())
+            self.assertTrue(completed_releases[2].is_dir())
 
     def test_root_maintenance_covers_current_script_tooling_tests(self) -> None:
         root_maintenance = load_root_maintenance_module()
@@ -429,6 +690,21 @@ class BuildToolingPolicyTest(unittest.TestCase):
             ],
         )
 
+    def test_python_sdk_gate_and_publish_routing_match_policy(self) -> None:
+        justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
+        sdk_recipe = justfile.split("\nsdk-python-check:\n", 1)[1].split("\n\n", 1)[0]
+        scripts_policy = (REPO_ROOT / "scripts" / "AGENTS.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("--group dev ruff check .", sdk_recipe)
+        self.assertIn("--group dev pytest", sdk_recipe)
+        self.assertIn(
+            "python\n  scripts/root_maintenance.py test-python --changed\n  "
+            "scripts/publish-local-codex.ps1",
+            scripts_policy,
+        )
+
     def test_root_maintenance_script_audit_plan_covers_every_script_type(self) -> None:
         root_maintenance = load_root_maintenance_module()
         tools = {
@@ -448,6 +724,12 @@ class BuildToolingPolicyTest(unittest.TestCase):
         self.assertIn("Python format", labels)
         self.assertIn("Python lint", labels)
         self.assertIn("PowerShell syntax", labels)
+        self.assertIn("justfile PowerShell syntax", labels)
+        self.assertIn("justfile Python syntax", labels)
+        self.assertIn(
+            "Parser]::ParseInput",
+            dict(commands)["justfile PowerShell syntax"][-1],
+        )
         javascript_targets = [
             target
             for target, kind in root_maintenance.script_kind_map().items()
@@ -482,6 +764,39 @@ class BuildToolingPolicyTest(unittest.TestCase):
             [label for label, _command in commands_without_tests],
         )
 
+    def test_root_maintenance_parses_every_just_recipe_as_powershell(self) -> None:
+        ps = powershell()
+        if ps is None:
+            self.skipTest("PowerShell is required for justfile syntax validation")
+        root_maintenance = load_root_maintenance_module()
+        commands, missing = root_maintenance.script_audit_commands(
+            include_tests=False,
+            resolve_tool={"uv": "uv", "pwsh": ps, "node": "node"}.get,
+        )
+        self.assertEqual(missing, [])
+        result = subprocess.run(
+            dict(commands)["justfile PowerShell syntax"],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_justfile_script_recipes_are_checked_by_their_own_interpreter(self) -> None:
+        root_maintenance = load_root_maintenance_module()
+
+        powershell_sources = root_maintenance.just_powershell_sources()
+        python_sources = root_maintenance.just_python_sources()
+
+        self.assertTrue(any("cargo run" in source for _, source in powershell_sources))
+        self.assertFalse(
+            any("import runpy" in source for _, source in powershell_sources)
+        )
+        self.assertTrue(any("import runpy" in source for _, source in python_sources))
+        for name, source in python_sources:
+            compile(source, name, "exec")
+
     def test_root_maintenance_script_inventory_covers_owned_script_roots(
         self,
     ) -> None:
@@ -490,9 +805,11 @@ class BuildToolingPolicyTest(unittest.TestCase):
         expected_kinds = {
             ".codex/environments/setup.py": "python",
             ".codex/hooks/task-continuity.ps1": "powershell",
+            "codex-cli/bin/codex.js": "javascript",
             "codex-cli/scripts/build_npm_package.py": "python",
             "codex-rs/app-server-test-client/scripts/live_elicitation_hold.ps1": "powershell",
             "codex-rs/config/scripts/generate-proto.ps1": "powershell",
+            "codex-rs/responses-api-proxy/npm/bin/codex-responses-api-proxy.js": "javascript",
             "codex-rs/scripts/nextest_windows_stack.py": "python",
             "codex-rs/skills/src/assets/samples/imagegen/scripts/image_gen.py": "python",
             "sdk/python/scripts/update_sdk_artifacts.py": "python",
@@ -507,6 +824,23 @@ class BuildToolingPolicyTest(unittest.TestCase):
             "tools/argument-comment-lint/test_wrapper_common.py",
             root_maintenance.python_unittest_targets(),
         )
+
+    def test_root_maintenance_routes_every_task_continuity_owner(self) -> None:
+        root_maintenance = load_root_maintenance_module()
+
+        for target in (
+            ".codex/hooks.json",
+            ".codex/hooks/task-continuity-entry.ps1",
+            ".codex/hooks/task-continuity-fast-basic.ps1",
+            ".codex/hooks/task-continuity-fast-compact.ps1",
+            ".codex/hooks/task-continuity-fast-session.ps1",
+            ".codex/hooks/task-continuity.ps1",
+        ):
+            with self.subTest(target=target):
+                self.assertEqual(
+                    root_maintenance.test_modules_for_changed_path(target),
+                    ("scripts.test_task_continuity_hook",),
+                )
 
     def test_obsolete_developer_tooling_residue_is_absent(self) -> None:
         obsolete_paths = (
@@ -750,7 +1084,29 @@ class BuildToolingPolicyTest(unittest.TestCase):
         )
         self.assertEqual(run.call_count, 2)
         self.assertIn("-z", run.call_args_list[0].args[0])
+        self.assertIn("--diff-filter=ACDMRTUXB", run.call_args_list[0].args[0])
         self.assertIn("--others", run.call_args_list[1].args[0])
+
+    def test_changed_production_script_without_tests_is_unverified(self) -> None:
+        root_maintenance = load_root_maintenance_module()
+
+        with mock.patch.object(root_maintenance, "run") as run:
+            self.assertEqual(
+                root_maintenance.main(
+                    [
+                        "test-python",
+                        "--changed",
+                        "scripts/unmapped_audit189_helper.py",
+                    ]
+                ),
+                2,
+            )
+            self.assertEqual(
+                root_maintenance.main(["test-python", "--changed", "docs/example.md"]),
+                0,
+            )
+
+        run.assert_not_called()
 
     def test_format_empty_changed_selection_is_a_noop(self) -> None:
         format_script = load_format_module()
@@ -853,6 +1209,35 @@ class BuildToolingPolicyTest(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_run_python_enforces_the_supported_interpreter_version(self) -> None:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node is not available")
+        launcher = REPO_ROOT / "scripts" / "run-python.js"
+        self.assertIn(
+            "sys.version_info >= (3, 11)", launcher.read_text(encoding="utf-8")
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            marker = Path(temp_dir) / "selected.txt"
+            script = Path(temp_dir) / "selected.py"
+            script.write_text(
+                "from pathlib import Path\n"
+                f"Path({str(marker)!r}).write_text('ok', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [node, str(launcher), str(script)],
+                cwd=REPO_ROOT,
+                env={**os.environ, "PYTHON": sys.executable},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "ok")
 
     def test_formatting_commands_only_target_existing_repository_sources(
         self,
@@ -1154,10 +1539,6 @@ class BuildToolingPolicyTest(unittest.TestCase):
     def test_dead_code_matrix_uses_dedicated_cargo_lane(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
 
-        self.assertIn(
-            'RUSTFLAGS="-Ddead_code" just cargo-lane rust-dead-code-matrix cargo check',
-            justfile,
-        )
         self.assertIn("cargo-workspace-analyzer.ps1", justfile)
         analyzer = (REPO_ROOT / "scripts/cargo-workspace-analyzer.ps1").read_text(
             encoding="utf-8"
@@ -1167,7 +1548,30 @@ class BuildToolingPolicyTest(unittest.TestCase):
             analyzer,
         )
         self.assertIn('$lane = "rust-dead-code-matrix"', analyzer)
-        self.assertIn('$env:RUSTFLAGS = "-Ddead_code"', analyzer)
+        result, payloads = self.run_workspace_analyzer(
+            "dead-code",
+            "--package=codex-core",
+            rustflags="-C target-cpu=native --cfg existing",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(payloads), 1, result.stdout)
+        self.assertEqual(
+            payloads[0]["rustflags"],
+            "-C target-cpu=native --cfg existing -Ddead_code",
+        )
+        self.assertNotIn("--workspace", payloads[0]["args"])
+
+    def test_workspace_analyzer_recognizes_equals_form_selectors(self) -> None:
+        for selector in (
+            "--package=codex-core",
+            "--manifest-path=codex-rs/core/Cargo.toml",
+        ):
+            with self.subTest(selector=selector):
+                result, payloads = self.run_workspace_analyzer("dead-code", selector)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(payloads), 1, result.stdout)
+                self.assertIn(selector, payloads[0]["args"])
+                self.assertNotIn("--workspace", payloads[0]["args"])
 
     def test_windows_v8_fallback_tracks_remaining_forwarding_packages(self) -> None:
         analyzer = (REPO_ROOT / "scripts/cargo-workspace-analyzer.ps1").read_text(
@@ -1181,6 +1585,20 @@ class BuildToolingPolicyTest(unittest.TestCase):
             analyzer,
         )
         self.assertIn('$packageArgs += @("--package", $v8SandboxPackage)', analyzer)
+        justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
+        workspace_recipe = justfile.split("clippy-workspace *args:", 1)[1].split(
+            "\n\n", 1
+        )[0]
+        self.assertIn("-Analyzer clippy --workspace @forwarded_args", workspace_recipe)
+
+        result, payloads = self.run_workspace_analyzer(
+            "clippy", "--workspace", "--all-features", os_name="Windows_NT"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(payloads), 2, result.stdout)
+        self.assertIn("--workspace", payloads[0]["args"])
+        self.assertIn("--exclude", payloads[0]["args"])
+        self.assertIn("--package", payloads[1]["args"])
 
     def test_package_validation_defaults_do_not_expand_to_workspace(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
@@ -1239,6 +1657,77 @@ class BuildToolingPolicyTest(unittest.TestCase):
         self.assertIn("cargo fetch --locked", justfile)
         self.assertNotIn("cargo fetch\n", justfile)
 
+    def test_high_frequency_python_recipes_bypass_the_powershell_adapter(self) -> None:
+        justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
+
+        for recipe in ("fmt", "fmt-check-fast", "fmt-full", "fmt-check"):
+            marker = f'[script("python")]\n{recipe}:'
+            self.assertIn(marker, justfile)
+        self.assertIn(
+            '[no-cd]\n[script("python")]\ncheck-kd4-features *args:', justfile
+        )
+        feature_recipe = subprocess.run(
+            ["just", "--show", "check-kd4-features"],
+            cwd=REPO_ROOT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(feature_recipe.returncode, 0, feature_recipe.stderr)
+        self.assertIn('[script("python")]', feature_recipe.stdout)
+        self.assertIn("forwarded = sys.argv[1:]", feature_recipe.stdout)
+        self.assertIn("json.loads", feature_recipe.stdout)
+        self.assertIn("sys.argv = [script, *forwarded]", feature_recipe.stdout)
+
+    def test_direct_python_recipe_preserves_argv_and_exit_code(self) -> None:
+        help_result = subprocess.run(
+            ["just", "check-kd4-features", "--help"],
+            cwd=REPO_ROOT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertIn("usage:", help_result.stdout.lower())
+
+        unicode_argument = "--unknown-KD4-λ-path with spaces"
+        rejected = subprocess.run(
+            ["just", "check-kd4-features", unicode_argument],
+            cwd=REPO_ROOT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn(unicode_argument, rejected.stderr)
+
+    def test_release_packaging_policy_is_explicit_and_pinned(self) -> None:
+        justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
+        cargo_manifest = (REPO_ROOT / "codex-rs" / "Cargo.toml").read_text(
+            encoding="utf-8"
+        )
+        npm_manifest = json.loads(
+            (REPO_ROOT / "codex-cli" / "package.json").read_text(encoding="utf-8")
+        )
+
+        self.assertIn('rust_parallelism := "8"', justfile)
+        self.assertIn('$requiredPwshVersion = [version]"7.5.2"', justfile)
+        self.assertIn("just test-release-tooling", justfile)
+        self.assertIn("prepare-codex-release version:", justfile)
+        self.assertIn("cosign verify-blob", justfile)
+        self.assertIn('strip = "symbols"', cargo_manifest)
+        self.assertTrue(npm_manifest["private"])
+        self.assertEqual(
+            npm_manifest["repository"]["url"],
+            "git+https://github.com/ikhdark/KD4.git",
+        )
+
     def test_dependency_policy_gate_runs_offline_cargo_deny(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
 
@@ -1277,8 +1766,8 @@ class BuildToolingPolicyTest(unittest.TestCase):
             "_core-test-helpers-runtime target_dir:",
             "_core-test-helpers-mcp target_dir:",
             "_core-test-helpers-windows-sandbox target_dir:",
-            'cargo build --target-dir "{{ target_dir }}" -p codex-cli --bin codex',
-            'cargo build --target-dir "{{ target_dir }}" -p codex-code-mode-host --bin codex-code-mode-host',
+            'cargo build --target-dir "{{ target_dir }}" -p codex-cli --bin codex -p codex-code-mode-host --bin codex-code-mode-host',
+            'cargo build --target-dir "{{ target_dir }}" -p codex-windows-sandbox --bin codex-windows-sandbox-setup --bin codex-command-runner',
             "just _test-lane-package-reserved",
             "$target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR",
             '$env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; cargo nextest run --target-dir $target_dir -p "{{ package }}" @forwarded_args',
@@ -1294,6 +1783,12 @@ class BuildToolingPolicyTest(unittest.TestCase):
             justfile.count('scripts\\rust_build_status.py" run-lane'), 10
         )
         self.assertNotIn('$target_dir = "target\\lanes\\', justfile)
+        self.assertEqual(
+            justfile.count(
+                'cargo build --target-dir "{{ target_dir }}" -p codex-cli --bin codex -p codex-code-mode-host --bin codex-code-mode-host'
+            ),
+            1,
+        )
 
     def test_perf_env_recipes_pass_structured_argv(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")

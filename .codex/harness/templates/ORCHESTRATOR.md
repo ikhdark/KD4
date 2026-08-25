@@ -1,6 +1,9 @@
 # Orchestrator Template
 
-Use this template when multi-agent work is active.
+Use this template when multi-agent work is active. Follow the
+[`workflow.md` multi-agent procedure](../workflow.md#optional-multi-agent-mode)
+and resolve a copy of [`PREFLIGHT.json`](PREFLIGHT.json) before concurrent
+writers or validation lanes start.
 
 ## Objective
 

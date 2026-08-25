@@ -59,6 +59,7 @@ codex-state = { workspace = true }
 codex-terminal-detection = { workspace = true }
 codex-thread-store = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
+codex-utils-build-info = { workspace = true }
 codex-utils-cli = { workspace = true }
 codex-utils-home-dir = { workspace = true }
 codex-utils-image = { workspace = true }
@@ -85,7 +86,6 @@ ratatui = { workspace = true, features = [
 ] }
 ratatui-macros = { workspace = true }
 regex-lite = { workspace = true }
-reqwest = { workspace = true, features = ["blocking", "json", "rustls"] }
 rmcp = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["preserve_order"] }
@@ -145,6 +145,7 @@ core_test_support = { workspace = true }
 codex-utils-cargo-bin = { workspace = true }
 assert_matches = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
+http = { workspace = true }
 insta = { workspace = true }
 pretty_assertions = { workspace = true }
 rand = { workspace = true }

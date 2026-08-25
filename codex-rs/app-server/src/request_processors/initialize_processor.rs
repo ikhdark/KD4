@@ -1,3 +1,4 @@
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
@@ -27,6 +28,7 @@ pub(crate) struct InitializeRequestProcessor {
     config: Arc<Config>,
     config_warnings: Arc<Vec<ConfigWarningNotification>>,
     rpc_transport: AppServerRpcTransport,
+    experimental_api_mode: Arc<Mutex<Option<bool>>>,
 }
 
 impl InitializeRequestProcessor {
@@ -43,6 +45,7 @@ impl InitializeRequestProcessor {
             config,
             config_warnings: Arc::new(config_warnings),
             rpc_transport,
+            experimental_api_mode: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -65,18 +68,11 @@ impl InitializeRequestProcessor {
             return Err(invalid_request("Already initialized"));
         }
 
-        // TODO(maxj): Revisit capability scoping for `experimental_api_enabled`.
-        // Current behavior is per-connection. Reviewer feedback notes this can
-        // create odd cross-client behavior (for example dynamic tool calls on a
-        // shared thread when another connected client did not opt into
-        // experimental API). Proposed direction is instance-global first-write-wins
-        // with initialize-time mismatch rejection.
         let analytics_initialize_params = params.clone();
         let capabilities = params.capabilities.unwrap_or_default();
         let experimental_api_enabled = capabilities.experimental_api;
         let request_attestation = capabilities.request_attestation;
         let supports_openai_form_elicitation = capabilities.mcp_server_openai_form_elicitation;
-        let desktop_activation_receipts = capabilities.desktop_activation_receipts;
         let opt_out_notification_methods = capabilities
             .opt_out_notification_methods
             .unwrap_or_default();
@@ -96,19 +92,34 @@ impl InitializeRequestProcessor {
         let user_agent_suffix = format!("{name}; {version}");
         let mutates_global_identity = !NON_ORIGINATING_CLIENT_NAMES.contains(&name.as_str());
         let codex_home = self.config.codex_home.clone();
-        if session
-            .initialize(InitializedConnectionSessionState {
-                experimental_api_enabled,
-                opted_out_notification_methods: opt_out_notification_methods.into_iter().collect(),
-                app_server_client_name: name.clone(),
-                client_version: version,
-                request_attestation,
-                supports_openai_form_elicitation,
-                desktop_activation_receipts,
-            })
-            .is_err()
         {
-            return Err(invalid_request("Already initialized"));
+            let mut experimental_api_mode = self
+                .experimental_api_mode
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(selected) = *experimental_api_mode
+                && selected != experimental_api_enabled
+            {
+                return Err(invalid_request(format!(
+                    "experimental_api must match the first initialized connection (expected {selected})"
+                )));
+            }
+            if session
+                .initialize(InitializedConnectionSessionState {
+                    experimental_api_enabled,
+                    opted_out_notification_methods: opt_out_notification_methods
+                        .into_iter()
+                        .collect(),
+                    app_server_client_name: name.clone(),
+                    client_version: version,
+                    request_attestation,
+                    supports_openai_form_elicitation,
+                })
+                .is_err()
+            {
+                return Err(invalid_request("Already initialized"));
+            }
+            experimental_api_mode.get_or_insert(experimental_api_enabled);
         }
 
         if mutates_global_identity {

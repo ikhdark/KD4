@@ -53,45 +53,6 @@ fn thread_store_sort_direction(sort_direction: SortDirection) -> StoreSortDirect
     }
 }
 
-fn desktop_activation_unavailable_reason(
-    error: codex_core::DesktopActivationVerificationError,
-) -> DesktopActivationUnavailableReason {
-    use codex_core::DesktopActivationVerificationError as Error;
-    match error {
-        Error::NoAuthenticatedHostTransport => {
-            DesktopActivationUnavailableReason::NoAuthoritativeBootstrapEvidence
-        }
-        Error::InvalidAuthoritativeEvidence
-        | Error::RunningProcessIdentityMissing
-        | Error::ImplementationIdentityMismatch
-        | Error::ChallengeIdentityMismatch
-        | Error::AuthenticatedChannelMismatch
-        | Error::InitializedProcessMismatch => {
-            DesktopActivationUnavailableReason::BootstrapEvidenceMismatch
-        }
-        Error::AuthoritativeEvidenceStale => {
-            DesktopActivationUnavailableReason::BootstrapEvidenceStale
-        }
-        Error::RunningExecutableMismatch => {
-            DesktopActivationUnavailableReason::RunningExecutableMismatch
-        }
-        Error::ChallengeMissingOrConsumed => {
-            DesktopActivationUnavailableReason::ChallengeMissingOrConsumed
-        }
-        Error::ChallengeExpired => DesktopActivationUnavailableReason::ChallengeExpired,
-        Error::InvalidDesktopObservation => {
-            DesktopActivationUnavailableReason::InvalidDesktopObservation
-        }
-        Error::ActivationObligationChanged => {
-            DesktopActivationUnavailableReason::ActivationObligationChanged
-        }
-        Error::ChallengeAlreadyRecordedWithDifferentPayload => {
-            DesktopActivationUnavailableReason::ReplayPayloadMismatch
-        }
-        Error::PersistenceFailed => DesktopActivationUnavailableReason::PersistenceFailed,
-    }
-}
-
 struct ThreadListFilters {
     model_providers: Option<Vec<String>>,
     source_kinds: Option<Vec<ThreadSourceKind>>,
@@ -376,10 +337,6 @@ pub(crate) struct ThreadRequestProcessor {
     pub(super) background_tasks: TaskTracker,
     pub(super) skills_watcher: Arc<SkillsWatcher>,
     pub(super) initial_config_warnings: Arc<Vec<ConfigWarningNotification>>,
-    pub(super) desktop_activation_bootstrap:
-        Arc<crate::desktop_activation::DesktopActivationBootstrap>,
-    pub(super) desktop_activation_challenge_owners:
-        Arc<Mutex<HashMap<String, (String, ConnectionId)>>>,
     handled_thread_creation_instances:
         Arc<std::sync::Mutex<HandledThreadCreationInstances<CodexThread>>>,
 }
@@ -447,7 +404,6 @@ impl ThreadRequestProcessor {
         log_db: Option<LogDbLayer>,
         skills_watcher: Arc<SkillsWatcher>,
         initial_config_warnings: Vec<ConfigWarningNotification>,
-        desktop_activation_bootstrap: Arc<crate::desktop_activation::DesktopActivationBootstrap>,
     ) -> Self {
         Self {
             auth_manager,
@@ -467,8 +423,6 @@ impl ThreadRequestProcessor {
             background_tasks: TaskTracker::new(),
             skills_watcher,
             initial_config_warnings: Arc::new(initial_config_warnings),
-            desktop_activation_bootstrap,
-            desktop_activation_challenge_owners: Arc::new(Mutex::new(HashMap::new())),
             handled_thread_creation_instances: Arc::new(std::sync::Mutex::new(
                 HandledThreadCreationInstances::default(),
             )),
@@ -596,161 +550,6 @@ impl ThreadRequestProcessor {
             .map_err(|_| invalid_request(format!("thread not found: {thread_id}")))?;
 
         Ok((thread_id, thread))
-    }
-
-    pub(crate) async fn desktop_activation_obligation(
-        &self,
-        params: ThreadDesktopActivationObligationParams,
-    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        let (_, thread) = self.load_thread(&params.thread_id).await?;
-        let obligation = thread.desktop_activation_obligation().await.map(|value| {
-            ApiDesktopActivationObligation {
-                thread_id: value.thread_id,
-                evidence_epoch: value.evidence_epoch,
-                implementation_identity: value.implementation_identity,
-                activation_obligation_identity: value.activation_obligation_identity,
-                requiring_plan_step_ids: value.requiring_plan_step_ids,
-            }
-        });
-        Ok(Some(
-            ThreadDesktopActivationObligationResponse { obligation }.into(),
-        ))
-    }
-
-    pub(crate) async fn desktop_activation_challenge(
-        &self,
-        connection_id: ConnectionId,
-        params: ThreadDesktopActivationChallengeParams,
-    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        let (_, thread) = self.load_thread(&params.thread_id).await?;
-        if thread.desktop_activation_obligation().await.is_none() {
-            return Ok(Some(
-                ThreadDesktopActivationChallengeResponse {
-                    challenge: None,
-                    unavailable_reason: Some(
-                        DesktopActivationUnavailableReason::NoCurrentActivationObligation,
-                    ),
-                }
-                .into(),
-            ));
-        }
-        let (evidence, consumed_at) =
-            match self.desktop_activation_bootstrap.as_ref() {
-                crate::desktop_activation::DesktopActivationBootstrap::Absent => return Ok(Some(
-                    ThreadDesktopActivationChallengeResponse {
-                        challenge: None,
-                        unavailable_reason: Some(
-                            DesktopActivationUnavailableReason::NoAuthoritativeBootstrapEvidence,
-                        ),
-                    }
-                    .into(),
-                )),
-                crate::desktop_activation::DesktopActivationBootstrap::Malformed => {
-                    return Ok(Some(
-                        ThreadDesktopActivationChallengeResponse {
-                            challenge: None,
-                            unavailable_reason: Some(
-                                DesktopActivationUnavailableReason::BootstrapEvidenceMalformed,
-                            ),
-                        }
-                        .into(),
-                    ));
-                }
-                crate::desktop_activation::DesktopActivationBootstrap::Available {
-                    evidence,
-                    consumed_at,
-                } => (evidence.as_ref().clone(), consumed_at.clone()),
-            };
-        match thread
-            .issue_desktop_activation_challenge(evidence, consumed_at)
-            .await
-        {
-            Ok(value) => {
-                let mut owners = self.desktop_activation_challenge_owners.lock().await;
-                match owners.get(&value.challenge_id) {
-                    Some((_, owner)) if *owner != connection_id => {
-                        return Err(invalid_request(
-                            "Desktop activation challenge belongs to another connection",
-                        ));
-                    }
-                    Some(_) => {}
-                    None => {
-                        owners.insert(
-                            value.challenge_id.clone(),
-                            (params.thread_id, connection_id),
-                        );
-                    }
-                }
-                drop(owners);
-                Ok(Some(
-                    ThreadDesktopActivationChallengeResponse {
-                        challenge: Some(ApiDesktopActivationChallenge {
-                            challenge_id: value.challenge_id,
-                            thread_id: value.thread_id,
-                            evidence_epoch: value.evidence_epoch,
-                            implementation_identity: value.implementation_identity,
-                            activation_obligation_identity: value.activation_obligation_identity,
-                            publisher_evidence_id: value.publisher_evidence_id,
-                            expected_installed_executable_path: value
-                                .expected_installed_executable_path,
-                            expected_installed_executable_sha256: value
-                                .expected_installed_executable_sha256,
-                            publish_id: value.publish_id,
-                            issued_at: value.issued_at,
-                            expires_at: value.expires_at,
-                        }),
-                        unavailable_reason: None,
-                    }
-                    .into(),
-                ))
-            }
-            Err(error) => Ok(Some(
-                ThreadDesktopActivationChallengeResponse {
-                    challenge: None,
-                    unavailable_reason: Some(desktop_activation_unavailable_reason(error)),
-                }
-                .into(),
-            )),
-        }
-    }
-
-    pub(crate) async fn desktop_activation_record(
-        &self,
-        connection_id: ConnectionId,
-        params: ThreadDesktopActivationRecordParams,
-    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        let thread_id = self
-            .desktop_activation_challenge_owners
-            .lock()
-            .await
-            .get(&params.challenge_id)
-            .filter(|(_, owner)| *owner == connection_id)
-            .map(|(thread_id, _)| thread_id.clone())
-            .ok_or_else(|| invalid_request("unknown Desktop activation challenge"))?;
-        let (_, thread) = self.load_thread(&thread_id).await?;
-        let result = thread
-            .record_desktop_activation(codex_core::DesktopActivationRecordObservation {
-                challenge_id: params.challenge_id,
-                desktop_process_id: params.desktop_process_id,
-                desktop_executable_path: params.desktop_executable_path,
-                observation_timestamp: params.observation_timestamp,
-                initialization_observation_identity: params.initialization_observation_identity,
-            })
-            .await
-            .map_err(|error| {
-                invalid_request(format!(
-                    "Desktop activation record rejected: {:?}",
-                    desktop_activation_unavailable_reason(error)
-                ))
-            })?;
-        Ok(Some(
-            ThreadDesktopActivationRecordResponse {
-                challenge_id: result.challenge_id,
-                recorded_at: result.recorded_at,
-                already_recorded: result.already_recorded,
-            }
-            .into(),
-        ))
     }
 
     pub(super) async fn acquire_thread_list_state_permit(
@@ -1637,22 +1436,32 @@ impl ThreadRequestProcessor {
             .clone()
             .ok_or_else(|| internal_error("sqlite state db unavailable for memory reset"))?;
 
-        state_db
-            .memories()
-            .clear_memory_data()
-            .await
-            .map_err(|err| {
-                internal_error(format!("failed to clear memory rows in memories db: {err}"))
-            })?;
-
-        clear_memory_roots_contents(&self.config.codex_home)
+        let staged_roots = stage_memory_roots_reset(&self.config.codex_home)
             .await
             .map_err(|err| {
                 internal_error(format!(
-                    "failed to clear memory directories under {}: {err}",
+                    "failed to stage memory directories under {} for reset: {err}",
                     self.config.codex_home.display()
                 ))
             })?;
+
+        if let Err(err) = state_db.memories().clear_memory_data().await {
+            let rollback_result = staged_roots.rollback().await;
+            return Err(internal_error(match rollback_result {
+                Ok(()) => format!("failed to clear memory rows in memories db: {err}"),
+                Err(rollback_err) => format!(
+                    "failed to clear memory rows in memories db: {err}; also failed to restore memory directories: {rollback_err}"
+                ),
+            }));
+        }
+
+        if let Err(err) = staged_roots.commit().await {
+            tracing::warn!(
+                error = %err,
+                codex_home = %self.config.codex_home.display(),
+                "memory reset completed but stale staged directories could not be removed"
+            );
+        }
 
         Ok(MemoryResetResponse {})
     }
@@ -2596,10 +2405,6 @@ impl ThreadRequestProcessor {
     }
 
     pub(crate) async fn connection_closed(&self, connection_id: ConnectionId) {
-        {
-            let mut owners = self.desktop_activation_challenge_owners.lock().await;
-            remove_desktop_activation_challenge_owners_for_connection(&mut owners, connection_id);
-        }
         let thread_ids = self
             .thread_state_manager
             .remove_connection(connection_id)
@@ -3248,7 +3053,7 @@ impl ThreadRequestProcessor {
                     redact_resume_payloads,
                 }),
             );
-            if listener_command_tx.send(command).is_err() {
+            if listener_command_tx.send(command).await.is_err() {
                 return Err(internal_error(format!(
                     "failed to enqueue running thread resume for thread {existing_thread_id}: thread listener command channel is closed"
                 )));
@@ -4854,13 +4659,6 @@ fn paginate_background_terminals(
     let end = start.saturating_add(effective_limit).min(terminals.len());
     let next_cursor = (end < terminals.len()).then(|| terminals[end - 1].process_id.clone());
     Ok((terminals[start..end].to_vec(), next_cursor))
-}
-
-fn remove_desktop_activation_challenge_owners_for_connection(
-    owners: &mut HashMap<String, (String, ConnectionId)>,
-    connection_id: ConnectionId,
-) {
-    owners.retain(|_, (_, owner)| *owner != connection_id);
 }
 
 fn build_thread_from_loaded_snapshot(

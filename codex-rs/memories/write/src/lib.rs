@@ -21,7 +21,9 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use std::path::Path;
 use std::path::PathBuf;
 
+pub use control::StagedMemoryRootsReset;
 pub use control::clear_memory_roots_contents;
+pub use control::stage_memory_roots_reset;
 pub use extensions::prune_old_extension_resources;
 pub use prompts::build_consolidation_prompt;
 pub use prompts::build_stage_one_input_message;

@@ -5,14 +5,18 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::user_input::UserInput;
+use serde::Serialize;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::io;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
 
 const MAX_PENDING_MAILBOX_COMMUNICATIONS: usize = 1_024;
 const MAX_SEEN_MAILBOX_COMMUNICATION_IDS: usize = 4_096;
+const MAX_PENDING_TURN_INPUT_ITEMS: usize = 1_024;
+const MAX_PENDING_TURN_INPUT_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum TurnInput {
@@ -30,6 +34,12 @@ pub(crate) enum InputQueueActivity {
     Steer,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PendingInputAdmissionError {
+    pub(crate) max_items: usize,
+    pub(crate) max_bytes: usize,
+}
+
 /// Turn-local pending input storage owned by the input queue flow.
 #[derive(Default)]
 pub(crate) struct TurnInputQueue {
@@ -43,6 +53,8 @@ pub(crate) struct InputQueue {
     mailbox: Mutex<MailboxState>,
     max_pending_mailbox_communications: usize,
     max_seen_mailbox_communication_ids: usize,
+    max_pending_turn_input_items: usize,
+    max_pending_turn_input_bytes: usize,
 }
 
 #[derive(Default)]
@@ -61,6 +73,8 @@ impl InputQueue {
             mailbox: Mutex::new(MailboxState::default()),
             max_pending_mailbox_communications: MAX_PENDING_MAILBOX_COMMUNICATIONS,
             max_seen_mailbox_communication_ids: MAX_SEEN_MAILBOX_COMMUNICATION_IDS,
+            max_pending_turn_input_items: MAX_PENDING_TURN_INPUT_ITEMS,
+            max_pending_turn_input_bytes: MAX_PENDING_TURN_INPUT_BYTES,
         }
     }
 
@@ -69,6 +83,14 @@ impl InputQueue {
         let mut queue = Self::new();
         queue.max_pending_mailbox_communications = max_pending;
         queue.max_seen_mailbox_communication_ids = max_seen_ids;
+        queue
+    }
+
+    #[cfg(test)]
+    fn with_pending_turn_input_limits(max_items: usize, max_bytes: usize) -> Self {
+        let mut queue = Self::new();
+        queue.max_pending_turn_input_items = max_items;
+        queue.max_pending_turn_input_bytes = max_bytes;
         queue
     }
 
@@ -163,10 +185,10 @@ impl InputQueue {
             .any(|mail| mail.trigger_turn)
     }
 
-    /// Restores input owned by a taskless startup placeholder that was
-    /// cancelled before a supervisor could take ownership. Restored items
-    /// precede work accepted after the cancellation.
-    pub(crate) async fn recover_cancelled_startup_input(&self, input: Vec<TurnInput>) {
+    /// Restores already-admitted input owned by a taskless startup placeholder
+    /// that was cancelled before a supervisor could take ownership. Restored
+    /// items precede work accepted after the cancellation.
+    pub(crate) async fn restore_transferred_startup_input(&self, input: Vec<TurnInput>) {
         if input.is_empty() {
             return;
         }
@@ -255,25 +277,80 @@ impl InputQueue {
             .accept_mailbox_delivery_for_current_turn();
     }
 
+    // Both queue locks must remain held through admission so recovery and active input are
+    // measured as one atomic bounded queue.
+    #[allow(clippy::await_holding_invalid_type, clippy::await_holding_lock)]
     pub(super) async fn extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
         &self,
         turn_state: &Mutex<TurnState>,
-        input: Vec<TurnInput>,
-    ) {
+        input: &[TurnInput],
+    ) -> Result<(), PendingInputAdmissionError> {
         {
+            let recovered = self.startup_recovery_items.lock().await;
             let mut turn_state = turn_state.lock().await;
-            turn_state.pending_input.items.extend(input);
+            self.check_pending_turn_input_capacity(
+                recovered.iter(),
+                turn_state.pending_input.items.iter(),
+                input,
+            )?;
+            turn_state.pending_input.items.extend_from_slice(input);
             turn_state.accept_mailbox_delivery_for_current_turn();
         }
         self.activity_tx.send_replace(InputQueueActivity::Steer);
+        Ok(())
     }
 
+    // Keep the same lock ordering and atomic capacity check as the accepting path above.
+    #[allow(clippy::await_holding_invalid_type, clippy::await_holding_lock)]
     pub(crate) async fn extend_pending_input_for_turn_state(
+        &self,
+        turn_state: &Mutex<TurnState>,
+        input: &[TurnInput],
+    ) -> Result<(), PendingInputAdmissionError> {
+        let recovered = self.startup_recovery_items.lock().await;
+        let mut turn_state = turn_state.lock().await;
+        self.check_pending_turn_input_capacity(
+            recovered.iter(),
+            turn_state.pending_input.items.iter(),
+            input,
+        )?;
+        turn_state.pending_input.items.extend_from_slice(input);
+        Ok(())
+    }
+
+    pub(crate) async fn restore_transferred_input_for_turn_state(
         &self,
         turn_state: &Mutex<TurnState>,
         input: Vec<TurnInput>,
     ) {
+        // This is an ownership transfer from the session's recovery, active,
+        // and bounded mailbox queues, not a new external admission.
         turn_state.lock().await.pending_input.items.extend(input);
+    }
+
+    fn check_pending_turn_input_capacity<'a>(
+        &self,
+        recovered: impl Iterator<Item = &'a TurnInput>,
+        active: impl Iterator<Item = &'a TurnInput>,
+        input: &[TurnInput],
+    ) -> Result<(), PendingInputAdmissionError> {
+        let mut item_count = input.len();
+        let mut byte_count = input.iter().fold(0usize, |total, item| {
+            total.saturating_add(turn_input_size_bytes(item))
+        });
+        for item in recovered.chain(active) {
+            item_count = item_count.saturating_add(1);
+            byte_count = byte_count.saturating_add(turn_input_size_bytes(item));
+        }
+        if item_count > self.max_pending_turn_input_items
+            || byte_count > self.max_pending_turn_input_bytes
+        {
+            return Err(PendingInputAdmissionError {
+                max_items: self.max_pending_turn_input_items,
+                max_bytes: self.max_pending_turn_input_bytes,
+            });
+        }
+        Ok(())
     }
 
     pub(crate) async fn take_pending_input_for_turn_state(
@@ -358,6 +435,35 @@ fn compact_seen_mailbox_ids(mailbox: &mut MailboxState, max_seen_ids: usize) {
     }
 }
 
+fn turn_input_size_bytes(input: &TurnInput) -> usize {
+    match input {
+        TurnInput::UserInput { content, client_id } => serialized_size(&(content, client_id)),
+        TurnInput::ResponseItem(item) => serialized_size(item),
+        TurnInput::InterAgentCommunication(communication) => serialized_size(communication),
+    }
+}
+
+fn serialized_size(value: &impl Serialize) -> usize {
+    let mut counter = ByteCounter::default();
+    serde_json::to_writer(&mut counter, value).map_or(usize::MAX, |()| counter.bytes)
+}
+
+#[derive(Default)]
+struct ByteCounter {
+    bytes: usize,
+}
+
+impl io::Write for ByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(buffer.len());
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 impl TurnInputQueue {
     fn has_user_input(&self) -> bool {
         self.items
@@ -429,7 +535,7 @@ mod tests {
         input_queue
             .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
                 &turn_state,
-                vec![TurnInput::UserInput {
+                &[TurnInput::UserInput {
                     content: vec![UserInput::Text {
                         text: "steer".to_string(),
                         text_elements: Vec::new(),
@@ -437,7 +543,8 @@ mod tests {
                     client_id: None,
                 }],
             )
-            .await;
+            .await
+            .expect("steer input should fit");
 
         activity_rx.changed().await.expect("steer update");
         assert_eq!(*activity_rx.borrow_and_update(), InputQueueActivity::Steer);
@@ -450,7 +557,7 @@ mod tests {
         input_queue
             .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
                 &turn_state,
-                vec![TurnInput::UserInput {
+                &[TurnInput::UserInput {
                     content: vec![UserInput::Text {
                         text: "already pending".to_string(),
                         text_elements: Vec::new(),
@@ -458,7 +565,8 @@ mod tests {
                     client_id: None,
                 }],
             )
-            .await;
+            .await
+            .expect("steer input should fit");
 
         let (_activity_rx, pending_activity) =
             input_queue.subscribe_activity(Some(&turn_state)).await;
@@ -621,5 +729,77 @@ mod tests {
 
         assert!(input_queue.enqueue_mailbox_communication(oldest).await);
         assert!(!input_queue.enqueue_mailbox_communication(newest).await);
+    }
+
+    #[tokio::test]
+    async fn pending_turn_input_item_admission_is_bounded_across_recovery() {
+        let input_queue = InputQueue::with_pending_turn_input_limits(1, usize::MAX);
+        let turn_state = Mutex::new(TurnState::default());
+        let input = vec![TurnInput::UserInput {
+            content: vec![UserInput::Text {
+                text: "first".to_string(),
+                text_elements: Vec::new(),
+            }],
+            client_id: None,
+        }];
+
+        input_queue
+            .extend_pending_input_for_turn_state(&turn_state, &input)
+            .await
+            .expect("first item should fit");
+        assert_eq!(
+            input_queue
+                .extend_pending_input_for_turn_state(&turn_state, &input)
+                .await,
+            Err(PendingInputAdmissionError {
+                max_items: 1,
+                max_bytes: usize::MAX,
+            })
+        );
+
+        let recovered = input_queue
+            .take_pending_input_for_turn_state(&turn_state)
+            .await;
+        input_queue
+            .restore_transferred_startup_input(recovered)
+            .await;
+        let next_turn_state = Mutex::new(TurnState::default());
+        assert_eq!(
+            input_queue
+                .extend_pending_input_for_turn_state(&next_turn_state, &input)
+                .await,
+            Err(PendingInputAdmissionError {
+                max_items: 1,
+                max_bytes: usize::MAX,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_turn_input_byte_admission_is_bounded() {
+        let input = TurnInput::UserInput {
+            content: vec![UserInput::Text {
+                text: "bounded bytes".to_string(),
+                text_elements: Vec::new(),
+            }],
+            client_id: None,
+        };
+        let input_size = turn_input_size_bytes(&input);
+        let input_queue = InputQueue::with_pending_turn_input_limits(2, input_size);
+        let turn_state = Mutex::new(TurnState::default());
+
+        input_queue
+            .extend_pending_input_for_turn_state(&turn_state, std::slice::from_ref(&input))
+            .await
+            .expect("first item should fit the exact byte budget");
+        assert_eq!(
+            input_queue
+                .extend_pending_input_for_turn_state(&turn_state, &[input])
+                .await,
+            Err(PendingInputAdmissionError {
+                max_items: 2,
+                max_bytes: input_size,
+            })
+        );
     }
 }

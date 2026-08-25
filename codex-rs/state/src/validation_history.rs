@@ -4,6 +4,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -11,13 +12,16 @@ use anyhow::Context;
 use hmac::Hmac;
 use hmac::Mac;
 use sha2::Sha256;
+use sqlx::QueryBuilder;
 use sqlx::Row;
+use sqlx::Sqlite;
 use tokio::sync::Mutex;
 
 const KEY_FILE: &str = "validation-history.key";
 const KEY_LOCK_FILE: &str = "validation-history.key.lock";
 const KEY_VERSION: i64 = 1;
 const CACHE_CAPACITY: usize = 256;
+const PRUNE_EVERY_WRITE_BATCHES: u64 = 64;
 const MAX_PERSISTED_ROWS: i64 = 8_192;
 const FINE_GRAINED_EXPIRY_SECONDS: i64 = 30 * 24 * 60 * 60;
 const READ_TIMEOUT: Duration = Duration::from_millis(40);
@@ -73,8 +77,17 @@ struct StoredKey {
 
 #[derive(Default)]
 struct ValidationHistoryCache {
-    entries: HashMap<StoredKey, ValidationHistoryAggregate>,
+    entries: HashMap<StoredKey, Option<ValidationHistoryAggregate>>,
     generation: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ObservationDelta {
+    completed: i64,
+    below: i64,
+    above: i64,
+    sum: f64,
+    squares: f64,
 }
 
 #[cfg(test)]
@@ -94,6 +107,7 @@ pub struct ValidationHistoryStore {
     pool: Arc<sqlx::SqlitePool>,
     secret: Option<Arc<[u8; 32]>>,
     cache: Arc<Mutex<ValidationHistoryCache>>,
+    successful_write_batches: Arc<AtomicU64>,
 }
 
 impl ValidationHistoryStore {
@@ -109,6 +123,7 @@ impl ValidationHistoryStore {
             pool,
             secret,
             cache: Arc::new(Mutex::new(ValidationHistoryCache::default())),
+            successful_write_batches: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -120,7 +135,7 @@ impl ValidationHistoryStore {
         let observed_generation = {
             let cache = self.cache.lock().await;
             if let Some(value) = cache.entries.get(&key).cloned() {
-                return Ok(Some(value));
+                return Ok(value);
             }
             cache.generation
         };
@@ -153,12 +168,10 @@ WHERE scope_kind = ? AND repository_id = ? AND fingerprint_id = ?
             duration_sum_ms: row.get(3),
             duration_sum_squares_ms: row.get(4),
         });
-        if let Some(value) = value.clone() {
-            #[cfg(test)]
-            run_lookup_before_cache_insert_hook(&key).await;
-            self.cache_insert_if_generation(key, value, observed_generation)
-                .await;
-        }
+        #[cfg(test)]
+        run_lookup_before_cache_insert_hook(&key).await;
+        self.cache_insert_if_generation(key, value.clone(), observed_generation)
+            .await;
         Ok(value)
     }
 
@@ -187,52 +200,42 @@ WHERE scope_kind = ? AND repository_id = ? AND fingerprint_id = ?
                 return;
             }
         };
-        let (completed, below, above, sum, squares) = match observation {
+        if keys.is_empty() {
+            return;
+        }
+        let delta = match observation {
             ValidationHistoryObservation::Completed { duration_ms } => {
                 let duration = duration_ms as f64;
-                (1_i64, 0_i64, 0_i64, duration, duration * duration)
+                ObservationDelta {
+                    completed: 1,
+                    below: 0,
+                    above: 0,
+                    sum: duration,
+                    squares: duration * duration,
+                }
             }
             ValidationHistoryObservation::Cancelled {
                 elapsed_ms,
                 threshold_ms,
-            } if elapsed_ms >= threshold_ms => (0, 0, 1, 0.0, 0.0),
-            ValidationHistoryObservation::Cancelled { .. } => (0, 1, 0, 0.0, 0.0),
+            } if elapsed_ms >= threshold_ms => ObservationDelta {
+                completed: 0,
+                below: 0,
+                above: 1,
+                sum: 0.0,
+                squares: 0.0,
+            },
+            ValidationHistoryObservation::Cancelled { .. } => ObservationDelta {
+                completed: 0,
+                below: 1,
+                above: 0,
+                sum: 0.0,
+                squares: 0.0,
+            },
         };
         let write = async {
             let mut transaction = self.pool.begin().await?;
-            for key in &keys {
-                sqlx::query(
-                    r#"
-INSERT INTO validation_history_aggregates (
-    scope_kind, repository_id, fingerprint_id, operation, ecosystem, breadth,
-    model_version, key_version, completed_count, censored_below_count,
-    censored_above_count, duration_sum_ms, duration_sum_squares_ms, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
-ON CONFLICT DO UPDATE SET
-    completed_count = completed_count + excluded.completed_count,
-    censored_below_count = censored_below_count + excluded.censored_below_count,
-    censored_above_count = censored_above_count + excluded.censored_above_count,
-    duration_sum_ms = duration_sum_ms + excluded.duration_sum_ms,
-    duration_sum_squares_ms = duration_sum_squares_ms + excluded.duration_sum_squares_ms,
-    updated_at = excluded.updated_at
-                    "#,
-                )
-                .bind(key.scope)
-                .bind(&key.repository_id)
-                .bind(&key.fingerprint_id)
-                .bind(key.operation)
-                .bind(key.ecosystem)
-                .bind(key.breadth)
-                .bind(key.model_version)
-                .bind(key.key_version)
-                .bind(completed)
-                .bind(below)
-                .bind(above)
-                .bind(sum)
-                .bind(squares)
-                .execute(&mut *transaction)
-                .await?;
-            }
+            let mut query = batch_upsert_query(&keys, delta);
+            query.build().execute(&mut *transaction).await?;
             transaction.commit().await
         };
         match tokio::time::timeout(WRITE_TIMEOUT, write).await {
@@ -247,10 +250,10 @@ ON CONFLICT DO UPDATE SET
                 if write_timeout_recovered {
                     tracing::info!("validation history writes recovered after an earlier timeout");
                 }
-                for key in &keys {
-                    self.invalidate_cache(key).await;
+                self.invalidate_cache_batch(&keys).await;
+                if self.should_prune_after_write() {
+                    self.prune_persisted_rows().await;
                 }
-                self.prune_persisted_rows().await;
             }
             Ok(Err(error)) if !WRITE_ERROR_WARNING_EMITTED.swap(true, Ordering::Relaxed) => {
                 tracing::warn!(%error, "validation history write failed")
@@ -286,7 +289,7 @@ ON CONFLICT DO UPDATE SET
     async fn cache_insert_if_generation(
         &self,
         key: StoredKey,
-        value: ValidationHistoryAggregate,
+        value: Option<ValidationHistoryAggregate>,
         observed_generation: u64,
     ) {
         let mut cache = self.cache.lock().await;
@@ -301,10 +304,23 @@ ON CONFLICT DO UPDATE SET
         cache.entries.insert(key, value);
     }
 
-    async fn invalidate_cache(&self, key: &StoredKey) {
+    async fn invalidate_cache_batch(&self, keys: &[StoredKey]) {
+        if keys.is_empty() {
+            return;
+        }
         let mut cache = self.cache.lock().await;
         cache.generation = cache.generation.wrapping_add(1);
-        cache.entries.remove(key);
+        for key in keys {
+            cache.entries.remove(key);
+        }
+    }
+
+    fn should_prune_after_write(&self) -> bool {
+        let write_batch = self
+            .successful_write_batches
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        write_batch == 1 || write_batch.is_multiple_of(PRUNE_EVERY_WRITE_BATCHES)
     }
 
     async fn prune_persisted_rows(&self) {
@@ -330,6 +346,45 @@ WHERE (scope_kind = ? AND updated_at < unixepoch() - ?)
             Err(_) => tracing::debug!("validation history pruning timed out"),
         }
     }
+}
+
+fn batch_upsert_query(keys: &[StoredKey], delta: ObservationDelta) -> QueryBuilder<Sqlite> {
+    let mut query = QueryBuilder::new(
+        r#"
+INSERT INTO validation_history_aggregates (
+    scope_kind, repository_id, fingerprint_id, operation, ecosystem, breadth,
+    model_version, key_version, completed_count, censored_below_count,
+    censored_above_count, duration_sum_ms, duration_sum_squares_ms, updated_at
+) "#,
+    );
+    query.push_values(keys, |mut row, key| {
+        row.push_bind(key.scope)
+            .push_bind(&key.repository_id)
+            .push_bind(&key.fingerprint_id)
+            .push_bind(key.operation)
+            .push_bind(key.ecosystem)
+            .push_bind(key.breadth)
+            .push_bind(key.model_version)
+            .push_bind(key.key_version)
+            .push_bind(delta.completed)
+            .push_bind(delta.below)
+            .push_bind(delta.above)
+            .push_bind(delta.sum)
+            .push_bind(delta.squares)
+            .push("unixepoch()");
+    });
+    query.push(
+        r#"
+ON CONFLICT DO UPDATE SET
+    completed_count = completed_count + excluded.completed_count,
+    censored_below_count = censored_below_count + excluded.censored_below_count,
+    censored_above_count = censored_above_count + excluded.censored_above_count,
+    duration_sum_ms = duration_sum_ms + excluded.duration_sum_ms,
+    duration_sum_squares_ms = duration_sum_squares_ms + excluded.duration_sum_squares_ms,
+    updated_at = excluded.updated_at
+        "#,
+    );
+    query
 }
 
 fn clear_write_warnings(error_warning: &AtomicBool, timeout_warning: &AtomicBool) -> (bool, bool) {
@@ -569,13 +624,120 @@ mod tests {
         }
     }
 
+    fn missing_history_key() -> ValidationHistoryKey<'static> {
+        ValidationHistoryKey {
+            fingerprint: b"missing-fingerprint",
+            ..history_key()
+        }
+    }
+
+    fn test_store(pool: sqlx::SqlitePool) -> ValidationHistoryStore {
+        ValidationHistoryStore {
+            pool: Arc::new(pool),
+            secret: Some(Arc::new([7; 32])),
+            cache: Arc::new(Mutex::new(ValidationHistoryCache::default())),
+            successful_write_batches: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    #[test]
+    fn batch_upsert_builds_one_statement_for_all_keys() {
+        let store_key = StoredKey {
+            scope: 0,
+            repository_id: "repository".to_string(),
+            fingerprint_id: "fingerprint".to_string(),
+            operation: 1,
+            ecosystem: 2,
+            breadth: 3,
+            model_version: 4,
+            key_version: KEY_VERSION,
+        };
+        let mut second_key = store_key.clone();
+        second_key.fingerprint_id = "second".to_string();
+        let keys = [store_key, second_key];
+        let query = batch_upsert_query(
+            &keys,
+            ObservationDelta {
+                completed: 1,
+                below: 0,
+                above: 0,
+                sum: 10.0,
+                squares: 100.0,
+            },
+        );
+
+        let sql = query.sql();
+        let sql: &str = sql.as_ref();
+        assert_eq!(sql.matches("INSERT INTO").count(), 1);
+        assert_eq!(sql.matches("unixepoch()").count(), 2);
+    }
+
     #[tokio::test]
-    async fn concurrent_record_prevents_stale_lookup_cache_publication() {
+    async fn batch_invalidation_uses_one_generation_change() {
+        let pool = SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool");
+        let store = test_store(pool);
+        let first = store.stored_key(history_key()).expect("first stored key");
+        let mut second = first.clone();
+        second.fingerprint_id = "second".to_string();
+        {
+            let mut cache = store.cache.lock().await;
+            cache.entries.insert(first.clone(), None);
+            cache.entries.insert(second.clone(), None);
+        }
+
+        store
+            .invalidate_cache_batch(&[first.clone(), second.clone()])
+            .await;
+
+        let cache = store.cache.lock().await;
+        assert_eq!(cache.generation, 1);
+        assert!(!cache.entries.contains_key(&first));
+        assert!(!cache.entries.contains_key(&second));
+    }
+
+    #[tokio::test]
+    async fn pruning_is_amortized_across_successful_write_batches() {
+        let pool = SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool");
+        let store = test_store(pool);
+
+        assert!(store.should_prune_after_write());
+        for _ in 2..PRUNE_EVERY_WRITE_BATCHES {
+            assert!(!store.should_prune_after_write());
+        }
+        assert!(store.should_prune_after_write());
+    }
+
+    #[tokio::test]
+    async fn lookup_caches_a_missing_aggregate() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .expect("sqlite pool");
+        create_history_table(&pool).await;
+        let store = test_store(pool.clone());
+
+        assert_eq!(
+            store.lookup(history_key()).await.expect("first lookup"),
+            None
+        );
+        sqlx::query("DROP TABLE validation_history_aggregates")
+            .execute(&pool)
+            .await
+            .expect("drop history table");
+        assert_eq!(
+            store.lookup(history_key()).await.expect("cached lookup"),
+            None
+        );
+    }
+
+    async fn create_history_table(pool: &sqlx::SqlitePool) {
         sqlx::query(
             r#"
 CREATE TABLE validation_history_aggregates (
@@ -600,14 +762,20 @@ CREATE TABLE validation_history_aggregates (
 )
             "#,
         )
-        .execute(&pool)
+        .execute(pool)
         .await
         .expect("history table");
-        let store = ValidationHistoryStore {
-            pool: Arc::new(pool),
-            secret: Some(Arc::new([7; 32])),
-            cache: Arc::new(Mutex::new(ValidationHistoryCache::default())),
-        };
+    }
+
+    #[tokio::test]
+    async fn concurrent_record_prevents_stale_lookup_cache_publication() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool");
+        create_history_table(&pool).await;
+        let store = test_store(pool);
         store
             .record(
                 history_key(),
@@ -648,5 +816,47 @@ CREATE TABLE validation_history_aggregates (
             .expect("fresh lookup")
             .expect("updated aggregate");
         assert_eq!(fresh.completed_count, 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_record_prevents_stale_negative_cache_publication() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool");
+        create_history_table(&pool).await;
+        let store = test_store(pool);
+        let stored_key = store.stored_key(missing_history_key()).expect("stored key");
+        let reached = Arc::new(tokio::sync::Barrier::new(2));
+        let resume = Arc::new(tokio::sync::Barrier::new(2));
+        install_lookup_before_cache_insert_hook(
+            stored_key.clone(),
+            Arc::clone(&reached),
+            Arc::clone(&resume),
+        );
+
+        let lookup_store = store.clone();
+        let lookup = tokio::spawn(async move { lookup_store.lookup(missing_history_key()).await });
+        reached.wait().await;
+        store
+            .record(
+                missing_history_key(),
+                ValidationHistoryObservation::Completed { duration_ms: 20 },
+            )
+            .await;
+        resume.wait().await;
+
+        assert_eq!(lookup.await.expect("lookup task").expect("lookup"), None);
+        assert!(!store.cache.lock().await.entries.contains_key(&stored_key));
+        assert_eq!(
+            store
+                .lookup(missing_history_key())
+                .await
+                .expect("fresh lookup")
+                .expect("updated aggregate")
+                .completed_count,
+            1
+        );
     }
 }

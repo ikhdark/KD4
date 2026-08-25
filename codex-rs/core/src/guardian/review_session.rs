@@ -165,7 +165,7 @@ struct GuardianReviewSessionReuseKey {
     cwd: AbsolutePathBuf,
     mcp_servers: Constrained<HashMap<String, McpServerConfig>>,
     features: ManagedFeatures,
-    use_experimental_unified_exec_tool: bool,
+    unified_exec_enabled: bool,
 }
 
 impl GuardianReviewSessionReuseKey {
@@ -190,7 +190,7 @@ impl GuardianReviewSessionReuseKey {
             cwd: spawn_config.cwd.clone(),
             mcp_servers: spawn_config.mcp_servers.clone(),
             features: spawn_config.features.clone(),
-            use_experimental_unified_exec_tool: spawn_config.use_experimental_unified_exec_tool,
+            unified_exec_enabled: spawn_config.unified_exec_enabled,
         }
     }
 }

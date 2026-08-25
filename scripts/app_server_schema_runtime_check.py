@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import shlex
 import subprocess
@@ -25,6 +26,13 @@ SCHEMA_INPUTS = (
     "codex-rs/protocol/src",
 )
 GENERATED_OUTPUTS = ("codex-rs/app-server-protocol/schema",)
+STABLE_SCHEMA_BUNDLE = (
+    "codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.schemas.json"
+)
+IGNORED_SCHEMA_ANNOTATIONS = frozenset(
+    {"$schema", "description", "title", "default", "examples"}
+)
+ADDITIVE_SCHEMA_MAPS = frozenset({"definitions", "properties"})
 
 
 def repo_root() -> Path:
@@ -138,6 +146,139 @@ def run_protocol_check(root: Path) -> int:
     )
 
 
+def _canonical_json(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def stable_schema_compatibility_issues(
+    baseline: object,
+    current: object,
+    path: str = "$",
+) -> list[str]:
+    """Return stable-schema changes that can break generated clients.
+
+    Optional properties and new definitions are additive. Other schema changes
+    require an explicit acknowledgement because the bundle describes both
+    client-produced requests and server-produced responses.
+    """
+    if type(baseline) is not type(current):
+        return [f"{path}:type"]
+    if isinstance(baseline, dict):
+        assert isinstance(current, dict)
+        issues: list[str] = []
+        for key, baseline_value in baseline.items():
+            child_path = f"{path}/{key}"
+            if key in IGNORED_SCHEMA_ANNOTATIONS:
+                continue
+            if key not in current:
+                issues.append(f"{child_path}:removed")
+                continue
+            current_value = current[key]
+            if key in {"required", "enum", "oneOf", "anyOf", "allOf"}:
+                if _canonical_json(baseline_value) != _canonical_json(current_value):
+                    issues.append(f"{child_path}:changed")
+                continue
+            issues.extend(
+                stable_schema_compatibility_issues(
+                    baseline_value,
+                    current_value,
+                    child_path,
+                )
+            )
+        parent_key = path.rsplit("/", 1)[-1]
+        for key in current.keys() - baseline.keys():
+            if key in IGNORED_SCHEMA_ANNOTATIONS or parent_key in ADDITIVE_SCHEMA_MAPS:
+                continue
+            issues.append(f"{path}/{key}:added")
+        return issues
+    if isinstance(baseline, list):
+        assert isinstance(current, list)
+        if _canonical_json(baseline) != _canonical_json(current):
+            return [f"{path}:changed"]
+        return []
+    if baseline != current:
+        return [f"{path}:changed"]
+    return []
+
+
+def load_schema_at_baseline(root: Path, baseline: str) -> object | None:
+    try:
+        completed = subprocess.run(
+            ["git", "show", f"{baseline}:{STABLE_SCHEMA_BUNDLE}"],
+            cwd=root,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError as error:
+        print(f"Could not read stable schema at {baseline}: {error}", file=sys.stderr)
+        return None
+    if completed.returncode != 0:
+        print(
+            f"Could not read {STABLE_SCHEMA_BUNDLE} at {baseline}.",
+            file=sys.stderr,
+        )
+        if completed.stderr:
+            print(completed.stderr, file=sys.stderr, end="")
+        return None
+    try:
+        return json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        print(f"Stable schema at {baseline} is invalid JSON: {error}", file=sys.stderr)
+        return None
+
+
+def run_stable_compatibility_check(
+    root: Path,
+    baseline: str,
+    allowed_breaks: Sequence[str] = (),
+) -> int:
+    baseline_schema = load_schema_at_baseline(root, baseline)
+    if baseline_schema is None:
+        return 2
+    try:
+        current_schema = json.loads((root / STABLE_SCHEMA_BUNDLE).read_text("utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"Could not read current stable schema: {error}", file=sys.stderr)
+        return 2
+    issues = stable_schema_compatibility_issues(baseline_schema, current_schema)
+    unapproved = [issue for issue in issues if issue not in set(allowed_breaks)]
+    if unapproved:
+        print(
+            f"Stable app-server schema is incompatible with {baseline}:",
+            file=sys.stderr,
+        )
+        for issue in unapproved:
+            print(f"  {issue}", file=sys.stderr)
+        print(
+            "Use --allow-stable-break <issue> only for an intentionally reviewed "
+            "stable API break.",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"Stable app-server schema is compatible with {baseline}.")
+    return 0
+
+
+def run_python_sdk_contract_check(root: Path) -> int:
+    return run(
+        [
+            "uv",
+            "run",
+            "--directory",
+            str(root / "sdk" / "python"),
+            "--group",
+            "dev",
+            "pytest",
+            "tests/test_contract_generation.py",
+        ],
+        cwd=root,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -146,6 +287,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         required=True,
     )
     parser.add_argument("--baseline", default="HEAD")
+    parser.add_argument(
+        "--compatibility-baseline",
+        default="HEAD^",
+        help="Committed schema revision used as the independent stable API baseline.",
+    )
+    parser.add_argument(
+        "--allow-stable-break",
+        action="append",
+        default=[],
+        metavar="ISSUE",
+        help="Acknowledge one compatibility issue emitted by the stable-schema check.",
+    )
     parser.add_argument(
         "--owner",
         help="Required identity for the serialized force-regeneration lane.",
@@ -197,6 +350,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 file=sys.stderr,
             )
         return protocol_code
+    stable_lane = "--experimental" not in generator_args
+    if stable_lane:
+        compatibility_code = run_stable_compatibility_check(
+            root,
+            args.compatibility_baseline,
+            args.allow_stable_break,
+        )
+        if compatibility_code != 0:
+            return compatibility_code
+    else:
+        print("Skipping stable compatibility comparison for experimental schemas.")
+    consumer_code = run_python_sdk_contract_check(root)
+    if consumer_code != 0:
+        return consumer_code
     if generated_changed:
         print("Schema regeneration changed generated outputs; review and include them.")
         if args.mode != "force":

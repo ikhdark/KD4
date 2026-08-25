@@ -48,16 +48,13 @@ async fn remote_model_override_uses_catalog_model_for_strict_auto_review() -> Re
     let review_model = "remote-auto-review-reviewer";
     let mut review_model_info = remote_model_with_auto_review_override(review_model, review_model);
     review_model_info.auto_review_model_override = None;
-    mount_models_once(
-        &server,
-        ModelsResponse {
-            models: vec![
-                remote_model_with_auto_review_override(model, review_model),
-                review_model_info,
-            ],
-        },
-    )
-    .await;
+    let models_response = ModelsResponse {
+        models: vec![
+            remote_model_with_auto_review_override(model, review_model),
+            review_model_info,
+        ],
+    };
+    mount_models_once(&server, models_response.clone()).await;
 
     let permissions_call_id = "auto-review-permissions-call";
     let permissions_args = json!({
@@ -133,12 +130,16 @@ async fn remote_model_override_uses_catalog_model_for_strict_auto_review() -> Re
     } = builder.build(&server).await?;
 
     let models_manager = thread_manager.get_models_manager();
+    // Thread startup may refresh the catalog before this test requests an
+    // explicit online refresh, so provide a response for both operations.
+    mount_models_once(&server, models_response).await;
     models_manager
         .list_models(
             RefreshStrategy::OnlineIfUncached,
             codex_core::test_support::default_http_client_factory(),
         )
-        .await;
+        .await
+        .expect("model listing should succeed");
     let model_info = models_manager
         .get_model_info(model, &config.to_models_manager_config())
         .await;

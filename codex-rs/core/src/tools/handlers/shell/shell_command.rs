@@ -51,6 +51,7 @@ use super::parse_shell_command_hook_invocation;
 use super::prepare_validation_proof;
 use super::run_exec_like;
 use super::shell_command_payload_command;
+use super::validation_environment_hash;
 use super::validation_structured_output;
 
 pub(super) fn effective_stall_timeout_ms(
@@ -139,6 +140,7 @@ impl ShellCommandHandler {
         shell.derive_exec_args(command, use_login_shell)
     }
 
+    #[cfg(test)]
     pub(super) fn to_exec_params(
         params: &ShellCommandToolCallParams,
         invocation: &CommandInvocation,
@@ -150,8 +152,31 @@ impl ShellCommandHandler {
     ) -> Result<ExecParams, FunctionCallError> {
         let session_shell = session.user_shell();
         let shell = resolve_command_shell(invocation, turn_environment, session_shell.as_ref())?;
+        Self::to_exec_params_with_shell(
+            params,
+            invocation,
+            session,
+            turn_context,
+            turn_environment,
+            cwd,
+            allow_login_shell,
+            &shell,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn to_exec_params_with_shell(
+        params: &ShellCommandToolCallParams,
+        invocation: &CommandInvocation,
+        session: &crate::session::session::Session,
+        turn_context: &TurnContext,
+        turn_environment: &TurnEnvironment,
+        cwd: AbsolutePathBuf,
+        allow_login_shell: bool,
+        shell: &Shell,
+    ) -> Result<ExecParams, FunctionCallError> {
         let use_login_shell = Self::resolve_use_login_shell(params.login, allow_login_shell)?;
-        let command = invocation.to_exec_args(&shell, use_login_shell);
+        let command = invocation.to_exec_args(shell, use_login_shell);
 
         let mut env = create_env(
             &turn_context.config.permissions.shell_environment_policy,
@@ -285,6 +310,7 @@ impl ShellCommandHandler {
                 "{issue}\nRegenerate the command and call `shell_command` again."
             ))
         })?;
+        let command_repaired = preflight.repaired();
         let command_invocation = preflight.invocation;
         let repair_notice = preflight.repair_notice;
         let git_repository = get_git_repo_root(cwd.as_path());
@@ -347,19 +373,27 @@ impl ShellCommandHandler {
         let hook_command = command_invocation.display_command();
         maybe_emit_implicit_skill_invocation(session.as_ref(), turn.as_ref(), &hook_command, &cwd)
             .await;
-        let safety_shell = resolve_command_shell(
-            &command_invocation,
-            &turn_environment,
-            session_shell.as_ref(),
-        )?;
-        let safety_command = command_invocation.to_safety_args(&safety_shell, use_login_shell);
+        let safety_shell = if command_repaired {
+            resolve_command_shell(
+                &command_invocation,
+                &turn_environment,
+                session_shell.as_ref(),
+            )?
+        } else {
+            original_safety_shell
+        };
+        let safety_command = if command_repaired {
+            command_invocation.to_safety_args(&safety_shell, use_login_shell)
+        } else {
+            original_safety_command.clone()
+        };
         let shell_type = if command_invocation.is_argv() {
             None
         } else {
             Some(safety_shell.shell_type)
         };
         let is_powershell_script = command_invocation.is_powershell_script();
-        let exec_params = Self::to_exec_params(
+        let exec_params = Self::to_exec_params_with_shell(
             &params,
             &command_invocation,
             session.as_ref(),
@@ -367,23 +401,26 @@ impl ShellCommandHandler {
             &turn_environment,
             cwd,
             allow_login_shell,
+            &safety_shell,
         )?;
-        let sandbox_context = format!(
-            "requested={:?};additional={:?};approval={:?};profile={:?};windows={:?};private_desktop={}",
+        let sandbox_context = (
             params.sandbox_permissions.unwrap_or_default(),
-            params.additional_permissions,
+            &params.additional_permissions,
             turn.approval_policy.value(),
             turn.permission_profile(),
             turn.windows_sandbox_level,
             exec_params.windows_sandbox_private_desktop,
         );
+        let stall_timeout_ms =
+            effective_stall_timeout_ms(params.timeout_ms, params.stall_timeout_ms);
         let runtime_context = format!(
             "shell={shell_type:?};login={use_login_shell};capture={:?};network_environment={:?};network={:?};stall_timeout_ms={:?}",
             exec_params.capture_policy,
             exec_params.network_environment_id,
             exec_params.network,
-            effective_stall_timeout_ms(params.timeout_ms, params.stall_timeout_ms),
+            stall_timeout_ms,
         );
+        let environment_hash = validation_environment_hash(&exec_params.env);
         let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
         let repository_epoch = session
             .services
@@ -412,6 +449,7 @@ impl ShellCommandHandler {
             cwd: &validation_cwd,
             command_invocation: &command_invocation,
             environment: &exec_params.env,
+            environment_hash: &environment_hash,
             execution_context: &runtime_context,
             repository_epoch,
             call_id: &call_id,
@@ -429,11 +467,10 @@ impl ShellCommandHandler {
         let attempt_key = CommandAttemptKey::new(
             tool_name.name.as_str(),
             &turn_environment.environment_id,
-            exec_params.cwd.to_string_lossy().into_owned(),
-            &original_safety_command,
+            validation_cwd,
+            &exec_params.command,
         )
-        .with_executed_command(&exec_params.command)
-        .with_environment(&exec_params.env)
+        .with_environment_fingerprint(&environment_hash)
         .with_timeout_ms(exec_params.expiration.timeout_ms())
         .with_sandbox_context(&sandbox_context)
         .with_input_context(&prefix_rule)
@@ -461,10 +498,8 @@ impl ShellCommandHandler {
         let mut run_args = RunExecLikeArgs {
             tool_name,
             exec_params,
-            stall_timeout_ms: effective_stall_timeout_ms(
-                params.timeout_ms,
-                params.stall_timeout_ms,
-            ),
+            environment_hash,
+            stall_timeout_ms,
             cancellation_token,
             hook_command,
             safety_command,

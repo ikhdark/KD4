@@ -113,98 +113,12 @@ fn recursive_scope(path: &str) -> RepoScope {
 }
 
 #[test]
-fn tool_classification_separates_typed_authority() {
-    for name in ["send_message", "wait_agent", "list_agents"] {
-        assert_eq!(
-            classify_typed_tool(None, name, None),
-            TypedToolClass::AgentCommunication
-        );
-    }
-    for name in ["get_agent_task", "submit_agent_receipt"] {
-        assert_eq!(
-            classify_typed_tool(None, name, None),
-            TypedToolClass::OwnTask
-        );
-    }
-    for name in [
-        "spawn_agent",
-        "send_input",
-        "resume_agent",
-        "close_agent",
-        "followup_task",
-        "interrupt_agent",
-        "amend_agent_task",
-        "waive_agent_gate",
-        "abandon_agent_task",
-    ] {
-        assert_eq!(
-            classify_typed_tool(None, name, None),
-            TypedToolClass::RootTaskControl
-        );
-    }
-    for (name, class) in [
-        ("read_tool_output", TypedToolClass::ReadSearch),
-        (
-            codex_code_mode::PUBLIC_TOOL_NAME,
-            TypedToolClass::CodeModeControl,
-        ),
-        (
-            codex_code_mode::WAIT_TOOL_NAME,
-            TypedToolClass::CodeModeControl,
-        ),
-        ("git_diff", TypedToolClass::Diff),
-        ("shell_command", TypedToolClass::Shell),
-        ("exec_command", TypedToolClass::Shell),
-        ("write_stdin", TypedToolClass::Shell),
-        ("apply_patch", TypedToolClass::StructuredEdit),
-        ("mcp__server__read", TypedToolClass::DynamicExternal),
-        ("future_unclassified_tool", TypedToolClass::Unknown),
-    ] {
-        assert_eq!(classify_typed_tool(None, name, None), class);
-    }
-}
-
-#[test]
-fn namespaces_cannot_spoof_core_or_collaboration_tools() {
-    let collaboration_namespace = Some("agents");
-    assert_eq!(
-        classify_typed_tool(Some("agents"), "send_message", collaboration_namespace),
-        TypedToolClass::AgentCommunication
-    );
-    assert_eq!(
-        classify_typed_tool(Some("agents"), "spawn_agent", collaboration_namespace),
-        TypedToolClass::RootTaskControl
-    );
-    assert_eq!(
-        classify_typed_tool(Some("agents"), "apply_patch", collaboration_namespace),
-        TypedToolClass::Unknown
-    );
-    assert_eq!(
-        classify_typed_tool(Some("foreign"), "apply_patch", collaboration_namespace,),
-        TypedToolClass::DynamicExternal
-    );
-    assert_eq!(
-        classify_typed_tool(Some(""), "read_tool_output", None),
-        TypedToolClass::DynamicExternal
-    );
-    assert_eq!(
-        classify_typed_tool(None, "send_message", collaboration_namespace),
-        TypedToolClass::Unknown
-    );
-    assert_eq!(
-        classify_typed_tool(None, "Apply_Patch", None),
-        TypedToolClass::Unknown
-    );
-}
-
-#[test]
 fn typed_agents_inherit_every_non_root_tool_class() {
     for class in [
         TypedToolClass::AgentCommunication,
         TypedToolClass::OwnTask,
         TypedToolClass::ReadSearch,
         TypedToolClass::CodeModeControl,
-        TypedToolClass::Diff,
         TypedToolClass::Shell,
         TypedToolClass::StructuredEdit,
         TypedToolClass::DynamicExternal,

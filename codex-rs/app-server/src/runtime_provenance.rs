@@ -68,7 +68,20 @@ fn expected_local_binary_path() -> Option<AbsolutePathBuf> {
         .or_else(|| std::env::var_os("HOME").filter(|value| !value.is_empty()))
         .map(PathBuf::from);
 
-    expected_local_binary_path_from_inputs(local_cli_path, local_publish_dir, default_home, true)
+    expected_local_binary_path_for_target(local_cli_path, local_publish_dir, default_home)
+}
+
+fn expected_local_binary_path_for_target(
+    local_cli_path: Option<PathBuf>,
+    local_publish_dir: Option<PathBuf>,
+    default_home: Option<PathBuf>,
+) -> Option<AbsolutePathBuf> {
+    expected_local_binary_path_from_inputs(
+        local_cli_path,
+        local_publish_dir,
+        default_home,
+        cfg!(windows),
+    )
 }
 
 fn expected_local_binary_path_from_inputs(
@@ -316,6 +329,35 @@ mod tests {
                 .map(AbsolutePathBuf::into_path_buf),
             Some(home.join("Desktop").join("LOCAL-KD").join("codex.exe"))
         );
+    }
+
+    #[test]
+    fn audit_runtime_provenance_uses_target_platform_path_semantics() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let publish_dir = temp_dir.path().join("publish");
+        let home = temp_dir.path().join("home");
+
+        let explicit_publish = expected_local_binary_path_for_target(
+            None,
+            Some(publish_dir.clone()),
+            Some(home.clone()),
+        )
+        .map(AbsolutePathBuf::into_path_buf);
+        assert_eq!(
+            explicit_publish,
+            Some(publish_dir.join(if cfg!(windows) { "codex.exe" } else { "codex" }))
+        );
+
+        let default_install = expected_local_binary_path_for_target(None, None, Some(home.clone()))
+            .map(AbsolutePathBuf::into_path_buf);
+        if cfg!(windows) {
+            assert_eq!(
+                default_install,
+                Some(home.join("Desktop").join("LOCAL-KD").join("codex.exe"))
+            );
+        } else {
+            assert_eq!(default_install, None);
+        }
     }
 
     #[test]

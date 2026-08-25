@@ -26,15 +26,14 @@ pub(crate) fn repository_identity(repo_root: &Path) -> StoreResult<RepositoryIde
         ))
     })?;
     let canonical_path = canonical_root.to_string_lossy().into_owned();
-    let workspace_identity_input = canonical_path.to_lowercase();
+    let workspace_identity_input = filesystem_identity_bytes(&canonical_root);
     let repository_identity_input = git_common_directory(&canonical_root)
         .and_then(|path| std::fs::canonicalize(path).ok())
-        .map(|path| path.to_string_lossy().into_owned())
-        .map(|path| path.to_lowercase())
+        .map(|path| filesystem_identity_bytes(&path))
         .unwrap_or_else(|| workspace_identity_input.clone());
     Ok(RepositoryIdentity {
-        id: format!("{:x}", Sha256::digest(repository_identity_input.as_bytes())),
-        workspace_id: format!("{:x}", Sha256::digest(workspace_identity_input.as_bytes())),
+        id: format!("{:x}", Sha256::digest(&repository_identity_input)),
+        workspace_id: format!("{:x}", Sha256::digest(&workspace_identity_input)),
         canonical_root,
         canonical_path,
     })
@@ -118,7 +117,7 @@ pub fn normalize_repo_scopes(
     for scope in scopes {
         let path = normalize_lexically(&scope.path)?;
         let path = canonical_relative_identity(&canonical_root, &path)?;
-        let duplicate_key = path.to_lowercase();
+        let duplicate_key = comparison_key(&path);
         if !seen.insert(duplicate_key) {
             return Err(StoreError::InvalidScope(format!(
                 "duplicate scope path {path}"
@@ -249,9 +248,163 @@ fn paths_equal(left: &str, right: &str) -> bool {
 }
 
 fn comparison_key(path: &str) -> String {
-    path.to_lowercase()
+    if cfg!(windows) {
+        path.to_lowercase()
+    } else {
+        path.to_string()
+    }
+}
+
+pub(crate) fn path_comparison_key(path: &str) -> String {
+    comparison_key(path)
+}
+
+pub(crate) fn filesystem_paths_equal(left: &str, right: &str) -> bool {
+    paths_equal(left, right)
+}
+
+pub(crate) fn relative_path_identity(path: &Path) -> String {
+    if let Some(path) = path.to_str()
+        && !path.starts_with(ENCODED_PATH_PREFIX)
+    {
+        return path.replace(std::path::MAIN_SEPARATOR, "/");
+    }
+    format!(
+        "{ENCODED_PATH_PREFIX}{}",
+        hex_encode(&native_os_bytes(path.as_os_str()))
+    )
 }
 
 pub(crate) fn absolute_repo_path(repo_root: &Path, relative: &str) -> PathBuf {
+    if let Some(encoded) = relative.strip_prefix(ENCODED_PATH_PREFIX)
+        && let Some(path) = native_os_string_from_hex(encoded)
+    {
+        return repo_root.join(PathBuf::from(path));
+    }
     repo_root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR))
+}
+
+const ENCODED_PATH_PREFIX: &str = ":native-path:";
+
+fn filesystem_identity_bytes(path: &Path) -> Vec<u8> {
+    let bytes = native_os_bytes(path.as_os_str());
+    if cfg!(windows) {
+        // Canonical Windows paths normally preserve the filesystem's spelling. Lowercase
+        // valid Unicode paths for compatibility with the legacy identity while retaining a
+        // lossless wide-character fallback for paths that cannot be represented as UTF-8.
+        if let Some(path) = path.to_str() {
+            return path.to_lowercase().into_bytes();
+        }
+    } else if let Some(path) = path.to_str() {
+        return path.as_bytes().to_vec();
+    }
+    let mut identity = if cfg!(windows) {
+        b"windows\0".to_vec()
+    } else {
+        b"unix\0".to_vec()
+    };
+    identity.extend(bytes);
+    identity
+}
+
+#[cfg(unix)]
+fn native_os_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    value.as_bytes().to_vec()
+}
+
+#[cfg(windows)]
+fn native_os_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+    value
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>()
+}
+
+#[cfg(unix)]
+fn native_os_string_from_hex(value: &str) -> Option<std::ffi::OsString> {
+    use std::os::unix::ffi::OsStringExt;
+    Some(std::ffi::OsString::from_vec(hex_decode(value)?))
+}
+
+#[cfg(windows)]
+fn native_os_string_from_hex(value: &str) -> Option<std::ffi::OsString> {
+    use std::os::windows::ffi::OsStringExt;
+    let bytes = hex_decode(value)?;
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    Some(std::ffi::OsString::from_wide(
+        &bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>(),
+    ))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0xf) as usize] as char);
+    }
+    encoded
+}
+
+fn hex_decode(value: &str) -> Option<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16)?;
+            let low = (pair[1] as char).to_digit(16)?;
+            Some(((high << 4) | low) as u8)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn audit_workspace_case_identity_is_platform_aware() {
+        if cfg!(windows) {
+            assert_eq!(comparison_key("Src/Lib.rs"), comparison_key("src/lib.rs"));
+        } else {
+            assert_ne!(comparison_key("Src/Lib.rs"), comparison_key("src/lib.rs"));
+        }
+    }
+
+    #[test]
+    fn audit_workspace_native_path_encoding_is_lossless() {
+        #[cfg(unix)]
+        let (left, right) = {
+            use std::os::unix::ffi::OsStringExt;
+            (
+                PathBuf::from(std::ffi::OsString::from_vec(vec![b'a', 0x80])),
+                PathBuf::from(std::ffi::OsString::from_vec(vec![b'a', 0x81])),
+            )
+        };
+        #[cfg(windows)]
+        let (left, right) = {
+            use std::os::windows::ffi::OsStringExt;
+            (
+                PathBuf::from(std::ffi::OsString::from_wide(&[b'a' as u16, 0xd800])),
+                PathBuf::from(std::ffi::OsString::from_wide(&[b'a' as u16, 0xd801])),
+            )
+        };
+
+        let left_identity = relative_path_identity(&left);
+        let right_identity = relative_path_identity(&right);
+        assert_ne!(left_identity, right_identity);
+        let root = Path::new("root");
+        assert_eq!(absolute_repo_path(root, &left_identity), root.join(left));
+        assert_eq!(absolute_repo_path(root, &right_identity), root.join(right));
+    }
 }

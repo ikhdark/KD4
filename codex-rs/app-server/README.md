@@ -169,7 +169,7 @@ Example with notification opt-out:
 - `thread/backgroundTerminals/terminate` — terminate one running background terminal by app-server `processId` (experimental; requires `capabilities.experimentalApi`); returns whether a process was terminated.
 - `thread/rollback` — deprecated and will be removed soon. Drop the last N turns from the agent’s in-memory context and persist a rollback marker in the rollout so future resumes see the pruned history; returns the updated `thread` (with `turns` populated) on success.
 - `turn/start` — add user input to a thread and begin Codex generation; responds with the initial `turn` object and streams `turn/started`, `item/*`, and `turn/completed` notifications. `clientUserMessageId` is optional; when supplied, the corresponding `userMessage` item echoes it as `clientId`. Experimental `runtimeWorkspaceRoots` replaces the thread-scoped runtime workspace roots used to materialize `:workspace_roots`; paths must be absolute. Prefer experimental `permissions` profile selection by id for permission overrides; the legacy `sandboxPolicy` field is still accepted but cannot be combined with `permissions`. For `collaborationMode`, `settings.developer_instructions: null` means "use built-in instructions for the selected mode".
-- `thread/injectItems` — append raw Responses API items to a loaded thread’s model-visible history without starting a user turn; returns `{}` on success. The deprecated `thread/inject_items` spelling remains accepted for compatibility.
+- `thread/injectItems` — append raw Responses API items to a loaded thread’s model-visible history without starting a user turn; returns `{}` on success.
 - `turn/steer` — add user input to an already in-flight regular turn without starting a new turn; returns the active `turnId` that accepted the input. `clientUserMessageId` is optional; when supplied, the corresponding `userMessage` item echoes it as `clientId`. Review and manual compaction turns reject `turn/steer`.
 - `turn/interrupt` — request cancellation of an in-flight turn by `(thread_id, turn_id)`; success is an empty `{}` response and the turn finishes with `status: "interrupted"`.
 - `bug/create` — durably save an exact bug or audit report for an initialized thread without creating or waiting for a turn; responds with its numeric and formatted IDs plus the initial `pending` status.
@@ -2114,23 +2114,3 @@ For server-initiated request payloads, annotate the field the same way so schema
    ```bash
    just test -p codex-app-server-protocol
    ```
-
-## Desktop activation bootstrap contract
-
-Trusted Desktop publishers provide `DesktopPublishInstallEvidenceV1` to a newly
-launched app-server over a one-shot inherited pipe. The child receives the
-decimal read-handle value in `CODEX_DESKTOP_ACTIVATION_EVIDENCE_HANDLE`; no
-publish/install evidence is accepted over JSON-RPC.
-
-The native publisher must create the evidence only after installing the binary,
-write exactly one UTF-8 JSON value to the pipe, close its write end, and arrange
-for only the read handle to be inherited. At startup, app-server removes the
-Windows inheritance flag, reads at most 64 KiB to EOF, and closes the handle. It
-keeps successfully decoded evidence only in process memory. A missing, malformed,
-oversized, mismatched, or unverifiable value fails closed and makes
-`thread/desktopActivation/challenge` unavailable.
-
-Clients opt in to the obligation, challenge, and record methods with
-`capabilities.desktopActivationReceipts = true`. A record request carries only
-the issued challenge identity and Desktop-owned restart/load observations; it
-cannot supply or replace authoritative publish/install fields.

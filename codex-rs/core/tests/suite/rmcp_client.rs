@@ -26,6 +26,7 @@ use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::Environment;
 use codex_exec_server::HttpRedirectPolicy;
 use codex_exec_server::HttpRequestParams;
+use codex_http_client::HttpClientBuilder;
 use codex_login::CodexAuth;
 use codex_mcp::MCP_SANDBOX_STATE_META_CAPABILITY;
 use codex_mcp::SandboxState;
@@ -66,12 +67,11 @@ use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::test_docker_container_name;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_mcp_server;
+use http::StatusCode;
 use image::DynamicImage;
 use image::GenericImageView;
 use image::ImageBuffer;
 use image::Rgba;
-use reqwest::Client;
-use reqwest::StatusCode;
 use serde_json::Value;
 use serde_json::json;
 use serial_test::serial;
@@ -1668,7 +1668,8 @@ async fn stdio_image_responses_are_sanitized_for_text_only_model() -> anyhow::Re
             RefreshStrategy::Online,
             codex_core::test_support::default_http_client_factory(),
         )
-        .await;
+        .await
+        .expect("model listing should succeed");
     assert_eq!(models_mock.requests().len(), 1);
 
     fixture
@@ -2807,7 +2808,7 @@ async fn wait_for_local_streamable_http_server(
 ) -> anyhow::Result<()> {
     let deadline = Instant::now() + timeout;
     let metadata_url = streamable_http_metadata_url(server_url);
-    let client = Client::builder().no_proxy().build()?;
+    let client = HttpClientBuilder::new().build_direct()?;
     loop {
         if let Some(status) = server_child.try_wait()? {
             return Err(anyhow::anyhow!(
@@ -2911,7 +2912,7 @@ async fn wait_for_streamable_http_metadata(
 ) -> anyhow::Result<()> {
     let deadline = Instant::now() + timeout;
     let metadata_url = streamable_http_metadata_url(server_url);
-    let client = Client::builder().no_proxy().build()?;
+    let client = HttpClientBuilder::new().build_direct()?;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {

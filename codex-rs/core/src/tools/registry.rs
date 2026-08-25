@@ -1,4 +1,5 @@
 use crate::FunctionCallError;
+use crate::agent::task_capabilities::TypedToolClass;
 use crate::client_common::ToolSchemaArtifact;
 use crate::hook_runtime::PreToolUseHookResult;
 use crate::hook_runtime::record_additional_contexts;
@@ -686,11 +687,21 @@ pub(crate) struct RegisteredTool {
     tool_name: ToolName,
     runtime: Arc<dyn CoreToolRuntime>,
     exposure: ToolExposure,
+    authorization_class: TypedToolClass,
+    external_mutation_intent: crate::agent::task_capabilities::ExternalMutationIntent,
     spec: ToolSpec,
 }
 
 impl RegisteredTool {
-    pub(crate) fn new(runtime: Arc<dyn CoreToolRuntime>) -> Self {
+    pub(crate) fn new(
+        runtime: Arc<dyn CoreToolRuntime>,
+        authorization_class: TypedToolClass,
+    ) -> Self {
+        assert_ne!(
+            authorization_class,
+            TypedToolClass::Unknown,
+            "registered tools must declare an authorization class"
+        );
         let exposure = runtime.exposure();
         let spec = runtime.spec();
         let tool_name = spec.sole_callable_tool_name().unwrap_or_else(|| {
@@ -700,11 +711,23 @@ impl RegisteredTool {
             tool_name,
             runtime,
             exposure,
+            authorization_class,
+            external_mutation_intent:
+                crate::agent::task_capabilities::ExternalMutationIntent::MayMutate,
             spec,
         }
     }
 
-    pub(crate) fn with_exposure(runtime: Arc<dyn CoreToolRuntime>, exposure: ToolExposure) -> Self {
+    pub(crate) fn with_exposure(
+        runtime: Arc<dyn CoreToolRuntime>,
+        exposure: ToolExposure,
+        authorization_class: TypedToolClass,
+    ) -> Self {
+        assert_ne!(
+            authorization_class,
+            TypedToolClass::Unknown,
+            "registered tools must declare an authorization class"
+        );
         let spec = runtime.spec();
         let tool_name = spec.sole_callable_tool_name().unwrap_or_else(|| {
             panic!("registered runtime specs must declare exactly one callable tool")
@@ -713,8 +736,19 @@ impl RegisteredTool {
             tool_name,
             runtime,
             exposure,
+            authorization_class,
+            external_mutation_intent:
+                crate::agent::task_capabilities::ExternalMutationIntent::MayMutate,
             spec,
         }
+    }
+
+    pub(crate) fn with_external_mutation_intent(
+        mut self,
+        intent: crate::agent::task_capabilities::ExternalMutationIntent,
+    ) -> Self {
+        self.external_mutation_intent = intent;
+        self
     }
 
     pub(crate) fn runtime(&self) -> &Arc<dyn CoreToolRuntime> {
@@ -729,8 +763,22 @@ impl RegisteredTool {
         self.exposure
     }
 
+    pub(crate) fn authorization_class(&self) -> TypedToolClass {
+        self.authorization_class
+    }
+
+    pub(crate) fn external_mutation_intent(
+        &self,
+    ) -> crate::agent::task_capabilities::ExternalMutationIntent {
+        self.external_mutation_intent
+    }
+
     pub(crate) fn spec(&self) -> &ToolSpec {
         &self.spec
+    }
+
+    pub(crate) fn search_info(&self) -> Option<codex_tools::ToolSearchInfo> {
+        self.runtime.search_info_for_registered_spec(&self.spec)
     }
 
     pub(crate) fn set_exposure(&mut self, exposure: ToolExposure) {
@@ -754,7 +802,11 @@ impl ToolRegistry {
     #[cfg(test)]
     #[tracing::instrument(level = "trace", skip_all)]
     pub(crate) fn from_tools(tools: impl IntoIterator<Item = Arc<dyn CoreToolRuntime>>) -> Self {
-        Self::from_unique_registered_tools(tools.into_iter().map(RegisteredTool::new))
+        Self::from_unique_registered_tools(
+            tools
+                .into_iter()
+                .map(|runtime| RegisteredTool::new(runtime, TypedToolClass::DynamicExternal)),
+        )
     }
 
     pub(crate) fn from_unique_registered_tools(
@@ -778,7 +830,7 @@ impl ToolRegistry {
         T: CoreToolRuntime + 'static,
     {
         let runtime = handler as Arc<dyn CoreToolRuntime>;
-        let registered = RegisteredTool::new(runtime);
+        let registered = RegisteredTool::new(runtime, TypedToolClass::DynamicExternal);
         Self::new(HashMap::from([(
             registered.tool_name().clone(),
             registered,
@@ -798,6 +850,21 @@ impl ToolRegistry {
 
     pub(crate) fn tool_exposure(&self, name: &ToolName) -> Option<ToolExposure> {
         self.tools.get(name).map(RegisteredTool::exposure)
+    }
+
+    pub(crate) fn tool_authorization_class(&self, name: &ToolName) -> Option<TypedToolClass> {
+        self.tools
+            .get(name)
+            .map(RegisteredTool::authorization_class)
+    }
+
+    pub(crate) fn tool_external_mutation_intent(
+        &self,
+        name: &ToolName,
+    ) -> Option<crate::agent::task_capabilities::ExternalMutationIntent> {
+        self.tools
+            .get(name)
+            .map(RegisteredTool::external_mutation_intent)
     }
 
     pub(crate) fn set_model_visible_specs(&mut self, specs: Vec<ToolSpec>) {
@@ -1023,6 +1090,41 @@ impl ToolRegistry {
             }
         }
 
+        // PreToolUse hooks may replace the arguments after the initial code-mode
+        // admission check. Validate the final payload that will reach the
+        // handler so a hook cannot turn a schema-valid call into an invalid one.
+        if matches!(invocation.source, ToolCallSource::CodeMode { .. })
+            && let Err(message) = preflight_code_mode_arguments(
+                &tool_name,
+                &tool_spec,
+                &invocation.payload,
+                parsed_function_arguments.as_ref(),
+            )
+        {
+            let log_payload = invocation.payload.log_payload();
+            otel.tool_result_with_tags(
+                tool_name_flat.as_ref(),
+                &call_id_owned,
+                log_payload.as_ref(),
+                Duration::ZERO,
+                /*success*/ false,
+                &message,
+                &tool_result_tags,
+                &extra_trace_fields,
+            );
+            let err = FunctionCallError::RespondToModel(message);
+            dispatch_trace.record_failed(&err);
+            notify_tool_finish_if_unclaimed(
+                &invocation,
+                terminal_outcome_reached.as_ref(),
+                ToolCallOutcome::Failed {
+                    handler_executed: false,
+                },
+            )
+            .await;
+            return Err(err);
+        }
+
         let invocation_for_tool = invocation.clone();
         let log_payload = invocation.payload.log_payload();
 
@@ -1116,15 +1218,6 @@ impl ToolRegistry {
                 handler_executed: true,
             },
         };
-        let phase_started = Instant::now();
-        notify_tool_finish_if_unclaimed(
-            &invocation,
-            terminal_outcome_reached.as_ref(),
-            lifecycle_outcome,
-        )
-        .await;
-        record_lifecycle_phase(&invocation, "notify_finish", phase_started);
-
         match result {
             Ok(mut result) => {
                 if let Some(outcome) = post_tool_use_outcome {
@@ -1133,6 +1226,14 @@ impl ToolRegistry {
                             "PostToolUse hook blocked the tool result".to_string()
                         });
                         let err = FunctionCallError::RespondToModel(message);
+                        let phase_started = Instant::now();
+                        notify_tool_finish_if_unclaimed(
+                            &invocation,
+                            terminal_outcome_reached.as_ref(),
+                            lifecycle_outcome,
+                        )
+                        .await;
+                        record_lifecycle_phase(&invocation, "notify_finish", phase_started);
                         dispatch_trace.record_failed(&err);
                         return Err(err);
                     }
@@ -1193,6 +1294,16 @@ impl ToolRegistry {
                         "failed to preserve and admit the fully received result for {} as a canonical artifact",
                         flat_tool_name(&invocation.tool_name)
                     ));
+                    let phase_started = Instant::now();
+                    notify_tool_finish_if_unclaimed(
+                        &invocation,
+                        terminal_outcome_reached.as_ref(),
+                        ToolCallOutcome::Failed {
+                            handler_executed: true,
+                        },
+                    )
+                    .await;
+                    record_lifecycle_phase(&invocation, "notify_finish", phase_started);
                     dispatch_trace.record_failed(&err);
                     return Err(err);
                 }
@@ -1225,6 +1336,14 @@ impl ToolRegistry {
                     }
                 }
                 result.install_model_projection(model_projection);
+                let phase_started = Instant::now();
+                notify_tool_finish_if_unclaimed(
+                    &invocation,
+                    terminal_outcome_reached.as_ref(),
+                    lifecycle_outcome,
+                )
+                .await;
+                record_lifecycle_phase(&invocation, "notify_finish", phase_started);
                 dispatch_trace.record_completed(
                     &invocation,
                     &result.call_id,
@@ -1234,6 +1353,14 @@ impl ToolRegistry {
                 Ok(result)
             }
             Err(err) => {
+                let phase_started = Instant::now();
+                notify_tool_finish_if_unclaimed(
+                    &invocation,
+                    terminal_outcome_reached.as_ref(),
+                    lifecycle_outcome,
+                )
+                .await;
+                record_lifecycle_phase(&invocation, "notify_finish", phase_started);
                 dispatch_trace.record_failed(&err);
                 Err(err)
             }
@@ -2295,6 +2422,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
                 proof_identity: None,
                 supersession_identity,
                 consumed_by_generation: None,
+                derived: Default::default(),
             }),
             projected_tokens: approx_token_count(&original_output_text)
                 .saturating_add(non_text_tokens) as u64,
@@ -2428,6 +2556,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
             proof_identity: None,
             supersession_identity,
             consumed_by_generation: None,
+            derived: Default::default(),
         }),
         projected_tokens,
         canonical_bytes: canonical.exact_bytes,

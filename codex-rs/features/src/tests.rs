@@ -6,6 +6,7 @@ use crate::Features;
 use crate::FeaturesToml;
 use crate::Stage;
 use crate::feature_for_key;
+use crate::feature_requirement_for_key;
 use crate::is_known_feature_key;
 use crate::unstable_features_warning_event;
 use crate::user_settable_feature_for_key;
@@ -73,6 +74,16 @@ fn user_settable_registry_excludes_internal_features_and_legacy_aliases() {
 }
 
 #[test]
+fn managed_requirement_alias_resolves_only_through_requirement_lookup() {
+    assert_eq!(
+        feature_requirement_for_key("auto_review"),
+        Some(Feature::GuardianApproval)
+    );
+    assert_eq!(user_settable_feature_for_key("auto_review"), None);
+    assert_eq!(feature_for_key("auto_review"), None);
+}
+
+#[test]
 fn deleted_zombie_feature_keys_are_unknown() {
     for key in ["artifact", "enable_mcp_apps", "realtime_conversation"] {
         assert_eq!(feature_for_key(key), None, "{key}");
@@ -108,15 +119,39 @@ fn default_enabled_features_are_stable() {
 }
 
 #[test]
-fn retired_feature_keys_are_unknown() {
+fn retired_feature_keys_are_unknown_and_ignored_by_feature_sources() {
     for key in [
         "terminal_resize_reflow",
         "apps_mcp_path_override",
         "item_ids",
         "remote_compaction_v2",
+        "mentions_v2",
+        "image_detail_original",
+        "remote_control",
+        "workspace_dependencies",
+        "chronicle",
+        "telepathy",
+        "resize_all_images",
+        "undo",
+        "js_repl",
+        "js_repl_tools_only",
+        "apply_patch_freeform",
+        "plugin_hooks",
+        "tool_search_always_defer_mcp_tools",
     ] {
         assert!(!is_known_feature_key(key), "{key}");
         assert_eq!(feature_for_key(key), None, "{key}");
+
+        let features_toml = FeaturesToml::from(BTreeMap::from([(key.to_string(), true)]));
+        let features = Features::from_sources(
+            FeatureConfigSource {
+                features: Some(&features_toml),
+            },
+            FeatureConfigSource::default(),
+            FeatureOverrides::default(),
+        );
+
+        assert_eq!(features, Features::with_defaults(), "{key}");
     }
 }
 
@@ -187,29 +222,6 @@ fn completed_runtime_mechanisms_are_stable_and_enabled_by_default() {
         assert_eq!(feature.stage(), Stage::Stable, "{feature:?}");
         assert_eq!(feature.default_enabled(), true, "{feature:?}");
     }
-}
-
-#[test]
-fn terminal_resize_reflow_is_removed_and_enabled_by_default() {
-    assert_eq!(feature_for_key("terminal_resize_reflow"), None);
-}
-
-#[test]
-fn from_sources_ignores_removed_terminal_resize_reflow_feature_key() {
-    let features_toml = FeaturesToml::from(BTreeMap::from([(
-        "terminal_resize_reflow".to_string(),
-        false,
-    )]));
-
-    let features = Features::from_sources(
-        FeatureConfigSource {
-            features: Some(&features_toml),
-        },
-        FeatureConfigSource::default(),
-        FeatureOverrides::default(),
-    );
-
-    assert_eq!(features, Features::with_defaults());
 }
 
 #[test]
@@ -292,24 +304,6 @@ fn image_generation_toggle_controls_extension_backed_generation() {
 }
 
 #[test]
-fn removed_transitional_features_are_no_op() {
-    let entries = BTreeMap::from([
-        ("mentions_v2".to_string(), false),
-        ("remote_compaction_v2".to_string(), false),
-    ]);
-    let mut features = Features::with_defaults();
-    features.apply_map(&entries);
-
-    assert_eq!(feature_for_key("remote_compaction_v2"), None);
-    assert_eq!(features.legacy_feature_usages().count(), 0);
-}
-
-#[test]
-fn image_detail_original_is_a_removed_feature_key() {
-    assert_eq!(feature_for_key("image_detail_original"), None);
-}
-
-#[test]
 fn tool_call_mcp_elicitation_is_stable_and_enabled_by_default() {
     assert_eq!(Feature::ToolCallMcpElicitation.stage(), Stage::Stable);
     assert_eq!(Feature::ToolCallMcpElicitation.default_enabled(), true);
@@ -326,58 +320,22 @@ fn auth_elicitation_is_stable_and_enabled_by_default() {
 }
 
 #[test]
-fn remote_compaction_v2_is_a_removed_feature_key() {
-    assert_eq!(feature_for_key("remote_compaction_v2"), None);
-}
-
-#[test]
-fn remote_control_is_removed_and_disabled_by_default() {
-    assert_eq!(feature_for_key("remote_control"), None);
-}
-
-#[test]
-fn remote_control_config_is_ignored() {
-    let mut entries = BTreeMap::new();
-    entries.insert("remote_control".to_string(), true);
-
-    let mut features = Features::with_defaults();
-    features.apply_map(&entries);
-
-    assert_eq!(features, Features::with_defaults());
-}
-
-#[test]
-fn workspace_dependencies_is_removed_and_disabled_by_default() {
-    assert_eq!(feature_for_key("workspace_dependencies"), None);
-}
-
-#[test]
-fn workspace_dependencies_config_is_ignored() {
-    let mut entries = BTreeMap::new();
-    entries.insert("workspace_dependencies".to_string(), true);
-
-    let mut features = Features::with_defaults();
-    features.apply_map(&entries);
-
-    assert_eq!(features, Features::with_defaults());
-}
-
-#[test]
-fn chronicle_and_legacy_alias_are_unknown() {
-    assert_eq!(feature_for_key("chronicle"), None);
-    assert_eq!(feature_for_key("telepathy"), None);
-}
-
-#[test]
-fn multi_agent_legacy_alias_is_unknown() {
-    assert_eq!(feature_for_key("multi_agent"), Some(Feature::Collab));
-    assert_eq!(feature_for_key("collab"), None);
-}
-
-#[test]
-fn hooks_legacy_alias_is_unknown() {
-    assert_eq!(feature_for_key("hooks"), Some(Feature::CodexHooks));
-    assert_eq!(feature_for_key("codex_hooks"), None);
+fn renamed_feature_variants_keep_canonical_config_keys() {
+    for (canonical_key, variant_shaped_key, feature) in [
+        ("multi_agent", "collab", Feature::Collab),
+        ("hooks", "codex_hooks", Feature::CodexHooks),
+    ] {
+        assert_eq!(
+            feature_for_key(canonical_key),
+            Some(feature),
+            "{canonical_key}"
+        );
+        assert_eq!(
+            feature_for_key(variant_shaped_key),
+            None,
+            "{variant_shaped_key}"
+        );
+    }
 }
 
 #[test]
@@ -449,138 +407,6 @@ fn from_sources_applies_base_profile_and_overrides() {
     assert_eq!(features.enabled(Feature::CodeModeOnly), true);
     assert_eq!(features.enabled(Feature::CodeMode), true);
     assert_eq!(features.enabled(Feature::WebSearchRequest), false);
-}
-
-#[test]
-fn from_sources_ignores_removed_image_detail_original_feature_key() {
-    let features_toml = FeaturesToml::from(BTreeMap::from([(
-        "image_detail_original".to_string(),
-        true,
-    )]));
-
-    let features = Features::from_sources(
-        FeatureConfigSource {
-            features: Some(&features_toml),
-        },
-        FeatureConfigSource::default(),
-        FeatureOverrides::default(),
-    );
-
-    assert_eq!(features, Features::with_defaults());
-}
-
-#[test]
-fn from_sources_ignores_removed_resize_all_images_feature_key() {
-    let features_toml =
-        FeaturesToml::from(BTreeMap::from([("resize_all_images".to_string(), false)]));
-
-    let features = Features::from_sources(
-        FeatureConfigSource {
-            features: Some(&features_toml),
-        },
-        FeatureConfigSource::default(),
-        FeatureOverrides::default(),
-    );
-
-    assert_eq!(features, Features::with_defaults());
-}
-
-#[test]
-fn from_sources_ignores_removed_item_ids_feature_key() {
-    let features_toml = FeaturesToml::from(BTreeMap::from([("item_ids".to_string(), true)]));
-
-    let features = Features::from_sources(
-        FeatureConfigSource {
-            features: Some(&features_toml),
-        },
-        FeatureConfigSource::default(),
-        FeatureOverrides::default(),
-    );
-
-    assert_eq!(features, Features::with_defaults());
-    assert_eq!(feature_for_key("item_ids"), None);
-}
-
-#[test]
-fn from_sources_ignores_removed_undo_feature_key() {
-    let features_toml = FeaturesToml::from(BTreeMap::from([("undo".to_string(), true)]));
-
-    let features = Features::from_sources(
-        FeatureConfigSource {
-            features: Some(&features_toml),
-        },
-        FeatureConfigSource::default(),
-        FeatureOverrides::default(),
-    );
-
-    assert_eq!(features, Features::with_defaults());
-}
-
-#[test]
-fn from_sources_ignores_removed_js_repl_feature_keys() {
-    let features_toml = FeaturesToml::from(BTreeMap::from([
-        ("js_repl".to_string(), true),
-        ("js_repl_tools_only".to_string(), true),
-    ]));
-
-    let features = Features::from_sources(
-        FeatureConfigSource {
-            features: Some(&features_toml),
-        },
-        FeatureConfigSource::default(),
-        FeatureOverrides::default(),
-    );
-
-    assert_eq!(features, Features::with_defaults());
-}
-
-#[test]
-fn from_sources_ignores_removed_apply_patch_freeform_feature_key() {
-    let features_toml =
-        FeaturesToml::from(BTreeMap::from([("apply_patch_freeform".to_string(), true)]));
-
-    let features = Features::from_sources(
-        FeatureConfigSource {
-            features: Some(&features_toml),
-        },
-        FeatureConfigSource::default(),
-        FeatureOverrides::default(),
-    );
-
-    assert_eq!(features, Features::with_defaults());
-}
-
-#[test]
-fn from_sources_ignores_removed_plugin_hooks_feature_key() {
-    let features_toml = FeaturesToml::from(BTreeMap::from([("plugin_hooks".to_string(), true)]));
-
-    let features = Features::from_sources(
-        FeatureConfigSource {
-            features: Some(&features_toml),
-        },
-        FeatureConfigSource::default(),
-        FeatureOverrides::default(),
-    );
-
-    assert_eq!(features, Features::with_defaults());
-}
-
-#[test]
-fn from_sources_ignores_removed_tool_search_always_defer_mcp_tools_feature_key() {
-    let features_toml = FeaturesToml::from(BTreeMap::from([(
-        "tool_search_always_defer_mcp_tools".to_string(),
-        false,
-    )]));
-
-    let features = Features::from_sources(
-        FeatureConfigSource {
-            features: Some(&features_toml),
-        },
-        FeatureConfigSource::default(),
-        FeatureOverrides::default(),
-    );
-
-    assert_eq!(features, Features::with_defaults());
 }
 
 #[test]

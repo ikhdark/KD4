@@ -32,10 +32,13 @@ impl ToolExecutor<ToolInvocation> for Handler {
         create_spawn_agent_tool_v1(self.options.clone())
     }
 
-    fn search_info(&self) -> Option<ToolSearchInfo> {
+    fn search_info_for_registered_spec(
+        &self,
+        registered_spec: &ToolSpec,
+    ) -> Option<ToolSearchInfo> {
         multi_agent_tool_search_info(
             "spawn_agent spawn agent subagent sub-agent delegate delegation parallel work worker explorer no-apps fork model reasoning",
-            self.spec(),
+            registered_spec.clone(),
         )
     }
 

@@ -6,13 +6,14 @@ use crate::store::PluginStore;
 use crate::store::PluginStoreError;
 use crate::store::error_context_sub_error_type;
 use crate::store::validate_plugin_version_segment;
+use codex_http_client::HttpError;
+use codex_http_client::HttpResponse;
 use codex_login::default_client::create_client_without_request_logging;
 use codex_plugin::PluginId;
 use codex_plugin::PluginIdError;
 use codex_plugin::find_plugin_manifest_path;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use reqwest::Response;
-use reqwest::StatusCode;
+use http::StatusCode;
 use serde_json::Value as JsonValue;
 use std::fs;
 use std::io;
@@ -90,7 +91,7 @@ pub enum RemotePluginBundleInstallError {
     DownloadRequest {
         url: String,
         #[source]
-        source: reqwest::Error,
+        source: HttpError,
     },
 
     #[error("remote plugin bundle download from {url} failed with status {status}: {body}")]
@@ -104,7 +105,7 @@ pub enum RemotePluginBundleInstallError {
     DownloadBody {
         url: String,
         #[source]
-        source: reqwest::Error,
+        source: HttpError,
     },
 
     #[error("remote plugin bundle download from {url} exceeded maximum size of {max_bytes} bytes")]
@@ -306,8 +307,8 @@ async fn download_remote_plugin_bundle_with_limit(
         })?;
 
     let final_url = response.url().clone();
-    // reqwest may already have followed redirects here. For backend-issued bundle URLs, keep the
-    // shared client policy and fail unsupported final schemes before caching.
+    // The shared client may already have followed redirects here. For backend-issued bundle URLs,
+    // keep the shared client policy and fail unsupported final schemes before caching.
     if !is_allowed_bundle_download_url(&final_url, allow_test_loopback_http_bundle_downloads()) {
         return Err(
             RemotePluginBundleInstallError::UnsupportedBundleDownloadFinalUrl {
@@ -358,7 +359,7 @@ async fn download_remote_plugin_bundle_with_limit(
 }
 
 async fn read_response_body_with_limit(
-    mut response: Response,
+    mut response: HttpResponse,
     url: &str,
     max_bytes: u64,
 ) -> Result<Vec<u8>, RemotePluginBundleInstallError> {

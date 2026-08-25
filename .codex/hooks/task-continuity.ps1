@@ -2,7 +2,9 @@ param(
     [AllowEmptyString()]
     [string]$TaskContinuityRawInput,
     [switch]$TaskContinuitySkipFastPath,
-    [AllowNull()][object]$TaskContinuityRepositoryState
+    [AllowNull()][string]$TaskContinuityExpectedEvent,
+    [AllowNull()][object]$TaskContinuityRepositoryState,
+    [AllowNull()][string]$TaskContinuityRepositoryRoot
 )
 
 Set-StrictMode -Version 2.0
@@ -16,8 +18,16 @@ $WarningPreference = 'SilentlyContinue'
 $script:SchemaVersion = 1
 $script:MaxExcerptChars = 4000
 $script:MaxContextChars = 8000
-$script:StateDirectory = [System.IO.Path]::GetFullPath(
-    (Join-Path $PSScriptRoot '..\harness\runs\task-continuity\v1')
+$script:RepositoryRoot = if (
+    [string]::IsNullOrWhiteSpace($TaskContinuityRepositoryRoot)
+) {
+    [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
+}
+else {
+    [System.IO.Path]::GetFullPath($TaskContinuityRepositoryRoot)
+}
+$script:StateDirectory = Join-Path $script:RepositoryRoot (
+    '.codex\harness\runs\task-continuity\v1'
 )
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $script:EmptyOutput = '{}'
@@ -33,66 +43,60 @@ else {
     [Console]::In.ReadToEnd()
 }
 $script:FastInput = $null
-$script:FastJsonSerializer = $null
+$script:FastInputParseError = $null
+$script:PrefetchedCapsule = $null
+$script:PrefetchedCapsulePath = $null
 if (-not $TaskContinuitySkipFastPath) {
 try {
     if ([string]::IsNullOrWhiteSpace($script:RawInput)) {
         throw 'hook stdin was empty'
     }
-    [void][Reflection.Assembly]::Load(
-        'System.Web.Extensions, Version=4.0.0.0, Culture=neutral, ' +
-            'PublicKeyToken=31bf3856ad364e35'
-    )
-    $script:FastJsonSerializer = [Activator]::CreateInstance(
-        [type]'System.Web.Script.Serialization.JavaScriptSerializer'
-    )
-    $script:FastInput = $script:FastJsonSerializer.DeserializeObject($script:RawInput)
+    $script:FastInput = $script:RawInput | ConvertFrom-Json -ErrorAction Stop
 }
 catch {
-    # The validated path owns malformed or unsupported input diagnostics.
+    $script:FastInputParseError = $_.Exception
 }
 
-if ($script:FastInput -is [Collections.IDictionary] -and
-    $script:FastInput.ContainsKey('agent_id')) {
+if ($script:FastInput -is [pscustomobject] -and
+    $null -ne $script:FastInput.PSObject.Properties['agent_id']) {
     [Console]::Out.Write($script:EmptyOutput)
     exit 0
 }
 
 try {
-    if ($script:FastInput -is [Collections.IDictionary]) {
+    if ($script:FastInput -is [pscustomobject] -or
+        $script:FastInput -is [Collections.IDictionary]) {
         $fastEvent = [string]$script:FastInput.hook_event_name
+        if (-not [string]::IsNullOrWhiteSpace($TaskContinuityExpectedEvent) -and
+            $fastEvent -ne $TaskContinuityExpectedEvent) {
+            throw "hook event '$fastEvent' did not match '$TaskContinuityExpectedEvent'"
+        }
         $fastSessionGuid = [Guid]::Empty
         $fastSessionValue = [string]$script:FastInput.session_id
         if ([Guid]::TryParse($fastSessionValue, [ref]$fastSessionGuid)) {
             $fastSessionId = $fastSessionGuid.ToString('D').ToLowerInvariant()
             $fastCapsulePath = Join-Path $script:StateDirectory "$fastSessionId.json"
             if ([System.IO.File]::Exists($fastCapsulePath)) {
-                $fastCapsule = $script:FastJsonSerializer.DeserializeObject(
-                    [System.IO.File]::ReadAllText(
-                        $fastCapsulePath,
-                        [Text.Encoding]::UTF8
-                    )
-                )
+                $fastCapsule = [System.IO.File]::ReadAllText(
+                    $fastCapsulePath,
+                    [Text.Encoding]::UTF8
+                ) | ConvertFrom-Json -ErrorAction Stop
+                $script:PrefetchedCapsule = $fastCapsule
+                $script:PrefetchedCapsulePath = $fastCapsulePath
                 $fastInputTranscript = if (
-                    -not $script:FastInput.ContainsKey('transcript_path')
+                    $null -eq $script:FastInput.PSObject.Properties['transcript_path']
                 ) {
                     $null
                 }
                 else {
                     $script:FastInput.transcript_path
                 }
-                $fastTurnMatches = if (
-                    -not $script:FastInput.ContainsKey('turn_id')
-                ) {
-                    $true
-                }
-                elseif ($null -eq $script:FastInput.turn_id) {
-                    $null -eq $fastCapsule.last_turn_id
-                }
-                else {
+                $fastTurnMatches = (
+                    $null -ne $script:FastInput.PSObject.Properties['turn_id'] -and
                     $script:FastInput.turn_id -is [string] -and
-                        [string]$script:FastInput.turn_id -eq [string]$fastCapsule.last_turn_id
-                }
+                    -not [string]::IsNullOrWhiteSpace([string]$script:FastInput.turn_id) -and
+                    [string]$script:FastInput.turn_id -eq [string]$fastCapsule.last_turn_id
+                )
                 $fastCommonMatches = (
                     [string]$fastCapsule.schema_version -eq [string]$script:SchemaVersion -and
                     [string]$fastCapsule.session_id -eq $fastSessionId -and
@@ -107,29 +111,6 @@ try {
                     $fastTurnMatches) {
                     [Console]::Out.Write($script:EmptyOutput)
                     exit 0
-                }
-
-                if ($fastCommonMatches -and $fastEvent -eq 'Stop' -and
-                    [string]$fastCapsule.last_event -eq 'Stop' -and
-                    $fastTurnMatches) {
-                    $fastAssistant = if (
-                        -not $script:FastInput.ContainsKey('last_assistant_message')
-                    ) {
-                        $null
-                    }
-                    else {
-                        $script:FastInput.last_assistant_message
-                    }
-                    $fastAssistantMatches = (
-                        ($null -eq $fastAssistant -and
-                            $null -eq $fastCapsule.last_assistant_result) -or
-                        ($fastAssistant -is [string] -and
-                            [string]$fastAssistant -eq [string]$fastCapsule.last_assistant_result)
-                    )
-                    if ($fastAssistantMatches) {
-                        [Console]::Out.Write($script:EmptyOutput)
-                        exit 0
-                    }
                 }
 
                 # SessionStart recovery must use the canonical full-snapshot
@@ -202,6 +183,14 @@ try {
                                 $fastDirty = $fastDirty.Substring(0, 1997) + '...'
                             }
                         }
+                        if ($fastDirty -eq 'clean') {
+                            $script:RepositoryStateObservation = [pscustomobject][ordered]@{
+                                working_directory = [string]$script:FastInput.cwd
+                                root = $fastRoot
+                                revision = $fastRevision
+                                dirty_summary = $fastDirty
+                            }
+                        }
                     }
                     $fastRepositoryMatches = (
                         [string]$fastCapsule.repository.root -eq [string]$fastRoot -and
@@ -210,7 +199,7 @@ try {
                     )
 
                     $fastCarriesSummary = $fastEvent -eq 'PostCompact' -and
-                        $script:FastInput.ContainsKey('compaction_summary') -and
+                        $null -ne $script:FastInput.PSObject.Properties['compaction_summary'] -and
                         -not [string]::IsNullOrWhiteSpace(
                             [string]$script:FastInput.compaction_summary
                         )
@@ -236,14 +225,22 @@ catch {
 }
 }
 
-$script:SlowImplementation = @'
+$script:SlowImplementation = {
 $script:ParsedInput = $null
 $script:InputParseError = $null
 try {
     if ([string]::IsNullOrWhiteSpace($script:RawInput)) {
         throw 'hook stdin was empty'
     }
-    $script:ParsedInput = $script:RawInput | ConvertFrom-Json -ErrorAction Stop
+    if ($script:FastInput -is [pscustomobject]) {
+        $script:ParsedInput = $script:FastInput
+    }
+    elseif ($null -ne $script:FastInputParseError) {
+        throw $script:FastInputParseError
+    }
+    else {
+        $script:ParsedInput = $script:RawInput | ConvertFrom-Json -ErrorAction Stop
+    }
 }
 catch {
     $script:InputParseError = $_.Exception
@@ -273,6 +270,12 @@ function Get-OptionalProperty {
     if ($null -eq $Object) {
         return $null
     }
+    if ($Object -is [Collections.IDictionary]) {
+        if (-not $Object.ContainsKey($Name)) {
+            return $null
+        }
+        return $Object[$Name]
+    }
     $property = $Object.PSObject.Properties[$Name]
     if ($null -eq $property) {
         return $null
@@ -286,6 +289,9 @@ function Test-HasProperty {
         [string]$Name
     )
 
+    if ($Object -is [Collections.IDictionary]) {
+        return $Object.ContainsKey($Name)
+    }
     return $null -ne $Object -and $null -ne $Object.PSObject.Properties[$Name]
 }
 
@@ -333,10 +339,21 @@ function ConvertTo-SessionId {
 }
 
 function Get-CapsulePath {
-    param([string]$SessionId)
+    param([string]$NormalizedSessionId)
 
-    $normalized = ConvertTo-SessionId -Value $SessionId
-    return Join-Path $script:StateDirectory "$normalized.json"
+    return Join-Path $script:StateDirectory "$NormalizedSessionId.json"
+}
+
+function Get-BoundedExcerpt {
+    param(
+        [AllowNull()][string]$Value,
+        [int]$MaximumCharacters
+    )
+
+    if ($null -eq $Value -or $Value.Length -le $MaximumCharacters) {
+        return $Value
+    }
+    return $Value.Substring(0, $MaximumCharacters - 3) + '...'
 }
 
 function Get-RedactedExcerpt {
@@ -372,21 +389,24 @@ function Get-RedactedExcerpt {
         '$1[REDACTED]'
     )
 
-    if ($text.Length -gt $MaximumCharacters) {
-        return $text.Substring(0, $MaximumCharacters - 3) + '...'
-    }
-    return $text
+    return Get-BoundedExcerpt -Value $text -MaximumCharacters $MaximumCharacters
 }
 
 function Get-TaskLabel {
     param([string]$Prompt)
 
     $candidate = $null
-    foreach ($line in ($Prompt -split "`n")) {
-        if (-not [string]::IsNullOrWhiteSpace($line)) {
-            $candidate = $line.Trim()
-            break
+    $reader = [System.IO.StringReader]::new($Prompt)
+    try {
+        while ($null -ne ($line = $reader.ReadLine())) {
+            if (-not [string]::IsNullOrWhiteSpace($line)) {
+                $candidate = $line.Trim()
+                break
+            }
         }
+    }
+    finally {
+        $reader.Dispose()
     }
     if ([string]::IsNullOrWhiteSpace($candidate)) {
         return 'Untitled task'
@@ -464,10 +484,14 @@ function Get-RepositoryState {
         }
 
         $rootLines = @(
-            & git.exe -C $WorkingDirectory rev-parse --show-toplevel 2>$null
+            & git.exe -C $WorkingDirectory rev-parse --show-toplevel 2>&1
         )
         if ($LASTEXITCODE -ne 0 -or $rootLines.Count -eq 0) {
-            throw 'working directory is not a Git repository'
+            $rootFailure = ($rootLines -join "`n").Trim()
+            if ($rootFailure -match '(?i)not a git repository') {
+                throw 'working directory is not a Git repository'
+            }
+            throw "Git repository root lookup failed: $rootFailure"
         }
         $root = ($rootLines -join "`n").Trim()
         if (-not [string]::IsNullOrWhiteSpace($KnownRoot) -and
@@ -482,29 +506,27 @@ function Get-RepositoryState {
         }
 
         $revision = $null
-        $dirtyLines = @()
+        $boundedDirtyLines = [Collections.Generic.List[string]]::new(50)
+        $dirtyLineCount = 0
         foreach ($statusLine in $statusLines) {
             if ($statusLine.StartsWith('# branch.oid ')) {
                 $revision = $statusLine.Substring(13).Trim()
             }
             elseif (-not $statusLine.StartsWith('# ')) {
-                $dirtyLines += $statusLine
+                $dirtyLineCount += 1
+                if ($boundedDirtyLines.Count -lt 50) {
+                    $boundedDirtyLines.Add([string]$statusLine)
+                }
             }
         }
         if ([string]::IsNullOrWhiteSpace($revision) -or $revision -eq '(initial)') {
             throw 'Git revision lookup failed'
         }
-        $boundedDirtyLines = @($dirtyLines | Select-Object -First 50)
-        $dirty = if ($boundedDirtyLines.Count -eq 0) {
-            'clean'
-        }
-        else {
-            $summary = $boundedDirtyLines -join "`n"
-            if ($dirtyLines.Count -gt 50) {
-                $summary += "`n..."
-            }
-            Get-RedactedExcerpt -Value $summary -MaximumCharacters 2000
-        }
+        $dirty = Get-DirtyRepositoryIdentity `
+            -RepositoryRoot $root `
+            -StatusLines $statusLines `
+            -BoundedDirtyLines $boundedDirtyLines `
+            -DirtyLineCount $dirtyLineCount
 
         return [pscustomobject][ordered]@{
             root = Get-RedactedExcerpt -Value $root -MaximumCharacters 1000
@@ -523,6 +545,66 @@ function New-CompactionState {
         phase = 'none'
         trigger = $null
     }
+}
+
+function Get-DirtyRepositoryIdentity {
+    param(
+        [string]$RepositoryRoot,
+        [string[]]$StatusLines,
+        [Collections.Generic.List[string]]$BoundedDirtyLines,
+        [int]$DirtyLineCount
+    )
+
+    if ($DirtyLineCount -eq 0) {
+        return 'clean'
+    }
+
+    $diffHashLines = @(
+        & git.exe -C $RepositoryRoot diff --no-ext-diff --binary HEAD |
+            & git.exe hash-object --stdin 2>$null
+    )
+    if ($LASTEXITCODE -ne 0 -or $diffHashLines.Count -ne 1) {
+        throw 'Git content hash lookup failed'
+    }
+    $identityLines = New-Object Collections.ArrayList
+    foreach ($line in $StatusLines) {
+        [void]$identityLines.Add([string]$line)
+    }
+    [void]$identityLines.Add("diff:$([string]$diffHashLines[0])")
+
+    $untrackedPaths = @(
+        & git.exe -C $RepositoryRoot ls-files --others --exclude-standard 2>$null
+    )
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Git untracked-file lookup failed'
+    }
+    foreach ($relativePath in $untrackedPaths) {
+        $hashLines = @(
+            & git.exe -C $RepositoryRoot hash-object -- ([string]$relativePath) 2>$null
+        )
+        if ($LASTEXITCODE -ne 0 -or $hashLines.Count -ne 1) {
+            throw "Git content hash failed for '$relativePath'"
+        }
+        [void]$identityLines.Add("untracked:$relativePath`:$([string]$hashLines[0])")
+    }
+
+    $identityText = [string[]]$identityLines -join "`n"
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $identityHash = [BitConverter]::ToString(
+            $sha256.ComputeHash([Text.Encoding]::UTF8.GetBytes($identityText))
+        ).Replace('-', '').ToLowerInvariant()
+    }
+    finally {
+        $sha256.Dispose()
+    }
+
+    $summary = $BoundedDirtyLines -join "`n"
+    if ($DirtyLineCount -gt 50) {
+        $summary += "`n..."
+    }
+    $display = Get-RedactedExcerpt -Value $summary -MaximumCharacters 1900
+    return "sha256:$identityHash`n$display"
 }
 
 function New-TaskState {
@@ -742,6 +824,16 @@ function Read-Capsule {
         [string]$ExpectedSessionId
     )
 
+    if ($null -ne $script:PrefetchedCapsule -and
+        [string]::Equals(
+            $script:PrefetchedCapsulePath,
+            $Path,
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+        return Assert-Capsule `
+            -Capsule $script:PrefetchedCapsule `
+            -ExpectedSessionId $ExpectedSessionId
+    }
     if (-not [System.IO.File]::Exists($Path)) {
         return $null
     }
@@ -762,7 +854,9 @@ function Get-MaterialDigest {
         continuity_epoch = $Capsule.continuity_epoch
         predecessor_thread_id = $Capsule.predecessor_thread_id
         last_turn_id = $Capsule.last_turn_id
+        last_event = $Capsule.last_event
         working_directory = $Capsule.working_directory
+        transcript_path = $Capsule.transcript_path
         task_label = $Capsule.task_label
         last_user_request = $Capsule.last_user_request
         last_assistant_result = $Capsule.last_assistant_result
@@ -820,10 +914,16 @@ function Save-Capsule {
         [object]$Capsule,
         [string]$Path,
         [AllowNull()][string]$PreviousDigest,
+        [AllowNull()][string]$MaterialDigest,
         [switch]$PreserveIfUnchanged
     )
 
-    $newDigest = Get-MaterialDigest -Capsule $Capsule
+    $newDigest = if ($null -eq $MaterialDigest) {
+        Get-MaterialDigest -Capsule $Capsule
+    }
+    else {
+        $MaterialDigest
+    }
     if ($PreserveIfUnchanged -and $null -ne $PreviousDigest -and
         $PreviousDigest -eq $newDigest) {
         return $false
@@ -847,8 +947,15 @@ function Set-CommonEventFields {
     $Capsule.working_directory = $WorkingDirectory
     $Capsule.transcript_path = $TranscriptPath
     if (Test-HasProperty -Object $InputObject -Name 'turn_id') {
-        $Capsule.last_turn_id = Get-OptionalString -Object $InputObject -Name 'turn_id'
+        $turnId = Get-OptionalString -Object $InputObject -Name 'turn_id'
+        if (-not [string]::IsNullOrWhiteSpace($turnId)) {
+            $Capsule.last_turn_id = $turnId
+            return
+        }
     }
+    # Without a host turn identity, distinct same-text receipts cannot be
+    # distinguished from redelivery. Conservatively preserve every receipt.
+    $Capsule.last_turn_id = "receipt:$([guid]::NewGuid().ToString())"
 }
 
 function Get-ForkedFromId {
@@ -905,38 +1012,15 @@ function Get-ForkedFromId {
 }
 
 function Invoke-Retention {
-    param([string]$CurrentSessionId)
+    param(
+        [string]$CurrentSessionId,
+        [string[]]$ProtectedSessionIds = @()
+    )
 
     [void][System.IO.Directory]::CreateDirectory($script:StateDirectory)
-    $currentName = "$CurrentSessionId.json"
-    $cutoff = [DateTime]::UtcNow.AddDays(-30)
-    $inactive = @(
-        Get-ChildItem -LiteralPath $script:StateDirectory -Filter '*.json' -File |
-            Where-Object { $_.Name -ne $currentName }
-    )
-
-    foreach ($file in @($inactive | Where-Object { $_.LastWriteTimeUtc -lt $cutoff })) {
-        try {
-            Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
-        }
-        catch {
-            Write-Diagnostic "retention could not remove '$($file.Name)': $($_.Exception.Message)"
-        }
-    }
-
-    $remaining = @(
-        Get-ChildItem -LiteralPath $script:StateDirectory -Filter '*.json' -File |
-            Where-Object { $_.Name -ne $currentName } |
-            Sort-Object LastWriteTimeUtc -Descending
-    )
-    foreach ($file in @($remaining | Select-Object -Skip 100)) {
-        try {
-            Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
-        }
-        catch {
-            Write-Diagnostic "retention could not remove '$($file.Name)': $($_.Exception.Message)"
-        }
-    }
+    # The v1 schema has no terminal-session marker or live lease. Age, count,
+    # and predecessor reachability cannot prove that another capsule is safe to
+    # delete, so retention remains non-destructive until that proof exists.
 }
 
 function Build-RecoveryContext {
@@ -1052,8 +1136,11 @@ function Invoke-SessionStart {
         throw "SessionStart source '$source' is invalid"
     }
 
-    Invoke-Retention -CurrentSessionId $SessionId
-    $capsulePath = Get-CapsulePath -SessionId $SessionId
+    $capsulePath = Get-CapsulePath -NormalizedSessionId $SessionId
+
+    if ($source -ne 'startup') {
+        Invoke-Retention -CurrentSessionId $SessionId
+    }
 
     if ($source -eq 'clear') {
         $existing = $null
@@ -1080,10 +1167,27 @@ function Invoke-SessionStart {
     $existing = Read-Capsule -Path $capsulePath -ExpectedSessionId $SessionId
 
     if ($source -eq 'startup') {
+        if ($null -ne $existing) {
+            $previousDigest = Get-OptionalString -Object $existing -Name 'material_digest'
+            Set-CommonEventFields `
+                -Capsule $existing `
+                -InputObject $InputObject `
+                -EventName 'SessionStart' `
+                -WorkingDirectory $WorkingDirectory `
+                -TranscriptPath $TranscriptPath
+            $existing.repository = Get-RepositoryState -WorkingDirectory $WorkingDirectory
+            [void](Save-Capsule `
+                -Capsule $existing `
+                -Path $capsulePath `
+                -PreviousDigest $previousDigest `
+                -PreserveIfUnchanged)
+            return $script:EmptyOutput
+        }
+
         $predecessorId = Get-ForkedFromId -TranscriptPath $TranscriptPath
         $seed = $null
         if ($null -ne $predecessorId) {
-            $predecessorPath = Get-CapsulePath -SessionId $predecessorId
+            $predecessorPath = Get-CapsulePath -NormalizedSessionId $predecessorId
             try {
                 $seed = Read-Capsule -Path $predecessorPath -ExpectedSessionId $predecessorId
             }
@@ -1094,6 +1198,10 @@ function Invoke-SessionStart {
                 Write-Diagnostic "predecessor capsule '$predecessorId' is unavailable"
             }
         }
+
+        Invoke-Retention `
+            -CurrentSessionId $SessionId `
+            -ProtectedSessionIds @($predecessorId)
 
         $epoch = if ($null -eq $seed) { 0 } else { [int]$seed.continuity_epoch }
         $startupCapsule = New-Capsule `
@@ -1170,7 +1278,8 @@ function Invoke-SessionStart {
 function Invoke-TaskContinuity {
     param([object]$InputObject)
 
-    if ($InputObject -isnot [pscustomobject]) {
+    if ($InputObject -isnot [pscustomobject] -and
+        $InputObject -isnot [Collections.IDictionary]) {
         throw 'hook input must be a JSON object'
     }
     if (Test-HasProperty -Object $InputObject -Name 'agent_id') {
@@ -1187,9 +1296,28 @@ function Invoke-TaskContinuity {
     )) {
         throw "hook event '$eventName' is unsupported"
     }
+    if (-not [string]::IsNullOrWhiteSpace($TaskContinuityExpectedEvent) -and
+        $eventName -ne $TaskContinuityExpectedEvent) {
+        throw "hook event '$eventName' did not match '$TaskContinuityExpectedEvent'"
+    }
     $sessionId = ConvertTo-SessionId -Value (
         Get-RequiredString -Object $InputObject -Name 'session_id'
     )
+    $sessionMutex = [Threading.Mutex]::new(
+        $false,
+        "Local\KD4TaskContinuity-$sessionId"
+    )
+    $lockAcquired = $false
+    try {
+        try {
+            $lockAcquired = $sessionMutex.WaitOne(25000)
+        }
+        catch [Threading.AbandonedMutexException] {
+            $lockAcquired = $true
+        }
+        if (-not $lockAcquired) {
+            throw "timed out waiting for continuity state lock for '$sessionId'"
+        }
     $workingDirectory = Get-RequiredString -Object $InputObject -Name 'cwd'
     $transcriptPath = Get-OptionalString -Object $InputObject -Name 'transcript_path'
 
@@ -1201,7 +1329,7 @@ function Invoke-TaskContinuity {
             -TranscriptPath $transcriptPath
     }
 
-    $capsulePath = Get-CapsulePath -SessionId $sessionId
+    $capsulePath = Get-CapsulePath -NormalizedSessionId $sessionId
     $capsule = Read-Capsule -Path $capsulePath -ExpectedSessionId $sessionId
     if ($null -eq $capsule) {
         $capsule = New-Capsule `
@@ -1231,10 +1359,17 @@ function Invoke-TaskContinuity {
     switch ($eventName) {
         'UserPromptSubmit' {
             $prompt = Get-RequiredString -Object $InputObject -Name 'prompt' -AllowEmpty
-            $capsule.last_user_request = Get-RedactedExcerpt -Value $prompt
-            $capsule.task_label = Get-TaskLabel -Prompt $capsule.last_user_request
+            $redactedPrompt = Get-RedactedExcerpt `
+                -Value $prompt `
+                -MaximumCharacters ([int]::MaxValue)
+            $capsule.last_user_request = Get-BoundedExcerpt `
+                -Value $redactedPrompt `
+                -MaximumCharacters $script:MaxExcerptChars
+            $capsule.task_label = Get-TaskLabel -Prompt $redactedPrompt
             $capsule.task_state = New-TaskState
-            $capsule.task_state.goal = Get-RedactedExcerpt -Value $prompt -MaximumCharacters 1200
+            $capsule.task_state.goal = Get-BoundedExcerpt `
+                -Value $redactedPrompt `
+                -MaximumCharacters 1200
             [void](Save-Capsule `
                 -Capsule $capsule `
                 -Path $capsulePath `
@@ -1281,36 +1416,44 @@ function Invoke-TaskContinuity {
         }
         'Stop' {
             $assistantResult = Get-OptionalString -Object $InputObject -Name 'last_assistant_message'
-            $capsule.last_assistant_result = Get-RedactedExcerpt -Value $assistantResult
-            if (-not [string]::IsNullOrWhiteSpace($assistantResult)) {
-                $capsule.task_state.current_state = Get-RedactedExcerpt `
-                    -Value $assistantResult `
+            $redactedAssistantResult = Get-RedactedExcerpt `
+                -Value $assistantResult `
+                -MaximumCharacters ([int]::MaxValue)
+            $capsule.last_assistant_result = Get-BoundedExcerpt `
+                -Value $redactedAssistantResult `
+                -MaximumCharacters $script:MaxExcerptChars
+            if (-not [string]::IsNullOrWhiteSpace($redactedAssistantResult)) {
+                $capsule.task_state.current_state = Get-BoundedExcerpt `
+                    -Value $redactedAssistantResult `
                     -MaximumCharacters 1200
-                $capsule.task_state.evidence = Get-RedactedExcerpt `
-                    -Value $assistantResult `
+                $capsule.task_state.evidence = Get-BoundedExcerpt `
+                    -Value $redactedAssistantResult `
                     -MaximumCharacters 1200
-                $capsule.task_state.completed_work = Get-RedactedExcerpt `
-                    -Value $assistantResult `
-                    -MaximumCharacters 1200
-                $capsule.task_state.unresolved_work = $null
-                $capsule.task_state.next_action = 'Await the next user request.'
             }
 
+            $capsule.repository = Get-RepositoryState `
+                -WorkingDirectory $workingDirectory `
+                -KnownRoot $knownRepositoryRoot
             $fastDigest = Get-MaterialDigest -Capsule $capsule
             if ($null -ne $previousDigest -and $fastDigest -eq $previousDigest) {
                 return $script:EmptyOutput
             }
-            $capsule.repository = Get-RepositoryState `
-                -WorkingDirectory $workingDirectory `
-                -KnownRoot $knownRepositoryRoot
             [void](Save-Capsule `
                 -Capsule $capsule `
                 -Path $capsulePath `
                 -PreviousDigest $previousDigest `
+                -MaterialDigest $fastDigest `
                 -PreserveIfUnchanged)
         }
     }
     return $script:EmptyOutput
+    }
+    finally {
+        if ($lockAcquired) {
+            [void]$sessionMutex.ReleaseMutex()
+        }
+        $sessionMutex.Dispose()
+    }
 }
 
 $hookOutput = $script:EmptyOutput
@@ -1330,8 +1473,7 @@ catch {
 
 [Console]::Out.Write($hookOutput)
 exit 0
-'@
+}
 
-$slowScriptBlock = [ScriptBlock]::Create($script:SlowImplementation)
-& $slowScriptBlock
+& $script:SlowImplementation
 exit 0

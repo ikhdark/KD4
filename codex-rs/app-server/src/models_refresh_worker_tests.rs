@@ -98,10 +98,37 @@ async fn defers_initial_refresh_then_refreshes_periodically_and_stops_when_dropp
 
     tokio::time::advance(refresh_interval).await;
     endpoint.wait_for_fetch_count(/*expected*/ 2).await;
-    drop(worker);
-    endpoint.release_second_fetch.notify_one();
+    worker.shutdown_and_wait().await;
+    assert_eq!(Arc::strong_count(&models_manager), 1);
     tokio::time::advance(refresh_interval * 2).await;
     tokio::task::yield_now().await;
 
     assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_cancels_and_joins_an_inflight_refresh() {
+    let codex_home = tempdir().expect("temp dir");
+    let endpoint = TestModelsEndpoint::new();
+    let models_manager: SharedModelsManager = Arc::new(OpenAiModelsManager::new(
+        codex_home.path().to_path_buf(),
+        endpoint.clone(),
+        /*auth_manager*/ None,
+        Arc::new(|| "test-provider-identity".to_string()),
+    ));
+    let refresh_interval = Duration::from_secs(10);
+    let worker = spawn_with_interval(
+        &models_manager,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        refresh_interval,
+    );
+
+    tokio::time::advance(refresh_interval).await;
+    endpoint.wait_for_fetch_count(1).await;
+    tokio::time::advance(refresh_interval).await;
+    endpoint.wait_for_fetch_count(2).await;
+
+    worker.shutdown_and_wait().await;
+
+    assert!(worker.task.lock().expect("worker task lock").is_none());
 }

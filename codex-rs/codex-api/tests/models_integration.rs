@@ -2,7 +2,8 @@ use codex_api::AuthProvider;
 use codex_api::ModelsClient;
 use codex_api::Provider;
 use codex_api::RetryConfig;
-use codex_client::ReqwestTransport;
+use codex_http_client::HttpClientBuilder;
+use codex_http_client::ReqwestTransport;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::ModelInfo;
@@ -117,7 +118,10 @@ async fn models_client_hits_models_endpoint() {
         .mount(&server)
         .await;
 
-    let transport = ReqwestTransport::new(reqwest::Client::new());
+    let http_client = HttpClientBuilder::new()
+        .build_direct()
+        .expect("local test HTTP client should build");
+    let transport = ReqwestTransport::from_http_client(http_client);
     let provider = provider(&base_url);
     let request_url = ModelsClient::<ReqwestTransport>::request_url(&provider, "0.1.0");
     let client = ModelsClient::new(transport, provider, Arc::new(DummyAuth));

@@ -25,6 +25,8 @@ use codex_rollout::state_integration::StateDbHandle;
 use codex_thread_store::ThreadStore;
 
 use crate::outgoing_message::OutgoingMessageSender;
+#[cfg(test)]
+use crate::thread_state::THREAD_LISTENER_COMMAND_CAPACITY;
 use crate::thread_state::ThreadListenerCommand;
 use crate::thread_state::ThreadStateManager;
 #[cfg(test)]
@@ -128,9 +130,16 @@ impl ExtensionEventSink for AppServerExtensionEventSink {
                         turn_id: turn_id.clone(),
                         goal: goal.clone(),
                     };
-                    match listener_command_tx.send(command) {
+                    match listener_command_tx.try_send(command) {
                         Ok(()) => return,
-                        Err(_) => {
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            tracing::warn!(
+                                %thread_id,
+                                capacity = crate::thread_state::THREAD_LISTENER_COMMAND_CAPACITY,
+                                "extension goal update exceeded listener command capacity; sending an explicit unordered fallback notification"
+                            );
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                             tracing::warn!(
                                 "failed to enqueue extension goal update for {thread_id}: listener command channel is closed"
                             );
@@ -202,6 +211,7 @@ mod tests {
         }
         listener_command_tx
             .send(ThreadListenerCommand::EmitThreadGoalCleared)
+            .await
             .expect("listener command channel should be open");
 
         let mut observed = Vec::new();
@@ -232,7 +242,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn listener_command_admission_preserves_every_ordered_update() {
+    async fn listener_command_admission_is_bounded_with_observable_overflow() {
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel(4);
         let outgoing = Arc::new(OutgoingMessageSender::new(
             outgoing_tx,
@@ -244,7 +254,7 @@ mod tests {
         thread_state_manager.register_listener_command_tx(thread_id, listener_command_tx);
         let sink = app_server_extension_event_sink(outgoing, thread_state_manager);
 
-        const COMMAND_COUNT: usize = 300;
+        const COMMAND_COUNT: usize = THREAD_LISTENER_COMMAND_CAPACITY + 1;
         for index in 0..COMMAND_COUNT {
             sink.emit(thread_goal_updated_event(
                 thread_id,
@@ -252,12 +262,22 @@ mod tests {
             ));
         }
 
-        assert_eq!(listener_command_rx.len(), COMMAND_COUNT);
-        assert!(
-            outgoing_rx.try_recv().is_err(),
-            "listener commands must not escape FIFO via broadcast fallback"
-        );
-        for index in 0..COMMAND_COUNT {
+        assert_eq!(listener_command_rx.len(), THREAD_LISTENER_COMMAND_CAPACITY);
+        let overflow = outgoing_rx
+            .try_recv()
+            .expect("overload must surface as an explicit fallback notification");
+        let crate::outgoing_message::OutgoingEnvelope::Broadcast { message } = overflow else {
+            panic!("expected a broadcast overflow notification");
+        };
+        let crate::outgoing_message::OutgoingMessage::AppServerNotification(
+            ServerNotification::ThreadGoalUpdated(overflow),
+        ) = message
+        else {
+            panic!("expected an overflow goal notification");
+        };
+        let overflow_turn_id = format!("turn-{THREAD_LISTENER_COMMAND_CAPACITY}");
+        assert_eq!(overflow.turn_id.as_deref(), Some(overflow_turn_id.as_str()));
+        for index in 0..THREAD_LISTENER_COMMAND_CAPACITY {
             let command = listener_command_rx
                 .recv()
                 .await

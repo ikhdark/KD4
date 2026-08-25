@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::FunctionCallError;
+use crate::agent::task_capabilities::ExternalMutationIntent;
 use crate::mcp_tool_call::handle_mcp_tool_call;
 use crate::task_evidence::ExternalEvidenceCapture;
 use crate::tools::context::McpToolOutput;
@@ -48,6 +49,64 @@ impl McpHandler {
     fn hook_tool_name(&self) -> HookToolName {
         HookToolName::new(ensure_mcp_prefix(&join_tool_name(&self.tool_name())))
     }
+
+    pub(crate) fn external_mutation_intent(&self) -> ExternalMutationIntent {
+        let tool_name = self.tool_name();
+        let read_only = self
+            .tool_info
+            .tool
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.read_only_hint)
+            .unwrap_or_else(|| is_allowlisted_read_only_external_tool(&tool_name));
+        if read_only {
+            ExternalMutationIntent::ProvenReadOnly
+        } else {
+            ExternalMutationIntent::MayMutate
+        }
+    }
+}
+
+pub(crate) fn is_allowlisted_read_only_external_tool(name: &ToolName) -> bool {
+    matches!(
+        (name.namespace.as_deref(), name.name.as_str()),
+        (
+            Some("mcp__repo_atlas"),
+            "batch"
+                | "cochange"
+                | "context_for"
+                | "contract"
+                | "crate_graph"
+                | "crate_summary"
+                | "find_def"
+                | "find_refs"
+                | "impact"
+                | "index_status"
+                | "outline"
+                | "repo_facts"
+                | "select_root"
+                | "slice"
+                | "trace"
+                | "where_belongs"
+        ) | (
+            Some("mcp__codex_apps__github"),
+            "fetch"
+                | "fetch_blob"
+                | "fetch_commit"
+                | "fetch_commit_workflow_runs"
+                | "fetch_file"
+                | "fetch_issue"
+                | "fetch_issue_comments"
+                | "fetch_pr"
+                | "fetch_pr_comments"
+                | "fetch_pr_file_patch"
+                | "fetch_pr_patch"
+                | "fetch_workflow_job_logs"
+                | "fetch_workflow_job_steps"
+                | "fetch_workflow_run_artifacts"
+                | "fetch_workflow_run_jobs"
+        )
+    )
 }
 
 fn join_tool_name(tool_name: &ToolName) -> String {
@@ -91,7 +150,10 @@ impl ToolExecutor<ToolInvocation> for McpHandler {
                 .unwrap_or(false)
     }
 
-    fn search_info(&self) -> Option<ToolSearchInfo> {
+    fn search_info_for_registered_spec(
+        &self,
+        registered_spec: &ToolSpec,
+    ) -> Option<ToolSearchInfo> {
         let source_name = self
             .tool_info
             .connector_name
@@ -112,7 +174,7 @@ impl ToolExecutor<ToolInvocation> for McpHandler {
 
         ToolSearchInfo::from_spec(
             build_mcp_search_text(&self.tool_info),
-            self.spec(),
+            registered_spec.clone(),
             source_info,
         )
     }

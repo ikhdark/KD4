@@ -76,7 +76,7 @@ async fn renews_cache_ttl_on_matching_models_etag() -> Result<()> {
             RefreshStrategy::OnlineIfUncached,
             codex_core::test_support::default_http_client_factory(),
         )
-        .await;
+        .await?;
 
     let cache_path = config.codex_home.join(CACHE_FILE);
     let stale_time = Utc.timestamp_opt(0, 0).single().expect("valid epoch");
@@ -95,6 +95,7 @@ async fn renews_cache_ttl_on_matching_models_etag() -> Result<()> {
     .await;
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(PermissionProfile::Disabled, test.cwd_path());
+    let refresh_started_at = Utc::now();
 
     codex
         .submit(Op::UserInput {
@@ -124,12 +125,24 @@ async fn renews_cache_ttl_on_matching_models_etag() -> Result<()> {
         .await?;
 
     let _ = wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    let refresh_finished_at = Utc::now();
 
     let refreshed_cache = read_cache(&cache_path).await?;
     assert!(
-        refreshed_cache.fetched_at > stale_time,
-        "cache TTL should be renewed"
+        refreshed_cache.fetched_at >= refresh_started_at
+            && refreshed_cache.fetched_at <= refresh_finished_at,
+        "cache TTL should be renewed to the response-processing interval; got {} outside {}..={}",
+        refreshed_cache.fetched_at,
+        refresh_started_at,
+        refresh_finished_at,
     );
+    assert_eq!(refreshed_cache.etag.as_deref(), Some(ETAG));
+    assert_eq!(
+        refreshed_cache.client_version,
+        Some(client_version_to_whole())
+    );
+    assert!(refreshed_cache.provider_cache_identity.is_some());
+    assert_eq!(refreshed_cache.models, vec![remote_model]);
     assert_eq!(
         models_mock.requests().len(),
         1,
@@ -144,7 +157,7 @@ async fn renews_cache_ttl_on_matching_models_etag() -> Result<()> {
             RefreshStrategy::Offline,
             codex_core::test_support::default_http_client_factory(),
         )
-        .await;
+        .await?;
     assert!(
         offline_models
             .iter()
@@ -182,7 +195,7 @@ async fn uses_cache_when_version_matches() -> Result<()> {
             RefreshStrategy::OnlineIfUncached,
             codex_core::test_support::default_http_client_factory(),
         )
-        .await;
+        .await?;
     assert!(
         seed_models
             .iter()
@@ -205,7 +218,7 @@ async fn uses_cache_when_version_matches() -> Result<()> {
             RefreshStrategy::OnlineIfUncached,
             codex_core::test_support::default_http_client_factory(),
         )
-        .await;
+        .await?;
 
     assert!(
         models.iter().any(|preset| preset.model == VERSIONED_MODEL),
@@ -256,7 +269,7 @@ async fn refreshes_when_cache_version_missing() -> Result<()> {
             RefreshStrategy::OnlineIfUncached,
             codex_core::test_support::default_http_client_factory(),
         )
-        .await;
+        .await?;
 
     assert!(
         models.iter().any(|preset| preset.model == "remote-missing"),
@@ -275,28 +288,64 @@ async fn refreshes_when_cache_version_missing() -> Result<()> {
 async fn refreshes_when_cache_version_differs() -> Result<()> {
     let server = MockServer::start().await;
     let cached_model = test_remote_model(DIFFERENT_VERSION_MODEL, /*priority*/ 1);
-    let models_response = ModelsResponse {
-        models: vec![test_remote_model("remote-different", /*priority*/ 2)],
-    };
-    let mut models_mocks = Vec::new();
-    for _ in 0..3 {
-        models_mocks.push(responses::mount_models_once(&server, models_response.clone()).await);
-    }
+    let refreshed_model = test_remote_model("remote-different", /*priority*/ 2);
+    let home = Arc::new(TempDir::new()?);
 
-    let mut builder = test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
-    builder = builder
-        .with_pre_build_hook(move |home| {
-            let client_version = client_version_to_whole();
-            let cache = ModelsCache {
-                fetched_at: Utc::now(),
-                etag: None,
-                client_version: Some(format!("{client_version}-diff")),
-                provider_cache_identity: None,
-                models: vec![cached_model],
-            };
-            let cache_path = home.join(CACHE_FILE);
-            write_cache_sync(&cache_path, &cache).expect("write cache");
-        })
+    // Seed through the real manager so the cache contains the exact provider/auth identity
+    // that the restarted manager will require.
+    let seed_mock = responses::mount_models_once(
+        &server,
+        ModelsResponse {
+            models: vec![cached_model.clone()],
+        },
+    )
+    .await;
+    let mut seed_builder = test_codex()
+        .with_home(Arc::clone(&home))
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(|config| {
+            config.model_provider.request_max_retries = Some(0);
+        });
+    let seed_test = seed_builder.build(&server).await?;
+    let seeded_models = seed_test
+        .thread_manager
+        .get_models_manager()
+        .list_models(
+            RefreshStrategy::OnlineIfUncached,
+            codex_core::test_support::default_http_client_factory(),
+        )
+        .await?;
+    assert!(
+        seeded_models
+            .iter()
+            .any(|preset| preset.model == DIFFERENT_VERSION_MODEL),
+        "expected seeded model"
+    );
+    assert_eq!(seed_mock.requests().len(), 1, "expected one seed request");
+    drop(seed_test);
+
+    let cache_path = home.path().join(CACHE_FILE);
+    let mut stale_cache = read_cache(&cache_path).await?;
+    let seeded_identity = stale_cache
+        .provider_cache_identity
+        .clone()
+        .expect("real manager should persist a provider cache identity");
+    stale_cache.client_version = Some(format!("{}-diff", client_version_to_whole()));
+    stale_cache.models = vec![cached_model];
+    write_cache(&cache_path, &stale_cache).await?;
+
+    let models_mock = responses::mount_models_once(
+        &server,
+        ModelsResponse {
+            models: vec![refreshed_model.clone()],
+        },
+    )
+    .await;
+
+    let refresh_started_at = Utc::now();
+    let mut builder = test_codex()
+        .with_home(Arc::clone(&home))
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(|config| {
             config.model_provider.request_max_retries = Some(0);
         });
@@ -308,7 +357,8 @@ async fn refreshes_when_cache_version_differs() -> Result<()> {
             RefreshStrategy::OnlineIfUncached,
             codex_core::test_support::default_http_client_factory(),
         )
-        .await;
+        .await?;
+    let refresh_finished_at = Utc::now();
 
     assert!(
         models
@@ -316,10 +366,61 @@ async fn refreshes_when_cache_version_differs() -> Result<()> {
             .any(|preset| preset.model == "remote-different"),
         "expected refreshed models"
     );
-    let models_request_count: usize = models_mocks.iter().map(|mock| mock.requests().len()).sum();
+    assert_eq!(
+        models_mock.requests().len(),
+        1,
+        "/models should be called exactly once when cache version differs"
+    );
+
+    let cache = read_cache(&cache_path).await?;
     assert!(
-        models_request_count >= 1,
-        "/models should be called when cache version differs"
+        cache.fetched_at >= refresh_started_at && cache.fetched_at <= refresh_finished_at,
+        "refreshed cache timestamp should come from the refresh interval"
+    );
+    assert_eq!(cache.etag, None);
+    assert_eq!(
+        cache.client_version,
+        Some(client_version_to_whole()),
+        "refreshed cache should record the current client version"
+    );
+    assert_eq!(
+        cache.provider_cache_identity,
+        Some(seeded_identity),
+        "refresh should preserve the current provider/auth identity"
+    );
+    assert_eq!(
+        cache.models,
+        vec![refreshed_model],
+        "refreshed cache should replace stale model metadata on disk"
+    );
+    drop(test);
+
+    // A fresh manager must consume the repaired cache without another network request.
+    let mut restart_builder = test_codex()
+        .with_home(home)
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(|config| {
+            config.model_provider.request_max_retries = Some(0);
+        });
+    let restarted = restart_builder.build(&server).await?;
+    let restarted_models = restarted
+        .thread_manager
+        .get_models_manager()
+        .list_models(
+            RefreshStrategy::OnlineIfUncached,
+            codex_core::test_support::default_http_client_factory(),
+        )
+        .await?;
+    assert!(
+        restarted_models
+            .iter()
+            .any(|preset| preset.model == "remote-different"),
+        "restarted manager should use repaired cache"
+    );
+    assert_eq!(
+        models_mock.requests().len(),
+        1,
+        "restarted manager should not refetch the repaired cache"
     );
 
     Ok(())

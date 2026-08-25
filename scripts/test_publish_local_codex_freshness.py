@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 
 from pathlib import Path
+import json
 import os
+import subprocess
 import tempfile
 import unittest
 
 from scripts.publish_local_codex_test_support import PublishLocalCodexTestBase
+from scripts.publish_local_codex_test_support import ps_single_quote
+
+
+SCRIPT = Path(__file__).resolve().parent / "publish-local-codex.ps1"
 
 
 FIXTURE_TIME = 946684900
@@ -13,6 +19,35 @@ FRESH_SOURCE_TIME = FIXTURE_TIME + 10_000
 
 
 class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
+    def test_audit_publish_unknown_timestamps_fail_closed_as_stale(self) -> None:
+        command = rf"""
+. {ps_single_quote(SCRIPT)} -ImportOnly
+[pscustomobject]@{{
+    missingSource = Test-FileStaleAgainstSource -SourceNewestUtc $null -FileLastWriteUtc ([DateTime]::UtcNow)
+    missingArtifact = Test-FileStaleAgainstSource -SourceNewestUtc ([DateTime]::UtcNow) -FileLastWriteUtc $null
+    malformed = Test-FileStaleAgainstSource -SourceNewestUtc 'not-a-time' -FileLastWriteUtc ([DateTime]::UtcNow)
+}} | ConvertTo-Json -Compress
+"""
+        result = subprocess.run(
+            [
+                self.shell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                command,
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {"missingSource": True, "missingArtifact": True, "malformed": True},
+        )
+
     def test_apply_skips_replacement_when_target_hash_matches_source(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

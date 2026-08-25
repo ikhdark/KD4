@@ -74,6 +74,29 @@ fn test_absolute_path() -> AbsolutePathBuf {
 }
 
 #[test]
+fn managed_hooks_requirements_default_interrupt_to_empty() {
+    let value = json!({
+        "managedDir": null,
+        "windowsManagedDir": null,
+        "PreToolUse": [],
+        "PermissionRequest": [],
+        "PostToolUse": [],
+        "PreCompact": [],
+        "PostCompact": [],
+        "SessionStart": [],
+        "UserPromptSubmit": [],
+        "SubagentStart": [],
+        "SubagentStop": [],
+        "Stop": []
+    });
+
+    let parsed: ManagedHooksRequirements =
+        serde_json::from_value(value).expect("deserialize managed hooks requirements");
+
+    assert_eq!(parsed.interrupt, Vec::new());
+}
+
+#[test]
 fn thread_sources_round_trip_as_scalar_labels() {
     for (source, label) in [
         (ThreadSource::User, "user"),

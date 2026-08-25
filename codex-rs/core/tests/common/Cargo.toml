@@ -24,6 +24,7 @@ codex-exec-server = { workspace = true }
 codex-home = { workspace = true }
 codex-features = { workspace = true }
 codex-hooks = { workspace = true }
+codex-http-client = { workspace = true }
 codex-login = { workspace = true }
 codex-model-provider-info = { workspace = true }
 codex-models-manager = { workspace = true }
@@ -50,5 +51,5 @@ wiremock = { workspace = true }
 zstd = { workspace = true }
 
 [dev-dependencies]
+http = { workspace = true }
 pretty_assertions = { workspace = true }
-reqwest = { workspace = true }

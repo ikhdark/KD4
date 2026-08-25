@@ -27,10 +27,6 @@
             "null"
           ]
         },
-        "requiresDesktopActivation": {
-          "default": false,
-          "type": "boolean"
-        },
         "risks": {
           "items": {
             "type": "string"

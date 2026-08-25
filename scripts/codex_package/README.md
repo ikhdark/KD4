@@ -12,22 +12,27 @@ Run the canonical wrapper from the repository root:
 python scripts/build_codex_package.py \
   --target x86_64-pc-windows-msvc \
   --cargo-profile release \
+  --release-version 0.133.0 \
   --package-dir dist/codex-package \
-  --archive-output dist/codex-package-x86_64-pc-windows-msvc.zip
+  --release-dir dist/release
 ```
 
 The wrapper routes to `codex_package.cli.main` and is the canonical packaging
-entrypoint in this fork. Upstream release automation may wrap it to supply signed
-or prebuilt artifacts and create additional archive formats, but those `.github`
-workflow scripts are not present in this checkout.
+entrypoint in this fork. `--release-dir` emits the exact archive name consumed by
+the standalone installer together with `codex-package_SHA256SUMS` and an
+artifact/source provenance manifest. The repository-local npm staging command
+can consume the resulting package tree with `--vendor-src`; a GitHub workflow is
+not required.
 
 ## Package Layout
 
-The layout version remains `1`:
+The layout version is `2`:
 
 ```text
 .
 ├── codex-package.json
+├── LICENSE
+├── NOTICE
 ├── bin
 │   ├── <entrypoint>.exe
 │   └── codex-code-mode-host.exe
@@ -47,9 +52,10 @@ entrypoint because the runtime discovers it as a sibling process.
 ## Inputs And Source Builds
 
 Without overrides, Cargo builds the entrypoint, code-mode host, and required
-platform helpers in one package target lane. Release callers should pass the
-already signed artifacts with `--entrypoint-bin`, `--code-mode-host-bin`, and
-the applicable helper flags.
+platform helpers in one package target lane. `--release-version` is embedded
+into the source-built CLI and reused by package metadata. Explicit binary
+inputs are accepted only when their PE target matches the requested package;
+the resulting manifest binds every input digest into one bundle identity.
 
 `--reuse-source-builds` reuses outputs only when the target/profile/variant,
 source-tree fingerprint, and output fingerprints match. `--force-source-rebuild`
@@ -59,9 +65,8 @@ or source-build reuse flags.
 
 The CLI validates package/archive destinations,
 duplicate outputs, and compression compatibility before starting Cargo builds
-or downloads. `--reuse-package-dir` removes only package-managed paths and
-preserves unrelated local contents; those unmanaged paths are excluded from
-canonical archives.
+or downloads. `--reuse-package-dir` removes every prior entry before staging so
+residue can never leak into a release.
 
 ## DotSlash Resources
 
@@ -76,7 +81,9 @@ successful validation.
 
 Supported outputs are `.tar.gz`, `.tgz`, `.tar.zst`, and `.zip`. Archive writes
 use a same-directory temporary file and atomically replace the destination, so a
-failed forced rebuild preserves the previous archive.
+failed forced rebuild preserves the previous archive. Tar and ZIP metadata is
+normalized for byte-reproducible output. `.tar.zst` additionally requires the
+explicit `CODEX_ZSTD` executable and matching `CODEX_ZSTD_SHA256` digest.
 
 Run the focused suite with:
 

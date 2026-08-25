@@ -60,7 +60,7 @@ pub(super) fn extract_external_evidence_metadata(
     if meta
         .get("operation")
         .and_then(Value::as_str)
-        .is_none_or(str::is_empty)
+        .is_none_or(|operation| operation.trim().is_empty())
     {
         return Err("MCP evidenceMeta operation is malformed and was ignored");
     }

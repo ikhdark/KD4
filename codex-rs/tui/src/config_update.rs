@@ -85,7 +85,7 @@ pub(crate) fn build_service_tier_selection_edits(service_tier: Option<&str>) -> 
                 SERVICE_TIER_DEFAULT_REQUEST_VALUE
             } else {
                 match codex_protocol::config_types::ServiceTier::from_request_value(service_tier) {
-                    Some(codex_protocol::config_types::ServiceTier::Fast) => "fast",
+                    Some(codex_protocol::config_types::ServiceTier::Fast) => "priority",
                     Some(codex_protocol::config_types::ServiceTier::Flex) => "flex",
                     None => service_tier,
                 }

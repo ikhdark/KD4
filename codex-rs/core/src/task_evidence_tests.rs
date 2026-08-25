@@ -412,7 +412,6 @@ fn legacy_task_evidence_fixture(
             "runtime_paths": [],
             "generated_artifacts": [],
             "risks": [],
-            "requires_desktop_activation": false,
             "edit_paths": [],
             "validation_receipt_ids": []
         }],
@@ -427,7 +426,6 @@ fn legacy_task_evidence_fixture(
         "risks": [],
         "validation_epoch": null,
         "wiring_receipt": null,
-        "desktop_activation_receipt": null,
         "repair_turns_used": 0,
         "completion": {
             "status": "passed",
@@ -724,6 +722,20 @@ async fn external_evidence_blank_producer_is_ignored_with_warning() {
                 .is_empty(),
             "{producer:?}"
         );
+    }
+}
+
+#[tokio::test]
+async fn external_evidence_blank_operation_is_ignored_with_warning() {
+    for operation in ["", "   ", "\t\r\n"] {
+        let mut result = evidence_result("test-provider", "diagnostic", serde_json::json!({}));
+        result.structured_content.as_mut().expect("structured")["evidenceMeta"]["operation"] =
+            serde_json::json!(operation);
+        assert_external_evidence_rejected(
+            &result,
+            "MCP evidenceMeta operation is malformed and was ignored",
+        )
+        .await;
     }
 }
 
@@ -1379,7 +1391,6 @@ fn plan_item(id: &str, status: StepStatus) -> PlanItemArg {
         runtime_paths: vec![format!("src/{id}.rs")],
         generated_artifacts: Vec::new(),
         risks: Vec::new(),
-        requires_desktop_activation: false,
         validation_route: None,
     }
 }
@@ -1655,7 +1666,7 @@ async fn legacy_planning_fact_is_rendered_as_unverified_evidence() {
     assert_eq!(legacy_fact.provenance, ResultProvenance::Unverified);
     assert_eq!(legacy_fact.source, None);
     assert!(legacy_fact.depends_on_paths.is_empty());
-    assert!(legacy_fact.dependencies_current);
+    assert!(!legacy_fact.dependencies_current);
 
     let (_temp, _repo, ledger) = ledger_fixture().await;
     let update = PlanningUpdateInput {
@@ -2399,7 +2410,6 @@ fn repository_wide_validation_coverage_invalidates_for_disjoint_mutations() {
         runtime_paths: Vec::new(),
         generated_artifacts: Vec::new(),
         risks: Vec::new(),
-        requires_desktop_activation: false,
         validation_route: Some(focused_validation_route(Vec::new())),
         external_validation_route: None,
         validation_disposition: ValidationDisposition::Executable,
@@ -2753,7 +2763,6 @@ async fn migration_repairs_duplicate_command_receipts_without_reopening_current_
         runtime_paths: Vec::new(),
         generated_artifacts: Vec::new(),
         risks: Vec::new(),
-        requires_desktop_activation: false,
         validation_route: None,
         external_validation_route: None,
         validation_disposition: ValidationDisposition::NotRequired,
@@ -2797,7 +2806,6 @@ async fn migration_drops_unattributed_legacy_file_hashes() {
         runtime_paths: Vec::new(),
         generated_artifacts: Vec::new(),
         risks: Vec::new(),
-        requires_desktop_activation: false,
         validation_route: None,
         external_validation_route: None,
         validation_disposition: ValidationDisposition::NotRequired,
@@ -3405,11 +3413,10 @@ async fn generated_artifact_gate_checks_current_file_state() {
 }
 
 #[tokio::test]
-async fn skipped_step_artifact_and_desktop_requirements_do_not_block_completion() {
+async fn skipped_step_artifact_requirements_do_not_block_completion() {
     let (_temp, _repo, ledger) = ledger_fixture().await;
     let mut skipped = plan_item("skipped", StepStatus::Skipped);
     skipped.generated_artifacts = vec!["generated/missing.json".to_string()];
-    skipped.requires_desktop_activation = true;
     ledger.record_plan_update(&plan_with(vec![skipped])).await;
 
     let gate = ledger.completion_gate().await.expect("completion gate");
@@ -3420,7 +3427,6 @@ async fn skipped_step_artifact_and_desktop_requirements_do_not_block_completion(
     let document = guard.as_ref().expect("document");
     assert!(declared_generated_artifact_requirements(document).is_empty());
     assert!(document.latest_generated_artifact_hashes.is_empty());
-    assert!(document.desktop_activation_receipt.is_none());
 }
 
 #[tokio::test]
@@ -3441,7 +3447,6 @@ async fn current_schema_reload_removes_stale_skipped_step_requirements() {
     let ledger = TaskEvidenceLedger::load_or_new(codex_home.clone(), thread_id, &repo).await;
     let mut skipped = plan_item("skipped", StepStatus::Skipped);
     skipped.generated_artifacts = vec!["generated/missing.json".to_string()];
-    skipped.requires_desktop_activation = true;
     ledger.record_plan_update(&plan_with(vec![skipped])).await;
     drop(ledger);
 
@@ -3870,7 +3875,6 @@ async fn rich_v4_to_v5_migration_preserves_evidence_and_seeds_terminal_lineage()
             "runtime_paths": ["core/runtime/prepare"],
             "generated_artifacts": ["generated/out.json"],
             "risks": ["preserve the v4 contract"],
-            "requires_desktop_activation": false,
             "edit_paths": ["src/owned.rs"]
         },
         {
@@ -3882,7 +3886,6 @@ async fn rich_v4_to_v5_migration_preserves_evidence_and_seeds_terminal_lineage()
             "runtime_paths": ["core/runtime/verify"],
             "generated_artifacts": [],
             "risks": [],
-            "requires_desktop_activation": false,
             "edit_paths": []
         }
     ]);
@@ -3967,13 +3970,6 @@ async fn rich_v4_to_v5_migration_preserves_evidence_and_seeds_terminal_lineage()
         "resolved": true,
         "epoch": 7
     }]);
-    v4["desktop_activation_receipt"] = serde_json::json!({
-        "epoch": 7,
-        "recorded_at": "2026-07-31T23:58:04Z",
-        "process_path": "C:/legacy/codex.exe",
-        "binary_sha1": "0123456789abcdef0123456789abcdef01234567",
-        "runtime_evidence": "legacy desktop restarted"
-    });
     v4["next_edit_receipt_sequence"] = serde_json::json!(2);
     v4["next_command_receipt_sequence"] = serde_json::json!(2);
     v4["next_external_evidence_receipt_sequence"] = serde_json::json!(1);
@@ -4049,27 +4045,6 @@ async fn rich_v4_to_v5_migration_preserves_evidence_and_seeds_terminal_lineage()
                 .iter()
                 .any(|risk| { risk.id == "legacy-observed-risk" && risk.resolved })
         );
-        let activation = document
-            .desktop_activation_receipt
-            .as_ref()
-            .expect("legacy activation receipt");
-        assert_eq!(
-            activation.process_path.as_deref(),
-            Some("C:/legacy/codex.exe")
-        );
-        assert_eq!(
-            activation.binary_sha1.as_deref(),
-            Some("0123456789abcdef0123456789abcdef01234567")
-        );
-        assert_eq!(
-            activation.runtime_evidence.as_deref(),
-            Some("legacy desktop restarted")
-        );
-        assert!(!desktop_activation_receipt_is_complete(
-            activation,
-            &DesktopActivationRuntimeSnapshot::default(),
-            document,
-        ));
         assert_eq!(
             document.completion.as_ref().map(|gate| gate.status),
             Some(TaskCompletionStatus::Passed)
@@ -5688,310 +5663,6 @@ fn unreadable_risk_ids_are_stable() {
     assert!(edit_outcome_succeeded("completed"));
     assert!(!edit_outcome_succeeded(" completed "));
     assert!(!edit_outcome_succeeded("failed"));
-}
-
-#[test]
-fn legacy_self_asserted_desktop_activation_receipts_never_satisfy_completion() {
-    let receipt = DesktopActivationReceipt {
-        trusted_producer_version: 0,
-        publisher_evidence_id: String::new(),
-        thread_id: String::new(),
-        epoch: 7,
-        activation_obligation_identity: String::new(),
-        activation_timestamp: "2026-08-02T12:00:01Z".to_string(),
-        process_path: None,
-        binary_sha1: None,
-        runtime_evidence: None,
-        expected_installed_executable_path: "C:/local/codex.exe".to_string(),
-        installed_executable_sha256: "b".repeat(64),
-        running_process_id: 4101,
-        running_process_identity: "self-asserted running process".to_string(),
-        observed_running_executable_path: "C:/local/codex.exe".to_string(),
-        observed_running_executable_sha256: "b".repeat(64),
-        desktop_process_id: 4100,
-        desktop_process_identity: "self-asserted Desktop process".to_string(),
-        desktop_executable_path: "C:/local/Codex.exe".to_string(),
-        initialization_observation_identity: String::new(),
-        post_restart_initialization_observation: "self-asserted initialization".to_string(),
-        observation_timestamp: "2026-08-02T12:00:01Z".to_string(),
-        implementation_identity_hash: Some("a".repeat(64)),
-        publish_identity: String::new(),
-        install_generation: 0,
-        authoritative_install_evidence_hash: String::new(),
-        authenticated_host_channel_identity: String::new(),
-        challenge_identity: String::new(),
-        challenge_expires_at: String::new(),
-        publish_install_timestamp: String::new(),
-        bootstrap_consumed_timestamp: String::new(),
-        challenge_issued_timestamp: String::new(),
-        running_executable_observed_timestamp: String::new(),
-    };
-
-    assert!(!desktop_activation_receipt_matches_live_proof_at(
-        &receipt,
-        &DesktopActivationRuntimeSnapshot::default(),
-        &desktop_test_obligation(&"a".repeat(64)),
-        None,
-        desktop_test_timestamp("2026-08-02T12:00:01Z"),
-    ));
-}
-
-fn desktop_test_timestamp(value: &str) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(value)
-        .expect("valid desktop test timestamp")
-        .with_timezone(&Utc)
-}
-
-fn desktop_test_executable_path() -> &'static str {
-    "C:/Program Files/Codex/codex.exe"
-}
-
-fn desktop_test_obligation(implementation_identity: &str) -> DesktopActivationObligation {
-    DesktopActivationObligation {
-        thread_id: "thread-1".to_string(),
-        evidence_epoch: 3,
-        implementation_identity: implementation_identity.to_string(),
-        activation_obligation_identity: format!("obligation-{implementation_identity}"),
-        requiring_plan_step_ids: vec!["desktop-step".to_string()],
-    }
-}
-
-fn authenticated_desktop_install_source(
-    obligation: &DesktopActivationObligation,
-) -> DesktopInstallEvidenceSource {
-    DesktopInstallEvidenceSource::AuthenticatedHostBootstrap {
-        channel_identity: "native-host-channel-1".to_string(),
-        peer_identity: "publisher-record-1".to_string(),
-        evidence: Box::new(AuthoritativeDesktopInstallEvidence {
-            schema_version: DESKTOP_INSTALL_EVIDENCE_SCHEMA_VERSION,
-            trusted_producer_version: DESKTOP_INSTALL_EVIDENCE_SCHEMA_VERSION,
-            publisher_evidence_id: "publisher-record-1".to_string(),
-            thread_id: obligation.thread_id.clone(),
-            evidence_epoch: obligation.evidence_epoch,
-            implementation_identity_hash: obligation.implementation_identity.clone(),
-            activation_obligation_identity: obligation.activation_obligation_identity.clone(),
-            publish_identity: "a".repeat(64),
-            install_generation: 7,
-            expected_installed_executable_path: desktop_test_executable_path().to_string(),
-            installed_executable_sha256: "a".repeat(64),
-            issued_at: "2026-08-14T12:00:00Z".to_string(),
-            expires_at: "2026-08-14T12:10:00Z".to_string(),
-        }),
-    }
-}
-
-fn desktop_running_process() -> DesktopRunningProcessObservation {
-    DesktopRunningProcessObservation {
-        process_id: 4242,
-        process_identity: "pid-4242-start-100".to_string(),
-        executable_path: desktop_test_executable_path().to_string(),
-        executable_sha256: "a".repeat(64),
-        observed_at: "2026-08-14T12:00:02Z".to_string(),
-    }
-}
-
-#[tokio::test]
-async fn desktop_activation_attestation_service_owns_serialization_and_runtime_state() {
-    let service = DesktopActivationAttestationService::default();
-
-    assert_eq!(service.gate.available_permits(), 1);
-    assert_eq!(
-        service.snapshot(),
-        DesktopActivationRuntimeSnapshot::default()
-    );
-
-    let permit = service.acquire().await.expect("activation gate is open");
-    assert_eq!(service.gate.available_permits(), 0);
-    drop(permit);
-    assert_eq!(service.gate.available_permits(), 1);
-}
-
-#[test]
-fn desktop_activation_cannot_issue_a_challenge_without_authenticated_host_transport() {
-    let now = desktop_test_timestamp("2026-08-14T12:00:03Z");
-    let obligation = desktop_test_obligation(&"b".repeat(64));
-    let mut runtime = DesktopActivationRuntimeState::default();
-
-    assert_eq!(
-        runtime.prepare_challenge(
-            &obligation,
-            desktop_running_process(),
-            "nonce-1",
-            "2026-08-14T12:00:01Z",
-            now,
-        ),
-        Err(DesktopActivationVerificationError::NoAuthenticatedHostTransport)
-    );
-    assert_eq!(
-        runtime.snapshot(),
-        DesktopActivationRuntimeSnapshot::default()
-    );
-}
-
-#[test]
-fn authenticated_desktop_activation_is_exact_live_and_single_use() {
-    let now = desktop_test_timestamp("2026-08-14T12:00:04Z");
-    let implementation_identity = "b".repeat(64);
-    let obligation = desktop_test_obligation(&implementation_identity);
-    let mut runtime = DesktopActivationRuntimeState {
-        install_evidence_source: authenticated_desktop_install_source(&obligation),
-        ..DesktopActivationRuntimeState::default()
-    };
-    let challenge = runtime
-        .prepare_challenge(
-            &obligation,
-            desktop_running_process(),
-            "nonce-1",
-            "2026-08-14T12:00:01Z",
-            now,
-        )
-        .expect("authenticated evidence issues a challenge");
-    let acknowledgement = DesktopActivationAcknowledgement {
-        challenge_identity: challenge.challenge_identity.clone(),
-        authenticated_host_channel_identity: challenge.authenticated_host_channel_identity.clone(),
-        initialized_process_id: challenge.running_process.process_id,
-        initialized_process_identity: challenge.running_process.process_identity,
-        desktop_process_id: 8080,
-        desktop_process_identity: "desktop-pid-8080-start-50".to_string(),
-        desktop_executable_path: "C:/Program Files/Codex Desktop/Codex.exe".to_string(),
-        initialization_observation_identity: "desktop-initialized-pid-4242".to_string(),
-        observed_at: "2026-08-14T12:00:04Z".to_string(),
-    };
-    let receipt = runtime
-        .complete_challenge(acknowledgement.clone(), now)
-        .expect("exact acknowledgement completes activation");
-    let snapshot = runtime.snapshot();
-
-    assert!(desktop_activation_receipt_matches_live_proof_at(
-        &receipt,
-        &snapshot,
-        &obligation,
-        None,
-        now,
-    ));
-    let mut tampered = receipt.clone();
-    tampered.publish_identity.push_str("-tampered");
-    assert!(!desktop_activation_receipt_matches_live_proof_at(
-        &tampered,
-        &snapshot,
-        &obligation,
-        None,
-        now,
-    ));
-    assert_eq!(
-        runtime.complete_challenge(acknowledgement, now),
-        Err(DesktopActivationVerificationError::ChallengeMissingOrConsumed)
-    );
-    assert!(!desktop_activation_receipt_matches_live_proof_at(
-        &receipt,
-        &DesktopActivationRuntimeSnapshot::default(),
-        &obligation,
-        None,
-        now,
-    ));
-    let DesktopInstallEvidenceSource::AuthenticatedHostBootstrap { evidence, .. } =
-        &mut runtime.install_evidence_source
-    else {
-        unreachable!("test helper always returns authenticated evidence");
-    };
-    evidence.publish_identity.push_str("-mutated");
-    assert!(!desktop_activation_receipt_matches_live_proof_at(
-        &receipt,
-        &runtime.snapshot(),
-        &obligation,
-        None,
-        now,
-    ));
-    assert!(!desktop_activation_receipt_matches_live_proof_at(
-        &receipt,
-        &snapshot,
-        &obligation,
-        None,
-        now + ChronoDuration::seconds(DESKTOP_ACTIVATION_CHALLENGE_TTL_SECONDS + 1),
-    ));
-}
-
-#[test]
-fn desktop_activation_rejects_circular_and_mismatched_expected_identity() {
-    let now = desktop_test_timestamp("2026-08-14T12:00:03Z");
-    let implementation_identity = "b".repeat(64);
-    let obligation = desktop_test_obligation(&implementation_identity);
-    let mut runtime = DesktopActivationRuntimeState {
-        install_evidence_source: authenticated_desktop_install_source(&obligation),
-        ..DesktopActivationRuntimeState::default()
-    };
-    let mut wrong_running_binary = desktop_running_process();
-    wrong_running_binary.executable_path = "C:/tmp/running-codex.exe".to_string();
-
-    assert_eq!(
-        runtime.prepare_challenge(
-            &obligation,
-            wrong_running_binary,
-            "nonce-1",
-            "2026-08-14T12:00:01Z",
-            now,
-        ),
-        Err(DesktopActivationVerificationError::RunningExecutableMismatch)
-    );
-    let mismatched_obligation = desktop_test_obligation(&"c".repeat(64));
-    assert_eq!(
-        runtime.prepare_challenge(
-            &mismatched_obligation,
-            desktop_running_process(),
-            "nonce-2",
-            "2026-08-14T12:00:01Z",
-            now,
-        ),
-        Err(DesktopActivationVerificationError::ImplementationIdentityMismatch)
-    );
-
-    let mut stale_source = authenticated_desktop_install_source(&obligation);
-    let DesktopInstallEvidenceSource::AuthenticatedHostBootstrap { evidence, .. } =
-        &mut stale_source
-    else {
-        unreachable!("test helper always returns authenticated evidence");
-    };
-    evidence.issued_at = "2026-08-14T12:00:04Z".to_string();
-    runtime.install_evidence_source = stale_source;
-    assert_eq!(
-        runtime.prepare_challenge(
-            &obligation,
-            desktop_running_process(),
-            "nonce-stale",
-            "2026-08-14T12:00:01Z",
-            now,
-        ),
-        Err(DesktopActivationVerificationError::AuthoritativeEvidenceStale)
-    );
-    runtime.install_evidence_source = authenticated_desktop_install_source(&obligation);
-
-    let challenge = runtime
-        .prepare_challenge(
-            &obligation,
-            desktop_running_process(),
-            "nonce-3",
-            "2026-08-14T12:00:01Z",
-            now,
-        )
-        .expect("valid challenge");
-    assert_eq!(
-        runtime.complete_challenge(
-            DesktopActivationAcknowledgement {
-                challenge_identity: challenge.challenge_identity,
-                authenticated_host_channel_identity: "different-channel".to_string(),
-                initialized_process_id: challenge.running_process.process_id,
-                initialized_process_identity: challenge.running_process.process_identity,
-                desktop_process_id: 8080,
-                desktop_process_identity: "desktop-pid-8080-start-50".to_string(),
-                desktop_executable_path: "C:/Program Files/Codex Desktop/Codex.exe".to_string(),
-                initialization_observation_identity: "desktop-initialized-pid-4242".to_string(),
-                observed_at: "2026-08-14T12:00:03Z".to_string(),
-            },
-            now,
-        ),
-        Err(DesktopActivationVerificationError::AuthenticatedChannelMismatch)
-    );
-    assert!(runtime.snapshot().live_proof.is_none());
 }
 
 #[tokio::test]

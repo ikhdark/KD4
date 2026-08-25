@@ -69,7 +69,19 @@ pub trait ToolExecutor<Invocation>: Send + Sync {
 
     fn search_info(&self) -> Option<ToolSearchInfo> {
         let spec = self.spec();
-        ToolSearchInfo::from_tool_spec(spec, /*source_info*/ None)
+        self.search_info_for_registered_spec(&spec)
+    }
+
+    /// Builds search metadata from the registry's authoritative spec snapshot.
+    ///
+    /// Hosts should use this after registration instead of asking the runtime
+    /// to regenerate its spec. The separate method preserves the existing
+    /// extension-facing `search_info` contract.
+    fn search_info_for_registered_spec(
+        &self,
+        registered_spec: &ToolSpec,
+    ) -> Option<ToolSearchInfo> {
+        ToolSearchInfo::from_tool_spec(registered_spec.clone(), /*source_info*/ None)
     }
 
     fn supports_parallel_tool_calls(&self) -> bool {

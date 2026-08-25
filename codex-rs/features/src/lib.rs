@@ -477,6 +477,17 @@ pub fn user_settable_feature_for_key(key: &str) -> Option<Feature> {
     canonical_feature_for_key(key).filter(|feature| !matches!(feature.stage(), Stage::Internal))
 }
 
+/// Resolves a feature key accepted by managed feature requirements.
+///
+/// Requirements retain a bounded compatibility alias that is deliberately not
+/// accepted by current user-facing feature configuration.
+pub fn feature_requirement_for_key(key: &str) -> Option<Feature> {
+    match key {
+        "auto_review" => Some(Feature::GuardianApproval),
+        _ => user_settable_feature_for_key(key),
+    }
+}
+
 /// Feature definitions exposed by current catalogs and listing commands.
 pub fn user_settable_features() -> impl Iterator<Item = &'static FeatureSpec> {
     FEATURES

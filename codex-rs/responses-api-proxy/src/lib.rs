@@ -7,20 +7,19 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use clap::Parser;
-use codex_http_client::build_blocking_reqwest_client_with_custom_ca;
-use reqwest::Url;
-use reqwest::blocking::Client;
-use reqwest::header::AUTHORIZATION;
-use reqwest::header::HOST;
-use reqwest::header::HeaderMap;
-use reqwest::header::HeaderName;
-use reqwest::header::HeaderValue;
+use codex_http_client::BlockingHttpClient;
+use codex_http_client::BlockingHttpClientBuilder;
+use http::HeaderMap;
+use http::HeaderName;
+use http::HeaderValue;
+use http::Uri;
+use http::header::AUTHORIZATION;
+use http::header::HOST;
 use serde::Serialize;
 use tiny_http::Header;
 use tiny_http::Method;
@@ -65,8 +64,9 @@ struct ServerInfo {
     pid: u32,
 }
 
+#[derive(Debug)]
 struct ForwardConfig {
-    upstream_url: Url,
+    upstream_url: String,
     host_header: HeaderValue,
 }
 
@@ -74,19 +74,7 @@ struct ForwardConfig {
 pub fn run_main(args: Args) -> Result<()> {
     let auth_header = read_auth_header_from_stdin()?;
 
-    let upstream_url = Url::parse(&args.upstream_url).context("parsing --upstream-url")?;
-    let host = match (upstream_url.host_str(), upstream_url.port()) {
-        (Some(host), Some(port)) => format!("{host}:{port}"),
-        (Some(host), None) => host.to_string(),
-        _ => return Err(anyhow!("upstream URL must include a host")),
-    };
-    let host_header =
-        HeaderValue::from_str(&host).context("constructing Host header from upstream URL")?;
-
-    let forward_config = Arc::new(ForwardConfig {
-        upstream_url,
-        host_header,
-    });
+    let forward_config = Arc::new(parse_forward_config(args.upstream_url)?);
     let dump_dir = args
         .dump_dir
         .map(ExchangeDumper::new)
@@ -101,12 +89,11 @@ pub fn run_main(args: Args) -> Result<()> {
     let server = Server::from_listener(listener, None)
         .map_err(|err| anyhow!("creating HTTP server: {err}"))?;
     let client = Arc::new(
-        build_blocking_reqwest_client_with_custom_ca(
-            Client::builder()
-                // Disable reqwest's 30s default so long-lived response streams keep flowing.
-                .timeout(None::<Duration>),
-        )
-        .context("building reqwest client")?,
+        BlockingHttpClientBuilder::new()
+            // Disable the transport's default timeout so long-lived response streams keep flowing.
+            .request_timeout(None)
+            .build_with_transport_default_proxy()
+            .context("building HTTP client")?,
     );
 
     eprintln!("responses-api-proxy listening on {bound_addr}");
@@ -137,6 +124,27 @@ pub fn run_main(args: Args) -> Result<()> {
     Err(anyhow!("server stopped unexpectedly"))
 }
 
+fn parse_forward_config(upstream_url: String) -> Result<ForwardConfig> {
+    let upstream_uri = upstream_url
+        .parse::<Uri>()
+        .context("parsing --upstream-url")?;
+    if !matches!(upstream_uri.scheme_str(), Some("http") | Some("https")) {
+        return Err(anyhow!("upstream URL must use http or https"));
+    }
+    let host = match (upstream_uri.host(), upstream_uri.port_u16()) {
+        (Some(host), Some(port)) => format!("{host}:{port}"),
+        (Some(host), None) => host.to_string(),
+        _ => return Err(anyhow!("upstream URL must include a host")),
+    };
+    let host_header =
+        HeaderValue::from_str(&host).context("constructing Host header from upstream URL")?;
+
+    Ok(ForwardConfig {
+        upstream_url,
+        host_header,
+    })
+}
+
 fn bind_listener(port: Option<u16>) -> Result<(TcpListener, SocketAddr)> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port.unwrap_or(0)));
     let listener = TcpListener::bind(addr).with_context(|| format!("failed to bind {addr}"))?;
@@ -163,7 +171,7 @@ fn write_server_info(path: &Path, port: u16) -> Result<()> {
 }
 
 fn forward_request(
-    client: &Client,
+    client: &BlockingHttpClient,
     auth_header: &'static str,
     config: &ForwardConfig,
     dump_dir: Option<&ExchangeDumper>,
@@ -223,16 +231,14 @@ fn forward_request(
     headers.insert(HOST, config.host_header.clone());
 
     let upstream_resp = client
-        .post(config.upstream_url.clone())
+        .post(&config.upstream_url)
         .headers(headers)
         .body(body)
         .send()
         .context("forwarding request to upstream")?;
 
-    // We have to create an adapter between a `reqwest::blocking::Response`
-    // and a `tiny_http::Response`. Fortunately, `reqwest::blocking::Response`
-    // implements `Read`, so we can use it directly as the body of the
-    // `tiny_http::Response`.
+    // The shared blocking response implements `Read`, so it can be used directly
+    // as the body of the `tiny_http::Response`.
     let status = upstream_resp.status();
     let mut response_headers = Vec::new();
     for (name, value) in upstream_resp.headers().iter() {
@@ -274,4 +280,26 @@ fn forward_request(
 
     let _ = req.respond(response);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forward_config_uses_http_uri_and_preserves_explicit_port() {
+        let config = parse_forward_config("http://127.0.0.1:4318/v1/responses".to_string())
+            .expect("parse forward config");
+
+        assert_eq!(config.upstream_url, "http://127.0.0.1:4318/v1/responses");
+        assert_eq!(config.host_header.to_str().unwrap(), "127.0.0.1:4318");
+    }
+
+    #[test]
+    fn forward_config_rejects_non_http_scheme() {
+        let error = parse_forward_config("file:///tmp/responses".to_string())
+            .expect_err("file URL should be rejected");
+
+        assert!(error.to_string().contains("must use http or https"));
+    }
 }

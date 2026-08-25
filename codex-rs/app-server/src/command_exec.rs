@@ -65,6 +65,16 @@ pub(crate) fn validate_command_argv(command: &[String]) -> Result<(), JSONRPCErr
     Ok(())
 }
 
+fn attach_connection_cancellation(
+    exec_request: &mut ExecRequest,
+    connection_cancellation: CancellationToken,
+) {
+    exec_request.expiration = exec_request
+        .expiration
+        .clone()
+        .with_cancellation(connection_cancellation);
+}
+
 #[derive(Clone)]
 pub(crate) struct CommandExecManager {
     sessions: Arc<Mutex<HashMap<ConnectionProcessId, CommandExecSession>>>,
@@ -249,6 +259,8 @@ impl CommandExecManager {
                     .ok_or_else(|| invalid_request("connection is closed"))??;
             }
             let sessions = Arc::clone(&self.sessions);
+            let mut exec_request = exec_request;
+            attach_connection_cancellation(&mut exec_request, connection_cancellation.clone());
             tokio::spawn(async move {
                 let _started_network_proxy = started_network_proxy;
                 let (delivery_relay, delivery_handle) = if stream_stdout_stderr {
@@ -1114,6 +1126,20 @@ mod tests {
             })
             .await
             .expect("streaming windows sandbox exec should start");
+    }
+
+    #[tokio::test]
+    async fn windows_sandbox_exec_inherits_connection_cancellation() {
+        let connection_cancellation = CancellationToken::new();
+        let mut request = windows_sandbox_exec_request();
+        attach_connection_cancellation(&mut request, connection_cancellation.clone());
+
+        connection_cancellation.cancel();
+
+        assert_eq!(
+            request.expiration.wait_with_outcome().await,
+            ExecExpirationOutcome::Cancelled
+        );
     }
 
     #[tokio::test]

@@ -15,10 +15,6 @@ experimentalApi: boolean,
  */
 requestAttestation: boolean,
 /**
- * Opt into the trusted Desktop activation obligation/challenge/receipt API.
- */
-desktopActivationReceipts?: boolean,
-/**
  * Allow downstream MCP servers to request OpenAI extended form elicitations.
  */
 mcpServerOpenaiFormElicitation?: boolean,

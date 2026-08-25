@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import shlex
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -37,7 +38,7 @@ def repo_root() -> Path:
 
 
 def run(args: Sequence[str], *, cwd: Path) -> int:
-    print("$ " + " ".join(str(arg) for arg in args), flush=True)
+    print("$ " + shlex.join(str(arg) for arg in args), flush=True)
     try:
         return subprocess.run(list(args), cwd=cwd).returncode
     except OSError as error:

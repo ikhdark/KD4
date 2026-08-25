@@ -6,6 +6,7 @@ use codex_http_client::HttpClientFactory;
 use codex_login::AuthManager;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::config_types::CollaborationModeMask;
+use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CoreResult;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
@@ -119,13 +120,13 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
         &self,
         refresh_strategy: RefreshStrategy,
         http_client_factory: HttpClientFactory,
-    ) -> ModelsManagerFuture<'_, Vec<ModelPreset>> {
+    ) -> ModelsManagerFuture<'_, CoreResult<Vec<ModelPreset>>> {
         Box::pin(
             async move {
                 let catalog = self
                     .raw_model_catalog(refresh_strategy, http_client_factory)
-                    .await;
-                self.build_available_models(catalog.models)
+                    .await?;
+                Ok(self.build_available_models(catalog.models))
             }
             .instrument(tracing::info_span!(
                 "list_models",
@@ -139,12 +140,12 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
         &self,
         refresh_strategy: RefreshStrategy,
         http_client_factory: HttpClientFactory,
-    ) -> ModelsManagerFuture<'_, Arc<Vec<ModelPreset>>> {
+    ) -> ModelsManagerFuture<'_, CoreResult<Arc<Vec<ModelPreset>>>> {
         Box::pin(async move {
-            Arc::new(
+            Ok(Arc::new(
                 self.list_models(refresh_strategy, http_client_factory)
-                    .await,
-            )
+                    .await?,
+            ))
         })
     }
 
@@ -153,7 +154,7 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
         &self,
         refresh_strategy: RefreshStrategy,
         http_client_factory: HttpClientFactory,
-    ) -> ModelsManagerFuture<'_, ModelsResponse>;
+    ) -> ModelsManagerFuture<'_, CoreResult<ModelsResponse>>;
 
     /// Return the current in-memory remote model catalog without refreshing or loading cache state.
     fn get_remote_models(&self) -> ModelsManagerFuture<'_, Vec<ModelInfo>>;
@@ -204,15 +205,15 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
         allow_provider_model_fallback: bool,
         refresh_strategy: RefreshStrategy,
         http_client_factory: HttpClientFactory,
-    ) -> ModelsManagerFuture<'a, String> {
+    ) -> ModelsManagerFuture<'a, CoreResult<String>> {
         Box::pin(
             async move {
                 if let Some(model) = model.as_ref() {
-                    return model.to_string();
+                    return Ok(model.to_string());
                 }
                 default_model_from_available(
                     self.list_models(refresh_strategy, http_client_factory)
-                        .await,
+                        .await?,
                 )
             }
             .instrument(tracing::info_span!(
@@ -353,7 +354,7 @@ impl ModelState {
             return false;
         }
 
-        self.replace_remote_models(load_bundled_models().unwrap_or_default());
+        self.replace_remote_models(load_bundled_models_or_panic());
         self.etag = None;
         self.active_cache_identity = cache_identity;
         true
@@ -434,7 +435,7 @@ impl OpenAiModelsManager {
         let cache_manager =
             ModelsCacheManager::new(cache_path, DEFAULT_MODEL_CACHE_TTL, cache_identity);
         let active_cache_identity = cache_manager.current_identity();
-        let remote_models = load_bundled_models().unwrap_or_default();
+        let remote_models = load_bundled_models_or_panic();
         Self {
             state: RwLock::new(ModelState::new(remote_models, None, active_cache_identity)),
             cache_manager,
@@ -471,12 +472,12 @@ impl ModelsManager for OpenAiModelsManager {
         &self,
         refresh_strategy: RefreshStrategy,
         http_client_factory: HttpClientFactory,
-    ) -> ModelsManagerFuture<'_, Vec<ModelPreset>> {
+    ) -> ModelsManagerFuture<'_, CoreResult<Vec<ModelPreset>>> {
         Box::pin(async move {
-            self.list_models_shared(refresh_strategy, http_client_factory)
-                .await
-                .as_ref()
-                .clone()
+            let models = self
+                .list_models_shared(refresh_strategy, http_client_factory)
+                .await?;
+            Ok(models.as_ref().clone())
         })
     }
 
@@ -484,23 +485,20 @@ impl ModelsManager for OpenAiModelsManager {
         &self,
         refresh_strategy: RefreshStrategy,
         http_client_factory: HttpClientFactory,
-    ) -> ModelsManagerFuture<'_, Arc<Vec<ModelPreset>>> {
+    ) -> ModelsManagerFuture<'_, CoreResult<Arc<Vec<ModelPreset>>>> {
         Box::pin(async move {
-            if let Err(err) = self
-                .refresh_available_models(refresh_strategy, &http_client_factory)
-                .await
-            {
-                error!("failed to refresh available models: {err}");
-            }
+            self.refresh_available_models(refresh_strategy, &http_client_factory)
+                .await?;
             self.ensure_current_cache_identity().await;
             let uses_codex_backend = self
                 .auth_manager()
                 .is_some_and(AuthManager::current_auth_uses_codex_backend);
-            self.state
+            Ok(self
+                .state
                 .read()
                 .await
                 .available_models
-                .for_auth(uses_codex_backend)
+                .for_auth(uses_codex_backend))
         })
     }
 
@@ -508,7 +506,7 @@ impl ModelsManager for OpenAiModelsManager {
         &self,
         refresh_strategy: RefreshStrategy,
         http_client_factory: HttpClientFactory,
-    ) -> ModelsManagerFuture<'_, ModelsResponse> {
+    ) -> ModelsManagerFuture<'_, CoreResult<ModelsResponse>> {
         Box::pin(OpenAiModelsManager::raw_model_catalog(
             self,
             refresh_strategy,
@@ -578,16 +576,12 @@ impl OpenAiModelsManager {
         &self,
         refresh_strategy: RefreshStrategy,
         http_client_factory: HttpClientFactory,
-    ) -> ModelsResponse {
-        if let Err(err) = self
-            .refresh_available_models(refresh_strategy, &http_client_factory)
-            .await
-        {
-            error!("failed to refresh available models: {err}");
-        }
-        ModelsResponse {
+    ) -> CoreResult<ModelsResponse> {
+        self.refresh_available_models(refresh_strategy, &http_client_factory)
+            .await?;
+        Ok(ModelsResponse {
             models: self.get_remote_models().await,
-        }
+        })
     }
 
     fn submit_etag_notice(self: Arc<Self>, etag: String, http_client_factory: HttpClientFactory) {
@@ -783,7 +777,7 @@ impl OpenAiModelsManager {
         if !self.should_refresh_models().await {
             match refresh_strategy {
                 RefreshStrategy::Offline | RefreshStrategy::OnlineIfUncached => {
-                    self.try_load_cache().await;
+                    self.try_load_cache().await?;
                 }
                 RefreshStrategy::Online => {
                     // This no-op route has no cache or fetch operation to own
@@ -797,12 +791,12 @@ impl OpenAiModelsManager {
         match refresh_strategy {
             RefreshStrategy::Offline => {
                 // Only try to load from cache, never fetch
-                self.try_load_cache().await;
+                self.try_load_cache().await?;
                 Ok(())
             }
             RefreshStrategy::OnlineIfUncached => {
                 // Try cache first, fall back to online if unavailable
-                if self.try_load_cache().await {
+                if self.try_load_cache().await? {
                     info!("models cache: using cached models for OnlineIfUncached");
                     return Ok(());
                 }
@@ -984,7 +978,7 @@ impl OpenAiModelsManager {
         if should_use_remote_models_only {
             models
         } else {
-            let mut existing_models = load_bundled_models().unwrap_or_default();
+            let mut existing_models = load_bundled_models_or_panic();
             let mut existing_indices: HashMap<String, usize> = existing_models
                 .iter()
                 .enumerate()
@@ -1003,7 +997,7 @@ impl OpenAiModelsManager {
     }
 
     /// Attempt to satisfy the refresh from the cache when its complete identity and TTL match.
-    async fn try_load_cache(&self) -> bool {
+    async fn try_load_cache(&self) -> CoreResult<bool> {
         let load_identity = self.ensure_current_cache_identity().await;
         let _timer =
             codex_otel::start_global_timer("codex.remote_models.load_cache.duration_ms", &[]);
@@ -1012,17 +1006,17 @@ impl OpenAiModelsManager {
         let cache = match self
             .cache_manager
             .load_fresh_for_identity(&client_version, &load_identity)
-            .await
+            .await?
         {
             Some(cache) => cache,
             None => {
                 info!("models cache: no usable cache entry");
-                return false;
+                return Ok(false);
             }
         };
         if !self.cache_manager.identity_is_current(&load_identity) {
             self.ensure_current_cache_identity().await;
-            return false;
+            return Ok(false);
         }
         let models = cache.models.clone();
         if !self
@@ -1034,18 +1028,18 @@ impl OpenAiModelsManager {
             .await
         {
             self.ensure_current_cache_identity().await;
-            return false;
+            return Ok(false);
         }
         if !self.cache_manager.identity_is_current(&load_identity) {
             self.ensure_current_cache_identity().await;
-            return false;
+            return Ok(false);
         }
         info!(
             models_count = models.len(),
             etag = ?cache.etag,
             "models cache: cache entry applied"
         );
-        true
+        Ok(true)
     }
 }
 
@@ -1054,7 +1048,7 @@ impl ModelsManager for StaticModelsManager {
         &self,
         _refresh_strategy: RefreshStrategy,
         _http_client_factory: HttpClientFactory,
-    ) -> ModelsManagerFuture<'_, Vec<ModelPreset>> {
+    ) -> ModelsManagerFuture<'_, CoreResult<Vec<ModelPreset>>> {
         Box::pin(async move {
             #[cfg(test)]
             self.list_models_calls
@@ -1062,10 +1056,11 @@ impl ModelsManager for StaticModelsManager {
             let uses_codex_backend = self
                 .auth_manager()
                 .is_some_and(AuthManager::current_auth_uses_codex_backend);
-            self.available_models
+            Ok(self
+                .available_models
                 .for_auth(uses_codex_backend)
                 .as_ref()
-                .clone()
+                .clone())
         })
     }
 
@@ -1073,12 +1068,12 @@ impl ModelsManager for StaticModelsManager {
         &self,
         _refresh_strategy: RefreshStrategy,
         _http_client_factory: HttpClientFactory,
-    ) -> ModelsManagerFuture<'_, Arc<Vec<ModelPreset>>> {
+    ) -> ModelsManagerFuture<'_, CoreResult<Arc<Vec<ModelPreset>>>> {
         Box::pin(async move {
             let uses_codex_backend = self
                 .auth_manager()
                 .is_some_and(AuthManager::current_auth_uses_codex_backend);
-            self.available_models.for_auth(uses_codex_backend)
+            Ok(self.available_models.for_auth(uses_codex_backend))
         })
     }
 
@@ -1088,15 +1083,15 @@ impl ModelsManager for StaticModelsManager {
         allow_provider_model_fallback: bool,
         refresh_strategy: RefreshStrategy,
         http_client_factory: HttpClientFactory,
-    ) -> ModelsManagerFuture<'a, String> {
+    ) -> ModelsManagerFuture<'a, CoreResult<String>> {
         Box::pin(
             async move {
                 if !allow_provider_model_fallback && let Some(model) = model.as_ref() {
-                    return model.clone();
+                    return Ok(model.clone());
                 }
                 let available_models = self
                     .list_models(refresh_strategy, http_client_factory)
-                    .await;
+                    .await?;
                 let requested_model = model.as_deref();
 
                 if allow_provider_model_fallback {
@@ -1104,7 +1099,7 @@ impl ModelsManager for StaticModelsManager {
                         || requested_model_is_sol(requested_model))
                         && let Some(requested_model) = requested_model
                     {
-                        return requested_model.to_string();
+                        return Ok(requested_model.to_string());
                     }
                     return default_model_from_available(available_models);
                 }
@@ -1124,11 +1119,11 @@ impl ModelsManager for StaticModelsManager {
         &self,
         _refresh_strategy: RefreshStrategy,
         _http_client_factory: HttpClientFactory,
-    ) -> ModelsManagerFuture<'_, ModelsResponse> {
+    ) -> ModelsManagerFuture<'_, CoreResult<ModelsResponse>> {
         Box::pin(async move {
-            ModelsResponse {
+            Ok(ModelsResponse {
                 models: self.get_remote_models().await,
-            }
+            })
         })
     }
 
@@ -1179,13 +1174,21 @@ fn load_bundled_models() -> Result<Vec<ModelInfo>, std::io::Error> {
     Ok(crate::bundled_models()?.models.clone())
 }
 
-fn default_model_from_available(available: Vec<ModelPreset>) -> String {
+fn load_bundled_models_or_panic() -> Vec<ModelInfo> {
+    require_bundled_models(load_bundled_models())
+}
+
+fn require_bundled_models(result: Result<Vec<ModelInfo>, std::io::Error>) -> Vec<ModelInfo> {
+    result.unwrap_or_else(|err| panic!("bundled model catalog must load: {err}"))
+}
+
+fn default_model_from_available(available: Vec<ModelPreset>) -> CoreResult<String> {
     available
         .iter()
         .find(|model| model.is_default)
         .or_else(|| available.first())
         .map(|model| model.model.clone())
-        .unwrap_or_default()
+        .ok_or_else(|| CodexErr::Fatal("model catalog does not contain a usable model".to_string()))
 }
 
 fn requested_model_is_available(

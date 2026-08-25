@@ -22,12 +22,14 @@ use codex_exec_server::HttpResponseBodyStream;
 use futures::StreamExt;
 use futures::stream;
 use futures::stream::BoxStream;
-use reqwest::StatusCode;
-use reqwest::header::ACCEPT;
-use reqwest::header::AUTHORIZATION;
-use reqwest::header::CONTENT_TYPE;
-use reqwest::header::HeaderMap;
-use reqwest::header::HeaderName;
+use http::HeaderMap;
+use http::HeaderName;
+use http::HeaderValue;
+use http::StatusCode;
+use http::header::ACCEPT;
+use http::header::AUTHORIZATION;
+use http::header::CONTENT_TYPE;
+use http::header::WWW_AUTHENTICATE;
 use rmcp::model::ClientJsonRpcMessage;
 use rmcp::model::ClientNotification;
 use rmcp::model::ConstString;
@@ -40,6 +42,7 @@ use rmcp::transport::streamable_http_client::StreamableHttpError;
 use rmcp::transport::streamable_http_client::StreamableHttpPostResponse;
 use sse_stream::Sse;
 use sse_stream::SseStream;
+use url::Url;
 
 mod www_authenticate;
 
@@ -95,7 +98,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
         message: ClientJsonRpcMessage,
         session_id: Option<Arc<str>>,
         auth_token: Option<String>,
-        custom_headers: HashMap<HeaderName, reqwest::header::HeaderValue>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> std::result::Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
         let (mcp_method, mcp_request_id) = client_jsonrpc_message_fields(&message);
         let has_session_id = session_id.is_some();
@@ -168,8 +171,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
             ));
         }
         if response.status == StatusCode::UNAUTHORIZED.as_u16()
-            && let Some(header) =
-                response_header(&response.headers, reqwest::header::WWW_AUTHENTICATE)
+            && let Some(header) = response_header(&response.headers, WWW_AUTHENTICATE)
         {
             return Err(StreamableHttpError::AuthRequired(AuthRequiredError::new(
                 header,
@@ -236,7 +238,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
         uri: Arc<str>,
         session: Arc<str>,
         auth_token: Option<String>,
-        custom_headers: HashMap<HeaderName, reqwest::header::HeaderValue>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> std::result::Result<(), StreamableHttpError<Self::Error>> {
         let mut headers = self.default_headers.clone();
         headers.extend(custom_headers);
@@ -290,7 +292,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
         session_id: Arc<str>,
         last_event_id: Option<String>,
         auth_token: Option<String>,
-        custom_headers: HashMap<HeaderName, reqwest::header::HeaderValue>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> std::result::Result<
         BoxStream<'static, std::result::Result<Sse, sse_stream::Error>>,
         StreamableHttpError<Self::Error>,
@@ -439,20 +441,14 @@ fn log_post_message_http_error(
     has_session_id: bool,
     has_authorization_header: bool,
 ) {
-    let parsed_url = reqwest::Url::parse(uri).ok();
+    let parsed_url = Url::parse(uri).ok();
     tracing::warn!(
-        endpoint_scheme = parsed_url
-            .as_ref()
-            .map(reqwest::Url::scheme)
-            .unwrap_or("<invalid>"),
+        endpoint_scheme = parsed_url.as_ref().map(Url::scheme).unwrap_or("<invalid>"),
         endpoint_host = parsed_url
             .as_ref()
-            .and_then(reqwest::Url::host_str)
+            .and_then(Url::host_str)
             .unwrap_or("<invalid>"),
-        endpoint_path = parsed_url
-            .as_ref()
-            .map(reqwest::Url::path)
-            .unwrap_or("<invalid>"),
+        endpoint_path = parsed_url.as_ref().map(Url::path).unwrap_or("<invalid>"),
         endpoint_has_query = parsed_url.as_ref().is_some_and(|url| url.query().is_some()),
         mcp_method = mcp_method.unwrap_or("<none>"),
         mcp_request_id = mcp_request_id.unwrap_or("<none>"),
@@ -471,7 +467,7 @@ fn insert_header<Error>(
 where
     Error: std::error::Error + Send + Sync + 'static,
 {
-    let value = reqwest::header::HeaderValue::from_str(&value)
+    let value = HeaderValue::from_str(&value)
         .map_err(|error| StreamableHttpError::Client(map_error(error.to_string())))?;
     headers.insert(name, value);
     Ok(())
@@ -575,7 +571,7 @@ async fn collect_body(
 fn sse_stream_from_body(
     body_stream: HttpResponseBodyStream,
 ) -> BoxStream<'static, std::result::Result<Sse, sse_stream::Error>> {
-    SseStream::from_byte_stream(stream::unfold(body_stream, |mut body_stream| async move {
+    SseStream::from_bytes_stream(stream::unfold(body_stream, |mut body_stream| async move {
         match body_stream.recv().await {
             Ok(Some(bytes)) => Some((Ok(Bytes::from(bytes)), body_stream)),
             Ok(None) => None,

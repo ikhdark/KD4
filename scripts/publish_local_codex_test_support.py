@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 from pathlib import Path
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -60,10 +61,12 @@ class PublishLocalCodexTestBase(unittest.TestCase):
         comspec = os.environ.get("ComSpec")
         if not comspec:
             self.skipTest("ComSpec is not available")
-        self.source_exe = Path(comspec)
-        self.source_exe_bytes = self.source_exe.read_bytes()
+        system_source_exe = Path(comspec)
+        self.source_exe_bytes = system_source_exe.read_bytes()
         self.repo_temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.repo_temp.cleanup)
+        self.source_exe = Path(self.repo_temp.name) / "fixture-codex.exe"
+        self.source_exe.write_bytes(self.source_exe_bytes)
         self.repo_root = Path(self.repo_temp.name) / "repo"
         self.repo_root.mkdir()
         (self.repo_root / "codex-rs").mkdir()
@@ -225,6 +228,8 @@ class PublishLocalCodexTestBase(unittest.TestCase):
         timestamp: float,
         source_exe: Path,
         source_code_mode_host: Path | None = None,
+        *,
+        env: dict[str, str] | None = None,
     ) -> Path:
         stamp = (
             self.repo_root
@@ -268,7 +273,7 @@ class PublishLocalCodexTestBase(unittest.TestCase):
             check=False,
             timeout=RUN_TIMEOUT_SECONDS,
             creationflags=CREATE_NO_WINDOW,
-            env=clean_env(),
+            env=clean_env() if env is None else env,
         )
         if result.returncode != 0:
             self.fail(
@@ -378,6 +383,60 @@ class PublishLocalCodexTestBase(unittest.TestCase):
             os.utime(path, (timestamp, timestamp))
         return path
 
+    def write_source_bundle_manifest(
+        self,
+        entrypoint: Path,
+        code_mode_host: Path | None = None,
+        sandbox_setup: Path | None = None,
+        command_runner: Path | None = None,
+    ) -> Path:
+        role_paths = (
+            ("entrypoint", entrypoint),
+            ("code-mode-host", code_mode_host or self.source_code_mode_host),
+            ("sandbox-setup", sandbox_setup or self.source_windows_sandbox_setup),
+            ("command-runner", command_runner or self.source_command_runner),
+        )
+        common_root = Path(
+            os.path.commonpath([str(path.resolve().parent) for _, path in role_paths])
+        )
+        manifest_handle = tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            suffix=".json",
+            prefix="codex-package-test-",
+            dir=common_root,
+            delete=False,
+        )
+        manifest_path = Path(manifest_handle.name)
+        files = []
+        for role, path in role_paths:
+            content = path.read_bytes() if path.is_file() else b""
+            files.append(
+                {
+                    "path": path.resolve().relative_to(common_root).as_posix(),
+                    "role": role,
+                    "size": len(content),
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                }
+            )
+        bundle_id = hashlib.sha256(
+            json.dumps(files, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        json.dump(
+            {
+                "layoutVersion": 2,
+                "version": "9.9.9",
+                "target": self.expected_windows_rusty_v8_target(),
+                "bundleId": bundle_id,
+                "buildIdentity": {"fixture": True},
+                "files": files,
+            },
+            manifest_handle,
+        )
+        manifest_handle.close()
+        self.addCleanup(manifest_path.unlink, missing_ok=True)
+        return manifest_path
+
     def run_script(
         self,
         *args: str,
@@ -399,6 +458,30 @@ class PublishLocalCodexTestBase(unittest.TestCase):
             publish_args.extend(
                 ["-SourceCommandRunnerExe", str(self.source_command_runner)]
             )
+        if "-BackupDir" not in publish_args and "-InstallDir" in publish_args:
+            install_dir = Path(publish_args[publish_args.index("-InstallDir") + 1])
+            backup_dir = install_dir.parent / "publisher-backups"
+            if backup_dir.exists():
+                (backup_dir / ".codex-local-publish-backups").write_text(
+                    "KD4 codex local publish backups v1\n", encoding="utf-8"
+                )
+            publish_args.extend(["-BackupDir", str(backup_dir)])
+        if "-SkipBuild" in publish_args and "-SourceBundleManifest" not in publish_args:
+            def argument_path(name: str, default: Path) -> Path:
+                if name not in publish_args:
+                    return default
+                return Path(publish_args[publish_args.index(name) + 1])
+
+            manifest_path = self.write_source_bundle_manifest(
+                argument_path("-SourceExe", self.source_exe),
+                argument_path("-SourceCodeModeHostExe", self.source_code_mode_host),
+                argument_path(
+                    "-SourceWindowsSandboxSetupExe",
+                    self.source_windows_sandbox_setup,
+                ),
+                argument_path("-SourceCommandRunnerExe", self.source_command_runner),
+            )
+            publish_args.extend(["-SourceBundleManifest", str(manifest_path)])
         return subprocess.run(
             [
                 self.shell,

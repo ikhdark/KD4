@@ -125,7 +125,7 @@ pub(crate) mod announcement {
     use crate::version::CODEX_CLI_VERSION;
     use chrono::NaiveDate;
     use chrono::Utc;
-    use codex_http_client::build_blocking_reqwest_client_with_custom_ca;
+    use codex_http_client::BlockingHttpClientBuilder;
     use codex_protocol::account::PlanType;
     use regex_lite::Regex;
     use serde::Deserialize;
@@ -202,10 +202,7 @@ pub(crate) mod announcement {
 
     fn blocking_init_announcement_tip() -> Option<String> {
         // Avoid system proxy detection to prevent macOS system-configuration panics (#8912).
-        let client = build_blocking_reqwest_client_with_custom_ca(
-            reqwest::blocking::Client::builder().no_proxy(),
-        )
-        .ok()?;
+        let client = BlockingHttpClientBuilder::new().build_direct().ok()?;
         let response = client
             .get(ANNOUNCEMENT_TIP_URL)
             .timeout(Duration::from_millis(2000))

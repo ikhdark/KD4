@@ -1,4 +1,5 @@
 use crate::remote::RemotePluginServiceConfig;
+use codex_http_client::HttpError;
 use codex_login::CodexAuth;
 use codex_login::default_client::create_client_without_request_logging;
 use codex_protocol::protocol::Product;
@@ -15,13 +16,13 @@ pub enum RemotePluginFetchError {
     Request {
         url: String,
         #[source]
-        source: reqwest::Error,
+        source: HttpError,
     },
 
     #[error("remote featured plugin request to {url} failed with status {status}: {body}")]
     UnexpectedStatus {
         url: String,
-        status: reqwest::StatusCode,
+        status: http::StatusCode,
         body: String,
     },
 

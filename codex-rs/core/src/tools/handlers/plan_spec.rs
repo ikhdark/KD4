@@ -77,13 +77,6 @@ pub fn create_update_plan_tool(include_task_evidence: bool) -> ToolSpec {
                 Some("Risks that must remain visible in durable evidence.".to_string()),
             ),
         ),
-        (
-            "requires_desktop_activation".to_string(),
-            JsonSchema::boolean(Some(
-                "Require a fresh Desktop runtime activation receipt before passing."
-                    .to_string(),
-            )),
-        ),
         ("validation_route".to_string(), validation_route_schema()),
     ]);
 
@@ -238,7 +231,7 @@ Use a short evidence-first medium plan for bounded multi-surface work. Use the c
 Internal tier selection never changes collaboration mode. Omitted facts and steps remain active; removals need reasons.
 At most one step can be in_progress at a time.
 Structured validation routes accept only direct cargo, just, python, or python3 leaves; run formatting and diff checks separately outside the route.
-Use stable ids, owners, bounded surfaces, dependencies, obligations, and acceptance criteria. Set a step to passed only when applicable fresh proof exists; completion still checks declared artifacts, Desktop activation, plan structure, and blocking risks.
+Use stable ids, owners, bounded surfaces, dependencies, obligations, and acceptance criteria. Set a step to passed only when applicable fresh proof exists; completion still checks declared artifacts, plan structure, and blocking risks.
 "#
         .to_string(),
         strict: false,

@@ -31,6 +31,8 @@ pub const DEFAULT_SNAPSHOT_CHUNK_BYTES: usize = 64 * 1024;
 pub const MAX_SNAPSHOT_CHUNK_BYTES: usize = 256 * 1024;
 pub const MAX_MUTATION_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_WORKSPACE_LEASE_SECONDS: i64 = 120;
+pub const MAX_VALIDATION_LEASE_SECONDS: i64 = 120;
+pub const NONPRODUCTIVE_RECOVERY_POLICY_VERSION: u32 = 1;
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRole {
@@ -631,6 +633,25 @@ pub struct WorkspaceRevision {
     pub epoch: u64,
     pub manifest_hash: String,
     pub files: Vec<WorkspaceManifestEntry>,
+    #[serde(default)]
+    pub capture_mode: WorkspaceCaptureMode,
+    #[serde(default)]
+    pub complete: bool,
+    #[serde(default)]
+    pub discovery_errors: Vec<String>,
+    #[serde(default)]
+    pub ignored_path_count: u64,
+    #[serde(default)]
+    pub excluded_path_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceCaptureMode {
+    #[default]
+    ExplicitPaths,
+    GitOverlay,
+    FilesystemFallback,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -895,6 +916,12 @@ impl ValidationEvidence {
 pub struct ValidationExecutionSnapshot {
     pub manifest: Vec<WorkspaceManifestEntry>,
     pub manifest_hash: String,
+    #[serde(default)]
+    pub capture_mode: WorkspaceCaptureMode,
+    #[serde(default)]
+    pub complete: bool,
+    #[serde(default)]
+    pub discovery_errors: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -992,6 +1019,8 @@ pub struct AgentReceipt {
 pub struct ProductivitySummary {
     pub active_owned_operation_count: u32,
     pub cancelled_expired_operation_count: u32,
+    pub recovery_threshold_seconds: u64,
+    pub recovery_policy_version: u32,
 }
 
 /// Atomic outcome of one nonproductive-assignment recovery evaluation.
@@ -1103,6 +1132,15 @@ pub struct MutationEvidence {
     pub start_epoch: u64,
     #[serde(default)]
     pub end_epoch: Option<u64>,
+}
+
+/// A bounded mutation-evidence page whose completeness is explicit.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MutationEvidencePage {
+    pub evidence: Vec<MutationEvidence>,
+    pub total_count: usize,
+    pub truncated: bool,
+    pub next_cursor: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1270,6 +1308,8 @@ pub struct WakeEvent {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WakeRead {
+    #[serde(default)]
+    pub status: WakeReadStatus,
     pub reason: Option<ObservationKind>,
     pub updated_agents: Vec<WakeEvent>,
     pub latest_event_id: Option<WakeEventId>,
@@ -1281,6 +1321,19 @@ pub struct WakeRead {
     pub remaining_count: u64,
     pub truncated_count: u64,
     pub timed_out: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WakeReadStatus {
+    /// Status was absent from a response serialized by an older producer.
+    #[default]
+    Unknown,
+    NoStream,
+    Empty,
+    EventsAvailable,
+    TimedOut,
+    Closed,
 }
 
 fn validate_nonempty(field: &str, value: &str) -> StoreResult<()> {

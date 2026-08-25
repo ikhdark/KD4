@@ -27,7 +27,6 @@ pub(crate) enum TypedToolClass {
     RootTaskControl,
     ReadSearch,
     CodeModeControl,
-    Diff,
     Shell,
     StructuredEdit,
     DynamicExternal,
@@ -201,67 +200,6 @@ pub(crate) fn build_cold_review_context(
     })
 }
 
-/// Classifies a tool name without trusting an arbitrary namespace to impersonate a core tool.
-///
-/// Callers must pass the collaboration namespace selected for the active agent-tool version and
-/// turn. Any other namespace is external. When collaboration tools are unnamespaced, pass `None`
-/// for both namespace arguments.
-pub(crate) fn classify_typed_tool(
-    namespace: Option<&str>,
-    name: &str,
-    collaboration_namespace: Option<&str>,
-) -> TypedToolClass {
-    if let Some(namespace) = namespace {
-        if namespace.is_empty() || collaboration_namespace != Some(namespace) {
-            return TypedToolClass::DynamicExternal;
-        }
-        return classify_collaboration_tool(name);
-    }
-
-    if collaboration_namespace.is_none() {
-        let collaboration_class = classify_collaboration_tool(name);
-        if collaboration_class != TypedToolClass::Unknown {
-            return collaboration_class;
-        }
-    }
-    if matches_name(
-        name,
-        &[
-            "read_tool_output",
-            "tool_search",
-            "view_image",
-            "list_mcp_resources",
-            "list_mcp_resource_templates",
-            "read_mcp_resource",
-            "current_time",
-        ],
-    ) {
-        return TypedToolClass::ReadSearch;
-    }
-    if matches_name(
-        name,
-        &[
-            codex_code_mode::PUBLIC_TOOL_NAME,
-            codex_code_mode::WAIT_TOOL_NAME,
-        ],
-    ) {
-        return TypedToolClass::CodeModeControl;
-    }
-    if matches_name(name, &["git_diff"]) {
-        return TypedToolClass::Diff;
-    }
-    if matches_name(name, &["shell_command", "exec_command", "write_stdin"]) {
-        return TypedToolClass::Shell;
-    }
-    if name == "apply_patch" {
-        return TypedToolClass::StructuredEdit;
-    }
-    if starts_with_external_prefix(name) {
-        return TypedToolClass::DynamicExternal;
-    }
-    TypedToolClass::Unknown
-}
-
 /// Keeps lifecycle task control root-only while giving active non-review typed agents the same
 /// tool authority as their root turn.
 pub(crate) fn authorize_typed_tool(class: TypedToolClass) -> Result<(), CapabilityPolicyError> {
@@ -341,34 +279,6 @@ pub(crate) fn derive_risk_policy(
         matched_high_risk_path,
         matched_high_risk_contract,
     })
-}
-
-fn classify_collaboration_tool(name: &str) -> TypedToolClass {
-    if matches_name(name, &["send_message", "wait_agent", "list_agents"]) {
-        TypedToolClass::AgentCommunication
-    } else if matches_name(
-        name,
-        &["get_agent_task", "submit_agent_receipt", "set_agent_gate"],
-    ) {
-        TypedToolClass::OwnTask
-    } else if matches_name(
-        name,
-        &[
-            "spawn_agent",
-            "send_input",
-            "resume_agent",
-            "close_agent",
-            "followup_task",
-            "interrupt_agent",
-            "amend_agent_task",
-            "waive_agent_gate",
-            "abandon_agent_task",
-        ],
-    ) {
-        TypedToolClass::RootTaskControl
-    } else {
-        TypedToolClass::Unknown
-    }
 }
 
 fn scopes_cover_path(
@@ -610,16 +520,6 @@ fn invalid_path(path: &str, reason: impl Into<String>) -> CapabilityPolicyError 
         path: path.to_string(),
         reason: reason.into(),
     }
-}
-
-fn matches_name(name: &str, candidates: &[&str]) -> bool {
-    candidates.contains(&name)
-}
-
-fn starts_with_external_prefix(name: &str) -> bool {
-    ["mcp__", "extension__", "dynamic__"]
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
 }
 
 #[cfg(test)]

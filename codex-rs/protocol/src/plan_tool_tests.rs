@@ -93,17 +93,37 @@ fn update_plan_accepts_evidence_backed_step_metadata_and_states() {
                 "status": "implemented",
                 "depends_on": ["inspect"],
                 "generated_artifacts": ["schema/generated.json"],
-                "risks": ["Desktop restart required"],
-                "requires_desktop_activation": true
+                "risks": ["Desktop restart required"]
             }
         ]
     }))
     .expect("evidence metadata should deserialize");
 
-    assert_eq!(args.plan[0].status, StepStatus::Passed);
-    assert_eq!(args.plan[1].status, StepStatus::Implemented);
-    assert_eq!(args.plan[1].depends_on, ["inspect"]);
-    assert!(args.plan[1].requires_desktop_activation);
+    assert_eq!(
+        args,
+        UpdatePlanArgs {
+            explanation: None,
+            plan: vec![
+                PlanItemArg {
+                    id: Some("inspect".to_string()),
+                    step: "Inspect the owner".to_string(),
+                    status: StepStatus::Passed,
+                    acceptance_criteria: vec!["owner identified".to_string()],
+                    runtime_paths: vec!["src/owner.rs".to_string()],
+                    ..PlanItemArg::default()
+                },
+                PlanItemArg {
+                    id: Some("implement".to_string()),
+                    step: "Implement the change".to_string(),
+                    status: StepStatus::Implemented,
+                    depends_on: vec!["inspect".to_string()],
+                    generated_artifacts: vec!["schema/generated.json".to_string()],
+                    risks: vec!["Desktop restart required".to_string()],
+                    ..PlanItemArg::default()
+                },
+            ],
+        }
+    );
 }
 
 #[test]

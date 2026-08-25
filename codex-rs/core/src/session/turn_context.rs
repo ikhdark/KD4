@@ -294,12 +294,14 @@ impl TurnContext {
             .revision
     }
 
-    pub(crate) fn activated_deferred_tools(&self) -> HashSet<codex_tools::ToolName> {
+    pub(crate) fn deferred_tool_activation_snapshot(
+        &self,
+    ) -> (u64, HashSet<codex_tools::ToolName>) {
         let state = self
             .deferred_tool_activations
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state
+        let activated = state
             .activations
             .iter()
             .filter(|(tool_name, activation)| {
@@ -310,7 +312,12 @@ impl TurnContext {
             })
             .map(|(tool_name, _)| tool_name)
             .cloned()
-            .collect()
+            .collect();
+        (state.revision, activated)
+    }
+
+    pub(crate) fn activated_deferred_tools(&self) -> HashSet<codex_tools::ToolName> {
+        self.deferred_tool_activation_snapshot().1
     }
 
     /// Releases only deferred capabilities that were advertised to the model
@@ -456,7 +463,11 @@ impl TurnContext {
                 RefreshStrategy::OnlineIfUncached,
                 config.http_client_factory(),
             )
-            .await;
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "model refresh failed; retaining the current turn catalog");
+                Arc::clone(&self.available_models)
+            });
 
         Self {
             sub_id: self.sub_id.clone(),
@@ -810,6 +821,9 @@ impl Session {
         sub_id: &str,
         updates: &SessionSettingsUpdate,
     ) -> CodexResult<SessionConfiguration> {
+        if updates.is_empty() {
+            return Ok(self.state.lock().await.session_configuration.clone());
+        }
         let Ok(_refresh_guard) = self.managed_network_proxy_refresh_lock.acquire().await else {
             unreachable!("managed network proxy refresh semaphore is never closed");
         };

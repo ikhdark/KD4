@@ -18,6 +18,10 @@ use crate::thread_state::ThreadStateManager;
 
 const ATTESTATION_GENERATE_TIMEOUT: Duration = Duration::from_millis(100);
 
+fn attestation_timeout_milliseconds(timeout_duration: Duration) -> u128 {
+    timeout_duration.as_millis()
+}
+
 pub(crate) fn app_server_attestation_provider(
     outgoing: Arc<OutgoingMessageSender>,
     thread_state_manager: ThreadStateManager,
@@ -107,7 +111,7 @@ async fn request_attestation_header_value_with_timeout(
         Err(_) => {
             let _canceled = outgoing.cancel_request(&request_id).await;
             warn!(
-                timeout_seconds = timeout_duration.as_secs(),
+                timeout_milliseconds = attestation_timeout_milliseconds(timeout_duration),
                 "attestation generation request timed out"
             );
             return app_server_attestation_header_value(
@@ -179,8 +183,10 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
+    use super::ATTESTATION_GENERATE_TIMEOUT;
     use super::AppServerAttestationStatus;
     use super::app_server_attestation_header_value;
+    use super::attestation_timeout_milliseconds;
     use super::request_attestation_header_value_with_timeout;
     use crate::outgoing_message::ConnectionId;
     use crate::outgoing_message::OutgoingEnvelope;
@@ -236,6 +242,14 @@ mod tests {
                 /*token*/ None
             ),
             Some(r#"{"v":1,"s":4}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn attestation_timeout_diagnostic_preserves_subsecond_deadline() {
+        assert_eq!(
+            attestation_timeout_milliseconds(ATTESTATION_GENERATE_TIMEOUT),
+            100
         );
     }
 

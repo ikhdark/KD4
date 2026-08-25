@@ -61,7 +61,9 @@ pub(crate) fn select_handlers_for_matcher_inputs(
                         .any(|input| matches_matcher(handler.matcher.as_deref(), Some(input)))
                 }
             }
-            HookEventName::UserPromptSubmit | HookEventName::Stop => true,
+            HookEventName::UserPromptSubmit | HookEventName::Stop | HookEventName::Interrupt => {
+                true
+            }
         })
         .cloned()
         .collect()
@@ -149,7 +151,8 @@ pub(crate) fn scope_for_event(event_name: HookEventName) -> HookScope {
         | HookEventName::PostCompact
         | HookEventName::UserPromptSubmit
         | HookEventName::SubagentStop
-        | HookEventName::Stop => HookScope::Turn,
+        | HookEventName::Stop
+        | HookEventName::Interrupt => HookScope::Turn,
     }
 }
 

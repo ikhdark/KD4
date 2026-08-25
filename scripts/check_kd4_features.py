@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate KD4's declared feature ownership and static reachability evidence."""
+"""Validate KD4 feature ownership, reachability, and executable test routes."""
 
 from __future__ import annotations
 
@@ -28,7 +28,12 @@ ALLOWED_CAPABILITY_KINDS = frozenset({"runtime", "workflow", "library", "guidanc
 ALLOWED_EVIDENCE_KINDS = frozenset(
     {"entrypoint", "module", "registration", "config", "protocol", "test", "workflow"}
 )
+ALLOWED_RUNTIME_VERIFICATION_KINDS = frozenset({"contract_test", "integration_test"})
 COMMIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+
+
+class ProjectConfigError(ValueError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -62,6 +67,50 @@ class CheckResult:
         }
 
 
+def execute_runtime_verification(
+    manifest_path: Path,
+    *,
+    feature_id: str,
+    repo_root: Path,
+) -> int:
+    """Execute one manifest-declared narrow runtime verification command."""
+    try:
+        with manifest_path.open("rb") as manifest_file:
+            manifest = tomllib.load(manifest_file)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        print(f"runtime verification manifest could not be read: {exc}")
+        return 2
+
+    matching = [
+        feature
+        for feature in manifest.get("features", [])
+        if isinstance(feature, dict) and feature.get("id") == feature_id
+    ]
+    if len(matching) != 1:
+        print(f"runtime verification feature must resolve exactly once: {feature_id!r}")
+        return 2
+    feature = matching[0]
+    verification = feature.get("runtime_verification")
+    command = verification.get("command") if isinstance(verification, dict) else None
+    if (
+        feature.get("status") != "enabled"
+        or feature.get("capability_kind") != "runtime"
+        or not isinstance(command, list)
+        or not command
+        or not all(isinstance(argument, str) and argument for argument in command)
+    ):
+        print(f"feature has no executable enabled runtime verification: {feature_id!r}")
+        return 2
+
+    execution_root = repo_root / "codex-rs" if command[0] == "cargo" else repo_root
+    try:
+        completed = subprocess.run(command, cwd=execution_root, check=False)
+    except OSError as exc:
+        print(f"runtime verification could not start for {feature_id!r}: {exc}")
+        return 2
+    return completed.returncode
+
+
 def _safe_repo_path(
     repo_root: Path, path_text: object
 ) -> tuple[Path | None, str | None]:
@@ -70,11 +119,21 @@ def _safe_repo_path(
     relative = Path(path_text)
     if relative.is_absolute() or ".." in relative.parts:
         return None, f"path must stay repo-relative: {path_text!r}"
-    root = repo_root.resolve()
+    root = repo_root
     candidate = (root / relative).resolve()
     if not candidate.is_relative_to(root):
         return None, f"path escapes repository root: {path_text!r}"
     return candidate, None
+
+
+def _executable_source_text(path: Path, text: str) -> str:
+    """Exclude comments from source-marker reachability checks."""
+    if path.suffix.lower() not in {".rs", ".py", ".ps1", ".js", ".ts"}:
+        return text
+    if path.suffix.lower() in {".rs", ".js", ".ts"}:
+        text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+        return re.sub(r"(?m)^\s*//.*$", "", text)
+    return re.sub(r"(?m)^\s*#.*$", "", text)
 
 
 def _required_text(
@@ -88,14 +147,27 @@ def _required_text(
     )
 
 
-def _project_feature_override(repo_root: Path, feature_key: str) -> bool | None:
+def _project_feature_override(
+    repo_root: Path,
+    feature_key: str,
+    config_cache: dict[str, object],
+) -> bool | None:
     config_path = repo_root / ".codex" / "config.toml"
-    if not config_path.is_file():
-        return None
-    try:
-        with config_path.open("rb") as config_file:
-            value: object = tomllib.load(config_file)
-    except (OSError, tomllib.TOMLDecodeError):
+    if "project_config" not in config_cache:
+        if not config_path.is_file():
+            config_cache["project_config"] = None
+        else:
+            try:
+                with config_path.open("rb") as config_file:
+                    config_cache["project_config"] = tomllib.load(config_file)
+            except (OSError, tomllib.TOMLDecodeError) as exc:
+                config_cache["project_config"] = ProjectConfigError(
+                    f"could not read .codex/config.toml: {exc}"
+                )
+    value = config_cache["project_config"]
+    if isinstance(value, ProjectConfigError):
+        raise value
+    if value is None:
         return None
     for part in feature_key.split("."):
         if not isinstance(value, dict) or part not in value:
@@ -177,6 +249,7 @@ def _validate_runtime_status(
     repo_root: Path,
     findings: list[Finding],
     feature_registry_cache: dict[str, dict[str, bool] | None],
+    project_config_cache: dict[str, object],
 ) -> str | None:
     config_keys = feature.get("config_keys")
     feature_config_keys = (
@@ -239,7 +312,20 @@ def _validate_runtime_status(
     if not isinstance(runtime_feature_key, str):
         return runtime_status
 
-    project_override = _project_feature_override(repo_root, runtime_feature_key)
+    try:
+        project_override = _project_feature_override(
+            repo_root, runtime_feature_key, project_config_cache
+        )
+    except ProjectConfigError as exc:
+        findings.append(
+            Finding(
+                "error",
+                "invalid-project-config",
+                str(exc),
+                feature_id,
+            )
+        )
+        return runtime_status
     if project_override is not None:
         expected_enabled = project_override
         expected_source = ".codex/config.toml"
@@ -428,7 +514,7 @@ def _validate_evidence(
         try:
             if path not in text_cache:
                 text_cache[path] = path.read_text(encoding="utf-8")
-            text = text_cache[path]
+            text = _executable_source_text(path, text_cache[path])
         except (OSError, UnicodeError) as exc:
             findings.append(
                 Finding(
@@ -483,6 +569,216 @@ def _validate_evidence(
     return kinds
 
 
+def _validate_runtime_verification(
+    *,
+    feature_id: str,
+    verification: object,
+    repo_root: Path,
+    findings: list[Finding],
+    text_cache: dict[Path, str],
+) -> bool:
+    if not isinstance(verification, dict):
+        findings.append(
+            Finding(
+                "error",
+                "missing-runtime-verification",
+                "enabled runtime feature must name an executable contract or integration test",
+                feature_id,
+            )
+        )
+        return False
+
+    kind = verification.get("kind")
+    if kind not in ALLOWED_RUNTIME_VERIFICATION_KINDS:
+        findings.append(
+            Finding(
+                "error",
+                "invalid-runtime-verification",
+                f"runtime_verification.kind must be one of {sorted(ALLOWED_RUNTIME_VERIFICATION_KINDS)!r}",
+                feature_id,
+            )
+        )
+        return False
+
+    path, path_error = _safe_repo_path(repo_root, verification.get("path"))
+    if path_error is not None:
+        findings.append(
+            Finding("error", "invalid-runtime-verification", path_error, feature_id)
+        )
+        return False
+    assert path is not None
+    if not path.is_file():
+        findings.append(
+            Finding(
+                "error",
+                "stale-runtime-verification",
+                f"runtime verification path {verification.get('path')!r} does not exist",
+                feature_id,
+            )
+        )
+        return False
+
+    symbol = verification.get("symbol")
+    command = verification.get("command")
+    if not isinstance(symbol, str) or not symbol:
+        findings.append(
+            Finding(
+                "error",
+                "invalid-runtime-verification",
+                "runtime_verification.symbol must be a non-empty string",
+                feature_id,
+            )
+        )
+        return False
+    if (
+        not isinstance(command, list)
+        or not command
+        or not all(isinstance(argument, str) and argument for argument in command)
+        or not any(symbol in argument for argument in command)
+    ):
+        findings.append(
+            Finding(
+                "error",
+                "invalid-runtime-verification",
+                "runtime_verification.command must be a non-empty string array selecting symbol",
+                feature_id,
+            )
+        )
+        return False
+
+    try:
+        if path not in text_cache:
+            text_cache[path] = path.read_text(encoding="utf-8")
+        text = _executable_source_text(path, text_cache[path])
+    except (OSError, UnicodeError) as exc:
+        findings.append(
+            Finding(
+                "error",
+                "unreadable-runtime-verification",
+                f"failed to read {path}: {exc}",
+                feature_id,
+            )
+        )
+        return False
+    if symbol not in text:
+        findings.append(
+            Finding(
+                "error",
+                "stale-runtime-verification",
+                f"{verification.get('path')} no longer contains {symbol!r}",
+                feature_id,
+            )
+        )
+        return False
+    return True
+
+
+def _validate_contract_schema(
+    *,
+    feature: dict[str, Any],
+    feature_id: str,
+    repo_root: Path,
+    findings: list[Finding],
+    text_cache: dict[Path, str],
+) -> None:
+    declared = feature.get("contract_schema_version")
+    source_text = feature.get("contract_schema_source")
+    symbol = feature.get("contract_schema_symbol")
+    present = [
+        key in feature
+        for key in (
+            "contract_schema_version",
+            "contract_schema_source",
+            "contract_schema_symbol",
+        )
+    ]
+    if not any(present):
+        return
+    if not all(present):
+        findings.append(
+            Finding(
+                "error",
+                "invalid-contract-schema",
+                "contract schema version, source, and symbol must be declared together",
+                feature_id,
+            )
+        )
+        return
+    if not isinstance(declared, int) or declared < 1:
+        findings.append(
+            Finding(
+                "error",
+                "invalid-contract-schema",
+                "contract_schema_version must be a positive integer",
+                feature_id,
+            )
+        )
+        return
+    path, path_error = _safe_repo_path(repo_root, source_text)
+    if path_error is not None:
+        findings.append(
+            Finding("error", "invalid-contract-schema", path_error, feature_id)
+        )
+        return
+    if not isinstance(symbol, str) or not symbol:
+        findings.append(
+            Finding(
+                "error",
+                "invalid-contract-schema",
+                "contract_schema_symbol must be a non-empty string",
+                feature_id,
+            )
+        )
+        return
+    assert path is not None
+    if not path.is_file():
+        findings.append(
+            Finding(
+                "error",
+                "stale-contract-schema",
+                f"contract schema source {source_text!r} does not exist",
+                feature_id,
+            )
+        )
+        return
+    try:
+        if path not in text_cache:
+            text_cache[path] = path.read_text(encoding="utf-8")
+        text = text_cache[path]
+    except (OSError, UnicodeError) as exc:
+        findings.append(
+            Finding(
+                "error",
+                "unreadable-contract-schema",
+                f"failed to read {path}: {exc}",
+                feature_id,
+            )
+        )
+        return
+    match = re.search(
+        rf"\b{re.escape(symbol)}\b\s*:\s*[^=]+?=\s*(\d+)\s*;",
+        text,
+    )
+    if match is None:
+        findings.append(
+            Finding(
+                "error",
+                "stale-contract-schema",
+                f"{source_text} no longer declares integer constant {symbol!r}",
+                feature_id,
+            )
+        )
+    elif int(match.group(1)) != declared:
+        findings.append(
+            Finding(
+                "error",
+                "contract-schema-drift",
+                f"declared schema version {declared} does not match {symbol}={match.group(1)}",
+                feature_id,
+            )
+        )
+
+
 def _source_owner_evidence(
     *,
     source_owner_id: object,
@@ -490,6 +786,7 @@ def _source_owner_evidence(
     feature_id: str,
     findings: list[Finding],
     owner_cache: dict[str, dict[str, Any]] | None,
+    owner_observation_cache: dict[str, tuple[frozenset[str], Counter[str]]],
     text_cache: dict[Path, str],
 ) -> tuple[Counter[str], dict[str, dict[str, Any]] | None]:
     kinds: Counter[str] = Counter()
@@ -550,8 +847,28 @@ def _source_owner_evidence(
         )
         return kinds, owner_cache
 
-    feature_ids = owner.get("feature_ids")
-    if not isinstance(feature_ids, list) or feature_id not in feature_ids:
+    cached_observation = owner_observation_cache.get(source_owner_id)
+    if cached_observation is not None:
+        feature_ids, cached_kinds = cached_observation
+        if feature_id not in feature_ids:
+            findings.append(
+                Finding(
+                    "error",
+                    "source-owner-feature-mismatch",
+                    f"owner {source_owner_id!r} does not declare feature {feature_id!r}",
+                    feature_id,
+                )
+            )
+            return kinds, owner_cache
+        return Counter(cached_kinds), owner_cache
+
+    declared_feature_ids = owner.get("feature_ids")
+    feature_ids = (
+        frozenset(item for item in declared_feature_ids if isinstance(item, str))
+        if isinstance(declared_feature_ids, list)
+        else frozenset()
+    )
+    if feature_id not in feature_ids:
         findings.append(
             Finding(
                 "error",
@@ -561,6 +878,8 @@ def _source_owner_evidence(
             )
         )
         return kinds, owner_cache
+
+    finding_count_before_observation = len(findings)
 
     def marker_is_live(marker: object, label: str) -> bool:
         if isinstance(marker, str):
@@ -614,7 +933,7 @@ def _source_owner_evidence(
         try:
             if path not in text_cache:
                 text_cache[path] = path.read_text(encoding="utf-8")
-            text = text_cache[path]
+            text = _executable_source_text(path, text_cache[path])
         except (OSError, UnicodeError) as exc:
             findings.append(
                 Finding(
@@ -670,6 +989,8 @@ def _source_owner_evidence(
                 for marker_index, marker in enumerate(evidence)
             ):
                 kinds["registration"] += 1
+    if len(findings) == finding_count_before_observation:
+        owner_observation_cache[source_owner_id] = (feature_ids, Counter(kinds))
     return kinds, owner_cache
 
 
@@ -692,6 +1013,7 @@ def validate_manifest(
             findings=(Finding("error", "manifest-load", str(exc)),),
         )
 
+    repo_root = repo_root.resolve()
     schema_version = manifest.get("schema_version")
     if schema_version != SCHEMA_VERSION:
         findings.append(
@@ -754,7 +1076,9 @@ def validate_manifest(
     runtime_status_counts: Counter[str] = Counter()
     text_cache: dict[Path, str] = {}
     feature_registry_cache: dict[str, dict[str, bool] | None] = {}
+    project_config_cache: dict[str, object] = {}
     owner_cache: dict[str, dict[str, Any]] | None = None
+    owner_observation_cache: dict[str, tuple[frozenset[str], Counter[str]]] = {}
     for index, feature in enumerate(features):
         if not isinstance(feature, dict):
             findings.append(
@@ -789,7 +1113,7 @@ def validate_manifest(
                 )
             )
 
-        for key in ("summary", "owner", "upstream_equivalent"):
+        for key in ("summary", "upstream_equivalent"):
             finding = _required_text(feature, key, feature_id)
             if finding is not None:
                 findings.append(finding)
@@ -830,7 +1154,31 @@ def validate_manifest(
             )
 
         owner = feature.get("owner")
-        if isinstance(owner, str) and owner.strip():
+        external_owner = feature.get("external_owner")
+        has_owner = isinstance(owner, str) and bool(owner.strip())
+        has_external_owner = isinstance(external_owner, str) and bool(
+            external_owner.strip()
+        )
+        if not has_owner and not has_external_owner:
+            findings.append(
+                Finding(
+                    "error",
+                    "missing-field",
+                    "feature must declare owner or external_owner",
+                    feature_id,
+                )
+            )
+        elif has_owner and has_external_owner:
+            findings.append(
+                Finding(
+                    "error",
+                    "invalid-owner",
+                    "feature must declare exactly one of owner or external_owner",
+                    feature_id,
+                )
+            )
+        if has_owner:
+            assert isinstance(owner, str)
             owner_path, owner_error = _safe_repo_path(repo_root, owner)
             if owner_error is not None:
                 findings.append(
@@ -845,6 +1193,15 @@ def validate_manifest(
                         feature_id,
                     )
                 )
+        if has_external_owner and status != "planned":
+            findings.append(
+                Finding(
+                    "error",
+                    "invalid-external-owner",
+                    "external_owner is only valid for a planned unsupported surface",
+                    feature_id,
+                )
+            )
 
         config_keys = feature.get("config_keys")
         if not isinstance(config_keys, list) or not all(
@@ -865,9 +1222,18 @@ def validate_manifest(
             repo_root=repo_root,
             findings=findings,
             feature_registry_cache=feature_registry_cache,
+            project_config_cache=project_config_cache,
         )
         if runtime_status is not None:
             runtime_status_counts[runtime_status] += 1
+
+        _validate_contract_schema(
+            feature=feature,
+            feature_id=feature_id,
+            repo_root=repo_root,
+            findings=findings,
+            text_cache=text_cache,
+        )
 
         _validate_declared_paths(
             feature_id=feature_id,
@@ -887,6 +1253,15 @@ def validate_manifest(
         )
 
         source_owner = feature.get("source_owner")
+        if status == "planned" and (source_owner is not None or feature.get("evidence")):
+            findings.append(
+                Finding(
+                    "error",
+                    "planned-feature-has-production-route",
+                    "planned feature must not declare live source-owner or inline route evidence",
+                    feature_id,
+                )
+            )
         if source_owner is None:
             evidence_kinds = _validate_evidence(
                 feature_id=feature_id,
@@ -911,6 +1286,7 @@ def validate_manifest(
                 feature_id=feature_id,
                 findings=findings,
                 owner_cache=owner_cache,
+                owner_observation_cache=owner_observation_cache,
                 text_cache=text_cache,
             )
         if status == "enabled":
@@ -946,6 +1322,14 @@ def validate_manifest(
                         "enabled runtime/workflow feature has no declared test evidence",
                         feature_id,
                     )
+                )
+            if capability_kind == "runtime":
+                _validate_runtime_verification(
+                    feature_id=feature_id,
+                    verification=feature.get("runtime_verification"),
+                    repo_root=repo_root,
+                    findings=findings,
+                    text_cache=text_cache,
                 )
         if status == "orphaned":
             findings.append(
@@ -1002,6 +1386,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--json", action="store_true", help="Emit one JSON result object."
     )
+    parser.add_argument(
+        "--run-runtime-verification",
+        metavar="FEATURE_ID",
+        help="After static validation passes, execute only this feature's declared runtime test.",
+    )
     return parser
 
 
@@ -1029,7 +1418,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(
                 f"[{finding.level.upper()}]{feature} {finding.code}: {finding.message}"
             )
-    return 0 if result.ok else 1
+    if not result.ok:
+        return 1
+    if args.run_runtime_verification:
+        return execute_runtime_verification(
+            manifest_path,
+            feature_id=args.run_runtime_verification,
+            repo_root=args.repo_root,
+        )
+    return 0
 
 
 if __name__ == "__main__":

@@ -453,7 +453,8 @@ async fn cancelled_startup_keeps_store_and_ledger_until_termination_is_confirmed
                 "cancelled startup fixture",
             ),
         )
-        .await;
+        .await
+        .expect("track running process");
     let context =
         UnifiedExecContext::new(Arc::clone(&session), Arc::clone(&turn), "call".to_string());
     let mut registration = PendingProcessRegistration::new(

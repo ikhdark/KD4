@@ -581,19 +581,16 @@ impl ToolCallRuntime {
             if let Some(registration) = signal_registration.as_ref()
                 && let Some(guard) = registration.suppressed_source_pass.as_ref()
             {
-                let mut output = FunctionCallOutputPayload::from_text(
+                let response = suppressed_function_response(
+                    &call.call_id,
                     serde_json::json!({
                         "kind": "unchanged_source_pass_suppression",
+                        "disposition": "suppressed",
                         "reason": "the same broad source action is blocked because the active obligation, evidence identity, and action are unchanged; change one of them before another broad source pass",
                     })
                     .to_string(),
                 );
-                output.success = Some(true);
-                let response = ResponseInputItem::FunctionCallOutput {
-                    call_id: call.call_id.clone(),
-                    output,
-                };
-                timing.record_outcome("success");
+                timing.record_outcome("skipped");
                 timing.mark_output_collected();
                 if let Some(signal_collector) = signal_collector.as_ref() {
                     signal_collector.record_suppressed_source_pass(
@@ -623,7 +620,8 @@ impl ToolCallRuntime {
                 if snapshot.owner == guard.owner
                     && snapshot.state_revision == guard.state_revision
                 {
-                    let mut output = FunctionCallOutputPayload::from_text(
+                    let response = suppressed_function_response(
+                        &call.call_id,
                         serde_json::json!({
                             "kind": "authoritative_wait_suppression",
                             "disposition": "blocked",
@@ -633,12 +631,7 @@ impl ToolCallRuntime {
                         })
                         .to_string(),
                     );
-                    output.success = Some(true);
-                    let response = ResponseInputItem::FunctionCallOutput {
-                        call_id: call.call_id.clone(),
-                        output,
-                    };
-                    timing.record_outcome("success");
+                    timing.record_outcome("skipped");
                     timing.mark_output_collected();
                     if let Some(signal_collector) = signal_collector.as_ref() {
                         signal_collector
@@ -1155,6 +1148,15 @@ impl ToolCallRuntime {
         }
             .in_current_span(),
         )
+    }
+}
+
+fn suppressed_function_response(call_id: &str, message: String) -> ResponseInputItem {
+    let mut output = FunctionCallOutputPayload::from_text(message);
+    output.success = Some(false);
+    ResponseInputItem::FunctionCallOutput {
+        call_id: call_id.to_string(),
+        output,
     }
 }
 
@@ -2742,5 +2744,26 @@ mod tests {
         assert!(text.contains("aborted by user"));
 
         Ok(())
+    }
+
+    #[test]
+    fn suppressed_source_pass_response_is_explicitly_unsuccessful() {
+        let response = suppressed_function_response(
+            "suppressed-call",
+            serde_json::json!({
+                "disposition": "suppressed",
+                "reason": "policy skipped execution"
+            })
+            .to_string(),
+        );
+        let ResponseInputItem::FunctionCallOutput { call_id, output } = response else {
+            panic!("suppressed source pass must return a function output");
+        };
+        assert_eq!(call_id, "suppressed-call");
+        assert_eq!(output.success, Some(false));
+        let FunctionCallOutputBody::Text(text) = output.body else {
+            panic!("suppression receipt must be textual");
+        };
+        assert!(text.contains("\"disposition\":\"suppressed\""));
     }
 }

@@ -9,6 +9,8 @@ use crate::events::common::ContextInjectingHookOutcome;
 use crate::events::common::StatelessHookOutcome;
 use crate::events::compact::PostCompactRequest;
 use crate::events::compact::PreCompactRequest;
+use crate::events::interrupt::InterruptOutcome;
+use crate::events::interrupt::InterruptRequest;
 use crate::events::permission_request::PermissionRequestOutcome;
 use crate::events::permission_request::PermissionRequestRequest;
 use crate::events::post_tool_use::PostToolUseOutcome;
@@ -207,6 +209,14 @@ impl Hooks {
 
     pub async fn run_stop(&self, request: StopRequest) -> StopOutcome {
         self.engine.run_stop(request).await
+    }
+
+    pub fn preview_interrupt(&self) -> Vec<codex_protocol::protocol::HookRunSummary> {
+        self.engine.preview_interrupt()
+    }
+
+    pub async fn run_interrupt(&self, request: InterruptRequest) -> InterruptOutcome {
+        self.engine.run_interrupt(request).await
     }
 }
 

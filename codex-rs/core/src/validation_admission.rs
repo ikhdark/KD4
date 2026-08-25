@@ -76,6 +76,7 @@ pub(crate) struct ValidationAuthorization {
     pub(crate) revision: u64,
     next_sequence: u64,
     pub(crate) rules: Vec<ValidationAuthorizationRule>,
+    rule_indexes_by_operation: [Vec<usize>; 5],
 }
 
 pub(crate) type SharedValidationAuthorization = Arc<RwLock<ValidationAuthorization>>;
@@ -99,16 +100,18 @@ impl ValidationAuthorization {
         if !self.enabled {
             return false;
         }
-        let mut parsed = parse_directives(text);
+        let parsed = parse_directives(text);
         if parsed.is_empty() {
             return false;
         }
         self.revision = self.revision.saturating_add(1);
-        for rule in &mut parsed {
+        for mut rule in parsed {
             rule.sequence = self.next_sequence;
             self.next_sequence = self.next_sequence.saturating_add(1);
+            let rule_index = self.rules.len();
+            self.rule_indexes_by_operation[operation_index(rule.operation)].push(rule_index);
+            self.rules.push(rule);
         }
-        self.rules.extend(parsed);
         true
     }
 
@@ -119,38 +122,63 @@ impl ValidationAuthorization {
         breadth: ValidationBreadth,
         selector: Option<&str>,
     ) -> ValidationAuthorizationMatch {
-        let mut latest_grant = None;
-        let mut latest_deny = None;
-        for rule in self.rules.iter().filter(|rule| {
-            rule.policy_version == VALIDATION_POLICY_VERSION
-                && rule.operation == operation
-                && rule
-                    .ecosystem
-                    .is_none_or(|candidate| candidate == ecosystem)
-                && breadth_matches(rule, breadth)
-                && selector_matches(rule, selector)
-        }) {
-            let candidate = (rule_specificity(rule), rule.sequence);
-            match rule.decision {
-                ValidationAuthorizationDecision::Grant => latest_grant = Some(candidate),
-                ValidationAuthorizationDecision::Deny => latest_deny = Some(candidate),
+        decision_for_rules(
+            self.rule_indexes_by_operation[operation_index(operation)]
+                .iter()
+                .filter_map(|&index| self.rules.get(index)),
+            operation,
+            ecosystem,
+            breadth,
+            selector,
+        )
+    }
+}
+
+fn operation_index(operation: ValidationOperation) -> usize {
+    match operation {
+        ValidationOperation::Test => 0,
+        ValidationOperation::Check => 1,
+        ValidationOperation::Lint => 2,
+        ValidationOperation::Bench => 3,
+        ValidationOperation::Fuzz => 4,
+    }
+}
+
+fn decision_for_rules<'a>(
+    rules: impl Iterator<Item = &'a ValidationAuthorizationRule>,
+    operation: ValidationOperation,
+    ecosystem: ValidationEcosystem,
+    breadth: ValidationBreadth,
+    selector: Option<&str>,
+) -> ValidationAuthorizationMatch {
+    let mut latest_grant = None;
+    let mut latest_deny = None;
+    for rule in rules.filter(|rule| {
+        rule.policy_version == VALIDATION_POLICY_VERSION
+            && rule.operation == operation
+            && rule
+                .ecosystem
+                .is_none_or(|candidate| candidate == ecosystem)
+            && breadth_matches(rule, breadth)
+            && selector_matches(rule, selector)
+    }) {
+        let candidate = (rule_specificity(rule), rule.sequence);
+        match rule.decision {
+            ValidationAuthorizationDecision::Grant => latest_grant = Some(candidate),
+            ValidationAuthorizationDecision::Deny => latest_deny = Some(candidate),
+        }
+    }
+    match (latest_grant, latest_deny) {
+        (Some((grant_specificity, grant_sequence)), Some((deny_specificity, deny_sequence))) => {
+            if deny_specificity > grant_specificity || deny_sequence > grant_sequence {
+                ValidationAuthorizationMatch::Prohibited
+            } else {
+                ValidationAuthorizationMatch::Authorized
             }
         }
-        match (latest_grant, latest_deny) {
-            (
-                Some((grant_specificity, grant_sequence)),
-                Some((deny_specificity, deny_sequence)),
-            ) => {
-                if deny_specificity > grant_specificity || deny_sequence > grant_sequence {
-                    ValidationAuthorizationMatch::Prohibited
-                } else {
-                    ValidationAuthorizationMatch::Authorized
-                }
-            }
-            (None, Some(_)) => ValidationAuthorizationMatch::Prohibited,
-            (Some(_), None) => ValidationAuthorizationMatch::Authorized,
-            (None, None) => ValidationAuthorizationMatch::Unspecified,
-        }
+        (None, Some(_)) => ValidationAuthorizationMatch::Prohibited,
+        (Some(_), None) => ValidationAuthorizationMatch::Authorized,
+        (None, None) => ValidationAuthorizationMatch::Unspecified,
     }
 }
 
@@ -366,7 +394,11 @@ pub(crate) fn prohibited_skip_for(
     authorization: &ValidationAuthorization,
     invocation: &CommandInvocation,
 ) -> Option<ValidationSkippedToolOutput> {
-    if let Some(descriptor) = validation_like_wrapper_descriptor(invocation)
+    let ValidationAnalysis {
+        classification,
+        validation_like_wrapper,
+    } = analyze_validation(invocation);
+    if let Some(descriptor) = validation_like_wrapper
         && authorization.decision_for(
             descriptor.operation,
             descriptor.ecosystem,
@@ -376,8 +408,7 @@ pub(crate) fn prohibited_skip_for(
     {
         return Some(ValidationSkippedToolOutput::prohibited(&descriptor));
     }
-    let ValidationClassification::Validation { leaves, .. } = classify_validation(invocation)
-    else {
+    let ValidationClassification::Validation { leaves, .. } = classification else {
         return None;
     };
     leaves
@@ -391,21 +422,6 @@ pub(crate) fn prohibited_skip_for(
             ) == ValidationAuthorizationMatch::Prohibited
         })
         .map(ValidationSkippedToolOutput::prohibited)
-}
-
-fn validation_like_wrapper_descriptor(
-    invocation: &CommandInvocation,
-) -> Option<ValidationCommandDescriptor> {
-    match invocation {
-        CommandInvocation::Argv { program, args } => wrapper_descriptor(program, args),
-        CommandInvocation::Script(script) | CommandInvocation::PowerShellScript(script) => script
-            .replace("&&", ";")
-            .replace("||", ";")
-            .replace(['\r', '\n'], ";")
-            .split(';')
-            .filter_map(shlex::split)
-            .find_map(|words| wrapper_descriptor(words.first()?, &words[1..])),
-    }
 }
 
 fn wrapper_descriptor(program: &str, args: &[String]) -> Option<ValidationCommandDescriptor> {
@@ -703,6 +719,16 @@ pub(crate) struct ValidationObservationPlan {
     keys: Vec<ValidationObservationKey>,
 }
 
+impl ValidationObservationPlan {
+    fn keys_for_descriptor(&self, descriptor_index: usize) -> &[ValidationObservationKey] {
+        const KEYS_PER_DESCRIPTOR: usize = 3;
+        let start = descriptor_index.saturating_mul(KEYS_PER_DESCRIPTOR);
+        self.keys
+            .get(start..start.saturating_add(KEYS_PER_DESCRIPTOR))
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ValidationObservationKey {
     scope: codex_state::ValidationHistoryScope,
@@ -769,24 +795,13 @@ pub(crate) async fn admit_validation(
     let (revision, denied, authorized) = {
         let guard = authorization.read().await;
         let revision = guard.revision;
-        let denied = leaves
-            .iter()
-            .find(|leaf| {
-                guard.decision_for(
-                    leaf.operation,
-                    leaf.ecosystem,
-                    leaf.breadth,
-                    leaf.selector.as_deref(),
-                ) == ValidationAuthorizationMatch::Prohibited
-            })
-            .cloned();
-        let authorized = leaves.iter().all(|leaf| {
+        let (denied, authorized) = summarize_authorization(&leaves, |leaf| {
             guard.decision_for(
                 leaf.operation,
                 leaf.ecosystem,
                 leaf.breadth,
                 leaf.selector.as_deref(),
-            ) == ValidationAuthorizationMatch::Authorized
+            )
         });
         (revision, denied, authorized)
     };
@@ -806,8 +821,8 @@ pub(crate) async fn admit_validation(
             observation: Some(observation),
         };
     };
-    for descriptor in &leaves {
-        match predict(state, repository, descriptor).await {
+    for (descriptor_index, descriptor) in leaves.iter().enumerate() {
+        match predict(state, observation.keys_for_descriptor(descriptor_index)).await {
             Ok(Some(prediction)) if prediction_requires_skip(&prediction) => {
                 return ValidationAdmission::Skip(ValidationSkippedToolOutput::predicted(
                     descriptor, prediction,
@@ -827,6 +842,21 @@ pub(crate) async fn admit_validation(
         authorization_revision: revision,
         observation: Some(observation),
     }
+}
+
+fn summarize_authorization(
+    leaves: &[ValidationCommandDescriptor],
+    mut decision_for: impl FnMut(&ValidationCommandDescriptor) -> ValidationAuthorizationMatch,
+) -> (Option<ValidationCommandDescriptor>, bool) {
+    let mut all_authorized = true;
+    for leaf in leaves {
+        match decision_for(leaf) {
+            ValidationAuthorizationMatch::Prohibited => return (Some(leaf.clone()), false),
+            ValidationAuthorizationMatch::Authorized => {}
+            ValidationAuthorizationMatch::Unspecified => all_authorized = false,
+        }
+    }
+    (None, all_authorized)
 }
 
 fn prediction_requires_skip(prediction: &ValidationPrediction) -> bool {
@@ -934,12 +964,10 @@ fn observation_plan(
 
 async fn predict(
     state: &codex_state::StateRuntime,
-    repository: &[u8],
-    descriptor: &ValidationCommandDescriptor,
+    candidates: &[ValidationObservationKey],
 ) -> anyhow::Result<Option<ValidationPrediction>> {
-    let candidates = observation_plan(repository, std::slice::from_ref(descriptor));
-    for key in candidates.keys {
-        let aggregate = state.validation_history().lookup(history_key(&key)).await?;
+    for key in candidates {
+        let aggregate = state.validation_history().lookup(history_key(key)).await?;
         let Some(aggregate) = aggregate else { continue };
         let minimum = match key.scope {
             codex_state::ValidationHistoryScope::RepositoryFingerprint => 8,
@@ -1296,21 +1324,41 @@ fn cheaper_alternatives(descriptor: &ValidationCommandDescriptor) -> Vec<String>
     }
 }
 
-pub(crate) fn classify_validation(invocation: &CommandInvocation) -> ValidationClassification {
+struct ValidationAnalysis {
+    classification: ValidationClassification,
+    validation_like_wrapper: Option<ValidationCommandDescriptor>,
+}
+
+fn analyze_validation(invocation: &CommandInvocation) -> ValidationAnalysis {
     match invocation {
-        CommandInvocation::Argv { program, args } => classify_argv(program, args),
+        CommandInvocation::Argv { program, args } => ValidationAnalysis {
+            classification: classify_argv(program, args),
+            validation_like_wrapper: wrapper_descriptor(program, args),
+        },
         CommandInvocation::Script(script) | CommandInvocation::PowerShellScript(script) => {
-            classify_script(script, 0)
+            analyze_script(script, 0, true)
         }
     }
 }
 
+pub(crate) fn classify_validation(invocation: &CommandInvocation) -> ValidationClassification {
+    analyze_validation(invocation).classification
+}
+
 fn classify_script(script: &str, depth: usize) -> ValidationClassification {
+    analyze_script(script, depth, false).classification
+}
+
+fn analyze_script(script: &str, depth: usize, find_wrapper: bool) -> ValidationAnalysis {
     if depth > 4 {
-        return ValidationClassification::Opaque;
+        return ValidationAnalysis {
+            classification: ValidationClassification::Opaque,
+            validation_like_wrapper: None,
+        };
     }
     let mut leaves = Vec::new();
     let mut uncertain = false;
+    let mut validation_like_wrapper = None;
     let normalized = script
         .replace("&&", ";")
         .replace("||", ";")
@@ -1323,6 +1371,9 @@ fn classify_script(script: &str, depth: usize) -> ValidationClassification {
         };
         if words.is_empty() {
             continue;
+        }
+        if find_wrapper && validation_like_wrapper.is_none() {
+            validation_like_wrapper = wrapper_descriptor(&words[0], &words[1..]);
         }
         if leaf_is_dynamic && !looks_like_known_validation(&words) {
             uncertain = true;
@@ -1343,7 +1394,7 @@ fn classify_script(script: &str, depth: usize) -> ValidationClassification {
             ValidationClassification::NonValidation => {}
         }
     }
-    if leaves.is_empty() {
+    let classification = if leaves.is_empty() {
         if uncertain {
             ValidationClassification::Opaque
         } else {
@@ -1358,6 +1409,10 @@ fn classify_script(script: &str, depth: usize) -> ValidationClassification {
                 ValidationCostCertainty::Certain
             },
         }
+    };
+    ValidationAnalysis {
+        classification,
+        validation_like_wrapper,
     }
 }
 
@@ -1712,6 +1767,142 @@ fn descriptor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validation_analysis_discovers_wrapper_while_classifying_script() {
+        let analysis = analyze_validation(&CommandInvocation::Script(
+            "echo preparing; yarn run test:unit".into(),
+        ));
+
+        assert!(matches!(
+            analysis.classification,
+            ValidationClassification::Validation { ref leaves, .. }
+                if leaves.len() == 1
+                    && leaves[0].operation == ValidationOperation::Test
+                    && leaves[0].ecosystem == ValidationEcosystem::Node
+        ));
+        assert!(matches!(
+            analysis.validation_like_wrapper,
+            Some(ValidationCommandDescriptor {
+                operation: ValidationOperation::Test,
+                ecosystem: ValidationEcosystem::Other,
+                breadth: ValidationBreadth::Unknown,
+                selector: Some(ref selector),
+                ..
+            }) if selector == "test:unit"
+        ));
+    }
+
+    #[test]
+    fn authorization_summary_visits_each_leaf_at_most_once() {
+        let leaves = vec![
+            descriptor(ValidationOperation::Test, ValidationEcosystem::Rust, &[]),
+            descriptor(ValidationOperation::Check, ValidationEcosystem::Rust, &[]),
+            descriptor(ValidationOperation::Lint, ValidationEcosystem::Rust, &[]),
+        ];
+        let mut calls = 0;
+        let (denied, authorized) = summarize_authorization(&leaves, |leaf| {
+            calls += 1;
+            if leaf.operation == ValidationOperation::Check {
+                ValidationAuthorizationMatch::Prohibited
+            } else {
+                ValidationAuthorizationMatch::Authorized
+            }
+        });
+
+        assert_eq!(calls, 2);
+        assert_eq!(
+            denied.as_ref().map(|descriptor| descriptor.operation),
+            Some(ValidationOperation::Check)
+        );
+        assert!(!authorized);
+
+        calls = 0;
+        let (denied, authorized) = summarize_authorization(&leaves, |_| {
+            calls += 1;
+            ValidationAuthorizationMatch::Authorized
+        });
+        assert_eq!(calls, leaves.len());
+        assert_eq!(denied, None);
+        assert!(authorized);
+    }
+
+    #[test]
+    fn operation_index_matches_linear_authorization_decisions() {
+        let mut authorization = ValidationAuthorization::enabled();
+        assert!(authorization.update_from_user_input(
+            "Run focused tests; do not run the workspace suite; run checks; run lint."
+        ));
+
+        for operation in [
+            ValidationOperation::Test,
+            ValidationOperation::Check,
+            ValidationOperation::Lint,
+            ValidationOperation::Bench,
+            ValidationOperation::Fuzz,
+        ] {
+            for breadth in [
+                ValidationBreadth::Selector,
+                ValidationBreadth::Package,
+                ValidationBreadth::Workspace,
+                ValidationBreadth::Unknown,
+            ] {
+                let indexed = authorization.decision_for(
+                    operation,
+                    ValidationEcosystem::Rust,
+                    breadth,
+                    Some("selected_test"),
+                );
+                let linear = decision_for_rules(
+                    authorization.rules.iter(),
+                    operation,
+                    ValidationEcosystem::Rust,
+                    breadth,
+                    Some("selected_test"),
+                );
+                assert_eq!(indexed, linear, "{operation:?} {breadth:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn observation_plan_reuses_each_descriptors_three_prediction_keys() {
+        let leaves = vec![
+            descriptor(ValidationOperation::Test, ValidationEcosystem::Rust, &[]),
+            descriptor(ValidationOperation::Check, ValidationEcosystem::Rust, &[]),
+        ];
+        let plan = observation_plan(b"repository", &leaves);
+
+        for (index, descriptor) in leaves.iter().enumerate() {
+            let keys = plan.keys_for_descriptor(index);
+            assert_eq!(keys.len(), 3);
+            assert_eq!(keys[0].descriptor, *descriptor);
+            assert_eq!(keys[1].descriptor, *descriptor);
+            assert_eq!(keys[2].descriptor, *descriptor);
+            assert_eq!(
+                keys[0].repository.as_deref(),
+                Some(b"repository".as_slice())
+            );
+            assert_eq!(
+                keys[1].repository.as_deref(),
+                Some(b"repository".as_slice())
+            );
+            assert_eq!(keys[2].repository, None);
+            assert_eq!(
+                keys[0].fingerprint,
+                descriptor_fingerprint(descriptor, true)
+            );
+            assert_eq!(
+                keys[1].fingerprint,
+                descriptor_fingerprint(descriptor, false)
+            );
+            assert_eq!(
+                keys[2].fingerprint,
+                descriptor_fingerprint(descriptor, false)
+            );
+        }
+        assert!(plan.keys_for_descriptor(leaves.len()).is_empty());
+    }
 
     #[tokio::test]
     async fn disabled_validation_policy_does_not_parse_or_classify_commands() {

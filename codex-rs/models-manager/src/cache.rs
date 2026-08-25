@@ -95,7 +95,10 @@ impl ModelsCacheManager {
 
     /// Attempt to load a fresh cache entry. Returns `None` if the cache doesn't exist or is stale.
     #[cfg(test)]
-    pub(crate) async fn load_fresh(&self, expected_version: &str) -> Option<ModelsCache> {
+    pub(crate) async fn load_fresh(
+        &self,
+        expected_version: &str,
+    ) -> io::Result<Option<ModelsCache>> {
         let expected_identity = self.current_identity();
         self.load_fresh_for_identity(expected_version, &expected_identity)
             .await
@@ -107,40 +110,24 @@ impl ModelsCacheManager {
         &self,
         expected_version: &str,
         expected_identity: &str,
-    ) -> Option<ModelsCache> {
-        let _permit = match self.acquire_io_permit().await {
-            Ok(permit) => permit,
-            Err(err) => {
-                error!("failed to acquire models cache I/O gate: {err}");
-                return None;
-            }
-        };
-        let _file_lock = match self.acquire_file_lock().await {
-            Ok(lock) => lock,
-            Err(err) => {
-                error!("failed to acquire models cache file lock: {err}");
-                return None;
-            }
-        };
+    ) -> io::Result<Option<ModelsCache>> {
+        let _permit = self.acquire_io_permit().await?;
+        let _file_lock = self.acquire_file_lock().await?;
         if !self.identity_is_current(expected_identity) {
             info!(
                 cache_path = %self.cache_path.display(),
                 mismatch_category = "provider_cache_identity",
                 "models cache: skipped load after identity changed"
             );
-            return None;
+            return Ok(None);
         }
         info!(
                 cache_path = %self.cache_path.display(),
                 expected_version,
             "models cache: attempting load_fresh"
         );
-        let cache = match self.load().await {
-            Ok(cache) => cache?,
-            Err(err) => {
-                error!("failed to load models cache: {err}");
-                return None;
-            }
+        let Some(cache) = self.load().await? else {
+            return Ok(None);
         };
         info!(
             cache_path = %self.cache_path.display(),
@@ -155,7 +142,7 @@ impl ModelsCacheManager {
                 cached_version = ?cache.client_version,
                 "models cache: cache version mismatch"
             );
-            return None;
+            return Ok(None);
         }
         if cache.provider_cache_identity.as_deref() != Some(expected_identity) {
             info!(
@@ -163,7 +150,7 @@ impl ModelsCacheManager {
                 mismatch_category = "provider_cache_identity",
                 "models cache: eligibility mismatch"
             );
-            return None;
+            return Ok(None);
         }
         if !cache.is_fresh(self.cache_ttl) {
             info!(
@@ -172,14 +159,14 @@ impl ModelsCacheManager {
                 fetched_at = %cache.fetched_at,
                 "models cache: cache is stale"
             );
-            return None;
+            return Ok(None);
         }
         info!(
             cache_path = %self.cache_path.display(),
             cache_ttl_secs = self.cache_ttl.as_secs(),
             "models cache: cache hit"
         );
-        self.identity_is_current(expected_identity).then_some(cache)
+        Ok(self.identity_is_current(expected_identity).then_some(cache))
     }
 
     /// Persist the cache to disk, creating parent directories as needed.
@@ -546,14 +533,14 @@ mod tests {
         first
             .persist_cache(&[], Some("etag-one".to_string()), "client-one".to_string())
             .await;
-        assert!(first.load_fresh("client-one").await.is_some());
+        assert!(first.load_fresh("client-one").await.unwrap().is_some());
 
         let second = ModelsCacheManager::new(
             path.clone(),
             Duration::from_secs(300),
             fixed_identity("provider-two"),
         );
-        assert!(second.load_fresh("client-one").await.is_none());
+        assert!(second.load_fresh("client-one").await.unwrap().is_none());
         assert!(
             second
                 .renew_cache_ttl("client-one", "etag-one")
@@ -565,7 +552,7 @@ mod tests {
             .mutate_cache_for_test(|cache| cache.provider_cache_identity = None)
             .await
             .expect("rewrite as providerless legacy cache");
-        assert!(first.load_fresh("client-one").await.is_none());
+        assert!(first.load_fresh("client-one").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -579,7 +566,7 @@ mod tests {
         manager
             .persist_cache(&[], Some("etag-one".to_string()), "client-one".to_string())
             .await;
-        assert!(manager.load_fresh("client-two").await.is_none());
+        assert!(manager.load_fresh("client-two").await.unwrap().is_none());
         assert!(
             manager
                 .renew_cache_ttl("client-two", "etag-one")
@@ -593,7 +580,7 @@ mod tests {
             })
             .await
             .expect("make cache stale");
-        assert!(manager.load_fresh("client-one").await.is_none());
+        assert!(manager.load_fresh("client-one").await.unwrap().is_none());
         assert!(
             manager
                 .renew_cache_ttl("client-one", "different-etag")
@@ -604,7 +591,7 @@ mod tests {
             .renew_cache_ttl("client-one", "etag-one")
             .await
             .expect("a matching 304 response should refresh a stale cache entry");
-        assert!(manager.load_fresh("client-one").await.is_some());
+        assert!(manager.load_fresh("client-one").await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -625,7 +612,22 @@ mod tests {
             .await
             .expect("move cache timestamp into the future");
 
-        assert!(manager.load_fresh("client-one").await.is_none());
+        assert!(manager.load_fresh("client-one").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn corrupt_cache_is_not_reported_as_a_miss() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("models_cache.json");
+        std::fs::write(&path, b"{not-json").expect("write corrupt cache");
+        let manager =
+            ModelsCacheManager::new(path, Duration::from_secs(300), fixed_identity("provider"));
+
+        let error = manager
+            .load_fresh("client-one")
+            .await
+            .expect_err("corrupt cache must be distinguishable from a miss");
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
     }
 
     #[tokio::test]
@@ -646,13 +648,13 @@ mod tests {
         manager
             .persist_cache(&[], Some("etag-one".to_string()), "client-one".to_string())
             .await;
-        assert!(manager.load_fresh("client-one").await.is_some());
+        assert!(manager.load_fresh("client-one").await.unwrap().is_some());
 
         *identity
             .lock()
             .expect("identity lock should not be poisoned") = "scope-digest-two".to_string();
 
-        assert!(manager.load_fresh("client-one").await.is_none());
+        assert!(manager.load_fresh("client-one").await.unwrap().is_none());
         assert!(
             manager
                 .renew_cache_ttl("client-one", "etag-one")
@@ -707,6 +709,7 @@ mod tests {
         let persisted = newer
             .load_fresh("client")
             .await
+            .expect("cache read")
             .expect("newer cache remains readable");
         assert_eq!(persisted.etag.as_deref(), Some("newer-etag"));
         assert_eq!(persisted.revision, Some(1));
@@ -761,6 +764,7 @@ mod tests {
         let persisted = newer
             .load_fresh("client")
             .await
+            .expect("cache read")
             .expect("newer cache remains readable");
         assert_eq!(persisted.etag.as_deref(), Some("new-etag"));
         assert_eq!(persisted.revision, Some(2));

@@ -171,6 +171,14 @@ def parse_args() -> argparse.Namespace:
         help="Optional workflow URL to reuse for native artifacts.",
     )
     parser.add_argument(
+        "--vendor-src",
+        type=Path,
+        help=(
+            "Local canonical package tree containing one directory per target. "
+            "Use this for repository-local releases without a GitHub workflow."
+        ),
+    )
+    parser.add_argument(
         "--github-repo",
         default=os.environ.get("CODEX_STAGE_GITHUB_REPO"),
         help=(
@@ -230,11 +238,6 @@ def parse_args() -> argparse.Namespace:
             "How cached vendor trees are materialized: auto uses hardlinks with "
             "copy fallback (default), copy always copies, hardlink requires links."
         ),
-    )
-    parser.add_argument(
-        "--allow-source-native-mismatch",
-        action="store_true",
-        help="Allow dirty or commit-mismatched sources with a prominent warning.",
     )
     return parser.parse_args()
 
@@ -1120,12 +1123,15 @@ def commit_staged_packages(
 
 def main() -> int:
     args = parse_args()
+    vendor_src_arg = getattr(args, "vendor_src", None)
 
     output_dir = args.output_dir or (REPO_ROOT / "dist" / "npm")
 
     runner_temp = Path(os.environ.get("RUNNER_TEMP", tempfile.gettempdir())).resolve()
     if is_relative_to(runner_temp, REPO_ROOT.resolve()):
         raise ValueError("RUNNER_TEMP must be outside the repository")
+    if vendor_src_arg is not None and (args.workflow_url or args.workflow_name):
+        raise ValueError("--vendor-src cannot be combined with workflow artifact options")
     workflow_repo = (
         github_repo_from_workflow_url(args.workflow_url) if args.workflow_url else None
     )
@@ -1144,7 +1150,8 @@ def main() -> int:
             f"{args.github_repo}"
         )
     github_repo = args.github_repo or workflow_repo
-    github_repo = resolve_github_repo(github_repo)
+    if vendor_src_arg is None:
+        github_repo = resolve_github_repo(github_repo)
 
     packages = expand_packages(list(args.packages))
     native_component_sets = collect_native_component_sets(packages)
@@ -1169,66 +1176,79 @@ def main() -> int:
 
     try:
         if native_component_sets:
-            workflow_url, resolved_head_sha = resolve_workflow_url(
-                args.release_version,
-                args.workflow_url,
-                github_repo,
-                args.workflow_name,
-            )
-            if not resolved_head_sha:
-                raise RuntimeError("native artifact workflow did not report a head SHA")
-            workflow_id = workflow_id_from_url(workflow_url)
-            ensure_source_matches_workflow(
-                resolved_head_sha,
-                allow_mismatch=args.allow_source_native_mismatch,
-            )
-            print(f"Using native artifacts from {workflow_url}", flush=True)
-            if args.cache_dir is None:
-                artifacts_temp_root = Path(
-                    tempfile.mkdtemp(prefix="npm-native-artifacts-", dir=runner_temp)
-                )
-                cleanup_artifacts_root = True
-                print(
-                    f"Caching downloaded artifacts in {artifacts_temp_root}",
-                    flush=True,
-                )
+            if vendor_src_arg is not None:
+                vendor_src = vendor_src_arg.resolve(strict=True)
+                if not vendor_src.is_dir():
+                    raise RuntimeError(f"--vendor-src is not a directory: {vendor_src}")
+                for components, targets in native_component_sets:
+                    missing_targets = [
+                        target for target in targets if not (vendor_src / target).is_dir()
+                    ]
+                    if missing_targets:
+                        raise RuntimeError(
+                            "--vendor-src is missing canonical targets: "
+                            + ", ".join(missing_targets)
+                        )
+                    vendor_src_by_native_key[(components, targets)] = vendor_src
             else:
-                artifacts_temp_root = (
-                    args.cache_dir / github_repo_cache_key(github_repo) / workflow_id
-                ).resolve()
-                artifacts_temp_root.mkdir(parents=True, exist_ok=True)
-                print(
-                    f"Using persistent native artifact cache {artifacts_temp_root}",
-                    flush=True,
-                )
-            extracted_cache_dir = artifacts_temp_root / "_extracted-codex-packages"
-            for components, targets in native_component_sets:
-                vendor_temp_root = Path(
-                    tempfile.mkdtemp(prefix="npm-native-", dir=runner_temp)
-                )
-                vendor_temp_roots.append(vendor_temp_root)
-                print(
-                    "Installing native components "
-                    + ", ".join(components)
-                    + " for targets "
-                    + ", ".join(targets)
-                    + f" into {vendor_temp_root}",
-                    flush=True,
-                )
-                install_native_components(
-                    workflow_url,
+                assert github_repo is not None
+                workflow_url, resolved_head_sha = resolve_workflow_url(
+                    args.release_version,
+                    args.workflow_url,
                     github_repo,
-                    set(components),
-                    targets,
-                    vendor_temp_root,
-                    artifacts_temp_root,
-                    extracted_cache_dir=extracted_cache_dir,
-                    max_download_workers=args.max_download_workers,
-                    vendor_copy_mode=args.vendor_copy_mode,
+                    args.workflow_name,
                 )
-                vendor_src_by_native_key[(components, targets)] = (
-                    vendor_temp_root / "vendor"
-                )
+                if not resolved_head_sha:
+                    raise RuntimeError("native artifact workflow did not report a head SHA")
+                workflow_id = workflow_id_from_url(workflow_url)
+                ensure_source_matches_workflow(resolved_head_sha)
+                print(f"Using native artifacts from {workflow_url}", flush=True)
+                if args.cache_dir is None:
+                    artifacts_temp_root = Path(
+                        tempfile.mkdtemp(prefix="npm-native-artifacts-", dir=runner_temp)
+                    )
+                    cleanup_artifacts_root = True
+                    print(
+                        f"Caching downloaded artifacts in {artifacts_temp_root}",
+                        flush=True,
+                    )
+                else:
+                    artifacts_temp_root = (
+                        args.cache_dir / github_repo_cache_key(github_repo) / workflow_id
+                    ).resolve()
+                    artifacts_temp_root.mkdir(parents=True, exist_ok=True)
+                    print(
+                        f"Using persistent native artifact cache {artifacts_temp_root}",
+                        flush=True,
+                    )
+                extracted_cache_dir = artifacts_temp_root / "_extracted-codex-packages"
+                for components, targets in native_component_sets:
+                    vendor_temp_root = Path(
+                        tempfile.mkdtemp(prefix="npm-native-", dir=runner_temp)
+                    )
+                    vendor_temp_roots.append(vendor_temp_root)
+                    print(
+                        "Installing native components "
+                        + ", ".join(components)
+                        + " for targets "
+                        + ", ".join(targets)
+                        + f" into {vendor_temp_root}",
+                        flush=True,
+                    )
+                    install_native_components(
+                        workflow_url,
+                        github_repo,
+                        set(components),
+                        targets,
+                        vendor_temp_root,
+                        artifacts_temp_root,
+                        extracted_cache_dir=extracted_cache_dir,
+                        max_download_workers=args.max_download_workers,
+                        vendor_copy_mode=args.vendor_copy_mode,
+                    )
+                    vendor_src_by_native_key[(components, targets)] = (
+                        vendor_temp_root / "vendor"
+                    )
 
         staged_output_root = Path(
             tempfile.mkdtemp(prefix="npm-output-", dir=runner_temp)
@@ -1249,7 +1269,6 @@ def main() -> int:
                 owned_paths.append(artifacts_temp_root)
             ensure_source_matches_workflow(
                 resolved_head_sha,
-                allow_mismatch=args.allow_source_native_mismatch,
                 owned_paths=owned_paths,
             )
 

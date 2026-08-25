@@ -13,6 +13,7 @@ use codex_agent_task_store::MAX_WAKE_EVENTS_PER_ROOT;
 use codex_agent_task_store::NonproductiveRecovery;
 use codex_agent_task_store::WakeEventId;
 use codex_agent_task_store::WakeRead;
+use codex_agent_task_store::WakeReadStatus;
 use codex_protocol::protocol::DeterministicContinuationClass;
 use codex_protocol::protocol::DeterministicContinuationHostAction;
 use codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt;
@@ -1234,6 +1235,7 @@ mod tests {
     fn durable_progress_rejects_missing_and_repeated_cursor_revisions() {
         let cursor = WakeEventId::new();
         let missing = WakeRead {
+            status: WakeReadStatus::Unknown,
             reason: None,
             updated_agents: Vec::new(),
             latest_event_id: None,
@@ -1274,6 +1276,7 @@ mod tests {
         remaining_count: u64,
     ) -> WakeRead {
         WakeRead {
+            status: WakeReadStatus::Unknown,
             reason: events.last().map(|event| event.reason),
             latest_event_id: events.last().map(|event| event.event_id),
             updated_agents: events,
@@ -2037,6 +2040,7 @@ async fn read_wake_events(
                 .await
         }
         _ => Ok(WakeRead {
+            status: WakeReadStatus::NoStream,
             reason: None,
             updated_agents: Vec::new(),
             latest_event_id: cursor,
@@ -2083,6 +2087,7 @@ async fn wait_for_activity(
         return Ok((
             outcome,
             WakeRead {
+                status: WakeReadStatus::Unknown,
                 reason: None,
                 updated_agents: Vec::new(),
                 latest_event_id: cursor,

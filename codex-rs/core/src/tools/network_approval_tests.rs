@@ -428,11 +428,14 @@ async fn finish_call_returns_denial_and_unregisters_active_call() {
 
 #[tokio::test]
 async fn deferred_finish_reuses_denial_result_after_first_consumer() {
-    let service = NetworkApprovalService::default();
+    let service = Arc::new(NetworkApprovalService::default());
     let cancellation_token =
         register_call_with_default_shell_trigger(&service, "registration-1").await;
     let deferred = DeferredNetworkApproval {
-        registration_id: "registration-1".to_string(),
+        registration: Arc::new(NetworkApprovalRegistration::new(
+            "registration-1".to_string(),
+            Arc::clone(&service),
+        )),
         cancellation_token,
         finish_outcome: Arc::new(OnceCell::new()),
         _execution_proxy: None,
@@ -445,11 +448,11 @@ async fn deferred_finish_reuses_denial_result_after_first_consumer() {
         .await;
 
     let first = deferred
-        .finish(&service)
+        .finish()
         .await
         .expect_err("first consumer should see denial");
     let second = deferred
-        .finish(&service)
+        .finish()
         .await
         .expect_err("second consumer should reuse denial");
 
@@ -476,17 +479,47 @@ async fn record_call_outcome_ignores_inactive_call() {
 }
 
 #[tokio::test]
-async fn record_blocked_request_ignores_ambiguous_unattributed_blocked_requests() {
+async fn ambiguous_unattributed_blocked_request_marks_and_cancels_every_candidate() {
     let service = NetworkApprovalService::default();
-    register_call_with_default_shell_trigger(&service, "registration-1").await;
-    register_call_with_default_shell_trigger(&service, "registration-2").await;
+    let first = register_call_with_default_shell_trigger(&service, "registration-1").await;
+    let second = register_call_with_default_shell_trigger(&service, "registration-2").await;
 
     service
         .record_blocked_request(denied_blocked_request("example.com"))
         .await;
 
-    assert_eq!(service.take_call_outcome("registration-1").await, None);
-    assert_eq!(service.take_call_outcome("registration-2").await, None);
+    assert!(first.is_cancelled());
+    assert!(second.is_cancelled());
+    for registration_id in ["registration-1", "registration-2"] {
+        assert!(matches!(
+            service.take_call_outcome(registration_id).await,
+            Some(NetworkApprovalOutcome::DeniedByPolicy(message))
+                if message.contains("attribution was ambiguous across 2 active tool calls")
+        ));
+    }
+}
+
+#[tokio::test]
+async fn dropped_network_registration_is_unregistered_without_explicit_finish() {
+    let service = Arc::new(NetworkApprovalService::default());
+    register_call_with_default_shell_trigger(&service, "registration-1").await;
+    let registration = Arc::new(NetworkApprovalRegistration::new(
+        "registration-1".to_string(),
+        Arc::clone(&service),
+    ));
+
+    drop(registration);
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if service.resolve_single_active_call().await.is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dropped registration should clean up its active call");
 }
 
 #[tokio::test]

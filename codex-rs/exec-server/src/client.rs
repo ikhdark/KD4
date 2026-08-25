@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use codex_exec_server_protocol::JSONRPCNotification;
+use codex_http_client::HttpError;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use serde_json::Value;
@@ -487,7 +488,7 @@ pub enum ExecServerError {
     Server { code: i64, message: String },
     #[error("environment registry request failed ({status}{code_suffix}): {message}", code_suffix = .code.as_ref().map(|code| format!(", {code}")).unwrap_or_default())]
     EnvironmentRegistryHttp {
-        status: reqwest::StatusCode,
+        status: http::StatusCode,
         code: Option<String>,
         message: String,
     },
@@ -496,7 +497,7 @@ pub enum ExecServerError {
     #[error("environment registry authentication error: {0}")]
     EnvironmentRegistryAuth(String),
     #[error("environment registry request failed: {0}")]
-    EnvironmentRegistryRequest(#[from] reqwest::Error),
+    EnvironmentRegistryRequest(#[from] HttpError),
     #[error("exec-server connection attempt failed: {0}")]
     ConnectionAttempt(#[source] Arc<ExecServerError>),
 }

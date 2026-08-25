@@ -35,8 +35,8 @@ use tempfile::tempdir;
 
 use super::active_collaboration_namespace;
 use super::merge_into_namespaces;
+use crate::agent::task_capabilities::ExternalMutationIntent;
 use crate::agent::task_capabilities::TypedToolClass;
-use crate::agent::task_capabilities::classify_typed_tool;
 use crate::config::CurrentTimeReminderConfig;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
@@ -102,6 +102,8 @@ struct ToolPlanProbe {
     namespace_functions: BTreeMap<String, Vec<String>>,
     registered_names: Vec<String>,
     exposures: BTreeMap<String, ToolExposure>,
+    authorization_classes: BTreeMap<String, TypedToolClass>,
+    external_mutation_intents: BTreeMap<String, ExternalMutationIntent>,
     warnings: Vec<String>,
 }
 
@@ -145,6 +147,22 @@ impl ToolPlanProbe {
                     .map(|exposure| (name.to_string(), exposure))
             })
             .collect::<BTreeMap<_, _>>();
+        let authorization_classes = registered_tool_names
+            .iter()
+            .filter_map(|name| {
+                router
+                    .tool_authorization_class_for_test(name)
+                    .map(|class| (name.to_string(), class))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let external_mutation_intents = registered_tool_names
+            .iter()
+            .filter_map(|name| {
+                router
+                    .tool_external_mutation_intent_for_test(name)
+                    .map(|intent| (name.to_string(), intent))
+            })
+            .collect::<BTreeMap<_, _>>();
 
         Self {
             visible_specs,
@@ -152,6 +170,8 @@ impl ToolPlanProbe {
             namespace_functions,
             registered_names,
             exposures,
+            authorization_classes,
+            external_mutation_intents,
             warnings,
         }
     }
@@ -220,6 +240,25 @@ impl ToolPlanProbe {
             .get(name)
             .unwrap_or_else(|| panic!("expected registered tool `{name}`"))
     }
+
+    fn authorization_class(&self, name: &str) -> TypedToolClass {
+        *self
+            .authorization_classes
+            .get(name)
+            .unwrap_or_else(|| panic!("expected registered tool `{name}`"))
+    }
+
+    fn assert_no_unknown_authorization_classes(&self) {
+        let unknown = self
+            .authorization_classes
+            .iter()
+            .filter_map(|(name, class)| (*class == TypedToolClass::Unknown).then_some(name))
+            .collect::<Vec<_>>();
+        assert!(
+            unknown.is_empty(),
+            "production tool registrations require an explicit authorization class: {unknown:?}"
+        );
+    }
 }
 
 async fn probe_with(
@@ -261,6 +300,45 @@ async fn update_plan_is_not_exposed_or_registered_in_plan_mode() {
     .await;
     plan_mode.assert_visible_lacks(&["update_plan"]);
     plan_mode.assert_registered_lacks(&["update_plan"]);
+}
+
+#[tokio::test]
+async fn production_tool_registrations_have_explicit_authorization_classes() {
+    let utilities = probe(|turn| {
+        set_features(
+            turn,
+            &[
+                Feature::CurrentTimeReminder,
+                Feature::RequestPermissionsTool,
+            ],
+        );
+        let mut config = (*turn.config).clone();
+        config.current_time_reminder = Some(CurrentTimeReminderConfig {
+            sleep_tool: true,
+            ..CurrentTimeReminderConfig::default()
+        });
+        turn.config = Arc::new(config);
+        turn.model_info
+            .experimental_supported_tools
+            .push("test_sync_tool".to_string());
+    })
+    .await;
+    utilities.assert_no_unknown_authorization_classes();
+
+    let plugins = probe_with(
+        |turn| {
+            set_features(
+                turn,
+                &[Feature::ToolSuggest, Feature::Apps, Feature::Plugins],
+            );
+        },
+        ToolPlanInputs {
+            tool_suggest_candidates: Some(plugin_candidates(ToolSuggestPresentation::ListTool)),
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+    plugins.assert_no_unknown_authorization_classes();
 }
 
 #[tokio::test]
@@ -408,6 +486,60 @@ impl ToolExecutor<ExtensionToolCall> for DeferredExtensionTool {
 
     fn exposure(&self) -> ToolExposure {
         ToolExposure::Deferred
+    }
+
+    fn handle(&self, _call: ExtensionToolCall) -> codex_tools::ToolExecutorFuture<'_> {
+        Box::pin(async { panic!("spec planning should not execute extension tools") })
+    }
+}
+
+struct DeferredExtensionWithoutSearchInfo;
+
+impl ToolExecutor<ExtensionToolCall> for DeferredExtensionWithoutSearchInfo {
+    fn tool_name(&self) -> ToolName {
+        ToolName::plain("undiscoverable_extension")
+    }
+
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::Function(ResponsesApiTool {
+            name: "undiscoverable_extension".to_string(),
+            description: "Synthetic deferred tool without search metadata.".to_string(),
+            strict: true,
+            defer_loading: None,
+            parameters: codex_tools::JsonSchema::default(),
+            output_schema: None,
+        })
+    }
+
+    fn exposure(&self) -> ToolExposure {
+        ToolExposure::Deferred
+    }
+
+    fn search_info(&self) -> Option<codex_tools::ToolSearchInfo> {
+        None
+    }
+
+    fn handle(&self, _call: ExtensionToolCall) -> codex_tools::ToolExecutorFuture<'_> {
+        Box::pin(async { panic!("spec planning should not execute extension tools") })
+    }
+}
+
+struct MalformedExtensionTool {
+    namespace: &'static str,
+    tool_name: &'static str,
+}
+
+impl ToolExecutor<ExtensionToolCall> for MalformedExtensionTool {
+    fn tool_name(&self) -> ToolName {
+        ToolName::namespaced(self.namespace, self.tool_name)
+    }
+
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::Namespace(codex_tools::ResponsesApiNamespace {
+            name: self.namespace.to_string(),
+            description: "Malformed empty namespace.".to_string(),
+            tools: Vec::new(),
+        })
     }
 
     fn handle(&self, _call: ExtensionToolCall) -> codex_tools::ToolExecutorFuture<'_> {
@@ -810,6 +942,10 @@ async fn host_context_gates_agent_job_tools() {
     .await;
     normal_agent_job.assert_visible_contains(&["spawn_agents_on_csv"]);
     normal_agent_job.assert_visible_lacks(&["report_agent_job_result"]);
+    assert_eq!(
+        normal_agent_job.authorization_class("spawn_agents_on_csv"),
+        TypedToolClass::RootTaskControl
+    );
 
     let worker_agent_job = probe(|turn| {
         set_feature(turn, Feature::SpawnCsv, /*enabled*/ true);
@@ -818,6 +954,10 @@ async fn host_context_gates_agent_job_tools() {
     })
     .await;
     worker_agent_job.assert_visible_contains(&["spawn_agents_on_csv", "report_agent_job_result"]);
+    assert_eq!(
+        worker_agent_job.authorization_class("report_agent_job_result"),
+        TypedToolClass::OwnTask
+    );
 
     let remote_agent_job = probe(|turn| {
         set_feature(turn, Feature::SpawnCsv, /*enabled*/ true);
@@ -849,6 +989,10 @@ async fn sleep_tool_follows_current_time_config() {
     })
     .await;
     assert_eq!(disabled.namespace_function_names("clock"), ["curr_time"]);
+    assert_eq!(
+        disabled.authorization_class(&ToolName::namespaced("clock", "curr_time").to_string()),
+        TypedToolClass::ReadSearch
+    );
 
     let enabled = probe(|turn| {
         set_feature(turn, Feature::CurrentTimeReminder, /*enabled*/ true);
@@ -1021,6 +1165,92 @@ async fn deferred_extension_tools_are_discoverable_with_tool_search() {
 }
 
 #[tokio::test]
+async fn deferred_extension_without_search_metadata_is_promoted_with_a_warning() {
+    let plan = probe_with(
+        |turn| turn.model_info.supports_search_tool = true,
+        ToolPlanInputs {
+            extension_tool_executors: vec![Arc::new(DeferredExtensionWithoutSearchInfo)],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    plan.assert_visible_contains(&["undiscoverable_extension"]);
+    assert_eq!(
+        plan.exposure("undiscoverable_extension"),
+        ToolExposure::Direct
+    );
+    assert!(
+        plan.warnings
+            .iter()
+            .any(|warning| warning.contains("no search metadata"))
+    );
+}
+
+#[tokio::test]
+async fn malformed_extension_specs_are_skipped_without_panicking() {
+    let plan = probe_with(
+        |_| {},
+        ToolPlanInputs {
+            extension_tool_executors: vec![Arc::new(MalformedExtensionTool {
+                namespace: "broken",
+                tool_name: "run",
+            })],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    plan.assert_registered_lacks(&["broken.run"]);
+    assert!(
+        plan.warnings
+            .iter()
+            .any(|warning| warning.contains("exactly one callable tool"))
+    );
+}
+
+#[tokio::test]
+async fn winning_registered_runtime_owns_its_external_mutation_intent() {
+    let mut read_only = mcp_tool("reader", "mcp__shared", "lookup");
+    read_only.tool.annotations = Some(rmcp::model::ToolAnnotations::new().read_only(true));
+    let plan = probe_with(
+        |_| {},
+        ToolPlanInputs {
+            mcp_tools: Some(vec![read_only]),
+            extension_tool_executors: vec![Arc::new(TestNamespaceExtensionTool {
+                namespace: "mcp__shared",
+                tool_name: "lookup",
+            })],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        plan.external_mutation_intents.get("mcp__shared.lookup"),
+        Some(&ExternalMutationIntent::ProvenReadOnly)
+    );
+
+    let mut mutating = mcp_tool("writer", "mcp__shared", "lookup");
+    mutating.tool.annotations = Some(rmcp::model::ToolAnnotations::new().read_only(false));
+    let plan = probe_with(
+        |_| {},
+        ToolPlanInputs {
+            mcp_tools: Some(vec![mutating]),
+            extension_tool_executors: vec![Arc::new(TestNamespaceExtensionTool {
+                namespace: "mcp__shared",
+                tool_name: "lookup",
+            })],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        plan.external_mutation_intents.get("mcp__shared.lookup"),
+        Some(&ExternalMutationIntent::MayMutate)
+    );
+}
+
+#[tokio::test]
 async fn duplicate_extension_tool_names_surface_an_actionable_warning() {
     let plan = probe_with(
         |_| {},
@@ -1126,7 +1356,8 @@ async fn deferred_web_run_stays_reachable_with_and_without_tool_search() {
     )
     .await;
     with_tool_search.assert_visible_contains(&["tool_search"]);
-    with_tool_search.assert_visible_lacks(&["web", "web_search"]);
+    with_tool_search.assert_visible_contains(&["web_search"]);
+    with_tool_search.assert_visible_lacks(&["web"]);
     with_tool_search.assert_registered_contains(&[&ToolName::namespaced("web", "run").to_string()]);
     assert_eq!(
         with_tool_search.exposure(&ToolName::namespaced("web", "run").to_string()),
@@ -1704,12 +1935,6 @@ async fn collaboration_namespace_selection_tracks_the_active_agent_version_and_s
 
     let namespace = active_collaboration_namespace(&turn, AgentSurfaceStage::TypedAdministration);
     assert_eq!(namespace, Some(MULTI_AGENT_V1_NAMESPACE));
-    for name in ["spawn_agent", "resume_agent", "close_agent"] {
-        assert_eq!(
-            classify_typed_tool(Some(MULTI_AGENT_V1_NAMESPACE), name, namespace),
-            TypedToolClass::RootTaskControl
-        );
-    }
 
     set_feature(&mut turn, Feature::MultiAgentV2, /*enabled*/ true);
     let namespace = active_collaboration_namespace(&turn, AgentSurfaceStage::TypedAdministration);

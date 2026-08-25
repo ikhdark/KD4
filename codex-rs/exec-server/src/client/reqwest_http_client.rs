@@ -1,4 +1,4 @@
-//! `reqwest`-backed `HttpClient` implementation.
+//! Shared-transport-backed `HttpClient` implementation.
 //!
 //! This code runs wherever the real network request should originate:
 //! - in a local environment, that means the orchestrator process
@@ -9,16 +9,18 @@ use std::error::Error as StdError;
 use std::time::Duration;
 
 use codex_exec_server_protocol::JSONRPCErrorError;
-use codex_http_client::build_reqwest_client_with_custom_ca;
-use codex_http_client::with_chatgpt_cloudflare_cookie_store;
+use codex_http_client::HttpClient as SharedHttpClient;
+use codex_http_client::HttpClientBuilder;
+use codex_http_client::HttpError;
+use codex_http_client::HttpResponse;
 use futures::FutureExt;
 use futures::StreamExt;
 use futures::future::BoxFuture;
-use reqwest::Method;
-use reqwest::Url;
-use reqwest::header::HeaderMap;
-use reqwest::header::HeaderName;
-use reqwest::header::HeaderValue;
+use http::HeaderMap;
+use http::HeaderName;
+use http::HeaderValue;
+use http::Method;
+use http::Uri;
 use tracing::Instrument;
 
 use super::HttpResponseBodyStream;
@@ -35,7 +37,7 @@ use crate::rpc::internal_error;
 use crate::rpc::invalid_params;
 
 /// `HttpClient` implementation that performs the actual HTTP request with
-/// `reqwest`.
+/// the repository-owned HTTP transport.
 #[derive(Clone, Default)]
 pub struct ReqwestHttpClient;
 
@@ -43,31 +45,27 @@ pub struct ReqwestHttpClient;
 /// downstream body-delta forwarding.
 pub(crate) struct PendingReqwestHttpBodyStream {
     pub(crate) request_id: String,
-    pub(crate) response: reqwest::Response,
+    pub(crate) response: HttpResponse,
 }
 
-/// Validates `http/request` parameters and runs the actual `reqwest` call used
+/// Validates `http/request` parameters and runs the actual HTTP call used
 /// by the exec-server route and the local [`HttpClient`] backend.
 pub(crate) struct ReqwestHttpRequestRunner {
-    client: reqwest::Client,
+    client: SharedHttpClient,
+    timeout: Option<Duration>,
 }
 
 impl ReqwestHttpClient {
     fn build_client(
-        timeout_ms: Option<u64>,
         redirect_policy: HttpRedirectPolicy,
-    ) -> Result<reqwest::Client, ExecServerError> {
-        let builder = match timeout_ms {
-            None => reqwest::Client::builder(),
-            Some(timeout_ms) => {
-                reqwest::Client::builder().timeout(Duration::from_millis(timeout_ms))
-            }
-        };
+    ) -> Result<SharedHttpClient, ExecServerError> {
+        let builder = HttpClientBuilder::new().with_chatgpt_cloudflare_cookie_store();
         let builder = match redirect_policy {
             HttpRedirectPolicy::Follow => builder,
-            HttpRedirectPolicy::Stop => builder.redirect(reqwest::redirect::Policy::none()),
+            HttpRedirectPolicy::Stop => builder.without_redirects(),
         };
-        build_reqwest_client_with_custom_ca(with_chatgpt_cloudflare_cookie_store(builder))
+        builder
+            .build_with_transport_default_proxy()
             .map_err(|error| ExecServerError::HttpRequest(error.to_string()))
     }
 }
@@ -125,9 +123,12 @@ impl ReqwestHttpRequestRunner {
         timeout_ms: Option<u64>,
         redirect_policy: HttpRedirectPolicy,
     ) -> Result<Self, JSONRPCErrorError> {
-        let client = ReqwestHttpClient::build_client(timeout_ms, redirect_policy)
+        let client = ReqwestHttpClient::build_client(redirect_policy)
             .map_err(|error| internal_error(error.to_string()))?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            timeout: timeout_ms.map(Duration::from_millis),
+        })
     }
 
     pub(crate) async fn run(
@@ -137,13 +138,16 @@ impl ReqwestHttpRequestRunner {
     {
         let method = Method::from_bytes(params.method.as_bytes())
             .map_err(|error| invalid_params(format!("http/request method is invalid: {error}")))?;
-        let url = Url::parse(&params.url)
+        let url = params
+            .url
+            .parse::<Uri>()
             .map_err(|error| invalid_params(format!("http/request url is invalid: {error}")))?;
-        match url.scheme() {
-            "http" | "https" => {}
+        match url.scheme_str() {
+            Some("http") | Some("https") => {}
             scheme => {
                 return Err(invalid_params(format!(
-                    "http/request only supports http and https URLs, got {scheme}"
+                    "http/request only supports http and https URLs, got {}",
+                    scheme.unwrap_or("<missing>")
                 )));
             }
         }
@@ -152,14 +156,20 @@ impl ReqwestHttpRequestRunner {
             "codex.exec_server.http_request",
             otel.kind = "client",
             http.request.method = method.as_str(),
-            server.address = url.host_str().unwrap_or_default(),
-            server.port = u64::from(url.port_or_known_default().unwrap_or_default()),
+            server.address = url.host().unwrap_or_default(),
+            server.port = u64::from(url.port_u16().unwrap_or_else(|| if url.scheme_str() == Some("https") { 443 } else { 80 })),
             http.response.status_code = tracing::field::Empty,
             error.type = tracing::field::Empty,
         );
         let mut headers = Self::build_headers(params.headers)?;
         codex_otel::inject_span_w3c_trace_headers(&request_span, &mut headers);
-        let mut request = self.client.request(method.clone(), url).headers(headers);
+        let mut request = self
+            .client
+            .request(method.clone(), params.url.clone())
+            .headers(headers);
+        if let Some(timeout) = self.timeout {
+            request = request.timeout(timeout);
+        }
         if let Some(body) = params.body {
             request = request.body(body.into_inner());
         }
@@ -298,7 +308,7 @@ impl ReqwestHttpRequestRunner {
     }
 }
 
-fn log_send_error(method: &Method, error: reqwest::Error) {
+fn log_send_error(method: &Method, error: HttpError) {
     let error = error.without_url();
     let source_chain = error_source_chain(&error);
     tracing::warn!(
@@ -311,7 +321,7 @@ fn log_send_error(method: &Method, error: reqwest::Error) {
     );
 }
 
-fn error_source_chain(error: &reqwest::Error) -> Option<String> {
+fn error_source_chain(error: &HttpError) -> Option<String> {
     let mut sources = Vec::new();
     let mut source = error.source();
     while let Some(error) = source {
@@ -319,4 +329,51 @@ fn error_source_chain(error: &reqwest::Error) -> Option<String> {
         source = error.source();
     }
     (!sources.is_empty()).then(|| sources.join(": "))
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::header;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn request_runner_uses_shared_client_for_buffered_http_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/shared-client"))
+            .and(header("x-codex-test", "exec-server"))
+            .respond_with(ResponseTemplate::new(201).set_body_bytes(b"created".to_vec()))
+            .mount(&server)
+            .await;
+        let runner = ReqwestHttpRequestRunner::new(Some(2_000), HttpRedirectPolicy::Follow)
+            .expect("build request runner");
+
+        let (response, pending_stream) = runner
+            .run(HttpRequestParams {
+                method: "POST".to_string(),
+                url: format!("{}/shared-client", server.uri()),
+                headers: vec![HttpHeader {
+                    name: "x-codex-test".to_string(),
+                    value: "exec-server".to_string(),
+                }],
+                body: Some(b"payload".to_vec().into()),
+                timeout_ms: Some(2_000),
+                redirect_policy: HttpRedirectPolicy::Follow,
+                request_id: "request-1".to_string(),
+                stream_response: false,
+            })
+            .await
+            .expect("run request");
+
+        assert_eq!(response.status, 201);
+        assert_eq!(response.body.into_inner(), b"created".to_vec());
+        assert!(pending_stream.is_none());
+    }
 }

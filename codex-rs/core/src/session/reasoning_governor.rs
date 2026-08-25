@@ -248,17 +248,19 @@ pub(crate) struct SamplingRequestBaselines {
     validation_revision: Option<u64>,
     plan_revision: u64,
     input_revision: u64,
+    tool_exposure_revision: u64,
 }
 
 impl SamplingRequestBaselines {
     fn revision_key(&self) -> String {
         format!(
-            "mutation={};validation_status={:?};validation_revision={:?};plan={};input={}",
+            "mutation={};validation_status={:?};validation_revision={:?};plan={};input={};tool_exposure={}",
             self.mutation_revision,
             self.validation_status,
             self.validation_revision,
             self.plan_revision,
             self.input_revision,
+            self.tool_exposure_revision,
         )
     }
 
@@ -272,6 +274,7 @@ pub(crate) struct SamplingRequestSettledState {
     pub(crate) mutation_revision: u64,
     pub(crate) validation_status: ValidationFreshnessStatus,
     pub(crate) validation_revision: Option<u64>,
+    pub(crate) tool_exposure_revision: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1884,11 +1887,27 @@ impl SamplingReasoningGovernor {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn baselines(
         &self,
         mutation_revision: u64,
         validation_status: ValidationFreshnessStatus,
         validation_revision: Option<u64>,
+    ) -> SamplingRequestBaselines {
+        self.baselines_with_tool_exposure_revision(
+            mutation_revision,
+            validation_status,
+            validation_revision,
+            0,
+        )
+    }
+
+    pub(crate) fn baselines_with_tool_exposure_revision(
+        &self,
+        mutation_revision: u64,
+        validation_status: ValidationFreshnessStatus,
+        validation_revision: Option<u64>,
+        tool_exposure_revision: u64,
     ) -> SamplingRequestBaselines {
         SamplingRequestBaselines {
             mutation_revision,
@@ -1896,6 +1915,7 @@ impl SamplingReasoningGovernor {
             validation_revision,
             plan_revision: self.plan_revision,
             input_revision: self.input_revision,
+            tool_exposure_revision,
         }
     }
 
@@ -1977,6 +1997,7 @@ impl SamplingReasoningGovernor {
             || settled.validation_revision != baselines.validation_revision
             || self.plan_revision != baselines.plan_revision
             || self.input_revision != baselines.input_revision
+            || settled.tool_exposure_revision != baselines.tool_exposure_revision
         {
             return None;
         }
@@ -2431,12 +2452,13 @@ impl SamplingReasoningGovernor {
 
     fn settled_revision_key(&self, settled: &SamplingRequestSettledState) -> String {
         format!(
-            "mutation={};validation_status={:?};validation_revision={:?};plan={};input={}",
+            "mutation={};validation_status={:?};validation_revision={:?};plan={};input={};tool_exposure={}",
             settled.mutation_revision,
             settled.validation_status,
             settled.validation_revision,
             self.plan_revision,
             self.input_revision,
+            settled.tool_exposure_revision,
         )
     }
 
@@ -2646,7 +2668,6 @@ fn lowest_supported_equivalent(
         .min_by_key(|preset| reasoning_effort_rank(&preset.effort))
         .map(|preset| preset.effort.clone())
         .or_else(|| model_info.default_reasoning_level.clone())
-        .or(Some(selected))
 }
 
 fn reasoning_effort_rank(effort: &ReasoningEffort) -> u8 {
@@ -2687,18 +2708,16 @@ fn supported_effort(
     {
         return Some(selected);
     }
+    let selected_rank = reasoning_effort_rank(&selected);
     model_info
         .supported_reasoning_levels
-        .get(
-            model_info
-                .supported_reasoning_levels
-                .len()
-                .saturating_sub(1)
-                / 2,
-        )
+        .iter()
+        .min_by_key(|preset| {
+            let rank = reasoning_effort_rank(&preset.effort);
+            (rank.abs_diff(selected_rank), rank)
+        })
         .map(|preset| preset.effort.clone())
         .or_else(|| model_info.default_reasoning_level.clone())
-        .or(Some(selected))
 }
 
 fn plan_is_unfinished(plan: &UpdatePlanArgs) -> bool {
@@ -2850,6 +2869,7 @@ mod tests {
             mutation_revision,
             validation_status,
             validation_revision,
+            tool_exposure_revision: 0,
         }
     }
 
@@ -3226,6 +3246,64 @@ mod tests {
                 .resolve_policy(Some(&config), Some(ReasoningEffort::Low), &low_only)
                 .effective_effort,
             Some(ReasoningEffort::Low)
+        );
+    }
+
+    #[test]
+    fn unsupported_effort_without_capabilities_is_not_emitted() {
+        let mut model_without_capabilities = model(&[], ReasoningEffort::Medium);
+        model_without_capabilities.default_reasoning_level = None;
+
+        assert_eq!(
+            supported_effort(Some(ReasoningEffort::High), &model_without_capabilities),
+            None
+        );
+        assert_eq!(
+            lowest_supported_equivalent(ReasoningEffort::High, &model_without_capabilities),
+            None
+        );
+    }
+
+    #[test]
+    fn unsupported_effort_fallback_is_order_independent() {
+        let ascending = model(
+            &[ReasoningEffort::Low, ReasoningEffort::High],
+            ReasoningEffort::Low,
+        );
+        let descending = model(
+            &[ReasoningEffort::High, ReasoningEffort::Low],
+            ReasoningEffort::Low,
+        );
+
+        assert_eq!(
+            supported_effort(Some(ReasoningEffort::Medium), &ascending),
+            Some(ReasoningEffort::Low)
+        );
+        assert_eq!(
+            supported_effort(Some(ReasoningEffort::Medium), &descending),
+            Some(ReasoningEffort::Low)
+        );
+    }
+
+    #[test]
+    fn deferred_tool_activation_changes_relevant_state_identity() {
+        let governor = SamplingReasoningGovernor::new(None);
+        let baselines = governor.baselines_with_tool_exposure_revision(
+            0,
+            ValidationFreshnessStatus::None,
+            None,
+            4,
+        );
+        let settled = SamplingRequestSettledState {
+            mutation_revision: 0,
+            validation_status: ValidationFreshnessStatus::None,
+            validation_revision: None,
+            tool_exposure_revision: 5,
+        };
+
+        assert_ne!(
+            baselines.revision_key(),
+            governor.settled_revision_key(&settled)
         );
     }
 
@@ -4080,6 +4158,7 @@ mod tests {
             mutation_revision: 7,
             validation_status: ValidationFreshnessStatus::None,
             validation_revision: None,
+            tool_exposure_revision: 0,
         };
         (baselines, settled)
     }

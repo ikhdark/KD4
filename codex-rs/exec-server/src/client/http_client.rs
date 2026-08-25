@@ -2,7 +2,8 @@
 //!
 //! This module is the facade for the environment-owned [`crate::HttpClient`]
 //! capability:
-//! - [`ReqwestHttpClient`] executes requests directly with `reqwest`
+//! - [`ReqwestHttpClient`] preserves the historical public name while executing requests through
+//!   `codex-http-client`
 //! - [`ExecServerClient`] forwards requests over the JSON-RPC transport
 //! - [`HttpResponseBodyStream`] presents buffered local bodies and streamed
 //!   remote `http/request/bodyDelta` notifications through one byte-stream API

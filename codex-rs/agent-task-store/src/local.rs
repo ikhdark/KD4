@@ -1,6 +1,7 @@
 use chrono::Duration;
 use chrono::Utc;
 use codex_state::StateRuntime;
+use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::Digest;
@@ -21,6 +22,7 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
@@ -64,7 +66,6 @@ use crate::MAX_MUTATION_EVIDENCE_LIMIT;
 use crate::MAX_MUTATION_SNAPSHOT_BYTES;
 use crate::MAX_OBSERVATION_LIMIT;
 use crate::MAX_SNAPSHOT_CHUNK_BYTES;
-use crate::MAX_VALIDATION_CALLS_PER_TASK;
 use crate::MAX_WAKE_EVENTS_PER_READ;
 use crate::MAX_WAKE_EVENTS_PER_ROOT;
 use crate::MissingEvidenceObligation;
@@ -90,6 +91,7 @@ use crate::ValidationEvidence;
 use crate::WakeEvent;
 use crate::WakeEventId;
 use crate::WakeRead;
+use crate::WakeReadStatus;
 use crate::WorkspaceActorRegistration;
 use crate::WorkspaceRevision;
 use crate::WorkspaceStrategy;
@@ -108,6 +110,20 @@ const COLD_REVIEW_REASON_PREFIX: &str = "cold review required: ";
 const DATABASE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const EXTERNAL_WAKE_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 const DATABASE_FILENAME: &str = "agent_tasks.sqlite";
+
+fn workspace_actor_lease_state(
+    state: &str,
+    lease_expires_at: Option<chrono::DateTime<Utc>>,
+    now: chrono::DateTime<Utc>,
+) -> Option<crate::LeaseState> {
+    if state != "active" {
+        return Some(crate::LeaseState::Released);
+    }
+    Some(match lease_expires_at {
+        Some(expires_at) if expires_at >= now => crate::LeaseState::Active,
+        _ => crate::LeaseState::Expired,
+    })
+}
 
 fn sqlite_contention_code(error: &sqlx::Error) -> Option<&str> {
     let sqlx::Error::Database(error) = error else {
@@ -155,6 +171,7 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 tokio::task_local! {
     static TEST_COMPARISON_NOW: chrono::DateTime<Utc>;
     static TEST_SNAPSHOT_CAPTURE_PAUSE: Arc<TestSnapshotCapturePause>;
+    static TEST_RECEIPT_REFRESH_PAUSE: Arc<TestReceiptRefreshPause>;
 }
 
 #[cfg(test)]
@@ -165,6 +182,22 @@ pub(crate) struct TestSnapshotCapturePause {
 
 #[cfg(test)]
 impl TestSnapshotCapturePause {
+    pub(crate) fn new() -> Self {
+        Self {
+            started: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct TestReceiptRefreshPause {
+    pub(crate) started: tokio::sync::Semaphore,
+    pub(crate) release: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+impl TestReceiptRefreshPause {
     pub(crate) fn new() -> Self {
         Self {
             started: tokio::sync::Semaphore::new(0),
@@ -195,6 +228,24 @@ pub(crate) async fn with_test_snapshot_capture_pause<T>(
     future: impl std::future::Future<Output = T>,
 ) -> T {
     TEST_SNAPSHOT_CAPTURE_PAUSE.scope(pause, future).await
+}
+
+#[cfg(test)]
+pub(crate) async fn with_test_receipt_refresh_pause<T>(
+    pause: Arc<TestReceiptRefreshPause>,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    TEST_RECEIPT_REFRESH_PAUSE.scope(pause, future).await
+}
+
+#[cfg(test)]
+async fn pause_after_receipt_validation_refresh() {
+    if let Ok(pause) = TEST_RECEIPT_REFRESH_PAUSE.try_with(Arc::clone) {
+        pause.started.add_permits(1);
+        if let Ok(permit) = pause.release.acquire().await {
+            permit.forget();
+        }
+    }
 }
 
 enum ReceiptHandoffAction {
@@ -405,7 +456,8 @@ impl LocalAgentTaskStore {
             .drain_snapshot_gc_queue_best_effort("store initialization")
             .await;
         store.reconcile_snapshot_files().await?;
-        store.rebuild_wake_streams().await?;
+        store.reconcile_task_capsules().await?;
+        store.rebuild_wake_streams_if_needed().await?;
         Ok(store)
     }
 
@@ -716,13 +768,16 @@ impl LocalAgentTaskStore {
             return Err(StoreError::AttemptNotActive(attempt_id));
         }
         let capsule_path = task_capsule_path(&self.coordination_root, assignment_id);
-        if capsule_path.try_exists()? {
+        if assignment.task_capsule.is_some() || capsule_path.try_exists()? {
             return Err(StoreError::TaskCapsuleAlreadyAttached(assignment_id));
         }
         if let Some(parent) = capsule_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let temporary_path = capsule_path.with_extension(format!("{}.tmp", uuid::Uuid::now_v7()));
+        let temporary_path = task_capsule_staging_path(&self.coordination_root, assignment_id);
+        if temporary_path.try_exists()? {
+            std::fs::remove_file(&temporary_path)?;
+        }
         let mut file = match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -740,19 +795,12 @@ impl LocalAgentTaskStore {
             return Err(error.into());
         }
         drop(file);
-        if let Err(error) = std::fs::hard_link(&temporary_path, &capsule_path) {
-            let _ = std::fs::remove_file(&temporary_path);
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                return Err(StoreError::TaskCapsuleAlreadyAttached(assignment_id));
-            }
-            return Err(error.into());
-        }
-        let _ = std::fs::remove_file(&temporary_path);
+        assignment.task_capsule = Some(canonical_payload.clone());
         if let Err(error) = transaction.commit().await {
-            let _ = std::fs::remove_file(&capsule_path);
+            let _ = std::fs::remove_file(&temporary_path);
             return Err(error.into());
         }
-        assignment.task_capsule = Some(canonical_payload);
+        std::fs::rename(&temporary_path, &capsule_path)?;
         Ok(assignment)
     }
 
@@ -784,17 +832,15 @@ impl LocalAgentTaskStore {
             .into_iter()
             .map(|row| decode(row.get::<String, _>("body_json").as_str()))
             .collect::<StoreResult<Vec<_>>>()?;
-        let mut validation_calls = sqlx::query(
-            "SELECT body_json FROM validation_calls WHERE attempt_id = ? ORDER BY julianday(json_extract(recorded_at, '$')) DESC, call_id DESC LIMIT ?",
+        let validation_calls = sqlx::query(
+            "SELECT body_json FROM validation_calls WHERE attempt_id = ? ORDER BY julianday(json_extract(recorded_at, '$')), call_id",
         )
         .bind(current_attempt.attempt_id.to_string())
-        .bind(MAX_VALIDATION_CALLS_PER_TASK as i64)
         .fetch_all(&mut *transaction)
         .await?
         .into_iter()
         .map(|row| decode(row.get::<String, _>("body_json").as_str()))
         .collect::<StoreResult<Vec<_>>>()?;
-        validation_calls.reverse();
         let mut observations = if limit == 0 {
             Vec::new()
         } else {
@@ -824,16 +870,20 @@ impl LocalAgentTaskStore {
             .transpose()?;
         let lease_state = actor_row
             .as_ref()
-            .and_then(|row| row.get::<Option<String>, _>("lease_expires_at"))
-            .map(|value| decode::<chrono::DateTime<Utc>>(&value))
+            .map(|row| {
+                let state = row.get::<String, _>("state");
+                let expires_at = row
+                    .get::<Option<String>, _>("lease_expires_at")
+                    .map(|value| decode::<chrono::DateTime<Utc>>(&value))
+                    .transpose()?;
+                Ok::<Option<crate::LeaseState>, StoreError>(workspace_actor_lease_state(
+                    &state,
+                    expires_at,
+                    Utc::now(),
+                ))
+            })
             .transpose()?
-            .map(|expires_at| {
-                if expires_at < Utc::now() {
-                    crate::LeaseState::Expired
-                } else {
-                    crate::LeaseState::Active
-                }
-            });
+            .flatten();
         let nudge_sent_at = actor_row
             .as_ref()
             .and_then(|row| row.get::<Option<String>, _>("nudge_sent_at"))
@@ -1244,6 +1294,11 @@ impl LocalAgentTaskStore {
             ));
         }
         let mut call = prepare_validation_call(&self.pool, call).await?;
+        if call.status == crate::ValidationCallStatus::Running {
+            call.evidence.lease_expires_at = Some(
+                comparison_now() + chrono::Duration::seconds(crate::MAX_VALIDATION_LEASE_SECONDS),
+            );
+        }
         let mut transaction = self.pool.begin().await?;
         lock_attempt_tx(&mut transaction, call.attempt_id).await?;
         let attempt = load_attempt_tx(&mut transaction, call.attempt_id).await?;
@@ -1253,7 +1308,6 @@ impl LocalAgentTaskStore {
         }
         let attempt_is_active =
             attempt.state == AttemptState::Active && attempt.sealed_at.is_none();
-        let mut reconciliation_exhausted = false;
         if let Some(row) = sqlx::query(
             "SELECT attempt_id, body_json, status FROM validation_calls WHERE call_id = ?",
         )
@@ -1401,7 +1455,7 @@ impl LocalAgentTaskStore {
                            AND julianday(json_extract(lease_expires_at, '$')) >= julianday(json_extract(?, '$'))",
                     )
                     .bind(&workspace_id)
-                    .bind(call.evidence.start_epoch as i64)
+                    .bind(sqlite_epoch(call.evidence.start_epoch)?)
                     .bind(&fingerprint)
                     .bind(&now)
                     .fetch_optional(&mut *transaction)
@@ -1436,7 +1490,7 @@ impl LocalAgentTaskStore {
                         updated_at = excluded.updated_at",
                 )
                 .bind(workspace_id)
-                .bind(call.evidence.start_epoch as i64)
+                .bind(sqlite_epoch(call.evidence.start_epoch)?)
                 .bind(validation_inflight_fingerprint(&call)?)
                 .bind(&call.call_id)
                 .bind(
@@ -1450,9 +1504,7 @@ impl LocalAgentTaskStore {
                 .execute(&mut *transaction)
                 .await?;
             }
-            reconciliation_exhausted =
-                reserve_reconciliation_validation_tx(&mut transaction, &attempt, &call.call_id)
-                    .await?;
+            reserve_reconciliation_validation_tx(&mut transaction, &attempt, &call.call_id).await?;
         }
         if call.status.is_terminal() {
             sqlx::query(
@@ -1480,7 +1532,7 @@ impl LocalAgentTaskStore {
                 )
                 .await?;
             }
-            if attempt_is_active {
+            if attempt_is_active && call.status == crate::ValidationCallStatus::Succeeded {
                 let workspace_id =
                     assignment_workspace_id_tx(&mut transaction, attempt.assignment_id).await?;
                 let progress_at = comparison_now();
@@ -1501,9 +1553,6 @@ impl LocalAgentTaskStore {
             }
         }
         transaction.commit().await?;
-        if reconciliation_exhausted {
-            return Err(StoreError::StaleRecoveryExhausted(call.attempt_id));
-        }
         Ok(())
     }
 
@@ -1527,7 +1576,7 @@ impl LocalAgentTaskStore {
     async fn heartbeat_validation_call_impl(
         &self,
         call_id: String,
-        lease_expires_at: chrono::DateTime<Utc>,
+        _lease_expires_at: chrono::DateTime<Utc>,
     ) -> StoreResult<bool> {
         let mut transaction = self.pool.begin().await?;
         let body = sqlx::query_scalar::<_, String>(
@@ -1564,6 +1613,8 @@ impl LocalAgentTaskStore {
                 return Ok(false);
             }
         }
+        let lease_expires_at =
+            comparison_now() + chrono::Duration::seconds(crate::MAX_VALIDATION_LEASE_SECONDS);
         call.evidence.lease_expires_at = Some(lease_expires_at);
         let updated = sqlx::query(
             "UPDATE validation_calls SET body_json = ?
@@ -1581,7 +1632,7 @@ impl LocalAgentTaskStore {
                  WHERE leader_call_id = ? AND state = 'running'",
             )
             .bind(encode(&lease_expires_at)?)
-            .bind(encode(&Utc::now())?)
+            .bind(encode(&comparison_now())?)
             .bind(&call_id)
             .execute(&mut *transaction)
             .await?;
@@ -1782,6 +1833,10 @@ impl LocalAgentTaskStore {
         } else {
             ValidationRefreshResult::default()
         };
+        #[cfg(test)]
+        if draft.status == AgentStatusClaim::Completed {
+            pause_after_receipt_validation_refresh().await;
+        }
         let handoff_action = if draft.status == AgentStatusClaim::Completed {
             self.prepare_receipt_handoff_action(attempt_id).await?
         } else {
@@ -1806,6 +1861,24 @@ impl LocalAgentTaskStore {
             return Err(StoreError::ReceiptAlreadySealed(attempt_id));
         }
         let assignment = load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
+        let commit_revision = if draft.status == AgentStatusClaim::Completed {
+            let canonical_root = sqlx::query_scalar::<_, String>(
+                "SELECT canonical_root FROM assignment_repositories WHERE assignment_id = ?",
+            )
+            .bind(assignment.assignment_id.to_string())
+            .fetch_one(&mut *transaction)
+            .await?;
+            let commit_revision = crate::workspace::capture_revision_tx(
+                &mut transaction,
+                Path::new(&canonical_root),
+                vec![crate::workspace::REPOSITORY_WIDE_PATH.to_string()],
+            )
+            .await?;
+            require_complete_workspace_capture(&commit_revision)?;
+            Some(commit_revision)
+        } else {
+            None
+        };
         validate_criterion_results(&assignment, attempt.amendment.as_ref(), &draft)?;
         let mut invalid_calls = Vec::new();
         let mut invalid_statuses = Vec::new();
@@ -1840,16 +1913,39 @@ impl LocalAgentTaskStore {
                     "validation call {call_id} has inconsistent persisted identity or status"
                 )));
             }
-            if draft.status == AgentStatusClaim::Completed
+            let receipt_stale_reason = if draft.status == AgentStatusClaim::Completed
                 && call.status == crate::ValidationCallStatus::Succeeded
-                && let Some((reason, current_epoch)) = validation_stale_event_reason_tx(
-                    &mut transaction,
-                    &assignment,
-                    &call,
-                    validation_refresh.exact_fresh_epochs.get(call_id).copied(),
-                )
-                .await?
             {
+                let revision = commit_revision.as_ref().ok_or_else(|| {
+                    StoreError::CorruptData(
+                        "completed receipt is missing its commit workspace revision".to_string(),
+                    )
+                })?;
+                let commit_dependency_manifest_hash = validation_dependency_manifest_hash(
+                    &call.command_summary,
+                    &revision.files,
+                    &call.evidence.covered_scopes,
+                    call.evidence.repository_wide,
+                )?;
+                if commit_dependency_manifest_hash != call.evidence.dependency_manifest_hash {
+                    Some((
+                            "repository contents changed after validation refresh and before receipt commit"
+                                .to_string(),
+                            revision.epoch,
+                        ))
+                } else {
+                    validation_stale_event_reason_tx(
+                        &mut transaction,
+                        &assignment,
+                        &call,
+                        validation_refresh.exact_fresh_epochs.get(call_id).copied(),
+                    )
+                    .await?
+                }
+            } else {
+                None
+            };
+            if let Some((reason, current_epoch)) = receipt_stale_reason {
                 let mut superseded = call.clone();
                 superseded.status = crate::ValidationCallStatus::Superseded;
                 superseded.evidence.end_epoch = Some(current_epoch);
@@ -1879,6 +1975,7 @@ impl LocalAgentTaskStore {
                 && call.proof_kind == crate::ValidationProofKind::Focused
                 && call.evidence.end_epoch.is_some()
                 && call.evidence.stale_reason.is_none()
+                && validation_has_complete_exact_snapshot(&call)?
                 && call
                     .resolved_executable
                     .as_deref()
@@ -2626,13 +2723,14 @@ impl LocalAgentTaskStore {
             .await?
         else {
             return Ok(WakeRead {
+                status: WakeReadStatus::NoStream,
                 reason: None,
                 updated_agents: Vec::new(),
                 latest_event_id: None,
                 lost_to_retention_count: 0,
                 remaining_count: 0,
                 truncated_count: 0,
-                timed_out: true,
+                timed_out: false,
             });
         };
         let retained_from = stream.get::<i64, _>("retained_from_sequence");
@@ -2675,8 +2773,13 @@ impl LocalAgentTaskStore {
             .or(after_event_id);
         transaction.commit().await?;
         Ok(WakeRead {
+            status: if updated_agents.is_empty() {
+                WakeReadStatus::Empty
+            } else {
+                WakeReadStatus::EventsAvailable
+            },
             reason,
-            timed_out: updated_agents.is_empty(),
+            timed_out: false,
             updated_agents,
             latest_event_id,
             lost_to_retention_count: lost_to_retention,
@@ -2757,21 +2860,84 @@ impl LocalAgentTaskStore {
         expected: Option<WakeEventId>,
         next: WakeEventId,
     ) -> StoreResult<bool> {
+        async fn wake_event_sequence_tx(
+            transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+            root_session_id: &str,
+            event_id: WakeEventId,
+        ) -> StoreResult<i64> {
+            let Some(row) = sqlx::query(
+                "SELECT root_session_id, wake_sequence
+                 FROM observations WHERE wake_event_id = ?",
+            )
+            .bind(event_id.to_string())
+            .fetch_optional(&mut **transaction)
+            .await?
+            else {
+                return Err(StoreError::InvalidWakeWatermark(event_id.to_string()));
+            };
+            if row.get::<String, _>("root_session_id") != root_session_id {
+                return Err(StoreError::InvalidWakeWatermark(event_id.to_string()));
+            }
+            Ok(row.get::<i64, _>("wake_sequence"))
+        }
+
+        if root_session_id.trim().is_empty() || consuming_agent_path.trim().is_empty() {
+            return Err(StoreError::InvalidAssignment(
+                "automatic wake cursor keys cannot be empty".to_string(),
+            ));
+        }
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE automatic_wake_cursors SET updated_at = updated_at
+             WHERE root_session_id = ? AND consuming_agent_path = ?",
+        )
+        .bind(&root_session_id)
+        .bind(&consuming_agent_path)
+        .execute(&mut *transaction)
+        .await?;
+        let Some(row) = sqlx::query(
+            "SELECT event_id FROM automatic_wake_cursors
+             WHERE root_session_id = ? AND consuming_agent_path = ?",
+        )
+        .bind(&root_session_id)
+        .bind(&consuming_agent_path)
+        .fetch_optional(&mut *transaction)
+        .await?
+        else {
+            transaction.commit().await?;
+            return Ok(false);
+        };
+        let stored = row.get::<Option<String>, _>("event_id");
         let expected = expected.map(|value| value.to_string());
+        if stored != expected {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+        let next_sequence =
+            wake_event_sequence_tx(&mut transaction, &root_session_id, next).await?;
+        if let Some(stored) = stored {
+            let current = WakeEventId::parse(&stored)?;
+            let current_sequence =
+                wake_event_sequence_tx(&mut transaction, &root_session_id, current).await?;
+            if next_sequence < current_sequence {
+                return Err(StoreError::WakeWatermarkRegression {
+                    current: current_sequence,
+                    next: next_sequence,
+                });
+            }
+        }
         let changed = sqlx::query(
             "UPDATE automatic_wake_cursors
              SET event_id = ?, updated_at = ?
-             WHERE root_session_id = ? AND consuming_agent_path = ?
-               AND ((event_id = ?) OR (event_id IS NULL AND ? IS NULL))",
+             WHERE root_session_id = ? AND consuming_agent_path = ?",
         )
         .bind(next.to_string())
         .bind(encode(&Utc::now())?)
-        .bind(root_session_id)
-        .bind(consuming_agent_path)
-        .bind(&expected)
-        .bind(&expected)
-        .execute(&self.pool)
+        .bind(&root_session_id)
+        .bind(&consuming_agent_path)
+        .execute(&mut *transaction)
         .await?;
+        transaction.commit().await?;
         Ok(changed.rows_affected() == 1)
     }
 
@@ -2839,6 +3005,12 @@ impl LocalAgentTaskStore {
         }
         let workspace_id = assignment_workspace_id_tx(&mut transaction, assignment_id).await?;
         let now = comparison_now();
+        let recovery_threshold_seconds = u64::try_from(
+            now.signed_duration_since(no_progress_before)
+                .num_seconds()
+                .max(0),
+        )
+        .unwrap_or(u64::MAX);
         let idle = sqlx::query_scalar::<_, i64>(
             "SELECT EXISTS(
                 SELECT 1 FROM workspace_actors
@@ -2875,6 +3047,8 @@ impl LocalAgentTaskStore {
             return Ok(NonproductiveRecovery::Suspended(ProductivitySummary {
                 active_owned_operation_count,
                 cancelled_expired_operation_count: 0,
+                recovery_threshold_seconds,
+                recovery_policy_version: crate::NONPRODUCTIVE_RECOVERY_POLICY_VERSION,
             }));
         }
 
@@ -2938,13 +3112,18 @@ impl LocalAgentTaskStore {
             assignment_id,
             attempt_id: attempt.attempt_id,
             status: AgentStatusClaim::Abandoned,
-            summary: "assignment abandoned after 120 seconds without meaningful progress"
-                .to_string(),
+            summary: format!(
+                "assignment abandoned after {recovery_threshold_seconds} seconds without meaningful progress (recovery policy v{})",
+                crate::NONPRODUCTIVE_RECOVERY_POLICY_VERSION
+            ),
             criterion_results,
             declared_changes: Vec::new(),
             validation_call_ids: Vec::new(),
             blockers: Vec::new(),
-            risks: Vec::new(),
+            risks: vec![format!(
+                "nonproductive_recovery_policy_version={}",
+                crate::NONPRODUCTIVE_RECOVERY_POLICY_VERSION
+            )],
             next_action: None,
             architecture_contract: None,
             evidence_epoch: current_epoch,
@@ -2992,6 +3171,8 @@ impl LocalAgentTaskStore {
             productivity: ProductivitySummary {
                 active_owned_operation_count: 0,
                 cancelled_expired_operation_count,
+                recovery_threshold_seconds,
+                recovery_policy_version: crate::NONPRODUCTIVE_RECOVERY_POLICY_VERSION,
             },
         })
     }
@@ -3023,72 +3204,8 @@ impl LocalAgentTaskStore {
     ) -> StoreResult<MutationEventId> {
         let normalized = normalize_repo_path(repo_root, &path)?;
         let repository = repository_identity(repo_root)?;
-        let (assignment_id, existing, start_epoch) = {
-            let mut transaction = self.pool.begin().await?;
-            let attempt = require_active_current_attempt_tx(&mut transaction, attempt_id).await?;
-            let assignment = load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
-            require_repository_identity_tx(&mut transaction, &assignment, &repository).await?;
-            let existing = sqlx::query(
-                "SELECT finalized_at FROM mutation_files WHERE attempt_id = ? AND path = ?",
-            )
-            .bind(attempt_id.to_string())
-            .bind(&normalized)
-            .fetch_optional(&mut *transaction)
-            .await?;
-            if existing
-                .as_ref()
-                .is_some_and(|row| row.get::<Option<String>, _>("finalized_at").is_some())
-            {
-                return Err(StoreError::MutationAlreadyFinalized {
-                    attempt_id,
-                    path: normalized,
-                });
-            }
-            let start_epoch = if existing.is_none() {
-                let epoch = assignment_epoch_tx(&mut transaction, assignment.assignment_id).await?;
-                Some(i64::try_from(epoch).map_err(|_| {
-                    StoreError::CorruptData(
-                        "workspace epoch exceeds SQLite integer range".to_string(),
-                    )
-                })?)
-            } else {
-                None
-            };
-            transaction.commit().await?;
-            (assignment.assignment_id, existing.is_some(), start_epoch)
-        };
-
-        let snapshot_candidate = if existing {
-            None
-        } else {
-            let start_epoch = start_epoch.ok_or_else(|| {
-                StoreError::CorruptData("new mutation is missing its start epoch".to_string())
-            })?;
-            let absolute = absolute_repo_path(&repository.canonical_root, &normalized);
-            let snapshot_name = unique_snapshot_name(snapshot_name(
-                assignment_id,
-                attempt_id,
-                &normalized,
-                MutationSnapshotVersion::PreWrite,
-                absolute.exists(),
-            ))?;
-            let snapshot_name = snapshot_name.to_string_lossy().into_owned();
-            let snapshot_path = private_snapshot_path(&self.coordination_root, &snapshot_name)?;
-            let snapshot_started = Instant::now();
-            let pre_write =
-                capture_snapshot_atomic(absolute, snapshot_path.clone(), normalized.clone())
-                    .await?;
-            record_coordination_timing(
-                "begin_mutation",
-                "snapshot_capture",
-                snapshot_started,
-                None,
-            );
-            Some((pre_write, snapshot_name, snapshot_path, start_epoch))
-        };
-
-        let transaction_started = Instant::now();
-        let result: StoreResult<(MutationEventId, bool)> = async {
+        let mut snapshot_candidate = None;
+        let result: StoreResult<MutationEventId> = async {
             let mut transaction = self.pool.begin().await?;
             lock_attempt_tx(&mut transaction, attempt_id).await?;
             let attempt = require_active_current_attempt_tx(&mut transaction, attempt_id).await?;
@@ -3112,13 +3229,28 @@ impl LocalAgentTaskStore {
             }
             let inserted_snapshot = existing.is_none();
             if inserted_snapshot {
-                let Some((pre_write, snapshot_name, _, start_epoch)) =
-                    snapshot_candidate.as_ref()
-                else {
-                    return Err(StoreError::CorruptData(
-                        "mutation snapshot candidate is missing".to_string(),
-                    ));
-                };
+                let start_epoch = sqlite_epoch(
+                    assignment_epoch_tx(&mut transaction, assignment.assignment_id).await?,
+                )?;
+                let absolute = absolute_repo_path(&repository.canonical_root, &normalized);
+                let snapshot_name = unique_snapshot_name(snapshot_name(
+                    assignment.assignment_id,
+                    attempt_id,
+                    &normalized,
+                    MutationSnapshotVersion::PreWrite,
+                    absolute.exists(),
+                ))?
+                .to_string_lossy()
+                .into_owned();
+                let snapshot_path =
+                    private_snapshot_path(&self.coordination_root, &snapshot_name)?;
+                let pre_write = capture_snapshot_atomic(
+                    absolute,
+                    snapshot_path.clone(),
+                    normalized.clone(),
+                )
+                .await?;
+                snapshot_candidate = Some((snapshot_name.clone(), snapshot_path));
                 sqlx::query("INSERT INTO mutation_files (attempt_id, assignment_id, path, pre_write_hash, pre_write_existed, attribution_confidence, snapshot_name, snapshot_retained, first_observed_at, start_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)")
                     .bind(attempt_id.to_string())
                     .bind(assignment.assignment_id.to_string())
@@ -3126,9 +3258,9 @@ impl LocalAgentTaskStore {
                     .bind(&pre_write.hash)
                     .bind(i64::from(pre_write.existed))
                     .bind(encode(&confidence)?)
-                    .bind(snapshot_name)
+                    .bind(&snapshot_name)
                     .bind(encode(&Utc::now())?)
-                    .bind(*start_epoch)
+                    .bind(start_epoch)
                     .execute(&mut *transaction)
                     .await?;
             } else if confidence == AttributionConfidence::Definitive {
@@ -3157,27 +3289,16 @@ impl LocalAgentTaskStore {
             )
             .await?;
             transaction.commit().await?;
-            Ok((event_id, inserted_snapshot))
+            Ok(event_id)
         }
         .await;
-        let timing_error = result.as_ref().err().and_then(|error| match error {
-            StoreError::Sql(error) => Some(error),
-            _ => None,
-        });
-        record_coordination_timing(
-            "begin_mutation",
-            "write_transaction",
-            transaction_started,
-            timing_error,
-        );
-        let keep_snapshot = matches!(&result, Ok((_, true)));
-        if !keep_snapshot
-            && let Some((_, snapshot_name, snapshot_path, _)) = snapshot_candidate.as_ref()
+        if result.is_err()
+            && let Some((snapshot_name, snapshot_path)) = snapshot_candidate.as_ref()
         {
             remove_unpublished_snapshot(&self.pool, snapshot_name, snapshot_path, "begin mutation")
                 .await;
         }
-        result.map(|(event_id, _)| event_id)
+        result
     }
 
     async fn finalize_mutation_impl(
@@ -3187,132 +3308,85 @@ impl LocalAgentTaskStore {
         path: String,
     ) -> StoreResult<MutationEvidence> {
         let normalized = normalize_repo_path(repo_root, &path)?;
+        self.finalize_mutations_atomically_impl(attempt_id, repo_root, Some(vec![normalized]))
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| StoreError::CorruptData("finalization returned no evidence".into()))
+    }
+
+    async fn finalize_mutations_atomically_impl(
+        &self,
+        attempt_id: AttemptId,
+        repo_root: &Path,
+        requested_paths: Option<Vec<String>>,
+    ) -> StoreResult<Vec<MutationEvidence>> {
         let repository = repository_identity(repo_root)?;
-        let assignment_id = {
+        let mut snapshots: Vec<(String, PathBuf)> = Vec::new();
+        let mut requested_paths = requested_paths;
+        let result: StoreResult<Vec<MutationEvidence>> = async {
             let mut transaction = self.pool.begin().await?;
+            lock_attempt_tx(&mut transaction, attempt_id).await?;
             let attempt = require_active_current_attempt_tx(&mut transaction, attempt_id).await?;
             let assignment = load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
             require_repository_identity_tx(&mut transaction, &assignment, &repository).await?;
-            let existing = sqlx::query(
-                "SELECT finalized_at FROM mutation_files WHERE attempt_id = ? AND path = ?",
-            )
-            .bind(attempt_id.to_string())
-            .bind(&normalized)
-            .fetch_optional(&mut *transaction)
-            .await?;
-            let Some(existing) = existing else {
-                return Err(StoreError::MutationNotStarted {
-                    attempt_id,
-                    path: normalized,
-                });
+            let paths = match requested_paths.take() {
+                Some(paths) => paths,
+                None => sqlx::query_scalar::<_, String>(
+                    "SELECT path FROM mutation_files WHERE attempt_id = ? AND finalized_at IS NULL ORDER BY first_observed_at, path",
+                )
+                .bind(attempt_id.to_string())
+                .fetch_all(&mut *transaction)
+                .await?,
             };
-            if existing.get::<Option<String>, _>("finalized_at").is_some() {
-                return Err(StoreError::MutationAlreadyFinalized {
-                    attempt_id,
-                    path: normalized,
-                });
-            }
-            transaction.commit().await?;
-            assignment.assignment_id
-        };
-        let absolute = absolute_repo_path(&repository.canonical_root, &normalized);
-        let final_snapshot_name = unique_snapshot_name(snapshot_name(
-            assignment_id,
-            attempt_id,
-            &normalized,
-            MutationSnapshotVersion::Final,
-            absolute.exists(),
-        ))?;
-        let final_snapshot_name = final_snapshot_name.to_string_lossy().into_owned();
-        let snapshot_path = private_snapshot_path(&self.coordination_root, &final_snapshot_name)?;
-        let snapshot_started = Instant::now();
-        let final_write =
-            capture_snapshot_atomic(absolute, snapshot_path.clone(), normalized.clone()).await?;
-        record_coordination_timing(
-            "finalize_mutation",
-            "snapshot_capture",
-            snapshot_started,
-            None,
-        );
-
-        let result: StoreResult<MutationEvidence> = async {
-            let acquire_started = Instant::now();
-            let mut connection = self.pool.acquire().await.inspect_err(|error| {
-                record_coordination_timing(
-                    "finalize_mutation",
-                    "connection_acquire",
-                    acquire_started,
-                    Some(error),
-                );
-            })?;
-            record_coordination_timing(
-                "finalize_mutation",
-                "connection_acquire",
-                acquire_started,
-                None,
-            );
-            let begin_started = Instant::now();
-            let mut transaction = connection.begin().await.inspect_err(|error| {
-                record_coordination_timing(
-                    "finalize_mutation",
-                    "transaction_begin",
-                    begin_started,
-                    Some(error),
-                );
-            })?;
-            record_coordination_timing(
-                "finalize_mutation",
-                "transaction_begin",
-                begin_started,
-                None,
-            );
-            let transaction_started = Instant::now();
-            let writer_started = Instant::now();
-            let writer_result = lock_attempt_tx(&mut transaction, attempt_id).await;
-            let writer_error = writer_result.as_ref().err().and_then(|error| match error {
-                StoreError::Sql(error) => Some(error),
-                _ => None,
-            });
-            record_coordination_timing(
-                "finalize_mutation",
-                "writer_lock",
-                writer_started,
-                writer_error,
-            );
-            writer_result?;
-            let write_result: StoreResult<MutationEvidence> = async {
-                let attempt =
-                    require_active_current_attempt_tx(&mut transaction, attempt_id).await?;
-                let assignment =
-                    load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
-                require_repository_identity_tx(&mut transaction, &assignment, &repository).await?;
-                let existing = sqlx::query(
+            let mut evidence = Vec::with_capacity(paths.len());
+            for normalized in paths {
+                let existing = sqlx::query_scalar::<_, Option<String>>(
                     "SELECT finalized_at FROM mutation_files WHERE attempt_id = ? AND path = ?",
                 )
                 .bind(attempt_id.to_string())
                 .bind(&normalized)
                 .fetch_optional(&mut *transaction)
-                .await?;
-                let Some(existing) = existing else {
-                    return Err(StoreError::MutationNotStarted {
-                        attempt_id,
-                        path: normalized.clone(),
-                    });
-                };
-                if existing.get::<Option<String>, _>("finalized_at").is_some() {
+                .await?
+                .ok_or_else(|| StoreError::MutationNotStarted {
+                    attempt_id,
+                    path: normalized.clone(),
+                })?;
+                if existing.is_some() {
                     return Err(StoreError::MutationAlreadyFinalized {
                         attempt_id,
-                        path: normalized.clone(),
+                        path: normalized,
                     });
                 }
+                let absolute = absolute_repo_path(&repository.canonical_root, &normalized);
+                let final_snapshot_name = unique_snapshot_name(snapshot_name(
+                    assignment.assignment_id,
+                    attempt_id,
+                    &normalized,
+                    MutationSnapshotVersion::Final,
+                    absolute.exists(),
+                ))?
+                .to_string_lossy()
+                .into_owned();
+                let snapshot_path =
+                    private_snapshot_path(&self.coordination_root, &final_snapshot_name)?;
+                let final_write = capture_snapshot_atomic(
+                    absolute.clone(),
+                    snapshot_path.clone(),
+                    normalized.clone(),
+                )
+                .await?;
+                snapshots.push((final_snapshot_name.clone(), snapshot_path));
+                if inspect_source(absolute, normalized.clone()).await? != final_write {
+                    return Err(StoreError::SnapshotHashMismatch {
+                        attempt_id,
+                        path: normalized,
+                    });
+                }
+                let end_epoch = sqlite_epoch(
+                    assignment_epoch_tx(&mut transaction, assignment.assignment_id).await?,
+                )?;
                 let finalized_at = Utc::now();
-                let end_epoch =
-                    assignment_epoch_tx(&mut transaction, assignment.assignment_id).await?;
-                let end_epoch = i64::try_from(end_epoch).map_err(|_| {
-                    StoreError::CorruptData(
-                        "workspace epoch exceeds SQLite integer range".to_string(),
-                    )
-                })?;
                 let updated = sqlx::query("UPDATE mutation_files SET final_hash = ?, final_write_existed = ?, final_snapshot_name = ?, finalized_at = ?, end_epoch = ? WHERE attempt_id = ? AND path = ? AND finalized_at IS NULL")
                     .bind(&final_write.hash)
                     .bind(i64::from(final_write.existed))
@@ -3324,38 +3398,18 @@ impl LocalAgentTaskStore {
                     .execute(&mut *transaction)
                     .await?;
                 if updated.rows_affected() != 1 {
-                    return Err(StoreError::MutationAlreadyFinalized {
-                        attempt_id,
-                        path: normalized.clone(),
-                    });
+                    return Err(StoreError::MutationAlreadyFinalized { attempt_id, path: normalized });
                 }
-                let evidence =
-                    load_mutation_evidence_tx(&mut transaction, attempt_id, &normalized).await?;
-                transaction.commit().await?;
-                Ok(evidence)
+                evidence.push(load_mutation_evidence_tx(&mut transaction, attempt_id, &normalized).await?);
             }
-            .await;
-            let timing_error = write_result.as_ref().err().and_then(|error| match error {
-                StoreError::Sql(error) => Some(error),
-                _ => None,
-            });
-            record_coordination_timing(
-                "finalize_mutation",
-                "write_transaction",
-                transaction_started,
-                timing_error,
-            );
-            write_result
-        }
-        .await;
+            transaction.commit().await?;
+            Ok(evidence)
+        }.await;
         if result.is_err() {
-            remove_unpublished_snapshot(
-                &self.pool,
-                &final_snapshot_name,
-                &snapshot_path,
-                "finalize mutation",
-            )
-            .await;
+            for (name, path) in &snapshots {
+                remove_unpublished_snapshot(&self.pool, name, path, "atomic mutation finalization")
+                    .await;
+            }
         }
         result
     }
@@ -3365,7 +3419,6 @@ impl LocalAgentTaskStore {
         attempt_id: AttemptId,
     ) -> StoreResult<Vec<MutationEvidence>> {
         let mut transaction = self.pool.begin().await?;
-        lock_attempt_tx(&mut transaction, attempt_id).await?;
         let attempt = require_active_current_attempt_tx(&mut transaction, attempt_id).await?;
         let canonical_root = sqlx::query_scalar::<_, String>(
             "SELECT canonical_root FROM assignment_repositories WHERE assignment_id = ?",
@@ -3374,23 +3427,9 @@ impl LocalAgentTaskStore {
         .fetch_optional(&mut *transaction)
         .await?
         .ok_or(StoreError::RepositoryBindingMissing(attempt.assignment_id))?;
-        let paths = sqlx::query_scalar::<_, String>(
-            "SELECT path FROM mutation_files WHERE attempt_id = ? AND finalized_at IS NULL ORDER BY first_observed_at, path",
-        )
-        .bind(attempt_id.to_string())
-        .fetch_all(&mut *transaction)
-        .await?;
         transaction.commit().await?;
-
-        let repo_root = PathBuf::from(canonical_root);
-        let mut finalized = Vec::with_capacity(paths.len());
-        for path in paths {
-            finalized.push(
-                self.finalize_mutation_impl(attempt_id, &repo_root, path)
-                    .await?,
-            );
-        }
-        Ok(finalized)
+        self.finalize_mutations_atomically_impl(attempt_id, Path::new(&canonical_root), None)
+            .await
     }
 
     async fn list_mutation_evidence_impl(
@@ -3398,16 +3437,32 @@ impl LocalAgentTaskStore {
         attempt_id: AttemptId,
         limit: Option<usize>,
     ) -> StoreResult<Vec<MutationEvidence>> {
+        Ok(self
+            .list_mutation_evidence_page_impl(attempt_id, limit)
+            .await?
+            .evidence)
+    }
+
+    async fn list_mutation_evidence_page_impl(
+        &self,
+        attempt_id: AttemptId,
+        limit: Option<usize>,
+    ) -> StoreResult<crate::MutationEvidencePage> {
         let limit = limit.unwrap_or(DEFAULT_MUTATION_EVIDENCE_LIMIT);
-        if limit > MAX_MUTATION_EVIDENCE_LIMIT {
+        if limit == 0 || limit > MAX_MUTATION_EVIDENCE_LIMIT {
             return Err(StoreError::InvalidMutationEvidenceLimit(limit));
         }
         let mut transaction = self.pool.begin().await?;
         load_attempt_tx(&mut transaction, attempt_id).await?;
-        if limit == 0 {
-            transaction.commit().await?;
-            return Ok(Vec::new());
-        }
+        let total_count = usize::try_from(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM mutation_files WHERE attempt_id = ?",
+            )
+            .bind(attempt_id.to_string())
+            .fetch_one(&mut *transaction)
+            .await?,
+        )
+        .map_err(|_| StoreError::CorruptData("mutation evidence count is negative".into()))?;
         let mut rows = sqlx::query("SELECT path FROM mutation_files WHERE attempt_id = ? ORDER BY first_observed_at DESC, path DESC LIMIT ?")
             .bind(attempt_id.to_string())
             .bind(limit as i64)
@@ -3426,7 +3481,13 @@ impl LocalAgentTaskStore {
             );
         }
         transaction.commit().await?;
-        Ok(evidence)
+        let truncated = evidence.len() < total_count;
+        Ok(crate::MutationEvidencePage {
+            next_cursor: truncated.then_some(evidence.len()),
+            evidence,
+            total_count,
+            truncated,
+        })
     }
 
     async fn read_mutation_snapshot_impl(
@@ -3649,6 +3710,118 @@ impl LocalAgentTaskStore {
             }
         }
         Ok(())
+    }
+
+    async fn reconcile_task_capsules(&self) -> StoreResult<()> {
+        let capsule_dir = self.coordination_root.join("task_capsules");
+        std::fs::create_dir_all(&capsule_dir)?;
+        for entry in std::fs::read_dir(&capsule_dir)? {
+            let path = entry?.path();
+            let is_stage = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with('.') && name.ends_with(".staged.json"));
+            if is_stage {
+                let payload = std::fs::read_to_string(&path)?;
+                let capsule: TaskCapsuleV1 = serde_json::from_str(&payload)
+                    .map_err(|error| StoreError::InvalidTaskCapsule(error.to_string()))?;
+                let exists = sqlx::query_scalar::<_, i64>(
+                    "SELECT EXISTS(SELECT 1 FROM assignments WHERE assignment_id = ?)",
+                )
+                .bind(capsule.assignment_id.to_string())
+                .fetch_one(&self.pool)
+                .await?
+                    != 0;
+                let expected_stage =
+                    task_capsule_staging_path(&self.coordination_root, capsule.assignment_id);
+                if !exists || path != expected_stage {
+                    std::fs::remove_file(path)?;
+                    continue;
+                }
+                let final_path = task_capsule_path(&self.coordination_root, capsule.assignment_id);
+                if final_path.try_exists()? {
+                    std::fs::remove_file(path)?;
+                } else {
+                    std::fs::rename(path, final_path)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn rebuild_wake_streams_if_needed(&self) -> StoreResult<()> {
+        if self.wake_streams_are_current().await? {
+            return Ok(());
+        }
+        self.rebuild_wake_streams().await
+    }
+
+    async fn wake_streams_are_current(&self) -> StoreResult<bool> {
+        let mismatch = sqlx::query_scalar::<_, i64>(
+            r#"
+            WITH expected_streams AS (
+                SELECT
+                    observations.root_session_id,
+                    MAX(observations.wake_sequence) + 1 AS next_sequence,
+                    MAX(MAX(observations.wake_sequence) - ? + 1, 1) AS retained_from_sequence,
+                    (
+                        SELECT latest.wake_event_id
+                        FROM observations AS latest
+                        WHERE latest.root_session_id = observations.root_session_id
+                        ORDER BY latest.wake_sequence DESC
+                        LIMIT 1
+                    ) AS latest_event_id
+                FROM observations
+                GROUP BY observations.root_session_id
+            ), expected_events AS (
+                SELECT
+                    observations.root_session_id,
+                    observations.wake_sequence,
+                    observations.wake_event_id,
+                    observations.assignment_id,
+                    observations.attempt_id
+                FROM observations
+                JOIN expected_streams
+                    ON expected_streams.root_session_id = observations.root_session_id
+                WHERE observations.wake_sequence >= expected_streams.retained_from_sequence
+            )
+            SELECT EXISTS (
+                SELECT 1
+                FROM expected_streams
+                LEFT JOIN wake_streams USING (root_session_id)
+                WHERE wake_streams.root_session_id IS NULL
+                    OR wake_streams.next_sequence != expected_streams.next_sequence
+                    OR wake_streams.retained_from_sequence != expected_streams.retained_from_sequence
+                    OR wake_streams.latest_event_id != expected_streams.latest_event_id
+                UNION ALL
+                SELECT 1
+                FROM wake_streams
+                LEFT JOIN expected_streams USING (root_session_id)
+                WHERE expected_streams.root_session_id IS NULL
+                UNION ALL
+                SELECT 1
+                FROM expected_events
+                LEFT JOIN wake_events
+                    ON wake_events.root_session_id = expected_events.root_session_id
+                    AND wake_events.wake_sequence = expected_events.wake_sequence
+                WHERE wake_events.root_session_id IS NULL
+                    OR wake_events.event_id != expected_events.wake_event_id
+                    OR wake_events.assignment_id != expected_events.assignment_id
+                    OR wake_events.attempt_id != expected_events.attempt_id
+                UNION ALL
+                SELECT 1
+                FROM wake_events
+                LEFT JOIN expected_events
+                    ON expected_events.root_session_id = wake_events.root_session_id
+                    AND expected_events.wake_sequence = wake_events.wake_sequence
+                WHERE expected_events.root_session_id IS NULL
+            )
+            "#,
+        )
+        .bind(MAX_WAKE_EVENTS_PER_ROOT as i64)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(mismatch == 0)
     }
 
     async fn rebuild_wake_streams(&self) -> StoreResult<()> {
@@ -4189,6 +4362,17 @@ impl LocalAgentTaskStore {
         Box::pin(async move { self.list_mutation_evidence_impl(attempt_id, limit).await })
     }
 
+    pub fn list_mutation_evidence_page(
+        &self,
+        attempt_id: AttemptId,
+        limit: Option<usize>,
+    ) -> TaskStoreFuture<'_, crate::MutationEvidencePage> {
+        Box::pin(async move {
+            self.list_mutation_evidence_page_impl(attempt_id, limit)
+                .await
+        })
+    }
+
     pub fn read_mutation_snapshot(
         &self,
         attempt_id: AttemptId,
@@ -4322,32 +4506,24 @@ async fn prepare_validation_call(
         }
         let retained_output_ref = call.evidence.retained_output_ref.clone();
         let output_summary = call.evidence.output_summary.clone();
+        let validation_result = call.evidence.validation_result.clone();
         call.evidence = existing.evidence.clone();
         if call.status.is_terminal() {
             let context = validation_context(pool, call.attempt_id).await?;
-            let paths = if existing.evidence.covered_scopes.is_empty() {
-                existing
-                    .evidence
-                    .covered_manifest
-                    .iter()
-                    .map(|entry| entry.path.clone())
-                    .collect::<Vec<_>>()
-            } else {
-                existing
-                    .evidence
-                    .covered_scopes
-                    .iter()
-                    .map(|scope| scope.path.clone())
-                    .collect::<Vec<_>>()
-            };
-            let current =
-                crate::workspace::capture_revision(pool, &context.repo_root, paths).await?;
             let execution_current = crate::workspace::capture_revision(
                 pool,
                 &context.repo_root,
                 vec![crate::workspace::REPOSITORY_WIDE_PATH.to_string()],
             )
             .await?;
+            require_complete_workspace_capture(&execution_current)?;
+            let mut current = execution_current.clone();
+            current.files = validation_covered_manifest(
+                &execution_current.files,
+                &existing.evidence.covered_scopes,
+                existing.evidence.repository_wide,
+            );
+            current.manifest_hash = validation_manifest_hash(&current.files)?;
             let exact_snapshot_complete = validation_has_complete_exact_snapshot(&existing)?;
             let execution_changes = existing
                 .evidence
@@ -4360,6 +4536,8 @@ async fn prepare_validation_call(
                     )
                 })
                 .unwrap_or_default();
+            let executable_changed = validation_normalized_invocation(&existing)?
+                != existing.evidence.normalized_invocation;
             let dependency_changed = if exact_snapshot_complete {
                 validation_dependency_manifest_hash(
                     &existing.command_summary,
@@ -4370,7 +4548,12 @@ async fn prepare_validation_call(
             } else {
                 !execution_changes.is_empty()
             };
-            let stale_reason = if !dependency_changed {
+            let stale_reason = if executable_changed {
+                Some(
+                    "resolved validation executable content changed while validation was running"
+                        .to_string(),
+                )
+            } else if !dependency_changed {
                 validation_stale_reason(
                     pool,
                     &context.repo_root,
@@ -4406,6 +4589,8 @@ async fn prepare_validation_call(
             call.evidence.retained_output_ref =
                 retained_output_ref.or(existing.evidence.retained_output_ref);
             call.evidence.output_summary = output_summary.or(existing.evidence.output_summary);
+            call.evidence.validation_result =
+                validation_result.or(existing.evidence.validation_result);
             if let Some(reason) = stale_reason {
                 call.status = crate::ValidationCallStatus::Superseded;
                 call.evidence.stale_reason = Some(reason);
@@ -4443,26 +4628,22 @@ async fn prepare_validation_call(
         }
     }
     let repository_wide = covered_scopes.is_empty();
-    covered_scopes.extend(repository_global_validation_scopes(&context.repo_root)?);
+    covered_scopes.extend(repository_global_validation_scopes(&context.repo_root).await?);
+    covered_scopes.extend(cargo_local_dependency_scopes(&context.repo_root, &call).await?);
     covered_scopes = merge_validation_scopes(covered_scopes);
-    let paths = if repository_wide {
-        vec![crate::workspace::REPOSITORY_WIDE_PATH.to_string()]
-    } else {
-        covered_scopes
-            .iter()
-            .map(|scope| scope.path.clone())
-            .collect::<Vec<_>>()
-    };
     covered_contracts.sort();
     covered_contracts.dedup();
-    let revision = crate::workspace::capture_revision(pool, &context.repo_root, paths).await?;
     let execution_revision = crate::workspace::capture_revision(
         pool,
         &context.repo_root,
         vec![crate::workspace::REPOSITORY_WIDE_PATH.to_string()],
     )
     .await?;
-    let covered_input_manifest_hash = revision.manifest_hash.clone();
+    require_complete_workspace_capture(&execution_revision)?;
+    let covered_manifest =
+        validation_covered_manifest(&execution_revision.files, &covered_scopes, repository_wide);
+    let covered_input_manifest_hash = validation_manifest_hash(&covered_manifest)?;
+    let execution_manifest_hash = validation_manifest_hash(&execution_revision.files)?;
     let dependency_manifest_hash = validation_dependency_manifest_hash(
         &call.command_summary,
         &execution_revision.files,
@@ -4477,13 +4658,13 @@ async fn prepare_validation_call(
         call.evidence.toolchain.as_deref(),
     )?;
     let implementation_identity =
-        validation_implementation_identity(&context.assignment, &revision.manifest_hash)?;
+        validation_implementation_identity(&context.assignment, &covered_input_manifest_hash)?;
     let candidate_id = validation_candidate_identity(
         &implementation_identity,
         &normalized_invocation,
         &coverage_identity,
         &features_configuration_identity,
-        &revision.manifest_hash,
+        &covered_input_manifest_hash,
         &dependency_manifest_hash,
     )?;
     call.evidence = ValidationEvidence {
@@ -4495,13 +4676,16 @@ async fn prepare_validation_call(
         start_epoch: execution_revision.epoch,
         end_epoch: None,
         covered_scopes,
-        covered_manifest: revision.files,
+        covered_manifest,
         execution_snapshot: Some(Box::new(crate::ValidationExecutionSnapshot {
             manifest: execution_revision.files,
-            manifest_hash: execution_revision.manifest_hash,
+            manifest_hash: execution_manifest_hash,
+            capture_mode: execution_revision.capture_mode,
+            complete: execution_revision.complete,
+            discovery_errors: execution_revision.discovery_errors,
         })),
         covered_contracts,
-        manifest_hash: revision.manifest_hash,
+        manifest_hash: covered_input_manifest_hash.clone(),
         repository_wide,
         cwd: call
             .evidence
@@ -4525,6 +4709,23 @@ async fn prepare_validation_call(
         stale_reason: None,
     };
     Ok(call)
+}
+
+pub(crate) fn require_complete_workspace_capture(
+    revision: &crate::WorkspaceRevision,
+) -> StoreResult<()> {
+    if revision.complete {
+        return Ok(());
+    }
+    Err(StoreError::InvalidAssignment(format!(
+        "workspace capture is incomplete ({:?}): {}",
+        revision.capture_mode,
+        if revision.discovery_errors.is_empty() {
+            "discovery completeness was not established".to_string()
+        } else {
+            revision.discovery_errors.join("; ")
+        }
+    )))
 }
 
 async fn claim_isolated_handoffs_tx(
@@ -4612,7 +4813,7 @@ async fn persist_receipt_handoff_action_tx(
             )
             .bind(handoff.assignment_id.to_string())
             .bind(&handoff.source_workspace_id)
-            .bind(handoff.source_epoch as i64)
+            .bind(sqlite_epoch(handoff.source_epoch)?)
             .bind(&handoff.source_manifest_hash)
             .bind(encode(&handoff.covered_manifest)?)
             .bind(encode(&IsolationHandoffState::Ready)?)
@@ -4811,7 +5012,8 @@ async fn validation_stale_reason(
         )));
     }
     if !call.evidence.covered_scopes.is_empty() {
-        let newly_global = repository_global_validation_scopes(repo_root)?
+        let newly_global = repository_global_validation_scopes(repo_root)
+            .await?
             .into_iter()
             .filter(|current_scope| {
                 !call
@@ -4846,8 +5048,8 @@ async fn validation_stale_reason(
              WHERE workspace_id = ? AND epoch > ? AND epoch <= ? ORDER BY epoch",
         )
         .bind(&assignment.workspace_id)
-        .bind(call.evidence.start_epoch as i64)
-        .bind(current.epoch as i64)
+        .bind(sqlite_epoch(call.evidence.start_epoch)?)
+        .bind(sqlite_epoch(current.epoch)?)
         .fetch_all(pool)
         .await?;
         let mut expected_epoch = call.evidence.start_epoch + 1;
@@ -4933,7 +5135,7 @@ async fn validation_stale_event_reason_tx(
          WHERE workspace_id = ? AND epoch > ? ORDER BY epoch",
     )
     .bind(&assignment.workspace_id)
-    .bind(evidence_epoch as i64)
+    .bind(sqlite_epoch(evidence_epoch)?)
     .fetch_all(&mut **transaction)
     .await?;
     let mut expected_epoch = evidence_epoch + 1;
@@ -5030,7 +5232,7 @@ fn validation_event_is_repository_global(path: &str) -> bool {
     if is_repository_global_validation_file(Path::new(path)) {
         return true;
     }
-    let path = path.to_lowercase();
+    let path = crate::scope::path_comparison_key(path);
     [
         "codex-rs/app-server-protocol/schema",
         "codex-rs/hooks/schema/generated",
@@ -5042,7 +5244,7 @@ fn validation_event_is_repository_global(path: &str) -> bool {
 fn merge_validation_scopes(scopes: Vec<RepoScope>) -> Vec<RepoScope> {
     let mut merged = HashMap::<String, RepoScope>::new();
     for scope in scopes {
-        let key = scope.path.to_lowercase();
+        let key = crate::scope::path_comparison_key(&scope.path);
         merged
             .entry(key)
             .and_modify(|existing| existing.recursive |= scope.recursive)
@@ -5057,9 +5259,26 @@ fn merge_validation_scopes(scopes: Vec<RepoScope>) -> Vec<RepoScope> {
     scopes
 }
 
-fn repository_global_validation_scopes(repo_root: &Path) -> StoreResult<Vec<RepoScope>> {
-    let mut scopes = Vec::new();
-    collect_repository_global_validation_files(repo_root, repo_root, &mut scopes)?;
+pub(crate) async fn repository_global_validation_scopes(
+    repo_root: &Path,
+) -> StoreResult<Vec<RepoScope>> {
+    let repo_root = repo_root.to_path_buf();
+    tokio::task::spawn_blocking(move || repository_global_validation_scopes_blocking(&repo_root))
+        .await
+        .map_err(|error| {
+            StoreError::CorruptData(format!("validation discovery task failed: {error}"))
+        })?
+}
+
+fn repository_global_validation_scopes_blocking(repo_root: &Path) -> StoreResult<Vec<RepoScope>> {
+    let mut scopes = match git_repository_validation_scopes(repo_root)? {
+        Some(scopes) => scopes,
+        None => {
+            let mut scopes = Vec::new();
+            collect_repository_global_validation_files(repo_root, repo_root, &mut scopes)?;
+            scopes
+        }
+    };
     for schema_dir in [
         "codex-rs/app-server-protocol/schema",
         "codex-rs/hooks/schema/generated",
@@ -5072,6 +5291,41 @@ fn repository_global_validation_scopes(repo_root: &Path) -> StoreResult<Vec<Repo
         }
     }
     Ok(merge_validation_scopes(scopes))
+}
+
+fn git_repository_validation_scopes(repo_root: &Path) -> StoreResult<Option<Vec<RepoScope>>> {
+    let output = match Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["ls-files", "-co", "--exclude-standard", "-z"])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut scopes = Vec::new();
+    for raw_path in output.stdout.split(|byte| *byte == 0) {
+        if raw_path.is_empty() {
+            continue;
+        }
+        let relative = std::str::from_utf8(raw_path).map_err(|error| {
+            StoreError::InvalidScope(format!(
+                "Git returned a validation path that is not UTF-8: {error}"
+            ))
+        })?;
+        let relative_path = Path::new(relative);
+        if repo_root.join(relative_path).is_file()
+            && is_repository_global_validation_file(relative_path)
+        {
+            scopes.push(RepoScope {
+                path: crate::scope::relative_path_identity(relative_path),
+                recursive: false,
+            });
+        }
+    }
+    Ok(Some(scopes))
 }
 
 fn collect_repository_global_validation_files(
@@ -5087,15 +5341,7 @@ fn collect_repository_global_validation_files(
             let file_type = entry.file_type()?;
             let path = entry.path();
             if file_type.is_dir() {
-                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-                if name == ".git"
-                    || name == "node_modules"
-                    || name == ".venv"
-                    || name == "venv"
-                    || name == "dist"
-                    || name == "build"
-                    || name.starts_with("target")
-                {
+                if entry.file_name() == ".git" {
                     continue;
                 }
                 directories.push(path);
@@ -5107,11 +5353,7 @@ fn collect_repository_global_validation_files(
                     ))
                 })?;
                 scopes.push(RepoScope {
-                    path: relative
-                        .components()
-                        .map(|component| component.as_os_str().to_string_lossy())
-                        .collect::<Vec<_>>()
-                        .join("/"),
+                    path: crate::scope::relative_path_identity(relative),
                     recursive: false,
                 });
             }
@@ -5157,22 +5399,330 @@ fn is_repository_global_validation_file(path: &Path) -> bool {
                 .is_some_and(|parent| parent.eq_ignore_ascii_case(".cargo"))
 }
 
+#[derive(Clone, Deserialize)]
+struct CargoMetadataDependency {
+    path: Option<PathBuf>,
+}
+
+#[derive(Clone, Deserialize)]
+struct CargoMetadataPackage {
+    id: String,
+    name: String,
+    manifest_path: PathBuf,
+    dependencies: Vec<CargoMetadataDependency>,
+}
+
+#[derive(Deserialize)]
+struct CargoMetadata {
+    packages: Vec<CargoMetadataPackage>,
+    workspace_members: Vec<String>,
+    #[serde(default)]
+    workspace_default_members: Vec<String>,
+}
+
+async fn cargo_local_dependency_scopes(
+    repo_root: &Path,
+    call: &ValidationCall,
+) -> StoreResult<Vec<RepoScope>> {
+    if !validation_command_is_cargo(&call.command_summary) {
+        return Ok(Vec::new());
+    }
+    let repo_root = repo_root.to_path_buf();
+    let command_summary = call.command_summary.clone();
+    let cwd = call.evidence.cwd.clone();
+    let executable = call.resolved_executable.clone().ok_or_else(|| {
+        StoreError::InvalidAssignment(
+            "Cargo dependency discovery requires resolved executable provenance".to_string(),
+        )
+    })?;
+    tokio::task::spawn_blocking(move || {
+        cargo_local_dependency_scopes_blocking(
+            &repo_root,
+            &command_summary,
+            cwd.as_deref(),
+            &executable,
+        )
+    })
+    .await
+    .map_err(|error| {
+        StoreError::CorruptData(format!("Cargo dependency discovery task failed: {error}"))
+    })?
+}
+
+fn cargo_local_dependency_scopes_blocking(
+    repo_root: &Path,
+    command_summary: &str,
+    cwd: Option<&str>,
+    executable: &str,
+) -> StoreResult<Vec<RepoScope>> {
+    let canonical_root = std::fs::canonicalize(repo_root)?;
+    let command_cwd = cwd
+        .map(PathBuf::from)
+        .map(|cwd| {
+            if cwd.is_absolute() {
+                cwd
+            } else {
+                canonical_root.join(cwd)
+            }
+        })
+        .unwrap_or_else(|| canonical_root.clone());
+    let Some(manifest_path) = cargo_manifest_path(command_summary, &command_cwd, &canonical_root)
+    else {
+        return Ok(Vec::new());
+    };
+    let initial = read_cargo_metadata(executable, &manifest_path, &command_cwd)?;
+    let requested_packages = cargo_requested_packages(command_summary);
+    let mut packages = HashMap::new();
+    for package in initial.packages {
+        packages.insert(cargo_package_root(&package)?, package);
+    }
+    let initial_manifest = std::fs::canonicalize(&manifest_path)?;
+    let selected = if requested_packages.is_empty() {
+        let manifest_package = packages.iter().find(|(_, package)| {
+            std::fs::canonicalize(&package.manifest_path)
+                .is_ok_and(|manifest| manifest == initial_manifest)
+        });
+        if !cargo_selects_workspace(command_summary)
+            && let Some((root, _)) = manifest_package
+        {
+            vec![root.clone()]
+        } else {
+            let selected_ids = if initial.workspace_default_members.is_empty()
+                || cargo_selects_workspace(command_summary)
+            {
+                initial.workspace_members
+            } else {
+                initial.workspace_default_members
+            }
+            .into_iter()
+            .collect::<HashSet<_>>();
+            packages
+                .iter()
+                .filter(|(_, package)| selected_ids.contains(&package.id))
+                .map(|(root, _)| root.clone())
+                .collect::<Vec<_>>()
+        }
+    } else {
+        let selected = packages
+            .iter()
+            .filter(|(_, package)| requested_packages.contains(&package.name))
+            .map(|(root, _)| root.clone())
+            .collect::<Vec<_>>();
+        if selected.len() != requested_packages.len() {
+            return Err(StoreError::InvalidAssignment(format!(
+                "Cargo metadata did not resolve every requested package for reusable validation: {}",
+                requested_packages
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        selected
+    };
+
+    let mut pending = selected;
+    let mut visited = HashSet::new();
+    let mut scopes = Vec::new();
+    while let Some(package_root) = pending.pop() {
+        let package_root = std::fs::canonicalize(package_root)?;
+        if !visited.insert(package_root.clone()) {
+            continue;
+        }
+        if !packages.contains_key(&package_root) {
+            let metadata =
+                read_cargo_metadata(executable, &package_root.join("Cargo.toml"), &package_root)?;
+            for package in metadata.packages {
+                packages.insert(cargo_package_root(&package)?, package);
+            }
+        }
+        let package = packages.get(&package_root).ok_or_else(|| {
+            StoreError::InvalidAssignment(format!(
+                "Cargo metadata omitted local package at {}",
+                package_root.display()
+            ))
+        })?;
+        let relative = package_root.strip_prefix(&canonical_root).map_err(|_| {
+            StoreError::InvalidAssignment(format!(
+                "reusable validation cannot bind a local Cargo dependency outside the repository: {}",
+                package_root.display()
+            ))
+        })?;
+        scopes.push(RepoScope {
+            path: if relative.as_os_str().is_empty() {
+                ".".to_string()
+            } else {
+                crate::scope::relative_path_identity(relative)
+            },
+            recursive: true,
+        });
+        pending.extend(
+            package
+                .dependencies
+                .iter()
+                .filter_map(|dependency| dependency.path.clone()),
+        );
+    }
+    Ok(merge_validation_scopes(scopes))
+}
+
+fn cargo_package_root(package: &CargoMetadataPackage) -> StoreResult<PathBuf> {
+    let root = package
+        .manifest_path
+        .parent()
+        .ok_or_else(|| {
+            StoreError::InvalidAssignment(format!(
+                "Cargo metadata package manifest has no parent: {}",
+                package.manifest_path.display()
+            ))
+        })?
+        .to_path_buf();
+    std::fs::canonicalize(&root).map_err(|error| {
+        StoreError::InvalidAssignment(format!(
+            "Cargo metadata package root cannot be canonicalized at {}: {error}",
+            root.display()
+        ))
+    })
+}
+
+fn read_cargo_metadata(
+    executable: &str,
+    manifest_path: &Path,
+    cwd: &Path,
+) -> StoreResult<CargoMetadata> {
+    let output = Command::new(executable)
+        .current_dir(cwd)
+        .args(["metadata", "--no-deps", "--locked", "--format-version", "1"])
+        .arg("--manifest-path")
+        .arg(manifest_path)
+        .output()
+        .map_err(|error| {
+            StoreError::InvalidAssignment(format!(
+                "Cargo metadata could not start for reusable validation at {}: {error}",
+                manifest_path.display()
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(StoreError::InvalidAssignment(format!(
+            "Cargo metadata could not establish reusable validation dependencies at {}: {}",
+            manifest_path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    serde_json::from_slice(&output.stdout).map_err(StoreError::from)
+}
+
+fn cargo_manifest_path(command_summary: &str, cwd: &Path, repo_root: &Path) -> Option<PathBuf> {
+    let arguments = command_summary
+        .split_whitespace()
+        .map(|argument| argument.trim_matches(['\'', '"']))
+        .collect::<Vec<_>>();
+    for (index, argument) in arguments.iter().enumerate() {
+        let value = argument.strip_prefix("--manifest-path=").or_else(|| {
+            (*argument == "--manifest-path")
+                .then(|| arguments.get(index + 1))
+                .flatten()
+                .copied()
+        });
+        if let Some(value) = value {
+            let path = PathBuf::from(value);
+            return Some(if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            });
+        }
+    }
+    let mut directory = cwd.to_path_buf();
+    loop {
+        let manifest = directory.join("Cargo.toml");
+        if manifest.is_file() {
+            return Some(manifest);
+        }
+        if directory == repo_root || !directory.pop() || !directory.starts_with(repo_root) {
+            return None;
+        }
+    }
+}
+
+fn cargo_requested_packages(command_summary: &str) -> HashSet<String> {
+    let arguments = command_summary
+        .split_whitespace()
+        .map(|argument| argument.trim_matches(['\'', '"']))
+        .collect::<Vec<_>>();
+    let mut packages = HashSet::new();
+    for (index, argument) in arguments.iter().enumerate() {
+        let package = argument.strip_prefix("--package=").or_else(|| {
+            matches!(*argument, "-p" | "--package")
+                .then(|| arguments.get(index + 1))
+                .flatten()
+                .copied()
+        });
+        if let Some(package) = package {
+            packages.insert(package.split('@').next().unwrap_or(package).to_string());
+        }
+    }
+    packages
+}
+
+fn cargo_selects_workspace(command_summary: &str) -> bool {
+    command_summary
+        .split_whitespace()
+        .map(|argument| argument.trim_matches(['\'', '"']))
+        .any(|argument| matches!(argument, "--workspace" | "--all"))
+}
+
+fn validation_command_is_cargo(command_summary: &str) -> bool {
+    command_summary.split_whitespace().any(|argument| {
+        let argument = argument.trim_matches(['\'', '"']).to_ascii_lowercase();
+        argument == "cargo" || argument.ends_with("/cargo") || argument.ends_with("\\cargo.exe")
+    })
+}
+
 fn validation_normalized_invocation(call: &ValidationCall) -> StoreResult<String> {
     #[derive(Serialize)]
     struct Invocation<'a> {
         command: &'a str,
         executable: &'a Option<String>,
+        executable_content_identity: Option<String>,
         cwd: &'a Option<String>,
     }
 
+    let executable_content_identity = call
+        .resolved_executable
+        .as_deref()
+        .map(validation_executable_content_identity)
+        .transpose()?;
     Ok(hash_bytes(
         encode(&Invocation {
             command: call.command_summary.trim(),
             executable: &call.resolved_executable,
+            executable_content_identity,
             cwd: &call.evidence.cwd,
         })?
         .as_bytes(),
     ))
+}
+
+fn validation_executable_content_identity(path: &str) -> StoreResult<String> {
+    let mut executable = std::fs::File::open(path).map_err(|error| {
+        StoreError::InvalidAssignment(format!(
+            "resolved validation executable cannot be opened for content identity at {path}: {error}"
+        ))
+    })?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = executable.read(&mut buffer).map_err(|error| {
+            StoreError::InvalidAssignment(format!(
+                "resolved validation executable cannot be read for content identity at {path}: {error}"
+            ))
+        })?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn validation_coverage_identity(
@@ -5268,11 +5818,37 @@ fn validation_dependency_manifest_hash(
     Ok(hash_bytes(encode(&manifest)?.as_bytes()))
 }
 
+fn validation_manifest_hash(manifest: &[crate::WorkspaceManifestEntry]) -> StoreResult<String> {
+    Ok(hash_bytes(encode(&manifest)?.as_bytes()))
+}
+
+fn validation_covered_manifest(
+    execution_manifest: &[crate::WorkspaceManifestEntry],
+    covered_scopes: &[RepoScope],
+    repository_wide: bool,
+) -> Vec<crate::WorkspaceManifestEntry> {
+    if repository_wide {
+        return execution_manifest.to_vec();
+    }
+    execution_manifest
+        .iter()
+        .filter(|entry| {
+            covered_scopes
+                .iter()
+                .any(|scope| scope.covers_path(&entry.path))
+        })
+        .cloned()
+        .collect()
+}
+
 fn validation_has_complete_exact_snapshot(call: &ValidationCall) -> StoreResult<bool> {
     let Some(snapshot) = call.evidence.execution_snapshot.as_deref() else {
         return Ok(false);
     };
-    if call.evidence.candidate_id.is_empty()
+    if !snapshot.complete
+        || snapshot.capture_mode == crate::WorkspaceCaptureMode::FilesystemFallback
+        || !snapshot.discovery_errors.is_empty()
+        || call.evidence.candidate_id.is_empty()
         || call.evidence.implementation_identity.is_empty()
         || call.evidence.normalized_invocation.is_empty()
         || call.evidence.coverage_identity.is_empty()
@@ -5298,55 +5874,30 @@ fn validation_has_complete_exact_snapshot(call: &ValidationCall) -> StoreResult<
 }
 
 fn validation_dependency_affects_path(
-    command_summary: &str,
-    covered_scopes: &[RepoScope],
-    repository_wide: bool,
+    _command_summary: &str,
+    _covered_scopes: &[RepoScope],
+    _repository_wide: bool,
     path: &str,
 ) -> bool {
-    let command = command_summary.to_ascii_lowercase();
-    let is_cargo = command.split_whitespace().any(|argument| {
-        argument == "cargo" || argument.ends_with("/cargo") || argument.ends_with("\\cargo.exe")
-    });
-    if !is_cargo {
-        return true;
-    }
-    if repository_wide {
-        return true;
-    }
-    let dependency_scope = RepoScope {
-        path: path.to_string(),
-        recursive: true,
-    };
-    if covered_scopes
-        .iter()
-        .any(|scope| dependency_scope.overlaps(scope))
-    {
-        return true;
-    }
-    if is_cargo_inert_documentation_path(path) {
-        return false;
-    }
-    if path == crate::REPOSITORY_WIDE_PATH {
-        return false;
-    }
-    validation_event_is_repository_global(path)
-}
-
-fn is_cargo_inert_documentation_path(path: &str) -> bool {
-    let path = path.to_ascii_lowercase();
-    path.ends_with(".md") || path.ends_with(".markdown") || path.ends_with(".rst")
+    path != crate::REPOSITORY_WIDE_PATH
 }
 
 fn validation_output_digest(call: &ValidationCall) -> StoreResult<String> {
-    Ok(hash_bytes(
-        encode(&(
-            call.status,
-            call.evidence.retained_output_ref.as_deref(),
-            call.evidence.output_summary.as_deref(),
-            call.evidence.validation_result.as_ref(),
-        ))?
-        .as_bytes(),
-    ))
+    let Some(digest) = call
+        .evidence
+        .validation_result
+        .as_ref()
+        .and_then(|result| result.get("raw_artifact_sha256"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(String::new());
+    };
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(StoreError::InvalidAssignment(
+            "validation raw artifact SHA-256 must be 64 hexadecimal characters".to_string(),
+        ));
+    }
+    Ok(digest.to_ascii_lowercase())
 }
 
 fn validation_inflight_fingerprint(call: &ValidationCall) -> StoreResult<String> {
@@ -5447,7 +5998,7 @@ async fn reserve_reconciliation_validation_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     attempt: &Attempt,
     call_id: &str,
-) -> StoreResult<bool> {
+) -> StoreResult<()> {
     let row = sqlx::query(
         "SELECT stale_events, reconciliation_call_id FROM stale_recovery WHERE attempt_id = ?",
     )
@@ -5455,18 +6006,16 @@ async fn reserve_reconciliation_validation_tx(
     .fetch_optional(&mut **transaction)
     .await?;
     let Some(row) = row else {
-        return Ok(false);
+        return Ok(());
     };
     if row.get::<i64, _>("stale_events") == 0 {
-        return Ok(false);
+        return Ok(());
     }
     if let Some(existing) = row.get::<Option<String>, _>("reconciliation_call_id") {
         if existing != call_id {
-            pause_active_attempt_for_stale_recovery_tx(transaction, attempt).await?;
-            release_claim(transaction, attempt.assignment_id, None).await?;
-            return Ok(true);
+            return Err(StoreError::StaleRecoveryExhausted(attempt.attempt_id));
         }
-        return Ok(false);
+        return Ok(());
     }
     sqlx::query(
         "UPDATE stale_recovery SET reconciliation_call_id = ?, updated_at = ?
@@ -5477,26 +6026,27 @@ async fn reserve_reconciliation_validation_tx(
     .bind(attempt.attempt_id.to_string())
     .execute(&mut **transaction)
     .await?;
-    Ok(false)
+    Ok(())
 }
 
-async fn record_stale_event_tx(
+pub(crate) async fn record_stale_event_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     attempt: &Attempt,
     stale_epoch: u64,
     reason: &str,
 ) -> StoreResult<()> {
     let existing = sqlx::query(
-        "SELECT stale_events, last_stale_epoch FROM stale_recovery WHERE attempt_id = ?",
+        "SELECT stale_events, last_stale_epoch, last_reason FROM stale_recovery WHERE attempt_id = ?",
     )
     .bind(attempt.attempt_id.to_string())
     .fetch_optional(&mut **transaction)
     .await?;
-    if existing.as_ref().and_then(|row| {
+    if existing.as_ref().is_some_and(|row| {
         row.get::<Option<i64>, _>("last_stale_epoch")
             .and_then(|value| u64::try_from(value).ok())
-    }) == Some(stale_epoch)
-    {
+            == Some(stale_epoch)
+            && row.get::<Option<String>, _>("last_reason").as_deref() == Some(reason)
+    }) {
         sqlx::query(
             "UPDATE stale_recovery SET last_reason = ?, updated_at = ? WHERE attempt_id = ?",
         )
@@ -5526,7 +6076,7 @@ async fn record_stale_event_tx(
     )
     .bind(attempt.attempt_id.to_string())
     .bind(stale_events)
-    .bind(stale_epoch as i64)
+    .bind(sqlite_epoch(stale_epoch)?)
     .bind(reason)
     .bind(encode(&Utc::now())?)
     .execute(&mut **transaction)
@@ -6895,7 +7445,8 @@ async fn require_repository_identity_tx(
     let bound_id = row.get::<String, _>("repository_id");
     let bound_workspace_id = row.get::<String, _>("workspace_id");
     let bound_root = row.get::<String, _>("canonical_root");
-    let root_matches = bound_root.to_lowercase() == repository.canonical_path.to_lowercase();
+    let root_matches =
+        crate::scope::filesystem_paths_equal(&bound_root, &repository.canonical_path);
     if assignment.repository_id.is_empty()
         || assignment.repository_id != bound_id
         || repository.id != bound_id
@@ -7063,6 +7614,12 @@ fn task_capsule_path(coordination_root: &Path, assignment_id: AssignmentId) -> P
         .join(format!("{assignment_id}.json"))
 }
 
+fn task_capsule_staging_path(coordination_root: &Path, assignment_id: AssignmentId) -> PathBuf {
+    coordination_root
+        .join("task_capsules")
+        .join(format!(".{assignment_id}.staged.json"))
+}
+
 fn hydrate_task_capsule(coordination_root: &Path, assignment: &mut Assignment) -> StoreResult<()> {
     let capsule_path = task_capsule_path(coordination_root, assignment.assignment_id);
     let canonical_payload = match std::fs::read_to_string(capsule_path) {
@@ -7114,9 +7671,61 @@ fn private_snapshot_path(coordination_root: &Path, snapshot_name: &str) -> Store
     Ok(coordination_root.join(relative))
 }
 
+#[derive(Eq, PartialEq)]
 struct SnapshotCapture {
     existed: bool,
     hash: Option<String>,
+}
+
+async fn inspect_source(
+    source_path: PathBuf,
+    logical_path: String,
+) -> StoreResult<SnapshotCapture> {
+    tokio::task::spawn_blocking(move || match std::fs::File::open(&source_path) {
+        Ok(mut source) => {
+            let initial_bytes = source.metadata()?.len();
+            if initial_bytes > MAX_MUTATION_SNAPSHOT_BYTES {
+                return Err(StoreError::SnapshotTooLarge {
+                    path: logical_path,
+                    bytes: initial_bytes,
+                    max_bytes: MAX_MUTATION_SNAPSHOT_BYTES,
+                });
+            }
+            let mut hasher = Sha256::new();
+            let mut total_bytes = 0_u64;
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let read = source.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                total_bytes = total_bytes.saturating_add(read as u64);
+                if total_bytes > MAX_MUTATION_SNAPSHOT_BYTES {
+                    return Err(StoreError::SnapshotTooLarge {
+                        path: logical_path,
+                        bytes: total_bytes,
+                        max_bytes: MAX_MUTATION_SNAPSHOT_BYTES,
+                    });
+                }
+                hasher.update(&buffer[..read]);
+            }
+            Ok(SnapshotCapture {
+                existed: true,
+                hash: Some(format!("{:x}", hasher.finalize())),
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(SnapshotCapture {
+            existed: false,
+            hash: None,
+        }),
+        Err(error) => Err(error.into()),
+    })
+    .await
+    .map_err(|error| {
+        StoreError::Io(std::io::Error::other(format!(
+            "source inspection task failed: {error}"
+        )))
+    })?
 }
 
 async fn capture_snapshot_atomic(
@@ -7768,7 +8377,12 @@ fn hash_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn encode<T: Serialize>(value: &T) -> StoreResult<String> {
+fn sqlite_epoch(epoch: u64) -> StoreResult<i64> {
+    i64::try_from(epoch)
+        .map_err(|_| StoreError::CorruptData("workspace epoch exceeds SQLite integer range".into()))
+}
+
+fn encode<T: Serialize + ?Sized>(value: &T) -> StoreResult<String> {
     Ok(serde_json::to_string(value)?)
 }
 

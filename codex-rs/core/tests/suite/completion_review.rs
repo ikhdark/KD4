@@ -332,7 +332,6 @@ fn plan_response(response_id: &str, call_id: &str, status: &str) -> String {
             "runtime_paths": ["src/lib.rs"],
             "generated_artifacts": [],
             "risks": [],
-            "requires_desktop_activation": false,
             "validation_route": {
                 "leaves": [{
                     "argv": [

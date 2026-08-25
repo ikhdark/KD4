@@ -1,6 +1,7 @@
-use codex_http_client::build_reqwest_client_with_custom_ca;
-use reqwest::header::CONTENT_TYPE;
-use reqwest::header::HeaderMap;
+use codex_http_client::HttpClient;
+use codex_http_client::HttpClientBuilder;
+use http::HeaderMap;
+use http::header::CONTENT_TYPE;
 use std::collections::HashMap;
 use tracing::info;
 use tracing::warn;
@@ -76,7 +77,7 @@ pub async fn autodetect_environment_id(
     };
     crate::append_error_log(format!("env: GET {list_url}"));
     // Fetch and log the full environments JSON for debugging
-    let http = build_reqwest_client_with_custom_ca(reqwest::Client::builder())?;
+    let http = HttpClientBuilder::new().build_with_transport_default_proxy()?;
     let res = http.get(&list_url).headers(headers.clone()).send().await?;
     let status = res.status();
     let ct = res
@@ -150,7 +151,15 @@ async fn get_json<T: serde::de::DeserializeOwned>(
     url: &str,
     headers: &HeaderMap,
 ) -> anyhow::Result<T> {
-    let http = build_reqwest_client_with_custom_ca(reqwest::Client::builder())?;
+    let http = HttpClientBuilder::new().build_with_transport_default_proxy()?;
+    get_json_with_client(&http, url, headers).await
+}
+
+async fn get_json_with_client<T: serde::de::DeserializeOwned>(
+    http: &HttpClient,
+    url: &str,
+    headers: &HeaderMap,
+) -> anyhow::Result<T> {
     let res = http.get(url).headers(headers.clone()).send().await?;
     let status = res.status();
     let ct = res
@@ -168,6 +177,39 @@ async fn get_json<T: serde::de::DeserializeOwned>(
         anyhow::anyhow!("Decode error for {url}: {e}; content-type={ct}; body={body}")
     })?;
     Ok(parsed)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn get_json_uses_shared_http_client() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/environments"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([{"id": "env-1", "label": "Local"}])),
+            )
+            .mount(&server)
+            .await;
+        let http = HttpClientBuilder::new()
+            .build_direct()
+            .expect("shared HTTP client should build");
+
+        let environments: Vec<CodeEnvironment> = get_json_with_client(
+            &http,
+            &format!("{}/environments", server.uri()),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect("environment response should decode");
+
+        assert_eq!(environments.len(), 1);
+        assert_eq!(environments[0].id, "env-1");
+    }
 }
 
 fn get_git_origins() -> Vec<String> {

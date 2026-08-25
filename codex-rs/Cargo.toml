@@ -330,6 +330,7 @@ notify = "8.2.0"
 nucleo = { git = "https://github.com/helix-editor/nucleo.git", rev = "4253de9faabb4e5c6d81d946a5e35a90f87347ee" }
 opentelemetry = "0.32.0"
 opentelemetry-appender-tracing = "0.32.0"
+opentelemetry-http = "0.32.0"
 opentelemetry-otlp = "0.32.0"
 opentelemetry-semantic-conventions = "0.32.1"
 opentelemetry_sdk = "0.32.0"
@@ -509,9 +510,9 @@ strip = "symbols"
 lto = "thin"
 debug = "line-tables-only"
 split-debuginfo = "off"
-# Keep release binaries symbolicateable until packaging has archived the
-# sidecar symbols and stripped the binaries.
-strip = false
+# Release archives do not publish a separate symbol bundle. Strip symbols in
+# the owner build so distributable binaries cannot silently retain them.
+strip = "symbols"
 
 # Balance parallel release code generation against binary size.
 codegen-units = 4

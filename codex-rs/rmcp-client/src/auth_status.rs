@@ -3,13 +3,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use codex_exec_server::ExecServerError;
 use codex_exec_server::HttpClient;
-use codex_http_client::build_reqwest_client_with_custom_ca;
+use codex_exec_server::HttpHeader;
+use codex_exec_server::HttpRedirectPolicy;
+use codex_exec_server::HttpRequestParams;
+use codex_exec_server::HttpRequestResponse;
+use codex_exec_server::HttpResponseBodyStream;
+use codex_http_client::HttpClientBuilder;
 use codex_protocol::protocol::McpAuthStatus;
 use futures::FutureExt;
-use reqwest::Client;
-use reqwest::header::AUTHORIZATION;
-use reqwest::header::HeaderMap;
+use futures::future::BoxFuture;
+use http::HeaderMap;
+use http::HeaderName;
+use http::HeaderValue;
+use http::Method;
+use http::header::AUTHORIZATION;
 use rmcp::transport::AuthorizationManager;
 use rmcp::transport::auth::AuthError;
 use tracing::debug;
@@ -17,12 +26,97 @@ use tracing::debug;
 use crate::oauth::StoredOAuthTokenStatus;
 use crate::oauth::oauth_token_status;
 use crate::oauth_http_client::OAuthHttpClientAdapter;
-use crate::utils::apply_default_headers;
 use crate::utils::build_default_headers;
 use codex_config::types::AuthKeyringBackendKind;
 use codex_config::types::OAuthCredentialsStoreMode;
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone)]
+struct DiscoveryHttpClient {
+    follow_redirects: codex_http_client::HttpClient,
+    stop_redirects: codex_http_client::HttpClient,
+}
+
+impl DiscoveryHttpClient {
+    fn new(default_headers: HeaderMap) -> Result<Self> {
+        let builder = HttpClientBuilder::new()
+            .default_headers(default_headers)
+            .timeout(DISCOVERY_TIMEOUT);
+        Ok(Self {
+            follow_redirects: builder.clone().build_direct()?,
+            stop_redirects: builder.without_redirects().build_direct()?,
+        })
+    }
+}
+
+impl HttpClient for DiscoveryHttpClient {
+    fn http_request(
+        &self,
+        params: HttpRequestParams,
+    ) -> BoxFuture<'_, Result<HttpRequestResponse, ExecServerError>> {
+        async move {
+            let client = match params.redirect_policy {
+                HttpRedirectPolicy::Follow => &self.follow_redirects,
+                HttpRedirectPolicy::Stop => &self.stop_redirects,
+            };
+            let method = Method::from_bytes(params.method.as_bytes())
+                .map_err(|error| ExecServerError::HttpRequest(error.to_string()))?;
+            let mut headers = HeaderMap::new();
+            for header in params.headers {
+                let name = HeaderName::from_bytes(header.name.as_bytes())
+                    .map_err(|error| ExecServerError::HttpRequest(error.to_string()))?;
+                let value = HeaderValue::from_bytes(header.value.as_bytes())
+                    .map_err(|error| ExecServerError::HttpRequest(error.to_string()))?;
+                headers.append(name, value);
+            }
+            let mut request = client.request(method, params.url).headers(headers);
+            if let Some(timeout_ms) = params.timeout_ms {
+                request = request.timeout(Duration::from_millis(timeout_ms).min(DISCOVERY_TIMEOUT));
+            }
+            if let Some(body) = params.body {
+                request = request.body(body.into_inner());
+            }
+            let response = request
+                .send()
+                .await
+                .map_err(|error| ExecServerError::HttpRequest(error.to_string()))?;
+            let status = response.status().as_u16();
+            let headers = response
+                .headers()
+                .iter()
+                .filter_map(|(name, value)| {
+                    Some(HttpHeader {
+                        name: name.as_str().to_string(),
+                        value: value.to_str().ok()?.to_string(),
+                    })
+                })
+                .collect();
+            let body = response
+                .bytes()
+                .await
+                .map_err(|error| ExecServerError::HttpRequest(error.to_string()))?;
+            Ok(HttpRequestResponse {
+                status,
+                headers,
+                body: body.to_vec().into(),
+            })
+        }
+        .boxed()
+    }
+
+    fn http_request_stream(
+        &self,
+        _params: HttpRequestParams,
+    ) -> BoxFuture<'_, Result<(HttpRequestResponse, HttpResponseBodyStream), ExecServerError>> {
+        async {
+            Err(ExecServerError::Protocol(
+                "OAuth discovery client only supports buffered requests".to_string(),
+            ))
+        }
+        .boxed()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamableHttpOAuthDiscovery {
@@ -211,11 +305,17 @@ async fn discover_streamable_http_oauth_with_headers(
 ) -> Result<Option<StreamableHttpOAuthDiscovery>> {
     // Use no_proxy to avoid a bug in the system-configuration crate that
     // can result in a panic. See #8912.
-    let builder = Client::builder().timeout(DISCOVERY_TIMEOUT).no_proxy();
-    let client =
-        build_reqwest_client_with_custom_ca(apply_default_headers(builder, default_headers))?;
-    let mut authorization_manager = AuthorizationManager::new(url).await?;
-    authorization_manager.with_client(client)?;
+    let authorization_manager = AuthorizationManager::new_with_oauth_http_client(
+        url,
+        Arc::new(
+            OAuthHttpClientAdapter::new(
+                Arc::new(DiscoveryHttpClient::new(default_headers.clone())?),
+                HeaderMap::new(),
+            )
+            .with_buffered_responses(),
+        ),
+    )
+    .await?;
     discover_streamable_http_oauth_with_manager(&authorization_manager).await
 }
 
@@ -409,6 +509,68 @@ mod tests {
                 .to_string()
                 .contains("Failed to read CA certificate file")
         );
+    }
+
+    #[tokio::test]
+    async fn discovery_http_client_applies_default_headers_and_request_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("listener should have address");
+        let (observed_header_tx, mut observed_header_rx) = tokio::sync::mpsc::channel(1);
+        let app = Router::new().route(
+            "/discovery-client",
+            get(move |headers: HeaderMap| {
+                let observed_header_tx = observed_header_tx.clone();
+                async move {
+                    observed_header_tx
+                        .send(
+                            headers
+                                .get("x-rmcp-discovery")
+                                .and_then(|value| value.to_str().ok())
+                                == Some("shared-direct-client"),
+                        )
+                        .await
+                        .expect("header observation should be received");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    Json(serde_json::json!({
+                        "authorization_endpoint": "https://example.com/authorize",
+                        "token_endpoint": "https://example.com/token",
+                    }))
+                }
+            }),
+        );
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server should run");
+        });
+        let mut default_headers = HeaderMap::new();
+        default_headers.insert(
+            "x-rmcp-discovery",
+            HeaderValue::from_static("shared-direct-client"),
+        );
+        let client =
+            DiscoveryHttpClient::new(default_headers).expect("discovery HTTP client should build");
+
+        client
+            .http_request(HttpRequestParams {
+                method: "GET".to_string(),
+                url: format!("http://{address}/discovery-client"),
+                headers: Vec::new(),
+                body: None,
+                timeout_ms: Some(200),
+                redirect_policy: HttpRedirectPolicy::Follow,
+                request_id: "discovery-timeout-test".to_string(),
+                stream_response: false,
+            })
+            .await
+            .expect_err("request should use its shorter timeout");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), observed_header_rx.recv())
+                .await
+                .expect("server should observe the request"),
+            Some(true)
+        );
+        handle.abort();
     }
 
     #[tokio::test]

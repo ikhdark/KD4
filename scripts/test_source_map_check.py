@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from scripts.generated_output_lock import source_map_lock
 from scripts import source_map_check
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -79,6 +80,24 @@ def complete_source_map(
 
 
 class SourceMapCheckTest(unittest.TestCase):
+    def test_source_map_check_respects_shared_writer_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_map = root / "SOURCEMAP.md"
+            source_map.write_text("# Source Map\n", encoding="utf-8")
+            stderr = io.StringIO()
+            with (
+                source_map_lock(root, "test-holder"),
+                contextlib.redirect_stderr(stderr),
+            ):
+                self.assertEqual(
+                    source_map_check.main(
+                        [str(source_map), "--repo-root", str(root)]
+                    ),
+                    1,
+                )
+            self.assertIn("source map outputs is already locked", stderr.getvalue())
+
     def test_declared_top_level_owners_extracts_every_path_in_path_cell(self) -> None:
         owners = source_map_check.declared_top_level_owners(
             source_map_with_rows(
@@ -92,7 +111,7 @@ class SourceMapCheckTest(unittest.TestCase):
             [".codex", "package.json", "pnpm-workspace.yaml"],
         )
 
-    def test_check_fails_when_a_declared_owner_is_missing(self) -> None:
+    def test_untracked_file_cannot_satisfy_declared_owner(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             subprocess.run(
@@ -102,7 +121,6 @@ class SourceMapCheckTest(unittest.TestCase):
                 text=True,
                 check=True,
             )
-            (root / ".gitignore").write_text("/.github/\n", encoding="utf-8")
             generated = root / ".github" / "generated"
             generated.mkdir(parents=True)
             (generated / "local.log").write_text("local\n", encoding="utf-8")
@@ -337,6 +355,23 @@ class SourceMapCheckTest(unittest.TestCase):
                 1,
             )
 
+    def test_sync_snapshot_preserves_target_when_replace_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_map = Path(temp_dir) / "SOURCEMAP.md"
+            original = (
+                "# Source Map\n\n"
+                + source_map_check.TRACKED_PATH_SNAPSHOT_INSERT_AFTER
+                + "\n"
+            )
+            source_map.write_text(original, encoding="utf-8")
+            with mock.patch.object(source_map_check.os, "replace", side_effect=OSError):
+                with self.assertRaises(OSError):
+                    source_map_check.sync_tracked_path_snapshot(
+                        source_map, source_paths={"AGENTS.md"}
+                    )
+            self.assertEqual(source_map.read_text(encoding="utf-8"), original)
+            self.assertEqual(list(Path(temp_dir).glob("*.tmp")), [])
+
     def test_main_synchronizes_snapshot_before_validation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -405,6 +440,7 @@ class SourceMapCheckTest(unittest.TestCase):
             synchronized = source_map.read_text(encoding="utf-8")
             self.assertIn(source_map_check.TRACKED_PATH_SNAPSHOT_BEGIN, synchronized)
             self.assertIn("count=2", synchronized)
+            self.assertTrue((root / ".codex" / "locks" / "source-map.lock").is_file())
 
     def test_repository_source_map_matches_material_inventory(self) -> None:
         self.assertEqual(

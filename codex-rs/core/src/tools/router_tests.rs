@@ -1,9 +1,12 @@
+use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 
-use crate::agent::task_capabilities::classify_typed_tool;
+use crate::agent::task_capabilities::TypedToolClass;
 use crate::config::Config;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
+use crate::session::turn_context::TurnEnvironment;
 use crate::tools::context::ToolPayload;
 use crate::tools::exposure::GoalSurfaceState;
 use crate::tools::exposure::ToolExposureIdentity;
@@ -15,6 +18,7 @@ use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::ResponsesApiTool;
 use codex_extension_api::ToolCall as ExtensionToolCall;
 use codex_extension_api::ToolExecutor;
+use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
 use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
@@ -22,8 +26,10 @@ use codex_protocol::dynamic_tools::DynamicToolNamespaceTool;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ApplyPatchToolType;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_tools::ResponsesApiNamespace;
@@ -31,6 +37,8 @@ use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use codex_tools::default_namespace_description;
+use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -153,6 +161,96 @@ fn extension_tool_test_registry() -> Arc<ExtensionRegistry<Config>> {
     let mut builder = ExtensionRegistryBuilder::new();
     builder.tool_contributor(Arc::new(ExtensionEchoContributor));
     Arc::new(builder.build())
+}
+
+async fn enable_typed_router_task(
+    session: &mut crate::session::session::Session,
+    turn: &mut crate::session::turn_context::TurnContext,
+    repo: &Path,
+    write_path: &str,
+) -> (
+    codex_agent_task_store::AttemptId,
+    Arc<codex_agent_task_store::LocalAgentTaskStore>,
+) {
+    let root_session_id = "router-apply-patch-root".to_string();
+    let state_runtime =
+        codex_state::StateRuntime::init(repo.join(".typed-task-home"), "test-provider".to_string())
+            .await
+            .expect("typed task state initializes");
+    let coordinator = session.services.agent_control.task_coordinator();
+    coordinator
+        .initialize(state_runtime, root_session_id.clone())
+        .await
+        .expect("typed task coordinator initializes");
+    let (assignment, attempt) = coordinator
+        .create_assignment(
+            repo,
+            codex_agent_task_store::AssignmentDraft {
+                root_session_id,
+                admission_origin: codex_agent_task_store::AssignmentAdmissionOrigin::Typed,
+                role: codex_agent_task_store::AgentRole::Worker,
+                capability_profile: codex_agent_task_store::CapabilityProfile::ScopedSourceWrite,
+                objective: "exercise router apply_patch mutation evidence".to_string(),
+                acceptance_criteria: vec![codex_agent_task_store::AcceptanceCriterion {
+                    id: "router-mutation-evidence".to_string(),
+                    text: "router-dispatched apply_patch finalizes mutation evidence".to_string(),
+                }],
+                read_scope: Vec::new(),
+                write_scope: vec![codex_agent_task_store::RepoScope {
+                    path: write_path.to_string(),
+                    recursive: false,
+                }],
+                stop_condition: "mutation evidence finalized".to_string(),
+                dependencies: Vec::new(),
+                risk_hints: Vec::new(),
+                required_evidence: vec!["router boundary test".to_string()],
+                prohibited_changes: Vec::new(),
+                contract_claims: Vec::new(),
+                workspace_strategy: codex_agent_task_store::WorkspaceStrategy::Auto,
+                relation: None,
+                architecture_contract_ref: None,
+            },
+        )
+        .await
+        .expect("typed assignment is created");
+    let agent_path =
+        AgentPath::try_from("/root/router_apply_patch_worker").expect("valid agent path");
+    coordinator
+        .bind_agent_task(codex_agent_task_store::AgentTaskBindingDraft {
+            assignment_id: assignment.assignment_id,
+            attempt_id: attempt.attempt_id,
+            agent_path: agent_path.to_string(),
+            task_name: "router_apply_patch_worker".to_string(),
+            thread_id: None,
+        })
+        .await
+        .expect("typed assignment is bound");
+    turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id: ThreadId::new(),
+        depth: 1,
+        agent_path: Some(agent_path),
+        agent_nickname: None,
+        agent_role: Some("worker".to_string()),
+    });
+    (
+        attempt.attempt_id,
+        coordinator.store().expect("typed task store is available"),
+    )
+}
+
+fn set_router_environment(turn: &mut crate::session::turn_context::TurnContext, repo: &Path) {
+    let template = turn
+        .environments
+        .primary()
+        .expect("primary environment")
+        .clone();
+    let cwd = AbsolutePathBuf::from_absolute_path(repo).expect("absolute repository path");
+    turn.environments.turn_environments = vec![TurnEnvironment::new(
+        codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
+        Arc::clone(&template.environment),
+        PathUri::from_abs_path(&cwd),
+        template.shell,
+    )];
 }
 
 #[tokio::test]
@@ -451,6 +549,9 @@ async fn specs_filter_deferred_dynamic_tools() -> anyhow::Result<()> {
         .expect("registered deferred dynamic tool name");
     turn.refresh_deferred_tool_capabilities(router.deferred_tool_capability_revisions());
     turn.activate_deferred_tools([hidden_name]);
+    let (activation_revision, activated) = turn.deferred_tool_activation_snapshot();
+    assert_eq!(activation_revision, 1);
+    assert_eq!(activated.len(), 1);
     let activated_schemas = router.model_visible_schemas_for_turn(turn.as_ref());
     assert_eq!(
         namespace_function_names(activated_schemas.specs(), "codex_app"),
@@ -460,6 +561,28 @@ async fn specs_filter_deferred_dynamic_tools() -> anyhow::Result<()> {
         &activated_schemas,
         &router.model_visible_schemas_for_turn(turn.as_ref())
     ));
+    let activated_manifest = router
+        .tool_manifest(turn.as_ref())
+        .manifest
+        .expect("activated tool surface emits one manifest snapshot");
+    assert!(
+        activated_manifest["registered"]
+            .as_array()
+            .is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry["name"]
+                        .as_str()
+                        .is_some_and(|name| name.contains(hidden_tool))
+                        && entry["activated"] == true
+                })
+            })
+    );
+    assert!(
+        activated_manifest["model_visible"]
+            .to_string()
+            .contains(hidden_tool),
+        "the manifest and activated schema snapshot must expose the same deferred tool"
+    );
 
     Ok(())
 }
@@ -549,12 +672,14 @@ fn independent_review_policy_allows_inspection_and_denies_mutation() {
         }),
     ];
     for source in sources {
-        for tool_name in [
-            ToolName::plain("read_tool_output"),
-            ToolName::plain("git_diff"),
-            ToolName::plain("shell_command"),
-            ToolName::plain("exec_command"),
-            ToolName::plain("write_stdin"),
+        for (tool_name, class) in [
+            (
+                ToolName::plain("read_tool_output"),
+                TypedToolClass::ReadSearch,
+            ),
+            (ToolName::plain("shell_command"), TypedToolClass::Shell),
+            (ToolName::plain("exec_command"), TypedToolClass::Shell),
+            (ToolName::plain("write_stdin"), TypedToolClass::Shell),
         ] {
             let call = ToolCall {
                 tool_name,
@@ -563,11 +688,6 @@ fn independent_review_policy_allows_inspection_and_denies_mutation() {
                     arguments: "{}".to_string(),
                 },
             };
-            let class = classify_typed_tool(
-                call.tool_name.namespace.as_deref(),
-                &call.tool_name.name,
-                None,
-            );
             authorize_independent_review_tool_call(
                 &source,
                 class,
@@ -584,23 +704,27 @@ fn independent_review_policy_allows_inspection_and_denies_mutation() {
                 arguments: "{}".to_string(),
             },
         };
-        let class = classify_typed_tool(
-            repo_atlas_call.tool_name.namespace.as_deref(),
-            &repo_atlas_call.tool_name.name,
-            None,
-        );
         authorize_independent_review_tool_call(
             &source,
-            class,
+            TypedToolClass::DynamicExternal,
             &repo_atlas_call,
             ExternalMutationIntent::ProvenReadOnly,
         )
         .expect("allowlisted Repo Atlas inspection should be authorized");
 
-        for tool_name in [
-            ToolName::plain("apply_patch"),
-            ToolName::namespaced("mcp__repo_atlas", "write_file"),
-            ToolName::namespaced("mcp__codex_apps__github", "create_branch"),
+        for (tool_name, class) in [
+            (
+                ToolName::plain("apply_patch"),
+                TypedToolClass::StructuredEdit,
+            ),
+            (
+                ToolName::namespaced("mcp__repo_atlas", "write_file"),
+                TypedToolClass::DynamicExternal,
+            ),
+            (
+                ToolName::namespaced("mcp__codex_apps__github", "create_branch"),
+                TypedToolClass::DynamicExternal,
+            ),
         ] {
             let call = ToolCall {
                 tool_name,
@@ -609,11 +733,6 @@ fn independent_review_policy_allows_inspection_and_denies_mutation() {
                     arguments: "{}".to_string(),
                 },
             };
-            let class = classify_typed_tool(
-                call.tool_name.namespace.as_deref(),
-                &call.tool_name.name,
-                None,
-            );
             assert!(
                 authorize_independent_review_tool_call(
                     &source,
@@ -625,6 +744,91 @@ fn independent_review_policy_allows_inspection_and_denies_mutation() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn router_apply_patch_finalizes_typed_mutation_evidence() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir().expect("temporary repository");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repository");
+    let status = Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&repo)
+        .status()
+        .expect("launch git init");
+    assert!(status.success(), "git init failed");
+    std::fs::write(repo.join("tracked.txt"), "before\n").expect("write patch fixture");
+
+    let (mut session, mut turn) = make_session_and_context().await;
+    set_router_environment(&mut turn, &repo);
+    turn.permission_profile = PermissionProfile::Disabled;
+    turn.model_info.apply_patch_tool_type = Some(ApplyPatchToolType::Freeform);
+    let (attempt_id, store) =
+        enable_typed_router_task(&mut session, &mut turn, &repo, "tracked.txt").await;
+    let turn = Arc::new(turn);
+    let step_context = StepContext::for_test(Arc::clone(&turn));
+    let router = ToolRouter::from_context(
+        step_context.as_ref(),
+        ToolRouterParams {
+            tool_suggest_candidates: None,
+            deferred_mcp_tools: None,
+            mcp_tools: None,
+            extension_tool_executors: Vec::new(),
+            dynamic_tools: turn.dynamic_tools.as_slice(),
+            exposure_identity: Default::default(),
+        },
+        &Default::default(),
+    );
+    assert!(
+        router
+            .registered_tool_names_for_test()
+            .contains(&ToolName::plain("apply_patch")),
+        "production tool planning must register apply_patch"
+    );
+
+    let call = ToolRouter::build_tool_call(ResponseItem::CustomToolCall {
+        id: None,
+        status: None,
+        call_id: "router-apply-patch".to_string(),
+        name: "apply_patch".to_string(),
+        namespace: None,
+        input: "*** Begin Patch\n*** Update File: tracked.txt\n@@\n-before\n+after\n*** End Patch"
+            .to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    })?
+    .expect("custom tool call");
+    let terminal_outcome_reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    router
+        .dispatch_tool_call_with_terminal_outcome(
+            Arc::new(session),
+            step_context,
+            CancellationToken::new(),
+            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+            call,
+            ToolCallSource::Direct,
+            Arc::clone(&terminal_outcome_reached),
+        )
+        .await?;
+    assert!(terminal_outcome_reached.load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(
+        std::fs::read_to_string(repo.join("tracked.txt")).expect("read patched file"),
+        "after\n"
+    );
+
+    let evidence = store
+        .list_mutation_evidence(
+            attempt_id,
+            Some(codex_agent_task_store::MAX_MUTATION_EVIDENCE_LIMIT),
+        )
+        .await
+        .expect("mutation evidence remains queryable");
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(evidence[0].path, "tracked.txt");
+    assert_ne!(evidence[0].pre_write_hash, evidence[0].final_hash);
+    assert!(evidence[0].finalized_at.is_some());
+    assert!(evidence[0].end_epoch.is_some());
+
+    Ok(())
 }
 
 #[tokio::test]

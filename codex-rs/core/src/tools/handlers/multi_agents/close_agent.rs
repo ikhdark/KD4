@@ -15,10 +15,13 @@ impl ToolExecutor<ToolInvocation> for Handler {
         create_close_agent_tool_v1()
     }
 
-    fn search_info(&self) -> Option<ToolSearchInfo> {
+    fn search_info_for_registered_spec(
+        &self,
+        registered_spec: &ToolSpec,
+    ) -> Option<ToolSearchInfo> {
         multi_agent_tool_search_info(
             "close_agent close shutdown stop agent subagent thread status target",
-            self.spec(),
+            registered_spec.clone(),
         )
     }
 

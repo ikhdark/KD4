@@ -38,10 +38,13 @@ impl ToolExecutor<ToolInvocation> for Handler {
         create_wait_agent_tool_v1(self.options)
     }
 
-    fn search_info(&self) -> Option<ToolSearchInfo> {
+    fn search_info_for_registered_spec(
+        &self,
+        registered_spec: &ToolSpec,
+    ) -> Option<ToolSearchInfo> {
         multi_agent_tool_search_info(
             "wait_agent wait agent subagent status final result complete timeout targets",
-            self.spec(),
+            registered_spec.clone(),
         )
     }
 

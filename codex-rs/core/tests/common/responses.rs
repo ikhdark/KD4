@@ -249,6 +249,14 @@ impl ResponsesRequest {
             .any(|texts| predicate(texts))
     }
 
+    /// Returns whether the latest message for `role` has an `input_text` span
+    /// whose value exactly matches `text`.
+    pub fn has_last_message_input_text(&self, role: &str, text: &str) -> bool {
+        self.message_input_text_groups(role)
+            .last()
+            .is_some_and(|texts| texts.iter().any(|candidate| candidate == text))
+    }
+
     /// Returns all `input_image` `image_url` spans from `message` inputs for the provided role.
     pub fn message_input_image_urls(&self, role: &str) -> Vec<String> {
         self.inputs_of_type("message")
@@ -419,6 +427,18 @@ pub fn namespace_child_tool<'a>(
     None
 }
 
+/// Matches an exact `input_text` value on the latest message for `role`.
+///
+/// This is intended for mock routing: it does not match text in earlier turns,
+/// other roles, tool arguments, metadata, or unrelated JSON fields.
+pub fn request_has_last_message_input_text(
+    request: &wiremock::Request,
+    role: &str,
+    text: &str,
+) -> bool {
+    ResponsesRequest(request.clone()).has_last_message_input_text(role, text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,6 +456,44 @@ mod tests {
             body: serde_json::to_vec(&serde_json::json!({ "input": input }))
                 .expect("serialize request body"),
         })
+    }
+
+    #[test]
+    fn body_matches_typed_text_items() {
+        let stale_or_untyped = request_with_input(serde_json::json!([
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "route me" }]
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "input_text", "text": "route me" }]
+            },
+            { "type": "fixture_metadata", "text": "route me" },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "different current turn" }]
+            }
+        ]));
+        assert!(!stale_or_untyped.has_last_message_input_text("user", "route me"));
+
+        let current = request_with_input(serde_json::json!([
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "route me earlier" }]
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "route me" }]
+            }
+        ]));
+        assert!(current.has_last_message_input_text("user", "route me"));
+        assert!(!current.has_last_message_input_text("user", "route"));
     }
 
     #[test]

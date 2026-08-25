@@ -11,6 +11,7 @@ use codex_app_server_protocol::PluginInterface;
 use codex_app_server_protocol::PluginRemoteErrorData;
 use codex_app_server_protocol::PluginRemoteErrorReason;
 use codex_app_server_protocol::SkillInterface;
+use codex_http_client::HttpError;
 use codex_http_client::RequestBuilder;
 use codex_login::CodexAuth;
 use codex_login::default_client::create_client_without_request_logging;
@@ -314,13 +315,13 @@ pub enum RemotePluginCatalogError {
     Request {
         url: String,
         #[source]
-        source: reqwest::Error,
+        source: HttpError,
     },
 
     #[error("remote plugin catalog request to {url} failed with status {status}: {body}")]
     UnexpectedStatus {
         url: String,
-        status: reqwest::StatusCode,
+        status: http::StatusCode,
         body: String,
     },
 
@@ -423,21 +424,19 @@ impl RemotePluginCatalogError {
         let reason = match self {
             Self::AuthRequired => PluginRemoteErrorReason::AuthenticationRequired,
             Self::UnsupportedAuthMode => PluginRemoteErrorReason::UnsupportedAuthMode,
-            Self::UnexpectedStatus { status, .. }
-                if *status == reqwest::StatusCode::UNAUTHORIZED =>
-            {
+            Self::UnexpectedStatus { status, .. } if *status == http::StatusCode::UNAUTHORIZED => {
                 PluginRemoteErrorReason::AuthenticationRequired
             }
-            Self::UnexpectedStatus { status, .. } if *status == reqwest::StatusCode::FORBIDDEN => {
+            Self::UnexpectedStatus { status, .. } if *status == http::StatusCode::FORBIDDEN => {
                 PluginRemoteErrorReason::AccessDenied
             }
-            Self::UnexpectedStatus { status, .. } if *status == reqwest::StatusCode::NOT_FOUND => {
+            Self::UnexpectedStatus { status, .. } if *status == http::StatusCode::NOT_FOUND => {
                 PluginRemoteErrorReason::NotFound
             }
             Self::Request { .. } => PluginRemoteErrorReason::Transient,
             Self::UnexpectedStatus { status, .. }
-                if *status == reqwest::StatusCode::REQUEST_TIMEOUT
-                    || *status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                if *status == http::StatusCode::REQUEST_TIMEOUT
+                    || *status == http::StatusCode::TOO_MANY_REQUESTS
                     || status.is_server_error() =>
             {
                 PluginRemoteErrorReason::Transient

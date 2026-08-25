@@ -9,6 +9,7 @@ from functools import cache
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -30,6 +31,21 @@ SCRIPT_AUDIT_ROOTS = (
     REPO_ROOT / "sdk" / "python" / "scripts",
     REPO_ROOT / "tools" / "argument-comment-lint",
 )
+
+# Tracked executable examples whose syntax belongs to an SDK/toolchain owner,
+# not the repository maintenance-script audit. Keep exclusions path-specific
+# and explain why they are not silently omitted from discovery.
+SCRIPT_AUDIT_EXCLUSIONS: dict[str, str] = {
+    "sdk/typescript/samples/basic_streaming.ts": (
+        "TypeScript SDK sample; validated by the SDK toolchain"
+    ),
+    "sdk/typescript/samples/structured_output.ts": (
+        "TypeScript SDK sample; validated by the SDK toolchain"
+    ),
+    "sdk/typescript/samples/structured_output_zod.ts": (
+        "TypeScript SDK sample; validated by the SDK toolchain"
+    ),
+}
 
 SCRIPT_KIND_BY_SUFFIX = {
     ".py": "python",
@@ -81,6 +97,44 @@ def script_kind_for_path(path: Path) -> str | None:
     return None
 
 
+def tracked_script_entrypoints() -> tuple[Path, ...]:
+    """Return tracked executable scripts outside the owned script roots."""
+    result = subprocess.run(
+        ["git", "ls-files", "--stage", "-z"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if result.returncode != 0:
+        return ()
+    entrypoints: list[Path] = []
+    for record in result.stdout.split("\0"):
+        if not record:
+            continue
+        metadata, separator, target = record.partition("\t")
+        if not separator:
+            continue
+        path = REPO_ROOT / target
+        if any(
+            root == path.parent or root in path.parents for root in SCRIPT_AUDIT_ROOTS
+        ):
+            continue
+        if target in SCRIPT_AUDIT_EXCLUSIONS:
+            continue
+        mode = metadata.split(" ", 1)[0]
+        try:
+            with path.open("rb") as script_file:
+                first_line = script_file.readline(256)
+        except OSError:
+            continue
+        if mode == "100755" or first_line.startswith(b"#!"):
+            entrypoints.append(path)
+    return tuple(entrypoints)
+
+
 @cache
 def script_inventory() -> tuple[
     tuple[str, ...], tuple[str, ...], tuple[tuple[str, str], ...]
@@ -88,38 +142,130 @@ def script_inventory() -> tuple[
     python_sources: list[str] = []
     unittest_targets: list[str] = []
     script_kinds: list[tuple[str, str]] = []
-    for root in SCRIPT_AUDIT_ROOTS:
-        for path in root.rglob("*"):
-            if (
-                not path.is_file()
-                or "__pycache__" in path.parts
-                or ".venv" in path.parts
-            ):
-                continue
-            target = path.relative_to(REPO_ROOT).as_posix()
-            if path.suffix.lower() == ".py":
-                python_sources.append(target)
-                if path.name.lower().startswith("test_"):
-                    if SCRIPTS_ROOT in path.parents:
-                        unittest_targets.append(
-                            path.relative_to(REPO_ROOT)
-                            .with_suffix("")
-                            .as_posix()
-                            .replace("/", ".")
-                        )
-                    else:
-                        # unittest accepts repository-relative file paths. Keep
-                        # tests below non-package script roots discoverable even
-                        # when a path segment cannot be a Python identifier.
-                        unittest_targets.append(target)
-            kind = script_kind_for_path(path)
-            if kind is not None:
-                script_kinds.append((target, kind))
+    owned_paths = (path for root in SCRIPT_AUDIT_ROOTS for path in root.rglob("*"))
+    for path in dict.fromkeys((*owned_paths, *tracked_script_entrypoints())):
+        if not path.is_file() or "__pycache__" in path.parts or ".venv" in path.parts:
+            continue
+        target = path.relative_to(REPO_ROOT).as_posix()
+        if path.suffix.lower() == ".py":
+            python_sources.append(target)
+            if path.name.lower().startswith("test_"):
+                if SCRIPTS_ROOT in path.parents:
+                    unittest_targets.append(
+                        path.relative_to(REPO_ROOT)
+                        .with_suffix("")
+                        .as_posix()
+                        .replace("/", ".")
+                    )
+                else:
+                    # unittest accepts repository-relative file paths. Keep
+                    # tests below non-package script roots discoverable even
+                    # when a path segment cannot be a Python identifier.
+                    unittest_targets.append(target)
+        kind = script_kind_for_path(path)
+        if kind is not None:
+            script_kinds.append((target, kind))
     return (
         tuple(sorted(python_sources)),
         tuple(sorted(unittest_targets)),
         tuple(sorted(script_kinds)),
     )
+
+
+def replace_just_interpolations(source: str) -> str:
+    """Replace just expressions while preserving the surrounding PowerShell."""
+    rendered: list[str] = []
+    cursor = 0
+    while True:
+        start = source.find("{{", cursor)
+        if start < 0:
+            rendered.append(source[cursor:])
+            return "".join(rendered)
+        rendered.append(source[cursor:start])
+        depth = 0
+        index = start + 2
+        while index < len(source):
+            if source[index] == "{":
+                depth += 1
+            elif source[index] == "}":
+                if depth:
+                    depth -= 1
+                elif index + 1 < len(source) and source[index + 1] == "}":
+                    rendered.append("KD4_JUST_VALUE")
+                    cursor = index + 2
+                    break
+            index += 1
+        else:
+            rendered.append(source[start:])
+            return "".join(rendered)
+
+
+def just_recipe_sources(
+    text: str | None = None, *, script_interpreter: str | None
+) -> tuple[tuple[str, str], ...]:
+    """Extract recipe bodies handled by one interpreter."""
+    if text is None:
+        text = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
+    sources: list[tuple[str, str]] = []
+    recipe_start: int | None = None
+    recipe_lines: list[str] = []
+    pending_script_interpreter: str | None = None
+    active_script_interpreter: str | None = None
+
+    def flush_recipe() -> None:
+        nonlocal recipe_start, recipe_lines
+        if recipe_start is not None and recipe_lines:
+            if script_interpreter is None and not recipe_lines[0].startswith("#!"):
+                # Ordinary just recipes execute each body line in a fresh
+                # shell. Parse those lines independently; only script/shebang
+                # recipes are one multi-line source unit.
+                sources.extend(
+                    (f"justfile:{recipe_start + offset}", source)
+                    for offset, source in enumerate(recipe_lines)
+                )
+            else:
+                sources.append((f"justfile:{recipe_start}", "\n".join(recipe_lines)))
+        recipe_start = None
+        recipe_lines = []
+
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        if not line.startswith("    "):
+            flush_recipe()
+            stripped = line.strip()
+            script_match = re.fullmatch(r'\[script\("([^"\r\n]+)"\)\]', stripped)
+            if script_match is not None:
+                pending_script_interpreter = script_match.group(1)
+            elif stripped.startswith("[") or not stripped or stripped.startswith("#"):
+                pass
+            elif re.match(r"^[A-Za-z_][A-Za-z0-9_-]*(?:\s[^:]*)?:", stripped):
+                active_script_interpreter = pending_script_interpreter
+                pending_script_interpreter = None
+            else:
+                pending_script_interpreter = None
+                active_script_interpreter = None
+            continue
+        if active_script_interpreter != script_interpreter:
+            continue
+        source = line[4:]
+        if recipe_start is None:
+            recipe_start = line_number
+        if (script_interpreter is None or not recipe_lines) and source.startswith("@"):
+            source = source[1:]
+        source = replace_just_interpolations(source)
+        source = re.sub(r"\{[A-Za-z_][A-Za-z0-9_]*\}", "$null", source)
+        recipe_lines.append(source)
+    flush_recipe()
+    return tuple(sources)
+
+
+def just_powershell_sources(text: str | None = None) -> tuple[tuple[str, str], ...]:
+    """Extract recipe lines executed by the default PowerShell adapter."""
+    return just_recipe_sources(text, script_interpreter=None)
+
+
+def just_python_sources(text: str | None = None) -> tuple[tuple[str, str], ...]:
+    """Extract recipe bodies executed directly by Python script recipes."""
+    return just_recipe_sources(text, script_interpreter="python")
 
 
 def python_source_targets() -> list[str]:
@@ -144,6 +290,18 @@ UV_RUN_SCRIPTS = ["uv", "run", "--frozen", "--project", "scripts"]
 # same-stem test file. Keep that routing explicit so changed PowerShell
 # helpers and shared Python utilities do not receive syntax-only validation.
 SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
+    ".codex/hooks.json": ("scripts.test_task_continuity_hook",),
+    ".codex/hooks/task-continuity-entry.ps1": ("scripts.test_task_continuity_hook",),
+    ".codex/hooks/task-continuity-fast-basic.ps1": (
+        "scripts.test_task_continuity_hook",
+    ),
+    ".codex/hooks/task-continuity-fast-compact.ps1": (
+        "scripts.test_task_continuity_hook",
+    ),
+    ".codex/hooks/task-continuity-fast-session.ps1": (
+        "scripts.test_task_continuity_hook",
+    ),
+    ".codex/hooks/task-continuity.ps1": ("scripts.test_task_continuity_hook",),
     "scripts/app_server_schema_runtime_check.py": ("scripts.test_dev_environment",),
     "scripts/build_codex_package.py": ("scripts.test_stage_npm_packages",),
     "scripts/cargo-lane-trash-cleanup.ps1": ("scripts.test_cargo_lane",),
@@ -240,7 +398,10 @@ def git_changed_paths() -> list[str]:
             "diff",
             "--name-only",
             "-z",
-            "--diff-filter=ACMRTUXB",
+            # Deleted scripts still own regression routes. Keep their paths so
+            # changed-only validation can select the maintained mapping even
+            # though the source no longer exists on disk.
+            "--diff-filter=ACDMRTUXB",
             "HEAD",
             "--",
         ],
@@ -336,6 +497,27 @@ def python_test_targets(modules: Sequence[str], changed: Sequence[str]) -> list[
     if not selected and not changed:
         return python_unittest_targets()
     return sorted(dict.fromkeys(selected))
+
+
+def changed_production_script_requires_test(path_text: str) -> bool:
+    """Return whether a changed path is an owned production script surface."""
+    path = repository_relative_path(path_text)
+    if path is None:
+        return False
+    path_key = path.as_posix()
+    if path_key in SCRIPT_TEST_MODULES:
+        return True
+    absolute = REPO_ROOT / path
+    if not any(
+        root == absolute.parent or root in absolute.parents
+        for root in SCRIPT_AUDIT_ROOTS
+    ):
+        return False
+    return (
+        path.suffix.lower() in SCRIPT_CANDIDATE_SUFFIXES
+        and not path.name.lower().startswith("test_")
+        and path.name != "__init__.py"
+    )
 
 
 def script_audit_test_targets() -> list[str]:
@@ -595,6 +777,38 @@ def script_audit_commands(
                     ),
                 )
             )
+            just_sources_json = json.dumps(just_powershell_sources()).replace("'", "''")
+            just_parse_script = (
+                f"$sources = ConvertFrom-Json '{just_sources_json}'; "
+                "$failed = $false; foreach ($item in $sources) { "
+                "$tokens = $null; $errors = $null; "
+                "[System.Management.Automation.Language.Parser]::ParseInput("
+                "$item[1], $item[0], [ref]$tokens, [ref]$errors) | Out-Null; "
+                "foreach ($parseError in $errors) { "
+                "Write-Error ('{0}: {1}' -f $item[0], $parseError.Message); "
+                "$failed = $true } }; if ($failed) { exit 1 }"
+            )
+            commands.append(
+                (
+                    "justfile PowerShell syntax",
+                    (powershell, "-NoProfile", "-Command", just_parse_script),
+                )
+            )
+
+    just_python = just_python_sources()
+    if just_python:
+        sources_json = json.dumps(just_python)
+        python_parse_script = (
+            "import json,sys; "
+            "sources=json.loads(sys.argv[1]); "
+            "[compile(source, name, 'exec') for name, source in sources]"
+        )
+        commands.append(
+            (
+                "justfile Python syntax",
+                (sys.executable, "-c", python_parse_script, sources_json),
+            )
+        )
 
     javascript_targets = [
         target for target, kind in kind_by_target.items() if kind == "javascript"
@@ -799,6 +1013,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         if not targets:
             print("No matching changed Python test modules to run.")
+            if args.changed and any(
+                changed_production_script_requires_test(path) for path in changed_paths
+            ):
+                print(
+                    "Changed production script validation is unverified because no "
+                    "focused test route was selected.",
+                    file=sys.stderr,
+                )
+                return 2
             return 0
         return run(
             [

@@ -143,15 +143,18 @@ const POWERSHELL_FALLBACK_PATHS: &[&str] =
     &[r#"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"#];
 
 fn get_powershell_shell(path: Option<&PathBuf>) -> Option<DetectedShell> {
-    let provided = path.and_then(|path| file_exists(path));
-    let pwsh = find_binary_or_fallback("pwsh", PWSH_FALLBACK_PATHS);
-    let default_powershell = get_user_shell_path().and_then(|default_shell_path| {
-        (detect_shell_type(&default_shell_path) == Some(ShellType::PowerShell))
-            .then(|| file_exists(&default_shell_path))
-            .flatten()
-    });
-    let windows_powershell = find_binary_or_fallback("powershell", POWERSHELL_FALLBACK_PATHS);
-    let shell_path = select_powershell_host(provided, pwsh, default_powershell, windows_powershell);
+    let shell_path = select_powershell_host(
+        || path.and_then(|path| file_exists(path)),
+        || find_binary_or_fallback("pwsh", PWSH_FALLBACK_PATHS),
+        || {
+            get_user_shell_path().and_then(|default_shell_path| {
+                (detect_shell_type(&default_shell_path) == Some(ShellType::PowerShell))
+                    .then(|| file_exists(&default_shell_path))
+                    .flatten()
+            })
+        },
+        || find_binary_or_fallback("powershell", POWERSHELL_FALLBACK_PATHS),
+    );
 
     shell_path.map(|shell_path| DetectedShell {
         shell_type: ShellType::PowerShell,
@@ -168,15 +171,15 @@ fn find_binary_or_fallback(binary_name: &str, fallback_paths: &[&str]) -> Option
 }
 
 fn select_powershell_host(
-    provided: Option<PathBuf>,
-    pwsh: Option<PathBuf>,
-    default_powershell: Option<PathBuf>,
-    windows_powershell: Option<PathBuf>,
+    provided: impl FnOnce() -> Option<PathBuf>,
+    pwsh: impl FnOnce() -> Option<PathBuf>,
+    default_powershell: impl FnOnce() -> Option<PathBuf>,
+    windows_powershell: impl FnOnce() -> Option<PathBuf>,
 ) -> Option<PathBuf> {
-    provided
-        .or(pwsh)
-        .or(default_powershell)
-        .or(windows_powershell)
+    provided()
+        .or_else(pwsh)
+        .or_else(default_powershell)
+        .or_else(windows_powershell)
 }
 
 fn get_cmd_shell(path: Option<&PathBuf>) -> Option<DetectedShell> {
@@ -219,6 +222,7 @@ pub fn default_user_shell_from_path(_user_shell_path: Option<PathBuf>) -> Detect
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use std::cell::Cell;
 
     #[test]
     fn test_detect_shell_type() {
@@ -314,24 +318,24 @@ mod tests {
 
         assert_eq!(
             select_powershell_host(
-                None,
-                Some(pwsh.clone()),
-                Some(default.clone()),
-                Some(compatibility.clone())
+                || None,
+                || Some(pwsh.clone()),
+                || Some(default.clone()),
+                || Some(compatibility.clone())
             ),
             Some(pwsh)
         );
         assert_eq!(
             select_powershell_host(
-                None,
-                None,
-                Some(default.clone()),
-                Some(compatibility.clone())
+                || None,
+                || None,
+                || Some(default.clone()),
+                || Some(compatibility.clone())
             ),
             Some(default)
         );
         assert_eq!(
-            select_powershell_host(None, None, None, Some(compatibility.clone())),
+            select_powershell_host(|| None, || None, || None, || Some(compatibility.clone())),
             Some(compatibility)
         );
     }
@@ -342,7 +346,7 @@ mod tests {
         let pwsh = PathBuf::from("C:/Program Files/PowerShell/7/pwsh.exe");
 
         assert_eq!(
-            select_powershell_host(Some(provided.clone()), Some(pwsh), None, None),
+            select_powershell_host(|| Some(provided.clone()), || Some(pwsh), || None, || None),
             Some(provided)
         );
         assert_eq!(
@@ -353,5 +357,62 @@ mod tests {
             powershell_host_kind("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"),
             Some(PowerShellHostKind::WindowsPowerShell)
         );
+    }
+
+    #[test]
+    fn powershell_resolver_stops_probing_after_the_first_available_host() {
+        let provided_calls = Cell::new(0);
+        let pwsh_calls = Cell::new(0);
+        let default_calls = Cell::new(0);
+        let compatibility_calls = Cell::new(0);
+        let provided = PathBuf::from("D:/pinned/powershell.exe");
+
+        assert_eq!(
+            select_powershell_host(
+                || {
+                    provided_calls.set(provided_calls.get() + 1);
+                    Some(provided.clone())
+                },
+                || {
+                    pwsh_calls.set(pwsh_calls.get() + 1);
+                    Some(PathBuf::from("pwsh.exe"))
+                },
+                || {
+                    default_calls.set(default_calls.get() + 1);
+                    Some(PathBuf::from("default-powershell.exe"))
+                },
+                || {
+                    compatibility_calls.set(compatibility_calls.get() + 1);
+                    Some(PathBuf::from("powershell.exe"))
+                },
+            ),
+            Some(provided)
+        );
+        assert_eq!(provided_calls.get(), 1);
+        assert_eq!(pwsh_calls.get(), 0);
+        assert_eq!(default_calls.get(), 0);
+        assert_eq!(compatibility_calls.get(), 0);
+
+        assert_eq!(
+            select_powershell_host(
+                || None,
+                || {
+                    pwsh_calls.set(pwsh_calls.get() + 1);
+                    Some(PathBuf::from("pwsh.exe"))
+                },
+                || {
+                    default_calls.set(default_calls.get() + 1);
+                    None
+                },
+                || {
+                    compatibility_calls.set(compatibility_calls.get() + 1);
+                    None
+                },
+            ),
+            Some(PathBuf::from("pwsh.exe"))
+        );
+        assert_eq!(pwsh_calls.get(), 1);
+        assert_eq!(default_calls.get(), 0);
+        assert_eq!(compatibility_calls.get(), 0);
     }
 }

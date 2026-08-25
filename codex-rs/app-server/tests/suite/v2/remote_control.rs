@@ -217,7 +217,7 @@ async fn explicit_remote_control_startup_fails_when_disabled_by_requirements() -
         codex_home.path().join("requirements.toml"),
         "allow_remote_control = false\n",
     )?;
-    let managed_config_path = codex_home.path().join("managed_config.toml");
+    let system_requirements_path = codex_home.path().join("requirements.toml");
     let socket_path = codex_home.path().join("app-server.sock");
     let transport =
         AppServerTransport::from_listen_url(&format!("unix://{}", socket_path.display()))?;
@@ -230,7 +230,7 @@ async fn explicit_remote_control_startup_fails_when_disabled_by_requirements() -
                 codex_self_exe: Some(std::env::current_exe()?),
             },
             CliConfigOverrides::default(),
-            LoaderOverrides::with_managed_config_path_for_tests(managed_config_path),
+            LoaderOverrides::with_system_requirements_path_for_tests(system_requirements_path),
             /*strict_config*/ false,
             /*default_analytics_enabled*/ false,
             transport,

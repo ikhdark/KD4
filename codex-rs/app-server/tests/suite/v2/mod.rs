@@ -13,7 +13,6 @@ mod config_rpc;
 mod connection_handling_websocket;
 
 mod current_time;
-mod desktop_activation;
 mod dynamic_tools;
 mod environment_add;
 mod environment_info;

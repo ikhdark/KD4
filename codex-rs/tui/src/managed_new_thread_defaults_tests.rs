@@ -16,7 +16,7 @@ fn defaults() -> NewThreadModelDefaults {
     NewThreadModelDefaults {
         model: Some("managed-model".to_string()),
         model_reasoning_effort: Some(ReasoningEffort::High),
-        service_tier: Some("fast".to_string()),
+        service_tier: Some("priority".to_string()),
     }
 }
 

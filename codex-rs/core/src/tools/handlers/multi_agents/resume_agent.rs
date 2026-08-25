@@ -18,10 +18,13 @@ impl ToolExecutor<ToolInvocation> for Handler {
         create_resume_agent_tool()
     }
 
-    fn search_info(&self) -> Option<ToolSearchInfo> {
+    fn search_info_for_registered_spec(
+        &self,
+        registered_spec: &ToolSpec,
+    ) -> Option<ToolSearchInfo> {
         multi_agent_tool_search_info(
             "resume_agent resume reopen closed agent subagent thread id target",
-            self.spec(),
+            registered_spec.clone(),
         )
     }
 

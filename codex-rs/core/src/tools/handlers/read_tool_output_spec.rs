@@ -104,42 +104,82 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
         ],
         Some("Ordered search or exact-select operations over the original artifact.".to_string()),
     );
+    let artifact_id = JsonSchema::string(Some(
+        "Opaque UUID from the original tool projection.".to_string(),
+    ));
+    let max_bytes = JsonSchema::integer(Some(
+        "Legacy compatibility field; validated but never used to clip a selected value."
+            .to_string(),
+    ));
+    let selectors = JsonSchema::array(selector_schema, Some("Preferred selector list; exact duplicates and overlapping or adjacent same-kind ranges are normalized into stable canonical source order.".to_string()));
+    let legacy_start_line = bounded_integer(
+        1,
+        usize::MAX as u64,
+        "Legacy first 1-based line.".to_string(),
+    );
+    let legacy_end_line = bounded_integer(
+        1,
+        usize::MAX as u64,
+        "Legacy inclusive last line.".to_string(),
+    );
+    let legacy_ranges = JsonSchema::array(
+        JsonSchema::object(
+            BTreeMap::from([
+                (
+                    "start_line".to_string(),
+                    bounded_integer(1, usize::MAX as u64, "One-based first line.".to_string()),
+                ),
+                (
+                    "end_line".to_string(),
+                    bounded_integer(1, usize::MAX as u64, "Inclusive last line.".to_string()),
+                ),
+            ]),
+            Some(vec!["start_line".to_string(), "end_line".to_string()]),
+            Some(false.into()),
+        ),
+        Some("Up to 16 legacy line ranges normalized into selectors.".to_string()),
+    );
+    let input_variant = |variant_properties: Vec<(String, JsonSchema)>, required: Vec<&str>| {
+        let mut properties = BTreeMap::from([
+            ("artifact_id".to_string(), artifact_id.clone()),
+            ("max_bytes".to_string(), max_bytes.clone()),
+        ]);
+        properties.extend(variant_properties);
+        JsonSchema::object(
+            properties,
+            Some(required.into_iter().map(str::to_string).collect()),
+            Some(false.into()),
+        )
+    };
+
     ToolSpec::Function(ResponsesApiTool {
         name: READ_TOOL_OUTPUT_TOOL_NAME.to_string(),
         description: "Search or select from one validated immutable tool-output snapshot without rerunning its producer. Exact selectors are deduplicated; overlapping or adjacent byte and line ranges are coalesced; results use stable canonical source order. A search selector returns its merged exact contexts in hydrated_ranges in the same call; child_selectors remain exact recovery receipts and continuation advances only when another bounded page exists. Batch independent line, byte, section, and JSON-pointer selectors instead of rereading tiny fragments. Exact values are never clipped: deterministic byte subdivisions are consumed internally only when the complete transaction fits its final budget; otherwise selector_too_large or aggregate_omitted returns exact canonical ranges and deterministic child selectors. complete is true only when every normalized selector is present. After an overflow status, retry only the returned continuation or child_selectors and never broaden or repeat the parent selector. Recovery reopens and validates the retained artifact, never recursively spills, and never creates a child artifact."
             .to_string(),
         strict: false,
         defer_loading: None,
-        parameters: JsonSchema::object(
-            BTreeMap::from([
-                (
-                    "artifact_id".to_string(),
-                    JsonSchema::string(Some("Opaque UUID from the original tool projection.".to_string())),
+        parameters: JsonSchema::one_of(
+            vec![
+                input_variant(
+                    vec![("selectors".to_string(), selectors)],
+                    vec!["artifact_id", "selectors"],
                 ),
-                (
-                    "selectors".to_string(),
-                    JsonSchema::array(selector_schema, Some("Preferred selector list; exact duplicates and overlapping or adjacent same-kind ranges are normalized into stable canonical source order.".to_string())),
+                input_variant(
+                    vec![("ranges".to_string(), legacy_ranges)],
+                    vec!["artifact_id", "ranges"],
                 ),
-                ("start_line".to_string(), JsonSchema::integer(Some("Legacy first 1-based line.".to_string()))),
-                ("end_line".to_string(), JsonSchema::integer(Some("Legacy inclusive last line.".to_string()))),
-                (
-                    "ranges".to_string(),
-                    JsonSchema::array(
-                        JsonSchema::object(
-                            BTreeMap::from([
-                                ("start_line".to_string(), JsonSchema::integer(None)),
-                                ("end_line".to_string(), JsonSchema::integer(None)),
-                            ]),
-                            Some(vec!["start_line".to_string(), "end_line".to_string()]),
-                            Some(false.into()),
-                        ),
-                        Some("Up to 16 legacy line ranges normalized into selectors.".to_string()),
-                    ),
+                input_variant(
+                    vec![
+                        ("start_line".to_string(), legacy_start_line),
+                        ("end_line".to_string(), legacy_end_line),
+                    ],
+                    vec!["artifact_id"],
                 ),
-                ("max_bytes".to_string(), JsonSchema::integer(Some("Legacy compatibility field; validated but never used to clip a selected value.".to_string()))),
-            ]),
-            Some(vec!["artifact_id".to_string()]),
-            Some(false.into()),
+            ],
+            Some(
+                "Use selectors, legacy ranges, or the legacy single-line range form; do not mix forms."
+                    .to_string(),
+            ),
         ),
         output_schema: None,
     })
@@ -176,7 +216,7 @@ mod tests {
         let tool = serde_json::to_value(create_read_tool_output_tool())
             .expect("serialize read_tool_output spec");
         let selectors = tool
-            .pointer("/parameters/properties/selectors/items/oneOf")
+            .pointer("/parameters/oneOf/0/properties/selectors/items/oneOf")
             .and_then(serde_json::Value::as_array)
             .expect("selector variants");
         let kinds = selectors
@@ -190,7 +230,7 @@ mod tests {
         );
         assert_eq!(
             tool.pointer(
-                "/parameters/properties/selectors/items/oneOf/4/properties/max_results/maximum"
+                "/parameters/oneOf/0/properties/selectors/items/oneOf/4/properties/max_results/maximum"
             ),
             Some(&serde_json::json!(ARTIFACT_SEARCH_MAX_RESULTS)),
         );
@@ -201,5 +241,33 @@ mod tests {
         assert!(description.contains("instead of rereading tiny fragments"));
         assert!(description.contains("retry only the returned continuation or child_selectors"));
         assert!(description.contains("reopens and validates the retained artifact"));
+    }
+
+    #[test]
+    fn artifact_recovery_schema_keeps_canonical_and_legacy_forms_exclusive() {
+        let tool = serde_json::to_value(create_read_tool_output_tool())
+            .expect("serialize read_tool_output spec");
+        let branches = tool["parameters"]["oneOf"]
+            .as_array()
+            .expect("input form branches");
+        assert_eq!(branches.len(), 3);
+        assert!(
+            branches
+                .iter()
+                .all(|branch| branch["additionalProperties"] == false)
+        );
+        assert!(
+            branches[0]["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&serde_json::json!("selectors")))
+        );
+        assert!(
+            branches[1]["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&serde_json::json!("ranges")))
+        );
+        assert!(branches[2]["properties"].get("selectors").is_none());
+        assert!(branches[2]["properties"].get("ranges").is_none());
+        assert_eq!(branches[2]["properties"]["start_line"]["minimum"], 1);
     }
 }

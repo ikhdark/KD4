@@ -1,6 +1,9 @@
 """Command-line interface for building Codex package directories."""
 
 import argparse
+import json
+import os
+import re
 import shutil
 import tempfile
 import uuid
@@ -19,6 +22,7 @@ from .cargo import build_source_binaries
 from .cargo import cargo_package_target_dir
 from .cargo import cargo_profile_output_dir
 from .cargo import source_build_stamp_matches
+from .cargo import source_tree_fingerprint
 from .cargo import validate_source_outputs
 from .layout import build_package_dir
 from .layout import prepare_package_dir
@@ -26,6 +30,7 @@ from .layout import remove_tree_allow_readonly
 from .layout import validate_package_dir_destination
 from .layout import validate_package_dir
 from .layout import validate_package_input_roles
+from .layout import sha256_file
 from .ripgrep import resolve_rg_bin
 from .targets import PACKAGE_VARIANTS
 from .targets import SUPPORTED_TARGETS
@@ -74,7 +79,15 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help=(
             "Optional archive output path. May be repeated. Supported suffixes: "
-            ".tar.gz, .tgz, .tar.zst, .zip."
+            ".tar.gz, .tgz, .tar.zst, .zip. Archives require validation."
+        ),
+    )
+    parser.add_argument(
+        "--release-dir",
+        type=Path,
+        help=(
+            "Emit the installer-owned codex-package-<target>.tar.gz asset plus "
+            "checksum and provenance manifests into this directory."
         ),
     )
     parser.add_argument(
@@ -89,9 +102,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--cargo-profile",
-        default="dev-small",
+        default="release",
+        help="Cargo profile for source-built package artifacts.",
+    )
+    parser.add_argument(
+        "--release-version",
         help=(
-            "Cargo profile for source-built package artifacts. Use release for release packages."
+            "Authoritative semantic version embedded into source-built release "
+            "binaries and package metadata. Required for distributable output."
         ),
     )
     parser.add_argument(
@@ -163,11 +181,6 @@ def parse_args() -> argparse.Namespace:
         help="Skip package layout validation after copying files.",
     )
     parser.add_argument(
-        "--fast-validate",
-        action="store_true",
-        help="Run validation without slower executable-bit checks.",
-    )
-    parser.add_argument(
         "--reuse-package-dir",
         action="store_true",
         help="Allow copying into an existing non-empty package directory.",
@@ -190,6 +203,12 @@ def main() -> int:
     args = parse_args()
     spec = TARGET_SPECS[getattr(args, "target", None) or default_target()]
     variant = PACKAGE_VARIANTS[args.variant]
+    release_dir = getattr(args, "release_dir", None)
+    if release_dir is not None:
+        if variant.name != "codex":
+            raise RuntimeError("--release-dir supports only the codex package variant")
+        release_archive = release_dir.resolve() / f"codex-package-{spec.target}.tar.gz"
+        args.archive_output = [*args.archive_output, release_archive]
     package_dir_arg = getattr(args, "package_dir", None)
     package_dir = (
         package_dir_arg.resolve()
@@ -212,7 +231,18 @@ def main() -> int:
                 force=True,
                 reuse=reuse_package_dir,
             )
-            build_package_dir(staged_package_dir, version, variant, spec, inputs)
+            build_identity = {
+                "packagingSource": source_tree_fingerprint(),
+                "inputs": package_input_identity(inputs),
+            }
+            build_package_dir(
+                staged_package_dir,
+                version,
+                variant,
+                spec,
+                inputs,
+                build_identity=build_identity,
+            )
         if not getattr(args, "skip_validate", False):
             with timed_step("validate", timings):
                 validate_package_dir(
@@ -220,7 +250,6 @@ def main() -> int:
                     variant,
                     spec,
                     expected_version=version,
-                    fast=getattr(args, "fast_validate", False),
                 )
 
     archive_entries = None
@@ -239,6 +268,12 @@ def main() -> int:
             )
     for archive_path in archive_paths:
         print(f"Built Codex package archive at {archive_path}")
+    if release_dir is not None:
+        write_release_manifests(
+            release_dir.resolve(),
+            package_dir,
+            [path for path in archive_paths if path.parent == release_dir.resolve()],
+        )
 
     print(f"Built Codex package directory at {package_dir}")
     return 0
@@ -369,7 +404,9 @@ def resolve_package_inputs(
         source_outputs_future = executor.submit(
             resolve_source_outputs, args, spec, variant
         )
-        version_future = executor.submit(read_workspace_version)
+        version_future = executor.submit(
+            lambda: getattr(args, "release_version", None) or read_workspace_version()
+        )
         rg_future = executor.submit(resolve_rg_bin, spec, args.rg_bin)
         source_outputs = source_outputs_future.result()
         version = version_future.result()
@@ -431,6 +468,21 @@ def validate_cli_request(
     )
 
     compression = getattr(args, "archive_compression", "default")
+    release_version = getattr(args, "release_version", None)
+    if release_version is not None and re.fullmatch(
+        r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?",
+        release_version,
+    ) is None:
+        raise RuntimeError("--release-version must be a semantic version")
+    if getattr(args, "archive_output", []) and getattr(args, "skip_validate", False):
+        raise RuntimeError("--skip-validate cannot be used with --archive-output")
+    if getattr(args, "archive_output", []) and not release_version:
+        raise RuntimeError("Distributable archives require --release-version")
+    if (
+        getattr(args, "archive_output", [])
+        and getattr(args, "cargo_profile", "release") != "release"
+    ):
+        raise RuntimeError("Distributable archives require --cargo-profile release")
     seen_outputs: set[Path] = set()
     for archive_output in getattr(args, "archive_output", []):
         _, resolved_output, _ = validate_archive_output(
@@ -462,6 +514,7 @@ def resolve_source_outputs(
             variant=variant,
             outputs=outputs,
             cargo=args.cargo,
+            release_version=getattr(args, "release_version", None),
         ):
             raise RuntimeError(
                 "--skip-build-if-present found binaries, but their content or "
@@ -497,7 +550,82 @@ def resolve_source_outputs(
         ),
         reuse_existing=getattr(args, "reuse_source_builds", False),
         force_rebuild=getattr(args, "force_source_rebuild", False),
+        release_version=getattr(args, "release_version", None),
     )
+
+
+def package_input_identity(inputs: PackageInputs) -> dict[str, dict[str, object]]:
+    paths = {
+        "entrypoint": inputs.entrypoint_bin,
+        "code-mode-host": inputs.code_mode_host_bin,
+        "ripgrep": inputs.rg_bin,
+        "command-runner": inputs.codex_command_runner_bin,
+        "sandbox-setup": inputs.codex_windows_sandbox_setup_bin,
+    }
+    return {
+        role: {
+            "size": path.stat().st_size,
+            "sha256": sha256_file(path),
+        }
+        for role, path in paths.items()
+        if path is not None
+    }
+
+
+def write_release_manifests(
+    release_dir: Path, package_dir: Path, archive_paths: list[Path]
+) -> None:
+    release_dir.mkdir(parents=True, exist_ok=True)
+    artifacts = [
+        {
+            "name": path.name,
+            "size": path.stat().st_size,
+            "sha256": sha256_file(path),
+        }
+        for path in sorted(archive_paths)
+    ]
+    if not artifacts:
+        raise RuntimeError("release output did not produce an installer archive")
+    metadata = json.loads(
+        (package_dir / "codex-package.json").read_text(encoding="utf-8")
+    )
+    provenance = {
+        "schemaVersion": 1,
+        "sourceRepository": "https://github.com/ikhdark/KD4",
+        "version": metadata["version"],
+        "target": metadata["target"],
+        "bundleId": metadata["bundleId"],
+        "buildIdentity": metadata["buildIdentity"],
+        "artifacts": artifacts,
+    }
+    write_text_atomically(
+        release_dir / f"codex-package_{metadata['target']}_PROVENANCE.json",
+        json.dumps(provenance, sort_keys=True, indent=2) + "\n",
+    )
+    checksum_path = release_dir / "codex-package_SHA256SUMS"
+    checksum_entries: dict[str, str] = {}
+    if checksum_path.is_file():
+        for line in checksum_path.read_text(encoding="utf-8").splitlines():
+            parts = line.split(None, 1)
+            if len(parts) == 2 and len(parts[0]) == 64:
+                checksum_entries[parts[1].strip()] = parts[0].lower()
+    checksum_entries.update({item["name"]: item["sha256"] for item in artifacts})
+    write_text_atomically(
+        checksum_path,
+        "".join(
+            f"{digest}  {name}\n"
+            for name, digest in sorted(checksum_entries.items())
+        ),
+    )
+
+
+def write_text_atomically(path: Path, contents: str) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(contents, encoding="utf-8", newline="\n")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def source_outputs_from_existing(

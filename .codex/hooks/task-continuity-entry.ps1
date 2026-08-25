@@ -19,15 +19,53 @@ $WarningPreference = 'SilentlyContinue'
 
 $emptyOutput = '{}'
 $rawInput = [Console]::In.ReadToEnd()
-$fastHelperName = switch ($ExpectedEvent) {
-    { $_ -in @('UserPromptSubmit', 'Stop') } { 'task-continuity-fast-basic.ps1'; break }
-    { $_ -in @('PreCompact', 'PostCompact') } { 'task-continuity-fast-compact.ps1'; break }
-    'SessionStart' { 'task-continuity-fast-session.ps1'; break }
-}
 
 try {
-    $fastHelper = Join-Path $PSScriptRoot $fastHelperName
-    & $fastHelper -TaskContinuityRawInput $rawInput -ExpectedEvent $ExpectedEvent
+    $repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
+    $expectedHookDirectory = [System.IO.Path]::GetFullPath(
+        (Join-Path $repositoryRoot '.codex\hooks')
+    )
+    if (-not [string]::Equals(
+        $expectedHookDirectory.TrimEnd([char[]]@('\', '/')),
+        ([System.IO.Path]::GetFullPath($PSScriptRoot)).TrimEnd([char[]]@('\', '/')),
+        [StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw 'repository root validation failed'
+    }
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $lockIdentity = [BitConverter]::ToString(
+            $sha256.ComputeHash(
+                [Text.Encoding]::UTF8.GetBytes(
+                    [System.IO.Path]::GetFullPath($PSScriptRoot).ToLowerInvariant()
+                )
+            )
+        ).Replace('-', '')
+    }
+    finally {
+        $sha256.Dispose()
+    }
+    $stateMutex = [Threading.Mutex]::new(
+        $false,
+        "Local\KD4TaskContinuity-$lockIdentity"
+    )
+    $lockTaken = $false
+    try {
+        $lockTaken = $stateMutex.WaitOne([TimeSpan]::FromSeconds(15))
+        if (-not $lockTaken) {
+            throw 'timed out waiting for the task-continuity state lease'
+        }
+        & (Join-Path $PSScriptRoot 'task-continuity.ps1') `
+            -TaskContinuityRawInput $rawInput `
+            -TaskContinuityExpectedEvent $ExpectedEvent `
+            -TaskContinuityRepositoryRoot $repositoryRoot
+    }
+    finally {
+        if ($lockTaken) {
+            $stateMutex.ReleaseMutex()
+        }
+        $stateMutex.Dispose()
+    }
 }
 catch {
     try {

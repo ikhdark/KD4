@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -25,6 +26,24 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
             3.85,
         )
 
+    def test_sample_statistics_share_one_ordering(self) -> None:
+        builtin_sorted = sorted
+        for values, expected in (
+            ([4.0], (4.0, 4.0, 4.0, 4.0)),
+            ([2.0, 1.0], (1.5, 1.95, 1.0, 2.0)),
+            ([3.0, 1.0, 2.0], (2.0, 2.9, 1.0, 3.0)),
+            ([4.0, 1.0, 3.0, 2.0], (2.5, 3.85, 1.0, 4.0)),
+            ([2.0, 1.0, 2.0, 1.0], (1.5, 2.0, 1.0, 2.0)),
+        ):
+            with self.subTest(values=values), mock.patch(
+                "builtins.sorted", wraps=builtin_sorted
+            ) as ordering:
+                actual = kd4_perf_snapshot._ordered_sample_statistics(values)
+
+            self.assertEqual(ordering.call_count, 1)
+            for actual_value, expected_value in zip(actual, expected, strict=True):
+                self.assertAlmostEqual(actual_value, expected_value)
+
     def test_successful_scenario_records_cold_and_warm_samples(self) -> None:
         scenario = kd4_perf_snapshot.Scenario(
             name="fixture",
@@ -41,6 +60,42 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
         self.assertIsNotNone(result.cold_ms)
         self.assertIsNotNone(result.warm_p50_ms)
         self.assertGreater(result.samples[0].stdout_bytes, 0)
+
+    def test_scenario_streams_output_to_files_and_bounds_failure_diagnostics(
+        self,
+    ) -> None:
+        scenario = kd4_perf_snapshot.Scenario(
+            name="fixture",
+            command=(sys.executable, "fixture.py"),
+            cwd=Path.cwd(),
+            default_iterations=1,
+            category="test",
+        )
+        stdout = b"a" * (kd4_perf_snapshot.FAILURE_OUTPUT_TAIL_BYTES + 17)
+        stderr = b"prefix" + b"\xff" * (
+            kd4_perf_snapshot.FAILURE_OUTPUT_TAIL_BYTES + 23
+        )
+
+        def run(
+            command: tuple[str, ...], **kwargs: object
+        ) -> subprocess.CompletedProcess:
+            self.assertNotIn("capture_output", kwargs)
+            kwargs["stdout"].write(stdout)  # type: ignore[union-attr]
+            kwargs["stderr"].write(stderr)  # type: ignore[union-attr]
+            return subprocess.CompletedProcess(command, 7)
+
+        with mock.patch.object(kd4_perf_snapshot.subprocess, "run", side_effect=run):
+            result = kd4_perf_snapshot.measure_scenario(scenario)
+
+        self.assertEqual(result.samples[0].stdout_bytes, len(stdout))
+        self.assertEqual(result.samples[0].stderr_bytes, len(stderr))
+        self.assertEqual(result.status, "failed")
+        self.assertIn("command exited 7", result.reason or "")
+        self.assertNotIn("prefix", result.reason or "")
+        self.assertLessEqual(
+            len((result.reason or "").encode("utf-8")),
+            2 * kd4_perf_snapshot.FAILURE_OUTPUT_TAIL_BYTES * 3 + 128,
+        )
 
     def test_missing_executable_is_skipped(self) -> None:
         scenario = kd4_perf_snapshot.Scenario(
@@ -124,13 +179,54 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
         self,
     ) -> None:
         with mock.patch.object(
-            kd4_perf_snapshot, "_git_text", side_effect=["", "head", "main"]
-        ):
+            kd4_perf_snapshot,
+            "_git_text",
+            return_value="# branch.oid head\n# branch.head main",
+        ) as git_text:
             metadata = kd4_perf_snapshot.environment_metadata(
                 Path.cwd(), hash_binary=False
             )
 
         self.assertEqual(metadata["dirtyPaths"], 0)
+        self.assertEqual(metadata["head"], "head")
+        self.assertEqual(metadata["branch"], "main")
+        git_text.assert_called_once_with(
+            Path.cwd(),
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "--untracked-files=all",
+        )
+
+    def test_git_metadata_parses_dirty_detached_and_unborn_status(self) -> None:
+        for status, expected in (
+            (
+                "# branch.oid abc\n# branch.head (detached)\n? untracked file",
+                ("abc", None, 1),
+            ),
+            (
+                "# branch.oid (initial)\n# branch.head feature/unborn",
+                (None, "feature/unborn", 0),
+            ),
+        ):
+            with self.subTest(status=status), mock.patch.object(
+                kd4_perf_snapshot, "_git_text", return_value=status
+            ) as git_text:
+                metadata = kd4_perf_snapshot._git_repository_metadata(Path.cwd())
+
+            self.assertEqual(metadata, expected)
+            self.assertEqual(git_text.call_count, 1)
+
+    def test_git_metadata_uses_compatibility_fallback_for_legacy_git(self) -> None:
+        with mock.patch.object(
+            kd4_perf_snapshot,
+            "_git_text",
+            side_effect=[None, " M tracked\n?? new", "head", "main"],
+        ) as git_text:
+            metadata = kd4_perf_snapshot._git_repository_metadata(Path.cwd())
+
+        self.assertEqual(metadata, ("head", "main", 2))
+        self.assertEqual(git_text.call_count, 4)
 
     def test_model_attempt_analysis_filters_groups_and_reconciles(self) -> None:
         def attempt(

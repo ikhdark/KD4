@@ -112,7 +112,6 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "json"
 uuid = { workspace = true, features = ["serde", "v7"] }
 
 codex-windows-sandbox = { workspace = true }
-windows-sys = { workspace = true, features = ["Win32_Foundation"] }
 
 [dev-dependencies]
 app_test_support = { workspace = true }
@@ -126,10 +125,10 @@ codex-utils-cargo-bin = { workspace = true }
 core_test_support = { workspace = true }
 flate2 = { workspace = true }
 hmac = { workspace = true }
+http = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 pretty_assertions = { workspace = true }
-reqwest = { workspace = true, features = ["rustls"] }
 rmcp = { workspace = true, default-features = false, features = [
     "elicitation",
     "server",

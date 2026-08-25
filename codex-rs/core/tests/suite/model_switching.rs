@@ -1018,7 +1018,7 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
             RefreshStrategy::Online,
             codex_core::test_support::default_http_client_factory(),
         )
-        .await;
+        .await?;
     assert!(
         available_models
             .iter()

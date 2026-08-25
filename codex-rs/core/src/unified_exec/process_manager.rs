@@ -1644,7 +1644,7 @@ impl UnifiedExecProcessManager {
         let completed_validation_route = validation_launch
             .as_ref()
             .and_then(|launch| launch.structured_route.clone());
-        context
+        if let Err(error) = context
             .session
             .services
             .command_execution
@@ -1657,7 +1657,18 @@ impl UnifiedExecProcessManager {
                 validation_launch,
                 started_at,
             )
-            .await;
+            .await
+        {
+            let termination_error = process.terminate_confirmed().await.err();
+            self.release_process_id(process_id).await;
+            let message = match termination_error {
+                Some(termination_error) => format!(
+                    "{error}; additionally failed to terminate the untracked process: {termination_error}"
+                ),
+                None => error,
+            };
+            return Err(UnifiedExecError::process_failed(message));
+        }
 
         spawn_exit_watcher(
             Arc::clone(&process),

@@ -29,6 +29,10 @@ pub struct HttpClientBuilder {
     default_headers: Option<HeaderMap>,
     follow_redirects: bool,
     connect_timeout: Option<Duration>,
+    request_timeout: Option<Option<Duration>>,
+    tls_certs_only: Option<Vec<reqwest::Certificate>>,
+    identity: Option<reqwest::Identity>,
+    https_only: bool,
     chatgpt_cloudflare_cookie_store: bool,
     chatgpt_cookie_store: Option<Arc<ChatGptCookieStore>>,
     request_logging: RequestLogging,
@@ -87,6 +91,34 @@ impl HttpClientBuilder {
     /// Limits only connection establishment, not the request as a whole.
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = Some(timeout);
+        self
+    }
+
+    /// Sets the client-wide request timeout. `None` disables the transport default timeout.
+    pub fn request_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.request_timeout = Some(timeout);
+        self
+    }
+
+    pub fn timeout(self, timeout: Duration) -> Self {
+        self.request_timeout(Some(timeout))
+    }
+
+    /// Replaces the transport root set with the certificate encoded by `pem`.
+    pub fn tls_certs_only_pem(mut self, pem: &[u8]) -> Result<Self, crate::HttpError> {
+        let certificate = reqwest::Certificate::from_pem(pem)?;
+        self.tls_certs_only = Some(vec![certificate]);
+        Ok(self)
+    }
+
+    /// Configures a PEM-encoded client certificate and private key identity.
+    pub fn identity_pem(mut self, pem: &[u8]) -> Result<Self, crate::HttpError> {
+        self.identity = Some(reqwest::Identity::from_pem(pem)?);
+        Ok(self)
+    }
+
+    pub fn https_only(mut self, enabled: bool) -> Self {
+        self.https_only = enabled;
         self
     }
 
@@ -198,6 +230,16 @@ impl HttpClientBuilder {
         if let Some(connect_timeout) = self.connect_timeout {
             builder = builder.connect_timeout(connect_timeout);
         }
+        if let Some(Some(timeout)) = self.request_timeout {
+            builder = builder.timeout(timeout);
+        }
+        if let Some(certificates) = self.tls_certs_only {
+            builder = builder.tls_certs_only(certificates);
+        }
+        if let Some(identity) = self.identity {
+            builder = builder.identity(identity);
+        }
+        builder = builder.https_only(self.https_only);
         if self.chatgpt_cloudflare_cookie_store {
             builder = match self.chatgpt_cookie_store {
                 Some(store) => builder.cookie_provider(store),
@@ -214,6 +256,10 @@ impl Default for HttpClientBuilder {
             default_headers: None,
             follow_redirects: true,
             connect_timeout: None,
+            request_timeout: None,
+            tls_certs_only: None,
+            identity: None,
+            https_only: false,
             chatgpt_cloudflare_cookie_store: false,
             chatgpt_cookie_store: None,
             request_logging: RequestLogging::Enabled,

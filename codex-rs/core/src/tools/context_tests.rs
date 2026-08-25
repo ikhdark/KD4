@@ -45,6 +45,20 @@ fn function_payloads_remain_function_outputs() {
 }
 
 #[test]
+fn omitted_function_output_status_is_not_reported_as_success() {
+    let output = FunctionToolOutput::from_text("status unavailable".to_string(), None);
+
+    assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Failure);
+    assert!(!output.success_for_logging());
+    assert_eq!(
+        output
+            .projection_metadata()
+            .map(|metadata| metadata.outcome),
+        Some(ToolOutputOutcome::Failure)
+    );
+}
+
+#[test]
 fn apply_patch_code_mode_result_preserves_output() {
     let text = "Success. Updated the following files:\nA code_mode_apply_patch.txt\n".to_string();
     let output = ApplyPatchToolOutput::from_text(text.clone());

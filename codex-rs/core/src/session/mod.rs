@@ -374,6 +374,7 @@ pub enum SteerInputError {
     ExpectedTurnMismatch { expected: String, actual: String },
     ActiveTurnNotSteerable { turn_kind: NonSteerableTurnKind },
     EmptyInput,
+    PendingInputLimitExceeded { max_items: usize, max_bytes: usize },
 }
 
 impl SteerInputError {
@@ -402,6 +403,15 @@ impl SteerInputError {
             Self::EmptyInput => ErrorEvent {
                 message: "input must not be empty".to_string(),
                 codex_error_info: Some(CodexErrorInfo::BadRequest),
+            },
+            Self::PendingInputLimitExceeded {
+                max_items,
+                max_bytes,
+            } => ErrorEvent {
+                message: format!(
+                    "pending input limit exceeded (maximum {max_items} items or {max_bytes} bytes)"
+                ),
+                codex_error_info: Some(CodexErrorInfo::ServerOverloaded),
             },
         }
     }
@@ -475,7 +485,6 @@ use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::CompactedItem;
-use codex_protocol::protocol::DeprecationNoticeEvent;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -703,7 +712,7 @@ impl Codex {
                 refresh_strategy,
                 config.http_client_factory(),
             )
-            .await;
+            .await?;
         if allow_provider_model_fallback
             && let Some(requested_model) = config.model.as_ref()
             && model != *requested_model
@@ -1668,6 +1677,10 @@ impl Session {
         // will be processed again if the rollout is reconstructed in a future session.
         // This meets image resizing requirements without modifying persisted rollouts.
         prepare_response_items(&mut history);
+        self.services
+            .plan_store
+            .restore_from_history(&history)
+            .await;
         let prefix_tokens = if matches!(
             turn_context.config.model_auto_compact_token_limit_scope,
             AutoCompactTokenLimitScope::BodyAfterPrefix
@@ -1747,8 +1760,15 @@ impl Session {
         &self,
         updates: SessionSettingsUpdate,
     ) -> ConstraintResult<()> {
-        let Ok(_refresh_guard) = self.managed_network_proxy_refresh_lock.acquire().await else {
-            unreachable!("managed network proxy refresh semaphore is never closed");
+        let _refresh_guard = if updates.permission_profile.is_some()
+            || updates.sandbox_policy.is_some()
+        {
+            let Ok(refresh_guard) = self.managed_network_proxy_refresh_lock.acquire().await else {
+                unreachable!("managed network proxy refresh semaphore is never closed");
+            };
+            Some(refresh_guard)
+        } else {
+            None
         };
         let notify_config_contributors = !self.services.extensions.config_contributors().is_empty();
         let (
@@ -4846,10 +4866,7 @@ impl Session {
 
     pub(crate) async fn recompute_token_usage(&self, turn_context: &TurnContext) {
         let history = self.clone_history().await;
-        let base_instructions = self.get_base_instructions().await;
-        let Some(estimated_total_tokens) =
-            history.estimate_token_count_with_base_instructions(&base_instructions)
-        else {
+        let Some(estimated_total_tokens) = history.estimate_token_count(turn_context) else {
             return;
         };
         {
@@ -5188,9 +5205,13 @@ impl Session {
         self.input_queue
             .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
                 active_turn.turn_state.as_ref(),
-                pending_input,
+                &pending_input,
             )
-            .await;
+            .await
+            .map_err(|err| SteerInputError::PendingInputLimitExceeded {
+                max_items: err.max_items,
+                max_bytes: err.max_bytes,
+            })?;
         drop(active);
         active_turn_context
             .session_telemetry

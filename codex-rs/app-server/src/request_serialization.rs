@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::future::Future;
+use std::path::Component;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -77,7 +78,9 @@ impl RequestSerializationQueueKey {
                 RequestSerializationAccess::Exclusive,
             ),
             ClientRequestSerializationScope::ThreadPath { path } => (
-                Self::ThreadPath { path },
+                Self::ThreadPath {
+                    path: normalize_thread_path(path),
+                },
                 RequestSerializationAccess::Exclusive,
             ),
             ClientRequestSerializationScope::CommandExecProcess { process_id } => (
@@ -113,6 +116,26 @@ impl RequestSerializationQueueKey {
     }
 }
 
+fn normalize_thread_path(path: PathBuf) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(&path) {
+        return canonical;
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
 pub(crate) struct QueuedInitializedRequest {
     gate: Arc<ConnectionRpcGate>,
     estimated_bytes: usize,
@@ -146,7 +169,9 @@ impl QueuedInitializedRequest {
 
     pub(crate) async fn run(self) {
         let Self { gate, future, .. } = self;
-        gate.run(future).await;
+        if let Err(error) = gate.run(future).await {
+            tracing::error!(?error, "initialized request handler task failed");
+        }
     }
 
     fn belongs_to_gate(&self, gate: &Arc<ConnectionRpcGate>) -> bool {
@@ -423,6 +448,27 @@ mod tests {
 
     fn shutdown_wait_timeout() -> Duration {
         Duration::from_millis(/*millis*/ 50)
+    }
+
+    #[test]
+    fn thread_path_scope_normalizes_lexical_aliases() {
+        let (aliased, _) = RequestSerializationQueueKey::from_scope(
+            ConnectionId(1),
+            ClientRequestSerializationScope::ThreadPath {
+                path: PathBuf::from("threads")
+                    .join("old")
+                    .join("..")
+                    .join("active"),
+            },
+        );
+        let (direct, _) = RequestSerializationQueueKey::from_scope(
+            ConnectionId(2),
+            ClientRequestSerializationScope::ThreadPath {
+                path: PathBuf::from("threads").join("active"),
+            },
+        );
+
+        assert_eq!(aliased, direct);
     }
 
     #[tokio::test]

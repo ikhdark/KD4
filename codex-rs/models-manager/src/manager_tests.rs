@@ -352,7 +352,8 @@ async fn etag_notices_are_non_blocking_coalesced_latest_wins_and_are_waitable() 
                 RefreshStrategy::Offline,
                 DEFAULT_HTTP_CLIENT_FACTORY,
             )
-            .await,
+            .await
+            .expect("default model"),
         "latest-etag-model"
     );
 }
@@ -502,7 +503,7 @@ async fn older_openai_manager_fetch_cannot_overwrite_newer_process_cache() {
         codex_home.path().to_path_buf(),
         TestModelsEndpoint::new(Vec::new()),
     );
-    assert!(verifier.try_load_cache().await);
+    assert!(verifier.try_load_cache().await.expect("load cache"));
     let persisted = verifier.get_remote_models().await;
     assert!(
         persisted
@@ -556,6 +557,7 @@ async fn matching_etag_renews_ttl_without_fetching() {
             .cache_manager
             .load_fresh(&crate::client_version_to_whole())
             .await
+            .expect("read cache")
             .is_some()
     );
 }
@@ -574,7 +576,7 @@ async fn online_refresh_revalidates_stale_cache_with_its_etag() {
             crate::client_version_to_whole(),
         )
         .await;
-    assert!(manager.try_load_cache().await);
+    assert!(manager.try_load_cache().await.expect("load cache"));
     manager
         .cache_manager
         .manipulate_cache_for_test(|fetched_at| {
@@ -585,7 +587,8 @@ async fn online_refresh_revalidates_stale_cache_with_its_etag() {
 
     manager
         .raw_model_catalog(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
-        .await;
+        .await
+        .expect("refresh catalog");
 
     assert_eq!(
         *endpoint
@@ -599,6 +602,7 @@ async fn online_refresh_revalidates_stale_cache_with_its_etag() {
             .cache_manager
             .load_fresh(&crate::client_version_to_whole())
             .await
+            .expect("read cache")
             .is_some()
     );
     assert!(
@@ -608,6 +612,22 @@ async fn online_refresh_revalidates_stale_cache_with_its_etag() {
             .iter()
             .any(|model| model.slug == "revalidated-model")
     );
+}
+
+#[tokio::test]
+async fn online_list_models_reports_refresh_failure_instead_of_stale_success() {
+    let codex_home = tempdir().expect("temp dir");
+    let endpoint = ControlledModelsEndpoint::new(vec![ControlledResponse::Failure]);
+    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
+    endpoint.release_one();
+
+    let error = manager
+        .list_models(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
+        .await
+        .expect_err("an online refresh failure must be observable by the caller");
+
+    assert!(error.to_string().contains("controlled model failure"));
+    assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 1);
 }
 
 fn openai_manager_for_tests(
@@ -720,7 +740,8 @@ async fn static_manager_preserves_supported_requested_model_when_fallback_is_all
             RefreshStrategy::Offline,
             DEFAULT_HTTP_CLIENT_FACTORY,
         )
-        .await;
+        .await
+        .expect("default model");
 
     assert_eq!(model, "provider-supported");
 }
@@ -742,7 +763,8 @@ async fn static_manager_falls_back_from_unsupported_requested_model_when_allowed
             RefreshStrategy::Offline,
             DEFAULT_HTTP_CLIENT_FACTORY,
         )
-        .await;
+        .await
+        .expect("default model");
 
     assert_eq!(model, "provider-default");
 }
@@ -765,7 +787,8 @@ async fn static_manager_preserves_requested_sol_when_fallback_is_allowed() {
                 RefreshStrategy::Offline,
                 DEFAULT_HTTP_CLIENT_FACTORY,
             )
-            .await;
+            .await
+            .expect("default model");
 
         assert_eq!(model, requested_model);
     }
@@ -789,7 +812,8 @@ async fn static_manager_falls_back_from_unqualified_sol_suffixes() {
                 RefreshStrategy::Offline,
                 DEFAULT_HTTP_CLIENT_FACTORY,
             )
-            .await;
+            .await
+            .expect("default model");
 
         assert_eq!(model, "provider-default");
     }
@@ -813,27 +837,42 @@ async fn static_manager_preserves_unsupported_requested_model_when_fallback_is_d
             RefreshStrategy::Offline,
             DEFAULT_HTTP_CLIENT_FACTORY,
         )
-        .await;
+        .await
+        .expect("default model");
 
     assert_eq!(model, "unsupported");
     assert_eq!(manager.list_models_call_count(), 0);
 }
 
 #[tokio::test]
-async fn static_manager_uses_empty_default_when_fallback_is_allowed_and_catalog_is_empty() {
+async fn static_manager_rejects_fallback_when_catalog_is_empty() {
     let manager = static_manager_for_tests(ModelsResponse { models: Vec::new() });
     let requested_model = Some("unsupported".to_string());
 
-    let model = manager
+    let error = manager
         .get_default_model(
             &requested_model,
             /*allow_provider_model_fallback*/ true,
             RefreshStrategy::Offline,
             DEFAULT_HTTP_CLIENT_FACTORY,
         )
-        .await;
+        .await
+        .expect_err("an empty catalog must not select an empty model identifier");
 
-    assert_eq!(model, "");
+    assert!(
+        error
+            .to_string()
+            .contains("does not contain a usable model")
+    );
+}
+
+#[test]
+#[should_panic(expected = "bundled model catalog must load")]
+fn bundled_catalog_load_errors_are_not_replaced_with_an_empty_catalog() {
+    let _ = require_bundled_models(Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "invalid bundled catalog",
+    )));
 }
 
 #[tokio::test]
@@ -850,7 +889,8 @@ async fn dynamic_manager_preserves_requested_model_when_fallback_is_allowed() {
             RefreshStrategy::Online,
             DEFAULT_HTTP_CLIENT_FACTORY,
         )
-        .await;
+        .await
+        .expect("default model");
 
     assert_eq!(model, "unsupported");
     assert_eq!(endpoint.fetch_count(), 0);
@@ -992,7 +1032,8 @@ async fn refresh_available_models_sorts_by_priority() {
             RefreshStrategy::Online,
             HttpClientFactory::new(OutboundProxyPolicy::RespectSystemProxy),
         )
-        .await;
+        .await
+        .expect("list models");
     assert_models_contain(&manager.get_remote_models().await, &remote_models);
     assert_eq!(
         endpoint.observed_proxy_policy(),
@@ -1029,7 +1070,8 @@ async fn picker_snapshot_is_reused_until_the_catalog_changes() {
         .expect("initial picker snapshot should be available");
     let repeated = manager
         .list_models_shared(RefreshStrategy::Offline, DEFAULT_HTTP_CLIENT_FACTORY)
-        .await;
+        .await
+        .expect("list models");
     assert!(Arc::ptr_eq(&initial, &repeated));
 
     let initial_slug = initial
@@ -1047,7 +1089,8 @@ async fn picker_snapshot_is_reused_until_the_catalog_changes() {
 
     let refreshed = manager
         .list_models_shared(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
-        .await;
+        .await
+        .expect("refresh models");
     assert!(!Arc::ptr_eq(&initial, &refreshed));
     assert!(
         refreshed
@@ -1056,7 +1099,8 @@ async fn picker_snapshot_is_reused_until_the_catalog_changes() {
     );
     let refreshed_again = manager
         .list_models_shared(RefreshStrategy::Offline, DEFAULT_HTTP_CLIENT_FACTORY)
-        .await;
+        .await
+        .expect("list models");
     assert!(Arc::ptr_eq(&refreshed, &refreshed_again));
 }
 
@@ -1960,7 +2004,8 @@ async fn static_manager_reads_latest_auth_mode() {
 
     let chatgpt_models = manager
         .list_models(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
-        .await;
+        .await
+        .expect("list models");
     assert_eq!(
         chatgpt_models
             .iter()
@@ -1975,7 +2020,8 @@ async fn static_manager_reads_latest_auth_mode() {
         .expect("external API key auth should resolve");
     let api_models = manager
         .list_models(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
-        .await;
+        .await
+        .expect("list models");
 
     assert_eq!(
         api_models

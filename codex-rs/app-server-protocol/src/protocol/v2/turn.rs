@@ -523,8 +523,6 @@ pub struct TurnPlanStep {
     pub generated_artifacts: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub risks: Vec<String>,
-    #[serde(default)]
-    pub requires_desktop_activation: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema, TS)]
@@ -552,7 +550,6 @@ impl From<CorePlanItemArg> for TurnPlanStep {
             runtime_paths: value.runtime_paths,
             generated_artifacts: value.generated_artifacts,
             risks: value.risks,
-            requires_desktop_activation: value.requires_desktop_activation,
         }
     }
 }

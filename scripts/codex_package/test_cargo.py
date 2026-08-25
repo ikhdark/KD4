@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import os
+import json
+import struct
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -191,6 +193,7 @@ class SourceBinariesForTargetTest(unittest.TestCase):
                                 code_mode_host_bin=None,
                                 codex_command_runner_bin=None,
                                 codex_windows_sandbox_setup_bin=None,
+                                release_version="1.2.3",
                             )
 
         self.assertGreaterEqual(len(calls), 1)
@@ -199,6 +202,7 @@ class SourceBinariesForTargetTest(unittest.TestCase):
             self.assertTrue(call.check)
             self.assertIn("--locked", call.cmd)
             self.assertEqual(call.env["RUST_MIN_STACK"], "8388608")
+            self.assertEqual(call.env["CODEX_RELEASE_VERSION"], "1.2.3")
             self.assertEqual(call.env["RUSTC_WRAPPER"], "sccache")
             self.assertEqual(
                 call.env["SCCACHE_BASEDIR"], str(cargo_module.REPO_ROOT.resolve())
@@ -210,9 +214,9 @@ class SourceBinariesForTargetTest(unittest.TestCase):
                 Path(target_dir_arg),
                 codex_rs / "target" / "package" / "x86_64-pc-windows-msvc-release",
             )
-            rustflags = call.env["CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS"]
-            self.assertIn("link-arg=/STACK:8388608", rustflags)
-            self.assertIn("target-feature=+crt-static", rustflags)
+            self.assertNotIn(
+                "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS", call.env
+            )
             self.assertEqual(
                 call.env["CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"],
                 "C:/LLVM/bin/lld-link.exe",
@@ -229,6 +233,42 @@ class SourceBinariesForTargetTest(unittest.TestCase):
                 )
 
         self.assertNotIn("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS", env)
+
+    def test_prebuilt_pe_machine_must_match_requested_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            entrypoint = write_pe(root / "codex.exe", 0x8664)
+            code_mode_host = write_pe(root / "codex-code-mode-host.exe", 0xAA64)
+            command_runner = write_pe(root / "codex-command-runner.exe", 0x8664)
+            sandbox_setup = write_pe(root / "codex-windows-sandbox-setup.exe", 0x8664)
+
+            with self.assertRaisesRegex(RuntimeError, "code-mode-host target mismatch"):
+                build_source_binaries(
+                    TARGET_SPECS["x86_64-pc-windows-msvc"],
+                    PACKAGE_VARIANTS["codex"],
+                    cargo="cargo",
+                    profile="release",
+                    entrypoint_bin=entrypoint,
+                    code_mode_host_bin=code_mode_host,
+                    codex_command_runner_bin=command_runner,
+                    codex_windows_sandbox_setup_bin=sandbox_setup,
+                )
+
+    def test_release_version_is_hashed_into_source_reuse_identity(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            first = cargo_module.build_recipe_fingerprint(
+                spec=TARGET_SPECS["x86_64-pc-windows-msvc"],
+                profile="release",
+                release_version="1.2.3",
+            )
+            second = cargo_module.build_recipe_fingerprint(
+                spec=TARGET_SPECS["x86_64-pc-windows-msvc"],
+                profile="release",
+                release_version="1.2.4",
+            )
+
+        self.assertNotEqual(first, second)
+        self.assertNotIn("1.2.3", json.dumps(first))
 
     def test_package_build_uses_scoop_lld_link_when_not_on_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -930,6 +970,17 @@ def write_bins_for_cmd(
 def touch_file(path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("", encoding="utf-8")
+    return path.resolve()
+
+
+def write_pe(path: Path, machine: int) -> Path:
+    contents = bytearray(128)
+    contents[0:2] = b"MZ"
+    struct.pack_into("<I", contents, 0x3C, 64)
+    contents[64:68] = b"PE\0\0"
+    struct.pack_into("<H", contents, 68, machine)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(contents)
     return path.resolve()
 
 

@@ -10,9 +10,7 @@ use super::ConstraintError;
 use super::ConstraintResult;
 use super::is_permission_allowed;
 use super::merge_managed_permission_profiles;
-use super::permissions::BUILT_IN_DANGER_FULL_ACCESS_PROFILE;
-use super::permissions::BUILT_IN_READ_ONLY_PROFILE;
-use super::permissions::BUILT_IN_WORKSPACE_PROFILE;
+use super::permissions::builtin_permission_profiles;
 use super::permissions::compile_permission_profile_selection;
 use super::permissions::validate_user_permission_profile_names;
 use super::validate_required_permission_profile_catalog;
@@ -50,24 +48,13 @@ pub(super) fn permission_profile_catalog_from_permissions(
     validate_user_permission_profile_names(permissions)?;
     validate_required_permission_profile_catalog(requirements_toml, permissions)?;
 
-    let mut catalog = [
-        (BUILT_IN_READ_ONLY_PROFILE, PermissionProfile::read_only()),
-        (
-            BUILT_IN_WORKSPACE_PROFILE,
-            PermissionProfile::workspace_write(),
-        ),
-        (
-            BUILT_IN_DANGER_FULL_ACCESS_PROFILE,
-            PermissionProfile::Disabled,
-        ),
-    ]
-    .into_iter()
-    .map(|(id, permission_profile)| PermissionProfileCatalogEntry {
-        id: id.to_string(),
-        description: None,
-        allowed: permission_profile_is_allowed(config_layer_stack, id, &permission_profile),
-    })
-    .collect::<Vec<_>>();
+    let mut catalog = builtin_permission_profiles()
+        .map(|(id, permission_profile)| PermissionProfileCatalogEntry {
+            id: id.to_string(),
+            description: None,
+            allowed: permission_profile_is_allowed(config_layer_stack, id, &permission_profile),
+        })
+        .collect::<Vec<_>>();
 
     if let Some(permissions) = permissions {
         catalog.extend(permissions.entries.iter().map(|(id, profile)| {

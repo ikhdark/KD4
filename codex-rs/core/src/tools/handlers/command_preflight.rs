@@ -14,6 +14,7 @@ use super::command_search::reject_rg_search_without_native_scope;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommandPreflightIssueCode {
     UnbalancedQuotes,
+    UnparseableCommand,
     ShellMismatch,
     WindowsLiteralPathRequired,
     DirectArgvPowerShellCmdlet,
@@ -107,6 +108,7 @@ impl CommandPreflightIssueCode {
     fn tool_error_kind(self) -> &'static str {
         match self {
             Self::UnbalancedQuotes => "command_preflight_unbalanced_quotes",
+            Self::UnparseableCommand => "command_preflight_unparseable_command",
             Self::ShellMismatch => "command_preflight_shell_mismatch",
             Self::WindowsLiteralPathRequired => "windows_literal_path_required",
             Self::DirectArgvPowerShellCmdlet => "direct_argv_powershell_cmdlet",
@@ -162,7 +164,22 @@ fn preflight_command_issue(
     shell_type: Option<ShellType>,
 ) -> Result<(), CommandPreflightIssue> {
     let preflight_shell_type = shell_type.or_else(|| infer_direct_shell_type(command));
-    let argv_commands = argv_commands(command, preflight_shell_type).unwrap_or_default();
+    let Some(argv_commands) = argv_commands(command, preflight_shell_type) else {
+        let rejected = shell_script(command, preflight_shell_type)
+            .map(|script| CommandPreflightRejected::Script(script.into_owned()))
+            .unwrap_or_else(|| CommandPreflightRejected::Argv(command.to_vec()));
+        return Err(CommandPreflightIssue::reject(
+            CommandPreflightIssueCode::UnparseableCommand,
+            rejected,
+            "the shell command could not be parsed precisely enough to validate every invoked command."
+                .to_string(),
+            Some(
+                "use structured argv for a single native command, or rewrite the script into a statically parseable form."
+                    .to_string(),
+            ),
+            None,
+        ));
+    };
 
     if let Some(script) = shell_script(command, preflight_shell_type) {
         let script = script.as_ref();

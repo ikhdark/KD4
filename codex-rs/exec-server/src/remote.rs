@@ -4,12 +4,14 @@ use std::time::Instant;
 
 use codex_api::AuthProvider;
 use codex_api::SharedAuthProvider;
-use codex_http_client::build_reqwest_client_with_custom_ca;
+use codex_http_client::HttpClient;
+use codex_http_client::HttpClientBuilder;
+use codex_http_client::HttpResponse;
 use futures::FutureExt;
 use http::HeaderMap;
 use http::HeaderName;
 use http::HeaderValue;
-use reqwest::StatusCode;
+use http::StatusCode;
 use serde::Deserialize;
 use tokio::time::sleep;
 use tokio_tungstenite::MaybeTlsStream;
@@ -50,7 +52,7 @@ const NOISE_RELAY_SECURITY_PROFILE: &str = "noise_hybrid_ik_v1";
 struct EnvironmentRegistryClient {
     base_url: String,
     auth_provider: SharedAuthProvider,
-    http: reqwest::Client,
+    http: HttpClient,
     connect_timeout: Duration,
     telemetry: ExecServerTelemetry,
 }
@@ -79,10 +81,10 @@ impl EnvironmentRegistryClient {
         Ok(Self {
             base_url,
             auth_provider,
-            http: build_reqwest_client_with_custom_ca(
-                reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()),
-            )
-            .map_err(|error| ExecServerError::EnvironmentRegistryConfig(error.to_string()))?,
+            http: HttpClientBuilder::new()
+                .without_redirects()
+                .build_with_transport_default_proxy()
+                .map_err(|error| ExecServerError::EnvironmentRegistryConfig(error.to_string()))?,
             connect_timeout: DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT,
             telemetry,
         })
@@ -208,10 +210,7 @@ impl EnvironmentRegistryClient {
         })
     }
 
-    async fn parse_json_response<R>(
-        &self,
-        response: reqwest::Response,
-    ) -> Result<R, ExecServerError>
+    async fn parse_json_response<R>(&self, response: HttpResponse) -> Result<R, ExecServerError>
     where
         R: for<'de> Deserialize<'de>,
     {

@@ -947,7 +947,8 @@ mod tests {
                 RefreshStrategy::Online,
                 HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
             )
-            .await;
+            .await
+            .expect("Bedrock catalog should load");
         let models = catalog
             .models
             .iter()
@@ -971,6 +972,7 @@ mod tests {
                 HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
             )
             .await
+            .expect("Bedrock catalog should load")
             .into_iter()
             .find(|preset| preset.is_default)
             .expect("Bedrock catalog should have a default model");
@@ -1006,7 +1008,8 @@ mod tests {
                 RefreshStrategy::Online,
                 HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
             )
-            .await;
+            .await
+            .expect("configured Bedrock catalog should load");
 
         assert_eq!(catalog.models.len(), 1);
         assert_eq!(catalog.models[0].slug, "gpt-5.5");
@@ -1056,7 +1059,8 @@ mod tests {
                 RefreshStrategy::Online,
                 HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
             )
-            .await;
+            .await
+            .expect("provider catalog should load with its bearer token");
 
         assert!(
             catalog
@@ -1127,7 +1131,8 @@ mod tests {
                 RefreshStrategy::Online,
                 HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
             )
-            .await;
+            .await
+            .expect("first account catalog should load");
         assert!(
             first_catalog
                 .models
@@ -1151,7 +1156,8 @@ mod tests {
                 RefreshStrategy::OnlineIfUncached,
                 HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
             )
-            .await;
+            .await
+            .expect("same-scope catalog should load");
         assert!(
             same_scope_catalog
                 .models
@@ -1167,7 +1173,8 @@ mod tests {
                 RefreshStrategy::Offline,
                 HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
             )
-            .await;
+            .await
+            .expect("restricted catalog should load");
         assert!(
             !restricted_catalog
                 .models
@@ -1196,7 +1203,8 @@ mod tests {
                 RefreshStrategy::OnlineIfUncached,
                 HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
             )
-            .await;
+            .await
+            .expect("second account catalog should load");
 
         assert!(
             second_catalog

@@ -45,19 +45,26 @@ pub(crate) struct ApprovalStore {
 }
 
 impl ApprovalStore {
-    pub fn get<K>(&self, key: &K) -> Option<ReviewDecision>
+    fn serialized_key<K>(tool_name: &str, key: &K) -> Option<String>
     where
         K: Serialize,
     {
-        let s = serde_json::to_string(key).ok()?;
+        serde_json::to_string(&(1_u8, tool_name, std::any::type_name::<K>(), key)).ok()
+    }
+
+    pub fn get<K>(&self, tool_name: &str, key: &K) -> Option<ReviewDecision>
+    where
+        K: Serialize,
+    {
+        let s = Self::serialized_key(tool_name, key)?;
         self.map.get(&s).cloned()
     }
 
-    pub fn put<K>(&mut self, key: K, value: ReviewDecision)
+    pub fn put<K>(&mut self, tool_name: &str, key: K, value: ReviewDecision)
     where
         K: Serialize,
     {
-        if let Ok(s) = serde_json::to_string(&key) {
+        if let Some(s) = Self::serialized_key(tool_name, &key) {
             self.map.insert(s, value);
         }
     }
@@ -88,8 +95,12 @@ where
 
     let already_approved = {
         let store = services.tool_approvals.lock().await;
-        keys.iter()
-            .all(|key| matches!(store.get(key), Some(ReviewDecision::ApprovedForSession)))
+        keys.iter().all(|key| {
+            matches!(
+                store.get(tool_name, key),
+                Some(ReviewDecision::ApprovedForSession)
+            )
+        })
     };
 
     if already_approved {
@@ -110,7 +121,7 @@ where
     if matches!(decision, ReviewDecision::ApprovedForSession) {
         let mut store = services.tool_approvals.lock().await;
         for key in keys {
-            store.put(key, ReviewDecision::ApprovedForSession);
+            store.put(tool_name, key, ReviewDecision::ApprovedForSession);
         }
     }
 

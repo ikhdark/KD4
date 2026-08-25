@@ -8,6 +8,7 @@ use codex_tools::ConversationHistory;
 use codex_tools::ConversationHistoryRequirement;
 use codex_tools::ExtensionTurnItem;
 use codex_tools::ToolCall as ExtensionToolCall;
+use codex_tools::ToolCallSource as ExtensionToolCallSource;
 use codex_tools::ToolEnvironment;
 use codex_tools::ToolName;
 use codex_tools::ToolSearchInfo;
@@ -49,8 +50,16 @@ impl ToolExecutor<ToolInvocation> for ExtensionToolAdapter {
         self.0.supports_parallel_tool_calls()
     }
 
-    fn search_info(&self) -> Option<ToolSearchInfo> {
-        self.0.search_info()
+    fn search_info_for_registered_spec(
+        &self,
+        registered_spec: &ToolSpec,
+    ) -> Option<ToolSearchInfo> {
+        let search_info = self.0.search_info()?;
+        ToolSearchInfo::from_spec(
+            search_info.entry.search_text,
+            registered_spec.clone(),
+            search_info.source_info,
+        )
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
@@ -185,6 +194,16 @@ async fn to_extension_call(
             .model_info
             .truncation_policy
             .into(),
+        source: match &invocation.source {
+            crate::tools::context::ToolCallSource::Direct => ExtensionToolCallSource::Direct,
+            crate::tools::context::ToolCallSource::CodeMode {
+                cell_id,
+                runtime_tool_call_id,
+            } => ExtensionToolCallSource::CodeMode {
+                cell_id: cell_id.clone(),
+                runtime_tool_call_id: runtime_tool_call_id.clone(),
+            },
+        },
         conversation_history,
         turn_item_emitter: Arc::new(CoreTurnItemEmitter {
             session: Arc::downgrade(&invocation.session),
@@ -200,6 +219,8 @@ async fn to_extension_call(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
     use codex_extension_items::ExtensionItem;
     use codex_extension_items::image_generation::ImageGenerationItem;
@@ -264,6 +285,32 @@ mod tests {
                         as Box<dyn codex_tools::ToolOutput>,
                 )
             })
+        }
+    }
+
+    struct StatefulSpecExtensionExecutor {
+        spec_calls: AtomicUsize,
+    }
+
+    impl codex_extension_api::ToolExecutor<codex_tools::ToolCall> for StatefulSpecExtensionExecutor {
+        fn tool_name(&self) -> codex_tools::ToolName {
+            codex_tools::ToolName::plain("stateful_extension")
+        }
+
+        fn spec(&self) -> codex_tools::ToolSpec {
+            let call = self.spec_calls.fetch_add(1, Ordering::Relaxed);
+            codex_tools::ToolSpec::Function(codex_tools::ResponsesApiTool {
+                name: "stateful_extension".to_string(),
+                description: format!("schema snapshot {call}"),
+                strict: true,
+                parameters: codex_tools::JsonSchema::default(),
+                output_schema: None,
+                defer_loading: None,
+            })
+        }
+
+        fn handle(&self, _call: codex_tools::ToolCall) -> codex_tools::ToolExecutorFuture<'_> {
+            Box::pin(async { panic!("search metadata generation must not execute the tool") })
         }
     }
 
@@ -403,6 +450,25 @@ mod tests {
                 ))
             })
         }
+    }
+
+    #[test]
+    fn extension_search_info_keeps_the_registered_schema_snapshot() {
+        let handler = ExtensionToolAdapter::new(Arc::new(StatefulSpecExtensionExecutor {
+            spec_calls: AtomicUsize::new(0),
+        }));
+        let registered_spec = crate::tools::registry::ToolExecutor::spec(&handler);
+
+        let search_info = crate::tools::registry::ToolExecutor::search_info_for_registered_spec(
+            &handler,
+            &registered_spec,
+        )
+        .expect("function extension should be discoverable");
+
+        let codex_tools::LoadableToolSpec::Function(discovered) = search_info.entry.output else {
+            panic!("expected a function search result");
+        };
+        assert_eq!(discovered.description, "schema snapshot 0");
     }
 
     #[tokio::test]

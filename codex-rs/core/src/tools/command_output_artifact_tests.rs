@@ -1350,6 +1350,117 @@ async fn retention_sweeps_are_serialized() {
         .expect("retention sweep task");
 }
 
+#[test]
+#[serial_test::serial(command_output_artifact)]
+fn audit_output_artifact_creation_reconciles_uncommitted_family() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let directory = temp.path().join("tool-output").join("thread");
+    std::fs::create_dir_all(&directory).expect("artifact directory");
+    let id = ToolOutputArtifactId::new();
+    let path = directory.join(format!("{id}.log"));
+    std::fs::write(&path, b"uncommitted base").expect("uncommitted base segment");
+    std::fs::write(logical_segment_path(&path, 1), b"uncommitted tail")
+        .expect("uncommitted tail segment");
+    begin_logical_artifact_transaction(&path, false).expect("creation transaction");
+
+    assert_eq!(
+        load_logical_metadata(&path, id),
+        Err(ReadToolOutputError::StillWriting),
+        "a family with an active transaction must never fall back to a complete raw artifact"
+    );
+    reconcile_logical_artifact_transactions(&directory).expect("reconcile transactions");
+
+    assert!(!path.exists());
+    assert!(!logical_segment_path(&path, 1).exists());
+    assert!(!logical_transaction_path(&path).exists());
+}
+
+#[test]
+#[serial_test::serial(command_output_artifact)]
+fn audit_output_artifact_attach_rollback_preserves_only_base_segment() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let directory = temp.path().join("tool-output").join("thread");
+    std::fs::create_dir_all(&directory).expect("artifact directory");
+    let path = directory.join(format!("{}.log", ToolOutputArtifactId::new()));
+    std::fs::write(&path, b"legacy exact output").expect("legacy base segment");
+    begin_logical_artifact_transaction(&path, true).expect("attach transaction");
+    std::fs::write(logical_segment_path(&path, 1), b"uncommitted tail")
+        .expect("new segment installed before metadata failure");
+
+    reconcile_logical_artifact_transaction(&path).expect("rollback failed attach");
+
+    assert_eq!(
+        std::fs::read(&path).expect("preserved base"),
+        b"legacy exact output"
+    );
+    assert!(!logical_segment_path(&path, 1).exists());
+    assert!(!logical_transaction_path(&path).exists());
+}
+
+#[test]
+fn audit_output_artifact_unavailable_ranges_preserve_canonical_gaps() {
+    assert_eq!(
+        normalized_unavailable_ranges(12, &[CanonicalByteRange::new(2, 4)], 12),
+        vec![CanonicalByteRange::new(2, 4)]
+    );
+    assert_eq!(
+        normalized_unavailable_ranges(
+            12,
+            &[
+                CanonicalByteRange::new(2, 4),
+                CanonicalByteRange::new(7, 10),
+            ],
+            8,
+        ),
+        vec![
+            CanonicalByteRange::new(2, 4),
+            CanonicalByteRange::new(7, 12)
+        ]
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn audit_output_artifact_retention_permit_uses_interprocess_lock() {
+    let permit = retention_sweep_permit().await;
+    retention_interprocess_index_stale().store(false, Ordering::Release);
+    let generation_path = retention_interprocess_lock_target();
+    let lock_path =
+        codex_file_system::atomic_write_lock_path(&generation_path).expect("retention lock path");
+    let contender = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .expect("contending retention lock handle");
+
+    assert!(
+        fs2::FileExt::try_lock_exclusive(&contender).is_err(),
+        "another process handle must not enter retention while the permit is held"
+    );
+    drop(permit);
+    fs2::FileExt::try_lock_exclusive(&contender)
+        .expect("interprocess lock should release with the retention permit");
+    let external_generation = std::fs::read_to_string(&generation_path)
+        .expect("retention generation")
+        .trim()
+        .parse::<u64>()
+        .expect("numeric retention generation")
+        .checked_add(1)
+        .expect("external generation increment");
+    write_bytes_atomically(&generation_path, external_generation.to_string().as_bytes())
+        .expect("simulate another process mutation");
+    fs2::FileExt::unlock(&contender).expect("unlock contender");
+
+    let next_permit = retention_sweep_permit().await;
+    assert!(
+        retention_interprocess_index_stale().swap(false, Ordering::AcqRel),
+        "a generation advanced by another process must invalidate the local index"
+    );
+    drop(next_permit);
+}
+
 async fn create_artifacts_and_measure(count: usize) -> (RetentionDiagnostics, std::time::Duration) {
     let temp = tempfile::tempdir().expect("tempdir");
     let started = Instant::now();

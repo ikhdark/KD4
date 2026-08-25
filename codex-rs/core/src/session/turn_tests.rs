@@ -111,6 +111,39 @@ async fn kd4_latency_deferred_tool_schema_lease_releases_only_advertised_tools()
     );
 }
 
+#[tokio::test]
+async fn deferred_tool_schema_lease_releases_on_sampling_error_exit() {
+    let (_, turn_context, _) = crate::session::tests::make_session_and_context_with_rx().await;
+    let advertised = codex_tools::ToolName::plain("advertised_deferred");
+    let discovered_during_request = codex_tools::ToolName::plain("discovered_during_request");
+    turn_context.refresh_deferred_tool_capabilities(HashMap::from([
+        (advertised.clone(), "revision-a".to_string()),
+        (discovered_during_request.clone(), "revision-b".to_string()),
+    ]));
+    turn_context.activate_deferred_tools(std::iter::once(advertised.clone()));
+
+    {
+        let _lease = AdvertisedDeferredToolLease::new(
+            Arc::clone(&turn_context),
+            turn_context.activated_deferred_tools(),
+        );
+        turn_context.activate_deferred_tools(std::iter::once(discovered_during_request.clone()));
+    }
+
+    assert!(!turn_context.deferred_tool_is_activated(&advertised));
+    assert!(turn_context.deferred_tool_is_activated(&discovered_during_request));
+}
+
+#[test]
+fn sampling_retry_rebuilds_after_accepted_output() {
+    let mut progress = SamplingAttemptProgress::default();
+    assert!(!progress.requires_authoritative_retry_input());
+
+    progress.accepted_output = true;
+
+    assert!(progress.requires_authoritative_retry_input());
+}
+
 #[test]
 fn kd4_latency_continuation_prefetch_rejects_stale_or_steered_state() {
     assert!(continuation_workspace_prefetch_is_current(7, 7, false));
@@ -2020,8 +2053,13 @@ async fn unchanged_model_and_comp_hash_skip_previous_model_context_reconstructio
     let turn_context = Arc::new(turn_context);
 
     assert!(
-        !maybe_run_previous_model_inline_compact(&session, &turn_context, &mut client_session,)
-            .await?
+        !maybe_run_previous_model_inline_compact(
+            &session,
+            &turn_context,
+            &mut client_session,
+            &CancellationToken::new(),
+        )
+        .await?
     );
     let model_requests = server
         .received_requests()
@@ -2403,6 +2441,17 @@ fn pending_turn_mechanism_retries_remain_bounded_without_fixed_point_state() {
 }
 
 #[test]
+fn pending_turn_stale_builds_consume_iteration_budget() {
+    let mut iterations = 0;
+
+    for _ in 0..MAX_PENDING_TURN_PLAN_ITERATIONS {
+        charge_pending_turn_plan_build((), &mut iterations).expect("within retry bound");
+    }
+
+    assert!(charge_pending_turn_plan_build((), &mut iterations).is_err());
+}
+
+#[test]
 fn pending_turn_mechanism_does_not_replay_the_completed_mcp_effect() {
     let completed = ("install:tool@v1".to_string(), None);
     assert!(mcp_dependency_effect_is_completed(
@@ -2419,4 +2468,84 @@ fn pending_turn_mechanism_does_not_replay_the_completed_mcp_effect() {
 fn pending_turn_mechanism_inventory_effect_requires_a_newer_generation() {
     assert!(require_newer_planning_generation(4, 4).is_err());
     assert!(require_newer_planning_generation(4, 5).is_ok());
+}
+
+#[tokio::test]
+async fn post_sampling_state_reads_start_concurrently() {
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let pending_barrier = Arc::clone(&barrier);
+    let token_barrier = Arc::clone(&barrier);
+
+    let values = tokio::time::timeout(
+        Duration::from_millis(200),
+        collect_post_sampling_state(
+            async move {
+                pending_barrier.wait().await;
+                "pending"
+            },
+            async move {
+                token_barrier.wait().await;
+                "tokens"
+            },
+        ),
+    )
+    .await
+    .expect("independent post-sampling reads should both start without waiting for the other");
+
+    assert_eq!(values, ("pending", "tokens"));
+}
+
+#[tokio::test]
+async fn plugin_recommendation_and_mcp_tool_reads_start_concurrently() {
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let recommendation_barrier = Arc::clone(&barrier);
+    let mcp_barrier = Arc::clone(&barrier);
+
+    let values = tokio::time::timeout(
+        Duration::from_millis(200),
+        join_recommendations_and_mcp(
+            async move {
+                recommendation_barrier.wait().await;
+                "recommendations"
+            },
+            async move {
+                mcp_barrier.wait().await;
+                "mcp"
+            },
+        ),
+    )
+    .await
+    .expect("independent recommendation and MCP reads should overlap");
+
+    assert_eq!(values, ("recommendations", "mcp"));
+}
+
+#[tokio::test]
+async fn projected_prompt_state_reads_start_concurrently() {
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let active_barrier = Arc::clone(&barrier);
+    let history_barrier = Arc::clone(&barrier);
+    let compact_barrier = Arc::clone(&barrier);
+
+    let values = tokio::time::timeout(
+        Duration::from_millis(200),
+        collect_projected_prompt_state(
+            async move {
+                active_barrier.wait().await;
+                "active"
+            },
+            async move {
+                history_barrier.wait().await;
+                "history"
+            },
+            async move {
+                compact_barrier.wait().await;
+                "compact"
+            },
+        ),
+    )
+    .await
+    .expect("independent prompt-pressure state reads should overlap");
+
+    assert_eq!(values, ("active", "history", "compact"));
 }

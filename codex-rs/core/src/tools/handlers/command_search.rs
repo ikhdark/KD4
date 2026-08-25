@@ -9,7 +9,7 @@ use super::command_preflight::program_name;
 use super::command_preflight::rg_argv_commands;
 use super::command_preflight::rg_option_consumes_next;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 pub(crate) enum RgSearchBreadth {
     Narrow,
     Broad,

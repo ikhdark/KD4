@@ -11,7 +11,6 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use codex_exec_server::HttpClient;
 use codex_exec_server::ReqwestHttpClient;
-use reqwest::Url;
 use rmcp::transport::AuthorizationManager;
 use rmcp::transport::AuthorizationSession;
 use rmcp::transport::auth::OAuthClientConfig;
@@ -23,6 +22,7 @@ use tiny_http::Response;
 use tiny_http::Server;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
+use url::Url;
 use urlencoding::decode;
 
 use crate::StoredOAuthTokens;
@@ -742,11 +742,11 @@ mod tests {
     use axum::Router;
     use axum::routing::get;
     use codex_exec_server::ReqwestHttpClient;
+    use http::HeaderMap;
     use pretty_assertions::assert_eq;
-    use reqwest::Url;
-    use reqwest::header::HeaderMap;
     use serde_json::json;
     use tokio::net::TcpListener;
+    use url::Url;
 
     use super::CallbackOutcome;
     use super::OAuthHttpClientAdapter;

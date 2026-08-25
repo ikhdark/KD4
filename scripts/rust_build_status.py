@@ -138,6 +138,7 @@ RUST_PROCESS_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9_.-])(?:cargo|cargo-clippy|cargo-nextest|clippy-driver|rustc|rustup)(?:\.exe)?(?![A-Za-z0-9_.-])",
     re.IGNORECASE,
 )
+RUST_MIN_STACK_BYTES = "8388608"
 
 
 class CargoLanesRootValidationError(ValueError):
@@ -189,10 +190,24 @@ def validate_cargo_lanes_root(
 
 
 @dataclass(frozen=True)
+class RustProcessClassification:
+    is_rust: bool
+    lane_name: str | None
+
+
+@dataclass(frozen=True)
 class RustProcess:
     pid: int
     name: str
     command_line: str
+    classification: RustProcessClassification = field(
+        init=False,
+        compare=False,
+        repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "classification", _classify_rust_process(self))
 
 
 def rust_process_key(process: RustProcess) -> tuple[int, str, str]:
@@ -219,7 +234,8 @@ class BuildStatusSnapshot:
         processes: Sequence[RustProcess] | None = None,
         lane_mtime: Callable[[Path], float] | None = None,
     ) -> "BuildStatusSnapshot":
-        process_list = active_rust_processes() if processes is None else list(processes)
+        discovered = active_rust_processes() if processes is None else processes
+        process_list = list(discovered)
         lane_root = cargo_lanes_root(repo_root)
         lane_dirs = existing_lane_dirs(lane_root)
         lane_names_by_process: dict[tuple[int, str, str], str] = {}
@@ -326,24 +342,12 @@ def active_rust_processes_windows() -> list[RustProcess]:
         except (TypeError, ValueError):
             continue
         process = RustProcess(pid=pid, name=name, command_line=command_line)
-        if is_rust_process(process):
+        if process.classification.is_rust:
             processes.append(process)
     return processes
 
 
-def is_rust_process(process: RustProcess) -> bool:
-    name = process.name.lower().removesuffix(".exe")
-    if name in RUST_PROCESS_NAMES:
-        return True
-    if name in RUST_WRAPPER_PROCESS_NAMES:
-        return lane_name_for_process(process) is not None or bool(
-            RUST_PROCESS_TOKEN_RE.search(process.command_line)
-        )
-    return bool(RUST_PROCESS_TOKEN_RE.search(process.command_line))
-
-
-def lane_name_for_process(process: RustProcess) -> str | None:
-    command_line = process.command_line
+def _lane_name_from_command_line(command_line: str) -> str | None:
     if match := LANE_RE.search(command_line):
         return match.group(1)
     if match := SCRIPT_LANE_RE.search(command_line):
@@ -355,23 +359,49 @@ def lane_name_for_process(process: RustProcess) -> str | None:
     return None
 
 
+def _classify_rust_process(process: RustProcess) -> RustProcessClassification:
+    executable = process.name.lower().removesuffix(".exe")
+    lane_name = _lane_name_from_command_line(process.command_line)
+    contains_rust_command = bool(RUST_PROCESS_TOKEN_RE.search(process.command_line))
+    if executable in RUST_PROCESS_NAMES:
+        is_rust = True
+    elif executable in RUST_WRAPPER_PROCESS_NAMES:
+        is_rust = lane_name is not None or contains_rust_command
+    else:
+        is_rust = contains_rust_command
+    return RustProcessClassification(is_rust=is_rust, lane_name=lane_name)
+
+
+def observe_rust_process(process: RustProcess) -> RustProcess:
+    return process
+
+
+def is_rust_process(process: RustProcess) -> bool:
+    return process.classification.is_rust
+
+
+def lane_name_for_process(process: RustProcess) -> str | None:
+    return process.classification.lane_name
+
+
 def shared_target_rust_processes(
     processes: Sequence[RustProcess],
     lane_names_by_process: Mapping[tuple[int, str, str], str] | None = None,
 ) -> list[RustProcess]:
     shared = []
     for process in processes:
+        observed = observe_rust_process(process)
         lane_name = (
-            lane_names_by_process.get(rust_process_key(process))
+            lane_names_by_process.get(rust_process_key(observed))
             if lane_names_by_process is not None
-            else lane_name_for_process(process)
+            else observed.classification.lane_name
         )
         if (
-            is_rust_process(process)
+            observed.classification.is_rust
             and lane_name is None
-            and "nextest show-config" not in process.command_line
+            and "nextest show-config" not in observed.command_line
         ):
-            shared.append(process)
+            shared.append(observed)
     return shared
 
 
@@ -622,26 +652,81 @@ def initialize_cargo_lanes_root(repo_root: Path, lane_root: Path) -> Path:
     return lane_root
 
 
+@dataclass(frozen=True)
+class LaneReservationCandidate:
+    name: str
+    path: Path
+    observation: os.stat_result | None
+
+
+def _observation_is_indirect(observation: os.stat_result) -> bool:
+    file_attributes = getattr(observation, "st_file_attributes", 0) or 0
+    return stat.S_ISLNK(observation.st_mode) or bool(
+        file_attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    )
+
+
+def _lane_path_observation(path: Path) -> os.stat_result | None:
+    try:
+        return os.lstat(path)
+    except FileNotFoundError:
+        return None
+
+
 def _lane_reservation_candidates(
     lane_root: Path,
     base_lane: str,
     *,
     prefer_warm: bool,
-) -> list[str]:
-    candidates: list[str] = []
+) -> list[LaneReservationCandidate]:
+    candidates: list[LaneReservationCandidate] = []
     if prefer_warm:
         pattern = re.compile(rf"^{re.escape(base_lane)}(?:-\d+)?$")
-        warm = [
-            path
-            for path in lane_root.iterdir()
-            if path.is_dir()
-            and not is_indirect_directory(path)
-            and pattern.fullmatch(path.name)
-        ]
-        warm.sort(key=lambda path: path.stat().st_mtime, reverse=True)
-        candidates.extend(path.name for path in warm)
-    candidates.extend([base_lane, *(f"{base_lane}-{index}" for index in range(2, 66))])
-    return list(dict.fromkeys(candidates))
+        warm: list[LaneReservationCandidate] = []
+        with os.scandir(lane_root) as entries:
+            for entry in entries:
+                if pattern.fullmatch(entry.name) is None:
+                    continue
+                try:
+                    observation = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if not stat.S_ISDIR(observation.st_mode) or _observation_is_indirect(
+                    observation
+                ):
+                    continue
+                warm.append(
+                    LaneReservationCandidate(
+                        name=entry.name,
+                        path=Path(entry.path),
+                        observation=observation,
+                    )
+                )
+
+        def warm_sort_key(
+            candidate: LaneReservationCandidate,
+        ) -> tuple[float, str, str]:
+            assert candidate.observation is not None
+            return (
+                -candidate.observation.st_mtime,
+                candidate.name.casefold(),
+                candidate.name,
+            )
+
+        warm.sort(key=warm_sort_key)
+        candidates.extend(warm)
+    observed_names = {candidate.name for candidate in candidates}
+    for name in [base_lane, *(f"{base_lane}-{index}" for index in range(2, 66))]:
+        if name not in observed_names:
+            candidates.append(
+                LaneReservationCandidate(
+                    name=name,
+                    path=lane_root / name,
+                    observation=None,
+                )
+            )
+            observed_names.add(name)
+    return candidates
 
 
 @contextmanager
@@ -673,9 +758,10 @@ def reserve_cargo_lane(
             base_lane,
             prefer_warm=not explicit,
         ):
-            candidate = _safe_lane_name(candidate)
-            candidate_dir = root / candidate
-            if candidate_dir.exists() and is_indirect_directory(candidate_dir):
+            candidate_name = _safe_lane_name(candidate.name)
+            candidate_dir = candidate.path
+            observation = _lane_path_observation(candidate_dir)
+            if observation is not None and _observation_is_indirect(observation):
                 raise CargoLanesRootValidationError(
                     f"refusing indirect Cargo lane path {candidate_dir}"
                 )
@@ -685,7 +771,7 @@ def reserve_cargo_lane(
             )
             if active_handle is not None:
                 target_dir = candidate_dir.resolve()
-                resolved_lane = candidate
+                resolved_lane = candidate_name
                 break
     if active_handle is None or target_dir is None or resolved_lane is None:
         raise RuntimeError(f"unable to reserve an idle Cargo lane for {base_lane!r}")
@@ -907,6 +993,47 @@ def _cargo_command_with_target_dir(
     ]
 
 
+def _requires_core_test_helpers(arguments: Sequence[str]) -> bool:
+    return "codex-core" in arguments and (
+        "-p" in arguments or "--package" in arguments
+    )
+
+
+def _direct_reserved_lane_command(
+    command: Sequence[str],
+    child_env: dict[str, str],
+) -> list[str] | None:
+    if len(command) < 2 or Path(command[0]).stem.lower() != "just":
+        return None
+
+    recipe = command[1]
+    arguments = list(command[2:])
+    profile: str | None = None
+    cargo_arguments: list[str] | None = None
+    if recipe == "_test-lane-local-reserved":
+        if _requires_core_test_helpers(arguments):
+            return None
+        profile = "local"
+        cargo_arguments = ["--no-fail-fast", *arguments]
+    elif recipe == "_test-lane-fast-reserved":
+        if _requires_core_test_helpers(arguments):
+            return None
+        profile = "fast"
+        cargo_arguments = arguments
+    elif recipe == "_test-lane-package-reserved" and arguments:
+        package, *forwarded = arguments
+        if package == "codex-core":
+            return None
+        profile = "fast"
+        cargo_arguments = ["-p", package, *forwarded]
+    else:
+        return None
+
+    child_env["RUST_MIN_STACK"] = RUST_MIN_STACK_BYTES
+    child_env["NEXTEST_PROFILE"] = profile
+    return ["cargo", "nextest", "run", *cargo_arguments]
+
+
 def run_in_cargo_lane(
     *,
     repo_root: Path,
@@ -935,8 +1062,14 @@ def run_in_cargo_lane(
         # not fragment compiler-cache keys. Direct Cargo commands receive an
         # explicit --target-dir; nested just recipes consume the CODEX value.
         child_env.pop("CARGO_TARGET_DIR", None)
-        child_env["CODEX_CARGO_LANE_TARGET_DIR"] = str(target_dir)
-        child_command = _cargo_command_with_target_dir(command, target_dir)
+        child_env.pop("CODEX_CARGO_LANE_TARGET_DIR", None)
+        direct_command = _direct_reserved_lane_command(command, child_env)
+        if direct_command is None:
+            child_env["CODEX_CARGO_LANE_TARGET_DIR"] = str(target_dir)
+        child_command = _cargo_command_with_target_dir(
+            direct_command if direct_command is not None else command,
+            target_dir,
+        )
         if not Path(child_command[0]).parent.name:
             resolved_program = shutil.which(
                 child_command[0],

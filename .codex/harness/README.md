@@ -25,6 +25,10 @@ unused placeholder sections instead of filling artifacts for completeness. Start
 with one primary artifact and link to supporting artifacts instead of copying the
 same facts, decisions, or validation results into several files.
 
+Templates are durable source files, not per-task state. Copy each selected
+template into `.codex/harness/runs/<yyyy-mm-dd>-<slug>/`, keep its conventional
+basename, and fill the copy. Do not record task-specific state in `templates/`.
+
 Resolve a preflight manifest with
 `just workflow-preflight <manifest> <receipt>`. The command atomically
 checks and publishes against the repository's active-receipt registry. Path,

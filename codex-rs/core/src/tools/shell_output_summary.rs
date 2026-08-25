@@ -1,5 +1,3 @@
-use std::collections::BTreeSet;
-
 const DEFAULT_SUMMARY_AFTER_BYTES: usize = 48 * 1024;
 const DEFAULT_SUMMARY_AFTER_LINES: usize = 600;
 const EARLY_SUMMARY_AFTER_BYTES: usize = 10 * 1024;
@@ -33,38 +31,18 @@ pub(crate) fn summarize_shell_output_for_model(
         return None;
     }
 
-    let line_count = output.lines().count();
     let (byte_threshold, line_threshold) = if options.turn_cost_guard {
         (EARLY_SUMMARY_AFTER_BYTES, EARLY_SUMMARY_AFTER_LINES)
     } else {
         (DEFAULT_SUMMARY_AFTER_BYTES, DEFAULT_SUMMARY_AFTER_LINES)
     };
-    if output.len() <= byte_threshold && line_count <= line_threshold {
-        return None;
-    }
-
-    let lines = output.lines().collect::<Vec<_>>();
+    let lines = collect_lines_for_summary(output, byte_threshold, line_threshold)?;
+    let line_count = lines.len();
     let failed = timed_out || exit_code != 0;
     let validation = options
         .command_text
         .is_some_and(looks_like_validation_command);
-    let selected = selected_line_indexes(&lines, failed, validation);
-    let critical_signals = critical_signal_indexes(&lines);
-    let mut critical_context = BTreeSet::new();
-    add_context_ranges(
-        lines.len(),
-        critical_signals.iter().copied(),
-        &mut critical_context,
-    );
-    let tail_count = if failed || validation {
-        FAILURE_TAIL_LINES
-    } else {
-        SUCCESS_TAIL_LINES
-    };
-    let tail_start = lines.len().saturating_sub(tail_count);
-    let tail_indexes = (tail_start..lines.len()).collect::<BTreeSet<_>>();
-    let mut priority_indexes = critical_context.clone();
-    priority_indexes.extend(tail_indexes.iter().copied());
+    let line_states = select_line_states(&lines, failed, validation);
     let retained_shape = if validation {
         "failure-focused lines, final status lines, tail"
     } else if failed {
@@ -88,12 +66,7 @@ pub(crate) fn summarize_shell_output_for_model(
     // Emit exact failure signals, their context, and the final status tail
     // before advisory ranges. A source-ordered warning flood could otherwise
     // consume the bounded summary before either actionable region.
-    let ordered = critical_signals
-        .iter()
-        .copied()
-        .chain(critical_context.difference(&critical_signals).copied())
-        .chain(tail_indexes.difference(&critical_context).copied())
-        .chain(selected.difference(&priority_indexes).copied());
+    let ordered = ordered_line_indexes(&line_states);
     let mut previous = None;
     for index in ordered {
         if let Some(previous_index) = previous
@@ -112,111 +85,174 @@ pub(crate) fn summarize_shell_output_for_model(
     builder.finish()
 }
 
-fn selected_line_indexes(lines: &[&str], failed: bool, validation: bool) -> BTreeSet<usize> {
-    let mut selected = BTreeSet::new();
+fn collect_lines_for_summary(
+    output: &str,
+    byte_threshold: usize,
+    line_threshold: usize,
+) -> Option<Vec<&str>> {
+    debug_assert!(line_threshold <= DEFAULT_SUMMARY_AFTER_LINES);
+    let mut buffered = [None; DEFAULT_SUMMARY_AFTER_LINES + 1];
+    let mut buffered_len = 0;
+    let mut remaining = output.lines();
+    while let Some(line) = remaining.next() {
+        if output.len() > byte_threshold {
+            let mut lines = Vec::with_capacity(line_threshold.saturating_add(1));
+            lines.push(line);
+            lines.extend(remaining);
+            return Some(lines);
+        }
+        buffered[buffered_len] = Some(line);
+        buffered_len += 1;
+        if buffered_len > line_threshold {
+            let mut lines = Vec::with_capacity(buffered_len);
+            lines.extend(buffered[..buffered_len].iter().flatten().copied());
+            lines.extend(remaining);
+            return Some(lines);
+        }
+    }
+    None
+}
+
+#[derive(Clone, Copy, Default)]
+struct LineClassification {
+    critical: bool,
+    advisory: bool,
+    status: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct LineState {
+    classification: LineClassification,
+    selected: bool,
+    critical_priority: bool,
+    critical_context: bool,
+    tail: bool,
+}
+
+fn classify_line(line: &str) -> LineClassification {
+    let lower = line.to_ascii_lowercase();
+    let trimmed = lower.trim_start();
+    LineClassification {
+        critical: lower.contains("error")
+            || lower.contains("failed")
+            || lower.contains("failure")
+            || lower.contains("panic")
+            || lower.contains("thread ")
+            || lower.contains("expected")
+            || lower.contains("actual")
+            || lower.contains("error["),
+        advisory: lower.contains("warning")
+            || lower.contains("warning[")
+            || trimmed.starts_with("-->")
+            || trimmed.starts_with("note:")
+            || trimmed.starts_with("help:"),
+        status: lower.contains("test result:")
+            || lower.contains("failures:")
+            || lower.contains("failed.")
+            || lower.contains("passed")
+            || lower.contains("finished ")
+            || lower.contains("error:")
+            || lower.contains("summary:"),
+    }
+}
+
+fn select_line_states(lines: &[&str], failed: bool, validation: bool) -> Vec<LineState> {
+    let mut states = lines
+        .iter()
+        .map(|line| LineState {
+            classification: classify_line(line),
+            ..LineState::default()
+        })
+        .collect::<Vec<_>>();
     if failed || validation {
-        add_focus_ranges(lines, &mut selected);
-        add_status_lines(lines, &mut selected);
-        if selected.is_empty() {
-            add_head(lines, &mut selected, SUCCESS_HEAD_LINES);
+        add_focus_ranges(&mut states);
+        add_status_lines(&mut states);
+        if !states.iter().any(|state| state.selected) {
+            add_head(&mut states, SUCCESS_HEAD_LINES);
         }
-        add_tail(lines, &mut selected, FAILURE_TAIL_LINES);
+        add_tail(&mut states, FAILURE_TAIL_LINES);
     } else {
-        add_head(lines, &mut selected, SUCCESS_HEAD_LINES);
-        add_focus_ranges(lines, &mut selected);
-        add_tail(lines, &mut selected, SUCCESS_TAIL_LINES);
+        add_head(&mut states, SUCCESS_HEAD_LINES);
+        add_focus_ranges(&mut states);
+        add_tail(&mut states, SUCCESS_TAIL_LINES);
     }
-    selected
+    states
 }
 
-fn add_head(lines: &[&str], selected: &mut BTreeSet<usize>, count: usize) {
-    for index in 0..lines.len().min(count) {
-        selected.insert(index);
-    }
-}
-
-fn add_tail(lines: &[&str], selected: &mut BTreeSet<usize>, count: usize) {
-    let start = lines.len().saturating_sub(count);
-    for index in start..lines.len() {
-        selected.insert(index);
+fn add_head(states: &mut [LineState], count: usize) {
+    for state in states.iter_mut().take(count) {
+        state.selected = true;
     }
 }
 
-fn add_focus_ranges(lines: &[&str], selected: &mut BTreeSet<usize>) {
-    let critical = critical_signal_indexes(lines);
-    add_context_ranges(lines.len(), critical.iter().copied(), selected);
-    let remaining = MAX_FOCUS_MATCHES.saturating_sub(critical.len());
-    let advisory = lines
+fn add_tail(states: &mut [LineState], count: usize) {
+    let start = states.len().saturating_sub(count);
+    for state in &mut states[start..] {
+        state.selected = true;
+        state.tail = true;
+    }
+}
+
+fn add_focus_ranges(states: &mut [LineState]) {
+    let critical = states
         .iter()
         .enumerate()
-        .filter_map(|(index, line)| is_advisory_signal(line).then_some(index));
-    add_context_ranges(lines.len(), advisory.take(remaining), selected);
-}
-
-fn critical_signal_indexes(lines: &[&str]) -> BTreeSet<usize> {
-    lines
-        .iter()
-        .enumerate()
-        .filter_map(|(index, line)| is_critical_failure_signal(line).then_some(index))
+        .filter_map(|(index, state)| state.classification.critical.then_some(index))
         .take(MAX_FOCUS_MATCHES)
-        .collect()
+        .collect::<Vec<_>>();
+    for &index in &critical {
+        states[index].critical_priority = true;
+    }
+    add_context_ranges(states, &critical, true);
+    let remaining = MAX_FOCUS_MATCHES.saturating_sub(critical.len());
+    let advisory = states
+        .iter()
+        .enumerate()
+        .filter_map(|(index, state)| state.classification.advisory.then_some(index))
+        .take(remaining)
+        .collect::<Vec<_>>();
+    add_context_ranges(states, &advisory, false);
 }
 
-fn add_context_ranges(
-    line_count: usize,
-    indexes: impl Iterator<Item = usize>,
-    selected: &mut BTreeSet<usize>,
-) {
-    for index in indexes {
+fn add_context_ranges(states: &mut [LineState], indexes: &[usize], critical_context: bool) {
+    for &index in indexes {
         let start = index.saturating_sub(FOCUS_CONTEXT_LINES);
-        let end = (index + FOCUS_CONTEXT_LINES + 1).min(line_count);
-        for selected_index in start..end {
-            selected.insert(selected_index);
+        let end = (index + FOCUS_CONTEXT_LINES + 1).min(states.len());
+        for state in &mut states[start..end] {
+            state.selected = true;
+            state.critical_context |= critical_context;
         }
     }
 }
 
-fn add_status_lines(lines: &[&str], selected: &mut BTreeSet<usize>) {
-    for index in lines
+fn add_status_lines(states: &mut [LineState]) {
+    let status = states
         .iter()
         .enumerate()
-        .filter_map(|(index, line)| is_final_status_signal(line).then_some(index))
+        .filter_map(|(index, state)| state.classification.status.then_some(index))
         .take(MAX_FOCUS_MATCHES)
-    {
-        selected.insert(index);
+        .collect::<Vec<_>>();
+    for index in status {
+        states[index].selected = true;
     }
 }
 
-fn is_critical_failure_signal(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    lower.contains("error")
-        || lower.contains("failed")
-        || lower.contains("failure")
-        || lower.contains("panic")
-        || lower.contains("thread ")
-        || lower.contains("expected")
-        || lower.contains("actual")
-        || lower.contains("error[")
-}
-
-fn is_advisory_signal(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    lower.contains("warning")
-        || lower.contains("warning[")
-        || lower.trim_start().starts_with("-->")
-        || lower.trim_start().starts_with("note:")
-        || lower.trim_start().starts_with("help:")
-}
-
-fn is_final_status_signal(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    lower.contains("test result:")
-        || lower.contains("failures:")
-        || lower.contains("failed.")
-        || lower.contains("passed")
-        || lower.contains("finished ")
-        || lower.contains("error:")
-        || lower.contains("summary:")
+fn ordered_line_indexes(states: &[LineState]) -> impl Iterator<Item = usize> + '_ {
+    let critical = states
+        .iter()
+        .enumerate()
+        .filter_map(|(index, state)| state.critical_priority.then_some(index));
+    let critical_context = states.iter().enumerate().filter_map(|(index, state)| {
+        (state.critical_context && !state.critical_priority).then_some(index)
+    });
+    let tail = states
+        .iter()
+        .enumerate()
+        .filter_map(|(index, state)| (state.tail && !state.critical_context).then_some(index));
+    let advisory = states.iter().enumerate().filter_map(|(index, state)| {
+        (state.selected && !state.critical_context && !state.tail).then_some(index)
+    });
+    critical.chain(critical_context).chain(tail).chain(advisory)
 }
 
 fn looks_like_validation_command(command: &str) -> bool {
@@ -328,6 +364,57 @@ fn summarize_oversized_line(line: &str, max_bytes: usize) -> String {
     let tail_start = line.ceil_char_boundary(line.len().saturating_sub(tail_bytes));
     let tail = &line[tail_start..];
     format!("{head}{MARKER}{tail}")
+}
+
+#[cfg(test)]
+mod optimization_tests {
+    use super::*;
+
+    #[test]
+    fn summary_threshold_probe_traverses_lines_once_and_preserves_them() {
+        let at_threshold = "one\ntwo\nthree";
+        assert_eq!(collect_lines_for_summary(at_threshold, 128, 3), None);
+
+        let above_threshold = "one\ntwo\nthree\nfour";
+        assert_eq!(
+            collect_lines_for_summary(above_threshold, 128, 3),
+            Some(vec!["one", "two", "three", "four"])
+        );
+        assert_eq!(
+            collect_lines_for_summary("abcdef", 5, 20),
+            Some(vec!["abcdef"])
+        );
+    }
+
+    #[test]
+    fn line_classification_computes_all_signals_from_one_normalization() {
+        let classification = classify_line("  ERROR: warning; tests PASSED");
+        assert!(classification.critical);
+        assert!(classification.advisory);
+        assert!(classification.status);
+    }
+
+    #[test]
+    fn selection_flags_emit_each_index_once_in_priority_order() {
+        let lines = [
+            "warning: advisory",
+            "before",
+            "error: exact failure",
+            "after one",
+            "after two",
+            "after three",
+            "tail one",
+            "tail two",
+        ];
+        let states = select_line_states(&lines, true, true);
+        let ordered = ordered_line_indexes(&states).collect::<Vec<_>>();
+
+        assert_eq!(ordered, vec![2, 0, 1, 3, 4, 5, 6, 7]);
+        let mut sorted = ordered.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ordered.len());
+    }
 }
 
 #[cfg(test)]

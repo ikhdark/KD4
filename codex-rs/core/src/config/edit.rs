@@ -224,10 +224,8 @@ impl ConfigDocument {
             ConfigEdit::SetServiceTier { service_tier } => Ok(self.write_optional_value(
                 &["service_tier"],
                 service_tier.as_ref().map(|service_tier| {
-                    // Keep the legacy config spelling stable. Runtime values use
-                    // `priority`, but config.toml continues to store it as `fast`.
                     let config_value = match ServiceTier::from_request_value(service_tier) {
-                        Some(ServiceTier::Fast) => "fast",
+                        Some(ServiceTier::Fast) => "priority",
                         Some(ServiceTier::Flex) => "flex",
                         None => service_tier.as_str(),
                     };

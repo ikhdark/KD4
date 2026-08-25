@@ -160,7 +160,7 @@ impl AgentTaskCoordinator {
             .clone();
         let initialized_root_session_id = self
             .root_session_id
-            .get_or_init(|| async { root_session_id.clone() })
+            .get_or_init(|| std::future::ready(root_session_id.clone()))
             .await;
         if initialized_root_session_id != &root_session_id {
             return Err(StoreError::CorruptData(

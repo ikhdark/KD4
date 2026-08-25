@@ -9,6 +9,7 @@ use crate::session::turn_context::TurnContext;
 use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::WarningEvent;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 const MAX_RESPONSE_STREAM_RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -22,6 +23,7 @@ pub(crate) enum ResponsesStreamRequest {
 
 /// Handles a retryable stream error and returns `Ok(())` when the caller should
 /// retry the request loop.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_retryable_response_stream_error(
     retries: &mut u64,
     max_retries: u64,
@@ -30,6 +32,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
     sess: &Session,
     turn_context: &TurnContext,
     request: ResponsesStreamRequest,
+    cancellation_token: &CancellationToken,
 ) -> Result<(), CodexErr> {
     // Sampling requests have already exhausted the provider's request retry policy before a
     // transport timeout reaches this layer. Retrying it again as a stream failure multiplies
@@ -71,11 +74,21 @@ pub(crate) async fn handle_retryable_response_stream_error(
         )
         .await;
         let _retry_timing_guard = turn_context.turn_timing_state.begin_retry_backoff();
-        tokio::time::sleep(delay).await;
+        wait_for_retry_delay(delay, cancellation_token).await?;
         return Ok(());
     }
 
     Err(err)
+}
+
+async fn wait_for_retry_delay(
+    delay: Duration,
+    cancellation_token: &CancellationToken,
+) -> Result<(), CodexErr> {
+    tokio::select! {
+        _ = cancellation_token.cancelled() => Err(CodexErr::TurnAborted),
+        _ = tokio::time::sleep(delay) => Ok(()),
+    }
 }
 
 fn should_retry_response_stream(request: ResponsesStreamRequest, err: &CodexErr) -> bool {

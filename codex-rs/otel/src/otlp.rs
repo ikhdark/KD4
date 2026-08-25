@@ -1,22 +1,32 @@
 use crate::config::OtelTlsConfig;
+use codex_http_client::BlockingHttpClient;
+use codex_http_client::BlockingHttpClientBuilder;
+use codex_http_client::HttpClient;
+use codex_http_client::HttpClientBuilder;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use http::HeaderMap;
 use http::Uri;
+use http::header::HeaderName;
+use http::header::HeaderValue;
+use opentelemetry_http::Bytes;
+use opentelemetry_http::HttpClient as OtelHttpClient;
+use opentelemetry_http::HttpError as OtelHttpError;
+use opentelemetry_http::Request;
+use opentelemetry_http::Response;
 use opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT;
 use opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT;
 use opentelemetry_otlp::tonic_types::transport::Certificate as TonicCertificate;
 use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
 use opentelemetry_otlp::tonic_types::transport::Identity as TonicIdentity;
-use reqwest::Certificate as ReqwestCertificate;
-use reqwest::Identity as ReqwestIdentity;
-use reqwest::header::HeaderMap;
-use reqwest::header::HeaderName;
-use reqwest::header::HeaderValue;
 use std::env;
 use std::error::Error;
+use std::fmt;
 use std::fs;
+use std::future::Future;
 use std::io;
 use std::io::ErrorKind;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::time::Duration;
 
 pub(crate) fn build_header_map(headers: &std::collections::HashMap<String, String>) -> HeaderMap {
@@ -69,12 +79,12 @@ pub(crate) fn build_grpc_tls_config(
 
 /// Build a blocking HTTP client with TLS configuration for OTLP HTTP exporters.
 ///
-/// We use `reqwest::blocking::Client` because OTEL exporters run on dedicated
+/// We use the shared blocking facade because OTEL exporters run on dedicated
 /// OS threads that are not necessarily backed by tokio.
 pub(crate) fn build_http_client(
     tls: &OtelTlsConfig,
     timeout_var: &str,
-) -> Result<reqwest::blocking::Client, Box<dyn Error>> {
+) -> Result<OtlpBlockingHttpClient, Box<dyn Error>> {
     if current_tokio_runtime_is_multi_thread() {
         tokio::task::block_in_place(|| build_http_client_inner(tls, timeout_var))
     } else if tokio::runtime::Handle::try_current().is_ok() {
@@ -101,67 +111,180 @@ pub(crate) fn current_tokio_runtime_is_multi_thread() -> bool {
 fn build_http_client_inner(
     tls: &OtelTlsConfig,
     timeout_var: &str,
-) -> Result<reqwest::blocking::Client, Box<dyn Error>> {
-    let mut builder =
-        reqwest::blocking::Client::builder().timeout(resolve_otlp_timeout(timeout_var));
-    let ReqwestTlsMaterial {
+) -> Result<OtlpBlockingHttpClient, Box<dyn Error>> {
+    let mut builder = BlockingHttpClientBuilder::new().timeout(resolve_otlp_timeout(timeout_var));
+    let HttpTlsMaterial {
         ca_certificate,
         client_identity,
-    } = load_reqwest_tls_material(tls)?;
+    } = load_http_tls_material(tls)?;
 
-    if let Some(certificate) = ca_certificate {
-        builder = builder.tls_certs_only([certificate]);
+    if let Some(PemMaterial { bytes, location }) = ca_certificate {
+        builder = builder.tls_certs_only_pem(&bytes).map_err(|error| {
+            config_error(format!(
+                "failed to parse certificate {}: {error}",
+                location.display()
+            ))
+        })?;
     }
-    if let Some(identity) = client_identity {
-        builder = builder.identity(identity).https_only(true);
+    if let Some(ClientIdentityPem {
+        bytes,
+        certificate_location,
+        key_location,
+    }) = client_identity
+    {
+        builder = builder.identity_pem(&bytes).map_err(|error| {
+            config_error(format!(
+                "failed to parse client identity using {} and {}: {error}",
+                certificate_location.display(),
+                key_location.display()
+            ))
+        })?;
+        builder = builder.https_only(true);
     }
 
     builder
-        .build()
+        .build_with_transport_default_proxy()
+        .map(OtlpBlockingHttpClient)
         .map_err(|error| Box::new(error) as Box<dyn Error>)
 }
 
 pub(crate) fn build_async_http_client(
     tls: Option<&OtelTlsConfig>,
     timeout_var: &str,
-) -> Result<reqwest::Client, Box<dyn Error>> {
-    let mut builder = reqwest::Client::builder().timeout(resolve_otlp_timeout(timeout_var));
+) -> Result<OtlpAsyncHttpClient, Box<dyn Error>> {
+    let mut builder = HttpClientBuilder::new().timeout(resolve_otlp_timeout(timeout_var));
 
     if let Some(tls) = tls {
-        let ReqwestTlsMaterial {
+        let HttpTlsMaterial {
             ca_certificate,
             client_identity,
-        } = load_reqwest_tls_material(tls)?;
-        if let Some(certificate) = ca_certificate {
-            builder = builder.tls_certs_only([certificate]);
-        }
-        if let Some(identity) = client_identity {
-            builder = builder.identity(identity).https_only(true);
-        }
-    }
-
-    builder
-        .build()
-        .map_err(|error| Box::new(error) as Box<dyn Error>)
-}
-
-struct ReqwestTlsMaterial {
-    ca_certificate: Option<ReqwestCertificate>,
-    client_identity: Option<ReqwestIdentity>,
-}
-
-fn load_reqwest_tls_material(tls: &OtelTlsConfig) -> Result<ReqwestTlsMaterial, Box<dyn Error>> {
-    let ca_certificate = tls
-        .ca_certificate
-        .as_ref()
-        .map(|path| {
-            let (pem, location) = read_bytes(path)?;
-            ReqwestCertificate::from_pem(pem.as_slice()).map_err(|error| {
+        } = load_http_tls_material(tls)?;
+        if let Some(PemMaterial { bytes, location }) = ca_certificate {
+            builder = builder.tls_certs_only_pem(&bytes).map_err(|error| {
                 config_error(format!(
                     "failed to parse certificate {}: {error}",
                     location.display()
                 ))
-            })
+            })?;
+        }
+        if let Some(ClientIdentityPem {
+            bytes,
+            certificate_location,
+            key_location,
+        }) = client_identity
+        {
+            builder = builder.identity_pem(&bytes).map_err(|error| {
+                config_error(format!(
+                    "failed to parse client identity using {} and {}: {error}",
+                    certificate_location.display(),
+                    key_location.display()
+                ))
+            })?;
+            builder = builder.https_only(true);
+        }
+    }
+
+    builder
+        .build_with_transport_default_proxy()
+        .map(OtlpAsyncHttpClient)
+        .map_err(|error| Box::new(error) as Box<dyn Error>)
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct OtlpAsyncHttpClient(HttpClient);
+
+pub(crate) struct OtlpBlockingHttpClient(BlockingHttpClient);
+
+impl fmt::Debug for OtlpBlockingHttpClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OtlpBlockingHttpClient")
+    }
+}
+
+impl OtelHttpClient for OtlpAsyncHttpClient {
+    fn send_bytes<'life0, 'async_trait>(
+        &'life0 self,
+        request: Request<Bytes>,
+    ) -> Pin<Box<dyn Future<Output = Result<Response<Bytes>, OtelHttpError>> + Send + 'async_trait>>
+    where
+        Self: 'async_trait,
+        'life0: 'async_trait,
+    {
+        Box::pin(async move {
+            let (parts, body) = request.into_parts();
+            let response = self
+                .0
+                .request(parts.method, parts.uri.to_string())
+                .headers(parts.headers)
+                .body(body)
+                .send()
+                .await?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(format!("request failed with status {status}").into());
+            }
+            let headers = response.headers().clone();
+            let body = response.bytes().await?;
+            let mut response = Response::builder().status(status).body(body)?;
+            *response.headers_mut() = headers;
+            Ok(response)
+        })
+    }
+}
+
+impl OtelHttpClient for OtlpBlockingHttpClient {
+    fn send_bytes<'life0, 'async_trait>(
+        &'life0 self,
+        request: Request<Bytes>,
+    ) -> Pin<Box<dyn Future<Output = Result<Response<Bytes>, OtelHttpError>> + Send + 'async_trait>>
+    where
+        Self: 'async_trait,
+        'life0: 'async_trait,
+    {
+        Box::pin(async move {
+            let (parts, body) = request.into_parts();
+            let response = self
+                .0
+                .request(parts.method, parts.uri.to_string())
+                .headers(parts.headers)
+                .body(body.to_vec())
+                .send()?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(format!("request failed with status {status}").into());
+            }
+            let headers = response.headers().clone();
+            let body = response.bytes()?;
+            let mut response = Response::builder().status(status).body(body)?;
+            *response.headers_mut() = headers;
+            Ok(response)
+        })
+    }
+}
+
+struct HttpTlsMaterial {
+    ca_certificate: Option<PemMaterial>,
+    client_identity: Option<ClientIdentityPem>,
+}
+
+struct PemMaterial {
+    bytes: Vec<u8>,
+    location: PathBuf,
+}
+
+struct ClientIdentityPem {
+    bytes: Vec<u8>,
+    certificate_location: PathBuf,
+    key_location: PathBuf,
+}
+
+fn load_http_tls_material(tls: &OtelTlsConfig) -> Result<HttpTlsMaterial, Box<dyn Error>> {
+    let ca_certificate = tls
+        .ca_certificate
+        .as_ref()
+        .map(|path| {
+            let (bytes, location) = read_bytes(path)?;
+            Ok::<_, Box<dyn Error>>(PemMaterial { bytes, location })
         })
         .transpose()?;
 
@@ -170,15 +293,11 @@ fn load_reqwest_tls_material(tls: &OtelTlsConfig) -> Result<ReqwestTlsMaterial, 
             let (mut cert_pem, cert_location) = read_bytes(cert_path)?;
             let (key_pem, key_location) = read_bytes(key_path)?;
             cert_pem.extend_from_slice(key_pem.as_slice());
-            Some(
-                ReqwestIdentity::from_pem(cert_pem.as_slice()).map_err(|error| {
-                    config_error(format!(
-                        "failed to parse client identity using {} and {}: {error}",
-                        cert_location.display(),
-                        key_location.display()
-                    ))
-                })?,
-            )
+            Some(ClientIdentityPem {
+                bytes: cert_pem,
+                certificate_location: cert_location,
+                key_location,
+            })
         }
         (Some(_), None) | (None, Some(_)) => {
             return Err(config_error(
@@ -188,7 +307,7 @@ fn load_reqwest_tls_material(tls: &OtelTlsConfig) -> Result<ReqwestTlsMaterial, 
         (None, None) => None,
     };
 
-    Ok(ReqwestTlsMaterial {
+    Ok(HttpTlsMaterial {
         ca_certificate,
         client_identity,
     })
@@ -231,7 +350,69 @@ fn config_error(message: impl Into<String>) -> Box<dyn Error> {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use std::io::Read;
+    use std::io::Write;
+    use std::net::TcpListener;
     use tokio::runtime::Builder;
+
+    fn spawn_http_response_server() -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
+        let address = listener.local_addr().expect("test listener address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("test request should connect");
+            let mut request = [0_u8; 4096];
+            let bytes_read = stream.read(&mut request).expect("test request should read");
+            let request = String::from_utf8_lossy(&request[..bytes_read]);
+            assert!(request.starts_with("POST /v1/traces HTTP/1.1"));
+            assert!(request.to_ascii_lowercase().contains("x-otel-test: shared"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nx-otel-response: ok\r\n\r\nok")
+                .expect("test response should write");
+        });
+        (format!("http://{address}/v1/traces"), server)
+    }
+
+    #[tokio::test]
+    async fn async_otlp_adapter_sends_through_shared_client() {
+        let (url, server) = spawn_http_response_server();
+        let client = OtlpAsyncHttpClient(
+            HttpClientBuilder::new()
+                .build_direct()
+                .expect("shared async client"),
+        );
+        let request = Request::post(url)
+            .header("x-otel-test", "shared")
+            .body(Bytes::from_static(b"payload"))
+            .expect("OTLP request");
+
+        let response = client.send_bytes(request).await.expect("OTLP response");
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(response.headers()["x-otel-response"], "ok");
+        assert_eq!(response.body(), &Bytes::from_static(b"ok"));
+        server.join().expect("test server should finish");
+    }
+
+    #[tokio::test]
+    async fn blocking_otlp_adapter_sends_through_shared_client() {
+        let (url, server) = spawn_http_response_server();
+        let client = OtlpBlockingHttpClient(
+            BlockingHttpClientBuilder::new()
+                .build_direct()
+                .expect("shared blocking client"),
+        );
+        let request = Request::post(url)
+            .header("x-otel-test", "shared")
+            .body(Bytes::from_static(b"payload"))
+            .expect("OTLP request");
+
+        let response = client.send_bytes(request).await.expect("OTLP response");
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(response.headers()["x-otel-response"], "ok");
+        assert_eq!(response.body(), &Bytes::from_static(b"ok"));
+        server.join().expect("test server should finish");
+    }
 
     #[test]
     fn current_tokio_runtime_is_multi_thread_detects_runtime_flavor() {
@@ -306,7 +487,7 @@ mod tests {
     }
 
     #[test]
-    fn reqwest_tls_material_rejects_unpaired_client_credentials() {
+    fn http_tls_material_rejects_unpaired_client_credentials() {
         let client_certificate = AbsolutePathBuf::try_from(
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("unused-client-cert.pem"),
         )
@@ -316,7 +497,7 @@ mod tests {
             ..OtelTlsConfig::default()
         };
 
-        let error = load_reqwest_tls_material(&tls)
+        let error = load_http_tls_material(&tls)
             .err()
             .expect("unpaired client credentials should fail");
 

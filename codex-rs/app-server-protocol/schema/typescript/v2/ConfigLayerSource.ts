@@ -25,7 +25,7 @@ name: string, } | { "type": "user",
  */
 file: AbsolutePathBuf,
 /**
- * Name of the selected profile-v2 config layered on top of the base
+ * Name of the selected profile config layered on top of the base
  * user config, when this layer represents one.
  */
 profile: string | null, } | { "type": "project", dotCodexFolder: AbsolutePathBuf, } | { "type": "sessionFlags" } | { "type": "legacyManagedConfigTomlFromFile", file: AbsolutePathBuf, } | { "type": "legacyManagedConfigTomlFromMdm" };

@@ -1180,7 +1180,8 @@ impl OutgoingMessageSender {
             .is_err()
         {
             self.delivery_shutdown.cancel();
-            self.delivery_tasks.wait().await;
+            let _ = tokio::time::timeout(TURN_DELIVERY_SHUTDOWN_GRACE, self.delivery_tasks.wait())
+                .await;
         }
     }
 

@@ -3,6 +3,13 @@ use crate::config::edit::ConfigEditsBuilder;
 use crate::config::edit::apply_blocking;
 use assert_matches::assert_matches;
 use codex_config::CONFIG_TOML_FILE;
+
+#[test]
+fn core_config_module_reexports_the_config_crate_filename_owner() {
+    let source = include_str!("mod.rs");
+    assert!(source.contains("pub use codex_config::CONFIG_TOML_FILE;"));
+    assert!(!source.contains("pub const CONFIG_TOML_FILE"));
+}
 use codex_config::ConfigLayerEntry;
 use codex_config::ConfigLayerSource;
 use codex_config::ConfigLayerStack;
@@ -5384,7 +5391,7 @@ async fn canonical_feature_toggle_loads() -> std::io::Result<()> {
 
     assert!(config.features.enabled(Feature::UnifiedExec));
 
-    assert!(config.use_experimental_unified_exec_tool);
+    assert!(config.unified_exec_enabled);
 
     Ok(())
 }
@@ -6799,15 +6806,24 @@ model = "gpt-4.1"
         .await?;
 
     let serialized = tokio::fs::read_to_string(config_path).await?;
-    let parsed: ConfigToml = toml::from_str(&serialized)?;
+    let parsed: toml::Value = toml::from_str(&serialized)?;
 
-    assert_eq!(parsed.model.as_deref(), Some("o4-mini"));
-    assert_eq!(parsed.model_reasoning_effort, Some(ReasoningEffort::High));
+    assert_eq!(
+        parsed.get("model").and_then(toml::Value::as_str),
+        Some("o4-mini")
+    );
     assert_eq!(
         parsed
-            .profiles
-            .get("dev")
-            .and_then(|profile| profile.model.as_deref()),
+            .get("model_reasoning_effort")
+            .and_then(toml::Value::as_str),
+        Some("high")
+    );
+    assert_eq!(
+        parsed
+            .get("profiles")
+            .and_then(|profiles| profiles.get("dev"))
+            .and_then(|profile| profile.get("model"))
+            .and_then(toml::Value::as_str),
         Some("gpt-4.1"),
     );
 
@@ -8254,62 +8270,6 @@ websocket_connect_timeout_ms = 15000
 }
 
 #[tokio::test]
-async fn legacy_profile_selection_is_rejected() -> std::io::Result<()> {
-    let mut fixture = create_test_fixture()?;
-    fixture.cfg.profile = Some("gpt3".to_string());
-
-    let err = Config::load_from_base_config_with_overrides(
-        fixture.cfg.clone(),
-        ConfigOverrides {
-            cwd: Some(fixture.cwd_path()),
-            ..Default::default()
-        },
-        fixture.codex_home(),
-    )
-    .await
-    .expect_err("legacy profile selection should be rejected");
-
-    assert_eq!(err.kind(), ErrorKind::InvalidData);
-    assert!(
-        err.to_string()
-            .contains("legacy `profile = \"gpt3\"` config is no longer supported"),
-        "unexpected error: {err}"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn legacy_profile_tables_are_rejected() -> std::io::Result<()> {
-    let mut fixture = create_test_fixture()?;
-    fixture.cfg = toml::from_str(
-        r#"
-[profiles.work]
-model = "gpt-work"
-"#,
-    )
-    .expect("TOML deserialization should succeed");
-
-    let err = Config::load_from_base_config_with_overrides(
-        fixture.cfg.clone(),
-        ConfigOverrides {
-            cwd: Some(fixture.cwd_path()),
-            ..Default::default()
-        },
-        fixture.codex_home(),
-    )
-    .await
-    .expect_err("legacy profile tables should be rejected");
-
-    assert_eq!(err.kind(), ErrorKind::InvalidData);
-    assert!(
-        err.to_string()
-            .contains("legacy `profiles` config tables are no longer supported"),
-        "unexpected error: {err}"
-    );
-    Ok(())
-}
-
-#[tokio::test]
 async fn metrics_exporter_defaults_to_statsig_when_missing() -> std::io::Result<()> {
     let fixture = create_test_fixture()?;
 
@@ -8519,14 +8479,14 @@ async fn default_service_tier_override_uses_default_request_value() -> std::io::
 }
 
 #[tokio::test]
-async fn legacy_fast_service_tier_override_uses_priority_request_value() -> std::io::Result<()> {
+async fn priority_service_tier_override_uses_priority_request_value() -> std::io::Result<()> {
     let fixture = create_test_fixture()?;
 
     let config = Config::load_from_base_config_with_overrides(
         fixture.cfg.clone(),
         ConfigOverrides {
             cwd: Some(fixture.cwd_path()),
-            service_tier: Some(Some("fast".to_string())),
+            service_tier: Some(Some("priority".to_string())),
             ..Default::default()
         },
         fixture.codex_home(),
@@ -8584,30 +8544,6 @@ async fn config_toml_service_tier_accepts_arbitrary_string() -> std::io::Result<
     assert_eq!(
         config.service_tier,
         Some("experimental-tier-id".to_string())
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn config_toml_legacy_fast_service_tier_uses_priority_request_value() -> std::io::Result<()> {
-    let mut fixture = create_test_fixture()?;
-    fixture.cfg.service_tier = Some("fast".to_string());
-    let cwd = fixture.cwd_path();
-    let codex_home = fixture.codex_home();
-
-    let config = Config::load_from_base_config_with_overrides(
-        fixture.cfg,
-        ConfigOverrides {
-            cwd: Some(cwd),
-            ..Default::default()
-        },
-        codex_home,
-    )
-    .await?;
-
-    assert_eq!(
-        config.service_tier,
-        Some(ServiceTier::Fast.request_value().to_string())
     );
     Ok(())
 }

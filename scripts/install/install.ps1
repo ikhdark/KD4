@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$Release = $env:CODEX_RELEASE,
-    [string]$ReleaseRepository = $env:CODEX_RELEASE_REPOSITORY
+    [string]$ReleaseRepository = $env:CODEX_RELEASE_REPOSITORY,
+    [switch]$Uninstall
 )
 
 Set-StrictMode -Version Latest
@@ -169,13 +170,26 @@ function Get-ReleaseAssetMetadata {
     return $metadata
 }
 
+function Get-FileSha256 {
+    param([string]$Path)
+
+    $stream = [IO.File]::OpenRead($Path)
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($sha256.ComputeHash($stream))).Replace("-", "").ToLowerInvariant()
+    } finally {
+        $sha256.Dispose()
+        $stream.Dispose()
+    }
+}
+
 function Test-ArchiveDigest {
     param(
         [string]$ArchivePath,
         [string]$ExpectedDigest
     )
 
-    $actualDigest = (Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $actualDigest = Get-FileSha256 -Path $ArchivePath
     if ($actualDigest -ne $ExpectedDigest) {
         throw "Downloaded Codex archive checksum did not match expected digest. Expected $ExpectedDigest but got $actualDigest."
     }
@@ -232,6 +246,28 @@ function Prepend-PathEntry {
     }
 
     return ($segments -join ";")
+}
+
+function Remove-PathEntry {
+    param(
+        [string]$PathValue,
+        [string]$Entry
+    )
+
+    if ([string]::IsNullOrWhiteSpace($PathValue)) {
+        return $PathValue
+    }
+    $needle = $Entry.TrimEnd("\")
+    return (@($PathValue.Split(";", [System.StringSplitOptions]::RemoveEmptyEntries) |
+        Where-Object { $_.TrimEnd("\") -ine $needle }) -join ";")
+}
+
+function Get-NativeTarCommand {
+    $command = Get-Command tar.exe -CommandType Application -ErrorAction SilentlyContinue
+    if ($null -eq $command -or [string]::IsNullOrWhiteSpace($command.Source)) {
+        throw "The standalone installer requires Windows tar.exe, but it was not found on PATH."
+    }
+    return $command.Source
 }
 
 function Invoke-WithInstallLock {
@@ -649,6 +685,37 @@ function Restore-JunctionSnapshot {
     }
 }
 
+function Get-PeMachine {
+    param([string]$Path)
+
+    $stream = $null
+    $reader = $null
+    try {
+        $stream = [IO.File]::OpenRead($Path)
+        $reader = [IO.BinaryReader]::new($stream)
+        if ($stream.Length -lt 64 -or $reader.ReadUInt16() -ne 0x5A4D) {
+            return $null
+        }
+        $stream.Position = 0x3C
+        $peOffset = $reader.ReadUInt32()
+        if ($peOffset -gt $stream.Length - 6) {
+            return -1
+        }
+        $stream.Position = $peOffset
+        if ($reader.ReadUInt32() -ne 0x00004550) {
+            return -1
+        }
+        return [int]$reader.ReadUInt16()
+    }
+    catch {
+        return -1
+    }
+    finally {
+        if ($null -ne $reader) { $reader.Dispose() }
+        elseif ($null -ne $stream) { $stream.Dispose() }
+    }
+}
+
 function Test-PackageContentsAreComplete {
     param(
         [string]$PackageDir,
@@ -660,17 +727,18 @@ function Test-PackageContentsAreComplete {
         return $false
     }
 
-    $expectedFiles = @(
-        "codex-package.json",
+    $requiredFiles = @(
         "bin\codex.exe",
         "bin\codex-code-mode-host.exe",
         "codex-path\apply_patch.bat",
         "codex-path\applypatch.bat",
         "codex-path\rg.exe",
         "codex-resources\codex-command-runner.exe",
-        "codex-resources\codex-windows-sandbox-setup.exe"
+        "codex-resources\codex-windows-sandbox-setup.exe",
+        "LICENSE",
+        "NOTICE"
     )
-    foreach ($name in $expectedFiles) {
+    foreach ($name in $requiredFiles) {
         if (-not (Test-Path -LiteralPath (Join-Path $PackageDir $name) -PathType Leaf)) {
             return $false
         }
@@ -682,7 +750,7 @@ function Test-PackageContentsAreComplete {
         return $false
     }
     $expectedMetadata = @{
-        layoutVersion = 1
+        layoutVersion = 2
         version = $ExpectedVersion
         target = $ExpectedTarget
         variant = "codex"
@@ -697,7 +765,113 @@ function Test-PackageContentsAreComplete {
         }
     }
 
+    if (
+        $metadata.bundleId -cnotmatch "^[0-9a-f]{64}$" -or
+        $null -eq $metadata.files -or
+        @($metadata.files).Count -eq 0 -or
+        $null -eq $metadata.buildIdentity
+    ) {
+        return $false
+    }
+
+    $declared = @{}
+    $canonicalInventory = @()
+    $expectedMachine = switch ($ExpectedTarget) {
+        "x86_64-pc-windows-msvc" { 0x8664 }
+        "aarch64-pc-windows-msvc" { 0xAA64 }
+        default { return $false }
+    }
+    foreach ($file in @($metadata.files)) {
+        foreach ($propertyName in @("path", "role", "size", "sha256")) {
+            if ($null -eq $file.PSObject.Properties[$propertyName]) {
+                return $false
+            }
+        }
+        $relative = [string]$file.path
+        if ([string]::IsNullOrWhiteSpace($relative) -or $relative.StartsWith("/") -or
+            $relative.StartsWith("\") -or $relative -match "(^|[\\/])\.\.([\\/]|$)" -or
+            $declared.ContainsKey($relative)) {
+            return $false
+        }
+        $nativeRelative = $relative.Replace("/", [IO.Path]::DirectorySeparatorChar)
+        $path = Join-Path $PackageDir $nativeRelative
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            return $false
+        }
+        $item = Get-Item -LiteralPath $path
+        $digest = Get-FileSha256 -Path $path
+        if ([long]$file.size -ne $item.Length -or [string]$file.sha256 -cne $digest) {
+            return $false
+        }
+        if ($relative.EndsWith(".exe", [StringComparison]::OrdinalIgnoreCase)) {
+            $machine = Get-PeMachine -Path $path
+            if ($null -ne $machine -and $machine -ne $expectedMachine) {
+                return $false
+            }
+        }
+        $declared[$relative] = $true
+        $canonicalInventory += [ordered]@{
+            path = $relative
+            role = [string]$file.role
+            sha256 = [string]$file.sha256
+            size = [long]$file.size
+        }
+    }
+
+    $canonicalJson = ConvertTo-Json -InputObject @($canonicalInventory) -Compress -Depth 4
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bundleBytes = [Text.Encoding]::UTF8.GetBytes($canonicalJson)
+        $expectedBundleId = ([BitConverter]::ToString($sha256.ComputeHash($bundleBytes))).Replace("-", "").ToLowerInvariant()
+    } finally {
+        $sha256.Dispose()
+    }
+    if ([string]$metadata.bundleId -cne $expectedBundleId) {
+        return $false
+    }
+
+    $actual = @{}
+    $packageRoot = [IO.Path]::GetFullPath($PackageDir).TrimEnd("\") + "\"
+    foreach ($file in Get-ChildItem -LiteralPath $PackageDir -File -Recurse) {
+        if ($file.Name -in @("codex-package.json", $InstallMetadataFile)) {
+            continue
+        }
+        $relative = $file.FullName.Substring($packageRoot.Length).Replace("\", "/")
+        $actual[$relative] = $true
+    }
+    if ($actual.Count -ne $declared.Count) {
+        return $false
+    }
+    foreach ($relative in $actual.Keys) {
+        if (-not $declared.ContainsKey($relative)) {
+            return $false
+        }
+    }
+
     return $true
+}
+
+function Remove-OldCompletedReleases {
+    param(
+        [string]$ReleasesDir,
+        [string]$ActiveReleaseDir,
+        [int]$RetainPrevious = 2
+    )
+
+    if (-not (Test-Path -LiteralPath $ReleasesDir -PathType Container)) {
+        return
+    }
+    $active = [IO.Path]::GetFullPath($ActiveReleaseDir)
+    $previous = @(Get-ChildItem -LiteralPath $ReleasesDir -Directory |
+        Where-Object {
+            -not $_.Name.StartsWith(".") -and
+            $_.FullName -ine $active -and
+            (Test-Path -LiteralPath (Join-Path $_.FullName $InstallMetadataFile) -PathType Leaf)
+        } |
+        Sort-Object LastWriteTimeUtc -Descending)
+    foreach ($release in @($previous | Select-Object -Skip $RetainPrevious)) {
+        Remove-Item -LiteralPath $release.FullName -Recurse -Force
+    }
 }
 
 function Write-InstallMetadata {
@@ -709,13 +883,20 @@ function Write-InstallMetadata {
     )
 
     $metadataPath = Join-Path $ReleaseDir $InstallMetadataFile
-    $tmpMetadataPath = "$metadataPath.$PID"
-    @(
-        "version=$ResolvedVersion"
-        "target=$Target"
-        "layout=$Layout"
-    ) | Set-Content -LiteralPath $tmpMetadataPath -Encoding UTF8
-    Move-Item -LiteralPath $tmpMetadataPath -Destination $metadataPath -Force
+    $tmpMetadataPath = "$metadataPath.$PID.$([Guid]::NewGuid().ToString('N')).tmp"
+    try {
+        @(
+            "version=$ResolvedVersion"
+            "target=$Target"
+            "layout=$Layout"
+        ) | Set-Content -LiteralPath $tmpMetadataPath -Encoding UTF8
+        Move-Item -LiteralPath $tmpMetadataPath -Destination $metadataPath -Force
+    }
+    finally {
+        if (Test-Path -LiteralPath $tmpMetadataPath -PathType Leaf) {
+            Remove-Item -LiteralPath $tmpMetadataPath -Force
+        }
+    }
 }
 
 function Get-InstallMetadataField {
@@ -812,12 +993,13 @@ function Get-ConflictingInstall {
     )
 
     $existingPath = Get-ExistingCodexCommand
-    $manager = Get-ExistingCodexManager -ExistingPath $existingPath -VisibleBinDir $VisibleBinDir
-    if ($null -eq $manager) {
+    if ([string]::IsNullOrWhiteSpace($existingPath) -or
+        (Test-PathIsEqualOrDescendant -CandidatePath $existingPath -RootPath $VisibleBinDir)) {
         return $null
     }
-
-    Write-Step "Detected existing $manager-managed Codex at $existingPath"
+    $manager = Get-ExistingCodexManager -ExistingPath $existingPath -VisibleBinDir $VisibleBinDir
+    $managerLabel = if ($null -eq $manager) { "externally managed" } else { "$manager-managed" }
+    Write-Step "Detected existing $managerLabel Codex at $existingPath"
     Write-WarningStep "Multiple managed Codex installs can be ambiguous because PATH order decides which one runs."
 
     return [PSCustomObject]@{
@@ -836,6 +1018,11 @@ function Maybe-HandleConflictingInstall {
     }
 
     $manager = $Conflict.Manager
+
+    if ($null -eq $manager) {
+        Write-WarningStep "Leaving the externally managed Codex installed. The standalone install directory will be placed first on PATH."
+        return
+    }
 
     $uninstallArgs = if ($manager -eq "bun") {
         @("remove", "-g", "@openai/codex")
@@ -914,6 +1101,37 @@ if ([string]::IsNullOrWhiteSpace($env:CODEX_INSTALL_DIR)) {
 }
 
 $currentVersion = Get-CurrentInstalledVersion -StandaloneCurrentDir $currentDir
+
+if ($Uninstall) {
+    Invoke-WithInstallLock -LockPath $lockPath -Script {
+        if (Test-IsJunction -Path $visibleBinDir) {
+            $visibleTarget = [string](Get-Item -LiteralPath $visibleBinDir -Force).Target
+            if (-not (Test-PathIsEqualOrDescendant -CandidatePath $visibleTarget -RootPath $standaloneRoot)) {
+                throw "Refusing to remove a visible bin junction not owned by this installer: $visibleBinDir"
+            }
+            Remove-Item -LiteralPath $visibleBinDir -Force
+        } elseif (Test-Path -LiteralPath $visibleBinDir) {
+            throw "Refusing to remove a non-junction visible bin path: $visibleBinDir"
+        }
+        foreach ($ownedPath in @($currentDir, $releasesDir)) {
+            if (Test-Path -LiteralPath $ownedPath) {
+                Remove-Item -LiteralPath $ownedPath -Recurse -Force
+            }
+        }
+    }
+    if (Test-Path -LiteralPath $standaloneRoot) {
+        Remove-Item -LiteralPath $standaloneRoot -Recurse -Force
+    }
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $newUserPath = Remove-PathEntry -PathValue $userPath -Entry $visibleBinDir
+    if ($newUserPath -cne $userPath) {
+        [Environment]::SetEnvironmentVariable("Path", $newUserPath, "User")
+    }
+    Write-Host "Codex CLI standalone installation removed successfully."
+    exit 0
+}
+
+$tarCommand = Get-NativeTarCommand
 $resolvedVersion = Resolve-Version
 $releaseName = "$resolvedVersion-$target"
 $releaseDir = Join-Path $releasesDir $releaseName
@@ -967,7 +1185,7 @@ try {
                 Remove-Item -LiteralPath $stagingDir -Recurse -Force
             }
             New-Item -ItemType Directory -Force -Path $stagingDir | Out-Null
-            tar -xzf $archivePath -C $stagingDir
+            & $tarCommand -xzf $archivePath -C $stagingDir
             if (-not (Test-PackageContentsAreComplete -PackageDir $stagingDir -ExpectedVersion $resolvedVersion -ExpectedTarget $target)) {
                 throw "Downloaded Codex package archive did not contain the expected package layout."
             }
@@ -980,10 +1198,25 @@ try {
 
             Write-InstallMetadata -ReleaseDir $stagingDir -ResolvedVersion $resolvedVersion -Target $target -Layout $installLayout
 
+            $repairBackup = $null
             if (Test-Path -LiteralPath $releaseDir) {
-                Remove-Item -LiteralPath $releaseDir -Recurse -Force
+                $repairBackup = Join-Path $releasesDir ".repair-backup.$releaseName.$PID"
+                if (Test-Path -LiteralPath $repairBackup) {
+                    Remove-Item -LiteralPath $repairBackup -Recurse -Force
+                }
+                Move-Item -LiteralPath $releaseDir -Destination $repairBackup
             }
-            Move-Item -LiteralPath $stagingDir -Destination $releaseDir
+            try {
+                Move-Item -LiteralPath $stagingDir -Destination $releaseDir
+            } catch {
+                if ($null -ne $repairBackup -and (Test-Path -LiteralPath $repairBackup) -and -not (Test-Path -LiteralPath $releaseDir)) {
+                    Move-Item -LiteralPath $repairBackup -Destination $releaseDir
+                }
+                throw
+            }
+            if ($null -ne $repairBackup -and (Test-Path -LiteralPath $repairBackup)) {
+                Remove-Item -LiteralPath $repairBackup -Recurse -Force
+            }
         }
 
         $currentSnapshot = Get-JunctionSnapshot -Path $currentDir
@@ -1015,6 +1248,7 @@ try {
         if ($null -ne $oldStandaloneBackup) {
             Remove-Item -LiteralPath $oldStandaloneBackup -Recurse -Force
         }
+        Remove-OldCompletedReleases -ReleasesDir $releasesDir -ActiveReleaseDir $releaseDir
     }
 } finally {
     Remove-Item -Recurse -Force $tempDir -ErrorAction SilentlyContinue

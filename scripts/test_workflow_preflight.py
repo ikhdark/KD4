@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 from scripts import workflow_preflight
 
@@ -142,6 +143,14 @@ class WorkflowPreflightTest(unittest.TestCase):
         self.assertTrue(
             workflow_preflight.claims_overlap(left, right, case_insensitive=True)
         )
+
+    def test_case_detection_reports_case_sensitive_when_alias_is_absent(
+        self,
+    ) -> None:
+        with mock.patch.object(Path, "exists", return_value=False):
+            self.assertFalse(
+                workflow_preflight.repository_paths_are_case_insensitive(self.repo)
+            )
 
     def test_workspace_fingerprint_hashes_dirty_content_not_only_status_shape(
         self,

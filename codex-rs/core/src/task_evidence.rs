@@ -1,5 +1,3 @@
-use chrono::DateTime;
-use chrono::Duration as ChronoDuration;
 use chrono::Utc;
 use codex_agent_task_store::WorkspaceManifestEntry;
 use codex_config::schema::canonicalize as canonicalize_json;
@@ -55,16 +53,9 @@ use crate::plan_store::PlanUpdateEffect;
 use crate::terminal_event_fingerprint;
 use crate::turn_diff_tracker::CommandMutation;
 
-mod desktop_activation;
 mod external_evidence;
 mod source_owner_index;
 
-pub use desktop_activation::DesktopActivationChallenge;
-pub use desktop_activation::DesktopActivationObligation;
-pub use desktop_activation::DesktopActivationRecordObservation;
-pub use desktop_activation::DesktopActivationRecordResult;
-pub use desktop_activation::DesktopActivationVerificationError;
-pub use desktop_activation::DesktopPublishInstallEvidenceV1;
 use external_evidence::EvidenceCompleteness;
 use external_evidence::canonical_mcp_result_payload;
 use external_evidence::encode_external_evidence_artifact;
@@ -108,13 +99,6 @@ const USER_SOURCE_LEDGER_CANONICAL_FORMAT: &str = "KD4_USER_SOURCE_LEDGER_CANONI
 const REQUIREMENT_MANIFEST_CANONICAL_FORMAT: &str = "KD4_REQUIREMENT_MANIFEST_CANONICAL_V1";
 const IMPLEMENTATION_IDENTITY_CANONICAL_FORMAT: &str = "KD4_IMPLEMENTATION_IDENTITY_CANONICAL_V1";
 const DOSSIER_SNAPSHOT_CANONICAL_FORMAT: &str = "KD4_DOSSIER_SNAPSHOT_CANONICAL_V1";
-const DESKTOP_INSTALL_EVIDENCE_CANONICAL_FORMAT: &str = "KD4_DESKTOP_INSTALL_EVIDENCE_CANONICAL_V1";
-const DESKTOP_ACTIVATION_CHALLENGE_CANONICAL_FORMAT: &str =
-    "KD4_DESKTOP_ACTIVATION_CHALLENGE_CANONICAL_V1";
-const DESKTOP_ACTIVATION_RECEIPT_CANONICAL_FORMAT: &str =
-    "KD4_DESKTOP_ACTIVATION_RECEIPT_CANONICAL_V1";
-const DESKTOP_INSTALL_EVIDENCE_SCHEMA_VERSION: u32 = 1;
-const DESKTOP_ACTIVATION_CHALLENGE_TTL_SECONDS: i64 = 120;
 const REPAIR_INSTRUCTION_CANONICAL_FORMAT: &str = "KD4_REPAIR_INSTRUCTION_CANONICAL_V1";
 const REPAIR_BASELINE_CANONICAL_FORMAT: &str = "KD4_REPAIR_BASELINE_CANONICAL_V1";
 const REPAIR_DELTA_CANONICAL_FORMAT: &str = "KD4_REPAIR_DELTA_CANONICAL_V1";
@@ -195,12 +179,8 @@ pub(crate) struct PlanningFactInput {
     pub(crate) source: Option<String>,
     #[serde(default)]
     pub(crate) depends_on_paths: Vec<String>,
-    #[serde(default = "planning_fact_dependencies_current_default")]
+    #[serde(default)]
     pub(crate) dependencies_current: bool,
-}
-
-const fn planning_fact_dependencies_current_default() -> bool {
-    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -677,7 +657,6 @@ pub(crate) struct TaskEvidenceLedger {
     freshness_state: Arc<std::sync::Mutex<FreshnessState>>,
     last_persisted_revision: Arc<AtomicU64>,
     source_capture_failed: Arc<AtomicBool>,
-    desktop_activation: DesktopActivationAttestationService,
     #[cfg(test)]
     persistence_test_control: Arc<std::sync::Mutex<Option<PersistenceTestControl>>>,
 }
@@ -813,7 +792,6 @@ struct TaskEvidenceDocument {
     latest_generated_artifact_hashes: BTreeMap<String, FileHashSnapshot>,
     latest_file_hashes: BTreeMap<String, FileHashSnapshot>,
     risks: Vec<EvidenceRisk>,
-    desktop_activation_receipt: Option<DesktopActivationReceipt>,
     #[serde(default = "initial_receipt_sequence")]
     next_edit_receipt_sequence: u64,
     #[serde(default = "initial_receipt_sequence")]
@@ -1968,7 +1946,6 @@ struct EvidencePlanStep {
     runtime_paths: Vec<String>,
     generated_artifacts: Vec<String>,
     risks: Vec<String>,
-    requires_desktop_activation: bool,
     #[serde(default)]
     validation_route: Option<ValidationRoute>,
     #[serde(default)]
@@ -2284,476 +2261,6 @@ struct EvidenceRisk {
     blocking: bool,
     resolved: bool,
     epoch: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct DesktopActivationReceipt {
-    #[serde(default)]
-    trusted_producer_version: u32,
-    #[serde(default)]
-    publisher_evidence_id: String,
-    #[serde(default)]
-    thread_id: String,
-    epoch: u64,
-    #[serde(default)]
-    activation_obligation_identity: String,
-    #[serde(default, alias = "recorded_at")]
-    activation_timestamp: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    process_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    binary_sha1: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    runtime_evidence: Option<String>,
-    #[serde(default)]
-    expected_installed_executable_path: String,
-    #[serde(default)]
-    installed_executable_sha256: String,
-    #[serde(default)]
-    running_process_id: u32,
-    #[serde(default)]
-    running_process_identity: String,
-    #[serde(default)]
-    observed_running_executable_path: String,
-    #[serde(default)]
-    observed_running_executable_sha256: String,
-    #[serde(default)]
-    desktop_process_id: u32,
-    #[serde(default)]
-    desktop_process_identity: String,
-    #[serde(default)]
-    desktop_executable_path: String,
-    #[serde(default)]
-    initialization_observation_identity: String,
-    #[serde(default)]
-    post_restart_initialization_observation: String,
-    #[serde(default)]
-    observation_timestamp: String,
-    #[serde(default)]
-    implementation_identity_hash: Option<String>,
-    #[serde(default)]
-    publish_identity: String,
-    #[serde(default)]
-    install_generation: u64,
-    #[serde(default)]
-    authoritative_install_evidence_hash: String,
-    #[serde(default)]
-    authenticated_host_channel_identity: String,
-    #[serde(default)]
-    challenge_identity: String,
-    #[serde(default)]
-    challenge_expires_at: String,
-    #[serde(default)]
-    publish_install_timestamp: String,
-    #[serde(default)]
-    bootstrap_consumed_timestamp: String,
-    #[serde(default)]
-    challenge_issued_timestamp: String,
-    #[serde(default)]
-    running_executable_observed_timestamp: String,
-}
-
-type AuthoritativeDesktopInstallEvidence = DesktopPublishInstallEvidenceV1;
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-enum DesktopInstallEvidenceAvailability {
-    #[default]
-    NoAuthenticatedHostTransport,
-    AuthenticatedHostBootstrap,
-}
-
-/// Sealed source boundary for authoritative install evidence. Production may only create the
-/// authenticated variant from the startup-consumed inherited bootstrap handle.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-enum DesktopInstallEvidenceSource {
-    #[default]
-    NoAuthenticatedHostTransport,
-    AuthenticatedHostBootstrap {
-        channel_identity: String,
-        peer_identity: String,
-        evidence: Box<AuthoritativeDesktopInstallEvidence>,
-    },
-}
-
-impl DesktopInstallEvidenceSource {
-    fn availability(&self) -> DesktopInstallEvidenceAvailability {
-        match self {
-            Self::NoAuthenticatedHostTransport => {
-                DesktopInstallEvidenceAvailability::NoAuthenticatedHostTransport
-            }
-            Self::AuthenticatedHostBootstrap { .. } => {
-                DesktopInstallEvidenceAvailability::AuthenticatedHostBootstrap
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DesktopRunningProcessObservation {
-    process_id: u32,
-    process_identity: String,
-    executable_path: String,
-    executable_sha256: String,
-    observed_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PendingDesktopActivationChallenge {
-    challenge_identity: String,
-    nonce: String,
-    thread_id: String,
-    evidence_epoch: u64,
-    implementation_identity_hash: String,
-    activation_obligation_identity: String,
-    publisher_evidence_id: String,
-    authoritative_install_evidence_hash: String,
-    publish_identity: String,
-    install_generation: u64,
-    expected_installed_executable_path: String,
-    installed_executable_sha256: String,
-    running_process: DesktopRunningProcessObservation,
-    authenticated_host_channel_identity: String,
-    authenticated_host_peer_identity: String,
-    issued_at: String,
-    expires_at: String,
-    bootstrap_consumed_at: String,
-    monotonic_deadline: Instant,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DesktopActivationAcknowledgement {
-    challenge_identity: String,
-    authenticated_host_channel_identity: String,
-    initialized_process_id: u32,
-    initialized_process_identity: String,
-    desktop_process_id: u32,
-    desktop_process_identity: String,
-    desktop_executable_path: String,
-    initialization_observation_identity: String,
-    observed_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LiveDesktopActivationProof {
-    receipt_hash: String,
-    evidence_epoch: u64,
-    implementation_identity_hash: String,
-    activation_obligation_identity: String,
-    authoritative_install_evidence_hash: String,
-    publish_identity: String,
-    install_generation: u64,
-    authenticated_host_channel_identity: String,
-    running_process_id: u32,
-    running_process_identity: String,
-    fresh_until: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct DesktopActivationRuntimeState {
-    install_evidence_source: DesktopInstallEvidenceSource,
-    pending_challenge: Option<PendingDesktopActivationChallenge>,
-    live_proof: Option<LiveDesktopActivationProof>,
-    recorded_challenges: BTreeMap<String, RecordedDesktopActivationChallenge>,
-}
-
-#[derive(Debug, Clone)]
-struct DesktopActivationAttestationService {
-    gate: Arc<Semaphore>,
-    runtime: Arc<std::sync::Mutex<DesktopActivationRuntimeState>>,
-}
-
-impl Default for DesktopActivationAttestationService {
-    fn default() -> Self {
-        Self {
-            gate: Arc::new(Semaphore::new(1)),
-            runtime: Arc::new(std::sync::Mutex::new(
-                DesktopActivationRuntimeState::default(),
-            )),
-        }
-    }
-}
-
-impl DesktopActivationAttestationService {
-    async fn acquire(
-        &self,
-    ) -> Result<tokio::sync::OwnedSemaphorePermit, DesktopActivationVerificationError> {
-        Arc::clone(&self.gate)
-            .acquire_owned()
-            .await
-            .map_err(|_| DesktopActivationVerificationError::PersistenceFailed)
-    }
-
-    fn lock_runtime(&self) -> std::sync::MutexGuard<'_, DesktopActivationRuntimeState> {
-        self.runtime
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn runtime_handle(&self) -> Arc<std::sync::Mutex<DesktopActivationRuntimeState>> {
-        Arc::clone(&self.runtime)
-    }
-
-    fn snapshot(&self) -> DesktopActivationRuntimeSnapshot {
-        self.lock_runtime().snapshot()
-    }
-
-    fn reset(&self) {
-        *self.lock_runtime() = DesktopActivationRuntimeState::default();
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RecordedDesktopActivationChallenge {
-    request_hash: String,
-    receipt: DesktopActivationReceipt,
-    recorded_at: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct DesktopActivationRuntimeSnapshot {
-    availability: DesktopInstallEvidenceAvailability,
-    current_install_evidence_hash: Option<String>,
-    live_proof: Option<LiveDesktopActivationProof>,
-}
-
-impl DesktopActivationRuntimeState {
-    fn snapshot(&self) -> DesktopActivationRuntimeSnapshot {
-        let current_install_evidence_hash = match &self.install_evidence_source {
-            DesktopInstallEvidenceSource::NoAuthenticatedHostTransport => None,
-            DesktopInstallEvidenceSource::AuthenticatedHostBootstrap {
-                channel_identity,
-                peer_identity,
-                evidence,
-            } => Some(desktop_install_evidence_hash(
-                evidence,
-                channel_identity,
-                peer_identity,
-            )),
-        };
-        DesktopActivationRuntimeSnapshot {
-            availability: self.install_evidence_source.availability(),
-            current_install_evidence_hash,
-            live_proof: self.live_proof.clone(),
-        }
-    }
-
-    fn prepare_challenge(
-        &mut self,
-        obligation: &DesktopActivationObligation,
-        running_process: DesktopRunningProcessObservation,
-        nonce: &str,
-        bootstrap_consumed_at: &str,
-        now: DateTime<Utc>,
-    ) -> Result<PendingDesktopActivationChallenge, DesktopActivationVerificationError> {
-        let DesktopInstallEvidenceSource::AuthenticatedHostBootstrap {
-            channel_identity,
-            peer_identity,
-            evidence,
-        } = &self.install_evidence_source
-        else {
-            return Err(DesktopActivationVerificationError::NoAuthenticatedHostTransport);
-        };
-        validate_authoritative_desktop_install_evidence(
-            evidence,
-            channel_identity,
-            peer_identity,
-            obligation,
-            now,
-        )?;
-        let bootstrap_consumed = parse_desktop_timestamp(bootstrap_consumed_at)
-            .filter(|consumed| *consumed <= now)
-            .ok_or(DesktopActivationVerificationError::InvalidAuthoritativeEvidence)?;
-        let installed_at = parse_desktop_timestamp(&evidence.issued_at)
-            .ok_or(DesktopActivationVerificationError::InvalidAuthoritativeEvidence)?;
-        if installed_at > bootstrap_consumed {
-            return Err(DesktopActivationVerificationError::AuthoritativeEvidenceStale);
-        }
-        if let Some(existing) = self.pending_challenge.as_ref()
-            && existing.thread_id == obligation.thread_id
-            && existing.evidence_epoch == obligation.evidence_epoch
-            && existing.implementation_identity_hash == obligation.implementation_identity
-            && existing.activation_obligation_identity == obligation.activation_obligation_identity
-            && existing.publisher_evidence_id == evidence.publisher_evidence_id
-            && Instant::now() <= existing.monotonic_deadline
-        {
-            return Ok(existing.clone());
-        }
-        self.pending_challenge = None;
-        self.live_proof = None;
-        let running_observed_at = parse_desktop_timestamp(&running_process.observed_at);
-        if running_process.process_id == 0
-            || running_process.process_identity.trim().is_empty()
-            || running_observed_at
-                .is_none_or(|observed_at| observed_at < bootstrap_consumed || observed_at > now)
-        {
-            return Err(DesktopActivationVerificationError::RunningProcessIdentityMissing);
-        }
-        if !desktop_paths_match(
-            &evidence.expected_installed_executable_path,
-            &running_process.executable_path,
-        ) || !evidence
-            .installed_executable_sha256
-            .eq_ignore_ascii_case(&running_process.executable_sha256)
-        {
-            return Err(DesktopActivationVerificationError::RunningExecutableMismatch);
-        }
-        if nonce.trim().is_empty() {
-            return Err(DesktopActivationVerificationError::InvalidAuthoritativeEvidence);
-        }
-        let authoritative_install_evidence_hash =
-            desktop_install_evidence_hash(evidence, channel_identity, peer_identity);
-        let expires_at = now + ChronoDuration::seconds(DESKTOP_ACTIVATION_CHALLENGE_TTL_SECONDS);
-        let issued_at = now.to_rfc3339();
-        let expires_at = expires_at.to_rfc3339();
-        let challenge_identity = canonical_hash(
-            DESKTOP_ACTIVATION_CHALLENGE_CANONICAL_FORMAT,
-            &serde_json::json!({
-                "nonce": nonce,
-                "threadId": obligation.thread_id,
-                "evidenceEpoch": obligation.evidence_epoch,
-                "implementationIdentity": obligation.implementation_identity,
-                "activationObligationIdentity": obligation.activation_obligation_identity,
-                "authoritativeInstallEvidence": authoritative_install_evidence_hash,
-                "publisherEvidenceId": evidence.publisher_evidence_id,
-                "publishIdentity": evidence.publish_identity,
-                "runningProcessId": running_process.process_id,
-                "runningProcessIdentity": running_process.process_identity,
-                "authenticatedHostChannel": channel_identity,
-                "authenticatedHostPeer": peer_identity,
-                "issuedAt": issued_at,
-                "expiresAt": expires_at,
-            }),
-        );
-        let challenge = PendingDesktopActivationChallenge {
-            challenge_identity,
-            nonce: nonce.to_string(),
-            thread_id: obligation.thread_id.clone(),
-            evidence_epoch: obligation.evidence_epoch,
-            implementation_identity_hash: obligation.implementation_identity.clone(),
-            activation_obligation_identity: obligation.activation_obligation_identity.clone(),
-            publisher_evidence_id: evidence.publisher_evidence_id.clone(),
-            authoritative_install_evidence_hash,
-            publish_identity: evidence.publish_identity.clone(),
-            install_generation: evidence.install_generation,
-            expected_installed_executable_path: evidence.expected_installed_executable_path.clone(),
-            installed_executable_sha256: evidence.installed_executable_sha256.clone(),
-            running_process,
-            authenticated_host_channel_identity: channel_identity.clone(),
-            authenticated_host_peer_identity: peer_identity.clone(),
-            issued_at,
-            expires_at,
-            bootstrap_consumed_at: bootstrap_consumed_at.to_string(),
-            monotonic_deadline: Instant::now()
-                + std::time::Duration::from_secs(DESKTOP_ACTIVATION_CHALLENGE_TTL_SECONDS as u64),
-        };
-        self.pending_challenge = Some(challenge.clone());
-        Ok(challenge)
-    }
-
-    fn complete_challenge(
-        &mut self,
-        acknowledgement: DesktopActivationAcknowledgement,
-        now: DateTime<Utc>,
-    ) -> Result<DesktopActivationReceipt, DesktopActivationVerificationError> {
-        let challenge = self
-            .pending_challenge
-            .take()
-            .ok_or(DesktopActivationVerificationError::ChallengeMissingOrConsumed)?;
-        if Instant::now() > challenge.monotonic_deadline {
-            return Err(DesktopActivationVerificationError::ChallengeExpired);
-        }
-        if acknowledgement.challenge_identity != challenge.challenge_identity {
-            return Err(DesktopActivationVerificationError::ChallengeIdentityMismatch);
-        }
-        if acknowledgement.authenticated_host_channel_identity
-            != challenge.authenticated_host_channel_identity
-        {
-            return Err(DesktopActivationVerificationError::AuthenticatedChannelMismatch);
-        }
-        if acknowledgement.initialized_process_id != challenge.running_process.process_id
-            || acknowledgement.initialized_process_identity
-                != challenge.running_process.process_identity
-        {
-            return Err(DesktopActivationVerificationError::InitializedProcessMismatch);
-        }
-        let observation_timestamp = parse_desktop_timestamp(&acknowledgement.observed_at)
-            .filter(|observed_at| {
-                parse_desktop_timestamp(&challenge.issued_at)
-                    .is_some_and(|issued_at| *observed_at >= issued_at && *observed_at <= now)
-            })
-            .ok_or(DesktopActivationVerificationError::InvalidDesktopObservation)?;
-        if acknowledgement.desktop_process_id == 0
-            || acknowledgement.desktop_process_identity.trim().is_empty()
-            || !Path::new(&acknowledgement.desktop_executable_path).is_absolute()
-            || acknowledgement
-                .initialization_observation_identity
-                .trim()
-                .is_empty()
-        {
-            return Err(DesktopActivationVerificationError::InvalidDesktopObservation);
-        }
-        let receipt = DesktopActivationReceipt {
-            trusted_producer_version: DESKTOP_INSTALL_EVIDENCE_SCHEMA_VERSION,
-            publisher_evidence_id: challenge.publisher_evidence_id.clone(),
-            thread_id: challenge.thread_id.clone(),
-            epoch: challenge.evidence_epoch,
-            activation_obligation_identity: challenge.activation_obligation_identity.clone(),
-            activation_timestamp: now.to_rfc3339(),
-            process_path: None,
-            binary_sha1: None,
-            runtime_evidence: Some("authenticated_host_bootstrap_v1".to_string()),
-            expected_installed_executable_path: challenge
-                .expected_installed_executable_path
-                .clone(),
-            installed_executable_sha256: challenge.installed_executable_sha256.clone(),
-            running_process_id: challenge.running_process.process_id,
-            running_process_identity: challenge.running_process.process_identity.clone(),
-            observed_running_executable_path: challenge.running_process.executable_path.clone(),
-            observed_running_executable_sha256: challenge.running_process.executable_sha256.clone(),
-            desktop_process_id: acknowledgement.desktop_process_id,
-            desktop_process_identity: acknowledgement.desktop_process_identity,
-            desktop_executable_path: acknowledgement.desktop_executable_path,
-            initialization_observation_identity: acknowledgement
-                .initialization_observation_identity,
-            post_restart_initialization_observation:
-                "authenticated host initialized the exact app-server process".to_string(),
-            observation_timestamp: observation_timestamp.to_rfc3339(),
-            implementation_identity_hash: Some(challenge.implementation_identity_hash.clone()),
-            publish_identity: challenge.publish_identity.clone(),
-            install_generation: challenge.install_generation,
-            authoritative_install_evidence_hash: challenge
-                .authoritative_install_evidence_hash
-                .clone(),
-            authenticated_host_channel_identity: challenge
-                .authenticated_host_channel_identity
-                .clone(),
-            challenge_identity: challenge.challenge_identity,
-            challenge_expires_at: challenge.expires_at.clone(),
-            publish_install_timestamp: match &self.install_evidence_source {
-                DesktopInstallEvidenceSource::AuthenticatedHostBootstrap { evidence, .. } => {
-                    evidence.issued_at.clone()
-                }
-                DesktopInstallEvidenceSource::NoAuthenticatedHostTransport => String::new(),
-            },
-            bootstrap_consumed_timestamp: challenge.bootstrap_consumed_at,
-            challenge_issued_timestamp: challenge.issued_at.clone(),
-            running_executable_observed_timestamp: challenge.running_process.observed_at.clone(),
-        };
-        self.live_proof = Some(LiveDesktopActivationProof {
-            receipt_hash: desktop_activation_receipt_hash(&receipt),
-            evidence_epoch: receipt.epoch,
-            implementation_identity_hash: challenge.implementation_identity_hash,
-            activation_obligation_identity: challenge.activation_obligation_identity,
-            authoritative_install_evidence_hash: challenge.authoritative_install_evidence_hash,
-            publish_identity: challenge.publish_identity,
-            install_generation: challenge.install_generation,
-            authenticated_host_channel_identity: challenge.authenticated_host_channel_identity,
-            running_process_id: challenge.running_process.process_id,
-            running_process_identity: challenge.running_process.process_identity,
-            fresh_until: challenge.expires_at,
-        });
-        Ok(receipt)
-    }
 }
 
 fn new_completion_review_ledger(root_task_id: &str) -> CompletionReviewLedgerV2 {
@@ -3297,7 +2804,6 @@ impl TaskEvidenceLedger {
                 latest_generated_artifact_hashes: BTreeMap::new(),
                 latest_file_hashes: BTreeMap::new(),
                 risks,
-                desktop_activation_receipt: None,
                 next_edit_receipt_sequence: initial_receipt_sequence(),
                 next_command_receipt_sequence: initial_receipt_sequence(),
                 next_external_evidence_receipt_sequence: initial_receipt_sequence(),
@@ -3334,7 +2840,6 @@ impl TaskEvidenceLedger {
             freshness_state: Arc::new(std::sync::Mutex::new(FreshnessState::default())),
             last_persisted_revision: Arc::new(AtomicU64::new(0)),
             source_capture_failed: Arc::new(AtomicBool::new(source_capture_failed)),
-            desktop_activation: DesktopActivationAttestationService::default(),
             #[cfg(test)]
             persistence_test_control: Arc::new(std::sync::Mutex::new(None)),
         };
@@ -3416,7 +2921,6 @@ impl TaskEvidenceLedger {
             freshness_state: Arc::new(std::sync::Mutex::new(FreshnessState::default())),
             last_persisted_revision: Arc::new(AtomicU64::new(0)),
             source_capture_failed: Arc::new(AtomicBool::new(false)),
-            desktop_activation: DesktopActivationAttestationService::default(),
             #[cfg(test)]
             persistence_test_control: Arc::new(std::sync::Mutex::new(None)),
         }
@@ -3472,7 +2976,6 @@ impl TaskEvidenceLedger {
                 .freshness_state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = FreshnessState::default();
-            self.desktop_activation.reset();
             return;
         };
         if self.allows_kd4_completion() && self.matches_repo_root(&repo_root) {
@@ -3529,7 +3032,6 @@ impl TaskEvidenceLedger {
                 .freshness_state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = FreshnessState::default();
-            self.desktop_activation.reset();
             return;
         }
         let rebound_document = rebound.document.lock().await.clone();
@@ -3563,288 +3065,7 @@ impl TaskEvidenceLedger {
             .freshness_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = FreshnessState::default();
-        self.desktop_activation.reset();
         self.enabled.store(true, Ordering::Release);
-    }
-
-    fn desktop_activation_runtime_snapshot(&self) -> DesktopActivationRuntimeSnapshot {
-        self.desktop_activation.snapshot()
-    }
-
-    pub(crate) async fn desktop_activation_obligation(
-        &self,
-    ) -> Option<DesktopActivationObligation> {
-        let runtime = self.desktop_activation_runtime_snapshot();
-        let document = self.document.lock().await;
-        let document = document.as_ref()?;
-        let obligation = current_desktop_activation_obligation(document)?;
-        if document
-            .desktop_activation_receipt
-            .as_ref()
-            .is_some_and(|receipt| {
-                desktop_activation_receipt_is_complete(receipt, &runtime, document)
-            })
-        {
-            return None;
-        }
-        Some(obligation)
-    }
-
-    pub(crate) async fn issue_desktop_activation_challenge(
-        &self,
-        evidence: AuthoritativeDesktopInstallEvidence,
-        bootstrap_consumed_at: String,
-    ) -> Result<DesktopActivationChallenge, DesktopActivationVerificationError> {
-        let _activation_permit = self.desktop_activation.acquire().await?;
-        let runtime_snapshot = self.desktop_activation_runtime_snapshot();
-        let (obligation, last_mutation_at) = {
-            let document = self.document.lock().await;
-            let document = document
-                .as_ref()
-                .ok_or(DesktopActivationVerificationError::ActivationObligationChanged)?;
-            if document
-                .desktop_activation_receipt
-                .as_ref()
-                .is_some_and(|receipt| {
-                    desktop_activation_receipt_is_complete(receipt, &runtime_snapshot, document)
-                })
-            {
-                return Err(DesktopActivationVerificationError::ActivationObligationChanged);
-            }
-            (
-                current_desktop_activation_obligation(document)
-                    .ok_or(DesktopActivationVerificationError::ActivationObligationChanged)?,
-                document.last_mutation_at.clone(),
-            )
-        };
-        let now = Utc::now();
-        validate_authoritative_desktop_install_evidence(
-            &evidence,
-            "inherited-bootstrap-handle-v1",
-            &evidence.publisher_evidence_id,
-            &obligation,
-            now,
-        )?;
-        if last_mutation_at
-            .as_deref()
-            .and_then(parse_desktop_timestamp)
-            .is_some_and(|mutated_at| {
-                parse_desktop_timestamp(&evidence.issued_at)
-                    .is_none_or(|installed_at| installed_at < mutated_at)
-            })
-        {
-            return Err(DesktopActivationVerificationError::AuthoritativeEvidenceStale);
-        }
-        let running_process = verified_desktop_running_process(&evidence).await?;
-        {
-            let document = self.document.lock().await;
-            if document
-                .as_ref()
-                .and_then(current_desktop_activation_obligation)
-                .as_ref()
-                != Some(&obligation)
-            {
-                return Err(DesktopActivationVerificationError::ActivationObligationChanged);
-            }
-        }
-        let mut runtime = self.desktop_activation.lock_runtime();
-        runtime.install_evidence_source =
-            DesktopInstallEvidenceSource::AuthenticatedHostBootstrap {
-                channel_identity: "inherited-bootstrap-handle-v1".to_string(),
-                peer_identity: evidence.publisher_evidence_id.clone(),
-                evidence: Box::new(evidence),
-            };
-        let pending = runtime.prepare_challenge(
-            &obligation,
-            running_process,
-            &uuid::Uuid::new_v4().to_string(),
-            &bootstrap_consumed_at,
-            Utc::now(),
-        )?;
-        Ok(desktop_activation_challenge_public(&pending))
-    }
-
-    pub(crate) async fn record_desktop_activation(
-        &self,
-        observation: DesktopActivationRecordObservation,
-    ) -> Result<DesktopActivationRecordResult, DesktopActivationVerificationError> {
-        let _activation_permit = self.desktop_activation.acquire().await?;
-        let request_hash = canonical_hash(
-            "KD4_DESKTOP_ACTIVATION_RECORD_REQUEST_V1",
-            &serde_json::to_value(&observation).unwrap_or(Value::Null),
-        );
-        if let Some(result) =
-            self.recorded_desktop_activation_result(&observation.challenge_id, &request_hash)?
-        {
-            return Ok(result);
-        }
-        let pending = {
-            let runtime = self.desktop_activation.lock_runtime();
-            runtime
-                .pending_challenge
-                .as_ref()
-                .filter(|pending| pending.challenge_identity == observation.challenge_id)
-                .cloned()
-                .ok_or(DesktopActivationVerificationError::ChallengeMissingOrConsumed)?
-        };
-        if Instant::now() > pending.monotonic_deadline {
-            return Err(DesktopActivationVerificationError::ChallengeExpired);
-        }
-        verify_pending_desktop_running_process(&pending).await?;
-
-        for _ in 0..8 {
-            let expected_revision = {
-                let document_guard = self.document.lock().await;
-                let document = document_guard
-                    .as_ref()
-                    .ok_or(DesktopActivationVerificationError::ActivationObligationChanged)?;
-                let obligation = current_desktop_activation_obligation(document)
-                    .ok_or(DesktopActivationVerificationError::ActivationObligationChanged)?;
-                if obligation.thread_id != pending.thread_id
-                    || obligation.evidence_epoch != pending.evidence_epoch
-                    || obligation.implementation_identity != pending.implementation_identity_hash
-                    || obligation.activation_obligation_identity
-                        != pending.activation_obligation_identity
-                {
-                    return Err(DesktopActivationVerificationError::ActivationObligationChanged);
-                }
-                let runtime_snapshot = self.desktop_activation_runtime_snapshot();
-                if document
-                    .desktop_activation_receipt
-                    .as_ref()
-                    .is_some_and(|receipt| {
-                        desktop_activation_receipt_is_complete(receipt, &runtime_snapshot, document)
-                    })
-                {
-                    return Err(DesktopActivationVerificationError::ActivationObligationChanged);
-                }
-                document.revision
-            };
-            let mut runtime_candidate = self.desktop_activation.lock_runtime().clone();
-            if let Some(recorded) = runtime_candidate
-                .recorded_challenges
-                .get(&observation.challenge_id)
-            {
-                if recorded.request_hash != request_hash {
-                    return Err(
-                        DesktopActivationVerificationError::ChallengeAlreadyRecordedWithDifferentPayload,
-                    );
-                }
-                return Ok(DesktopActivationRecordResult {
-                    challenge_id: observation.challenge_id,
-                    recorded_at: recorded.recorded_at.clone(),
-                    already_recorded: true,
-                });
-            }
-            let acknowledgement = DesktopActivationAcknowledgement {
-                challenge_identity: observation.challenge_id.clone(),
-                authenticated_host_channel_identity: pending
-                    .authenticated_host_channel_identity
-                    .clone(),
-                initialized_process_id: pending.running_process.process_id,
-                initialized_process_identity: pending.running_process.process_identity.clone(),
-                desktop_process_id: observation.desktop_process_id,
-                desktop_process_identity: canonical_hash(
-                    "KD4_DESKTOP_PROCESS_OBSERVATION_V1",
-                    &serde_json::json!({
-                        "processId": observation.desktop_process_id,
-                        "path": observation.desktop_executable_path,
-                    }),
-                ),
-                desktop_executable_path: observation.desktop_executable_path.clone(),
-                initialization_observation_identity: observation
-                    .initialization_observation_identity
-                    .clone(),
-                observed_at: observation.observation_timestamp.clone(),
-            };
-            let receipt = runtime_candidate.complete_challenge(acknowledgement, Utc::now())?;
-            let result = DesktopActivationRecordResult {
-                challenge_id: observation.challenge_id.clone(),
-                recorded_at: receipt.activation_timestamp.clone(),
-                already_recorded: false,
-            };
-            runtime_candidate.recorded_challenges.insert(
-                observation.challenge_id.clone(),
-                RecordedDesktopActivationChallenge {
-                    request_hash: request_hash.clone(),
-                    receipt: receipt.clone(),
-                    recorded_at: result.recorded_at.clone(),
-                },
-            );
-            while runtime_candidate.recorded_challenges.len() > 32 {
-                let Some(first) = runtime_candidate.recorded_challenges.keys().next().cloned()
-                else {
-                    break;
-                };
-                runtime_candidate.recorded_challenges.remove(&first);
-            }
-            let committed_runtime = self.desktop_activation.runtime_handle();
-            let receipt_for_document = receipt.clone();
-            let pending_for_document = pending.clone();
-            let transition = self
-                .atomic_review_update_with_commit(
-                    expected_revision,
-                    None,
-                    None,
-                    move |document| {
-                        let Some(obligation) = current_desktop_activation_obligation(document)
-                        else {
-                            return false;
-                        };
-                        if obligation.thread_id != pending_for_document.thread_id
-                            || obligation.evidence_epoch != pending_for_document.evidence_epoch
-                            || obligation.implementation_identity
-                                != pending_for_document.implementation_identity_hash
-                            || obligation.activation_obligation_identity
-                                != pending_for_document.activation_obligation_identity
-                        {
-                            return false;
-                        }
-                        document.desktop_activation_receipt = Some(receipt_for_document);
-                        document.updated_at = timestamp();
-                        document.completion = None;
-                        true
-                    },
-                    move || {
-                        *committed_runtime
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = runtime_candidate;
-                    },
-                )
-                .await;
-            match transition {
-                AtomicReviewTransition::Persisted(true) => return Ok(result),
-                AtomicReviewTransition::Persisted(false) => {
-                    return Err(DesktopActivationVerificationError::ActivationObligationChanged);
-                }
-                AtomicReviewTransition::Superseded => continue,
-                AtomicReviewTransition::Failed => {
-                    return Err(DesktopActivationVerificationError::PersistenceFailed);
-                }
-            }
-        }
-        Err(DesktopActivationVerificationError::PersistenceFailed)
-    }
-
-    fn recorded_desktop_activation_result(
-        &self,
-        challenge_id: &str,
-        request_hash: &str,
-    ) -> Result<Option<DesktopActivationRecordResult>, DesktopActivationVerificationError> {
-        let runtime = self.desktop_activation.lock_runtime();
-        let Some(recorded) = runtime.recorded_challenges.get(challenge_id) else {
-            return Ok(None);
-        };
-        if recorded.request_hash != request_hash {
-            return Err(
-                DesktopActivationVerificationError::ChallengeAlreadyRecordedWithDifferentPayload,
-            );
-        }
-        Ok(Some(DesktopActivationRecordResult {
-            challenge_id: challenge_id.to_string(),
-            recorded_at: recorded.recorded_at.clone(),
-            already_recorded: true,
-        }))
     }
 
     #[cfg(test)]
@@ -4527,7 +3748,6 @@ impl TaskEvidenceLedger {
                         accepted_review_id: None,
                     });
                     document.evidence_epoch = document.evidence_epoch.saturating_add(1);
-                    document.desktop_activation_receipt = None;
                     document.completion = None;
                     document.updated_at = timestamp();
                     true
@@ -4691,7 +3911,6 @@ impl TaskEvidenceLedger {
                 document.latest_generated_artifact_hashes.clear();
                 document.latest_file_hashes.clear();
                 document.risks.clear();
-                document.desktop_activation_receipt = None;
                 document.host_mutation_revision = 0;
                 document.completion_review_v2 = Some(ledger);
                 document.source_classification_cache.clear();
@@ -4923,7 +4142,6 @@ impl TaskEvidenceLedger {
                         runtime_paths: item.runtime_paths.clone(),
                         generated_artifacts: item.generated_artifacts.clone(),
                         risks: item.risks.clone(),
-                        requires_desktop_activation: item.requires_desktop_activation,
                         validation_route: item.validation_route.clone().or_else(|| {
                             old.as_ref().and_then(|step| step.validation_route.clone())
                         }),
@@ -5851,14 +5069,12 @@ impl TaskEvidenceLedger {
         if !self.allows_kd4_completion() {
             return None;
         }
-        let desktop_activation = self.desktop_activation_runtime_snapshot();
         let evidence_path = self.evidence_path();
         let (gate, latest_review_audit) = {
             let guard = self.document.lock().await;
             let document = guard.as_ref()?;
             task_is_tracked(document).then(|| {
-                let gate =
-                    derive_completion_gate(document, evidence_path.as_deref(), &desktop_activation);
+                let gate = derive_completion_gate(document, evidence_path.as_deref());
                 let latest_review_audit = document
                     .completion_review_receipts
                     .iter()
@@ -5939,7 +5155,6 @@ impl TaskEvidenceLedger {
         let source_capture_failed = self.user_source_capture_failed();
         let candidate_completion = candidate_completion.map(str::to_string);
         let authoritative_input_errors = authoritative_input_errors.to_vec();
-        let desktop_activation_runtime = self.desktop_activation_runtime_snapshot();
         let evidence_path = self.evidence_path();
         let (
             document_revision,
@@ -6210,24 +5425,9 @@ impl TaskEvidenceLedger {
                 })
                 .collect::<Vec<_>>();
             external_evidence.sort_by_key(std::string::ToString::to_string);
-            let evidence_gate = derive_completion_gate(
-                document,
-                evidence_path.as_deref(),
-                &desktop_activation_runtime,
-            );
+            let evidence_gate = derive_completion_gate(document, evidence_path.as_deref());
             let locally_obtainable_proof_routes =
                 completion_review_locally_obtainable_proof_routes(&evidence_gate);
-            let desktop_activation =
-                document
-                    .desktop_activation_receipt
-                    .as_ref()
-                    .filter(|receipt| {
-                        desktop_activation_receipt_is_complete(
-                            receipt,
-                            &desktop_activation_runtime,
-                            document,
-                        )
-                    });
             let reviewer_visible_evidence = serde_json::json!({
                 "implementationIdentity": implementation_identity_hash,
                 "taskAttributedPaths": path_hashes,
@@ -6235,7 +5435,6 @@ impl TaskEvidenceLedger {
                 "typedMutationIdentities": typed_mutation_identities,
                 "proofReceipts": proof_receipts,
                 "externalEvidence": external_evidence,
-                "desktopActivation": desktop_activation,
                 "plan": document.plan,
                 "risks": effective_risks(document).collect::<Vec<_>>(),
                 "evidenceGate": evidence_gate,
@@ -7961,7 +7160,6 @@ impl TaskEvidenceLedger {
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned());
         let completion_evidence_path = self.evidence_path();
-        let desktop_activation_runtime = self.desktop_activation_runtime_snapshot();
         let ((result, changed), snapshot) = self
             .update_document(move |document| {
                 let basis = completion_candidate_basis(document, &input);
@@ -7993,11 +7191,8 @@ impl TaskEvidenceLedger {
                     )
                     .unwrap_or(u64::MAX),
                 };
-                let mut gate = derive_completion_gate(
-                    document,
-                    completion_evidence_path.as_deref(),
-                    &desktop_activation_runtime,
-                );
+                let mut gate =
+                    derive_completion_gate(document, completion_evidence_path.as_deref());
                 let missing_or_failed = missing_or_failed_obligations(
                     &candidate,
                     &validation_plan,
@@ -8334,7 +7529,6 @@ impl TaskEvidenceLedger {
                 continue;
             }
             let completion_proof_manifest = self.completion_proof_manifest();
-            let desktop_activation_runtime = self.desktop_activation_runtime_snapshot();
             let mut freshness_state_changed = false;
             let (gate, snapshot) = self
                 .update_document(|document| {
@@ -8352,11 +7546,7 @@ impl TaskEvidenceLedger {
                     if evidence_path.is_some() {
                         resolve_risk(document, "task-evidence-storage-failure");
                     }
-                    let mut gate = derive_completion_gate(
-                        document,
-                        evidence_path.as_deref(),
-                        &desktop_activation_runtime,
-                    );
+                    let mut gate = derive_completion_gate(document, evidence_path.as_deref());
                     overlay_completion_review_gate(document, &mut gate, source_capture_failed);
                     document.completion = Some(gate.clone());
                     document.updated_at = timestamp();
@@ -8407,7 +7597,6 @@ impl TaskEvidenceLedger {
         if gate.status != TaskCompletionStatus::Blocked {
             gate.status = TaskCompletionStatus::Partial;
         }
-        let desktop_activation_runtime = self.desktop_activation_runtime_snapshot();
         let evidence_path = self.evidence_path();
         let snapshot = {
             let mut guard = self.document.lock().await;
@@ -8419,11 +7608,7 @@ impl TaskEvidenceLedger {
                     );
                 }
                 if snapshot_revision.is_some() && snapshot_revision != Some(document.revision) {
-                    let current_gate = derive_completion_gate(
-                        document,
-                        evidence_path.as_deref(),
-                        &desktop_activation_runtime,
-                    );
+                    let current_gate = derive_completion_gate(document, evidence_path.as_deref());
                     if current_gate.status == TaskCompletionStatus::Blocked {
                         gate.status = TaskCompletionStatus::Blocked;
                     }
@@ -10300,8 +9485,7 @@ fn completion_checkpoint_for(
             }
         })
         .collect::<Vec<_>>();
-    let evidence_gate =
-        derive_completion_gate(document, None, &DesktopActivationRuntimeSnapshot::default());
+    let evidence_gate = derive_completion_gate(document, None);
     let unresolved_blockers = evidence_gate.reasons;
     let unresolved_risks = effective_risks(document)
         .filter(|risk| !risk.resolved)
@@ -11214,338 +10398,6 @@ fn canonical_hash(format_name: &str, value: &Value) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn parse_desktop_timestamp(value: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(value)
-        .ok()
-        .map(|timestamp| timestamp.with_timezone(&Utc))
-}
-
-fn current_desktop_activation_obligation(
-    document: &TaskEvidenceDocument,
-) -> Option<DesktopActivationObligation> {
-    let mut requiring_plan_step_ids = document
-        .plan
-        .iter()
-        .filter(|step| step.status != StepStatus::Skipped && step.requires_desktop_activation)
-        .map(|step| step.id.clone())
-        .collect::<Vec<_>>();
-    requiring_plan_step_ids.sort();
-    requiring_plan_step_ids.dedup();
-    if requiring_plan_step_ids.is_empty() {
-        return None;
-    }
-    let completion = document.completion_review_v2.as_ref();
-    let implementation_identity = canonical_hash(
-        "KD4_DESKTOP_ACTIVATION_IMPLEMENTATION_IDENTITY_V1",
-        &serde_json::json!({
-            "threadId": document.thread_id,
-            "evidenceEpoch": document.evidence_epoch,
-            "hostMutationRevision": document.host_mutation_revision,
-            "completionEpoch": completion.map(|ledger| ledger.completion_epoch),
-            "manifestRevision": completion.map(|ledger| ledger.manifest_revision),
-            "latestFileHashes": document.latest_file_hashes,
-            "latestGeneratedArtifactHashes": document.latest_generated_artifact_hashes,
-        }),
-    );
-    let activation_obligation_identity = canonical_hash(
-        "KD4_DESKTOP_ACTIVATION_OBLIGATION_IDENTITY_V1",
-        &serde_json::json!({
-            "threadId": document.thread_id,
-            "evidenceEpoch": document.evidence_epoch,
-            "implementationIdentity": implementation_identity,
-            "requiringPlanStepIds": requiring_plan_step_ids,
-        }),
-    );
-    Some(DesktopActivationObligation {
-        thread_id: document.thread_id.clone(),
-        evidence_epoch: document.evidence_epoch,
-        implementation_identity,
-        activation_obligation_identity,
-        requiring_plan_step_ids,
-    })
-}
-
-fn desktop_activation_challenge_public(
-    pending: &PendingDesktopActivationChallenge,
-) -> DesktopActivationChallenge {
-    DesktopActivationChallenge {
-        challenge_id: pending.challenge_identity.clone(),
-        thread_id: pending.thread_id.clone(),
-        evidence_epoch: pending.evidence_epoch,
-        implementation_identity: pending.implementation_identity_hash.clone(),
-        activation_obligation_identity: pending.activation_obligation_identity.clone(),
-        publisher_evidence_id: pending.publisher_evidence_id.clone(),
-        expected_installed_executable_path: pending.expected_installed_executable_path.clone(),
-        expected_installed_executable_sha256: pending.installed_executable_sha256.clone(),
-        publish_id: pending.publish_identity.clone(),
-        issued_at: pending.issued_at.clone(),
-        expires_at: pending.expires_at.clone(),
-    }
-}
-
-async fn verified_desktop_running_process(
-    evidence: &AuthoritativeDesktopInstallEvidence,
-) -> Result<DesktopRunningProcessObservation, DesktopActivationVerificationError> {
-    let expected = tokio::fs::canonicalize(&evidence.expected_installed_executable_path)
-        .await
-        .map_err(|_| DesktopActivationVerificationError::RunningExecutableMismatch)?;
-    let running = tokio::fs::canonicalize(
-        std::env::current_exe()
-            .map_err(|_| DesktopActivationVerificationError::RunningExecutableMismatch)?,
-    )
-    .await
-    .map_err(|_| DesktopActivationVerificationError::RunningExecutableMismatch)?;
-    let sha256 = sha256_file(&expected)
-        .await
-        .map_err(|_| DesktopActivationVerificationError::RunningExecutableMismatch)?;
-    if !desktop_paths_match(&expected.to_string_lossy(), &running.to_string_lossy())
-        || !sha256.eq_ignore_ascii_case(&evidence.installed_executable_sha256)
-        || !sha256.eq_ignore_ascii_case(&evidence.publish_identity)
-    {
-        return Err(DesktopActivationVerificationError::RunningExecutableMismatch);
-    }
-    let process_id = std::process::id();
-    Ok(DesktopRunningProcessObservation {
-        process_id,
-        process_identity: canonical_hash(
-            "KD4_DESKTOP_RUNNING_PROCESS_IDENTITY_V1",
-            &serde_json::json!({
-                "processId": process_id,
-                "path": normalize_path_for_identity(&running),
-                "sha256": &sha256,
-            }),
-        ),
-        executable_path: running.to_string_lossy().into_owned(),
-        executable_sha256: sha256,
-        observed_at: Utc::now().to_rfc3339(),
-    })
-}
-
-async fn verify_pending_desktop_running_process(
-    pending: &PendingDesktopActivationChallenge,
-) -> Result<(), DesktopActivationVerificationError> {
-    let expected = tokio::fs::canonicalize(&pending.expected_installed_executable_path)
-        .await
-        .map_err(|_| DesktopActivationVerificationError::RunningExecutableMismatch)?;
-    let running = tokio::fs::canonicalize(
-        std::env::current_exe()
-            .map_err(|_| DesktopActivationVerificationError::RunningExecutableMismatch)?,
-    )
-    .await
-    .map_err(|_| DesktopActivationVerificationError::RunningExecutableMismatch)?;
-    let sha256 = sha256_file(&expected)
-        .await
-        .map_err(|_| DesktopActivationVerificationError::RunningExecutableMismatch)?;
-    if !desktop_paths_match(&expected.to_string_lossy(), &running.to_string_lossy())
-        || !sha256.eq_ignore_ascii_case(&pending.installed_executable_sha256)
-    {
-        return Err(DesktopActivationVerificationError::RunningExecutableMismatch);
-    }
-    Ok(())
-}
-
-fn is_sha256_hex(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-fn desktop_paths_match(expected: &str, observed: &str) -> bool {
-    codex_utils_absolute_path::paths_match_after_normalization(expected, observed)
-}
-
-fn desktop_install_evidence_hash(
-    evidence: &AuthoritativeDesktopInstallEvidence,
-    authenticated_channel_identity: &str,
-    authenticated_peer_identity: &str,
-) -> String {
-    canonical_hash(
-        DESKTOP_INSTALL_EVIDENCE_CANONICAL_FORMAT,
-        &serde_json::json!({
-            "schemaVersion": evidence.schema_version,
-            "trustedProducerVersion": evidence.trusted_producer_version,
-            "publisherEvidenceId": evidence.publisher_evidence_id,
-            "threadId": evidence.thread_id,
-            "evidenceEpoch": evidence.evidence_epoch,
-            "implementationIdentity": evidence.implementation_identity_hash,
-            "activationObligationIdentity": evidence.activation_obligation_identity,
-            "publishIdentity": evidence.publish_identity,
-            "installGeneration": evidence.install_generation,
-            "expectedInstalledExecutablePath": normalize_path_for_identity(Path::new(
-                &evidence.expected_installed_executable_path,
-            )),
-            "installedExecutableSha256": evidence.installed_executable_sha256,
-            "issuedAt": evidence.issued_at,
-            "expiresAt": evidence.expires_at,
-            "authenticatedHostChannel": authenticated_channel_identity,
-            "authenticatedHostPeer": authenticated_peer_identity,
-        }),
-    )
-}
-
-fn desktop_activation_receipt_hash(receipt: &DesktopActivationReceipt) -> String {
-    canonical_hash(
-        DESKTOP_ACTIVATION_RECEIPT_CANONICAL_FORMAT,
-        &serde_json::to_value(receipt).unwrap_or(Value::Null),
-    )
-}
-
-fn validate_authoritative_desktop_install_evidence(
-    evidence: &AuthoritativeDesktopInstallEvidence,
-    authenticated_channel_identity: &str,
-    authenticated_peer_identity: &str,
-    current_obligation: &DesktopActivationObligation,
-    now: DateTime<Utc>,
-) -> Result<(), DesktopActivationVerificationError> {
-    if evidence.schema_version != DESKTOP_INSTALL_EVIDENCE_SCHEMA_VERSION
-        || !is_sha256_hex(&evidence.implementation_identity_hash)
-        || evidence.trusted_producer_version != DESKTOP_INSTALL_EVIDENCE_SCHEMA_VERSION
-        || evidence.publisher_evidence_id.trim().is_empty()
-        || !is_sha256_hex(&evidence.publish_identity)
-        || !Path::new(&evidence.expected_installed_executable_path).is_absolute()
-        || !is_sha256_hex(&evidence.installed_executable_sha256)
-        || !evidence
-            .publish_identity
-            .eq_ignore_ascii_case(&evidence.installed_executable_sha256)
-        || authenticated_channel_identity.trim().is_empty()
-        || authenticated_peer_identity.trim().is_empty()
-        || authenticated_peer_identity != evidence.publisher_evidence_id
-    {
-        return Err(DesktopActivationVerificationError::InvalidAuthoritativeEvidence);
-    }
-    if evidence.thread_id != current_obligation.thread_id
-        || evidence.evidence_epoch != current_obligation.evidence_epoch
-        || evidence.implementation_identity_hash != current_obligation.implementation_identity
-        || evidence.activation_obligation_identity
-            != current_obligation.activation_obligation_identity
-    {
-        return Err(DesktopActivationVerificationError::ImplementationIdentityMismatch);
-    }
-    let issued_at = parse_desktop_timestamp(&evidence.issued_at)
-        .ok_or(DesktopActivationVerificationError::InvalidAuthoritativeEvidence)?;
-    if issued_at > now {
-        return Err(DesktopActivationVerificationError::AuthoritativeEvidenceStale);
-    }
-    Ok(())
-}
-
-fn desktop_activation_receipt_is_complete(
-    receipt: &DesktopActivationReceipt,
-    runtime: &DesktopActivationRuntimeSnapshot,
-    document: &TaskEvidenceDocument,
-) -> bool {
-    desktop_activation_receipt_is_complete_at(receipt, runtime, document, Utc::now())
-}
-
-fn desktop_activation_receipt_is_complete_at(
-    receipt: &DesktopActivationReceipt,
-    runtime: &DesktopActivationRuntimeSnapshot,
-    document: &TaskEvidenceDocument,
-    now: DateTime<Utc>,
-) -> bool {
-    let Some(obligation) = current_desktop_activation_obligation(document) else {
-        return false;
-    };
-    let last_mutation_at = document
-        .last_mutation_at
-        .as_deref()
-        .and_then(parse_desktop_timestamp);
-    desktop_activation_receipt_matches_live_proof_at(
-        receipt,
-        runtime,
-        &obligation,
-        last_mutation_at,
-        now,
-    )
-}
-
-fn desktop_activation_receipt_matches_live_proof_at(
-    receipt: &DesktopActivationReceipt,
-    runtime: &DesktopActivationRuntimeSnapshot,
-    obligation: &DesktopActivationObligation,
-    last_mutation_at: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
-) -> bool {
-    let Some(live) = runtime.live_proof.as_ref() else {
-        // Persisted and legacy receipts are audit evidence only. A process
-        // restart deliberately drops this non-serializable live proof.
-        return false;
-    };
-    let timestamps = [
-        &receipt.publish_install_timestamp,
-        &receipt.bootstrap_consumed_timestamp,
-        &receipt.running_executable_observed_timestamp,
-        &receipt.challenge_issued_timestamp,
-        &receipt.observation_timestamp,
-        &receipt.activation_timestamp,
-    ]
-    .map(|timestamp| parse_desktop_timestamp(timestamp));
-    let [
-        Some(installed_at),
-        Some(bootstrap_at),
-        Some(running_at),
-        Some(issued_at),
-        Some(observed_at),
-        Some(recorded_at),
-    ] = timestamps
-    else {
-        return false;
-    };
-    let post_mutation = last_mutation_at.is_none_or(|mutated_at| installed_at >= mutated_at);
-    runtime.availability == DesktopInstallEvidenceAvailability::AuthenticatedHostBootstrap
-        && receipt.trusted_producer_version == DESKTOP_INSTALL_EVIDENCE_SCHEMA_VERSION
-        && receipt.thread_id == obligation.thread_id
-        && receipt.epoch == live.evidence_epoch
-        && receipt.epoch == obligation.evidence_epoch
-        && receipt.implementation_identity_hash.as_deref()
-            == Some(live.implementation_identity_hash.as_str())
-        && receipt.implementation_identity_hash.as_deref()
-            == Some(obligation.implementation_identity.as_str())
-        && receipt.activation_obligation_identity == live.activation_obligation_identity
-        && receipt.activation_obligation_identity == obligation.activation_obligation_identity
-        && receipt.authoritative_install_evidence_hash == live.authoritative_install_evidence_hash
-        && runtime.current_install_evidence_hash.as_deref()
-            == Some(live.authoritative_install_evidence_hash.as_str())
-        && receipt.publish_identity == live.publish_identity
-        && receipt.install_generation == live.install_generation
-        && receipt.authenticated_host_channel_identity == live.authenticated_host_channel_identity
-        && receipt.running_process_id == live.running_process_id
-        && receipt.running_process_identity == live.running_process_identity
-        && receipt.running_process_id != 0
-        && receipt.desktop_process_id != 0
-        && !receipt.publisher_evidence_id.trim().is_empty()
-        && !receipt.challenge_identity.trim().is_empty()
-        && !receipt
-            .initialization_observation_identity
-            .trim()
-            .is_empty()
-        && Path::new(&receipt.expected_installed_executable_path).is_absolute()
-        && Path::new(&receipt.observed_running_executable_path).is_absolute()
-        && Path::new(&receipt.desktop_executable_path).is_absolute()
-        && desktop_paths_match(
-            &receipt.expected_installed_executable_path,
-            &receipt.observed_running_executable_path,
-        )
-        && is_sha256_hex(&receipt.installed_executable_sha256)
-        && is_sha256_hex(&receipt.observed_running_executable_sha256)
-        && is_sha256_hex(&receipt.publish_identity)
-        && receipt
-            .publish_identity
-            .eq_ignore_ascii_case(&receipt.installed_executable_sha256)
-        && receipt
-            .installed_executable_sha256
-            .eq_ignore_ascii_case(&receipt.observed_running_executable_sha256)
-        && post_mutation
-        && installed_at <= bootstrap_at
-        && bootstrap_at <= running_at
-        && running_at <= issued_at
-        && issued_at <= observed_at
-        && observed_at <= recorded_at
-        && recorded_at <= now
-        && parse_desktop_timestamp(&receipt.challenge_expires_at)
-            .is_some_and(|expires_at| observed_at <= expires_at && now <= expires_at)
-        && parse_desktop_timestamp(&live.fresh_until).is_some_and(|fresh_until| now <= fresh_until)
-        && desktop_activation_receipt_hash(receipt) == live.receipt_hash
-}
-
 pub(crate) async fn sha256_file(path: &Path) -> io::Result<String> {
     let mut file = tokio::fs::File::open(path).await?;
     let mut hasher = Sha256::new();
@@ -11708,7 +10560,6 @@ fn plan_structure_hash(plan: &[EvidencePlanStep]) -> String {
                 "runtimePaths": step.runtime_paths,
                 "generatedArtifacts": step.generated_artifacts,
                 "risks": step.risks,
-                "requiresDesktopActivation": step.requires_desktop_activation,
                 "editPaths": step.edit_paths,
             })
         })
@@ -14414,7 +13265,6 @@ fn step_requires_validation(step: &EvidencePlanStep) -> bool {
         || !step.runtime_paths.is_empty()
         || !step.generated_artifacts.is_empty()
         || !step.validation_asset_paths.is_empty()
-        || step.requires_desktop_activation
         || !step.implementation_surfaces.is_empty()
         || !step.mutation_obligations.is_empty()
 }
@@ -14897,7 +13747,6 @@ fn step_materially_matches_item(step: &EvidencePlanStep, item: &PlanItemArg) -> 
         && step.runtime_paths == item.runtime_paths
         && step.generated_artifacts == item.generated_artifacts
         && step.risks == item.risks
-        && step.requires_desktop_activation == item.requires_desktop_activation
         && (item.validation_route.is_none() || step.validation_route == item.validation_route)
 }
 
@@ -14911,7 +13760,6 @@ fn plan_item_from_evidence(step: &EvidencePlanStep) -> PlanItemArg {
         runtime_paths: step.runtime_paths.clone(),
         generated_artifacts: step.generated_artifacts.clone(),
         risks: step.risks.clone(),
-        requires_desktop_activation: step.requires_desktop_activation,
         validation_route: step.validation_route.clone(),
     }
 }
@@ -15355,13 +14203,6 @@ fn completion_review_locally_obtainable_proof_routes(gate: &TaskCompletionGate) 
                 Some(format!(
                     "Complete the named durable plan obligation and attach its deterministic focused proof: {reason}"
                 ))
-            } else if reason
-                .starts_with("required Desktop activation receipt is missing or stale")
-            {
-                Some(
-                    "Desktop activation proof is unavailable until the native host implements a publish-ID-bound initialization handshake; command output cannot satisfy this requirement"
-                        .to_string(),
-                )
             } else if reason.starts_with(
                 "required generated artifact is missing, unreadable, or unhashable:",
             ) {
@@ -15400,7 +14241,6 @@ fn extend_completion_gate_reasons(
 fn derive_completion_gate(
     document: &TaskEvidenceDocument,
     evidence_path: Option<&Path>,
-    desktop_activation_runtime: &DesktopActivationRuntimeSnapshot,
 ) -> TaskCompletionGate {
     let mut blocked = BTreeSet::new();
     let mut partial = BTreeSet::new();
@@ -15489,32 +14329,6 @@ fn derive_completion_gate(
             "plan dependency cycle includes: {}",
             cycle_members.into_iter().collect::<Vec<_>>().join(", ")
         ));
-    }
-    if document
-        .plan
-        .iter()
-        .any(|step| step.status != StepStatus::Skipped && step.requires_desktop_activation)
-        && document
-            .desktop_activation_receipt
-            .as_ref()
-            .is_none_or(|receipt| {
-                receipt.epoch != document.evidence_epoch
-                    || !desktop_activation_receipt_is_complete(
-                        receipt,
-                        desktop_activation_runtime,
-                        document,
-                    )
-            })
-    {
-        partial.insert(match desktop_activation_runtime.availability {
-            DesktopInstallEvidenceAvailability::NoAuthenticatedHostTransport => {
-                "required Desktop activation receipt is missing or stale: no authenticated host transport"
-                    .to_string()
-            }
-            DesktopInstallEvidenceAvailability::AuthenticatedHostBootstrap => {
-                "required Desktop activation receipt is missing or stale".to_string()
-            }
-        });
     }
     for requirement in declared_generated_artifact_requirements(document) {
         if let Some(path) = requirement.path.as_ref()
@@ -15690,7 +14504,6 @@ fn invalidate_for_mutation(
     }
     document.evidence_epoch = document.evidence_epoch.saturating_add(1);
     document.last_mutation_at = Some(timestamp());
-    document.desktop_activation_receipt = None;
     document.completion = None;
     if let Some(ledger) = document.completion_review_v2.as_mut()
         && let Some(cycle) = ledger.active_review_cycle.as_mut()
@@ -16415,7 +15228,6 @@ mod tests {
                 runtime_paths: vec!["src/lib.rs".to_string()],
                 generated_artifacts: Vec::new(),
                 risks: Vec::new(),
-                requires_desktop_activation: false,
                 validation_route: None,
             }],
         }
@@ -16433,11 +15245,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_generation_and_desktop_activation_are_partial_conditions() {
+    async fn missing_generation_is_a_partial_condition() {
         let (_temp, ledger) = ledger_fixture().await;
         let mut update = plan(StepStatus::Completed);
         update.plan[0].generated_artifacts = vec!["generated/missing.json".to_string()];
-        update.plan[0].requires_desktop_activation = true;
         ledger.record_plan_update(&update).await;
         let gate = ledger.completion_gate().await.expect("gate");
         assert_eq!(gate.status, TaskCompletionStatus::Partial);
@@ -16445,20 +15256,6 @@ mod tests {
             gate.reasons
                 .iter()
                 .any(|reason| reason.contains("generated artifact"))
-        );
-        assert!(
-            gate.reasons
-                .iter()
-                .any(|reason| reason.contains("Desktop activation"))
-        );
-        let routes = completion_review_locally_obtainable_proof_routes(&gate);
-        assert!(routes.iter().any(|route| {
-            route.contains("native host implements a publish-ID-bound initialization handshake")
-        }));
-        assert!(
-            routes
-                .iter()
-                .all(|route| !route.contains("Run the supported publish/restart route"))
         );
     }
 
@@ -16927,7 +15724,6 @@ mod tests {
             runtime_paths: vec!["src/lib.rs".to_string()],
             generated_artifacts: vec!["generated/schema.json".to_string()],
             risks: vec!["protocol".to_string()],
-            requires_desktop_activation: false,
             validation_route: None,
             external_validation_route: None,
             validation_disposition: ValidationDisposition::NotRequired,

@@ -757,7 +757,7 @@ class UserConfigLayerSource(BaseModel):
     profile: Annotated[
         str | None,
         Field(
-            description="Name of the selected profile-v2 config layered on top of the base user config, when this layer represents one."
+            description="Name of the selected profile config layered on top of the base user config, when this layer represents one."
         ),
     ] = None
     type: Annotated[Literal["user"], Field(title="UserConfigLayerSourceType")]
@@ -967,53 +967,6 @@ class DeprecationNoticeNotification(BaseModel):
         Field(description="Optional extra guidance, such as migration steps or rationale."),
     ] = None
     summary: Annotated[str, Field(description="Concise summary of what is deprecated.")]
-
-
-class DesktopActivationChallenge(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    activation_obligation_identity: Annotated[str, Field(alias="activationObligationIdentity")]
-    challenge_id: Annotated[str, Field(alias="challengeId")]
-    evidence_epoch: Annotated[int, Field(alias="evidenceEpoch", ge=0)]
-    expected_installed_executable_path: Annotated[
-        str, Field(alias="expectedInstalledExecutablePath")
-    ]
-    expected_installed_executable_sha256: Annotated[
-        str, Field(alias="expectedInstalledExecutableSha256")
-    ]
-    expires_at: Annotated[str, Field(alias="expiresAt")]
-    implementation_identity: Annotated[str, Field(alias="implementationIdentity")]
-    issued_at: Annotated[str, Field(alias="issuedAt")]
-    publish_id: Annotated[str, Field(alias="publishId")]
-    publisher_evidence_id: Annotated[str, Field(alias="publisherEvidenceId")]
-    thread_id: Annotated[str, Field(alias="threadId")]
-
-
-class DesktopActivationObligation(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    activation_obligation_identity: Annotated[str, Field(alias="activationObligationIdentity")]
-    evidence_epoch: Annotated[int, Field(alias="evidenceEpoch", ge=0)]
-    implementation_identity: Annotated[str, Field(alias="implementationIdentity")]
-    requiring_plan_step_ids: Annotated[list[str], Field(alias="requiringPlanStepIds")]
-    thread_id: Annotated[str, Field(alias="threadId")]
-
-
-class DesktopActivationUnavailableReason(Enum):
-    no_current_activation_obligation = "noCurrentActivationObligation"
-    no_authoritative_bootstrap_evidence = "noAuthoritativeBootstrapEvidence"
-    bootstrap_evidence_malformed = "bootstrapEvidenceMalformed"
-    bootstrap_evidence_mismatch = "bootstrapEvidenceMismatch"
-    bootstrap_evidence_stale = "bootstrapEvidenceStale"
-    running_executable_mismatch = "runningExecutableMismatch"
-    challenge_expired = "challengeExpired"
-    challenge_missing_or_consumed = "challengeMissingOrConsumed"
-    activation_obligation_changed = "activationObligationChanged"
-    invalid_desktop_observation = "invalidDesktopObservation"
-    replay_payload_mismatch = "replayPayloadMismatch"
-    persistence_failed = "persistenceFailed"
 
 
 class DeterministicContinuationClass(Enum):
@@ -1660,17 +1613,6 @@ class GitInfo(BaseModel):
     sha: str | None = None
 
 
-class ApplyPatchGuardianApprovalReviewAction(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    cwd: AbsolutePathBuf
-    files: list[AbsolutePathBuf]
-    type: Annotated[
-        Literal["applyPatch"], Field(title="ApplyPatchGuardianApprovalReviewActionType")
-    ]
-
-
 class McpToolCallGuardianApprovalReviewAction(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -1741,6 +1683,7 @@ class HookEventName(Enum):
     subagent_start = "subagentStart"
     subagent_stop = "subagentStop"
     stop = "stop"
+    interrupt = "interrupt"
 
 
 class HookExecutionMode(Enum):
@@ -1832,13 +1775,6 @@ class InitializeCapabilities(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
-    desktop_activation_receipts: Annotated[
-        bool | None,
-        Field(
-            alias="desktopActivationReceipts",
-            description="Opt into the trusted Desktop activation obligation/challenge/receipt API.",
-        ),
-    ] = None
     experimental_api: Annotated[
         bool | None,
         Field(
@@ -2092,6 +2028,7 @@ class ManagedHooksRequirements(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
+    interrupt: Annotated[list[ConfiguredHookMatcherGroup] | None, Field(alias="Interrupt")] = []
     permission_request: Annotated[
         list[ConfiguredHookMatcherGroup], Field(alias="PermissionRequest")
     ]
@@ -4190,60 +4127,6 @@ class ThreadDeletedNotification(BaseModel):
     thread_id: Annotated[str, Field(alias="threadId")]
 
 
-class ThreadDesktopActivationChallengeParams(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    thread_id: Annotated[str, Field(alias="threadId")]
-
-
-class ThreadDesktopActivationChallengeResponse(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    challenge: DesktopActivationChallenge | None = None
-    unavailable_reason: Annotated[
-        DesktopActivationUnavailableReason | None, Field(alias="unavailableReason")
-    ] = None
-
-
-class ThreadDesktopActivationObligationParams(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    thread_id: Annotated[str, Field(alias="threadId")]
-
-
-class ThreadDesktopActivationObligationResponse(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    obligation: DesktopActivationObligation | None = None
-
-
-class ThreadDesktopActivationRecordParams(BaseModel):
-    model_config = ConfigDict(
-        extra="forbid",
-        populate_by_name=True,
-    )
-    challenge_id: Annotated[str, Field(alias="challengeId")]
-    desktop_executable_path: Annotated[str, Field(alias="desktopExecutablePath")]
-    desktop_process_id: Annotated[int, Field(alias="desktopProcessId", ge=0)]
-    initialization_observation_identity: Annotated[
-        str, Field(alias="initializationObservationIdentity")
-    ]
-    observation_timestamp: Annotated[str, Field(alias="observationTimestamp")]
-
-
-class ThreadDesktopActivationRecordResponse(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    already_recorded: Annotated[bool, Field(alias="alreadyRecorded")]
-    challenge_id: Annotated[str, Field(alias="challengeId")]
-    recorded_at: Annotated[str, Field(alias="recordedAt")]
-
-
 class ThreadErrorReason(Enum):
     not_found = "notFound"
     not_loaded = "notLoaded"
@@ -5671,6 +5554,15 @@ class WindowsSandboxSetupStartResponse(BaseModel):
     started: bool
 
 
+class WindowsWorldWritableWarningNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    extra_count: Annotated[int, Field(alias="extraCount", ge=0)]
+    failed_scan: Annotated[bool, Field(alias="failedScan")]
+    sample_paths: Annotated[list[str], Field(alias="samplePaths")]
+
+
 class WorkspaceMessageType(Enum):
     headline = "headline"
     announcement = "announcement"
@@ -5819,42 +5711,6 @@ class ThreadResumeRequest(BaseModel):
     id: RequestId
     method: Annotated[Literal["thread/resume"], Field(title="Thread/resumeRequestMethod")]
     params: ThreadResumeParams
-
-
-class ThreadDesktopActivationObligationRequest(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    id: RequestId
-    method: Annotated[
-        Literal["thread/desktopActivation/obligation"],
-        Field(title="Thread/desktopActivation/obligationRequestMethod"),
-    ]
-    params: ThreadDesktopActivationObligationParams
-
-
-class ThreadDesktopActivationChallengeRequest(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    id: RequestId
-    method: Annotated[
-        Literal["thread/desktopActivation/challenge"],
-        Field(title="Thread/desktopActivation/challengeRequestMethod"),
-    ]
-    params: ThreadDesktopActivationChallengeParams
-
-
-class ThreadDesktopActivationRecordRequest(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    id: RequestId
-    method: Annotated[
-        Literal["thread/desktopActivation/record"],
-        Field(title="Thread/desktopActivation/recordRequestMethod"),
-    ]
-    params: ThreadDesktopActivationRecordParams
 
 
 class ThreadArchiveRequest(BaseModel):
@@ -7031,6 +6887,17 @@ class ExecveGuardianApprovalReviewAction(BaseModel):
     type: Annotated[Literal["execve"], Field(title="ExecveGuardianApprovalReviewActionType")]
 
 
+class ApplyPatchGuardianApprovalReviewAction(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    cwd: LegacyAppPathString
+    files: list[LegacyAppPathString]
+    type: Annotated[
+        Literal["applyPatch"], Field(title="ApplyPatchGuardianApprovalReviewActionType")
+    ]
+
+
 class NetworkAccessGuardianApprovalReviewAction(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -7729,6 +7596,17 @@ class ConfigWarningServerNotification(BaseModel):
     params: ConfigWarningNotification
 
 
+class WindowsWorldWritableWarningServerNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    method: Annotated[
+        Literal["windows/worldWritableWarning"],
+        Field(title="Windows/worldWritableWarningNotificationMethod"),
+    ]
+    params: WindowsWorldWritableWarningNotification
+
+
 class SkillDependencies(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -8153,9 +8031,6 @@ class TurnPlanStep(BaseModel):
     depends_on: Annotated[list[str] | None, Field(alias="dependsOn")] = None
     generated_artifacts: Annotated[list[str] | None, Field(alias="generatedArtifacts")] = None
     id: str | None = None
-    requires_desktop_activation: Annotated[
-        bool | None, Field(alias="requiresDesktopActivation")
-    ] = False
     risks: list[str] | None = None
     runtime_paths: Annotated[list[str] | None, Field(alias="runtimePaths")] = None
     status: TurnPlanStepStatus
@@ -10278,9 +10153,6 @@ class ClientRequest(
         InitializeRequest
         | ThreadStartRequest
         | ThreadResumeRequest
-        | ThreadDesktopActivationObligationRequest
-        | ThreadDesktopActivationChallengeRequest
-        | ThreadDesktopActivationRecordRequest
         | ThreadForkRequest
         | ThreadArchiveRequest
         | ThreadDeleteRequest
@@ -10377,9 +10249,6 @@ class ClientRequest(
         InitializeRequest
         | ThreadStartRequest
         | ThreadResumeRequest
-        | ThreadDesktopActivationObligationRequest
-        | ThreadDesktopActivationChallengeRequest
-        | ThreadDesktopActivationRecordRequest
         | ThreadForkRequest
         | ThreadArchiveRequest
         | ThreadDeleteRequest
@@ -10952,6 +10821,7 @@ class ServerNotification(
         | ConfigWarningServerNotification
         | FuzzyFileSearchSessionUpdatedServerNotification
         | FuzzyFileSearchSessionCompletedServerNotification
+        | WindowsWorldWritableWarningServerNotification
         | WindowsSandboxSetupCompletedServerNotification
         | AccountLoginCompletedServerNotification
     ]
@@ -11018,6 +10888,7 @@ class ServerNotification(
         | ConfigWarningServerNotification
         | FuzzyFileSearchSessionUpdatedServerNotification
         | FuzzyFileSearchSessionCompletedServerNotification
+        | WindowsWorldWritableWarningServerNotification
         | WindowsSandboxSetupCompletedServerNotification
         | AccountLoginCompletedServerNotification,
         Field(

@@ -29,14 +29,15 @@ in conversation and create no run directory.
 
 ## Phase 2: Preflight and Plan
 
-Create `PLAN.md` only when durable planning is useful. Capture the objective,
-non-goals, owner scope, validation intent, risks, and a short milestone list.
-Add `EVAL.md` before implementation when capability or regression criteria need
-to survive later turns.
+Create a copy of [`templates/PLAN.md`](templates/PLAN.md) only when durable
+planning is useful. Capture the objective, non-goals, owner scope, validation
+intent, risks, and a short milestone list. Add a copy of
+[`templates/EVAL.md`](templates/EVAL.md) before implementation when capability
+or regression criteria need to survive later turns.
 
 Before starting concurrent writers or validation lanes, copy
-`templates/PREFLIGHT.json`, replace every `<...>` placeholder, and resolve it
-with
+[`templates/PREFLIGHT.json`](templates/PREFLIGHT.json), replace every `<...>`
+placeholder, and resolve it with
 `just workflow-preflight <manifest> <receipt>`. The
 preflight publishes the receipt into the repository's locked active-receipt
 registry and checks every registered receipt atomically. Use
@@ -60,8 +61,8 @@ before continuing.
 
 Follow root `AGENTS.md`, the nearest scoped instructions, and any explicitly
 selected or clearly applicable skill. The harness may record implementation
-decisions in `IMPLEMENT.md`, but that artifact does not replace owner-path
-inspection or task-scoped validation.
+decisions in a copy of [`templates/IMPLEMENT.md`](templates/IMPLEMENT.md), but
+that artifact does not replace owner-path inspection or task-scoped validation.
 
 Keep unrelated dirty changes intact. Keep generated output under its owning
 workflow. Do not add logs, screenshots, binaries, or large transcripts to
@@ -92,8 +93,10 @@ staleness pauses the task for root and offers an isolated-worktree restart
 instead of beginning another validation loop.
 
 Use the completion-gate status definitions below and the repository rules from
-root `AGENTS.md`. Use `QA_CHECKLIST.md` for broad verification and
-`HARNESS_AUDIT.md` for harness-policy or skill changes.
+root `AGENTS.md`. Use [`templates/QA_CHECKLIST.md`](templates/QA_CHECKLIST.md)
+for broad verification and
+[`templates/HARNESS_AUDIT.md`](templates/HARNESS_AUDIT.md) for harness-policy or
+skill changes.
 
 ### Completion Gate Status
 
@@ -108,19 +111,20 @@ root `AGENTS.md`. Use `QA_CHECKLIST.md` for broad verification and
 
 ## Phase 5: Finish
 
-Summarize the material changes, focused validation, and remaining risk. Write
-`HANDOFF.md` before stopping only when unresolved work or important context must
-survive. Release any active preflight receipt after its assignment is terminal.
+Summarize the material changes, focused validation, and remaining risk. Write a
+copy of [`templates/HANDOFF.md`](templates/HANDOFF.md) before stopping only when
+unresolved work or important context must survive. Release any active preflight
+receipt after its assignment is terminal.
 
 ## Optional Multi-Agent Mode
 
-Use `ORCHESTRATOR.md` when multi-agent work is active. Give each agent a bounded
-task, durable identity, claim set, and evidence target. Name one owner for each
-complete behavioral contract and one owner for final validation; overlaps remain
-visible as risk metadata. Before root completion, linked assignments,
-validations, and gates must be terminal. Root
-completion rechecks sealed receipt evidence so later relevant drift remains a
-blocker; unrelated task roots only warn and do not join this barrier.
+Use [`templates/ORCHESTRATOR.md`](templates/ORCHESTRATOR.md) when multi-agent
+work is active. Give each agent a bounded task, durable identity, claim set, and
+evidence target. Name one owner for each complete behavioral contract and one
+owner for final validation; overlaps remain visible as risk metadata. Before
+root completion, linked assignments, validations, and gates must be terminal.
+Root completion rechecks sealed receipt evidence so later relevant drift remains
+a blocker; unrelated task roots only warn and do not join this barrier.
 
 Investigation agents remain read-only, load root and nearest scoped
 instructions, inspect the smallest owner/caller/test/contract surface, separate

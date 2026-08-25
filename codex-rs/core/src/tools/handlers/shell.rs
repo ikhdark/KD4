@@ -158,6 +158,7 @@ fn shell_command_payload_command(payload: &ToolPayload) -> Option<String> {
 pub(super) struct RunExecLikeArgs {
     pub(super) tool_name: ToolName,
     pub(super) exec_params: ExecParams,
+    pub(super) environment_hash: String,
     pub(super) stall_timeout_ms: Option<u64>,
     pub(super) cancellation_token: CancellationToken,
     pub(super) hook_command: String,
@@ -266,10 +267,10 @@ impl ValidationExecutionOutcome {
 
     pub(super) fn from_value_or_legacy_success(value: &serde_json::Value) -> Self {
         Self::from_value(value).unwrap_or_else(|| {
-            if value.get("success").and_then(serde_json::Value::as_bool) == Some(false) {
-                Self::ExecutedFailure
-            } else {
-                Self::ExecutedSuccess
+            match value.get("success").and_then(serde_json::Value::as_bool) {
+                Some(true) => Self::ExecutedSuccess,
+                Some(false) => Self::ExecutedFailure,
+                None => Self::NotExecuted,
             }
         })
     }
@@ -336,6 +337,7 @@ pub(super) struct ValidationProofPreparationArgs<'a> {
     pub(super) cwd: &'a str,
     pub(super) command_invocation: &'a CommandInvocation,
     pub(super) environment: &'a HashMap<String, String>,
+    pub(super) environment_hash: &'a str,
     pub(super) execution_context: &'a str,
     pub(super) repository_epoch: u64,
     pub(super) call_id: &'a str,
@@ -357,7 +359,7 @@ pub(super) async fn prepare_validation_proof(
     }
 
     let environment =
-        validation_execution_environment_hash(args.environment, args.execution_context);
+        validation_execution_environment_hash(args.environment_hash, args.execution_context);
     let toolchain = child_env_value(args.environment, "RUSTUP_TOOLCHAIN")
         .map(|value| value.to_string_lossy().into_owned())
         .unwrap_or_default();
@@ -442,11 +444,11 @@ pub(super) async fn prepare_validation_proof(
 }
 
 fn validation_execution_environment_hash(
-    environment: &HashMap<String, String>,
+    environment_hash: &str,
     execution_context: &str,
 ) -> String {
     let mut digest = Sha256::new();
-    digest.update(validation_environment_hash(environment).as_bytes());
+    digest.update(environment_hash.as_bytes());
     digest.update([0]);
     digest.update(execution_context.as_bytes());
     format!("{:x}", digest.finalize())
@@ -766,7 +768,7 @@ pub(super) async fn run_exec_like_with_exit_code(
                 resolved_executable,
                 ValidationEvidence {
                     cwd: Some(args.exec_params.cwd.to_string_lossy().into_owned()),
-                    environment_hash: Some(validation_environment_hash(&args.exec_params.env)),
+                    environment_hash: Some(args.environment_hash.clone()),
                     toolchain,
                     retained_output_ref: Some(retained_output_ref.clone()),
                     lease_expires_at: Some(lease_expires_at),
@@ -2338,6 +2340,7 @@ async fn run_exec_like_with_exit_code_inner(
     let RunExecLikeArgs {
         tool_name,
         exec_params,
+        environment_hash: _,
         stall_timeout_ms,
         cancellation_token,
         hook_command,

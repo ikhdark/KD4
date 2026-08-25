@@ -88,7 +88,7 @@ async fn config_requirements_read_includes_new_thread_model_defaults() -> Result
 [models.new_thread]
 model = "gpt-managed"
 model_reasoning_effort = "medium"
-service_tier = "fast"
+service_tier = "priority"
 "#,
     )?;
     let mut mcp = TestAppServer::builder()
@@ -116,7 +116,7 @@ service_tier = "fast"
         defaults.model_reasoning_effort,
         Some(ReasoningEffort::Medium)
     );
-    assert_eq!(defaults.service_tier.as_deref(), Some("fast"));
+    assert_eq!(defaults.service_tier.as_deref(), Some("priority"));
     Ok(())
 }
 

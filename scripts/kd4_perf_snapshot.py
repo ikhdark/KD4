@@ -11,12 +11,13 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
-from typing import Any, Sequence
+from typing import Any, BinaryIO, Sequence
 
 try:
     from scripts.atomic_json import write_json_atomic
@@ -28,6 +29,7 @@ except ImportError:  # Direct script execution places scripts/ on sys.path.
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TIMEOUT_SECONDS = 1_800
+FAILURE_OUTPUT_TAIL_BYTES = 4_096
 
 
 @dataclass(frozen=True)
@@ -70,17 +72,50 @@ class ScenarioResult:
         return self.status == "passed"
 
 
-def percentile(values: Sequence[float], fraction: float) -> float:
-    if not values:
+def _percentile_from_ordered(ordered: Sequence[float], fraction: float) -> float:
+    if not ordered:
         raise ValueError("percentile requires at least one value")
     if not 0 <= fraction <= 1:
         raise ValueError("fraction must be between zero and one")
-    ordered = sorted(values)
     position = (len(ordered) - 1) * fraction
     lower = int(position)
     upper = min(lower + 1, len(ordered) - 1)
     weight = position - lower
     return ordered[lower] * (1 - weight) + ordered[upper] * weight
+
+
+def percentile(values: Sequence[float], fraction: float) -> float:
+    return _percentile_from_ordered(sorted(values), fraction)
+
+
+def _ordered_sample_statistics(
+    values: Sequence[float],
+) -> tuple[float, float, float, float]:
+    ordered = sorted(values)
+    return (
+        _percentile_from_ordered(ordered, 0.50),
+        _percentile_from_ordered(ordered, 0.95),
+        ordered[0],
+        ordered[-1],
+    )
+
+
+def _output_size_and_tail(output: BinaryIO) -> tuple[int, str]:
+    output.flush()
+    output.seek(0, os.SEEK_END)
+    size = output.tell()
+    output.seek(max(0, size - FAILURE_OUTPUT_TAIL_BYTES))
+    tail = output.read(FAILURE_OUTPUT_TAIL_BYTES).decode("utf-8", errors="replace")
+    return size, tail
+
+
+def _failure_reason(message: str, stdout_tail: str, stderr_tail: str) -> str:
+    diagnostics = []
+    if stdout_tail:
+        diagnostics.append(f"stdout tail: {stdout_tail!r}")
+    if stderr_tail:
+        diagnostics.append(f"stderr tail: {stderr_tail!r}")
+    return f"{message}; " + "; ".join(diagnostics) if diagnostics else message
 
 
 def _installed_codex_path(install_dir: Path | None = None) -> Path:
@@ -233,33 +268,51 @@ def measure_scenario(
     reason: str | None = None
     for _ in range(count):
         started = time.perf_counter_ns()
-        try:
-            completed = subprocess.run(
-                scenario.command,
-                cwd=scenario.cwd,
-                capture_output=True,
-                timeout=timeout_seconds,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            reason = str(exc)
-            break
+        with (
+            tempfile.TemporaryFile() as stdout_file,
+            tempfile.TemporaryFile() as stderr_file,
+        ):
+            try:
+                completed = subprocess.run(
+                    scenario.command,
+                    cwd=scenario.cwd,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    timeout=timeout_seconds,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                _stdout_bytes, stdout_tail = _output_size_and_tail(stdout_file)
+                _stderr_bytes, stderr_tail = _output_size_and_tail(stderr_file)
+                reason = _failure_reason(str(exc), stdout_tail, stderr_tail)
+                break
+            stdout_bytes, stdout_tail = _output_size_and_tail(stdout_file)
+            stderr_bytes, stderr_tail = _output_size_and_tail(stderr_file)
         elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
         samples.append(
             Sample(
                 elapsed_ms=round(elapsed_ms, 3),
                 exit_code=completed.returncode,
-                stdout_bytes=len(completed.stdout),
-                stderr_bytes=len(completed.stderr),
+                stdout_bytes=stdout_bytes,
+                stderr_bytes=stderr_bytes,
             )
         )
         if completed.returncode != 0:
-            reason = f"command exited {completed.returncode}"
+            reason = _failure_reason(
+                f"command exited {completed.returncode}",
+                stdout_tail,
+                stderr_tail,
+            )
             break
 
     elapsed = [sample.elapsed_ms for sample in samples]
     passed = len(samples) == count and all(sample.exit_code == 0 for sample in samples)
     warm = elapsed[1:]
+    p50_ms, p95_ms, min_ms, max_ms = (
+        _ordered_sample_statistics(elapsed)
+        if elapsed
+        else (None, None, None, None)
+    )
     return ScenarioResult(
         name=scenario.name,
         category=scenario.category,
@@ -271,10 +324,10 @@ def measure_scenario(
         samples=tuple(samples),
         cold_ms=elapsed[0] if elapsed else None,
         warm_p50_ms=round(median(warm), 3) if warm else None,
-        p50_ms=round(percentile(elapsed, 0.50), 3) if elapsed else None,
-        p95_ms=round(percentile(elapsed, 0.95), 3) if elapsed else None,
-        min_ms=min(elapsed) if elapsed else None,
-        max_ms=max(elapsed) if elapsed else None,
+        p50_ms=round(p50_ms, 3) if p50_ms is not None else None,
+        p95_ms=round(p95_ms, 3) if p95_ms is not None else None,
+        min_ms=min_ms,
+        max_ms=max_ms,
     )
 
 
@@ -293,6 +346,51 @@ def _git_text(repo_root: Path, *args: str) -> str | None:
     except (OSError, subprocess.TimeoutExpired):
         return None
     return completed.stdout.strip() if completed.returncode == 0 else None
+
+
+def _legacy_git_repository_metadata(
+    repo_root: Path,
+) -> tuple[str | None, str | None, int | None]:
+    status = _git_text(repo_root, "status", "--porcelain=v1", "--untracked-files=all")
+    return (
+        _git_text(repo_root, "rev-parse", "HEAD"),
+        _git_text(repo_root, "branch", "--show-current"),
+        len(status.splitlines()) if status is not None else None,
+    )
+
+
+def _git_repository_metadata(
+    repo_root: Path,
+) -> tuple[str | None, str | None, int | None]:
+    status = _git_text(
+        repo_root,
+        "status",
+        "--porcelain=v2",
+        "--branch",
+        "--untracked-files=all",
+    )
+    if status is None:
+        return _legacy_git_repository_metadata(repo_root)
+
+    head: str | None = None
+    branch: str | None = None
+    saw_head = False
+    saw_branch = False
+    dirty_paths = 0
+    for line in status.splitlines():
+        if line.startswith("# branch.oid "):
+            saw_head = True
+            value = line.removeprefix("# branch.oid ")
+            head = None if value == "(initial)" else value
+        elif line.startswith("# branch.head "):
+            saw_branch = True
+            value = line.removeprefix("# branch.head ")
+            branch = None if value == "(detached)" else value
+        elif not line.startswith("# "):
+            dirty_paths += 1
+    if not saw_head or not saw_branch:
+        return _legacy_git_repository_metadata(repo_root)
+    return head, branch, dirty_paths
 
 
 def _sha256(path: Path) -> str:
@@ -316,13 +414,13 @@ def environment_metadata(
         binary.update({"size": stat.st_size, "mtimeNs": stat.st_mtime_ns})
         if hash_binary:
             binary["sha256"] = _sha256(installed_codex)
-    status = _git_text(repo_root, "status", "--porcelain=v1", "--untracked-files=all")
+    head, branch, dirty_paths = _git_repository_metadata(repo_root)
     return {
         "capturedAt": datetime.now(timezone.utc).isoformat(),
         "repository": str(repo_root.resolve()),
-        "head": _git_text(repo_root, "rev-parse", "HEAD"),
-        "branch": _git_text(repo_root, "branch", "--show-current"),
-        "dirtyPaths": len(status.splitlines()) if status is not None else None,
+        "head": head,
+        "branch": branch,
+        "dirtyPaths": dirty_paths,
         "platform": platform.platform(),
         "python": sys.version,
         "cpuCount": os.cpu_count(),

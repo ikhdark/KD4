@@ -11,6 +11,7 @@ use codex_extension_api::ToolContributor;
 use codex_extension_api::ToolExecutor;
 use codex_extension_api::ToolName;
 use codex_extension_api::ToolPayload;
+use codex_tools::ToolCallSource;
 use codex_tools::ToolOutput;
 use codex_utils_absolute_path::test_support::PathBufExt;
 use codex_utils_absolute_path::test_support::PathExt;
@@ -247,6 +248,7 @@ async fn add_ad_hoc_note_tool_creates_note_file() {
             tool_name: memory_tool_name(crate::ADD_AD_HOC_NOTE_TOOL_NAME),
             model: "gpt-test".to_string(),
             truncation_policy: TruncationPolicy::Bytes(1024),
+            source: ToolCallSource::Direct,
             conversation_history: codex_extension_api::ConversationHistory::default(),
             turn_item_emitter: Arc::new(NoopTurnItemEmitter),
             cancellation_token: Default::default(),
@@ -293,6 +295,7 @@ async fn add_ad_hoc_note_tool_rejects_paths_as_filenames() {
             tool_name: memory_tool_name(crate::ADD_AD_HOC_NOTE_TOOL_NAME),
             model: "gpt-test".to_string(),
             truncation_policy: TruncationPolicy::Bytes(1024),
+            source: ToolCallSource::Direct,
             conversation_history: codex_extension_api::ConversationHistory::default(),
             turn_item_emitter: Arc::new(NoopTurnItemEmitter),
             cancellation_token: Default::default(),
@@ -340,6 +343,7 @@ async fn read_tool_reads_memory_file() {
             tool_name: memory_tool_name(crate::READ_TOOL_NAME),
             model: "gpt-test".to_string(),
             truncation_policy: TruncationPolicy::Bytes(1024),
+            source: ToolCallSource::Direct,
             conversation_history: codex_extension_api::ConversationHistory::default(),
             turn_item_emitter: Arc::new(NoopTurnItemEmitter),
             cancellation_token: Default::default(),
@@ -390,6 +394,7 @@ async fn search_tool_accepts_multiple_queries() {
             tool_name: memory_tool_name(crate::SEARCH_TOOL_NAME),
             model: "gpt-test".to_string(),
             truncation_policy: TruncationPolicy::Bytes(1024),
+            source: ToolCallSource::Direct,
             conversation_history: codex_extension_api::ConversationHistory::default(),
             turn_item_emitter: Arc::new(NoopTurnItemEmitter),
             cancellation_token: Default::default(),
@@ -466,6 +471,7 @@ async fn search_tool_accepts_windowed_all_match_mode() {
             tool_name: memory_tool_name(crate::SEARCH_TOOL_NAME),
             model: "gpt-test".to_string(),
             truncation_policy: TruncationPolicy::Bytes(1024),
+            source: ToolCallSource::Direct,
             conversation_history: codex_extension_api::ConversationHistory::default(),
             turn_item_emitter: Arc::new(NoopTurnItemEmitter),
             cancellation_token: Default::default(),
@@ -522,6 +528,7 @@ async fn search_tool_rejects_legacy_single_query() {
             tool_name: memory_tool_name(crate::SEARCH_TOOL_NAME),
             model: "gpt-test".to_string(),
             truncation_policy: TruncationPolicy::Bytes(1024),
+            source: ToolCallSource::Direct,
             conversation_history: codex_extension_api::ConversationHistory::default(),
             turn_item_emitter: Arc::new(NoopTurnItemEmitter),
             cancellation_token: Default::default(),

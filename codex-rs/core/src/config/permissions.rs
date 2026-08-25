@@ -47,6 +47,110 @@ pub(crate) const BUILT_IN_WORKSPACE_PROFILE: &str = BUILT_IN_PERMISSION_PROFILE_
 pub(crate) const BUILT_IN_DANGER_FULL_ACCESS_PROFILE: &str =
     BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BuiltInPermissionProfileId {
+    ReadOnly,
+    Workspace,
+    DangerFullAccess,
+}
+
+#[derive(Clone, Copy)]
+struct BuiltInPermissionProfileDescriptor {
+    id: &'static str,
+    kind: BuiltInPermissionProfileId,
+}
+
+const BUILT_IN_PERMISSION_PROFILES: [BuiltInPermissionProfileDescriptor; 3] = [
+    BuiltInPermissionProfileDescriptor {
+        id: BUILT_IN_READ_ONLY_PROFILE,
+        kind: BuiltInPermissionProfileId::ReadOnly,
+    },
+    BuiltInPermissionProfileDescriptor {
+        id: BUILT_IN_WORKSPACE_PROFILE,
+        kind: BuiltInPermissionProfileId::Workspace,
+    },
+    BuiltInPermissionProfileDescriptor {
+        id: BUILT_IN_DANGER_FULL_ACCESS_PROFILE,
+        kind: BuiltInPermissionProfileId::DangerFullAccess,
+    },
+];
+
+fn builtin_permission_profile_descriptor(
+    profile_name: &str,
+) -> Option<BuiltInPermissionProfileDescriptor> {
+    BUILT_IN_PERMISSION_PROFILES
+        .iter()
+        .copied()
+        .find(|descriptor| descriptor.id == profile_name)
+}
+
+impl BuiltInPermissionProfileId {
+    pub(crate) fn from_str(id: &str) -> Option<Self> {
+        builtin_permission_profile_descriptor(id).map(|descriptor| descriptor.kind)
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => BUILT_IN_READ_ONLY_PROFILE,
+            Self::Workspace => BUILT_IN_WORKSPACE_PROFILE,
+            Self::DangerFullAccess => BUILT_IN_DANGER_FULL_ACCESS_PROFILE,
+        }
+    }
+}
+
+pub(super) fn builtin_permission_profiles()
+-> impl Iterator<Item = (&'static str, PermissionProfile)> {
+    BUILT_IN_PERMISSION_PROFILES.into_iter().map(|descriptor| {
+        (
+            descriptor.id,
+            descriptor.permission_profile(/*workspace_write*/ None),
+        )
+    })
+}
+
+impl BuiltInPermissionProfileDescriptor {
+    fn permission_profile(
+        self,
+        workspace_write: Option<&SandboxWorkspaceWrite>,
+    ) -> PermissionProfile {
+        match self.kind {
+            BuiltInPermissionProfileId::ReadOnly => PermissionProfile::read_only(),
+            BuiltInPermissionProfileId::Workspace => match workspace_write {
+                Some(SandboxWorkspaceWrite {
+                    writable_roots: _,
+                    network_access,
+                    exclude_tmpdir_env_var,
+                    exclude_slash_tmp,
+                }) => PermissionProfile::workspace_write_with(
+                    &[],
+                    if *network_access {
+                        NetworkSandboxPolicy::Enabled
+                    } else {
+                        NetworkSandboxPolicy::Restricted
+                    },
+                    *exclude_tmpdir_env_var,
+                    *exclude_slash_tmp,
+                ),
+                None => PermissionProfile::workspace_write(),
+            },
+            BuiltInPermissionProfileId::DangerFullAccess => PermissionProfile::Disabled,
+        }
+    }
+
+    fn extensible_parent_profile(self) -> Option<PermissionProfileToml> {
+        let file_system = match self.kind {
+            BuiltInPermissionProfileId::ReadOnly => FileSystemSandboxPolicy::read_only(),
+            BuiltInPermissionProfileId::Workspace => FileSystemSandboxPolicy::workspace_write(
+                &[],
+                /*exclude_tmpdir_env_var*/ false,
+                /*exclude_slash_tmp*/ false,
+            ),
+            BuiltInPermissionProfileId::DangerFullAccess => return None,
+        };
+        Some(permission_profile_toml_from_file_system_policy(file_system))
+    }
+}
+
 pub(crate) fn default_builtin_permission_profile_name(
     active_project: &ProjectConfig,
     windows_sandbox_level: WindowsSandboxLevel,
@@ -61,41 +165,15 @@ pub(crate) fn default_builtin_permission_profile_name(
 }
 
 pub(crate) fn is_builtin_permission_profile_name(profile_name: &str) -> bool {
-    matches!(
-        profile_name,
-        BUILT_IN_READ_ONLY_PROFILE
-            | BUILT_IN_WORKSPACE_PROFILE
-            | BUILT_IN_DANGER_FULL_ACCESS_PROFILE
-    )
+    builtin_permission_profile_descriptor(profile_name).is_some()
 }
 
 pub(crate) fn builtin_permission_profile(
     profile_name: &str,
     workspace_write: Option<&SandboxWorkspaceWrite>,
 ) -> Option<PermissionProfile> {
-    match profile_name {
-        BUILT_IN_READ_ONLY_PROFILE => Some(PermissionProfile::read_only()),
-        BUILT_IN_WORKSPACE_PROFILE => Some(match workspace_write {
-            Some(SandboxWorkspaceWrite {
-                writable_roots: _,
-                network_access,
-                exclude_tmpdir_env_var,
-                exclude_slash_tmp,
-            }) => PermissionProfile::workspace_write_with(
-                &[],
-                if *network_access {
-                    NetworkSandboxPolicy::Enabled
-                } else {
-                    NetworkSandboxPolicy::Restricted
-                },
-                *exclude_tmpdir_env_var,
-                *exclude_slash_tmp,
-            ),
-            None => PermissionProfile::workspace_write(),
-        }),
-        BUILT_IN_DANGER_FULL_ACCESS_PROFILE => Some(PermissionProfile::Disabled),
-        _ => None,
-    }
+    builtin_permission_profile_descriptor(profile_name)
+        .map(|descriptor| descriptor.permission_profile(workspace_write))
 }
 
 pub(crate) fn validate_user_permission_profile_names(
@@ -203,16 +281,8 @@ pub(crate) fn resolve_permission_profile(
 }
 
 fn extensible_builtin_parent_profile(profile_name: &str) -> Option<PermissionProfileToml> {
-    let file_system = match profile_name {
-        BUILT_IN_READ_ONLY_PROFILE => FileSystemSandboxPolicy::read_only(),
-        BUILT_IN_WORKSPACE_PROFILE => FileSystemSandboxPolicy::workspace_write(
-            &[],
-            /*exclude_tmpdir_env_var*/ false,
-            /*exclude_slash_tmp*/ false,
-        ),
-        _ => return None,
-    };
-    Some(permission_profile_toml_from_file_system_policy(file_system))
+    builtin_permission_profile_descriptor(profile_name)
+        .and_then(BuiltInPermissionProfileDescriptor::extensible_parent_profile)
 }
 
 fn permission_profile_toml_from_file_system_policy(

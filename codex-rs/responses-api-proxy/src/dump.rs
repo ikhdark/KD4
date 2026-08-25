@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use reqwest::header::HeaderMap;
+use http::HeaderMap;
 use serde::Serialize;
 use serde_json::Value;
 use tiny_http::Header;
@@ -167,8 +167,8 @@ impl From<&Header> for HeaderDump {
     }
 }
 
-impl From<(&reqwest::header::HeaderName, &reqwest::header::HeaderValue)> for HeaderDump {
-    fn from(header: (&reqwest::header::HeaderName, &reqwest::header::HeaderValue)) -> Self {
+impl From<(&http::HeaderName, &http::HeaderValue)> for HeaderDump {
+    fn from(header: (&http::HeaderName, &http::HeaderValue)) -> Self {
         let name = header.0.as_str();
         let value = if should_redact_header(name) {
             REDACTED_HEADER_VALUE.to_string()
@@ -208,11 +208,11 @@ mod tests {
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
 
+    use http::HeaderMap;
+    use http::HeaderValue;
+    use http::header::AUTHORIZATION;
+    use http::header::CONTENT_TYPE;
     use pretty_assertions::assert_eq;
-    use reqwest::header::AUTHORIZATION;
-    use reqwest::header::CONTENT_TYPE;
-    use reqwest::header::HeaderMap;
-    use reqwest::header::HeaderValue;
     use serde_json::json;
     use tiny_http::Header;
     use tiny_http::Method;

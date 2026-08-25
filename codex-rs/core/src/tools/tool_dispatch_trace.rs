@@ -488,18 +488,6 @@ pub(crate) fn mark_exec_process_exited() {
     let _ = ACTIVE_TOOL_DISPATCH_TIMING.try_with(|timing| timing.mark_exec_process_exited());
 }
 
-pub(crate) fn increment_retry_count() -> Option<u32> {
-    ACTIVE_TOOL_DISPATCH_TIMING
-        .try_with(|timing| timing.increment_retry_count())
-        .ok()
-}
-
-pub(crate) fn increment_reentry_count() -> Option<u32> {
-    ACTIVE_TOOL_DISPATCH_TIMING
-        .try_with(|timing| timing.increment_reentry_count())
-        .ok()
-}
-
 pub(crate) fn record_timer_wait(wait: ToolLifecycleTimerWait) {
     let _ = ACTIVE_TOOL_DISPATCH_TIMING.try_with(|timing| timing.record_timer_wait(wait));
 }

@@ -440,6 +440,21 @@ fn repository_stable_context_bundle_is_a_pure_derived_value() {
 }
 
 #[test]
+fn repository_stable_context_render_carries_exact_body_and_rendered_hashes() {
+    let loaded = stable_context_loaded(&[("AGENTS.md", "root"), ("nested/AGENTS.md", "nested")]);
+
+    let rendered = loaded.render_stable_context();
+    let expected_rendered_hash: [u8; 32] = Sha256::digest(rendered.text.as_bytes()).into();
+    let expected_entry_hashes: Vec<[u8; 32]> = vec![
+        Sha256::digest(b"root").into(),
+        Sha256::digest(b"nested").into(),
+    ];
+
+    assert_eq!(rendered.rendered_hash, expected_rendered_hash);
+    assert_eq!(rendered.entry_hashes, expected_entry_hashes);
+}
+
+#[test]
 fn repository_stable_context_does_not_infer_replacement_without_session_history() {
     let cwd = PathUri::parse("file:///stable-context-semantic-replacement").expect("cwd URI");
     let original = stable_context_loaded(&[(
@@ -817,8 +832,14 @@ async fn source_byte_limit_includes_mandatory_truncation_notice() {
 #[tokio::test]
 async fn rendered_project_doc_overhead_uses_a_bounded_aggregate_omission_notice() {
     const SOURCE_LIMIT: usize = 1;
+    let maximal_omission = ProjectDocOmission {
+        environment_id: "e".repeat(1024),
+        cwd: "c".repeat(1024),
+        path: "p".repeat(1024),
+        source_bytes: u64::MAX,
+    };
     assert!(
-        aggregate_project_doc_omission_notice(usize::MAX, u64::MAX)
+        aggregate_project_doc_omission_notice(&[maximal_omission])
             .len()
             .saturating_add(2)
             <= PROJECT_DOC_AGGREGATE_NOTICE_RESERVE_BYTES
@@ -850,12 +871,14 @@ async fn rendered_project_doc_overhead_uses_a_bounded_aggregate_omission_notice(
                 InstructionProvenance::Project { source_path, .. } if source_path == &nearest_path
             )
     }));
-    assert!(text.contains("Project documentation omission notice:"));
+    assert!(text.contains("Project docs omitted:"));
+    assert!(text.contains("manifest_sha256="));
+    assert!(text.contains("rediscover AGENTS/override files"));
     assert!(text.len() <= project_doc_rendered_max_bytes(SOURCE_LIMIT));
 }
 
 #[test]
-fn long_project_doc_provenance_collapses_to_path_independent_aggregate_notice() {
+fn long_project_doc_provenance_retains_a_bounded_scope_manifest() {
     let long_path = PathUri::parse(&format!(
         "file:///workspace/{}/AGENTS.md",
         "deeply-nested-scope/".repeat(512)
@@ -867,7 +890,7 @@ fn long_project_doc_provenance_collapses_to_path_independent_aggregate_notice() 
         &cwd,
         vec![LoadedProjectDoc {
             candidate: ProjectDocCandidate {
-                path: long_path.clone(),
+                path: long_path,
                 size: 2,
             },
             read: ProjectDocRead {
@@ -880,13 +903,12 @@ fn long_project_doc_provenance_collapses_to_path_independent_aggregate_notice() 
     );
 
     assert!(rendered.loaded.is_none());
-    assert_eq!(rendered.aggregate_omitted_documents, 1);
-    assert_eq!(rendered.aggregate_omitted_bytes, 2);
-    let notice = aggregate_project_doc_omission_notice(
-        rendered.aggregate_omitted_documents,
-        rendered.aggregate_omitted_bytes,
-    );
-    assert!(!notice.contains(&long_path.to_string()));
+    assert_eq!(rendered.omitted_documents.len(), 1);
+    assert_eq!(rendered.omitted_documents[0].source_bytes, 2);
+    let notice = aggregate_project_doc_omission_notice(&rendered.omitted_documents);
+    assert!(notice.contains("manifest_sha256="));
+    assert!(notice.contains("scope=local@"));
+    assert!(notice.contains("rediscover AGENTS/override files"));
     assert!(notice.len().saturating_add(2) <= PROJECT_DOC_AGGREGATE_NOTICE_RESERVE_BYTES);
 }
 
@@ -966,7 +988,7 @@ async fn read_agents_md_propagates_read_errors() {
 }
 
 #[tokio::test]
-async fn read_agents_md_ignores_files_removed_after_discovery() {
+async fn read_agents_md_reports_files_removed_after_discovery() {
     let tmp = tempfile::tempdir().expect("tempdir");
     fs::write(tmp.path().join("AGENTS.md"), "project doc").unwrap();
     let config = make_config(&tmp, /*limit*/ 4096, /*instructions*/ None).await;
@@ -977,11 +999,11 @@ async fn read_agents_md_ignores_files_removed_after_discovery() {
     };
 
     let cwd = config.cwd.clone();
-    let loaded = read_agents_md(&config.config, &fs, "local", &PathUri::from_abs_path(&cwd))
+    let err = read_agents_md(&config.config, &fs, "local", &PathUri::from_abs_path(&cwd))
         .await
-        .expect("removed file is recoverable");
+        .expect_err("removed discovered file must make the snapshot incomplete");
 
-    assert_eq!(loaded, None);
+    assert_eq!(err.kind(), io::ErrorKind::NotFound);
 }
 
 #[tokio::test]
@@ -1455,6 +1477,105 @@ async fn independent_environment_reads_are_budgeted_sequentially_and_preserve_se
     )
     .await
     .expect("secondary read should start after the primary read completes");
+
+    let loaded = tokio::time::timeout(std::time::Duration::from_secs(5), load)
+        .await
+        .expect("environment load should complete")
+        .expect("environment load task")
+        .loaded
+        .expect("instructions expected");
+    assert_eq!(
+        loaded.text(),
+        format!(
+            "for `primary` with root {}\n\nprimary doc\n\nfor `secondary` with root {}\n\nsecondary doc",
+            primary.path().display(),
+            secondary.path().display()
+        )
+    );
+}
+
+#[tokio::test]
+async fn independent_environment_discovery_runs_concurrently_and_preserves_selection_order() {
+    let primary = tempfile::tempdir().expect("primary tempdir");
+    let secondary = tempfile::tempdir().expect("secondary tempdir");
+    let primary_doc = primary.path().join("AGENTS.md");
+    let secondary_doc = secondary.path().join("AGENTS.md");
+    fs::write(&primary_doc, "primary doc").unwrap();
+    fs::write(&secondary_doc, "secondary doc").unwrap();
+    let config = make_config(&primary, /*limit*/ 4096, /*instructions*/ None).await;
+    let primary_control = Arc::new(MetadataCallCounts::default());
+    let secondary_control = Arc::new(MetadataCallCounts::default());
+    let primary_filesystem: Arc<dyn ExecutorFileSystem> = Arc::new(FailingFileSystem {
+        path: primary_doc.abs(),
+        failure: InjectedFailure::MetadataBlocked,
+        metadata_calls: Arc::clone(&primary_control),
+    });
+    let secondary_filesystem: Arc<dyn ExecutorFileSystem> = Arc::new(FailingFileSystem {
+        path: secondary_doc.abs(),
+        failure: InjectedFailure::ReadObserved,
+        metadata_calls: Arc::clone(&secondary_control),
+    });
+    let environments = TurnEnvironmentSnapshot {
+        generation: 0,
+        turn_environments: vec![
+            TurnEnvironment::new(
+                "primary".to_string(),
+                Arc::new(Environment::default_for_tests_with_filesystem(
+                    primary_filesystem,
+                )),
+                PathUri::from_abs_path(&config.cwd),
+                /*shell*/ None,
+            ),
+            TurnEnvironment::new(
+                "secondary".to_string(),
+                Arc::new(Environment::default_for_tests_with_filesystem(
+                    secondary_filesystem,
+                )),
+                PathUri::from_abs_path(&secondary.abs()),
+                /*shell*/ None,
+            ),
+        ],
+        starting: Vec::new(),
+    };
+    let config = config.config;
+    let primary_doc = PathUri::from_abs_path(&primary_doc.abs());
+
+    let load = tokio::spawn(async move {
+        load_project_instructions(&config, /*user_instructions*/ None, &environments).await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let started = primary_control.started.notified();
+            if primary_control
+                .paths
+                .lock()
+                .expect("primary metadata paths")
+                .contains(&primary_doc)
+            {
+                break;
+            }
+            started.await;
+        }
+    })
+    .await
+    .expect("primary discovery should reach its blocked document");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let started = secondary_control.started.notified();
+            if !secondary_control
+                .paths
+                .lock()
+                .expect("secondary metadata paths")
+                .is_empty()
+            {
+                break;
+            }
+            started.await;
+        }
+    })
+    .await
+    .expect("secondary discovery should start while primary discovery is blocked");
+    primary_control.release.notify_one();
 
     let loaded = tokio::time::timeout(std::time::Duration::from_secs(5), load)
         .await

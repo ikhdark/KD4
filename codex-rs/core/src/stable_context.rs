@@ -12,6 +12,16 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+#[cfg(test)]
+use std::cell::Cell;
+
+#[cfg(test)]
+std::thread_local! {
+    static MANIFEST_FINGERPRINT_CALLS: Cell<usize> = const { Cell::new(0) };
+    static COMPACT_CATALOG_CALLS: Cell<usize> = const { Cell::new(0) };
+    static CLASSIFY_STABLE_TEXT_CALLS: Cell<usize> = const { Cell::new(0) };
+}
+
 const STABLE_CONTEXT_CONTRACT_VERSION: u16 = 1;
 const STABLE_CONTEXT_HASH_DOMAIN: &[u8] = b"codex.stable-context.component.v1";
 const STABLE_CONTEXT_MANIFEST_HASH_DOMAIN: &[u8] = b"codex.stable-context.manifest.v1";
@@ -186,7 +196,12 @@ impl StableContextManifest {
         for component in &mut components {
             component.local_reused = local_reused;
         }
-        Self::from_components(components, self.projection_enabled, self.fail_open)
+        Self {
+            components: components.into(),
+            fingerprint: self.fingerprint,
+            projection_enabled: self.projection_enabled,
+            fail_open: self.fail_open,
+        }
     }
 
     pub(crate) fn with_base_model(&self, model_slug: &str, base_instructions: &str) -> Self {
@@ -391,13 +406,27 @@ impl StableContextSlot {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 struct Occurrence {
     item_index: usize,
     content_index: usize,
     slot: StableContextSlot,
-    text: String,
-    turn_id: Option<String>,
+}
+
+impl Occurrence {
+    fn text<'a>(&self, items: &'a [ResponseItem]) -> &'a str {
+        let ResponseItem::Message { content, .. } = &items[self.item_index] else {
+            unreachable!("stable context occurrences only reference messages");
+        };
+        let ContentItem::InputText { text } = &content[self.content_index] else {
+            unreachable!("stable context occurrences only reference input text");
+        };
+        text
+    }
+
+    fn turn_id<'a>(&self, items: &'a [ResponseItem]) -> Option<&'a str> {
+        items[self.item_index].turn_id()
+    }
 }
 
 pub(crate) fn project_stable_context(
@@ -407,7 +436,8 @@ pub(crate) fn project_stable_context(
     let fallback_items = Arc::clone(&items);
     let mut occurrences = Vec::new();
     let mut ambiguous = false;
-    let mut latest_real_user: Option<(usize, Option<String>)> = None;
+    let mut latest_real_user = None;
+    let mut user_insertion_by_turn = HashMap::<&str, usize>::new();
 
     for (item_index, item) in items.iter().enumerate() {
         let ResponseItem::Message {
@@ -420,10 +450,12 @@ pub(crate) fn project_stable_context(
             continue;
         };
         let mut contains_stable = false;
+        let mut contains_ordinary_user_content = false;
         let mut contains_unprojectable = false;
         for (content_index, content_item) in content.iter().enumerate() {
             let ContentItem::InputText { text } = content_item else {
                 contains_unprojectable = true;
+                contains_ordinary_user_content = true;
                 continue;
             };
             if let Some(slot) = classify_stable_text(role, text) {
@@ -432,11 +464,12 @@ pub(crate) fn project_stable_context(
                     item_index,
                     content_index,
                     slot,
-                    text: text.clone(),
-                    turn_id: item.turn_id().map(str::to_string),
                 });
             } else if contains_known_open_marker(text) {
                 ambiguous = true;
+                contains_ordinary_user_content = true;
+            } else {
+                contains_ordinary_user_content = true;
             }
         }
         // Splitting a registered fragment away from images or output text
@@ -445,8 +478,11 @@ pub(crate) fn project_stable_context(
         if contains_stable && contains_unprojectable {
             ambiguous = true;
         }
-        if role == "user" && !contains_stable {
-            latest_real_user = Some((item_index, item.turn_id().map(str::to_string)));
+        if role == "user" && contains_ordinary_user_content {
+            latest_real_user = Some(item_index);
+            if let Some(turn_id) = item.turn_id() {
+                user_insertion_by_turn.entry(turn_id).or_insert(item_index);
+            }
         }
     }
 
@@ -454,9 +490,17 @@ pub(crate) fn project_stable_context(
     let enabled = target == StableContextTarget::Sampling && !ambiguous;
     let fail_open = ambiguous || target_fail_open;
     let (projected, components) = if enabled {
-        project_items(&items, &occurrences, latest_real_user.as_ref())
+        project_items(
+            &items,
+            &occurrences,
+            latest_real_user,
+            &user_insertion_by_turn,
+        )
     } else {
-        (items.to_vec(), analyze_unprojected(&occurrences, fail_open))
+        (
+            items.to_vec(),
+            analyze_unprojected(&items, &occurrences, fail_open),
+        )
     };
     StableContextProjection {
         items: projected.into(),
@@ -468,9 +512,11 @@ pub(crate) fn project_stable_context(
 fn project_items(
     items: &[ResponseItem],
     occurrences: &[Occurrence],
-    latest_real_user: Option<&(usize, Option<String>)>,
+    latest_real_user: Option<usize>,
+    user_insertion_by_turn: &HashMap<&str, usize>,
 ) -> (Vec<ResponseItem>, Vec<StableContextComponent>) {
-    let selected_skill_indexes = current_selected_skill_indexes(occurrences, latest_real_user);
+    let selected_skill_indexes =
+        current_selected_skill_indexes(items, occurrences, latest_real_user);
     let selected_skills_active = !selected_skill_indexes.is_empty();
     let mut latest_by_slot = HashMap::<StableContextSlot, usize>::new();
     for (index, occurrence) in occurrences.iter().enumerate() {
@@ -482,21 +528,33 @@ fn project_items(
     let collaboration_removed = latest_by_slot
         .get(&StableContextSlot::Collaboration)
         .and_then(|index| occurrences.get(*index))
-        .is_some_and(|occurrence| occurrence.text.contains(COLLABORATION_RESET_NOTICE));
+        .is_some_and(|occurrence| occurrence.text(items).contains(COLLABORATION_RESET_NOTICE));
     let repository_removed = latest_by_slot
         .get(&StableContextSlot::Repository)
         .and_then(|index| occurrences.get(*index))
-        .is_some_and(|occurrence| occurrence.text.contains(REPOSITORY_REMOVAL_NOTICE));
+        .is_some_and(|occurrence| occurrence.text(items).contains(REPOSITORY_REMOVAL_NOTICE));
     let recommended_plugins_current = latest_by_slot
         .get(&StableContextSlot::RecommendedPlugins)
         .and_then(|index| occurrences.get(*index))
         .is_some_and(|occurrence| {
             latest_real_user.is_none()
-                || occurrence_matches_latest_user_turn(occurrence, latest_real_user)
+                || occurrence_matches_latest_user_turn(items, occurrence, latest_real_user)
         });
 
+    let compact_catalog = if selected_skills_active {
+        latest_by_slot
+            .get(&StableContextSlot::SkillCatalog)
+            .map(|occurrence_index| {
+                (
+                    *occurrence_index,
+                    compact_skill_catalog_reference(occurrences[*occurrence_index].text(items)),
+                )
+            })
+    } else {
+        None
+    };
+
     let mut keep = HashSet::<(usize, usize)>::new();
-    let mut replacement_catalog = HashMap::<(usize, usize), String>::new();
     for (slot, occurrence_index) in &latest_by_slot {
         let occurrence = &occurrences[*occurrence_index];
         let should_keep = match slot {
@@ -509,12 +567,6 @@ fn project_items(
         };
         if should_keep {
             keep.insert((occurrence.item_index, occurrence.content_index));
-        }
-        if *slot == StableContextSlot::SkillCatalog && selected_skills_active {
-            replacement_catalog.insert(
-                (occurrence.item_index, occurrence.content_index),
-                compact_skill_catalog_reference(&occurrence.text),
-            );
         }
     }
     for occurrence_index in &selected_skill_indexes {
@@ -541,21 +593,18 @@ fn project_items(
         let Some(item) = items.get(occurrence.item_index) else {
             continue;
         };
-        let mut projected_item = item.clone();
-        // A mixed producer message can yield multiple canonical fragments.
-        // Do not duplicate a provider item ID across the split messages.
-        projected_item.set_id(/*new_id*/ None);
-        let content_item = replacement_catalog.get(&key).map_or_else(
-            || ContentItem::InputText {
-                text: occurrence.text.clone(),
-            },
-            |replacement| ContentItem::InputText {
-                text: replacement.clone(),
-            },
-        );
-        if let ResponseItem::Message { content, .. } = &mut projected_item {
-            *content = vec![content_item];
-        }
+        let text = compact_catalog
+            .as_ref()
+            .filter(|(compact_index, _)| *compact_index == occurrence_index)
+            .map_or_else(
+                || occurrence.text(items).to_string(),
+                |(_, replacement)| replacement.clone(),
+            );
+        let Some(projected_item) =
+            projected_message(item, false, vec![ContentItem::InputText { text }])
+        else {
+            continue;
+        };
         let target = if occurrence.slot.is_volatile() {
             &mut volatile
         } else {
@@ -587,11 +636,9 @@ fn project_items(
         if next_content.is_empty() {
             continue;
         }
-        let mut next_item = item.clone();
-        if let ResponseItem::Message { content, .. } = &mut next_item {
-            *content = next_content;
+        if let Some(next_item) = projected_message(item, true, next_content) {
+            ordinary.push((item_index, next_item));
         }
-        ordinary.push((item_index, next_item));
     }
 
     let mut projected = Vec::with_capacity(items.len() + reusable.len() + volatile.len());
@@ -599,8 +646,13 @@ fn project_items(
     let mut volatile_by_item = HashMap::<usize, Vec<ResponseItem>>::new();
     for (_, occurrence_index, item) in volatile {
         let occurrence = &occurrences[occurrence_index];
-        let item_index = volatile_user_insertion_index(occurrence, items, latest_real_user)
-            .unwrap_or(occurrence.item_index);
+        let item_index = volatile_user_insertion_index(
+            occurrence,
+            items,
+            latest_real_user,
+            user_insertion_by_turn,
+        )
+        .unwrap_or(occurrence.item_index);
         volatile_by_item.entry(item_index).or_default().push(item);
     }
     let mut ordinary = ordinary.into_iter().peekable();
@@ -622,32 +674,27 @@ fn project_items(
     let mut components = Vec::new();
     for (slot, latest_index) in latest_by_slot {
         let occurrence = &occurrences[latest_index];
-        let prior = occurrences[..latest_index]
-            .iter()
-            .filter(|candidate| candidate.slot == slot)
-            .collect::<Vec<_>>();
-        let replaced = prior
-            .iter()
-            .any(|candidate| candidate.text != occurrence.text);
+        let (prior_count, replaced) =
+            prior_occurrence_summary(items, occurrences, latest_index, slot);
         let removed = (slot == StableContextSlot::Repository && repository_removed)
             || (slot == StableContextSlot::Collaboration && collaboration_removed);
         let gated = (matches!(slot, StableContextSlot::SkillUsage) && selected_skills_active)
             || (slot == StableContextSlot::RecommendedPlugins && !recommended_plugins_current);
-        let text = if slot == StableContextSlot::SkillCatalog && selected_skills_active {
-            compact_skill_catalog_reference(&occurrence.text)
-        } else {
-            occurrence.text.clone()
-        };
+        let text = compact_catalog
+            .as_ref()
+            .filter(|(compact_index, _)| *compact_index == latest_index)
+            .map(|(_, replacement)| replacement.as_str())
+            .unwrap_or_else(|| occurrence.text(items));
         let mut component = component_from_text(
             slot.kind(),
             slot.semantic_key(),
-            &text,
+            text,
             !removed && !gated,
             if removed {
                 StableContextDisposition::Removed
             } else if gated || (slot == StableContextSlot::SkillCatalog && selected_skills_active) {
                 StableContextDisposition::Gated
-            } else if replaced || prior.len() > 1 {
+            } else if replaced || prior_count > 1 {
                 StableContextDisposition::Replaced
             } else {
                 StableContextDisposition::Unchanged
@@ -667,14 +714,14 @@ fn project_items(
         let mut component = component_from_text(
             StableContextKind::SelectedSkill,
             "selected_skill",
-            &occurrence.text,
+            occurrence.text(items),
             true,
             StableContextDisposition::Unchanged,
         );
         component.identity.semantic_id = semantic_id(
             StableContextKind::SelectedSkill,
             &[
-                occurrence.turn_id.as_deref().unwrap_or_default().as_bytes(),
+                occurrence.turn_id(items).unwrap_or_default().as_bytes(),
                 &component.identity.content_hash,
             ],
         );
@@ -683,34 +730,80 @@ fn project_items(
     (projected, components)
 }
 
-fn current_selected_skill_indexes(
+fn projected_message(
+    item: &ResponseItem,
+    preserve_id: bool,
+    content: Vec<ContentItem>,
+) -> Option<ResponseItem> {
+    let ResponseItem::Message {
+        id,
+        role,
+        phase,
+        internal_chat_message_metadata_passthrough,
+        ..
+    } = item
+    else {
+        return None;
+    };
+    Some(ResponseItem::Message {
+        id: if preserve_id { id.clone() } else { None },
+        role: role.clone(),
+        content,
+        phase: phase.clone(),
+        internal_chat_message_metadata_passthrough: internal_chat_message_metadata_passthrough
+            .clone(),
+    })
+}
+
+fn prior_occurrence_summary(
+    items: &[ResponseItem],
     occurrences: &[Occurrence],
-    latest_real_user: Option<&(usize, Option<String>)>,
+    latest_index: usize,
+    slot: StableContextSlot,
+) -> (usize, bool) {
+    let latest_text = occurrences[latest_index].text(items);
+    occurrences[..latest_index]
+        .iter()
+        .filter(|candidate| candidate.slot == slot)
+        .fold((0, false), |(prior_count, replaced), candidate| {
+            (
+                prior_count + 1,
+                replaced || candidate.text(items) != latest_text,
+            )
+        })
+}
+
+fn current_selected_skill_indexes(
+    items: &[ResponseItem],
+    occurrences: &[Occurrence],
+    latest_real_user: Option<usize>,
 ) -> Vec<usize> {
-    let Some((user_index, user_turn_id)) = latest_real_user else {
+    let Some(user_index) = latest_real_user else {
         return Vec::new();
     };
+    let user_turn_id = items[user_index].turn_id();
     occurrences
         .iter()
         .enumerate()
         .filter(|(_, occurrence)| occurrence.slot == StableContextSlot::SelectedSkill)
         .filter(|(_, occurrence)| match user_turn_id {
-            Some(turn_id) => occurrence.turn_id.as_ref() == Some(turn_id),
-            None => occurrence.item_index > *user_index,
+            Some(turn_id) => occurrence.turn_id(items) == Some(turn_id),
+            None => occurrence.item_index > user_index,
         })
         .map(|(index, _)| index)
         .collect()
 }
 
 fn occurrence_matches_latest_user_turn(
+    items: &[ResponseItem],
     occurrence: &Occurrence,
-    latest_real_user: Option<&(usize, Option<String>)>,
+    latest_real_user: Option<usize>,
 ) -> bool {
-    let Some((_, latest_turn_id)) = latest_real_user else {
+    let Some(latest_real_user) = latest_real_user else {
         return false;
     };
-    match latest_turn_id {
-        Some(turn_id) => occurrence.turn_id.as_ref() == Some(turn_id),
+    match items[latest_real_user].turn_id() {
+        Some(turn_id) => occurrence.turn_id(items) == Some(turn_id),
         // Legacy histories without turn metadata cannot establish expiry safely.
         None => true,
     }
@@ -719,30 +812,20 @@ fn occurrence_matches_latest_user_turn(
 fn volatile_user_insertion_index(
     occurrence: &Occurrence,
     items: &[ResponseItem],
-    latest_real_user: Option<&(usize, Option<String>)>,
+    latest_real_user: Option<usize>,
+    user_insertion_by_turn: &HashMap<&str, usize>,
 ) -> Option<usize> {
-    if let Some(turn_id) = occurrence.turn_id.as_deref()
-        && let Some((item_index, _)) = items.iter().enumerate().find(|(_, item)| {
-            let ResponseItem::Message { role, content, .. } = item else {
-                return false;
-            };
-            role == "user"
-                && item.turn_id() == Some(turn_id)
-                && content.iter().any(|content_item| {
-                    let ContentItem::InputText { text } = content_item else {
-                        return false;
-                    };
-                    classify_stable_text(role, text).is_none()
-                })
-        })
+    if let Some(turn_id) = occurrence.turn_id(items)
+        && let Some(item_index) = user_insertion_by_turn.get(turn_id)
     {
-        return Some(item_index);
+        return Some(*item_index);
     }
 
-    latest_real_user.map(|(item_index, _)| *item_index)
+    latest_real_user
 }
 
 fn analyze_unprojected(
+    items: &[ResponseItem],
     occurrences: &[Occurrence],
     retained_fallback: bool,
 ) -> Vec<StableContextComponent> {
@@ -752,7 +835,7 @@ fn analyze_unprojected(
             component_from_text(
                 occurrence.slot.kind(),
                 occurrence.slot.semantic_key(),
-                &occurrence.text,
+                occurrence.text(items),
                 true,
                 if retained_fallback {
                     StableContextDisposition::RetainedFallback
@@ -765,6 +848,9 @@ fn analyze_unprojected(
 }
 
 fn classify_stable_text(role: &str, text: &str) -> Option<StableContextSlot> {
+    #[cfg(test)]
+    CLASSIFY_STABLE_TEXT_CALLS.with(|calls| calls.set(calls.get() + 1));
+
     if role == "user" && marked(text, REPOSITORY_OPEN_TAG, REPOSITORY_CLOSE_TAG) {
         return Some(StableContextSlot::Repository);
     }
@@ -876,6 +962,9 @@ fn marked(text: &str, open: &str, close: &str) -> bool {
 }
 
 fn compact_skill_catalog_reference(catalog: &str) -> String {
+    #[cfg(test)]
+    COMPACT_CATALOG_CALLS.with(|calls| calls.set(calls.get() + 1));
+
     let digest: [u8; 32] = Sha256::digest(catalog.as_bytes()).into();
     format!(
         "<skills_instructions>\n<active_catalog version=\"v1\" sha256=\"{}\" state=\"selected\" />\nThe full catalog is inactive while explicitly selected skill instructions are active. It will be restored for a later capability-selection turn.\n</skills_instructions>",
@@ -952,6 +1041,9 @@ fn manifest_fingerprint(
     projection_enabled: bool,
     fail_open: bool,
 ) -> [u8; 32] {
+    #[cfg(test)]
+    MANIFEST_FINGERPRINT_CALLS.with(|calls| calls.set(calls.get() + 1));
+
     let mut hasher = Sha256::new();
     hasher.update(STABLE_CONTEXT_MANIFEST_HASH_DOMAIN);
     hasher.update([u8::from(projection_enabled), u8::from(fail_open)]);
@@ -972,6 +1064,268 @@ pub(crate) fn short_hash(hash: &[u8; 32]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+#[cfg(test)]
+mod tests_optimization {
+    use super::*;
+    use codex_protocol::ResponseItemId;
+    use codex_protocol::models::MessagePhase;
+
+    fn text_message(role: &str, text: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: role.to_string(),
+            content: vec![ContentItem::InputText {
+                text: text.to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    fn text_message_for_turn(role: &str, text: &str, turn_id: &str) -> ResponseItem {
+        let mut item = text_message(role, text);
+        item.set_turn_id_if_missing(turn_id);
+        item
+    }
+
+    fn skill(name: &str) -> String {
+        format!("<skill>\n<name>{name}</name>\n<body>{name} body</body>\n</skill>")
+    }
+
+    fn content_text(content: &ContentItem) -> Option<&str> {
+        match content {
+            ContentItem::InputText { text } | ContentItem::OutputText { text } => Some(text),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn local_reuse_preserves_order_and_reuses_fingerprint() {
+        let manifest = StableContextManifest::from_components(
+            vec![
+                component_from_text(
+                    StableContextKind::Repository,
+                    "repository",
+                    "repository",
+                    true,
+                    StableContextDisposition::Unchanged,
+                ),
+                component_from_text(
+                    StableContextKind::Collaboration,
+                    "collaboration",
+                    "collaboration",
+                    true,
+                    StableContextDisposition::Unchanged,
+                ),
+            ],
+            true,
+            false,
+        );
+        MANIFEST_FINGERPRINT_CALLS.with(|calls| calls.set(0));
+
+        let reused = manifest.with_local_reused(true);
+
+        assert_eq!(
+            MANIFEST_FINGERPRINT_CALLS.with(Cell::get),
+            0,
+            "local reuse does not affect ordering or the manifest fingerprint"
+        );
+        assert_eq!(reused.fingerprint(), manifest.fingerprint());
+        assert_eq!(reused.components().len(), manifest.components().len());
+        for (reused, original) in reused.components().iter().zip(manifest.components()) {
+            assert_eq!(reused.kind, original.kind);
+            assert_eq!(reused.identity, original.identity);
+            assert_eq!(reused.active, original.active);
+            assert_eq!(reused.disposition, original.disposition);
+            assert!(reused.local_reused);
+        }
+    }
+
+    #[test]
+    fn occurrence_records_only_source_indexes_and_slot() {
+        assert_eq!(
+            std::mem::size_of::<Occurrence>(),
+            std::mem::size_of::<usize>() * 3
+        );
+    }
+
+    #[test]
+    fn projected_messages_clone_the_shell_and_selected_content_only() {
+        let id = ResponseItemId::with_suffix("msg", "stable-context");
+        let mut source = ResponseItem::Message {
+            id: Some(id.clone()),
+            role: "developer".to_string(),
+            content: vec![
+                ContentItem::InputText {
+                    text: "first".to_string(),
+                },
+                ContentItem::InputText {
+                    text: "second".to_string(),
+                },
+            ],
+            phase: Some(MessagePhase::Commentary),
+            internal_chat_message_metadata_passthrough: None,
+        };
+        source.set_turn_id_if_missing("turn-1");
+
+        let stable = projected_message(
+            &source,
+            false,
+            vec![ContentItem::InputText {
+                text: "second".to_string(),
+            }],
+        )
+        .expect("message shell");
+        let ordinary = projected_message(
+            &source,
+            true,
+            vec![ContentItem::InputText {
+                text: "first".to_string(),
+            }],
+        )
+        .expect("message shell");
+
+        assert_eq!(stable.turn_id(), Some("turn-1"));
+        assert_eq!(ordinary.turn_id(), Some("turn-1"));
+
+        let ResponseItem::Message {
+            id: stable_id,
+            role: stable_role,
+            content: stable_content,
+            phase: stable_phase,
+            ..
+        } = stable
+        else {
+            panic!("projected stable fragment must remain a message");
+        };
+        assert_eq!(stable_id, None);
+        assert_eq!(stable_role, "developer");
+        assert_eq!(stable_phase, Some(MessagePhase::Commentary));
+        assert_eq!(stable_content.len(), 1);
+        assert_eq!(content_text(&stable_content[0]), Some("second"));
+
+        let ResponseItem::Message {
+            id: ordinary_id,
+            role: ordinary_role,
+            content: ordinary_content,
+            phase: ordinary_phase,
+            ..
+        } = ordinary
+        else {
+            panic!("projected ordinary content must remain a message");
+        };
+        assert_eq!(ordinary_id, Some(id));
+        assert_eq!(ordinary_role, "developer");
+        assert_eq!(ordinary_phase, Some(MessagePhase::Commentary));
+        assert_eq!(ordinary_content.len(), 1);
+        assert_eq!(content_text(&ordinary_content[0]), Some("first"));
+    }
+
+    #[test]
+    fn selected_skill_compacts_the_catalog_once() {
+        let catalog = "<skills_instructions>\nfull catalog\n</skills_instructions>";
+        let selected = skill("one");
+        COMPACT_CATALOG_CALLS.with(|calls| calls.set(0));
+
+        let projection = project_stable_context(
+            vec![
+                text_message("developer", catalog),
+                text_message("user", "use one"),
+                text_message("user", &selected),
+            ]
+            .into(),
+            StableContextTarget::Sampling,
+        );
+
+        assert_eq!(COMPACT_CATALOG_CALLS.with(Cell::get), 1);
+        assert!(projection.manifest.components().iter().any(|component| {
+            component.kind == StableContextKind::SkillCatalog
+                && component.disposition == StableContextDisposition::Gated
+        }));
+    }
+
+    #[test]
+    fn volatile_context_uses_the_preindexed_user_insertion() {
+        let items = vec![
+            text_message_for_turn(
+                "user",
+                "<environment_context>\nenvironment\n</environment_context>",
+                "turn-1",
+            ),
+            text_message_for_turn("developer", "<app-context>\napp\n</app-context>", "turn-1"),
+            text_message_for_turn(
+                "developer",
+                "<model_switch>\nmodel\n</model_switch>",
+                "turn-1",
+            ),
+            text_message_for_turn(
+                "user",
+                "<recommended_plugins>\nplugins\n</recommended_plugins>",
+                "turn-1",
+            ),
+            text_message_for_turn("user", "do the work", "turn-1"),
+        ];
+        CLASSIFY_STABLE_TEXT_CALLS.with(|calls| calls.set(0));
+
+        let projection = project_stable_context(items.into(), StableContextTarget::Sampling);
+
+        assert_eq!(
+            CLASSIFY_STABLE_TEXT_CALLS.with(Cell::get),
+            5,
+            "projection classifies each source fragment exactly once"
+        );
+        let prompt_index = projection
+            .items
+            .iter()
+            .position(|item| {
+                matches!(
+                    item,
+                    ResponseItem::Message { content, .. }
+                        if content.iter().any(|content| content_text(content) == Some("do the work"))
+                )
+            })
+            .expect("ordinary user prompt");
+        assert_eq!(prompt_index, 4);
+    }
+
+    #[test]
+    fn prior_occurrence_summary_folds_count_and_replacement() {
+        let old = "# AGENTS.md instructions\n<INSTRUCTIONS>old</INSTRUCTIONS>";
+        let current = "# AGENTS.md instructions\n<INSTRUCTIONS>current</INSTRUCTIONS>";
+        let items = vec![
+            text_message("user", old),
+            text_message("user", old),
+            text_message("user", current),
+        ];
+        let occurrences = vec![
+            Occurrence {
+                item_index: 0,
+                content_index: 0,
+                slot: StableContextSlot::Repository,
+            },
+            Occurrence {
+                item_index: 1,
+                content_index: 0,
+                slot: StableContextSlot::Repository,
+            },
+            Occurrence {
+                item_index: 2,
+                content_index: 0,
+                slot: StableContextSlot::Repository,
+            },
+        ];
+
+        assert_eq!(
+            prior_occurrence_summary(&items, &occurrences, 1, StableContextSlot::Repository),
+            (1, false)
+        );
+        assert_eq!(
+            prior_occurrence_summary(&items, &occurrences, 2, StableContextSlot::Repository),
+            (2, true)
+        );
+    }
 }
 
 #[cfg(test)]

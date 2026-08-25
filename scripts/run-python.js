@@ -18,9 +18,15 @@ const candidates = configuredPython
     ];
 
 for (const [command, prefixArgs] of candidates) {
-  const probe = spawnSync(command, [...prefixArgs, "--version"], {
-    stdio: "ignore",
-  });
+  const probe = spawnSync(
+    command,
+    [
+      ...prefixArgs,
+      "-c",
+      "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)",
+    ],
+    { stdio: "ignore" },
+  );
   if (probe.error?.code === "ENOENT") {
     continue;
   }

@@ -35,6 +35,7 @@ use crate::context::ContextualUserFragment;
 use crate::hook_runtime::inspect_pending_input;
 use crate::hook_runtime::record_additional_contexts;
 use crate::hook_runtime::record_pending_input;
+use crate::hook_runtime::run_turn_interrupt_hooks;
 use crate::session::TurnInput;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
@@ -103,6 +104,7 @@ const GRACEFUL_INTERRUPTION_TIMEOUT: Duration =
     crate::tools::parallel::TOOL_RUNTIME_CANCELLATION_GRACE
         .saturating_add(GRACEFUL_INTERRUPTION_MARGIN);
 const TERMINAL_MUTATION_FINALIZATION_TIMEOUT: Duration = Duration::from_secs(1);
+const INTERRUPT_HOOK_FINALIZATION_TIMEOUT: Duration = Duration::from_secs(3);
 // Sealing is the only terminal phase that may need to collect and persist the
 // complete proof bundle. Give it a little more room without lengthening every
 // terminal cleanup operation.
@@ -544,6 +546,16 @@ enum TurnTerminalOutcome {
     WorkerJoinFailed(WorkerJoinFailure),
 }
 
+impl TurnTerminalOutcome {
+    fn abort_reason(&self) -> Option<TurnAbortReason> {
+        match self {
+            Self::Aborted(reason) => Some(reason.clone()),
+            Self::ReturnedError(CodexErr::TurnAborted) => Some(TurnAbortReason::Interrupted),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WorkerJoinFailure {
     Cancelled,
@@ -976,7 +988,7 @@ impl Session {
         let pending_items = self.input_queue.get_pending_input(&self.active_turn).await;
         turn_state.lock().await.token_usage_at_turn_start = token_usage_at_turn_start.clone();
         self.input_queue
-            .extend_pending_input_for_turn_state(turn_state.as_ref(), pending_items)
+            .restore_transferred_input_for_turn_state(turn_state.as_ref(), pending_items)
             .await;
         self.emit_turn_start_lifecycle(turn_context.as_ref(), &token_usage_at_turn_start)
             .await;
@@ -1107,7 +1119,7 @@ impl Session {
         };
         let recovered_work = !recovered_input.is_empty();
         self.input_queue
-            .recover_cancelled_startup_input(recovered_input)
+            .restore_transferred_startup_input(recovered_input)
             .await;
         if !recovered_work {
             self.emit_thread_idle_lifecycle_if_idle().await;
@@ -2991,12 +3003,9 @@ impl Session {
 
         turn_context.turn_timing_state.begin_finalization();
 
-        let explicit_abort_reason = match &finalization.outcome {
-            TurnTerminalOutcome::Aborted(reason) => Some(reason.clone()),
-            _ => None,
-        };
+        let abort_reason = finalization.outcome.abort_reason();
         let mut interrupted_marker_repair = Vec::new();
-        if explicit_abort_reason == Some(TurnAbortReason::Interrupted)
+        if abort_reason == Some(TurnAbortReason::Interrupted)
             && let Some(marker) = interrupted_turn_history_marker(
                 InterruptedTurnHistoryMarker::from_config_and_version(
                     turn_context.config.as_ref(),
@@ -3028,21 +3037,18 @@ impl Session {
             }
         }
 
-        let (mut last_agent_message, surfaced_result, abort_reason) = match &finalization.outcome {
+        let (mut last_agent_message, surfaced_result) = match &finalization.outcome {
             TurnTerminalOutcome::Completed { result } => (
                 result.last_agent_message.clone(),
                 result.surfaced_result.clone(),
-                None,
             ),
-            TurnTerminalOutcome::ReturnedError(CodexErr::TurnAborted) => {
-                (None, None, Some(TurnAbortReason::Interrupted))
-            }
+            TurnTerminalOutcome::ReturnedError(CodexErr::TurnAborted) => (None, None),
             TurnTerminalOutcome::ReturnedError(err) => {
                 warn!(%err, "session task returned an unexpected error");
-                (None, None, None)
+                (None, None)
             }
-            TurnTerminalOutcome::Aborted(reason) => (None, None, Some(reason.clone())),
-            TurnTerminalOutcome::WorkerJoinFailed(_) => (None, None, None),
+            TurnTerminalOutcome::Aborted(_) => (None, None),
+            TurnTerminalOutcome::WorkerJoinFailed(_) => (None, None),
         };
 
         let pending_input_result = finalization
@@ -3098,6 +3104,22 @@ impl Session {
             warn!(turn_id = %turn_context.sub_id, "pending-input terminal hooks did not quiesce before the deadline");
         }
 
+        let interrupt_hook_result = if abort_reason == Some(TurnAbortReason::Interrupted) {
+            finalization
+                .deadline
+                .run(
+                    "hooks_quiescence",
+                    INTERRUPT_HOOK_FINALIZATION_TIMEOUT,
+                    run_turn_interrupt_hooks(self, &turn_context),
+                )
+                .await
+        } else {
+            Ok(())
+        };
+        if interrupt_hook_result.is_err() {
+            warn!(turn_id = %turn_context.sub_id, "Interrupt hooks did not quiesce before the deadline");
+        }
+
         // Extension lifecycle callbacks have no restrictive effects contract. They therefore
         // remain mutation-capable and must finish before final freshness and gate evaluation.
         let terminal_lifecycle_result = finalization
@@ -3106,7 +3128,7 @@ impl Session {
                 "hooks_quiescence",
                 TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
                 async {
-                    if let Some(reason) = explicit_abort_reason.as_ref() {
+                    if let Some(reason) = abort_reason.as_ref() {
                         self.emit_turn_abort_lifecycle(
                             reason.clone(),
                             turn_context.extension_data.as_ref(),
@@ -3122,8 +3144,9 @@ impl Session {
         if terminal_lifecycle_result.is_err() {
             warn!(turn_id = %turn_context.sub_id, "mutation-capable terminal lifecycle hook did not quiesce");
         }
-        let terminal_hooks_complete =
-            pending_input_result.is_ok() && terminal_lifecycle_result.is_ok();
+        let terminal_hooks_complete = pending_input_result.is_ok()
+            && interrupt_hook_result.is_ok()
+            && terminal_lifecycle_result.is_ok();
         finalization.mutation_quiescent = true;
 
         let (
@@ -4164,13 +4187,7 @@ impl Session {
             Ok(Ok(_))
         );
 
-        let abort_reason = match &finalization.outcome {
-            TurnTerminalOutcome::Aborted(reason) => Some(reason.clone()),
-            TurnTerminalOutcome::ReturnedError(CodexErr::TurnAborted) => {
-                Some(TurnAbortReason::Interrupted)
-            }
-            _ => None,
-        };
+        let abort_reason = finalization.outcome.abort_reason();
         let mut interrupted_marker_repair = Vec::new();
         if abort_reason == Some(TurnAbortReason::Interrupted)
             && let Some(marker) = interrupted_turn_history_marker(

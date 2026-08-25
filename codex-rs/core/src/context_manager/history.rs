@@ -436,7 +436,6 @@ impl ContextManager {
 
     pub(crate) fn set_tool_history_state(&mut self, state: ToolHistoryState) {
         self.tool_history = Arc::new(state);
-        self.projection_revision = self.projection_revision.saturating_add(1);
         self.invalidate_prepared_history();
     }
 
@@ -446,7 +445,6 @@ impl ContextManager {
 
     pub(crate) fn register_tool_history_candidate(&mut self, candidate: ToolHistoryCandidate) {
         Arc::make_mut(&mut self.tool_history).register(candidate);
-        self.projection_revision = self.projection_revision.saturating_add(1);
         self.invalidate_prepared_history();
     }
 
@@ -455,7 +453,6 @@ impl ContextManager {
         observation: crate::tool_history::WorkspaceEvidenceObservation,
     ) {
         Arc::make_mut(&mut self.tool_history).register_workspace_evidence(observation);
-        self.projection_revision = self.projection_revision.saturating_add(1);
         self.invalidate_prepared_history();
     }
 
@@ -467,7 +464,6 @@ impl ContextManager {
         let changed = Arc::make_mut(&mut self.tool_history)
             .invalidate_source_dependencies(affected_paths, current_workspace_identity);
         if changed {
-            self.projection_revision = self.projection_revision.saturating_add(1);
             self.invalidate_prepared_history();
         }
         changed
@@ -480,7 +476,6 @@ impl ContextManager {
     ) -> bool {
         let changed = Arc::make_mut(&mut self.tool_history).mark_consumed(input, generation);
         if changed {
-            self.projection_revision = self.projection_revision.saturating_add(1);
             self.invalidate_prepared_history();
         }
         changed
@@ -570,9 +565,24 @@ impl ContextManager {
         let base_instructions = BaseInstructions {
             text: model_info.get_model_instructions(personality),
         };
-        self.estimate_token_count_with_base_instructions(&base_instructions)
+        self.estimate_prepared_token_count_with_base_instructions(
+            &model_info.input_modalities,
+            &base_instructions,
+        )
     }
 
+    pub(crate) fn estimate_prepared_token_count_with_base_instructions(
+        &self,
+        input_modalities: &[InputModality],
+        base_instructions: &BaseInstructions,
+    ) -> Option<i64> {
+        let prepared = self
+            .clone()
+            .prepare_for_prompt_target(input_modalities, StableContextTarget::Sampling);
+        Self::estimate_items_token_count_with_base_instructions(prepared.items(), base_instructions)
+    }
+
+    #[cfg(test)]
     pub(crate) fn estimate_token_count_with_base_instructions(
         &self,
         base_instructions: &BaseInstructions,

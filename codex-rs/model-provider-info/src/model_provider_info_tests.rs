@@ -6,6 +6,24 @@ use std::num::NonZeroU64;
 use tempfile::tempdir;
 
 #[test]
+fn request_retry_config_owns_the_complete_transport_retry_policy() {
+    let provider: ModelProviderInfo = toml::from_str(
+        r#"
+name = "Custom"
+request_max_retries = 7
+"#,
+    )
+    .expect("provider config");
+
+    let retry = provider.request_retry_config();
+    assert_eq!(retry.max_retries, 7);
+    assert_eq!(retry.base_delay, Duration::from_millis(200));
+    assert!(!retry.retry_429);
+    assert!(retry.retry_5xx);
+    assert!(retry.retry_transport);
+}
+
+#[test]
 fn test_deserialize_ollama_model_provider_toml() {
     let azure_provider_toml = r#"
 name = "Ollama"

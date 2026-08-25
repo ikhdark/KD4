@@ -53,7 +53,6 @@ WINDOWS_MSVC_LINKER_ENV_VARS = (
 )
 WINDOWS_LLVM_LLD_LINK_DEFAULT = shared_rust_tool_env.WINDOWS_LLVM_LLD_LINK_DEFAULT
 DISABLE_SCRIPT_VENV_VALUES = frozenset({"1", "true", "yes", "on"})
-TOOL_RUN_RESULTS: dict[tuple[str, ...], bool] = {}
 RUST_COMMAND_PATTERN = re.compile(
     r"(?<![\w.-])(?:cargo|rustc|rustup)(?![\w.-])", re.IGNORECASE
 )
@@ -393,13 +392,8 @@ def normalize_path_for_compare(path: str) -> str:
 
 
 def cached_tool_runs(command: list[str], *, cache_dir: Path | None = None) -> bool:
-    key = tuple(command)
-    if key in TOOL_RUN_RESULTS:
-        return TOOL_RUN_RESULTS[key]
-
     cached_result = read_cached_tool_run(command, cache_dir)
     if cached_result is not None:
-        TOOL_RUN_RESULTS[key] = cached_result
         return cached_result
 
     result = tool_runs(command)
@@ -408,7 +402,6 @@ def cached_tool_runs(command: list[str], *, cache_dir: Path | None = None) -> bo
         # rescan). Let the real invocation proceed and report its own error if
         # the tool is actually unusable; do not cache an inconclusive probe.
         return True
-    TOOL_RUN_RESULTS[key] = result
     write_cached_tool_run(command, cache_dir, result)
     return result
 

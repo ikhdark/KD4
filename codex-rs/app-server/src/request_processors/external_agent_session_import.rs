@@ -235,7 +235,8 @@ impl ExternalAgentSessionImporter {
                 RefreshStrategy::Offline,
                 config.http_client_factory(),
             )
-            .await;
+            .await
+            .map_err(|err| format!("failed to resolve imported session model: {err}"))?;
         let model_info = models_manager
             .get_model_info(model.as_str(), &config.to_models_manager_config())
             .await;

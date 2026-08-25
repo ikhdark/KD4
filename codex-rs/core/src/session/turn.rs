@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -450,10 +451,11 @@ pub(crate) async fn run_turn(
         };
         let request_baselines = {
             let tracker = turn_diff_tracker.lock().await;
-            reasoning_governor.baselines(
+            reasoning_governor.baselines_with_tool_exposure_revision(
                 tracker.current_mutation_revision(),
                 tracker.validation_freshness_status(),
                 tracker.last_successful_validation_revision(),
+                turn_context.deferred_tool_activation_revision(),
             )
         };
         let request_signals = reasoning_governor.collector(&request_baselines);
@@ -585,16 +587,13 @@ pub(crate) async fn run_turn(
                 prefetched_workspace_identity = next_workspace_identity;
                 reasoning_governor.settle(&request_baselines, &request_signals, &settled_state);
                 can_drain_pending_input = true;
-                let (has_pending_input, token_status) = async {
-                    let has_pending_input =
-                        sess.input_queue.has_pending_input(&sess.active_turn).await;
-                    let token_status = super::context_window::context_window_token_status(
+                let (has_pending_input, token_status) = collect_post_sampling_state(
+                    sess.input_queue.has_pending_input(&sess.active_turn),
+                    super::context_window::context_window_token_status(
                         sess.as_ref(),
                         turn_context.as_ref(),
-                    )
-                    .await;
-                    (has_pending_input, token_status)
-                }
+                    ),
+                )
                 .instrument(trace_span!("run_turn.collect_post_sampling_state"))
                 .await;
                 // A proven loop receives one final, tool-free generation. Once
@@ -714,6 +713,7 @@ pub(crate) async fn run_turn(
                         InitialContextInjection::AtStart(Arc::clone(&world_state)),
                         CompactionReason::ContextLimit,
                         CompactionPhase::MidTurn,
+                        &cancellation_token,
                     )
                     .await
                     {
@@ -1145,6 +1145,28 @@ pub(crate) async fn run_turn(
     })
 }
 
+async fn collect_post_sampling_state<A, B>(
+    pending_input: impl Future<Output = A> + Send,
+    token_status: impl Future<Output = B> + Send,
+) -> (A, B) {
+    tokio::join!(pending_input, token_status)
+}
+
+async fn join_recommendations_and_mcp<A, B>(
+    recommendations: impl Future<Output = A> + Send,
+    mcp_tools: impl Future<Output = B> + Send,
+) -> (A, B) {
+    tokio::join!(recommendations, mcp_tools)
+}
+
+async fn collect_projected_prompt_state<A, B, C>(
+    active_context: impl Future<Output = A> + Send,
+    committed_history: impl Future<Output = B> + Send,
+    auto_compact_window: impl Future<Output = C> + Send,
+) -> (A, B, C) {
+    tokio::join!(active_context, committed_history, auto_compact_window)
+}
+
 fn authoritative_wait_terminal_surface(
     decision: &SamplingConvergenceDecision,
 ) -> Option<SurfacedToolResult> {
@@ -1307,6 +1329,38 @@ struct PendingTurnPlan {
 enum PendingTurnPlanBuild {
     Stale,
     Ready(Box<PendingTurnPlan>),
+}
+
+#[derive(Default)]
+struct SamplingAttemptProgress {
+    accepted_output: bool,
+}
+
+impl SamplingAttemptProgress {
+    fn requires_authoritative_retry_input(&self) -> bool {
+        self.accepted_output
+    }
+}
+
+struct AdvertisedDeferredToolLease {
+    turn_context: Arc<TurnContext>,
+    advertised: HashSet<ToolName>,
+}
+
+impl AdvertisedDeferredToolLease {
+    fn new(turn_context: Arc<TurnContext>, advertised: HashSet<ToolName>) -> Self {
+        Self {
+            turn_context,
+            advertised,
+        }
+    }
+}
+
+impl Drop for AdvertisedDeferredToolLease {
+    fn drop(&mut self) {
+        self.turn_context
+            .release_advertised_deferred_tools(&self.advertised);
+    }
 }
 
 fn contains_task_term(task: &str, term: &str) -> bool {
@@ -1503,22 +1557,24 @@ async fn build_pure_pending_turn_plan(
             _ => None,
         })
         .collect::<Vec<_>>();
-    let recommended_plugin_items = build_recommended_plugin_items(
-        sess,
-        turn_context,
-        &loaded_plugins,
-        &recommended_plugin_input,
+    let connector_snapshot = step_context.mcp.config().connector_snapshot.clone();
+    let (recommended_plugin_items, mcp_tools) = join_recommendations_and_mcp(
+        build_recommended_plugin_items(
+            sess,
+            turn_context,
+            &loaded_plugins,
+            &recommended_plugin_input,
+        ),
+        async {
+            if turn_context.apps_enabled() || !mentioned_plugins.is_empty() {
+                step_context.mcp_tools().or_cancel(cancellation_token).await
+            } else {
+                Ok(&[][..])
+            }
+        },
     )
     .await;
-    let connector_snapshot = step_context.mcp.config().connector_snapshot.clone();
-    let mcp_tools = if turn_context.apps_enabled() || !mentioned_plugins.is_empty() {
-        step_context
-            .mcp_tools()
-            .or_cancel(cancellation_token)
-            .await?
-    } else {
-        &[]
-    };
+    let mcp_tools = mcp_tools?;
     let available_connectors = if turn_context.apps_enabled() {
         let connectors = codex_connectors::merge::merge_plugin_connectors_with_accessible(
             connector_snapshot
@@ -1687,6 +1743,7 @@ async fn stabilize_pending_turn_plan(
             turn_context,
             client_session,
             check_previous_model_compaction,
+            cancellation_token,
         )
         .await?;
         drop(compaction_timing_guard);
@@ -1709,20 +1766,22 @@ async fn stabilize_pending_turn_plan(
 
         let planning_generation = sess.services.planning_generation();
         let step_context = sess.capture_step_context(Arc::clone(turn_context)).await;
-        let plan = match build_pure_pending_turn_plan(
-            sess,
-            step_context,
-            input,
-            planning_generation,
-            cancellation_token,
+        let plan_build = charge_pending_turn_plan_build(
+            build_pure_pending_turn_plan(
+                sess,
+                step_context,
+                input,
+                planning_generation,
+                cancellation_token,
+            )
+            .await?,
+            planning_iterations,
         )
-        .await?
-        {
+        .map_err(|message| planning_failure_with_timing(turn_context, message))?;
+        let plan = match plan_build {
             PendingTurnPlanBuild::Stale => continue,
             PendingTurnPlanBuild::Ready(plan) => *plan,
         };
-        advance_pending_turn_plan_iteration(planning_iterations)
-            .map_err(|message| planning_failure_with_timing(turn_context, message))?;
         turn_context
             .turn_timing_state
             .record_planning_fixed_point_iteration();
@@ -1739,6 +1798,7 @@ async fn stabilize_pending_turn_plan(
             client_session,
             plan.projected_prompt_pressure,
             !incoming_precompaction_completed,
+            cancellation_token,
         )
         .await?;
         drop(compaction_timing_guard);
@@ -1819,6 +1879,11 @@ fn advance_pending_turn_plan_iteration(iterations: &mut usize) -> Result<(), Str
         ));
     }
     Ok(())
+}
+
+fn charge_pending_turn_plan_build<T>(build: T, iterations: &mut usize) -> Result<T, String> {
+    advance_pending_turn_plan_iteration(iterations)?;
+    Ok(build)
 }
 
 fn mcp_dependency_effect_is_completed(
@@ -2005,14 +2070,31 @@ async fn projected_prompt_pressure(
     turn_context: &TurnContext,
     pending_token_estimate: PendingTokenEstimate,
 ) -> ProjectedPromptPressure {
-    let active_context_tokens = sess.get_total_token_usage().await;
-    let committed_history_tokens = if pending_token_estimate.resolves_active_reasoning {
-        sess.get_estimated_token_count_after_pending_user_boundary(turn_context)
-            .await
-    } else {
-        sess.get_estimated_token_count(turn_context).await
-    }
-    .unwrap_or(active_context_tokens);
+    let body_after_prefix = matches!(
+        turn_context.config.model_auto_compact_token_limit_scope,
+        AutoCompactTokenLimitScope::BodyAfterPrefix
+    );
+    let (active_context_tokens, committed_history_tokens, auto_compact_window) =
+        collect_projected_prompt_state(
+            sess.get_total_token_usage(),
+            async {
+                if pending_token_estimate.resolves_active_reasoning {
+                    sess.get_estimated_token_count_after_pending_user_boundary(turn_context)
+                        .await
+                } else {
+                    sess.get_estimated_token_count(turn_context).await
+                }
+            },
+            async {
+                if body_after_prefix {
+                    Some(sess.auto_compact_window_snapshot().await)
+                } else {
+                    None
+                }
+            },
+        )
+        .await;
+    let committed_history_tokens = committed_history_tokens.unwrap_or(active_context_tokens);
     let total_tokens = projected_prompt_tokens_from_estimates(
         active_context_tokens,
         committed_history_tokens,
@@ -2022,10 +2104,8 @@ async fn projected_prompt_pressure(
     let auto_compact_scope_tokens = match turn_context.config.model_auto_compact_token_limit_scope {
         AutoCompactTokenLimitScope::Total => total_tokens,
         AutoCompactTokenLimitScope::BodyAfterPrefix => {
-            let baseline = sess
-                .auto_compact_window_snapshot()
-                .await
-                .prefill_input_tokens
+            let baseline = auto_compact_window
+                .and_then(|window| window.prefill_input_tokens)
                 .unwrap_or(active_context_tokens);
             active_context_tokens
                 .saturating_sub(baseline)
@@ -2234,9 +2314,16 @@ async fn run_history_pre_sampling_compact(
     turn_context: &Arc<TurnContext>,
     client_session: &mut ModelClientSession,
     check_previous_model: bool,
+    cancellation_token: &CancellationToken,
 ) -> CodexResult<HistoryPreSamplingCompaction> {
     if check_previous_model
-        && maybe_run_previous_model_inline_compact(sess, turn_context, client_session).await?
+        && maybe_run_previous_model_inline_compact(
+            sess,
+            turn_context,
+            client_session,
+            cancellation_token,
+        )
+        .await?
     {
         return Ok(HistoryPreSamplingCompaction {
             reason: Some(PreSamplingCompactionReason::PreviousModel),
@@ -2252,6 +2339,7 @@ async fn run_pending_input_pre_sampling_compact(
     client_session: &mut ModelClientSession,
     projected_prompt_pressure: ProjectedPromptPressure,
     allow_pending_input_compaction: bool,
+    cancellation_token: &CancellationToken,
 ) -> CodexResult<Option<PreSamplingCompactionReason>> {
     // Compare one absolute projection of the next prompt against the limits. Adding the pure
     // plan's full tool schema estimate to the previous server usage double-counts the stable tool
@@ -2277,6 +2365,7 @@ async fn run_pending_input_pre_sampling_compact(
         InitialContextInjection::DoNotInject,
         CompactionReason::ContextLimit,
         CompactionPhase::PreTurn,
+        cancellation_token,
     )
     .await?;
     Ok(Some(PreSamplingCompactionReason::ProjectedContextLimit))
@@ -2320,6 +2409,7 @@ async fn maybe_run_previous_model_inline_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     client_session: &mut ModelClientSession,
+    cancellation_token: &CancellationToken,
 ) -> CodexResult<bool> {
     let Some(previous_turn_settings) = sess.previous_turn_settings().await else {
         return Ok(false);
@@ -2356,6 +2446,7 @@ async fn maybe_run_previous_model_inline_compact(
             InitialContextInjection::DoNotInject,
             CompactionReason::CompHashChanged,
             CompactionPhase::PreTurn,
+            cancellation_token,
         )
         .await?;
         return Ok(true);
@@ -2403,6 +2494,7 @@ async fn maybe_run_previous_model_inline_compact(
             InitialContextInjection::DoNotInject,
             CompactionReason::ModelDownshift,
             CompactionPhase::PreTurn,
+            cancellation_token,
         )
         .await?;
         return Ok(true);
@@ -2415,6 +2507,7 @@ async fn maybe_run_previous_model_inline_compact(
     skip_all,
     fields(reason = ?reason, phase = ?phase)
 )]
+#[allow(clippy::too_many_arguments)]
 async fn run_auto_compact(
     sess: &Arc<Session>,
     step_context: Arc<StepContext>,
@@ -2423,6 +2516,7 @@ async fn run_auto_compact(
     initial_context_injection: InitialContextInjection,
     reason: CompactionReason,
     phase: CompactionPhase,
+    cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
     let turn_context = &step_context.turn;
     let initial_context_injection = match initial_context_injection {
@@ -2447,6 +2541,7 @@ async fn run_auto_compact(
             initial_context_injection,
             reason,
             phase,
+            cancellation_token,
         )
         .await?;
     } else {
@@ -2461,6 +2556,7 @@ async fn run_auto_compact(
             initial_context_injection,
             reason,
             phase,
+            cancellation_token,
         )
         .await?;
     }
@@ -2776,6 +2872,8 @@ async fn run_sampling_request(
     // request creates new activations that must remain available to the next
     // continuation and therefore are not part of this release set.
     let advertised_deferred_tools = turn_context.activated_deferred_tools();
+    let _advertised_deferred_tool_lease =
+        AdvertisedDeferredToolLease::new(Arc::clone(&turn_context), advertised_deferred_tools);
     let cached_router = prebuilt_router.take();
     let router = match cached_router {
         Some(router)
@@ -2841,7 +2939,7 @@ async fn run_sampling_request(
     );
     let max_retries = turn_context.provider.info().stream_max_retries();
     let mut retries = 0;
-    let initial_input = prepared_input.shared_items();
+    let mut accepted_attempt_input = prepared_input.shared_items();
     let prompt_construction_guard = turn_context
         .turn_timing_state
         .begin_local_phase(TurnLocalPhase::PromptConstruction);
@@ -2868,6 +2966,7 @@ async fn run_sampling_request(
             generation_request.failure_fingerprint.clone(),
         );
     loop {
+        let mut attempt_progress = SamplingAttemptProgress::default();
         let err = match try_run_sampling_request(
             tool_runtime.clone(),
             Arc::clone(&sess),
@@ -2883,12 +2982,12 @@ async fn run_sampling_request(
             reasoning_trigger,
             generation_request.sampling.clone(),
             cancellation_token.child_token(),
+            &mut attempt_progress,
         )
         .await
         {
             Ok(output) => {
-                turn_context.release_advertised_deferred_tools(&advertised_deferred_tools);
-                return Ok((output, initial_input.to_vec()));
+                return Ok((output, accepted_attempt_input.to_vec()));
             }
             Err(CodexErr::ContextWindowExceeded) => {
                 sess.set_total_tokens_full(&turn_context).await;
@@ -2908,7 +3007,6 @@ async fn run_sampling_request(
             return Err(err);
         }
 
-        let retry_timing_guard = turn_context.turn_timing_state.begin_retry_backoff();
         let retry_result = handle_retryable_response_stream_error(
             &mut retries,
             max_retries,
@@ -2917,12 +3015,14 @@ async fn run_sampling_request(
             &sess,
             &turn_context,
             ResponsesStreamRequest::Sampling,
+            &cancellation_token,
         )
         .await;
-        drop(retry_timing_guard);
         retry_result?;
         turn_context.turn_timing_state.record_sampling_retry();
-        if !crate::latency_switches::shared_prompt_input_enabled() {
+        if attempt_progress.requires_authoritative_retry_input()
+            || !crate::latency_switches::shared_prompt_input_enabled()
+        {
             let history = sess.clone_history().await;
             let retry_input = prepare_sampling_prompt_for_client(
                 history,
@@ -2931,6 +3031,7 @@ async fn run_sampling_request(
                 sess.services.git_workspace.as_ref(),
             )
             .await;
+            accepted_attempt_input = retry_input.shared_items();
             prompt = build_projected_prompt(
                 sess.as_ref(),
                 &retry_input,
@@ -4061,6 +4162,7 @@ async fn try_run_sampling_request(
     reasoning_trigger: codex_protocol::protocol::ReasoningPolicyTrigger,
     sampling: SamplingGenerationDisposition,
     cancellation_token: CancellationToken,
+    attempt_progress: &mut SamplingAttemptProgress,
 ) -> CodexResult<SamplingRequestResult> {
     let mut active_without_pending_passes = 0_u8;
     let next_sample_reason = reconcile_turn_progress(
@@ -4479,6 +4581,7 @@ async fn try_run_sampling_request(
         match event {
             ResponseEvent::Created => {}
             ResponseEvent::OutputItemDone(mut item) => {
+                attempt_progress.accepted_output = true;
                 assign_missing_streamed_response_item_id(&mut item, active_item.as_ref());
                 if let Some((_, mut consumer)) = active_tool_argument_diff_consumer.take()
                     && let Ok(Some(event)) = consumer.finish()
@@ -4951,6 +5054,7 @@ async fn try_run_sampling_request(
             mutation_revision: tracker.current_mutation_revision(),
             validation_status: tracker.validation_freshness_status(),
             validation_revision: tracker.last_successful_validation_revision(),
+            tool_exposure_revision: turn_context.deferred_tool_activation_revision(),
         }
     };
     let prefetched_workspace_identity = match continuation_workspace_prefetch {

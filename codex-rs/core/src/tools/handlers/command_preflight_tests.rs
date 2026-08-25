@@ -358,6 +358,25 @@ fn rejects_known_rg_flag_typo_for_direct_argv() {
 }
 
 #[test]
+fn audit_command_preflight_rejects_unparseable_shell_command() {
+    let issue = preflight_command_issue(
+        &strings(&[
+            "pwsh",
+            "-NoProfile",
+            "-Command",
+            "$tool = 'git'; & $tool status --short",
+        ]),
+        /*shell_type*/ None,
+    )
+    .expect_err("an unparseable shell command must fail closed");
+
+    assert_eq!(issue.code, CommandPreflightIssueCode::UnparseableCommand);
+    let rendered = issue.render_for_model();
+    assert!(rendered.contains("could not be parsed precisely enough"));
+    assert!(rendered.contains("command_preflight_unparseable_command"));
+}
+
+#[test]
 fn repairs_one_read_only_direct_argv_typo() {
     let invocation = CommandInvocation::Argv {
         program: "rg".to_string(),

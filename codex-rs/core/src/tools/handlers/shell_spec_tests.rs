@@ -7,10 +7,19 @@ fn windows_shell_guidance_description() -> String {
 }
 
 fn has_parameter(tool: &ToolSpec, parameter_name: &str) -> bool {
-    serde_json::to_value(tool)
-        .expect("tool spec should serialize")
-        .pointer(&format!("/parameters/properties/{parameter_name}"))
+    let tool = serde_json::to_value(tool).expect("tool spec should serialize");
+    tool.pointer(&format!("/parameters/properties/{parameter_name}"))
         .is_some()
+        || tool
+            .pointer("/parameters/oneOf")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|branches| {
+                branches.iter().any(|branch| {
+                    branch
+                        .pointer(&format!("/properties/{parameter_name}"))
+                        .is_some()
+                })
+            })
 }
 
 #[test]
@@ -90,16 +99,18 @@ fn exec_command_tool_matches_expected_spec() {
         ),
         (
             "yield_time_ms".to_string(),
-            JsonSchema::number(Some(
-                    "Wait before yielding output. Defaults to 2000 ms; effective range is 250-30000 ms.".to_string(),
-                )),
+            bounded_integer(
+                "Wait before yielding output. Defaults to 2000 ms; effective range is 250-30000 ms.".to_string(),
+                crate::unified_exec::MIN_YIELD_TIME_MS,
+                crate::unified_exec::MAX_YIELD_TIME_MS,
+            ),
         ),
         (
             "max_output_tokens".to_string(),
-            JsonSchema::number(Some(format!(
+            bounded_integer(format!(
                 "Output token budget. {}; larger requests may be capped by policy.",
                 codex_utils_output_truncation::adaptive_output_budget_description()
-            ))),
+            ), 0, usize::MAX as u64),
         ),
         (
             "login".to_string(),
@@ -126,7 +137,7 @@ fn exec_command_tool_matches_expected_spec() {
             description,
             strict: false,
             defer_loading: None,
-            parameters: JsonSchema::object(properties, /*required*/ None, Some(false.into())),
+            parameters: command_parameters_schema(properties, "cmd"),
             output_schema: Some(unified_exec_output_schema()),
         })
     );
@@ -154,9 +165,11 @@ fn write_stdin_tool_matches_expected_spec() {
     let properties = BTreeMap::from([
         (
             "session_id".to_string(),
-            JsonSchema::number(Some(
+            bounded_integer(
                 "Identifier of the running unified exec session.".to_string(),
-            )),
+                0,
+                u32::MAX as u64,
+            ),
         ),
         (
             "chars".to_string(),
@@ -166,16 +179,18 @@ fn write_stdin_tool_matches_expected_spec() {
         ),
         (
             "yield_time_ms".to_string(),
-            JsonSchema::number(Some(
+            bounded_integer(
                 "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms; empty polls default to one event-driven 60000 ms wait. A wait deadline does not terminate the process.".to_string(),
-            )),
+                crate::unified_exec::MIN_YIELD_TIME_MS,
+                crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS,
+            ),
         ),
         (
             "max_output_tokens".to_string(),
-            JsonSchema::number(Some(format!(
+            bounded_integer(format!(
                 "Output token budget. {}; larger requests may be capped by policy.",
                 codex_utils_output_truncation::adaptive_output_budget_description()
-            ))),
+            ), 0, usize::MAX as u64),
         ),
     ]);
 
@@ -308,16 +323,20 @@ Examples of valid command strings:
         ),
         (
             "timeout_ms".to_string(),
-            JsonSchema::number(Some(
+            bounded_integer(
                 "Maximum command runtime. Defaults to 10000 ms.".to_string(),
-            )),
+                0,
+                u64::MAX,
+            ),
         ),
         (
             "stall_timeout_ms".to_string(),
-            JsonSchema::number(Some(
+            bounded_integer(
                 "Optional maximum time without stdout or stderr progress before cancellation. Omit or set zero to disable the stall deadline."
                     .to_string(),
-            )),
+                0,
+                u64::MAX,
+            ),
         ),
         ("validation".to_string(), validation_context_schema()),
         (
@@ -345,8 +364,85 @@ Examples of valid command strings:
             description,
             strict: false,
             defer_loading: None,
-            parameters: JsonSchema::object(properties, /*required*/ None, Some(false.into())),
+            parameters: command_parameters_schema(properties, "command"),
             output_schema: None,
         })
+    );
+}
+
+#[test]
+fn command_tools_advertise_only_mutually_exclusive_explicit_forms() {
+    for tool in [
+        create_exec_command_tool(CommandToolOptions {
+            allow_login_shell: true,
+            exec_permission_approvals_enabled: false,
+        }),
+        create_shell_command_tool(CommandToolOptions {
+            allow_login_shell: true,
+            exec_permission_approvals_enabled: false,
+        }),
+    ] {
+        let tool = serde_json::to_value(tool).expect("serialize command tool");
+        let branches = tool
+            .pointer("/parameters/oneOf")
+            .and_then(serde_json::Value::as_array)
+            .expect("command form branches");
+        assert_eq!(branches.len(), 3);
+        let kinds = branches
+            .iter()
+            .map(|branch| branch["properties"]["kind"]["enum"][0].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![json!("script"), json!("argv"), json!("powershell_script")]
+        );
+        assert!(
+            branches
+                .iter()
+                .all(|branch| branch["additionalProperties"] == false)
+        );
+        assert!(branches.iter().all(|branch| {
+            branch["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&json!("kind")))
+        }));
+        assert!(
+            branches
+                .iter()
+                .all(|branch| branch["properties"]["kind"]["enum"] != json!(["legacy"]))
+        );
+    }
+}
+
+#[test]
+fn integer_arguments_expose_destination_types_and_runtime_bounds() {
+    let exec = serde_json::to_value(create_exec_command_tool(CommandToolOptions {
+        allow_login_shell: true,
+        exec_permission_approvals_enabled: false,
+    }))
+    .expect("serialize exec tool");
+    let exec_yield = &exec["parameters"]["oneOf"][0]["properties"]["yield_time_ms"];
+    assert_eq!(exec_yield["type"], "integer");
+    assert_eq!(
+        exec_yield["minimum"],
+        crate::unified_exec::MIN_YIELD_TIME_MS
+    );
+    assert_eq!(
+        exec_yield["maximum"],
+        crate::unified_exec::MAX_YIELD_TIME_MS
+    );
+
+    let write = serde_json::to_value(create_write_stdin_tool()).expect("serialize write tool");
+    assert_eq!(
+        write["parameters"]["properties"]["session_id"]["type"],
+        "integer"
+    );
+    assert_eq!(
+        write["parameters"]["properties"]["session_id"]["maximum"],
+        u32::MAX
+    );
+    assert_eq!(
+        write["parameters"]["properties"]["yield-time_ms"]["maximum"],
+        crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS
     );
 }

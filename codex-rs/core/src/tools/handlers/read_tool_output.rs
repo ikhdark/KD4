@@ -27,6 +27,7 @@ use codex_tools::ToolOutput;
 use codex_tools::ToolOutputProjectionMetadata;
 use codex_tools::ToolSpec;
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
@@ -48,14 +49,26 @@ struct DrainedRecoveryTransaction {
     output: ReadToolOutputResult,
     reused: bool,
     drained_continuation_pages: u32,
+    continuation_stop: Option<RecoveryContinuationStopV1>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 enum ContinuationStopReason {
     Budget,
+    Cancelled,
     IdentityDrift,
     IncompleteOwnerResult,
+    PageReadError,
     RepeatedSelector,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct RecoveryContinuationStopV1 {
+    version: u8,
+    reason: ContinuationStopReason,
+    selector: Option<ToolOutputSelector>,
+    resumable: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -74,6 +87,7 @@ struct RecoveryContinuationState {
     followed_selectors: Vec<ToolOutputSelector>,
     drained_continuation_pages: u32,
     token_ceiling: usize,
+    continuation_stop: Option<RecoveryContinuationStopV1>,
 }
 
 impl RecoveryContinuationState {
@@ -84,7 +98,33 @@ impl RecoveryContinuationState {
             followed_selectors: Vec::new(),
             drained_continuation_pages: 0,
             token_ceiling,
+            continuation_stop: None,
         }
+    }
+
+    fn record_stop(
+        &mut self,
+        reason: ContinuationStopReason,
+        selector: Option<ToolOutputSelector>,
+    ) {
+        self.continuation_stop = Some(RecoveryContinuationStopV1 {
+            version: 1,
+            reason,
+            selector,
+            resumable: matches!(
+                reason,
+                ContinuationStopReason::Budget
+                    | ContinuationStopReason::Cancelled
+                    | ContinuationStopReason::PageReadError
+            ),
+        });
+    }
+
+    fn first_pending_selector(&self) -> Option<ToolOutputSelector> {
+        self.output
+            .results
+            .iter()
+            .find_map(|result| result.continuation.clone())
     }
 
     fn next_step(&self) -> ContinuationStep {
@@ -182,6 +222,7 @@ impl RecoveryContinuationState {
             output: self.output,
             reused: self.reused,
             drained_continuation_pages: self.drained_continuation_pages,
+            continuation_stop: self.continuation_stop,
         }
     }
 }
@@ -347,6 +388,7 @@ async fn handle_read_tool_output(
         output,
         reused,
         drained_continuation_pages,
+        continuation_stop,
     } = transaction;
     if !reused {
         invocation
@@ -367,10 +409,20 @@ async fn handle_read_tool_output(
         action_bounds_hash,
         drained_continuation_pages,
     );
-    let semantic_evidence = read_tool_output_semantic_evidence(&output);
-    let output = serde_json::to_value(output).map_err(|err| {
+    let semantic_evidence = read_tool_output_semantic_evidence(&output, continuation_stop.as_ref());
+    let mut output = serde_json::to_value(output).map_err(|err| {
         FunctionCallError::RespondToModel(format!("failed to serialize recovery result: {err}"))
     })?;
+    if let (Some(stop), Some(object)) = (continuation_stop, output.as_object_mut()) {
+        object.insert(
+            "continuation_stop".to_string(),
+            serde_json::to_value(stop).map_err(|err| {
+                FunctionCallError::RespondToModel(format!(
+                    "failed to serialize recovery continuation stop: {err}"
+                ))
+            })?,
+        );
+    }
     let exact_recovery = exact_recovery_receipt.map(|receipt| (receipt, output.clone()));
     Ok(boxed_tool_output(ReadToolOutputToolOutput {
         inner: JsonToolOutput::new(output),
@@ -387,16 +439,38 @@ fn parse_read_tool_output_args(arguments: &str) -> Result<ReadToolOutputArgs, Fu
     })
 }
 
-fn read_tool_output_semantic_evidence(output: &ReadToolOutputResult) -> Vec<String> {
-    let recovered_text = output
+fn read_tool_output_semantic_evidence(
+    output: &ReadToolOutputResult,
+    continuation_stop: Option<&RecoveryContinuationStopV1>,
+) -> Vec<String> {
+    let recovered_fragments = output
         .results
         .iter()
         .filter(|result| result.status == ToolOutputSelectorStatus::Ok)
-        .filter_map(|result| result.text.as_deref())
-        .collect::<Vec<_>>()
-        .join("\n");
-    if !recovered_text.is_empty() {
-        let mut evidence = semantic_evidence_for_command_output(recovered_text.as_bytes());
+        .filter_map(|result| result.text.as_deref().map(|text| (result, text)))
+        .collect::<Vec<_>>();
+    if !recovered_fragments.is_empty() {
+        let mut evidence = Vec::new();
+        for (result, recovered_fragment) in recovered_fragments {
+            let fragment_facts =
+                semantic_evidence_for_command_output(recovered_fragment.as_bytes());
+            for fact in &fragment_facts {
+                if !evidence.contains(fact) {
+                    evidence.push(fact.clone());
+                }
+            }
+            let provenance = serde_json::to_vec(&serde_json::json!({
+                "canonical_sha256": output.canonical_sha256,
+                "selector": result.selector,
+                "canonical_range": result.canonical_range,
+                "facts": fragment_facts,
+            }))
+            .unwrap_or_default();
+            evidence.push(format!(
+                "artifact-recovery-fragment-v1:{}",
+                crate::tool_history::sha256(&provenance)
+            ));
+        }
         let supplemental_results = output
             .results
             .iter()
@@ -414,6 +488,7 @@ fn read_tool_output_semantic_evidence(output: &ReadToolOutputResult) -> Vec<Stri
                 "complete": output.complete,
                 "unavailable_ranges": output.unavailable_ranges,
                 "results": supplemental_results,
+                "continuation_stop": continuation_stop,
             }))
             .unwrap_or_default();
             evidence.push(format!(
@@ -440,6 +515,7 @@ fn read_tool_output_semantic_evidence(output: &ReadToolOutputResult) -> Vec<Stri
         "complete": output.complete,
         "unavailable_ranges": output.unavailable_ranges,
         "results": output.results,
+        "continuation_stop": continuation_stop,
     }))
     .unwrap_or_default();
     vec![format!(
@@ -491,12 +567,21 @@ async fn execute_recovery_transaction_with_continuations(
         RECOVERY_AGGREGATE_TOKEN_CEILING
     };
     let mut state = RecoveryContinuationState::new(output, reused, token_ceiling);
-    while let ContinuationStep::Follow {
-        result_index,
-        selector,
-    } = state.next_step()
-    {
+    loop {
+        let (result_index, selector) = match state.next_step() {
+            ContinuationStep::Complete => break,
+            ContinuationStep::Stop(reason) => {
+                let selector = state.first_pending_selector();
+                state.record_stop(reason, selector);
+                break;
+            }
+            ContinuationStep::Follow {
+                result_index,
+                selector,
+            } => (result_index, selector),
+        };
         if cancellation_token.is_cancelled() {
+            state.record_stop(ContinuationStopReason::Cancelled, Some(selector));
             break;
         }
         let page = execute_recovery_transaction(
@@ -508,15 +593,18 @@ async fn execute_recovery_transaction_with_continuations(
         )
         .await;
         if cancellation_token.is_cancelled() {
+            state.record_stop(ContinuationStopReason::Cancelled, Some(selector));
             break;
         }
-        let Ok((page, page_reused)) = page else {
-            break;
+        let (page, page_reused) = match page {
+            Ok(page) => page,
+            Err(_) => {
+                state.record_stop(ContinuationStopReason::PageReadError, Some(selector));
+                break;
+            }
         };
-        if state
-            .accept_page(result_index, &selector, page, page_reused)
-            .is_err()
-        {
+        if let Err(reason) = state.accept_page(result_index, &selector, page, page_reused) {
+            state.record_stop(reason, Some(selector));
             break;
         }
     }
@@ -639,6 +727,11 @@ fn resolved_line_range(args: &ReadToolOutputArgs) -> Result<(usize, usize), Func
                 FunctionCallError::RespondToModel("start_line is too large".to_string())
             })?,
     };
+    if start_line == 0 || end_line < start_line {
+        return Err(FunctionCallError::RespondToModel(
+            "line ranges require 1-based start_line <= end_line".to_string(),
+        ));
+    }
     Ok((start_line, end_line))
 }
 
@@ -1032,7 +1125,7 @@ mod tests {
         };
 
         assert_eq!(
-            read_tool_output_semantic_evidence(&output),
+            read_tool_output_semantic_evidence(&output, None),
             vec!["canonical-output-v1:canonical-revision"]
         );
     }
@@ -1051,11 +1144,18 @@ mod tests {
             results: vec![result],
         };
 
+        let expected = semantic_evidence_for_command_output(
+            b"diff --git a/src/lib.rs b/src/lib.rs\n@@ -9,0 +10 @@\n+let stable = compute();",
+        );
+        let evidence = read_tool_output_semantic_evidence(&output, None);
+
+        assert!(expected.iter().all(|fact| evidence.contains(fact)));
         assert_eq!(
-            read_tool_output_semantic_evidence(&output),
-            semantic_evidence_for_command_output(
-                b"diff --git a/src/lib.rs b/src/lib.rs\n@@ -9,0 +10 @@\n+let stable = compute();"
-            )
+            evidence
+                .iter()
+                .filter(|fact| fact.starts_with("artifact-recovery-fragment-v1:"))
+                .count(),
+            1
         );
     }
 
@@ -1081,8 +1181,91 @@ mod tests {
         };
 
         assert_ne!(
-            read_tool_output_semantic_evidence(&incomplete),
-            read_tool_output_semantic_evidence(&complete)
+            read_tool_output_semantic_evidence(&incomplete, None),
+            read_tool_output_semantic_evidence(&complete, None)
+        );
+    }
+
+    #[test]
+    fn disjoint_recovered_fragments_do_not_create_synthetic_semantic_facts() {
+        let fragments = [
+            "diff --git a/src/lib.rs b/src/lib.rs",
+            "@@ -9,0 +10 @@\n+let stable = compute();",
+        ];
+        let mut results = Vec::new();
+        for fragment in fragments {
+            let mut result = selector_result(ToolOutputSelectorStatus::Ok);
+            result.text = Some(fragment.to_string());
+            results.push(result);
+        }
+        let output = ReadToolOutputResult {
+            artifact_id: "artifact".to_string(),
+            canonical_sha256: "canonical-revision".to_string(),
+            canonical_bytes: 80,
+            retained_bytes: 80,
+            complete: true,
+            unavailable_ranges: Vec::new(),
+            results,
+        };
+        let expected = fragments
+            .iter()
+            .flat_map(|fragment| semantic_evidence_for_command_output(fragment.as_bytes()))
+            .collect::<Vec<_>>();
+
+        let evidence = read_tool_output_semantic_evidence(&output, None);
+        assert!(expected.iter().all(|fact| evidence.contains(fact)));
+        assert_eq!(
+            evidence
+                .iter()
+                .filter(|fact| fact.starts_with("artifact-recovery-fragment-v1:"))
+                .count(),
+            fragments.len()
+        );
+        assert_ne!(
+            evidence,
+            semantic_evidence_for_command_output(fragments.join("\n").as_bytes())
+        );
+    }
+
+    #[test]
+    fn recovered_fragment_identity_includes_its_selector() {
+        let mut first = selector_result(ToolOutputSelectorStatus::Ok);
+        first.selector = ToolOutputSelector::Lines { start: 1, end: 1 };
+        first.text = Some("same recovered fact".to_string());
+        let mut second = first.clone();
+        second.selector = ToolOutputSelector::Lines { start: 2, end: 2 };
+        let output = recovery_output(vec![first, second]);
+
+        let provenance = read_tool_output_semantic_evidence(&output, None)
+            .into_iter()
+            .filter(|fact| fact.starts_with("artifact-recovery-fragment-v1:"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(provenance.len(), 2);
+        assert_ne!(provenance[0], provenance[1]);
+    }
+
+    #[test]
+    fn continuation_stop_is_typed_and_preserves_the_unconsumed_selector() {
+        let selector = search_selector(10);
+        let initial = recovery_output(vec![continuation_result(
+            search_selector(0),
+            Some(selector.clone()),
+            "first page",
+        )]);
+        let mut state = RecoveryContinuationState::new(initial, true, usize::MAX);
+        state.record_stop(ContinuationStopReason::Budget, Some(selector.clone()));
+
+        let stop = state
+            .finish()
+            .continuation_stop
+            .expect("typed stop receipt");
+        assert_eq!(stop.reason, ContinuationStopReason::Budget);
+        assert_eq!(stop.selector, Some(selector));
+        assert!(stop.resumable);
+        assert_eq!(
+            serde_json::to_value(stop).expect("serialize stop")["reason"],
+            "budget"
         );
     }
 
@@ -1106,6 +1289,34 @@ mod tests {
             max_bytes: None,
         };
         assert_eq!(resolved_line_range(&args).unwrap(), (17, 216));
+    }
+
+    #[test]
+    fn legacy_single_range_uses_the_canonical_line_invariants() {
+        for (start_line, end_line) in [(0, Some(1)), (3, Some(2))] {
+            let args = ReadToolOutputArgs {
+                artifact_id: uuid::Uuid::now_v7().to_string(),
+                selectors: None,
+                start_line: Some(start_line),
+                end_line,
+                ranges: Vec::new(),
+                max_bytes: None,
+            };
+            assert!(resolved_selectors(&args).is_err());
+        }
+
+        let args = ReadToolOutputArgs {
+            artifact_id: uuid::Uuid::now_v7().to_string(),
+            selectors: None,
+            start_line: Some(3),
+            end_line: Some(3),
+            ranges: Vec::new(),
+            max_bytes: None,
+        };
+        assert_eq!(
+            resolved_selectors(&args).unwrap(),
+            vec![ToolOutputSelector::Lines { start: 3, end: 3 }]
+        );
     }
 
     #[test]

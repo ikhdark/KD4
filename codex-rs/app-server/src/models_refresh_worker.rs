@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use codex_http_client::HttpClientFactory;
@@ -12,18 +13,38 @@ const MODELS_REFRESH_INTERVAL: Duration = Duration::from_secs(3 * 60);
 #[derive(Debug)]
 pub(crate) struct ModelsRefreshWorker {
     shutdown: CancellationToken,
-    _task: JoinHandle<()>,
+    task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl ModelsRefreshWorker {
     pub(crate) fn shutdown(&self) {
         self.shutdown.cancel();
     }
+
+    pub(crate) async fn shutdown_and_wait(&self) {
+        self.shutdown.cancel();
+        let task = self
+            .task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+    }
 }
 
 impl Drop for ModelsRefreshWorker {
     fn drop(&mut self) {
         self.shutdown();
+        if let Some(task) = self
+            .task
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            task.abort();
+        }
     }
 }
 
@@ -57,15 +78,22 @@ fn spawn_with_interval(
             let Some(models_manager) = models_manager.upgrade() else {
                 break;
             };
-            models_manager
-                .list_models(RefreshStrategy::Online, http_client_factory.clone())
-                .await;
+            let refresh =
+                models_manager.list_models(RefreshStrategy::Online, http_client_factory.clone());
+            tokio::select! {
+                _ = worker_shutdown.cancelled() => break,
+                result = refresh => {
+                    if let Err(error) = result {
+                        tracing::warn!(?error, "periodic model catalog refresh failed");
+                    }
+                }
+            }
             drop(models_manager);
         }
     });
     ModelsRefreshWorker {
         shutdown,
-        _task: task,
+        task: Mutex::new(Some(task)),
     }
 }
 

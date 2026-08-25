@@ -8,7 +8,7 @@ use crate::attestation::app_server_attestation_provider;
 use crate::config_manager::ConfigManager;
 use crate::connection_rpc_gate::ConnectionRpcGate;
 use crate::current_time::app_server_time_provider;
-use crate::desktop_activation::DesktopActivationBootstrap;
+use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
 use crate::extensions::ThreadExtensionDependencies;
 use crate::extensions::app_server_extension_event_sink;
@@ -55,7 +55,6 @@ use codex_analytics::AnalyticsEventsClient;
 use codex_analytics::AppServerRpcTransport;
 use codex_app_server_protocol::ClientNotification;
 use codex_app_server_protocol::ClientRequest;
-use codex_app_server_protocol::ClientRequestRequiredCapability;
 use codex_app_server_protocol::ClientResponsePayload;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::ExperimentalApi;
@@ -80,6 +79,8 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_rollout::StateDbHandle;
 use codex_state::log_db::LogDbLayer;
+use futures::FutureExt;
+use std::panic::AssertUnwindSafe;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -144,7 +145,6 @@ pub(crate) struct InitializedConnectionSessionState {
     pub(crate) client_version: String,
     pub(crate) request_attestation: bool,
     pub(crate) supports_openai_form_elicitation: bool,
-    pub(crate) desktop_activation_receipts: bool,
 }
 
 impl Default for ConnectionSessionState {
@@ -201,11 +201,6 @@ impl ConnectionSessionState {
             .get()
             .is_some_and(|session| session.supports_openai_form_elicitation)
     }
-    pub(crate) fn desktop_activation_receipts(&self) -> bool {
-        self.initialized
-            .get()
-            .is_some_and(|session| session.desktop_activation_receipts)
-    }
 
     pub(crate) fn initialize(&self, session: InitializedConnectionSessionState) -> Result<(), ()> {
         self.initialized.set(session).map_err(|_| ())
@@ -229,7 +224,6 @@ pub(crate) struct MessageProcessorArgs {
     pub(crate) rpc_transport: AppServerRpcTransport,
     pub(crate) remote_control_handle: Option<RemoteControlHandle>,
     pub(crate) plugin_startup_tasks: crate::PluginStartupTasks,
-    pub(crate) desktop_activation_bootstrap: Arc<DesktopActivationBootstrap>,
 }
 
 impl MessageProcessor {
@@ -253,7 +247,6 @@ impl MessageProcessor {
             rpc_transport,
             remote_control_handle,
             plugin_startup_tasks,
-            desktop_activation_bootstrap,
         } = args;
         let bug_worker_shutdown = CancellationToken::new();
         let thread_state_manager = ThreadStateManager::new();
@@ -439,7 +432,6 @@ impl MessageProcessor {
             log_db,
             Arc::clone(&skills_watcher),
             config_warnings,
-            desktop_activation_bootstrap,
         );
         let turn_processor = TurnRequestProcessor::new(
             auth_manager.clone(),
@@ -662,7 +654,7 @@ impl MessageProcessor {
 
     pub(crate) async fn drain_background_tasks(&self) {
         self.bug_worker_shutdown.cancel();
-        self.models_refresh_worker.shutdown();
+        self.models_refresh_worker.shutdown_and_wait().await;
         self.thread_processor.drain_background_tasks().await;
         self.outgoing.shutdown_delivery_tasks().await;
     }
@@ -784,14 +776,6 @@ impl MessageProcessor {
         {
             return Err(invalid_request(experimental_required_message(reason)));
         }
-        if codex_request.required_capability()
-            == Some(ClientRequestRequiredCapability::DesktopActivationReceipts)
-            && !session.desktop_activation_receipts()
-        {
-            return Err(invalid_request(
-                "Desktop activation receipts capability was not enabled during initialize",
-            ));
-        }
         let connection_id = connection_request_id.connection_id;
         self.initialize_processor.track_initialized_request(
             connection_id,
@@ -824,7 +808,7 @@ impl MessageProcessor {
                 tokio::select! {
                     biased;
                     _ = rpc_cancellation.cancelled() => {}
-                    result = processor_for_request.handle_initialized_client_request(
+                    result = AssertUnwindSafe(processor_for_request.handle_initialized_client_request(
                         connection_request_id,
                         codex_request,
                         request_context,
@@ -832,9 +816,18 @@ impl MessageProcessor {
                             rpc_gate: handler_rpc_gate,
                             ..client_metadata
                         },
-                    ) => {
-                        if let Err(error) = result {
-                            processor.outgoing.send_error(error_request_id, error).await;
+                    )).catch_unwind() => {
+                        match result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                processor.outgoing.send_error(error_request_id, error).await;
+                            }
+                            Err(_) => {
+                                processor.outgoing.send_error(
+                                    error_request_id,
+                                    internal_error("initialized request handler panicked"),
+                                ).await;
+                            }
                         }
                     }
                 }
@@ -1054,21 +1047,6 @@ impl MessageProcessor {
                     )
                     .await
                     .map(|()| None)
-            }
-            ClientRequest::ThreadDesktopActivationObligation { params, .. } => {
-                self.thread_processor
-                    .desktop_activation_obligation(params)
-                    .await
-            }
-            ClientRequest::ThreadDesktopActivationChallenge { params, .. } => {
-                self.thread_processor
-                    .desktop_activation_challenge(connection_id, params)
-                    .await
-            }
-            ClientRequest::ThreadDesktopActivationRecord { params, .. } => {
-                self.thread_processor
-                    .desktop_activation_record(connection_id, params)
-                    .await
             }
             ClientRequest::ThreadFork { params, .. } => {
                 self.thread_processor

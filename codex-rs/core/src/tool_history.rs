@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::io::Write;
@@ -23,6 +24,7 @@ use crate::tools::command_output_artifact::reconcile_active_tool_history_artifac
 use crate::tools::command_output_artifact::remint_tool_history_artifact_for_thread;
 
 const RECEIPT_VERSION: u8 = 1;
+const TOOL_SEARCH_RECEIPT_VERSION: u8 = 1;
 const RECEIPT_MAX_TOKENS: usize = 256;
 const RECEIPT_DIGEST_TARGET_TOKENS: usize = 96;
 const MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET: usize = 10_000;
@@ -50,6 +52,22 @@ pub(crate) struct ToolHistoryReceiptV1 {
     artifact: ReceiptArtifact,
     original: ReceiptOriginalSize,
     retrieval: ReceiptRetrieval,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct ToolSearchReceiptV1 {
+    version: u8,
+    receipt_id: String,
+    call_id: String,
+    status: String,
+    execution: String,
+    arguments: serde_json::Value,
+    result_set_sha256: String,
+    result_count: usize,
+    omitted_result_count: Option<usize>,
+    complete: bool,
+    ordered_tool_identities: Vec<String>,
+    omitted_identity_count: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -89,6 +107,15 @@ struct ReceiptRetrieval {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ToolHistoryArtifactPinV1 {
+    version: u8,
+    kind: String,
+    artifact_id: String,
+    bytes: u64,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct ToolHistoryCandidate {
     pub(crate) call_id: String,
     pub(crate) tool_identity: String,
@@ -111,6 +138,17 @@ pub(crate) struct ToolHistoryCandidate {
     pub(crate) proof_identity: Option<String>,
     pub(crate) supersession_identity: Option<String>,
     pub(crate) consumed_by_generation: Option<ModelGenerationId>,
+    #[serde(skip)]
+    pub(crate) derived: ToolHistoryCandidateDerived,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ToolHistoryCandidateDerived {
+    receipt_id: String,
+    bounded_model_output_sha256: String,
+    bounded_model_output_tokens: u64,
+    receipt: Option<String>,
+    receipt_tokens: u64,
 }
 
 impl ToolHistoryCandidate {
@@ -118,13 +156,13 @@ impl ToolHistoryCandidate {
         (self.artifact_bytes, self.artifact_sha256.clone())
     }
 
-    fn receipt(&self) -> Option<(String, String)> {
+    fn receipt(&self) -> Option<(&str, &str, u64)> {
         self.render_receipt(
             /*require_consumed*/ true, /*require_savings*/ true,
         )
     }
 
-    fn admission_receipt(&self) -> Option<(String, String)> {
+    fn admission_receipt(&self) -> Option<(&str, &str, u64)> {
         self.render_receipt(
             /*require_consumed*/ false, /*require_savings*/ false,
         )
@@ -134,64 +172,99 @@ impl ToolHistoryCandidate {
         &self,
         require_consumed: bool,
         require_savings: bool,
-    ) -> Option<(String, String)> {
+    ) -> Option<(&str, &str, u64)> {
         if !self.complete
             || !self.projection_eligible
             || (require_consumed && self.consumed_by_generation.is_none())
         {
             return None;
         }
-        let bounded_tokens =
-            u64::try_from(approx_token_count(&self.bounded_model_output)).unwrap_or(u64::MAX);
+        let bounded_tokens = self.derived.bounded_model_output_tokens;
         if require_savings && bounded_tokens < MINIMUM_RAW_TOKENS {
             return None;
         }
-        let receipt_id = receipt_id_for(&self.call_id, &self.artifact_sha256);
+        let rendered = self.derived.receipt.as_deref()?;
+        let receipt_tokens = self.derived.receipt_tokens;
+        let saved = bounded_tokens.saturating_sub(receipt_tokens);
+        let relative = saved
+            .saturating_mul(100)
+            .checked_div(bounded_tokens.max(1))
+            .unwrap_or(0);
+        if require_savings
+            && (saved < MINIMUM_SAVED_TOKENS || relative < MINIMUM_RELATIVE_SAVINGS_PERCENT)
+        {
+            return None;
+        }
+        Some((self.derived.receipt_id.as_str(), rendered, receipt_tokens))
+    }
+
+    fn refresh_derived(&mut self) {
+        let receipt_id = receipt_id_for(
+            &self.call_id,
+            &self.artifact_sha256,
+            &self.tool_identity,
+            &self.semantic_class,
+            self.artifact_bytes,
+        );
+        let bounded_model_output_sha256 = sha256(self.bounded_model_output.as_bytes());
+        let bounded_model_output_tokens =
+            u64::try_from(approx_token_count(&self.bounded_model_output)).unwrap_or(u64::MAX);
+        let (receipt, receipt_tokens) = self
+            .fit_receipt(&receipt_id)
+            .map_or((None, 0), |(receipt, tokens)| (Some(receipt), tokens));
+        self.derived = ToolHistoryCandidateDerived {
+            receipt_id,
+            bounded_model_output_sha256,
+            bounded_model_output_tokens,
+            receipt,
+            receipt_tokens,
+        };
+    }
+
+    fn fit_receipt(&self, receipt_id: &str) -> Option<(String, u64)> {
+        if !self.complete || !self.projection_eligible {
+            return None;
+        }
+        let mut receipt = ToolHistoryReceiptV1 {
+            version: RECEIPT_VERSION,
+            receipt_id: receipt_id.to_string(),
+            call_id: self.call_id.clone(),
+            tool_identity: self.tool_identity.clone(),
+            semantic_class: self.semantic_class.clone(),
+            source_dependencies_current: self.source_dependencies_current,
+            digest: String::new(),
+            artifact: ReceiptArtifact {
+                artifact_id: self.artifact_id.clone(),
+                byte_start: 0,
+                byte_end: self.artifact_bytes,
+                sha256: self.artifact_sha256.clone(),
+                complete: self.complete,
+            },
+            original: ReceiptOriginalSize {
+                bytes: self.artifact_bytes,
+                approximate_tokens: self.original_tokens,
+            },
+            retrieval: ReceiptRetrieval {
+                tool: "read_tool_output".to_string(),
+                instruction: "Use artifact_id with a narrow byte/line range; verify canonical_sha256 for exact recovery.".to_string(),
+            },
+        };
+        if !self.source_dependencies_current {
+            receipt.digest = "STALE: a source dependency changed after this result was produced; rerun the tool before relying on it."
+                .to_string();
+            let rendered = serde_json::to_string(&receipt).ok()?;
+            let tokens = u64::try_from(approx_token_count(&rendered)).unwrap_or(u64::MAX);
+            return (tokens <= RECEIPT_MAX_TOKENS as u64).then_some((rendered, tokens));
+        }
+
         let mut digest_limit = RECEIPT_DIGEST_TARGET_TOKENS;
         loop {
-            let receipt = ToolHistoryReceiptV1 {
-                version: RECEIPT_VERSION,
-                receipt_id: receipt_id.clone(),
-                call_id: self.call_id.clone(),
-                tool_identity: self.tool_identity.clone(),
-                semantic_class: self.semantic_class.clone(),
-                source_dependencies_current: self.source_dependencies_current,
-                digest: if self.source_dependencies_current {
-                    truncate_text_to_token_ceiling(&self.bounded_model_output, digest_limit)
-                } else {
-                    "STALE: a source dependency changed after this result was produced; rerun the tool before relying on it."
-                        .to_string()
-                },
-                artifact: ReceiptArtifact {
-                    artifact_id: self.artifact_id.clone(),
-                    byte_start: 0,
-                    byte_end: self.artifact_bytes,
-                    sha256: self.artifact_sha256.clone(),
-                    complete: self.complete,
-                },
-                original: ReceiptOriginalSize {
-                    bytes: self.artifact_bytes,
-                    approximate_tokens: self.original_tokens,
-                },
-                retrieval: ReceiptRetrieval {
-                    tool: "read_tool_output".to_string(),
-                    instruction: "Use artifact_id with a narrow byte/line range; verify canonical_sha256 for exact recovery.".to_string(),
-                },
-            };
+            receipt.digest =
+                truncate_text_to_token_ceiling(&self.bounded_model_output, digest_limit);
             let rendered = serde_json::to_string(&receipt).ok()?;
             let receipt_tokens = u64::try_from(approx_token_count(&rendered)).unwrap_or(u64::MAX);
             if receipt_tokens <= RECEIPT_MAX_TOKENS as u64 {
-                let saved = bounded_tokens.saturating_sub(receipt_tokens);
-                let relative = saved
-                    .saturating_mul(100)
-                    .checked_div(bounded_tokens.max(1))
-                    .unwrap_or(0);
-                if require_savings
-                    && (saved < MINIMUM_SAVED_TOKENS || relative < MINIMUM_RELATIVE_SAVINGS_PERCENT)
-                {
-                    return None;
-                }
-                return Some((receipt_id, rendered));
+                return Some((rendered, receipt_tokens));
             }
             if digest_limit == 0 {
                 return None;
@@ -204,17 +277,20 @@ impl ToolHistoryCandidate {
     }
 
     fn matches_receipt(&self, text: &str) -> bool {
-        serde_json::from_str::<ToolHistoryReceiptV1>(text).is_ok_and(|receipt| {
-            receipt.version == RECEIPT_VERSION
-                && receipt.call_id == self.call_id
-                && receipt.receipt_id == receipt_id_for(&self.call_id, &self.artifact_sha256)
-                && receipt.source_dependencies_current == self.source_dependencies_current
-                && receipt.artifact.artifact_id == self.artifact_id
-                && receipt.artifact.sha256 == self.artifact_sha256
-                && receipt.artifact.byte_start == 0
-                && receipt.artifact.byte_end == self.artifact_bytes
-                && receipt.artifact.complete == self.complete
-        })
+        serde_json::from_str::<ToolHistoryReceiptV1>(text)
+            .is_ok_and(|receipt| self.matches_parsed_receipt(&receipt))
+    }
+
+    fn matches_parsed_receipt(&self, receipt: &ToolHistoryReceiptV1) -> bool {
+        receipt.version == RECEIPT_VERSION
+            && receipt.call_id == self.call_id
+            && receipt.receipt_id == self.derived.receipt_id
+            && receipt.source_dependencies_current == self.source_dependencies_current
+            && receipt.artifact.artifact_id == self.artifact_id
+            && receipt.artifact.sha256 == self.artifact_sha256
+            && receipt.artifact.byte_start == 0
+            && receipt.artifact.byte_end == self.artifact_bytes
+            && receipt.artifact.complete == self.complete
     }
 }
 
@@ -240,6 +316,8 @@ pub(crate) struct ToolHistoryState {
     candidates: BTreeMap<String, ToolHistoryCandidate>,
     #[serde(default)]
     workspace_evidence: BTreeMap<String, WorkspaceEvidenceObservation>,
+    #[serde(skip)]
+    artifact_call_ids: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -277,7 +355,7 @@ impl WorkspaceEvidenceObservation {
         source_dependencies: BTreeSet<SourceDependencyV1>,
         source_dependencies_current: bool,
     ) -> Option<Self> {
-        let (call_id, output) = textual_output_identity(item)?;
+        let (call_id, output) = canonical_textual_output_identity(item)?;
         Some(Self {
             call_id: call_id.to_string(),
             output_sha256: sha256(output.as_bytes()),
@@ -319,8 +397,26 @@ impl WorkspaceEvidenceObservation {
 }
 
 impl ToolHistoryState {
-    pub(crate) fn register(&mut self, candidate: ToolHistoryCandidate) {
+    pub(crate) fn register(&mut self, mut candidate: ToolHistoryCandidate) {
+        candidate.refresh_derived();
         self.candidates.insert(candidate.call_id.clone(), candidate);
+        self.rebuild_artifact_index();
+    }
+
+    fn refresh_derived_and_indexes(&mut self) {
+        for candidate in self.candidates.values_mut() {
+            candidate.refresh_derived();
+        }
+        self.rebuild_artifact_index();
+    }
+
+    fn rebuild_artifact_index(&mut self) {
+        self.artifact_call_ids.clear();
+        for (call_id, candidate) in &self.candidates {
+            self.artifact_call_ids
+                .entry(candidate.artifact_id.clone())
+                .or_insert_with(|| call_id.clone());
+        }
     }
 
     pub(crate) fn invalidate_source_dependencies(
@@ -343,15 +439,15 @@ impl ToolHistoryState {
                 tool_observes_workspace(&candidate.tool_identity)
             } else {
                 normalized_affected.as_ref().is_none_or(|paths| {
-                    candidate.source_dependencies.iter().any(|dependency| {
-                        paths
-                            .iter()
-                            .any(|path| source_dependency_overlaps(dependency, path))
-                    })
+                    candidate
+                        .source_dependencies
+                        .iter()
+                        .any(|dependency| affected_paths_overlap_dependency(paths, dependency))
                 })
             };
             if affected {
                 candidate.source_dependencies_current = false;
+                candidate.refresh_derived();
                 changed = true;
             }
         }
@@ -361,11 +457,10 @@ impl ToolHistoryState {
             }
             let affected = observation.source_dependencies.is_empty()
                 || normalized_affected.as_ref().is_none_or(|paths| {
-                    observation.source_dependencies.iter().any(|dependency| {
-                        paths
-                            .iter()
-                            .any(|path| source_dependency_overlaps(dependency, path))
-                    })
+                    observation
+                        .source_dependencies
+                        .iter()
+                        .any(|dependency| affected_paths_overlap_dependency(paths, dependency))
                 });
             if affected {
                 observation.source_dependencies_current = false;
@@ -412,20 +507,37 @@ impl ToolHistoryState {
         input: &[ResponseItem],
         generation: ModelGenerationId,
     ) -> bool {
+        struct ExposedOutputIdentity<'a> {
+            text: Cow<'a, str>,
+            output_sha256: String,
+        }
         let exposed = input
             .iter()
-            .filter_map(textual_output_identity)
-            .map(|(call_id, text)| (call_id.to_string(), text.to_string()))
+            .filter_map(canonical_textual_output_identity)
+            .map(|(call_id, text)| {
+                let output_sha256 = sha256(text.as_bytes());
+                (
+                    call_id,
+                    ExposedOutputIdentity {
+                        text,
+                        output_sha256,
+                    },
+                )
+            })
             .collect::<BTreeMap<_, _>>();
         let mut changed = false;
         for candidate in self.candidates.values_mut() {
             if candidate.consumed_by_generation.is_some() {
                 continue;
             }
-            let bounded_output_sha256 = sha256(candidate.bounded_model_output.as_bytes());
-            if exposed.get(&candidate.call_id).is_some_and(|text| {
-                sha256(text.as_bytes()) == bounded_output_sha256 || candidate.matches_receipt(text)
-            }) {
+            if exposed
+                .get(candidate.call_id.as_str())
+                .is_some_and(|output| {
+                    output.output_sha256 == candidate.derived.bounded_model_output_sha256
+                        || serde_json::from_str::<ToolHistoryReceiptV1>(&output.text)
+                            .is_ok_and(|receipt| candidate.matches_parsed_receipt(&receipt))
+                })
+            {
                 candidate.consumed_by_generation = Some(generation.clone());
                 changed = true;
             }
@@ -489,16 +601,34 @@ impl ToolHistoryState {
                 git_workspace,
             );
         }
+        let tool_search_arguments = projected
+            .iter()
+            .filter_map(|item| match item {
+                ResponseItem::ToolSearchCall {
+                    call_id: Some(call_id),
+                    arguments,
+                    ..
+                } => Some((call_id.clone(), arguments.clone())),
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>();
+        let exposed_output_sha256 = projected
+            .iter()
+            .filter_map(canonical_textual_output_identity)
+            .map(|(call_id, output)| (call_id.to_string(), sha256(output.as_bytes())))
+            .collect::<BTreeMap<_, _>>();
         let mut latest_supersession = BTreeMap::<String, String>::new();
         let mut superseded_call_ids = BTreeSet::new();
         for item in &projected {
-            let Some((call_id, output)) = textual_output_identity(item) else {
+            let Some((call_id, _output)) = canonical_textual_output_identity(item) else {
                 continue;
             };
             let Some(candidate) = self.candidates.get(call_id) else {
                 continue;
             };
-            if sha256(output.as_bytes()) != sha256(candidate.bounded_model_output.as_bytes()) {
+            if exposed_output_sha256.get(call_id)
+                != Some(&candidate.derived.bounded_model_output_sha256)
+            {
                 continue;
             }
             let Some(identity) = candidate.supersession_identity.as_ref() else {
@@ -531,21 +661,24 @@ impl ToolHistoryState {
             .iter()
             .enumerate()
             .filter_map(|(item_index, item)| {
-                let (call_id, output) = textual_output_identity(item)?;
+                let (call_id, output) = canonical_textual_output_identity(item)?;
                 let candidate = self.candidates.get(call_id)?;
-                (sha256(output.as_bytes()) == sha256(candidate.bounded_model_output.as_bytes()))
-                    .then(|| AdmissionCandidate {
-                        priority: admission_priority(candidate, output),
-                        item_index: std::cmp::Reverse(item_index),
-                        call_id: call_id.to_string(),
-                        structured_tokens: None,
-                    })
+                (exposed_output_sha256.get(call_id)
+                    == Some(&candidate.derived.bounded_model_output_sha256))
+                .then(|| AdmissionCandidate {
+                    priority: admission_priority(candidate, &output),
+                    item_index: std::cmp::Reverse(item_index),
+                    call_id: call_id.to_string(),
+                    structured_tokens: None,
+                })
             })
             .collect::<Vec<_>>();
         admission_candidates.extend(projected.iter().enumerate().filter_map(
             |(item_index, item)| {
                 let ResponseItem::ToolSearchOutput {
                     call_id: Some(call_id),
+                    status,
+                    tools,
                     ..
                 } = item
                 else {
@@ -553,7 +686,7 @@ impl ToolHistoryState {
                 };
                 let serialized = serde_json::to_string(item).ok()?;
                 Some(AdmissionCandidate {
-                    priority: 2,
+                    priority: tool_search_admission_priority(status, tools),
                     item_index: std::cmp::Reverse(item_index),
                     call_id: call_id.clone(),
                     structured_tokens: Some(approx_token_count(&serialized)),
@@ -572,6 +705,7 @@ impl ToolHistoryState {
         enum AdmissionRepresentation {
             Raw,
             Receipt { receipt_id: String, text: String },
+            StructuredReceipt { item: ResponseItem },
             Drop,
         }
         #[derive(Debug)]
@@ -582,26 +716,47 @@ impl ToolHistoryState {
 
         let mut decisions = BTreeMap::<String, AdmissionDecision>::new();
         let mut remaining_tokens = MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET;
+        let mut remaining_fallback_tokens = MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET;
         for admission_candidate in admission_candidates {
             let item_index = admission_candidate.item_index.0;
             let call_id = admission_candidate.call_id;
             if let Some(raw_tokens) = admission_candidate.structured_tokens {
-                let representation = if raw_tokens <= remaining_tokens {
+                let receipt = projected.get(item_index).and_then(|item| {
+                    tool_search_receipt_item(item, tool_search_arguments.get(&call_id))
+                });
+                let (representation, retain_raw_fallback) = if raw_tokens <= remaining_tokens {
                     remaining_tokens = remaining_tokens.saturating_sub(raw_tokens);
-                    AdmissionRepresentation::Raw
+                    remaining_fallback_tokens =
+                        remaining_fallback_tokens.saturating_sub(raw_tokens);
+                    (AdmissionRepresentation::Raw, true)
+                } else if let Some((item, receipt_tokens)) = receipt
+                    && receipt_tokens <= remaining_tokens
+                {
+                    remaining_tokens = remaining_tokens.saturating_sub(receipt_tokens);
+                    let retain_raw = raw_tokens <= remaining_fallback_tokens;
+                    if retain_raw {
+                        remaining_fallback_tokens =
+                            remaining_fallback_tokens.saturating_sub(raw_tokens);
+                    }
+                    (
+                        AdmissionRepresentation::StructuredReceipt { item },
+                        retain_raw,
+                    )
                 } else {
-                    AdmissionRepresentation::Drop
+                    (AdmissionRepresentation::Drop, false)
                 };
                 decisions.insert(
                     call_id,
                     AdmissionDecision {
                         representation,
-                        retain_raw_fallback: true,
+                        retain_raw_fallback,
                     },
                 );
                 continue;
             }
-            let Some((_, output)) = projected.get(item_index).and_then(textual_output_identity)
+            let Some((_, output)) = projected
+                .get(item_index)
+                .and_then(canonical_textual_output_identity)
             else {
                 continue;
             };
@@ -610,7 +765,7 @@ impl ToolHistoryState {
             };
             let non_text_tokens =
                 usize::try_from(candidate.preserved_non_text_tokens).unwrap_or(usize::MAX);
-            let raw_tokens = approx_token_count(output).saturating_add(non_text_tokens);
+            let raw_tokens = approx_token_count(&output).saturating_add(non_text_tokens);
             let receipt = if candidate.consumed_by_generation.is_some() {
                 candidate
                     .receipt()
@@ -618,21 +773,37 @@ impl ToolHistoryState {
             } else {
                 candidate.admission_receipt()
             };
-            let receipt = receipt.map(|(receipt_id, text)| {
-                let tokens = approx_token_count(&text).saturating_add(non_text_tokens);
+            let receipt = receipt.map(|(receipt_id, text, receipt_tokens)| {
+                let tokens = usize::try_from(receipt_tokens)
+                    .unwrap_or(usize::MAX)
+                    .saturating_add(non_text_tokens);
                 (receipt_id, text, tokens)
             });
 
             let decision = if raw_tokens <= remaining_tokens {
-                remaining_tokens = remaining_tokens.saturating_sub(raw_tokens);
                 if candidate.consumed_by_generation.is_some()
-                    && let Some((receipt_id, text, _)) = receipt
+                    && let Some((receipt_id, text, receipt_tokens)) = receipt
+                    && receipt_tokens <= raw_tokens
+                    && receipt_tokens <= remaining_tokens
                 {
+                    remaining_tokens = remaining_tokens.saturating_sub(receipt_tokens);
                     AdmissionDecision {
-                        representation: AdmissionRepresentation::Receipt { receipt_id, text },
-                        retain_raw_fallback: true,
+                        representation: AdmissionRepresentation::Receipt {
+                            receipt_id: receipt_id.to_string(),
+                            text: text.to_string(),
+                        },
+                        retain_raw_fallback: if raw_tokens <= remaining_fallback_tokens {
+                            remaining_fallback_tokens =
+                                remaining_fallback_tokens.saturating_sub(raw_tokens);
+                            true
+                        } else {
+                            false
+                        },
                     }
                 } else {
+                    remaining_tokens = remaining_tokens.saturating_sub(raw_tokens);
+                    remaining_fallback_tokens =
+                        remaining_fallback_tokens.saturating_sub(raw_tokens);
                     AdmissionDecision {
                         representation: AdmissionRepresentation::Raw,
                         retain_raw_fallback: true,
@@ -643,8 +814,17 @@ impl ToolHistoryState {
             {
                 remaining_tokens = remaining_tokens.saturating_sub(receipt_tokens);
                 AdmissionDecision {
-                    representation: AdmissionRepresentation::Receipt { receipt_id, text },
-                    retain_raw_fallback: false,
+                    representation: AdmissionRepresentation::Receipt {
+                        receipt_id: receipt_id.to_string(),
+                        text: text.to_string(),
+                    },
+                    retain_raw_fallback: if raw_tokens <= remaining_fallback_tokens {
+                        remaining_fallback_tokens =
+                            remaining_fallback_tokens.saturating_sub(raw_tokens);
+                        true
+                    } else {
+                        false
+                    },
                 }
             } else {
                 AdmissionDecision {
@@ -658,10 +838,9 @@ impl ToolHistoryState {
         let mut unreplaced_projected = projected.clone();
         unreplaced_projected.retain(|item| {
             item_call_id(item).is_none_or(|call_id| {
-                decisions.get(call_id).is_none_or(|decision| {
-                    !matches!(&decision.representation, AdmissionRepresentation::Drop)
-                        && decision.retain_raw_fallback
-                })
+                decisions
+                    .get(call_id)
+                    .is_none_or(|decision| decision.retain_raw_fallback)
             })
         });
         projected.retain(|item| {
@@ -672,16 +851,57 @@ impl ToolHistoryState {
             })
         });
 
+        for item in &mut projected {
+            let call_id = match item {
+                ResponseItem::ToolSearchCall {
+                    call_id: Some(call_id),
+                    ..
+                }
+                | ResponseItem::ToolSearchOutput {
+                    call_id: Some(call_id),
+                    ..
+                } => call_id,
+                _ => continue,
+            };
+            let Some(AdmissionDecision {
+                representation: AdmissionRepresentation::StructuredReceipt { item: receipt_item },
+                ..
+            }) = decisions.get(call_id)
+            else {
+                continue;
+            };
+            match item {
+                ResponseItem::ToolSearchOutput { .. } => *item = receipt_item.clone(),
+                ResponseItem::ToolSearchCall { arguments, .. } => {
+                    let ResponseItem::ToolSearchOutput { tools, .. } = receipt_item else {
+                        continue;
+                    };
+                    let Some(receipt_arguments) = tools
+                        .first()
+                        .and_then(|value| value.get("receipt"))
+                        .and_then(|value| value.get("arguments"))
+                    else {
+                        continue;
+                    };
+                    *arguments = receipt_arguments.clone();
+                }
+                _ => {}
+            }
+        }
+
         let mut substitutions = Vec::new();
         for (item_index, item) in projected.iter_mut().enumerate() {
-            let Some((call_id, output)) = textual_output_mut(item) else {
+            let Some((call_id, body)) = textual_output_body_mut(item) else {
+                continue;
+            };
+            let Some(_output) = canonical_model_visible_output_text(body) else {
                 continue;
             };
             let Some(candidate) = self.candidates.get(call_id) else {
                 continue;
             };
-            let bounded_output_sha256 = sha256(candidate.bounded_model_output.as_bytes());
-            if sha256(output.as_bytes()) != bounded_output_sha256 {
+            let bounded_output_sha256 = candidate.derived.bounded_model_output_sha256.clone();
+            if exposed_output_sha256.get(call_id) != Some(&bounded_output_sha256) {
                 continue;
             }
             let Some(AdmissionDecision {
@@ -692,7 +912,7 @@ impl ToolHistoryState {
                 continue;
             };
             let substituted_output_sha256 = sha256(text.as_bytes());
-            *output = text.clone();
+            replace_model_visible_output_text(body, text.clone());
             substitutions.push(ToolHistorySubstitution {
                 item_index,
                 call_id: call_id.to_string(),
@@ -735,13 +955,8 @@ impl ToolHistoryState {
             // reads even though the carrier itself is not a host executable.
             // Explicitly registered evidence is authoritative for any other
             // tool whose current classifier no longer exposes that detail.
-            let call_observes_workspace = name == "functions.exec"
-                || tool_call_observes_workspace(
-                    name,
-                    &ToolPayload::Function {
-                        arguments: arguments.clone(),
-                    },
-                );
+            let call_observes_workspace =
+                name == "functions.exec" || tool_call_observes_workspace_parts(name, arguments);
             if call_observes_workspace || self.workspace_evidence.contains_key(call_id) {
                 requirements.insert(call_id.clone(), call_id.clone());
                 continue;
@@ -749,16 +964,13 @@ impl ToolHistoryState {
             if name != "read_tool_output" {
                 continue;
             }
-            let Some(artifact_id) = serde_json::from_str::<serde_json::Value>(arguments)
-                .ok()
-                .and_then(|value| value.get("artifact_id")?.as_str().map(str::to_string))
-            else {
+            let Some(artifact_id) = read_tool_output_artifact_id(arguments) else {
                 continue;
             };
             let origin = self
-                .candidates
-                .values()
-                .find(|candidate| candidate.artifact_id == artifact_id);
+                .artifact_call_ids
+                .get(&artifact_id)
+                .and_then(|call_id| self.candidates.get(call_id));
             match origin {
                 Some(candidate)
                     if candidate.tool_identity == "functions.exec"
@@ -776,7 +988,10 @@ impl ToolHistoryState {
         }
 
         for item in items.iter_mut() {
-            let Some((call_id, output)) = textual_output_mut(item) else {
+            let Some((call_id, body)) = textual_output_body_mut(item) else {
+                continue;
+            };
+            let Some(output) = canonical_model_visible_output_text(body) else {
                 continue;
             };
             let Some(origin_call_id) = requirements.get(call_id) else {
@@ -803,12 +1018,15 @@ impl ToolHistoryState {
             } else {
                 "the repository identity is unavailable or changed after this tool result was captured; rerun the tool before relying on it"
             };
-            *output = serde_json::json!({
-                "call_id": call_id,
-                "reason": reason,
-                "stale_workspace_evidence": true,
-            })
-            .to_string();
+            replace_model_visible_output_text(
+                body,
+                serde_json::json!({
+                    "call_id": call_id,
+                    "reason": reason,
+                    "stale_workspace_evidence": true,
+                })
+                .to_string(),
+            );
         }
     }
 
@@ -833,24 +1051,25 @@ impl ToolHistoryState {
             if name != "read_tool_output" {
                 continue;
             }
-            let Some(artifact_id) = serde_json::from_str::<serde_json::Value>(arguments)
-                .ok()
-                .and_then(|value| value.get("artifact_id")?.as_str().map(str::to_string))
-            else {
+            let Some(artifact_id) = read_tool_output_artifact_id(arguments) else {
                 continue;
             };
-            if let Some(origin_call_id) = self
-                .candidates
-                .values()
-                .find(|candidate| candidate.artifact_id == artifact_id)
-                .map(|candidate| candidate.call_id.clone())
+            if let Some(origin_call_id) = self.artifact_call_ids.get(&artifact_id) {
+                live.insert(origin_call_id.clone());
+            }
+        }
+        for candidate in self.candidates.values() {
+            if items
+                .iter()
+                .any(|item| response_item_references_artifact(item, candidate))
             {
-                live.insert(origin_call_id);
+                live.insert(candidate.call_id.clone());
             }
         }
         self.candidates.retain(|call_id, _| live.contains(call_id));
         self.workspace_evidence
             .retain(|call_id, _| live.contains(call_id));
+        self.rebuild_artifact_index();
     }
 
     pub(crate) fn artifact_references(&self) -> BTreeMap<String, (u64, String)> {
@@ -875,7 +1094,14 @@ impl ToolHistoryState {
             live.contains(&candidate.artifact_id)
                 && expected.get(&candidate.artifact_id) == Some(&reference)
         });
+        self.rebuild_artifact_index();
     }
+}
+
+fn read_tool_output_artifact_id(arguments: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|value| value.get("artifact_id")?.as_str().map(str::to_string))
 }
 
 fn action_bound_supersession_identity(identity: &str) -> bool {
@@ -900,6 +1126,10 @@ fn is_true(value: &bool) -> bool {
 }
 
 fn normalized_source_path(path: &Path) -> String {
+    normalized_source_path_with_case_sensitivity(path, !cfg!(windows))
+}
+
+fn normalized_source_path_with_case_sensitivity(path: &Path, case_sensitive: bool) -> String {
     let mut lexical = PathBuf::new();
     for component in path.components() {
         match component {
@@ -918,7 +1148,11 @@ fn normalized_source_path(path: &Path) -> String {
     }
     let normalized = lexical.to_string_lossy().replace('\\', "/");
 
-    let normalized = normalized.to_ascii_lowercase();
+    let normalized = if case_sensitive {
+        normalized
+    } else {
+        normalized.to_ascii_lowercase()
+    };
     let trimmed = normalized.trim_end_matches('/');
     if trimmed.is_empty() {
         normalized
@@ -927,6 +1161,7 @@ fn normalized_source_path(path: &Path) -> String {
     }
 }
 
+#[cfg(test)]
 fn source_dependency_overlaps(dependency: &SourceDependencyV1, changed: &str) -> bool {
     changed == dependency.path
         || dependency.recursive
@@ -939,18 +1174,137 @@ fn source_dependency_overlaps(dependency: &SourceDependencyV1, changed: &str) ->
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
+fn affected_paths_overlap_dependency(
+    affected_paths: &BTreeSet<String>,
+    dependency: &SourceDependencyV1,
+) -> bool {
+    if affected_paths.contains(&dependency.path) {
+        return true;
+    }
+    if dependency.recursive {
+        let descendant_prefix = format!("{}/", dependency.path);
+        if affected_paths
+            .range(descendant_prefix.clone()..)
+            .next()
+            .is_some_and(|path| path.starts_with(&descendant_prefix))
+        {
+            return true;
+        }
+    }
+
+    let mut ancestor = dependency.path.as_str();
+    while let Some((parent, _)) = ancestor.rsplit_once('/') {
+        if affected_paths.contains(parent) {
+            return true;
+        }
+        if parent.is_empty() {
+            return false;
+        }
+        ancestor = parent;
+    }
+    false
+}
+
 #[derive(Deserialize, Serialize)]
 struct ToolHistoryLedgerFile {
     version: u8,
     state: ToolHistoryState,
 }
 
+#[derive(Serialize)]
+struct ToolHistoryLedgerRef<'a> {
+    version: u8,
+    state: &'a ToolHistoryState,
+}
+
+#[derive(Debug)]
+pub(crate) enum ToolHistoryLoadOutcome {
+    Missing,
+    Loaded(ToolHistoryState),
+    Corrupt {
+        path: std::path::PathBuf,
+        error: String,
+    },
+    UnsupportedVersion {
+        path: std::path::PathBuf,
+        found: u8,
+        supported: u8,
+    },
+    IoFailure {
+        path: std::path::PathBuf,
+        error: String,
+    },
+}
+
+impl ToolHistoryLoadOutcome {
+    pub(crate) fn into_state_and_warning(self) -> (ToolHistoryState, Option<String>) {
+        match self {
+            Self::Missing => (ToolHistoryState::default(), None),
+            Self::Loaded(state) => (state, None),
+            Self::Corrupt { path, error } => (
+                ToolHistoryState::default(),
+                Some(format!(
+                    "Ignoring corrupt completed-tool history ledger {}: {error}",
+                    path.display()
+                )),
+            ),
+            Self::UnsupportedVersion {
+                path,
+                found,
+                supported,
+            } => (
+                ToolHistoryState::default(),
+                Some(format!(
+                    "Ignoring completed-tool history ledger {} with unsupported version {found}; this build supports version {supported}",
+                    path.display()
+                )),
+            ),
+            Self::IoFailure { path, error } => (
+                ToolHistoryState::default(),
+                Some(format!(
+                    "Could not read completed-tool history ledger {}: {error}",
+                    path.display()
+                )),
+            ),
+        }
+    }
+}
+
 pub(crate) async fn load_tool_history_state(
     codex_home: &std::path::Path,
     thread_id: &str,
-) -> ToolHistoryState {
-    let state = load_tool_history_state_for_fork(codex_home, thread_id).await;
-    reconcile_tool_history_state(codex_home, thread_id, state).await
+) -> ToolHistoryLoadOutcome {
+    match load_tool_history_state_for_fork(codex_home, thread_id).await {
+        ToolHistoryLoadOutcome::Loaded(state) => ToolHistoryLoadOutcome::Loaded(
+            reconcile_tool_history_state(codex_home, thread_id, state).await,
+        ),
+        ToolHistoryLoadOutcome::Corrupt { path, error } => {
+            let quarantine_path = corrupt_ledger_quarantine_path(&path);
+            match tokio::fs::rename(&path, &quarantine_path).await {
+                Ok(()) => ToolHistoryLoadOutcome::Corrupt {
+                    path: quarantine_path.clone(),
+                    error: format!(
+                        "{error}; quarantined from {} to {}",
+                        path.display(),
+                        quarantine_path.display()
+                    ),
+                },
+                Err(rename_error) => ToolHistoryLoadOutcome::Corrupt {
+                    path,
+                    error: format!("{error}; failed to quarantine ledger: {rename_error}"),
+                },
+            }
+        }
+        outcome => outcome,
+    }
+}
+
+fn corrupt_ledger_quarantine_path(path: &std::path::Path) -> std::path::PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    path.with_extension(format!("corrupt-{}-{nonce}", std::process::id()))
 }
 
 /// Reads a parent ledger for fork without reconciling the parent's protection markers.
@@ -960,15 +1314,34 @@ pub(crate) async fn load_tool_history_state(
 pub(crate) async fn load_tool_history_state_for_fork(
     codex_home: &std::path::Path,
     thread_id: &str,
-) -> ToolHistoryState {
+) -> ToolHistoryLoadOutcome {
     let path = ledger_path(codex_home, thread_id);
-    match tokio::fs::read(path).await {
-        Ok(bytes) => serde_json::from_slice::<ToolHistoryLedgerFile>(&bytes)
-            .ok()
-            .filter(|file| file.version == LEDGER_VERSION)
-            .map(|file| file.state)
-            .unwrap_or_default(),
-        Err(_) => ToolHistoryState::default(),
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ToolHistoryLoadOutcome::Missing;
+        }
+        Err(error) => {
+            return ToolHistoryLoadOutcome::IoFailure {
+                path,
+                error: error.to_string(),
+            };
+        }
+    };
+    match serde_json::from_slice::<ToolHistoryLedgerFile>(&bytes) {
+        Ok(mut file) if file.version == LEDGER_VERSION => {
+            file.state.refresh_derived_and_indexes();
+            ToolHistoryLoadOutcome::Loaded(file.state)
+        }
+        Ok(file) => ToolHistoryLoadOutcome::UnsupportedVersion {
+            path,
+            found: file.version,
+            supported: LEDGER_VERSION,
+        },
+        Err(error) => ToolHistoryLoadOutcome::Corrupt {
+            path,
+            error: error.to_string(),
+        },
     }
 }
 
@@ -1033,15 +1406,16 @@ pub(crate) async fn remint_tool_history_state_for_fork(
             continue;
         };
         candidate.artifact_id = reminted_id;
+        candidate.refresh_derived();
         reminted_candidates.insert(call_id, candidate);
     }
-    (
-        ToolHistoryState {
-            candidates: reminted_candidates,
-            workspace_evidence,
-        },
-        dropped_candidates,
-    )
+    let mut reminted_state = ToolHistoryState {
+        candidates: reminted_candidates,
+        workspace_evidence,
+        artifact_call_ids: BTreeMap::new(),
+    };
+    reminted_state.rebuild_artifact_index();
+    (reminted_state, dropped_candidates)
 }
 
 pub(crate) async fn persist_tool_history_state(
@@ -1050,9 +1424,9 @@ pub(crate) async fn persist_tool_history_state(
     state: &ToolHistoryState,
 ) -> Result<(), String> {
     let path = ledger_path(codex_home, thread_id);
-    let bytes = serde_json::to_vec(&ToolHistoryLedgerFile {
+    let bytes = serde_json::to_vec(&ToolHistoryLedgerRef {
         version: LEDGER_VERSION,
-        state: state.clone(),
+        state,
     })
     .map_err(|err| format!("failed to serialize tool-history ledger: {err}"))?;
     tokio::task::spawn_blocking(move || {
@@ -1074,6 +1448,7 @@ pub(crate) async fn persist_tool_history_state(
         installed
             .sync_all()
             .map_err(|err| format!("failed to sync installed tool-history ledger: {err}"))?;
+        sync_tool_history_ledger_directory(directory)?;
 
         Ok(())
     })
@@ -1087,6 +1462,138 @@ fn ledger_path(codex_home: &std::path::Path, thread_id: &str) -> std::path::Path
         .join(format!("{thread_id}.json"))
 }
 
+#[cfg(test)]
+static TOOL_HISTORY_DIRECTORY_SYNC_ATTEMPTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn sync_tool_history_ledger_directory(directory: &std::path::Path) -> Result<(), String> {
+    #[cfg(test)]
+    TOOL_HISTORY_DIRECTORY_SYNC_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    sync_tool_history_ledger_directory_impl(directory)
+}
+
+#[cfg(unix)]
+fn sync_tool_history_ledger_directory_impl(directory: &std::path::Path) -> Result<(), String> {
+    std::fs::File::open(directory)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|err| format!("failed to sync tool-history ledger directory: {err}"))
+}
+
+#[cfg(not(unix))]
+fn sync_tool_history_ledger_directory_impl(_directory: &std::path::Path) -> Result<(), String> {
+    // Rust does not expose a portable directory fsync on Windows. The file itself is synced above.
+    Ok(())
+}
+
+fn response_item_references_artifact(
+    item: &ResponseItem,
+    candidate: &ToolHistoryCandidate,
+) -> bool {
+    serde_json::to_value(item)
+        .is_ok_and(|value| json_value_contains_artifact_pin(&value, candidate))
+}
+
+fn json_value_contains_artifact_pin(
+    value: &serde_json::Value,
+    candidate: &ToolHistoryCandidate,
+) -> bool {
+    if serde_json::to_string(value).is_ok_and(|text| candidate.matches_receipt(&text)) {
+        return true;
+    }
+    if let Ok(pin) = serde_json::from_value::<ToolHistoryArtifactPinV1>(value.clone())
+        && pin.version == 1
+        && pin.kind == "tool_history_artifact_pin"
+        && pin.artifact_id == candidate.artifact_id
+        && pin.bytes == candidate.artifact_bytes
+        && pin.sha256 == candidate.artifact_sha256
+    {
+        return true;
+    }
+    match value {
+        serde_json::Value::String(value) => serde_json::from_str::<serde_json::Value>(value)
+            .is_ok_and(|value| json_value_contains_artifact_pin(&value, candidate)),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|value| json_value_contains_artifact_pin(value, candidate)),
+        serde_json::Value::Object(values) => values
+            .values()
+            .any(|value| json_value_contains_artifact_pin(value, candidate)),
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            false
+        }
+    }
+}
+
+fn canonical_textual_output_identity(item: &ResponseItem) -> Option<(&str, Cow<'_, str>)> {
+    match item {
+        ResponseItem::FunctionCallOutput {
+            call_id, output, ..
+        }
+        | ResponseItem::CustomToolCallOutput {
+            call_id, output, ..
+        } => canonical_model_visible_output_text(&output.body).map(|text| (call_id.as_str(), text)),
+        _ => None,
+    }
+}
+
+fn textual_output_body_mut(item: &mut ResponseItem) -> Option<(&str, &mut FunctionCallOutputBody)> {
+    match item {
+        ResponseItem::FunctionCallOutput {
+            call_id, output, ..
+        }
+        | ResponseItem::CustomToolCallOutput {
+            call_id, output, ..
+        } => Some((call_id.as_str(), &mut output.body)),
+        _ => None,
+    }
+}
+
+fn canonical_model_visible_output_text(body: &FunctionCallOutputBody) -> Option<Cow<'_, str>> {
+    match body {
+        FunctionCallOutputBody::Text(text) => Some(Cow::Borrowed(text)),
+        FunctionCallOutputBody::ContentItems(items) => {
+            let mut text_items = items.iter().filter_map(|item| match item {
+                FunctionCallOutputContentItem::InputText { text } => Some(text.as_str()),
+                FunctionCallOutputContentItem::InputImage { .. }
+                | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
+            });
+            let first = text_items.next()?;
+            let Some(second) = text_items.next() else {
+                return Some(Cow::Borrowed(first));
+            };
+            let mut joined = String::with_capacity(first.len() + second.len() + 1);
+            joined.push_str(first);
+            joined.push('\n');
+            joined.push_str(second);
+            for text in text_items {
+                joined.push('\n');
+                joined.push_str(text);
+            }
+            Some(Cow::Owned(joined))
+        }
+    }
+}
+
+fn replace_model_visible_output_text(body: &mut FunctionCallOutputBody, replacement: String) {
+    match body {
+        FunctionCallOutputBody::Text(text) => *text = replacement,
+        FunctionCallOutputBody::ContentItems(items) => {
+            let mut replacement = Some(replacement);
+            items.retain_mut(|item| match item {
+                FunctionCallOutputContentItem::InputText { text } => {
+                    let Some(replacement) = replacement.take() else {
+                        return false;
+                    };
+                    *text = replacement;
+                    true
+                }
+                FunctionCallOutputContentItem::InputImage { .. }
+                | FunctionCallOutputContentItem::EncryptedContent { .. } => true,
+            });
+        }
+    }
+}
+
 fn textual_output_identity(item: &ResponseItem) -> Option<(&str, &str)> {
     match item {
         ResponseItem::FunctionCallOutput {
@@ -1095,18 +1602,6 @@ fn textual_output_identity(item: &ResponseItem) -> Option<(&str, &str)> {
         | ResponseItem::CustomToolCallOutput {
             call_id, output, ..
         } => model_visible_output_text(&output.body).map(|text| (call_id.as_str(), text)),
-        _ => None,
-    }
-}
-
-fn textual_output_mut(item: &mut ResponseItem) -> Option<(&str, &mut String)> {
-    match item {
-        ResponseItem::FunctionCallOutput {
-            call_id, output, ..
-        }
-        | ResponseItem::CustomToolCallOutput {
-            call_id, output, ..
-        } => model_visible_output_text_mut(&mut output.body).map(|text| (call_id.as_str(), text)),
         _ => None,
     }
 }
@@ -1126,27 +1621,6 @@ fn model_visible_output_text(body: &FunctionCallOutputBody) -> Option<&str> {
     }
 }
 
-fn model_visible_output_text_mut(body: &mut FunctionCallOutputBody) -> Option<&mut String> {
-    match body {
-        FunctionCallOutputBody::Text(text) => Some(text),
-        FunctionCallOutputBody::ContentItems(items) => {
-            let mut text_indexes = items.iter().enumerate().filter_map(|(index, item)| {
-                matches!(item, FunctionCallOutputContentItem::InputText { .. }).then_some(index)
-            });
-            let text_index = text_indexes.next()?;
-            if text_indexes.next().is_some() {
-                return None;
-            }
-            match items.get_mut(text_index)? {
-                FunctionCallOutputContentItem::InputText { text } => Some(text),
-                FunctionCallOutputContentItem::InputImage { .. }
-                | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
-            }
-        }
-    }
-}
-
-#[cfg(test)]
 pub(crate) fn response_item_has_valid_tool_history_receipt(item: &ResponseItem) -> bool {
     let Some((call_id, text)) = textual_output_identity(item) else {
         return false;
@@ -1156,7 +1630,14 @@ pub(crate) fn response_item_has_valid_tool_history_receipt(item: &ResponseItem) 
     };
     receipt.version == RECEIPT_VERSION
         && receipt.call_id == call_id
-        && receipt.receipt_id == receipt_id_for(call_id, &receipt.artifact.sha256)
+        && receipt.receipt_id
+            == receipt_id_for(
+                call_id,
+                &receipt.artifact.sha256,
+                &receipt.tool_identity,
+                &receipt.semantic_class,
+                receipt.original.bytes,
+            )
         && receipt.artifact.complete
         && receipt.artifact.byte_start == 0
         && receipt.artifact.byte_end > 0
@@ -1205,12 +1686,23 @@ fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn receipt_id_for(call_id: &str, artifact_sha256: &str) -> String {
+fn receipt_id_for(
+    call_id: &str,
+    artifact_sha256: &str,
+    tool_identity: &str,
+    semantic_class: &str,
+    artifact_bytes: u64,
+) -> String {
     format!(
         "thr1-{}",
         &format!(
             "{:x}",
-            Sha256::digest(format!("{call_id}:{artifact_sha256}").as_bytes())
+            Sha256::digest(
+                format!(
+                    "{call_id}:{artifact_sha256}:{tool_identity}:{semantic_class}:{artifact_bytes}"
+                )
+                .as_bytes()
+            )
         )[..16]
     )
 }
@@ -1229,6 +1721,185 @@ fn admission_priority(candidate: &ToolHistoryCandidate, output: &str) -> u8 {
     } else {
         2
     }
+}
+
+fn tool_search_admission_priority(status: &str, tools: &[serde_json::Value]) -> u8 {
+    if status != "completed" || tools.is_empty() {
+        1
+    } else {
+        2
+    }
+}
+
+pub(crate) fn tool_search_receipt_item(
+    item: &ResponseItem,
+    arguments: Option<&serde_json::Value>,
+) -> Option<(ResponseItem, usize)> {
+    let ResponseItem::ToolSearchOutput {
+        call_id: Some(call_id),
+        status,
+        execution,
+        tools,
+        omitted_result_count,
+        ..
+    } = item
+    else {
+        return None;
+    };
+    let serialized_tools = serde_json::to_vec(tools).ok()?;
+    let result_set_sha256 = sha256(&serialized_tools);
+    let mut ordered_tool_identities = tools
+        .iter()
+        .filter_map(tool_search_result_identity)
+        .collect::<Vec<_>>();
+    let total_identity_count = ordered_tool_identities.len();
+    let arguments = compact_tool_search_arguments(arguments);
+
+    loop {
+        let complete = status == "completed" && omitted_result_count.unwrap_or(0) == 0;
+        let omitted_identity_count =
+            total_identity_count.saturating_sub(ordered_tool_identities.len());
+        let receipt = ToolSearchReceiptV1 {
+            version: TOOL_SEARCH_RECEIPT_VERSION,
+            receipt_id: tool_search_receipt_id(
+                call_id,
+                status,
+                execution,
+                &arguments,
+                &result_set_sha256,
+                tools.len(),
+                *omitted_result_count,
+                complete,
+                omitted_identity_count,
+            ),
+            call_id: call_id.clone(),
+            status: status.clone(),
+            execution: execution.clone(),
+            arguments: arguments.clone(),
+            result_set_sha256: result_set_sha256.clone(),
+            result_count: tools.len(),
+            omitted_result_count: *omitted_result_count,
+            complete,
+            omitted_identity_count,
+            ordered_tool_identities: ordered_tool_identities.clone(),
+        };
+        let receipt_value = serde_json::json!({
+            "type": "tool_search_receipt",
+            "receipt": receipt,
+        });
+        let mut receipt_item = item.clone();
+        let ResponseItem::ToolSearchOutput { tools, .. } = &mut receipt_item else {
+            return None;
+        };
+        *tools = vec![receipt_value];
+        let serialized = serde_json::to_string(&receipt_item).ok()?;
+        let tokens = approx_token_count(&serialized);
+        if tokens <= RECEIPT_MAX_TOKENS {
+            return Some((receipt_item, tokens));
+        }
+        if ordered_tool_identities.is_empty() {
+            return None;
+        }
+        ordered_tool_identities.pop();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tool_search_receipt_id(
+    call_id: &str,
+    status: &str,
+    execution: &str,
+    arguments: &serde_json::Value,
+    result_set_sha256: &str,
+    result_count: usize,
+    omitted_result_count: Option<usize>,
+    complete: bool,
+    omitted_identity_count: usize,
+) -> String {
+    let semantic_identity = serde_json::json!({
+        "call_id": call_id,
+        "status": status,
+        "execution": execution,
+        "arguments": arguments,
+        "result_set_sha256": result_set_sha256,
+        "result_count": result_count,
+        "omitted_result_count": omitted_result_count,
+        "complete": complete,
+        "omitted_identity_count": omitted_identity_count,
+    });
+    format!(
+        "tsr1-{}",
+        &sha256(semantic_identity.to_string().as_bytes())[..16]
+    )
+}
+
+fn compact_tool_search_arguments(arguments: Option<&serde_json::Value>) -> serde_json::Value {
+    let Some(arguments) = arguments else {
+        return serde_json::Value::Null;
+    };
+    let mut compact = serde_json::Map::new();
+    for key in ["query", "namespace", "limit", "cursor"] {
+        let Some(value) = arguments.get(key) else {
+            continue;
+        };
+        let serialized = value.to_string();
+        if approx_token_count(&serialized) > RECEIPT_DIGEST_TARGET_TOKENS {
+            let bounded = value.as_str().map(|text| {
+                serde_json::Value::String(truncate_text_to_token_ceiling(
+                    text,
+                    RECEIPT_DIGEST_TARGET_TOKENS,
+                ))
+            });
+            compact.insert(
+                key.to_string(),
+                bounded.unwrap_or_else(|| {
+                    serde_json::json!({
+                        "value_sha256": sha256(serialized.as_bytes())
+                    })
+                }),
+            );
+            compact.insert(
+                format!("{key}_sha256"),
+                serde_json::Value::String(sha256(serialized.as_bytes())),
+            );
+        } else {
+            compact.insert(key.to_string(), value.clone());
+        }
+    }
+    if compact.is_empty() {
+        serde_json::json!({"arguments_sha256": sha256(arguments.to_string().as_bytes())})
+    } else {
+        serde_json::Value::Object(compact)
+    }
+}
+
+fn tool_search_result_identity(tool: &serde_json::Value) -> Option<String> {
+    let name = tool
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            tool.pointer("/function/name")
+                .and_then(serde_json::Value::as_str)
+        })?;
+    let namespace = tool
+        .get("namespace")
+        .and_then(serde_json::Value::as_str)
+        .filter(|namespace| !namespace.is_empty());
+    Some(match namespace {
+        Some(namespace) => format!("{namespace}.{name}"),
+        None => name.to_string(),
+    })
+}
+
+#[cfg(test)]
+fn tool_search_receipt(item: &ResponseItem) -> Option<ToolSearchReceiptV1> {
+    let ResponseItem::ToolSearchOutput { tools, .. } = item else {
+        return None;
+    };
+    let value = tools.first()?;
+    (value.get("type")?.as_str()? == "tool_search_receipt")
+        .then(|| serde_json::from_value(value.get("receipt")?.clone()).ok())
+        .flatten()
 }
 
 fn item_call_id(item: &ResponseItem) -> Option<&str> {
@@ -1303,11 +1974,23 @@ pub(crate) fn classify_workspace_tool_call(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn tool_call_observes_workspace(tool_identity: &str, payload: &ToolPayload) -> bool {
     if !tool_observes_workspace(tool_identity) {
         return false;
     }
-    workspace_call_observes_from_arguments(workspace_call_arguments(payload).as_ref())
+    let ToolPayload::Function { arguments } = payload else {
+        return true;
+    };
+    tool_call_observes_workspace_parts(tool_identity, arguments)
+}
+
+fn tool_call_observes_workspace_parts(tool_identity: &str, arguments: &str) -> bool {
+    if !tool_observes_workspace(tool_identity) {
+        return false;
+    }
+    let arguments = serde_json::from_str(arguments).ok();
+    workspace_call_observes_from_arguments(arguments.as_ref())
 }
 
 fn workspace_call_arguments(payload: &ToolPayload) -> Option<serde_json::Value> {

@@ -222,7 +222,8 @@ impl CatalogRequestProcessor {
             include_hidden.unwrap_or(false),
             http_client_factory,
         )
-        .await;
+        .await
+        .map_err(|err| internal_error(format!("failed to list models: {err}")))?;
         let total = models.len();
 
         if total == 0 {

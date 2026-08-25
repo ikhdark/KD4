@@ -76,7 +76,6 @@ coverage/
 personal/
 /kd-ui/
 /task-evidence/
-/WORKTREE_REVIEW.txt
 .codex/harness/runs/
 .codex/locks/
 
@@ -102,5 +101,3 @@ CHANGELOG.ignore.md
 # Python bytecode files
 __pycache__/
 *.pyc
-
-# Local phase-effort benchmark scratch crates and Cargo outputs.

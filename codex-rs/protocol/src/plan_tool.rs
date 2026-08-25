@@ -153,8 +153,6 @@ pub struct PlanItemArg {
     pub generated_artifacts: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub risks: Vec<String>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub requires_desktop_activation: bool,
     /// Optional deterministic validation bound to this work unit. Absence keeps
     /// the existing model-selected validation path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -194,8 +192,6 @@ impl<'de> Deserialize<'de> for PlanItemArg {
             #[serde(default)]
             risks: Vec<String>,
             #[serde(default)]
-            requires_desktop_activation: bool,
-            #[serde(default)]
             validation_route: Option<ValidationRoute>,
         }
 
@@ -221,7 +217,6 @@ impl<'de> Deserialize<'de> for PlanItemArg {
             runtime_paths: raw.runtime_paths,
             generated_artifacts: raw.generated_artifacts,
             risks: raw.risks,
-            requires_desktop_activation: raw.requires_desktop_activation,
             validation_route: raw.validation_route,
         })
     }

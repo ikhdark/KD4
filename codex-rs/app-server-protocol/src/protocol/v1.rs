@@ -53,9 +53,6 @@ pub struct InitializeCapabilities {
     /// Opt into `attestation/generate` requests for upstream `x-oai-attestation`.
     #[serde(default)]
     pub request_attestation: bool,
-    /// Opt into the trusted Desktop activation obligation/challenge/receipt API.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub desktop_activation_receipts: bool,
     /// Allow downstream MCP servers to request OpenAI extended form elicitations.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mcp_server_openai_form_elicitation: bool,

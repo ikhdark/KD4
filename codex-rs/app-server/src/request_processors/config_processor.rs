@@ -412,6 +412,7 @@ fn map_hooks_requirements_to_api(hooks: ManagedHooksRequirementsToml) -> Managed
         subagent_start,
         subagent_stop,
         stop,
+        interrupt,
     } = hooks;
 
     ManagedHooksRequirements {
@@ -427,6 +428,7 @@ fn map_hooks_requirements_to_api(hooks: ManagedHooksRequirementsToml) -> Managed
         subagent_start: map_hook_matcher_groups_to_api(subagent_start),
         subagent_stop: map_hook_matcher_groups_to_api(subagent_stop),
         stop: map_hook_matcher_groups_to_api(stop),
+        interrupt: map_hook_matcher_groups_to_api(interrupt),
     }
 }
 
@@ -659,7 +661,7 @@ mod tests {
                 new_thread: Some(NewThreadModelDefaultsToml {
                     model: Some("gpt-managed".to_string()),
                     model_reasoning_effort: Some(ReasoningEffort::Medium),
-                    service_tier: Some("fast".to_string()),
+                    service_tier: Some("priority".to_string()),
                 }),
             }),
             ..ConfigRequirementsToml::default()
@@ -674,7 +676,7 @@ mod tests {
             defaults.model_reasoning_effort,
             Some(ReasoningEffort::Medium)
         );
-        assert_eq!(defaults.service_tier.as_deref(), Some("fast"));
+        assert_eq!(defaults.service_tier.as_deref(), Some("priority"));
     }
 
     #[test]

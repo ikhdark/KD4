@@ -37,7 +37,8 @@
       checked against their expected callers
 - [ ] Validation output reviewed
 - [ ] Skipped checks are named with reasons
-- [ ] Completion gate status is recorded using `workflow.md`
+- [ ] Completion gate status is recorded using
+      [`../workflow.md`](../workflow.md#completion-gate-status)
 - [ ] Claims in the final answer match the evidence
 
 ## Finish

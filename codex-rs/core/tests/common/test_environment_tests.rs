@@ -46,6 +46,31 @@ fn parses_each_explicit_environment() {
 }
 
 #[test]
+fn public_loader_accepts_wine_exec_only_on_linux_hosts() {
+    let load_for_host = |host_os| {
+        load_test_environment(
+            Some(OsStr::new("wine-exec")),
+            /*legacy_remote_environment*/ None,
+            /*docker_container*/ None,
+            host_os,
+        )
+    };
+
+    assert_eq!(
+        load_for_host(TestTargetOs::Linux),
+        Ok(TestEnvironment::WineExec)
+    );
+    for host_os in [TestTargetOs::MacOs, TestTargetOs::Windows] {
+        assert_eq!(
+            load_for_host(host_os),
+            Err(format!(
+                "{TEST_ENVIRONMENT_ENV_VAR}=wine-exec is only supported on Linux"
+            ))
+        );
+    }
+}
+
+#[test]
 fn treats_the_legacy_remote_value_as_a_docker_container() {
     assert_eq!(
         parse_test_environment(
@@ -119,7 +144,7 @@ fn rejects_invalid_or_incomplete_configuration() {
 
 #[test]
 fn derives_target_operating_system_and_placement() {
-    let expected_local_target_os = TestTargetOs::Windows;
+    let expected_local_target_os = TestTargetOs::host();
 
     let environments = [
         TestEnvironment::Local,

@@ -64,6 +64,7 @@ use super::super::shell::ValidationProofPreparation;
 use super::super::shell::ValidationProofPreparationArgs;
 use super::super::shell::joined_validation_structured_output;
 use super::super::shell::prepare_validation_proof;
+use super::super::shell::validation_environment_hash;
 use super::super::shell::validation_structured_output;
 use super::super::shell_spec::CommandToolOptions;
 use super::super::shell_spec::create_exec_command_tool_with_environment_id;
@@ -566,9 +567,10 @@ impl ExecCommandHandler {
             }
         };
 
-        let sandbox_context = format!(
-            "requested={sandbox_permissions:?};effective={:?};additional={normalized_additional_permissions:?};preapproved={};approval={:?};windows={:?}",
+        let sandbox_context = (
+            sandbox_permissions,
             effective_additional_permissions.sandbox_permissions,
+            &normalized_additional_permissions,
             effective_additional_permissions.permissions_preapproved,
             context.turn.approval_policy.value(),
             context.turn.windows_sandbox_level,
@@ -579,6 +581,7 @@ impl ExecCommandHandler {
         );
         let input_context = format!("prefix={prefix_rule:?}");
         let effective_environment = manager.effective_environment(&context);
+        let environment_hash = validation_environment_hash(&effective_environment);
         let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
         let repository_epoch = session
             .services
@@ -598,13 +601,14 @@ impl ExecCommandHandler {
             }
             Err(_) => None,
         };
+        let validation_cwd = cwd.to_string();
         let attempt_key = CommandAttemptKey::new(
             self.tool_name().name.as_str(),
             &turn_environment.environment_id,
-            cwd.to_string(),
+            validation_cwd.clone(),
             &command,
         )
-        .with_environment(&effective_environment)
+        .with_environment_fingerprint(&environment_hash)
         .with_timeout_ms(None)
         .with_sandbox_context(&sandbox_context)
         .with_permission_context(&sandbox_context)
@@ -659,7 +663,6 @@ impl ExecCommandHandler {
         let known_delta_hit = known_delta
             .as_ref()
             .is_some_and(crate::tools::known_delta_store::PreparedKnownDelta::is_hit);
-        let validation_cwd = cwd.to_string();
         let (validation_leader, validation_waiter) = loop {
             match prepare_validation_proof(ValidationProofPreparationArgs {
                 session: session.as_ref(),
@@ -670,6 +673,7 @@ impl ExecCommandHandler {
                 cwd: &validation_cwd,
                 command_invocation: &command_invocation,
                 environment: &effective_environment,
+                environment_hash: &environment_hash,
                 execution_context: &runtime_context,
                 repository_epoch,
                 call_id: &call_id,

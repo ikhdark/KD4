@@ -260,7 +260,7 @@ impl ExecExpiration {
         }
     }
 
-    pub(crate) fn with_cancellation(self, cancellation: CancellationToken) -> Self {
+    pub fn with_cancellation(self, cancellation: CancellationToken) -> Self {
         match self {
             ExecExpiration::Timeout(timeout) => ExecExpiration::TimeoutOrCancellation {
                 timeout,

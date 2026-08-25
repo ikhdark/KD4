@@ -1370,7 +1370,6 @@ mod tests {
             thread_watch_manager
                 .note_turn_completed(&thread_id_string, /*failed*/ false)
                 .await;
-
             Self {
                 thread_manager,
                 outgoing,
@@ -1441,7 +1440,6 @@ mod tests {
                     .await,
                 ThreadStatus::NotLoaded
             );
-
             let envelope = tokio::time::timeout(Duration::from_secs(2), self.outgoing_rx.recv())
                 .await
                 .expect("ThreadClosed should be delivered")

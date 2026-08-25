@@ -1306,6 +1306,7 @@ pub enum HookEventName {
     SubagentStart,
     SubagentStop,
     Stop,
+    Interrupt,
 }
 
 impl HookEventName {
@@ -1322,6 +1323,7 @@ impl HookEventName {
             Self::SubagentStart => "SubagentStart",
             Self::SubagentStop => "SubagentStop",
             Self::Stop => "Stop",
+            Self::Interrupt => "Interrupt",
         }
     }
 }
@@ -1403,6 +1405,7 @@ mod hook_label_tests {
                 HookEventName::SubagentStart,
                 HookEventName::SubagentStop,
                 HookEventName::Stop,
+                HookEventName::Interrupt,
             ]
             .map(HookEventName::as_pascal_case_label),
             [
@@ -1416,6 +1419,7 @@ mod hook_label_tests {
                 "SubagentStart",
                 "SubagentStop",
                 "Stop",
+                "Interrupt",
             ]
         );
         assert_eq!(

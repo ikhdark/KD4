@@ -163,6 +163,47 @@ fn plan_history_projection_keeps_only_the_authoritative_current_plan() {
 }
 
 #[test]
+fn context_pressure_estimate_uses_the_prepared_plan_projection() {
+    let mut items = update_plan_pair(
+        "plan-1",
+        &"obsolete plan detail ".repeat(500),
+        serde_json::json!({
+            "current_plan": {"explanation": null, "plan": [{"step": "obsolete"}]},
+            "validation_results": []
+        }),
+    );
+    items.extend(update_plan_pair(
+        "plan-2",
+        "{}",
+        serde_json::json!({
+            "current_plan": {"explanation": null, "plan": [{"step": "current"}]},
+            "validation_results": []
+        }),
+    ));
+    let history = create_history_with_items(items);
+    let base = BaseInstructions {
+        text: "base instructions".to_string(),
+    };
+    let raw = history
+        .estimate_token_count_with_base_instructions(&base)
+        .expect("raw estimate");
+    let prepared = history
+        .estimate_prepared_token_count_with_base_instructions(&default_input_modalities(), &base)
+        .expect("prepared estimate");
+
+    assert!(prepared < raw);
+    let expected_items = history
+        .prepare_for_sampling_prompt(&default_input_modalities(), StableContextTarget::Sampling)
+        .items()
+        .to_vec();
+    assert_eq!(
+        prepared,
+        ContextManager::estimate_items_token_count_with_base_instructions(&expected_items, &base)
+            .expect("prepared prompt estimate")
+    );
+}
+
+#[test]
 fn plan_history_projection_fails_open_for_legacy_outputs() {
     let mut items = update_plan_pair(
         "plan-1",
@@ -2328,6 +2369,16 @@ fn prepared_prompt_cache_updates_only_for_safe_reasoning_append() {
             .expect("prepared history lock")
             .is_none()
     );
+}
+
+#[test]
+fn tool_history_mutation_advances_projection_revision_once() {
+    let mut history = ContextManager::new();
+    let initial_revision = history.projection_revision;
+
+    history.set_tool_history_state(ToolHistoryState::default());
+
+    assert_eq!(history.projection_revision, initial_revision + 1);
 }
 
 #[test]

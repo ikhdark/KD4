@@ -70,7 +70,7 @@ use tokio_tungstenite::tungstenite::Message;
 #[allow(dead_code)]
 async fn unified_exec_test(server: &wiremock::MockServer) -> Result<TestCodex> {
     let mut builder = test_codex().with_config(|config| {
-        config.use_experimental_unified_exec_tool = true;
+        config.unified_exec_enabled = true;
         let result = config.features.enable(Feature::UnifiedExec);
         assert!(
             result.is_ok(),
@@ -263,7 +263,7 @@ async fn explicit_remote_shell_uses_snapshot_in_remote_cwd() -> Result<()> {
         "yield_time_ms": 10_000,
     }))?;
     let mut builder = test_codex().with_config(|config| {
-        config.use_experimental_unified_exec_tool = true;
+        config.unified_exec_enabled = true;
         config
             .features
             .enable(Feature::UnifiedExec)
@@ -553,7 +553,7 @@ async fn deferred_executor_updates_context_and_tools_after_startup() -> Result<(
         .with_exec_server_url(format!("ws://{}", listener.local_addr()?))
         .with_config(|config| {
             config.project_doc_max_bytes = 0;
-            config.use_experimental_unified_exec_tool = true;
+            config.unified_exec_enabled = true;
             config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
             config.approvals_reviewer = ApprovalsReviewer::User;
             assert!(config.features.enable(Feature::DeferredExecutor).is_ok());
@@ -791,7 +791,7 @@ async fn deferred_executor_wait_reports_startup_failure() -> Result<()> {
     let mut builder = test_codex()
         .with_exec_server_url(format!("ws://{}", listener.local_addr()?))
         .with_config(|config| {
-            config.use_experimental_unified_exec_tool = true;
+            config.unified_exec_enabled = true;
             assert!(config.features.enable(Feature::DeferredExecutor).is_ok());
             assert!(config.features.enable(Feature::UnifiedExec).is_ok());
         });

@@ -7,11 +7,34 @@ use assert_cmd::prelude::*;
 use predicates::prelude::*;
 use std::process::Command;
 use std::process::Stdio;
+use std::time::Duration;
+use std::time::Instant;
 use tempfile::TempDir;
 
+fn require_api_key_from(value: Result<String, std::env::VarError>) -> Result<String, String> {
+    value.map_err(|_| "OPENAI_API_KEY env var not set".to_string())
+}
+
 fn require_api_key() -> String {
-    std::env::var("OPENAI_API_KEY")
-        .expect("OPENAI_API_KEY env var not set — skip running live tests")
+    require_api_key_from(std::env::var("OPENAI_API_KEY"))
+        .expect("OPENAI_API_KEY env var not set — live test cannot run")
+}
+
+fn wait_for_child(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep((deadline - now).min(Duration::from_millis(10)));
+    }
 }
 
 /// Helper that spawns the binary inside a TempDir with minimal flags. Returns (Assert, TempDir).
@@ -101,7 +124,18 @@ fn run_live(prompt: &str) -> (assert_cmd::assert::Assert, TempDir) {
         std::io::stderr(),
     );
 
-    let status = child.wait().expect("failed to wait on child");
+    let status = match wait_for_child(&mut child, Duration::from_secs(5 * 60))
+        .expect("failed to wait on child")
+    {
+        Some(status) => status,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_handle.join();
+            let _ = stderr_handle.join();
+            panic!("live codex CLI exceeded the five-minute deadline");
+        }
+    };
     let stdout = stdout_handle.join().expect("stdout thread panicked");
     let stderr = stderr_handle.join().expect("stderr thread panicked");
 
@@ -117,11 +151,6 @@ fn run_live(prompt: &str) -> (assert_cmd::assert::Assert, TempDir) {
 #[ignore]
 #[test]
 fn live_create_file_hello_txt() {
-    if std::env::var("OPENAI_API_KEY").is_err() {
-        eprintln!("skipping live_create_file_hello_txt – OPENAI_API_KEY not set");
-        return;
-    }
-
     let (assert, dir) = run_live(
         "Use the shell tool with the apply_patch command to create a file named hello.txt containing the text 'hello'.",
     );
@@ -139,14 +168,44 @@ fn live_create_file_hello_txt() {
 #[ignore]
 #[test]
 fn live_print_working_directory() {
-    if std::env::var("OPENAI_API_KEY").is_err() {
-        eprintln!("skipping live_print_working_directory – OPENAI_API_KEY not set");
-        return;
-    }
-
     let (assert, dir) = run_live("Print the current working directory using the shell function.");
 
     assert
         .success()
         .stdout(predicate::str::contains(dir.path().to_string_lossy()));
+}
+
+#[test]
+fn missing_api_key_is_an_error() {
+    assert_eq!(
+        require_api_key_from(Err(std::env::VarError::NotPresent)),
+        Err("OPENAI_API_KEY env var not set".to_string())
+    );
+}
+
+#[test]
+fn run_codex_times_out() {
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("suite::live_cli::timeout_test_child")
+        .arg("--nocapture")
+        .env("CODEX_LIVE_CLI_TIMEOUT_CHILD", "1")
+        .spawn()
+        .expect("spawn timeout test child");
+
+    let status =
+        wait_for_child(&mut child, Duration::from_millis(25)).expect("poll timeout test child");
+    assert!(
+        status.is_none(),
+        "child should still be running at the deadline"
+    );
+    child.kill().expect("kill timeout test child");
+    child.wait().expect("reap timeout test child");
+}
+
+#[test]
+fn timeout_test_child() {
+    if std::env::var_os("CODEX_LIVE_CLI_TIMEOUT_CHILD").is_some() {
+        std::thread::sleep(Duration::from_secs(30));
+    }
 }

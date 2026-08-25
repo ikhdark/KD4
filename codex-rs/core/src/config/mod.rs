@@ -336,7 +336,7 @@ pub(crate) const DEFAULT_AGENT_MAX_DEPTH: i32 = 1;
 pub(crate) const DEFAULT_AGENT_JOB_MAX_RUNTIME_SECONDS: Option<u64> = None;
 const LOCAL_DEV_BUILD_VERSION: &str = "0.0.0";
 
-pub const CONFIG_TOML_FILE: &str = "config.toml";
+pub use codex_config::CONFIG_TOML_FILE;
 const CONFIG_PROFILE_V2_SUFFIX: &str = ".config.toml";
 
 fn resolve_sqlite_home_env(resolved_cwd: &Path) -> Option<PathBuf> {
@@ -1061,10 +1061,10 @@ pub struct Config {
     pub code_mode: CodeModeConfig,
 
     /// If set to `true`, used only the experimental unified exec tool.
-    pub use_experimental_unified_exec_tool: bool,
+    pub unified_exec_enabled: bool,
 
     /// Maximum poll window for background terminal output (`write_stdin`), in milliseconds.
-    /// Default: `300000` (5 minutes).
+    /// Default: `60000` (1 minute).
     pub background_terminal_max_timeout: u64,
 
     /// Settings specific to the task-path-based multi-agent tool surface.
@@ -2871,21 +2871,6 @@ impl Config {
                 "`permission_profile` and `default_permissions` overrides cannot both be set",
             ));
         }
-        if let Some(profile) = cfg.profile.as_deref() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "legacy `profile = \"{profile}\"` config is no longer supported; use `--profile {profile}` with `{profile}.config.toml` instead"
-                ),
-            ));
-        }
-        if !cfg.profiles.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "legacy `profiles` config tables are no longer supported; use `--profile <name>` with `<name>.config.toml` instead",
-            ));
-        }
-
         let tool_suggest = resolve_tool_suggest_config(&cfg, &config_layer_stack);
         let feature_overrides = FeatureOverrides {
             web_search_request: override_tools_web_search_request,
@@ -3387,7 +3372,7 @@ impl Config {
             .unwrap_or(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS)
             .max(MIN_EMPTY_YIELD_TIME_MS);
 
-        let use_experimental_unified_exec_tool = features.enabled(Feature::UnifiedExec);
+        let unified_exec_enabled = features.enabled(Feature::UnifiedExec);
 
         let forced_chatgpt_workspace_id = cfg
             .forced_chatgpt_workspace_id
@@ -3743,7 +3728,7 @@ impl Config {
             web_search_config,
             experimental_request_user_input_enabled,
             code_mode,
-            use_experimental_unified_exec_tool,
+            unified_exec_enabled,
             background_terminal_max_timeout,
             multi_agent_v2,
             current_time_reminder,

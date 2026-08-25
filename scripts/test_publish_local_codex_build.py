@@ -262,6 +262,7 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
                     [
                         "@echo off",
                         "echo fake cargo %*",
+                        'if "%1"=="--version" exit /b 0',
                         f'echo build>>"{build_count}"',
                         f'if not exist "{built_dir}" mkdir "{built_dir}"',
                         f'copy /y "%ComSpec%" "{built_dir / "codex.exe"}" >nul',
@@ -407,7 +408,6 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
                 ),
                 encoding="utf-8",
             )
-            self.write_build_stamp("release", FIXTURE_TIME, fake_codex)
             fake_bin = temp_path / "bin"
             fake_bin.mkdir()
             fake_cargo = fake_bin / "cargo.cmd"
@@ -423,6 +423,7 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
             )
             env = clean_env()
             env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+            self.write_build_stamp("release", FIXTURE_TIME, fake_codex, env=env)
 
             result = self.run_script(
                 "-TestRun",

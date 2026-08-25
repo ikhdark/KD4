@@ -4,14 +4,24 @@
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
 import hashlib
+import heapq
 import json
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 import tempfile
+import threading
 import tomllib
+import unicodedata
+
+try:
+    from scripts.generated_output_lock import GenerationLockError, source_map_lock
+except ModuleNotFoundError:
+    from generated_output_lock import GenerationLockError, source_map_lock
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -19,6 +29,7 @@ DEFAULT_MANIFEST = REPO_ROOT / "source_owners.toml"
 DEFAULT_SOURCEMAP = REPO_ROOT / "SOURCEMAP.md"
 DEFAULT_ARCHITECTURE_INDEX = REPO_ROOT / "architecture_index.json"
 SCHEMA_VERSION = 2
+ARCHITECTURE_INDEX_VERSION = 1
 BEGIN_PREFIX = "<!-- BEGIN KD4 SOURCE OWNERS"
 END_MARKER = "<!-- END KD4 SOURCE OWNERS -->"
 RELATIONSHIP_CATEGORIES = frozenset(
@@ -52,6 +63,8 @@ INVARIANT_KINDS = frozenset({"semantic", "compatibility"})
 TARGET_PREFIXES = ("owner:", "path:", "config:", "generated:", "contract:")
 MAX_QUERY_RELATIONSHIPS = 64
 MAX_SLICE_RELATIONSHIPS = 32
+MAX_SNAPSHOT_CACHE_ENTRIES = 256
+MAX_SNAPSHOT_CACHE_BYTES = 8 * 1024 * 1024
 ARCHITECTURE_FACETS = (
     "control_and_data_flow",
     "callers_and_consumers",
@@ -155,12 +168,12 @@ def normalize(value: str) -> str:
     return " ".join(re.findall(r"[^\W_]+|_+", value.casefold()))
 
 
-def confined_path(root: Path, raw_path: str) -> Path:
+def confined_path(resolved_root: Path, raw_path: str) -> Path:
     candidate = Path(raw_path)
     if candidate.is_absolute() or ".." in candidate.parts:
         raise ValueError(f"path is not repository-relative: {raw_path}")
-    resolved = (root / candidate).resolve(strict=False)
-    if not resolved.is_relative_to(root.resolve()):
+    resolved = (resolved_root / candidate).resolve(strict=False)
+    if not resolved.is_relative_to(resolved_root):
         raise ValueError(f"path escapes repository: {raw_path}")
     return resolved
 
@@ -291,7 +304,9 @@ def _schema_errors(manifest: object) -> list[str]:
 
 
 def load_and_validate(
-    manifest_path: Path, root: Path | None = None
+    manifest_path: Path,
+    root: Path | None = None,
+    owner_ids: list[str] | None = None,
 ) -> tuple[dict, str]:
     raw = manifest_path.read_bytes()
     digest = hashlib.sha256(raw).hexdigest()
@@ -304,9 +319,10 @@ def load_and_validate(
         )
     if root is None:
         root = manifest_path.resolve().parent
+    root = root.resolve()
     confined_paths: dict[str, tuple[Path | None, str | None]] = {}
-    path_existence: dict[Path, bool] = {}
-    directory_existence: dict[Path, bool] = {}
+    path_observations: dict[Path, tuple[bool, bool]] = {}
+    source_text: dict[Path, str] = {}
 
     def resolve_confined(raw_path: str) -> tuple[Path | None, str | None]:
         cached = confined_paths.get(raw_path)
@@ -319,15 +335,46 @@ def load_and_validate(
         confined_paths[raw_path] = result
         return result
 
+    def observe_path(candidate: Path) -> tuple[bool, bool]:
+        observation = path_observations.get(candidate)
+        if observation is None:
+            try:
+                mode = candidate.stat().st_mode
+                observation = (True, stat.S_ISDIR(mode))
+            except OSError:
+                observation = (False, False)
+            path_observations[candidate] = observation
+        return observation
+
     def path_exists(candidate: Path) -> bool:
-        if candidate not in path_existence:
-            path_existence[candidate] = candidate.exists()
-        return path_existence[candidate]
+        return observe_path(candidate)[0]
 
     def path_is_dir(candidate: Path) -> bool:
-        if candidate not in directory_existence:
-            directory_existence[candidate] = candidate.is_dir()
-        return directory_existence[candidate]
+        return observe_path(candidate)[1]
+
+    def validate_symbol(owner_id: str, label: str, evidence: dict) -> None:
+        symbol = evidence.get("symbol")
+        if not isinstance(symbol, str) or not symbol:
+            return
+        raw_path = evidence.get("path", "")
+        candidate, path_error = resolve_confined(raw_path)
+        if path_error is not None or candidate is None or not path_exists(candidate):
+            return
+        if path_is_dir(candidate):
+            errors.append(
+                f"{owner_id}: {label} symbol evidence must name a file: {raw_path}"
+            )
+            return
+        try:
+            if candidate not in source_text:
+                source_text[candidate] = candidate.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            errors.append(f"{owner_id}: unreadable symbol evidence {raw_path}: {error}")
+            return
+        if symbol not in source_text[candidate]:
+            errors.append(
+                f"{owner_id}: stale symbol evidence {raw_path}::{symbol}"
+            )
 
     if manifest.get("schema_version") != SCHEMA_VERSION:
         errors.append(f"unsupported schema_version: {manifest.get('schema_version')!r}")
@@ -335,11 +382,16 @@ def load_and_validate(
     declared_owner_ids = {
         owner.get("id") for owner in owners if isinstance(owner.get("id"), str)
     }
+    selected_owner_ids = declared_owner_ids if not owner_ids else set(owner_ids)
+    unknown_owner_ids = sorted(selected_owner_ids - declared_owner_ids)
+    if unknown_owner_ids:
+        errors.append(f"unknown owner ids: {', '.join(unknown_owner_ids)}")
     seen_ids: set[str] = set()
     phrases: dict[str, list[dict]] = {}
     symbols: dict[str, list[tuple[dict, dict]]] = {}
     for owner in owners:
         owner_id = owner.get("id", "")
+        validate_owner_paths = owner_id in selected_owner_ids
         if not owner_id or owner_id in seen_ids:
             errors.append(f"duplicate or empty owner id: {owner_id!r}")
         seen_ids.add(owner_id)
@@ -347,31 +399,76 @@ def load_and_validate(
             phrases.setdefault(normalize(phrase), []).append(owner)
         for entry in owner.get("primary_entries", []):
             symbols.setdefault(entry.get("symbol", ""), []).append((owner, entry))
+        if validate_owner_paths:
+            for index, entry in enumerate(owner.get("primary_entries", [])):
+                validate_symbol(owner_id, f"primary_entries[{index}]", entry)
+        for relationship_index, relationship in enumerate(
+            owner.get("relationships", [])
+        ):
+            target_owner = (
+                relationship.get("target", "")[6:]
+                if relationship.get("target", "").startswith("owner:")
+                else None
+            )
+            if validate_owner_paths or target_owner in selected_owner_ids:
+                for evidence_index, evidence in enumerate(
+                    relationship.get("evidence", [])
+                ):
+                    validate_symbol(
+                        owner_id,
+                        f"relationships[{relationship_index}].evidence[{evidence_index}]",
+                        evidence,
+                    )
+        if validate_owner_paths:
+            for invariant_index, invariant in enumerate(owner.get("invariants", [])):
+                for evidence_index, evidence in enumerate(
+                    invariant.get("evidence", [])
+                ):
+                    validate_symbol(
+                        owner_id,
+                        f"invariants[{invariant_index}].evidence[{evidence_index}]",
+                        evidence,
+                    )
         generated_mirrors = set(owner.get("generated_mirrors", []))
-        declared = [
-            *owner.get("roots", []),
-            *owner.get("instructions", []),
-            *owner.get("consumers", []),
-            *owner.get("contracts", []),
-            *owner.get("generated_mirrors", []),
-            *owner.get("tests", []),
-            *(entry.get("path", "") for entry in owner.get("primary_entries", [])),
-            *(
+        declared = []
+        if validate_owner_paths:
+            declared.extend(
+                [
+                    *owner.get("roots", []),
+                    *owner.get("instructions", []),
+                    *owner.get("consumers", []),
+                    *owner.get("contracts", []),
+                    *owner.get("generated_mirrors", []),
+                    *owner.get("tests", []),
+                    *(
+                        entry.get("path", "")
+                        for entry in owner.get("primary_entries", [])
+                    ),
+                    *(
+                        evidence.get("path", "")
+                        for relationship in owner.get("relationships", [])
+                        for evidence in relationship.get("evidence", [])
+                    ),
+                    *(
+                        evidence.get("path", "")
+                        for invariant in owner.get("invariants", [])
+                        for evidence in invariant.get("evidence", [])
+                    ),
+                    *(
+                        test
+                        for invariant in owner.get("invariants", [])
+                        for test in invariant.get("tests", [])
+                    ),
+                ]
+            )
+        else:
+            declared.extend(
                 evidence.get("path", "")
                 for relationship in owner.get("relationships", [])
+                if relationship.get("target", "").startswith("owner:")
+                and relationship.get("target", "")[6:] in selected_owner_ids
                 for evidence in relationship.get("evidence", [])
-            ),
-            *(
-                evidence.get("path", "")
-                for invariant in owner.get("invariants", [])
-                for evidence in invariant.get("evidence", [])
-            ),
-            *(
-                test
-                for invariant in owner.get("invariants", [])
-                for test in invariant.get("tests", [])
-            ),
-        ]
+            )
         for raw_path in declared:
             candidate, path_error = resolve_confined(raw_path)
             if path_error is not None:
@@ -393,11 +490,12 @@ def load_and_validate(
             argv = validation.get("argv", [])
             if not argv or not isinstance(argv[0], str) or not argv[0].strip():
                 errors.append(f"{owner_id}: {validation_id}: argv must be nonempty")
-            cwd, path_error = resolve_confined(validation.get("cwd", ""))
-            if path_error is not None:
-                errors.append(f"{owner_id}: {validation_id}: {path_error}")
-            elif cwd is not None and not path_is_dir(cwd):
-                errors.append(f"{owner_id}: {validation_id}: invalid cwd")
+            if validate_owner_paths:
+                cwd, path_error = resolve_confined(validation.get("cwd", ""))
+                if path_error is not None:
+                    errors.append(f"{owner_id}: {validation_id}: {path_error}")
+                elif cwd is not None and not path_is_dir(cwd):
+                    errors.append(f"{owner_id}: {validation_id}: invalid cwd")
         invariant_ids: set[str] = set()
         for invariant in owner.get("invariants", []):
             invariant_id = invariant.get("id", "")
@@ -432,7 +530,7 @@ def load_and_validate(
                 errors.append(
                     f"{owner_id}: unknown relationship owner target: {target!r}"
                 )
-            elif target.startswith("path:"):
+            elif target.startswith("path:") and validate_owner_paths:
                 candidate, path_error = resolve_confined(target[5:])
                 if path_error is not None:
                     errors.append(f"{owner_id}: {path_error}")
@@ -468,11 +566,180 @@ def load_and_validate(
     return manifest, digest
 
 
-def repository_revision(_root: Path, manifest_digest: str) -> str:
+def _supporting_source_digest(manifest: dict, root: Path) -> str:
+    root = root.resolve()
+    paths: set[str] = set()
+    generated_mirrors = {
+        path
+        for owner in manifest.get("owners", [])
+        for path in owner.get("generated_mirrors", [])
+    }
+    for owner in manifest.get("owners", []):
+        paths.update(owner.get("tests", []))
+        paths.update(
+            entry.get("path", "") for entry in owner.get("primary_entries", [])
+        )
+        paths.update(
+            evidence.get("path", "")
+            for relationship in owner.get("relationships", [])
+            for evidence in relationship.get("evidence", [])
+        )
+        paths.update(
+            evidence.get("path", "")
+            for invariant in owner.get("invariants", [])
+            for evidence in invariant.get("evidence", [])
+        )
+        paths.update(
+            test
+            for invariant in owner.get("invariants", [])
+            for test in invariant.get("tests", [])
+        )
+    digest = hashlib.sha256()
+    for raw_path in sorted(
+        path for path in paths if path and path not in generated_mirrors
+    ):
+        digest.update(raw_path.encode("utf-8"))
+        digest.update(b"\0")
+        try:
+            candidate = confined_path(root, raw_path)
+            if candidate.is_file():
+                digest.update(hashlib.sha256(candidate.read_bytes()).digest())
+            else:
+                digest.update(b"missing-or-directory")
+        except (OSError, ValueError):
+            digest.update(b"unreadable")
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+_snapshot_cache: OrderedDict[
+    tuple[str, int, int, int, int, int], bytes
+] = OrderedDict()
+_snapshot_cache_bytes = 0
+_snapshot_cache_lock = threading.Lock()
+
+
+def _metadata_change_token(path: Path, observation: os.stat_result) -> int | None:
+    if os.name != "nt":
+        return observation.st_ctime_ns
+    try:
+        import ctypes
+        import msvcrt
+
+        class FileBasicInfo(ctypes.Structure):
+            _fields_ = [
+                ("creation_time", ctypes.c_longlong),
+                ("last_access_time", ctypes.c_longlong),
+                ("last_write_time", ctypes.c_longlong),
+                ("change_time", ctypes.c_longlong),
+                ("file_attributes", ctypes.c_ulong),
+            ]
+
+        with path.open("rb") as source:
+            handle = msvcrt.get_osfhandle(source.fileno())
+            info = FileBasicInfo()
+            get_file_information = (
+                ctypes.windll.kernel32.GetFileInformationByHandleEx
+            )
+            get_file_information.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.c_ulong,
+            ]
+            get_file_information.restype = ctypes.c_int
+            succeeded = get_file_information(
+                ctypes.c_void_p(handle), 0, ctypes.byref(info), ctypes.sizeof(info)
+            )
+            return info.change_time if succeeded else None
+    except (OSError, ValueError):
+        return None
+
+
+def _snapshot_file_signature(path: Path) -> tuple[str, int, int, int, int, int] | None:
+    try:
+        observation = path.stat()
+    except OSError:
+        return None
+    if not stat.S_ISREG(observation.st_mode):
+        return None
+    change_token = _metadata_change_token(path, observation)
+    if change_token is None:
+        return None
+    return (
+        os.fspath(path),
+        observation.st_dev,
+        observation.st_ino,
+        observation.st_size,
+        observation.st_mtime_ns,
+        change_token,
+    )
+
+
+def _read_snapshot_file(path: Path) -> tuple[bytes | None, bool]:
+    """Read a stable regular file, reusing only an identity-keyed observation."""
+    global _snapshot_cache_bytes
+
+    before = _snapshot_file_signature(path)
+    if before is None:
+        return None, False
+    with _snapshot_cache_lock:
+        cached = _snapshot_cache.get(before)
+    if cached is not None:
+        # Windows change timestamps can share a filesystem clock tick with a
+        # same-size rewrite whose write timestamp is restored. Re-read before
+        # trusting the metadata-keyed entry so the cache never returns stale
+        # source bytes; an equal payload still avoids downstream reprocessing.
+        try:
+            observed_contents = path.read_bytes()
+        except OSError:
+            return None, False
+        if _snapshot_file_signature(path) == before and observed_contents == cached:
+            with _snapshot_cache_lock:
+                if before in _snapshot_cache:
+                    _snapshot_cache.move_to_end(before)
+            return cached, False
+        contents = observed_contents
+    else:
+        contents = None
+    for _ in range(2):
+        if contents is None:
+            try:
+                contents = path.read_bytes()
+            except OSError:
+                return None, False
+        after = _snapshot_file_signature(path)
+        if after == before:
+            break
+        before = after
+        contents = None
+        if before is None:
+            return None, True
+    else:
+        raise OSError(f"file changed while snapshotting: {path}")
+    assert contents is not None
+    if len(contents) <= MAX_SNAPSHOT_CACHE_BYTES:
+        with _snapshot_cache_lock:
+            previous = _snapshot_cache.pop(before, None)
+            if previous is not None:
+                _snapshot_cache_bytes -= len(previous)
+            _snapshot_cache[before] = contents
+            _snapshot_cache_bytes += len(contents)
+            while (
+                len(_snapshot_cache) > MAX_SNAPSHOT_CACHE_ENTRIES
+                or _snapshot_cache_bytes > MAX_SNAPSHOT_CACHE_BYTES
+            ):
+                _, evicted = _snapshot_cache.popitem(last=False)
+                _snapshot_cache_bytes -= len(evicted)
+    return contents, True
+
+
+def repository_revision(root: Path, manifest_digest: str, manifest: dict) -> str:
     # A generated file cannot reproducibly embed the commit that contains it:
     # committing that value creates a new commit and immediately makes the
-    # file stale. Key the graph by its authoritative manifest content instead.
-    return f"manifest:{manifest_digest}"
+    # file stale. Key the graph by its authoritative manifest and supporting
+    # source identities instead.
+    return f"manifest:{manifest_digest}:sources:{_supporting_source_digest(manifest, root)}"
 
 
 def query_graph(
@@ -486,6 +753,16 @@ def query_graph(
         raise ValueError(
             f"max_relationships must be between 1 and {MAX_QUERY_RELATIONSHIPS}"
         )
+    return _query_graph(manifest, digest, root, owner_ids, max_relationships)
+
+
+def _query_graph(
+    manifest: dict,
+    digest: str,
+    root: Path,
+    owner_ids: list[str] | None,
+    max_relationships: int | None,
+) -> dict:
     owners_by_id = {owner["id"]: owner for owner in manifest["owners"]}
     selected_ids = sorted(set(owner_ids or owners_by_id))
     unknown = sorted(set(selected_ids) - set(owners_by_id))
@@ -503,16 +780,23 @@ def query_graph(
             if source_id not in selected_ids and target_owner not in selected_ids:
                 continue
             relationships.append({"source": f"owner:{source_id}", **relationship})
-    relationships.sort(
-        key=lambda item: (
+    relationships = _deduplicate_graph_relationships(relationships)
+    relationship_count = len(relationships)
+    def relationship_key(item: dict) -> tuple[str, str, str, str]:
+        return (
             item["source"],
             item["category"],
             item["kind"],
             item["target"],
         )
+    relationships = _bounded_sorted(
+        relationships, relationship_key, max_relationships
     )
-    omitted_relationships = max(0, len(relationships) - max_relationships)
-    relationships = relationships[:max_relationships]
+    omitted_relationships = (
+        0
+        if max_relationships is None
+        else max(0, relationship_count - max_relationships)
+    )
 
     selected_owners = []
     for owner_id in selected_ids:
@@ -533,13 +817,154 @@ def query_graph(
         )
     return {
         "schema_version": SCHEMA_VERSION,
-        "repository_revision": repository_revision(root, digest),
+        "repository_revision": repository_revision(root, digest, manifest),
         "manifest_sha256": digest,
         "status": "partial" if omitted_relationships else "complete",
         "owners": selected_owners,
         "relationships": relationships,
         "omitted": {"relationships": omitted_relationships},
         "unresolved": [],
+    }
+
+
+def _manifest_projection_from_graph(graph: dict) -> dict:
+    owners: list[dict] = []
+    owners_by_id: dict[str, dict] = {}
+    for projected in graph["owners"]:
+        owner = {
+            **projected,
+            "contracts": projected.get("configuration", []),
+            "generated_mirrors": projected.get("generated_artifacts", []),
+            "relationships": [],
+        }
+        owners.append(owner)
+        owners_by_id[owner["id"]] = owner
+    for relationship in graph["relationships"]:
+        source_id = relationship["source"].removeprefix("owner:")
+        owner = owners_by_id.get(source_id)
+        if owner is not None:
+            owner["relationships"].append(
+                {key: value for key, value in relationship.items() if key != "source"}
+            )
+    return {"owners": owners}
+
+
+def _architecture_index_is_usable(index: object, digest: str) -> bool:
+    if not isinstance(index, dict):
+        return False
+    if (
+        index.get("index_version") != ARCHITECTURE_INDEX_VERSION
+        or index.get("schema_version") != SCHEMA_VERSION
+        or index.get("manifest_sha256") != digest
+        or index.get("status") != "complete"
+        or index.get("omitted") != {"relationships": 0}
+        or not isinstance(index.get("owners"), list)
+        or not isinstance(index.get("relationships"), list)
+    ):
+        return False
+    stored_checksum = index.get("index_sha256")
+    if not isinstance(stored_checksum, str):
+        return False
+    checksum_payload = {
+        key: value for key, value in index.items() if key != "index_sha256"
+    }
+    if stored_checksum != hashlib.sha256(
+        json.dumps(
+            checksum_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest():
+        return False
+    owner_ids: set[str] = set()
+    for owner in index["owners"]:
+        if not isinstance(owner, dict) or not isinstance(owner.get("id"), str):
+            return False
+        if owner["id"] in owner_ids:
+            return False
+        owner_ids.add(owner["id"])
+    for relationship in index["relationships"]:
+        if not isinstance(relationship, dict):
+            return False
+        if not all(
+            isinstance(relationship.get(field), str)
+            for field in ("source", "category", "kind", "target", "confidence")
+        ) or not isinstance(relationship.get("evidence"), list):
+            return False
+        if relationship["source"].removeprefix("owner:") not in owner_ids:
+            return False
+    return True
+
+
+def load_architecture_index(
+    index_path: Path, digest: str, root: Path
+) -> dict | None:
+    try:
+        candidate = json.loads(index_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not _architecture_index_is_usable(candidate, digest):
+        return None
+    candidate["repository_revision"] = repository_revision(
+        root, digest, _manifest_projection_from_graph(candidate)
+    )
+    return candidate
+
+
+def _select_index_graph(
+    index: dict,
+    owner_ids: list[str] | None,
+    max_relationships: int | None,
+) -> dict:
+    owners_by_id = {owner["id"]: owner for owner in index["owners"]}
+    selected_ids = sorted(set(owner_ids or owners_by_id))
+    unknown = sorted(set(selected_ids) - set(owners_by_id))
+    if unknown:
+        raise ValueError(f"unknown owner ids: {', '.join(unknown)}")
+    relationships = [
+        relationship
+        for relationship in index["relationships"]
+        if relationship["source"].removeprefix("owner:") in selected_ids
+        or (
+            relationship["target"].startswith("owner:")
+            and relationship["target"].removeprefix("owner:") in selected_ids
+        )
+    ]
+    relationships = _deduplicate_graph_relationships(relationships)
+    relationship_count = len(relationships)
+    relationships = _bounded_sorted(
+        relationships,
+        lambda item: (
+            item["source"],
+            item["category"],
+            item["kind"],
+            item["target"],
+        ),
+        max_relationships,
+    )
+    omitted_relationships = (
+        0
+        if max_relationships is None
+        else max(0, relationship_count - max_relationships)
+    )
+    return {
+        key: value
+        for key, value in index.items()
+        if key
+        not in {
+            "index_version",
+            "index_sha256",
+            "owners",
+            "relationships",
+            "status",
+            "omitted",
+        }
+    } | {
+        "owners": [owners_by_id[owner_id] for owner_id in selected_ids],
+        "relationships": relationships,
+        "status": "partial" if omitted_relationships else "complete",
+        "omitted": {"relationships": omitted_relationships},
     }
 
 
@@ -551,10 +976,11 @@ def _evidence_location(evidence: dict) -> str:
 def _ranking_tokens(value: str | None) -> set[str]:
     if not value:
         return set()
+    normalized = unicodedata.normalize("NFKC", value).casefold()
     return {
         token
-        for token in re.findall(r"[a-z0-9]+", value.casefold())
-        if len(token) > 1 and token not in RANKING_STOP_WORDS
+        for token in re.findall(r"[^\W_]+", normalized)
+        if (len(token) > 1 or not token.isascii()) and token not in RANKING_STOP_WORDS
     }
 
 
@@ -610,10 +1036,53 @@ def _deduplicate_relationships(relationships: list[dict]) -> list[dict]:
     return unique
 
 
+def _deduplicate_graph_relationships(relationships: list[dict]) -> list[dict]:
+    unique: list[dict] = []
+    seen: set[str] = set()
+    for relationship in relationships:
+        identity = json.dumps(
+            relationship,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        unique.append(relationship)
+    return unique
+
+
+def _bounded_sorted(
+    items: list[dict], key: object, limit: int | None
+) -> list[dict]:
+    if limit is None or limit >= len(items):
+        return sorted(items, key=key)
+    return heapq.nsmallest(limit, items, key=key)
+
+
+def _round_robin_relationships(
+    relationships_by_facet: dict[str, list[dict]], limit: int
+) -> dict[str, list[dict]]:
+    retained: dict[str, list[dict]] = {
+        facet: [] for facet in relationships_by_facet
+    }
+    retained_count = 0
+    for rank in range(max(map(len, relationships_by_facet.values()), default=0)):
+        if retained_count >= limit:
+            break
+        for facet, relationships in relationships_by_facet.items():
+            if rank < len(relationships) and retained_count < limit:
+                retained[facet].append(relationships[rank])
+                retained_count += 1
+    return retained
+
+
 def _slice_source_snapshot(
     root: Path, graph: dict, owners: list[dict]
 ) -> tuple[str, int, int]:
     """Hash the exact declared files that support a bounded architecture slice."""
+    root = root.resolve()
     paths: set[str] = set()
     for relationship in graph["relationships"]:
         paths.update(item["path"] for item in relationship["evidence"])
@@ -630,15 +1099,20 @@ def _slice_source_snapshot(
     bytes_read = 0
     for relative_path in sorted(paths):
         digest.update(relative_path.encode("utf-8"))
-        candidate = root / relative_path
-        if not candidate.is_file():
+        try:
+            candidate = confined_path(root, relative_path)
+        except ValueError:
             digest.update(b"\0missing-or-not-a-file\0")
             continue
-        contents = candidate.read_bytes()
+        contents, was_read = _read_snapshot_file(candidate)
+        if contents is None:
+            digest.update(b"\0missing-or-not-a-file\0")
+            continue
         digest.update(b"\0file\0")
         digest.update(contents)
-        files_read += 1
-        bytes_read += len(contents)
+        if was_read:
+            files_read += 1
+            bytes_read += len(contents)
     return digest.hexdigest(), files_read, bytes_read
 
 
@@ -649,16 +1123,27 @@ def architecture_slice(
     owner_ids: list[str] | None = None,
     max_relationships: int = MAX_SLICE_RELATIONSHIPS,
     focus: str | None = None,
+    manifest_bytes_read: int = 0,
+    graph: dict | None = None,
 ) -> dict:
     """Return a completeness-first slice ranked within each architecture facet."""
     if not 1 <= max_relationships <= MAX_SLICE_RELATIONSHIPS:
         raise ValueError(
             f"max_relationships must be between 1 and {MAX_SLICE_RELATIONSHIPS}"
         )
-    graph = query_graph(
-        manifest, digest, root, owner_ids, max_relationships=MAX_QUERY_RELATIONSHIPS
-    )
-    selected = {owner["id"]: owner for owner in manifest["owners"]}
+    if graph is None:
+        graph = _query_graph(manifest, digest, root, owner_ids, max_relationships=None)
+        selected = {owner["id"]: owner for owner in manifest["owners"]}
+    else:
+        graph = _select_index_graph(graph, owner_ids, max_relationships=None)
+        selected = {
+            owner["id"]: {
+                **owner,
+                "contracts": owner.get("configuration", []),
+                "generated_mirrors": owner.get("generated_artifacts", []),
+            }
+            for owner in graph["owners"]
+        }
     selected_ids = sorted(set(owner_ids or selected))
     selected_id_set = set(selected_ids)
     focus_tokens = _ranking_tokens(focus)
@@ -753,6 +1238,7 @@ def architecture_slice(
 
     unknowns: list[str] = []
     output: dict[str, object] = {}
+    facet_relationship_totals: dict[str, int] = {}
     for facet in ARCHITECTURE_FACETS:
         uncovered = []
         reasons = []
@@ -766,11 +1252,14 @@ def architecture_slice(
                 uncovered.append(owner_id)
         if uncovered:
             unknowns.append(f"{facet}: missing declarations for {', '.join(uncovered)}")
-        relationships = sorted(
-            _deduplicate_relationships(facets[facet]),
-            key=lambda item: _relationship_rank_key(
+        unique_relationships = _deduplicate_relationships(facets[facet])
+        facet_relationship_totals[facet] = len(unique_relationships)
+        relationships = _bounded_sorted(
+            unique_relationships,
+            lambda item: _relationship_rank_key(
                 facet, item, selected_id_set, focus_tokens
             ),
+            max_relationships,
         )
         if relationships:
             output[facet] = {"status": "established", "relationships": relationships}
@@ -783,22 +1272,16 @@ def architecture_slice(
                 **({"not_applicable_reason": "; ".join(reasons)} if reasons else {}),
             }
 
-    relationship_total = sum(
-        len(output[facet]["relationships"]) for facet in ARCHITECTURE_FACETS
-    )
+    relationship_total = sum(facet_relationship_totals.values())
     omitted_relationships = graph["omitted"]["relationships"]
     if relationship_total > max_relationships:
-        retained: dict[str, list[dict]] = {facet: [] for facet in ARCHITECTURE_FACETS}
-        for rank in range(
-            max(len(output[facet]["relationships"]) for facet in ARCHITECTURE_FACETS)
-        ):
-            for facet in ARCHITECTURE_FACETS:
-                relationships = output[facet]["relationships"]
-                if (
-                    rank < len(relationships)
-                    and sum(map(len, retained.values())) < max_relationships
-                ):
-                    retained[facet].append(relationships[rank])
+        retained = _round_robin_relationships(
+            {
+                facet: output[facet]["relationships"]
+                for facet in ARCHITECTURE_FACETS
+            },
+            max_relationships,
+        )
         omitted_relationships += relationship_total - max_relationships
         for facet in ARCHITECTURE_FACETS:
             output[facet]["relationships"] = retained[facet]
@@ -820,21 +1303,24 @@ def architecture_slice(
         "metrics": {
             "tool_calls": 1,
             "files_read": files_read + 1,
-            "bytes_read": bytes_read
-            + (
-                DEFAULT_MANIFEST.stat().st_size
-                if DEFAULT_MANIFEST.exists() and root == REPO_ROOT
-                else 0
-            ),
+            "bytes_read": bytes_read + manifest_bytes_read,
             "late_relationship_discoveries": 0,
         },
     }
 
 
 def expected_architecture_index(manifest: dict, digest: str, root: Path) -> str:
-    return (
-        json.dumps(query_graph(manifest, digest, root), indent=2, sort_keys=True) + "\n"
-    )
+    graph = _query_graph(manifest, digest, root, None, max_relationships=None)
+    graph["index_version"] = ARCHITECTURE_INDEX_VERSION
+    graph["index_sha256"] = hashlib.sha256(
+        json.dumps(
+            graph,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    return json.dumps(graph, indent=2, sort_keys=True) + "\n"
 
 
 def render_block(manifest: dict, digest: str) -> str:
@@ -959,30 +1445,68 @@ def main() -> int:
         help="Repository root for declared paths (defaults to the manifest directory).",
     )
     args = parser.parse_args()
-    root = args.repo_root or args.manifest.resolve().parent
+    root = (args.repo_root or args.manifest.resolve().parent).resolve()
+    if args.command == "generate":
+        try:
+            with source_map_lock(root, f"source-owners:{os.getpid()}"):
+                manifest, digest = load_and_validate(args.manifest, root)
+                source_map = args.source_map.read_text(encoding="utf-8")
+                expected = replace_managed_block(
+                    source_map, render_block(manifest, digest)
+                )
+                expected_index = expected_architecture_index(manifest, digest, root)
+                write_text_atomic(args.source_map, expected)
+                write_text_atomic(args.architecture_index, expected_index)
+            return 0
+        except (GenerationLockError, OSError, ValueError, tomllib.TOMLDecodeError) as error:
+            print(error, file=sys.stderr)
+            return 1
     try:
         if args.command in {"query", "slice"}:
-            manifest, digest = load_and_validate(args.manifest, root)
+            manifest_bytes = args.manifest.read_bytes()
+            digest = hashlib.sha256(manifest_bytes).hexdigest()
+            cached_graph = load_architecture_index(
+                args.architecture_index, digest, root
+            )
+            if cached_graph is None:
+                manifest, digest = load_and_validate(
+                    args.manifest, root, owner_ids=args.owners
+                )
+            else:
+                manifest = None
+            if args.command == "query":
+                if not 1 <= args.max_relationships <= MAX_QUERY_RELATIONSHIPS:
+                    raise ValueError(
+                        "max_relationships must be between "
+                        f"1 and {MAX_QUERY_RELATIONSHIPS}"
+                    )
+                result = (
+                    query_graph(
+                        manifest,
+                        digest,
+                        root,
+                        args.owners,
+                        args.max_relationships,
+                    )
+                    if cached_graph is None
+                    else _select_index_graph(
+                        cached_graph, args.owners, args.max_relationships
+                    )
+                )
+            else:
+                result = architecture_slice(
+                    manifest or {"owners": []},
+                    digest,
+                    root,
+                    args.owners,
+                    min(args.max_relationships, MAX_SLICE_RELATIONSHIPS),
+                    args.focus,
+                    len(manifest_bytes),
+                    graph=cached_graph,
+                )
             print(
                 json.dumps(
-                    (
-                        query_graph(
-                            manifest,
-                            digest,
-                            root,
-                            args.owners,
-                            args.max_relationships,
-                        )
-                        if args.command == "query"
-                        else architecture_slice(
-                            manifest,
-                            digest,
-                            root,
-                            args.owners,
-                            min(args.max_relationships, MAX_SLICE_RELATIONSHIPS),
-                            args.focus,
-                        )
-                    ),
+                    result,
                     indent=2,
                     sort_keys=True,
                 )
@@ -1014,9 +1538,7 @@ def main() -> int:
             )
             stale = True
         return int(stale)
-    write_text_atomic(args.source_map, expected)
-    write_text_atomic(args.architecture_index, expected_index)
-    return 0
+    raise AssertionError(f"unhandled source-owner command: {args.command}")
 
 
 if __name__ == "__main__":

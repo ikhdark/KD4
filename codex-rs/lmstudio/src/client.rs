@@ -1,11 +1,13 @@
 use codex_core::config::Config;
+use codex_http_client::HttpClient;
+use codex_http_client::HttpClientBuilder;
 use codex_model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;
 use std::io;
 use std::path::Path;
 
 #[derive(Clone)]
 pub struct LMStudioClient {
-    client: reqwest::Client,
+    client: HttpClient,
     base_url: String,
 }
 
@@ -29,10 +31,10 @@ impl LMStudioClient {
             )
         })?;
 
-        let client = reqwest::Client::builder()
+        let client = HttpClientBuilder::new()
             .connect_timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .build_with_transport_default_proxy()
+            .map_err(io::Error::other)?;
 
         let client = LMStudioClient {
             client,
@@ -178,15 +180,15 @@ impl LMStudioClient {
 
     /// Low-level constructor given a raw host root, e.g. "http://localhost:1234".
     #[cfg(test)]
-    fn from_host_root(host_root: impl Into<String>) -> Self {
-        let client = reqwest::Client::builder()
+    fn from_host_root(host_root: impl Into<String>) -> io::Result<Self> {
+        let client = HttpClientBuilder::new()
             .connect_timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-        Self {
+            .build_direct()
+            .map_err(io::Error::other)?;
+        Ok(Self {
             client,
             base_url: host_root.into(),
-        }
+        })
     }
 }
 
@@ -222,7 +224,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = LMStudioClient::from_host_root(server.uri());
+        let client = LMStudioClient::from_host_root(server.uri()).expect("shared HTTP client");
         let models = client.fetch_models().await.expect("fetch models");
         assert!(models.contains(&"openai/gpt-oss-20b".to_string()));
     }
@@ -247,7 +249,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = LMStudioClient::from_host_root(server.uri());
+        let client = LMStudioClient::from_host_root(server.uri()).expect("shared HTTP client");
         let result = client.fetch_models().await;
         assert!(result.is_err());
         assert!(
@@ -275,7 +277,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = LMStudioClient::from_host_root(server.uri());
+        let client = LMStudioClient::from_host_root(server.uri()).expect("shared HTTP client");
         let result = client.fetch_models().await;
         assert!(result.is_err());
         assert!(
@@ -303,7 +305,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = LMStudioClient::from_host_root(server.uri());
+        let client = LMStudioClient::from_host_root(server.uri()).expect("shared HTTP client");
         client
             .check_server()
             .await
@@ -327,7 +329,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = LMStudioClient::from_host_root(server.uri());
+        let client = LMStudioClient::from_host_root(server.uri()).expect("shared HTTP client");
         let result = client.check_server().await;
         assert!(result.is_err());
         assert!(
@@ -336,6 +338,35 @@ mod tests {
                 .to_string()
                 .contains("Server returned error: 404")
         );
+    }
+
+    #[tokio::test]
+    async fn test_load_model_posts_through_shared_http_client() {
+        if std::env::var(codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
+            tracing::info!(
+                "{} is set; skipping test_load_model_posts_through_shared_http_client",
+                codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR
+            );
+            return;
+        }
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/responses"))
+            .and(wiremock::matchers::header(
+                "content-type",
+                "application/json",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = LMStudioClient::from_host_root(server.uri()).expect("shared HTTP client");
+        client
+            .load_model("openai/gpt-oss-20b")
+            .await
+            .expect("load request should succeed");
     }
 
     #[test]
@@ -367,10 +398,12 @@ mod tests {
 
     #[test]
     fn test_from_host_root() {
-        let client = LMStudioClient::from_host_root("http://localhost:1234");
+        let client =
+            LMStudioClient::from_host_root("http://localhost:1234").expect("shared HTTP client");
         assert_eq!(client.base_url, "http://localhost:1234");
 
-        let client = LMStudioClient::from_host_root("https://example.com:8080/api");
+        let client = LMStudioClient::from_host_root("https://example.com:8080/api")
+            .expect("shared HTTP client");
         assert_eq!(client.base_url, "https://example.com:8080/api");
     }
 }

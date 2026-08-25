@@ -132,20 +132,33 @@ def normalize_claims(value: Any, root: Path) -> list[dict[str, Any]]:
 def repository_paths_are_case_insensitive(root: Path) -> bool:
     """Detect case aliases without writing a probe into the repository."""
     current = root.resolve()
-    for path in (current, *current.parents):
+
+    def case_alias_result(path: Path) -> bool | None:
         swapped = "".join(
             character.swapcase() if character.isalpha() else character
             for character in path.name
         )
         if not swapped or swapped == path.name:
-            continue
+            return None
         alias = path.with_name(swapped)
         try:
-            if alias.exists() and os.path.samefile(path, alias):
-                return True
+            if not alias.exists():
+                return False
+            return os.path.samefile(path, alias)
         except OSError:
-            continue
-    return True
+            return None
+
+    try:
+        for entry in current.iterdir():
+            if (result := case_alias_result(entry)) is not None:
+                return result
+    except OSError:
+        pass
+
+    for path in (current, *current.parents):
+        if (result := case_alias_result(path)) is not None:
+            return result
+    return os.path.normcase("A") == os.path.normcase("a")
 
 
 def claim_covers(

@@ -8,6 +8,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ConfigWarningNotification;
+use codex_app_server_protocol::InitializeCapabilities;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::InitializeResponse;
 use codex_app_server_protocol::JSONRPCError;
@@ -21,12 +22,15 @@ use codex_app_server_protocol::ThreadLoadedListResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_core::config::set_project_trust_level;
+use codex_http_client::HttpClient;
+use codex_http_client::HttpClientBuilder;
+use codex_http_client::HttpResponse;
 use codex_protocol::config_types::TrustLevel;
 use futures::SinkExt;
 use futures::StreamExt;
 use hmac::Hmac;
 use hmac::Mac;
-use reqwest::StatusCode;
+use http::StatusCode;
 use serde_json::json;
 use sha2::Sha256;
 use std::net::SocketAddr;
@@ -103,6 +107,53 @@ async fn websocket_transport_routes_per_connection_handshake_and_responses() -> 
         .kill()
         .await
         .context("failed to stop websocket app-server process")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn websocket_rejects_experimental_api_mismatch_in_both_initialization_orders() -> Result<()> {
+    for (first_enabled, second_enabled) in [(false, true), (true, false)] {
+        let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+        let codex_home = TempDir::new()?;
+        create_config_toml(codex_home.path(), &server.uri(), "never")?;
+
+        let (mut process, bind_addr) = spawn_websocket_server(codex_home.path()).await?;
+        let mut first = connect_websocket(bind_addr).await?;
+        let mut second = connect_websocket(bind_addr).await?;
+
+        send_initialize_request_with_experimental_api(
+            &mut first,
+            /*id*/ 1,
+            "first_client",
+            first_enabled,
+        )
+        .await?;
+        read_response_for_id(&mut first, /*id*/ 1).await?;
+
+        send_initialize_request_with_experimental_api(
+            &mut second,
+            /*id*/ 2,
+            "second_client",
+            second_enabled,
+        )
+        .await?;
+        let mismatch = read_error_for_id(&mut second, /*id*/ 2).await?;
+        assert_eq!(
+            mismatch.error.message,
+            format!(
+                "experimental_api must match the first initialized connection (expected {first_enabled})"
+            )
+        );
+
+        send_config_read_request(&mut second, /*id*/ 3).await?;
+        let still_uninitialized = read_error_for_id(&mut second, /*id*/ 3).await?;
+        assert_eq!(still_uninitialized.error.message, "Not initialized");
+
+        process
+            .kill()
+            .await
+            .context("failed to stop websocket app-server process")?;
+    }
     Ok(())
 }
 
@@ -312,7 +363,7 @@ async fn websocket_transport_serves_health_endpoints_on_same_listener() -> Resul
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
 
     let (mut process, bind_addr) = spawn_websocket_server(codex_home.path()).await?;
-    let client = reqwest::Client::new();
+    let client = HttpClientBuilder::new().build_direct()?;
 
     let readyz = http_get(&client, bind_addr, "/readyz").await?;
     assert_eq!(readyz.status(), StatusCode::OK);
@@ -794,11 +845,7 @@ async fn run_websocket_server_to_completion_with_args(
         .context("failed to run websocket app-server")
 }
 
-async fn http_get(
-    client: &reqwest::Client,
-    bind_addr: SocketAddr,
-    path: &str,
-) -> Result<reqwest::Response> {
+async fn http_get(client: &HttpClient, bind_addr: SocketAddr, path: &str) -> Result<HttpResponse> {
     let connectable_bind_addr = connectable_bind_addr(bind_addr);
     let deadline = Instant::now() + DEFAULT_READ_TIMEOUT;
     loop {
@@ -848,13 +895,40 @@ pub(super) async fn send_initialize_request(
     id: i64,
     client_name: &str,
 ) -> Result<()> {
+    send_initialize_request_with_capabilities(stream, id, client_name, None).await
+}
+
+async fn send_initialize_request_with_experimental_api(
+    stream: &mut WsClient,
+    id: i64,
+    client_name: &str,
+    experimental_api: bool,
+) -> Result<()> {
+    send_initialize_request_with_capabilities(
+        stream,
+        id,
+        client_name,
+        Some(InitializeCapabilities {
+            experimental_api,
+            ..Default::default()
+        }),
+    )
+    .await
+}
+
+async fn send_initialize_request_with_capabilities(
+    stream: &mut WsClient,
+    id: i64,
+    client_name: &str,
+    capabilities: Option<InitializeCapabilities>,
+) -> Result<()> {
     let params = InitializeParams {
         client_info: ClientInfo {
             name: client_name.to_string(),
             title: Some("WebSocket Test Client".to_string()),
             version: "0.1.0".to_string(),
         },
-        capabilities: None,
+        capabilities,
     };
     send_request(
         stream,

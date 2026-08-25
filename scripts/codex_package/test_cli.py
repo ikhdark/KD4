@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 from pathlib import Path
+import json
 import sys
 import tempfile
 import unittest
@@ -66,7 +67,8 @@ class CliPerformanceFlagsTest(unittest.TestCase):
                         archive_output=[archive_a, archive_b],
                         force=True,
                         cargo="cargo",
-                        cargo_profile="debug",
+                        cargo_profile="release",
+                        release_version="1.2.3",
                         entrypoint_bin=None,
                         code_mode_host_bin=None,
                         codex_command_runner_bin=None,
@@ -74,7 +76,6 @@ class CliPerformanceFlagsTest(unittest.TestCase):
                         rg_bin=target_dir / "rg.exe",
                         skip_build_if_present=True,
                         skip_validate=False,
-                        fast_validate=True,
                         reuse_package_dir=True,
                         archive_compression="fast",
                         timings=True,
@@ -117,7 +118,6 @@ class CliPerformanceFlagsTest(unittest.TestCase):
                 cli.PACKAGE_VARIANTS["codex"],
                 cli.TARGET_SPECS["x86_64-pc-windows-msvc"],
                 expected_version="1.2.3",
-                fast=True,
             )
             entries.assert_called_once_with(package_dir)
             resolve_rg_bin.assert_called_once_with(
@@ -330,6 +330,42 @@ class CliPerformanceFlagsTest(unittest.TestCase):
 
 
 class CliPreflightTest(unittest.TestCase):
+    def test_release_manifests_use_installer_asset_name_and_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            package_dir = root / "package"
+            release_dir = root / "release"
+            package_dir.mkdir()
+            archive_path = release_dir / "codex-package-x86_64-pc-windows-msvc.tar.gz"
+            release_dir.mkdir()
+            archive_path.write_bytes(b"archive")
+            (package_dir / "codex-package.json").write_text(
+                json.dumps(
+                    {
+                        "version": "1.2.3",
+                        "target": "x86_64-pc-windows-msvc",
+                        "bundleId": "a" * 64,
+                        "buildIdentity": {"source": "test"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            cli.write_release_manifests(
+                release_dir, package_dir, [archive_path]
+            )
+
+            checksums = (release_dir / "codex-package_SHA256SUMS").read_text()
+            self.assertIn(archive_path.name, checksums)
+            provenance = json.loads(
+                (
+                    release_dir
+                    / "codex-package_x86_64-pc-windows-msvc_PROVENANCE.json"
+                ).read_text()
+            )
+            self.assertEqual(provenance["version"], "1.2.3")
+            self.assertEqual(provenance["artifacts"][0]["name"], archive_path.name)
+
     def test_skip_build_rejects_ignored_source_override(self) -> None:
         args = request_args(
             skip_build_if_present=True,
@@ -393,6 +429,8 @@ def request_args(**overrides) -> cli.argparse.Namespace:
         "reuse_package_dir": False,
         "archive_output": [],
         "archive_compression": "fast",
+        "cargo_profile": "release",
+        "release_version": "1.2.3",
         "codex_command_runner_bin": None,
         "codex_windows_sandbox_setup_bin": None,
         "skip_build_if_present": False,

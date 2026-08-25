@@ -1833,7 +1833,8 @@
         "userPromptSubmit",
         "subagentStart",
         "subagentStop",
-        "stop"
+        "stop",
+        "interrupt"
       ],
       "type": "string"
     },
@@ -5407,10 +5408,6 @@
             "string",
             "null"
           ]
-        },
-        "requiresDesktopActivation": {
-          "default": false,
-          "type": "boolean"
         },
         "risks": {
           "items": {

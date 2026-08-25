@@ -896,7 +896,8 @@ async fn wait_for_model_available(manager: &SharedModelsManager, slug: &str) {
                 RefreshStrategy::OnlineIfUncached,
                 codex_core::test_support::default_http_client_factory(),
             )
-            .await;
+            .await
+            .expect("model catalog refresh should succeed");
         if models.iter().any(|model| model.model == slug) {
             return;
         }

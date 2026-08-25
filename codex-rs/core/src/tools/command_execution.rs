@@ -1,8 +1,8 @@
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
-use std::hash::Hash;
-use std::hash::Hasher;
+use std::io;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -24,7 +24,6 @@ use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
 use tokio::sync::Mutex;
-use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
 use crate::tools::command_output_artifact::RawOutputArtifact;
@@ -34,7 +33,8 @@ use crate::validation_admission::ValidationLaunchPlan;
 
 const MAX_TRACKED_COMMANDS: usize = 128;
 const MAX_COMPLETED_VALIDATION_PROOFS: usize = 128;
-const COMMAND_EXECUTION_CACHE_SCHEMA_VERSION: u32 = 1;
+const COMMAND_EXECUTION_CACHE_SCHEMA_VERSION: u32 = 2;
+const COMMAND_FINGERPRINT_VERSION: &str = "v2";
 static NEXT_COMMAND_EXECUTION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -54,16 +54,17 @@ impl CompletionApplyResult {
         matches!(self, Self::Applied | Self::AlreadyApplied)
     }
 }
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub(crate) struct CommandAttemptKey {
     tool_name: String,
     environment_id: String,
     cwd: String,
     command: Vec<String>,
+    execution_context: BTreeMap<String, String>,
     search_narrowing: Option<SearchNarrowingAttempt>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 struct SearchNarrowingAttempt {
     turn_id: String,
     environment_id: String,
@@ -81,7 +82,7 @@ struct SearchMissCacheKey {
     environment_id: String,
     repository_identity: String,
     search_identity: String,
-    execution_context: Vec<String>,
+    execution_context: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -117,22 +118,18 @@ impl CommandAttemptKey {
             environment_id: environment_id.to_string(),
             cwd: cwd.into(),
             command: command.to_vec(),
+            execution_context: BTreeMap::new(),
             search_narrowing: None,
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_executed_command(mut self, command: &[String]) -> Self {
-        let context = self
-            .command
-            .iter()
-            .filter(|argument| argument.starts_with('\0'))
-            .cloned()
-            .collect::<Vec<_>>();
         self.command = command.to_vec();
-        self.command.extend(context);
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn with_environment(self, environment: &HashMap<String, String>) -> Self {
         let mut entries = environment.iter().collect::<Vec<_>>();
         entries.sort_unstable_by(|(left_key, left_value), (right_key, right_value)| {
@@ -143,23 +140,27 @@ impl CommandAttemptKey {
         self.with_context_fingerprint("environment", &entries)
     }
 
+    pub(crate) fn with_environment_fingerprint(self, fingerprint: &str) -> Self {
+        self.with_context_fingerprint("environment", fingerprint)
+    }
+
     pub(crate) fn with_timeout_ms(self, timeout_ms: Option<u64>) -> Self {
         self.with_context_fingerprint("timeout_ms", &timeout_ms)
     }
 
-    pub(crate) fn with_sandbox_context<T: Hash + ?Sized>(self, context: &T) -> Self {
+    pub(crate) fn with_sandbox_context<T: Serialize + ?Sized>(self, context: &T) -> Self {
         self.with_context_fingerprint("sandbox", context)
     }
 
-    pub(crate) fn with_permission_context<T: Hash + ?Sized>(self, context: &T) -> Self {
+    pub(crate) fn with_permission_context<T: Serialize + ?Sized>(self, context: &T) -> Self {
         self.with_context_fingerprint("permission", context)
     }
 
-    pub(crate) fn with_input_context<T: Hash + ?Sized>(self, context: &T) -> Self {
+    pub(crate) fn with_input_context<T: Serialize + ?Sized>(self, context: &T) -> Self {
         self.with_context_fingerprint("input", context)
     }
 
-    pub(crate) fn with_runtime_context<T: Hash + ?Sized>(self, context: &T) -> Self {
+    pub(crate) fn with_runtime_context<T: Serialize + ?Sized>(self, context: &T) -> Self {
         self.with_context_fingerprint("runtime", context)
     }
 
@@ -206,45 +207,50 @@ impl CommandAttemptKey {
     }
 
     fn search_miss_cache_key_for(&self, search: &SearchNarrowingAttempt) -> SearchMissCacheKey {
-        let has_workspace_identity = self
-            .command
-            .iter()
-            .any(|argument| argument.starts_with("\0kd4-context:workspace_identity:"));
+        let has_workspace_identity = self.execution_context.contains_key("workspace_identity");
         SearchMissCacheKey {
             environment_id: search.environment_id.clone(),
             repository_identity: search.repository_identity.clone(),
             search_identity: search.search_identity.clone(),
             execution_context: self
-                .command
+                .execution_context
                 .iter()
-                .filter(|argument| {
-                    argument.starts_with('\0')
-                        && !(has_workspace_identity
-                            && argument.starts_with("\0kd4-context:repository_epoch:"))
-                })
-                .cloned()
+                .filter(|(label, _)| !(has_workspace_identity && *label == "repository_epoch"))
+                .map(|(label, fingerprint)| (label.clone(), fingerprint.clone()))
                 .collect(),
         }
     }
 
     pub(crate) fn fingerprint(&self) -> String {
-        format!("{:016x}", fingerprint_value(self))
+        fingerprint_value(self)
     }
 
-    fn with_context_fingerprint<T: Hash + ?Sized>(mut self, label: &str, value: &T) -> Self {
-        let prefix = format!("\0kd4-context:{label}:");
-        self.command
-            .retain(|argument| !argument.starts_with(&prefix));
-        self.command
-            .push(format!("{prefix}{:016x}", fingerprint_value(value)));
+    fn with_context_fingerprint<T: Serialize + ?Sized>(mut self, label: &str, value: &T) -> Self {
+        self.execution_context
+            .insert(label.to_string(), fingerprint_value(value));
         self
     }
 }
 
-fn fingerprint_value<T: Hash + ?Sized>(value: &T) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    value.hash(&mut hasher);
-    hasher.finish()
+fn fingerprint_value<T: Serialize + ?Sized>(value: &T) -> String {
+    let encoded = match serde_json::to_vec(value) {
+        Ok(encoded) => encoded,
+        Err(error) => unreachable!("command fingerprint input must serialize: {error}"),
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(b"kd4-command-fingerprint\0");
+    hasher.update(COMMAND_FINGERPRINT_VERSION.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(encoded);
+    format!("{}:{:x}", COMMAND_FINGERPRINT_VERSION, hasher.finalize())
+}
+
+fn workspace_identity_hash(identity: &crate::git_workspace::WorkspaceEvidenceIdentity) -> String {
+    let bytes = match serde_json::to_vec(identity) {
+        Ok(bytes) => bytes,
+        Err(error) => unreachable!("workspace evidence identity must serialize: {error}"),
+    };
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -398,6 +404,8 @@ struct PersistedValidationProof {
 struct PersistedValidationCacheDocument {
     schema_version: u32,
     completed_validations: Vec<PersistedValidationProof>,
+    #[serde(default)]
+    invalidated_validations: Vec<ValidationProofKey>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -420,6 +428,7 @@ struct CommandProcessState {
 struct CommandRepositoryState {
     epoch: u64,
     observed_workspace_identity: Option<(u64, crate::git_workspace::WorkspaceEvidenceIdentity)>,
+    observed_workspace_identity_hash: Option<(u64, String)>,
     observed_turn_mutation_revisions: HashMap<String, u64>,
     uncertain_command_baselines: HashMap<String, UncertainCommandBaseline>,
     typed_mutation_baselines: HashMap<String, PendingTypedMutationBaseline>,
@@ -458,6 +467,8 @@ struct CommandSearchState {
 struct CommandValidationState {
     completed: HashMap<ValidationProofKey, CompletedValidationProof>,
     completed_order: VecDeque<ValidationProofKey>,
+    invalidated: HashSet<ValidationProofKey>,
+    invalidated_order: VecDeque<ValidationProofKey>,
     results_by_call: HashMap<String, Arc<ValidationResult>>,
     bound_plan_steps_by_call: HashMap<String, (String, u64)>,
     result_call_order: VecDeque<String>,
@@ -510,10 +521,12 @@ impl CommandExecutionLedger {
             thread_id,
             cwd: cwd.to_path_buf(),
         };
+        let workspace_identity_hash = workspace_identity_hash(&workspace_identity);
         let ledger = Self {
             state: Mutex::new(CommandExecutionState {
                 repository: CommandRepositoryState {
                     observed_workspace_identity: Some((0, workspace_identity.clone())),
+                    observed_workspace_identity_hash: Some((0, workspace_identity_hash.clone())),
                     ..CommandRepositoryState::default()
                 },
                 ..CommandExecutionState::default()
@@ -529,6 +542,8 @@ impl CommandExecutionLedger {
             state.repository.epoch = document.repository_epoch;
             state.repository.observed_workspace_identity =
                 Some((document.repository_epoch, workspace_identity));
+            state.repository.observed_workspace_identity_hash =
+                Some((document.repository_epoch, workspace_identity_hash));
             for search_miss in document
                 .search_misses
                 .into_iter()
@@ -656,16 +671,43 @@ impl CommandExecutionLedger {
         &self,
         key: &ValidationProofKey,
     ) -> Option<ValidationResult> {
-        let mut proof = {
+        let (mut proof, superseded_keys) = {
             let mut state = self.state.lock().await;
-            supersede_validation_proofs_for_new_implementation(&mut state, key);
-            state.validation.completed.get(key).cloned()
+            let superseded_keys =
+                supersede_validation_proofs_for_new_implementation(&mut state, key);
+            (
+                state.validation.completed.get(key).cloned(),
+                superseded_keys,
+            )
         };
+        for superseded_key in superseded_keys {
+            if let Err(error) = self.remove_shared_validation(&superseded_key).await {
+                tracing::warn!(
+                    %error,
+                    "failed to persist superseded validation proof invalidation"
+                );
+            }
+        }
         if proof.is_none() {
             self.refresh_shared_validation_cache().await;
-            let mut state = self.state.lock().await;
-            supersede_validation_proofs_for_new_implementation(&mut state, key);
-            proof = state.validation.completed.get(key).cloned();
+            let (refreshed_proof, superseded_keys) = {
+                let mut state = self.state.lock().await;
+                let superseded_keys =
+                    supersede_validation_proofs_for_new_implementation(&mut state, key);
+                (
+                    state.validation.completed.get(key).cloned(),
+                    superseded_keys,
+                )
+            };
+            proof = refreshed_proof;
+            for superseded_key in superseded_keys {
+                if let Err(error) = self.remove_shared_validation(&superseded_key).await {
+                    tracing::warn!(
+                        %error,
+                        "failed to persist superseded validation proof invalidation"
+                    );
+                }
+            }
         }
         let proof = proof?;
         let Some((artifact_ref, artifact_sha256)) = proof.artifact.validation_integrity().await
@@ -692,8 +734,14 @@ impl CommandExecutionLedger {
                 .validation
                 .completed_order
                 .retain(|entry| entry != key);
+            mark_validation_invalidated(&mut state.validation, key.clone());
         }
-        self.remove_shared_validation(key).await;
+        if let Err(error) = self.remove_shared_validation(key).await {
+            tracing::warn!(
+                %error,
+                "failed to persist invalid validation proof tombstone"
+            );
+        }
     }
 
     async fn refresh_shared_validation_cache(&self) {
@@ -711,6 +759,14 @@ impl CommandExecutionLedger {
             return;
         }
         let mut state = self.state.lock().await;
+        for invalidated in document.invalidated_validations {
+            state.validation.completed.remove(&invalidated);
+            state
+                .validation
+                .completed_order
+                .retain(|entry| entry != &invalidated);
+            mark_validation_invalidated(&mut state.validation, invalidated);
+        }
         restore_persisted_validations(
             &mut state,
             &persistence.codex_home,
@@ -719,67 +775,26 @@ impl CommandExecutionLedger {
         );
     }
 
-    async fn persist_shared_validation(&self, proof: PersistedValidationProof) {
+    async fn persist_shared_validation(&self, proof: PersistedValidationProof) -> io::Result<()> {
         let Some(persistence) = self.persistence.as_ref() else {
-            return;
+            return Ok(());
         };
-        let Ok(_permit) = shared_validation_cache_write_gate().acquire().await else {
-            return;
-        };
-        let mut proofs = tokio::fs::read(&persistence.shared_validation_cache_path)
-            .await
-            .ok()
-            .and_then(|bytes| {
-                serde_json::from_slice::<PersistedValidationCacheDocument>(&bytes).ok()
-            })
-            .filter(|document| document.schema_version == COMMAND_EXECUTION_CACHE_SCHEMA_VERSION)
-            .map(|document| document.completed_validations)
-            .unwrap_or_default();
-        proofs.retain(|candidate| {
-            candidate.result.status == ValidationTerminalStatus::Succeeded
-                && candidate.result.proof_key != proof.result.proof_key
-        });
-        proofs.push(proof);
-        let excess = proofs.len().saturating_sub(MAX_COMPLETED_VALIDATION_PROOFS);
-        proofs.drain(..excess);
-        let document = PersistedValidationCacheDocument {
-            schema_version: COMMAND_EXECUTION_CACHE_SCHEMA_VERSION,
-            completed_validations: proofs,
-        };
-        let Ok(bytes) = serde_json::to_vec_pretty(&document) else {
-            return;
-        };
-        write_cache_document(persistence.shared_validation_cache_path.clone(), bytes).await;
+        update_shared_validation_cache(
+            persistence.shared_validation_cache_path.clone(),
+            SharedValidationCacheUpdate::Persist(Box::new(proof)),
+        )
+        .await
     }
 
-    async fn remove_shared_validation(&self, key: &ValidationProofKey) {
+    async fn remove_shared_validation(&self, key: &ValidationProofKey) -> io::Result<()> {
         let Some(persistence) = self.persistence.as_ref() else {
-            return;
+            return Ok(());
         };
-        let Ok(_permit) = shared_validation_cache_write_gate().acquire().await else {
-            return;
-        };
-        let Ok(bytes) = tokio::fs::read(&persistence.shared_validation_cache_path).await else {
-            return;
-        };
-        let Ok(mut document) = serde_json::from_slice::<PersistedValidationCacheDocument>(&bytes)
-        else {
-            return;
-        };
-        if document.schema_version != COMMAND_EXECUTION_CACHE_SCHEMA_VERSION {
-            return;
-        }
-        let previous_len = document.completed_validations.len();
-        document
-            .completed_validations
-            .retain(|proof| proof.result.proof_key != *key);
-        if document.completed_validations.len() == previous_len {
-            return;
-        }
-        let Ok(bytes) = serde_json::to_vec_pretty(&document) else {
-            return;
-        };
-        write_cache_document(persistence.shared_validation_cache_path.clone(), bytes).await;
+        update_shared_validation_cache(
+            persistence.shared_validation_cache_path.clone(),
+            SharedValidationCacheUpdate::Invalidate(key.clone()),
+        )
+        .await
     }
 
     pub(crate) async fn validation_result_for_call(
@@ -856,6 +871,7 @@ impl CommandExecutionLedger {
                 .and_then(|(_, identity)| identity.repository_root.clone());
             if refresh_workspace_identity {
                 state.repository.observed_workspace_identity = None;
+                state.repository.observed_workspace_identity_hash = None;
             }
             (
                 repository_epoch,
@@ -886,12 +902,15 @@ impl CommandExecutionLedger {
                 workspace_identity
             }
         };
+        let workspace_identity_hash = workspace_identity_hash(&workspace_identity);
         let mut state = self.state.lock().await;
         if state.repository.epoch == repository_epoch
             && state.repository.observed_workspace_identity.is_none()
         {
             state.repository.observed_workspace_identity =
                 Some((repository_epoch, workspace_identity));
+            state.repository.observed_workspace_identity_hash =
+                Some((repository_epoch, workspace_identity_hash));
         }
         state.repository.epoch
     }
@@ -907,12 +926,11 @@ impl CommandExecutionLedger {
             return None;
         }
         let state = self.state.lock().await;
-        let (epoch, identity) = state.repository.observed_workspace_identity.as_ref()?;
+        let (epoch, identity_hash) = state.repository.observed_workspace_identity_hash.as_ref()?;
         if *epoch != state.repository.epoch {
             return None;
         }
-        let bytes = serde_json::to_vec(identity).ok()?;
-        Some(format!("{:x}", Sha256::digest(bytes)))
+        Some(identity_hash.clone())
     }
 
     #[cfg(test)]
@@ -948,7 +966,7 @@ impl CommandExecutionLedger {
                 && state.search.misses.contains(&search_miss_key)
             {
                 return Err(CommandAttemptBlocked {
-                    fingerprint: format!("{:016x}", fingerprint_value(&search_miss_key)),
+                    fingerprint: fingerprint_value(&search_miss_key),
                     reason: CommandAttemptBlockedReason::SearchMiss,
                 });
             }
@@ -989,7 +1007,7 @@ impl CommandExecutionLedger {
         process_id: u32,
         key: CommandAttemptKey,
         artifact: RawOutputArtifact,
-    ) {
+    ) -> Result<(), String> {
         let execution_id = self.allocate_execution_id();
         self.track_running_process_with_execution_id(
             execution_id,
@@ -1000,7 +1018,7 @@ impl CommandExecutionLedger {
             None,
             Instant::now(),
         )
-        .await;
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1012,7 +1030,7 @@ impl CommandExecutionLedger {
         artifact: RawOutputArtifact,
         validation_launch: Option<ValidationLaunchPlan>,
         started_at: Instant,
-    ) {
+    ) -> Result<(), String> {
         let execution_id = self.allocate_execution_id();
         self.track_running_process_with_execution_id(
             execution_id,
@@ -1023,7 +1041,7 @@ impl CommandExecutionLedger {
             validation_launch,
             started_at,
         )
-        .await;
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1036,12 +1054,14 @@ impl CommandExecutionLedger {
         artifact: RawOutputArtifact,
         validation_launch: Option<ValidationLaunchPlan>,
         started_at: Instant,
-    ) {
+    ) -> Result<(), String> {
         let mut state = self.state.lock().await;
         debug_assert_command_execution_invariants(&state);
         if state.process.running.contains_key(&process_id) {
             tracing::error!(process_id, "refusing to replace live command bookkeeping");
-            return;
+            return Err(format!(
+                "process id {process_id} already has live command bookkeeping"
+            ));
         }
         state.process.running.insert(
             process_id,
@@ -1056,6 +1076,7 @@ impl CommandExecutionLedger {
             },
         );
         debug_assert_command_execution_invariants(&state);
+        Ok(())
     }
 
     pub(crate) async fn running_process(&self, process_id: u32) -> Option<RunningCommand> {
@@ -1145,7 +1166,9 @@ impl CommandExecutionLedger {
         let Ok(bytes) = serde_json::to_vec_pretty(&document) else {
             return;
         };
-        write_cache_document(persistence.cache_path, bytes).await;
+        if let Err(error) = write_cache_document(persistence.cache_path, bytes).await {
+            tracing::warn!(%error, "failed to persist command execution cache");
+        }
     }
 
     async fn forget_turn_repository_revision(&self, turn_id: &str) {
@@ -1470,14 +1493,18 @@ impl CommandExecutionLedger {
         else {
             return false;
         };
-        let selected_test_count = validation_route_is_test(&route)
-            .then(|| selected_test_count(&retained_output))
-            .flatten();
+        let selected_test_evidence = selected_test_evidence(&route, &retained_output);
+        let selected_test_count = match selected_test_evidence {
+            SelectedTestEvidence::Exact(count) => Some(count),
+            SelectedTestEvidence::NotATest
+            | SelectedTestEvidence::Missing
+            | SelectedTestEvidence::Ambiguous => None,
+        };
         let missing_selected_tests =
             completed_validation_skip_disposition(&route, &retained_output, exit_code)
                 == Some(codex_tools::ToolOutputSkipDisposition::NotApplicable);
-        let succeeded = exit_code == 0 && !missing_selected_tests;
-        let result = ValidationResult {
+        let mut succeeded = exit_code == 0 && !missing_selected_tests;
+        let mut result = ValidationResult {
             proof_key: proof_key.clone(),
             route,
             call_id: call_id.clone(),
@@ -1523,10 +1550,21 @@ impl CommandExecutionLedger {
             .as_ref()
             .map(|persistence| persistence.thread_id.clone())
             .unwrap_or_default();
-        let persisted_success = succeeded.then(|| PersistedValidationProof {
-            result: result.clone(),
-            artifact_thread_id: artifact_thread_id.clone(),
-        });
+        if succeeded
+            && let Err(error) = self
+                .persist_shared_validation(PersistedValidationProof {
+                    result: result.clone(),
+                    artifact_thread_id,
+                })
+                .await
+        {
+            succeeded = false;
+            result.status = ValidationTerminalStatus::Failed;
+            result.summary = Some("focused validation cache persistence failed".to_string());
+            result.failure_excerpt = Some(format!(
+                "validation completed but its reusable proof could not be durably persisted: {error}"
+            ));
+        }
         let result = Arc::new(result);
         {
             let mut state = self.state.lock().await;
@@ -1555,6 +1593,11 @@ impl CommandExecutionLedger {
                     .insert(call_id.clone(), bound_plan_step);
             }
             if succeeded && !state.validation.completed.contains_key(&proof_key) {
+                state.validation.invalidated.remove(&proof_key);
+                state
+                    .validation
+                    .invalidated_order
+                    .retain(|entry| entry != &proof_key);
                 while state.validation.completed.len() >= MAX_COMPLETED_VALIDATION_PROOFS {
                     let Some(oldest) = state.validation.completed_order.pop_front() else {
                         break;
@@ -1573,9 +1616,6 @@ impl CommandExecutionLedger {
                     },
                 );
             }
-        }
-        if let Some(persisted_success) = persisted_success {
-            self.persist_shared_validation(persisted_success).await;
         }
         if let Some(turn_timing_state) = turn_timing_state {
             turn_timing_state.record_executed_validation(duration_ms, force_fresh);
@@ -1880,21 +1920,73 @@ fn command_attempt_is_active(state: &CommandExecutionState, key: &CommandAttempt
         .any(|running| running.key == *key)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValidationTestRunner {
+    Cargo,
+    Nextest,
+    Wrapped,
+    Unverified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectedTestEvidence {
+    NotATest,
+    Exact(u64),
+    Missing,
+    Ambiguous,
+}
+
+fn validation_test_runner(route: &ValidationRoute) -> Option<ValidationTestRunner> {
+    let leaf = route.leaves.as_slice().first()?;
+    let [program, arguments @ ..] = leaf.argv.as_slice() else {
+        return None;
+    };
+    let program = normalized_executable_name(program);
+    match (program.as_str(), arguments) {
+        ("cargo", [subcommand, ..]) if subcommand == "test" => Some(ValidationTestRunner::Cargo),
+        ("cargo", [plugin, subcommand, ..]) if plugin == "nextest" && subcommand == "run" => {
+            Some(ValidationTestRunner::Nextest)
+        }
+        ("cargo-nextest", [subcommand, ..]) if subcommand == "run" => {
+            Some(ValidationTestRunner::Nextest)
+        }
+        ("just", [recipe, ..])
+            if matches!(
+                recipe.as_str(),
+                "test-fast" | "test-lane" | "test-lane-fast" | "test-lane-package"
+            ) =>
+        {
+            Some(ValidationTestRunner::Wrapped)
+        }
+        _ if leaf.argv.iter().any(|argument| test_intent_token(argument)) => {
+            Some(ValidationTestRunner::Unverified)
+        }
+        _ => None,
+    }
+}
+
 fn validation_route_is_test(route: &ValidationRoute) -> bool {
-    route.leaves.as_slice().first().is_some_and(|leaf| {
-        matches!(
-            leaf.argv.as_slice(),
-            [program, subcommand, ..] if program == "cargo" && subcommand == "test"
-        ) || matches!(
-            leaf.argv.as_slice(),
-            [program, recipe, ..]
-                if program == "just"
-                    && matches!(
-                        recipe.as_str(),
-                        "test-fast" | "test-lane" | "test-lane-fast" | "test-lane-package"
-                    )
-        )
-    })
+    validation_test_runner(route).is_some()
+}
+
+fn normalized_executable_name(program: &str) -> String {
+    let file_name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let normalized = file_name.to_ascii_lowercase();
+    normalized
+        .strip_suffix(".exe")
+        .unwrap_or(&normalized)
+        .to_string()
+}
+
+fn test_intent_token(argument: &str) -> bool {
+    let normalized = normalized_executable_name(argument);
+    matches!(
+        normalized.as_str(),
+        "test" | "tests" | "pytest" | "unittest" | "nextest"
+    ) || normalized.starts_with("test-")
+        || normalized.ends_with("-test")
+        || normalized.contains("-test-")
+        || normalized.starts_with("--test")
 }
 
 pub(crate) fn completed_validation_skip_disposition(
@@ -1904,7 +1996,10 @@ pub(crate) fn completed_validation_skip_disposition(
 ) -> Option<codex_tools::ToolOutputSkipDisposition> {
     (exit_code == 0
         && validation_route_is_test(route)
-        && selected_test_count(output).is_none_or(|count| count == 0))
+        && !matches!(
+            selected_test_evidence(route, output),
+            SelectedTestEvidence::Exact(1..)
+        ))
     .then_some(codex_tools::ToolOutputSkipDisposition::NotApplicable)
 }
 
@@ -1937,6 +2032,7 @@ fn restore_persisted_validations(
     for persisted in persisted_validations.into_iter().skip(skip) {
         let result = Arc::new(persisted.result);
         if result.status != ValidationTerminalStatus::Succeeded
+            || state.validation.invalidated.contains(&result.proof_key)
             || state.validation.completed.contains_key(&result.proof_key)
         {
             continue;
@@ -1996,32 +2092,142 @@ fn restore_persisted_validations(
     }
 }
 
-fn shared_validation_cache_write_gate() -> &'static Semaphore {
-    static WRITE_GATE: std::sync::OnceLock<Semaphore> = std::sync::OnceLock::new();
-    WRITE_GATE.get_or_init(|| Semaphore::new(1))
+enum SharedValidationCacheUpdate {
+    Persist(Box<PersistedValidationProof>),
+    Invalidate(ValidationProofKey),
 }
 
-async fn write_cache_document(cache_path: PathBuf, bytes: Vec<u8>) {
-    let _ = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+async fn update_shared_validation_cache(
+    cache_path: PathBuf,
+    update: SharedValidationCacheUpdate,
+) -> io::Result<()> {
+    tokio::task::spawn_blocking(move || {
         let Some(parent) = cache_path.parent() else {
-            return Err(std::io::Error::other("command cache path has no parent"));
+            return Err(io::Error::other("validation cache path has no parent"));
         };
         std::fs::create_dir_all(parent)?;
-        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-        temporary.write_all(&bytes)?;
-        temporary.as_file().sync_all()?;
-        temporary
-            .persist(&cache_path)
-            .map_err(|error| error.error)?;
+        let lock_path = cache_path.with_extension("lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_path)?;
+        lock_file.lock()?;
+
+        let mut document = match std::fs::read(&cache_path) {
+            Ok(bytes) => serde_json::from_slice::<PersistedValidationCacheDocument>(&bytes)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                PersistedValidationCacheDocument {
+                    schema_version: COMMAND_EXECUTION_CACHE_SCHEMA_VERSION,
+                    completed_validations: Vec::new(),
+                    invalidated_validations: Vec::new(),
+                }
+            }
+            Err(error) => return Err(error),
+        };
+        if document.schema_version != COMMAND_EXECUTION_CACHE_SCHEMA_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported validation cache schema version {}",
+                    document.schema_version
+                ),
+            ));
+        }
+
+        match update {
+            SharedValidationCacheUpdate::Persist(proof) => {
+                let proof = *proof;
+                document.completed_validations.retain(|candidate| {
+                    candidate.result.status == ValidationTerminalStatus::Succeeded
+                        && candidate.result.proof_key != proof.result.proof_key
+                });
+                document
+                    .invalidated_validations
+                    .retain(|key| key != &proof.result.proof_key);
+                document.completed_validations.push(proof);
+                let excess = document
+                    .completed_validations
+                    .len()
+                    .saturating_sub(MAX_COMPLETED_VALIDATION_PROOFS);
+                document.completed_validations.drain(..excess);
+            }
+            SharedValidationCacheUpdate::Invalidate(key) => {
+                document
+                    .completed_validations
+                    .retain(|proof| proof.result.proof_key != key);
+                document
+                    .invalidated_validations
+                    .retain(|candidate| candidate != &key);
+                document.invalidated_validations.push(key);
+                let excess = document
+                    .invalidated_validations
+                    .len()
+                    .saturating_sub(MAX_COMPLETED_VALIDATION_PROOFS);
+                document.invalidated_validations.drain(..excess);
+            }
+        }
+
+        let bytes = serde_json::to_vec_pretty(&document)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let _commit = write_cache_document_blocking(&cache_path, &bytes)?;
+        lock_file.unlock()?;
         Ok(())
     })
-    .await;
+    .await
+    .map_err(|error| io::Error::other(format!("validation cache task failed: {error}")))?
+}
+
+async fn write_cache_document(cache_path: PathBuf, bytes: Vec<u8>) -> io::Result<()> {
+    let _commit =
+        tokio::task::spawn_blocking(move || write_cache_document_blocking(&cache_path, &bytes))
+            .await
+            .map_err(|error| io::Error::other(format!("command cache task failed: {error}")))??;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DurableCacheCommit;
+
+fn write_cache_document_blocking(
+    cache_path: &Path,
+    bytes: &[u8],
+) -> io::Result<DurableCacheCommit> {
+    let Some(parent) = cache_path.parent() else {
+        return Err(io::Error::other("command cache path has no parent"));
+    };
+    std::fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(cache_path).map_err(|error| error.error)?;
+    sync_cache_parent(parent)?;
+    Ok(DurableCacheCommit)
+}
+
+#[cfg(windows)]
+fn sync_cache_parent(parent: &Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(parent)?
+        .sync_all()
+}
+
+#[cfg(not(windows))]
+fn sync_cache_parent(parent: &Path) -> io::Result<()> {
+    std::fs::File::open(parent)?.sync_all()
 }
 
 fn supersede_validation_proofs_for_new_implementation(
     state: &mut CommandExecutionState,
     requested: &ValidationProofKey,
-) {
+) -> Vec<ValidationProofKey> {
     let superseded_keys = state
         .validation
         .completed
@@ -2040,14 +2246,15 @@ fn supersede_validation_proofs_for_new_implementation(
         .cloned()
         .collect::<Vec<_>>();
 
-    for superseded_key in superseded_keys {
-        let Some(proof) = state.validation.completed.remove(&superseded_key) else {
+    for superseded_key in &superseded_keys {
+        let Some(proof) = state.validation.completed.remove(superseded_key) else {
             continue;
         };
         state
             .validation
             .completed_order
-            .retain(|entry| entry != &superseded_key);
+            .retain(|entry| entry != superseded_key);
+        mark_validation_invalidated(&mut state.validation, superseded_key.clone());
         let Some(result) = state
             .validation
             .results_by_call
@@ -2063,26 +2270,117 @@ fn supersede_validation_proofs_for_new_implementation(
             requested.implementation_identity
         ));
     }
+    superseded_keys
 }
 
-fn selected_test_count(output: &[u8]) -> Option<u64> {
+fn mark_validation_invalidated(validation: &mut CommandValidationState, key: ValidationProofKey) {
+    if validation.invalidated.insert(key.clone()) {
+        validation.invalidated_order.push_back(key);
+    }
+    while validation.invalidated.len() > MAX_COMPLETED_VALIDATION_PROOFS {
+        let Some(oldest) = validation.invalidated_order.pop_front() else {
+            break;
+        };
+        validation.invalidated.remove(&oldest);
+    }
+}
+
+fn selected_test_evidence(route: &ValidationRoute, output: &[u8]) -> SelectedTestEvidence {
+    let Some(runner) = validation_test_runner(route) else {
+        return SelectedTestEvidence::NotATest;
+    };
+    let cargo = cargo_selected_test_count(output);
+    let nextest = nextest_selected_test_count(output);
+    match runner {
+        ValidationTestRunner::Cargo => {
+            cargo.map_or(SelectedTestEvidence::Missing, SelectedTestEvidence::Exact)
+        }
+        ValidationTestRunner::Nextest => {
+            nextest.map_or(SelectedTestEvidence::Missing, SelectedTestEvidence::Exact)
+        }
+        ValidationTestRunner::Wrapped => match (cargo, nextest) {
+            (Some(count), None) | (None, Some(count)) => SelectedTestEvidence::Exact(count),
+            (Some(_), Some(_)) => SelectedTestEvidence::Ambiguous,
+            (None, None) => SelectedTestEvidence::Missing,
+        },
+        ValidationTestRunner::Unverified => SelectedTestEvidence::Missing,
+    }
+}
+
+fn cargo_selected_test_count(output: &[u8]) -> Option<u64> {
     let output = String::from_utf8_lossy(output);
-    let cargo_count = output.lines().filter_map(|line| {
-        line.trim()
-            .strip_prefix("running ")
-            .and_then(|summary| summary.split_whitespace().next())
-            .and_then(|count| count.parse::<u64>().ok())
-    });
-    let nextest_count = output.lines().filter_map(|line| {
-        let words = line.split_whitespace().collect::<Vec<_>>();
-        words.windows(3).find_map(|window| {
-            matches!(window[1], "test" | "tests")
-                .then(|| window[0].parse::<u64>().ok())
-                .flatten()
-                .filter(|_| window[2].starts_with("run"))
+    let running = output
+        .lines()
+        .filter_map(parse_cargo_running_line)
+        .collect::<Vec<_>>();
+    let results = output
+        .lines()
+        .filter_map(parse_cargo_result_line)
+        .collect::<Vec<_>>();
+    (!running.is_empty()
+        && running.len() == results.len()
+        && running
+            .iter()
+            .zip(&results)
+            .all(|(left, right)| left == right))
+    .then(|| running.into_iter().sum())
+}
+
+fn parse_cargo_running_line(line: &str) -> Option<u64> {
+    let words = line.split_whitespace().collect::<Vec<_>>();
+    match words.as_slice() {
+        ["running", count, "test" | "tests"] => count.parse().ok(),
+        _ => None,
+    }
+}
+
+fn parse_cargo_result_line(line: &str) -> Option<u64> {
+    let summary = line.trim().strip_prefix("test result: ")?;
+    let (status, fields) = summary.split_once(". ")?;
+    if !matches!(status, "ok" | "FAILED") {
+        return None;
+    }
+    let mut passed = None;
+    let mut failed = None;
+    let mut ignored = 0;
+    let mut measured = 0;
+    for field in fields.split(';') {
+        let mut words = field.split_whitespace();
+        let Some(count) = words.next().and_then(|count| count.parse::<u64>().ok()) else {
+            continue;
+        };
+        match words.next()? {
+            "passed" => passed = Some(count),
+            "failed" => failed = Some(count),
+            "ignored" => ignored = count,
+            "measured" => measured = count,
+            _ => {}
+        }
+    }
+    Some(passed? + failed? + ignored + measured)
+}
+
+fn nextest_selected_test_count(output: &[u8]) -> Option<u64> {
+    let output = String::from_utf8_lossy(output);
+    let summaries = output
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if !line.starts_with("Summary [") {
+                return None;
+            }
+            let words = line.split_whitespace().collect::<Vec<_>>();
+            words.windows(3).find_map(|window| {
+                (matches!(window[1], "test" | "tests") && window[2] == "run:")
+                    .then(|| window[0].parse::<u64>().ok())
+                    .flatten()
+            })
         })
-    });
-    cargo_count.chain(nextest_count).max()
+        .collect::<Vec<_>>();
+    match summaries.as_slice() {
+        [count] => Some(*count),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -2165,6 +2463,273 @@ mod tests {
             .status()
             .expect("launch git init");
         assert!(status.success(), "git init failed");
+    }
+
+    fn validation_route_with_argv(argv: &[&str]) -> ValidationRoute {
+        let mut route = focused_cargo_route();
+        route.leaves[0].argv = argv
+            .iter()
+            .map(|argument| (*argument).to_string())
+            .collect();
+        route
+    }
+
+    const AUDIT_CARGO_SUCCESS: &[u8] = b"running 1 test\n\
+test focused_case ... ok\n\
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
+
+    #[test]
+    fn audit_validation_execution_rejects_mixed_runner_count_evidence() {
+        let route = validation_route_with_argv(&["just", "test-fast"]);
+        let output = b"running 2 tests\n\
+test first ... ok\n\
+test second ... ok\n\
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n\
+Summary [ 0.10s] 7 tests run: 7 passed, 0 skipped\n";
+
+        assert_eq!(
+            selected_test_evidence(&route, output),
+            SelectedTestEvidence::Ambiguous
+        );
+        assert_eq!(
+            completed_validation_skip_disposition(&route, output, 0),
+            Some(codex_tools::ToolOutputSkipDisposition::NotApplicable)
+        );
+    }
+
+    #[test]
+    fn audit_validation_execution_sums_disjoint_cargo_suites() {
+        let output = b"running 1 test\n\
+test first ... ok\n\
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n\
+running 2 tests\n\
+test second ... ok\n\
+test third ... ok\n\
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
+
+        assert_eq!(
+            selected_test_evidence(&focused_cargo_route(), output),
+            SelectedTestEvidence::Exact(3)
+        );
+    }
+
+    #[test]
+    fn audit_validation_execution_normalizes_windows_runner_paths() {
+        for program in ["cargo.exe", r"C:\\Rust\\bin\\cargo.exe"] {
+            let route = validation_route_with_argv(&[program, "test", "focused_case"]);
+            assert_eq!(
+                selected_test_evidence(&route, AUDIT_CARGO_SUCCESS),
+                SelectedTestEvidence::Exact(1)
+            );
+        }
+        let just_route = validation_route_with_argv(&["C:/tools/just.exe", "test-fast"]);
+        assert_eq!(
+            selected_test_evidence(&just_route, AUDIT_CARGO_SUCCESS),
+            SelectedTestEvidence::Exact(1)
+        );
+    }
+
+    #[test]
+    fn audit_validation_execution_rejects_free_form_count_phrases() {
+        let output = b"application log: starting\nrunning 12 tests\napplication log: complete\n";
+
+        assert_eq!(
+            selected_test_evidence(&focused_cargo_route(), output),
+            SelectedTestEvidence::Missing
+        );
+        assert_eq!(
+            completed_validation_skip_disposition(&focused_cargo_route(), output, 0),
+            Some(codex_tools::ToolOutputSkipDisposition::NotApplicable)
+        );
+    }
+
+    #[test]
+    fn audit_validation_execution_unverified_test_runner_cannot_succeed() {
+        let route = validation_route_with_argv(&["custom-test-runner", "focused_case"]);
+
+        assert!(validation_route_is_test(&route));
+        assert_eq!(
+            selected_test_evidence(&route, b"all checks passed\n"),
+            SelectedTestEvidence::Missing
+        );
+        assert_eq!(
+            completed_validation_skip_disposition(&route, b"all checks passed\n", 0),
+            Some(codex_tools::ToolOutputSkipDisposition::NotApplicable)
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_validation_execution_shared_cache_uses_os_file_lock() {
+        let temp = tempfile::tempdir().expect("cache fixture");
+        let cache_path = temp.path().join("cache").join("validation.json");
+        std::fs::create_dir_all(cache_path.parent().expect("cache parent"))
+            .expect("create cache parent");
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(cache_path.with_extension("lock"))
+            .expect("open validation cache lock");
+        lock_file.lock().expect("hold validation cache lock");
+
+        let key = validation_proof_key("locked-update");
+        let update = tokio::spawn(update_shared_validation_cache(
+            cache_path.clone(),
+            SharedValidationCacheUpdate::Invalidate(key.clone()),
+        ));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !update.is_finished(),
+            "cache update must wait for a lock held outside its task"
+        );
+        lock_file.unlock().expect("release validation cache lock");
+        update
+            .await
+            .expect("join cache update")
+            .expect("cache update");
+
+        let document: PersistedValidationCacheDocument =
+            serde_json::from_slice(&std::fs::read(cache_path).expect("read validation cache"))
+                .expect("parse validation cache");
+        assert_eq!(document.invalidated_validations, vec![key]);
+    }
+
+    #[tokio::test]
+    async fn audit_validation_execution_tombstone_blocks_stale_reimport() {
+        let temp = tempfile::tempdir().expect("cache fixture");
+        let repository = temp.path().join("repo");
+        let codex_home = temp.path().join("codex-home");
+        initialize_git_repository(&repository);
+        let ledger = CommandExecutionLedger::load_or_new(
+            codex_home.clone(),
+            "tombstone-producer".to_string(),
+            &repository,
+        )
+        .await;
+        let old_key = validation_proof_key("tombstoned-old");
+        let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
+            &codex_home,
+            "tombstone-producer",
+            AUDIT_CARGO_SUCCESS,
+        )
+        .await;
+        assert!(
+            ledger
+                .publish_completed_validation(
+                    old_key.clone(),
+                    focused_cargo_route(),
+                    "tombstone-call".to_string(),
+                    artifact,
+                    Instant::now(),
+                    0,
+                    None,
+                )
+                .await
+        );
+        let cache_path = ledger
+            .persistence
+            .as_ref()
+            .expect("persistent ledger")
+            .shared_validation_cache_path
+            .clone();
+        let original: PersistedValidationCacheDocument = serde_json::from_slice(
+            &std::fs::read(&cache_path).expect("read original validation cache"),
+        )
+        .expect("parse original validation cache");
+        let stale_proof = original.completed_validations[0].clone();
+
+        let mut current_key = old_key.clone();
+        current_key.implementation_identity = "tombstoned-current".to_string();
+        assert!(ledger.reusable_validation(&current_key).await.is_none());
+        let mut tombstoned: PersistedValidationCacheDocument = serde_json::from_slice(
+            &std::fs::read(&cache_path).expect("read tombstoned validation cache"),
+        )
+        .expect("parse tombstoned validation cache");
+        assert_eq!(tombstoned.invalidated_validations, vec![old_key.clone()]);
+        tombstoned.completed_validations.push(stale_proof);
+        let bytes = serde_json::to_vec_pretty(&tombstoned).expect("serialize stale cache state");
+        write_cache_document_blocking(&cache_path, &bytes).expect("inject stale cache record");
+        drop(ledger);
+
+        let reopened = CommandExecutionLedger::load_or_new(
+            codex_home,
+            "tombstone-consumer".to_string(),
+            &repository,
+        )
+        .await;
+        assert!(reopened.reusable_validation(&old_key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn audit_validation_execution_cache_write_failure_is_reported() {
+        let temp = tempfile::tempdir().expect("cache fixture");
+        let repository = temp.path().join("repo");
+        let codex_home = temp.path().join("codex-home");
+        initialize_git_repository(&repository);
+        let ledger = CommandExecutionLedger::load_or_new(
+            codex_home.clone(),
+            "persistence-failure".to_string(),
+            &repository,
+        )
+        .await;
+        let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
+            &codex_home,
+            "persistence-failure",
+            AUDIT_CARGO_SUCCESS,
+        )
+        .await;
+        let cache_parent = ledger
+            .persistence
+            .as_ref()
+            .expect("persistent ledger")
+            .shared_validation_cache_path
+            .parent()
+            .expect("cache parent")
+            .to_path_buf();
+        if cache_parent.exists() {
+            std::fs::remove_dir_all(&cache_parent).expect("remove cache directory fixture");
+        }
+        std::fs::write(&cache_parent, b"not a directory").expect("block cache directory creation");
+
+        let proof_key = validation_proof_key("persistence-failure");
+        assert!(
+            ledger
+                .publish_completed_validation(
+                    proof_key.clone(),
+                    focused_cargo_route(),
+                    "persistence-failure-call".to_string(),
+                    artifact,
+                    Instant::now(),
+                    0,
+                    None,
+                )
+                .await
+        );
+        let result = ledger
+            .validation_result_for_call("persistence-failure-call")
+            .await
+            .expect("failed validation result");
+        assert_eq!(result.status, ValidationTerminalStatus::Failed);
+        assert!(
+            result
+                .summary
+                .as_deref()
+                .is_some_and(|summary| summary.contains("persistence failed"))
+        );
+        assert!(ledger.reusable_validation(&proof_key).await.is_none());
+    }
+
+    #[test]
+    fn audit_validation_execution_cache_commit_syncs_parent() {
+        let temp = tempfile::tempdir().expect("cache fixture");
+        let cache_path = temp.path().join("cache").join("document.json");
+
+        let commit = write_cache_document_blocking(&cache_path, b"durable")
+            .expect("write and sync cache document");
+
+        assert_eq!(commit, DurableCacheCommit);
+        assert_eq!(std::fs::read(cache_path).expect("read cache"), b"durable");
     }
 
     #[tokio::test]
@@ -2284,7 +2849,7 @@ mod tests {
         let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
             &codex_home,
             thread_id,
-            b"running 1 test\ntest persisted_case ... ok\n",
+            b"running 1 test\ntest persisted_case ... ok\ntest result: ok. 1 passed; 0 failed\n",
         )
         .await;
         assert!(
@@ -2365,7 +2930,7 @@ mod tests {
         let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
             &codex_home,
             "producer-thread",
-            b"running 1 test\ntest cross_thread_case ... ok\n",
+            b"running 1 test\ntest cross_thread_case ... ok\ntest result: ok. 1 passed; 0 failed\n",
         )
         .await;
         assert!(
@@ -2451,7 +3016,7 @@ mod tests {
         let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
             &codex_home,
             producer_thread,
-            b"running 1 test\ntest focused_case ... ok\n",
+            b"running 1 test\ntest focused_case ... ok\ntest result: ok. 1 passed; 0 failed\n",
         )
         .await;
         assert!(
@@ -2510,7 +3075,7 @@ mod tests {
         let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
             temp.path(),
             "superseded-validation",
-            b"running 1 test\ntest focused_case ... ok\n",
+            b"running 1 test\ntest focused_case ... ok\ntest result: ok. 1 passed; 0 failed\n",
         )
         .await;
         assert!(
@@ -2577,7 +3142,7 @@ mod tests {
         let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
             &codex_home,
             thread_id,
-            b"running 1 test\ntest persisted_case ... ok\n",
+            b"running 1 test\ntest persisted_case ... ok\ntest result: ok. 1 passed; 0 failed\n",
         )
         .await;
         assert!(
@@ -2668,7 +3233,7 @@ mod tests {
         let selected_artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
             temp.path(),
             "selected-test",
-            b"running 1 test\ntest focused_case ... ok\n",
+            b"running 1 test\ntest focused_case ... ok\ntest result: ok. 1 passed; 0 failed\n",
         )
         .await;
         assert!(
@@ -2700,7 +3265,7 @@ mod tests {
         let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
             temp.path(),
             "telemetry-test",
-            b"running 1 test\ntest focused_case ... ok\n",
+            b"running 1 test\ntest focused_case ... ok\ntest result: ok. 1 passed; 0 failed\n",
         )
         .await;
         assert!(
@@ -2735,7 +3300,7 @@ mod tests {
         let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
             temp.path(),
             "bound-plan-step-test",
-            b"running 1 test\ntest focused_case ... ok\n",
+            b"running 1 test\ntest focused_case ... ok\ntest result: ok. 1 passed; 0 failed\n",
         )
         .await;
 
@@ -2981,7 +3546,8 @@ mod tests {
                 first,
                 RawOutputArtifact::unavailable("background search fixture"),
             )
-            .await;
+            .await
+            .expect("track running process");
         assert!(
             ledger
                 .mark_running_process_completed(42, 1)
@@ -3009,7 +3575,8 @@ mod tests {
                 None,
                 Instant::now(),
             )
-            .await;
+            .await
+            .expect("track first running process");
         assert_eq!(
             ledger
                 .mark_process_exited(42, first_id, &first_parent, 0)
@@ -3041,7 +3608,8 @@ mod tests {
                 None,
                 Instant::now(),
             )
-            .await;
+            .await
+            .expect("track second running process");
         assert_eq!(
             ledger
                 .mark_process_exited(42, first_id, &first_parent, 0)
@@ -3076,6 +3644,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_running_process_id_is_rejected_without_replacing_owner() {
+        let ledger = CommandExecutionLedger::default();
+        let first_id = ledger.allocate_execution_id();
+        let first_parent = ToolExecutionId("tool-execution-first".to_string());
+        let first_key = key("first");
+        ledger
+            .track_running_process_with_execution_id(
+                first_id,
+                first_parent.clone(),
+                42,
+                first_key.clone(),
+                RawOutputArtifact::unavailable("first"),
+                None,
+                Instant::now(),
+            )
+            .await
+            .expect("track first running process");
+
+        let second_id = ledger.allocate_execution_id();
+        let error = ledger
+            .track_running_process_with_execution_id(
+                second_id,
+                ToolExecutionId("tool-execution-second".to_string()),
+                42,
+                key("second"),
+                RawOutputArtifact::unavailable("second"),
+                None,
+                Instant::now(),
+            )
+            .await
+            .expect_err("a live process id must not be reassigned");
+
+        assert!(error.contains("process id 42"));
+        let running = ledger
+            .running_process(42)
+            .await
+            .expect("first owner remains");
+        assert_eq!(running.execution_id, first_id);
+        assert_eq!(running.parent_tool_execution_id, first_parent);
+        assert_eq!(running.key, first_key);
+    }
+
+    #[tokio::test]
     async fn exit_before_watcher_registration_is_observed_once() {
         let ledger = CommandExecutionLedger::default();
         let execution_id = ledger.allocate_execution_id();
@@ -3090,7 +3701,8 @@ mod tests {
                 None,
                 Instant::now(),
             )
-            .await;
+            .await
+            .expect("track running process");
         let exit = CancellationToken::new();
         exit.cancel();
 
@@ -3223,7 +3835,8 @@ mod tests {
                     bytes: 0,
                 },
             )
-            .await;
+            .await
+            .expect("track running process");
 
         assert!(
             ledger
@@ -3263,7 +3876,8 @@ mod tests {
                     command_key.clone(),
                     RawOutputArtifact::unavailable("fixture"),
                 )
-                .await;
+                .await
+                .expect("track running process");
         }
 
         let completed = ledger
@@ -3317,7 +3931,8 @@ mod tests {
                 Some(validation_launch()),
                 Instant::now() - Duration::from_millis(25),
             )
-            .await;
+            .await
+            .expect("track validation process");
 
         assert!(
             ledger
@@ -3362,7 +3977,8 @@ mod tests {
                 Some(validation_launch()),
                 Instant::now() - Duration::from_millis(25),
             )
-            .await;
+            .await
+            .expect("track validation process");
         ledger
             .update_running_artifact(43, finalized_artifact.clone())
             .await;
@@ -3401,7 +4017,8 @@ mod tests {
                 Some(validation_launch()),
                 Instant::now(),
             )
-            .await;
+            .await
+            .expect("track validation process");
 
         assert!(
             ledger
@@ -3422,6 +4039,14 @@ mod tests {
     }
 
     #[test]
+    fn persisted_command_fingerprint_is_versioned_and_stable() {
+        assert_eq!(
+            fingerprint_value("fixed"),
+            "v2:5728fd88252f0fa0389c2564eb565e93671ef99ac9678ed4c24f0c8343786617"
+        );
+    }
+
+    #[test]
     fn retry_identity_tracks_executed_command_and_execution_context() {
         let original = vec!["rg".to_string(), "--ignorecase".to_string()];
         let repaired = vec!["rg".to_string(), "--ignore-case".to_string()];
@@ -3436,6 +4061,15 @@ mod tests {
             .with_sandbox_context(&"workspace-write")
             .with_runtime_context(&"classic")
             .with_repository_epoch(1);
+        assert!(
+            base.command
+                .iter()
+                .all(|argument| !argument.starts_with('\0'))
+        );
+        assert_eq!(base.execution_context.len(), 5);
+        let replaced_runtime = base.clone().with_runtime_context(&"unified");
+        assert_eq!(replaced_runtime.execution_context.len(), 5);
+        assert_ne!(base.fingerprint(), replaced_runtime.fingerprint());
 
         let mut changed_execution = base.clone();
         changed_execution.command.push("src".to_string());
@@ -3465,6 +4099,293 @@ mod tests {
             base.fingerprint(),
             base.with_repository_epoch(2).fingerprint()
         );
+    }
+
+    #[test]
+    fn audit189_retry_identity_covers_every_semantic_dimension() {
+        let environment = HashMap::from([("LANG".to_string(), "en-US".to_string())]);
+        let search = RgSearchNarrowing {
+            breadth: RgSearchBreadth::Narrow,
+            query_identity: "needle".to_string(),
+            search_identity: "needle:src".to_string(),
+            scope_identity: "src".to_string(),
+            parent_scope_identity: Some("repo".to_string()),
+            can_record_miss: true,
+        };
+        let base = CommandAttemptKey::new(
+            "exec_command",
+            "local",
+            "C:/repo",
+            &["rg needle src".to_string()],
+        )
+        .with_executed_command(&["rg".to_string(), "needle".to_string(), "src".to_string()])
+        .with_environment(&environment)
+        .with_timeout_ms(Some(1_000))
+        .with_sandbox_context(&"workspace-write")
+        .with_permission_context(&"standard")
+        .with_input_context(&"closed")
+        .with_runtime_context(&"unified")
+        .with_repository_epoch(7)
+        .with_workspace_identity(Some("workspace-a"))
+        .with_search_narrowing("turn-a", "repo-a", Some(search.clone()));
+
+        let mut changed_tool = base.clone();
+        changed_tool.tool_name = "shell_command".to_string();
+        let mut changed_environment_id = base.clone();
+        changed_environment_id.environment_id = "sandbox-a".to_string();
+        let mut changed_cwd = base.clone();
+        changed_cwd.cwd = "C:/repo/subdir".to_string();
+        let variants = [
+            ("tool", changed_tool),
+            ("environment_id", changed_environment_id),
+            ("cwd", changed_cwd),
+            (
+                "executed_command",
+                base.clone().with_executed_command(&[
+                    "rg".to_string(),
+                    "other".to_string(),
+                    "src".to_string(),
+                ]),
+            ),
+            (
+                "environment",
+                base.clone()
+                    .with_environment(&HashMap::from([("LANG".to_string(), "de-DE".to_string())])),
+            ),
+            ("timeout", base.clone().with_timeout_ms(Some(2_000))),
+            ("sandbox", base.clone().with_sandbox_context(&"read-only")),
+            (
+                "permission",
+                base.clone().with_permission_context(&"elevated"),
+            ),
+            ("input", base.clone().with_input_context(&"interactive")),
+            ("runtime", base.clone().with_runtime_context(&"classic")),
+            ("repository_epoch", base.clone().with_repository_epoch(8)),
+            (
+                "workspace_identity",
+                base.clone().with_workspace_identity(Some("workspace-b")),
+            ),
+            (
+                "search_identity",
+                base.clone().with_search_narrowing(
+                    "turn-a",
+                    "repo-a",
+                    Some(RgSearchNarrowing {
+                        search_identity: "needle:tests".to_string(),
+                        scope_identity: "tests".to_string(),
+                        ..search
+                    }),
+                ),
+            ),
+        ];
+
+        for (dimension, variant) in variants {
+            assert_ne!(
+                base.fingerprint(),
+                variant.fingerprint(),
+                "{dimension} must participate in retry identity"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn audit189_production_binding_invalidates_ledger_reuse_after_covered_mutation() {
+        let temp = tempfile::tempdir().expect("validation binding fixture");
+        let repository = temp.path().join("repo");
+        let codex_home = temp.path().join("codex-home");
+        initialize_git_repository(&repository);
+        std::fs::write(repository.join("kd4_features.toml"), "# fixture\n")
+            .expect("KD4 marker writes");
+        std::fs::create_dir_all(repository.join("src")).expect("source directory creates");
+        std::fs::write(repository.join("src/covered.rs"), "before\n")
+            .expect("covered source writes");
+        let evidence = crate::task_evidence::TaskEvidenceLedger::load_or_new(
+            codex_home.clone(),
+            codex_protocol::ThreadId::new(),
+            &repository,
+        )
+        .await;
+        let route = ValidationRoute {
+            leaves: vec![codex_protocol::plan_tool::ValidationRouteLeaf {
+                argv: vec![
+                    "cargo".to_string(),
+                    "test".to_string(),
+                    "-p".to_string(),
+                    "fixture".to_string(),
+                    "covered_case".to_string(),
+                ],
+                uncertainty: "covered behavior remains correct".to_string(),
+                covered_paths: vec!["src/covered.rs".to_string()],
+                covered_contracts: vec!["covered-contract".to_string()],
+                timeout_ms: 30_000,
+                semantic_timeout: false,
+            }],
+            ordering: Default::default(),
+        };
+        let leaf = &route.leaves[0];
+        let invocation = crate::tools::handlers::command_shape::CommandInvocation::Argv {
+            program: leaf.argv[0].clone(),
+            args: leaf.argv[1..].to_vec(),
+        };
+        let implementation_identity = evidence
+            .direct_validation_implementation_binding_for_leaf(leaf)
+            .await
+            .expect("production implementation binding")
+            .0;
+        let proof_key = crate::validation_admission::validation_identity_with_scope(
+            repository.to_string_lossy().as_bytes(),
+            repository.to_string_lossy(),
+            &invocation,
+            "test-environment",
+            "test-toolchain",
+            "test-configuration",
+            implementation_identity,
+            &leaf.uncertainty,
+            &leaf.covered_paths,
+            &leaf.covered_contracts,
+        );
+        let ledger = CommandExecutionLedger::load_or_new(
+            codex_home.clone(),
+            "binding-producer".to_string(),
+            &repository,
+        )
+        .await;
+        let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
+            &codex_home,
+            "binding-producer",
+            AUDIT_CARGO_SUCCESS,
+        )
+        .await;
+        assert!(
+            ledger
+                .publish_completed_validation(
+                    proof_key.clone(),
+                    route.clone(),
+                    "binding-call".to_string(),
+                    artifact,
+                    Instant::now(),
+                    0,
+                    None,
+                )
+                .await
+        );
+        assert!(ledger.reusable_validation(&proof_key).await.is_some());
+
+        std::fs::write(repository.join("src/covered.rs"), "after\n")
+            .expect("covered source mutates");
+        let changed_implementation = evidence
+            .direct_validation_implementation_binding_for_leaf(leaf)
+            .await
+            .expect("changed production implementation binding")
+            .0;
+        let changed_key = crate::validation_admission::validation_identity_with_scope(
+            repository.to_string_lossy().as_bytes(),
+            repository.to_string_lossy(),
+            &invocation,
+            "test-environment",
+            "test-toolchain",
+            "test-configuration",
+            changed_implementation,
+            &leaf.uncertainty,
+            &leaf.covered_paths,
+            &leaf.covered_contracts,
+        );
+        assert_ne!(proof_key, changed_key);
+        assert!(ledger.reusable_validation(&changed_key).await.is_none());
+        assert!(ledger.reusable_validation(&proof_key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn audit189_rg_classifier_drives_narrowing_ledger_for_real_commands() {
+        use crate::shell::ShellType;
+        use crate::tools::handlers::command_search::classify_rg_search_narrowing;
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("codex-core is nested under the repository root");
+        let argv = |args: &[&str]| args.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let narrow_command = argv(&["rg", "-n", "needle with space", "codex-rs/core/src/tools"]);
+        let equivalent_command =
+            argv(&["rg", "-n", "needle with space", "./codex-rs/core/src/tools"]);
+        let broad_command = argv(&["rg", "-n", "needle with space", "."]);
+        let classify = |command: &[String], shell| {
+            classify_rg_search_narrowing(command, shell, root, root)
+                .expect("rg command classifies")
+                .expect("rg search is present")
+        };
+        let narrow_search = classify(&narrow_command, None);
+        let equivalent_search = classify(&equivalent_command, None);
+        assert_eq!(
+            narrow_search.search_identity,
+            equivalent_search.search_identity
+        );
+        let narrow = CommandAttemptKey::new(
+            "exec_command",
+            "local",
+            root.to_string_lossy(),
+            &narrow_command,
+        )
+        .with_repository_epoch(1)
+        .with_workspace_identity(Some("workspace-a"))
+        .with_search_narrowing("turn-a", "repo-a", Some(narrow_search));
+        let equivalent = CommandAttemptKey::new(
+            "exec_command",
+            "local",
+            root.to_string_lossy(),
+            &equivalent_command,
+        )
+        .with_repository_epoch(2)
+        .with_workspace_identity(Some("workspace-a"))
+        .with_search_narrowing("turn-b", "repo-a", Some(equivalent_search.clone()));
+        let changed_workspace = CommandAttemptKey::new(
+            "exec_command",
+            "local",
+            root.to_string_lossy(),
+            &equivalent_command,
+        )
+        .with_repository_epoch(2)
+        .with_workspace_identity(Some("workspace-b"))
+        .with_search_narrowing("turn-b", "repo-a", Some(equivalent_search));
+        let ledger = CommandExecutionLedger::default();
+        ledger.record_exit(&narrow, 1).await;
+        ledger
+            .begin_attempt(&equivalent, false)
+            .await
+            .expect_err("equivalent real rg miss is cached");
+        ledger
+            .begin_attempt(&changed_workspace, false)
+            .await
+            .expect("workspace identity mutation invalidates the real rg miss");
+
+        let compound_command = argv(&[
+            "pwsh",
+            "-NoProfile",
+            "-Command",
+            "rg -n 'needle with space' codex-rs/core/src/tools | Measure-Object",
+        ]);
+        let compound_search = classify(&compound_command, Some(ShellType::PowerShell));
+        assert!(!compound_search.can_record_miss);
+        let compound = CommandAttemptKey::new(
+            "exec_command",
+            "local",
+            root.to_string_lossy(),
+            &compound_command,
+        )
+        .with_search_narrowing("turn-c", "repo-a", Some(compound_search));
+        let broad = CommandAttemptKey::new(
+            "exec_command",
+            "local",
+            root.to_string_lossy(),
+            &broad_command,
+        )
+        .with_search_narrowing("turn-c", "repo-a", Some(classify(&broad_command, None)));
+        let compound_ledger = CommandExecutionLedger::default();
+        compound_ledger.record_exit(&compound, 1).await;
+        compound_ledger
+            .admit_search_narrowing(&broad)
+            .await
+            .expect_err("compound rg output cannot authorize repository-wide expansion");
     }
 
     #[tokio::test]
@@ -3506,10 +4427,15 @@ mod tests {
             1
         );
 
+        let identity_hash = workspace_identity_hash(&identity);
         let state = ledger.state.lock().await;
         assert_eq!(
             state.repository.observed_workspace_identity,
             Some((1, identity))
+        );
+        assert_eq!(
+            state.repository.observed_workspace_identity_hash,
+            Some((1, identity_hash))
         );
     }
 
@@ -3624,7 +4550,8 @@ mod tests {
         ledger.begin_attempt(&key, false).await.expect("attempt");
         ledger
             .track_running_process(42, key.clone(), RawOutputArtifact::unavailable("fixture"))
-            .await;
+            .await
+            .expect("track running process");
 
         assert!(ledger.finish_running_process(42, Some(-1)).await.accepted());
         assert!(
@@ -3651,7 +4578,8 @@ mod tests {
                     key.clone(),
                     RawOutputArtifact::unavailable("fixture"),
                 )
-                .await;
+                .await
+                .expect("track running process");
         }
         let replacement_key = keys.last().expect("replacement key");
         ledger
@@ -3664,7 +4592,8 @@ mod tests {
                 replacement_key.clone(),
                 RawOutputArtifact::unavailable("replacement fixture"),
             )
-            .await;
+            .await
+            .expect("track replacement process");
 
         assert!(ledger.running_process(0).await.is_some());
         assert_eq!(ledger.consecutive_failures(&keys[0]).await, 0);

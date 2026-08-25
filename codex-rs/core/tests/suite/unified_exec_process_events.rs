@@ -407,7 +407,7 @@ async fn exec_command_consumes_pushed_remote_process_events(
         .with_exec_server_url(exec_server_url)
         .with_config(|config| {
             config.project_doc_max_bytes = 0;
-            config.use_experimental_unified_exec_tool = true;
+            config.unified_exec_enabled = true;
             config
                 .features
                 .enable(Feature::UnifiedExec)

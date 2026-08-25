@@ -144,22 +144,33 @@ impl Respond for AgentJobsResponder {
 }
 
 fn decode_body_bytes(request: &wiremock::Request) -> Vec<u8> {
-    let Some(encoding) = request
+    let content_encoding = request
         .headers
         .get("content-encoding")
-        .and_then(|value| value.to_str().ok())
-    else {
-        return request.body.clone();
-    };
-    if encoding
-        .split(',')
-        .any(|entry| entry.trim().eq_ignore_ascii_case("zstd"))
-    {
-        zstd::stream::decode_all(std::io::Cursor::new(&request.body))
-            .unwrap_or_else(|_| request.body.clone())
+        .and_then(|value| value.to_str().ok());
+    decode_body_bytes_for_content_encoding(&request.body, content_encoding)
+        .expect("request body should decode according to content-encoding")
+}
+
+fn decode_body_bytes_for_content_encoding(
+    body: &[u8],
+    content_encoding: Option<&str>,
+) -> std::io::Result<Vec<u8>> {
+    if content_encoding.is_some_and(|encoding| {
+        encoding
+            .split(',')
+            .any(|entry| entry.trim().eq_ignore_ascii_case("zstd"))
+    }) {
+        zstd::stream::decode_all(std::io::Cursor::new(body))
     } else {
-        request.body.clone()
+        Ok(body.to_vec())
     }
+}
+
+#[test]
+fn decode_body_bytes_rejects_invalid_zstd() {
+    decode_body_bytes_for_content_encoding(b"not a zstd frame", Some("gzip, zstd"))
+        .expect_err("invalid zstd must not fall back to compressed bytes");
 }
 
 fn has_function_call_output(body: &Value) -> bool {
@@ -212,6 +223,65 @@ fn message_input_texts(body: &Value) -> Vec<String> {
 
 fn parse_simple_csv_line(line: &str) -> Vec<String> {
     line.split(',').map(str::to_string).collect()
+}
+
+fn parse_csv_records(input: &str) -> std::result::Result<Vec<Vec<String>>, &'static str> {
+    let mut records = Vec::new();
+    let mut record = Vec::new();
+    let mut field = String::new();
+    let mut chars = input.chars().peekable();
+    let mut in_quotes = false;
+    let mut closed_quote = false;
+
+    while let Some(ch) = chars.next() {
+        if in_quotes {
+            if ch == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    field.push('"');
+                } else {
+                    in_quotes = false;
+                    closed_quote = true;
+                }
+            } else {
+                field.push(ch);
+            }
+            continue;
+        }
+
+        match ch {
+            '"' if field.is_empty() && !closed_quote => in_quotes = true,
+            '"' => return Err("unexpected quote in unquoted CSV field"),
+            ',' => {
+                record.push(std::mem::take(&mut field));
+                closed_quote = false;
+            }
+            '\n' => {
+                record.push(std::mem::take(&mut field));
+                records.push(std::mem::take(&mut record));
+                closed_quote = false;
+            }
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                record.push(std::mem::take(&mut field));
+                records.push(std::mem::take(&mut record));
+                closed_quote = false;
+            }
+            _ if closed_quote => return Err("characters follow closing CSV quote"),
+            _ => field.push(ch),
+        }
+    }
+
+    if in_quotes {
+        return Err("unterminated quoted CSV field");
+    }
+    if !field.is_empty() || !record.is_empty() || closed_quote {
+        record.push(field);
+        records.push(record);
+    }
+    Ok(records)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -322,9 +392,63 @@ async fn spawn_agents_on_csv_runs_and_exports() -> Result<()> {
     }
 
     let output = fs::read_to_string(&output_path)?;
-    assert!(output.contains("result_json"));
-    assert!(output.contains("item_id"));
-    assert!(output.contains("\"item_id\""));
+    let records = parse_csv_records(&output).map_err(|error| anyhow::anyhow!(error))?;
+    assert_eq!(records.len(), 3, "header plus one record per input row");
+    assert_eq!(
+        records[0],
+        [
+            "path",
+            "area",
+            "job_id",
+            "item_id",
+            "row_index",
+            "source_id",
+            "status",
+            "attempt_count",
+            "last_error",
+            "result_json",
+            "reported_at",
+            "completed_at",
+        ]
+        .map(str::to_string)
+    );
+
+    let job_id = records[1][2].clone();
+    uuid::Uuid::parse_str(&job_id).expect("exported job_id should be a UUID");
+    let expected_rows = [
+        [
+            "file-1",
+            "test",
+            job_id.as_str(),
+            "row-1",
+            "0",
+            "",
+            "completed",
+            "1",
+            "",
+            r#"{"item_id":"row-1"}"#,
+        ],
+        [
+            "file-2",
+            "test",
+            job_id.as_str(),
+            "row-2",
+            "1",
+            "",
+            "completed",
+            "1",
+            "",
+            r#"{"item_id":"row-2"}"#,
+        ],
+    ];
+    for (record, expected) in records[1..].iter().zip(expected_rows) {
+        assert_eq!(record.len(), records[0].len());
+        assert_eq!(&record[..10], expected.as_slice());
+        chrono::DateTime::parse_from_rfc3339(&record[10])
+            .expect("reported_at should be an RFC 3339 timestamp");
+        chrono::DateTime::parse_from_rfc3339(&record[11])
+            .expect("completed_at should be an RFC 3339 timestamp");
+    }
     Ok(())
 }
 

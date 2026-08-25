@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import ast
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -24,6 +25,38 @@ def publish_source_text() -> str:
 
 
 class PublishLocalCodexSourceLayoutTest(unittest.TestCase):
+    def test_backup_pruning_rejects_unmarked_directory(self) -> None:
+        shell = powershell()
+        if shell is None:
+            self.skipTest("PowerShell is not available")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            backup = Path(temp_dir) / "codex-20000101T000000000Z.exe"
+            backup.write_bytes(b"unrelated")
+            command = r"""
+$tokens=$null; $errors=$null
+$ast=[Management.Automation.Language.Parser]::ParseFile(%s,[ref]$tokens,[ref]$errors)
+$fn=$ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Remove-OldCodexBackups'},$true)[0]
+Invoke-Expression $fn.Extent.Text
+try { Remove-OldCodexBackups -BackupDir %s -Keep 0; exit 9 } catch { }
+if (-not (Test-Path -LiteralPath %s -PathType Leaf)) { exit 10 }
+""" % (ps_single_quote(SCRIPT), ps_single_quote(Path(temp_dir)), ps_single_quote(backup))
+            completed = subprocess.run(
+                [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+                text=True, capture_output=True, check=False,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_audit_publish_noop_routing_change_requires_doctor(self) -> None:
+        publish_script = publish_source_text()
+        noop_branch = publish_script.split("if (-not $binaryChanged) {", 1)[1].split(
+            "$publishedCodeModeHost = $false", 1
+        )[0]
+
+        self.assertIn(
+            "if ($DoctorOnNoop -or $desktopRoutingResult.Changed)", noop_branch
+        )
+        self.assertIn("Invoke-DoctorForPublish -TargetPath $targetPath", noop_branch)
+
     def test_publish_test_helpers_are_shared_by_sibling_suites(self) -> None:
         helper_names = {"clean_env", "powershell", "ps_single_quote"}
         scripts_dir = Path(__file__).resolve().parent
@@ -68,7 +101,62 @@ class PublishLocalCodexSourceLayoutTest(unittest.TestCase):
         self.assertIn("LocalPublishContentHashCache", publish_script)
         self.assertIn("Get-CachedLocalPublishFileSha256", publish_script)
         self.assertIn("LastWriteTimeUtcTicks", publish_script)
-        self.assertIn("$before.Length -ne $after.Length", publish_script)
+        self.assertIn("$Before.Length -ne $after.Length", publish_script)
+
+    def test_cached_hash_reuses_verified_observation_without_nested_file_hash(self) -> None:
+        shell = powershell()
+        if shell is None:
+            self.skipTest("PowerShell is not available")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            payload = Path(temp_dir) / "payload with spaces.bin"
+            payload.write_bytes("héllo".encode())
+            command = rf"""
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile({ps_single_quote(SCRIPT)}, [ref]$tokens, [ref]$errors)
+if ($errors.Count -ne 0) {{ throw $errors[0].Message }}
+foreach ($name in @('Get-VerifiedFileHashObservation', 'Get-CachedLocalPublishFileSha256')) {{
+    $functionAst = @($ast.FindAll({{
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $name
+    }}, $true))
+    if ($functionAst.Count -ne 1) {{ throw "function $name was not found exactly once" }}
+    Invoke-Expression $functionAst[0].Extent.Text
+}}
+$script:LocalPublishContentHashCache = @{{}}
+function Test-Sha256Text {{ param($Value) return ([string]$Value) -cmatch '\A[0-9a-f]{{64}}\z' }}
+function Get-FileSha256 {{ throw 'nested hash helper must not be called' }}
+$first = Get-CachedLocalPublishFileSha256 -Path {ps_single_quote(payload)}
+$second = Get-CachedLocalPublishFileSha256 -Path {ps_single_quote(payload)}
+[pscustomobject]@{{ first = $first; second = $second }} | ConvertTo-Json -Compress
+"""
+            result = subprocess.run(
+                [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+                capture_output=True,
+                text=True,
+                timeout=RUN_TIMEOUT_SECONDS,
+                check=False,
+                creationflags=CREATE_NO_WINDOW,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = json.loads(result.stdout)
+        expected = hashlib.sha256("héllo".encode()).hexdigest()
+        self.assertEqual(output, {"first": expected, "second": expected})
+
+    def test_shutdown_waits_on_verified_handles_without_polling(self) -> None:
+        source = publish_source_text()
+        start = source.index("function Stop-RunningCodexTargetProcesses")
+        end = source.index("function Format-ProofValue", start)
+        function_source = source[start:end]
+
+        self.assertIn("$process.WaitForExit($remainingMilliseconds)", function_source)
+        self.assertNotIn("Start-Sleep -Milliseconds 200", function_source)
+        self.assertNotIn("while ((Get-Date) -lt $forceDeadline)", function_source)
 
     def test_build_input_snapshot_reuses_one_inventory_for_hash_and_newest_time(
         self,
@@ -356,6 +444,69 @@ if (-not $script:disposed) {{
             "validate-local-publish",
         ):
             self.assertNotIn(f"{recipe} *args:", justfile)
+
+    def test_final_publish_recipe_requires_doctor_on_noop_and_desktop_restart(
+        self,
+    ) -> None:
+        justfile = (SCRIPT.parent.parent / "justfile").read_text(encoding="utf-8")
+        recipe = justfile.split("publish-local-codex-final *args:", 1)[1].split(
+            "\n\n", 1
+        )[0]
+
+        self.assertIn("-RunDoctor -DoctorOnNoop", recipe)
+        self.assertIn("-RestartDesktop", recipe)
+
+    def test_requested_restart_rejects_unavailable_desktop(self) -> None:
+        shell = powershell()
+        if shell is None:
+            self.skipTest("PowerShell is not available")
+        command = rf"""
+. {ps_single_quote(SCRIPT)} -ImportOnly
+function Get-CodexDesktopExecutableProof {{ return '<missing>' }}
+try {{
+    Restart-CodexDesktop
+    throw 'expected unavailable Desktop restart to fail'
+}}
+catch {{
+    if ($_.Exception.Message -eq 'expected unavailable Desktop restart to fail') {{
+        throw
+    }}
+    $_.Exception.Message
+}}
+"""
+        result = subprocess.run(
+            [
+                shell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                command,
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=RUN_TIMEOUT_SECONDS,
+            creationflags=CREATE_NO_WINDOW,
+            env=clean_env(),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Codex Desktop is unavailable", result.stdout)
+
+    def test_noop_restart_failure_is_terminal_after_committed_publish(self) -> None:
+        publish_script = publish_source_text()
+        noop_branch = publish_script.split("if (-not $binaryChanged) {", 1)[1].split(
+            "$publishedCodeModeHost = $false", 1
+        )[0]
+
+        self.assertIn(
+            "Publish committed but Desktop restart failed", noop_branch
+        )
+        self.assertLess(
+            noop_branch.index("Publish committed but Desktop restart failed"),
+            noop_branch.index("exit 0"),
+        )
 
     def test_default_local_publish_target_is_not_openai_appdata_bin(self) -> None:
         publish_script = publish_source_text()

@@ -20,15 +20,58 @@ use crate::StoreError;
 use crate::StoreResult;
 use crate::WorkspaceActorKind;
 use crate::WorkspaceActorRegistration;
+use crate::WorkspaceCaptureMode;
 use crate::WorkspaceManifestEntry;
 use crate::WorkspaceRevision;
 use crate::scope::RepositoryIdentity;
 use crate::scope::absolute_repo_path;
+use crate::scope::filesystem_paths_equal;
 use crate::scope::normalize_repo_path;
+use crate::scope::path_comparison_key;
+use crate::scope::relative_path_identity;
 use crate::scope::repository_identity;
 
 /// Reserved scope for repository-wide revision capture and workspace event coverage.
 pub const REPOSITORY_WIDE_PATH: &str = ":repository:";
+
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_WORKSPACE_CAPTURE_PAUSE: std::sync::Arc<TestWorkspaceCapturePause>;
+}
+
+#[cfg(test)]
+pub(crate) struct TestWorkspaceCapturePause {
+    pub(crate) started: tokio::sync::Semaphore,
+    pub(crate) release: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+impl TestWorkspaceCapturePause {
+    pub(crate) fn new() -> Self {
+        Self {
+            started: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn with_test_workspace_capture_pause<T>(
+    pause: std::sync::Arc<TestWorkspaceCapturePause>,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    TEST_WORKSPACE_CAPTURE_PAUSE.scope(pause, future).await
+}
+
+#[cfg(test)]
+async fn pause_test_workspace_capture() {
+    if let Ok(pause) = TEST_WORKSPACE_CAPTURE_PAUSE.try_with(std::sync::Arc::clone) {
+        pause.started.add_permits(1);
+        if let Ok(permit) = pause.release.acquire().await {
+            permit.forget();
+        }
+    }
+}
 
 pub(crate) async fn capture_revision(
     pool: &SqlitePool,
@@ -37,18 +80,56 @@ pub(crate) async fn capture_revision(
 ) -> StoreResult<WorkspaceRevision> {
     let repository = repository_identity(repo_root)?;
     let normalized = normalize_paths(repo_root, paths)?;
+    let mut transaction = pool.begin().await?;
+    ensure_workspace_tx(&mut transaction, &repository).await?;
+    // Acquire the SQLite writer lane before observing the filesystem. Every capture for a
+    // workspace therefore scans in the same order in which its epoch can be published.
+    sqlx::query("UPDATE workspace_repositories SET epoch = epoch WHERE workspace_id = ?")
+        .bind(&repository.workspace_id)
+        .execute(&mut *transaction)
+        .await?;
     let root = repository.canonical_root.clone();
     let snapshot_paths = normalized.clone();
-    let mut entries =
+    let mut capture =
         tokio::task::spawn_blocking(move || collect_manifest_entries(&root, &snapshot_paths))
             .await
             .map_err(|error| StoreError::CorruptData(format!("manifest task failed: {error}")))??;
-    let mut transaction = pool.begin().await?;
-    ensure_workspace_tx(&mut transaction, &repository).await?;
-    let epoch =
-        reconcile_entries_tx(&mut transaction, &repository, &normalized, &mut entries).await?;
+    #[cfg(test)]
+    pause_test_workspace_capture().await;
+    let epoch = reconcile_entries_tx(
+        &mut transaction,
+        &repository,
+        &normalized,
+        &mut capture.entries,
+    )
+    .await?;
     transaction.commit().await?;
-    revision(&repository, epoch, entries)
+    revision(&repository, epoch, capture)
+}
+
+pub(crate) async fn capture_revision_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    repo_root: &Path,
+    paths: Vec<String>,
+) -> StoreResult<WorkspaceRevision> {
+    let repository = repository_identity(repo_root)?;
+    let normalized = normalize_paths(repo_root, paths)?;
+    ensure_workspace_tx(transaction, &repository).await?;
+    sqlx::query("UPDATE workspace_repositories SET epoch = epoch WHERE workspace_id = ?")
+        .bind(&repository.workspace_id)
+        .execute(&mut **transaction)
+        .await?;
+    let root = repository.canonical_root.clone();
+    let snapshot_paths = normalized.clone();
+    let mut capture =
+        tokio::task::spawn_blocking(move || collect_manifest_entries(&root, &snapshot_paths))
+            .await
+            .map_err(|error| StoreError::CorruptData(format!("manifest task failed: {error}")))??;
+    #[cfg(test)]
+    pause_test_workspace_capture().await;
+    let epoch =
+        reconcile_entries_tx(transaction, &repository, &normalized, &mut capture.entries).await?;
+    revision(&repository, epoch, capture)
 }
 
 pub(crate) async fn read_events(
@@ -65,7 +146,7 @@ pub(crate) async fn read_events(
          ORDER BY epoch",
     )
     .bind(&repository.workspace_id)
-    .bind(after_epoch as i64)
+    .bind(sqlite_epoch(after_epoch)?)
     .fetch_all(pool)
     .await?;
     rows.into_iter()
@@ -110,14 +191,12 @@ pub(crate) async fn register_actor(
          ON CONFLICT(workspace_id, actor_id) DO UPDATE SET
             root_session_id = excluded.root_session_id,
             kind = excluded.kind,
-            assignment_id = COALESCE(excluded.assignment_id, workspace_actors.assignment_id),
-            attempt_id = COALESCE(excluded.attempt_id, workspace_actors.attempt_id),
+            assignment_id = excluded.assignment_id,
+            attempt_id = excluded.attempt_id,
             strategy = excluded.strategy,
-            state = CASE
-                WHEN workspace_actors.state = 'terminal' THEN workspace_actors.state
-                ELSE 'idle'
-            END,
-            last_progress_at = excluded.last_progress_at",
+            state = 'idle',
+            last_progress_at = excluded.last_progress_at,
+            lease_expires_at = NULL",
     )
     .bind(&repository.workspace_id)
     .bind(&registration.actor_id)
@@ -296,7 +375,7 @@ pub(crate) async fn ensure_workspace_tx(
     .fetch_one(&mut **transaction)
     .await?;
     let stored_repository_id = row.get::<String, _>("repository_id");
-    if !paths_equal(
+    if !filesystem_paths_equal(
         &row.get::<String, _>("canonical_root"),
         &repository.canonical_path,
     ) {
@@ -343,19 +422,37 @@ pub(crate) async fn current_epoch_tx(
         .map_err(|_| StoreError::CorruptData("workspace epoch is negative".to_string()))
 }
 
-pub(crate) fn revision(
+fn revision(
     repository: &RepositoryIdentity,
     epoch: u64,
-    mut files: Vec<WorkspaceManifestEntry>,
+    mut capture: ManifestCapture,
 ) -> StoreResult<WorkspaceRevision> {
-    files.sort();
-    let manifest_hash = format!("{:x}", Sha256::digest(json(&files)?.as_bytes()));
+    capture.entries.sort();
+    let manifest_hash = format!(
+        "{:x}",
+        Sha256::digest(
+            json(&(
+                capture.mode,
+                capture.complete,
+                &capture.discovery_errors,
+                capture.ignored_path_count,
+                capture.excluded_path_count,
+                &capture.entries,
+            ))?
+            .as_bytes()
+        )
+    );
     Ok(WorkspaceRevision {
         repository_id: repository.id.clone(),
         workspace_id: repository.workspace_id.clone(),
         epoch,
         manifest_hash,
-        files,
+        files: capture.entries,
+        capture_mode: capture.mode,
+        complete: capture.complete,
+        discovery_errors: capture.discovery_errors,
+        ignored_path_count: capture.ignored_path_count,
+        excluded_path_count: capture.excluded_path_count,
     })
 }
 
@@ -399,16 +496,23 @@ fn normalize_paths(repo_root: &Path, paths: Vec<String>) -> StoreResult<Vec<Stri
     Ok(normalized)
 }
 
-fn collect_manifest_entries(
-    root: &Path,
-    paths: &[String],
-) -> StoreResult<Vec<WorkspaceManifestEntry>> {
+struct ManifestCapture {
+    entries: Vec<WorkspaceManifestEntry>,
+    mode: WorkspaceCaptureMode,
+    complete: bool,
+    discovery_errors: Vec<String>,
+    ignored_path_count: u64,
+    excluded_path_count: u64,
+}
+
+fn collect_manifest_entries(root: &Path, paths: &[String]) -> StoreResult<ManifestCapture> {
     let mut files = BTreeSet::new();
     let mut repository_wide = false;
+    let mut provenance = CaptureProvenance::explicit();
     for path in paths {
         if path == REPOSITORY_WIDE_PATH {
             repository_wide = true;
-            collect_repository_overlay_files(root, &mut files)?;
+            provenance = collect_repository_overlay_files(root, &mut files)?;
             continue;
         }
         let absolute = absolute_repo_path(root, path);
@@ -426,7 +530,14 @@ fn collect_manifest_entries(
         entries.push(repository_head_entry(root));
         entries.sort();
     }
-    Ok(entries)
+    Ok(ManifestCapture {
+        entries,
+        mode: provenance.mode,
+        complete: provenance.complete,
+        discovery_errors: provenance.discovery_errors,
+        ignored_path_count: provenance.ignored_path_count,
+        excluded_path_count: provenance.excluded_path_count,
+    })
 }
 
 fn repository_head_entry(root: &Path) -> WorkspaceManifestEntry {
@@ -445,7 +556,31 @@ fn repository_head_entry(root: &Path) -> WorkspaceManifestEntry {
     }
 }
 
-fn collect_repository_overlay_files(root: &Path, files: &mut BTreeSet<String>) -> StoreResult<()> {
+#[derive(Debug)]
+struct CaptureProvenance {
+    mode: WorkspaceCaptureMode,
+    complete: bool,
+    discovery_errors: Vec<String>,
+    ignored_path_count: u64,
+    excluded_path_count: u64,
+}
+
+impl CaptureProvenance {
+    fn explicit() -> Self {
+        Self {
+            mode: WorkspaceCaptureMode::ExplicitPaths,
+            complete: true,
+            discovery_errors: Vec::new(),
+            ignored_path_count: 0,
+            excluded_path_count: 0,
+        }
+    }
+}
+
+fn collect_repository_overlay_files(
+    root: &Path,
+    files: &mut BTreeSet<String>,
+) -> StoreResult<CaptureProvenance> {
     collect_repository_overlay_files_with(root, files, spawn_repository_overlay_command)
 }
 
@@ -453,7 +588,7 @@ fn collect_repository_overlay_files_with(
     root: &Path,
     files: &mut BTreeSet<String>,
     mut spawn: impl FnMut(&Path, &[&str]) -> std::io::Result<Child>,
-) -> StoreResult<()> {
+) -> StoreResult<CaptureProvenance> {
     let tracked = spawn(
         root,
         &["diff", "--name-only", "-z", "--no-ext-diff", "HEAD", "--"],
@@ -473,10 +608,7 @@ fn collect_repository_overlay_files_with(
             if raw_path.is_empty() {
                 continue;
             }
-            let path = String::from_utf8_lossy(raw_path).replace('\\', "/");
-            if repository_overlay_path_is_excluded(&path) {
-                continue;
-            }
+            let path = git_relative_path_identity(raw_path)?;
             let absolute = absolute_repo_path(root, &path);
             if absolute.is_dir() {
                 collect_directory_files(root, &absolute, files)?;
@@ -484,38 +616,45 @@ fn collect_repository_overlay_files_with(
                 files.insert(path);
             }
         }
-        return Ok(());
+        return Ok(CaptureProvenance {
+            mode: WorkspaceCaptureMode::GitOverlay,
+            complete: true,
+            discovery_errors: Vec::new(),
+            ignored_path_count: 0,
+            excluded_path_count: 0,
+        });
     }
 
-    collect_repository_files_fallback(root, root, files)
+    let mut excluded_path_count = 0;
+    collect_repository_files_fallback(root, root, files, &mut excluded_path_count)?;
+    Ok(CaptureProvenance {
+        mode: WorkspaceCaptureMode::FilesystemFallback,
+        complete: false,
+        discovery_errors: vec![
+            "Git overlay discovery failed; filesystem fallback cannot preserve tracked/ignored semantics"
+                .to_string(),
+        ],
+        ignored_path_count: 0,
+        excluded_path_count,
+    })
 }
 
-fn repository_overlay_path_is_excluded(path: &str) -> bool {
-    let mut components = path
-        .split('/')
-        .filter(|component| !component.is_empty())
-        .peekable();
-    let mut parent_components = Vec::new();
-    while let Some(component) = components.next() {
-        if components.peek().is_none() {
-            break;
-        }
-        parent_components.push(component);
-        let name = component.to_ascii_lowercase();
-        if name == ".git"
-            || name == "node_modules"
-            || name == ".venv"
-            || name == "venv"
-            || name == "dist"
-            || name == "build"
-            || name.starts_with("target")
-        {
-            return true;
-        }
-    }
-    parent_components.len() >= 2
-        && parent_components[0].eq_ignore_ascii_case(".codex")
-        && parent_components[1].eq_ignore_ascii_case("locks")
+#[cfg(unix)]
+fn git_relative_path_identity(raw_path: &[u8]) -> StoreResult<String> {
+    use std::os::unix::ffi::OsStrExt;
+    Ok(relative_path_identity(Path::new(
+        std::ffi::OsStr::from_bytes(raw_path),
+    )))
+}
+
+#[cfg(windows)]
+fn git_relative_path_identity(raw_path: &[u8]) -> StoreResult<String> {
+    let path = std::str::from_utf8(raw_path).map_err(|_| {
+        StoreError::InvalidScope(
+            "Git returned a path that cannot be represented losslessly on Windows".to_string(),
+        )
+    })?;
+    Ok(relative_path_identity(Path::new(path)))
 }
 
 fn spawn_repository_overlay_command(root: &Path, args: &[&str]) -> std::io::Result<Child> {
@@ -538,6 +677,7 @@ fn collect_repository_files_fallback(
     root: &Path,
     directory: &Path,
     files: &mut BTreeSet<String>,
+    excluded_path_count: &mut u64,
 ) -> StoreResult<()> {
     let mut directories = vec![directory.to_path_buf()];
     while let Some(directory) = directories.pop() {
@@ -546,16 +686,8 @@ fn collect_repository_files_fallback(
         for child in children {
             let path = child.path();
             if child.file_type()?.is_dir() {
-                let name = child.file_name().to_string_lossy().to_ascii_lowercase();
-                if name == ".git"
-                    || name == "node_modules"
-                    || name == ".venv"
-                    || name == "venv"
-                    || name == "dist"
-                    || name == "build"
-                    || name.starts_with("target")
-                    || path == root.join(".codex").join("locks")
-                {
+                if child.file_name() == ".git" {
+                    *excluded_path_count = excluded_path_count.saturating_add(1);
                     continue;
                 }
                 directories.push(path);
@@ -566,13 +698,7 @@ fn collect_repository_files_fallback(
                         path.display()
                     ))
                 })?;
-                files.insert(
-                    relative
-                        .components()
-                        .map(|component| component.as_os_str().to_string_lossy())
-                        .collect::<Vec<_>>()
-                        .join("/"),
-                );
+                files.insert(relative_path_identity(relative));
             }
         }
     }
@@ -599,13 +725,7 @@ fn collect_directory_files(
                         path.display()
                     ))
                 })?;
-                files.insert(
-                    relative
-                        .components()
-                        .map(|component| component.as_os_str().to_string_lossy())
-                        .collect::<Vec<_>>()
-                        .join("/"),
-                );
+                files.insert(relative_path_identity(relative));
             }
         }
     }
@@ -614,17 +734,50 @@ fn collect_directory_files(
 
 fn snapshot_file(root: &Path, path: String) -> StoreResult<WorkspaceManifestEntry> {
     let absolute = absolute_repo_path(root, &path);
-    if !absolute.exists() {
+    let link_metadata = match std::fs::symlink_metadata(&absolute) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(WorkspaceManifestEntry {
+                path,
+                content_hash: None,
+                existed: false,
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if link_metadata.file_type().is_symlink() {
+        let target = std::fs::read_link(&absolute)?;
+        let target_identity = relative_path_identity(&target);
+        let target_state = match std::fs::metadata(&absolute) {
+            Ok(metadata) if metadata.is_file() => hash_regular_file(&absolute, &path)?,
+            Ok(metadata) if metadata.is_dir() => "directory".to_string(),
+            Ok(_) => "other".to_string(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => "broken".to_string(),
+            Err(error) => return Err(error.into()),
+        };
+        let content_hash = format!(
+            "{:x}",
+            Sha256::digest(json(&("symlink", target_identity, target_state))?.as_bytes())
+        );
         return Ok(WorkspaceManifestEntry {
             path,
-            content_hash: None,
-            existed: false,
+            content_hash: Some(content_hash),
+            existed: true,
         });
     }
-    let mut file = File::open(&absolute)?;
+    let content_hash = hash_regular_file(&absolute, &path)?;
+    Ok(WorkspaceManifestEntry {
+        path,
+        content_hash: Some(content_hash),
+        existed: true,
+    })
+}
+
+fn hash_regular_file(absolute: &Path, logical_path: &str) -> StoreResult<String> {
+    let mut file = File::open(absolute)?;
     let before = FileSnapshotIdentity::capture(&file).ok_or_else(|| {
         StoreError::Io(std::io::Error::other(format!(
-            "workspace manifest cannot establish a trustworthy file identity for {path}"
+            "workspace manifest cannot establish a trustworthy file identity for {logical_path}"
         )))
     })?;
     let mut digest = Sha256::new();
@@ -638,25 +791,21 @@ fn snapshot_file(root: &Path, path: String) -> StoreResult<WorkspaceManifestEntr
     }
     let opened_after = FileSnapshotIdentity::capture(&file).ok_or_else(|| {
         StoreError::Io(std::io::Error::other(format!(
-            "workspace manifest lost the file identity for {path}"
+            "workspace manifest lost the file identity for {logical_path}"
         )))
     })?;
-    let path_file = File::open(&absolute)?;
+    let path_file = File::open(absolute)?;
     let path_after = FileSnapshotIdentity::capture(&path_file).ok_or_else(|| {
         StoreError::Io(std::io::Error::other(format!(
-            "workspace manifest cannot revalidate the file identity for {path}"
+            "workspace manifest cannot revalidate the file identity for {logical_path}"
         )))
     })?;
     if before != opened_after || before != path_after {
         return Err(StoreError::Io(std::io::Error::other(format!(
-            "workspace file changed or was atomically replaced while hashing {path}"
+            "workspace file changed or was atomically replaced while hashing {logical_path}"
         ))));
     }
-    Ok(WorkspaceManifestEntry {
-        path,
-        content_hash: Some(format!("{:x}", digest.finalize())),
-        existed: true,
-    })
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -790,7 +939,7 @@ async fn include_missing_observed_entries_tx(
         .any(|path| path == REPOSITORY_WIDE_PATH);
     let present = entries
         .iter()
-        .map(|entry| comparison_path(&entry.path))
+        .map(|entry| path_comparison_key(&entry.path))
         .collect::<BTreeSet<_>>();
     let rows = sqlx::query(
         "SELECT path, existed FROM workspace_paths
@@ -801,7 +950,7 @@ async fn include_missing_observed_entries_tx(
     .await?;
     for row in rows {
         let path = row.get::<String, _>("path");
-        if present.contains(&comparison_path(&path)) {
+        if present.contains(&path_comparison_key(&path)) {
             continue;
         }
         if repository_wide {
@@ -825,13 +974,9 @@ fn observed_path_covers(observed: &str, path: &str) -> bool {
     if observed == REPOSITORY_WIDE_PATH {
         return false;
     }
-    let observed = comparison_path(observed);
-    let path = comparison_path(path);
+    let observed = path_comparison_key(observed);
+    let path = path_comparison_key(path);
     path == observed || path.starts_with(&format!("{observed}/"))
-}
-
-fn comparison_path(path: &str) -> String {
-    path.to_lowercase()
 }
 
 async fn update_workspace_entries_tx(
@@ -861,7 +1006,7 @@ async fn update_workspace_entries_tx(
         .bind(&entry.path)
         .bind(&entry.content_hash)
         .bind(i64::from(entry.existed))
-        .bind(epoch as i64)
+        .bind(sqlite_epoch(epoch)?)
         .bind(actor_id)
         .bind(json(&confidence)?)
         .bind(json(&now)?)
@@ -879,7 +1024,7 @@ async fn set_epoch_tx(
     sqlx::query(
         "UPDATE workspace_repositories SET epoch = ?, updated_at = ? WHERE workspace_id = ?",
     )
-    .bind(epoch as i64)
+    .bind(sqlite_epoch(epoch)?)
     .bind(json(&Utc::now())?)
     .bind(workspace_id)
     .execute(&mut **transaction)
@@ -908,7 +1053,7 @@ async fn record_workspace_event_tx(
          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(event.workspace_id)
-    .bind(event.epoch as i64)
+    .bind(sqlite_epoch(event.epoch)?)
     .bind(event.actor_id)
     .bind(json(&event.actor_kind)?)
     .bind(json(&event.confidence)?)
@@ -918,6 +1063,11 @@ async fn record_workspace_event_tx(
     .execute(&mut **transaction)
     .await?;
     Ok(())
+}
+
+fn sqlite_epoch(epoch: u64) -> StoreResult<i64> {
+    i64::try_from(epoch)
+        .map_err(|_| StoreError::CorruptData("workspace epoch exceeds SQLite integer range".into()))
 }
 
 async fn query_assignment_ids(
@@ -932,10 +1082,6 @@ async fn query_assignment_ids(
     rows.into_iter()
         .map(|row| AssignmentId::parse(&row.get::<String, _>("assignment_id")))
         .collect()
-}
-
-fn paths_equal(left: &str, right: &str) -> bool {
-    left.eq_ignore_ascii_case(right)
 }
 
 fn json<T: serde::Serialize + ?Sized>(value: &T) -> StoreResult<String> {
@@ -1007,20 +1153,18 @@ mod overlay_observation_tests {
     }
 
     #[test]
-    fn repository_overlay_excludes_generated_directory_contents() {
-        assert!(repository_overlay_path_is_excluded(
+    fn repository_overlay_preserves_git_reported_paths() {
+        assert_eq!(
+            git_relative_path_identity(
+                b"target-codex-agent-task-store-revision/debug/deps/store.pdb"
+            )
+            .expect("Git path is represented"),
             "target-codex-agent-task-store-revision/debug/deps/store.pdb"
-        ));
-        assert!(repository_overlay_path_is_excluded(
-            "nested/node_modules/package/index.js"
-        ));
-        assert!(repository_overlay_path_is_excluded(
-            ".codex/locks/workspace.lock"
-        ));
-        assert!(!repository_overlay_path_is_excluded(
-            "codex-rs/example/build.rs"
-        ));
-        assert!(!repository_overlay_path_is_excluded("src/targeting.rs"));
+        );
+        assert_eq!(
+            git_relative_path_identity(b"build/source.rs").expect("Git path is represented"),
+            "build/source.rs"
+        );
     }
 
     #[test]

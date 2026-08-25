@@ -37,3 +37,13 @@ fn server_requested_retry_delay_below_the_ceiling_is_preserved() {
 
     assert_eq!(response_stream_retry_delay(&err, 1), requested_delay);
 }
+
+#[tokio::test]
+async fn retry_backoff_is_cancelled_by_owner() {
+    let cancellation_token = CancellationToken::new();
+    cancellation_token.cancel();
+
+    let result = wait_for_retry_delay(Duration::from_secs(60), &cancellation_token).await;
+
+    assert!(matches!(result, Err(CodexErr::TurnAborted)));
+}

@@ -20,6 +20,31 @@ use std::collections::BTreeMap;
 use tempfile::TempDir;
 
 #[test]
+fn builtin_permission_descriptor_drives_identity_and_runtime_profiles() {
+    let profiles = builtin_permission_profiles().collect::<Vec<_>>();
+    assert_eq!(
+        profiles,
+        vec![
+            (BUILT_IN_READ_ONLY_PROFILE, PermissionProfile::read_only()),
+            (
+                BUILT_IN_WORKSPACE_PROFILE,
+                PermissionProfile::workspace_write(),
+            ),
+            (
+                BUILT_IN_DANGER_FULL_ACCESS_PROFILE,
+                PermissionProfile::Disabled,
+            ),
+        ]
+    );
+
+    for (id, _) in profiles {
+        let parsed = BuiltInPermissionProfileId::from_str(id).expect("known built-in id");
+        assert_eq!(parsed.as_str(), id);
+        assert!(is_builtin_permission_profile_name(id));
+    }
+}
+
+#[test]
 fn normalize_absolute_path_for_platform_simplifies_windows_verbatim_paths() {
     let parsed = normalize_absolute_path_for_platform(
         r"\\?\D:\c\x\worktrees\2508\swift-base",

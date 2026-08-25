@@ -3,7 +3,7 @@ use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
 use codex_login::AuthManager;
 use codex_utils_cli::CliConfigOverrides;
-use reqwest::header::HeaderMap;
+use http::HeaderMap;
 use std::sync::Arc;
 
 use crate::urls::CloudBaseUrl;
@@ -72,8 +72,8 @@ async fn load_config(config_overrides: &CliConfigOverrides) -> std::io::Result<C
 /// Build headers for ChatGPT-backed requests: `User-Agent`, optional `Authorization`,
 /// and optional `ChatGPT-Account-Id`.
 pub async fn build_chatgpt_headers(auth_manager: Option<&AuthManager>) -> HeaderMap {
-    use reqwest::header::HeaderValue;
-    use reqwest::header::USER_AGENT;
+    use http::HeaderValue;
+    use http::header::USER_AGENT;
 
     set_user_agent_suffix("codex_cloud_tui");
     let ua = codex_login::default_client::get_codex_user_agent();
@@ -120,14 +120,14 @@ mod tests {
 
         assert!(
             headers
-                .get(reqwest::header::USER_AGENT)
+                .get(http::header::USER_AGENT)
                 .and_then(|value| value.to_str().ok())
                 .is_some_and(|value| value.contains("codex_cloud_tui"))
         );
 
         assert_eq!(
             headers
-                .get(reqwest::header::AUTHORIZATION)
+                .get(http::header::AUTHORIZATION)
                 .and_then(|value| value.to_str().ok()),
             Some("Bearer Access Token")
         );

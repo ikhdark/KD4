@@ -35,6 +35,8 @@ use crate::sanitize_metric_tag_value;
 use codex_api::AgentIdentityTelemetry;
 use codex_api::ApiError;
 use codex_api::ResponseEvent;
+use codex_http_client::HttpError;
+use codex_http_client::HttpResponse;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::models::ResponseItem;
@@ -47,8 +49,6 @@ use codex_protocol::user_input::UserInput;
 use eventsource_stream::Event as StreamEvent;
 use eventsource_stream::EventStreamError as StreamError;
 use opentelemetry_sdk::metrics::data::ResourceMetrics;
-use reqwest::Error;
-use reqwest::Response;
 use std::future::Future;
 use std::time::Duration;
 use std::time::Instant;
@@ -721,10 +721,10 @@ impl SessionTelemetry {
         );
     }
 
-    pub async fn log_request<F, Fut>(&self, attempt: u64, f: F) -> Result<Response, Error>
+    pub async fn log_request<F, Fut>(&self, attempt: u64, f: F) -> Result<HttpResponse, HttpError>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<Response, Error>>,
+        Fut: Future<Output = Result<HttpResponse, HttpError>>,
     {
         let start = Instant::now();
         let response = f().await;

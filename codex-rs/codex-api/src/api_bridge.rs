@@ -136,7 +136,11 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
             }),
             TransportError::Timeout => CodexErr::RequestTimeout,
             TransportError::Connection(source) => {
-                CodexErr::ConnectionFailed(ConnectionFailedError { source })
+                let status = source.status();
+                CodexErr::ConnectionFailed(ConnectionFailedError {
+                    message: source.to_string(),
+                    status,
+                })
             }
             TransportError::Network(msg) | TransportError::Build(msg) => {
                 CodexErr::Stream(msg, None)

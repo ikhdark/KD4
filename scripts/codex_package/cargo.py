@@ -15,6 +15,7 @@ try:
 except ImportError:
     import rust_tool_env as shared_rust_tool_env
 
+from .layout import pe_machine
 from .targets import REPO_ROOT
 from .targets import PackageVariant
 from .targets import TargetSpec
@@ -51,9 +52,12 @@ def build_source_binaries(
     codex_windows_sandbox_setup_bin: Path | None,
     reuse_existing: bool = False,
     force_rebuild: bool = False,
+    release_version: str | None = None,
 ) -> SourceBuildOutputs:
-    validate_prebuilt_resource_inputs(
+    validate_prebuilt_executable_targets(
         spec,
+        entrypoint_bin=entrypoint_bin,
+        code_mode_host_bin=code_mode_host_bin,
         codex_command_runner_bin=codex_command_runner_bin,
         codex_windows_sandbox_setup_bin=codex_windows_sandbox_setup_bin,
     )
@@ -103,6 +107,7 @@ def build_source_binaries(
         reuse_existing=reuse_existing,
         force_rebuild=force_rebuild,
         cargo=cargo,
+        release_version=release_version,
     )
     if requested_binaries and not binaries:
         print(
@@ -117,6 +122,7 @@ def build_source_binaries(
             profile,
             binaries,
             target_dir=target_dir,
+            release_version=release_version,
         )
 
     validate_source_outputs(outputs)
@@ -128,6 +134,7 @@ def build_source_binaries(
             variant=variant,
             outputs=outputs,
             cargo=cargo,
+            release_version=release_version,
         )
     return outputs
 
@@ -139,6 +146,7 @@ def run_cargo_build(
     binaries: list[str],
     *,
     target_dir: Path,
+    release_version: str | None = None,
 ) -> None:
     cmd = [
         cargo,
@@ -154,7 +162,9 @@ def run_cargo_build(
     for binary in binaries:
         cmd.extend(["--bin", binary])
 
-    cargo_env = cargo_build_env(spec, profile, target_dir=target_dir)
+    cargo_env = cargo_build_env(
+        spec, profile, target_dir=target_dir, release_version=release_version
+    )
     print("+", " ".join(cmd))
     start = time.perf_counter()
     try:
@@ -204,13 +214,34 @@ def source_binaries_for_target(
     return binaries
 
 
-def validate_prebuilt_resource_inputs(
+def validate_prebuilt_executable_targets(
     spec: TargetSpec,
     *,
+    entrypoint_bin: Path | None,
+    code_mode_host_bin: Path | None,
     codex_command_runner_bin: Path | None,
     codex_windows_sandbox_setup_bin: Path | None,
 ) -> None:
-    _ = (spec, codex_command_runner_bin, codex_windows_sandbox_setup_bin)
+    expected_machine = {
+        "x86_64-pc-windows-msvc": 0x8664,
+        "aarch64-pc-windows-msvc": 0xAA64,
+    }.get(spec.target)
+    if expected_machine is None:
+        return
+    for role, path in (
+        ("entrypoint", entrypoint_bin),
+        ("code-mode-host", code_mode_host_bin),
+        ("codex-command-runner", codex_command_runner_bin),
+        ("codex-windows-sandbox-setup", codex_windows_sandbox_setup_bin),
+    ):
+        if path is None or not path.is_file():
+            continue
+        machine = pe_machine(path)
+        if machine is not None and machine != expected_machine:
+            raise RuntimeError(
+                f"prebuilt {role} target mismatch: {path} has PE machine "
+                f"0x{machine:04x}, expected 0x{expected_machine:04x}"
+            )
 
 
 def validate_explicit_output_paths(
@@ -309,16 +340,15 @@ def cargo_build_env(
     profile: str,
     *,
     target_dir: Path,
+    release_version: str | None = None,
 ) -> dict[str, str]:
     env = dict(os.environ)
     env.pop("CARGO_TARGET_DIR", None)
     env.setdefault("RUST_MIN_STACK", DEFAULT_RUST_MIN_STACK)
-    static_msvc_flags = static_msvc_rustflags(spec, profile)
-    if static_msvc_flags:
-        env_name = cargo_target_rustflags_env_name(spec.target)
-        existing = env.get(env_name, "").strip()
-        flags = " ".join(static_msvc_flags)
-        env[env_name] = f"{existing} {flags}".strip()
+    if release_version is not None:
+        env["CODEX_RELEASE_VERSION"] = release_version
+    # Target rustflags are owned by codex-rs/.cargo/config.toml. Do not
+    # duplicate that policy here; Cargo applies the checked-in target table.
     if spec.target.endswith("-msvc"):
         linker_env_name = cargo_target_linker_env_name(spec.target)
         if not env.get(linker_env_name):
@@ -359,16 +389,6 @@ def find_windows_lld_link() -> str | None:
     )
 
 
-def static_msvc_rustflags(spec: TargetSpec, profile: str) -> tuple[str, ...]:
-    if not spec.target.endswith("-msvc") or profile == "dev":
-        return ()
-
-    flags = ["-C", "link-arg=/STACK:8388608", "-C", "target-feature=+crt-static"]
-    if spec.target == "aarch64-pc-windows-msvc":
-        flags.extend(["-C", "link-arg=/arm64hazardfree"])
-    return tuple(flags)
-
-
 def cargo_profile_dirname(profile: str) -> str:
     if profile == "dev":
         return "debug"
@@ -388,6 +408,7 @@ def binaries_missing_for_reuse(
     reuse_existing: bool,
     force_rebuild: bool,
     cargo: str = "cargo",
+    release_version: str | None = None,
 ) -> list[str]:
     if force_rebuild or not reuse_existing:
         return binaries
@@ -399,6 +420,7 @@ def binaries_missing_for_reuse(
         profile=profile,
         variant=variant,
         cargo=cargo,
+        release_version=release_version,
     ):
         return binaries
 
@@ -497,13 +519,17 @@ def write_source_build_stamp(
     variant: PackageVariant,
     outputs: SourceBuildOutputs,
     cargo: str = "cargo",
+    release_version: str | None = None,
 ) -> None:
     stamp = {
         "target": spec.target,
         "profile": profile,
         "variant": variant.name,
         "build_recipe": build_recipe_fingerprint(
-            spec=spec, profile=profile, cargo=cargo
+            spec=spec,
+            profile=profile,
+            cargo=cargo,
+            release_version=release_version,
         ),
         "source": source_tree_fingerprint(),
         "outputs": source_output_fingerprints(outputs),
@@ -536,6 +562,7 @@ def source_build_stamp_matches(
     variant: PackageVariant,
     outputs: SourceBuildOutputs,
     cargo: str = "cargo",
+    release_version: str | None = None,
 ) -> bool:
     stamp = read_source_build_stamp(target_dir)
     if stamp is None:
@@ -547,6 +574,7 @@ def source_build_stamp_matches(
         profile=profile,
         variant=variant,
         cargo=cargo,
+        release_version=release_version,
     ):
         return False
 
@@ -563,18 +591,28 @@ def source_build_stamp_metadata_matches(
     profile: str,
     variant: PackageVariant,
     cargo: str = "cargo",
+    release_version: str | None = None,
 ) -> bool:
     return (
         stamp.get("target") == spec.target
         and stamp.get("profile") == profile
         and stamp.get("variant") == variant.name
         and stamp.get("build_recipe")
-        == build_recipe_fingerprint(spec=spec, profile=profile, cargo=cargo)
+        == build_recipe_fingerprint(
+            spec=spec,
+            profile=profile,
+            cargo=cargo,
+            release_version=release_version,
+        )
     )
 
 
 def build_recipe_fingerprint(
-    *, spec: TargetSpec, profile: str, cargo: str = "cargo"
+    *,
+    spec: TargetSpec,
+    profile: str,
+    cargo: str = "cargo",
+    release_version: str | None = None,
 ) -> dict[str, object]:
     """Capture toolchain and environment inputs that can change Cargo output."""
     rustc = os.environ.get("RUSTC", "rustc")
@@ -603,17 +641,45 @@ def build_recipe_fingerprint(
         value = os.environ.get(name)
         if value is None:
             continue
-        candidate = Path(value).expanduser()
-        environment[name] = (
-            source_output_fingerprint(candidate) if candidate.is_file() else value
-        )
+        environment[name] = {
+            "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest()
+        }
+    if release_version is not None:
+        environment["CODEX_RELEASE_VERSION"] = {
+            "sha256": hashlib.sha256(release_version.encode("utf-8")).hexdigest()
+        }
+
+    target_dir = cargo_package_target_dir(spec, profile)
+    effective_command = [
+        cargo,
+        "build",
+        "--locked",
+        "--target-dir",
+        str(target_dir),
+        "--target",
+        spec.target,
+        "--profile",
+        profile,
+    ]
 
     return {
+        "schema_version": 2,
         "target": spec.target,
         "profile": profile,
         "cargo": command_identity(cargo, "--version", "--verbose"),
         "rustc": command_identity(rustc, "-Vv"),
         "environment": environment,
+        "effective_command_sha256": hashlib.sha256(
+            "\0".join(effective_command).encode("utf-8")
+        ).hexdigest(),
+        "recipe_source": files_fingerprint(
+            (
+                REPO_ROOT / "scripts" / "codex_package" / "cargo.py",
+                REPO_ROOT / "scripts" / "codex_package" / "targets.py",
+                REPO_ROOT / "scripts" / "rust_tool_env.py",
+                REPO_ROOT / "scripts" / "common-rust-env.ps1",
+            )
+        ),
         "profile_config": files_fingerprint(
             (
                 REPO_ROOT / "Cargo.toml",

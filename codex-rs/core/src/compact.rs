@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -42,6 +43,7 @@ use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
@@ -50,6 +52,8 @@ use codex_utils_image::MAX_PROMPT_IMAGE_SOURCE_BYTES;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::truncate_text_to_token_ceiling;
 use futures::prelude::*;
+use serde::Serialize;
+use tokio_util::sync::CancellationToken;
 
 use codex_model_provider_info::ModelProviderInfo;
 
@@ -80,6 +84,21 @@ pub(crate) const MAX_RETAINED_USER_IMAGE_BYTES: usize =
     MAX_PROMPT_IMAGE_SOURCE_BYTES / 3 * 4 + 4096;
 pub(crate) const COMPACT_IMAGE_OMISSION_MARKER: &str =
     "[codex-local-compaction omitted user images: limits exceeded]";
+const COMPACT_TEXT_OMISSION_MARKER: &str = "codex_local_compaction_text_omission";
+
+#[derive(Clone, Debug, Serialize)]
+struct CompactionTextOmissionReceiptV1 {
+    version: u8,
+    kind: &'static str,
+    role: &'static str,
+    source_item_id: Option<String>,
+    source_index: usize,
+    turn_id: Option<String>,
+    original_tokens: usize,
+    retained_tokens: usize,
+    omitted_tokens: usize,
+    unresolved: bool,
+}
 
 /// Controls whether compaction replacement history must include initial context.
 ///
@@ -141,6 +160,7 @@ pub(crate) async fn run_inline_auto_compact_task(
     initial_context_injection: InitialContextInjection,
     reason: CompactionReason,
     phase: CompactionPhase,
+    cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
     let prompt = turn_context
         .config
@@ -162,6 +182,7 @@ pub(crate) async fn run_inline_auto_compact_task(
         CompactionTrigger::Auto,
         reason,
         phase,
+        cancellation_token,
     )
     .await?;
     Ok(())
@@ -171,6 +192,7 @@ pub(crate) async fn run_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     input: Vec<UserInput>,
+    cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
     let start_event = EventMsg::TurnStarted(TurnStartedEvent {
         turn_id: turn_context.sub_id.clone(),
@@ -190,11 +212,13 @@ pub(crate) async fn run_compact_task(
         CompactionTrigger::Manual,
         CompactionReason::UserRequested,
         CompactionPhase::StandaloneTurn,
+        cancellation_token,
     )
     .await?;
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_compact_task_inner(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
@@ -203,6 +227,7 @@ async fn run_compact_task_inner(
     trigger: CompactionTrigger,
     reason: CompactionReason,
     phase: CompactionPhase,
+    cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
     let compaction_metadata =
         CompactionTurnMetadata::new(trigger, reason, CompactionImplementation::Responses, phase);
@@ -244,6 +269,7 @@ async fn run_compact_task_inner(
         input,
         initial_context_injection,
         compaction_metadata,
+        cancellation_token,
     )
     .await;
     let status = compaction_status_from_result(&result);
@@ -287,16 +313,17 @@ async fn run_compact_task_inner_impl(
     mut input: Vec<UserInput>,
     initial_context_injection: InitialContextInjection,
     compaction_metadata: CompactionTurnMetadata,
+    cancellation_token: &CancellationToken,
 ) -> CodexResult<String> {
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(&turn_context, &compaction_item)
         .await;
     let mut history = sess.clone_history().await;
-    let (mut unresolved_history, _retained_image_count, omitted_images) =
+    let (mut unresolved_history, _retained_image_count, omitted_images, omitted_user_text) =
         build_bounded_unresolved_input_history(history.raw_items());
     let previous_summary = latest_summary_message(history.raw_items()).map(str::to_string);
     let reuse_previous_summary = previous_summary.is_some()
-        && history_after_latest_summary_is_user_only(history.raw_items());
+        && can_reuse_previous_summary(history.raw_items(), omitted_user_text);
     if previous_summary.is_some() && !reuse_previous_summary {
         input.push(UserInput::Text {
             text: INCREMENTAL_SUMMARIZATION_PROMPT.to_string(),
@@ -351,11 +378,19 @@ async fn run_compact_task_inner_impl(
                 &mut client_session,
                 &responses_metadata,
                 &prompt,
+                cancellation_token,
             )
             .await;
 
             match attempt_result {
-                Ok(()) => {
+                Ok(output) => {
+                    sess.record_conversation_items(turn_context.as_ref(), &output.items)
+                        .await;
+                    sess.update_token_usage_info(
+                        turn_context.as_ref(),
+                        output.token_usage.as_ref(),
+                    )
+                    .await?;
                     break;
                 }
                 Err(err @ (CodexErr::Interrupted | CodexErr::TurnAborted)) => {
@@ -383,6 +418,7 @@ async fn run_compact_task_inner_impl(
                         sess.as_ref(),
                         turn_context.as_ref(),
                         ResponsesStreamRequest::LocalCompaction,
+                        cancellation_token,
                     )
                     .await
                     {
@@ -412,6 +448,9 @@ async fn run_compact_task_inner_impl(
         validate_generated_compaction_summary(previous_summary.as_deref(), &summary_suffix)?;
     }
     let summary_text = bounded_task_state_summary(previous_summary.as_deref(), &summary_suffix);
+    if has_compaction_section(&summary_text) {
+        validate_generated_compaction_summary(None, &summary_text)?;
+    }
     // The summary and durable world state own consumed continuation state. Preserve only the
     // exact input tail that no model-generated item has consumed yet, in its original order.
     let mut summary_for_history = summary_text.clone();
@@ -665,16 +704,80 @@ fn truncate_compaction_summary(summary: &str, max_tokens: usize) -> String {
         }
     }
 
-    let mut rendered = vec![truncate_text_to_token_ceiling(&preamble.join("\n"), 300)];
-    for (heading, budget, updates) in sections {
-        if updates.is_empty() {
-            continue;
-        }
-        let heading_tokens = approx_token_count(heading);
-        let body = retain_newest_section_updates(&updates, budget.saturating_sub(heading_tokens));
-        rendered.push(format!("{heading}\n{body}"));
+    let sections = sections
+        .into_iter()
+        .filter(|(_, _, updates)| !updates.is_empty())
+        .collect::<Vec<_>>();
+    let mut bodies = vec!["[truncated]".to_string(); sections.len()];
+    let mut bounded_preamble = String::new();
+    let mandatory = render_structured_compaction(&bounded_preamble, &sections, &bodies);
+    if approx_token_count(&mandatory) > max_tokens {
+        // A syntactically complete handoff has an irreducible minimum. Callers use a
+        // substantially larger bound, but preserve the typed structure if a future caller
+        // supplies an impossible limit instead of cutting a heading or body mid-field.
+        return mandatory;
     }
-    truncate_text_to_token_ceiling(&rendered.join("\n\n"), max_tokens)
+
+    let full_preamble = preamble.join("\n");
+    let mut low = 0usize;
+    let mut high = 300usize.min(max_tokens);
+    while low < high {
+        let candidate_budget = low.saturating_add(high).saturating_add(1) / 2;
+        let candidate = truncate_text_to_token_ceiling(&full_preamble, candidate_budget);
+        let rendered = render_structured_compaction(&candidate, &sections, &bodies);
+        if approx_token_count(&rendered) <= max_tokens {
+            low = candidate_budget;
+            bounded_preamble = candidate;
+        } else {
+            high = candidate_budget.saturating_sub(1);
+        }
+    }
+
+    for (index, (_, configured_budget, updates)) in sections.iter().enumerate() {
+        let mut low = 0usize;
+        let mut high = (*configured_budget).min(max_tokens);
+        let mut selected = bodies[index].clone();
+        while low < high {
+            let candidate_budget = low.saturating_add(high).saturating_add(1) / 2;
+            let candidate = retain_newest_section_updates(updates, candidate_budget);
+            let candidate = if candidate.trim().is_empty() {
+                "[truncated]".to_string()
+            } else {
+                candidate
+            };
+            let mut candidate_bodies = bodies.clone();
+            candidate_bodies[index] = candidate.clone();
+            let rendered =
+                render_structured_compaction(&bounded_preamble, &sections, &candidate_bodies);
+            if approx_token_count(&rendered) <= max_tokens {
+                low = candidate_budget;
+                selected = candidate;
+            } else {
+                high = candidate_budget.saturating_sub(1);
+            }
+        }
+        bodies[index] = selected;
+    }
+
+    render_structured_compaction(&bounded_preamble, &sections, &bodies)
+}
+
+fn render_structured_compaction(
+    preamble: &str,
+    sections: &[(&str, usize, Vec<Vec<String>>)],
+    bodies: &[String],
+) -> String {
+    let mut rendered = Vec::with_capacity(sections.len().saturating_add(1));
+    if !preamble.trim().is_empty() {
+        rendered.push(preamble.to_string());
+    }
+    rendered.extend(
+        sections
+            .iter()
+            .zip(bodies)
+            .map(|((heading, _, _), body)| format!("{heading}\n{body}")),
+    );
+    rendered.join("\n\n")
 }
 
 fn retain_newest_section_updates(updates: &[Vec<String>], max_tokens: usize) -> String {
@@ -825,6 +928,7 @@ pub fn content_items_to_text(content: &[ContentItem]) -> Option<String> {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CompactedUserMessage {
+    source_item_id: Option<String>,
     content: Vec<UserInput>,
     internal_chat_message_metadata_passthrough: Option<InternalChatMessageMetadataPassthrough>,
 }
@@ -834,6 +938,7 @@ pub(crate) fn collect_user_messages(items: &[ResponseItem]) -> Vec<CompactedUser
         .iter()
         .filter_map(|item| match item {
             ResponseItem::Message {
+                id,
                 role,
                 content,
                 internal_chat_message_metadata_passthrough,
@@ -847,6 +952,7 @@ pub(crate) fn collect_user_messages(items: &[ResponseItem]) -> Vec<CompactedUser
                 }
                 let content = crate::event_mapping::parse_user_message_content(content).content;
                 Some(CompactedUserMessage {
+                    source_item_id: id.as_ref().map(ToString::to_string),
                     content,
                     internal_chat_message_metadata_passthrough:
                         internal_chat_message_metadata_passthrough.clone(),
@@ -872,11 +978,53 @@ pub(crate) fn collect_unresolved_agent_messages(items: &[ResponseItem]) -> Vec<R
 }
 
 fn unresolved_compaction_items(items: &[ResponseItem]) -> Vec<ResponseItem> {
-    let start = items
+    let base_start = items
         .iter()
         .rposition(is_compaction_model_generated_item)
         .map_or(0, |index| index.saturating_add(1));
+    let pending_output_ids = items[base_start..]
+        .iter()
+        .filter_map(compaction_output_call_id)
+        .collect::<BTreeSet<_>>();
+    let start = items[..base_start]
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            compaction_call_id(item)
+                .filter(|call_id| pending_output_ids.contains(call_id))
+                .map(|_| index)
+        })
+        .min()
+        .unwrap_or(base_start);
     strip_compaction_startup_envelopes(items[start..].to_vec())
+}
+
+fn compaction_call_id(item: &ResponseItem) -> Option<&str> {
+    match item {
+        ResponseItem::FunctionCall { call_id, .. }
+        | ResponseItem::CustomToolCall { call_id, .. } => Some(call_id),
+        ResponseItem::LocalShellCall {
+            call_id: Some(call_id),
+            ..
+        }
+        | ResponseItem::ToolSearchCall {
+            call_id: Some(call_id),
+            ..
+        } => Some(call_id),
+        _ => None,
+    }
+}
+
+fn compaction_output_call_id(item: &ResponseItem) -> Option<&str> {
+    match item {
+        ResponseItem::FunctionCallOutput { call_id, .. }
+        | ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id),
+        ResponseItem::ToolSearchOutput {
+            call_id: Some(call_id),
+            ..
+        } => Some(call_id),
+        _ => None,
+    }
 }
 
 fn append_bounded_agent_messages_with_indices(
@@ -973,7 +1121,7 @@ fn is_compaction_model_generated_item(item: &ResponseItem) -> bool {
 }
 
 pub(crate) fn build_unresolved_user_history(items: &[ResponseItem]) -> (Vec<ResponseItem>, usize) {
-    let (mut history, retained_image_count, omitted_images) =
+    let (mut history, retained_image_count, omitted_images, _omitted_user_text) =
         build_bounded_unresolved_input_history(items);
     if omitted_images {
         history.push(ResponseItem::Message {
@@ -991,7 +1139,7 @@ pub(crate) fn build_unresolved_user_history(items: &[ResponseItem]) -> (Vec<Resp
 
 fn build_bounded_unresolved_input_history(
     items: &[ResponseItem],
-) -> (Vec<ResponseItem>, usize, bool) {
+) -> (Vec<ResponseItem>, usize, bool, bool) {
     let unresolved = unresolved_compaction_items(items);
     let messages = collect_user_messages(&unresolved);
     let user_source_indices = unresolved
@@ -1011,16 +1159,176 @@ fn build_bounded_unresolved_input_history(
         );
     let (agent_items, agent_source_indices) =
         append_bounded_agent_messages_with_indices(&unresolved, COMPACT_AGENT_MESSAGE_MAX_TOKENS);
-
-    let mut indexed_items = selected_user_indices
-        .into_iter()
-        .zip(user_items)
-        .map(|(user_index, item)| (user_source_indices[user_index], item))
-        .chain(agent_source_indices.into_iter().zip(agent_items))
+    let selected_agent_items = agent_source_indices
+        .iter()
+        .copied()
+        .zip(agent_items.iter().cloned())
         .collect::<Vec<_>>();
+
+    let selected_user_source_indices = selected_user_indices
+        .iter()
+        .map(|user_index| user_source_indices[*user_index])
+        .collect::<Vec<_>>();
+    let mut indexed_items = selected_user_source_indices
+        .iter()
+        .copied()
+        .zip(user_items)
+        .chain(selected_agent_items.iter().cloned())
+        .collect::<Vec<_>>();
+
+    let mut omitted_user_text = false;
+    for (user_index, message) in messages.iter().enumerate() {
+        let source_index = user_source_indices[user_index];
+        let original_tokens = compacted_user_message_text_tokens(message);
+        let retained_tokens = indexed_items
+            .iter()
+            .find(|(index, _)| *index == source_index)
+            .map_or(0, |(_, item)| response_item_text_tokens(item));
+        if retained_tokens < original_tokens {
+            omitted_user_text = true;
+            indexed_items.push((
+                source_index,
+                compaction_text_omission_receipt(
+                    "user",
+                    message.source_item_id.clone(),
+                    source_index,
+                    message
+                        .internal_chat_message_metadata_passthrough
+                        .as_ref()
+                        .and_then(|metadata| metadata.turn_id.clone()),
+                    original_tokens,
+                    retained_tokens,
+                ),
+            ));
+        }
+    }
+
+    for (source_index, item) in unresolved.iter().enumerate() {
+        let ResponseItem::AgentMessage {
+            id,
+            internal_chat_message_metadata_passthrough,
+            ..
+        } = item
+        else {
+            continue;
+        };
+        let original_tokens = agent_message_text_tokens(item);
+        let retained_tokens = selected_agent_items
+            .iter()
+            .find(|(index, _)| *index == source_index)
+            .map_or(0, |(_, item)| agent_message_text_tokens(item));
+        if retained_tokens < original_tokens {
+            indexed_items.push((
+                source_index,
+                compaction_text_omission_receipt(
+                    "agent",
+                    id.as_ref().map(ToString::to_string),
+                    source_index,
+                    internal_chat_message_metadata_passthrough
+                        .as_ref()
+                        .and_then(|metadata| metadata.turn_id.clone()),
+                    original_tokens,
+                    retained_tokens,
+                ),
+            ));
+        }
+    }
+
+    for (source_index, item) in unresolved.iter().enumerate() {
+        let Some(call_id) = compaction_call_id(item).or_else(|| compaction_output_call_id(item))
+        else {
+            continue;
+        };
+        let has_pending_output = unresolved
+            .iter()
+            .any(|candidate| compaction_output_call_id(candidate) == Some(call_id));
+        if has_pending_output {
+            indexed_items.push((source_index, item.clone()));
+        }
+    }
     indexed_items.sort_by_key(|(index, _)| *index);
     let history = indexed_items.into_iter().map(|(_, item)| item).collect();
-    (history, retained_image_count, omitted_images)
+    (
+        history,
+        retained_image_count,
+        omitted_images,
+        omitted_user_text,
+    )
+}
+
+fn compacted_user_message_text_tokens(message: &CompactedUserMessage) -> usize {
+    message
+        .content
+        .iter()
+        .filter_map(|item| match item {
+            UserInput::Text { text, .. } => Some(approx_token_count(text)),
+            _ => None,
+        })
+        .fold(0usize, usize::saturating_add)
+}
+
+fn response_item_text_tokens(item: &ResponseItem) -> usize {
+    match item {
+        ResponseItem::Message { content, .. } => content
+            .iter()
+            .filter_map(|item| match item {
+                ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                    Some(approx_token_count(text))
+                }
+                ContentItem::InputImage { .. } => None,
+            })
+            .fold(0usize, usize::saturating_add),
+        _ => 0,
+    }
+}
+
+fn agent_message_text_tokens(item: &ResponseItem) -> usize {
+    let ResponseItem::AgentMessage { content, .. } = item else {
+        return 0;
+    };
+    content
+        .iter()
+        .map(|item| match item {
+            AgentMessageInputContent::InputText { text } => approx_token_count(text),
+            AgentMessageInputContent::EncryptedContent { encrypted_content } => {
+                approx_token_count(encrypted_content)
+            }
+        })
+        .fold(0usize, usize::saturating_add)
+}
+
+fn compaction_text_omission_receipt(
+    role: &'static str,
+    source_item_id: Option<String>,
+    source_index: usize,
+    turn_id: Option<String>,
+    original_tokens: usize,
+    retained_tokens: usize,
+) -> ResponseItem {
+    let receipt = CompactionTextOmissionReceiptV1 {
+        version: 1,
+        kind: COMPACT_TEXT_OMISSION_MARKER,
+        role,
+        source_item_id,
+        source_index,
+        turn_id,
+        original_tokens,
+        retained_tokens,
+        omitted_tokens: original_tokens.saturating_sub(retained_tokens),
+        unresolved: true,
+    };
+    ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: match serde_json::to_string(&receipt) {
+                Ok(text) => text,
+                Err(error) => unreachable!("compaction omission receipt must serialize: {error}"),
+            },
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }
 }
 
 pub(crate) fn is_summary_message(message: &str) -> bool {
@@ -1051,6 +1359,10 @@ fn history_after_latest_summary_is_user_only(items: &[ResponseItem]) -> bool {
     items[summary_index + 1..]
         .iter()
         .all(|item| matches!(item, ResponseItem::Message { role, .. } if role == "user"))
+}
+
+fn can_reuse_previous_summary(items: &[ResponseItem], omitted_user_text: bool) -> bool {
+    !omitted_user_text && history_after_latest_summary_is_user_only(items)
 }
 
 pub(crate) fn insert_compaction_initial_context(
@@ -1254,6 +1566,7 @@ fn append_bounded_user_messages(
             selected_messages.push((
                 index,
                 CompactedUserMessage {
+                    source_item_id: message.source_item_id.clone(),
                     content,
                     internal_chat_message_metadata_passthrough: message
                         .internal_chat_message_metadata_passthrough
@@ -1300,16 +1613,42 @@ fn append_bounded_user_messages(
     )
 }
 
+#[derive(Default)]
+struct LocalCompactionAccumulator {
+    items: Vec<ResponseItem>,
+}
+
+impl LocalCompactionAccumulator {
+    fn record_output(&mut self, item: ResponseItem) {
+        self.items.push(item);
+    }
+
+    fn complete(self, token_usage: Option<TokenUsage>) -> LocalCompactionOutput {
+        LocalCompactionOutput {
+            items: self.items,
+            token_usage,
+        }
+    }
+}
+
+struct LocalCompactionOutput {
+    items: Vec<ResponseItem>,
+    token_usage: Option<TokenUsage>,
+}
+
 async fn drain_to_completed(
     sess: &Session,
     turn_context: &TurnContext,
     client_session: &mut ModelClientSession,
     responses_metadata: &CodexResponsesMetadata,
     prompt: &Prompt,
-) -> CodexResult<()> {
+    cancellation_token: &CancellationToken,
+) -> CodexResult<LocalCompactionOutput> {
     let model_request_timing_guard = turn_context.turn_timing_state.begin_model_request_wait();
-    let stream_result = client_session
-        .stream(
+    let inference_trace_context = InferenceTraceContext::disabled();
+    let stream_result = tokio::select! {
+        _ = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
+        result = client_session.stream(
             prompt,
             &turn_context.model_info,
             &turn_context.session_telemetry,
@@ -1322,15 +1661,19 @@ async fn drain_to_completed(
             responses_metadata,
             // Rollout tracing currently models remote compaction only; local compaction streams
             // are left untraced until the reducer has a first-class local compaction lifecycle.
-            &InferenceTraceContext::disabled(),
-        )
-        .await;
+            &inference_trace_context,
+        ) => result,
+    };
     drop(model_request_timing_guard);
     let mut stream = stream_result?;
+    let mut accumulator = LocalCompactionAccumulator::default();
     loop {
         let model_stream_wait_timing_guard =
             turn_context.turn_timing_state.begin_model_stream_wait();
-        let maybe_event = stream.next().await;
+        let maybe_event = tokio::select! {
+            _ = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
+            event = stream.next() => event,
+        };
         drop(model_stream_wait_timing_guard);
         let Some(event) = maybe_event else {
             return Err(CodexErr::Stream(
@@ -1343,8 +1686,7 @@ async fn drain_to_completed(
             .begin_model_stream_processing();
         match event {
             Ok(ResponseEvent::OutputItemDone(item)) => {
-                sess.record_conversation_items(turn_context, std::slice::from_ref(&item))
-                    .await;
+                accumulator.record_output(item);
             }
             Ok(ResponseEvent::ServerReasoningIncluded(included)) => {
                 sess.set_server_reasoning_included(included).await;
@@ -1353,9 +1695,7 @@ async fn drain_to_completed(
                 sess.update_rate_limits(turn_context, snapshot).await;
             }
             Ok(ResponseEvent::Completed { token_usage, .. }) => {
-                sess.update_token_usage_info(turn_context, token_usage.as_ref())
-                    .await?;
-                return Ok(());
+                return Ok(accumulator.complete(token_usage));
             }
             Ok(_) => continue,
             Err(e) => return Err(e),

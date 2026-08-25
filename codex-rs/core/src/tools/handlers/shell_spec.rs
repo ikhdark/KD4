@@ -2,6 +2,7 @@ use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolSpec;
 use codex_utils_output_truncation::adaptive_output_budget_description;
+use serde_json::Number;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -44,6 +45,74 @@ fn validation_context_schema() -> JsonSchema {
 }
 
 const LEGACY_SHELL_SCRIPT_DESCRIPTION: &str = "Legacy shell script to execute. Use this only when shell semantics are required, including PowerShell cmdlets, variables or interpolation, pipelines or redirection, here-docs, compound statements, shell builtins, and `.cmd`/`.bat` semantics. When a standalone native executable and separated arguments are already known, use `kind: \"argv\"` with `program` and `args` instead; do not serialize them into this string field. This includes Git (`git`), ripgrep (`rg`), Cargo (`cargo`), Node (`node`), Python (`python`), and KD4 helper executables such as `kds`. Examples: `git` with `[\"status\", \"--short\"]`; `rg` with `[\"--files\"]`; `cargo` with `[\"test\", \"-p\", \"codex-core\"]`; `node` with `[\"script.js\"]`; `python` with `[\"-m\", \"pytest\"]`; `kds` with `[\"--help\"]`. Arbitrary command strings remain shell scripts and must not be heuristically split. For complex PowerShell, prefer `kind: \"powershell_script\"`. If shell inspection is necessary, keep read-only PowerShell to direct cmdlet pipelines without variables, loops, or script blocks so it can remain outside the repository mutation lane.";
+
+fn bounded_integer(description: String, minimum: u64, maximum: u64) -> JsonSchema {
+    JsonSchema {
+        minimum: Some(Number::from(minimum)),
+        maximum: Some(Number::from(maximum)),
+        ..JsonSchema::integer(Some(description))
+    }
+}
+
+fn command_parameters_schema(
+    properties: BTreeMap<String, JsonSchema>,
+    script_field: &str,
+) -> JsonSchema {
+    let common = properties
+        .iter()
+        .filter(|(name, _)| {
+            !matches!(
+                name.as_str(),
+                "cmd" | "command" | "kind" | "program" | "args" | "script_body"
+            )
+        })
+        .map(|(name, schema)| (name.clone(), schema.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let command_property = properties[script_field].clone();
+    let program_property = properties["program"].clone();
+    let args_property = properties["args"].clone();
+    let powershell_property = properties["script_body"].clone();
+
+    let variant =
+        |kind: &str, variant_properties: Vec<(String, JsonSchema)>, required: Vec<String>| {
+            let mut branch = common.clone();
+            branch.insert(
+                "kind".to_string(),
+                JsonSchema::string_enum(vec![json!(kind)], None),
+            );
+            branch.extend(variant_properties);
+            let mut required_fields = vec!["kind".to_string()];
+            required_fields.extend(required);
+            JsonSchema::object(branch, Some(required_fields), Some(false.into()))
+        };
+
+    JsonSchema::one_of(
+        vec![
+            variant(
+                "script",
+                vec![(script_field.to_string(), command_property)],
+                vec![script_field.to_string()],
+            ),
+            variant(
+                "argv",
+                vec![
+                    ("program".to_string(), program_property),
+                    ("args".to_string(), args_property),
+                ],
+                vec!["program".to_string()],
+            ),
+            variant(
+                "powershell_script",
+                vec![("script_body".to_string(), powershell_property)],
+                vec!["script_body".to_string()],
+            ),
+        ],
+        Some(
+            "Exactly one explicit command encoding: script, argv, or PowerShell script."
+                .to_string(),
+        ),
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandToolOptions {
@@ -119,16 +188,18 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
         ),
         (
             "yield_time_ms".to_string(),
-            JsonSchema::number(Some(
+            bounded_integer(
                 "Wait before yielding output. Defaults to 2000 ms; effective range is 250-30000 ms.".to_string(),
-            )),
+                crate::unified_exec::MIN_YIELD_TIME_MS,
+                crate::unified_exec::MAX_YIELD_TIME_MS,
+            ),
         ),
         (
             "max_output_tokens".to_string(),
-            JsonSchema::number(Some(format!(
+            bounded_integer(format!(
                 "Output token budget. {}; larger requests may be capped by policy.",
                 adaptive_output_budget_description()
-            ))),
+            ), 0, usize::MAX as u64),
         ),
         (
             "validation".to_string(),
@@ -179,7 +250,7 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
         ),
         strict: false,
         defer_loading: None,
-        parameters: JsonSchema::object(properties, /*required*/ None, Some(false.into())),
+        parameters: command_parameters_schema(properties, "cmd"),
         output_schema: Some(unified_exec_output_schema()),
     })
 }
@@ -188,9 +259,11 @@ pub fn create_write_stdin_tool() -> ToolSpec {
     let properties = BTreeMap::from([
         (
             "session_id".to_string(),
-            JsonSchema::number(Some(
+            bounded_integer(
                 "Identifier of the running unified exec session.".to_string(),
-            )),
+                0,
+                u32::MAX as u64,
+            ),
         ),
         (
             "chars".to_string(),
@@ -200,16 +273,18 @@ pub fn create_write_stdin_tool() -> ToolSpec {
         ),
         (
             "yield_time_ms".to_string(),
-            JsonSchema::number(Some(
+            bounded_integer(
                 "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms; empty polls default to one event-driven 60000 ms wait. A wait deadline does not terminate the process.".to_string(),
-            )),
+                crate::unified_exec::MIN_YIELD_TIME_MS,
+                crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS,
+            ),
         ),
         (
             "max_output_tokens".to_string(),
-            JsonSchema::number(Some(format!(
+            bounded_integer(format!(
                 "Output token budget. {}; larger requests may be capped by policy.",
                 adaptive_output_budget_description()
-            ))),
+            ), 0, usize::MAX as u64),
         ),
     ]);
 
@@ -278,16 +353,20 @@ pub fn create_shell_command_tool(options: CommandToolOptions) -> ToolSpec {
         ),
         (
             "timeout_ms".to_string(),
-            JsonSchema::number(Some(
+            bounded_integer(
                 "Maximum command runtime. Defaults to 10000 ms.".to_string(),
-            )),
+                0,
+                u64::MAX,
+            ),
         ),
         (
             "stall_timeout_ms".to_string(),
-            JsonSchema::number(Some(
+            bounded_integer(
                 "Optional maximum time without stdout or stderr progress before cancellation. Omit or set zero to disable the stall deadline."
                     .to_string(),
-            )),
+                0,
+                u64::MAX,
+            ),
         ),
         (
             "validation".to_string(),
@@ -334,7 +413,7 @@ Examples of valid command strings:
         description,
         strict: false,
         defer_loading: None,
-        parameters: JsonSchema::object(properties, /*required*/ None, Some(false.into())),
+        parameters: command_parameters_schema(properties, "command"),
         output_schema: None,
     })
 }

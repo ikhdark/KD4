@@ -33,6 +33,7 @@ use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnStatus;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_http_client::HttpClientBuilder;
 use codex_login::AuthKeyringBackendKind;
 use codex_login::CLIENT_ID_OVERRIDE_ENV_VAR;
 use codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
@@ -1587,9 +1588,9 @@ async fn login_account_chatgpt_redirects_to_hosted_success_page() -> Result<()> 
         .query_pairs()
         .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
         .ok_or_else(|| anyhow::anyhow!("missing state"))?;
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
+    let client = HttpClientBuilder::new()
+        .without_redirects()
+        .build_direct()?;
 
     let response = client
         .get(format!("{callback_url}?code=test-code&state={state}"))

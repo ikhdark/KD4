@@ -564,18 +564,17 @@ async fn regular_turn_bounds_unfinished_startup_prewarm_handoff() {
     assert_eq!(turn_started.turn_id, tc.sub_id);
     assert_eq!(turn_started.trace_id, tc.trace_id);
     tokio::time::timeout(
-        crate::session_startup_prewarm::FIRST_TURN_PREWARM_HANDOFF_TIMEOUT
-            + std::time::Duration::from_secs(10),
+        std::time::Duration::from_millis(200),
         startup_prewarm_tx.closed(),
     )
     .await
-    .expect("expected regular turn to cancel prewarm after the bounded handoff window");
+    .expect("expected regular turn to cancel an unfinished prewarm immediately");
 
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
 
 #[tokio::test]
-async fn unfinished_startup_prewarm_falls_back_after_bounded_handoff() {
+async fn unfinished_startup_prewarm_falls_back_immediately() {
     let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -603,16 +602,15 @@ async fn unfinished_startup_prewarm_falls_back_after_bounded_handoff() {
     .await;
 
     let resolution = tokio::time::timeout(
-        crate::session_startup_prewarm::FIRST_TURN_PREWARM_HANDOFF_TIMEOUT
-            + std::time::Duration::from_millis(500),
+        std::time::Duration::from_millis(200),
         sess.consume_startup_prewarm_for_regular_turn(&CancellationToken::new()),
     )
     .await
-    .expect("ordinary dispatch should bound an unfinished startup prewarm");
+    .expect("ordinary dispatch should not wait for an unfinished startup prewarm");
     assert!(matches!(
         resolution,
         crate::session_startup_prewarm::SessionStartupPrewarmResolution::Unavailable {
-            status: "handoff_timeout",
+            status: "not_ready",
             ..
         }
     ));
@@ -689,7 +687,7 @@ async fn startup_prepared_router_handoff_is_one_shot() {
 }
 
 #[tokio::test]
-async fn startup_prewarm_completing_during_handoff_is_reused() {
+async fn startup_prewarm_completing_after_handoff_is_not_awaited() {
     let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
     let handle = tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -709,7 +707,10 @@ async fn startup_prewarm_completing_during_handoff_is_reused() {
 
     assert!(matches!(
         resolution,
-        crate::session_startup_prewarm::SessionStartupPrewarmResolution::Ready(_)
+        crate::session_startup_prewarm::SessionStartupPrewarmResolution::Unavailable {
+            status: "not_ready",
+            ..
+        }
     ));
 }
 
@@ -4794,15 +4795,15 @@ async fn session_settings_null_service_tier_update_uses_default_service_tier() {
 }
 
 #[tokio::test]
-async fn session_settings_legacy_fast_service_tier_update_uses_priority_request_value() {
+async fn session_settings_priority_service_tier_update_uses_priority_request_value() {
     let session_configuration = make_session_configuration_for_tests().await;
 
     let updated = session_configuration
         .apply(&SessionSettingsUpdate {
-            service_tier: Some(Some("fast".to_string())),
+            service_tier: Some(Some("priority".to_string())),
             ..Default::default()
         })
-        .expect("legacy fast service tier update should apply");
+        .expect("priority service tier update should apply");
 
     assert_eq!(
         updated.service_tier,
@@ -5570,6 +5571,49 @@ async fn session_update_settings_does_not_rewrite_sticky_environment_cwds() {
     assert_eq!(config.cwd, turn_cwd);
     assert_eq!(next_turn_cwd, turn_cwd);
     assert_eq!(next_turn.config.cwd, turn_cwd);
+}
+
+#[tokio::test]
+async fn unrelated_settings_update_does_not_wait_for_proxy_refresh_lock() {
+    let (session, _turn_context) = make_session_and_context().await;
+    let refresh_guard = session
+        .managed_network_proxy_refresh_lock
+        .acquire()
+        .await
+        .expect("proxy refresh semaphore remains open");
+
+    tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        session.update_settings(SessionSettingsUpdate {
+            personality: Some(Personality::Pragmatic),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("an unrelated settings update must not wait for proxy refresh serialization")
+    .expect("personality update should succeed");
+
+    drop(refresh_guard);
+}
+
+#[tokio::test]
+async fn default_turn_settings_skip_proxy_refresh_and_full_apply() {
+    let (session, _turn_context) = make_session_and_context().await;
+    let refresh_guard = session
+        .managed_network_proxy_refresh_lock
+        .acquire()
+        .await
+        .expect("proxy refresh semaphore remains open");
+
+    tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        session.apply_turn_settings("default-settings", &Default::default()),
+    )
+    .await
+    .expect("default turn settings must not enter the settings refresh path")
+    .expect("default settings should be accepted");
+
+    drop(refresh_guard);
 }
 
 #[tokio::test]
@@ -9888,6 +9932,125 @@ impl SessionTask for DelayedToolOutputRelayTask {
     }
 }
 
+#[derive(Clone)]
+struct SelfAbortingTask;
+
+impl SessionTask for SelfAbortingTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.self_aborting"
+    }
+
+    fn run(
+        self: Arc<Self>,
+        _session: Arc<Session>,
+        _ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        _cancellation_token: CancellationToken,
+    ) -> futures::future::BoxFuture<'static, SessionTaskResult> {
+        Box::pin(async { Err(CodexErr::TurnAborted) })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn self_aborting_task_runs_interrupt_hook_before_durable_abort() -> anyhow::Result<()> {
+    let (session, turn_context, rx_event) = make_session_and_context_with_rx().await;
+    let config = session.get_config().await;
+    let config_toml_path = config.codex_home.join(CONFIG_TOML_FILE);
+    let user_config: codex_config::TomlValue = serde_json::from_value(serde_json::json!({
+        "hooks": {
+            "Interrupt": [{
+                "matcher": "ignored",
+                "hooks": [{
+                    "type": "command",
+                    "command": "echo {}",
+                }],
+            }],
+        },
+    }))?;
+    let hooks = Hooks::new(HooksConfig {
+        feature_enabled: true,
+        bypass_hook_trust: true,
+        config_layer_stack: Some(
+            config
+                .config_layer_stack
+                .with_user_config(&config_toml_path, user_config),
+        ),
+        ..HooksConfig::default()
+    });
+    assert_eq!(hooks.preview_interrupt().len(), 1);
+    session.services.hooks.store(Arc::new(hooks));
+
+    session
+        .spawn_task(Arc::clone(&turn_context), Vec::new(), SelfAbortingTask)
+        .await;
+
+    let mut observed = Vec::new();
+    let aborted = timeout(Duration::from_secs(5), async {
+        loop {
+            let event = rx_event
+                .recv()
+                .await
+                .expect("event channel should remain open");
+            if let EventMsg::TurnAborted(aborted) = &event.msg {
+                observed.push(event.msg.clone());
+                break aborted.clone();
+            }
+            observed.push(event.msg);
+        }
+    })
+    .await
+    .expect("self-aborting task should reach a terminal event");
+
+    assert_eq!(aborted.reason, TurnAbortReason::Interrupted);
+    let hook_started_index = observed
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                EventMsg::HookStarted(started)
+                    if started.run.event_name
+                        == codex_protocol::protocol::HookEventName::Interrupt
+            )
+        })
+        .expect("Interrupt hook should start");
+    let hook_completed_index = observed
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                EventMsg::HookCompleted(completed)
+                    if completed.run.event_name
+                        == codex_protocol::protocol::HookEventName::Interrupt
+            )
+        })
+        .expect("Interrupt hook should complete");
+    let aborted_index = observed
+        .iter()
+        .position(|event| matches!(event, EventMsg::TurnAborted(_)))
+        .expect("turn should abort");
+    assert!(hook_started_index < hook_completed_index);
+    assert!(hook_completed_index < aborted_index);
+
+    let history = session.clone_history().await;
+    assert!(
+        history.raw_items().iter().any(|item| matches!(
+            item,
+            ResponseItem::Message { role, content, .. }
+                if role == "user" && content.iter().any(|content_item| matches!(
+                    content_item,
+                    ContentItem::InputText { text } if TurnAborted::matches_text(text)
+                ))
+        )),
+        "self-abort should persist the model-visible interrupted-turn marker",
+    );
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn abort_waits_for_delayed_tool_output_relay_before_terminal_event() {
     let (session, turn_context, rx_event) = make_session_and_context_with_rx().await;
@@ -10980,8 +11143,9 @@ async fn kd4_latency_cancelled_task_start_preserves_input_and_clears_placeholder
     };
     session
         .input_queue
-        .extend_pending_input_for_turn_state(turn_state.as_ref(), expected_input.clone())
-        .await;
+        .extend_pending_input_for_turn_state(turn_state.as_ref(), &expected_input)
+        .await
+        .expect("pending input should fit");
 
     let start = tokio::spawn({
         let session = Arc::clone(&session);
@@ -11404,9 +11568,10 @@ async fn abort_empty_active_turn_preserves_pending_input() {
     sess.input_queue
         .extend_pending_input_for_turn_state(
             turn_state.as_ref(),
-            vec![TurnInput::ResponseItem(pending_item.clone())],
+            &[TurnInput::ResponseItem(pending_item.clone())],
         )
-        .await;
+        .await
+        .expect("pending input should fit");
 
     sess.abort_all_tasks(TurnAbortReason::Replaced).await;
 

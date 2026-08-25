@@ -347,7 +347,7 @@ impl ToolOutput for FunctionToolOutput {
             ToolOutputOutcome::Skipped
         } else if let Some(outcome) = self.outcome {
             outcome
-        } else if self.success.unwrap_or(true) {
+        } else if self.success.unwrap_or(false) {
             ToolOutputOutcome::Success
         } else {
             ToolOutputOutcome::Failure

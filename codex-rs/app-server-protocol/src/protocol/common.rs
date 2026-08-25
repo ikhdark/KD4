@@ -143,21 +143,6 @@ pub enum ClientRequestSerializationScope {
     McpOauth { server_name: String },
 }
 
-/// Initialize-time capability required before a client request may be dispatched.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClientRequestRequiredCapability {
-    DesktopActivationReceipts,
-}
-
-macro_rules! required_capability_expr {
-    () => {
-        None
-    };
-    (desktop_activation_receipts) => {
-        Some(ClientRequestRequiredCapability::DesktopActivationReceipts)
-    };
-}
-
 macro_rules! serialization_scope_expr {
     ($actual_params:ident, None) => {
         None
@@ -238,7 +223,6 @@ macro_rules! client_request_definitions {
                 $(aliases: [$($alias:literal),* $(,)?],)?
                 params: $(#[$params_meta:meta])* $params:ty,
                 $(inspect_params: $inspect_params:tt,)?
-                $(requires: $required_capability:ident,)?
                 serialization: $serialization:ident $( ( $($serialization_args:tt)* ) )?,
                 $(manual_payload_conversion: $manual_payload_conversion:ident,)?
                 response: $response:ty,
@@ -280,16 +264,6 @@ macro_rules! client_request_definitions {
 
             pub fn method(&self) -> String {
                 self.method_name().to_string()
-            }
-
-            pub fn required_capability(&self) -> Option<ClientRequestRequiredCapability> {
-                match self {
-                    $(
-                        Self::$variant { .. } => {
-                            required_capability_expr!($($required_capability)?)
-                        }
-                    )*
-                }
             }
 
             pub fn serialization_scope(&self) -> Option<ClientRequestSerializationScope> {
@@ -548,24 +522,6 @@ client_request_definitions! {
         inspect_params: true,
         serialization: thread_or_path(params.thread_id, params.path),
         response: v2::ThreadResumeResponse,
-    },
-    ThreadDesktopActivationObligation => "thread/desktopActivation/obligation" {
-        params: v2::ThreadDesktopActivationObligationParams,
-        requires: desktop_activation_receipts,
-        serialization: thread_id(params.thread_id),
-        response: v2::ThreadDesktopActivationObligationResponse,
-    },
-    ThreadDesktopActivationChallenge => "thread/desktopActivation/challenge" {
-        params: v2::ThreadDesktopActivationChallengeParams,
-        requires: desktop_activation_receipts,
-        serialization: thread_id(params.thread_id),
-        response: v2::ThreadDesktopActivationChallengeResponse,
-    },
-    ThreadDesktopActivationRecord => "thread/desktopActivation/record" {
-        params: v2::ThreadDesktopActivationRecordParams,
-        requires: desktop_activation_receipts,
-        serialization: global("desktop_activation_record"),
-        response: v2::ThreadDesktopActivationRecordResponse,
     },
     ThreadFork => "thread/fork" {
         params: v2::ThreadForkParams,
@@ -1945,40 +1901,6 @@ mod tests {
     }
 
     #[test]
-    fn desktop_activation_capability_is_declared_with_each_request_route() {
-        let thread_id = "thread-1".to_string();
-        let required = ClientRequestRequiredCapability::DesktopActivationReceipts;
-        let requests = [
-            ClientRequest::ThreadDesktopActivationObligation {
-                request_id: request_id(),
-                params: v2::ThreadDesktopActivationObligationParams {
-                    thread_id: thread_id.clone(),
-                },
-            },
-            ClientRequest::ThreadDesktopActivationChallenge {
-                request_id: request_id(),
-                params: v2::ThreadDesktopActivationChallengeParams { thread_id },
-            },
-            ClientRequest::ThreadDesktopActivationRecord {
-                request_id: request_id(),
-                params: v2::ThreadDesktopActivationRecordParams {
-                    challenge_id: "challenge".to_string(),
-                    desktop_process_id: 42,
-                    desktop_executable_path: "desktop.exe".to_string(),
-                    observation_timestamp: "2026-08-24T00:00:00Z".to_string(),
-                    initialization_observation_identity: "observation".to_string(),
-                },
-            },
-        ];
-
-        assert!(
-            requests
-                .iter()
-                .all(|request| request.required_capability() == Some(required))
-        );
-    }
-
-    #[test]
     fn terminalization_completed_notification_requires_delivery() {
         let notification = ServerNotification::TurnTerminalizationCompleted(
             v2::TurnTerminalizationCompletedNotification {
@@ -2575,7 +2497,6 @@ mod tests {
                 capabilities: Some(v1::InitializeCapabilities {
                     experimental_api: true,
                     request_attestation: true,
-                    desktop_activation_receipts: false,
                     mcp_server_openai_form_elicitation: true,
                     opt_out_notification_methods: Some(vec![
                         "thread/started".to_string(),
@@ -2647,7 +2568,6 @@ mod tests {
                     capabilities: Some(v1::InitializeCapabilities {
                         experimental_api: true,
                         request_attestation: true,
-                        desktop_activation_receipts: false,
                         mcp_server_openai_form_elicitation: true,
                         opt_out_notification_methods: Some(vec![
                             "thread/started".to_string(),
@@ -3114,6 +3034,9 @@ mod tests {
                     "instructionSources": [absolute_path_string("tmp/AGENTS.md")],
                     "approvalPolicy": "on-request",
                     "approvalsReviewer": "user",
+                    "permissionProfile": {
+                        "type": "disabled"
+                    },
                     "sandbox": {
                         "type": "dangerFullAccess"
                     },

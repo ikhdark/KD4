@@ -2,7 +2,6 @@ use crate::FunctionCallError;
 use crate::agent::task_capabilities::ExternalMutationIntent;
 use crate::agent::task_capabilities::TypedToolClass;
 use crate::agent::task_capabilities::authorize_typed_tool;
-use crate::agent::task_capabilities::classify_typed_tool;
 use crate::agent::task_capabilities::is_independent_review_source;
 use crate::client_common::ToolSchemaArtifact;
 use crate::session::session::Session;
@@ -15,7 +14,6 @@ use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::registry::AnyToolResult;
 use crate::tools::registry::ToolArgumentDiffConsumer;
 use crate::tools::registry::ToolRegistry;
-use crate::tools::spec_plan::active_collaboration_namespace;
 use crate::tools::spec_plan::build_tool_router;
 use crate::tools::tool_dispatch_trace::record_authorization_state_coordination;
 use codex_agent_task_store::AssignmentAdmissionOrigin;
@@ -61,10 +59,14 @@ pub(crate) enum ToolCallBuildError {
 pub struct ToolRouter {
     registry: ToolRegistry,
     planning_warnings: Vec<String>,
-    proven_read_only_external_tools: HashSet<ToolName>,
     exposure_identity: ToolExposureIdentity,
-    schema_cache: Mutex<Option<(String, u64, Arc<ToolSchemaArtifact>)>>,
-    manifest_cache: Mutex<Option<(String, u64, ToolManifestItem)>>,
+    surface_cache: Mutex<Option<(String, u64, ToolSurfaceSnapshot)>>,
+}
+
+#[derive(Clone)]
+struct ToolSurfaceSnapshot {
+    schemas: Arc<ToolSchemaArtifact>,
+    manifest: ToolManifestItem,
 }
 
 pub(crate) struct ToolRouterParams<'a> {
@@ -94,13 +96,7 @@ impl ToolRouter {
         params: ToolRouterParams<'_>,
         tool_search_handler_cache: &ToolSearchHandlerCache,
     ) -> Self {
-        let proven_read_only_external_tools = collect_proven_read_only_external_tools(
-            params.mcp_tools.as_deref(),
-            params.deferred_mcp_tools.as_deref(),
-        );
-        let mut router = build_tool_router(step_context, params, tool_search_handler_cache);
-        router.proven_read_only_external_tools = proven_read_only_external_tools;
-        router
+        build_tool_router(step_context, params, tool_search_handler_cache)
     }
 
     #[cfg(test)]
@@ -132,10 +128,8 @@ impl ToolRouter {
         Self {
             registry,
             planning_warnings,
-            proven_read_only_external_tools: HashSet::new(),
             exposure_identity,
-            schema_cache: Mutex::new(None),
-            manifest_cache: Mutex::new(None),
+            surface_cache: Mutex::new(None),
         }
     }
 
@@ -145,14 +139,12 @@ impl ToolRouter {
 
     pub(crate) fn classify_tool_name(
         &self,
-        turn: &crate::session::turn_context::TurnContext,
+        _turn: &crate::session::turn_context::TurnContext,
         tool_name: &ToolName,
     ) -> TypedToolClass {
-        classify_typed_tool(
-            tool_name.namespace.as_deref(),
-            &tool_name.name,
-            active_collaboration_namespace(turn, self.exposure_identity.agent_surface_stage),
-        )
+        self.registry
+            .tool_authorization_class(tool_name)
+            .unwrap_or(TypedToolClass::Unknown)
     }
 
     pub fn model_visible_specs(&self) -> Vec<ToolSpec> {
@@ -167,42 +159,7 @@ impl ToolRouter {
         &self,
         turn: &crate::session::turn_context::TurnContext,
     ) -> Arc<ToolSchemaArtifact> {
-        let activated = turn.activated_deferred_tools();
-        if activated.is_empty() {
-            return self.model_visible_schemas();
-        }
-
-        let activation_revision = turn.deferred_tool_activation_revision();
-        let turn_id = turn.sub_id.clone();
-        if let Some((_, _, schemas)) = self
-            .schema_cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .filter(|(cached_turn, cached_revision, _)| {
-                cached_turn == &turn_id && *cached_revision == activation_revision
-            })
-        {
-            return Arc::clone(schemas);
-        }
-
-        let mut visible = self.model_visible_specs();
-        for (_, exposure, spec) in self.registry.manifest_entries() {
-            if exposure != crate::tools::registry::ToolExposure::Deferred {
-                continue;
-            }
-            let Some(spec) = filter_activated_deferred_spec(&spec, &activated) else {
-                continue;
-            };
-            merge_visible_tool_spec(&mut visible, spec);
-        }
-        let schemas = Arc::new(ToolSchemaArtifact::new(visible));
-        *self
-            .schema_cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some((turn_id, activation_revision, Arc::clone(&schemas)));
-        schemas
+        self.tool_surface_snapshot(turn).schemas
     }
 
     pub(crate) fn deferred_tool_capability_revisions(&self) -> HashMap<ToolName, String> {
@@ -227,19 +184,38 @@ impl ToolRouter {
         &self,
         turn: &crate::session::turn_context::TurnContext,
     ) -> ToolManifestItem {
-        let activation_revision = turn.deferred_tool_activation_revision();
+        self.tool_surface_snapshot(turn).manifest
+    }
+
+    fn tool_surface_snapshot(
+        &self,
+        turn: &crate::session::turn_context::TurnContext,
+    ) -> ToolSurfaceSnapshot {
+        let (activation_revision, activated) = turn.deferred_tool_activation_snapshot();
         let turn_id = turn.sub_id.clone();
-        if let Some((_, _, manifest)) = self
-            .manifest_cache
+        let mut cache = self
+            .surface_cache
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .filter(|(cached_turn, cached_revision, _)| {
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, _, snapshot)) =
+            cache.as_ref().filter(|(cached_turn, cached_revision, _)| {
                 cached_turn == &turn_id && *cached_revision == activation_revision
             })
         {
-            return manifest.clone();
+            return snapshot.clone();
         }
+
+        let mut visible = self.model_visible_specs();
+        for (_, exposure, spec) in self.registry.manifest_entries() {
+            if exposure != crate::tools::registry::ToolExposure::Deferred {
+                continue;
+            }
+            let Some(spec) = filter_activated_deferred_spec(&spec, &activated) else {
+                continue;
+            };
+            merge_visible_tool_spec(&mut visible, spec);
+        }
+        let schemas = Arc::new(ToolSchemaArtifact::new(visible));
         let registered = self
             .registry
             .manifest_entries()
@@ -261,7 +237,7 @@ impl ToolRouter {
                     "name": name.to_string(),
                     "exposure": exposure_name,
                     "activated": exposure != crate::tools::registry::ToolExposure::Deferred
-                        || turn.deferred_tool_is_activated(&name),
+                        || activated.contains(&name),
                     // Full schemas already live in `model_visible` or the deferred
                     // discovery index. Persist only their canonical identity here so
                     // the rollout manifest does not scale with every registered schema.
@@ -270,7 +246,7 @@ impl ToolRouter {
             })
             .collect::<Vec<_>>();
         let manifest = canonicalize_json(&serde_json::json!({
-            "model_visible": self.registry.model_visible_schemas().specs(),
+            "model_visible": schemas.specs(),
             "registered": registered,
         }));
         let fingerprint_input = serde_json::json!({
@@ -278,13 +254,12 @@ impl ToolRouter {
             "tool_exposure_identity": &self.exposure_identity,
         });
         let encoded = serde_json::to_vec(&fingerprint_input).unwrap_or_default();
-        let item = ToolManifestItem::full(format!("{:x}", Sha256::digest(encoded)), manifest);
-        *self
-            .manifest_cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some((turn_id, activation_revision, item.clone()));
-        item
+        let snapshot = ToolSurfaceSnapshot {
+            schemas,
+            manifest: ToolManifestItem::full(format!("{:x}", Sha256::digest(encoded)), manifest),
+        };
+        *cache = Some((turn_id, activation_revision, snapshot.clone()));
+        snapshot
     }
 
     pub(crate) fn planning_warnings(&self) -> &[String] {
@@ -302,6 +277,22 @@ impl ToolRouter {
         name: &ToolName,
     ) -> Option<crate::tools::registry::ToolExposure> {
         self.registry.tool_exposure(name)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tool_authorization_class_for_test(
+        &self,
+        name: &ToolName,
+    ) -> Option<TypedToolClass> {
+        self.registry.tool_authorization_class(name)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tool_external_mutation_intent_for_test(
+        &self,
+        name: &ToolName,
+    ) -> Option<ExternalMutationIntent> {
+        self.registry.tool_external_mutation_intent(name)
     }
 
     pub(crate) fn create_diff_consumer(
@@ -412,14 +403,10 @@ impl ToolRouter {
                 )));
             }
         }
-        let external_mutation_intent = if self
-            .proven_read_only_external_tools
-            .contains(&call.tool_name)
-        {
-            ExternalMutationIntent::ProvenReadOnly
-        } else {
-            ExternalMutationIntent::MayMutate
-        };
+        let external_mutation_intent = self
+            .registry
+            .tool_external_mutation_intent(&call.tool_name)
+            .unwrap_or(ExternalMutationIntent::MayMutate);
         let tool_class = self.classify_tool_name(step_context.turn.as_ref(), &call.tool_name);
         authorize_independent_review_tool_call(
             &step_context.turn.session_source,
@@ -521,6 +508,7 @@ fn merge_visible_tool_spec(visible: &mut Vec<ToolSpec>, spec: ToolSpec) {
     }
 }
 
+#[cfg(test)]
 fn collect_proven_read_only_external_tools(
     mcp_tools: Option<&[ToolInfo]>,
     deferred_mcp_tools: Option<&[ToolInfo]>,
@@ -552,6 +540,7 @@ fn collect_proven_read_only_external_tools(
         .collect()
 }
 
+#[cfg(test)]
 fn is_allowlisted_read_only_external_tool(name: &ToolName) -> bool {
     matches!(
         (name.namespace.as_deref(), name.name.as_str()),
@@ -609,7 +598,6 @@ fn authorize_independent_review_tool_call(
             | TypedToolClass::OwnTask
             | TypedToolClass::ReadSearch
             | TypedToolClass::CodeModeControl
-            | TypedToolClass::Diff
             | TypedToolClass::Shell
     ) || (class == TypedToolClass::DynamicExternal
         && external_mutation_intent == ExternalMutationIntent::ProvenReadOnly);

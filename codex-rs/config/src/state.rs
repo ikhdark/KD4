@@ -83,6 +83,15 @@ impl LoaderOverrides {
         }
     }
 
+    /// Returns overrides with host-managed inputs disabled and system requirements loaded from
+    /// `system_requirements_path`.
+    pub fn with_system_requirements_path_for_tests(system_requirements_path: PathBuf) -> Self {
+        Self {
+            system_requirements_path: Some(system_requirements_path),
+            ..Self::without_managed_config_for_tests()
+        }
+    }
+
     pub fn user_config_path(&self, codex_home: &Path) -> std::io::Result<AbsolutePathBuf> {
         match self.user_config_path.as_ref() {
             Some(path) => Ok(path.clone()),

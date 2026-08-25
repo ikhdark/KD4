@@ -9,9 +9,12 @@ use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
+use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
@@ -117,6 +120,14 @@ pub(crate) const EVIDENCE_SCHEMA_VERSION: u32 = 1;
 const GIT_TIMEOUT: Duration = Duration::from_secs(2);
 const STORE_DIRECTORY: &str = "known-delta";
 
+#[derive(Default)]
+struct RuntimeQuarantineState {
+    disabled_namespaces: HashSet<PathBuf>,
+    unsafe_lineages: HashSet<PathBuf>,
+}
+
+static RUNTIME_QUARANTINE_STATE: OnceLock<Mutex<RuntimeQuarantineState>> = OnceLock::new();
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct EvidenceIdentity {
     pub project_namespace: String,
@@ -206,6 +217,7 @@ pub(crate) enum KnownDeltaExecutionObservation<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Observation {
     Published,
+    PersistenceFailed,
     Unchanged { reuse_enabled: bool },
     Contradiction,
 }
@@ -277,11 +289,19 @@ pub(crate) async fn immutable_git_show_identity_with_project_namespace(
     let (object, suffix) = requested
         .split_once(':')
         .unwrap_or((requested.as_str(), ""));
-    if !is_resolved_object(object)
-        || (!suffix.is_empty() && normalize_relative_path(suffix).is_none())
-    {
+    if !is_resolved_object(object) {
         return None;
     }
+    let normalized_suffix = if suffix.is_empty() {
+        String::new()
+    } else {
+        normalize_relative_path(suffix)?
+    };
+    let normalized_requested = if normalized_suffix.is_empty() {
+        object.to_string()
+    } else {
+        format!("{object}:{normalized_suffix}")
+    };
     let project_namespace = match project_namespace_hint {
         ProjectNamespaceHint::Resolved(Some(namespace)) => namespace.to_owned(),
         ProjectNamespaceHint::Resolved(None) => return None,
@@ -290,14 +310,15 @@ pub(crate) async fn immutable_git_show_identity_with_project_namespace(
     let cwd_position = git_stdout(cwd, &["rev-parse", "--show-prefix"])
         .await
         .unwrap_or_default();
-    let resolved_blob = git_resolve_blob(cwd, requested).await?;
+    let resolved_blob = git_resolve_blob(cwd, &normalized_requested).await?;
     let program_identity = program.replace('\\', "/");
     let lineage_key = digest(
-        format!("git_show_resolved_object\0program={program_identity}\0{suffix}").as_bytes(),
+        format!("git_show_resolved_object\0program={program_identity}\0{normalized_suffix}")
+            .as_bytes(),
     );
     let fingerprint = digest(
         format!(
-            "schema={EVIDENCE_SCHEMA_VERSION}\0project={project_namespace}\0op=git_show\0program={program_identity}\0cwd={cwd_position}\0object={requested}\0blob={resolved_blob}"
+            "schema={EVIDENCE_SCHEMA_VERSION}\0project={project_namespace}\0op=git_show\0program={program_identity}\0cwd={cwd_position}\0object={normalized_requested}\0blob={resolved_blob}"
         )
         .as_bytes(),
     );
@@ -305,7 +326,7 @@ pub(crate) async fn immutable_git_show_identity_with_project_namespace(
         project_namespace,
         lineage_key,
         fingerprint,
-        provenance: format!("git-object:{requested}"),
+        provenance: format!("git-object:{normalized_requested}"),
         fingerprint_cost: started.elapsed(),
     })
 }
@@ -382,9 +403,9 @@ pub(crate) async fn lookup(
     #[cfg(test)]
     test_observation::record_lookup();
     let started = Instant::now();
-    if tokio::fs::try_exists(unsafe_path(codex_home, identity))
-        .await
-        .ok()?
+    let unsafe_marker = unsafe_path(codex_home, identity);
+    if lookup_disabled(codex_home, &unsafe_marker)
+        || tokio::fs::try_exists(&unsafe_marker).await.ok()?
     {
         return None;
     }
@@ -404,6 +425,11 @@ pub(crate) async fn lookup(
         .await
         .ok()?;
     if digest(&output) != record.blob_digest {
+        return None;
+    }
+    // A contradiction may be reported while this lookup is reading the old
+    // record. Recheck the process-local deny state before returning it.
+    if lookup_disabled(codex_home, &unsafe_marker) {
         return None;
     }
     Some(EvidenceCandidate {
@@ -446,13 +472,13 @@ pub(crate) async fn record_success(
                     .saturating_add(record.metrics.fingerprint_micros);
         let reuse_enabled = record.reusable;
         if write_record(codex_home, identity, &record).await.is_none() {
-            return Observation::Published;
+            return Observation::PersistenceFailed;
         }
         return Observation::Unchanged { reuse_enabled };
     }
 
     if write_blob(codex_home, &blob_digest, output).await.is_none() {
-        return Observation::Published;
+        return Observation::PersistenceFailed;
     }
     let record = EvidenceRecord {
         schema_version: EVIDENCE_SCHEMA_VERSION,
@@ -467,7 +493,9 @@ pub(crate) async fn record_success(
         reusable: false,
         metrics: EvidenceMetrics::default(),
     };
-    let _ = write_record(codex_home, identity, &record).await;
+    if write_record(codex_home, identity, &record).await.is_none() {
+        return Observation::PersistenceFailed;
+    }
     Observation::Published
 }
 
@@ -563,6 +591,32 @@ fn unsafe_path(codex_home: &Path, identity: &EvidenceIdentity) -> PathBuf {
         .join(format!("{}.unsafe", identity.lineage_key))
 }
 
+fn runtime_quarantine_state() -> &'static Mutex<RuntimeQuarantineState> {
+    RUNTIME_QUARANTINE_STATE.get_or_init(|| Mutex::new(RuntimeQuarantineState::default()))
+}
+
+fn lookup_disabled(codex_home: &Path, unsafe_marker: &Path) -> bool {
+    let Ok(state) = runtime_quarantine_state().lock() else {
+        // A poisoned deny-state lock must not restore access to suspect cache
+        // entries.
+        return true;
+    };
+    state.disabled_namespaces.contains(&store_root(codex_home))
+        || state.unsafe_lineages.contains(unsafe_marker)
+}
+
+fn mark_lineage_unsafe(unsafe_marker: PathBuf) {
+    if let Ok(mut state) = runtime_quarantine_state().lock() {
+        state.unsafe_lineages.insert(unsafe_marker);
+    }
+}
+
+fn disable_namespace(codex_home: &Path) {
+    if let Ok(mut state) = runtime_quarantine_state().lock() {
+        state.disabled_namespaces.insert(store_root(codex_home));
+    }
+}
+
 async fn write_blob(codex_home: &Path, blob_digest: &str, output: &[u8]) -> Option<()> {
     let path = blob_path(codex_home, blob_digest);
     if let Ok(existing) = tokio::fs::read(&path).await
@@ -627,13 +681,49 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Option<()> {
     Some(())
 }
 
+#[derive(Clone, Copy, Default)]
+struct QuarantineFaults {
+    marker_publication: bool,
+    evidence_rename: bool,
+}
+
 async fn quarantine(codex_home: &Path, identity: &EvidenceIdentity) {
+    quarantine_with_faults(codex_home, identity, QuarantineFaults::default()).await;
+}
+
+async fn quarantine_with_faults(
+    codex_home: &Path,
+    identity: &EvidenceIdentity,
+    faults: QuarantineFaults,
+) {
     let evidence = evidence_path(codex_home, identity);
-    if tokio::fs::try_exists(&evidence).await.unwrap_or(false) {
+    let unsafe_marker = unsafe_path(codex_home, identity);
+    // Close the in-process race before attempting either durable mutation.
+    mark_lineage_unsafe(unsafe_marker.clone());
+
+    // Publish the lineage tombstone first. Once durable, even a failed move of
+    // the old evidence cannot make it reusable by a later process.
+    let marker_published =
+        !faults.marker_publication && atomic_write(&unsafe_marker, b"unsafe\n").await.is_some();
+    let evidence_quarantined = if tokio::fs::try_exists(&evidence).await.unwrap_or(false) {
         let quarantine = evidence.with_extension(format!("quarantine-{}", now_ms()));
-        let _ = tokio::fs::rename(&evidence, quarantine).await;
+        !faults.evidence_rename && tokio::fs::rename(&evidence, quarantine).await.is_ok()
+    } else {
+        true
+    };
+
+    if !marker_published || !evidence_quarantined {
+        // If quarantine cannot be made wholly durable, fail closed for every
+        // Known Delta lookup sharing this cache namespace for this process.
+        disable_namespace(codex_home);
+        tracing::error!(
+            marker_published,
+            evidence_quarantined,
+            evidence = %evidence.display(),
+            unsafe_marker = %unsafe_marker.display(),
+            "Known Delta quarantine was not fully durable; cache namespace disabled"
+        );
     }
-    let _ = atomic_write(&unsafe_path(codex_home, identity), b"unsafe\n").await;
 }
 
 async fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
@@ -717,15 +807,24 @@ async fn git_project_namespace(cwd: &Path) -> Option<String> {
 }
 
 fn normalize_relative_path(path: &str) -> Option<String> {
-    let path = Path::new(path);
-    if path.is_absolute()
+    if path.starts_with('/')
+        || path.starts_with('\\')
         || path
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
+            .as_bytes()
+            .get(1)
+            .is_some_and(|separator| *separator == b':')
     {
         return None;
     }
-    Some(path.to_string_lossy().replace('\\', "/"))
+    let mut normalized = Vec::new();
+    for component in path.split(['/', '\\']) {
+        match component {
+            "" | "." => {}
+            ".." => return None,
+            component => normalized.push(component),
+        }
+    }
+    Some(normalized.join("/"))
 }
 
 fn is_git_program(program: &str) -> bool {
@@ -786,6 +885,25 @@ mod tests {
             provenance: "git-clean:src/lib.rs@0123456789012345678901234567890123456789".to_string(),
             fingerprint_cost: Duration::ZERO,
         }
+    }
+
+    #[tokio::test]
+    async fn publication_reports_persistence_failure_when_the_store_is_unwritable() {
+        let root = TempDir::new().unwrap();
+        let blocked_home = root.path().join("not-a-directory");
+        tokio::fs::write(&blocked_home, b"blocked").await.unwrap();
+
+        assert_eq!(
+            record_success(
+                &blocked_home,
+                &identity("project", "lineage", "fingerprint"),
+                None,
+                b"output",
+                Duration::from_millis(1),
+            )
+            .await,
+            Observation::PersistenceFailed
+        );
     }
 
     fn run_git(cwd: &Path, args: &[&str]) -> String {
@@ -912,6 +1030,50 @@ mod tests {
         assert_eq!(observed.immutable_git_show_identity_calls, 1);
         assert_eq!(observed.lookup_calls, 3);
         assert_eq!(observed.fingerprint_git_subprocesses, 3);
+    }
+
+    #[tokio::test]
+    async fn immutable_git_show_identity_uses_the_normalized_path_suffix() {
+        let root = TempDir::new().unwrap();
+        let repo = root.path().join("repo");
+        init_repo(&repo, "immutable\n");
+        let commit = run_git(&repo, &["rev-parse", "HEAD"]);
+
+        let direct = immutable_git_show_identity(
+            &repo,
+            "git",
+            &["show".to_string(), format!("{commit}:read.txt")],
+        )
+        .await
+        .expect("direct path identity");
+        let dotted = immutable_git_show_identity(
+            &repo,
+            "git",
+            &["show".to_string(), format!("{commit}:./read.txt")],
+        )
+        .await
+        .expect("normalized path identity");
+
+        assert_eq!(direct.lineage_key, dotted.lineage_key);
+        assert_eq!(direct.fingerprint, dotted.fingerprint);
+        assert_eq!(direct.provenance, dotted.provenance);
+        for invalid in [
+            "../read.txt",
+            "src/../read.txt",
+            "/read.txt",
+            "C:\\read.txt",
+        ] {
+            assert!(
+                immutable_git_show_identity(
+                    &repo,
+                    "git",
+                    &["show".to_string(), format!("{commit}:{invalid}")],
+                )
+                .await
+                .is_none(),
+                "invalid suffix must not produce an identity: {invalid}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1154,6 +1316,134 @@ mod tests {
         record_contradictory_failure(home.path(), &id, true).await;
 
         assert!(lookup(home.path(), &id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn audit_known_delta_quarantine_rename_failure_disables_namespace() {
+        let home = TempDir::new().unwrap();
+        let contradicted = identity("project", "lineage", "fingerprint");
+        let unrelated = identity("other-project", "other-lineage", "other-fingerprint");
+        record_success(
+            home.path(),
+            &contradicted,
+            None,
+            b"known wrong",
+            Duration::from_millis(1),
+        )
+        .await;
+        record_success(
+            home.path(),
+            &unrelated,
+            None,
+            b"otherwise reusable",
+            Duration::from_millis(1),
+        )
+        .await;
+
+        quarantine_with_faults(
+            home.path(),
+            &contradicted,
+            QuarantineFaults {
+                evidence_rename: true,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert!(
+            tokio::fs::try_exists(evidence_path(home.path(), &contradicted))
+                .await
+                .unwrap()
+        );
+        assert!(
+            tokio::fs::try_exists(unsafe_path(home.path(), &contradicted))
+                .await
+                .unwrap()
+        );
+        assert!(lookup(home.path(), &contradicted).await.is_none());
+        assert!(lookup(home.path(), &unrelated).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn audit_known_delta_quarantine_marker_failure_disables_namespace() {
+        let home = TempDir::new().unwrap();
+        let contradicted = identity("project", "lineage", "fingerprint");
+        let unrelated = identity("other-project", "other-lineage", "other-fingerprint");
+        record_success(
+            home.path(),
+            &contradicted,
+            None,
+            b"known wrong",
+            Duration::from_millis(1),
+        )
+        .await;
+        record_success(
+            home.path(),
+            &unrelated,
+            None,
+            b"otherwise reusable",
+            Duration::from_millis(1),
+        )
+        .await;
+
+        quarantine_with_faults(
+            home.path(),
+            &contradicted,
+            QuarantineFaults {
+                marker_publication: true,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert!(
+            !tokio::fs::try_exists(evidence_path(home.path(), &contradicted))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !tokio::fs::try_exists(unsafe_path(home.path(), &contradicted))
+                .await
+                .unwrap()
+        );
+        assert!(lookup(home.path(), &contradicted).await.is_none());
+        assert!(lookup(home.path(), &unrelated).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn audit_known_delta_quarantine_combined_failure_never_reuses_record() {
+        let home = TempDir::new().unwrap();
+        let contradicted = identity("project", "lineage", "fingerprint");
+        record_success(
+            home.path(),
+            &contradicted,
+            None,
+            b"known wrong",
+            Duration::from_millis(1),
+        )
+        .await;
+
+        quarantine_with_faults(
+            home.path(),
+            &contradicted,
+            QuarantineFaults {
+                marker_publication: true,
+                evidence_rename: true,
+            },
+        )
+        .await;
+
+        assert!(
+            tokio::fs::try_exists(evidence_path(home.path(), &contradicted))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !tokio::fs::try_exists(unsafe_path(home.path(), &contradicted))
+                .await
+                .unwrap()
+        );
+        assert!(lookup(home.path(), &contradicted).await.is_none());
     }
 
     #[tokio::test]

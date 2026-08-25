@@ -438,7 +438,7 @@ allow_local_binding = true
         .with_home(home)
         .with_cloud_config_bundle(managed_network_requirements_loader())
         .with_config(move |config| {
-            config.use_experimental_unified_exec_tool = true;
+            config.unified_exec_enabled = true;
             config
                 .features
                 .enable(Feature::UnifiedExec)
@@ -571,7 +571,7 @@ async fn unified_exec_owner_wait_delivers_terminal_output_before_model_resumes()
     )
     .await;
     let mut builder = test_codex().with_config(|config| {
-        config.use_experimental_unified_exec_tool = true;
+        config.unified_exec_enabled = true;
         config
             .features
             .enable(Feature::UnifiedExec)

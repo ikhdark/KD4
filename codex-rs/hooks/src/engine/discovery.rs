@@ -18,6 +18,7 @@ use codex_config::RequirementSource;
 use codex_config::TomlValue;
 use codex_config::version_for_toml;
 use codex_plugin::PluginHookSource;
+use codex_protocol::protocol::HookEventName;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::Deserialize;
 use serde::Serialize;
@@ -474,7 +475,18 @@ fn append_matcher_groups(
                         ));
                         continue;
                     }
-                    let timeout_sec = timeout_sec.unwrap_or(600).max(1);
+                    let timeout_sec = if event_name == HookEventName::Interrupt {
+                        let timeout_sec = timeout_sec.unwrap_or(1).max(1);
+                        if timeout_sec > 3 {
+                            warnings.push(format!(
+                                "clamping Interrupt hook timeout to 3s in {}",
+                                source.path.display()
+                            ));
+                        }
+                        timeout_sec.min(3)
+                    } else {
+                        timeout_sec.unwrap_or(600).max(1)
+                    };
                     let normalized_handler = HookHandlerConfig::Command {
                         command: command.clone(),
                         command_windows: None,
@@ -816,6 +828,45 @@ mod tests {
                 display_order: 0,
                 env: std::collections::HashMap::new(),
             }]
+        );
+    }
+
+    #[test]
+    fn interrupt_ignores_matcher_and_clamps_timeout() {
+        let mut handlers = Vec::new();
+        let mut warnings = Vec::new();
+        let mut display_order = 0;
+        let source_path = source_path();
+        let hook_states = std::collections::HashMap::new();
+
+        append_matcher_groups(
+            &mut handlers,
+            &mut Vec::new(),
+            &mut warnings,
+            &mut display_order,
+            &hook_handler_source(&source_path, &hook_states),
+            HookEventName::Interrupt,
+            vec![MatcherGroup {
+                matcher: Some("[".to_string()),
+                hooks: vec![HookHandlerConfig::Command {
+                    command: "echo hello".to_string(),
+                    command_windows: None,
+                    timeout_sec: Some(99),
+                    r#async: false,
+                    status_message: None,
+                }],
+            }],
+        );
+
+        assert_eq!(handlers.len(), 1);
+        assert_eq!(handlers[0].matcher, None);
+        assert_eq!(handlers[0].timeout_sec, 3);
+        assert_eq!(
+            warnings,
+            vec![format!(
+                "clamping Interrupt hook timeout to 3s in {}",
+                source_path.display()
+            )]
         );
     }
 

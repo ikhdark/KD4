@@ -458,7 +458,6 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
                         ["tool", "--version"], cache_dir=cache_dir
                     )
                 )
-            just_shell.TOOL_RUN_RESULTS.clear()
             with mock.patch.object(
                 just_shell,
                 "tool_runs",
@@ -471,6 +470,17 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
                 )
 
         run.assert_called_once()
+
+    def test_local_just_shell_does_not_keep_one_shot_process_probe_cache(
+        self,
+    ) -> None:
+        just_shell = load_just_shell_module()
+
+        with mock.patch.object(just_shell, "tool_runs", return_value=True) as run:
+            self.assertTrue(just_shell.cached_tool_runs(["tool", "--version"]))
+            self.assertTrue(just_shell.cached_tool_runs(["tool", "--version"]))
+
+        self.assertEqual(run.call_count, 2)
 
     def test_local_just_shell_inconclusive_tool_probe_proceeds_without_cache(
         self,

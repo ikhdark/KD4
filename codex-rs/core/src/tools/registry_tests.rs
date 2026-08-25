@@ -52,7 +52,7 @@ fn direct_recovery_is_exempt_from_recursive_generic_projection() {
 }
 
 #[test]
-fn typed_preflight_enforces_code_mode_registered_schema() {
+fn typed_preflight_rejects_invalid_hook_rewritten_code_mode_arguments() {
     let spec = ToolSpec::Function(codex_tools::ResponsesApiTool {
         name: "typed_helper".to_string(),
         description: "test helper".to_string(),
@@ -75,6 +75,8 @@ fn typed_preflight_enforces_code_mode_registered_schema() {
         preflight_code_mode_arguments(&name, &spec, &valid_payload, valid_arguments.as_ref(),),
         Ok(())
     );
+    // This represents the final payload after a PreToolUse hook rewrites the
+    // initially valid invocation.
     let invalid_payload = ToolPayload::Function {
         arguments: serde_json::json!({ "path": 7, "extra": true }).to_string(),
     };
@@ -1955,6 +1957,24 @@ fn registry_caches_each_runtime_spec_once() {
 }
 
 #[test]
+fn registered_search_info_reuses_the_authoritative_spec_snapshot() {
+    let tool_name = ToolName::plain("searchable_counted_spec");
+    let spec_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let runtime: Arc<dyn CoreToolRuntime> = Arc::new(SpecCountingHandler {
+        tool_name: tool_name.clone(),
+        spec_calls: Arc::clone(&spec_calls),
+    });
+    let registered = RegisteredTool::new(runtime, TypedToolClass::ReadSearch);
+
+    let search_info = registered
+        .search_info()
+        .expect("function tools should be discoverable");
+
+    assert_eq!(search_info.entry.tool_names, vec![tool_name.to_string()]);
+    assert_eq!(spec_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+#[test]
 fn registry_dispatch_identity_is_derived_from_the_cached_spec() {
     let runtime: Arc<dyn CoreToolRuntime> = Arc::new(IndependentNameHandler);
     let authoritative_name = ToolName::plain("authoritative_name");
@@ -1991,7 +2011,11 @@ fn registered_tool_keeps_exposure_as_registry_metadata() {
     let runtime: Arc<dyn CoreToolRuntime> = Arc::new(TestHandler {
         tool_name: tool_name.clone(),
     });
-    let registered = RegisteredTool::with_exposure(Arc::clone(&runtime), ToolExposure::Hidden);
+    let registered = RegisteredTool::with_exposure(
+        Arc::clone(&runtime),
+        ToolExposure::Hidden,
+        TypedToolClass::ReadSearch,
+    );
 
     assert_eq!(registered.exposure(), ToolExposure::Hidden);
     assert_eq!(registered.runtime().exposure(), ToolExposure::Direct);
@@ -2005,6 +2029,16 @@ fn registered_tool_keeps_exposure_as_registry_metadata() {
         &runtime,
         &registry.tool(&tool_name).expect("registered runtime")
     ));
+}
+
+#[test]
+#[should_panic(expected = "registered tools must declare an authorization class")]
+fn registered_tool_rejects_unknown_authorization_class() {
+    let runtime: Arc<dyn CoreToolRuntime> = Arc::new(TestHandler {
+        tool_name: ToolName::plain("missing_authorization_class"),
+    });
+
+    let _registered = RegisteredTool::new(runtime, TypedToolClass::Unknown);
 }
 
 #[test]
@@ -2024,7 +2058,36 @@ fn prevalidated_registry_constructor_does_not_repeat_duplicate_filtering() {
 #[derive(Clone)]
 enum LifecycleTestResult {
     Ok { success: bool },
+    RequiredArtifact,
     Err,
+}
+
+struct RequiredArtifactOutput(crate::tools::context::FunctionToolOutput);
+
+impl crate::tools::context::ToolOutput for RequiredArtifactOutput {
+    fn log_preview(&self) -> String {
+        self.0.log_preview()
+    }
+
+    fn success_for_logging(&self) -> bool {
+        self.0.success_for_logging()
+    }
+
+    fn projection_metadata(&self) -> Option<codex_tools::ToolOutputProjectionMetadata> {
+        self.0.projection_metadata()
+    }
+
+    fn requires_canonical_artifact(&self) -> bool {
+        true
+    }
+
+    fn canonical_result(&self, payload: &ToolPayload) -> Option<CanonicalToolResult> {
+        self.0.canonical_result(payload)
+    }
+
+    fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
+        self.0.to_response_item(call_id, payload)
+    }
 }
 
 struct LifecycleTestHandler {
@@ -2057,6 +2120,13 @@ impl LifecycleTestHandler {
                     Some(success),
                 ),
             )
+                as Box<dyn crate::tools::context::ToolOutput>),
+            LifecycleTestResult::RequiredArtifact => Ok(Box::new(RequiredArtifactOutput(
+                crate::tools::context::FunctionToolOutput::from_text(
+                    "fully received result".to_string(),
+                    Some(true),
+                ),
+            ))
                 as Box<dyn crate::tools::context::ToolOutput>),
             LifecycleTestResult::Err => Err(FunctionCallError::RespondToModel(
                 "handler failed".to_string(),
@@ -2474,6 +2544,72 @@ async fn dispatch_notifies_tool_lifecycle_contributors() -> anyhow::Result<()> {
         .drain(..)
         .collect::<Vec<_>>();
     assert_eq!(expected, actual);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn projection_failure_notifies_failed_lifecycle_instead_of_completed() -> anyhow::Result<()> {
+    let (mut session, mut turn) = crate::session::tests::make_session_and_context().await;
+    let temp = tempfile::tempdir()?;
+    let blocked_home = temp.path().join("not-a-directory");
+    tokio::fs::write(&blocked_home, b"blocked").await?;
+    let mut config = (*turn.config).clone();
+    config.codex_home = codex_utils_absolute_path::AbsolutePathBuf::try_from(blocked_home)?;
+    turn.config = Arc::new(config);
+
+    let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
+    builder.tool_lifecycle_contributor(Arc::new(ToolLifecycleRecorder {
+        records: Arc::clone(&records),
+    }));
+    session.services.extensions = Arc::new(builder.build());
+
+    let tool_name = codex_tools::ToolName::plain("required_artifact_tool");
+    let registry = ToolRegistry::from_tools([Arc::new(LifecycleTestHandler {
+        tool_name: tool_name.clone(),
+        result: LifecycleTestResult::RequiredArtifact,
+    }) as Arc<dyn CoreToolRuntime>]);
+    let terminal_outcome = Arc::new(AtomicBool::new(false));
+    let result = registry
+        .dispatch_any_with_terminal_outcome(
+            test_invocation(
+                Arc::new(session),
+                Arc::new(turn),
+                "artifact-call",
+                tool_name.clone(),
+            ),
+            Arc::clone(&terminal_outcome),
+        )
+        .await;
+    let error = match result {
+        Ok(_) => panic!("required artifact persistence must fail"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("failed to preserve and admit"));
+    assert!(terminal_outcome.load(Ordering::Acquire));
+    let actual = records
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .drain(..)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        vec![
+            RecordedToolLifecycle::Start {
+                call_id: "artifact-call".to_string(),
+                tool_name: tool_name.clone(),
+            },
+            RecordedToolLifecycle::Finish {
+                call_id: "artifact-call".to_string(),
+                tool_name,
+                outcome: codex_extension_api::ToolCallOutcome::Failed {
+                    handler_executed: true,
+                },
+            },
+        ]
+    );
 
     Ok(())
 }

@@ -12,6 +12,8 @@ use crate::pull::PullEvent;
 use crate::url::base_url_to_host_root;
 use crate::url::is_openai_compatible_base_url;
 use codex_core::config::Config;
+use codex_http_client::HttpClient;
+use codex_http_client::HttpClientBuilder;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::OLLAMA_OSS_PROVIDER_ID;
 #[cfg(test)]
@@ -23,7 +25,7 @@ const OLLAMA_CONNECTION_ERROR: &str = "No running Ollama server detected. Start 
 
 /// Client for interacting with a local Ollama instance.
 pub struct OllamaClient {
-    client: reqwest::Client,
+    client: HttpClient,
     host_root: String,
     uses_openai_compat: bool,
 }
@@ -64,10 +66,10 @@ impl OllamaClient {
             .expect("oss provider must have a base_url");
         let uses_openai_compat = is_openai_compatible_base_url(base_url);
         let host_root = base_url_to_host_root(base_url);
-        let client = reqwest::Client::builder()
+        let client = HttpClientBuilder::new()
             .connect_timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .build_with_transport_default_proxy()
+            .map_err(io::Error::other)?;
         let client = Self {
             client,
             host_root,
@@ -243,16 +245,16 @@ impl OllamaClient {
 
     /// Low-level constructor given a raw host root, e.g. "http://localhost:11434".
     #[cfg(test)]
-    fn from_host_root(host_root: impl Into<String>) -> Self {
-        let client = reqwest::Client::builder()
+    fn from_host_root(host_root: impl Into<String>) -> io::Result<Self> {
+        let client = HttpClientBuilder::new()
             .connect_timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-        Self {
+            .build_direct()
+            .map_err(io::Error::other)?;
+        Ok(Self {
             client,
             host_root: host_root.into(),
             uses_openai_compat: false,
-        }
+        })
     }
 }
 
@@ -288,7 +290,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = OllamaClient::from_host_root(server.uri());
+        let client = OllamaClient::from_host_root(server.uri()).expect("shared HTTP client");
         let models = client.fetch_models().await.expect("fetch models");
         assert!(models.contains(&"llama3.2:3b".to_string()));
         assert!(models.contains(&"mistral".to_string()));
@@ -331,10 +333,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_pull_model_stream_parses_large_json_lines() {
+    async fn test_pull_model_stream_uses_shared_http_client() {
         if std::env::var(codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
             tracing::info!(
-                "{} set; skipping test_pull_model_stream_parses_large_json_lines",
+                "{} set; skipping test_pull_model_stream_uses_shared_http_client",
                 codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR
             );
             return;
@@ -357,7 +359,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = OllamaClient::from_host_root(server.uri());
+        let client = OllamaClient::from_host_root(server.uri()).expect("shared HTTP client");
         let events = client
             .pull_model_stream("test-model")
             .await
@@ -392,7 +394,7 @@ mod tests {
             .respond_with(wiremock::ResponseTemplate::new(200))
             .mount(&server)
             .await;
-        let native = OllamaClient::from_host_root(server.uri());
+        let native = OllamaClient::from_host_root(server.uri()).expect("shared HTTP client");
         native.probe_server().await.expect("probe native");
 
         // OpenAI compatibility endpoint

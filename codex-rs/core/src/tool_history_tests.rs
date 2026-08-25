@@ -1,4 +1,16 @@
 use super::*;
+
+#[test]
+fn source_dependency_normalization_preserves_case_on_case_sensitive_filesystems() {
+    let upper = normalized_source_path_with_case_sensitivity(Path::new("src/Owner.rs"), true);
+    let lower = normalized_source_path_with_case_sensitivity(Path::new("src/owner.rs"), true);
+
+    assert_ne!(upper, lower);
+    assert_eq!(
+        normalized_source_path_with_case_sensitivity(Path::new("src/Owner.rs"), false),
+        normalized_source_path_with_case_sensitivity(Path::new("src/owner.rs"), false),
+    );
+}
 use crate::tools::command_output_artifact::create_canonical_output_artifact;
 use crate::tools::command_output_artifact::protect_active_tool_history_artifact;
 use crate::tools::command_output_artifact::read_exact_tool_output_artifact;
@@ -12,7 +24,7 @@ fn bounded_output() -> String {
 }
 
 fn candidate(call_id: &str, bounded_model_output: String) -> ToolHistoryCandidate {
-    ToolHistoryCandidate {
+    let mut candidate = ToolHistoryCandidate {
         call_id: call_id.to_string(),
         tool_identity: "functions.exec".to_string(),
         semantic_class: "tool_output".to_string(),
@@ -30,7 +42,10 @@ fn candidate(call_id: &str, bounded_model_output: String) -> ToolHistoryCandidat
         proof_identity: None,
         supersession_identity: None,
         consumed_by_generation: None,
-    }
+        derived: ToolHistoryCandidateDerived::default(),
+    };
+    candidate.refresh_derived();
+    candidate
 }
 
 fn text_output(call_id: &str, text: String) -> ResponseItem {
@@ -54,6 +69,13 @@ fn named_function_call(call_id: &str, name: &str) -> ResponseItem {
         arguments: "{}".to_string(),
         call_id: call_id.to_string(),
         internal_chat_message_metadata_passthrough: None,
+    }
+}
+
+fn expect_loaded_tool_history(outcome: ToolHistoryLoadOutcome) -> ToolHistoryState {
+    match outcome {
+        ToolHistoryLoadOutcome::Loaded(state) => state,
+        outcome => panic!("expected loaded tool-history state, got {outcome:?}"),
     }
 }
 
@@ -837,7 +859,13 @@ fn tool_history_admission_charges_receipts_and_drops_unrepresentable_pairs() {
 
     assert!(projected_tokens <= MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET);
     assert!(projection.items.len() < 160);
-    assert!(projection.unreplaced_items.is_empty());
+    let fallback_tokens = projection
+        .unreplaced_items
+        .iter()
+        .filter_map(textual_output_identity)
+        .map(|(_, output)| approx_token_count(output))
+        .sum::<usize>();
+    assert!(fallback_tokens <= MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET);
     assert!(
         projection
             .items
@@ -864,6 +892,30 @@ fn tool_history_admission_charges_preserved_non_text_content() {
 
     assert!(projection.items.is_empty());
     assert!(projection.unreplaced_items.is_empty());
+}
+
+#[test]
+fn tool_history_admission_keeps_small_consumed_raw_output_when_receipt_costs_more() {
+    let call_id = "small-call";
+    let output = "ok".to_string();
+    let canonical: Arc<[ResponseItem]> = Arc::from([text_output(call_id, output.clone())]);
+    let mut state = ToolHistoryState::default();
+    state.register(candidate(call_id, output.clone()));
+    assert!(state.mark_consumed(
+        &canonical,
+        ModelGenerationId {
+            turn_id: "turn-1".to_string(),
+            ordinal: 1,
+        },
+    ));
+
+    let projection = state.project(canonical);
+
+    assert!(projection.substitutions.is_empty());
+    assert_eq!(
+        textual_output_identity(&projection.items[0]),
+        Some((call_id, output.as_str()))
+    );
 }
 
 #[test]
@@ -897,8 +949,8 @@ fn tool_history_admission_prioritizes_plain_failure_outputs() {
 
 #[test]
 fn tool_history_admission_budgets_structured_tool_search_pairs() {
-    let older = tool_search_pair("search-older", 24_000);
-    let latest = tool_search_pair("search-latest", 24_000);
+    let older = tool_search_pair("search-older", 48_000);
+    let latest = tool_search_pair("search-latest", 48_000);
     let canonical: Arc<[ResponseItem]> = Arc::from([
         older[0].clone(),
         older[1].clone(),
@@ -906,16 +958,123 @@ fn tool_history_admission_budgets_structured_tool_search_pairs() {
         latest[1].clone(),
     ]);
 
-    let projection = ToolHistoryState::default().project(canonical);
+    let projection = ToolHistoryState::default().project(Arc::clone(&canonical));
 
-    assert_eq!(projection.items.len(), 2);
-    assert!(
-        projection
-            .items
-            .iter()
-            .all(|item| item_call_id(item) == Some("search-latest"))
+    assert_eq!(projection.items.len(), 4);
+    let receipts = projection
+        .items
+        .iter()
+        .filter_map(tool_search_receipt)
+        .collect::<Vec<_>>();
+    assert_eq!(receipts.len(), 2);
+    assert!(receipts.iter().all(|receipt| {
+        receipt.complete
+            && receipt.result_count == 1
+            && receipt.omitted_result_count == Some(0)
+            && receipt.ordered_tool_identities.len() == 1
+            && receipt.arguments["query"] == "example"
+    }));
+    assert!(projection.unreplaced_items.is_empty());
+}
+
+#[test]
+fn tool_search_receipt_caps_all_argument_fields_and_binds_semantics() {
+    let mut pair = tool_search_pair("search", 48_000);
+    let ResponseItem::ToolSearchCall { arguments, .. } = &mut pair[0] else {
+        panic!("expected search call");
+    };
+    *arguments = serde_json::json!({
+        "query": "q".repeat(20_000),
+        "namespace": "n".repeat(20_000),
+        "limit": ["large".repeat(20_000)],
+        "cursor": "c".repeat(20_000),
+    });
+
+    let projection = ToolHistoryState::default().project(Arc::from(pair));
+    let receipt = projection
+        .items
+        .iter()
+        .find_map(tool_search_receipt)
+        .expect("bounded search receipt");
+    let rendered = serde_json::to_string(&receipt).expect("serialize receipt");
+    assert!(approx_token_count(&rendered) <= RECEIPT_MAX_TOKENS);
+    assert!(receipt.arguments.get("query_sha256").is_some());
+    assert!(receipt.arguments.get("namespace_sha256").is_some());
+    assert!(receipt.arguments.get("limit_sha256").is_some());
+    assert!(receipt.arguments.get("cursor_sha256").is_some());
+
+    let mut changed = receipt.clone();
+    changed.status = "failed".to_string();
+    assert_ne!(
+        receipt.receipt_id,
+        tool_search_receipt_id(
+            &changed.call_id,
+            &changed.status,
+            &changed.execution,
+            &changed.arguments,
+            &changed.result_set_sha256,
+            changed.result_count,
+            changed.omitted_result_count,
+            changed.complete,
+            changed.omitted_identity_count,
+        )
     );
-    assert_eq!(projection.items, projection.unreplaced_items);
+}
+
+#[test]
+fn structured_tool_search_negative_evidence_has_failure_priority() {
+    let tool = serde_json::json!({"name": "matching-tool"});
+
+    assert_eq!(
+        tool_search_admission_priority("failed", std::slice::from_ref(&tool)),
+        1
+    );
+    assert_eq!(tool_search_admission_priority("completed", &[]), 1);
+    assert_eq!(tool_search_admission_priority("completed", &[tool]), 2);
+}
+
+#[test]
+fn structured_tool_search_negative_evidence_precedes_success_under_budget() {
+    let mut failed = tool_search_pair("search-failed", 28_000);
+    let ResponseItem::ToolSearchCall { status, .. } = &mut failed[0] else {
+        panic!("expected search call");
+    };
+    *status = Some("failed".to_string());
+    let ResponseItem::ToolSearchOutput { status, .. } = &mut failed[1] else {
+        panic!("expected search output");
+    };
+    *status = "failed".to_string();
+    let successful = tool_search_pair("search-success", 28_000);
+
+    let projection = ToolHistoryState::default().project(Arc::from([
+        failed[0].clone(),
+        failed[1].clone(),
+        successful[0].clone(),
+        successful[1].clone(),
+    ]));
+
+    let failed_output = projection
+        .items
+        .iter()
+        .find(|item| item_call_id(item) == Some("search-failed"))
+        .and_then(|_| {
+            projection.items.iter().find(|item| {
+                matches!(
+                    item,
+                    ResponseItem::ToolSearchOutput { call_id: Some(call_id), .. }
+                        if call_id == "search-failed"
+                )
+            })
+        })
+        .expect("failed output retained");
+    assert!(tool_search_receipt(failed_output).is_none());
+    assert!(projection.items.iter().any(|item| {
+        matches!(
+            item,
+            ResponseItem::ToolSearchOutput { call_id: Some(call_id), .. }
+                if call_id == "search-success"
+        ) && tool_search_receipt(item).is_some()
+    }));
 }
 
 #[test]
@@ -1041,6 +1200,69 @@ fn mcp_content_item_receipt_preserves_non_text_modalities() {
 }
 
 #[test]
+fn mcp_multi_text_content_is_canonicalized_and_receipted_without_losing_modalities() {
+    let call_id = "mcp-multi-text";
+    let first = "first section\n".repeat(400);
+    let second = "second section\n".repeat(400);
+    let bounded = format!("{first}\n{second}");
+    let canonical: Arc<[ResponseItem]> = Arc::from([ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: call_id.to_string(),
+        output: FunctionCallOutputPayload::from_content_items(vec![
+            FunctionCallOutputContentItem::InputText { text: first },
+            FunctionCallOutputContentItem::InputImage {
+                image_url: "data:image/png;base64,aW1hZ2U=".to_string(),
+                detail: None,
+            },
+            FunctionCallOutputContentItem::InputText { text: second },
+            FunctionCallOutputContentItem::EncryptedContent {
+                encrypted_content: "opaque".to_string(),
+            },
+        ]),
+        internal_chat_message_metadata_passthrough: None,
+    }]);
+    let mut state = ToolHistoryState::default();
+    state.register(candidate(call_id, bounded));
+    assert!(state.mark_consumed(
+        &canonical,
+        ModelGenerationId {
+            turn_id: "turn-1".to_string(),
+            ordinal: 1,
+        },
+    ));
+
+    let projection = state.project(canonical);
+    let ResponseItem::FunctionCallOutput { output, .. } = &projection.items[0] else {
+        panic!("expected function output");
+    };
+    let FunctionCallOutputBody::ContentItems(items) = &output.body else {
+        panic!("expected content items");
+    };
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| matches!(item, FunctionCallOutputContentItem::InputText { .. }))
+            .count(),
+        1
+    );
+    assert!(items.iter().any(|item| matches!(
+        item,
+        FunctionCallOutputContentItem::InputText { text }
+            if serde_json::from_str::<ToolHistoryReceiptV1>(text).is_ok()
+    )));
+    assert!(items.iter().any(|item| matches!(
+        item,
+        FunctionCallOutputContentItem::InputImage { image_url, .. }
+            if image_url == "data:image/png;base64,aW1hZ2U="
+    )));
+    assert!(items.iter().any(|item| matches!(
+        item,
+        FunctionCallOutputContentItem::EncryptedContent { encrypted_content }
+            if encrypted_content == "opaque"
+    )));
+}
+
+#[test]
 fn structural_receipt_validation_rejects_receipt_like_text_and_tampering() {
     let call_id = "call-1";
     let bounded = bounded_output();
@@ -1081,6 +1303,7 @@ fn legacy_tool_history_ledger_keys_remain_compatible() {
     let state = ToolHistoryState {
         candidates: BTreeMap::from([("call-1".to_string(), candidate("call-1", bounded))]),
         workspace_evidence: BTreeMap::new(),
+        artifact_call_ids: BTreeMap::new(),
     };
     let mut serialized = serde_json::to_value(&state).expect("serialize ledger state");
     let candidate = &serialized["candidates"]["call-1"];
@@ -1092,6 +1315,136 @@ fn legacy_tool_history_ledger_keys_remain_compatible() {
     let restored: ToolHistoryState =
         serde_json::from_value(serialized).expect("legacy fields should be ignored");
     assert!(restored.candidates.contains_key("call-1"));
+}
+
+#[test]
+fn compaction_artifact_reference_survives_history_replacement() {
+    let call_id = "call-1";
+    let mut state = ToolHistoryState::default();
+    state.register(candidate(call_id, bounded_output()));
+    let compacted_summary = text_output(
+        "compaction-summary",
+        serde_json::to_string(&ToolHistoryArtifactPinV1 {
+            version: 1,
+            kind: "tool_history_artifact_pin".to_string(),
+            artifact_id: "artifact-1".to_string(),
+            bytes: 96_000,
+            sha256: sha256(b"canonical artifact"),
+        })
+        .expect("serialize artifact pin"),
+    );
+
+    state.retain_for_history(&[compacted_summary]);
+
+    assert!(state.candidates.contains_key(call_id));
+}
+
+#[test]
+fn plain_text_artifact_id_does_not_pin_tool_history() {
+    let call_id = "call-1";
+    let mut state = ToolHistoryState::default();
+    state.register(candidate(call_id, bounded_output()));
+
+    state.retain_for_history(&[text_output(
+        "compaction-summary",
+        "The earlier output can be recovered from artifact-1.".to_string(),
+    )]);
+
+    assert!(!state.candidates.contains_key(call_id));
+}
+
+#[test]
+fn compaction_tool_history_receipt_survives_history_replacement() {
+    let call_id = "call-1";
+    let candidate = candidate(call_id, bounded_output());
+    let (_, receipt, _) = candidate
+        .admission_receipt()
+        .expect("complete candidate has an admission receipt");
+    let receipt = receipt.to_string();
+    let mut state = ToolHistoryState::default();
+    state.register(candidate);
+
+    state.retain_for_history(&[text_output("compaction-summary", receipt)]);
+
+    assert!(state.candidates.contains_key(call_id));
+}
+
+#[tokio::test]
+async fn tool_history_ledger_load_distinguishes_absence_corruption_and_version_mismatch() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    assert!(matches!(
+        load_tool_history_state_for_fork(temp.path(), "missing").await,
+        ToolHistoryLoadOutcome::Missing
+    ));
+
+    let corrupt_path = ledger_path(temp.path(), "corrupt");
+    std::fs::create_dir_all(corrupt_path.parent().expect("ledger parent"))
+        .expect("create ledger parent");
+    std::fs::write(&corrupt_path, b"{not-json").expect("write corrupt ledger");
+    let corrupt = load_tool_history_state_for_fork(temp.path(), "corrupt").await;
+    assert!(matches!(&corrupt, ToolHistoryLoadOutcome::Corrupt { .. }));
+    let (_, warning) = corrupt.into_state_and_warning();
+    assert!(warning.is_some_and(|warning| warning.contains("corrupt")));
+
+    let unsupported_path = ledger_path(temp.path(), "unsupported");
+    std::fs::write(
+        unsupported_path,
+        serde_json::to_vec(&ToolHistoryLedgerFile {
+            version: LEDGER_VERSION.saturating_add(1),
+            state: ToolHistoryState::default(),
+        })
+        .expect("serialize unsupported ledger"),
+    )
+    .expect("write unsupported ledger");
+    assert!(matches!(
+        load_tool_history_state_for_fork(temp.path(), "unsupported").await,
+        ToolHistoryLoadOutcome::UnsupportedVersion {
+            found,
+            supported: LEDGER_VERSION,
+            ..
+        } if found == LEDGER_VERSION.saturating_add(1)
+    ));
+}
+
+#[tokio::test]
+async fn corrupt_own_thread_ledger_is_quarantined_but_fork_read_is_non_mutating() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fork_path = ledger_path(temp.path(), "fork-source");
+    std::fs::create_dir_all(fork_path.parent().expect("ledger parent"))
+        .expect("create ledger parent");
+    std::fs::write(&fork_path, b"{not-json").expect("write corrupt fork ledger");
+
+    assert!(matches!(
+        load_tool_history_state_for_fork(temp.path(), "fork-source").await,
+        ToolHistoryLoadOutcome::Corrupt { .. }
+    ));
+    assert!(
+        fork_path.exists(),
+        "fork reads must not mutate the parent ledger"
+    );
+
+    let own_path = ledger_path(temp.path(), "own-thread");
+    std::fs::write(&own_path, b"{not-json").expect("write corrupt own ledger");
+    let outcome = load_tool_history_state(temp.path(), "own-thread").await;
+    let ToolHistoryLoadOutcome::Corrupt { path, error } = outcome else {
+        panic!("expected corrupt outcome");
+    };
+    assert!(!own_path.exists());
+    assert!(path.exists());
+    assert!(error.contains("quarantined"));
+}
+
+#[tokio::test]
+async fn persist_tool_history_state_attempts_parent_directory_sync() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let before = TOOL_HISTORY_DIRECTORY_SYNC_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed);
+
+    persist_tool_history_state(temp.path(), "thread", &ToolHistoryState::default())
+        .await
+        .expect("persist ledger");
+
+    let after = TOOL_HISTORY_DIRECTORY_SYNC_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(after > before);
 }
 
 #[tokio::test]
@@ -1118,19 +1471,36 @@ async fn fork_remints_receipt_artifact_into_child_namespace() {
         .await
         .expect("persist source ledger");
 
-    let loaded = load_tool_history_state_for_fork(temp.path(), source_thread_id).await;
+    let loaded = expect_loaded_tool_history(
+        load_tool_history_state_for_fork(temp.path(), source_thread_id).await,
+    );
+    assert_eq!(
+        loaded
+            .artifact_call_ids
+            .get(&source_artifact_id)
+            .map(String::as_str),
+        Some(call_id)
+    );
     let (forked, dropped) =
         remint_tool_history_state_for_fork(temp.path(), source_thread_id, target_thread_id, loaded)
             .await;
     assert_eq!(dropped, 0);
     let target_artifact_id = forked.candidates[call_id].artifact_id.clone();
     assert_eq!(target_artifact_id, source_artifact_id);
+    assert_eq!(
+        forked
+            .artifact_call_ids
+            .get(&target_artifact_id)
+            .map(String::as_str),
+        Some(call_id)
+    );
 
     let forked = reconcile_tool_history_state(temp.path(), target_thread_id, forked).await;
     persist_tool_history_state(temp.path(), target_thread_id, &forked)
         .await
         .expect("persist target ledger");
-    let restored = load_tool_history_state(temp.path(), target_thread_id).await;
+    let restored =
+        expect_loaded_tool_history(load_tool_history_state(temp.path(), target_thread_id).await);
     let projection = restored.project(canonical_history);
     assert_eq!(projection.substitutions.len(), 1);
     let ResponseItem::FunctionCallOutput { output, .. } = &projection.items[0] else {
@@ -1177,7 +1547,8 @@ async fn reconciliation_keeps_unconsumed_artifacts_and_releases_pruned_history()
         .await
         .expect("persist ledger");
 
-    let mut restored = load_tool_history_state(temp.path(), thread_id).await;
+    let mut restored =
+        expect_loaded_tool_history(load_tool_history_state(temp.path(), thread_id).await);
     assert!(restored.candidates.contains_key(call_id));
     restored.retain_for_history(&[]);
     let reconciled = reconcile_tool_history_state(temp.path(), thread_id, restored).await;
@@ -1185,8 +1556,7 @@ async fn reconciliation_keeps_unconsumed_artifacts_and_releases_pruned_history()
         .await
         .expect("persist pruned ledger");
     assert!(
-        load_tool_history_state(temp.path(), thread_id)
-            .await
+        expect_loaded_tool_history(load_tool_history_state(temp.path(), thread_id).await)
             .candidates
             .is_empty()
     );
@@ -1272,4 +1642,155 @@ async fn fork_artifact_remint_is_idempotent_and_never_overwrites_a_collision() {
             .expect("read reminted artifact"),
         canonical_bytes
     );
+}
+
+#[test]
+fn receipt_and_candidate_fingerprints_are_cached_and_reused() {
+    let candidate = candidate("cached-call", bounded_output());
+    assert_eq!(
+        candidate.derived.bounded_model_output_sha256,
+        sha256(candidate.bounded_model_output.as_bytes())
+    );
+    assert_eq!(
+        candidate.derived.bounded_model_output_tokens,
+        u64::try_from(approx_token_count(&candidate.bounded_model_output)).unwrap_or(u64::MAX)
+    );
+
+    let first = candidate
+        .admission_receipt()
+        .expect("complete candidate has an admission receipt");
+    let second = candidate
+        .admission_receipt()
+        .expect("cached admission receipt remains available");
+    assert_eq!(first, second);
+    assert_eq!(first.0, candidate.derived.receipt_id);
+    assert!(std::ptr::eq(first.1.as_ptr(), second.1.as_ptr()));
+    assert_eq!(
+        first.2,
+        u64::try_from(approx_token_count(first.1)).unwrap_or(u64::MAX)
+    );
+}
+
+#[test]
+fn affected_path_index_preserves_source_dependency_overlap_semantics() {
+    let dependencies = [
+        SourceDependencyV1 {
+            path: "src/exact.rs".to_string(),
+            recursive: false,
+        },
+        SourceDependencyV1 {
+            path: "src/tree".to_string(),
+            recursive: true,
+        },
+        SourceDependencyV1 {
+            path: "src/tree/leaf.rs".to_string(),
+            recursive: false,
+        },
+    ];
+    let affected_paths = BTreeSet::from([
+        "docs/unrelated.md".to_string(),
+        "src/exact.rs".to_string(),
+        "src/tree/child.rs".to_string(),
+    ]);
+
+    for dependency in dependencies {
+        let linear_result = affected_paths
+            .iter()
+            .any(|path| source_dependency_overlaps(&dependency, path));
+        assert_eq!(
+            affected_paths_overlap_dependency(&affected_paths, &dependency),
+            linear_result,
+            "indexed lookup changed overlap semantics for {dependency:?}"
+        );
+    }
+    assert!(affected_paths_overlap_dependency(
+        &BTreeSet::from(["src".to_string()]),
+        &SourceDependencyV1 {
+            path: "src/nested/file.rs".to_string(),
+            recursive: false,
+        }
+    ));
+}
+
+#[test]
+fn textual_output_identity_borrows_single_text_outputs() {
+    let output = text_output("borrowed-call", "model-visible text".to_string());
+    let (call_id, text) =
+        canonical_textual_output_identity(&output).expect("text output has an identity");
+    assert_eq!(call_id, "borrowed-call");
+    assert!(matches!(text, Cow::Borrowed("model-visible text")));
+}
+
+#[test]
+fn artifact_index_is_deterministic_and_rebuilt_after_retention() {
+    assert_eq!(read_tool_output_artifact_id("not-json"), None);
+    assert_eq!(read_tool_output_artifact_id(r#"{"other":"value"}"#), None);
+    assert_eq!(
+        read_tool_output_artifact_id(r#"{"artifact_id":"artifact-1"}"#).as_deref(),
+        Some("artifact-1")
+    );
+    let mut state = ToolHistoryState::default();
+    state.register(candidate("call-2", bounded_output()));
+    state.register(candidate("call-1", bounded_output()));
+    assert_eq!(
+        state
+            .artifact_call_ids
+            .get("artifact-1")
+            .map(String::as_str),
+        Some("call-1")
+    );
+
+    let mut retrieval = named_function_call("retrieval", "read_tool_output");
+    let ResponseItem::FunctionCall { arguments, .. } = &mut retrieval else {
+        panic!("helper must return a function call");
+    };
+    *arguments = serde_json::json!({"artifact_id": "artifact-1"}).to_string();
+    state.retain_for_history(&[retrieval]);
+
+    assert!(state.candidates.contains_key("call-1"));
+    assert!(!state.candidates.contains_key("call-2"));
+    assert_eq!(
+        state
+            .artifact_call_ids
+            .get("artifact-1")
+            .map(String::as_str),
+        Some("call-1")
+    );
+}
+
+#[test]
+fn workspace_observation_from_argument_parts_matches_payload_classifier() {
+    for arguments in [
+        r#"{"cmd":"rg -n needle src"}"#,
+        r#"{"cmd":"git status --short"}"#,
+        r#"{"cmd":"cargo fmt"}"#,
+        "not-json",
+    ] {
+        let payload = ToolPayload::Function {
+            arguments: arguments.to_string(),
+        };
+        assert_eq!(
+            tool_call_observes_workspace_parts("exec_command", arguments),
+            tool_call_observes_workspace("exec_command", &payload),
+            "argument-only classification diverged for {arguments}"
+        );
+    }
+}
+
+#[test]
+fn borrowed_ledger_serialization_matches_owned_compatibility_shape() {
+    let mut state = ToolHistoryState::default();
+    state.register(candidate("serialized-call", bounded_output()));
+    let owned = serde_json::to_vec(&ToolHistoryLedgerFile {
+        version: LEDGER_VERSION,
+        state: state.clone(),
+    })
+    .expect("serialize owned compatibility envelope");
+    let borrowed = serde_json::to_vec(&ToolHistoryLedgerRef {
+        version: LEDGER_VERSION,
+        state: &state,
+    })
+    .expect("serialize borrowed ledger envelope");
+
+    assert_eq!(borrowed, owned);
 }

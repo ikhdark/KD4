@@ -108,8 +108,15 @@ struct EnvironmentProjectInstructions {
     loaded: Option<LoadedAgentsMd>,
     retained_source_bytes: usize,
     rendered_bytes: usize,
-    aggregate_omitted_documents: usize,
-    aggregate_omitted_bytes: u64,
+    omitted_documents: Vec<ProjectDocOmission>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ProjectDocOmission {
+    environment_id: String,
+    cwd: String,
+    path: String,
+    source_bytes: u64,
 }
 
 struct LoadedProjectDoc {
@@ -138,10 +145,27 @@ enum RetainedUtf8Boundary {
 
 /// Loads project AGENTS.md content and combines it with host-provided user
 /// instructions.
+#[cfg(test)]
 pub(crate) async fn load_project_instructions(
     config: &Config,
     user_instructions: Option<UserInstructions>,
     environments: &TurnEnvironmentSnapshot,
+) -> ProjectInstructionsLoad {
+    let project_root_markers = effective_project_root_markers(config);
+    load_project_instructions_with_markers(
+        config,
+        user_instructions,
+        environments,
+        &project_root_markers,
+    )
+    .await
+}
+
+pub(crate) async fn load_project_instructions_with_markers(
+    config: &Config,
+    user_instructions: Option<UserInstructions>,
+    environments: &TurnEnvironmentSnapshot,
+    project_root_markers: &[String],
 ) -> ProjectInstructionsLoad {
     let mut loaded = LoadedAgentsMd::from_user_instructions(user_instructions);
     let mut remaining_source_bytes = config.project_doc_max_bytes;
@@ -149,8 +173,7 @@ pub(crate) async fn load_project_instructions(
     let aggregate_reserve =
         remaining_rendered_bytes.min(PROJECT_DOC_AGGREGATE_NOTICE_RESERVE_BYTES);
     remaining_rendered_bytes = remaining_rendered_bytes.saturating_sub(aggregate_reserve);
-    let mut aggregate_omitted_documents = 0usize;
-    let mut aggregate_omitted_bytes = 0u64;
+    let mut omitted_documents = Vec::new();
     let mut complete = true;
     if remaining_source_bytes == 0 {
         return ProjectInstructionsLoad {
@@ -159,16 +182,33 @@ pub(crate) async fn load_project_instructions(
         };
     }
 
-    let mut discoveries = Vec::with_capacity(environments.turn_environments.len());
-    for turn_environment in &environments.turn_environments {
-        let environment_id = turn_environment.environment_id.clone();
-        let environment = turn_environment.environment.clone();
-        let cwd = turn_environment.cwd().clone();
-        let filesystem = environment.get_filesystem();
-        let result =
-            agents_md_paths(config, &cwd, filesystem.as_ref(), !environment.is_remote()).await;
-        discoveries.push((environment_id, cwd, filesystem, result));
-    }
+    let config = Arc::new(config.clone());
+    let project_root_markers: Arc<[String]> = Arc::from(project_root_markers.to_vec());
+    let discoveries =
+        futures::stream::iter(environments.turn_environments.clone().into_iter().map(
+            |turn_environment| {
+                let config = Arc::clone(&config);
+                let project_root_markers = Arc::clone(&project_root_markers);
+                async move {
+                    let environment_id = turn_environment.environment_id.clone();
+                    let environment = turn_environment.environment.clone();
+                    let cwd = turn_environment.cwd().clone();
+                    let filesystem = environment.get_filesystem();
+                    let result = agents_md_paths_with_markers(
+                        config.as_ref(),
+                        &cwd,
+                        filesystem.as_ref(),
+                        !environment.is_remote(),
+                        project_root_markers.as_ref(),
+                    )
+                    .await;
+                    (environment_id, cwd, filesystem, result)
+                }
+            },
+        ))
+        .buffered(MAX_CONCURRENT_DIRECTORY_SEARCHES)
+        .collect::<Vec<_>>()
+        .await;
 
     let contributing_environments = discoveries
         .iter()
@@ -194,14 +234,14 @@ pub(crate) async fn load_project_instructions(
                     .len();
                 }
                 if generated_overhead >= remaining_rendered_bytes {
-                    aggregate_omitted_documents =
-                        aggregate_omitted_documents.saturating_add(candidates.len());
-                    aggregate_omitted_bytes = aggregate_omitted_bytes.saturating_add(
-                        candidates
-                            .iter()
-                            .map(|candidate| candidate.size)
-                            .sum::<u64>(),
-                    );
+                    omitted_documents.extend(candidates.iter().map(|candidate| {
+                        ProjectDocOmission {
+                            environment_id: environment_id.clone(),
+                            cwd: cwd.inferred_native_path_string(),
+                            path: candidate.path.inferred_native_path_string(),
+                            source_bytes: candidate.size,
+                        }
+                    }));
                     remaining_rendered_bytes = 0;
                     first_project_environment = false;
                     continue;
@@ -236,10 +276,7 @@ pub(crate) async fn load_project_instructions(
                     remaining_source_bytes.saturating_sub(environment_load.retained_source_bytes);
                 remaining_rendered_bytes =
                     remaining_rendered_bytes.saturating_sub(environment_load.rendered_bytes);
-                aggregate_omitted_documents = aggregate_omitted_documents
-                    .saturating_add(environment_load.aggregate_omitted_documents);
-                aggregate_omitted_bytes = aggregate_omitted_bytes
-                    .saturating_add(environment_load.aggregate_omitted_bytes);
+                omitted_documents.extend(environment_load.omitted_documents);
                 if let Some(docs) = environment_load.loaded {
                     loaded.entries.extend(docs.entries);
                 }
@@ -256,11 +293,8 @@ pub(crate) async fn load_project_instructions(
         }
     }
 
-    if aggregate_omitted_documents > 0 {
-        let notice = aggregate_project_doc_omission_notice(
-            aggregate_omitted_documents,
-            aggregate_omitted_bytes,
-        );
+    if !omitted_documents.is_empty() {
+        let notice = aggregate_project_doc_omission_notice(&omitted_documents);
         debug_assert!(notice.len().saturating_add(2) <= aggregate_reserve);
         loaded.entries.push(InstructionEntry {
             contents: notice,
@@ -321,11 +355,8 @@ async fn read_discovered_agents_md(
         project_docs,
         rendered_max.saturating_sub(aggregate_reserve),
     );
-    if rendered.aggregate_omitted_documents > 0 {
-        let notice = aggregate_project_doc_omission_notice(
-            rendered.aggregate_omitted_documents,
-            rendered.aggregate_omitted_bytes,
-        );
+    if !rendered.omitted_documents.is_empty() {
+        let notice = aggregate_project_doc_omission_notice(&rendered.omitted_documents);
         debug_assert!(notice.len().saturating_add(2) <= aggregate_reserve);
         let mut loaded = rendered.loaded.take().unwrap_or_default();
         loaded.entries.push(InstructionEntry {
@@ -393,8 +424,7 @@ fn render_project_docs(
     let mut loaded = LoadedAgentsMd::default();
     let mut entries = Vec::new();
     let mut retained_source_bytes = 0usize;
-    let mut aggregate_omitted_documents = 0usize;
-    let mut aggregate_omitted_bytes = 0u64;
+    let mut omitted_documents = Vec::new();
 
     // Reapply the shared budget nearest-first. Each environment was prefetched with at least
     // this much local capacity, so narrowing a retained prefix never requires more I/O.
@@ -410,12 +440,19 @@ fn render_project_docs(
             &candidate.path,
             remaining.saturating_sub(separator_bytes),
         ) else {
-            aggregate_omitted_documents = aggregate_omitted_documents.saturating_add(1);
-            aggregate_omitted_bytes = aggregate_omitted_bytes.saturating_add(read.original_bytes);
-            for LoadedProjectDoc { read, .. } in project_docs {
-                aggregate_omitted_documents = aggregate_omitted_documents.saturating_add(1);
-                aggregate_omitted_bytes =
-                    aggregate_omitted_bytes.saturating_add(read.original_bytes);
+            omitted_documents.push(ProjectDocOmission {
+                environment_id: environment_id.to_string(),
+                cwd: cwd.inferred_native_path_string(),
+                path: candidate.path.inferred_native_path_string(),
+                source_bytes: read.original_bytes,
+            });
+            for LoadedProjectDoc { candidate, read } in project_docs {
+                omitted_documents.push(ProjectDocOmission {
+                    environment_id: environment_id.to_string(),
+                    cwd: cwd.inferred_native_path_string(),
+                    path: candidate.path.inferred_native_path_string(),
+                    source_bytes: read.original_bytes,
+                });
             }
             // Do not let a shorter broad-file notice displace this nearer document, or let a
             // later environment consume the capacity that was unavailable to this one.
@@ -452,8 +489,7 @@ fn render_project_docs(
         loaded: (!loaded.is_empty()).then_some(loaded),
         retained_source_bytes,
         rendered_bytes: max_rendered_bytes.saturating_sub(remaining),
-        aggregate_omitted_documents,
-        aggregate_omitted_bytes,
+        omitted_documents,
     }
 }
 
@@ -461,10 +497,49 @@ const fn project_doc_rendered_max_bytes(source_bytes: usize) -> usize {
     source_bytes.saturating_add(PROJECT_DOC_RENDERED_OVERHEAD_BYTES)
 }
 
-fn aggregate_project_doc_omission_notice(documents: usize, source_bytes: u64) -> String {
-    format!(
-        "Project documentation omission notice: {documents} additional document(s) totaling {source_bytes} source byte(s) were omitted to preserve the rendered prompt limit."
-    )
+fn aggregate_project_doc_omission_notice(documents: &[ProjectDocOmission]) -> String {
+    let source_bytes = documents
+        .iter()
+        .map(|document| document.source_bytes)
+        .sum::<u64>();
+    let manifest = serde_json::to_vec(documents).unwrap_or_default();
+    let manifest_sha256 = format!("{:x}", Sha256::digest(&manifest));
+    let first = &documents[0];
+    let mut notice = format!(
+        "Project docs omitted: count={} bytes={} manifest_sha256={}; rediscover AGENTS/override files from cwd to repository root.",
+        documents.len(),
+        source_bytes,
+        manifest_sha256,
+    );
+    let scope = format!(" scope={}@{}", first.environment_id, first.cwd);
+    if notice.len().saturating_add(scope.len()).saturating_add(2)
+        <= PROJECT_DOC_AGGREGATE_NOTICE_RESERVE_BYTES
+    {
+        notice.push_str(&scope);
+    } else {
+        let scope_sha256 = format!(
+            " scope_sha256={:x}",
+            Sha256::digest(format!("{}@{}", first.environment_id, first.cwd).as_bytes())
+        );
+        if notice
+            .len()
+            .saturating_add(scope_sha256.len())
+            .saturating_add(2)
+            <= PROJECT_DOC_AGGREGATE_NOTICE_RESERVE_BYTES
+        {
+            notice.push_str(&scope_sha256);
+        }
+    }
+    let first_path = format!(" first_path={}", first.path);
+    if notice
+        .len()
+        .saturating_add(first_path.len())
+        .saturating_add(2)
+        <= PROJECT_DOC_AGGREGATE_NOTICE_RESERVE_BYTES
+    {
+        notice.push_str(&first_path);
+    }
+    notice
 }
 
 fn render_project_doc_to_budget(
@@ -526,7 +601,6 @@ async fn read_project_doc(
 ) -> io::Result<Option<ProjectDocRead>> {
     let mut stream = match fs.read_file_stream(&candidate.path, /*sandbox*/ None).await {
         Ok(stream) => stream,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err),
     };
     let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
@@ -545,7 +619,6 @@ async fn read_project_doc(
         };
         let chunk = match chunk {
             Ok(chunk) => chunk,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err),
         };
         observed_bytes = observed_bytes.saturating_add(chunk.len() as u64);
@@ -708,16 +781,44 @@ fn project_doc_truncation_notice(
 
 /// Discovers AGENTS.md files from the project root to the current working
 /// directory, inclusive. Symlinks are allowed.
+#[cfg(test)]
 async fn agents_md_paths(
     config: &Config,
     cwd: &PathUri,
     fs: &dyn ExecutorFileSystem,
     reuse_project_discovery: bool,
 ) -> io::Result<Vec<ProjectDocCandidate>> {
-    let metrics = codex_otel::global();
-    agents_md_paths_with_metrics(config, cwd, fs, reuse_project_discovery, metrics.as_ref()).await
+    let project_root_markers = effective_project_root_markers(config);
+    agents_md_paths_with_markers(
+        config,
+        cwd,
+        fs,
+        reuse_project_discovery,
+        &project_root_markers,
+    )
+    .await
 }
 
+async fn agents_md_paths_with_markers(
+    config: &Config,
+    cwd: &PathUri,
+    fs: &dyn ExecutorFileSystem,
+    reuse_project_discovery: bool,
+    project_root_markers: &[String],
+) -> io::Result<Vec<ProjectDocCandidate>> {
+    let metrics = codex_otel::global();
+    agents_md_paths_with_metrics_and_markers(
+        config,
+        cwd,
+        fs,
+        reuse_project_discovery,
+        project_root_markers,
+        metrics.as_ref(),
+    )
+    .await
+}
+
+#[cfg(test)]
 async fn agents_md_paths_with_metrics(
     config: &Config,
     cwd: &PathUri,
@@ -725,9 +826,28 @@ async fn agents_md_paths_with_metrics(
     reuse_project_discovery: bool,
     metrics: Option<&MetricsClient>,
 ) -> io::Result<Vec<ProjectDocCandidate>> {
+    let project_root_markers = effective_project_root_markers(config);
+    agents_md_paths_with_metrics_and_markers(
+        config,
+        cwd,
+        fs,
+        reuse_project_discovery,
+        &project_root_markers,
+        metrics,
+    )
+    .await
+}
+
+async fn agents_md_paths_with_metrics_and_markers(
+    config: &Config,
+    cwd: &PathUri,
+    fs: &dyn ExecutorFileSystem,
+    reuse_project_discovery: bool,
+    project_root_markers: &[String],
+    metrics: Option<&MetricsClient>,
+) -> io::Result<Vec<ProjectDocCandidate>> {
     let dir = cwd.clone();
 
-    let project_root_markers = effective_project_root_markers(config);
     let reuse = if !reuse_project_discovery {
         ProjectDiscoveryReuse::Miss("reuse_disabled")
     } else if let Ok(cwd) = dir.to_abs_path() {
@@ -736,9 +856,7 @@ async fn agents_md_paths_with_metrics(
             Some(discovery) if !discovery.matches_cwd(&cwd) => {
                 ProjectDiscoveryReuse::Miss("cwd_mismatch")
             }
-            Some(discovery)
-                if discovery.project_root_markers() != project_root_markers.as_slice() =>
-            {
+            Some(discovery) if discovery.project_root_markers() != project_root_markers => {
                 ProjectDiscoveryReuse::Miss("markers_mismatch")
             }
             Some(discovery) => {
@@ -758,7 +876,7 @@ async fn agents_md_paths_with_metrics(
             find_nearest_ancestor_with_markers(
                 fs,
                 &dir,
-                project_root_markers,
+                project_root_markers.to_vec(),
                 FindUpErrorPolicy::Propagate,
                 /*sandbox*/ None,
             )
@@ -783,11 +901,15 @@ async fn agents_md_paths_with_metrics(
     } else {
         vec![dir]
     };
-    let candidate_filenames = project_doc_candidate_filenames(config);
-    let directory_searches = search_dirs.into_iter().map(|directory| {
-        let candidate_filenames = &candidate_filenames;
-        async move {
-            for name in candidate_filenames {
+    let candidate_filenames: Arc<[String]> = project_doc_candidate_filenames(config)
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let mut directory_searches = Vec::with_capacity(search_dirs.len());
+    for directory in search_dirs {
+        let candidate_filenames = Arc::clone(&candidate_filenames);
+        directory_searches.push(async move {
+            for name in candidate_filenames.iter() {
                 let candidate = directory
                     .join(name)
                     .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
@@ -804,8 +926,8 @@ async fn agents_md_paths_with_metrics(
                 }
             }
             Ok(None)
-        }
-    });
+        });
+    }
     // Directories can be probed independently. `buffered` keeps results in root-to-cwd order,
     // while each directory still checks override/default/fallback filenames sequentially.
     let mut directory_searches =
@@ -897,6 +1019,56 @@ pub(crate) struct RepositoryStableContextBundle {
     pub(crate) semantic_replacement: bool,
 }
 
+struct RenderedStableContext {
+    text: String,
+    rendered_hash: [u8; 32],
+    user_instructions_hash: Option<[u8; 32]>,
+    entry_hashes: Vec<[u8; 32]>,
+}
+
+struct StableContextRenderer {
+    text: String,
+    hasher: Sha256,
+    user_instructions_hash: Option<[u8; 32]>,
+    entry_hashes: Vec<[u8; 32]>,
+}
+
+impl StableContextRenderer {
+    fn new(entry_capacity: usize) -> Self {
+        Self {
+            text: String::new(),
+            hasher: Sha256::new(),
+            user_instructions_hash: None,
+            entry_hashes: Vec::with_capacity(entry_capacity),
+        }
+    }
+
+    fn push_str(&mut self, value: &str) {
+        self.text.push_str(value);
+        self.hasher.update(value.as_bytes());
+    }
+
+    fn push_user_instructions(&mut self, value: &str) {
+        self.user_instructions_hash = Some(Sha256::digest(value.as_bytes()).into());
+        self.push_str(value);
+    }
+
+    fn push_entry(&mut self, value: &str) {
+        self.entry_hashes
+            .push(Sha256::digest(value.as_bytes()).into());
+        self.push_str(value);
+    }
+
+    fn finish(self) -> RenderedStableContext {
+        RenderedStableContext {
+            text: self.text,
+            rendered_hash: self.hasher.finalize().into(),
+            user_instructions_hash: self.user_instructions_hash,
+            entry_hashes: self.entry_hashes,
+        }
+    }
+}
+
 impl RepositoryStableContextBundle {
     pub(crate) fn metadata(&self) -> ([u8; 32], bool, bool) {
         (self.identity, self.reused, self.semantic_replacement)
@@ -963,11 +1135,7 @@ impl LoadedAgentsMd {
 
     /// Returns the concatenated model-visible instruction text.
     pub fn text(&self) -> String {
-        if self.has_multiple_project_environments() {
-            self.environment_labeled_text()
-        } else {
-            self.legacy_text()
-        }
+        self.render_stable_context().text
     }
 
     /// Stable digest of the exact model-visible instruction text.
@@ -989,11 +1157,14 @@ impl LoadedAgentsMd {
         &self,
         active_cwd: &PathUri,
     ) -> RepositoryStableContextBundle {
-        let structure = self.stable_context_structure_key(active_cwd);
-        let rendered = self.text();
-        let rendered_hash: [u8; 32] = Sha256::digest(rendered.as_bytes()).into();
-        let identity = stable_context_identity_from_structure(structure, rendered_hash);
-        let rendered: Arc<str> = rendered.into();
+        let rendered = self.render_stable_context();
+        let structure = self.stable_context_structure_key_with_body_hashes(
+            active_cwd,
+            rendered.user_instructions_hash.as_ref(),
+            &rendered.entry_hashes,
+        );
+        let identity = stable_context_identity_from_structure(structure, rendered.rendered_hash);
+        let rendered: Arc<str> = rendered.text.into();
         RepositoryStableContextBundle {
             identity,
             rendered,
@@ -1014,7 +1185,30 @@ impl LoadedAgentsMd {
         )
     }
 
+    #[cfg(test)]
     fn stable_context_structure_key(&self, active_cwd: &PathUri) -> [u8; 32] {
+        let user_instructions_hash = self
+            .user_instructions
+            .as_ref()
+            .map(|instructions| Sha256::digest(instructions.text.as_bytes()).into());
+        let entry_hashes = self
+            .entries
+            .iter()
+            .map(|entry| Sha256::digest(entry.contents.as_bytes()).into())
+            .collect::<Vec<_>>();
+        self.stable_context_structure_key_with_body_hashes(
+            active_cwd,
+            user_instructions_hash.as_ref(),
+            &entry_hashes,
+        )
+    }
+
+    fn stable_context_structure_key_with_body_hashes(
+        &self,
+        active_cwd: &PathUri,
+        user_instructions_hash: Option<&[u8; 32]>,
+        entry_hashes: &[[u8; 32]],
+    ) -> [u8; 32] {
         fn update_part(hasher: &mut Sha256, value: &[u8]) {
             hasher.update((value.len() as u64).to_be_bytes());
             hasher.update(value);
@@ -1034,9 +1228,12 @@ impl LoadedAgentsMd {
                     .inferred_native_path_string()
                     .as_bytes(),
             );
-            update_part(&mut hasher, &Sha256::digest(instructions.text.as_bytes()));
+            let body_hash = user_instructions_hash
+                .copied()
+                .unwrap_or_else(|| Sha256::digest(instructions.text.as_bytes()).into());
+            update_part(&mut hasher, &body_hash);
         }
-        for entry in &self.entries {
+        for (entry, entry_hash) in self.entries.iter().zip(entry_hashes) {
             match &entry.provenance {
                 InstructionProvenance::Project {
                     source_path,
@@ -1053,17 +1250,30 @@ impl LoadedAgentsMd {
                 }
                 InstructionProvenance::Internal => update_part(&mut hasher, b"internal"),
             }
-            update_part(&mut hasher, &Sha256::digest(entry.contents.as_bytes()));
+            update_part(&mut hasher, entry_hash);
         }
         hasher.finalize().into()
     }
 
+    fn render_stable_context(&self) -> RenderedStableContext {
+        if self.has_multiple_project_environments() {
+            self.render_environment_labeled_text()
+        } else {
+            self.render_legacy_text()
+        }
+    }
+
+    #[cfg(test)]
     fn legacy_text(&self) -> String {
-        let mut output = String::new();
+        self.render_legacy_text().text
+    }
+
+    fn render_legacy_text(&self) -> RenderedStableContext {
+        let mut output = StableContextRenderer::new(self.entries.len());
         let mut has_previous = false;
         let mut previous_was_project = false;
         if let Some(instructions) = &self.user_instructions {
-            output.push_str(&instructions.text);
+            output.push_user_instructions(&instructions.text);
             has_previous = true;
         }
         for entry in &self.entries {
@@ -1079,19 +1289,24 @@ impl LoadedAgentsMd {
                 };
                 output.push_str(separator);
             }
-            output.push_str(&entry.contents);
+            output.push_entry(&entry.contents);
             has_previous = true;
             previous_was_project = is_project;
         }
-        output
+        output.finish()
     }
 
+    #[cfg(test)]
     fn environment_labeled_text(&self) -> String {
-        let mut output = String::new();
+        self.render_environment_labeled_text().text
+    }
+
+    fn render_environment_labeled_text(&self) -> RenderedStableContext {
+        let mut output = StableContextRenderer::new(self.entries.len());
         let mut has_previous = false;
         let mut previous_environment: Option<(&str, &PathUri)> = None;
         if let Some(instructions) = &self.user_instructions {
-            output.push_str(&instructions.text);
+            output.push_user_instructions(&instructions.text);
             has_previous = true;
         }
         for entry in &self.entries {
@@ -1115,20 +1330,20 @@ impl LoadedAgentsMd {
                             cwd.inferred_native_path_string()
                         ));
                     }
-                    output.push_str(&entry.contents);
+                    output.push_entry(&entry.contents);
                     previous_environment = Some(environment);
                 }
                 InstructionProvenance::Internal => {
                     if has_previous {
                         output.push_str("\n\n");
                     }
-                    output.push_str(&entry.contents);
+                    output.push_entry(&entry.contents);
                     previous_environment = None;
                 }
             }
             has_previous = true;
         }
-        output
+        output.finish()
     }
 
     #[cfg(test)]

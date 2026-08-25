@@ -38,7 +38,7 @@ async fn continue_after_stream_error() {
         .and(path("/v1/responses"))
         .and(body_string_contains("first message"))
         .respond_with(fail)
-        .up_to_n_times(2)
+        .expect(1)
         .mount(&server)
         .await;
 
@@ -75,7 +75,7 @@ async fn continue_after_stream_error() {
         query_params: None,
         http_headers: None,
         env_http_headers: None,
-        request_max_retries: Some(1),
+        request_max_retries: Some(0),
         stream_max_retries: Some(1),
         stream_idle_timeout_ms: Some(2_000),
         websocket_connect_timeout_ms: None,

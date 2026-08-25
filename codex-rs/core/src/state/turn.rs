@@ -603,12 +603,18 @@ impl TurnState {
             .remove(&(server_name.to_string(), request_id.clone()))
     }
 
-    pub(crate) fn insert_pending_dynamic_tool(
+    pub(crate) fn try_insert_pending_dynamic_tool(
         &mut self,
         key: String,
         tx: oneshot::Sender<DynamicToolResponse>,
-    ) -> Option<oneshot::Sender<DynamicToolResponse>> {
-        self.pending_dynamic_tools.insert(key, tx)
+    ) -> Result<(), oneshot::Sender<DynamicToolResponse>> {
+        match self.pending_dynamic_tools.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(tx);
+                Ok(())
+            }
+            std::collections::hash_map::Entry::Occupied(_) => Err(tx),
+        }
     }
 
     pub(crate) fn remove_pending_dynamic_tool(

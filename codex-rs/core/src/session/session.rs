@@ -275,8 +275,6 @@ impl SessionConfiguration {
             next_configuration.model_reasoning_summary = Some(summary);
         }
         if let Some(service_tier) = updates.service_tier.clone() {
-            // TODO(aibrahim): Remove once v2 clients no longer send the legacy
-            // "fast" service tier value.
             next_configuration.service_tier = match service_tier {
                 Some(service_tier) => Some(
                     ServiceTier::from_request_value(&service_tier)
@@ -470,6 +468,26 @@ pub(crate) struct SessionSettingsUpdate {
     pub(crate) personality: Option<Personality>,
     pub(crate) app_server_client_name: Option<String>,
     pub(crate) app_server_client_version: Option<String>,
+}
+
+impl SessionSettingsUpdate {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.environments.is_none()
+            && self.workspace_roots.is_none()
+            && self.profile_workspace_roots.is_none()
+            && self.approval_policy.is_none()
+            && self.approvals_reviewer.is_none()
+            && self.sandbox_policy.is_none()
+            && self.permission_profile.is_none()
+            && self.active_permission_profile.is_none()
+            && self.windows_sandbox_level.is_none()
+            && self.collaboration_mode.is_none()
+            && self.reasoning_summary.is_none()
+            && self.service_tier.is_none()
+            && self.personality.is_none()
+            && self.app_server_client_name.is_none()
+            && self.app_server_client_version.is_none()
+    }
 }
 
 pub(crate) struct AppServerClientMetadata {
@@ -841,15 +859,6 @@ impl Session {
 
             let mut post_session_configured_events = Vec::<Event>::new();
 
-            for usage in config.features.legacy_feature_usages() {
-                post_session_configured_events.push(Event {
-                    id: INITIAL_SUBMIT_ID.to_owned(),
-                    msg: EventMsg::DeprecationNotice(DeprecationNoticeEvent {
-                        summary: usage.summary.clone(),
-                        details: usage.details.clone(),
-                    }),
-                });
-            }
             for message in &config.startup_warnings {
                 post_session_configured_events.push(Event {
                     id: "".to_owned(),
@@ -1028,6 +1037,14 @@ impl Session {
                     )
                     .await
                 };
+                let (tool_history, ledger_warning) = tool_history.into_state_and_warning();
+                if let Some(message) = ledger_warning {
+                    tracing::warn!("{message}");
+                    post_session_configured_events.push(Event {
+                        id: INITIAL_SUBMIT_ID.to_owned(),
+                        msg: EventMsg::Warning(WarningEvent { message }),
+                    });
+                }
                 state.set_tool_history_state(tool_history);
             }
             let managed_network_requirements_configured = config

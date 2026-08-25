@@ -2176,12 +2176,16 @@ fn normalize_approval_decision_for_mode(
 
 async fn mcp_tool_approval_is_remembered(sess: &Session, key: &McpToolApprovalKey) -> bool {
     let store = sess.services.tool_approvals.lock().await;
-    matches!(store.get(key), Some(ReviewDecision::ApprovedForSession))
+    matches!(
+        store.get(&key.tool_name, key),
+        Some(ReviewDecision::ApprovedForSession)
+    )
 }
 
 async fn remember_mcp_tool_approval(sess: &Session, key: McpToolApprovalKey) {
     let mut store = sess.services.tool_approvals.lock().await;
-    store.put(key, ReviewDecision::ApprovedForSession);
+    let tool_name = key.tool_name.clone();
+    store.put(&tool_name, key, ReviewDecision::ApprovedForSession);
 }
 
 async fn apply_mcp_tool_approval_decision(

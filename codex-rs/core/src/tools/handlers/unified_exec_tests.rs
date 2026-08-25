@@ -1657,6 +1657,36 @@ async fn write_stdin_post_tool_use_payload_uses_original_exec_call_id_and_comman
 }
 
 #[tokio::test]
+async fn empty_write_stdin_poll_does_not_increment_retry_or_reentry_counters() {
+    let invocation = invocation_for_payload(
+        "write_stdin",
+        "ordinary-poll",
+        ToolPayload::Function {
+            arguments: serde_json::json!({
+                "session_id": u32::MAX,
+                "chars": "",
+                "yield_time_ms": 10,
+            })
+            .to_string(),
+        },
+    )
+    .await;
+    let timing = Arc::new(crate::tools::tool_dispatch_trace::ToolDispatchTiming::new(
+        tokio::time::Instant::now(),
+        false,
+    ));
+    let _ = crate::tools::tool_dispatch_trace::scope_tool_dispatch_timing(
+        Arc::clone(&timing),
+        WriteStdinHandler.handle(invocation),
+    )
+    .await;
+
+    let snapshot = timing.snapshot(tokio::time::Instant::now());
+    assert_eq!(snapshot.retry_count, 0);
+    assert_eq!(snapshot.reentry_count, 0);
+}
+
+#[tokio::test]
 async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separate() {
     let payload = ToolPayload::Function {
         arguments: serde_json::json!({ "session_id": 45, "chars": "" }).to_string(),

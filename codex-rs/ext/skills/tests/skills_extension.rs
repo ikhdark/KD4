@@ -13,6 +13,7 @@ use codex_extension_api::ConversationHistory;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionEventSink;
 use codex_extension_api::ExtensionRegistryBuilder;
+use codex_extension_api::FunctionCallError;
 use codex_extension_api::NoopTurnItemEmitter;
 use codex_extension_api::PreviousWorldStateSection;
 use codex_extension_api::ThreadStartInput;
@@ -47,6 +48,7 @@ use codex_skills_extension::provider::SkillListQuery;
 use codex_skills_extension::provider::SkillProvider;
 use codex_skills_extension::provider::SkillProviderFuture;
 use codex_skills_extension::provider::SkillReadRequest;
+use codex_tools::ToolCallSource;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
@@ -477,6 +479,7 @@ async fn skills_list_truncates_catalog_descriptions_in_tool_output() -> TestResu
             tool_name: list_tool.tool_name(),
             model: "gpt-test".to_string(),
             truncation_policy: TruncationPolicy::Bytes(1_024),
+            source: ToolCallSource::Direct,
             conversation_history: ConversationHistory::default(),
             turn_item_emitter: Arc::new(NoopTurnItemEmitter),
             cancellation_token: Default::default(),
@@ -494,6 +497,199 @@ async fn skills_list_truncates_catalog_descriptions_in_tool_output() -> TestResu
 
     assert_eq!(rendered_description, "x".repeat(1_021) + "...");
     assert_ne!(rendered_description, description);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn skills_read_honors_response_budgets_without_rereading_cached_contents() -> TestResult {
+    let contents = format!("{}終", "line \\\"quoted\\\" \\\\ 🚀\n".repeat(300));
+    let read_calls = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(ReadContentsProvider {
+        catalog: SkillCatalog {
+            entries: vec![test_entry(
+                SkillSourceKind::Orchestrator,
+                "codex_apps",
+                "orchestrator/paged",
+                "skill://orchestrator/paged/SKILL.md",
+            )],
+            warnings: Vec::new(),
+        },
+        contents: contents.clone(),
+        read_calls: Arc::clone(&read_calls),
+    });
+    let providers = SkillProviders::new().with_orchestrator_provider(provider);
+    let mut builder = ExtensionRegistryBuilder::new();
+    install_with_providers(&mut builder, providers, skills_extension_config);
+    let registry = builder.build();
+    let session_store = ExtensionData::new("session");
+    let thread_store = ExtensionData::new("thread");
+    let session_source = SessionSource::Cli;
+    let config = default_config();
+    registry.thread_lifecycle_contributors()[0]
+        .on_thread_start(ThreadStartInput {
+            config: &config,
+            session_source: &session_source,
+            persistent_thread_state_available: true,
+            environments: &[],
+            session_store: &session_store,
+            thread_store: &thread_store,
+        })
+        .await;
+
+    let tools = registry.tool_contributors()[0].tools(&session_store, &thread_store);
+    let read_tool = tools
+        .iter()
+        .find(|tool| tool.tool_name().name == "read")
+        .ok_or("skills.read tool should be registered")?;
+    let base_call = ToolCall {
+        turn_id: "turn-1".to_string(),
+        call_id: "read-page".to_string(),
+        tool_name: read_tool.tool_name(),
+        model: "gpt-test".to_string(),
+        truncation_policy: TruncationPolicy::Bytes(300),
+        source: ToolCallSource::Direct,
+        conversation_history: ConversationHistory::default(),
+        turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+        cancellation_token: Default::default(),
+        primary_environment_id: None,
+        environments: Vec::new(),
+        payload: ToolPayload::Function {
+            arguments: String::new(),
+        },
+    };
+
+    let mut reconstructed = String::new();
+    let mut cursor = None;
+    let mut first_cursor = None;
+    let mut page_count = 0;
+    loop {
+        let call_id = format!("read-page-{page_count}");
+        let payload = ToolPayload::Function {
+            arguments: serde_json::json!({
+                "authority": {"kind": "orchestrator"},
+                "package": "orchestrator/paged",
+                "resource": "skill://orchestrator/paged/SKILL.md",
+                "cursor": cursor,
+            })
+            .to_string(),
+        };
+        let output = read_tool
+            .handle(ToolCall {
+                call_id: call_id.clone(),
+                payload: payload.clone(),
+                ..base_call.clone()
+            })
+            .await?;
+        let response = output
+            .post_tool_use_response(&call_id, &payload)
+            .ok_or("skills.read should expose structured output")?;
+        assert!(serde_json::to_vec(&response)?.len() <= 360);
+        reconstructed.push_str(
+            response["contents"]
+                .as_str()
+                .ok_or("skills.read response should contain text")?,
+        );
+        cursor = response["next_cursor"].as_str().map(str::to_owned);
+        first_cursor.get_or_insert_with(|| cursor.clone());
+        page_count += 1;
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    assert!(page_count > 1);
+    assert_eq!(reconstructed, contents);
+    assert_eq!(read_calls.load(Ordering::Relaxed), 1);
+
+    let code_mode_payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "authority": {"kind": "orchestrator"},
+            "package": "orchestrator/paged",
+            "resource": "skill://orchestrator/paged/SKILL.md",
+        })
+        .to_string(),
+    };
+    let code_mode_output = read_tool
+        .handle(ToolCall {
+            call_id: "code-mode-read".to_string(),
+            truncation_policy: TruncationPolicy::Bytes(16),
+            source: ToolCallSource::CodeMode {
+                cell_id: "cell-1".to_string(),
+                runtime_tool_call_id: "nested-read-1".to_string(),
+            },
+            payload: code_mode_payload.clone(),
+            ..base_call.clone()
+        })
+        .await?;
+    let code_mode_response = code_mode_output
+        .post_tool_use_response("code-mode-read", &code_mode_payload)
+        .ok_or("skills.read should expose code-mode structured output")?;
+    assert_eq!(code_mode_response["contents"], contents);
+    assert_eq!(code_mode_response["next_cursor"], serde_json::Value::Null);
+    assert_eq!(read_calls.load(Ordering::Relaxed), 1);
+
+    let mut stale_cursor = first_cursor
+        .flatten()
+        .ok_or("the first page should provide a cursor")?;
+    stale_cursor.replace_range(
+        ..1,
+        if stale_cursor.starts_with('0') {
+            "1"
+        } else {
+            "0"
+        },
+    );
+    let stale_payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "authority": {"kind": "orchestrator"},
+            "package": "orchestrator/paged",
+            "resource": "skill://orchestrator/paged/SKILL.md",
+            "cursor": stale_cursor,
+        })
+        .to_string(),
+    };
+    let stale_error = read_tool
+        .handle(ToolCall {
+            call_id: "stale-read".to_string(),
+            payload: stale_payload,
+            ..base_call.clone()
+        })
+        .await
+        .err()
+        .ok_or("skills.read should reject a stale cursor")?;
+    assert_eq!(
+        stale_error,
+        FunctionCallError::RespondToModel(
+            "skills.read cursor is stale; restart from the first page".to_string()
+        )
+    );
+
+    let insufficient_payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "authority": {"kind": "orchestrator"},
+            "package": "orchestrator/paged",
+            "resource": "skill://orchestrator/paged/SKILL.md",
+        })
+        .to_string(),
+    };
+    let insufficient_error = read_tool
+        .handle(ToolCall {
+            call_id: "insufficient-read".to_string(),
+            truncation_policy: TruncationPolicy::Bytes(16),
+            payload: insufficient_payload,
+            ..base_call
+        })
+        .await
+        .err()
+        .ok_or("skills.read should reject a response with no room for contents")?;
+    assert_eq!(
+        insufficient_error,
+        FunctionCallError::RespondToModel(
+            "skills.read response budget leaves no room for contents".to_string()
+        )
+    );
+    assert_eq!(read_calls.load(Ordering::Relaxed), 1);
 
     Ok(())
 }
@@ -822,6 +1018,31 @@ struct StaticSkillProvider {
     read_requests: Arc<Mutex<Vec<SkillReadRequest>>>,
     list_calls: Option<Arc<AtomicUsize>>,
     fail_first_list: bool,
+}
+
+#[derive(Clone)]
+struct ReadContentsProvider {
+    catalog: SkillCatalog,
+    contents: String,
+    read_calls: Arc<AtomicUsize>,
+}
+
+impl SkillProvider for ReadContentsProvider {
+    fn list(&self, _query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
+        let catalog = self.catalog.clone();
+        Box::pin(async move { Ok(catalog) })
+    }
+
+    fn read(&self, request: SkillReadRequest) -> SkillProviderFuture<'_, SkillReadResult> {
+        self.read_calls.fetch_add(1, Ordering::Relaxed);
+        let contents = self.contents.clone();
+        Box::pin(async move {
+            Ok(SkillReadResult {
+                resource: request.resource,
+                contents,
+            })
+        })
+    }
 }
 
 struct ChannelEventSink(std::sync::mpsc::Sender<Event>);

@@ -2,7 +2,7 @@ use crate::agents_md::AgentsMdFreshness;
 use crate::agents_md::LoadedAgentsMd;
 use crate::agents_md::RepositoryStableContextBundle;
 use crate::agents_md::effective_project_root_markers;
-use crate::agents_md::load_project_instructions;
+use crate::agents_md::load_project_instructions_with_markers;
 use crate::config::Config;
 use crate::environment_selection::ThreadEnvironments;
 use crate::environment_selection::TurnEnvironmentSnapshot;
@@ -52,7 +52,17 @@ struct AgentsMdCacheKey {
 }
 
 impl AgentsMdCacheKey {
+    #[cfg(test)]
     fn capture(config: &Config, environments: &TurnEnvironmentSnapshot) -> Self {
+        let project_root_markers = effective_project_root_markers(config);
+        Self::capture_with_markers(config, environments, &project_root_markers)
+    }
+
+    fn capture_with_markers(
+        config: &Config,
+        environments: &TurnEnvironmentSnapshot,
+        project_root_markers: &[String],
+    ) -> Self {
         Self {
             active_cwd: PathUri::from_abs_path(&config.cwd),
             environment_generation: environments.generation,
@@ -72,7 +82,7 @@ impl AgentsMdCacheKey {
                 .collect(),
             project_doc_max_bytes: config.project_doc_max_bytes,
             fallback_filenames: config.project_doc_fallback_filenames.clone(),
-            project_root_markers: effective_project_root_markers(config),
+            project_root_markers: project_root_markers.to_vec(),
         }
     }
 }
@@ -148,9 +158,16 @@ impl AgentsMdManager {
         config: &Config,
         environments: &TurnEnvironmentSnapshot,
     ) -> AgentsMdObservation {
-        let key = AgentsMdCacheKey::capture(config, environments);
-        let load =
-            load_project_instructions(config, self.user_instructions.clone(), environments).await;
+        let project_root_markers = effective_project_root_markers(config);
+        let key =
+            AgentsMdCacheKey::capture_with_markers(config, environments, &project_root_markers);
+        let load = load_project_instructions_with_markers(
+            config,
+            self.user_instructions.clone(),
+            environments,
+            &project_root_markers,
+        )
+        .await;
         let mut cache = self.cache.lock().await;
         if !load.complete && cache.key.as_ref() == Some(&key) {
             return cache.cached_observation(AgentsMdFreshness::CachedFallback);

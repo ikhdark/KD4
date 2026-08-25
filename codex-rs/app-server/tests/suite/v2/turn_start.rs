@@ -1283,8 +1283,8 @@ async fn turn_start_rejects_invalid_permission_selection_before_starting_turn() 
         &BTreeMap::from([(Feature::Personality, true)]),
     )?;
     std::fs::write(
-        codex_home.path().join("managed_config.toml"),
-        "sandbox_mode = \"read-only\"\n",
+        codex_home.path().join("requirements.toml"),
+        "allowed_sandbox_modes = [\"read-only\"]\n",
     )?;
 
     let mut mcp = TestAppServer::builder()

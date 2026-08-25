@@ -1,5 +1,7 @@
 {
-  "manifest_sha256": "0261a42e2585112e5ea6091da977aa85a2a2befcce4254fa7cc1c352f0c30e98",
+  "index_sha256": "d77fd06323515cda941b854192dcf94b5e0331b7cc62ab70d730e6c2d2db579e",
+  "index_version": 1,
+  "manifest_sha256": "9f7b8e0c349816d9b113680fc9ce20d5815d5af841db704722872787a1997576",
   "omitted": {
     "relationships": 0
   },
@@ -461,7 +463,7 @@
           "evidence": [
             {
               "path": "codex-rs/core/src/tools/handlers/plan.rs",
-              "symbol": "PlanHandler::handle_call"
+              "symbol": "impl ToolExecutor<ToolInvocation> for PlanHandler"
             }
           ],
           "id": "durable-plan-update",
@@ -759,7 +761,9 @@
         "source_owners.toml"
       ],
       "facet_exclusions": {},
-      "feature_ids": [],
+      "feature_ids": [
+        "repository-intelligence"
+      ],
       "generated_artifacts": [
         "SOURCEMAP.md",
         "architecture_index.json"
@@ -811,7 +815,68 @@
     },
     {
       "configuration": [
-        "codex-rs/core/src/task_evidence/desktop_activation.rs",
+        ".codex/hooks.json"
+      ],
+      "facet_exclusions": {
+        "configuration_and_gates": "Hook selection is registered directly in .codex/hooks.json; the PowerShell entrypoint has no separate runtime configuration gate.",
+        "generated_artifacts": "Continuity capsules are bounded local runtime state rather than checked-in generated mirrors."
+      },
+      "feature_ids": [
+        "task-continuity-hooks"
+      ],
+      "generated_artifacts": [],
+      "id": "task-continuity-hooks",
+      "invariants": [
+        {
+          "evidence": [
+            {
+              "path": ".codex/hooks/task-continuity-entry.ps1",
+              "symbol": "$emptyOutput = '{}'"
+            }
+          ],
+          "id": "hook-fail-open",
+          "kind": "semantic",
+          "statement": "Every registered lifecycle hook must emit the canonical empty object and exit successfully when routing or continuity processing fails.",
+          "tests": [
+            "scripts/test_task_continuity_hook.py"
+          ]
+        }
+      ],
+      "primary_entries": [
+        {
+          "ambiguous": true,
+          "path": ".codex/hooks/task-continuity-entry.ps1",
+          "symbol": "param("
+        }
+      ],
+      "roots": [
+        ".codex/hooks.json",
+        ".codex/hooks/task-continuity-entry.ps1",
+        ".codex/hooks/task-continuity-fast-basic.ps1",
+        ".codex/hooks/task-continuity-fast-compact.ps1",
+        ".codex/hooks/task-continuity-fast-session.ps1",
+        ".codex/hooks/task-continuity.ps1",
+        "scripts/test_task_continuity_hook.py"
+      ],
+      "tests": [
+        "scripts/test_task_continuity_hook.py"
+      ],
+      "validation": [
+        {
+          "argv": [
+            "python",
+            "-m",
+            "unittest",
+            "scripts.test_task_continuity_hook"
+          ],
+          "cwd": ".",
+          "id": "task-continuity-hooks-focused",
+          "role": "focused_tests"
+        }
+      ]
+    },
+    {
+      "configuration": [
         "codex-rs/core/src/task_evidence/external_evidence.rs",
         "codex-rs/core/src/task_evidence/source_owner_index.rs"
       ],
@@ -829,7 +894,7 @@
           "evidence": [
             {
               "path": "codex-rs/core/src/task_evidence.rs",
-              "symbol": "TaskEvidenceLedger::completion_gate"
+              "symbol": "pub(crate) async fn completion_gate("
             }
           ],
           "id": "current-evidence-completion",
@@ -1021,8 +1086,8 @@
       "confidence": "declared",
       "evidence": [
         {
-          "path": "codex-rs/app-server/tests",
-          "symbol": "integration suites"
+          "path": "codex-rs/app-server/tests/suite/v2/mod.rs",
+          "symbol": "mod initialize;"
         }
       ],
       "kind": "validated_by",
@@ -1138,8 +1203,8 @@
       "confidence": "declared",
       "evidence": [
         {
-          "path": "codex-rs/core/tests",
-          "symbol": "integration suites"
+          "path": "codex-rs/core/tests/all.rs",
+          "symbol": "mod suite;"
         }
       ],
       "kind": "validated_by",
@@ -1204,7 +1269,7 @@
       "evidence": [
         {
           "path": "scripts/test_check_kd4_features.py",
-          "symbol": "FeatureManifestTest"
+          "symbol": "CheckKd4FeaturesTest"
         }
       ],
       "kind": "validated_by",
@@ -1282,7 +1347,7 @@
       "evidence": [
         {
           "path": "codex-rs/core/src/tools/handlers/plan.rs",
-          "symbol": "PlanHandler::handle_call"
+          "symbol": "impl ToolExecutor<ToolInvocation> for PlanHandler"
         }
       ],
       "kind": "calls",
@@ -1295,7 +1360,7 @@
       "evidence": [
         {
           "path": "codex-rs/core/src/tools/spec_plan.rs",
-          "symbol": "build_spec_plan"
+          "symbol": "build_tool_specs_and_registry"
         }
       ],
       "kind": "registers",
@@ -1346,8 +1411,8 @@
       "confidence": "compiler_resolved",
       "evidence": [
         {
-          "path": "codex-rs/core/src/session/mod.rs",
-          "symbol": "GitWorkspaceCache::new"
+          "path": "codex-rs/core/src/git_workspace.rs",
+          "symbol": "cache: GitWorkspaceCache::new()"
         }
       ],
       "kind": "constructs",
@@ -1360,7 +1425,7 @@
       "evidence": [
         {
           "path": "codex-rs/core/src/git_workspace_tests.rs",
-          "symbol": "nested repositories"
+          "symbol": "snapshot_preserves_native_environment_pairing_when_foreign_cwds_are_skipped"
         }
       ],
       "kind": "validated_by",
@@ -1373,7 +1438,7 @@
       "evidence": [
         {
           "path": "codex-rs/core/Cargo.toml",
-          "symbol": "[[bench]] turn_latency"
+          "symbol": "name = \"turn_latency\""
         }
       ],
       "kind": "consumed_by",
@@ -1399,7 +1464,7 @@
       "evidence": [
         {
           "path": "codex-rs/core/Cargo.toml",
-          "symbol": "[[bench]] turn_latency"
+          "symbol": "name = \"turn_latency\""
         }
       ],
       "kind": "registers",
@@ -1437,7 +1502,7 @@
       "confidence": "compiler_resolved",
       "evidence": [
         {
-          "path": "codex-rs/app-server/src",
+          "path": "codex-rs/app-server/src/lib.rs",
           "symbol": "codex_protocol"
         }
       ],
@@ -1462,8 +1527,8 @@
       "confidence": "declared",
       "evidence": [
         {
-          "path": "codex-rs/protocol/src",
-          "symbol": "crate tests"
+          "path": "codex-rs/protocol/src/validation.rs",
+          "symbol": "mod tests"
         }
       ],
       "kind": "validated_by",
@@ -1605,12 +1670,51 @@
       "target": "path:scripts/test_source_owners.py"
     },
     {
+      "category": "control_flow",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": ".codex/hooks/task-continuity-fast-basic.ps1",
+          "symbol": "task-continuity.ps1"
+        }
+      ],
+      "kind": "calls",
+      "source": "owner:task-continuity-hooks",
+      "target": "path:.codex/hooks/task-continuity.ps1"
+    },
+    {
+      "category": "runtime_registration",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": ".codex/hooks.json",
+          "symbol": "task-continuity-entry.ps1"
+        }
+      ],
+      "kind": "registers",
+      "source": "owner:task-continuity-hooks",
+      "target": "path:.codex/hooks/task-continuity-entry.ps1"
+    },
+    {
+      "category": "tests_contracts",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "scripts/test_task_continuity_hook.py",
+          "symbol": "class TaskContinuityHookTest"
+        }
+      ],
+      "kind": "validated_by",
+      "source": "owner:task-continuity-hooks",
+      "target": "path:scripts/test_task_continuity_hook.py"
+    },
+    {
       "category": "callers_consumers",
       "confidence": "compiler_resolved",
       "evidence": [
         {
           "path": "codex-rs/core/src/tools/handlers/mcp.rs",
-          "symbol": "McpHandler::handle_call"
+          "symbol": "impl ToolExecutor<ToolInvocation> for McpHandler"
         }
       ],
       "kind": "consumed_by",
@@ -1623,7 +1727,7 @@
       "evidence": [
         {
           "path": "codex-rs/core/src/task_evidence.rs",
-          "symbol": "TaskEvidenceLedger::record_planning_update"
+          "symbol": "pub(crate) async fn record_planning_update("
         }
       ],
       "kind": "calls",
@@ -1709,7 +1813,7 @@
       "target": "path:codex-rs/core/src/tools/command_output_artifact_tests.rs"
     }
   ],
-  "repository_revision": "manifest:0261a42e2585112e5ea6091da977aa85a2a2befcce4254fa7cc1c352f0c30e98",
+  "repository_revision": "manifest:9f7b8e0c349816d9b113680fc9ce20d5815d5af841db704722872787a1997576:sources:ceacb61514bedf02223c173f9b3367e7092115b2046c3894fb6c8cd5c300ee4f",
   "schema_version": 2,
   "status": "complete",
   "unresolved": []

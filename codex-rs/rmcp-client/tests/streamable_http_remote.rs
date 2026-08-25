@@ -2,7 +2,7 @@
 //!
 //! These tests exercise the orchestrator-side RMCP adapter against a real
 //! `exec-server` process so HTTP requests go through the remote runtime path
-//! instead of direct local `reqwest` calls.
+//! instead of the local shared HTTP client.
 
 mod streamable_http_test_support;
 
@@ -16,7 +16,7 @@ use streamable_http_test_support::spawn_streamable_http_server;
 
 /// What this tests: the RMCP remote Streamable HTTP adapter can initialize
 /// a server and call a tool while every MCP HTTP request goes through a real
-/// exec-server process instead of a direct reqwest transport.
+/// exec-server process instead of the local shared HTTP transport.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn streamable_http_remote_client_round_trips_through_exec_server() -> anyhow::Result<()> {
     // Phase 1: start the MCP Streamable HTTP test server and a local

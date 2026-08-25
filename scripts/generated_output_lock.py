@@ -88,3 +88,10 @@ def generated_output_lock(root: Path, owner: str) -> Iterator[Path]:
     lock_path = root / ".codex" / "locks" / "generated-output.lock"
     with repository_lock(lock_path, owner, "generated outputs") as acquired:
         yield acquired
+
+
+@contextlib.contextmanager
+def source_map_lock(root: Path, owner: str) -> Iterator[Path]:
+    lock_path = root / ".codex" / "locks" / "source-map.lock"
+    with repository_lock(lock_path, owner, "source map outputs") as acquired:
+        yield acquired

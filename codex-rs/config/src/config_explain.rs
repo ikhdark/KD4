@@ -9,6 +9,11 @@ pub struct ConfigOptionDoc {
 
 pub const CONFIG_OPTION_DOCS: &[ConfigOptionDoc] = &[
     doc(
+        "config_version",
+        "Configuration format",
+        "Version of the config.toml format used for compatibility checks.",
+    ),
+    doc(
         "model",
         "Model and provider",
         "Default model used for new turns.",
@@ -299,6 +304,11 @@ pub const CONFIG_OPTION_DOCS: &[ConfigOptionDoc] = &[
         "Maximum allowed timeout for background terminal commands.",
     ),
     doc(
+        "completed_tool_history_projection",
+        "Tools, apps, and plugins",
+        "Whether completed tool output is projected into retained conversation history.",
+    ),
+    doc(
         "hooks",
         "Tools, apps, and plugins",
         "Lifecycle hooks configured inline in config.toml.",
@@ -332,6 +342,11 @@ pub const CONFIG_OPTION_DOCS: &[ConfigOptionDoc] = &[
         "project_root_markers",
         "Project and profile",
         "Markers used to find project roots for `.codex` discovery.",
+    ),
+    doc(
+        "after_agent_policy",
+        "Project and profile",
+        "Policy applied after an agent finishes, including configured follow-up checks.",
     ),
     doc(
         "history",
@@ -419,6 +434,11 @@ pub const CONFIG_OPTION_DOCS: &[ConfigOptionDoc] = &[
         "features",
         "Telemetry and features",
         "Central feature flags.",
+    ),
+    doc(
+        "orchestrator",
+        "Telemetry and features",
+        "Feature settings owned by the orchestration runtime.",
     ),
     doc(
         "suppress_unstable_features_warning",

@@ -31,7 +31,7 @@ Use when the task is discovery, comparison, audit, or recommendation.
 
 Use when the task is broad, risky, multi-step, or likely to resume later.
 
-- Create or update `PLAN.md`.
+- Create or update a copy of [`templates/PLAN.md`](templates/PLAN.md).
 - State non-goals, unknowns, and validation intent.
 - Identify owner files, call paths, configs, generated artifacts, and tests.
 - Keep the plan short enough to execute.
@@ -42,7 +42,8 @@ Use when making focused changes.
 
 - Inspect the nearest scoped `AGENTS.md` and owner path before editing.
 - Use `apply_patch` for manual edits.
-- Update `IMPLEMENT.md` only for decisions or evidence worth preserving.
+- Update a copy of [`templates/IMPLEMENT.md`](templates/IMPLEMENT.md) only for
+  decisions or evidence worth preserving.
 - Avoid unrelated cleanup.
 
 ## Review Mode
@@ -52,7 +53,8 @@ Use when checking a patch, PR, or harness artifact.
 - Lead with severity-ranked findings.
 - Cite exact files and lines when possible.
 - Separate observed issues, inferred risks, and open questions.
-- Use `QA_CHECKLIST.md` for broad or risky changes.
+- Use [`templates/QA_CHECKLIST.md`](templates/QA_CHECKLIST.md) for broad or risky
+  changes.
 
 ## Finish Mode
 
@@ -61,7 +63,8 @@ Use when closing out a task.
 - Compare final claims against validation evidence.
 - Record skipped checks with reasons.
 - State remaining desktop publish or restart work when relevant.
-- Write `HANDOFF.md` before stopping if future continuation is likely.
+- Write a copy of [`templates/HANDOFF.md`](templates/HANDOFF.md) before stopping
+  if future continuation is likely.
 
 ## Phase-Boundary Compaction
 

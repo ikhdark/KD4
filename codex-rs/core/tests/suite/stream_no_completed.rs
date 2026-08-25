@@ -3,6 +3,7 @@
 
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
+use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
@@ -89,7 +90,24 @@ async fn retries_on_early_close() {
         .await
         .unwrap();
 
-    // Wait until TurnComplete (should succeed after retry).
+    let EventMsg::StreamError(stream_error) =
+        wait_for_event(&codex, |event| matches!(event, EventMsg::StreamError(_))).await
+    else {
+        unreachable!("predicate guarantees a stream error event");
+    };
+    assert_eq!(stream_error.message, "Reconnecting... 1/1");
+    assert_eq!(
+        stream_error.additional_details.as_deref(),
+        Some("stream disconnected before completion: stream closed before response.completed")
+    );
+    assert!(matches!(
+        stream_error.codex_error_info,
+        Some(CodexErrorInfo::ResponseStreamDisconnected {
+            http_status_code: None
+        })
+    ));
+
+    // Wait until TurnComplete (should succeed after the classified retry).
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
     let requests = server.requests().await;
