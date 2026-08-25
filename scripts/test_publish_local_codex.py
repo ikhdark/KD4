@@ -517,7 +517,7 @@ catch {{
             publish_script,
         )
 
-    def test_publish_doctor_allows_only_missing_auth_failure(self) -> None:
+    def test_publish_doctor_allows_only_non_runtime_failures(self) -> None:
         shell = powershell()
         if shell is None:
             self.skipTest("PowerShell is not available")
@@ -544,9 +544,17 @@ foreach ($function in $functions) {{
     Invoke-Expression $function.Extent.Text
 }}
 $authOnly = '{{"checks":{{"auth.credentials":{{"status":"fail"}},"network.websocket_reachability":{{"status":"warning"}}}}}}'
+$automationTerminal = '{{"checks":{{"terminal.env":{{"status":"fail","summary":"TERM=dumb - colors and cursor control are disabled"}},"local_publish.readiness":{{"status":"ok"}}}}}}'
+$authAndAutomationTerminal = '{{"checks":{{"auth.credentials":{{"status":"fail"}},"terminal.env":{{"status":"fail","summary":"TERM=dumb - colors and cursor control are disabled"}},"local_publish.readiness":{{"status":"ok"}}}}}}'
+$terminalWithoutReadiness = '{{"checks":{{"terminal.env":{{"status":"fail","summary":"TERM=dumb - colors and cursor control are disabled"}}}}}}'
+$differentTerminalFailure = '{{"checks":{{"terminal.env":{{"status":"fail","summary":"terminal metadata is invalid"}},"local_publish.readiness":{{"status":"ok"}}}}}}'
 $configFailure = '{{"checks":{{"auth.credentials":{{"status":"fail"}},"config.load":{{"status":"fail"}}}}}}'
 [pscustomobject]@{{
     authOnly = Test-DoctorFailureAllowedForPublish -OutputLines @($authOnly)
+    automationTerminal = Test-DoctorFailureAllowedForPublish -OutputLines @($automationTerminal)
+    authAndAutomationTerminal = Test-DoctorFailureAllowedForPublish -OutputLines @($authAndAutomationTerminal)
+    terminalWithoutReadiness = Test-DoctorFailureAllowedForPublish -OutputLines @($terminalWithoutReadiness)
+    differentTerminalFailure = Test-DoctorFailureAllowedForPublish -OutputLines @($differentTerminalFailure)
     configFailure = Test-DoctorFailureAllowedForPublish -OutputLines @($configFailure)
 }} | ConvertTo-Json -Compress
 """
@@ -565,13 +573,17 @@ $configFailure = '{{"checks":{{"auth.credentials":{{"status":"fail"}},"config.lo
         )
         output = json.loads(result.stdout)
         self.assertTrue(output["authOnly"])
+        self.assertTrue(output["automationTerminal"])
+        self.assertTrue(output["authAndAutomationTerminal"])
+        self.assertFalse(output["terminalWithoutReadiness"])
+        self.assertFalse(output["differentTerminalFailure"])
         self.assertFalse(output["configFailure"])
 
     def test_publish_run_doctor_uses_publish_classifier(self) -> None:
         publish_script = publish_source_text()
 
         self.assertIn("function Invoke-DoctorForPublish", publish_script)
-        self.assertIn("warning: auth.credentials missing", publish_script)
+        self.assertIn("warning: allowed non-runtime doctor failure", publish_script)
         self.assertEqual(
             publish_script.count("Invoke-DoctorForPublish -TargetPath $targetPath"),
             3,

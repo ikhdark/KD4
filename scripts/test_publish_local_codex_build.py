@@ -453,7 +453,8 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
             self.assertIn(f'doctorCommand: "{fake_codex}" doctor --json', result.stdout)
             self.assertIn("doctor warning", result.stdout)
             self.assertIn(
-                "doctorStatus: warning: auth.credentials missing", result.stdout
+                "doctorStatus: warning: allowed non-runtime doctor failure",
+                result.stdout,
             )
             self.assertIn("doctorLocalPublishStatus: warning", result.stdout)
             self.assertIn(

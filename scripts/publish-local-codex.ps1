@@ -416,7 +416,44 @@ function Test-DoctorFailureAllowedForPublish {
             ForEach-Object { $_.Name }
     )
 
-    return $failedChecks.Count -eq 1 -and $failedChecks[0] -eq "auth.credentials"
+    if ($failedChecks.Count -eq 0) {
+        return $false
+    }
+
+    foreach ($failedCheck in $failedChecks) {
+        if ($failedCheck -eq "auth.credentials") {
+            continue
+        }
+        if ($failedCheck -ne "terminal.env") {
+            return $false
+        }
+
+        $terminalCheck = $checksProperty.Value.PSObject.Properties["terminal.env"].Value
+        $terminalSummaryProperty = $terminalCheck.PSObject.Properties["summary"]
+        if (
+            $null -eq $terminalSummaryProperty -or
+            [string]$terminalSummaryProperty.Value -ne "TERM=dumb - colors and cursor control are disabled"
+        ) {
+            return $false
+        }
+
+        # Publish runs doctor through an automation pipe, so TERM=dumb describes
+        # the caller rather than the installed runtime. Only tolerate that exact
+        # caller failure after doctor has proved the local publish is ready.
+        $readinessProperty = $checksProperty.Value.PSObject.Properties["local_publish.readiness"]
+        if ($null -eq $readinessProperty -or $null -eq $readinessProperty.Value) {
+            return $false
+        }
+        $readinessStatusProperty = $readinessProperty.Value.PSObject.Properties["status"]
+        if (
+            $null -eq $readinessStatusProperty -or
+            [string]$readinessStatusProperty.Value -ne "ok"
+        ) {
+            return $false
+        }
+    }
+
+    return $true
 }
 
 function ConvertFrom-DoctorOutput {
@@ -526,7 +563,7 @@ function Invoke-DoctorForPublish {
     }
 
     if (Test-DoctorFailureAllowedForPublish -OutputLines $doctorOutput) {
-        Write-ProofLine "doctorStatus" "warning: auth.credentials missing"
+        Write-ProofLine "doctorStatus" "warning: allowed non-runtime doctor failure"
         return
     }
 
