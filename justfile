@@ -90,21 +90,10 @@ fmt-check:
 [no-cd]
 [script("python")]
 check-kd4-features *args:
-    import json
-    import os
     import runpy
     import sys
     script = r"{{ justfile_directory() }}/scripts/check_kd4_features.py"
     forwarded = sys.argv[1:]
-    if os.name == "nt":
-        # just's Windows script-recipe boundary applies two JSON-style escape
-        # layers to positional arguments. Remove both before handing argv to
-        # the underlying Python entrypoint.
-        def decode_argument(argument):
-            for _ in range(2):
-                argument = json.loads('"' + argument + '"')
-            return argument
-        forwarded = [decode_argument(argument) for argument in forwarded]
     sys.argv = [script, *forwarded]
     runpy.run_path(script, run_name="__main__")
 

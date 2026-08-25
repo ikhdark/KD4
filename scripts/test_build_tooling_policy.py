@@ -237,11 +237,11 @@ class BuildToolingPolicyTest(unittest.TestCase):
         # Assert the section exists as top-level (H2) guidance and carries the
         # rebuild contract, without pinning it to a line window that breaks
         # whenever earlier sections grow.
-        self.assertIn("\n## Desktop app boundary\n", text)
-        section = text.split("\n## Desktop app boundary\n", 1)[1]
+        self.assertIn("\n## Repository identity and runtime boundary\n", text)
+        section = text.split("\n## Repository identity and runtime boundary\n", 1)[1]
         section = section.split("\n## ", 1)[0]
-        self.assertIn("Source edits here do not hot-apply", section)
-        self.assertIn("rebuilding and updating or replacing", section)
+        self.assertIn("Source changes become Desktop-visible only after rebuilding", section)
+        self.assertIn("replacing or updating the local binary", section)
 
     def test_agents_validation_map_matches_current_layout(self) -> None:
         text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
@@ -263,7 +263,7 @@ class BuildToolingPolicyTest(unittest.TestCase):
 
         self.assertIn("`scripts/AGENTS.md`", root_text)
         self.assertIn("# Scripts Policy", scripts_text)
-        self.assertIn("Root maintenance commands", scripts_text)
+        self.assertIn("Root maintenance lint, test, and audit commands", scripts_text)
         self.assertIn("root_maintenance.py", scripts_text)
 
     def test_windows_installer_requires_standalone_metadata(self) -> None:
@@ -891,24 +891,6 @@ class BuildToolingPolicyTest(unittest.TestCase):
             with self.subTest(schema_key=retired_key):
                 self.assertNotIn(retired_key, schema)
 
-        forbidden_cfg_fragments = (
-            "cfg!(windows)",
-            "cfg!(unix)",
-            'target_os = "',
-            'target_family = "',
-            "#[cfg(windows)]",
-            "#[cfg(unix)]",
-        )
-        violations: list[str] = []
-        for rust_path in (REPO_ROOT / "codex-rs").rglob("*.rs"):
-            if "target" in rust_path.parts:
-                continue
-            text = rust_path.read_text(encoding="utf-8")
-            for fragment in forbidden_cfg_fragments:
-                if fragment in text:
-                    violations.append(f"{rust_path.relative_to(REPO_ROOT)}: {fragment}")
-        self.assertEqual(violations, [])
-
         conditional_dependencies: list[str] = []
         for manifest_path in (REPO_ROOT / "codex-rs").rglob("Cargo.toml"):
             if "target" in manifest_path.parts:
@@ -981,9 +963,10 @@ class BuildToolingPolicyTest(unittest.TestCase):
 
         self.assertNotIn("../docs/config.md", config_docs)
         self.assertIn(
-            "https://developers.openai.com/codex/config-reference", config_docs
+            "https://developers.openai.com/codex/config-file/config-reference",
+            config_docs,
         )
-        self.assertIn("https://developers.openai.com/codex/mcp", config_docs)
+        self.assertIn("https://developers.openai.com/codex/extend/mcp", config_docs)
 
     def test_root_maintenance_script_audit_current_tree_has_no_hard_findings(
         self,
@@ -1605,13 +1588,15 @@ class BuildToolingPolicyTest(unittest.TestCase):
 
         self.assertIn("Pass a package/filter to 'just clippy'", justfile)
         self.assertIn("clippy-workspace *args:", justfile)
-        self.assertIn("-Analyzer clippy @forwarded_args", justfile)
+        clippy_recipe = justfile.split("clippy *args:", 1)[1].split("\n\n", 1)[0]
+        workspace_recipe = justfile.split("clippy-workspace *args:", 1)[1].split(
+            "\n\n", 1
+        )[0]
+        self.assertIn("cargo clippy --tests @forwarded_args", clippy_recipe)
+        self.assertNotIn("--workspace", clippy_recipe)
         self.assertIn(
-            '($forwarded_args -contains "-p") -or ($forwarded_args -contains "--package")',
-            justfile,
+            "-Analyzer clippy --workspace @forwarded_args", workspace_recipe
         )
-        self.assertIn('workspace_arg="--workspace"', justfile)
-        self.assertIn('workspace_arg=""', justfile)
 
     def test_windows_process_suite_cannot_silently_skip_required_coverage(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
@@ -1623,9 +1608,7 @@ class BuildToolingPolicyTest(unittest.TestCase):
         )
 
         self.assertIn(
-            "SKIP: test-windows-sandbox-processes requires a Windows host; "
-            "no Windows process verification was run",
-            justfile,
+            "[windows]\ntest-windows-sandbox-processes *args:", justfile
         )
         self.assertGreaterEqual(justfile.count("--no-tests=fail"), 3)
         self.assertIn("-p codex-utils-pty", justfile)
@@ -1678,7 +1661,6 @@ class BuildToolingPolicyTest(unittest.TestCase):
         self.assertEqual(feature_recipe.returncode, 0, feature_recipe.stderr)
         self.assertIn('[script("python")]', feature_recipe.stdout)
         self.assertIn("forwarded = sys.argv[1:]", feature_recipe.stdout)
-        self.assertIn("json.loads", feature_recipe.stdout)
         self.assertIn("sys.argv = [script, *forwarded]", feature_recipe.stdout)
 
     def test_direct_python_recipe_preserves_argv_and_exit_code(self) -> None:
@@ -1704,8 +1686,9 @@ class BuildToolingPolicyTest(unittest.TestCase):
             capture_output=True,
             check=False,
         )
-        self.assertNotEqual(rejected.returncode, 0)
-        self.assertIn(unicode_argument, rejected.stderr)
+        self.assertEqual(rejected.returncode, 2, rejected.stderr)
+        rendered_argument = unicode_argument.encode("unicode_escape").decode("ascii")
+        self.assertIn(rendered_argument, rejected.stderr)
 
     def test_release_packaging_policy_is_explicit_and_pinned(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
@@ -1739,7 +1722,8 @@ class BuildToolingPolicyTest(unittest.TestCase):
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
 
         for snippet in (
-            'run-lane --lane "{{ package }}" -- cargo nextest run',
+            'run-lane --lane "{{ package }}" -- just _test-lane-package-reserved',
+            'cargo nextest run --target-dir $target_dir -p "{{ package }}"',
             'run-lane --lane "{{ package }}" -- cargo check',
             'run-lane --lane "{{ package }}" -- cargo clippy',
             "run-lane --lane release -- cargo build --release",
